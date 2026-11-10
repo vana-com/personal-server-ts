@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
-import type { RunIntakeStore } from "../../../core/src/localdb/run-intake.js";
 import type {
   BeginRequest,
   IntakeDeclarations,
@@ -10,18 +9,15 @@ import { createStreamSyncIntake } from "../../../core/src/stream-sync/intake.js"
 import { createLocalSync } from "../../../core/src/localdb/sync.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
+import { remoteFixture } from "./apply-fixture.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const ports = vi.hoisted(() => ({
-  intake: vi.fn(),
   cycle: vi.fn(),
   connection: vi.fn(),
   replace: vi.fn(() => false),
   listing: vi.fn(),
   resolver: vi.fn(),
-}));
-vi.mock("../../../core/src/localdb/run-intake.js", () => ({
-  createRunIntakeStore: ports.intake,
 }));
 vi.mock("../../../core/src/localdb/cycle.js", () => ({
   runCycle: ports.cycle,
@@ -71,63 +67,6 @@ const beginRequest: BeginRequest = {
   owner: { address: owner, leaseId: null },
 };
 
-// Only the unbuilt begin/batch port is a fixture. End, fence, merge, schema,
-// SQLite transactions and record reads below use their real implementations.
-function stagingFixture(db: SqlDriver): RunIntakeStore {
-  let observedAt = 0;
-  return {
-    async begin(runId) {
-      const [row] = await db.query<{ checkpoint: string | null }>(
-        "SELECT checkpoint FROM connections WHERE connection_id = 'c'",
-      );
-      await db.batch([
-        {
-          sql: "INSERT INTO runs(run_id, connection_id, o, generation, artifact_version, collection_mode, state) VALUES (?, 'c', ?, 1, '1', 'incremental', 'collecting')",
-          params: [runId, ++observedAt],
-        },
-        {
-          sql: "INSERT INTO run_streams(run_id, stream, delete_snapshot, primary_key, profile_key, profile_version) VALUES (?, 'items', 0, ?, ?, '1')",
-          params: [runId, JSON.stringify(["id"]), declaration.connector],
-        },
-      ]);
-      return {
-        runId,
-        status: "collecting",
-        discardReason: null,
-        stuck: false,
-        binding: { keyCheck: "fixture" },
-        start: {
-          collection_mode: "incremental",
-          state: row?.checkpoint ? JSON.parse(row.checkpoint) : null,
-        },
-        streams: [
-          {
-            ...declaration.streams[0]!,
-            incremental: true,
-            mode: "incremental",
-          },
-        ],
-      };
-    },
-    async batch(runId, req) {
-      await db.batch([
-        ...req.records.map(({ stream, data }) => {
-          const id = String((data as { id: string }).id);
-          return {
-            sql: "INSERT INTO run_rows(run_id, stream, pk_hash, record_key, body, body_sha256) VALUES (?, ?, ?, ?, ?, ?)",
-            params: [runId, stream, id, id, JSON.stringify(data), id],
-          };
-        }),
-        {
-          sql: "UPDATE runs SET last_batch = ? WHERE run_id = ?",
-          params: [req.batch, runId],
-        },
-      ]);
-      return { applied: true, accepted: req.records.length, deletesSkipped: 0 };
-    },
-  };
-}
-
 describe("local sync intake adapter", () => {
   const drivers: SqlDriver[] = [];
   beforeEach(() => {
@@ -150,41 +89,35 @@ describe("local sync intake adapter", () => {
     await openLocalDb(db, { owner, network: "test", deviceId: "fixture" });
     await db.batch([
       {
-        sql: "INSERT INTO connections(connection_id, connector, ns, control_state) VALUES ('c', ?, '_', 'active')",
+        sql: "INSERT INTO connections(connection_id, connector, ns, control_state) VALUES ('pdpp.fixture~', ?, '', 'active')",
         params: [declaration.connector],
       },
       {
-        sql: "INSERT INTO stream_state(connection_id, stream, primary_key, semantics, incremental, profile_key, profile_version) VALUES ('c', 'items', ?, 'mutable_state', 1, ?, '1')",
+        sql: "INSERT INTO stream_state(connection_id, stream, primary_key, semantics, incremental, profile_key, profile_version) VALUES ('pdpp.fixture~', 'items', ?, 'mutable_state', 1, ?, '1')",
         params: [JSON.stringify(["id"]), declaration.connector],
       },
     ]);
     let op = 0;
-    const unused = () => {
-      throw new Error("Unexpected host I/O");
+    const keys = {
+      namespaceHmac: async () => new Uint8Array(32),
+      encrypt: async (_s: string, b: Uint8Array) => b,
+      encryptPart: async (_s: string, b: Uint8Array) => b,
+      decrypt: async (_s: string, b: Uint8Array) => b,
     };
+    const remote = await remoteFixture(keys, declaration.connector);
+    let now = 0;
     const deps: LocalSyncDeps = {
       db,
       ownerAddress: owner,
       queue: connectionQueue(),
-      now: () => 1,
+      now: () => ++now,
       newOp: () => String(++op),
       logger: { info: vi.fn(), warn: vi.fn() },
-      registry: {
-        read: unused,
-        post: unused,
-        listControlRows: unused,
-        listStreamRows: unused,
-      },
-      blobs: { put: unused, get: unused },
-      keys: {
-        namespaceHmac: unused,
-        encrypt: unused,
-        encryptPart: unused,
-        decrypt: unused,
-      },
-      signer: { signAddData: unused },
+      registry: remote.registry,
+      blobs: remote.storage,
+      keys,
+      signer: { signAddData: async () => "0x00" },
     };
-    ports.intake.mockReturnValue(stagingFixture(db));
     const sync = createLocalSync(deps, {
       resolveArtifact: () => declaration,
       declaredStreams: () => ["items"],
@@ -232,7 +165,7 @@ describe("local sync intake adapter", () => {
       }),
     ).toEqual({ result: "queued", stuck: false, updateRequired: false });
     const afterA = await sync.query.listRecords({
-      connectionId: "c",
+      connectionId: "pdpp.fixture~",
       stream: "items",
       limit: 100,
     });
@@ -246,7 +179,7 @@ describe("local sync intake adapter", () => {
     ).toEqual([{ replace: 0 }]);
     expect(
       await db.query(
-        "SELECT complete FROM stream_state WHERE connection_id = 'c'",
+        "SELECT complete FROM stream_state WHERE connection_id = 'pdpp.fixture~'",
       ),
     ).toEqual([{ complete: 0 }]);
 
@@ -273,7 +206,7 @@ describe("local sync intake adapter", () => {
     ).toEqual({ result: "queued", stuck: false, updateRequired: false });
 
     const head = await sync.query.listRecords({
-      connectionId: "c",
+      connectionId: "pdpp.fixture~",
       stream: "items",
       limit: 100,
     });
@@ -315,7 +248,7 @@ describe("local sync intake adapter", () => {
     });
     expect(
       await db.query(
-        "SELECT checkpoint FROM connections WHERE connection_id = 'c'",
+        "SELECT checkpoint FROM connections WHERE connection_id = 'pdpp.fixture~'",
       ),
     ).toEqual([{ checkpoint: JSON.stringify({ items: "C0" }) }]);
     expect(
@@ -341,11 +274,11 @@ describe("local sync intake adapter", () => {
     await sync.intake.batch("deleted", { batch: 0, records: records(1, 1) });
     await db.batch([
       {
-        sql: "UPDATE connections SET checkpoint = ? WHERE connection_id = 'c'",
+        sql: "UPDATE connections SET checkpoint = ? WHERE connection_id = 'pdpp.fixture~'",
         params: [JSON.stringify({ items: "old" })],
       },
       {
-        sql: "UPDATE stream_state SET last_delete_version = 1 WHERE connection_id = 'c'",
+        sql: "UPDATE stream_state SET last_delete_version = 1 WHERE connection_id = 'pdpp.fixture~'",
       },
     ]);
     expect(

@@ -241,10 +241,10 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             continue;
           }
           statements.push({
-            sql: `INSERT INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256)
-              SELECT ?, stream, pk_hash, record_key, ?, ?, body, body_sha256
+            sql: `INSERT INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
+              SELECT ?, stream, pk_hash, record_key, ?, ?, body, body_sha256, ?
                 FROM run_rows WHERE run_id = ? AND stream = ?`,
-            params: [op, run.o, runId, runId, stream.stream],
+            params: [op, run.o, runId, run.o, runId, stream.stream],
           });
           merged ||= stream.row_count > 0;
           const nextVersion =

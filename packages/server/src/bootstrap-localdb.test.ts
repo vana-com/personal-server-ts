@@ -1,4 +1,5 @@
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { privateKeyToAccount } from "viem/accounts";
@@ -26,11 +27,12 @@ async function boot(
   rootPath: string,
   store = createMemoryModeRecordStore(),
   remote?: Awaited<ReturnType<typeof remoteFixture>>,
+  serverConfig = config,
 ) {
   vi.stubEnv("PS_ACCESS_TOKEN", "node-database-fixture");
   vi.stubEnv("VANA_OWNER_PRIVATE_KEY", "");
   const ownerSignature = await signature();
-  const context = await createServer(config, {
+  const context = await createServer(serverConfig, {
     rootPath,
     ownerSignature,
     accountModeStore: store,
@@ -117,5 +119,109 @@ describe("Node database composition", () => {
     expect(
       get.mock.calls.filter(([key]) => key.includes("/g1-p-")),
     ).toHaveLength(head.parts.length);
+  });
+  it("accepts real HTTP intake from a pinned artifact and stores retry progress in SQLite", async () => {
+    const root = await directory();
+    const declaration = JSON.stringify({
+      source_id: "https://example.test/fixture-source",
+      source_kind: "connector",
+      version: "1",
+      streams: [
+        {
+          name: "items",
+          fields: ["id"],
+          required_fields: ["id"],
+          primary_key: ["id"],
+        },
+      ],
+    });
+    const manifest = JSON.stringify({
+      connector_key: "fixture-source",
+      version: "1",
+      streams: [
+        { name: "items", semantics: "mutable_state", primary_key: ["id"] },
+      ],
+    });
+    const declarationPath = join(root, "declaration.json");
+    const manifestPath = join(root, "manifest.json");
+    await writeFile(declarationPath, declaration);
+    await writeFile(manifestPath, manifest);
+    const digest = createHash("sha256").update(manifest).digest("hex");
+    const remote = await remoteFixture(
+      createStreamSyncKeyPorts(await signature()),
+    );
+    const context = await boot(
+      root,
+      createMemoryModeRecordStore(),
+      remote,
+      ServerConfigSchema.parse({
+        ...config,
+        streamSync: { write: true },
+        pdpp: {
+          enabled: true,
+          declarationPaths: [declarationPath],
+          methods: [
+            {
+              method_id: "fixture-source",
+              declaration_path: declarationPath,
+              manifest_path: manifestPath,
+              manifest_sha256: digest,
+            },
+          ],
+        },
+      }),
+    );
+    await context.accountModeAuthority.submitEvidence({
+      owner: context.serverOwner!,
+      state: "on",
+    });
+    const send = (path: string, method: string, value: unknown) =>
+      context.app.request(path, {
+        method,
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify(value),
+      });
+    const begin = await send("/v1/stream-sync/runs/intake", "PUT", {
+      connector: "fixture-source",
+      artifactDigest: digest,
+      owner: { address: context.serverOwner!, leaseId: null },
+      observedAt: 42,
+    });
+    expect(begin.status).toBe(200);
+    expect(await begin.json()).toMatchObject({
+      status: "collecting",
+      start: { collection_mode: "full_refresh" },
+    });
+    const batch = await send("/v1/stream-sync/runs/intake/batches", "POST", {
+      batch: 0,
+      records: [{ stream: "items", data: { id: "from-intake" } }],
+    });
+    expect(batch.status).toBe(200);
+    expect(await batch.json()).toMatchObject({ accepted: 1 });
+    const end = await send("/v1/stream-sync/runs/intake/end", "POST", {
+      outcome: "retry_pending",
+      coveredStreams: [],
+      lastBatch: 0,
+      checkpointCandidate: { items: "C1" },
+    });
+    expect(end.status).toBe(200);
+    expect(await end.json()).toMatchObject({ result: "queued" });
+    const rows = await (
+      await context.getLocalSync!()
+    ).query.listRecords({
+      connectionId: "pdpp.fixture-source~",
+      stream: "items",
+      limit: 10,
+    });
+    expect(rows.records.map((r) => r.recordKey)).toEqual(["from-intake"]);
+    const resumed = await send("/v1/stream-sync/runs/resumed", "PUT", {
+      connector: "fixture-source",
+      artifactDigest: digest,
+      owner: { address: context.serverOwner!, leaseId: null },
+    });
+    expect(resumed.status).toBe(200);
+    expect(await resumed.json()).toMatchObject({
+      start: { collection_mode: "incremental", state: { items: "C1" } },
+    });
   });
 });
