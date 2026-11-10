@@ -40,7 +40,12 @@ const declaration = {
   connector: "fixture",
   version: "1",
   streams: [
-    { name: "items", semantics: "mutable_state" as const, primaryKey: ["id"] },
+    {
+      name: "items",
+      semantics: "mutable_state" as const,
+      primaryKey: ["id"],
+      coverageStrategy: "full_inventory" as const,
+    },
   ],
 };
 const id = "pdpp.fixture~";

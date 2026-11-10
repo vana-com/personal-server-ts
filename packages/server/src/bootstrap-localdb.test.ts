@@ -139,7 +139,12 @@ describe("Node database composition", () => {
       connector_key: "fixture-source",
       version: "1",
       streams: [
-        { name: "items", semantics: "mutable_state", primary_key: ["id"] },
+        {
+          name: "items",
+          semantics: "mutable_state",
+          primary_key: ["id"],
+          coverage_strategy: "full_inventory",
+        },
       ],
     });
     const declarationPath = join(root, "declaration.json");
