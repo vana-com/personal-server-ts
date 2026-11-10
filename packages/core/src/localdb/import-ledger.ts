@@ -1,3 +1,5 @@
+import { canonicalJson } from "@opendatalabs/personal-server-ts-stream-sync";
+import type { LegacyCopy } from "./legacy-import-types.js";
 import type { SqlDriver, SqlStatement, SqlValue } from "./driver.js";
 import type { ImportReceipt } from "./legacy-import-types.js";
 
@@ -142,6 +144,105 @@ export function createImportLedger(db: SqlDriver): ImportLedger {
           ],
         },
       ];
+    },
+  };
+}
+
+/** Localdb-owned journal, separate from source receipts and their free-text
+ * reason. An intent binds every copy field, including its raw content hash.
+ * The host writes it under its storage lock immediately before unlink. */
+export interface LegacyEraseLedger {
+  belongsTo(owner: string, network: string): Promise<boolean>;
+  record(copy: LegacyCopy): Promise<void>;
+  has(copy: LegacyCopy): Promise<boolean>;
+  pending(): AsyncIterable<LegacyCopy>;
+  finish(copy: LegacyCopy): Promise<void>;
+}
+export function createLegacyEraseLedger(
+  db: SqlDriver,
+  now: () => number,
+): LegacyEraseLedger {
+  const descriptor = (copy: LegacyCopy) =>
+    canonicalJson({
+      ...copy,
+      sources: [...copy.sources].sort((a, b) =>
+        canonicalJson(a) < canonicalJson(b)
+          ? -1
+          : canonicalJson(a) > canonicalJson(b)
+            ? 1
+            : 0,
+      ),
+    });
+  const valid = (copy: LegacyCopy) =>
+    !!copy &&
+    nonempty(copy.id) &&
+    nonempty(copy.path) &&
+    nonempty(copy.contentHash) &&
+    /^[0-9a-f]{64}$/.test(copy.contentHash) &&
+    nonempty(copy.revision) &&
+    nonempty(copy.dataSet) &&
+    Array.isArray(copy.sources) &&
+    copy.sources.length > 0 &&
+    copy.sources.every(
+      (s) =>
+        !!s &&
+        nonempty(s.source) &&
+        nonempty(s.connectionId) &&
+        nonempty(s.stream),
+    );
+  return {
+    async belongsTo(owner, network) {
+      const [meta] = await db.query<{ owner: string; network: string }>(
+        "SELECT owner, network FROM db_meta WHERE id = 1",
+      );
+      return meta?.owner === owner.toLowerCase() && meta.network === network;
+    },
+    async record(copy) {
+      if (!valid(copy)) throw new Error("invalid_erase_intent");
+      const text = descriptor(copy);
+      await db.batch([
+        {
+          sql: "INSERT OR IGNORE INTO legacy_erase_intents VALUES (?, ?, ?)",
+          params: [text, text, now()],
+        },
+      ]);
+    },
+    async has(copy) {
+      if (!valid(copy)) return false;
+      const text = descriptor(copy);
+      const [row] = await db.query<{ descriptor: string }>(
+        "SELECT descriptor FROM legacy_erase_intents WHERE copy_key = ?",
+        [text],
+      );
+      return row?.descriptor === text;
+    },
+    async *pending() {
+      let after = "";
+      for (;;) {
+        const [row] = await db.query<{ copy_key: string; descriptor: string }>(
+          "SELECT copy_key, descriptor FROM legacy_erase_intents WHERE copy_key > ? ORDER BY copy_key LIMIT 1",
+          [after],
+        );
+        if (!row) return;
+        let copy: LegacyCopy;
+        try {
+          copy = JSON.parse(row.descriptor);
+          if (!valid(copy) || descriptor(copy) !== row.copy_key)
+            throw new Error();
+        } catch {
+          throw new Error("invalid_erase_intent");
+        }
+        yield copy;
+        after = row.copy_key;
+      }
+    },
+    async finish(copy) {
+      await db.batch([
+        {
+          sql: "DELETE FROM legacy_erase_intents WHERE copy_key = ? AND descriptor = ?",
+          params: [descriptor(copy), descriptor(copy)],
+        },
+      ]);
     },
   };
 }

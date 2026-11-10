@@ -15,6 +15,11 @@ export interface LegacyRetireAccess {
   readBack(copy: LegacyCopy): Promise<readonly ImportReadback[]>;
   /** Atomic compare-and-erase of local copies only; never gateway operations. */
   erase(copy: LegacyCopy): Promise<boolean>;
+  /** Host checks exact absence AND matching durable intent under its storage
+   * lock. A replacement, generic ENOENT or missing intent must return false. */
+  erasedWithIntent?(copy: LegacyCopy): Promise<boolean>;
+  /** Clear intent only after retired receipts committed; retry is idempotent. */
+  finishErase?(copy: LegacyCopy): Promise<void>;
 }
 
 /** F.2: absent streamSync.retireLegacy means false on every host. */
@@ -35,11 +40,9 @@ export interface LegacyRetireOptions {
  * a crash after erase may leave the receipt unretired. Generic ENOENT or
  * erase(false) is not proof of exact-copy absence. Without durable host intent,
  * leave this unknown; never erase a replacement to reconcile old state.
- * import_ledger has no exact-copy erase intent (id/path/contentHash/revision).
- * Its source receipt and free-text reason cannot stand in for such intent.
- * An unconfirmed erase is reported held/erase-not-confirmed, never retired.
- * Successful absence reconciliation requires a future durable intent contract;
- * this implementation deliberately grants no authority from ENOENT alone.
+ * The separate legacy_erase_intents journal can prove an exact absent copy.
+ * Reconciliation rechecks durable receipts and publication fences, writes no
+ * file and never re-erases a replacement. Free-text reason is not intent.
  */
 export async function retireLegacyCopies(
   deps: LocalSyncDeps,
@@ -96,6 +99,42 @@ export async function retireLegacyCopies(
       // Reject known deletion before asking an adapter to read the source.
       if (!(await fencesPass(deps, copy))) {
         report("held", "connection-or-stream-fenced");
+        return;
+      }
+      const erasedWithIntent = access.erasedWithIntent?.bind(access);
+      if (
+        mode === "delete" &&
+        erasedWithIntent &&
+        (await erasedWithIntent(copy))
+      ) {
+        const receipts: ImportReceipt[] = [];
+        for (const source of copy.sources) {
+          const receipt = await ledger.get(
+            source.source,
+            source.connectionId,
+            source.stream,
+          );
+          if (!receipt || !validReceipt(receipt, copy)) {
+            report("held", "reconciliation-receipt-missing");
+            return;
+          }
+          receipts.push(receipt);
+        }
+        if (
+          !(await fencesPass(deps, copy, receipts)) ||
+          !(await erasedWithIntent(copy))
+        ) {
+          report("held", "reconciliation-fenced");
+          return;
+        }
+        await deps.db.batch(
+          receipts.flatMap((r) =>
+            ledger.statements({ ...r, state: "retired", at: deps.now() }),
+          ),
+        );
+        await access.finishErase?.(copy);
+        ready++;
+        report("retired", "erase-reconciled");
         return;
       }
       let proofs: readonly ImportReadback[];
@@ -183,6 +222,7 @@ export async function retireLegacyCopies(
           ledger.statements({ ...receipt, state: "retired", at }),
         ),
       );
+      await access.finishErase?.(copy);
       ready++;
       deleted++;
       report("retired", null);

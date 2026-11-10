@@ -1,5 +1,5 @@
 import { canonicalJson } from "@opendatalabs/personal-server-ts-stream-sync";
-import { computeRecordKeyFromData } from "../../../core/src/storage/pdpp-records/record-key.js";
+import { computeRecordKeyFromData } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type {
   ImportInventoryEntry,

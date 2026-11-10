@@ -113,4 +113,9 @@ END;`,
     `ALTER TABLE import_ledger ADD COLUMN generation INTEGER;`,
     `ALTER TABLE import_ledger ADD COLUMN highest_seq INTEGER;`,
   ],
+  [
+    `CREATE TABLE legacy_erase_intents (
+      copy_key TEXT PRIMARY KEY, descriptor TEXT NOT NULL, at INTEGER NOT NULL
+    ) WITHOUT ROWID;`,
+  ],
 ];
