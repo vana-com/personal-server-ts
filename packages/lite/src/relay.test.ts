@@ -1064,8 +1064,18 @@ describe("read-reliability events", () => {
     socket.receive(
       encodeDataFrame(streamId, httpRequest(method, target, headers)),
     );
-    await flushRelayTasks();
-    await flushRelayTasks();
+    // Wait for the response to finish (gzip takes several macrotasks under
+    // load); requests that stay pending give up after a bounded wait.
+    const closedThisStream = () =>
+      socket.sent.some(
+        (message) =>
+          typeof message === "string" &&
+          JSON.parse(message).type === "stream.close" &&
+          JSON.parse(message).streamId === streamId,
+      );
+    for (let tick = 0; tick < 200 && !closedThisStream(); tick += 1) {
+      await flushRelayTasks();
+    }
   }
 
   function wireText(socket: FakeRelayWebSocket, streamId = 1): string {
