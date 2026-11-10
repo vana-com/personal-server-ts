@@ -213,11 +213,117 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
           })),
       };
     },
-    async versions() {
-      throw new Error("PS-2: not built");
+    async versions({ scope, limit, offset }) {
+      // Logical scopes name the identity-less namespace; physical scopes
+      // additionally identify the namespace stored on the connection.
+      const name = scope.startsWith("pdpp.") ? scope.slice(5) : scope;
+      const match = /^([^.~]+)(?:~([a-f0-9]{16}|))?\.(.+)$/.exec(name);
+      const connector = match?.[1];
+      const stream = match?.[3];
+      if (!connector || !stream) return { ok: false, reason: "not_found" };
+      const [connection] = await deps.db.query<{
+        connection_id: string;
+        generation: number;
+        control_state: string;
+      }>(
+        "SELECT connection_id, generation, control_state FROM connections WHERE connector = ? AND ns = ? ORDER BY connection_id LIMIT 1",
+        [connector, match?.[2] ?? ""],
+      );
+      if (!connection) return { ok: false, reason: "not_found" };
+      if (connection.control_state === "deleted") {
+        return { ok: false, reason: "deleted" };
+      }
+      const [state] = await deps.db.query<{ head_version: number }>(
+        "SELECT head_version FROM stream_state WHERE connection_id = ? AND stream = ?",
+        [connection.connection_id, stream],
+      );
+      if (!state) return { ok: false, reason: "not_found" };
+
+      const params = [
+        connection.connection_id,
+        stream,
+        connection.generation,
+        options.olderVersionReads() ? 1 : 0,
+        state.head_version,
+      ];
+      const predicate =
+        "connection_id = ? AND stream = ? AND generation = ? AND kind IN ('published', 'applied') AND (? = 1 OR version = ?)";
+      const [count] = await deps.db.query<{ total: number }>(
+        "SELECT COUNT(*) AS total FROM stream_versions WHERE " + predicate,
+        params,
+      );
+      const rows = await deps.db.query<{
+        head_blob: string;
+        observed_at: number;
+        version: number;
+      }>(
+        "SELECT head_blob, observed_at, version FROM stream_versions WHERE " +
+          predicate +
+          " ORDER BY version DESC LIMIT ? OFFSET ?",
+        [...params, limit, offset],
+      );
+      return {
+        ok: true,
+        value: {
+          scope,
+          versions: rows.map((row) => ({
+            fileId: row.head_blob,
+            schemaId: null,
+            collectedAt: new Date(row.observed_at).toISOString(),
+            version: row.version,
+            producer: null,
+            producer_provenance: null,
+          })),
+          total: count?.total ?? 0,
+          limit,
+          offset,
+        },
+      };
     },
-    async lineage() {
-      throw new Error("PS-2: not built");
+    async lineage({ scope, version }) {
+      const name = scope.startsWith("pdpp.") ? scope.slice(5) : scope;
+      const match = /^([^.~]+)(?:~([a-f0-9]{16}|))?\.(.+)$/.exec(name);
+      const connector = match?.[1];
+      const stream = match?.[3];
+      if (!connector || !stream) return { ok: false, reason: "not_found" };
+      const [connection] = await deps.db.query<{
+        connection_id: string;
+        generation: number;
+        control_state: string;
+      }>(
+        "SELECT connection_id, generation, control_state FROM connections WHERE connector = ? AND ns = ? ORDER BY connection_id LIMIT 1",
+        [connector, match?.[2] ?? ""],
+      );
+      if (!connection) return { ok: false, reason: "not_found" };
+      if (connection.control_state === "deleted") {
+        return { ok: false, reason: "deleted" };
+      }
+      const [state] = await deps.db.query<{
+        head_version: number;
+        head_generation: number | null;
+      }>(
+        "SELECT head_version, head_generation FROM stream_state WHERE connection_id = ? AND stream = ?",
+        [connection.connection_id, stream],
+      );
+      if (!state) return { ok: false, reason: "not_found" };
+      const selected = version ?? state.head_version;
+      if (version === undefined) {
+        if (selected <= 0 || state.head_generation !== connection.generation) {
+          return { ok: false, reason: "not_found" };
+        }
+      } else {
+        const [retained] = await deps.db.query<{ version: number }>(
+          "SELECT version FROM stream_versions WHERE connection_id = ? AND stream = ? AND generation = ? AND version = ? AND kind IN ('published', 'applied')",
+          [connection.connection_id, stream, connection.generation, selected],
+        );
+        if (!retained) return { ok: false, reason: "not_found" };
+      }
+      // The gateway proof requires gateway/user signatures unavailable in
+      // this database. A local root has no sources and no fabricated proof.
+      return {
+        ok: true,
+        value: { scope, version: selected, sources: [], proof: null },
+      };
     },
   };
 }
