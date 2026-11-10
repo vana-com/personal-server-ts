@@ -1154,7 +1154,9 @@ const DATA_PATH_PREFIX = "/v1/data/";
 /** Scope of a relayed read, or undefined when the request is not a read. */
 function relayReadScope(request: ParsedHttpRequest): string | undefined {
   const method = request.method.toUpperCase();
-  if (method !== "GET" && method !== "HEAD") return undefined;
+  // Only GET reads data: core answers HEAD on `/v1/data/<scope>` with 405, so
+  // counting HEAD would show every probe as a failed read.
+  if (method !== "GET") return undefined;
   if (!request.path.startsWith(DATA_PATH_PREFIX)) return undefined;
   // Only the data read itself (`/v1/data/<scope>`) counts. Sub-routes such as
   // `/versions` and `/lineage` are metadata reads and would skew read rates.
