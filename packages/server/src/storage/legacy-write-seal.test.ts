@@ -869,19 +869,27 @@ describe("removal is admitted in every mode", () => {
     expect((await state(h)).rows).toBe(0);
   });
 
-  const owe = (h: Harness) =>
+  const otherScope = "instagram.posts";
+  const owe = (h: Harness, owedScope = scope) =>
     h.db
       .prepare(
         `INSERT INTO owner_import_operations (authority, owner, scope, operation, body_sha256, state, collected_at, path, envelope_bytes, metadata_json)
          VALUES ('local', 'owner', @scope, @operation, @sha, 'prepared', @collectedAt, @path, @bytes, '{}')`,
       )
       .run({
-        scope,
+        scope: owedScope,
         operation: "q".repeat(64),
         sha: "q".repeat(64),
         collectedAt,
-        path: relative(h.dataDir, finalPathOf(h)),
-        bytes: Buffer.from(JSON.stringify(envelope())),
+        path: relative(
+          h.dataDir,
+          buildDataFilePath(h.dataDir, owedScope, collectedAt),
+        ),
+        bytes: Buffer.from(
+          JSON.stringify(
+            createDataFileEnvelope(owedScope, collectedAt, { value: "v" }),
+          ),
+        ),
       });
 
   it("a delete never publishes an owed import under a switched account", async () => {
@@ -896,12 +904,24 @@ describe("removal is admitted in every mode", () => {
     expect(s.rows).toBe(0);
   });
 
-  it("a delete on an unswitched account finishes an owed import as its own commit, then removes", async () => {
+  it("a delete on an unswitched account finishes another scope's owed import as its own commit, then removes", async () => {
+    const h = await harness("off");
+    owe(h, otherScope);
+    const indexed = vi.spyOn(h.index, "insertIfCurrent");
+    await h.storage.deleteScope(scope);
+    expect(indexed).toHaveBeenCalledTimes(1);
+    expect(h.index.countByScope(otherScope)).toBe(1);
+    expect((await state(h)).rows).toBe(0);
+  });
+
+  it("a delete on an unswitched account cancels its own scope's owed import, never publishing it", async () => {
     const h = await harness("off");
     owe(h);
     const indexed = vi.spyOn(h.index, "insertIfCurrent");
     await h.storage.deleteScope(scope);
-    expect(indexed).toHaveBeenCalledTimes(1);
+    // Not even for a moment: the erase's target is cancelled before anything
+    // can publish it.
+    expect(indexed).not.toHaveBeenCalled();
     const s = await state(h);
     expect(s.published).toEqual([]);
     expect(s.rows).toBe(0);
