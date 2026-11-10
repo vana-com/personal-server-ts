@@ -1,41 +1,21 @@
 /**
- * A connection delete on the Node server, through the real stream-sync writer
- * that `createServer` builds, with an in-memory registry injected in place of
- * the gateway client. Rows are written under a host declaration; the server
- * then restarts without it (the connector removed from config). The delete
- * must still answer, and tombstone the row.
+ * Durable deletion on the retained file writer, using the real filesystem
+ * home and registry ports. Node now composes LocalSync; it no longer constructs
+ * this writer. Keep these four writer regressions independent of Node boot.
  */
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
-import type * as StreamSyncModule from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { recoverOwnerAddress } from "@opendatalabs/personal-server-ts-core/keys";
 import {
+  StreamSyncWriter,
+  createStreamSyncKeyPorts,
   createMemoryStreamSyncBlobs,
   createMemoryStreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
-import { createServer, type ServerContext } from "./bootstrap.js";
-
-const captured = vi.hoisted(() => ({
-  writers: [] as unknown[],
-}));
-
-vi.mock(
-  "@opendatalabs/personal-server-ts-core/stream-sync",
-  async (importOriginal) => {
-    const actual = await importOriginal<typeof StreamSyncModule>();
-    class CapturingWriter extends actual.StreamSyncWriter {
-      constructor(
-        options: ConstructorParameters<typeof actual.StreamSyncWriter>[0],
-      ) {
-        super(options);
-        captured.writers.push(this);
-      }
-    }
-    return { ...actual, StreamSyncWriter: CapturingWriter };
-  },
-);
+import { openFsStreamSyncHome } from "./fs-home.js";
+import { accountSigner, SERVER_KEY } from "./oracle.test-utils.js";
 
 const CONNECTOR = "acme";
 const HIGH_S_SIGNATURE =
@@ -60,10 +40,9 @@ type Writer = {
 };
 
 let tempDir: string;
-let ctx: ServerContext | undefined;
+let ctx: { cleanup(): Promise<void> } | undefined;
 
 beforeEach(async () => {
-  captured.writers.length = 0;
   tempDir = await mkdtemp(join(tmpdir(), "bootstrap-durable-delete-"));
   vi.stubEnv("VANA_MASTER_KEY_SIGNATURE", HIGH_S_SIGNATURE);
   vi.stubEnv("VANA_OWNER_PRIVATE_KEY", "");
@@ -76,29 +55,29 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-/** Boot on the same data directory; returns the writer `createServer` built. */
+/** Reopen the same durable file-writer home, with the host's declarations. */
 async function boot(
   registry: ReturnType<typeof createMemoryStreamSyncRegistry>,
   blobs: ReturnType<typeof createMemoryStreamSyncBlobs>,
-  declaredStreams?: (connector: string) => readonly string[],
+  declaredStreams: (connector: string) => readonly string[] = () => [],
 ): Promise<Writer> {
-  ctx = await createServer(
-    ServerConfigSchema.parse({
-      gateway: { url: "http://127.0.0.1:9" },
-      tunnel: { enabled: false },
-      sync: { enabled: true },
-      logging: { level: "warn", pretty: false },
-      streamSync: { write: true },
-    }),
-    {
-      serverDir: tempDir,
-      dataDir: join(tempDir, "data"),
-      streamSyncRegistry: registry,
-      streamSyncBlobs: blobs,
-      ...(declaredStreams ? { declaredStreams } : {}),
-    },
-  );
-  return captured.writers.at(-1) as Writer;
+  const ownerAddress = await recoverOwnerAddress(HIGH_S_SIGNATURE);
+  const opened = await openFsStreamSyncHome({
+    root: tempDir,
+    ownerAddress,
+    network: "fixture",
+  });
+  if (!opened) throw new Error("Fixture writer home is already held");
+  ctx = { cleanup: () => opened.close() };
+  return new StreamSyncWriter({
+    ownerAddress,
+    registry,
+    blobs,
+    home: opened.home,
+    keys: createStreamSyncKeyPorts(HIGH_S_SIGNATURE),
+    signer: accountSigner(SERVER_KEY),
+    declaredStreams,
+  }) as unknown as Writer;
 }
 
 /**

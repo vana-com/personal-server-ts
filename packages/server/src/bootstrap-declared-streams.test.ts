@@ -1,6 +1,6 @@
 /**
- * The host's `declaredStreams` option reaches the stream-sync writer through
- * `createServer`. The writer is wrapped, not replaced, so the boot is
+ * The host's `declaredStreams` option reaches the database composition through
+ * `createServer`. The composition is wrapped, not replaced, so the boot is
  * otherwise unchanged; the test reads the hook the boot handed to it.
  */
 import { mkdtemp, rm } from "node:fs/promises";
@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
-import type * as StreamSyncModule from "@opendatalabs/personal-server-ts-core/stream-sync";
+import type * as LocalSyncModule from "./localdb/sync.js";
 import { createServer, type ServerContext } from "./bootstrap.js";
 
 const captured = vi.hoisted(() => ({
@@ -17,21 +17,18 @@ const captured = vi.hoisted(() => ({
   }>,
 }));
 
-vi.mock(
-  "@opendatalabs/personal-server-ts-core/stream-sync",
-  async (importOriginal) => {
-    const actual = await importOriginal<typeof StreamSyncModule>();
-    class CapturingWriter extends actual.StreamSyncWriter {
-      constructor(
-        options: ConstructorParameters<typeof actual.StreamSyncWriter>[0],
-      ) {
-        super(options);
-        captured.options.push(options as never);
-      }
-    }
-    return { ...actual, StreamSyncWriter: CapturingWriter };
-  },
-);
+vi.mock("./localdb/sync.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof LocalSyncModule>();
+  return {
+    ...actual,
+    createServerLocalSync: (
+      ...args: Parameters<typeof actual.createServerLocalSync>
+    ) => {
+      captured.options.push(args[1]);
+      return actual.createServerLocalSync(...args);
+    },
+  };
+});
 
 const UNINSTALLED = "uninstalled-connector";
 const HIGH_S_SIGNATURE =
@@ -71,10 +68,15 @@ async function bootWriter(options?: {
       ...(options ?? {}),
     },
   );
+  await ctx.accountModeAuthority.submitEvidence({
+    owner: ctx.serverOwner!,
+    state: "on",
+  });
+  await ctx.getLocalSync!();
   return captured.options.at(-1)!.declaredStreams;
 }
 
-it("the host's declaredStreams option names an uninstalled connector's streams to the writer (mutant: BOOTSTRAP_OPTION_DROPPED)", async () => {
+it("the host's declaredStreams option names an uninstalled connector's streams to the database composition (mutant: BOOTSTRAP_OPTION_DROPPED)", async () => {
   const hook = await bootWriter({
     declaredStreams: (connector) =>
       connector === UNINSTALLED ? ["items"] : [],
@@ -82,7 +84,7 @@ it("the host's declaredStreams option names an uninstalled connector's streams t
   expect(hook(UNINSTALLED)).toEqual(["items"]);
 });
 
-it("without the option the writer's hook names nothing for an uninstalled connector", async () => {
+it("without the option the composition's hook names nothing for an uninstalled connector", async () => {
   const hook = await bootWriter();
   expect(hook(UNINSTALLED)).toEqual([]);
 });
