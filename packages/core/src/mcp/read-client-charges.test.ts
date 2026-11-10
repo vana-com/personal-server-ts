@@ -1,3 +1,7 @@
+import {
+  databaseReadFixture,
+  type DatabaseReadFixture,
+} from "../../../server/src/localdb/read-fixture.test-utils.js";
 import { describe, expect, it, vi } from "vitest";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
@@ -14,8 +18,6 @@ import { encodePaymentHeader, nextPaymentNonce } from "../payment/x402.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import { buildDataBlocksAsync } from "../storage/blocks/build.js";
 import { readBuiltScopeBlocks } from "../storage/blocks/page.js";
-import { Fixture, masterKey } from "../stream-sync-read/service-fixture.js";
-import { testOwnerKey } from "../stream-sync-read/testing.js";
 import { buildBinaryEnvelopeData } from "../contracts/binary.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 
@@ -82,9 +84,9 @@ interface HarnessOptions {
   legacyItems?: unknown[];
   /** Runs after a read decision chose its body, before the read settles. */
   afterDecision?: (stream: {
-    f: Fixture;
+    f: DatabaseReadFixture;
     ns: string;
-    service: Awaited<ReturnType<Fixture["service"]>>;
+    service: DatabaseReadFixture["local"]["resolver"];
   }) => Promise<void>;
 }
 
@@ -168,27 +170,15 @@ async function harness(options: HarnessOptions = {}) {
   let streamSyncRead: unknown = { resolve: async () => ({ kind: "pass" }) };
   /** The stream head each read decision served, in order. */
   const servedByDecision: ({ scope: string; version: number } | null)[] = [];
-  let fixture: Fixture | undefined;
+  let fixture: DatabaseReadFixture | undefined;
   let streamNs = "";
   if (options.stream) {
-    const f = new Fixture(await testOwnerKey(masterKey(341)));
-    const ns = await f.key.ns("acme", "account-1");
-    await f.activate("acme", ns);
-    if (options.deleteStream) {
-      await f.deleteConnection("acme", ns);
-    } else {
-      await f.publish({
-        connector: "acme",
-        ns,
-        stream: "items",
-        generation: 1,
-        records: RECORDS,
-        observedAt: T - 1000,
-        profileVersion: "1.0.0",
-      });
-    }
-    const service = await f.service();
-    await f.sync(service);
+    const f = await databaseReadFixture("acme");
+    const ns = "";
+    if (options.deleteStream) f.remote.setControl(2, true);
+    else await f.remote.head("items", RECORDS, { o: T - 1000 });
+    await f.local.apply();
+    const service = f.local.resolver;
     fixture = f;
     streamNs = ns;
     // Records what each decision served, then lets a test move the head
@@ -557,21 +547,18 @@ describe("mcp/read-client charges on a stream view", () => {
   it("settles against the head it served when the head advances before settlement", async () => {
     let advance = false;
     let advanced = false;
+    let applying: Promise<void> | undefined;
     const h = await harness({
       stream: true,
-      afterDecision: async ({ f, ns, service }) => {
+      afterDecision: async ({ f }) => {
         if (!advance || advanced) return;
         advanced = true;
-        await f.publish({
-          connector: "acme",
-          ns,
-          stream: "items",
-          generation: 1,
-          records: [...RECORDS, { id: "item-late", text: "published late" }],
-          observedAt: T + 1000,
-          profileVersion: "1.0.0",
-        });
-        await f.sync(service);
+        await f.remote.head(
+          "items",
+          [...RECORDS, { id: "item-late", text: "published late" }],
+          { o: T + 1000, version: 2 },
+        );
+        applying = f.local.apply();
       },
     });
     const validated = await servedNow(h);
@@ -583,6 +570,7 @@ describe("mcp/read-client charges on a stream view", () => {
       tool: "read_scope",
     });
 
+    await applying;
     expect(JSON.stringify(page)).not.toContain("published late");
     // The race is real: a later lookup finds a newer head than the one served.
     expect(advanced).toBe(true);

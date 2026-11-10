@@ -9,8 +9,14 @@ import { deriveKeyCheck } from "@opendatalabs/personal-server-ts-stream-sync";
 import { hexToBytes, keccak256, parseSignature, toBytes, toHex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
-import { createStreamSyncKeyPorts } from "../stream-sync/crypto.js";
-import { createStreamSyncReadKeys } from "./keys.js";
+import { createStreamSyncKeyPorts } from "./crypto.js";
+async function createStreamSyncReadKeys(signature: Uint8Array) {
+  const keys = createStreamSyncKeyPorts(signature);
+  return {
+    ...keys,
+    keyCheck: await deriveKeyCheck((message) => keys.namespaceHmac(message)),
+  };
+}
 
 const N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
 const HALF_N = N >> 1n;

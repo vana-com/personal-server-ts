@@ -192,10 +192,6 @@
       "types": "./dist/stream-sync-read/index.d.ts",
       "import": "./dist/stream-sync-read/index.js"
     },
-    "./stream-sync-read/testing": {
-      "types": "./dist/stream-sync-read/testing.d.ts",
-      "import": "./dist/stream-sync-read/testing.js"
-    },
     "./sync/manager": {
       "types": "./dist/sync/engine/sync-manager.d.ts",
       "import": "./dist/sync/engine/sync-manager.js"
