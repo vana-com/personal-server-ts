@@ -63,7 +63,7 @@ describe.each(rows)("local database on %s", (row, factory) => {
     r: string,
     body = "{}",
   ) => ({
-    sql: "INSERT INTO incoming VALUES (?, 's', ?, ?, ?, ?, ?, ?)",
+    sql: "INSERT INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256) VALUES (?, 's', ?, ?, ?, ?, ?, ?)",
     params: [op, pk, key, o, r, body, `sha-${body}`],
   });
   const merge = (
