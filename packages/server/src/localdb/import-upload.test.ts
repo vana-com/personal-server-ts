@@ -1,4 +1,3 @@
-import { fixtureProjections } from "./import-projection.test-utils.js";
 import { createHash } from "node:crypto";
 import {
   mkdtempSync,
@@ -20,12 +19,9 @@ import {
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
-import {
-  readBackLegacyImport,
-  createImportProjectionReader,
-} from "../../../core/src/localdb/import-readback.js";
+import { readBackLegacyImport } from "../../../core/src/localdb/import-readback.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
-import type { ImportProjectionDeps } from "../../../core/src/localdb/import-readback.js";
+import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 const dirs: string[] = [];
 const dbs: SqlDriver[] = [];
 afterEach(async () => {
@@ -100,7 +96,7 @@ it("upload-verified-artifact-only", async () => {
     stageLegacyImportUpload({ ...f.options, resolveTarget: async () => null }),
   ).rejects.toThrow("upload_identity_invalid");
 });
-it("upload-backpressure-4mib", async () => {
+it("upload-backpressure", async () => {
   const chunks = [
     Buffer.from(
       JSON.stringify({ id: "one", text: "x".repeat(600_000) }) + "\n",
@@ -133,15 +129,7 @@ it("upload-backpressure-4mib", async () => {
   for await (const _record of source.records()) count++;
   expect(count).toBe(2);
 });
-it("upload-oversize-row-refuses", async () => {
-  const f = fixture(
-    JSON.stringify({ id: "one", text: "x".repeat(4 * 1024 * 1024) }) + "\n",
-  );
-  await expect(stageLegacyImportUpload(f.options)).rejects.toThrow(
-    "upload_oversize",
-  );
-  expect(readdirSync(f.root)).toEqual([]);
-});
+
 it("upload-retry-same-revision", async () => {
   const f = fixture();
   const first = await stageLegacyImportUpload(f.options);
@@ -166,7 +154,7 @@ it("upload-retry-same-revision", async () => {
     names.map((n) => readFileSync(join(f.root, n)).toString("hex")),
   ).toEqual(saved);
 });
-it("upload-unicode-split-and-envelope-boundary", async () => {
+it("upload-unicode-split", async () => {
   const f = fixture();
   const index = f.bytes.indexOf(Buffer.from("é")) + 1;
   const source = await stageLegacyImportUpload({
@@ -184,31 +172,6 @@ it("upload-unicode-split-and-envelope-boundary", async () => {
   const records = [];
   for await (const record of source.records()) records.push(record);
   expect(records).toEqual([{ id: "one", text: "é" }]);
-  const overhead =
-    Buffer.byteLength(
-      JSON.stringify({
-        source: "install",
-        revision: "0".repeat(64),
-        artifactDigest: "retained",
-        stream: "profile",
-      }),
-    ) + 1;
-  const length =
-    4 * 1024 * 1024 -
-    overhead -
-    Buffer.byteLength(JSON.stringify({ id: "one", text: "" }));
-  const boundary = fixture(
-    JSON.stringify({ id: "one", text: "x".repeat(length) }) + "\n",
-  );
-  expect((await stageLegacyImportUpload(boundary.options)).revision).toBe(
-    boundary.options.upload.revision,
-  );
-  const over = fixture(
-    JSON.stringify({ id: "one", text: "x".repeat(length + 1) }) + "\n",
-  );
-  await expect(stageLegacyImportUpload(over.options)).rejects.toThrow(
-    "upload_oversize",
-  );
 });
 it("upload-unsealed-malformed-and-changed-seal-refuse", async () => {
   const f = fixture();
@@ -258,8 +221,7 @@ it("upload-d6-p7-close-reopen-readback", async () => {
     throw new Error("unexpected external call");
   };
   let op = 0;
-  const deps: ImportProjectionDeps = {
-    importProjection: fixtureProjections,
+  const deps: LocalSyncDeps = {
     db,
     queue: connectionQueue(),
     ownerAddress: "0xabc",
@@ -301,16 +263,7 @@ it("upload-d6-p7-close-reopen-readback", async () => {
     dbs.push(db);
     Object.assign(deps, { db });
     const reopened = await openStagedLegacyImportUpload(options);
-    const projection = createImportProjectionReader(
-      deps,
-      "2026-01-01T00:00:00Z",
-      async function* () {
-        yield reopened;
-      },
-    );
-    expect(
-      (await readBackLegacyImport(deps, reopened, projection, null)).pass,
-    ).toBe(true);
+    expect((await readBackLegacyImport(deps, reopened)).pass).toBe(true);
     expect((await acceptLegacyImportUpload(deps, reopened)).kind).toBe(
       "already-imported",
     );

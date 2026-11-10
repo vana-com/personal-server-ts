@@ -16,7 +16,6 @@ import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/
 import type { Database } from "better-sqlite3";
 import type {
   ImportInventoryEntry,
-  CopyRecords,
   LegacyCopy,
   ImportTarget,
   LegacyEraseLedger,
@@ -29,7 +28,7 @@ export interface LegacyAccessOptions {
   /** Borrowed native handle for root/index.db, NOT LocalSyncDeps.db. */
   readonly db: Database;
   readonly eraseLedger: LegacyEraseLedger;
-  /** Existing authenticated connection resolver; null holds the inventory. */
+  /** Existing authenticated connection resolver; null excludes the source from import. */
   readonly resolveTarget: (
     sourceId: string,
     instance: string,
@@ -64,7 +63,6 @@ export interface LegacyAccess {
   readonly network: string;
   /** Includes descriptors with exclusions for unmapped data; never silently omit a store. */
   sources(): AsyncIterable<ImportInventoryEntry>;
-  readonly copyRecords: CopyRecords;
   copies(): AsyncIterable<LegacyCopy>;
   erase(copy: LegacyCopy): Promise<boolean>;
   erasedWithIntent(copy: LegacyCopy): Promise<boolean>;
@@ -79,7 +77,7 @@ export interface LegacyAccess {
  * All raw SQL and file access for switched legacy stores is private here.
  * Inventory root/data using hierarchy's finalized-envelope layout and index
  * entries (including orphan/unmapped files); pending stages/blocks/sidecars
- * are held, never claimed covered. Reject symlinks and paths outside root.
+ * are counted with the remaining old files. Reject symlinks and paths outside root.
  * Read/hash exact bytes with SHA-256. Erase uses withScopeLock(scope, work)
  * and legacyWriteSeal.remove, matching node-data-storage; these are not
  * reentrant: do not call a storage delete method while holding the same lock.
@@ -238,14 +236,22 @@ export async function openLegacyAccess(
     },
     async connections(sourceId) {
       await authorized();
-      return store
-        .listConnections(sourceId)
-        .map((c) => ({ instance: c.instance, deleted: c.deletedAt !== null }));
+      return store.listConnections(sourceId).map((c) => ({
+        instance: c.instance,
+        deleted: c.deletedAt !== null,
+        lastActive: Math.max(
+          0,
+          ...store
+            .listStreams([c.instance])
+            .map((s) => (s.lastUpdated ? Date.parse(s.lastUpdated) : 0)),
+        ),
+      }));
     },
     async page(instance, stream, after, limit, maxBytes, expected) {
       await reader.assertRevision(expected);
       const rows: Record<string, unknown>[] = [];
       let cursor = after;
+      let bytes = 0;
       const metadata = db.prepare(
         "SELECT record_key, length(CAST(data AS BLOB)) AS bytes, length(CAST(record_key AS BLOB)) AS keyBytes FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0 AND (? IS NULL OR record_key > ?) ORDER BY record_key LIMIT 1",
       );
@@ -253,8 +259,8 @@ export async function openLegacyAccess(
         const next = metadata.get(instance, stream, cursor, cursor) as
           { record_key: string; bytes: number; keyBytes: number } | undefined;
         if (!next) return { rows, next: null };
-        if (next.bytes > maxBytes || next.keyBytes > maxBytes)
-          throw new Error("record_or_page_oversize");
+        if (rows.length && bytes + next.bytes + next.keyBytes > maxBytes)
+          return { rows, next: cursor };
         const row = db
           .prepare(
             "SELECT data FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ? AND deleted = 0",
@@ -269,15 +275,8 @@ export async function openLegacyAccess(
         } catch {
           throw new Error("invalid_record");
         }
-        if (
-          Buffer.byteLength(
-            JSON.stringify({ rows: [...rows, value], next: next.record_key }),
-          ) > maxBytes
-        ) {
-          if (rows.length === 0) throw new Error("record_or_page_oversize");
-          return { rows, next: cursor };
-        }
         rows.push(value);
+        bytes += next.bytes + next.keyBytes;
         cursor = next.record_key;
       }
       const more = metadata.get(instance, stream, cursor, cursor);
@@ -290,6 +289,7 @@ export async function openLegacyAccess(
       owner,
       network,
       revision,
+      bindings: options.importProjection.bindings,
       reader,
       resolveTarget: options.resolveTarget,
     });
@@ -313,7 +313,7 @@ export async function openLegacyAccess(
     }
     return absolute;
   }
-  async function read(path: string, payload: boolean) {
+  async function read(path: string) {
     await authorized();
     await safePath(path);
     const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -324,39 +324,15 @@ export async function openLegacyAccess(
       for await (const chunk of file.createReadStream({ autoClose: false }))
         hash.update(chunk);
       const contentHash = hash.digest("hex");
-      let envelope: Record<string, unknown> | null = null;
-      if (payload && info.size <= 4 * 1024 * 1024) {
-        const bytes = Buffer.alloc(info.size);
-        let offset = 0;
-        while (offset < bytes.length) {
-          const result = await file.read(
-            bytes,
-            offset,
-            bytes.length - offset,
-            offset,
-          );
-          if (!result.bytesRead) throw new Error("copy_changed");
-          offset += result.bytesRead;
-        }
-        try {
-          const value: unknown = JSON.parse(bytes.toString("utf8"));
-          if (value && typeof value === "object" && !Array.isArray(value))
-            envelope = value as Record<string, unknown>;
-        } catch {
-          /* Held by copyRecords; never guessed. */
-        }
-      }
-      return { contentHash, envelope };
+      return { contentHash };
     } finally {
       await file.close();
     }
   }
   async function describe(path: string): Promise<LegacyCopy> {
-    const { contentHash, envelope } = await read(path, true);
+    const { contentHash } = await read(path);
     const entry = index.findByPath(relative(dataRoot, path));
-    const dataSet =
-      entry?.scope ??
-      (typeof envelope?.scope === "string" ? envelope.scope : "");
+    const dataSet = entry?.scope ?? "";
     const binding = options.importProjection.bindings.get(dataSet);
     const dependencies: LegacyCopy["sources"][number][] = [];
     let excluded = false;
@@ -416,7 +392,7 @@ export async function openLegacyAccess(
     }
   }
   const sameCopy = (a: LegacyCopy, b: LegacyCopy) =>
-    canonicalJson(a) === canonicalJson(b);
+    a.id === b.id && a.path === b.path && a.contentHash === b.contentHash;
   async function erasedWithIntent(copy: LegacyCopy) {
     await authorized();
     await safePath(copy.path, true);
@@ -497,23 +473,6 @@ export async function openLegacyAccess(
         }
       }
     },
-    async *copyRecords(copy) {
-      await authorized();
-      if (!sameCopy(await describe(copy.path), copy))
-        throw new Error("copy_changed");
-      const { envelope } = await read(copy.path, true);
-      if (
-        !envelope ||
-        envelope.scope !== copy.dataSet ||
-        !envelope.data ||
-        typeof envelope.data !== "object" ||
-        Array.isArray(envelope.data)
-      )
-        throw new Error("copy_unreadable");
-      yield envelope.data as Record<string, unknown>;
-      if (!sameCopy(await describe(copy.path), copy))
-        throw new Error("copy_changed");
-    },
     async erase(copy) {
       await authorized();
       await safePath(copy.path, true);
@@ -522,17 +481,30 @@ export async function openLegacyAccess(
           await authorized();
           let current: LegacyCopy;
           try {
-            current = await describe(copy.path);
+            const { contentHash } = await read(copy.path);
+            const entry = index.findByPath(relative(dataRoot, copy.path));
+            current = {
+              ...copy,
+              contentHash,
+              id: createHash("sha256")
+                .update(canonicalJson([copy.path, entry?.id ?? null]))
+                .digest("hex"),
+            };
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code === "ENOENT")
               return false;
             throw error;
           }
-          if (!sameCopy(copy, current) || !copy.sources.length) return false;
+          if (!sameCopy(copy, current)) return false;
           await eraseLedger.record(copy);
-          // Recheck after the journal commit; a held descriptor never grants a
+          // Recheck after the journal commit; an old descriptor never grants a
           // second removal. No gateway call or legacy tombstone is involved.
-          if (!sameCopy(copy, await describe(copy.path))) return false;
+          const { contentHash } = await read(copy.path);
+          const entry = index.findByPath(relative(dataRoot, copy.path));
+          const id = createHash("sha256")
+            .update(canonicalJson([copy.path, entry?.id ?? null]))
+            .digest("hex");
+          if (contentHash !== copy.contentHash || id !== copy.id) return false;
           await unlink(copy.path);
           index.deleteByPath(relative(dataRoot, copy.path));
           return true;

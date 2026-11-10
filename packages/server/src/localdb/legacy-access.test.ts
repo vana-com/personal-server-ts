@@ -1,8 +1,5 @@
 import { fixtureProjections } from "./import-projection.test-utils.js";
-import {
-  createImportProjectionReader,
-  readBackLegacyImport,
-} from "../../../core/src/localdb/import-readback.js";
+import { readBackLegacyImport } from "../../../core/src/localdb/import-readback.js";
 import { afterEach, expect, it, vi } from "vitest";
 import {
   mkdtempSync,
@@ -38,7 +35,7 @@ import type {
 } from "../../../core/src/storage/legacy-write-seal.js";
 import type { DeclarationSnapshot } from "../../../core/src/pdpp/types.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
-import type { ImportProjectionDeps } from "../../../core/src/localdb/import-readback.js";
+import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import type {
   ImportSource,
   LegacyRetireFileReport,
@@ -218,7 +215,6 @@ it("legacy-access-hash-fenced-erase", async () => {
   const access = await openLegacyAccess(f.options);
   const [copy] = await collect(access.copies());
   expect(copy).toBeDefined();
-  expect(await collect(access.copyRecords(copy!))).toEqual([body]);
   const replacement = JSON.stringify({
     scope: "fixture.profile",
     data: { ...body, extra: "retained" },
@@ -227,9 +223,6 @@ it("legacy-access-hash-fenced-erase", async () => {
   expect(await access.erase(copy!)).toBe(false);
   expect(readFileSync(f.file, "utf8")).toBe(replacement);
   expect(await f.eraseLedger.has(copy!)).toBe(false);
-  await expect(collect(access.copyRecords(copy!))).rejects.toThrow(
-    "copy_changed",
-  );
 });
 it("legacy-access-no-gateway-delete-and-intent-before-unlink", async () => {
   const f = await fixture();
@@ -287,7 +280,7 @@ it("legacy-access-source-revision-and-complete-unknown-inventory", async () => {
     ]),
   );
 });
-it("legacy-access-symlink-and-orphan-held", async () => {
+it("legacy-access-orphan-is-inventory-and-symlink-refuses", async () => {
   const f = await fixture();
   const access = await openLegacyAccess(f.options);
   writeFileSync(
@@ -317,8 +310,7 @@ it.each(["after-unlink", "before-receipt"])(
       throw new Error("unexpected external call");
     };
     let op = 0;
-    const deps: ImportProjectionDeps = {
-      importProjection: fixtureProjections,
+    const deps: LocalSyncDeps = {
       db: f.local,
       queue: connectionQueue(),
       ownerAddress: "0xabc",
@@ -348,23 +340,10 @@ it.each(["after-unlink", "before-receipt"])(
     await f.local.batch([
       { sql: "UPDATE stream_state SET publish_watermark = 100" },
     ]);
-    const projector = createImportProjectionReader(
-      deps,
-      "2026-01-01T00:00:00.000Z",
-      async function* () {
-        yield source as ImportSource;
-      },
-      access.copyRecords,
-    );
     const proofAccess = {
       ...access,
-      readBack: async (exact: typeof copy) => [
-        await readBackLegacyImport(
-          deps,
-          source as ImportSource,
-          projector,
-          exact!,
-        ),
+      readBack: async () => [
+        await readBackLegacyImport(deps, source as ImportSource),
       ],
     };
     expect(
@@ -448,7 +427,7 @@ it.each(["after-unlink", "before-receipt"])(
     ]);
   },
 );
-it("legacy-access-missing-file-without-intent-is-held-inventory", async () => {
+it("legacy-access-missing-file-without-intent-is-reported", async () => {
   const f = await fixture();
   const access = await openLegacyAccess(f.options);
   rmSync(f.file);
@@ -491,4 +470,62 @@ it("legacy-access-revision-binds-content-not-device-counter", async () => {
   const first = (await collect(one.sources()))[0] as ImportSource;
   const second = (await collect(two.sources()))[0] as ImportSource;
   expect(first.revision).not.toBe(second.revision);
+});
+it.each(["no-binding", "no-declaration", "orphan"])(
+  "legacy-access-removes-unimported-copy: %s",
+  async (kind) => {
+    const f = await fixture();
+    const path =
+      kind === "orphan" ? join(f.root, "data", "orphan.json") : f.file;
+    if (kind === "orphan") writeFileSync(path, "unmapped old bytes");
+    const access = await openLegacyAccess({
+      ...f.options,
+      ...(kind === "no-binding"
+        ? { importProjection: { bindings: new Map() } }
+        : {}),
+      ...(kind === "no-declaration" ? { declarations: [] } : {}),
+    });
+    const copy = (await collect(access.copies())).find((c) => c.path === path)!;
+    expect(copy.sources).toEqual([]);
+    expect(await access.erase(copy)).toBe(true);
+    expect(existsSync(path)).toBe(false);
+    expect(await f.eraseLedger.has(copy)).toBe(true);
+    await access.finishErase(copy);
+    expect(await f.eraseLedger.has(copy)).toBe(false);
+  },
+);
+it("native access selects the latest active account and counts the older rows", async () => {
+  const f = await fixture();
+  f.store.registerConnection({
+    instance: "newer",
+    sourceId: "urn:fixture",
+    method: "profile-source",
+    label: "Newer",
+  });
+  expect(
+    f.store.ingestBatch(
+      [
+        {
+          instance: "newer",
+          stream: "profile",
+          key: "account",
+          data: body,
+          emitted_at: "2026-02-01T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "profile-source", generation: 1 },
+    ).accepted,
+  ).toBe(1);
+  const access = await openLegacyAccess(f.options);
+  const inventory = await collect(access.sources());
+  expect(inventory).toHaveLength(2);
+  expect(inventory.find((s) => "kind" in s)).toMatchObject({
+    kind: "excluded",
+    reason: "older_instance",
+    rows: 1,
+  });
+  const selected = inventory.find((s) => !("kind" in s))!;
+  expect(JSON.parse(selected.source)[0]).toBe("newer");
 });

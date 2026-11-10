@@ -199,6 +199,8 @@ export interface IndexedDbPsLiteRuntime {
   syncManager: PsLiteRuntimeOptions["syncManager"];
   /** Database facade when a host driver is supplied and available. */
   localSync?: LocalSync | null;
+  /** Lazily open the database after Account mode is known. */
+  getLocalSync?(): Promise<LocalSync>;
   /** Stop the sync manager before releasing its owner/network database. */
   closeStreamSync?(): Promise<void>;
   /**
@@ -581,6 +583,7 @@ export async function createIndexedDbPsLiteRuntime(
     get localSync() {
       return syncRuntime?.localSync ?? null;
     },
+    getLocalSync: syncRuntime?.getLocalSync,
     closeStreamSync,
     streamSyncIntake,
     derivatives,

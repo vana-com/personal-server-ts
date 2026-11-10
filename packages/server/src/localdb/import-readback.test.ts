@@ -1,8 +1,3 @@
-import {
-  fixtureBindings,
-  fixtureProjections,
-} from "./import-projection.test-utils.js";
-import { importProjection } from "./sync.js";
 import { afterEach, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -11,16 +6,9 @@ import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import { createImportLedger } from "../../../core/src/localdb/import-ledger.js";
 import { importLegacySource } from "../../../core/src/localdb/legacy-import.js";
-import {
-  readBackLegacyImport,
-  createImportProjectionReader,
-} from "../../../core/src/localdb/import-readback.js";
-import type { ImportProjectionDeps } from "../../../core/src/localdb/import-readback.js";
-import type {
-  ImportSource,
-  CopyRecords,
-  LegacyCopy,
-} from "../../../core/src/localdb/legacy-import-types.js";
+import { readBackLegacyImport } from "../../../core/src/localdb/import-readback.js";
+import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
+import type { ImportSource } from "../../../core/src/localdb/legacy-import-types.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
 const dbs = new Set<SqlDriver>();
 const dirs: string[] = [];
@@ -30,7 +18,6 @@ afterEach(async () => {
   for (const dir of dirs.splice(0))
     rmSync(dir, { recursive: true, force: true });
 });
-const time = "2026-01-01T00:00:00.000Z";
 const payload = {
   id: "account",
   display_name: "Example",
@@ -55,8 +42,7 @@ async function fixture(path = ":memory:") {
     throw new Error("unexpected external call");
   };
   let op = 0;
-  const deps: ImportProjectionDeps = {
-    importProjection: fixtureProjections,
+  const deps: LocalSyncDeps = {
     db,
     queue: connectionQueue(),
     ownerAddress: "0xabc",
@@ -96,231 +82,76 @@ async function fixture(path = ":memory:") {
       yield { ...payload };
     },
   };
-  const copy: LegacyCopy = {
-    id: "copy",
-    path: "fixture/copy.json",
-    contentHash: "f".repeat(64),
-    revision: "revision",
-    dataSet: "fixture.profile",
-    sources: [
-      { source: source.source, connectionId: "connection", stream: "profile" },
-    ],
-  };
-  const copyRecords: CopyRecords = async function* () {
-    yield { ...payload };
-  };
-  const peers = async function* () {
-    yield source;
-  };
-  const projections = createImportProjectionReader(
-    deps,
-    time,
-    peers,
-    copyRecords,
-  );
-  const run = () => readBackLegacyImport(deps, source, projections, copy);
+  const run = () => readBackLegacyImport(deps, source);
   return {
     db,
     deps,
     source,
-    copy,
-    projections,
-    copyRecords,
-    peers,
     run,
     import: () => importLegacySource(deps, createImportLedger(db), source),
   };
 }
-it("readback-sorted-count-and-fingerprint", async () => {
+it("readback verifies the seed without a projection or file proof", async () => {
   const f = await fixture();
   await f.import();
   expect((await f.run()).pass).toBe(true);
   await f.db.batch([
     { sql: "UPDATE records SET body_sha256 = ?", params: ["f".repeat(64)] },
   ]);
-  expect((await f.run()).pass).toBe(false);
-});
-it("readback-exact-copy", async () => {
-  const f = await fixture();
-  await f.import();
-  const first = await f.run();
-  expect(first.pass).toBe(true);
-  expect((await f.run()).projections).toEqual(first.projections);
-  const changed = createImportProjectionReader(
-    f.deps,
-    time,
-    f.peers,
-    async function* () {
-      yield { ...payload, additional: "uncovered content" };
-    },
-  );
-  expect(
-    (await readBackLegacyImport(f.deps, f.source, changed, f.copy)).pass,
-  ).toBe(false);
-});
-it("readback-no-missing-seam-pass", async () => {
-  const f = await fixture();
-  await f.import();
-  const absent = createImportProjectionReader(f.deps, time, f.peers);
-  expect(
-    await readBackLegacyImport(f.deps, f.source, absent, f.copy),
-  ).toMatchObject({ pass: false, reason: "copy_unreadable" });
-  expect(
-    (
-      await readBackLegacyImport(
-        f.deps,
-        f.source,
-        { compare: async () => [] },
-        null,
-      )
-    ).pass,
-  ).toBe(false);
-});
-it("readback-missing-or-lossy-holds", async () => {
-  const f = await fixture();
   expect(await f.run()).toMatchObject({
     pass: false,
-    receipt: null,
-    reason: "missing_receipt",
-  });
-  await f.import();
-  const missing = createImportProjectionReader(
-    f.deps,
-    time,
-    async function* () {},
-    f.copyRecords,
-  );
-  expect(
-    (await readBackLegacyImport(f.deps, f.source, missing, f.copy)).pass,
-  ).toBe(false);
-  expect(
-    (
-      await readBackLegacyImport(
-        f.deps,
-        { ...f.source, exclusions: [{ reason: "uncovered", rows: 1 }] },
-        f.projections,
-        f.copy,
-      )
-    ).pass,
-  ).toBe(false);
-  await f.db.batch([{ sql: "UPDATE import_ledger SET revision = NULL" }]);
-  expect(await f.run()).toMatchObject({
-    pass: false,
-    receipt: null,
-    reason: "missing_receipt",
+    reason: "stored_row_invalid",
   });
 });
-it("readback-newer-different-row-holds", async () => {
+it("readback-newer-different-row-succeeds", async () => {
   const f = await fixture();
   await f.import();
+  const { canonicalImportRow } =
+    await import("../../../core/src/localdb/import-snapshot.js");
+  const row = await canonicalImportRow(
+    { ...payload, display_name: "Changed" },
+    ["id"],
+  );
   await f.db.batch([
     {
-      sql: "UPDATE records SET body = ?, stamp_o = 99",
-      params: [JSON.stringify({ ...payload, display_name: "Changed" })],
+      sql: "UPDATE records SET body = ?, body_sha256 = ?, stamp_o = 99",
+      params: [row.body, row.body_sha256],
     },
   ]);
-  expect((await f.run()).pass).toBe(false);
+  expect((await f.run()).pass).toBe(true);
 });
-it("readback-every-legacy-data-set", async () => {
+
+it("readback reports missing receipts and rows as bugs", async () => {
   const f = await fixture();
-  const deps = { ...f.deps, importProjection };
-  for (const [name, binding] of importProjection.bindings) {
-    const source: ImportSource = {
-      ...f.source,
-      target: {
-        ...f.source.target,
-        connector: binding.connector,
-        stream: binding.streams[0]!,
-        primaryKey: binding.primaryKey[binding.streams[0]!]!,
-      },
-      async *records() {},
-    };
-    const reader = createImportProjectionReader(deps, time, async function* () {
-      yield source;
-    });
-    const results = await reader.compare(source, null);
-    expect(
-      results.some((p) => p.dataSet === name),
-      name,
-    ).toBe(true);
-    const names = [...importProjection.bindings]
-      .filter(
-        ([, b]) =>
-          b.connector === source.target.connector &&
-          b.streams.includes(source.target.stream),
-      )
-      .map(([n]) => n)
-      .sort();
-    expect(results.map((p) => p.dataSet).sort()).toEqual(names);
-  }
+  expect(await f.run()).toMatchObject({
+    pass: false,
+    reason: "missing_receipt",
+  });
+  await f.import();
+  await f.db.batch([{ sql: "DELETE FROM records" }]);
+  expect(await f.run()).toMatchObject({
+    pass: false,
+    reason: "record_mismatch",
+  });
 });
-it("readback-fixed-projection-time", async () => {
-  const f = await fixture();
-  const source: ImportSource = {
-    ...f.source,
-    target: { ...f.source.target, connector: "time-source", stream: "entries" },
-    async *records() {
-      yield { id: "m", content: "memory", created_at: null };
-    },
-  };
-  await f.db.batch([
-    { sql: "UPDATE connections SET connector = 'time-source'" },
-  ]);
-  await importLegacySource(f.deps, createImportLedger(f.db), source);
-  const expected = {
-    entries: [{ id: "m", content: "memory", created_at: time, type: "entry" }],
-    total: 1,
-  };
-  const copy = {
-    ...f.copy,
-    dataSet: "fixture-time.entries",
-    sources: [
-      {
-        source: source.source,
-        connectionId: source.target.connectionId,
-        stream: source.target.stream,
-      },
-    ],
-  };
-  const projection = createImportProjectionReader(
-    f.deps,
-    time,
-    async function* () {
-      yield source;
-    },
-    async function* () {
-      yield expected;
-    },
-  );
-  expect(
-    (await readBackLegacyImport(f.deps, source, projection, copy)).pass,
-  ).toBe(true);
-});
-it("readback-mutation-during-proof-and-unbound-copy-hold", async () => {
+it("a different valid database value succeeds regardless of its stamp", async () => {
   const f = await fixture();
   await f.import();
-  expect(
-    (
-      await readBackLegacyImport(f.deps, f.source, f.projections, {
-        ...f.copy,
-        dataSet: "unbound",
-      })
-    ).pass,
-  ).toBe(false);
-  const projection = {
-    compare: async () => {
-      const proofs = await f.projections.compare(f.source, f.copy);
-      f.source.records = async function* () {
-        throw new Error("source_changed");
-      };
-      return proofs;
+  const { canonicalImportRow } =
+    await import("../../../core/src/localdb/import-snapshot.js");
+  const row = await canonicalImportRow(
+    { ...payload, display_name: "authoritative database value" },
+    ["id"],
+  );
+  await f.db.batch([
+    {
+      sql: "UPDATE records SET body = ?, body_sha256 = ?",
+      params: [row.body, row.body_sha256],
     },
-  };
-  expect(
-    await readBackLegacyImport(f.deps, f.source, projection, f.copy),
-  ).toMatchObject({ pass: false, reason: "source_changed" });
+  ]);
+  expect((await f.run()).pass).toBe(true);
 });
-it("readback-reopen-and-no-proof-status-writes", async () => {
+it("readback does not write proof status and survives reopen", async () => {
   const dir = mkdtempSync(join(process.cwd(), ".import-readback-test-"));
   dirs.push(dir);
   const path = join(dir, "db.sqlite");
@@ -334,168 +165,14 @@ it("readback-reopen-and-no-proof-status-writes", async () => {
   expect(await f.db.query("SELECT * FROM import_ledger")).toEqual(before);
   expect(await f.db.query("SELECT * FROM import_snapshot")).toEqual([]);
 });
-it("readback-projection-bound-retains-large-copy", async () => {
+it("readback detects a changed immutable source", async () => {
   const f = await fixture();
-  f.source.records = async function* () {
-    yield { ...payload, extra: "x".repeat(3 * 1024 * 1024) };
-  };
   await f.import();
+  f.source.records = async function* () {
+    yield { ...payload, extra: 1 };
+  };
   expect(await f.run()).toMatchObject({
     pass: false,
-    reason: "projection_bound_exceeded",
+    reason: "source_changed",
   });
-});
-
-it("readback-order-independent-and-equal-count-different-body-fails", async () => {
-  const f = await fixture();
-  await f.db.batch([
-    { sql: "UPDATE connections SET connector = 'time-source'" },
-  ]);
-  let pass = 0;
-  const values = [
-    { id: "a", content: "first", created_at: time },
-    { id: "b", content: "second", created_at: time },
-  ];
-  const source: ImportSource = {
-    ...f.source,
-    target: { ...f.source.target, connector: "time-source", stream: "entries" },
-    async *records() {
-      yield* ++pass % 2 ? values : [...values].reverse();
-    },
-  };
-  await importLegacySource(f.deps, createImportLedger(f.db), source);
-  const reader = createImportProjectionReader(f.deps, time, async function* () {
-    yield source;
-  });
-  expect((await readBackLegacyImport(f.deps, source, reader, null)).pass).toBe(
-    true,
-  );
-  // A self-consistent different stored body still fails source equality.
-  const { createHash } = await import("node:crypto");
-  const body = JSON.stringify({
-    content: "different",
-    created_at: time,
-    id: "a",
-  });
-  await f.db.batch([
-    {
-      sql: "UPDATE records SET body = ?, body_sha256 = ?, stamp_o = 99 WHERE record_key = 'a'",
-      params: [body, createHash("sha256").update(body).digest("hex")],
-    },
-  ]);
-  expect(
-    await readBackLegacyImport(f.deps, source, reader, null),
-  ).toMatchObject({ pass: false, reason: "record_mismatch" });
-});
-it("readback-missing-joined-peer-holds", async () => {
-  const f = await fixture();
-  for (const [name, binding] of fixtureBindings) {
-    if (binding.streams.length < 2) continue;
-    const stream = binding.streams[0]!;
-    const source: ImportSource = {
-      ...f.source,
-      target: {
-        ...f.source.target,
-        connector: binding.connector,
-        stream,
-        primaryKey: binding.primaryKey[stream]!,
-      },
-      async *records() {
-        yield { id: "one" };
-      },
-    };
-    await f.db.batch([
-      {
-        sql: "UPDATE connections SET connector = ?",
-        params: [source.target.connector],
-      },
-    ]);
-    await importLegacySource(f.deps, createImportLedger(f.db), source);
-    const reader = createImportProjectionReader(
-      f.deps,
-      time,
-      async function* () {
-        yield source;
-      },
-    );
-    expect(
-      (await reader.compare(source, null)).find((p) => p.dataSet === name)
-        ?.pass,
-    ).toBe(false);
-  }
-});
-it("readback-arrival-evidence-is-the-only-missing-proof", async () => {
-  const f = await fixture();
-  const [name, binding] = [...fixtureBindings].find(
-    ([, value]) => value.rowOrder === "arrival",
-  )!;
-  const stream = binding.streams[0]!;
-  const connector = binding.connector;
-  await f.db.batch([
-    { sql: "UPDATE connections SET connector = ?", params: [connector] },
-  ]);
-  let values = [
-    { id: "a", value: 1 },
-    { id: "b", value: 2 },
-  ];
-  const source: ImportSource = {
-    ...f.source,
-    target: { ...f.source.target, connector, stream, primaryKey: ["id"] },
-    async *records() {
-      yield* values;
-    },
-  };
-  await importLegacySource(f.deps, createImportLedger(f.db), source);
-  const stored = await f.db.query<{ body: string }>(
-    "SELECT body FROM records ORDER BY pk_hash",
-  );
-  values = stored.map((row) => JSON.parse(row.body)).reverse();
-  expect(values).toHaveLength(2);
-  expect([...values].sort((a, b) => a.id.localeCompare(b.id))).toEqual(
-    stored
-      .map((row) => JSON.parse(row.body))
-      .sort((a, b) => a.id.localeCompare(b.id)),
-  );
-  expect(values).not.toEqual(stored.map((row) => JSON.parse(row.body)));
-  const reader = createImportProjectionReader(f.deps, time, async function* () {
-    yield source;
-  });
-  expect(
-    (await reader.compare(source, null)).find((p) => p.dataSet === name)?.pass,
-  ).toBe(false);
-  // All row identities, bodies, receipts, declarations and peer coverage match.
-  expect(
-    await readBackLegacyImport(f.deps, source, reader, null),
-  ).toMatchObject({ pass: false, reason: "projection_unproven" });
-});
-it("readback-missing-row-and-incomplete-projection-coverage-hold", async () => {
-  const f = await fixture();
-  await f.import();
-  const good = await f.projections.compare(f.source, f.copy);
-  expect(
-    (
-      await readBackLegacyImport(
-        f.deps,
-        f.source,
-        { compare: async () => [...good, ...good] },
-        f.copy,
-      )
-    ).pass,
-  ).toBe(false);
-  await f.db.batch([{ sql: "DELETE FROM records" }]);
-  expect((await f.run()).pass).toBe(false);
-});
-
-it("readback-copy-revision-and-malformed-identity-hold", async () => {
-  const f = await fixture();
-  await f.import();
-  for (const copy of [
-    { ...f.copy, revision: "different" },
-    { ...f.copy, contentHash: "" },
-    { ...f.copy, id: "" },
-  ]) {
-    expect(
-      (await readBackLegacyImport(f.deps, f.source, f.projections, copy)).pass,
-    ).toBe(false);
-  }
 });

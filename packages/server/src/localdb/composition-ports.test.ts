@@ -4,7 +4,6 @@ import { readFileSync, readdirSync } from "node:fs";
 const ports = vi.hoisted(() => ({
   build: vi.fn(),
   aliases: vi.fn(),
-  project: vi.fn(),
   bindings: new Map([
     [
       "fixture.summary",
@@ -26,7 +25,6 @@ vi.mock(
     ...(await original<object>()),
     LEGACY_SCOPE_BINDINGS: ports.bindings,
     legacyAliasScopes: ports.aliases,
-    projectPdppRecordsToLegacyPayload: ports.project,
   }),
 );
 import {
@@ -37,7 +35,6 @@ import {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  ports.project.mockReturnValue({ ok: true, payload: { records: [] } });
 });
 
 it("composes catalogue and alias ports at the host boundary", () => {
@@ -53,41 +50,7 @@ it("composes catalogue and alias ports at the host boundary", () => {
   expect(importProjection.bindings.get("fixture.summary")).toEqual({
     connector: "source",
     streams: ["items"],
-    primaryKey: { items: ["id"] },
-    rowOrder: "arrival",
   });
-});
-
-it("delegates complete projection with the fixed time and ordering evidence", () => {
-  const records = [{ stream: "items", data: { id: "one" } }];
-  const options = {
-    fetchedStreams: ["items"],
-    now: "2026-01-01T00:00:00.000Z",
-    orderByPrimaryKey: true as const,
-  };
-  expect(importProjection.project("fixture.summary", records, options)).toEqual(
-    { records: [] },
-  );
-  expect(ports.project).toHaveBeenCalledWith(
-    "fixture.summary",
-    records,
-    options,
-  );
-});
-
-it.each([
-  { ok: false, error: { kind: "unavailable" } },
-  { ok: true, payload: {}, diagnostics: [{ kind: "incomplete" }] },
-  { ok: true, payload: {}, projectionOmissions: [{ reason: "omitted" }] },
-])("holds failed, incomplete or lossy host projections: %j", (result) => {
-  ports.project.mockReturnValue(result);
-  expect(
-    importProjection.project("fixture.summary", [], {
-      fetchedStreams: [],
-      now: "fixed",
-      orderByPrimaryKey: true,
-    }),
-  ).toBeNull();
 });
 
 it("allows catalogue imports only at the host composition site", () => {

@@ -1,9 +1,9 @@
-import { canonicalJson } from "@opendatalabs/personal-server-ts-stream-sync";
 import { computeRecordKeyFromData } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type {
   ImportInventoryEntry,
   ImportTarget,
+  ImportProjectionPort,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 
 /** F.2/F.4: bounded page port implemented privately by legacy-access; no store opened here. */
@@ -24,14 +24,15 @@ export interface CanonicalImportPageReader {
   assertRevision(revision: string): Promise<void>;
   connections(
     sourceId: string,
-  ): Promise<readonly { instance: string; deleted: boolean }[]>;
+  ): Promise<
+    readonly { instance: string; deleted: boolean; lastActive: number }[]
+  >;
   page(
     instance: string,
     stream: string,
     after: string | null,
     limit: number,
-    /** <=4 MiB including serialized response envelope; enforced before retaining
-     * a full page. An oversize single record refuses, never truncates/skips. */
+    /** Page byte target. A single larger record travels alone, as in intake. */
     maxBytes: number,
     revision: string,
   ): Promise<{
@@ -42,21 +43,21 @@ export interface CanonicalImportPageReader {
 
 /**
  * F.2/F.3: adapt canonical pdpp_records via verified declarations and LIMIT
- * pages (byte bound too). Immutable revision, explicit exclusions; ambiguous
- * instances or missing declarations are held, never silently selected. Derive
+ * pages (byte bound too). Immutable revision, explicit exclusions; older
+ * instances or missing declarations are counted, not imported. Derive
  * connector/stream/key from declarations, never connector-id literals. Do not
- * invert legacy projected JSON or add transition tables. Oversized record
- * refuses, never skips silently. Factory returns descriptors lazily.
+ * invert legacy projected JSON or add transition tables. Record acceptance follows run intake; no import-only size limit. Factory returns descriptors lazily.
  * incremental defaults true as in IntakeStreamDeclaration; it is not inferred
- * from semantics or a new declaration field. Multiple live instances hold all.
+ * from semantics or a new declaration field. Most recently active live instance wins (stable instance tie break).
  * Unknown inventory yields ImportExclusion; never invent declaration/key/target.
  */
 export async function* createCanonicalImportSource(options: {
   readonly owner: string;
   readonly network: string;
   readonly revision: string;
+  readonly bindings: ImportProjectionPort["bindings"];
   readonly reader: CanonicalImportPageReader;
-  /** Same authenticated connection authority as host uploads; null holds.
+  /** Same authenticated connection authority as host uploads; null excludes.
    * Never turn a legacy instance/install id into a new sync namespace. */
   readonly resolveTarget: (
     sourceId: string,
@@ -103,8 +104,12 @@ export async function* createCanonicalImportSource(options: {
     const live = (await reader.connections(entry.sourceId!)).filter(
       (c) => !c.deleted,
     );
-    if (live.length !== 1 || live[0]!.instance !== entry.instance) {
-      yield exclude("ambiguous_instance");
+    live.sort(
+      (a, b) =>
+        b.lastActive - a.lastActive || a.instance.localeCompare(b.instance),
+    );
+    if (!live.length || live[0]!.instance !== entry.instance) {
+      yield exclude(live.length ? "older_instance" : "deleted_instance");
       continue;
     }
     const resolved = await resolveTarget(
@@ -119,6 +124,16 @@ export async function* createCanonicalImportSource(options: {
       resolved.stream !== entry.stream
     ) {
       yield exclude("unknown_identity");
+      continue;
+    }
+    if (
+      ![...options.bindings.values()].some(
+        (b) =>
+          b.connector === resolved.connector &&
+          b.streams.includes(entry.stream),
+      )
+    ) {
+      yield exclude("unbound_store");
       continue;
     }
     const target = Object.freeze({
@@ -150,13 +165,7 @@ export async function* createCanonicalImportSource(options: {
             revision,
           );
           await check();
-          if (
-            page.rows.length > 128 ||
-            new TextEncoder().encode(canonicalJson(page)).length >
-              4 * 1024 * 1024
-          ) {
-            throw new Error("record_or_page_oversize");
-          }
+          if (page.rows.length > 128) throw new Error("invalid_page_size");
           if (
             page.next !== null &&
             (page.next === cursor || page.rows.length === 0)

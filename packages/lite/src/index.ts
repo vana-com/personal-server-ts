@@ -1,3 +1,4 @@
+export type { PublicationReceipt } from "@opendatalabs/personal-server-ts-core/localdb";
 export {
   createIndexedDbPsLiteRuntime,
   type IndexedDbPsLiteRuntime,
@@ -6,6 +7,8 @@ export {
 
 export {
   startPersonalServer,
+  type PersonalServerLiteHandle,
+  type PersonalServerLitePublicationResult,
   type StartPersonalServerLiteOptions,
   type StartPersonalServerLiteRelayOptions,
 } from "./client.js";

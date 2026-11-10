@@ -797,3 +797,184 @@ describe("the legacy import wake of a runtime", () => {
     expect(runtime.importWaker).toBeUndefined();
   });
 });
+
+describe("startPersonalServer publication receipts", () => {
+  async function setup() {
+    const store = createMemoryModeRecordStore();
+    await store.save(ownerAddress.toLowerCase(), {
+      answer: "on",
+      generation: 0,
+      receivedAt: 1,
+    });
+    const held = new Set<string>();
+    const close = vi.fn();
+    const options = {
+      ownerAddress,
+      ownerSignature,
+      persistence: memoryBundle(),
+      accountModeStore: store,
+      gateway: createMockPsLiteGateway(),
+      relay: false as const,
+      localDb: {
+        openDriver: async ({ name }: { name: string }) => {
+          if (held.has(name)) throw new Error("database lock held");
+          held.add(name);
+          const db = openBetterSqlite3(":memory:");
+          return {
+            ...db,
+            close: async () => {
+              await db.close();
+              held.delete(name);
+              close();
+            },
+          };
+        },
+      },
+      streamSyncRegistry: createMemoryStreamSyncRegistry(),
+      streamSyncBlobs: createMemoryStreamSyncBlobs(),
+      streamSyncDeclaredStreams: () => ["items"],
+      streamSyncDeclarations: (connector: string) => ({
+        connector,
+        version: "1",
+        streams: [
+          {
+            name: "items",
+            semantics: "mutable_state" as const,
+            primaryKey: ["id"],
+          },
+        ],
+      }),
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    };
+    return { options, held, close };
+  }
+  async function write(
+    server: Awaited<ReturnType<typeof startPersonalServer>>,
+    connector: string,
+    runId: string,
+  ) {
+    await server.streamSyncIntake!.begin(runId, {
+      connector,
+      artifactDigest: connector,
+      owner: { address: ownerAddress, leaseId: null },
+      observedAt: Date.now(),
+    });
+    await server.streamSyncIntake!.batch(runId, {
+      batch: 0,
+      records: [{ stream: "items", data: { id: "a" } }],
+    });
+    await server.streamSyncIntake!.end(runId, {
+      outcome: "succeeded",
+      coveredStreams: ["items"],
+      provenFullStreams: ["items"],
+      lastBatch: 0,
+    });
+  }
+  it("returns both connections' confirmed heads and run coverage, then nothing new", async () => {
+    const { options } = await setup();
+    const server = await startPersonalServer(options);
+    try {
+      await write(server, "acme", "run-a");
+      await write(server, "other", "run-b");
+      const receipt = await server.publish();
+      expect(receipt.outcome).toBe("published");
+      expect(receipt.publications).toHaveLength(2);
+      expect(receipt.publications).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            connector: "acme",
+            stream: "items",
+            runIds: ["run-a"],
+          }),
+          expect.objectContaining({
+            connector: "other",
+            stream: "items",
+            runIds: ["run-b"],
+          }),
+        ]),
+      );
+      for (const publication of receipt.publications) {
+        expect(publication.ns).toEqual(expect.any(String));
+        expect(publication.head).toMatchObject({
+          version: 1,
+          dataHash: expect.any(String),
+          generation: 1,
+        });
+        expect(publication.watermark).toBeGreaterThan(0);
+      }
+      await expect(server.publish()).resolves.toEqual({
+        outcome: "noop",
+        publications: [],
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+  it("rejects a failed publication instead of returning a receipt", async () => {
+    const { options } = await setup();
+    const server = await startPersonalServer(options);
+    try {
+      await write(server, "acme", "run-a");
+      vi.spyOn(options.streamSyncRegistry, "post").mockRejectedValue(
+        new Error("registry unavailable"),
+      );
+      await expect(server.publish()).rejects.toThrow("registry unavailable");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("waits for an active publication before releasing the database", async () => {
+    const { options, close } = await setup();
+    const server = await startPersonalServer(options);
+    await write(server, "acme", "run-a");
+    let release!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const post = options.streamSyncRegistry.post.bind(
+      options.streamSyncRegistry,
+    );
+    vi.spyOn(options.streamSyncRegistry, "post").mockImplementation(
+      async (request) => {
+        entered();
+        await blocked;
+        return post(request);
+      },
+    );
+    const publication = server.publish();
+    await started;
+    const stopped = server.stop();
+    await expect(server.publish()).rejects.toThrow("unavailable");
+    expect(close).not.toHaveBeenCalled();
+    release();
+    await expect(publication).resolves.toMatchObject({ outcome: "published" });
+    await stopped;
+    expect(close).toHaveBeenCalledTimes(1);
+    await expect(server.publish()).rejects.toThrow("unavailable");
+  });
+
+  it("closes the database and releases the host lock before another start", async () => {
+    const { options, held, close } = await setup();
+    const first = await startPersonalServer(options);
+    await write(first, "acme", "run-a");
+    expect(held.size).toBe(1);
+    await first.stop();
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(held.size).toBe(0);
+    const second = await startPersonalServer(options);
+    try {
+      await write(second, "acme", "run-b");
+    } finally {
+      await second.stop();
+    }
+    expect(close).toHaveBeenCalledTimes(2);
+  });
+});

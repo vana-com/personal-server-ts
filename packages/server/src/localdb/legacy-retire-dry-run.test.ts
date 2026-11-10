@@ -152,9 +152,6 @@ async function fixture(missing = false, createTemp = mkdtempSync) {
       owner: supplied.owner,
       network: supplied.network,
       async *sources() {},
-      async *copyRecords() {
-        yield {};
-      },
       async *copies() {
         yield {
           id: "opaque",
@@ -190,14 +187,6 @@ async function fixture(missing = false, createTemp = mkdtempSync) {
             copy,
             pass: !!stored,
             reason: stored ? null : "missing_receipt",
-            projections: [
-              {
-                dataSet: copy.dataSet,
-                expectedHash: "projection",
-                actualHash: "projection",
-                pass: true,
-              },
-            ],
           },
         ];
       };
@@ -237,7 +226,7 @@ it("dry-run-per-file-deletes-nothing-flag-on", async () => {
     JSON.stringify({ streamSync: { retireLegacy: true } }),
   );
   const before = tree(f.input);
-  expect(await runLegacyRetireDryRun(f.options)).toEqual({
+  expect(await runLegacyRetireDryRun(f.options)).toMatchObject({
     mode: "dry-run",
     files: 1,
     ready: 1,
@@ -317,10 +306,13 @@ it("dry-run-no-import-publish-network", async () => {
   );
   expect(tree(f.input)).toBe(before);
 });
-it("dry-run-missing-receipt-holds", async () => {
+it("dry-run-reports-readback-bug-without-retaining-the-copy", async () => {
   const f = await fixture(true);
-  expect((await runLegacyRetireDryRun(f.options)).ready).toBe(0);
-  expect(f.reports[0]?.decision).toBe("held");
+  expect(await runLegacyRetireDryRun(f.options)).toMatchObject({
+    ready: 1,
+    readbackFailures: 1,
+  });
+  expect(f.reports[0]?.decision).toBe("ready");
   expect(f.erase).not.toHaveBeenCalled();
 });
 it("dry-run-closes-and-cleans-after-failure", async () => {
@@ -375,7 +367,7 @@ it("dry-run-reports-independent-copies-without-paths-or-bodies", async () => {
       ...access,
       async *copies() {
         for await (const copy of access.copies()) {
-          yield { ...copy, id: "held-copy", sources: [] };
+          yield { ...copy, id: "unimported-copy", sources: [] };
           yield copy;
         }
       },
@@ -383,8 +375,8 @@ it("dry-run-reports-independent-copies-without-paths-or-bodies", async () => {
   };
   expect(
     await runLegacyRetireDryRun({ ...f.options, openAccess }),
-  ).toMatchObject({ files: 2, ready: 1, deleted: 0 });
-  expect(f.reports.map((r) => r.decision)).toEqual(["held", "ready"]);
+  ).toMatchObject({ files: 2, ready: 2, deleted: 0, unimported: 1 });
+  expect(f.reports.map((r) => r.decision)).toEqual(["ready", "ready"]);
   for (const report of f.reports)
     expect(Object.keys(report).sort()).toEqual(["decision", "file", "reason"]);
   expect(JSON.stringify(f.reports)).not.toContain(f.input);

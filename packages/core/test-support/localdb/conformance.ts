@@ -11,8 +11,8 @@ import {
   type SqlDriver,
   type SqlStatement,
   type WriteOrigin,
-} from "./index.js";
-import { MIGRATIONS } from "./schema.js";
+} from "../../dist/localdb/index.js";
+import { MIGRATIONS } from "../../dist/localdb/schema.js";
 
 const ID = { owner: "0xAbC", network: "moksha", deviceId: "dev-1" };
 

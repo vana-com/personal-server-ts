@@ -8,7 +8,6 @@ import {
   stageImportSnapshot,
   snapshotRows,
   clearImportSnapshot,
-  boundedImportBatch,
   type ImportRow,
 } from "./import-snapshot.js";
 import type { SqlStatement } from "./driver.js";
@@ -16,7 +15,7 @@ import type { LocalSyncDeps } from "./deps.js";
 import type { ImportLedger } from "./import-ledger.js";
 import type { ImportReceipt, ImportSource } from "./legacy-import-types.js";
 
-/** F.2/C.0/F.5: refused/excluded never means the source is safe to erase. */
+/** Import refusals are diagnostics; copy removal has its own exact-byte fence. */
 export type LegacyImportResult =
   | {
       readonly kind: "imported" | "already-imported";
@@ -42,7 +41,7 @@ export type LegacyImportResult =
  * queue (kind end). Recheck local deleted control and delete_intents BEFORE
  * registry refresh, and again inside every merge batch: refresh cannot undo
  * a local delete. Never reconnect. Require known generation 1. Merge with
- * origin import, stamp (0,'seed'), first_o NULL, <=4 MiB per batch. Check
+ * origin import, stamp (0,'seed'), first_o NULL, one row per merge batch. Check
  * per-stream delete floor too. Replays/crash retries add no rows or changes.
  * Receipt and last merge commit atomically; highestSeq includes earlier crash
  * batches (conservatively use the stream change high-water mark). Empty,
@@ -120,7 +119,7 @@ export async function importLegacySource(
       for await (const row of snapshotRows(deps.db, op)) {
         const fence = await importFence(deps, source);
         if (fence) return { kind: "refused", reason: fence };
-        await deps.db.batch(boundedImportBatch(mergeBatch(row)));
+        await deps.db.batch(mergeBatch(row));
         lastRow = row;
       }
       const verificationOp = deps.newOp();
@@ -158,12 +157,10 @@ export async function importLegacySource(
       };
       // Final idempotent merge and receipt share this transaction. A crash
       // before it leaves only replayable batches, never a successful receipt.
-      await deps.db.batch(
-        boundedImportBatch([
-          ...mergeBatch(lastRow!),
-          ...ledger.statements(receipt),
-        ]),
-      );
+      await deps.db.batch([
+        ...mergeBatch(lastRow!),
+        ...ledger.statements(receipt),
+      ]);
       return {
         kind:
           prior?.revision === source.revision && high!.seq === before!.seq

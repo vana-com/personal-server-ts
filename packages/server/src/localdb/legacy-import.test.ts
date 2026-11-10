@@ -170,25 +170,7 @@ it("import-newer-row-wins", async () => {
     before,
   );
 });
-it("import-batch-4mib", async () => {
-  const f = await fixture();
-  f.setValues(
-    Array.from({ length: 3 }, (_, i) => ({
-      id: String(i),
-      text: "é".repeat(600_000),
-    })),
-  );
-  const batch = f.db.batch.bind(f.db);
-  f.db.batch = async (statements) => {
-    expect(Buffer.byteLength(JSON.stringify(statements))).toBeLessThanOrEqual(
-      4 * 1024 * 1024,
-    );
-    return batch(statements);
-  };
-  expect((await f.run()).kind).toBe("imported");
-  f.setValues([{ id: "oversize", text: "x".repeat(4 * 1024 * 1024) }]);
-  expect(await f.run()).toEqual({ kind: "refused", reason: "invalid_record" });
-});
+
 it("import-crash-resume-idempotent", async () => {
   const f = await fixture();
   const batch = f.db.batch.bind(f.db);
@@ -241,7 +223,7 @@ it("import-delete-between-batches-refuses", async () => {
   ]);
   expect(await f.db.query("SELECT * FROM import_ledger")).toEqual([]);
 });
-it("import-source-revision-changed-holds", async () => {
+it("import-source-revision-changed-refuses", async () => {
   const f = await fixture();
   let passes = 0;
   f.source.records = async function* () {
@@ -326,7 +308,7 @@ it("import-reopen-replay-preserves-receipt-and-sequence", async () => {
     await reopened.db.query("SELECT count(*) AS n FROM record_changes"),
   ).toEqual([{ n: 2 }]);
 });
-it("import-conflicting-duplicates-hold-and-identical-deduplicate", async () => {
+it("import-conflicting-duplicates-refuse-and-identical-deduplicate", async () => {
   const f = await fixture();
   f.setValues([
     { id: "a", value: 1 },
@@ -366,7 +348,7 @@ it("import-transaction-fence-closes-check-commit-race", async () => {
   expect(await f.db.query("SELECT * FROM records")).toEqual([]);
   expect(await f.db.query("SELECT * FROM import_ledger")).toEqual([]);
 });
-it("import-declaration-drift-holds", async () => {
+it("import-declaration-drift-refuses", async () => {
   const f = await fixture();
   await f.run();
   const changed = {
