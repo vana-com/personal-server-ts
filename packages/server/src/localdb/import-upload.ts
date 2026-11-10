@@ -34,7 +34,6 @@ interface UploadOptions {
     upload: LegacyImportUpload,
   ) => Promise<ImportSource["target"] | null>;
 }
-const MAX_BYTES = 4 * 1024 * 1024;
 
 /** Only local staging formats change: bytes are fsynced, then installed without
  * replacing an existing file. A separate atomic seal binds authenticated
@@ -50,7 +49,6 @@ export async function stageLegacyImportUpload(
   try {
     async function* persisted() {
       for await (const chunk of options.upload.body) {
-        if (chunk.byteLength > MAX_BYTES) throw new Error("upload_oversize");
         let offset = 0;
         while (offset < chunk.byteLength) {
           const result = await file.write(
@@ -66,7 +64,7 @@ export async function stageLegacyImportUpload(
         yield chunk;
       }
     }
-    for await (const record of decodeRecords(persisted(), context.overhead)) {
+    for await (const record of decodeRecords(persisted())) {
       try {
         computeRecordKeyFromData(record, [...context.target.primaryKey]);
       } catch {
@@ -177,16 +175,6 @@ async function uploadContext(options: UploadOptions) {
     target,
   };
   const seal = canonicalJson(identity);
-  const overhead =
-    Buffer.byteLength(
-      canonicalJson({
-        source: upload.source,
-        revision: upload.revision,
-        artifactDigest: upload.artifactDigest,
-        stream: upload.stream,
-      }),
-    ) + 1;
-  if (overhead >= MAX_BYTES) throw new Error("upload_oversize");
   // Reject a symlinked existing ancestor before recursive mkdir can follow it.
   let ancestor = resolve(options.stagingRoot);
   for (;;) {
@@ -223,7 +211,6 @@ async function uploadContext(options: UploadOptions) {
     sealPath: join(root, `${key}.seal.json`),
     seal,
     target,
-    overhead,
     connector: declarations.connector,
     revision: identity.revision,
     owner: identity.owner,
@@ -243,7 +230,7 @@ async function sealedSource(
     try {
       const stat = await file.stat();
       if (
-        stat.size > MAX_BYTES ||
+        stat.size !== Buffer.byteLength(context.seal) ||
         (await file.readFile("utf8")) !== context.seal
       )
         throw new Error("upload_identity_changed");
@@ -285,8 +272,7 @@ async function sealedSource(
             yield chunk as Uint8Array;
           }
         }
-        for await (const record of decodeRecords(chunks(), context.overhead))
-          yield record;
+        for await (const record of decodeRecords(chunks())) yield record;
         if (hash.digest("hex") !== context.revision)
           throw new Error("source_changed");
         await checkSeal();
@@ -298,13 +284,10 @@ async function sealedSource(
 }
 async function* decodeRecords(
   chunks: AsyncIterable<Uint8Array>,
-  overhead: number,
 ): AsyncIterable<Record<string, unknown>> {
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let pending = "";
   const parse = (line: string) => {
-    if (Buffer.byteLength(line) + overhead > MAX_BYTES)
-      throw new Error("upload_oversize");
     try {
       const record: unknown = JSON.parse(line);
       if (!record || typeof record !== "object" || Array.isArray(record))
@@ -323,8 +306,6 @@ async function* decodeRecords(
         pending = pending.slice(newline + 1);
         yield parse(line);
       }
-      if (Buffer.byteLength(pending) + overhead > MAX_BYTES)
-        throw new Error("upload_oversize");
     }
     pending += decoder.decode();
     if (pending) yield parse(pending);

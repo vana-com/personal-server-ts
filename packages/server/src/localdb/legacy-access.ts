@@ -251,6 +251,7 @@ export async function openLegacyAccess(
       await reader.assertRevision(expected);
       const rows: Record<string, unknown>[] = [];
       let cursor = after;
+      let bytes = 0;
       const metadata = db.prepare(
         "SELECT record_key, length(CAST(data AS BLOB)) AS bytes, length(CAST(record_key AS BLOB)) AS keyBytes FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0 AND (? IS NULL OR record_key > ?) ORDER BY record_key LIMIT 1",
       );
@@ -258,8 +259,8 @@ export async function openLegacyAccess(
         const next = metadata.get(instance, stream, cursor, cursor) as
           { record_key: string; bytes: number; keyBytes: number } | undefined;
         if (!next) return { rows, next: null };
-        if (next.bytes > maxBytes || next.keyBytes > maxBytes)
-          throw new Error("record_or_page_oversize");
+        if (rows.length && bytes + next.bytes + next.keyBytes > maxBytes)
+          return { rows, next: cursor };
         const row = db
           .prepare(
             "SELECT data FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ? AND deleted = 0",
@@ -274,15 +275,8 @@ export async function openLegacyAccess(
         } catch {
           throw new Error("invalid_record");
         }
-        if (
-          Buffer.byteLength(
-            JSON.stringify({ rows: [...rows, value], next: next.record_key }),
-          ) > maxBytes
-        ) {
-          if (rows.length === 0) throw new Error("record_or_page_oversize");
-          return { rows, next: cursor };
-        }
         rows.push(value);
+        bytes += next.bytes + next.keyBytes;
         cursor = next.record_key;
       }
       const more = metadata.get(instance, stream, cursor, cursor);

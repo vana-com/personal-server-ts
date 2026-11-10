@@ -20,8 +20,8 @@
  * removed by the next `streams()` call, which the writer makes before it
  * reads any rows, so a read never loses its file.
  *
- * Memory is bounded by one line (at most the record limit) plus one write
- * batch, whatever the upload size.
+ * Memory is bounded by one record plus one write batch, whatever the upload
+ * size. A record has the same acceptance rules as run intake.
  */
 
 import {

@@ -1,4 +1,3 @@
-import { canonicalJson } from "@opendatalabs/personal-server-ts-stream-sync";
 import { computeRecordKeyFromData } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type {
@@ -33,8 +32,7 @@ export interface CanonicalImportPageReader {
     stream: string,
     after: string | null,
     limit: number,
-    /** <=4 MiB including serialized response envelope; enforced before retaining
-     * a full page. An oversize single record refuses, never truncates/skips. */
+    /** Page byte target. A single larger record travels alone, as in intake. */
     maxBytes: number,
     revision: string,
   ): Promise<{
@@ -48,8 +46,7 @@ export interface CanonicalImportPageReader {
  * pages (byte bound too). Immutable revision, explicit exclusions; older
  * instances or missing declarations are counted, not imported. Derive
  * connector/stream/key from declarations, never connector-id literals. Do not
- * invert legacy projected JSON or add transition tables. Oversized record
- * refuses, never skips silently. Factory returns descriptors lazily.
+ * invert legacy projected JSON or add transition tables. Record acceptance follows run intake; no import-only size limit. Factory returns descriptors lazily.
  * incremental defaults true as in IntakeStreamDeclaration; it is not inferred
  * from semantics or a new declaration field. Most recently active live instance wins (stable instance tie break).
  * Unknown inventory yields ImportExclusion; never invent declaration/key/target.
@@ -168,13 +165,7 @@ export async function* createCanonicalImportSource(options: {
             revision,
           );
           await check();
-          if (
-            page.rows.length > 128 ||
-            new TextEncoder().encode(canonicalJson(page)).length >
-              4 * 1024 * 1024
-          ) {
-            throw new Error("record_or_page_oversize");
-          }
+          if (page.rows.length > 128) throw new Error("invalid_page_size");
           if (
             page.next !== null &&
             (page.next === cursor || page.rows.length === 0)

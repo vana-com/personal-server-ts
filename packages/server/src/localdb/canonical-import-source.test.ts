@@ -186,14 +186,9 @@ it("canonical-revision-changed-refuses", async () => {
   f.change();
   await expect(collect(s.records())).rejects.toThrow("source_changed");
 });
-it("canonical-oversize-and-invalid-key-refuse", async () => {
+it("canonical-invalid-key-refuses", async () => {
   const f = fixture();
   const s = await source(f);
-  f.reader.page = async () => ({
-    rows: [{ id: "a", body: "x".repeat(4 * 1024 * 1024) }],
-    next: null,
-  });
-  await expect(collect(s.records())).rejects.toThrow("record_or_page_oversize");
   f.reader.page = async () => ({ rows: [{ value: 1 }], next: null });
   await expect(collect(s.records())).rejects.toThrow("invalid_record");
 });
