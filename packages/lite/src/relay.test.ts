@@ -1415,6 +1415,63 @@ describe("read-reliability events", () => {
     );
   });
 
+  it("caps the event queue, dropping the oldest and logging the drop count", async () => {
+    const logs: string[] = [];
+    const { sockets, events } = startEventClient(
+      () => new Promise<Response>(() => {}),
+      { logger: (line) => logs.push(line) },
+    );
+    // All requests arrive before any macrotask, so nothing flushes between.
+    for (let streamId = 1; streamId <= 250; streamId += 1) {
+      sockets[0].receive(JSON.stringify({ type: "stream.open", streamId }));
+      sockets[0].receive(
+        encodeDataFrame(streamId, httpRequest("GET", "/v1/data/a.b", {})),
+      );
+    }
+    await flushEvents();
+    expect(events).toHaveLength(200);
+    expect(events.every((event) => event.type === "ps_read_received")).toBe(
+      true,
+    );
+    expect(logs).toContain("relay read events dropped (queue full): 50");
+  });
+
+  it("does not let one slow grantee lookup hold back later events", async () => {
+    let calls = 0;
+    const { sockets, events } = startEventClient(async (request) => {
+      calls += 1;
+      granteeObserverOf(request)?.(
+        calls === 1
+          ? new Promise<string | undefined>(() => {})
+          : Promise.resolve("0123456789ab"),
+      );
+      return json({ data: 1 });
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b", { streamRef: "first" });
+    await sendRequest(sockets[0], "/v1/data/a.b", {
+      streamId: 2,
+      streamRef: "second",
+    });
+    const finished = events.filter(
+      (event) => event.type === "ps_read_finished",
+    );
+    expect(finished.map((event) => event.readRef)).toEqual(["second:0"]);
+    expect(finished[0]).toMatchObject({ granteeRef: "0123456789ab" });
+  });
+
+  it("dispatches nothing once the client is closed", async () => {
+    const { client, sockets, events } = startEventClient(
+      () => new Promise<Response>(() => {}),
+    );
+    sockets[0].receive(JSON.stringify({ type: "stream.open", streamId: 1 }));
+    sockets[0].receive(
+      encodeDataFrame(1, httpRequest("GET", "/v1/data/a.b", {})),
+    );
+    client.close();
+    await flushEvents();
+    expect(events).toEqual([]);
+  });
+
   it("keeps serving when the read hook throws", async () => {
     const logs: string[] = [];
     const { sockets } = startEventClient(async () => json({ data: 1 }), {
