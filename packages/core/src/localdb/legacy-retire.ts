@@ -30,7 +30,10 @@ export interface LegacyRetireOptions {
  * connection order. Stored verified status alone grants nothing. Unknowns,
  * exclusions and deleted connections hold files. Dry run never calls erase or
  * persists verified/retired state even with the flag on. Erase then mark retired;
- * a crash after erase is recoverable by observing the exact copy is absent.
+ * a crash after erase may leave the receipt unretired. Generic ENOENT or
+ * erase(false) is NOT evidence of exact-copy absence. Until a host supplies
+ * durable exact-copy retirement intent/reconciliation, retain that unknown
+ * state; never erase a replacement or synthesize retired evidence.
  */
 export function retireLegacyCopies(
   _deps: LocalSyncDeps,

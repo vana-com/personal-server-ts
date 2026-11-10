@@ -20,7 +20,11 @@ export type LegacyImportResult =
     };
 
 /**
- * F.2, C.0, F.5; r5.2 §1.2. Bootstrap before staging, then hold the connection
+ * F.2, C.0, F.5; r5.2 §1.2. Only refresh through syncBeforeBegin when the
+ * target is its identityless controlScope; never use that helper to fabricate
+ * an identity for another namespace. Unknown nonidentityless targets refuse
+ * unknown_control; known generation-1 targets can proceed offline.
+ * Bootstrap before staging, then hold the connection
  * queue (kind end). Recheck local deleted control and delete_intents BEFORE
  * registry refresh, and again inside every merge batch: refresh cannot undo
  * a local delete. Never reconnect. Require known generation 1. Merge with

@@ -4,6 +4,7 @@ import type {
   ImportReadback,
   LegacyCopy,
   ProjectionProof,
+  CopyRecords,
 } from "./legacy-import-types.js";
 
 /** F.2: adapter uses frozen bindings.ts only; missing/ambiguous/lossy coverage fails closed. */
@@ -22,6 +23,9 @@ export interface ImportProjectionReader {
  * reacquire them), plus every projection. Newer differing DB rows
  * conservatively hold the source. Never read published frames or an overlay.
  * A mismatch, missing ledger, exclusion or uncovered copy cannot pass.
+ * Use createImportLedger for decoding; absent/NULL receipt returns receipt:null,
+ * pass:false, reason:missing_receipt. Use the same canonical row rules as
+ * ImportSource.records and importFingerprint; no second hash/key convention.
  */
 export function readBackLegacyImport(
   _deps: LocalSyncDeps,
@@ -42,6 +46,11 @@ export function createImportProjectionReader(
   _deps: LocalSyncDeps,
   _projectionTime: string,
   _sourcesFor: (source: ImportSource) => AsyncIterable<ImportSource>,
+  /** Required to prove a supplied copy; absent fails copy_unreadable. Compare
+   * canonical stored payload with frozen bindings' payload at projectionTime.
+   * Reuse storage/canonical-legacy-projection; never treat raw file hash as a
+   * projected digest. All peer sources must share the sealed snapshot. */
+  _copyRecords?: CopyRecords,
 ): ImportProjectionReader {
   throw new Error("PS-3: not built");
 }

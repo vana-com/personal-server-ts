@@ -95,3 +95,5 @@ export * from "./import-ledger.js";
 export * from "./legacy-import.js";
 export * from "./import-readback.js";
 export * from "./legacy-retire.js";
+
+export * from "./import-fingerprint.js";

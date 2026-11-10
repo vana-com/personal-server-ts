@@ -12,7 +12,7 @@ export interface ImportLedger {
   statements(receipt: ImportReceipt): readonly SqlStatement[];
 }
 
-/** F.2: use existing import_ledger only; reason = JSON {v:1, revision, generation, highestSeq, detail}. Unknown/malformed metadata never authorizes retire. */
+/** Migration 2 nullable receipt columns; reason is free text. NULL/malformed metadata holds. */
 export function createImportLedger(_db: SqlDriver): ImportLedger {
   throw new Error("PS-3: not built");
 }
