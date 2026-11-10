@@ -113,12 +113,13 @@ export function createImportOperations(
    * Finish interrupted work. Cleaning up a retired operation is a removal and
    * needs nothing; finishing a prepared one publishes a legacy file, so it
    * happens only for a caller that holds the seal (`hold`). Without a hold
-   * prepared operations are left as they are.
+   * prepared operations are left as they are, and so are those `spare` names.
    */
   function recover(
     hold: LegacyWriteHold | undefined,
     own?: ReturnType<typeof key>,
     replicaPath?: string,
+    spare?: (row: OperationRow) => boolean,
   ): void {
     const rows = db
       .prepare(
@@ -126,7 +127,7 @@ export function createImportOperations(
       )
       .all() as OperationRow[];
     for (const row of rows) {
-      if (row.state === "prepared" && !hold) continue;
+      if (row.state === "prepared" && (!hold || spare?.(row))) continue;
       try {
         recoverRow(row, hold);
       } catch (error) {
@@ -408,13 +409,16 @@ export function createImportOperations(
    * its own, run before and apart from the removal (the lock is not
    * re-entrant): a removal never publishes. A caller that already holds the
    * seal publishes under its own hold. A refusal leaves those operations
-   * prepared; the erase itself is never refused.
+   * prepared; the erase itself is never refused. The operations the erase
+   * targets (`spare`) stay prepared: the erase retires them, so they are never
+   * published, not even for the moment before the removal.
    */
   async function finishOwedPublications(
     hold: LegacyWriteHold | undefined,
+    spare?: (row: OperationRow) => boolean,
   ): Promise<void> {
     if (hold) {
-      immediate(() => recover(hold));
+      immediate(() => recover(hold, undefined, undefined, spare));
       return;
     }
     const owed = db
@@ -424,7 +428,9 @@ export function createImportOperations(
       .get();
     if (!owed) return;
     try {
-      await seal.commit((sealed) => immediate(() => recover(sealed)));
+      await seal.commit((sealed) =>
+        immediate(() => recover(sealed, undefined, undefined, spare)),
+      );
     } catch (error) {
       if (!(error instanceof LegacyWriteRefusedError)) throw error;
     }
@@ -468,7 +474,7 @@ export function createImportOperations(
     commitVersion,
     recoverAtBoot,
     async deleteScope(scope: string, hold?: LegacyWriteHold): Promise<number> {
-      await finishOwedPublications(hold);
+      await finishOwedPublications(hold, (row) => row.scope === scope);
       return removal(hold, scope, () => {
         const snapshot = immediate(() => {
           deleteFirstSeenLedgerSync(options, scope);
@@ -584,7 +590,10 @@ export function createImportOperations(
       indexedPath?: string,
       hold?: LegacyWriteHold,
     ): Promise<boolean> {
-      await finishOwedPublications(hold);
+      await finishOwedPublications(
+        hold,
+        (row) => row.scope === scope && row.collected_at === collectedAt,
+      );
       return removal(hold, scope, () => {
         immediate(() => {
           retire("scope = @scope AND collected_at = @collectedAt", {
