@@ -561,6 +561,12 @@ function projectSchemaToFields(
 
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   const app = new Hono();
+  // Metadata handlers also use the guarded reader. Preserve its typed refusal
+  // when it throws outside a record handler's local try/catch.
+  app.onError((error, c) => {
+    const reqId = requestId();
+    return sendError(c, mapAndLog(deps, c.req.path, reqId, error), reqId);
+  });
   const validateData = createRecordDataValidator(deps.declarations);
   const readsFor = deps.reads ?? (() => deps.store);
   /** The token class selects the reader; request input never does. */
@@ -1017,6 +1023,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     const reqId = requestId();
     const { context, error } = await authenticate(c, reqId);
     if (error) return error;
+    if (!context?.active)
+      return sendError(c, mapInactiveToError(context!), reqId);
 
     try {
       const query = parseRecordQuery(
@@ -1235,6 +1243,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     const reqId = requestId();
     const { context, error } = await authenticate(c, reqId);
     if (error) return error;
+    if (!context?.active)
+      return sendError(c, mapInactiveToError(context!), reqId);
 
     try {
       const query = parseRecordQuery(

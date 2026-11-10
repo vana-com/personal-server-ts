@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { afterEach, expect, it } from "vitest";
 import { Hono } from "hono";
 import pino from "pino";
@@ -133,6 +134,7 @@ function fixture(subject = owner, resourceOwner = owner) {
     () => ["id"],
   );
   const replica = pdppRecordsRoutes({
+    accountStorageMode: explicitLegacyStorageMode("unswitched"),
     store: records,
     auth,
     declarations: createStreamDeclarationRegistry([

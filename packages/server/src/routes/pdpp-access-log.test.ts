@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 /**
  * PDPP reads must appear in the owner's access feed.
  *
@@ -102,6 +103,7 @@ function app(kind: "client" | "owner", accessLog?: PdppAccessLogPort) {
   a.route(
     "/v1",
     pdppRecordsRoutes({
+      accountStorageMode: explicitLegacyStorageMode("unswitched"),
       store,
       auth: auth(kind),
       declarations,

@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 /**
  * A malformed cursor is a client error, not a server fault.
  *
@@ -95,6 +96,7 @@ function fixture() {
   a.route(
     "/v1",
     pdppRecordsRoutes({
+      accountStorageMode: explicitLegacyStorageMode("unswitched"),
       store,
       auth: clientAuth,
       declarations,

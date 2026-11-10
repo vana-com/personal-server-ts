@@ -73,6 +73,10 @@ function jsonError(
 
 export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   const app = new Hono();
+  app.onError((error, c) => {
+    if (error instanceof PdppError) return jsonError(c, error, requestId());
+    throw error;
+  });
   const readsFor = deps.reads ?? (() => deps.store);
 
   /**

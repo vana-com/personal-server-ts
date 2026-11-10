@@ -158,6 +158,7 @@ describe("MCP remember tool", () => {
     root.route(
       "/mcp",
       mcpStreamableHttpRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         logger,
         serverOrigin: SERVER_ORIGIN,
         serverOwner: ownerWallet.address,

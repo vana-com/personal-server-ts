@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import {
@@ -65,7 +66,12 @@ for (const backend of ["memory", "sqlite"])
               cursorField: "emitted_at",
             },
           ]);
-          const records = pdppRecordsRoutes({ store, auth, declarations });
+          const records = pdppRecordsRoutes({
+            accountStorageMode: explicitLegacyStorageMode("unswitched"),
+            store,
+            auth,
+            declarations,
+          });
           const blobs = pdppBlobsRoutes({
             store,
             auth,

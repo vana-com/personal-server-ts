@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode } from "../test-utils/account-mode.js";
 /**
  * One owner response is computed from one writer-and-import state. It names
  * the streams it read, and only a change to those streams can make it start
@@ -317,6 +318,7 @@ describe("a read is invalidated only by the streams it read", () => {
     rig = await baseRig();
     churn(rig);
     const deps: PersonalServerDataApiDeps = {
+      accountStorageMode: fixedOwnedAccountStorageMode("switched"),
       storage: createMemoryDataStorage(),
       streamSyncRead: rig.service,
       auth: {

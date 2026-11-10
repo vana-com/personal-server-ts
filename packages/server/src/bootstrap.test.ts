@@ -90,6 +90,7 @@ describe("createServer", () => {
     let ctx;
     try {
       ctx = await createServer(config, { rootPath: tempDir, ownerSignature });
+      await declareAccountMode(ctx, "off");
       const response = await ctx.app.request(
         "/v1/data/additions?tz=UTC&days=7",
         {
