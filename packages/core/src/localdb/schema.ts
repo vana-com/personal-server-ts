@@ -134,4 +134,10 @@ END;`,
     `UPDATE run_streams SET semantics=(SELECT s.semantics FROM stream_state s JOIN runs r ON r.connection_id=s.connection_id WHERE r.run_id=run_streams.run_id AND s.stream=run_streams.stream)`,
     `ALTER TABLE record_changes ADD COLUMN explicit_delete INTEGER NOT NULL DEFAULT 0`,
   ],
+  [
+    `ALTER TABLE runs ADD COLUMN begin_control_version INTEGER`,
+    `ALTER TABLE runs ADD COLUMN begin_request TEXT`,
+    `ALTER TABLE runs ADD COLUMN begin_response TEXT`,
+    `ALTER TABLE runs ADD COLUMN end_response TEXT`,
+  ],
 ];

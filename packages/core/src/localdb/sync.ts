@@ -1,3 +1,4 @@
+import { readBeginReceipt, readEndReceipt } from "./run-receipts.js";
 import { createGrantHistory } from "./query.js";
 import {
   createLinkedRecordQuery,
@@ -104,6 +105,8 @@ export function createLocalSync(
       if (req.owner.address.toLowerCase() !== deps.ownerAddress.toLowerCase()) {
         throw new RunIntakeError("owner_mismatch");
       }
+      const receipt = await readBeginReceipt(deps.db, runId, req);
+      if (receipt) return receipt;
       const binding = {
         connector: req.connector,
         leaseId: req.owner.leaseId,
@@ -118,7 +121,7 @@ export function createLocalSync(
         await checkBinding(binding);
       }
       const response = await intake().begin(runId, req, declarations);
-      bindings.set(runId, binding);
+      if (response.status === "collecting") bindings.set(runId, binding);
       return response;
     },
     async batch(runId, req) {
@@ -126,6 +129,8 @@ export function createLocalSync(
       return intake().batch(runId, req);
     },
     async end(runId, req) {
+      const receipt = await readEndReceipt(deps.db, runId);
+      if (receipt) return { ...receipt, stuck: false };
       await checkRun(runId);
       // The store owns the atomic merge/checkpoint rule, including retry_pending.
       const result = await endStore.end(runId, req);

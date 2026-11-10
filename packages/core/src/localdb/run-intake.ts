@@ -1,3 +1,5 @@
+import { readBeginReceipt } from "./run-receipts.js";
+import { RegistryRefusedError } from "../stream-sync/ports.js";
 import { sha256 } from "@noble/hashes/sha2";
 import { keccak_256 } from "@noble/hashes/sha3";
 import {
@@ -173,6 +175,14 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           (!Number.isFinite(req.observedAt) || req.observedAt < 0)
         )
           throw invalid("invalid observedAt");
+        if (
+          req.expectedControlVersion !== undefined &&
+          (!Number.isSafeInteger(req.expectedControlVersion) ||
+            req.expectedControlVersion < 0)
+        )
+          throw invalid("invalid expectedControlVersion");
+        const receipt = await readBeginReceipt(db, runId, req);
+        if (receipt) return receipt;
         if (declarations.connector !== req.connector)
           throw invalid("connector does not match artifact");
         const seen = new Set<string>();
@@ -236,6 +246,16 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
         )
           throw new RunIntakeError("connection_stopped");
         let synced = await syncBeforeBegin(deps, req.connector);
+        if (req.expectedControlVersion !== undefined) {
+          if (synced.unreachable)
+            throw new RunIntakeError("control_basis_unavailable");
+          if (
+            (synced.connection?.controlVersion ?? 0) !==
+            req.expectedControlVersion
+          )
+            throw new RunIntakeError("control_basis_mismatch");
+        }
+        let admittedControlVersion = synced.connection?.controlVersion ?? 0;
         if (
           synced.connection?.controlState === "deleted" &&
           req.connect === true &&
@@ -253,15 +273,28 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             metadataHash: hashes.activeMetadata,
             expectedVersion: BigInt(version),
           });
-          await deps.registry.post({
-            ownerAddress: deps.ownerAddress,
-            scope: id,
-            dataHash: hashes.activeData,
-            metadataHash: hashes.activeMetadata,
-            expectedVersion: String(version),
-            signature,
-          });
+          try {
+            const posted = await deps.registry.post({
+              ownerAddress: deps.ownerAddress,
+              scope: id,
+              dataHash: hashes.activeData,
+              metadataHash: hashes.activeMetadata,
+              expectedVersion: String(version),
+              signature,
+            });
+            if (posted.kind === "conflict")
+              throw new RunIntakeError("control_basis_mismatch");
+          } catch (error) {
+            if (error instanceof RegistryRefusedError && error.status === 409)
+              throw new RunIntakeError("control_basis_mismatch");
+            throw error;
+          }
+          admittedControlVersion = version;
           synced = await syncBeforeBegin(deps, req.connector);
+          if (synced.unreachable)
+            throw new RunIntakeError("control_basis_unavailable");
+          if (synced.connection?.controlVersion !== admittedControlVersion)
+            throw new RunIntakeError("control_basis_mismatch");
         }
         if (await stopped(id)) throw new RunIntakeError("connection_stopped");
         const [cached] = await db.query<{
@@ -306,16 +339,32 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
         const keyCheck = await deriveKeyCheck((m) =>
           deps.keys.namespaceHmac(m),
         );
+        const response: BeginResponse = {
+          runId,
+          status: "collecting",
+          discardReason: null,
+          stuck: false,
+          binding: { keyCheck },
+          start: { collection_mode: collection, state },
+          streams: declarations.streams.map((d) => ({
+            ...d,
+            incremental: d.incremental !== false,
+            mode: modes.get(d.name)!,
+          })),
+        };
         const statements: SqlStatement[] = [
           {
             sql: "INSERT OR IGNORE INTO connections(connection_id,connector,ns) VALUES (?,?,'')",
             params: [id, req.connector],
           },
           {
-            sql: `CREATE TEMP TRIGGER intake_begin_check BEFORE INSERT ON main.runs BEGIN SELECT RAISE(ABORT,'connection_stopped') WHERE ${STOPPED}; END`,
+            sql: `CREATE TEMP TRIGGER intake_begin_check BEFORE INSERT ON main.runs BEGIN
+              SELECT RAISE(ABORT,'control_basis_mismatch') WHERE NEW.begin_control_version IS NOT NULL
+                AND EXISTS (SELECT 1 FROM connections c WHERE c.connection_id=NEW.connection_id AND c.control_version<>NEW.begin_control_version);
+              SELECT RAISE(ABORT,'connection_stopped') WHERE ${STOPPED}; END`,
           },
           {
-            sql: "INSERT INTO runs(run_id,connection_id,o,generation,artifact_version,collection_mode,state) VALUES (?,?,?,?,?,?,'collecting')",
+            sql: "INSERT INTO runs(run_id,connection_id,o,generation,artifact_version,collection_mode,state,begin_control_version,begin_request,begin_response) VALUES (?,?,?,?,?,?,'collecting',?,?,?)",
             params: [
               runId,
               id,
@@ -323,6 +372,9 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
               generation,
               declarations.version,
               collection,
+              admittedControlVersion,
+              text,
+              JSON.stringify(response),
             ],
           },
         ];
@@ -367,23 +419,12 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
         try {
           await db.batch(statements);
         } catch (error) {
+          if (String(error).includes("control_basis_mismatch"))
+            throw new RunIntakeError("control_basis_mismatch");
           if (String(error).includes("connection_stopped"))
             throw new RunIntakeError("connection_stopped");
           throw error;
         }
-        const response: BeginResponse = {
-          runId,
-          status: "collecting",
-          discardReason: null,
-          stuck: false,
-          binding: { keyCheck },
-          start: { collection_mode: collection, state },
-          streams: declarations.streams.map((d) => ({
-            ...d,
-            incremental: d.incremental !== false,
-            mode: modes.get(d.name)!,
-          })),
-        };
         active.set(runId, { request: text, response });
         return response;
       }),

@@ -1,3 +1,4 @@
+import { readEndReceipt } from "./run-receipts.js";
 import {
   checkpointDecision,
   type StreamRunResult,
@@ -83,13 +84,17 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           "SELECT * FROM runs WHERE run_id = ?",
           [runId],
         );
-        if (!run || run.state !== "collecting")
+        if (!run) throw new RunIntakeError("gone");
+        if (run.state !== "collecting") {
+          const receipt = await readEndReceipt(db, runId);
+          if (receipt) return receipt;
           throw new RunIntakeError("gone");
-        const cleanup: SqlStatement[] = [
+        }
+        const cleanup = (receipt: RunEndResponse): SqlStatement[] => [
           { sql: "DELETE FROM run_rows WHERE run_id = ?", params: [runId] },
           {
-            sql: "UPDATE runs SET state = 'ended' WHERE run_id = ?",
-            params: [runId],
+            sql: "UPDATE runs SET state = 'ended',end_response=? WHERE run_id = ?",
+            params: [JSON.stringify(receipt), runId],
           },
         ];
         if (req.outcome === "failed" || req.outcome === "cancelled") {
@@ -98,7 +103,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               sql: "UPDATE run_streams SET decision = 'discarded', reason = ?, replace = 0 WHERE run_id = ?",
               params: [req.outcome, runId],
             },
-            ...cleanup,
+            ...cleanup({ result: "aborted", updateRequired: false }),
           ]);
           return { result: "aborted", updateRequired: false };
         }
@@ -129,7 +134,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               WHERE connection_id = ? AND stream IN (SELECT stream FROM run_streams WHERE run_id = ?)`,
               params: [run.connection_id, runId],
             },
-            ...cleanup,
+            ...cleanup({ result: "discarded", updateRequired: false }),
           ]);
           return { result: "discarded", updateRequired: false };
         }
@@ -363,9 +368,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             params: [JSON.stringify(candidate), run.connection_id],
           });
         }
-        statements.push(...cleanup);
-        await db.batch(withOrigin("local", statements));
-        return {
+        const response: RunEndResponse = {
           result: merged
             ? "queued"
             : saved
@@ -373,6 +376,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               : "no_checkpoint",
           updateRequired,
         };
+        statements.push(...cleanup(response));
+        await db.batch(withOrigin("local", statements));
+        return response;
       },
     );
   };
