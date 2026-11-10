@@ -1,3 +1,4 @@
+import type { LegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type { Database } from "better-sqlite3";
 import type {
@@ -27,7 +28,7 @@ export interface LegacyAccessOptions {
   readonly root: string;
   readonly declarations: readonly DeclarationSnapshot[];
   /** Existing storage removal authority; no new parallel lock/seal. */
-  readonly legacyWriteSeal: import("@opendatalabs/personal-server-ts-core/storage/legacy-write-seal").LegacyWriteSeal;
+  readonly legacyWriteSeal: LegacyWriteSeal;
   /** All legacy writers must be quiescent for the lifetime of this access.
    * Caller owns stopping them; false refuses before reads or door retirement. */
   readonly isQuiescent: () => Promise<boolean>;

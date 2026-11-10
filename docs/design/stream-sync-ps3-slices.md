@@ -2,7 +2,7 @@
 
 Base: `c43f493a9706fb0fabc85811bda12ddf32ea872c` (pushed `feat/stream-sync-ps2`). Interface branch: `feat/stream-sync-ps3`. This document is the committed copy of `~/.tmp/ps3-1110/SLICES.md`.
 
-Owner: Personal Server local database migration. Lifecycle: active implementation contract; update when ports or slice ownership change; archive after PS-3 acceptance. No function bodies are implemented in this skeleton. Existing exports remain unchanged; the localdb barrel only adds exports. Builders must not enable retirement by default.
+Owner: Personal Server local database migration. Lifecycle: active implementation contract; update when ports or slice ownership change; archive after PS-3 acceptance. Implemented slices are recorded by their commits and tests; remaining stubs refuse. Existing exports remain unchanged; the localdb barrel only adds exports. Builders must not enable retirement by default.
 
 Sources: SPECS-r5 F.2-F.5 and C.0; SPECS-r5.2-addendum §1.2 and §5 (PDPP wins over legacy counters and transition tables); MUSTHAVES-MAP-r5 rows 13 and 18; PLAN-1109 “Order and gates”; PS-2 SLICES.md at design time. Prior work read with `gh pr view` and `gh pr diff`: [#595](https://github.com/vana-com/personal-server-ts/pull/595), [#604](https://github.com/vana-com/personal-server-ts/pull/604), [#601](https://github.com/vana-com/personal-server-ts/pull/601). Reuse verified declarations, fresh read-back, content-fenced erase and copy-only diagnostics; do not carry the writer/spool/overlay implementation or legacy special-case counters.
 
@@ -61,4 +61,4 @@ Phone P7 supplies replayable, immutable snapshots through the same source/upload
 
 ## Skeleton verification
 
-No behaviour tests are implemented here: all exported function bodies throw `new Error("PS-3: not built")`. Builders own the named tests above. `CI=true npx tsc -b --noEmit` hits TS6310 for this repo's project references; use the repository's `CI=true npm run lint` (`tsc --build --force`) instead. Typecheck establishes interface compatibility only; it does not prove migration or deletion safety.
+S01, S02, S07 and S10 now have focused behaviour tests, as does the shared fingerprint helper. S03, S04, S05, S06 and S08 remain throwing stubs. S07 conservatively leaves post-erase crash state unknown until a durable exact-copy intent/reconciliation contract is supplied; it never treats generic absence as retirement proof. `CI=true npx tsc -b --noEmit` hits TS6310 for this repo's project references; use the repository's `CI=true npm run lint` (`tsc --build --force`) instead. Typecheck establishes interface compatibility only; it does not prove migration or deletion safety.

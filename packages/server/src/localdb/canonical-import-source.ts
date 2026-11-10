@@ -1,5 +1,10 @@
+import { canonicalJson } from "@opendatalabs/personal-server-ts-stream-sync";
+import { computeRecordKeyFromData } from "../../../core/src/storage/pdpp-records/record-key.js";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
-import type { ImportInventoryEntry } from "@opendatalabs/personal-server-ts-core/localdb";
+import type {
+  ImportInventoryEntry,
+  ImportTarget,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 
 /** F.2/F.4: bounded page port implemented privately by legacy-access; no store opened here. */
 export interface CanonicalImportPageReader {
@@ -46,7 +51,7 @@ export interface CanonicalImportPageReader {
  * from semantics or a new declaration field. Multiple live instances hold all.
  * Unknown inventory yields ImportExclusion; never invent declaration/key/target.
  */
-export function createCanonicalImportSource(_options: {
+export async function* createCanonicalImportSource(options: {
   readonly owner: string;
   readonly network: string;
   readonly revision: string;
@@ -57,9 +62,120 @@ export function createCanonicalImportSource(_options: {
     sourceId: string,
     instance: string,
     stream: string,
-  ) => Promise<
-    import("@opendatalabs/personal-server-ts-core/localdb").ImportTarget | null
-  >;
+  ) => Promise<ImportTarget | null>;
 }): AsyncIterable<ImportInventoryEntry> {
-  throw new Error("PS-3: not built");
+  const { owner, network, revision, reader, resolveTarget } = options;
+  const check = () => reader.assertRevision(revision);
+  await check();
+  for await (const entry of reader.inventory(revision)) {
+    await check();
+    const source = JSON.stringify([entry.instance, entry.sourceId, revision]);
+    const exclude = (reason: string) => ({
+      kind: "excluded" as const,
+      source,
+      revision,
+      reason,
+      rows: entry.rows,
+    });
+    const declarations = reader.declarations.filter(
+      (d) => d.source_id === entry.sourceId,
+    );
+    if (declarations.length !== 1) {
+      yield exclude(
+        declarations.length === 0
+          ? "undeclared_source"
+          : "ambiguous_declaration",
+      );
+      continue;
+    }
+    const streams = declarations[0]!.streams.filter(
+      (s) => s.name === entry.stream,
+    );
+    if (streams.length !== 1) {
+      yield exclude("undeclared_stream");
+      continue;
+    }
+    const stream = streams[0]!;
+    if (stream.primary_key.length === 0) {
+      yield exclude("unkeyed_stream");
+      continue;
+    }
+    const live = (await reader.connections(entry.sourceId!)).filter(
+      (c) => !c.deleted,
+    );
+    if (live.length !== 1 || live[0]!.instance !== entry.instance) {
+      yield exclude("ambiguous_instance");
+      continue;
+    }
+    const resolved = await resolveTarget(
+      entry.sourceId!,
+      entry.instance,
+      entry.stream,
+    );
+    if (
+      !resolved ||
+      !resolved.connectionId ||
+      !resolved.connector ||
+      resolved.stream !== entry.stream
+    ) {
+      yield exclude("unknown_identity");
+      continue;
+    }
+    const target = Object.freeze({
+      ...resolved,
+      primaryKey: Object.freeze([...stream.primary_key]),
+      semantics: stream.semantics ?? "mutable_state",
+    });
+    // Capture scalars, not mutable inventory objects from the adapter.
+    const instance = entry.instance;
+    const streamName = entry.stream;
+    yield {
+      source,
+      owner,
+      network,
+      revision,
+      target,
+      exclusions: [],
+      async *records() {
+        await check();
+        let cursor: string | null = null;
+        do {
+          await check();
+          const page = await reader.page(
+            instance,
+            streamName,
+            cursor,
+            128,
+            4 * 1024 * 1024,
+            revision,
+          );
+          await check();
+          if (
+            page.rows.length > 128 ||
+            new TextEncoder().encode(canonicalJson(page)).length >
+              4 * 1024 * 1024
+          ) {
+            throw new Error("record_or_page_oversize");
+          }
+          if (
+            page.next !== null &&
+            (page.next === cursor || page.rows.length === 0)
+          ) {
+            throw new Error("invalid_page_cursor");
+          }
+          for (const record of page.rows) {
+            try {
+              computeRecordKeyFromData(record, [...target.primaryKey]);
+            } catch {
+              throw new Error("invalid_record");
+            }
+            yield record;
+          }
+          cursor = page.next;
+        } while (cursor !== null);
+        await check();
+      },
+    };
+  }
+  await check();
 }
