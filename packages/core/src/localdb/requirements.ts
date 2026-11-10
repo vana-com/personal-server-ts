@@ -12,9 +12,10 @@ export type RequirementsAnswer =
 
 /**
  * Manifest data port: for a connection, stream name to the name of the
- * date-valued record field that its manifest declares as `history.since_field`.
- * Empty until the manifest carries the field. The Personal Server names no
- * connector; the manifest is the only source.
+ * date-valued record field that starts its history. That field is the
+ * stream's existing `consent_time_field` in the connector manifest; no separate
+ * history field exists. A stream that does not declare `consent_time_field` is
+ * omitted. The Personal Server names no connector; the manifest is the only source.
  */
 export interface SinceFieldSource {
   sinceFields(connectionId: string): Promise<Readonly<Record<string, string>>>;
