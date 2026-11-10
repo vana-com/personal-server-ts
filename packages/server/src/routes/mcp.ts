@@ -47,6 +47,7 @@ import {
   type McpProofReplayStore,
   createMcpDataReadClient,
   createMcpDataWriteClient,
+  McpDataWriteError,
   type McpDataWriteClient,
   denyMcpScopeAccessRequest,
   getMcpConnectionView,
@@ -373,18 +374,59 @@ async function parseFormBody(request: Request): Promise<URLSearchParams> {
   return new URLSearchParams(text);
 }
 
+/**
+ * A switched request must never accidentally answer from the old store.
+ * Every operation fails loudly, including optional reads that callers might
+ * otherwise treat as a missing entry or an empty listing.
+ */
+function sealedMcpLegacyStorage(): DataStoragePort {
+  return new Proxy({} as DataStoragePort, {
+    get() {
+      return () => {
+        throw new ProtocolError(
+          503,
+          "STREAM_SYNC_LEGACY_STORAGE",
+          "Legacy storage is sealed for a switched account.",
+        );
+      };
+    },
+  });
+}
+
+function streamSyncMemoryWriteRefusal(): McpDataWriteClient {
+  return {
+    async updateScope() {
+      throw new McpDataWriteError(
+        409,
+        jsonError(
+          409,
+          "STREAM_SYNC_WRITE_UNAVAILABLE",
+          "Memory writes are not available through stream sync.",
+        ),
+      );
+    },
+  };
+}
+
 function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
+  // Pin the account's answer before constructing either path. A reader being
+  // wired is a runtime capability, not permission to use it.
+  const mode = deps.accountStorageMode?.read() ?? "unknown";
+  const switched = mode === "switched";
   const dataStorage =
-    deps.dataStorage ??
-    (deps.indexManager && deps.hierarchyOptions
-      ? withLegacyProjection(
-          createNodeDataStorage({
-            indexManager: deps.indexManager,
-            hierarchyOptions: deps.hierarchyOptions,
-            legacyWriteSeal: deps.legacyWriteSeal ?? unwiredLegacyWriteSeal(),
-          }),
-        )
-      : undefined);
+    mode !== "unswitched"
+      ? sealedMcpLegacyStorage()
+      : (deps.dataStorage ??
+        (deps.indexManager && deps.hierarchyOptions
+          ? withLegacyProjection(
+              createNodeDataStorage({
+                indexManager: deps.indexManager,
+                hierarchyOptions: deps.hierarchyOptions,
+                legacyWriteSeal:
+                  deps.legacyWriteSeal ?? unwiredLegacyWriteSeal(),
+              }),
+            )
+          : undefined));
   if (!dataStorage) {
     throw new Error(
       "mcpRoutes requires either `dataStorage` or `{ indexManager, hierarchyOptions }` to build the read path",
@@ -398,14 +440,17 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
     devToken: deps.devToken,
     accessToken: deps.accessToken,
     tokenStore: deps.tokenStore,
-    dataStorage,
+    dataStorage: mode === "unswitched" ? dataStorage : undefined,
     runtimeAvailability: deps.runtimeAvailability,
   });
 
   return {
     storage: dataStorage,
-    streamSyncRead: deps.streamSyncRead,
-    accountStorageMode: deps.accountStorageMode,
+    streamSyncRead: switched ? deps.streamSyncRead : undefined,
+    accountStorageMode: {
+      owner: deps.accountStorageMode?.owner ?? deps.serverOwner ?? "",
+      read: () => mode,
+    },
     auth,
     accessLogWriter: deps.accessLogWriter,
     readFulfillmentReporter: deps.readFulfillmentReporter,
@@ -418,14 +463,17 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
 function buildWriteClient(
   deps: McpRouteDeps,
   granteeAccount: ReturnType<typeof loadMcpGranteeAccount>,
-  storage: PersonalServerDataApiDeps["storage"],
+  dataApiDeps: PersonalServerDataApiDeps,
 ): McpDataWriteClient | undefined {
+  if (dataApiDeps.accountStorageMode?.read() === "switched") {
+    return streamSyncMemoryWriteRefusal();
+  }
   const serverOwner = deps.serverOwner;
   if (!deps.mcpWrites || !serverOwner) return undefined;
   return createMcpDataWriteClient({
     serverOrigin: resolveOrigin(deps.serverOrigin),
     granteeAccount,
-    storage,
+    storage: dataApiDeps.storage,
     sessionStore: deps.mcpWrites.sessionStore,
     dispatch: deps.mcpWrites.dispatch,
     authorize: async ({ scope, grantId }) => {
@@ -442,6 +490,18 @@ function buildWriteClient(
           runtimeAvailability: deps.runtimeAvailability,
         },
       );
+      // Recheck after policy's asynchronous work, before updateScope reads
+      // the legacy record. A switch must not race a read-modify-write.
+      const mode = deps.accountStorageMode?.read() ?? "unknown";
+      if (mode !== "unswitched") {
+        throw new ProtocolError(
+          mode === "switched" ? 409 : 503,
+          mode === "switched"
+            ? "STREAM_SYNC_WRITE_UNAVAILABLE"
+            : "ACCOUNT_MODE_UNKNOWN",
+          "Legacy memory writes are unavailable for this account mode.",
+        );
+      }
     },
   });
 }
@@ -465,7 +525,7 @@ export function executeMcpConnectionRequest(
       granteeAccount,
       dataApiDeps,
     }),
-    writeClient: buildWriteClient(deps, granteeAccount, dataApiDeps.storage),
+    writeClient: buildWriteClient(deps, granteeAccount, dataApiDeps),
     activityRecorder: deps.activityRecorder,
     // Denied tool calls are recorded by the wrapper, not the read path.
     reporterDeps: {
@@ -1168,7 +1228,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
     const response = await handleMcpStreamableHttpRequest(c.req.raw, {
       connection: record,
       readClient,
-      writeClient: buildWriteClient(deps, granteeAccount, dataApiDeps.storage),
+      writeClient: buildWriteClient(deps, granteeAccount, dataApiDeps),
       activityRecorder: deps.activityRecorder,
       requestScopeAccess: async (input) => {
         return requestMcpScopeAccess(
@@ -1282,6 +1342,10 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
     return handleMcpStreamableHttpRequest(c.req.raw, {
       connection,
       readClient,
+      writeClient:
+        baseDeps.accountStorageMode?.read() === "switched"
+          ? streamSyncMemoryWriteRefusal()
+          : undefined,
       activityRecorder: deps.activityRecorder,
     });
   }

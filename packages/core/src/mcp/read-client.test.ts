@@ -22,6 +22,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           findEntry: () => ({
             scope: "oura.sleep",
@@ -65,6 +66,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           listScopes: () => ({
             scopes: [
@@ -112,6 +114,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -162,6 +165,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -237,6 +241,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -312,6 +317,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -388,6 +394,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -493,6 +500,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -560,6 +568,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -638,6 +647,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -695,6 +705,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -792,6 +803,7 @@ describe("mcp/read-client deletion gate", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -953,6 +965,7 @@ describe("mcp/read-client deletion gate", () => {
         serverOrigin: SERVER_ORIGIN,
         granteeAccount: createAccount(),
         dataApiDeps: {
+          accountStorageMode: { owner: "fixture", read: () => "unswitched" },
           storage: {
             kind: "custom",
             listScopes: () => ({ scopes: [], total: 0 }),

@@ -795,6 +795,7 @@ describe("MCP /mcp/:token route", () => {
     root.route(
       "/mcp",
       mcpStreamableHttpRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         logger,
         serverOrigin: SERVER_ORIGIN,
         serverOwner: ownerWallet.address,
@@ -993,6 +994,7 @@ describe("MCP /mcp/:token route", () => {
     root.route(
       "/mcp",
       mcpStreamableHttpRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         logger,
         serverOrigin: SERVER_ORIGIN,
         serverOwner: ownerWallet.address,
@@ -1622,6 +1624,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     });
     return {
       storage: dataStorage,
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       auth: createServerApiAuth({
         serverOrigin: SERVER_ORIGIN,
         serverOwner: ownerWallet.address,
@@ -1770,6 +1773,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     root.route(
       "/mcp",
       mcpStreamableHttpRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         logger,
         serverOrigin: SERVER_ORIGIN,
         serverOwner: ownerWallet.address,
@@ -2833,6 +2837,7 @@ describe("MCP /mcp/session (self-signing handshake)", () => {
     root.route(
       "/mcp",
       mcpStreamableHttpRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         logger,
         serverOrigin: SERVER_ORIGIN,
         serverOwner: ownerWallet.address,
@@ -2969,6 +2974,7 @@ describe("MCP /mcp/session (self-signing handshake)", () => {
     root.route(
       "/mcp",
       mcpStreamableHttpRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         logger,
         serverOrigin: SERVER_ORIGIN,
         serverOwner: ownerWallet.address,
@@ -2995,6 +3001,7 @@ describe("MCP /mcp/session (self-signing handshake)", () => {
     app.route(
       "/mcp",
       mcpStreamableHttpRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         logger,
         serverOrigin: SERVER_ORIGIN,
         serverOwner: ownerWallet.address,

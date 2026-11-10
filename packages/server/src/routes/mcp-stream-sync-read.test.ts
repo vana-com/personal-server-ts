@@ -23,7 +23,6 @@ import {
   fixedLegacyWriteSeal,
   createTestWallet,
   buildWeb3SignedHeader,
-  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type {
   GatewayClient,
@@ -193,12 +192,31 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
   let http: Hono;
   let mcp: Hono;
   let token: string;
+  let mode: "switched" | "unswitched";
 
   beforeEach(async () => {
+    mode = "switched";
     dataDir = await mkdtemp(join(tmpdir(), "mcp-stream-sync-read-"));
     const indexManager = createIndexManager(initializeDatabase(":memory:"));
     store = createInMemoryMcpConnectionStore();
-    const view = await streamView();
+    const view = Object.assign(await streamView(), {
+      listScopes: async ({
+        canRead,
+      }: {
+        canRead: (scope: string) => boolean | Promise<boolean>;
+      }) =>
+        (await canRead(SCOPE))
+          ? [
+              {
+                scope: SCOPE,
+                connector: "fixture",
+                ns: "",
+                records: 1,
+                updatedAt: Date.parse("2026-11-01T00:00:00Z"),
+              },
+            ]
+          : [],
+    });
     const created = await createMcpConnection(
       { displayName: "Claude" },
       { store, publicOrigin: SERVER_ORIGIN },
@@ -208,7 +226,7 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
     const hierarchyOptions = { dataDir };
 
     http = dataRoutes({
-      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      accountStorageMode: { owner: ownerWallet.address, read: () => mode },
       legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
@@ -238,6 +256,7 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
         connectionStore: store,
         indexManager,
         hierarchyOptions,
+        accountStorageMode: { owner: ownerWallet.address, read: () => mode },
         streamSyncRead: view,
         oauthApprovalUrl: "https://app-dev.vana.org/mcp/connect/claude",
         localApprovalPort: LOOPBACK_PORT,
@@ -350,11 +369,13 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
       uri: `/${SCOPE}`,
       body: new TextEncoder().encode(bodyText),
     });
+    mode = "unswitched";
     const ingest = await http.request(`/${SCOPE}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: auth },
       body: bodyText,
     });
+    mode = "switched";
     expect(ingest.ok).toBe(true);
   }
 
@@ -370,11 +391,13 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
       uri: `/${SCOPE}`,
       body: new TextEncoder().encode(bodyText),
     });
+    mode = "unswitched";
     const ingest = await http.request(`/${SCOPE}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: auth },
       body: bodyText,
     });
+    mode = "switched";
     expect(ingest.ok).toBe(true);
 
     const httpCaptions = captionsIn(await httpRead());
