@@ -52,6 +52,8 @@ const report: Record<string, unknown> = {};
 
 const rows = (ids: string[], tag: string) => ids.map((id) => ({ id, n: tag }));
 
+// Multi-MiB crypto and repeated registry I/O use the existing integration
+// deadline; the 5-second unit default is not a data-integrity assertion.
 const MiB = 1024 * 1024;
 
 /** A record whose canonical JSON body is exactly `bodyBytes` bytes long. */
@@ -603,7 +605,7 @@ describe.each(matrix)(
           .map((p) => p.hash);
       expect(longHashes(second.head)).toEqual(longHashes(first.head));
       expect(longHashes(first.head).length).toBeGreaterThan(0);
-    });
+    }, 120_000);
 
     it("replaces a long record when a later run updates it, to a long or a small one", async () => {
       const c = freshConnector("big-update");
@@ -642,7 +644,7 @@ describe.each(matrix)(
       if (view === "tombstoned") throw new Error("tombstoned");
       expect(view.records.get("huge")).toEqual({ id: "huge", n: "now small" });
       expect(view.head.parts).toHaveLength(1);
-    });
+    }, 120_000);
 
     it("drops a long record when the stream is deleted and published again", async () => {
       const c = freshConnector("big-delete");
@@ -671,7 +673,7 @@ describe.each(matrix)(
       const view = (await readStream(env.registry, env.blobs, c, NS, "s"))!;
       if (view === "tombstoned") throw new Error("tombstoned");
       expect([...view.records.keys()]).toEqual(["after"]);
-    });
+    }, 120_000);
 
     it("Q9: a no-op onto a complete:false base keeps needsFull and blocks the checkpoint", async () => {
       const c = freshConnector("noop-incomplete");
@@ -833,7 +835,7 @@ describe.each(matrix)(
         noop: first.outcome,
         healedRecords: healed.records.size,
       });
-    });
+    }, 120_000);
 
     it("R3 (dot): A decides T=1 and pauses before its stream-row read; B deletes, reconnects and commits H3; A gets stale_generation and posts nothing", async () => {
       const c = freshConnector("dot-interleave");
