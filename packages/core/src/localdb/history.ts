@@ -292,7 +292,10 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
       if (context?.control_state === "deleted") {
         return { ok: false, reason: "deleted" };
       }
-      if (context?.control_state !== "active" || context.head_version === null) {
+      if (
+        context?.control_state !== "active" ||
+        context.head_version === null
+      ) {
         return { ok: false, reason: "not_found" };
       }
       const versions = rows.filter((row) => row.version !== null);

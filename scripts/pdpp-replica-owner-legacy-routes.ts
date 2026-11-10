@@ -28,7 +28,8 @@ import type { LegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/stor
  * migrating the receiver's runtime.db; no authority database is opened.
  * Empty storage stays empty until a normal ingest writes actual envelopes.
  * This tool has no account-mode authority, so unless the caller passes a seal
- * every legacy write is refused as "mode unknown"; reads are unaffected.
+ * every legacy write is refused as "mode unknown". Routes likewise require
+ * an explicit account-mode answer before serving retained legacy reads.
  * The caller owns close(), including when route composition fails.
  */
 export function openReplicaOwnerLegacyStorage({
@@ -67,6 +68,7 @@ export function openReplicaOwnerLegacyStorage({
 
 export type ReplicaOwnerLegacyRouteDeps = Pick<
   DataRouteDeps,
+  | "accountStorageMode"
   | "indexManager"
   | "hierarchyOptions"
   | "logger"

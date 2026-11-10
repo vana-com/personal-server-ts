@@ -175,8 +175,9 @@ describe("local history additions", () => {
     const query = vi.spyOn(db, "query");
     const reader = history(db);
     for (const days of [0, -1, 32, 999, 1.5, Number.NaN, Infinity]) {
-      await expect(reader.additions({ timezone: "UTC", days }))
-        .rejects.toMatchObject({ code: 400 });
+      await expect(
+        reader.additions({ timezone: "UTC", days }),
+      ).rejects.toMatchObject({ code: 400 });
     }
     expect(query).not.toHaveBeenCalled();
   });

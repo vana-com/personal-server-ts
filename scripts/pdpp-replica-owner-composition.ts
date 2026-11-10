@@ -1,4 +1,5 @@
 /** Dedicated dev owner only: receives its master-key signature and derives worker keys. */
+import type { OwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
 import assert from "node:assert/strict";
 import {
   existsSync,
@@ -97,6 +98,7 @@ export type CompositionLegacyRoutesFactory = (
   | { routes: Hono; close?: () => void | Promise<void> };
 
 export type CompositionOptions = {
+  accountStorageMode?: OwnedAccountStorageMode;
   root: string;
   owner: Hex;
   origin: string;
@@ -574,6 +576,7 @@ export async function createOwnerComposition(options: CompositionOptions) {
         bindingStore: runtime.store,
         logger: pino({ level: "silent" }),
         ownerSubjectId: options.owner,
+        accountStorageMode: options.accountStorageMode,
         reads: (reader) => runtime.receiver.readStore({ reader }),
       }),
     );

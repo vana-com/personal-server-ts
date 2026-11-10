@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { mkdtempSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -121,6 +122,7 @@ describe("single issuer harness through real HTTP AS/RS and SQLite", () => {
     const f = fixture(join(root, "records.sqlite"));
     const issuer = await openConsentIssuer(root, "ephemeral-test-owner", 2);
     let rs = await openReplicaResourceServer(f.store, {
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       owner: "ephemeral-test-owner",
       issuerOrigin: issuer.origin,
       credential: issuer.credential,
@@ -129,6 +131,7 @@ describe("single issuer harness through real HTTP AS/RS and SQLite", () => {
     const reopen = async () => {
       await rs.close();
       rs = await openReplicaResourceServer(f.store, {
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         owner: "ephemeral-test-owner",
         issuerOrigin: issuer.origin,
         credential: issuer.credential,
@@ -400,6 +403,7 @@ async function scenario(
   const f = fixture(join(root, "records.sqlite"));
   const issuer = await openConsentIssuer(root, "ephemeral-contract-owner", 60);
   const rs = await openReplicaResourceServer(f.store, {
+    accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
     owner: "ephemeral-contract-owner",
     issuerOrigin: issuer.origin,
     credential: issuer.credential,
@@ -720,6 +724,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
         declarations: () => [{ sourceId, binding, validateData: () => true }],
       });
       const rs = await openReplicaResourceServer(f.store, {
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         owner,
         issuerOrigin: issuer.origin,
         credential: issuer.credential,
@@ -856,6 +861,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
     const f = fixture(join(root, "records.sqlite"));
     const issuer = await openConsentIssuer(root, "ephemeral-contract-owner", 2);
     const rs = await openReplicaResourceServer(f.store, {
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       owner: "ephemeral-contract-owner",
       issuerOrigin: issuer.origin,
       credential: issuer.credential,
@@ -1112,6 +1118,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
         return normalFetch(input, init);
       };
       const rs = await openReplicaResourceServer(f.store, {
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         owner: "ephemeral-contract-owner",
         issuerOrigin: issuer.origin,
         credential: issuer.credential,

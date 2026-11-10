@@ -84,10 +84,12 @@ async function fixture() {
       runId,
     ]);
   const checkpoint = async () =>
-    (await db.query<{ checkpoint: string | null }>(
-      "SELECT checkpoint FROM connections WHERE connection_id = ?",
-      ["connection"],
-    ))[0]!.checkpoint;
+    (
+      await db.query<{ checkpoint: string | null }>(
+        "SELECT checkpoint FROM connections WHERE connection_id = ?",
+        ["connection"],
+      )
+    )[0]!.checkpoint;
   const snapshot = async () => ({
     records: await records(),
     changes: await changes(),
@@ -101,10 +103,12 @@ async function versionedFixture() {
   const f = await fixture();
   await f.stage("newer-run", "2", 100);
   await f.end("newer-run");
-  await f.db.batch([{
-    sql: "UPDATE connections SET checkpoint = ? WHERE connection_id = ?",
-    params: [JSON.stringify({ items: "stored" }), "connection"],
-  }]);
+  await f.db.batch([
+    {
+      sql: "UPDATE connections SET checkpoint = ? WHERE connection_id = ?",
+      params: [JSON.stringify({ items: "stored" }), "connection"],
+    },
+  ]);
   return f;
 }
 
@@ -115,42 +119,53 @@ async function expectRefused(
   expect(await f.decision(runId)).toEqual([
     { decision: "refused", reason: "connector_update_required" },
   ]);
-  expect(await f.db.query(
-    "SELECT COUNT(*) AS n FROM run_rows WHERE run_id = ?", [runId],
-  )).toEqual([{ n: 0 }]);
+  expect(
+    await f.db.query("SELECT COUNT(*) AS n FROM run_rows WHERE run_id = ?", [
+      runId,
+    ]),
+  ).toEqual([{ n: 0 }]);
 }
 
 describe("run end update required", () => {
-
   it("old-version-unresolved-seed-refused", async () => {
     const f = await versionedFixture();
     const before = await f.snapshot();
     await f.stage("old-seed", "1", 200);
-    await f.db.batch([{
-      sql: "UPDATE run_streams SET seed = 'unresolved' WHERE run_id = ?",
-      params: ["old-seed"],
-    }]);
-    expect(await f.end("old-seed", {
-      checkpointCandidate: { items: "advanced" },
-    })).toEqual({ result: "no_checkpoint", updateRequired: true });
+    await f.db.batch([
+      {
+        sql: "UPDATE run_streams SET seed = 'unresolved' WHERE run_id = ?",
+        params: ["old-seed"],
+      },
+    ]);
+    expect(
+      await f.end("old-seed", {
+        checkpointCandidate: { items: "advanced" },
+      }),
+    ).toEqual({ result: "no_checkpoint", updateRequired: true });
     await expectRefused(f, "old-seed");
     expect(await f.snapshot()).toEqual(before);
   });
 
   it("old-version-unbound-generation-refused", async () => {
     const f = await versionedFixture();
-    await f.db.batch([{
-      sql: "UPDATE stream_state SET head_version = 1, head_generation = 1",
-    }]);
+    await f.db.batch([
+      {
+        sql: "UPDATE stream_state SET head_version = 1, head_generation = 1",
+      },
+    ]);
     const before = await f.snapshot();
     await f.stage("old-unbound", "1", 200);
-    await f.db.batch([{
-      sql: "UPDATE runs SET generation = NULL WHERE run_id = ?",
-      params: ["old-unbound"],
-    }]);
-    expect(await f.end("old-unbound", {
-      checkpointCandidate: { items: "advanced" },
-    })).toEqual({ result: "no_checkpoint", updateRequired: true });
+    await f.db.batch([
+      {
+        sql: "UPDATE runs SET generation = NULL WHERE run_id = ?",
+        params: ["old-unbound"],
+      },
+    ]);
+    expect(
+      await f.end("old-unbound", {
+        checkpointCandidate: { items: "advanced" },
+      }),
+    ).toEqual({ result: "no_checkpoint", updateRequired: true });
     await expectRefused(f, "old-unbound");
     expect(await f.snapshot()).toEqual(before);
   });
@@ -159,24 +174,29 @@ describe("run end update required", () => {
     const f = await versionedFixture();
     const before = await f.snapshot();
     await f.stage("old-retry", "1", 200);
-    expect(await f.end("old-retry", {
-      outcome: "retry_pending",
-      checkpointCandidate: { items: "advanced" },
-    })).toEqual({ result: "no_checkpoint", updateRequired: true });
+    expect(
+      await f.end("old-retry", {
+        outcome: "retry_pending",
+        checkpointCandidate: { items: "advanced" },
+      }),
+    ).toEqual({ result: "no_checkpoint", updateRequired: true });
     await expectRefused(f, "old-retry");
     expect(await f.snapshot()).toEqual(before);
   });
 
   it("mixed-retry-keeps-refused-cursor", async () => {
     const f = await versionedFixture();
-    await f.db.batch([{
-      sql: "INSERT INTO stream_state (connection_id, stream, primary_key, semantics, incremental) VALUES (?, ?, ?, 'mutable_state', 1)",
-      params: ["connection", "accepted", '["id"]'],
-    }]);
+    await f.db.batch([
+      {
+        sql: "INSERT INTO stream_state (connection_id, stream, primary_key, semantics, incremental) VALUES (?, ?, ?, 'mutable_state', 1)",
+        params: ["connection", "accepted", '["id"]'],
+      },
+    ]);
     const rows = await f.records();
     const changes = await f.changes();
     const floor = await f.db.query(
-      "SELECT * FROM stream_state WHERE stream = ?", ["items"],
+      "SELECT * FROM stream_state WHERE stream = ?",
+      ["items"],
     );
     const stored = await f.checkpoint();
     // A changed refused cursor blocks the entire candidate. An unchanged
@@ -197,30 +217,47 @@ describe("run end update required", () => {
         },
       ]);
       const candidate = { items: cursor, accepted: runId };
-      expect(await f.end(runId, {
-        outcome: "retry_pending",
-        coveredStreams: ["items", "accepted"],
-        checkpointCandidate: candidate,
-      })).toEqual({ result: "queued", updateRequired: true });
-      expect(await f.db.query(
-        "SELECT stream, decision, reason FROM run_streams WHERE run_id = ? ORDER BY stream",
-        [runId],
-      )).toEqual([
+      expect(
+        await f.end(runId, {
+          outcome: "retry_pending",
+          coveredStreams: ["items", "accepted"],
+          checkpointCandidate: candidate,
+        }),
+      ).toEqual({ result: "queued", updateRequired: true });
+      expect(
+        await f.db.query(
+          "SELECT stream, decision, reason FROM run_streams WHERE run_id = ? ORDER BY stream",
+          [runId],
+        ),
+      ).toEqual([
         { stream: "accepted", decision: "publish", reason: null },
-        { stream: "items", decision: "refused", reason: "connector_update_required" },
+        {
+          stream: "items",
+          decision: "refused",
+          reason: "connector_update_required",
+        },
       ]);
       expect(await f.records()).toEqual(rows);
-      expect((await f.changes()).filter((row) => row.stream === "items")).toEqual(changes);
-      expect(await f.db.query(
-        "SELECT * FROM stream_state WHERE stream = ?", ["items"],
-      )).toEqual(floor);
-      expect(await f.db.query(
-        "SELECT COUNT(*) AS n FROM run_rows WHERE run_id = ?", [runId],
-      )).toEqual([{ n: 0 }]);
-      expect(await f.db.query(
-        "SELECT COUNT(*) AS n FROM records WHERE stream = ? AND stamp_r = ?",
-        ["accepted", runId],
-      )).toEqual([{ n: 2 }]);
+      expect(
+        (await f.changes()).filter((row) => row.stream === "items"),
+      ).toEqual(changes);
+      expect(
+        await f.db.query("SELECT * FROM stream_state WHERE stream = ?", [
+          "items",
+        ]),
+      ).toEqual(floor);
+      expect(
+        await f.db.query(
+          "SELECT COUNT(*) AS n FROM run_rows WHERE run_id = ?",
+          [runId],
+        ),
+      ).toEqual([{ n: 0 }]);
+      expect(
+        await f.db.query(
+          "SELECT COUNT(*) AS n FROM records WHERE stream = ? AND stamp_r = ?",
+          ["accepted", runId],
+        ),
+      ).toEqual([{ n: 2 }]);
       expect(await f.checkpoint()).toBe(
         cursor === "advanced" ? stored : JSON.stringify(candidate),
       );
@@ -230,17 +267,23 @@ describe("run end update required", () => {
   it("current-version-deferrals-still-merge", async () => {
     for (const reason of ["seed_unresolved", "generation_unbound"] as const) {
       const f = await versionedFixture();
-      await f.db.batch([{
-        sql: "UPDATE stream_state SET head_version = 1, head_generation = 1",
-      }]);
+      await f.db.batch([
+        {
+          sql: "UPDATE stream_state SET head_version = 1, head_generation = 1",
+        },
+      ]);
       await f.stage("current-deferred", "2", 200);
-      await f.db.batch([reason === "seed_unresolved" ? {
-        sql: "UPDATE run_streams SET seed = 'unresolved' WHERE run_id = ?",
-        params: ["current-deferred"],
-      } : {
-        sql: "UPDATE runs SET generation = NULL WHERE run_id = ?",
-        params: ["current-deferred"],
-      }]);
+      await f.db.batch([
+        reason === "seed_unresolved"
+          ? {
+              sql: "UPDATE run_streams SET seed = 'unresolved' WHERE run_id = ?",
+              params: ["current-deferred"],
+            }
+          : {
+              sql: "UPDATE runs SET generation = NULL WHERE run_id = ?",
+              params: ["current-deferred"],
+            },
+      ]);
       expect(await f.end("current-deferred")).toEqual({
         result: "queued",
         updateRequired: false,
@@ -248,12 +291,19 @@ describe("run end update required", () => {
       expect(await f.decision("current-deferred")).toEqual([
         { decision: "deferred", reason },
       ]);
-      expect(await f.db.query(
-        "SELECT COUNT(*) AS n FROM records WHERE stamp_r = ?", ["current-deferred"],
-      )).toEqual([{ n: 2 }]);
-      expect(await f.db.query(
-        "SELECT floor_version, floor_o, floor_r FROM stream_state",
-      )).toEqual([{ floor_version: "2", floor_o: 200, floor_r: "current-deferred" }]);
+      expect(
+        await f.db.query(
+          "SELECT COUNT(*) AS n FROM records WHERE stamp_r = ?",
+          ["current-deferred"],
+        ),
+      ).toEqual([{ n: 2 }]);
+      expect(
+        await f.db.query(
+          "SELECT floor_version, floor_o, floor_r FROM stream_state",
+        ),
+      ).toEqual([
+        { floor_version: "2", floor_o: 200, floor_r: "current-deferred" },
+      ]);
     }
   });
   it("older-version-after-unpublished-newer-run", async () => {
