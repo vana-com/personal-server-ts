@@ -63,6 +63,9 @@ export const DEFAULTS = {
     // declare a stream-sync client is refused with `update_required`. Turn it
     // on only after the clients that send `Vana-Stream-Sync-Client` ship.
     refuseLegacyWrites: false,
+    // Off by default. Legacy copies may be retired only after an explicit
+    // opt-in and the import, read-back, and publication safety checks.
+    retireLegacy: false,
   },
   olderVersionReads: true,
   replication: {
@@ -248,6 +251,7 @@ export const ServerConfigSchema = z.object({
       refuseLegacyWrites: z
         .boolean()
         .default(DEFAULTS.streamSync.refuseLegacyWrites),
+      retireLegacy: z.boolean().default(DEFAULTS.streamSync.retireLegacy),
     })
     .default(DEFAULTS.streamSync),
   olderVersionReads: z.boolean().default(DEFAULTS.olderVersionReads),
