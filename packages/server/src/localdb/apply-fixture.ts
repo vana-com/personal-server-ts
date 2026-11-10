@@ -74,6 +74,8 @@ export async function remoteFixture(
       format?: Head["format"];
       pieceBytes?: number;
       complete?: boolean;
+      primaryKey?: string[];
+      profile?: { key: string | null; version: string };
     } = {},
   ) {
     const scope = streamScope(connector, ns, stream);
@@ -82,7 +84,7 @@ export async function remoteFixture(
     const frames = await Promise.all(
       values.map(async (v) => {
         const body = new TextEncoder().encode(canonicalJson(v));
-        const k = await pkHash(SHA, v, ["id"]);
+        const k = await pkHash(SHA, v, options.primaryKey ?? ["id"]);
         const envelope = {
           h: toHex(sha256(body)),
           k,
@@ -123,8 +125,8 @@ export async function remoteFixture(
       format,
       ...(format >= 3 ? { lastDeleteVersion: 0 } : {}),
       keyCheck,
-      primaryKey: ["id"],
-      profile: { key: null, version: "1" },
+      primaryKey: options.primaryKey ?? ["id"],
+      profile: options.profile ?? { key: null, version: "1" },
       complete: options.complete ?? true,
       observedAt: options.o ?? 100,
       recordCount: values.length,
