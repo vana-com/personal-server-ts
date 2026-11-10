@@ -1,4 +1,7 @@
-import type { PublicationReceipt } from "@opendatalabs/personal-server-ts-core/localdb";
+import type {
+  PublicationReceipt,
+  SeedIntake,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   accessLogsListPath,
   createOwnerSignedPersonalServerRequest,
@@ -107,6 +110,8 @@ export type PersonalServerLitePublicationResult = {
 export type PersonalServerLiteHandle = PersonalServerHandle & {
   /** In-process run intake; `null` unless `config.streamSync.write` is on. */
   readonly streamSyncIntake: RunIntake | null;
+  /** One-time retained-snapshot intake, with the runtime's Account admission. */
+  readonly streamSyncSeed: SeedIntake | null;
   /** Await a database publication cycle. Rejects if any stream cannot confirm publication.
    * Receipts cover individual streams, not every stream of a connection.
    * A noop contains no new coverage. Unavailable or stopped runtimes reject.
@@ -697,6 +702,21 @@ export async function startPersonalServer(
 
   const publishing = new Set<Promise<PersonalServerLitePublicationResult>>();
   let stopping = false;
+  const seedPort = runtime.streamSyncSeed;
+  const streamSyncSeed: SeedIntake | null = seedPort
+    ? {
+        async status(connector) {
+          if (stopping || status === "stopped")
+            throw new Error("Stream seed intake is unavailable");
+          return seedPort.status(connector);
+        },
+        async put(connector, stream, body) {
+          if (stopping || status === "stopped")
+            throw new Error("Stream seed intake is unavailable");
+          return seedPort.put(connector, stream, body);
+        },
+      }
+    : null;
   function publish(): Promise<PersonalServerLitePublicationResult> {
     if (stopping)
       return Promise.reject(new Error("Stream publication is unavailable"));
@@ -766,6 +786,7 @@ export async function startPersonalServer(
     syncStatus,
     syncNow,
     streamSyncIntake: runtimeBundle?.streamSyncIntake ?? null,
+    streamSyncSeed,
     publish,
     stop,
   };

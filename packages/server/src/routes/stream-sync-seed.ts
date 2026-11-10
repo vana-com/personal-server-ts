@@ -6,7 +6,7 @@
  *   PUT /v1/stream-sync/seed/:connector/:stream   (application/x-ndjson)
  *     line 1: {"primaryKey": [...], "profile": {"key", "version"}, "records": N}
  *     lines 2..N+1: one retained record object per line
- *     -> 200 {state: "merged" | "skipped"}  a receipt exists; body not read
+ *     -> 200 {state: "merged"}  a receipt exists; body not read
  *     -> 202 {state: "staged", records, invalid}
  *
  * Only the owner may call it; Desktop uses the sidecar access token it
@@ -18,15 +18,16 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
-import type { SeedReceipt } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import {
+  createSeedIntake,
+  type LocalSeedCapability,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { TokenStore } from "../token-store.js";
 import { createServerApiAuth } from "../api-auth.js";
 import {
   SeedUploadError,
   checkSeedNames,
-  type SeedStaging,
-  type SeedStreamState,
 } from "../stream-sync/seed-staging.js";
 
 export interface StreamSyncSeedRouteDeps {
@@ -37,16 +38,7 @@ export interface StreamSyncSeedRouteDeps {
   accessToken?: string;
   tokenStore?: TokenStore;
   /** Null on hosts without a database capability. Account mode gates admission. */
-  streamSyncSeed: {
-    writer: {
-      importStaged(connector: string): Promise<void>;
-      seedStatus(connector: string): Promise<{
-        targetKnown: boolean;
-        receipts: Readonly<Record<string, SeedReceipt>>;
-      }>;
-    };
-    staging: SeedStaging;
-  } | null;
+  streamSyncSeed: LocalSeedCapability | null;
 }
 
 function writeOff(): ProtocolError {
@@ -104,22 +96,7 @@ export function streamSyncSeedRoutes(deps: StreamSyncSeedRouteDeps): Hono {
     const seed = deps.streamSyncSeed;
     if (!seed) throw writeOff();
     const { connector } = names(c);
-    const status = await seed.writer.seedStatus(connector);
-    const streams: Record<string, SeedStreamState> = {};
-    for (const [stream, staged] of Object.entries(
-      await seed.staging.staged(connector),
-    )) {
-      streams[stream] = {
-        state: "staged",
-        records: staged.records,
-        invalid: staged.invalid,
-      };
-    }
-    for (const [stream, receipt] of Object.entries(status.receipts)) {
-      if (streams[stream]) await seed.staging.drop(connector, stream);
-      streams[stream] = { state: receipt };
-    }
-    return c.json({ targetKnown: status.targetKnown, streams });
+    return c.json(await createSeedIntake(seed).status(connector));
   });
 
   app.put("/:connector/:stream", async (c) => {
@@ -127,29 +104,20 @@ export function streamSyncSeedRoutes(deps: StreamSyncSeedRouteDeps): Hono {
     const seed = deps.streamSyncSeed;
     if (!seed) throw writeOff();
     const { connector, stream } = names(c);
-    const receipt = (await seed.writer.seedStatus(connector)).receipts[stream!];
-    if (receipt !== undefined) {
-      await seed.staging.drop(connector, stream!);
-      await c.req.raw.body?.cancel();
-      return c.json({ state: receipt }, 200);
-    }
-    const body = c.req.raw.body;
-    if (!body) {
-      throw badRequest(
-        new SeedUploadError("SEED_BAD_DESCRIPTOR", "the body is empty"),
-      );
-    }
     try {
-      const staged = await seed.staging.stage(connector, stream!, chunks(body));
-      await seed.writer.importStaged(connector);
-      return c.json(
-        {
-          state: "staged",
-          records: staged.records,
-          invalid: staged.invalid,
-        },
-        202,
+      const body = c.req.raw.body;
+      async function* upload() {
+        if (!body)
+          throw new SeedUploadError("SEED_BAD_DESCRIPTOR", "the body is empty");
+        yield* chunks(body);
+      }
+      const result = await createSeedIntake(seed).put(
+        connector,
+        stream!,
+        upload(),
       );
+      if (result.state === "merged") await body?.cancel();
+      return c.json(result, result.state === "merged" ? 200 : 202);
     } catch (error) {
       if (error instanceof SeedUploadError) throw badRequest(error);
       throw error;

@@ -156,14 +156,16 @@ export async function* createCanonicalImportSource(options: {
         let cursor: string | null = null;
         do {
           await check();
-          const page = await reader.page(
-            instance,
-            streamName,
-            cursor,
-            128,
-            4 * 1024 * 1024,
-            revision,
-          );
+          let page:
+            Awaited<ReturnType<CanonicalImportPageReader["page"]>> | undefined =
+            await reader.page(
+              instance,
+              streamName,
+              cursor,
+              128,
+              4 * 1024 * 1024,
+              revision,
+            );
           await check();
           if (page.rows.length > 128) throw new Error("invalid_page_size");
           if (
@@ -181,6 +183,9 @@ export async function* createCanonicalImportSource(options: {
             yield record;
           }
           cursor = page.next;
+          // A suspended generator keeps locals rooted. Drop the consumed page
+          // before the host handoff and the next decoded page allocation.
+          page = undefined;
           // A native reader can resolve every page synchronously. Let host
           // tasks and collection run before allocating the next decoded page.
           if (cursor !== null)

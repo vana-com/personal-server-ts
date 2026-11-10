@@ -115,4 +115,47 @@ describe("seed staging", () => {
     });
     expect(await readdir(join(root, "uploads")).catch(() => [])).toEqual([]);
   });
+  it.each([false, true])(
+    "reconciles a committed pointer after a lost write acknowledgement (readback unavailable: %s)",
+    async (unavailable) => {
+      const files = createFsStreamSyncFiles(root);
+      let failReadback = false;
+      const uncertain = createSeedStaging({
+        ...files,
+        async write(path, bytes) {
+          await files.write(path, bytes);
+          if (path.startsWith("staged/")) {
+            failReadback = unavailable;
+            throw new Error("pointer_ack_lost");
+          }
+        },
+        async read(path) {
+          if (failReadback && path.startsWith("staged/")) {
+            failReadback = false;
+            throw new Error("pointer_read_unavailable");
+          }
+          return files.read(path);
+        },
+      });
+      const descriptor = JSON.stringify({
+        primaryKey: ["id"],
+        profile: { key: null, version: "1" },
+        records: 1,
+      });
+      const staged = uncertain.stage(
+        "c",
+        "s",
+        pieces(descriptor + '\n{"id":"a"}\n', 5),
+      );
+      if (unavailable) await expect(staged).rejects.toThrow("pointer_ack_lost");
+      else expect(await staged).toMatchObject({ records: 1, invalid: 0 });
+      const source = createSeedStaging(files).source(
+        "install",
+        async () => NONE,
+      );
+      const rows = [];
+      for await (const row of source.records("c", "s")) rows.push(row);
+      expect(rows).toEqual([{ id: "a" }]);
+    },
+  );
 });

@@ -42,12 +42,13 @@ export type LegacyImportResult =
  * registry refresh, and again inside every merge batch: refresh cannot undo
  * a local delete. Never reconnect. Require known generation 1. Merge with
  * origin import, stamp (0,'seed'), first_o NULL, one row per merge batch. Check
- * per-stream delete floor too. Stage sorted digests only, then replay source
+ * per-stream deletion history too. Stage sorted digests only, then replay source
  * rows and check each digest before merging. Missing/extra/changed rows cannot
  * earn a receipt. Replays/crash retries add no rows or changes.
  * Receipt and last merge commit atomically; highestSeq includes earlier crash
- * batches (conservatively use the stream change high-water mark). Empty,
- * invalid, changed or excluded sources never prove delivery. No frame codec.
+ * batches (conservatively use the stream change high-water mark). Empty
+ * snapshots receive a zero-row receipt; invalid, changed or excluded sources
+ * never prove delivery. No frame codec.
  */
 export async function importLegacySource(
   deps: LocalSyncDeps,
@@ -87,8 +88,6 @@ export async function importLegacySource(
     await deps.db.batch(TEMP_TABLES.map((sql) => ({ sql })));
     try {
       const fingerprint = await stageImportSnapshot(deps.db, source, op);
-      if (fingerprint.rows === 0)
-        return { kind: "refused", reason: "invalid_record" };
       const prior = await ledger.get(source.source, connectionId, stream);
       if (
         prior?.revision === source.revision &&
@@ -170,7 +169,12 @@ export async function importLegacySource(
       // Final idempotent merge and receipt share this transaction. A crash
       // before it leaves only replayable batches, never a successful receipt.
       await deps.db.batch([
-        ...mergeBatch(lastRow!),
+        ...(lastRow
+          ? mergeBatch(lastRow)
+          : withOrigin("import", [
+              ...guard,
+              { sql: "UPDATE write_ctx SET origin = 'local' WHERE id = 1" },
+            ])),
         ...ledger.statements(receipt),
       ]);
       return {
@@ -234,21 +238,13 @@ async function importFence(
     semantics: string;
     incremental: number;
     last_delete_version: number;
-    floor_version: string | null;
-    floor_o: number | null;
-    floor_r: string | null;
   }>(
-    "SELECT primary_key, semantics, incremental, last_delete_version, floor_version, floor_o, floor_r FROM stream_state WHERE connection_id = ? AND stream = ?",
+    "SELECT primary_key, semantics, incremental, last_delete_version FROM stream_state WHERE connection_id = ? AND stream = ?",
     [source.target.connectionId, source.target.stream],
   );
-  if (
-    state &&
-    (state.last_delete_version !== 0 ||
-      state.floor_version !== null ||
-      state.floor_o !== null ||
-      state.floor_r !== null)
-  )
-    return "connection_deleted";
+  // A collection floor describes newer data, not a deletion. Seed stamps
+  // lose to real writes at the merge owner; actual delete history still fences.
+  if (state && state.last_delete_version !== 0) return "connection_deleted";
   if (
     state &&
     (state.primary_key !== JSON.stringify(source.target.primaryKey) ||
@@ -274,7 +270,7 @@ function guardImport(source: ImportSource, op: string): SqlStatement[] {
       sql: "CREATE TEMP TABLE IF NOT EXISTS import_guard (op TEXT PRIMARY KEY, ok INTEGER NOT NULL CHECK(ok = 1))",
     },
     {
-      sql: `INSERT INTO import_guard SELECT ?, CASE WHEN EXISTS(SELECT 1 FROM connections c WHERE c.connection_id = ? AND c.connector = ? AND c.generation = 1 AND c.control_state IN ('active','absent') AND c.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector = c.connector)) AND NOT EXISTS(SELECT 1 FROM stream_state s WHERE s.connection_id = ? AND s.stream = ? AND (s.last_delete_version <> 0 OR s.floor_version IS NOT NULL OR s.floor_o IS NOT NULL OR s.floor_r IS NOT NULL OR s.primary_key <> ? OR s.semantics <> ? OR s.incremental <> ?)) THEN 1 ELSE 0 END`,
+      sql: `INSERT INTO import_guard SELECT ?, CASE WHEN EXISTS(SELECT 1 FROM connections c WHERE c.connection_id = ? AND c.connector = ? AND c.generation = 1 AND c.control_state IN ('active','absent') AND c.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector = c.connector)) AND NOT EXISTS(SELECT 1 FROM stream_state s WHERE s.connection_id = ? AND s.stream = ? AND (s.last_delete_version <> 0 OR s.primary_key <> ? OR s.semantics <> ? OR s.incremental <> ?)) THEN 1 ELSE 0 END`,
       params: [
         op,
         connectionId,

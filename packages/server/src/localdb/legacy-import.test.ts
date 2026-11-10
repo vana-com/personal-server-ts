@@ -260,12 +260,12 @@ it("import-owner-network-unknown-and-exclusions-refuse", async () => {
   ).toEqual({ kind: "refused", reason: "invalid_record" });
   expect(f.unused).not.toHaveBeenCalled();
 });
-it("import-stream-delete-floor-refuses", async () => {
+it("import-stream-delete-refuses", async () => {
   const f = await fixture();
   await f.run();
   await f.db.batch([
     {
-      sql: "UPDATE stream_state SET floor_o = 1, floor_r = 'delete', floor_version = '1'",
+      sql: "UPDATE stream_state SET last_delete_version = 1",
     },
   ]);
   expect(await f.run()).toEqual({
@@ -476,4 +476,15 @@ it("import replay accepts reordered and repeated identical rows", async () => {
   expect(await f.db.query("SELECT count(*) AS n FROM record_changes")).toEqual([
     { n: 2 },
   ]);
+});
+
+it("import accepts a collection floor without treating it as a delete", async () => {
+  const f = await fixture();
+  await f.run();
+  await f.db.batch([
+    {
+      sql: "UPDATE stream_state SET floor_version = '1', floor_o = 1000, floor_r = 'real-run'",
+    },
+  ]);
+  expect((await f.run()).kind).toBe("already-imported");
 });

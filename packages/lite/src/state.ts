@@ -28,7 +28,8 @@ export type PsLiteStateKey =
   | `additions-publication-v1:${string}`
   | `additions-deletion-v1:${string}`
   | "derivative-questions-v1"
-  | "replication-door-v1";
+  | "replication-door-v1"
+  | `seed-v1:${string}`;
 
 /** Implementations must settle on abort and prevent late mutations. */
 export interface PsLiteBoundedStateStore {
