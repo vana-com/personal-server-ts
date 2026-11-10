@@ -23,9 +23,9 @@ import { decideReplace } from "./replace.js";
  * `planStreamStep` per stream on local state (refused = drop the stream's
  * `run_rows`; deferred or publish/noop = merge, store the decision, advance
  * the floor); then the checkpoint and retry rule in the SAME batch
- * (`retry_pending` merges what was received and saves the cursor of every
- * candidate stream); then the EndResult table. The result of `end` is
- * `EndResult`; `stuck` stays false until publish says otherwise.
+ * (`retry_pending` merges accepted streams and saves only a checkpoint that
+ * does not advance a refused stream); then the EndResult table. The result
+ * of `end` is `EndResult`; `stuck` stays false until publish says otherwise.
  */
 type RunEndResponse = Pick<EndResponse, "result" | "updateRequired">;
 
@@ -135,8 +135,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           connector: string;
           generation: number;
           control_state: string;
+          checkpoint: string | null;
         }>(
-          "SELECT connector, generation, control_state FROM connections WHERE connection_id = ?",
+          "SELECT connector, generation, control_state, checkpoint FROM connections WHERE connection_id = ?",
           [run.connection_id],
         );
         if (!connection) throw new RunIntakeError("gone");
@@ -297,8 +298,29 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         }
         statements.push(...mergeIncoming(op, run.connection_id));
         const candidate = req.checkpointCandidate;
+        const refused = Object.keys(results).filter(
+          (stream) => results[stream]!.state === "discarded",
+        );
+        let retryCanSave = retry;
+        if (retry && refused.length > 0) {
+          const stored =
+            connection.checkpoint === null
+              ? null
+              : (JSON.parse(connection.checkpoint) as Record<string, unknown>);
+          // Cursors are opaque: only unchanged or absent refused-stream entries
+          // prove that this candidate carries no progress for refused rows.
+          retryCanSave =
+            refused.length < streams.length &&
+            candidate != null &&
+            refused.every(
+              (stream) =>
+                !Object.prototype.hasOwnProperty.call(candidate, stream) ||
+                JSON.stringify(candidate[stream]) ===
+                  JSON.stringify(stored?.[stream]),
+            );
+        }
         const canSave =
-          retry ||
+          retryCanSave ||
           (req.outcome === "succeeded" &&
             run.generation !== null &&
             checkpointDecision({

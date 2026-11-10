@@ -179,6 +179,13 @@ export function planStreamStep(state: PlanState, run: PlanRun): StepDecision {
   if (floor.committed && stampBefore(run, floor.committed)) {
     return { kind: "refused", reason: "out_of_order" };
   }
+  // A known version floor applies even while admission or seed work is pending.
+  if (
+    floor.version !== null &&
+    compareConnectorVersions(run.profile.version, floor.version) === "lower"
+  ) {
+    return { kind: "refused", reason: "connector_update_required" };
+  }
   // A run admission has not bound publishes over no head (a first run made
   // offline), or over the head earlier unbound runs leave; over a bound head,
   // which generation it will target is not known yet.

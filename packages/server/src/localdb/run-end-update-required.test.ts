@@ -4,6 +4,7 @@ import type { SqlDriver } from "../../../core/src/localdb/driver.js";
 import { TEMP_TABLES } from "../../../core/src/localdb/merge.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
+import type { EndRequest } from "../../../core/src/stream-sync/intake.js";
 import { MIGRATIONS } from "../../../core/src/localdb/schema.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
@@ -65,11 +66,12 @@ async function fixture() {
       })),
     ]);
   };
-  const end = (runId: string) =>
+  const end = (runId: string, request: Partial<EndRequest> = {}) =>
     store.end(runId, {
       outcome: "succeeded",
       coveredStreams: ["items"],
       lastBatch: 0,
+      ...request,
     });
   const records = () =>
     db.query(
@@ -81,10 +83,179 @@ async function fixture() {
     db.query("SELECT decision, reason FROM run_streams WHERE run_id = ?", [
       runId,
     ]);
-  return { db, stage, end, records, changes, decision };
+  const checkpoint = async () =>
+    (await db.query<{ checkpoint: string | null }>(
+      "SELECT checkpoint FROM connections WHERE connection_id = ?",
+      ["connection"],
+    ))[0]!.checkpoint;
+  const snapshot = async () => ({
+    records: await records(),
+    changes: await changes(),
+    state: await db.query("SELECT * FROM stream_state ORDER BY stream"),
+    checkpoint: await checkpoint(),
+  });
+  return { db, stage, end, records, changes, decision, checkpoint, snapshot };
+}
+
+async function versionedFixture() {
+  const f = await fixture();
+  await f.stage("newer-run", "2", 100);
+  await f.end("newer-run");
+  await f.db.batch([{
+    sql: "UPDATE connections SET checkpoint = ? WHERE connection_id = ?",
+    params: [JSON.stringify({ items: "stored" }), "connection"],
+  }]);
+  return f;
+}
+
+async function expectRefused(
+  f: Awaited<ReturnType<typeof fixture>>,
+  runId: string,
+) {
+  expect(await f.decision(runId)).toEqual([
+    { decision: "refused", reason: "connector_update_required" },
+  ]);
+  expect(await f.db.query(
+    "SELECT COUNT(*) AS n FROM run_rows WHERE run_id = ?", [runId],
+  )).toEqual([{ n: 0 }]);
 }
 
 describe("run end update required", () => {
+
+  it("old-version-unresolved-seed-refused", async () => {
+    const f = await versionedFixture();
+    const before = await f.snapshot();
+    await f.stage("old-seed", "1", 200);
+    await f.db.batch([{
+      sql: "UPDATE run_streams SET seed = 'unresolved' WHERE run_id = ?",
+      params: ["old-seed"],
+    }]);
+    expect(await f.end("old-seed", {
+      checkpointCandidate: { items: "advanced" },
+    })).toEqual({ result: "no_checkpoint", updateRequired: true });
+    await expectRefused(f, "old-seed");
+    expect(await f.snapshot()).toEqual(before);
+  });
+
+  it("old-version-unbound-generation-refused", async () => {
+    const f = await versionedFixture();
+    await f.db.batch([{
+      sql: "UPDATE stream_state SET head_version = 1, head_generation = 1",
+    }]);
+    const before = await f.snapshot();
+    await f.stage("old-unbound", "1", 200);
+    await f.db.batch([{
+      sql: "UPDATE runs SET generation = NULL WHERE run_id = ?",
+      params: ["old-unbound"],
+    }]);
+    expect(await f.end("old-unbound", {
+      checkpointCandidate: { items: "advanced" },
+    })).toEqual({ result: "no_checkpoint", updateRequired: true });
+    await expectRefused(f, "old-unbound");
+    expect(await f.snapshot()).toEqual(before);
+  });
+
+  it("old-version-retry-keeps-checkpoint", async () => {
+    const f = await versionedFixture();
+    const before = await f.snapshot();
+    await f.stage("old-retry", "1", 200);
+    expect(await f.end("old-retry", {
+      outcome: "retry_pending",
+      checkpointCandidate: { items: "advanced" },
+    })).toEqual({ result: "no_checkpoint", updateRequired: true });
+    await expectRefused(f, "old-retry");
+    expect(await f.snapshot()).toEqual(before);
+  });
+
+  it("mixed-retry-keeps-refused-cursor", async () => {
+    const f = await versionedFixture();
+    await f.db.batch([{
+      sql: "INSERT INTO stream_state (connection_id, stream, primary_key, semantics, incremental) VALUES (?, ?, ?, 'mutable_state', 1)",
+      params: ["connection", "accepted", '["id"]'],
+    }]);
+    const rows = await f.records();
+    const changes = await f.changes();
+    const floor = await f.db.query(
+      "SELECT * FROM stream_state WHERE stream = ?", ["items"],
+    );
+    const stored = await f.checkpoint();
+    // A changed refused cursor blocks the entire candidate. An unchanged
+    // refused cursor still permits progress for the accepted stream.
+    for (const [runId, cursor, observedAt] of [
+      ["mixed-unsafe", "advanced", 200],
+      ["mixed-safe", "stored", 300],
+    ] as const) {
+      await f.stage(runId, "1", observedAt);
+      await f.db.batch([
+        {
+          sql: "INSERT INTO run_streams (run_id, stream, delete_snapshot, primary_key, profile_key, profile_version) SELECT run_id, ?, delete_snapshot, primary_key, profile_key, profile_version FROM run_streams WHERE run_id = ? AND stream = ?",
+          params: ["accepted", runId, "items"],
+        },
+        {
+          sql: "INSERT INTO run_rows (run_id, stream, pk_hash, record_key, body, body_sha256) SELECT run_id, ?, pk_hash, record_key, body, body_sha256 FROM run_rows WHERE run_id = ? AND stream = ?",
+          params: ["accepted", runId, "items"],
+        },
+      ]);
+      const candidate = { items: cursor, accepted: runId };
+      expect(await f.end(runId, {
+        outcome: "retry_pending",
+        coveredStreams: ["items", "accepted"],
+        checkpointCandidate: candidate,
+      })).toEqual({ result: "queued", updateRequired: true });
+      expect(await f.db.query(
+        "SELECT stream, decision, reason FROM run_streams WHERE run_id = ? ORDER BY stream",
+        [runId],
+      )).toEqual([
+        { stream: "accepted", decision: "publish", reason: null },
+        { stream: "items", decision: "refused", reason: "connector_update_required" },
+      ]);
+      expect(await f.records()).toEqual(rows);
+      expect((await f.changes()).filter((row) => row.stream === "items")).toEqual(changes);
+      expect(await f.db.query(
+        "SELECT * FROM stream_state WHERE stream = ?", ["items"],
+      )).toEqual(floor);
+      expect(await f.db.query(
+        "SELECT COUNT(*) AS n FROM run_rows WHERE run_id = ?", [runId],
+      )).toEqual([{ n: 0 }]);
+      expect(await f.db.query(
+        "SELECT COUNT(*) AS n FROM records WHERE stream = ? AND stamp_r = ?",
+        ["accepted", runId],
+      )).toEqual([{ n: 2 }]);
+      expect(await f.checkpoint()).toBe(
+        cursor === "advanced" ? stored : JSON.stringify(candidate),
+      );
+    }
+  });
+
+  it("current-version-deferrals-still-merge", async () => {
+    for (const reason of ["seed_unresolved", "generation_unbound"] as const) {
+      const f = await versionedFixture();
+      await f.db.batch([{
+        sql: "UPDATE stream_state SET head_version = 1, head_generation = 1",
+      }]);
+      await f.stage("current-deferred", "2", 200);
+      await f.db.batch([reason === "seed_unresolved" ? {
+        sql: "UPDATE run_streams SET seed = 'unresolved' WHERE run_id = ?",
+        params: ["current-deferred"],
+      } : {
+        sql: "UPDATE runs SET generation = NULL WHERE run_id = ?",
+        params: ["current-deferred"],
+      }]);
+      expect(await f.end("current-deferred")).toEqual({
+        result: "queued",
+        updateRequired: false,
+      });
+      expect(await f.decision("current-deferred")).toEqual([
+        { decision: "deferred", reason },
+      ]);
+      expect(await f.db.query(
+        "SELECT COUNT(*) AS n FROM records WHERE stamp_r = ?", ["current-deferred"],
+      )).toEqual([{ n: 2 }]);
+      expect(await f.db.query(
+        "SELECT floor_version, floor_o, floor_r FROM stream_state",
+      )).toEqual([{ floor_version: "2", floor_o: 200, floor_r: "current-deferred" }]);
+    }
+  });
   it("older-version-after-unpublished-newer-run", async () => {
     const f = await fixture();
     await f.stage("run-a", "2", 100);
