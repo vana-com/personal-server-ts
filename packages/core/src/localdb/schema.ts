@@ -108,4 +108,9 @@ END;`,
   DELETE FROM blob_refs WHERE connection_id = OLD.connection_id AND stream = OLD.stream AND pk_hash = OLD.pk_hash;
 END;`,
   ],
+  [
+    `ALTER TABLE import_ledger ADD COLUMN revision TEXT;`,
+    `ALTER TABLE import_ledger ADD COLUMN generation INTEGER;`,
+    `ALTER TABLE import_ledger ADD COLUMN highest_seq INTEGER;`,
+  ],
 ];
