@@ -17,7 +17,7 @@ const mocks = vi.hoisted(() => ({
   older: vi.fn(() => ({})),
 }));
 
-// These PS-2 siblings are interface-only at this slice's base.
+// These tests isolate listing policy; listing-alias-integration uses the real resolver.
 vi.mock("../../../core/src/localdb/resolve.js", () => ({
   createLocalResolver: () => ({ resolve: mocks.resolve }),
 }));
@@ -27,30 +27,16 @@ vi.mock("../../../core/src/localdb/query.js", () => ({
 vi.mock("../../../core/src/localdb/older-versions.js", () => ({
   createOlderVersions: mocks.older,
 }));
-vi.mock("../../../core/src/legacy-projection/bindings.js", () => ({
-  LEGACY_SCOPE_BINDINGS: new Map([["example.summary", {}]]),
-}));
-vi.mock("../../../core/src/stream-sync-read/service.js", () => ({
-  readTargets(scope: string) {
-    if (scope === "example.summary") {
-      return [
-        {
-          connector: "sample",
-          streams: ["items", "details"],
-          binding: {},
-        },
-      ];
-    }
-    const match = /^pdpp\.([^.]+)\.(.+)$/.exec(scope);
-    return match ? [{ connector: match[1], streams: [match[2]] }] : [];
-  },
-}));
 
 const opened: SqlDriver[] = [];
 const dirs: string[] = [];
 const olderCounts = { served: 2, gone: 3, off: 4 };
 
-async function fresh() {
+async function fresh(
+  options: { aliasScopes?: () => Iterable<string> } = {
+    aliasScopes: () => ["example.summary"],
+  },
+) {
   const dir = mkdtempSync(join(process.cwd(), ".listing-test-"));
   dirs.push(dir);
   const db = openBetterSqlite3(join(dir, "db.sqlite"));
@@ -69,7 +55,28 @@ async function fresh() {
     newOp: () => "listing-op",
   } as unknown as LocalSyncDeps;
   const counts = vi.fn(() => olderCounts);
-  return { db, warn, counts, listing: createLocalListing(deps, counts) };
+  return {
+    db,
+    warn,
+    counts,
+    listing: createLocalListing(
+      {
+        ...deps,
+        aliasTargets: (scope) =>
+          scope === "example.summary"
+            ? [
+                {
+                  connector: "sample",
+                  streams: ["items", "details"],
+                  project: () => ({ ok: true as const, payload: {} }),
+                },
+              ]
+            : [],
+        ...options,
+      },
+      counts,
+    ),
+  };
 }
 
 async function seed(db: SqlDriver, control: "active" | "absent" = "active") {
@@ -121,6 +128,61 @@ afterEach(async () => {
 });
 
 describe("local listing #597", () => {
+  it("listing-alias-scopes-from-caller", async () => {
+    const aliasScopes = vi.fn(function* () {
+      yield "example.summary";
+      yield "example.summary";
+    });
+    const { db, listing } = await fresh({ aliasScopes });
+    await seed(db);
+    mocks.resolve.mockImplementation(async () => view());
+    const canRead = vi.fn(() => true);
+    const expected = [
+      {
+        scope: "example.summary",
+        connector: "sample",
+        ns: "",
+        records: null,
+        updatedAt: 1234,
+      },
+      {
+        scope: "pdpp.sample.items",
+        connector: "sample",
+        ns: "",
+        records: 1,
+        updatedAt: 1234,
+      },
+    ];
+
+    expect(aliasScopes).not.toHaveBeenCalled();
+    expect(await listing.listScopes({ canRead })).toEqual(expected);
+    expect(canRead.mock.calls).toEqual([
+      ["example.summary"],
+      ["pdpp.sample.items"],
+    ]);
+    expect(await listing.listScopes({ canRead })).toEqual(expected);
+    expect(aliasScopes).toHaveBeenCalledTimes(2);
+  });
+
+  it("listing-no-alias-without-caller", async () => {
+    const { db, listing } = await fresh({});
+    await seed(db);
+    mocks.resolve.mockImplementation(async () => view());
+    const canRead = vi.fn(() => true);
+
+    expect(await listing.listScopes({ canRead })).toEqual([
+      {
+        scope: "pdpp.sample.items",
+        connector: "sample",
+        ns: "",
+        records: 1,
+        updatedAt: 1234,
+      },
+    ]);
+    expect(canRead.mock.calls).toEqual([["pdpp.sample.items"]]);
+    expect(mocks.resolve).toHaveBeenCalledTimes(1);
+  });
+
   it("lists readable scopes only, with the grant filter before all checks", async () => {
     const { db, listing } = await fresh();
     await seed(db);

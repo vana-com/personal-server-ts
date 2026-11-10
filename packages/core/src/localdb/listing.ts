@@ -1,16 +1,17 @@
 import { sha256 } from "@noble/hashes/sha2";
-import { LEGACY_SCOPE_BINDINGS } from "../legacy-projection/bindings.js";
-import {
-  readTargets,
-  type StreamSyncReadStatus,
-} from "../stream-sync-read/service.js";
+import type { StreamSyncReadStatus } from "../stream-sync-read/service.js";
+import { logicalStreamScopeParts } from "../stream-sync-read/routing.js";
 import type { LocalSyncDeps } from "./deps.js";
 import {
   createOlderVersions,
   type OlderVersionCounts,
 } from "./older-versions.js";
 import { createRecordQuery } from "./query.js";
-import { createLocalResolver } from "./resolve.js";
+import {
+  createLocalResolver,
+  type AliasScopes,
+  type AliasTargets,
+} from "./resolve.js";
 
 /** One listed scope of `GET /v1/data` (D.2). */
 export interface ListedScope {
@@ -59,17 +60,21 @@ type StreamState = {
 };
 
 export function createLocalListing(
-  deps: LocalSyncDeps,
+  deps: LocalSyncDeps & {
+    readonly aliasScopes?: AliasScopes;
+    readonly aliasTargets?: AliasTargets;
+  },
   counts: () => OlderVersionCounts,
 ): LocalListing {
-  let resolver: ReturnType<typeof createLocalResolver> | undefined;
   // Construct the read path only after the first successful grant check.
-  const latest = () =>
-    (resolver ??= createLocalResolver(deps, {
+  const latest = (aliasNames: readonly string[]) =>
+    createLocalResolver(deps, {
       query: createRecordQuery(deps.db),
       // ResolveInput has no historical selector: listing probes latest only.
       olderVersions: createOlderVersions(deps, { enabled: () => false }),
-    }));
+      aliasScopes: () => aliasNames,
+      aliasTargets: deps.aliasTargets,
+    });
 
   const connections = () =>
     deps.db.query<Connection>(
@@ -88,17 +93,25 @@ export function createLocalListing(
       const candidates = new Set(
         streams.map((row) => `pdpp.${row.connector}.${row.stream}`),
       );
-      for (const scope of LEGACY_SCOPE_BINDINGS.keys()) {
-        if (readTargets(scope).some((target) => known.has(target.connector))) {
+      const aliasNames = [...(deps.aliasScopes?.() ?? [])];
+      const targets = (scope: string) => {
+        const logical = logicalStreamScopeParts(scope);
+        return logical
+          ? [{ connector: logical.connector, streams: [logical.stream] }]
+          : (deps.aliasTargets?.(scope) ?? []);
+      };
+      for (const scope of aliasNames) {
+        if (targets(scope).some((target) => known.has(target.connector))) {
           candidates.add(scope);
         }
       }
 
       const out: ListedScope[] = [];
+      let resolver: ReturnType<typeof createLocalResolver> | undefined;
       for (const scope of [...candidates].sort()) {
         try {
           if (!(await canRead(scope))) continue;
-          const decision = await latest().resolve({
+          const decision = await (resolver ??= latest(aliasNames)).resolve({
             scope,
             connection: null,
             cursor: null,
@@ -118,7 +131,7 @@ export function createLocalListing(
           } finally {
             reader.releaseLock();
           }
-          const target = readTargets(scope).find(
+          const target = targets(scope).find(
             (entry) => entry.connector === decision.connector,
           );
           if (!target || target.streams.length === 0) continue;
@@ -142,7 +155,9 @@ export function createLocalListing(
             scope,
             connector: decision.connector,
             ns: decision.ns,
-            records: target.binding ? null : (records?.records ?? 0),
+            records: logicalStreamScopeParts(scope)
+              ? (records?.records ?? 0)
+              : null,
             updatedAt: times.length === 0 ? null : Math.max(...times),
           });
         } catch {

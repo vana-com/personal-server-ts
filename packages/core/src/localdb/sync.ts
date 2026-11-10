@@ -162,7 +162,6 @@ export function createLocalSync(
       aliasScopes: options.aliasScopes,
       aliasTargets: options.aliasTargets,
     }),
-    // wired with the listing alias port
     listing: createLocalListing(listingDeps, () => olderVersions.counts()),
     query,
     history: createLocalHistory(deps, {
