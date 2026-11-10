@@ -9,7 +9,8 @@ import {
   rmSync,
   symlinkSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
+import { homedir } from "node:os";
 import { afterEach, expect, it, vi } from "vitest";
 import {
   runLegacyRetireDryRun,
@@ -44,8 +45,10 @@ const receipt: ImportReceipt = {
   reason: null,
   at: 1,
 };
-async function fixture(missing = false) {
-  const root = mkdtempSync(join(process.cwd(), ".dry-run-test-"));
+async function fixture(missing = false, createTemp = mkdtempSync) {
+  const temporary = join(homedir(), ".tmp");
+  mkdirSync(temporary, { recursive: true });
+  const root = createTemp(join(temporary, "ps3-dry-run-test-"));
   roots.push(root);
   const input = join(root, "copy");
   const scratch = join(root, "scratch");
@@ -384,4 +387,21 @@ it("dry-run-reports-independent-copies-without-paths-or-bodies", async () => {
     expect(Object.keys(report).sort()).toEqual(["decision", "file", "reason"]);
   expect(JSON.stringify(f.reports)).not.toContain(f.input);
   expect(JSON.stringify(f.reports)).not.toContain("payload");
+});
+
+it("dry-run-fixture-is-independent-of-checkout-location", async () => {
+  const cwd = vi.spyOn(process, "cwd").mockReturnValue("/outside-checkout");
+  try {
+    // Reject a bad prefix before allocating anything outside the permitted
+    // temporary root; then run the actual admission path with a real fixture.
+    const f = await fixture(false, (prefix) => {
+      expect(String(prefix).startsWith(join(homedir(), ".tmp") + sep)).toBe(
+        true,
+      );
+      return mkdtempSync(prefix);
+    });
+    expect((await runLegacyRetireDryRun(f.options)).ready).toBe(1);
+  } finally {
+    cwd.mockRestore();
+  }
 });
