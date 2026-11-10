@@ -51,7 +51,11 @@ export async function encodePrefixes(
   },
 ): Promise<readonly EncodedPart[]> {
   const target = deps.partTargetBytes ?? 4 * 1024 * 1024;
-  if (!Number.isSafeInteger(target) || target < 1 || target > PART_LIMIT_BYTES) {
+  if (
+    !Number.isSafeInteger(target) ||
+    target < 1 ||
+    target > PART_LIMIT_BYTES
+  ) {
     throw new Error("partTargetBytes must be between 1 and 16 MiB");
   }
   if (!Number.isSafeInteger(input.generation) || input.generation < 1) {
@@ -106,7 +110,10 @@ export async function encodePrefixes(
       const blobName = `g${input.generation}-p-${partHash}`;
       const key = `${input.scope}/${blobName}`;
       if ((await deps.blobs.get(key)) === null) {
-        await deps.blobs.put(key, await deps.keys.encryptPart(input.scope, part.data));
+        await deps.blobs.put(
+          key,
+          await deps.keys.encryptPart(input.scope, part.data),
+        );
       }
       result.push({ prefix, seq, partHash, bytes, count, blobName });
       seq += 1;
@@ -139,7 +146,12 @@ export async function encodePrefixes(
         }
         for (let at = 0; at < frame.length; at += target) {
           await upload(
-            await encodePiece(hash, prefix, frame.subarray(at, at + target), at === 0),
+            await encodePiece(
+              hash,
+              prefix,
+              frame.subarray(at, at + target),
+              at === 0,
+            ),
           );
         }
       } else {

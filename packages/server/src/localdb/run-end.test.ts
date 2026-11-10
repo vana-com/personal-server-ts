@@ -29,7 +29,8 @@ beforeEach(() => {
 afterEach(async () => {
   vi.restoreAllMocks();
   for (const db of databases.splice(0)) await db.close();
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  for (const dir of dirs.splice(0))
+    rmSync(dir, { recursive: true, force: true });
 });
 
 async function fresh(complete = 1) {
@@ -38,10 +39,14 @@ async function fresh(complete = 1) {
   const driver = openBetterSqlite3(join(dir, "db.sqlite"));
   databases.push(driver);
   const db = await openLocalDb(driver, {
-    owner: "0xAbC", network: "moksha", deviceId: "run-end-test",
+    owner: "0xAbC",
+    network: "moksha",
+    deviceId: "run-end-test",
   });
   await db.batch([
-    { sql: "INSERT INTO connections (connection_id, connector, ns, generation, control_state) VALUES ('c1', 'example', '', 1, 'active')" },
+    {
+      sql: "INSERT INTO connections (connection_id, connector, ns, generation, control_state) VALUES ('c1', 'example', '', 1, 'active')",
+    },
     {
       sql: `INSERT INTO stream_state
           (connection_id, stream, primary_key, semantics, incremental,
@@ -52,7 +57,9 @@ async function fresh(complete = 1) {
   ]);
   let serial = 0;
   const deps: LocalSyncDeps = {
-    db, queue: connectionQueue(), ownerAddress: "0xabc",
+    db,
+    queue: connectionQueue(),
+    ownerAddress: "0xabc",
     registry: {} as LocalSyncDeps["registry"],
     blobs: {} as LocalSyncDeps["blobs"],
     keys: {} as LocalSyncDeps["keys"],
@@ -65,7 +72,13 @@ async function fresh(complete = 1) {
 }
 
 // The intake sibling is interface-only here. Seed its durable outputs instead.
-async function begin(db: SqlDriver, runId: string, start: number, end: number, o = 10) {
+async function begin(
+  db: SqlDriver,
+  runId: string,
+  start: number,
+  end: number,
+  o = 10,
+) {
   await db.batch([
     {
       sql: `INSERT INTO runs
@@ -89,16 +102,27 @@ async function begin(db: SqlDriver, runId: string, start: number, end: number, o
   ]);
 }
 
-const request = (outcome: EndRequest["outcome"], checkpoint = false): EndRequest => ({
-  outcome, coveredStreams: ["s"], lastBatch: 0,
+const request = (
+  outcome: EndRequest["outcome"],
+  checkpoint = false,
+): EndRequest => ({
+  outcome,
+  coveredStreams: ["s"],
+  lastBatch: 0,
   ...(checkpoint ? { checkpointCandidate: { s: "cursor" } } : {}),
 });
 const keys = async (db: SqlDriver) =>
-  (await db.query<{ record_key: string }>(
-    "SELECT record_key FROM records WHERE connection_id = 'c1' AND stream = 's' ORDER BY length(record_key), record_key",
-  )).map((row) => row.record_key);
+  (
+    await db.query<{ record_key: string }>(
+      "SELECT record_key FROM records WHERE connection_id = 'c1' AND stream = 's' ORDER BY length(record_key), record_key",
+    )
+  ).map((row) => row.record_key);
 const checkpoint = async (db: SqlDriver) =>
-  (await db.query<{ checkpoint: string | null }>("SELECT checkpoint FROM connections WHERE connection_id = 'c1'"))[0]!.checkpoint;
+  (
+    await db.query<{ checkpoint: string | null }>(
+      "SELECT checkpoint FROM connections WHERE connection_id = 'c1'",
+    )
+  )[0]!.checkpoint;
 
 describe("run end", () => {
   it("EndResult table", async () => {
@@ -108,36 +132,65 @@ describe("run end", () => {
       { name: "abort", outcome: "failed", rows: 1, expected: "aborted" },
       { name: "fenced", outcome: "succeeded", rows: 1, expected: "discarded" },
       { name: "merged", outcome: "succeeded", rows: 1, expected: "queued" },
-      { name: "checkpoint", outcome: "succeeded", rows: 0, expected: "checkpoint_only" },
-      { name: "empty", outcome: "succeeded", rows: 0, expected: "no_checkpoint" },
+      {
+        name: "checkpoint",
+        outcome: "succeeded",
+        rows: 0,
+        expected: "checkpoint_only",
+      },
+      {
+        name: "empty",
+        outcome: "succeeded",
+        rows: 0,
+        expected: "no_checkpoint",
+      },
     ] as const;
     for (const row of cases) {
       const { db, store } = await fresh();
       await begin(db, row.name, 1, row.rows);
-      vi.mocked(checkRunFence).mockResolvedValue(row.name === "fenced"
-        ? [{ stream: "s", trip: "stream_deleted_after_start" }]
-        : []);
+      vi.mocked(checkRunFence).mockResolvedValue(
+        row.name === "fenced"
+          ? [{ stream: "s", trip: "stream_deleted_after_start" }]
+          : [],
+      );
       if (row.name === "fenced") {
-        await db.batch([{ sql: "UPDATE connections SET checkpoint = 'old-cursor' WHERE connection_id = 'c1'" }]);
+        await db.batch([
+          {
+            sql: "UPDATE connections SET checkpoint = 'old-cursor' WHERE connection_id = 'c1'",
+          },
+        ]);
       }
       if (row.name === "abort") {
         // abort has a void API, but shares the failed/cancelled cleanup path.
         await expect(store.abort(row.name, "failed")).resolves.toBeUndefined();
-        expect(await db.query("SELECT decision, reason FROM run_streams"), row.name).toEqual([
-          { decision: "discarded", reason: "failed" },
-        ]);
+        expect(
+          await db.query("SELECT decision, reason FROM run_streams"),
+          row.name,
+        ).toEqual([{ decision: "discarded", reason: "failed" }]);
       } else {
-        expect(await store.end(row.name, request(row.outcome, row.name === "checkpoint")), row.name)
-          .toEqual({ result: row.expected });
+        expect(
+          await store.end(
+            row.name,
+            request(row.outcome, row.name === "checkpoint"),
+          ),
+          row.name,
+        ).toEqual({ result: row.expected });
       }
-      expect(await db.query("SELECT state FROM runs"), row.name).toEqual([{ state: "ended" }]);
-      expect(await db.query("SELECT COUNT(*) AS n FROM run_rows"), row.name).toEqual([{ n: 0 }]);
-      expect(await keys(db), row.name).toEqual(row.name === "merged" ? ["r1"] : []);
+      expect(await db.query("SELECT state FROM runs"), row.name).toEqual([
+        { state: "ended" },
+      ]);
+      expect(
+        await db.query("SELECT COUNT(*) AS n FROM run_rows"),
+        row.name,
+      ).toEqual([{ n: 0 }]);
+      expect(await keys(db), row.name).toEqual(
+        row.name === "merged" ? ["r1"] : [],
+      );
       if (row.name === "fenced") {
         expect(await checkpoint(db)).toBeNull();
-        expect(await db.query("SELECT needs_full, complete FROM stream_state")).toEqual([
-          { needs_full: 1, complete: 0 },
-        ]);
+        expect(
+          await db.query("SELECT needs_full, complete FROM stream_state"),
+        ).toEqual([{ needs_full: 1, complete: 0 }]);
       }
       if (row.name === "checkpoint") {
         expect(JSON.parse((await checkpoint(db))!)).toEqual({ s: "cursor" });
@@ -152,16 +205,33 @@ describe("run end", () => {
     const batches = vi.spyOn(db, "batch");
     // Even a replacement verdict cannot turn a retry into a full replacement.
     vi.mocked(decideReplace).mockReturnValue(true);
-    expect(await store.end("run-A", {
-      outcome: "retry_pending", coveredStreams: ["s"], provenFullStreams: ["s"],
-      checkpointCandidate: { s: "C50" }, lastBatch: 0,
-    })).toEqual({ result: "queued" });
+    expect(
+      await store.end("run-A", {
+        outcome: "retry_pending",
+        coveredStreams: ["s"],
+        provenFullStreams: ["s"],
+        checkpointCandidate: { s: "C50" },
+        lastBatch: 0,
+      }),
+    ).toEqual({ result: "queued" });
     const endBatch = batches.mock.calls.at(-1)![0];
-    expect(endBatch.some((statement) => statement.sql.includes("INSERT INTO records"))).toBe(true);
-    expect(endBatch.some((statement) => statement.sql.includes("UPDATE connections SET checkpoint"))).toBe(true);
+    expect(
+      endBatch.some((statement) =>
+        statement.sql.includes("INSERT INTO records"),
+      ),
+    ).toBe(true);
+    expect(
+      endBatch.some((statement) =>
+        statement.sql.includes("UPDATE connections SET checkpoint"),
+      ),
+    ).toBe(true);
     expect(await keys(db)).toEqual(first);
-    expect(await db.query("SELECT complete FROM stream_state")).toEqual([{ complete: 0 }]);
-    expect(await db.query("SELECT replace FROM run_streams WHERE run_id = 'run-A'")).toEqual([{ replace: 0 }]);
+    expect(await db.query("SELECT complete FROM stream_state")).toEqual([
+      { complete: 0 },
+    ]);
+    expect(
+      await db.query("SELECT replace FROM run_streams WHERE run_id = 'run-A'"),
+    ).toEqual([{ replace: 0 }]);
     expect(decideReplace).not.toHaveBeenCalled();
 
     // Model a producer resuming from the persisted cursor, not a replay of A.
@@ -175,11 +245,17 @@ describe("run end", () => {
     expect(received).toHaveLength(10);
     expect(received.every((row) => !first.includes(row.record_key))).toBe(true);
     vi.mocked(decideReplace).mockReturnValue(false);
-    expect(await store.end("run-B", {
-      outcome: "succeeded", coveredStreams: ["s"],
-      checkpointCandidate: { s: "C60" }, lastBatch: 0,
-    })).toEqual({ result: "queued" });
-    expect(await keys(db)).toEqual(Array.from({ length: 60 }, (_, index) => `r${index + 1}`));
+    expect(
+      await store.end("run-B", {
+        outcome: "succeeded",
+        coveredStreams: ["s"],
+        checkpointCandidate: { s: "C60" },
+        lastBatch: 0,
+      }),
+    ).toEqual({ result: "queued" });
+    expect(await keys(db)).toEqual(
+      Array.from({ length: 60 }, (_, index) => `r${index + 1}`),
+    );
     const counts = await db.query<{ record_key: string; n: number }>(
       `SELECT record_key, COUNT(*) AS n FROM record_changes
          WHERE connection_id = 'c1' AND stream = 's' AND origin = 'local'
@@ -188,24 +264,38 @@ describe("run end", () => {
     expect(counts.filter((row) => first.includes(row.record_key))).toEqual(
       first.map((record_key) => ({ record_key, n: 1 })),
     );
-    expect(await db.query("SELECT COUNT(*) AS n FROM run_rows")).toEqual([{ n: 0 }]);
-    expect(await db.query("SELECT COUNT(*) AS n FROM incoming")).toEqual([{ n: 0 }]);
+    expect(await db.query("SELECT COUNT(*) AS n FROM run_rows")).toEqual([
+      { n: 0 },
+    ]);
+    expect(await db.query("SELECT COUNT(*) AS n FROM incoming")).toEqual([
+      { n: 0 },
+    ]);
   });
 
   it("refused run never visible", async () => {
     const { db, store } = await fresh();
-    await db.batch([{
-      sql: "UPDATE stream_state SET floor_version = '2.0.0' WHERE connection_id = 'c1' AND stream = 's'",
-    }]);
+    await db.batch([
+      {
+        sql: "UPDATE stream_state SET floor_version = '2.0.0' WHERE connection_id = 'c1' AND stream = 's'",
+      },
+    ]);
     await begin(db, "old-version", 1, 1);
-    expect(await store.end("old-version", request("succeeded", true))).toEqual({ result: "no_checkpoint" });
+    expect(await store.end("old-version", request("succeeded", true))).toEqual({
+      result: "no_checkpoint",
+    });
     expect(await db.query("SELECT decision, reason FROM run_streams")).toEqual([
       { decision: "refused", reason: "connector_update_required" },
     ]);
-    expect(await db.query("SELECT COUNT(*) AS n FROM run_rows")).toEqual([{ n: 0 }]);
+    expect(await db.query("SELECT COUNT(*) AS n FROM run_rows")).toEqual([
+      { n: 0 },
+    ]);
     expect(await keys(db)).toEqual([]);
-    expect(await db.query("SELECT COUNT(*) AS n FROM record_changes")).toEqual([{ n: 0 }]);
+    expect(await db.query("SELECT COUNT(*) AS n FROM record_changes")).toEqual([
+      { n: 0 },
+    ]);
     expect(await checkpoint(db)).toBeNull();
-    expect(await db.query("SELECT floor_version FROM stream_state")).toEqual([{ floor_version: "2.0.0" }]);
+    expect(await db.query("SELECT floor_version FROM stream_state")).toEqual([
+      { floor_version: "2.0.0" },
+    ]);
   });
 });

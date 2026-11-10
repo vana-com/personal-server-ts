@@ -158,15 +158,16 @@ export function createRecordQuery(db: SqlDriver): RecordQuery {
           seq: row.seq!,
           op: row.op!,
           recordKey: row.change_key!,
-          record: row.pk_hash === null
-            ? null
-            : stored({
-                stream: row.stream!,
-                record_key: row.record_key!,
-                pk_hash: row.pk_hash,
-                body: row.body!,
-                stamp_o: row.stamp_o!,
-              }),
+          record:
+            row.pk_hash === null
+              ? null
+              : stored({
+                  stream: row.stream!,
+                  record_key: row.record_key!,
+                  pk_hash: row.pk_hash,
+                  body: row.body!,
+                  stamp_o: row.stamp_o!,
+                }),
         })),
         nextCursor: more ? page[page.length - 1]!.seq : null,
       };

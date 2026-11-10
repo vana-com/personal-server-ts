@@ -27,24 +27,26 @@ function harness(
     return fields;
   });
   const source: SinceFieldSource = { sinceFields };
-  const listRecords = vi.fn(async (input: Parameters<RecordQuery["listRecords"]>[0]) => {
-    expect(input.connectionId).toBe("connection-a");
-    expect(input.limit).toBeGreaterThan(0);
-    expect(input.limit).toBeLessThanOrEqual(100);
-    const all = bodies[input.stream] ?? [];
-    const start = input.cursor === undefined ? 0 : Number(input.cursor) + 1;
-    const end = Math.min(start + (input.limit ?? 25), all.length);
-    return {
-      records: all.slice(start, end).map((body, index) => ({
-        stream: input.stream,
-        recordKey: String(start + index).padStart(4, "0"),
-        pkHash: `key-${start + index}`,
-        body: JSON.stringify(body),
-        emittedAt: 0,
-      })),
-      nextCursor: end < all.length ? String(end - 1).padStart(4, "0") : null,
-    };
-  });
+  const listRecords = vi.fn(
+    async (input: Parameters<RecordQuery["listRecords"]>[0]) => {
+      expect(input.connectionId).toBe("connection-a");
+      expect(input.limit).toBeGreaterThan(0);
+      expect(input.limit).toBeLessThanOrEqual(100);
+      const all = bodies[input.stream] ?? [];
+      const start = input.cursor === undefined ? 0 : Number(input.cursor) + 1;
+      const end = Math.min(start + (input.limit ?? 25), all.length);
+      return {
+        records: all.slice(start, end).map((body, index) => ({
+          stream: input.stream,
+          recordKey: String(start + index).padStart(4, "0"),
+          pkHash: `key-${start + index}`,
+          body: JSON.stringify(body),
+          emittedAt: 0,
+        })),
+        nextCursor: end < all.length ? String(end - 1).padStart(4, "0") : null,
+      };
+    },
+  );
   const query: RecordQuery = {
     listRecords,
     async getRecord() {
@@ -78,11 +80,10 @@ describe("local history requirements", () => {
     };
     bodies.amber![101] = { openedDay: "1998-12-31" };
     bodies.violet![102] = { closedDay: "1996-02-29" };
-    const h = harness(
-      { amber: "openedDay", violet: "closedDay" },
-      bodies,
-      { amber: 1, violet: 1 },
-    );
+    const h = harness({ amber: "openedDay", violet: "closedDay" }, bodies, {
+      amber: 1,
+      violet: 1,
+    });
 
     expect(await h.requirements.requirements("connection-a")).toEqual({
       ok: true,

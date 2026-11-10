@@ -2,19 +2,29 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { openLocalDb, type SqlDriver } from "@opendatalabs/personal-server-ts-core/localdb";
+import {
+  openLocalDb,
+  type SqlDriver,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   frameOfBody,
   framesOfParts,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { encodePrefixes, type EncodedPart } from "../../../core/src/localdb/encode.js";
+import {
+  encodePrefixes,
+  type EncodedPart,
+} from "../../../core/src/localdb/encode.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
-import { openBytes, sealBytes } from "../../../core/src/stream-sync/stream-aead.js";
+import {
+  openBytes,
+  sealBytes,
+} from "../../../core/src/stream-sync/stream-aead.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const hash = async (bytes: Uint8Array) =>
   new Uint8Array(createHash("sha256").update(bytes).digest());
-const hex = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+const hex = (bytes: Uint8Array) =>
+  createHash("sha256").update(bytes).digest("hex");
 const keyHash = (prefix: string) => prefix.padEnd(64, "0");
 const input = {
   connectionId: "connection",
@@ -29,7 +39,8 @@ const drivers: SqlDriver[] = [];
 const dirs: string[] = [];
 afterEach(async () => {
   for (const driver of drivers.splice(0)) await driver.close();
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  for (const dir of dirs.splice(0))
+    rmSync(dir, { recursive: true, force: true });
 });
 
 async function fresh(partTargetBytes?: number) {
@@ -81,19 +92,21 @@ async function fresh(partTargetBytes?: number) {
       };
       return { row, body, envelope, frame: frameOfBody(envelope, bytes) };
     });
-    await db.batch(fixtures.map(({ row, body, envelope }) => ({
-      sql: "INSERT INTO records (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      params: [
-        row.connectionId ?? input.connectionId,
-        row.stream ?? input.stream,
-        row.k,
-        row.k,
-        envelope.o,
-        envelope.r,
-        body,
-        envelope.h,
-      ],
-    })));
+    await db.batch(
+      fixtures.map(({ row, body, envelope }) => ({
+        sql: "INSERT INTO records (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        params: [
+          row.connectionId ?? input.connectionId,
+          row.stream ?? input.stream,
+          row.k,
+          row.k,
+          envelope.o,
+          envelope.r,
+          body,
+          envelope.h,
+        ],
+      })),
+    );
     return fixtures;
   };
   const read = async (parts: readonly EncodedPart[]) => {
@@ -135,7 +148,9 @@ describe("encodePrefixes", () => {
       { k: keyHash("b"), stream: "another-stream" },
     ]);
     const query = vi.spyOn(f.db, "query");
-    const headExtras = Object.freeze({ checkpoint: Object.freeze({ cursor: "opaque" }) });
+    const headExtras = Object.freeze({
+      checkpoint: Object.freeze({ cursor: "opaque" }),
+    });
     const request = { ...input, changedPrefixes: ["1", "0", "1"], headExtras };
     const first = await encodePrefixes(f.deps, request);
     expect(first.map((part) => [part.prefix, part.seq, part.count])).toEqual([
@@ -150,12 +165,16 @@ describe("encodePrefixes", () => {
     f.put.mockClear();
     f.encryptPart.mockClear();
     const second = await encodePrefixes(f.deps, request);
-    expect(second.map((part) => part.partHash)).toEqual(first.map((part) => part.partHash));
+    expect(second.map((part) => part.partHash)).toEqual(
+      first.map((part) => part.partHash),
+    );
     expect(second).toEqual(first);
     expect(f.put).not.toHaveBeenCalled();
     expect(f.encryptPart).not.toHaveBeenCalled();
     expect(query).toHaveBeenCalledTimes(4);
-    expect(query.mock.calls.every(([sql]) => sql.includes("ORDER BY pk_hash"))).toBe(true);
+    expect(
+      query.mock.calls.every(([sql]) => sql.includes("ORDER BY pk_hash")),
+    ).toBe(true);
     expect(request.headExtras).toBe(headExtras);
   });
 
@@ -167,12 +186,22 @@ describe("encodePrefixes", () => {
       { k: keyHash("3") },
     ]);
     const exact = smallFrames[0]!.frame.length + smallFrames[1]!.frame.length;
-    const packed = await encodePrefixes({ ...small.deps, partTargetBytes: exact }, input);
-    expect(packed.map((part) => part.bytes)).toEqual([exact, smallFrames[2]!.frame.length]);
+    const packed = await encodePrefixes(
+      { ...small.deps, partTargetBytes: exact },
+      input,
+    );
+    expect(packed.map((part) => part.bytes)).toEqual([
+      exact,
+      smallFrames[2]!.frame.length,
+    ]);
     expect(packed.map((part) => part.count)).toEqual([2, 1]);
-    expect(await small.read(packed)).toEqual(smallFrames.map(({ envelope }) => ({
-      k: envelope.k, o: envelope.o, r: envelope.r,
-    })));
+    expect(await small.read(packed)).toEqual(
+      smallFrames.map(({ envelope }) => ({
+        k: envelope.k,
+        o: envelope.o,
+        r: envelope.r,
+      })),
+    );
 
     for (const configured of [undefined, 512]) {
       const target = configured ?? 4 * 1024 * 1024;
@@ -200,16 +229,24 @@ describe("encodePrefixes", () => {
       expect(parts.map((part) => part.seq)).toEqual([0, 1, 2, 3]);
       expect(parts.every((part) => part.bytes <= target)).toBe(true);
       expect(parts[0]!.blobName).toBe(existingName);
-      expect(f.blobs.get(input.scope + "/" + existingName)).toBe(existingCipher);
+      expect(f.blobs.get(input.scope + "/" + existingName)).toBe(
+        existingCipher,
+      );
       expect(f.get.mock.calls.map(([key]) => key)).toEqual(
         parts.map((part) => input.scope + "/" + part.blobName),
       );
       expect(f.put).toHaveBeenCalledTimes(3);
       expect(f.encryptPart).toHaveBeenCalledTimes(3);
-      expect(f.put.mock.calls.some(([key]) => key.endsWith(existingName))).toBe(false);
-      expect(await f.read(parts)).toEqual(fixtures.map(({ envelope }) => ({
-        k: envelope.k, o: envelope.o, r: envelope.r,
-      })));
+      expect(f.put.mock.calls.some(([key]) => key.endsWith(existingName))).toBe(
+        false,
+      );
+      expect(await f.read(parts)).toEqual(
+        fixtures.map(({ envelope }) => ({
+          k: envelope.k,
+          o: envelope.o,
+          r: envelope.r,
+        })),
+      );
     }
   });
 
@@ -238,6 +275,8 @@ describe("encodePrefixes", () => {
       { k: keyHash("bf"), o: 11, r: "a" },
     ]);
     expect(query).toHaveBeenCalledTimes(1);
-    expect(await f.db.query<{ n: number }>("SELECT count(*) AS n FROM records")).toEqual([{ n: 8 }]);
+    expect(
+      await f.db.query<{ n: number }>("SELECT count(*) AS n FROM records"),
+    ).toEqual([{ n: 8 }]);
   });
 });

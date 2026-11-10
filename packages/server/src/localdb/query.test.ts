@@ -57,9 +57,8 @@ export async function queryMemoryWorkload(input: {
 
 if (!process.argv[1]?.endsWith("/memory-oracle-child.ts")) {
   const { afterEach, describe, expect, it } = await import("vitest");
-  const { openLocalDb } = await import(
-    "@opendatalabs/personal-server-ts-core/localdb"
-  );
+  const { openLocalDb } =
+    await import("@opendatalabs/personal-server-ts-core/localdb");
   const opened = new Set<SqlDriver>();
   const dirs: string[] = [];
   const fresh = async () => {
@@ -117,36 +116,51 @@ if (!process.argv[1]?.endsWith("/memory-oracle-child.ts")) {
       expect(first.nextCursor).toBe(key(24));
       expect(first.records.every((r) => r.emittedAt === 123)).toBe(true);
       const second = await query.listRecords({
-        connectionId: "c", stream: "s", cursor: first.nextCursor!,
+        connectionId: "c",
+        stream: "s",
+        cursor: first.nextCursor!,
       });
       expect(second.records.map((r) => r.recordKey)).toEqual(
         Array.from({ length: 25 }, (_, i) => key(i + 25)),
       );
       const capped = await query.listRecords({
-        connectionId: "c", stream: "s", limit: 1000,
+        connectionId: "c",
+        stream: "s",
+        limit: 1000,
       });
       expect(capped.records).toHaveLength(100);
       expect(capped.nextCursor).toBe(key(99));
       const last = await query.listRecords({
-        connectionId: "c", stream: "s", cursor: capped.nextCursor!, limit: 100,
+        connectionId: "c",
+        stream: "s",
+        cursor: capped.nextCursor!,
+        limit: 100,
       });
       expect(last.records.map((r) => r.recordKey)).toEqual(
         Array.from({ length: 5 }, (_, i) => key(i + 100)),
       );
       expect(last.nextCursor).toBeNull();
       const afterEmpty = await query.listRecords({
-        connectionId: "c", stream: "collision", cursor: "",
+        connectionId: "c",
+        stream: "collision",
+        cursor: "",
       });
       expect(afterEmpty.records.every((r) => r.recordKey > "")).toBe(true);
       const collision = await query.getRecord({
-        connectionId: "c", stream: "collision", recordKey: "1",
+        connectionId: "c",
+        stream: "collision",
+        recordKey: "1",
       });
       expect(collision?.pkHash).toBe("a");
       expect(collision?.emittedAt).toBe(202);
       expect(typeof JSON.parse(collision!.body).id).toBe("number");
-      expect(await query.getRecord({
-        connectionId: "c", stream: "s", recordKey: "1",
-      })).toBeNull();
+      expect(
+        await query.getRecord({
+          connectionId: "c",
+          stream: "s",
+          recordKey: "1",
+        }),
+      ).toBeNull();
     });
 
     it("pages changes by seq and returns gone only below the global compaction floor", async () => {
@@ -154,7 +168,8 @@ if (!process.argv[1]?.endsWith("/memory-oracle-child.ts")) {
       const query = createRecordQuery(db);
       const input = { connectionId: "c", stream: "s" };
       expect(await query.changesSince({ ...input, cursor: 0 })).toEqual({
-        changes: [], nextCursor: null,
+        changes: [],
+        nextCursor: null,
       });
       await db.batch([
         insert("foreign-stream", "x", "other"),
@@ -174,12 +189,15 @@ if (!process.argv[1]?.endsWith("/memory-oracle-child.ts")) {
       expect(first.changes[1]?.record).toBeNull();
       expect(first.nextCursor).toBe(4);
       const last = await query.changesSince({
-        ...input, cursor: first.nextCursor!, limit: 2,
+        ...input,
+        cursor: first.nextCursor!,
+        limit: 2,
       });
       expect(last).not.toBe("gone");
       if (last === "gone") throw new Error("unexpected compaction refusal");
       expect(last.changes.map((c) => [c.seq, c.op, c.recordKey])).toEqual([
-        [5, "upsert", "c"], [6, "remove", "b"],
+        [5, "upsert", "c"],
+        [6, "remove", "b"],
       ]);
       expect(last.changes[1]?.record).toBeNull();
       expect(last.nextCursor).toBeNull();
@@ -192,7 +210,8 @@ if (!process.argv[1]?.endsWith("/memory-oracle-child.ts")) {
       await db.batch([{ sql: "DELETE FROM record_changes" }]);
       expect(await query.changesSince({ ...input, cursor: 5 })).toBe("gone");
       expect(await query.changesSince({ ...input, cursor: 6 })).toEqual({
-        changes: [], nextCursor: null,
+        changes: [],
+        nextCursor: null,
       });
     });
 
@@ -202,10 +221,18 @@ if (!process.argv[1]?.endsWith("/memory-oracle-child.ts")) {
       const bytesPerRecord = Buffer.byteLength(body, "utf8");
       expect(bytesPerRecord).toBeGreaterThan(body.length);
       for (let start = 0; start < ROWS; start += 512) {
-        await db.batch(Array.from(
-          { length: Math.min(512, ROWS - start) },
-          (_, offset) => insert(key(start + offset), key(start + offset), "s", "c", 123, body),
-        ));
+        await db.batch(
+          Array.from({ length: Math.min(512, ROWS - start) }, (_, offset) =>
+            insert(
+              key(start + offset),
+              key(start + offset),
+              "s",
+              "c",
+              123,
+              body,
+            ),
+          ),
+        );
       }
       await db.close();
       opened.delete(db);
@@ -220,7 +247,11 @@ if (!process.argv[1]?.endsWith("/memory-oracle-child.ts")) {
         exportName: "queryMemoryWorkload",
         args: { file, retainAll: true },
       });
-      const result = { count: ROWS, bodyBytes: ROWS * bytesPerRecord, ordered: true };
+      const result = {
+        count: ROWS,
+        bodyBytes: ROWS * bytesPerRecord,
+        ordered: true,
+      };
       expect(measured.result).toEqual(result);
       expect(retained.result).toEqual(result);
       console.info("query memory oracle", {
