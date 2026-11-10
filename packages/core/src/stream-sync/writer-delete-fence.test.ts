@@ -188,7 +188,7 @@ it("delete retries a CAS lost to a publish (mutant: Superseded swallowed)", asyn
   const row = await r.gateway.read(streamScope(CONNECTOR, "", "items"));
   expect(row).toMatchObject({ found: true, version: 4 });
   expect(await r.registeredHead()).toMatchObject({
-    format: 3,
+    format: 4,
     lastDeleteVersion: 4,
     recordCount: 0,
   });

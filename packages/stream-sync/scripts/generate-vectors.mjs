@@ -2033,9 +2033,157 @@ const vectors = {
 const f4 = { ...baseHead, format: 4, lastDeleteVersion: 2 };
 const f4Text = cj(f4);
 const f5Text = mutate({ format: 5, lastDeleteVersion: 2 });
+// v3 frames (head format 4): the envelope adds `f`, the record's first-seen
+// checkpoint (an integer, or null when unknown).
+const frameCaseV3 = (name, primaryKey, record, o, r, f) => {
+  const body = cj(record);
+  const k = sha(cj(primaryKey.map((field) => record[field])));
+  const envelope = cj({
+    f,
+    h: shaBytes(body),
+    k,
+    n: Buffer.byteLength(body),
+    o,
+    r,
+  });
+  return {
+    name,
+    primaryKey,
+    record,
+    o,
+    r,
+    f,
+    bodyBytes: Buffer.byteLength(body),
+    envelope,
+    frame: `${envelope}\n${body}\n`,
+  };
+};
+const frameCasesV3 = [
+  frameCaseV3(
+    "first seen",
+    ["id"],
+    { id: "a", body: 1 },
+    1700000000000,
+    "run-1",
+    1699999990000,
+  ),
+  frameCaseV3(
+    "unknown first seen",
+    ["id"],
+    { id: "é", t: "日本語" },
+    5,
+    "r",
+    null,
+  ),
+  frameCaseV3(
+    "zero first seen",
+    ["a", "b"],
+    { b: 2, a: "x", c: true },
+    0,
+    "run-2",
+    0,
+  ),
+].sort((x, y) =>
+  JSON.parse(x.envelope).k < JSON.parse(y.envelope).k ? -1 : 1,
+);
+const partOf = (text) => ({
+  text,
+  bytes: Buffer.byteLength(text),
+  hash: sha(text),
+});
+const v3PartText = frameCasesV3.map((c) => c.frame).join("");
+const v2PartText = frameCases.map((c) => c.frame).join("");
+const v3Part = partOf(v3PartText);
+const v3Head = {
+  ...baseHead,
+  format: 4,
+  lastDeleteVersion: 2,
+  parts: [
+    {
+      bytes: v3Part.bytes,
+      count: frameCasesV3.length,
+      hash: v3Part.hash,
+      prefix: "",
+    },
+  ],
+  recordCount: frameCasesV3.length,
+};
+const v3HeadText = cj(v3Head);
+const zero = "0".repeat(64);
+const framesV3 = {
+  description:
+    "Format 4 head parts hold v3 frames: envelope {f,h,k,n,o,r}, f = first-seen checkpoint (integer) or null. A reader picks the frame generation from the head format: format 4 reads v3, formats 2 and 3 read v2. Format 1-3 lines read with f null. A v2 frame in a format 4 head, or a v3 frame in a format 2 or 3 head, is refused.",
+  cases: frameCasesV3,
+  part: {
+    prefix: "",
+    frames: frameCasesV3.map((c) => c.name),
+    ...v3Part,
+    count: frameCasesV3.length,
+  },
+  envelopeErrors: [
+    {
+      text: `{"h":"${zero}","k":"${zero}","n":1,"o":1,"r":"r"}`,
+      why: "v2 envelope under v3",
+    },
+    {
+      text: `{"f":"1","h":"${zero}","k":"${zero}","n":1,"o":1,"r":"r"}`,
+      why: "f is a string",
+    },
+    {
+      text: `{"f":1.5,"h":"${zero}","k":"${zero}","n":1,"o":1,"r":"r"}`,
+      why: "f is not an integer",
+    },
+    {
+      text: `{"h":"${zero}","k":"${zero}","n":1,"o":1,"r":"r","f":null}`,
+      why: "f out of canonical order",
+    },
+  ],
+  readCases: [
+    {
+      name: "format 4 reads v3 frames",
+      headFormat: 4,
+      primaryKey: ["id"],
+      part: { ...v3Part, count: frameCasesV3.length },
+      expected: frameCasesV3.map((c) => ({
+        o: c.o,
+        r: c.r,
+        f: c.f,
+        v: c.record,
+      })),
+    },
+    {
+      name: "format 3 reads unknown first seen",
+      headFormat: 3,
+      primaryKey: ["id"],
+      part: { ...partOf(v2PartText), count: frameCases.length },
+      expected: frameCases.map((c) => ({
+        o: c.o,
+        r: c.r,
+        f: null,
+        v: c.record,
+      })),
+    },
+    {
+      name: "format 4 refuses a v2 frame",
+      headFormat: 4,
+      primaryKey: ["id"],
+      part: { ...partOf(v2PartText), count: frameCases.length },
+      error: true,
+    },
+    {
+      name: "format 3 refuses a v3 frame",
+      headFormat: 3,
+      primaryKey: ["id"],
+      part: { ...v3Part, count: frameCasesV3.length },
+      error: true,
+    },
+  ],
+};
+
 const vectorsV2 = {
   ...vectors,
   version: 2,
+  framesV3,
   heads: {
     ...vectors.heads,
     encode: [
@@ -2046,6 +2194,13 @@ const vectorsV2 = {
         text: f4Text,
         dataHash: keccak(f4Text),
         blobName: `h-${keccak(f4Text).slice(2)}`,
+      },
+      {
+        name: "format 4 head with v3 part hashes",
+        head: v3Head,
+        text: v3HeadText,
+        dataHash: keccak(v3HeadText),
+        blobName: `h-${keccak(v3HeadText).slice(2)}`,
       },
     ],
     decode: [

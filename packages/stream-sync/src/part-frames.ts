@@ -1,5 +1,5 @@
 /**
- * Format-2 parts (§2.2 as amended): a part is whole frames, or one piece of a
+ * Format-2 to 4 parts (§2.2 as amended): a part is whole frames, or one piece of a
  * frame too long to share a part. The parts of a head, read in order, are one
  * sequence of frames sorted by key hash.
  *
@@ -19,6 +19,7 @@ import {
   frameOfBody,
   type Envelope,
 } from "./frames.js";
+import { framesCarryFirstSeen } from "./head.js";
 import { decodePart, type EncodedPart, type HeadPart } from "./parts.js";
 import { decodeLine, inPrefix, type Line } from "./records.js";
 
@@ -156,8 +157,13 @@ export async function* framesOfParts(
   sha256: Sha256,
   parts: readonly HeadPart[],
   load: (part: HeadPart, index: number) => Promise<Uint8Array>,
-  options: { readonly verify?: boolean } = {},
+  options: {
+    readonly verify?: boolean;
+    /** Frame generation of these parts: "v3" for a format 4 head, else "v2". */
+    readonly generation?: "v2" | "v3";
+  } = {},
 ): AsyncGenerator<PartFrame> {
+  const generation = options.generation ?? "v2";
   let previousKey: string | null = null;
   const checkKey = (envelope: Envelope, part: HeadPart) => {
     if (!inPrefix(envelope.k, part.prefix)) {
@@ -187,7 +193,7 @@ export async function* framesOfParts(
     while (at < data.length) {
       const lf = data.subarray(at, at + ENVELOPE_LIMIT_BYTES + 1).indexOf(LF);
       if (lf === -1) throw new InvalidPartError("frame envelope is truncated");
-      const envelope = decodeEnvelope(data.subarray(at, at + lf));
+      const envelope = decodeEnvelope(data.subarray(at, at + lf), generation);
       checkKey(envelope, part);
       started += 1;
       const size = lf + 1 + envelope.n + 1;
@@ -264,9 +270,10 @@ export async function* framesOfParts(
 }
 
 /**
- * A format-1 line as a format-2 frame. The line is canonical
- * `{"o":..,"r":..,"v":BODY}`, so the body is the text after `"v":` and is
- * already canonical. `k` is the line's key hash, which the caller computed.
+ * A format-1 line as a v3 frame (first-seen unknown, `f: null`). The line is
+ * canonical `{"o":..,"r":..,"v":BODY}`, so the body is the text after `"v":`
+ * and is already canonical. `k` is the line's key hash, which the caller
+ * computed.
  */
 export async function frameOfLine(
   sha256: Sha256,
@@ -283,6 +290,7 @@ export async function frameOfLine(
     n: body.length,
     o: line.o,
     r: line.r,
+    f: line.f ?? null,
   };
   return { envelope, bytes: frameOfBody(envelope, body) };
 }
@@ -292,7 +300,10 @@ const textDecoder = new TextDecoder();
 /**
  * Every record of a head's parts as `{o, r, v}`, in key order, for a
  * consumer that needs objects (it holds one parsed record at a time). Reads
- * format 1 (NDJSON) and format 2 (frames) alike.
+ * format 1 (NDJSON), formats 2 and 3 (v2 frames) and format 4 (v3 frames).
+ * `f` is the first-seen checkpoint from a v3 frame; lines of formats 1-3
+ * carry `f: null`. A v2 frame in a format 4 head, or a v3 frame in a format
+ * 1-3 head, is refused.
  */
 export async function* linesOfParts(
   sha256: Sha256,
@@ -313,17 +324,16 @@ export async function* linesOfParts(
         part,
         head.primaryKey,
       )) {
-        yield line;
+        yield { ...line, f: null };
       }
     }
     return;
   }
-  // Format 4 parts carry v3 envelopes; this v2 reader refuses them rather than
-  // misreading them. The v3 part reader lands with the first-seen wiring.
-  if (head.format === 4) {
-    throw new InvalidPartError("format 4 parts need the v3 frame reader");
-  }
-  for await (const frame of framesOfParts(sha256, head.parts, load, options)) {
+  const generation = framesCarryFirstSeen(head.format) ? "v3" : "v2";
+  for await (const frame of framesOfParts(sha256, head.parts, load, {
+    ...options,
+    generation,
+  })) {
     const pieces: Uint8Array[] = [];
     let total = 0;
     for await (const piece of frame.body()) {
@@ -336,7 +346,7 @@ export async function* linesOfParts(
       bytes.set(piece, at);
       at += piece.length;
     }
-    const { o, r } = frame.envelope;
-    yield { o, r, v: JSON.parse(textDecoder.decode(bytes)) };
+    const { o, r, f } = frame.envelope;
+    yield { o, r, v: JSON.parse(textDecoder.decode(bytes)), f: f ?? null };
   }
 }

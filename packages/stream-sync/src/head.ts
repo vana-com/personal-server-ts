@@ -30,12 +30,8 @@ import { headBlobName } from "./names.js";
 import type { HeadPart } from "./parts.js";
 import type { ControlState } from "./control.js";
 
-/**
- * The format writers build new heads with. Readers and `encodeHead` already
- * handle formats 1-4; this moves to 4 in the slice where the writer emits v3
- * (first-seen) frames, because a format-4 head must carry v3 frames.
- */
-export const HEAD_FORMAT = 3;
+/** The format writers build new heads with: first-seen (v3) frames. Readers also accept formats 1, 2 and 3. */
+export const HEAD_FORMAT = 4;
 /** Parts are NDJSON lines (§2.2). Readers still accept it; writers no longer write it. */
 export const HEAD_FORMAT_PREVIOUS = 1;
 

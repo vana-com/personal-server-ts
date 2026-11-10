@@ -51,6 +51,7 @@ import {
   frameChunks,
   frameOfBody,
   frameOfLine,
+  framesCarryFirstSeen,
   framesOfParts,
   FrameReducer,
   HEAD_FORMAT,
@@ -3522,24 +3523,50 @@ export class StreamSyncWriter {
         }
       }
     } else if (wanted.length > 0) {
+      // A format 4 base already holds v3 frames. An older base holds v2
+      // frames: each is re-encoded as a v3 frame with an unknown first-seen
+      // checkpoint, so a format 4 head never holds a v2 frame.
+      const v3Base = base !== null && framesCarryFirstSeen(base.format);
       for await (const frame of framesOfParts(
         this.hashes.sha256,
         wanted,
         load,
+        { generation: v3Base ? "v3" : "v2" },
       )) {
         const { k, o, r } = frame.envelope;
         const reducer = route(k);
         if (reducer === null) continue;
+        if (v3Base) {
+          reducer.add({
+            k,
+            o,
+            r,
+            size: frame.size,
+            held: frame.raw !== null,
+            ref:
+              frame.raw !== null
+                ? { kind: "held", bytes: frame.raw.slice() }
+                : { kind: "run", parts: frame.parts },
+          });
+          continue;
+        }
+        // The body is held while the frame is rebuilt, as for a format 1 line.
+        const pieces: Uint8Array[] = [];
+        for await (const piece of frame.body()) pieces.push(piece);
+        const body = new Uint8Array(frame.envelope.n);
+        let at = 0;
+        for (const piece of pieces) {
+          body.set(piece, at);
+          at += piece.length;
+        }
+        const bytes = frameOfBody({ ...frame.envelope, f: null }, body);
         reducer.add({
           k,
           o,
           r,
-          size: frame.size,
-          held: frame.raw !== null,
-          ref:
-            frame.raw !== null
-              ? { kind: "held", bytes: frame.raw.slice() }
-              : { kind: "run", parts: frame.parts },
+          size: bytes.length,
+          held: bytes.length <= FRAME_SMALL_BYTES,
+          ref: { kind: "held", bytes },
         });
       }
     }
@@ -3560,7 +3587,9 @@ export class StreamSyncWriter {
           this.options.home.files,
           shardPath(dir, shard),
         )) {
-          const { k, o, r } = entry.envelope;
+          // Run lines carry no first-seen checkpoint: v3 frame with `f: null`.
+          const envelope: Envelope = { ...entry.envelope, f: null };
+          const { k, o, r } = envelope;
           const reducer = route(k);
           if (reducer === null) continue;
           // An old line is budgeted by the frame it becomes, not by its old
@@ -3569,7 +3598,7 @@ export class StreamSyncWriter {
           // origin: not held for the split, and alone in its own parts.
           const { body } = entry;
           if (body.kind === "inline") {
-            const bytes = frameOfInline(entry.envelope, body.text);
+            const bytes = frameOfInline(envelope, body.text);
             reducer.add({
               k,
               o,
@@ -3585,7 +3614,7 @@ export class StreamSyncWriter {
               r,
               size: entry.size,
               held: false,
-              ref: { kind: "file", path: body.path, envelope: entry.envelope },
+              ref: { kind: "file", path: body.path, envelope },
             });
           }
         }

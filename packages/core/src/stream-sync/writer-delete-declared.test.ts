@@ -42,7 +42,7 @@ it("an uninstalled connector with rows, whose streams come only from the host's 
   await r.publish();
 
   expect(await r.registeredHead()).toMatchObject({
-    format: 3,
+    format: 4,
     recordCount: 0,
   });
   expect((await persistedState(r)).deletes ?? {}).toEqual({});
@@ -72,7 +72,7 @@ it("a connector with rows and a retained declaration deletes when the host names
   await r.publish();
 
   expect(await r.registeredHead()).toMatchObject({
-    format: 3,
+    format: 4,
     recordCount: 0,
   });
   expect((await persistedState(r)).deletes ?? {}).toEqual({});
@@ -90,11 +90,11 @@ it("the host's declared names and a retained manifest's streams are both fenced,
   await r.publish();
 
   expect(await r.registeredHead("items")).toMatchObject({
-    format: 3,
+    format: 4,
     recordCount: 0,
   });
   expect(await r.registeredHead("extra")).toMatchObject({
-    format: 3,
+    format: 4,
     recordCount: 0,
   });
 });
@@ -117,7 +117,7 @@ it("rows written under a declaration, then a restart with the connector removed 
   await r.publish();
 
   expect(await r.registeredHead()).toMatchObject({
-    format: 3,
+    format: 4,
     recordCount: 0,
   });
 });
@@ -139,7 +139,7 @@ it("pre-change rows (no durable name, connector absent from config) delete with 
   ).resolves.toMatchObject({ deleteId: expect.any(String) });
   await r.publish();
   expect(await r.registeredHead()).toMatchObject({
-    format: 3,
+    format: 4,
     recordCount: 0,
   });
 });

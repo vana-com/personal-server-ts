@@ -32,7 +32,7 @@ export interface EncodedPart {
 
 /**
  * C.2 step 4: encode the changed prefixes of one stream from `records`
- * `ORDER BY pk_hash` (one prefix per query), as format-2 frames in parts of
+ * `ORDER BY pk_hash` (one prefix per query), as v3 frames (format 4 head) in parts of
  * at most `partTargetBytes`, STREAM-encrypted, and upload each part that does
  * not exist. Under replace (H), leave out rows below `replaceBelow`. Identical
  * rows give an identical part, so a repeat run makes zero PUTs.
@@ -99,8 +99,9 @@ export async function encodePrefixes(
       stamp_r: string;
       body: string;
       body_sha256: string;
+      first_o: number | null;
     }>(
-      `SELECT pk_hash, stamp_o, stamp_r, body, body_sha256 FROM records
+      `SELECT pk_hash, stamp_o, stamp_r, body, body_sha256, first_o FROM records
        WHERE ${where} ORDER BY pk_hash`,
       params,
     );
@@ -135,6 +136,7 @@ export async function encodePrefixes(
           n: body.length,
           o: row.stamp_o,
           r: row.stamp_r,
+          f: row.first_o ?? null,
         },
         body,
       );

@@ -75,6 +75,7 @@ async function fresh(partTargetBytes?: number) {
       k: string;
       o?: number;
       r?: string;
+      f?: number | null;
       value?: string;
       connectionId?: string;
       stream?: string;
@@ -89,12 +90,13 @@ async function fresh(partTargetBytes?: number) {
         n: bytes.length,
         o: row.o ?? 10,
         r: row.r ?? "run",
+        f: row.f ?? null,
       };
       return { row, body, envelope, frame: frameOfBody(envelope, bytes) };
     });
     await db.batch(
       fixtures.map(({ row, body, envelope }) => ({
-        sql: "INSERT INTO records (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        sql: "INSERT INTO records (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params: [
           row.connectionId ?? input.connectionId,
           row.stream ?? input.stream,
@@ -104,13 +106,15 @@ async function fresh(partTargetBytes?: number) {
           envelope.r,
           body,
           envelope.h,
+          envelope.f,
         ],
       })),
     );
     return fixtures;
   };
   const read = async (parts: readonly EncodedPart[]) => {
-    const summaries: { k: string; o: number; r: string }[] = [];
+    const summaries: { k: string; o: number; r: string; f: number | null }[] =
+      [];
     for await (const frame of framesOfParts(
       hash,
       parts.map((part) => ({
@@ -124,12 +128,13 @@ async function fresh(partTargetBytes?: number) {
         if (!cipher) throw new Error("missing fixture blob");
         return openBytes(testKey, cipher);
       },
+      { generation: "v3" },
     )) {
       const digest = createHash("sha256");
       for await (const piece of frame.body()) digest.update(piece);
       expect(digest.digest("hex")).toBe(frame.envelope.h);
-      const { k, o, r } = frame.envelope;
-      summaries.push({ k, o, r });
+      const { k, o, r, f } = frame.envelope;
+      summaries.push({ k, o, r, f: f ?? null });
     }
     return summaries;
   };
@@ -143,7 +148,7 @@ describe("encodePrefixes", () => {
     const high = keyHash("a");
     await f.insert([
       { k: high },
-      { k: low, value: "unicode-\u00e9" },
+      { k: low, value: "unicode-\u00e9", f: 7 },
       { k: keyHash("1"), connectionId: "another-connection" },
       { k: keyHash("b"), stream: "another-stream" },
     ]);
@@ -159,8 +164,8 @@ describe("encodePrefixes", () => {
     ]);
     expect(f.put).toHaveBeenCalledTimes(2);
     expect(await f.read(first)).toEqual([
-      { k: low, o: 10, r: "run" },
-      { k: high, o: 10, r: "run" },
+      { k: low, o: 10, r: "run", f: 7 },
+      { k: high, o: 10, r: "run", f: null },
     ]);
     f.put.mockClear();
     f.encryptPart.mockClear();
@@ -200,6 +205,7 @@ describe("encodePrefixes", () => {
         k: envelope.k,
         o: envelope.o,
         r: envelope.r,
+        f: null,
       })),
     );
 
@@ -245,6 +251,7 @@ describe("encodePrefixes", () => {
           k: envelope.k,
           o: envelope.o,
           r: envelope.r,
+          f: null,
         })),
       );
     }
@@ -253,9 +260,9 @@ describe("encodePrefixes", () => {
   it("replaceBelow leaves out rows with a stamp below the run stamp", async () => {
     const f = await fresh();
     await f.insert([
-      { k: keyHash("bf"), o: 11, r: "a" },
-      { k: keyHash("ae"), o: 10, r: "z" },
-      { k: keyHash("a2"), o: 10, r: "m" },
+      { k: keyHash("bf"), o: 11, r: "a", f: null },
+      { k: keyHash("ae"), o: 10, r: "z", f: null },
+      { k: keyHash("a2"), o: 10, r: "m", f: null },
       { k: keyHash("a1"), o: 10, r: "a" },
       { k: keyHash("a0"), o: 9, r: "z" },
       { k: keyHash("9f"), o: 11 },
@@ -270,9 +277,9 @@ describe("encodePrefixes", () => {
     });
     expect(parts.reduce((count, part) => count + part.count, 0)).toBe(3);
     expect(await f.read(parts)).toEqual([
-      { k: keyHash("a2"), o: 10, r: "m" },
-      { k: keyHash("ae"), o: 10, r: "z" },
-      { k: keyHash("bf"), o: 11, r: "a" },
+      { k: keyHash("a2"), o: 10, r: "m", f: null },
+      { k: keyHash("ae"), o: 10, r: "z", f: null },
+      { k: keyHash("bf"), o: 11, r: "a", f: null },
     ]);
     expect(query).toHaveBeenCalledTimes(1);
     expect(
