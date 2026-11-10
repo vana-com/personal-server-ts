@@ -52,7 +52,13 @@ export {
   type OlderVersions,
   type VersionInfo,
 } from "./older-versions.js";
-export { createLocalResolver, type LocalResolver } from "./resolve.js";
+export {
+  createLocalResolver,
+  type LocalResolver,
+  type LocalAliasTarget,
+  type LocalAliasRecord,
+  type AliasScopes,
+} from "./resolve.js";
 export {
   createLocalListing,
   type ListedScope,

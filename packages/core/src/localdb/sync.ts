@@ -10,7 +10,11 @@ import type { LocalSyncDeps } from "./deps.js";
 import { createLocalListing, type LocalListing } from "./listing.js";
 import { createOlderVersions, type OlderVersions } from "./older-versions.js";
 import { createRecordQuery, type RecordQuery } from "./query.js";
-import { createLocalResolver, type LocalResolver } from "./resolve.js";
+import {
+  createLocalResolver,
+  type LocalResolver,
+  type AliasScopes,
+} from "./resolve.js";
 import { createRunEndStore } from "./run-end.js";
 import { createRunIntakeStore } from "./run-intake.js";
 
@@ -40,6 +44,7 @@ export interface LocalSync {
 export function createLocalSync(
   deps: LocalSyncDeps,
   options: {
+    readonly aliasScopes?: AliasScopes;
     readonly resolveArtifact: ResolveArtifact;
     readonly declaredStreams: (connector: string) => readonly string[];
     readonly retainedManifests?: () => readonly string[];
@@ -129,7 +134,11 @@ export function createLocalSync(
   return {
     intake,
     deleter,
-    resolver: createLocalResolver(deps, { query, olderVersions }),
+    resolver: createLocalResolver(deps, {
+      query,
+      olderVersions,
+      aliasScopes: options.aliasScopes,
+    }),
     listing: createLocalListing(deps, () => olderVersions.counts()),
     query,
     olderVersions,

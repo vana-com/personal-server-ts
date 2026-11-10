@@ -1,14 +1,12 @@
 import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
-  projectPdppRecordsToLegacyPayload,
-  type PdppRecord,
-} from "../legacy-projection/index.js";
-import {
-  readTargets,
   type ReadDecision,
   type ResolveInput,
 } from "../stream-sync-read/service.js";
-import { streamReadScope } from "../stream-sync-read/routing.js";
+import {
+  logicalStreamScopeParts,
+  streamReadScope,
+} from "../stream-sync-read/routing.js";
 import { applyConnection } from "./apply.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { createOlderVersions, type OlderVersions } from "./older-versions.js";
@@ -23,7 +21,29 @@ export interface LocalResolver {
   resolve(input: ResolveInput): Promise<ReadDecision>;
 }
 
-type Target = ReturnType<typeof readTargets>[number];
+/** The host alone knows legacy aliases and how to project their records. */
+export interface LocalAliasTarget {
+  readonly connector: string;
+  readonly streams: readonly string[];
+  readonly servedStream?: string;
+  readonly windowed?: boolean;
+  readonly project: (
+    records: readonly LocalAliasRecord[],
+    now: string,
+  ) =>
+    | { readonly ok: true; readonly payload: unknown }
+    | { readonly ok: false; readonly error: { readonly kind: string } };
+}
+export interface LocalAliasRecord {
+  readonly stream: string;
+  readonly data: Record<string, unknown>;
+}
+export type AliasScopes = (scope: string) => readonly LocalAliasTarget[];
+type Target = {
+  readonly connector: string;
+  readonly streams: readonly string[];
+  readonly alias?: LocalAliasTarget;
+};
 type Connection = {
   connection_id: string;
   connector: string;
@@ -196,7 +216,11 @@ async function* single(text: string): AsyncGenerator<string> {
 
 export function createLocalResolver(
   deps: LocalSyncDeps,
-  parts: { readonly query: RecordQuery; readonly olderVersions: OlderVersions },
+  parts: {
+    readonly query: RecordQuery;
+    readonly olderVersions: OlderVersions;
+    readonly aliasScopes?: AliasScopes;
+  },
 ): LocalResolver {
   const completeReads = createOlderVersions(deps, { enabled: () => true });
   async function streams(connectionId: string): Promise<Stream[]> {
@@ -288,7 +312,7 @@ export function createLocalResolver(
       },
     };
     let payload: AsyncIterable<string>;
-    const binding = candidate.target.binding;
+    const binding = candidate.target.alias;
     if (!binding) {
       payload = rawPayload(
         readQuery,
@@ -300,22 +324,12 @@ export function createLocalResolver(
       if (installed.some((s) => s.profile_key !== candidate.target.connector)) {
         return noData();
       }
-      const options = {
-        fetchedStreams: [...candidate.target.streams],
-        profileKey: candidate.target.connector,
-        orderByPrimaryKey: true,
-        now: new Date(deps.now()).toISOString(),
-      };
-      if (binding.window) {
-        const probe = projectPdppRecordsToLegacyPayload(
-          input.scope,
-          [],
-          options,
-        );
-        if (!probe.ok && String(probe.error.kind).includes("profile"))
-          return noData();
+      const now = new Date(deps.now()).toISOString();
+      if (binding.windowed) {
+        const probe = binding.project([], now);
+        if (!probe.ok && probe.error.kind.includes("profile")) return noData();
       }
-      const records: PdppRecord[] = [];
+      const records: LocalAliasRecord[] = [];
       let bytes = 0;
       for (const stream of candidate.target.streams) {
         for await (const record of readQuery.streamRecords(
@@ -330,16 +344,11 @@ export function createLocalResolver(
           });
         }
       }
-      const projected = projectPdppRecordsToLegacyPayload(
-        input.scope,
-        records,
-        options,
-      );
+      const projected = binding.project(records, now);
       if (!projected.ok) return noData();
       payload = single(JSON.stringify(projected.payload));
     }
-    const servedStream =
-      binding?.window?.parentStream ?? candidate.target.streams[0]!;
+    const servedStream = binding?.servedStream ?? candidate.target.streams[0]!;
     const head = installed.find((s) => s.stream === servedStream)!;
     return {
       kind: "view",
@@ -372,7 +381,14 @@ export function createLocalResolver(
       if (input.cursor !== null && !validCursor(input.cursor))
         return { kind: "invalid_cursor" };
       const scope = streamReadScope(input.scope) ?? input.scope;
-      const targets = readTargets(scope);
+      const logical = logicalStreamScopeParts(streamReadScope(scope) ?? "");
+      const targets: readonly Target[] = logical
+        ? [{ connector: logical.connector, streams: [logical.stream] }]
+        : (parts.aliasScopes?.(scope) ?? []).map((alias) => ({
+            connector: alias.connector,
+            streams: alias.streams,
+            alias,
+          }));
       const candidates: Candidate[] = [];
       let sawDeleted = false;
       let sawForeign = false;

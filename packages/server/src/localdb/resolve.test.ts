@@ -33,12 +33,6 @@ const mocked = vi.hoisted(() => ({
 vi.mock("../../../core/src/localdb/apply.js", () => ({
   applyConnection: mocked.apply,
 }));
-vi.mock("../../../core/src/stream-sync-read/service.js", () => ({
-  readTargets: mocked.targets,
-}));
-vi.mock("../../../core/src/legacy-projection/index.js", () => ({
-  projectPdppRecordsToLegacyPayload: mocked.project,
-}));
 
 const CONNECTOR = "fixture-source";
 const BASE = {
@@ -161,7 +155,29 @@ async function fixture() {
     now: () => 5000,
     newOp: () => "test",
   } as unknown as LocalSyncDeps;
-  const resolver = createLocalResolver(deps, { query, olderVersions });
+  const aliasScopes = (scope: string) =>
+    mocked
+      .targets(scope)
+      .filter((target: { binding?: unknown }) => target.binding)
+      .map(
+        (target: {
+          connector: string;
+          streams: string[];
+          binding: { window?: { parentStream: string } };
+        }) => ({
+          connector: target.connector,
+          streams: target.streams,
+          servedStream: target.binding.window?.parentStream,
+          windowed: Boolean(target.binding.window),
+          project: (records: readonly unknown[], now: string) =>
+            mocked.project(scope, records, { now }),
+        }),
+      );
+  const resolver = createLocalResolver(deps, {
+    query,
+    olderVersions,
+    aliasScopes,
+  });
   async function connection(
     control = "active",
     id = "c1",
@@ -278,6 +294,24 @@ async function fixture() {
 }
 
 describe("local resolve", () => {
+  it("serves no legacy alias without a host port, while logical streams remain readable", async () => {
+    const f = await fixture();
+    await f.connection();
+    await f.head();
+    await f.record();
+    const isolated = createLocalResolver(f.deps, {
+      query: f.query,
+      olderVersions: f.olderVersions,
+    });
+    expect(verdict(await isolated.resolve(input("fixture.alias")))).toBe(
+      "no_data",
+    );
+    expect(mocked.project).not.toHaveBeenCalled();
+    const logical = await isolated.resolve(input());
+    expect(logical.kind).toBe("view");
+    if ("body" in logical) await logical.body.cancel();
+  });
+
   it("#590 serves each installed complete head, requires all alias streams, and fences partial data", async () => {
     const f = await fixture();
     await f.connection();
@@ -344,7 +378,7 @@ describe("local resolve", () => {
       stream: "items",
       generation: 2,
       complete: true,
-      format: 3,
+      format: 4,
       lastDeleteVersion: 0,
       keyCheck: "0000000000000000",
       observedAt: 1000,
@@ -361,7 +395,7 @@ describe("local resolve", () => {
     f.blobs.set(`${scope}/${partBlobName(2, part.entry.hash)}`, part.data);
     await f.db.batch([
       {
-        sql: "UPDATE stream_versions SET head_blob = ? WHERE version = 1",
+        sql: "UPDATE stream_versions SET head_blob = ?, head_format = 4 WHERE version = 1",
         params: [blobName],
       },
     ]);
