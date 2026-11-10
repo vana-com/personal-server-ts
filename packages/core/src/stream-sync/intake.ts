@@ -1,3 +1,4 @@
+import { ConnectionStoppedError } from "../localdb/delete.js";
 /**
  * Run intake: the entry point every app uses to feed whole-file stream sync
  * (run-intake contract v2, §2, as reduced by rulings R17-R19 and R23).
@@ -29,11 +30,7 @@ import {
   type JsonObject,
   type JsonValue,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import {
-  ConnectionStoppedError,
-  RunGoneError,
-  type StreamSyncWriter,
-} from "./writer.js";
+import { RunGoneError, type StreamSyncWriter } from "./writer.js";
 
 /** What `end` can answer (V2 §2.3). */
 export type EndResult =

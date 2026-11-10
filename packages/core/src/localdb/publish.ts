@@ -102,6 +102,18 @@ export async function publishConnection(
     `SELECT stream FROM stream_state WHERE connection_id = ? ORDER BY stream`,
     [connectionId],
   );
+  if (
+    (
+      await deps.db.query("SELECT 1 FROM delete_intents WHERE connector=?", [
+        connection.connector,
+      ])
+    ).length
+  )
+    return streams.map(({ stream }) => ({
+      stream,
+      outcome: "deferred",
+      watermark: null,
+    }));
   if (streams.length === 0) {
     const state = classifyControl(
       await deps.registry.read(
@@ -557,6 +569,14 @@ async function checkControl(
   connection: ConnectionRow,
   hashes: ControlHashes,
 ): Promise<"purged" | "deferred" | null> {
+  if (
+    (
+      await deps.db.query("SELECT 1 FROM delete_intents WHERE connector=?", [
+        connection.connector,
+      ])
+    ).length
+  )
+    return "deferred";
   const state = classifyControl(
     await deps.registry.read(controlScope(connection.connector, connection.ns)),
     hashes,
@@ -941,7 +961,8 @@ async function commitBatch(
   statements.push({
     sql: `UPDATE stream_state SET head_version = ?, head_generation = ?,
             head_data_hash = ?, head_blob = ?, publish_watermark = ?,
-            last_delete_version = ?, primary_key = ?, profile_key = ?, profile_version = ?, complete = ?
+            last_delete_version = ?, primary_key = ?, profile_key = ?, profile_version = ?, complete = ?,
+            needs_full = CASE WHEN ? = 1 THEN 0 WHEN ? > 0 THEN 1 ELSE needs_full END
           WHERE connection_id = ? AND stream = ?`,
     params: [
       input.version,
@@ -954,6 +975,8 @@ async function commitBatch(
       input.profile.key,
       input.profile.version,
       input.complete ? 1 : 0,
+      input.complete ? 1 : 0,
+      input.lastDeleteVersion,
       connectionId,
       stream,
     ],

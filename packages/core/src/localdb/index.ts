@@ -34,6 +34,9 @@ export { runCycle, syncConnection, type CycleReport } from "./cycle.js";
 export { purgeConnection } from "./purge.js";
 export {
   createConnectionDeleter,
+  ConnectionDeleteSuperseded,
+  ConnectorNotVerifiedError,
+  ConnectionStoppedError,
   type ConnectionDeleter,
   type DeleteIntent,
   type PendingDelete,

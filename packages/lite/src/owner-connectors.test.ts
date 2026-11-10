@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { ConnectorNotVerifiedError } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { ConnectorNotVerifiedError } from "@opendatalabs/personal-server-ts-core/localdb";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
 import {
   createMemoryPsLiteAccessLogStore,

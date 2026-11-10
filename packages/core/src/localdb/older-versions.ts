@@ -85,7 +85,8 @@ const versionInfo = (row: VersionRow): VersionInfo => ({
 
 const currentVersions = `SELECT v.*, c.connector, c.ns FROM stream_versions v
   JOIN connections c ON c.connection_id = v.connection_id
-  WHERE c.control_state = 'active' AND v.generation = c.generation`;
+  WHERE c.control_state = 'active' AND v.generation = c.generation
+  AND NOT EXISTS (SELECT 1 FROM delete_intents d WHERE d.connector=c.connector)`;
 const newestFirst = " ORDER BY v.observed_at DESC, v.version DESC";
 const sha = async (bytes: Uint8Array) => sha256(bytes);
 const keccak = async (bytes: Uint8Array) => keccak_256(bytes);

@@ -1,3 +1,8 @@
+import {
+  ConnectionStoppedError,
+  ConnectorNotVerifiedError,
+  ConnectionDeleteSuperseded,
+} from "../localdb/delete.js";
 /**
  * Stream-sync writer: run intake, the publish driver (§2.7), the checkpoint
  * re-check (§2.4), `needsFull`, the record limit (§2.2) and the Desktop seed
@@ -412,47 +417,6 @@ export interface StreamSyncRunStart {
   readonly issue?: { readonly wantFull: boolean };
   /** The write lease the run is bound to; `null` on hosts with no lease. */
   readonly leaseId?: string | null;
-}
-
-/**
- * A scheduled run of a connector this device has seen deleted (§2.4
- * `stopped`). Cleared by an explicit connect, or by observing a reconnect.
- */
-export class ConnectionStoppedError extends Error {
-  constructor(readonly connector: string) {
-    super(
-      `connection of ${connector} is stopped: deleted, not reconnected; an explicit connect is required`,
-    );
-    this.name = "ConnectionStoppedError";
-  }
-}
-
-/**
- * A connection delete refused before it wrote anything: the registry holds
- * rows of the connector, but this host verified no manifest that names its
- * streams. A stream the registry has no row for could then keep a stale
- * record that passes the fence after a reconnect, so the delete waits until
- * the host can name the streams (retryable).
- */
-export class ConnectorNotVerifiedError extends Error {
-  constructor(readonly connector: string) {
-    super(
-      `no verified manifest names the streams of ${connector}; its delete cannot fence rowless streams`,
-    );
-    this.name = "ConnectorNotVerifiedError";
-  }
-}
-
-/**
- * A fresh connection delete whose tombstone did not land: the connection
- * was reconnected or deleted again while the delete ran. The intent is
- * dropped; nothing was tombstoned at a version the caller did not see.
- */
-export class ConnectionDeleteSuperseded extends Error {
-  constructor(readonly connector: string) {
-    super(`delete of ${connector} was superseded before it landed`);
-    this.name = "ConnectionDeleteSuperseded";
-  }
 }
 
 /** A delete intent that could not be finished on this pass. */

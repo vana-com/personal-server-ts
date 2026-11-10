@@ -107,6 +107,10 @@ export function createLocalSync(
       if (!declarations) throw new RunIntakeError("unknown_artifact");
       // Artifact resolution can yield while the owner changes the write lease.
       await checkBinding(binding);
+      if (req.connect === true) {
+        await deletes().resumeDeletes();
+        await checkBinding(binding);
+      }
       const response = await intake().begin(runId, req, declarations);
       bindings.set(runId, binding);
       return response;
@@ -169,13 +173,20 @@ export function createLocalSync(
     }),
     olderVersions,
     blobs: createBlobStore(deps),
-    cycle: () => runCycle(deps),
+    async cycle() {
+      await deletes().resumeDeletes();
+      return runCycle(deps);
+    },
     async apply() {
+      await deletes().resumeDeletes();
       for (const connection of await bootstrapConnections(deps)) {
         await applyConnection(deps, connection.connectionId);
       }
     },
-    syncConnection: (connectionId) => syncConnection(deps, connectionId),
+    async syncConnection(connectionId) {
+      await deletes().resumeDeletes();
+      return syncConnection(deps, connectionId);
+    },
     close: () => (closing ??= deps.db.close()),
   };
 }

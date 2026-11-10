@@ -7,7 +7,7 @@
  */
 import { expect, it } from "vitest";
 import type { StreamSyncWriter } from "./writer.js";
-import { ConnectorNotVerifiedError } from "./writer.js";
+import { ConnectorNotVerifiedError } from "../localdb/delete.js";
 import {
   Rig,
   CONNECTOR,

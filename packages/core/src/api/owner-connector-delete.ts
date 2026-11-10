@@ -32,7 +32,7 @@
  */
 
 import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
-import { ConnectorNotVerifiedError } from "../stream-sync/writer.js";
+import { ConnectorNotVerifiedError } from "../localdb/delete.js";
 
 /**
  * What the route needs of the account's storage mode: the read shape of

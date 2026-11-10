@@ -100,6 +100,28 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
         [id],
       );
       if (!connection) return [...flight.streams].map((s) => result(s, "gone"));
+      if (
+        (
+          await deps.db.query(
+            "SELECT 1 FROM delete_intents WHERE connector=?",
+            [connection.connector],
+          )
+        ).length
+      ) {
+        await deps.db.batch([
+          {
+            sql: "UPDATE connections SET control_state='deleted',checkpoint=NULL WHERE connection_id=?",
+            params: [id],
+          },
+        ]);
+        if (flight.all)
+          for (const row of await deps.db.query<{ stream: string }>(
+            "SELECT stream FROM stream_state WHERE connection_id=?",
+            [id],
+          ))
+            flight.streams.add(row.stream);
+        return [...flight.streams].map((s) => result(s, "purged"));
+      }
       const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
       const hashes = await controlHashes(keccak, keyCheck);
       const initial = await control(locked, id, connection, hashes);

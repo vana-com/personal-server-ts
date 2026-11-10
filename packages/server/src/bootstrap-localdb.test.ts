@@ -292,5 +292,21 @@ describe("Node database composition", () => {
     expect(await read.json()).toMatchObject({
       data: { records: [{ id: "live-full" }] },
     });
+    const deletion = await context.app.request(
+      "/v1/owner/connectors/fixture-source",
+      { method: "DELETE", headers },
+    );
+    expect(deletion.status).toBe(202);
+    expect((await deletion.json()).deleteId).toBeTruthy();
+    expect(
+      await (await context.getLocalSync!()).deleter.resumeDeletes(),
+    ).toEqual([]);
+    expect(
+      (
+        await context.app.request("/v1/data/pdpp.fixture-source.items", {
+          headers,
+        })
+      ).status,
+    ).toBe(410);
   });
 });

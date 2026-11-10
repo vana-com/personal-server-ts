@@ -6,7 +6,7 @@
  */
 import { expect, it } from "vitest";
 import { parseScope } from "@opendatalabs/personal-server-ts-stream-sync";
-import { ConnectorNotVerifiedError } from "./writer.js";
+import { ConnectorNotVerifiedError } from "../localdb/delete.js";
 import { ask } from "../stream-sync-read/service-fixture.js";
 import {
   Rig,

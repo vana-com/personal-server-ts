@@ -13,7 +13,7 @@ import {
 import { AmbiguousRegistryReplyError } from "./ports.js";
 import { ask } from "../stream-sync-read/service-fixture.js";
 import { manifestStreamLister } from "./artifacts.js";
-import { ConnectorNotVerifiedError } from "./writer.js";
+import { ConnectorNotVerifiedError } from "../localdb/delete.js";
 import {
   bindStreamSyncHome,
   createMemoryStreamSyncFiles,

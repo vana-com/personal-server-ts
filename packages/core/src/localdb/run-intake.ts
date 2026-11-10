@@ -232,6 +232,8 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           ).length
         )
           throw new RunIntakeError("connection_stopped");
+        if (req.connect !== true && (await stopped(id)))
+          throw new RunIntakeError("connection_stopped");
         let synced = await syncBeforeBegin(deps, req.connector);
         if (
           synced.connection?.controlState === "deleted" &&
