@@ -64,6 +64,7 @@ export const DEFAULTS = {
     // on only after the clients that send `Vana-Stream-Sync-Client` ship.
     refuseLegacyWrites: false,
   },
+  olderVersionReads: true,
   replication: {
     // Off by default. When false, no replica code runs and no replica
     // schema is created. When true, the record store is built with the
@@ -249,6 +250,7 @@ export const ServerConfigSchema = z.object({
         .default(DEFAULTS.streamSync.refuseLegacyWrites),
     })
     .default(DEFAULTS.streamSync),
+  olderVersionReads: z.boolean().default(DEFAULTS.olderVersionReads),
   replication: z
     .object({
       enabled: z.boolean().default(DEFAULTS.replication.enabled),

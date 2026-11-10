@@ -23,6 +23,19 @@ async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   }
 }
 
+describe("ServerConfigSchema — olderVersionReads", () => {
+  it("olderVersionReads is a boolean that defaults to true and accepts false", () => {
+    expect(DEFAULTS.olderVersionReads).toBe(true);
+    expect(ServerConfigSchema.parse({}).olderVersionReads).toBe(true);
+    expect(
+      ServerConfigSchema.parse({ olderVersionReads: false }).olderVersionReads,
+    ).toBe(false);
+    expect(
+      ServerConfigSchema.safeParse({ olderVersionReads: "false" }).success,
+    ).toBe(false);
+  });
+});
+
 describe("ServerConfigSchema — sync fields", () => {
   it("default config has sync.enabled: false and sync.lastProcessedTimestamp: null", () => {
     const config = ServerConfigSchema.parse({});
