@@ -223,12 +223,14 @@ describe("local sync intake adapter", () => {
         .map((r) => ({ record_key: r.data.id, count: 1 }))
         .sort((a, b) => a.record_key.localeCompare(b.record_key)),
     );
-    expect(ports.replace).toHaveBeenCalledWith(
-      expect.objectContaining({
-        outcome: "succeeded",
-        provenFullStreams: ["items"],
-      }),
-    );
+    // B resumed incrementally: producer proof cannot bypass the server's
+    // full-read fact, so neither run reaches the replacement predicate.
+    expect(ports.replace).not.toHaveBeenCalled();
+    expect(
+      await db.query(
+        "SELECT full_read,replace FROM run_streams WHERE run_id='B'",
+      ),
+    ).toEqual([{ full_read: 0, replace: 0 }]);
   });
 
   it("returns checkpoint_only for an all-empty retry", async () => {
