@@ -431,9 +431,11 @@ export function startPsLiteRelayClient(
       droppedReadEvents = 0;
     }
     for (const produce of batch) {
+      // A producer may still await the grantee lookup when close() runs;
+      // re-check so nothing reaches the hook after close.
       void Promise.resolve()
         .then(produce)
-        .then((event) => hook(event))
+        .then((event) => (closed ? undefined : hook(event)))
         .catch(logHookError);
     }
   };
