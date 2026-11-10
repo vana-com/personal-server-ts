@@ -1,3 +1,4 @@
+import { uploadStreamBlobs } from "./blobs.js";
 // PS-2 P09 publish: the publish side of local sync.
 //
 // Per connection, in the connection queue (held by the caller, cycle.ts),
@@ -407,6 +408,12 @@ async function publishStream(
         ]),
       ].sort();
     }
+    await uploadStreamBlobs(deps, {
+      connectionId,
+      stream,
+      scope,
+      generation: headGeneration,
+    });
     const headExtras = await options?.headExtras?.(stream);
     const encoded =
       changedPrefixes.length === 0

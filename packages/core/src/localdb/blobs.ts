@@ -30,7 +30,7 @@ function namesBlob(body: string, blobId: string): boolean {
   const pending: unknown[] = [JSON.parse(body)];
   while (pending.length > 0) {
     const value = pending.pop();
-    if (value === blobId) return true;
+    if (value === blobId || value === `sha256:${blobId}`) return true;
     if (value !== null && typeof value === "object") {
       for (const child of Object.values(value)) pending.push(child);
     }
@@ -139,8 +139,42 @@ export function createBlobStore(deps: LocalSyncDeps): BlobStore {
       }>("SELECT mime_type, generation, bytes FROM blobs WHERE blob_id = ?", [
         blobId,
       ]);
-      if (local?.bytes !== null && local?.bytes !== undefined)
+      if (local?.bytes !== null && local?.bytes !== undefined) {
+        checkBytes(blobId, local.bytes);
         return { mimeType: local.mime_type, bytes: local.bytes };
+      }
+      // A new device has records before it has fetched any blob bytes. Rebuild
+      // refs from exact hash values in those records, without retaining bodies
+      // or assuming which surface wrote them. Recheck each body at insertion.
+      const candidates = await deps.db.query<{
+        connection_id: string;
+        stream: string;
+        pk_hash: string;
+        body: string;
+      }>(
+        `SELECT r.connection_id,r.stream,r.pk_hash,r.body FROM records r
+        JOIN connections c ON c.connection_id=r.connection_id
+        WHERE c.control_state='active' AND instr(r.body,?)>0
+        AND NOT EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector=c.connector)`,
+        [blobId],
+      );
+      const refs = candidates.filter((row) => namesBlob(row.body, blobId));
+      if (refs.length)
+        await deps.db.batch(
+          refs.map((row) => ({
+            sql: `INSERT OR IGNORE INTO blob_refs(blob_id,connection_id,stream,pk_hash)
+          SELECT ?,connection_id,stream,pk_hash FROM records WHERE connection_id=? AND stream=? AND pk_hash=? AND body=?
+          AND EXISTS(SELECT 1 FROM connections c WHERE c.connection_id=records.connection_id AND c.control_state='active'
+            AND NOT EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector=c.connector))`,
+            params: [
+              blobId,
+              row.connection_id,
+              row.stream,
+              row.pk_hash,
+              row.body,
+            ],
+          })),
+        );
       const locations = await deps.db.query<{
         connector: string;
         ns: string;
@@ -190,4 +224,51 @@ export function createBlobStore(deps: LocalSyncDeps): BlobStore {
       return { mimeType, bytes };
     },
   };
+}
+
+/** Publish cached run bytes before the head that references them (E.1).
+ * Page metadata, then hold one blob at a time; a set of 32 MiB attachments
+ * never becomes one SQL result containing all their payloads.
+ */
+export async function uploadStreamBlobs(
+  deps: LocalSyncDeps,
+  input: {
+    readonly connectionId: string;
+    readonly stream: string;
+    readonly scope: string;
+    readonly generation: number;
+  },
+): Promise<void> {
+  const store = createBlobStore(deps);
+  let after = "";
+  for (;;) {
+    const rows = await deps.db.query<{ blob_id: string }>(
+      `SELECT DISTINCT b.blob_id
+      FROM blobs b JOIN blob_refs f ON f.blob_id=b.blob_id
+      JOIN records r ON r.connection_id=f.connection_id AND r.stream=f.stream AND r.pk_hash=f.pk_hash
+      WHERE f.connection_id=? AND f.stream=? AND b.bytes IS NOT NULL AND b.blob_id>?
+      ORDER BY b.blob_id LIMIT 100`,
+      [input.connectionId, input.stream, after],
+    );
+    for (const row of rows) {
+      const records = await deps.db.query<{ body: string }>(
+        `SELECT r.body FROM records r JOIN blob_refs f
+        ON f.connection_id=r.connection_id AND f.stream=r.stream AND f.pk_hash=r.pk_hash
+        WHERE f.blob_id=? AND f.connection_id=? AND f.stream=?`,
+        [row.blob_id, input.connectionId, input.stream],
+      );
+      if (!records.some((record) => namesBlob(record.body, row.blob_id)))
+        continue;
+      const key = `${input.scope}/g${input.generation}-b-${row.blob_id}`;
+      if ((await deps.blobs.get(key)) !== null) continue;
+      const value = await store.get(row.blob_id);
+      if (value)
+        await deps.blobs.put(
+          key,
+          await deps.keys.encrypt(input.scope, value.bytes),
+        );
+    }
+    if (rows.length < 100) return;
+    after = rows.at(-1)!.blob_id;
+  }
 }
