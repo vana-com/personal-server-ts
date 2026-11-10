@@ -64,16 +64,17 @@ export function mergeIncoming(
      OR first_o IS NULL OR ${pick("first_o")} IS NULL THEN NULL
    WHEN ${pick("first_o")} < first_o THEN ${pick("first_o")}
    ELSE first_o END
- WHERE connection_id = ?
-   AND EXISTS (SELECT 1 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash)`,
+ WHERE (connection_id, stream, pk_hash) IN
+   (SELECT ?, stream, pk_hash FROM incoming WHERE op = ?)`,
       params: [op, op, op, connectionId, op],
     },
     {
       sql: `UPDATE records SET ${FIELDS.map((f) => `${f} = ${pick(f)}`).join(", ")}
- WHERE connection_id = ?
+ WHERE (connection_id, stream, pk_hash) IN
+   (SELECT ?, stream, pk_hash FROM incoming WHERE op = ?)
    AND EXISTS (SELECT 1 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash
                AND (i.stamp_o > records.stamp_o OR (i.stamp_o = records.stamp_o AND i.stamp_r > records.stamp_r)))`,
-      params: [...FIELDS.map(() => op), connectionId, op],
+      params: [...FIELDS.map(() => op), connectionId, op, op],
     },
     {
       sql: `INSERT INTO records (connection_id, stream, pk_hash, ${FIELDS.join(", ")}, first_o)

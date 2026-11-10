@@ -224,3 +224,19 @@ it("canonical-unknown-target-counted-without-reading", async () => {
   ).toMatchObject([{ kind: "excluded", reason: "unknown_identity" }]);
   expect(f.calls).toHaveLength(0);
 });
+
+it("yields pending host work between synchronous source pages", async () => {
+  const s = await source(fixture());
+  let consumed = 0;
+  let observed: number | undefined;
+  const timer = setTimeout(() => {
+    observed = consumed;
+  }, 0);
+  try {
+    for await (const _row of s.records()) consumed++;
+    expect(consumed).toBe(2);
+    expect(observed).toBe(1);
+  } finally {
+    clearTimeout(timer);
+  }
+});

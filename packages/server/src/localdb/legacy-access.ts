@@ -5,6 +5,7 @@ import { resolve, join, relative, dirname, sep } from "node:path";
 import { canonicalJson } from "@opendatalabs/personal-server-ts-stream-sync";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 import { retireReplication } from "../storage/pdpp-replication-door.js";
+import { createStatementCache } from "./better-sqlite3-driver.js";
 import { openRecordStore } from "../pdpp/records-bootstrap.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import {
@@ -105,6 +106,17 @@ export async function openLegacyAccess(
   retireReplication(db);
   const store = openRecordStore(db, false);
   const index = createIndexManager(db);
+  const cache = createStatementCache(db);
+  const { prepare } = cache;
+  const releaseReadPages = () => prepare("PRAGMA shrink_memory").run();
+  // The partial activity indexes can make an ordered continuation rescan and
+  // sort a whole stream. Require the existing primary-key order for this scan.
+  const keyIndex = (
+    db.pragma("index_list(pdpp_records)") as { name: string; origin: string }[]
+  ).find((index) => index.origin === "pk")?.name;
+  if (!keyIndex) throw new Error("legacy_record_key_index_missing");
+  const recordKeyScan = `pdpp_records INDEXED BY "${keyIndex.replaceAll('"', '""')}"`;
+
   let closed = false;
   async function authorized() {
     if (
@@ -127,7 +139,10 @@ export async function openLegacyAccess(
   }
   // Revision identifies content, not a device's coincidentally equal clock.
   // The clock/data_version are live fences only and never durable identity.
-  const dataVersion = db.pragma("data_version", { simple: true }) as number;
+  const readDataVersion = () =>
+    (prepare("PRAGMA data_version").get() as { data_version: number })
+      .data_version;
+  const dataVersion = readDataVersion();
   const clock = store.writeClock();
   const hash = createHash("sha256").update("legacy-canonical-snapshot/1");
   const frame = (value: unknown) => {
@@ -138,44 +153,46 @@ export async function openLegacyAccess(
   };
   let bindingAfter: string | null = null;
   for (;;) {
-    const row = db
-      .prepare(
-        "SELECT * FROM pdpp_instance_binding WHERE (? IS NULL OR instance > ?) ORDER BY instance LIMIT 1",
-      )
-      .get(bindingAfter, bindingAfter) as Record<string, unknown> | undefined;
+    const row = prepare(
+      "SELECT * FROM pdpp_instance_binding WHERE (? IS NULL OR instance > ?) ORDER BY instance LIMIT 1",
+    ).get(bindingAfter, bindingAfter) as Record<string, unknown> | undefined;
     if (!row) break;
     frame(row);
     bindingAfter = row.instance as string;
   }
+  const firstRevisionRow = prepare(
+    `SELECT instance,stream,record_key,length(CAST(data AS BLOB)) AS bytes FROM ${recordKeyScan} WHERE deleted = 0 ORDER BY instance,stream,record_key LIMIT 1`,
+  );
+  const nextRevisionRow = prepare(
+    `SELECT instance,stream,record_key,length(CAST(data AS BLOB)) AS bytes FROM ${recordKeyScan} WHERE deleted = 0 AND (instance,stream,record_key) > (?,?,?) ORDER BY instance,stream,record_key LIMIT 1`,
+  );
   let prior: [string, string, string] | null = null;
+  let hashedRows = 0;
   for (;;) {
-    const row = db
-      .prepare(
-        `SELECT instance,stream,record_key,length(CAST(data AS BLOB)) AS bytes FROM pdpp_records
-      WHERE deleted = 0 AND (? IS NULL OR (instance,stream,record_key) > (?,?,?)) ORDER BY instance,stream,record_key LIMIT 1`,
-      )
-      .get(
-        prior?.[0] ?? null,
-        prior?.[0] ?? null,
-        prior?.[1] ?? null,
-        prior?.[2] ?? null,
-      ) as
+    const row = (
+      prior ? nextRevisionRow.get(...prior) : firstRevisionRow.get()
+    ) as
       | { instance: string; stream: string; record_key: string; bytes: number }
       | undefined;
     if (!row) break;
     frame([row.instance, row.stream, row.record_key, row.bytes]);
     for (let offset = 0; offset < row.bytes; offset += 65536) {
-      const chunk = db
-        .prepare(
-          "SELECT substr(CAST(data AS BLOB),?,65536) AS bytes FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ?",
-        )
-        .get(offset + 1, row.instance, row.stream, row.record_key) as {
+      const chunk = prepare(
+        "SELECT substr(CAST(data AS BLOB),?,65536) AS bytes FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ?",
+      ).get(offset + 1, row.instance, row.stream, row.record_key) as {
         bytes: Buffer;
       };
       hash.update(chunk.bytes);
     }
     prior = [row.instance, row.stream, row.record_key];
+    // Admission uses the same row-page cadence as the source reader. Recheck
+    // the live storage capability without blocking the host for a whole store.
+    if (++hashedRows % 128 === 0) {
+      await authorized();
+      releaseReadPages();
+    }
   }
+  releaseReadPages();
   const revision = hash.digest("hex");
   const reader: CanonicalImportPageReader = {
     declarations: options.declarations,
@@ -184,7 +201,7 @@ export async function openLegacyAccess(
       if (
         expected !== revision ||
         store.writeClock() !== clock ||
-        db.pragma("data_version", { simple: true }) !== dataVersion
+        readDataVersion() !== dataVersion
       )
         throw new Error("source_changed");
     },
@@ -194,14 +211,12 @@ export async function openLegacyAccess(
       let stream = "";
       for (;;) {
         await reader.assertRevision(expected);
-        const row = db
-          .prepare(
-            `SELECT p.instance, p.stream, b.source_id AS sourceId, count(*) AS rows
+        const row = prepare(
+          `SELECT p.instance, p.stream, b.source_id AS sourceId, count(*) AS rows
           FROM pdpp_records p LEFT JOIN pdpp_instance_binding b ON b.instance = p.instance
           WHERE p.deleted = 0 AND (? IS NULL OR p.instance > ? OR (p.instance = ? AND p.stream > ?))
           GROUP BY p.instance,p.stream ORDER BY p.instance,p.stream LIMIT 1`,
-          )
-          .get(instance, instance, instance, stream) as
+        ).get(instance, instance, instance, stream) as
           | {
               instance: string;
               stream: string;
@@ -219,11 +234,9 @@ export async function openLegacyAccess(
       for (const declaration of options.declarations)
         for (const connection of store.listConnections(declaration.source_id))
           for (const stream of declaration.streams) {
-            const row = db
-              .prepare(
-                "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
-              )
-              .get(connection.instance, stream.name) as { n: number };
+            const row = prepare(
+              "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
+            ).get(connection.instance, stream.name) as { n: number };
             if (!row.n)
               yield {
                 instance: connection.instance,
@@ -252,20 +265,31 @@ export async function openLegacyAccess(
       const rows: Record<string, unknown>[] = [];
       let cursor = after;
       let bytes = 0;
-      const metadata = db.prepare(
-        "SELECT record_key, length(CAST(data AS BLOB)) AS bytes, length(CAST(record_key AS BLOB)) AS keyBytes FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0 AND (? IS NULL OR record_key > ?) ORDER BY record_key LIMIT 1",
+      // The decoded page owns these rows now. Source pages have no reuse until
+      // the next keyset page, so do not overlap their cache with the SQL merge.
+      const finish = (next: string | null) => {
+        releaseReadPages();
+        return { rows, next };
+      };
+      const first = prepare(
+        `SELECT record_key, length(CAST(data AS BLOB)) AS bytes, length(CAST(record_key AS BLOB)) AS keyBytes FROM ${recordKeyScan} WHERE instance = ? AND stream = ? AND deleted = 0 ORDER BY record_key LIMIT 1`,
       );
-      while (rows.length < limit) {
-        const next = metadata.get(instance, stream, cursor, cursor) as
+      const following = prepare(
+        `SELECT record_key, length(CAST(data AS BLOB)) AS bytes, length(CAST(record_key AS BLOB)) AS keyBytes FROM ${recordKeyScan} WHERE instance = ? AND stream = ? AND deleted = 0 AND record_key > ? ORDER BY record_key LIMIT 1`,
+      );
+      const metadata = (cursor: string | null) =>
+        (cursor === null
+          ? first.get(instance, stream)
+          : following.get(instance, stream, cursor)) as
           { record_key: string; bytes: number; keyBytes: number } | undefined;
-        if (!next) return { rows, next: null };
+      while (rows.length < limit) {
+        const next = metadata(cursor);
+        if (!next) return finish(null);
         if (rows.length && bytes + next.bytes + next.keyBytes > maxBytes)
-          return { rows, next: cursor };
-        const row = db
-          .prepare(
-            "SELECT data FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ? AND deleted = 0",
-          )
-          .get(instance, stream, next.record_key) as { data: string };
+          return finish(cursor);
+        const row = prepare(
+          "SELECT data FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ? AND deleted = 0",
+        ).get(instance, stream, next.record_key) as { data: string };
         let value: Record<string, unknown>;
         try {
           const parsed: unknown = JSON.parse(row.data);
@@ -279,9 +303,9 @@ export async function openLegacyAccess(
         bytes += next.bytes + next.keyBytes;
         cursor = next.record_key;
       }
-      const more = metadata.get(instance, stream, cursor, cursor);
+      const more = metadata(cursor);
       await reader.assertRevision(expected);
-      return { rows, next: more ? cursor : null };
+      return finish(more ? cursor : null);
     },
   };
   const sources = () =>
@@ -427,12 +451,9 @@ export async function openLegacyAccess(
       // known content hash and cannot authorize reconciliation or removal.
       let after = 0;
       for (;;) {
-        const row = db
-          .prepare(
-            "SELECT id,path,scope FROM data_files WHERE id > ? ORDER BY id LIMIT 1",
-          )
-          .get(after) as
-          { id: number; path: string; scope: string } | undefined;
+        const row = prepare(
+          "SELECT id,path,scope FROM data_files WHERE id > ? ORDER BY id LIMIT 1",
+        ).get(after) as { id: number; path: string; scope: string } | undefined;
         if (!row) break;
         after = row.id;
         const path = resolve(dataRoot, row.path);
@@ -546,6 +567,7 @@ export async function openLegacyAccess(
     },
     async close() {
       closed = true;
+      cache.clear();
     },
   };
 }

@@ -4,11 +4,27 @@ import {
   type JsonObject,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { sha256 } from "@noble/hashes/sha2";
-import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
+import { bytesToHex } from "@noble/hashes/utils";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { SqlDriver } from "./driver.js";
 import type { ImportSource } from "./legacy-import-types.js";
 import { importFingerprint } from "./import-fingerprint.js";
+
+const encoder = new TextEncoder();
+const hashBytes = new Uint8Array(64 * 1024);
+
+/** Synchronous hashing owns the scratch buffer until update returns; no await
+ * or retained view may cross this scope. Avoid one external allocation per row. */
+function bodyHash(body: string): string {
+  const hash = sha256.create();
+  let offset = 0;
+  while (offset < body.length) {
+    const { read, written } = encoder.encodeInto(body.slice(offset), hashBytes);
+    hash.update(hashBytes.subarray(0, written));
+    offset += read;
+  }
+  return bytesToHex(hash.digest());
+}
 
 export type ImportRow = {
   pk_hash: string;
@@ -17,7 +33,8 @@ export type ImportRow = {
   body_sha256: string;
 };
 
-/** One operation's disk-sortable source view. Owns canonical row composition,
+/** One operation's disk-sortable digest view; never retain source bodies.
+ * The replayable source supplies each body again for a checked merge. Owns canonical row composition,
  * not key/hash algorithms: those stay at their existing PDPP/stream-sync owners.
  * Conflicting duplicates refuse the import instead of choosing by device/order. */
 export async function stageImportSnapshot(
@@ -28,8 +45,8 @@ export async function stageImportSnapshot(
   await db.batch([
     {
       sql: `CREATE TEMP TABLE IF NOT EXISTS import_snapshot (
-    op TEXT NOT NULL, pk_hash TEXT NOT NULL, record_key TEXT NOT NULL,
-    body TEXT NOT NULL, body_sha256 TEXT NOT NULL,
+    op TEXT NOT NULL, pk_hash TEXT NOT NULL, body_sha256 TEXT NOT NULL,
+    seen INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (op, pk_hash)) WITHOUT ROWID`,
     },
   ]);
@@ -43,31 +60,15 @@ export async function stageImportSnapshot(
       throw new Error("invalid_record");
     await db.batch([
       {
-        sql: "INSERT OR IGNORE INTO import_snapshot VALUES (?, ?, ?, ?, ?)",
-        params: [op, row.pk_hash, row.record_key, row.body, row.body_sha256],
+        sql: "INSERT OR IGNORE INTO import_snapshot (op, pk_hash, body_sha256) VALUES (?, ?, ?)",
+        params: [op, row.pk_hash, row.body_sha256],
       },
     ]);
   }
   return importFingerprint(snapshotDigests(db, op));
 }
 
-/** Keyset iteration keeps at most one body live, even for large rows. */
-export async function* snapshotRows(
-  db: SqlDriver,
-  op: string,
-): AsyncIterable<ImportRow> {
-  let after = "";
-  for (;;) {
-    const [row] = await db.query<ImportRow>(
-      "SELECT pk_hash, record_key, body, body_sha256 FROM import_snapshot WHERE op = ? AND pk_hash > ? ORDER BY pk_hash LIMIT 1",
-      [op, after],
-    );
-    if (!row) return;
-    yield row;
-    after = row.pk_hash;
-  }
-}
-async function* snapshotDigests(db: SqlDriver, op: string) {
+export async function* snapshotDigests(db: SqlDriver, op: string) {
   let after = "";
   for (;;) {
     const rows = await db.query<{ pk_hash: string; body_sha256: string }>(
@@ -100,7 +101,7 @@ export async function canonicalImportRow(
         primaryKey,
       ),
       body,
-      body_sha256: bytesToHex(sha256(utf8ToBytes(body))),
+      body_sha256: bodyHash(body),
     };
     return row;
   } catch {

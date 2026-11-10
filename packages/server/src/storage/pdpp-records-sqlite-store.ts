@@ -1370,11 +1370,7 @@ export function createSqliteRecordStore(
   }
 
   function writeClock(): number {
-    return (
-      db.prepare("SELECT value FROM pdpp_write_clock WHERE id = 1").get() as {
-        value: number;
-      }
-    ).value;
+    return readWriteClock();
   }
 
   function listConnections(sourceId: string): PdppInstanceBinding[] {

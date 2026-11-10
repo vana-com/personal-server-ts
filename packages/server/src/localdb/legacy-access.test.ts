@@ -529,3 +529,106 @@ it("native access selects the latest active account and counts the older rows", 
   const selected = inventory.find((s) => !("kind" in s))!;
   expect(JSON.parse(selected.source)[0]).toBe("newer");
 });
+it("reuses native source statements across replay passes", async () => {
+  const f = await fixture();
+  const second = { ...body, id: "second" };
+  expect(
+    f.store.ingestBatch(
+      [
+        {
+          instance: "instance",
+          stream: "profile",
+          key: "second",
+          data: second,
+          emitted_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "profile-source", generation: 1 },
+    ).accepted,
+  ).toBe(1);
+  const prepare = vi.spyOn(f.db, "prepare");
+  const pragma = vi.spyOn(f.db, "pragma");
+  try {
+    const access = await openLegacyAccess(f.options);
+    const [source] = await collect(access.sources());
+    expect(source).not.toHaveProperty("kind");
+    for (let pass = 0; pass < 2; pass++)
+      expect(await collect((source as ImportSource).records())).toEqual([
+        body,
+        second,
+      ]);
+    expect(
+      prepare.mock.calls.filter(([sql]) =>
+        sql.startsWith("SELECT data FROM pdpp_records"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      prepare.mock.calls.filter(
+        ([sql]) => sql === "SELECT value FROM pdpp_write_clock WHERE id = 1",
+      ),
+    ).toHaveLength(1);
+    expect(
+      pragma.mock.calls.filter(([sql]) => sql === "shrink_memory"),
+    ).toHaveLength(0);
+    expect(
+      prepare.mock.calls.filter(([sql]) => sql === "PRAGMA shrink_memory"),
+    ).toHaveLength(1);
+    await access.close();
+    expect(f.db.open).toBe(true);
+  } finally {
+    prepare.mockRestore();
+    pragma.mockRestore();
+  }
+});
+it("seeks past the previous key while hashing a native revision", async () => {
+  const f = await fixture();
+  const prepare = vi.spyOn(f.db, "prepare");
+  try {
+    const access = await openLegacyAccess(f.options);
+    const sql = prepare.mock.calls
+      .map(([sql]) => sql)
+      .filter((sql) =>
+        sql.includes("length(CAST(data AS BLOB)) AS bytes FROM pdpp_records"),
+      )
+      .at(-1)!;
+    const plan = f.db
+      .prepare("EXPLAIN QUERY PLAN " + sql)
+      .all(...Array(sql.match(/\?/g)?.length ?? 0).fill(null)) as {
+      detail: string;
+    }[];
+    expect(
+      plan.some((row) =>
+        /SEARCH pdpp_records.+instance.+stream.+record_key/.test(row.detail),
+      ),
+    ).toBe(true);
+    await access.close();
+  } finally {
+    prepare.mockRestore();
+  }
+});
+it("rechecks quiescence between native snapshot hash pages", async () => {
+  const f = await fixture();
+  const rows = Array.from({ length: 128 }, (_, i) => ({
+    instance: "instance",
+    stream: "profile",
+    key: `row-${i}`,
+    data: { ...body, id: `row-${i}` },
+    emitted_at: "2026-01-01T00:00:00.000Z",
+  }));
+  expect(
+    f.store.ingestBatch(
+      rows,
+      () => "mutable_state",
+      () => ["id"],
+      { method: "profile-source", generation: 1 },
+    ).accepted,
+  ).toBe(128);
+  await expect(
+    openLegacyAccess({
+      ...f.options,
+      isQuiescent: vi.fn().mockResolvedValueOnce(true).mockResolvedValue(false),
+    }),
+  ).rejects.toThrow("legacy_access_unavailable");
+});

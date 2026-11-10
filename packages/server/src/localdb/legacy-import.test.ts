@@ -412,3 +412,68 @@ it("import-preserves-unrelated-operation-staging", async () => {
   ]);
   expect(await f.db.query("SELECT * FROM import_snapshot")).toEqual([]);
 });
+it("does not retain source bodies in the fingerprint stage", async () => {
+  const f = await fixture();
+  const batch = f.db.batch.bind(f.db);
+  f.db.batch = async (statements) => {
+    for (const statement of statements.filter((s) =>
+      s.sql.startsWith("INSERT OR IGNORE INTO import_snapshot"),
+    ))
+      expect(
+        statement.params?.some(
+          (p) => typeof p === "string" && p.includes('"text"'),
+        ),
+      ).toBe(false);
+    return batch(statements);
+  };
+  expect((await f.run()).kind).toBe("imported");
+});
+
+it.each([
+  [
+    "changed",
+    [
+      { id: "a", text: "changed" },
+      { id: "b", text: "two" },
+    ],
+  ],
+  ["missing", [{ id: "a", text: "one" }]],
+  ["added", [{ id: "a", text: "one" }, { id: "b", text: "two" }, { id: "c" }]],
+] as const)(
+  "import replay rejects %s rows without a receipt",
+  async (_name, replay) => {
+    const f = await fixture();
+    let pass = 0;
+    f.source.records = async function* () {
+      yield* ++pass === 1
+        ? [
+            { id: "a", text: "one" },
+            { id: "b", text: "two" },
+          ]
+        : replay;
+    };
+    expect(await f.run()).toEqual({
+      kind: "refused",
+      reason: "source_changed",
+    });
+    expect(await f.db.query("SELECT * FROM import_ledger")).toEqual([]);
+  },
+);
+it("import replay accepts reordered and repeated identical rows", async () => {
+  const f = await fixture();
+  let pass = 0;
+  const values = [
+    { id: "a", text: "one" },
+    { id: "b", text: "two" },
+  ];
+  f.source.records = async function* () {
+    yield* ++pass === 1 ? values : [values[1]!, values[0]!, values[1]!];
+  };
+  expect(await f.run()).toMatchObject({
+    kind: "imported",
+    receipt: { rows: 2 },
+  });
+  expect(await f.db.query("SELECT count(*) AS n FROM record_changes")).toEqual([
+    { n: 2 },
+  ]);
+});
