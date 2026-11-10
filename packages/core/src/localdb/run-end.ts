@@ -223,7 +223,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           const accepted = decision.kind !== "refused";
           const replace =
             accepted &&
-            !retry &&
+            full &&
             stream.row_count > 0 &&
             decideReplace({
               stream: stream.stream,
