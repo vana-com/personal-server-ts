@@ -2,7 +2,7 @@ import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
 import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { LocalSyncDeps } from "./deps.js";
-import type { SqlStatement } from "./driver.js";
+import type { SqlDriver, SqlStatement } from "./driver.js";
 
 /**
  * E.1: run blobs (at most 32 MiB). `PUT /v1/stream-sync/runs/:runId/blobs/:sha256`
@@ -226,6 +226,10 @@ export function createBlobStore(deps: LocalSyncDeps): BlobStore {
   };
 }
 
+// Remote object keys are immutable. Avoid downloading a 32 MiB object every
+// idle cycle just to test existence; restart safely probes the durable cache.
+const uploadedBlobs = new WeakMap<SqlDriver, Set<string>>();
+
 /** Publish cached run bytes before the head that references them (E.1).
  * Page metadata, then hold one blob at a time; a set of 32 MiB attachments
  * never becomes one SQL result containing all their payloads.
@@ -240,6 +244,8 @@ export async function uploadStreamBlobs(
   },
 ): Promise<void> {
   const store = createBlobStore(deps);
+  let uploaded = uploadedBlobs.get(deps.db);
+  if (!uploaded) uploadedBlobs.set(deps.db, (uploaded = new Set()));
   let after = "";
   for (;;) {
     const rows = await deps.db.query<{ blob_id: string }>(
@@ -251,6 +257,8 @@ export async function uploadStreamBlobs(
       [input.connectionId, input.stream, after],
     );
     for (const row of rows) {
+      const key = `${input.scope}/g${input.generation}-b-${row.blob_id}`;
+      if (uploaded.has(key)) continue;
       const records = await deps.db.query<{ body: string }>(
         `SELECT r.body FROM records r JOIN blob_refs f
         ON f.connection_id=r.connection_id AND f.stream=r.stream AND f.pk_hash=r.pk_hash
@@ -259,14 +267,18 @@ export async function uploadStreamBlobs(
       );
       if (!records.some((record) => namesBlob(record.body, row.blob_id)))
         continue;
-      const key = `${input.scope}/g${input.generation}-b-${row.blob_id}`;
-      if ((await deps.blobs.get(key)) !== null) continue;
+      if ((await deps.blobs.get(key)) !== null) {
+        uploaded.add(key);
+        continue;
+      }
       const value = await store.get(row.blob_id);
-      if (value)
+      if (value) {
         await deps.blobs.put(
           key,
           await deps.keys.encrypt(input.scope, value.bytes),
         );
+        uploaded.add(key);
+      }
     }
     if (rows.length < 100) return;
     after = rows.at(-1)!.blob_id;

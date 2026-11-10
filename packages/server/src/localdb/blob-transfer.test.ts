@@ -18,7 +18,7 @@ afterEach(async () => {
 });
 const owner = `0x${"11".repeat(20)}` as const;
 const id = "pdpp.fixture~";
-async function fixture() {
+async function fixture(late = false) {
   const registry = createMemoryStreamSyncRegistry();
   const blobs = createMemoryStreamSyncBlobs();
   const make = async (deviceId: string) => {
@@ -81,12 +81,14 @@ async function fixture() {
       },
     ],
   });
-  await a.sync.blobs.put({
-    runId: "run",
-    sha256: hash,
-    mimeType: "application/octet-stream",
-    bytes,
-  });
+  if (!late) {
+    await a.sync.blobs.put({
+      runId: "run",
+      sha256: hash,
+      mimeType: "application/octet-stream",
+      bytes,
+    });
+  }
   await a.sync.intake.end("run", {
     outcome: "succeeded",
     coveredStreams: ["media"],
@@ -95,6 +97,19 @@ async function fixture() {
   expect((await a.sync.cycle()).connections.map((c) => c.error)).toEqual([
     null,
   ]);
+  if (late) {
+    await a.sync.blobs.put({
+      runId: "run",
+      sha256: hash,
+      mimeType: "application/octet-stream",
+      bytes,
+    });
+    expect(
+      (await a.sync.cycle()).connections
+        .flatMap((c) => c.published)
+        .map((r) => r.outcome),
+    ).toEqual(["noop"]);
+  }
   await b.sync.apply();
   return { a, b, blobs, bytes, hash, blobId };
 }
@@ -120,4 +135,14 @@ it("applying a delete removes the second device's blob refs and cached bytes", a
   expect(await f.b.db.query("SELECT * FROM blob_refs")).toEqual([]);
   expect(await f.b.db.query("SELECT * FROM blobs")).toEqual([]);
   expect(await f.b.sync.blobs.get(f.hash)).toBeNull();
+});
+
+it("uploads bytes arriving after an unchanged head without republishing its records", async () => {
+  const f = await fixture(true);
+  expect(
+    new Uint8Array((await f.blobs.get(`${id}.media/g1-b-${f.hash}`))!),
+  ).toEqual(f.bytes);
+  expect(new Uint8Array((await f.b.sync.blobs.get(f.hash))!.bytes)).toEqual(
+    f.bytes,
+  );
 });

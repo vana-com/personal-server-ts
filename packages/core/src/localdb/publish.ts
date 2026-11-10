@@ -375,6 +375,13 @@ async function publishStream(
       continue;
     }
 
+    const headGeneration = plan.finalHead?.generation ?? connection.generation;
+    await uploadStreamBlobs(deps, {
+      connectionId,
+      stream,
+      scope,
+      generation: headGeneration,
+    });
     const hasWork =
       changes.length > 0 ||
       plan.replaceBelow !== undefined ||
@@ -383,7 +390,6 @@ async function publishStream(
       return { stream, outcome: sawRefusal ? "refused" : "noop", watermark };
     }
 
-    const headGeneration = plan.finalHead?.generation ?? connection.generation;
     // Seeds publish only into generation 1; otherwise they are purged
     // and the ledger records excluded(seed_skipped).
     if (headGeneration !== 1) {
@@ -408,12 +414,6 @@ async function publishStream(
         ]),
       ].sort();
     }
-    await uploadStreamBlobs(deps, {
-      connectionId,
-      stream,
-      scope,
-      generation: headGeneration,
-    });
     const headExtras = await options?.headExtras?.(stream);
     const encoded =
       changedPrefixes.length === 0
