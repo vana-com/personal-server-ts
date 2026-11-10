@@ -285,6 +285,10 @@ async function applyOne(
           sql: "UPDATE stream_state SET complete=0, head_version=0, head_blob=NULL, head_data_hash=NULL, last_delete_version=? WHERE connection_id=? AND stream=?",
           params: [read.version, id, stream],
         },
+        {
+          sql: "UPDATE connections SET checkpoint=NULL WHERE connection_id=?",
+          params: [id],
+        },
       ]),
     );
     return result(stream, "purged");

@@ -320,3 +320,28 @@ it("a recovered delete intent purges rows before apply reports purged", async ()
   expect(await f.rows()).toEqual([]);
   expect(await f.db.query("SELECT * FROM head_parts")).toEqual([]);
 });
+
+it("a stream tombstone invalidates the connection checkpoint", async () => {
+  const f = await fixture();
+  const h = await f.head("items", [{ id: "remote" }]);
+  await applyConnection(f.deps, f.id);
+  await f.db.batch([
+    {
+      sql: "UPDATE connections SET checkpoint='stale-cursor' WHERE connection_id=?",
+      params: [f.id],
+    },
+  ]);
+  f.reads.set(h.scope, {
+    found: true,
+    version: 2,
+    dataHash: f.hashes.tombstoneData,
+    metadataHash: f.hashes.tombstoneMetadata,
+    deleted: true,
+  });
+  expect(await applyStream(f.deps, f.id, "items")).toMatchObject({
+    outcome: "purged",
+  });
+  expect(await f.db.query("SELECT checkpoint FROM connections")).toEqual([
+    { checkpoint: null },
+  ]);
+});
