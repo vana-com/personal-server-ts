@@ -1,6 +1,7 @@
-import type { ApplyResult } from "./apply.js";
+import { applyConnection, type ApplyResult } from "./apply.js";
+import { bootstrapConnections } from "./bootstrap.js";
 import type { LocalSyncDeps } from "./deps.js";
-import type { PublishResult } from "./publish.js";
+import { publishConnection, type PublishResult } from "./publish.js";
 
 export interface CycleReport {
   readonly connections: readonly {
@@ -20,8 +21,12 @@ export interface CycleReport {
  * connection, then read).
  */
 export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
-  void deps;
-  throw new Error("PS-2: not built");
+  const connections = await bootstrapConnections(deps);
+  return {
+    connections: await Promise.all(
+      connections.map(({ connectionId }) => syncConnection(deps, connectionId)),
+    ),
+  };
 }
 
 /** One connection: apply, then publish. */
@@ -29,7 +34,29 @@ export async function syncConnection(
   deps: LocalSyncDeps,
   connectionId: string,
 ): Promise<CycleReport["connections"][number]> {
-  void deps;
-  void connectionId;
-  throw new Error("PS-2: not built");
+  let applied: readonly ApplyResult[] = [];
+  let published: readonly PublishResult[] = [];
+  let error: string | null = null;
+  try {
+    // A pass includes publish, so it must not join an apply-only operation.
+    await deps.queue.run(connectionId, "publish", async () => {
+      // The queue is not reentrant. Siblings may acquire it themselves; this
+      // pass already owns this connection until both operations have settled.
+      const queuedDeps: LocalSyncDeps = {
+        ...deps,
+        queue: {
+          run(id, kind, operation) {
+            return id === connectionId
+              ? Promise.resolve().then(operation)
+              : deps.queue.run(id, kind, operation);
+          },
+        },
+      };
+      applied = await applyConnection(queuedDeps, connectionId);
+      published = await publishConnection(queuedDeps, connectionId);
+    });
+  } catch (cause) {
+    error = cause instanceof Error ? cause.message : String(cause);
+  }
+  return { connectionId, applied, published, error };
 }
