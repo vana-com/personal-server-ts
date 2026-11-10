@@ -152,6 +152,55 @@ describe("the account-mode record", () => {
     expect(warnings).toHaveLength(1);
   });
 
+  it("never saves a stale Off while the load has failed, and recovers from the reload", async () => {
+    const saves: Array<{ owner: string; generation: number }> = [];
+    const durable = new Map([
+      ["0xabc", { answer: "on" as const, generation: 7, receivedAt: 1 }],
+    ]);
+    let loads = 0;
+    const warnings: string[] = [];
+    const authority = createModeAuthority({
+      store: {
+        load: async () => {
+          loads += 1;
+          if (loads <= 2) throw new Error("unreadable");
+          return durable;
+        },
+        save: async (owner, record) => {
+          saves.push({ owner, generation: record.generation });
+        },
+      },
+      onWarning: (m) => warnings.push(m),
+    });
+    await authority.ready;
+    expect(authority.read(OWNER).kind).toBe("refuse");
+    expect(loads).toBe(1);
+    const first = await authority.submitEvidence({
+      owner: OWNER,
+      state: "off",
+      generation: 6,
+    });
+    expect(first.kind).toBe("refuse");
+    expect(saves).toEqual([]);
+    expect(authority.read(OWNER).kind).toBe("refuse");
+    expect(await authority.commitLegacy(OWNER, () => 1)).toMatchObject({
+      ok: false,
+      decision: { status: 503 },
+    });
+    expect(loads).toBe(2);
+    expect(warnings).toHaveLength(2);
+    // The next evidence retries the load; the stale Off loses to the durable On.
+    const second = await authority.submitEvidence({
+      owner: OWNER,
+      state: "off",
+      generation: 6,
+    });
+    expect(second).toEqual({ kind: "streams" });
+    expect(authority.read(OWNER)).toEqual({ kind: "streams" });
+    expect(saves).toEqual([]);
+    expect(loads).toBe(3);
+  });
+
   it("applyAnswer never lowers an On at the same generation", () => {
     const on = { answer: "on" as const, generation: 0, receivedAt: 1 };
     expect(applyAnswer(on, "off", 0, 2)).toBe(on);
