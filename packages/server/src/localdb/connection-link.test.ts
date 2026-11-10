@@ -9,11 +9,11 @@ import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
 import { pdppRecordsRoutes } from "../routes/pdpp-records.js";
 import { pdppBlobsRoutes } from "../routes/pdpp-blobs.js";
 import { grantBlobStore } from "./grant-blobs.js";
-import { createGrantHistory } from "../../../core/src/localdb/query.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   createLinkedRecordQuery,
+  createGrantHistory,
   openLocalDb,
   type SqlDriver,
   type SqlValue,
@@ -276,7 +276,7 @@ describe("grant reads through database HTTP ports", () => {
       const app = pdppRecordsRoutes({
         store,
         recordQuery: query,
-        recordHistory: historyFor(db),
+        recordHistory: historyFor(db, deleted),
         accountStorageMode: { owner: "owner", read: () => "switched" },
         declarations,
         auth: createFixtureAuthorizationService({
@@ -316,9 +316,84 @@ describe("grant reads through database HTTP ports", () => {
       store.close();
     }
   });
-  const historyFor = (db: SqlDriver) =>
+  it("filters grant resources before paginating records or exposing cursors", async () => {
+    const { db, id, query } = await fixture();
+    for (const key of ["0-hidden", "z-visible"])
+      await run(
+        db,
+        "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,'selected',?,?,2,'run',?,'h')",
+        [id, key, key, JSON.stringify({ id: key })],
+      );
+    const store = createMemoryRecordStore();
+    try {
+      const app = pdppRecordsRoutes({
+        store,
+        recordQuery: query,
+        recordHistory: historyFor(db),
+        accountStorageMode: { owner: "owner", read: () => "switched" },
+        declarations,
+        auth: createFixtureAuthorizationService({
+          token: {
+            active: true,
+            tokenKind: "client",
+            subjectId: "owner",
+            grant: {
+              ...grant,
+              streams: [
+                { ...grant.streams[0]!, resources: ["allowed", "z-visible"] },
+              ],
+            },
+          },
+        }),
+      });
+      const headers = { Authorization: "Bearer token" };
+      const firstResponse = await app.request(
+        "/streams/selected/records?limit=1",
+        { headers },
+      );
+      expect(firstResponse.status).toBe(200);
+      const first = await firstResponse.json();
+      expect(first.data.map((r: { id: string }) => r.id)).toEqual(["allowed"]);
+      expect(first.has_more).toBe(true);
+      expect(typeof first.next_cursor).toBe("string");
+      expect(first.next_cursor).not.toContain("0-hidden");
+      expect(
+        Buffer.from(first.next_cursor, "base64url").toString(),
+      ).not.toContain("0-hidden");
+      const second = await (
+        await app.request(
+          `/streams/selected/records?limit=1&cursor=${encodeURIComponent(first.next_cursor)}`,
+          { headers },
+        )
+      ).json();
+      expect(second.data.map((r: { id: string }) => r.id)).toEqual([
+        "z-visible",
+      ]);
+      expect(second.has_more).toBe(false);
+      expect(second.next_cursor).toBeUndefined();
+      expect(
+        (await app.request("/streams/selected/records/0-hidden", { headers }))
+          .status,
+      ).toBe(404);
+      await run(
+        db,
+        "UPDATE records SET stamp_o=3,body_sha256='replacement' WHERE stream='selected' AND record_key='z-visible'",
+      );
+      const expired = await app.request(
+        `/streams/selected/records?limit=1&cursor=${encodeURIComponent(first.next_cursor)}`,
+        { headers },
+      );
+      expect(expired.status).toBe(410);
+      expect((await expired.json()).error.code).toBe("cursor_expired");
+    } finally {
+      store.close();
+    }
+  });
+  const historyFor = (db: SqlDriver, deleted?: Set<string>) =>
     createGrantHistory(db, (instance, stream) =>
-      instance === "handle-a" && stream === "selected"
+      !deleted?.has(instance) &&
+      instance === "handle-a" &&
+      stream === "selected"
         ? { connector: "fixture", namespace: "" }
         : null,
     );

@@ -244,7 +244,28 @@ describe("PS-2 D.8 local record routes", () => {
       expect(replaceStream).not.toHaveBeenCalled();
 
       const clientHeaders = { Authorization: "Bearer client" };
-      const client = await app.request(path, { headers: clientHeaders });
+      // Grant listing now needs the same frozen-snapshot port production supplies.
+      // The base app deliberately omits it to keep testing unavailable history below.
+      const clientListing = buildApp(tokens, {
+        ...deps,
+        recordHistory: async () => ({
+          data: [
+            {
+              instance: "inst_1",
+              stream: "playlists",
+              recordKey: "a",
+              data: { id: "a", name: "a", private_field: "hidden" },
+              version: 1,
+              emittedAt: new Date(stamp + 1000).toISOString(),
+              deleted: false,
+            },
+          ],
+          hasMore: false,
+        }),
+      }).app;
+      const client = await clientListing.request(path, {
+        headers: clientHeaders,
+      });
       expect(client.status).toBe(200);
       expect(Object.keys((await client.json()).data[0].data).sort()).toEqual([
         "id",

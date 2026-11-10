@@ -217,12 +217,12 @@ type RouteReadStore = Omit<PdppReplicaReadStore, "listStreamCompletions">;
 export interface PdppRecordsRouteDeps {
   /** The same owner-bound mode used by the legacy-write seal. */
   accountStorageMode?: OwnedAccountStorageMode;
-  /** Owner/network local database. Connection ids are the PDPP instance ids. */
+  /** Host-linked database query; callers pass logical PDPP instance ids. */
   recordQuery?: RecordQuery;
-  /** Database history only. Compare the authorized projection at BOTH frozen
-   * horizons, apply isVisible to both, preserve erasure/cursor expiry, then
-   * return unprojected rows. Never implement this port with current records
-   * or a legacy store: doing so reveals changes outside the grant. */
+  /** Query-backed frozen snapshots for grant listing and changes. Filter the
+   * authorized projection at both horizons, return unprojected rows, and expire
+   * when current records cannot answer exactly. No legacy or current-only
+   * approximation may substitute for an unavailable historical body. */
   recordHistory?: (
     stream: string,
     options: ChangesSinceOptions,
@@ -2324,6 +2324,42 @@ async function localRecordPage(
       hasMore,
       nextCursor: hasMore ? String(last) : null,
       nextChangesSince: String(last),
+    };
+  }
+
+  if (!owner) {
+    if (!history)
+      throw new PdppError(
+        "STREAM_HISTORY_UNAVAILABLE",
+        "Grant-safe stream snapshots are unavailable",
+      );
+    // Reuse the query module's frozen, visibility-filtered initial snapshot.
+    // Hidden identities never consume a page or escape in a list cursor.
+    const page = await history(stream, {
+      purpose: "listing",
+      instanceIds: instances,
+      cursor: input.cursor,
+      limit: input.limit,
+      fields: eligibilityFields,
+      isVisible: (row) =>
+        visible({
+          instance: row.instance,
+          recordKey: row.recordKey,
+          data: row.data,
+          emittedAt: row.emittedAt,
+          deleted: false,
+        }),
+    });
+    return {
+      data: page.data.map((row) => ({
+        instance: row.instance,
+        recordKey: row.recordKey,
+        data: row.deleted ? {} : row.data,
+        emittedAt: row.emittedAt,
+        deleted: row.deleted,
+      })),
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor ?? null,
     };
   }
 

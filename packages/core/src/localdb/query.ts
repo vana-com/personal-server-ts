@@ -215,14 +215,22 @@ export function createGrantHistory(db: SqlDriver, link: ConnectionLink) {
     const targets: { instance: string; id: string; generation: number }[] = [];
     for (const instance of instances) {
       const resolved = link(instance, stream);
-      if (!resolved) throw new CursorExpiredError();
+      if (!resolved) {
+        if (options.purpose === "listing" && !options.cursor)
+          return { data: [], hasMore: false };
+        throw new CursorExpiredError();
+      }
       const id = controlScope(resolved.connector, resolved.namespace);
       const [row] = await db.query<{ generation: number }>(
         `SELECT generation FROM connections WHERE connection_id=? AND control_state='active'
         AND NOT EXISTS (SELECT 1 FROM delete_intents WHERE connector=connections.connector)`,
         [id],
       );
-      if (!row) throw new CursorExpiredError();
+      if (!row) {
+        if (options.purpose === "listing" && !options.cursor)
+          return { data: [], hasMore: false };
+        throw new CursorExpiredError();
+      }
       targets.push({ instance, id, generation: row.generation });
     }
     const [meta] = await db.query<{
@@ -235,6 +243,7 @@ export function createGrantHistory(db: SqlDriver, link: ConnectionLink) {
       stream,
       targets,
       options.fields?.slice().sort() ?? null,
+      options.purpose ?? "changes",
     ]);
     const clock = async () => {
       const [row] = await db.query<{

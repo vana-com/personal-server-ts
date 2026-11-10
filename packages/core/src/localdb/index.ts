@@ -44,6 +44,7 @@ export {
 export { createBlobStore, type BlobStore } from "./blobs.js";
 export {
   createRecordQuery,
+  createGrantHistory,
   type ChangePage,
   type RecordPage,
   type RecordQuery,
