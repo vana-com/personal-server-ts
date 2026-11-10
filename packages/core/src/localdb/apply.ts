@@ -40,7 +40,6 @@ type Connection = {
   connector: string;
   ns: string;
   generation: number;
-  control_version: number;
 };
 type State = {
   primary_key: string;
@@ -101,7 +100,7 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
         },
       };
       const [connection] = await deps.db.query<Connection>(
-        "SELECT connector, ns, generation, control_version FROM connections WHERE connection_id = ?",
+        "SELECT connector, ns, generation FROM connections WHERE connection_id = ?",
         [id],
       );
       if (!connection) return [...flight.streams].map((s) => result(s, "gone"));
@@ -113,16 +112,21 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
           )
         ).length
       ) {
-        await purgeConnection(locked, id, {
-          controlVersion: connection.control_version,
-        });
+        // Only the pinned delete owner may purge this intent. Another device
+        // can have reconnected after its pins were captured.
+        await deps.db.batch([
+          {
+            sql: "UPDATE connections SET control_state='deleted',checkpoint=NULL WHERE connection_id=?",
+            params: [id],
+          },
+        ]);
         if (flight.all)
           for (const row of await deps.db.query<{ stream: string }>(
             "SELECT stream FROM stream_state WHERE connection_id=?",
             [id],
           ))
             flight.streams.add(row.stream);
-        return [...flight.streams].map((s) => result(s, "purged"));
+        return [...flight.streams].map((s) => result(s, "gone"));
       }
       const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
       const hashes = await controlHashes(keccak, keyCheck);
