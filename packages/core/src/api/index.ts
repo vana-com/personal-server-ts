@@ -2623,36 +2623,43 @@ export async function handlePersonalServerDataRequest(
           : /^\d{1,3}$/.test(daysRaw)
             ? Number(daysRaw)
             : Number.NaN;
-      if (mode !== "switched" && mode !== "unswitched") {
-        return accountModeUnknownResponse();
-      }
       if (!Number.isInteger(days) || days < 1 || days > 31) {
+        if (mode === "unswitched")
+          return contractErrorResponse({
+            ok: false,
+            status: 400,
+            body: {
+              error: "INVALID_QUERY",
+              message: "days must be an integer between 1 and 31",
+            },
+          });
         return errorResponse(
           400,
           "invalid_request",
           "days must be an integer from 1 to 31",
         );
       }
-      if (mode === "switched") {
-        if (!deps.history) {
-          return errorResponse(
-            503,
-            "STREAM_SYNC_UNAVAILABLE",
-            "Local history is not available on this server.",
-          );
-        }
-        return jsonResponse(await deps.history.additions({ timezone, days }));
+      if (mode === "unswitched") {
+        // Preserve the legacy query error contract before any storage access.
+        const result = await summarizeDataAdditionsContract({
+          additions: deps.additions,
+          storage: deps.storage,
+          isVisible: discoveryVisibility(deps),
+          timezone,
+          days,
+          now: (deps.now ?? (() => new Date()))(),
+        });
+        if ("ok" in result) return contractErrorResponse(result);
+        return jsonResponse(result);
       }
-      const result = await summarizeDataAdditionsContract({
-        additions: deps.additions,
-        storage: deps.storage,
-        isVisible: discoveryVisibility(deps),
-        timezone,
-        days,
-        now: (deps.now ?? (() => new Date()))(),
-      });
-      if ("ok" in result) return contractErrorResponse(result);
-      return jsonResponse(result);
+      if (!deps.history) {
+        return errorResponse(
+          503,
+          "STREAM_SYNC_UNAVAILABLE",
+          "Local history is not available on this server.",
+        );
+      }
+      return jsonResponse(await deps.history.additions({ timezone, days }));
     }
 
     const parts = pathname.split("/").filter(Boolean);

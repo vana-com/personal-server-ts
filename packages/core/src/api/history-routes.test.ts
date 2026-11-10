@@ -168,7 +168,7 @@ describe("history routes", () => {
     }
   });
 
-  it("invalid-additions-days-return-400-invalid-request", async () => {
+  it("invalid-additions-days-preserve-each-mode-error-contract", async () => {
     for (const mode of ["switched", "unswitched"] as const) {
       const { deps, history } = fixture(mode);
       for (const days of [
@@ -185,7 +185,14 @@ describe("history routes", () => {
       ]) {
         const response = await request("/additions?days=" + days, deps);
         expect(response.status).toBe(400);
-        expect((await response.json()).error.errorCode).toBe("invalid_request");
+        const body = await response.json();
+        if (mode === "switched")
+          expect(body.error.errorCode).toBe("invalid_request");
+        else
+          expect(body).toEqual({
+            error: "INVALID_QUERY",
+            message: "days must be an integer between 1 and 31",
+          });
       }
       expect(history.additions).not.toHaveBeenCalled();
       expect(legacy.additions).not.toHaveBeenCalled();
