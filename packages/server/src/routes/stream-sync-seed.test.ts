@@ -98,7 +98,7 @@ describe("stream-sync seed route", () => {
     root = await mkdtemp(join(tmpdir(), "stream-sync-seed-route-"));
     staging = createSeedStaging(createFsStreamSyncFiles(join(root, "seed")));
     status = { targetKnown: false, receipts: {} };
-    writer = { seedStatus: async () => status };
+    writer = { seedStatus: async () => status, importStaged: async () => {} };
     routes = app({ writer, staging });
   });
 

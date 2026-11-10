@@ -2,10 +2,40 @@ import { createLocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   LEGACY_SCOPE_BINDINGS,
   legacyAliasScopes,
+  projectPdppRecordsToLegacyPayload,
 } from "@opendatalabs/personal-server-ts-core/legacy-projection";
-export const aliasScopes = () => LEGACY_SCOPE_BINDINGS.keys();
+import { legacyConnectorKey } from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
+import type { ImportProjectionPort } from "@opendatalabs/personal-server-ts-core/localdb";
 
-/** Server composition supplies aliases explicitly; core has no default catalogue. */
+/** The one host composition site supplies the frozen catalogue to database
+ * listing, read-back and legacy access. It owns no projection algorithms. */
+export const aliasScopes = () => LEGACY_SCOPE_BINDINGS.keys();
+export const importProjection: ImportProjectionPort = {
+  bindings: new Map(
+    [...LEGACY_SCOPE_BINDINGS].map(([name, binding]) => [
+      name,
+      {
+        connector: legacyConnectorKey(binding.pdppSource),
+        streams: binding.pdppStreams,
+        primaryKey: binding.primaryKey,
+        rowOrder: binding.rowOrder,
+      },
+    ]),
+  ),
+  project(name, records, options) {
+    const result = projectPdppRecordsToLegacyPayload(
+      name,
+      [...records],
+      options,
+    );
+    return result.ok &&
+      !result.diagnostics?.length &&
+      !result.projectionOmissions?.length
+      ? result.payload
+      : null;
+  },
+};
+
 export function createServerLocalSync(
   deps: Parameters<typeof createLocalSync>[0],
   options: Omit<

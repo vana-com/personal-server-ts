@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { join } from "node:path";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import {
   DEFAULTS,
   ServerConfigSchema,
@@ -15,13 +14,57 @@ import {
 import { loadConfig, saveConfig } from "../../../server/src/config/loader.js";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
-  const dir = await mkdtemp(join(tmpdir(), "server-config-test-"));
+  const dir = await mkdtemp(join(process.cwd(), ".server-config-test-"));
   try {
     await fn(dir);
   } finally {
     await rm(dir, { recursive: true });
   }
 }
+
+describe("ServerConfigSchema — streamSync.retireLegacy", () => {
+  it("retire-legacy-default-off", () => {
+    expect(DEFAULTS.streamSync.retireLegacy).toBe(false);
+    expect(ServerConfigSchema.parse({ streamSync: {} }).streamSync).toEqual({
+      write: false,
+      read: false,
+      refuseLegacyWrites: false,
+      retireLegacy: false,
+    });
+  });
+
+  it("retire-legacy-explicit-true-only", () => {
+    expect(
+      ServerConfigSchema.parse({ streamSync: { retireLegacy: true } })
+        .streamSync.retireLegacy,
+    ).toBe(true);
+    expect(
+      ServerConfigSchema.parse({ streamSync: { retireLegacy: false } })
+        .streamSync.retireLegacy,
+    ).toBe(false);
+
+    for (const retireLegacy of ["true", "false", "", 1, 0, null, {}, []]) {
+      expect(
+        ServerConfigSchema.safeParse({ streamSync: { retireLegacy } }).success,
+      ).toBe(false);
+    }
+  });
+
+  it("retire-legacy-absent-host-option-off", () => {
+    for (const hostOptions of [
+      {},
+      { streamSync: undefined },
+      { streamSync: { retireLegacy: undefined } },
+      {
+        streamSync: { write: true, read: true, refuseLegacyWrites: true },
+      },
+    ]) {
+      expect(
+        ServerConfigSchema.parse(hostOptions).streamSync.retireLegacy,
+      ).toBe(false);
+    }
+  });
+});
 
 describe("ServerConfigSchema — olderVersionReads", () => {
   it("olderVersionReads is a boolean that defaults to true and accepts false", () => {

@@ -109,6 +109,7 @@ export interface SeedStaging {
     connector: string,
     stream: string,
     body: AsyncIterable<Uint8Array>,
+    validate?: (descriptor: SeedDescriptor) => void | Promise<void>,
   ): Promise<StagedSeed>;
   /** The staged streams of `connector`. */
   staged(connector: string): Promise<Record<string, StagedSeed>>;
@@ -326,7 +327,7 @@ export function createSeedStaging(files: StreamSyncFiles): SeedStaging {
       };
     },
 
-    async stage(connector, stream, body) {
+    async stage(connector, stream, body, validate) {
       checkSeedNames(connector, stream);
       const upload = randomId();
       active.add(upload);
@@ -349,6 +350,7 @@ export function createSeedStaging(files: StreamSyncFiles): SeedStaging {
         for await (const line of lines(body)) {
           if (descriptor === null) {
             descriptor = parseDescriptor(decoder.decode(line));
+            await validate?.(descriptor);
             continue;
           }
           if (line.length === 0) continue;

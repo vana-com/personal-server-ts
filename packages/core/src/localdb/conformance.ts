@@ -12,6 +12,7 @@ import {
   type SqlStatement,
   type WriteOrigin,
 } from "./index.js";
+import { MIGRATIONS } from "./schema.js";
 
 const ID = { owner: "0xAbC", network: "moksha", deviceId: "dev-1" };
 
@@ -92,10 +93,10 @@ export function runDriverConformance(
       );
     });
 
-    it("migrates a new file to version 1 and keeps data on reopen", async () => {
+    it("migrates a new file to the current schema and keeps data on reopen", async () => {
       const { driver, db } = await fresh();
       expect(await db.query("PRAGMA user_version")).toEqual([
-        { user_version: 1 },
+        { user_version: MIGRATIONS.length },
       ]);
       await seedConnection(db);
       await driver.close();
@@ -104,6 +105,71 @@ export function runDriverConformance(
       expect(
         await again.query("SELECT connection_id FROM connections"),
       ).toEqual([{ connection_id: "c1" }]);
+    });
+
+    it("upgrades a version-1 database through migrations 2 and 3 in order", async () => {
+      const driver = await opts.fresh();
+      const steps: {
+        version: number;
+        receiptRevision: boolean;
+        eraseIntents: boolean;
+      }[] = [];
+      const tracked: SqlDriver = {
+        ...driver,
+        async batch(statements) {
+          const result = await driver.batch(statements);
+          if (
+            statements.some(({ sql }) => /^PRAGMA user_version = /.test(sql))
+          ) {
+            const [version] = await driver.query<{ user_version: number }>(
+              "PRAGMA user_version",
+            );
+            const columns = await driver.query(
+              "PRAGMA table_info(import_ledger)",
+            );
+            const journal = await driver.query(
+              "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'legacy_erase_intents'",
+            );
+            steps.push({
+              version: version!.user_version,
+              receiptRevision: columns.some(
+                (column) => column.name === "revision",
+              ),
+              eraseIntents: journal.length === 1,
+            });
+          }
+          return result;
+        },
+      };
+      await tracked.batch([
+        ...MIGRATIONS[0]!.map((sql) => ({ sql })),
+        { sql: "PRAGMA user_version = 1" },
+      ]);
+      await driver.batch([
+        {
+          sql: "INSERT INTO import_ledger VALUES ('fixture', 'c1', 's', 'imported', 1, 'fingerprint', NULL, 1)",
+        },
+      ]);
+      await openLocalDb(tracked, ID);
+      expect(steps).toEqual([
+        { version: 1, receiptRevision: false, eraseIntents: false },
+        { version: 2, receiptRevision: true, eraseIntents: false },
+        { version: 3, receiptRevision: true, eraseIntents: true },
+      ]);
+      expect(
+        await driver.query(
+          "SELECT source, rows, fingerprint, revision, generation, highest_seq FROM import_ledger",
+        ),
+      ).toEqual([
+        {
+          source: "fixture",
+          rows: 1,
+          fingerprint: "fingerprint",
+          revision: null,
+          generation: null,
+          highest_seq: null,
+        },
+      ]);
     });
 
     it("refuses a file written by a newer build", async () => {
