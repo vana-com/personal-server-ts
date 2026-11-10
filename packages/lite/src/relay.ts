@@ -379,24 +379,47 @@ export function startPsLiteRelayClient(
       `relay read event hook failed: ${error instanceof Error ? error.message : String(error)}`,
     );
 
-  // Read events never run on the response path: each is built and handed to
-  // the hook in a later macrotask (after the response is written and the
-  // stream closed), in order, and the hook's result is never awaited.
-  let readDispatch: Promise<void> = Promise.resolve();
-  const dispatchReadEvent = (
-    produce: () => PsLiteReadEvent | Promise<PsLiteReadEvent>,
-  ) => {
+  // Read events never run on the response path. They are queued and one
+  // shared timer drains the whole queue in a later macrotask (after the
+  // response is written and the stream closed). Each event resolves on its
+  // own, so a slow one never holds back the rest, and the hook's result is
+  // never awaited. The queue is capped: throttled timers in a hidden tab must
+  // not let it grow without bound.
+  type ReadEventProducer = () => PsLiteReadEvent | Promise<PsLiteReadEvent>;
+  const readQueue: ReadEventProducer[] = [];
+  let readFlushTimer: ReturnType<typeof setTimeout> | undefined;
+  let droppedReadEvents = 0;
+  const flushReadEvents = () => {
+    readFlushTimer = undefined;
+    const batch = readQueue.splice(0);
     const hook = options.onReadEvent;
-    if (!hook) return;
-    readDispatch = readDispatch
-      .then(() => new Promise<void>((resolve) => setTimeout(resolve, 0)))
-      .then(produce)
-      .then((event) => {
-        void Promise.resolve()
-          .then(() => hook(event))
-          .catch(logHookError);
-      })
-      .catch(logHookError);
+    if (closed || !hook) return;
+    if (droppedReadEvents > 0) {
+      log(`relay read events dropped (queue full): ${droppedReadEvents}`);
+      droppedReadEvents = 0;
+    }
+    for (const produce of batch) {
+      void Promise.resolve()
+        .then(produce)
+        .then((event) => hook(event))
+        .catch(logHookError);
+    }
+  };
+  const dispatchReadEvent = (produce: ReadEventProducer) => {
+    if (closed || !options.onReadEvent) return;
+    if (readQueue.length >= MAX_QUEUED_READ_EVENTS) {
+      readQueue.shift();
+      droppedReadEvents += 1;
+    }
+    readQueue.push(produce);
+    readFlushTimer ??= setTimeout(flushReadEvents, 0);
+  };
+  const stopReadEvents = () => {
+    readQueue.length = 0;
+    if (readFlushTimer !== undefined) {
+      clearTimeout(readFlushTimer);
+      readFlushTimer = undefined;
+    }
   };
 
   const beginRead = (
@@ -437,28 +460,34 @@ export function startPsLiteRelayClient(
     if (appVisibility() === "hidden") tracker.hiddenDuring = true;
     const durationMs = Math.max(0, Date.now() - tracker.startedAt);
     const hiddenDuring = tracker.hiddenDuring;
+    // Keep only what the empty check can use: a body over the cap is never
+    // empty, so a large body is not held while the event waits.
+    const emptyCheckBody =
+      result.body && result.body.length <= EMPTY_CHECK_MAX_BYTES
+        ? result.body
+        : undefined;
+    const { status, contentType, granteeRef: granteeRefPromise } = result;
+    const outcomeOrClassify = result.outcome;
+    const bytesOut = result.bytesOut ?? 0;
+    const gzip = result.gzip ?? false;
     dispatchReadEvent(async () => {
       const outcome =
-        result.outcome === "classify"
-          ? classifyReadOutcome(
-              result.status ?? 0,
-              result.body ?? new Uint8Array(),
-              result.contentType,
-            )
-          : result.outcome;
+        outcomeOrClassify === "classify"
+          ? classifyReadOutcome(status ?? 0, emptyCheckBody, contentType)
+          : outcomeOrClassify;
       const granteeRef = validGranteeRef(
-        result.granteeRef
-          ? await withTimeout(result.granteeRef, GRANTEE_REF_WAIT_MS)
+        granteeRefPromise
+          ? await withTimeout(granteeRefPromise, GRANTEE_REF_WAIT_MS)
           : undefined,
       );
       return {
         type: "ps_read_finished",
         ...tracker.ids,
         ...(granteeRef ? { granteeRef } : {}),
-        ...(result.status !== undefined ? { status: result.status } : {}),
+        ...(status !== undefined ? { status } : {}),
         outcome,
-        bytesOut: result.bytesOut ?? 0,
-        gzip: result.gzip ?? false,
+        bytesOut,
+        gzip,
         durationMs,
         hiddenDuring,
       };
@@ -897,6 +926,7 @@ export function startPsLiteRelayClient(
       const detail = { code: event?.code, reason: event?.reason };
       if (closed) {
         stopVisibilityListener();
+        stopReadEvents();
         emitStatus("closed", detail);
         return;
       }
@@ -906,6 +936,7 @@ export function startPsLiteRelayClient(
         // client steps down for good and lets the host surface the handoff.
         closed = true;
         stopVisibilityListener();
+        stopReadEvents();
         // Cancel any reconnect already scheduled by an earlier drop so a
         // pending timer can't fire connect() after we've stepped down.
         if (reconnectTimer !== undefined) {
@@ -956,6 +987,7 @@ export function startPsLiteRelayClient(
       closed = true;
       stopHeartbeat();
       stopVisibilityListener();
+      stopReadEvents();
       if (reconnectTimer !== undefined) {
         clearTimeout(reconnectTimer);
         reconnectTimer = undefined;
@@ -1083,6 +1115,8 @@ const MAX_SCOPE_LENGTH = 128;
 // Hashing resolves in microseconds; the cap only keeps a stuck promise from
 // holding back later events.
 const GRANTEE_REF_WAIT_MS = 1_000;
+// Read events waiting for the next flush; the oldest are dropped beyond this.
+const MAX_QUEUED_READ_EVENTS = 200;
 
 function validGranteeRef(value: unknown): string | undefined {
   return typeof value === "string" && /^(owner|[0-9a-f]{12})$/.test(value)
@@ -1112,7 +1146,7 @@ const EMPTY_CHECK_MAX_BYTES = 64 * 1024;
 
 function classifyReadOutcome(
   status: number,
-  body: Uint8Array,
+  body: Uint8Array | undefined,
   contentType?: string,
 ): PsLiteReadOutcome {
   if (status === 401 || status === 403) return "denied";
@@ -1120,7 +1154,7 @@ function classifyReadOutcome(
   if (status === 404) return "not_found";
   if (status >= 400) return "error";
   if (status < 200 || status >= 300) return "ok";
-  return isEmptyJsonBody(body, contentType) ? "empty" : "ok";
+  return body && isEmptyJsonBody(body, contentType) ? "empty" : "ok";
 }
 
 function isEmptyJsonBody(body: Uint8Array, contentType?: string): boolean {
