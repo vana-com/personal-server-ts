@@ -302,3 +302,21 @@ describe("P06 database apply", () => {
     expect(await f.rows()).toEqual([]);
   });
 });
+
+it("a recovered delete intent purges rows before apply reports purged", async () => {
+  const f = await fixture();
+  await f.head("items", [{ id: "remote" }]);
+  await applyConnection(f.deps, f.id);
+  await f.insert({ id: "local" }, "local");
+  // Crash boundary: the durable intent landed before its local purge.
+  await f.db.batch([
+    {
+      sql: "INSERT INTO delete_intents VALUES ('fixture-source','delete','{}')",
+    },
+  ]);
+  expect((await applyConnection(f.deps, f.id)).map((r) => r.outcome)).toEqual([
+    "purged",
+  ]);
+  expect(await f.rows()).toEqual([]);
+  expect(await f.db.query("SELECT * FROM head_parts")).toEqual([]);
+});
