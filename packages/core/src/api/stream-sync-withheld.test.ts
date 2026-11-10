@@ -54,6 +54,7 @@ async function setupDeps(
 ) {
   const deps: PersonalServerDataApiDeps = {
     storage,
+    accountStorageMode: { owner: "fixture", read: () => "switched" },
     streamSyncRead: service,
     auth: {
       authorizeOwner: vi.fn(async () => undefined),
@@ -107,7 +108,7 @@ describe("data reads with a withheld local run", () => {
   });
 });
 
-describe("data reads whose answer is the existing body", () => {
+describe("switched incomplete reads refuse legacy fallback", () => {
   /** An incomplete base and a withheld run: no view can be served. */
   async function legacyOnly(seed: number) {
     const f = new Fixture(await testOwnerKey(masterKey(seed)));
@@ -163,19 +164,19 @@ describe("data reads whose answer is the existing body", () => {
 
   it("tells the owner of the withheld run in the header and the body", async () => {
     const read = await get(await legacyOnly(323), false);
-    expect(read.status).toBe(200);
-    expect(read.source).toBe("legacy");
+    expect(read.status).toBe(404);
+    expect(read.source).toBeNull();
     expect(read.withheld).toBe("connector_update_required");
     expect(read.body.withheld).toEqual([
       { runId: "r1", stream: "items", reason: "connector_update_required" },
     ]);
-    expect(read.body.data.records).toEqual([{ id: "stored" }]);
+    expect(read.body.error.errorCode).toBe("STREAM_DATA_NOT_FOUND");
   });
 
   it("tells a grantee nothing", async () => {
     const read = await get(await legacyOnly(324), true);
-    expect(read.status).toBe(200);
-    expect(read.source).toBe("legacy");
+    expect(read.status).toBe(404);
+    expect(read.source).toBeNull();
     expect(read.withheld).toBeNull();
     expect(read.body.withheld).toBeUndefined();
   });

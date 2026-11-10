@@ -1,3 +1,4 @@
+import type * as DataContracts from "../contracts/data.js";
 import { describe, expect, it, vi } from "vitest";
 import { ProtocolError } from "../errors/catalog.js";
 import type { LocalHistory } from "../localdb/history.js";
@@ -13,7 +14,7 @@ const legacy = vi.hoisted(() => ({
 
 // History routing is tested independently of the storage implementations.
 vi.mock("../contracts/data.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../contracts/data.js")>()),
+  ...(await importOriginal<typeof DataContracts>()),
   summarizeDataAdditionsContract: legacy.additions,
   listDataVersionsContract: legacy.versions,
 }));
@@ -89,7 +90,14 @@ function fixture(mode: "switched" | "unswitched" | "unknown") {
         events.push("history-versions");
         return {
           ok: true,
-          value: { scope, versions: [], total: 0, limit, offset, nextCursor: null },
+          value: {
+            scope,
+            versions: [],
+            total: 0,
+            limit,
+            offset,
+            nextCursor: null,
+          },
         };
       },
     ),
@@ -136,7 +144,6 @@ function request(path: string, deps: PersonalServerDataApiDeps) {
 }
 
 describe("history routes", () => {
-
   it("unknown-account-mode-never-falls-through-to-legacy-history", async () => {
     for (const missing of [false, true]) {
       const { deps, history, events } = fixture("unknown");
@@ -145,8 +152,12 @@ describe("history routes", () => {
         events.length = 0;
         const response = await request(path, deps);
         expect(response.status).toBe(503);
-        expect((await response.json()).error.errorCode).toBe("ACCOUNT_MODE_UNKNOWN");
-        expect(events).toEqual([["owner-auth", "versions-auth", "read-auth"][index]]);
+        expect((await response.json()).error.errorCode).toBe(
+          "ACCOUNT_MODE_UNKNOWN",
+        );
+        expect(events).toEqual([
+          ["owner-auth", "versions-auth", "read-auth"][index],
+        ]);
       }
       expect(history.additions).not.toHaveBeenCalled();
       expect(history.versions).not.toHaveBeenCalled();
@@ -160,7 +171,18 @@ describe("history routes", () => {
   it("invalid-additions-days-return-400-invalid-request", async () => {
     for (const mode of ["switched", "unswitched"] as const) {
       const { deps, history } = fixture(mode);
-      for (const days of ["", "0", "-1", "32", "999", "1.5", "1e1", "0x7", "%207", "1000"]) {
+      for (const days of [
+        "",
+        "0",
+        "-1",
+        "32",
+        "999",
+        "1.5",
+        "1e1",
+        "0x7",
+        "%207",
+        "1000",
+      ]) {
         const response = await request("/additions?days=" + days, deps);
         expect(response.status).toBe(400);
         expect((await response.json()).error.errorCode).toBe("invalid_request");
@@ -168,7 +190,9 @@ describe("history routes", () => {
       expect(history.additions).not.toHaveBeenCalled();
       expect(legacy.additions).not.toHaveBeenCalled();
       for (const days of [1, 31]) {
-        expect((await request("/additions?days=" + days, deps)).status).toBe(200);
+        expect((await request("/additions?days=" + days, deps)).status).toBe(
+          200,
+        );
       }
     }
   });
@@ -177,9 +201,16 @@ describe("history routes", () => {
     for (const mode of ["switched", "unswitched"] as const) {
       const { deps, history } = fixture(mode);
       for (const query of [
-        "limit=9007199254740992", "offset=9007199254740992",
-        "cursor=9007199254740992", "limit=1e3", "offset=1.5",
-        "limit=-1", "offset=-1", "limit=0", "limit=", "cursor=0",
+        "limit=9007199254740992",
+        "offset=9007199254740992",
+        "cursor=9007199254740992",
+        "limit=1e3",
+        "offset=1.5",
+        "limit=-1",
+        "offset=-1",
+        "limit=0",
+        "limit=",
+        "cursor=0",
       ]) {
         const response = await request(`/${SCOPE}/versions?${query}`, deps);
         expect(response.status).toBe(400);
@@ -187,25 +218,42 @@ describe("history routes", () => {
       }
       expect(history.versions).not.toHaveBeenCalled();
       expect(legacy.versions).not.toHaveBeenCalled();
-      expect((await request(`/${SCOPE}/versions?limit=9007199254740991`, deps)).status).toBe(200);
+      expect(
+        (await request(`/${SCOPE}/versions?limit=9007199254740991`, deps))
+          .status,
+      ).toBe(200);
       if (mode === "switched") {
         expect(history.versions).toHaveBeenLastCalledWith({
-          scope: SCOPE, limit: 1000, offset: 0,
+          scope: SCOPE,
+          limit: 1000,
+          offset: 0,
         });
-        expect((await request(`/${SCOPE}/versions?offset=1`, deps)).status).toBe(400);
+        expect(
+          (await request(`/${SCOPE}/versions?offset=1`, deps)).status,
+        ).toBe(400);
         await request(`/${SCOPE}/versions?cursor=9007199254740991`, deps);
         expect(history.versions).toHaveBeenLastCalledWith({
-          scope: SCOPE, limit: 20, offset: 0, cursor: Number.MAX_SAFE_INTEGER,
+          scope: SCOPE,
+          limit: 20,
+          offset: 0,
+          cursor: Number.MAX_SAFE_INTEGER,
         });
       } else {
-        expect(legacy.versions).toHaveBeenLastCalledWith(expect.objectContaining({
-          limit: 1000, offset: 0,
-        }));
+        expect(legacy.versions).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            limit: 1000,
+            offset: 0,
+          }),
+        );
         await request(`/${SCOPE}/versions?offset=9007199254740991`, deps);
-        expect(legacy.versions).toHaveBeenLastCalledWith(expect.objectContaining({
-          offset: Number.MAX_SAFE_INTEGER,
-        }));
-        expect((await request(`/${SCOPE}/versions?cursor=5`, deps)).status).toBe(400);
+        expect(legacy.versions).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            offset: Number.MAX_SAFE_INTEGER,
+          }),
+        );
+        expect(
+          (await request(`/${SCOPE}/versions?cursor=5`, deps)).status,
+        ).toBe(400);
       }
     }
   });
@@ -269,11 +317,15 @@ describe("history routes", () => {
 
     await request("/additions?tz=America%2FNew_York&days=007", deps);
     expect(history.additions).toHaveBeenLastCalledWith({
-      timezone: "America/New_York", days: 7,
+      timezone: "America/New_York",
+      days: 7,
     });
     await request(`/${SCOPE}/versions?limit=5&cursor=3`, deps);
     expect(history.versions).toHaveBeenLastCalledWith({
-      scope: SCOPE, limit: 5, offset: 0, cursor: 3,
+      scope: SCOPE,
+      limit: 5,
+      offset: 0,
+      cursor: 3,
     });
     await request(`/${SCOPE}/lineage/4`, deps);
     expect(history.lineage).toHaveBeenLastCalledWith({
@@ -323,7 +375,7 @@ describe("history routes", () => {
       if (index === 1) denied.deps.auth.authorizeScopeVersions = reject;
       if (index === 2) denied.deps.auth.authorizeBuilderRead = reject;
       expect((await request(path, denied.deps)).status).toBe(403);
-      expect(denied.deps.accountMode!.read).not.toHaveBeenCalled();
+      expect(denied.deps.accountMode!.read).toHaveBeenCalledTimes(1);
       expect(denied.history.additions).not.toHaveBeenCalled();
       expect(denied.history.versions).not.toHaveBeenCalled();
       expect(denied.history.lineage).not.toHaveBeenCalled();

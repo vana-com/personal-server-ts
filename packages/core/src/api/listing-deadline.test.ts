@@ -52,6 +52,7 @@ it.each(["hanging", "slow"])(
     });
     now = 100;
     const deps: PersonalServerDataApiDeps = {
+      accountStorageMode: { owner: "fixture", read: () => "unswitched" },
       storage,
       scopeDeletions: tracker,
       auth: {

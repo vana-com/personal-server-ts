@@ -6,9 +6,11 @@ import {
   linesOfParts,
   parseBlobName,
   parseScope,
+  streamScope,
   partBlobName,
   verifyHead,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { logicalStreamScopeParts } from "../stream-sync-read/routing.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlValue } from "./driver.js";
 
@@ -50,11 +52,18 @@ export interface OlderVersions {
   read(
     scope: string,
     select: { readonly fileId?: string; readonly at?: string },
+    selected?: (head: {
+      readonly scope: string;
+      readonly version: number;
+      readonly observedAt: number;
+    }) => void,
   ): Promise<ReadableStream<Uint8Array> | "gone">;
   counts(): OlderVersionCounts;
 }
 
 type VersionRow = {
+  connector: string;
+  ns: string;
   connection_id: string;
   stream: string;
   version: number;
@@ -74,7 +83,7 @@ const versionInfo = (row: VersionRow): VersionInfo => ({
   complete: row.complete === 1,
 });
 
-const currentVersions = `SELECT v.* FROM stream_versions v
+const currentVersions = `SELECT v.*, c.connector, c.ns FROM stream_versions v
   JOIN connections c ON c.connection_id = v.connection_id
   WHERE c.control_state = 'active' AND v.generation = c.generation`;
 const newestFirst = " ORDER BY v.observed_at DESC, v.version DESC";
@@ -109,18 +118,22 @@ export function createOlderVersions(
       return rows.map(versionInfo);
     },
 
-    async read(scope, select) {
+    async read(scope, select, selected) {
       let outcome: keyof OlderVersionCounts = "gone";
       try {
         if (!options.enabled()) {
           outcome = "off";
           return "gone";
         }
-        const name = parseScope(scope);
-        if (name?.kind !== "stream") return "gone";
+        const physical = parseScope(scope);
+        const logical = logicalStreamScopeParts(scope);
+        const name = physical?.kind === "stream" ? physical : logical;
+        if (!name) return "gone";
         // Current reads belong to the resolver, not this history interface.
         if (!select.fileId && !select.at) return "gone";
-        const params: SqlValue[] = [name.connector, name.ns, name.stream];
+        const params: SqlValue[] = [name.connector, name.stream];
+        const namespace = physical?.kind === "stream" ? " AND c.ns = ?" : "";
+        if (physical?.kind === "stream") params.push(physical.ns);
         let selection: string;
         if (select.fileId) {
           selection = " AND v.head_blob = ?";
@@ -134,13 +147,19 @@ export function createOlderVersions(
         }
         const [version] = await deps.db.query<VersionRow>(
           currentVersions +
-            " AND c.connector = ? AND c.ns = ? AND v.stream = ?" +
+            " AND c.connector = ? AND v.stream = ?" +
+            namespace +
             selection +
             newestFirst +
             " LIMIT 1",
           params,
         );
         if (!version) return "gone";
+        const physicalScope = streamScope(
+          version.connector,
+          version.ns,
+          version.stream,
+        );
         const blob = parseBlobName(version.head_blob);
         if (blob?.kind !== "head") return "gone";
         const evict = () =>
@@ -160,16 +179,16 @@ export function createOlderVersions(
           ]);
         try {
           const encrypted = await deps.blobs.get(
-            `${scope}/${version.head_blob}`,
+            `${physicalScope}/${version.head_blob}`,
           );
           if (encrypted === null) throw new MissingVersionBlob();
           const verified = await verifyHead(
             keccak,
-            await deps.keys.decrypt(scope, encrypted),
+            await deps.keys.decrypt(physicalScope, encrypted),
             {
               dataHash: `0x${blob.keccak}`,
               connector: name.connector,
-              ns: name.ns,
+              ns: version.ns,
               stream: name.stream,
               keyCheck: await deriveKeyCheck((message) =>
                 deps.keys.namespaceHmac(message),
@@ -191,10 +210,10 @@ export function createOlderVersions(
           const chunks: Uint8Array[] = [encoder.encode("[")];
           let count = 0;
           for await (const line of linesOfParts(sha, head, async (part) => {
-            const key = `${scope}/${partBlobName(head.generation, part.hash)}`;
+            const key = `${physicalScope}/${partBlobName(head.generation, part.hash)}`;
             const cipher = await deps.blobs.get(key);
             if (cipher === null) throw new MissingVersionBlob();
-            return deps.keys.decrypt(scope, cipher);
+            return deps.keys.decrypt(physicalScope, cipher);
           })) {
             chunks.push(
               encoder.encode(
@@ -226,6 +245,11 @@ export function createOlderVersions(
             },
           });
           outcome = "served";
+          selected?.({
+            scope: physicalScope,
+            version: version.version,
+            observedAt: version.observed_at,
+          });
           return body;
         } catch (error) {
           if (!(error instanceof MissingVersionBlob)) throw error;
