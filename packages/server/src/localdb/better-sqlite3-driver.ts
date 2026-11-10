@@ -15,6 +15,23 @@ const bind = (params: readonly SqlValue[] = []) =>
  */
 export function openBetterSqlite3(path: string): SqlDriver {
   const db = new Database(path);
+  // Recompiling every row's SQL leaves native statement allocations waiting
+  // for V8 collection through long synchronous merge loops. Reuse a bounded,
+  // connection-local set; run/all reset statements and clear their bindings.
+  const statements = new Map<string, Database.Statement>();
+  const prepare = (sql: string) => {
+    let statement = statements.get(sql);
+    if (statement && !statement.busy) {
+      statements.delete(sql);
+      statements.set(sql, statement);
+      return statement;
+    }
+    statement = db.prepare(sql);
+    statements.set(sql, statement);
+    if (statements.size > 64)
+      statements.delete(statements.keys().next().value!);
+    return statement;
+  };
   db.pragma("locking_mode = EXCLUSIVE");
   const { v } = db.prepare("SELECT sqlite_version() AS v").get() as {
     v: string;
@@ -29,7 +46,7 @@ export function openBetterSqlite3(path: string): SqlDriver {
       sql: string,
       params?: readonly SqlValue[],
     ) {
-      const stmt = db.prepare(sql);
+      const stmt = prepare(sql);
       if (stmt.reader) return stmt.all(...bind(params)) as R[];
       stmt.run(...bind(params));
       return [];
@@ -38,7 +55,7 @@ export function openBetterSqlite3(path: string): SqlDriver {
       db.exec("BEGIN IMMEDIATE");
       try {
         const changes = statements.map((s) => {
-          const stmt = db.prepare(s.sql);
+          const stmt = prepare(s.sql);
           return stmt.reader
             ? (stmt.all(...bind(s.params)), 0)
             : stmt.run(...bind(s.params)).changes;
@@ -51,6 +68,7 @@ export function openBetterSqlite3(path: string): SqlDriver {
       }
     },
     async close() {
+      statements.clear();
       db.close();
     },
   };
