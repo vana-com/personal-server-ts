@@ -66,7 +66,25 @@ import { checkRunFence } from "./fence.js";
 import { replaceMayApply } from "./replace.js";
 import { unwriteRefusedRun } from "./unwrite.js";
 
+/** Confirmed publication of one stream in a connector namespace. */
+export interface PublicationReceipt {
+  readonly connectionId: string;
+  readonly connector: string;
+  readonly ns: string;
+  readonly stream: string;
+  readonly head: {
+    readonly version: number;
+    readonly generation: number;
+    readonly dataHash: string;
+  };
+  /** Local record-change sequence included, scoped to this database. */
+  readonly watermark: number;
+  /** Accepted ended runs included in this stream's publication plan. */
+  readonly runIds: readonly string[];
+}
+
 export interface PublishResult {
+  readonly publication?: PublicationReceipt;
   readonly stream: string;
   readonly outcome:
     | "published"
@@ -495,7 +513,26 @@ async function publishStream(
         profile: head.profile,
         isNewVersion: false,
       });
-      return { stream, outcome: sawRefusal ? "refused" : "noop", watermark };
+      return {
+        stream,
+        outcome: sawRefusal ? "refused" : "noop",
+        watermark,
+        ...(watermark > local.publish_watermark && {
+          publication: {
+            connectionId,
+            connector: connection.connector,
+            ns: connection.ns,
+            stream,
+            head: {
+              version: registryVersion,
+              generation: headGeneration,
+              dataHash,
+            },
+            watermark,
+            runIds: plan.steps.map((step) => step.runId),
+          },
+        }),
+      };
     }
 
     const encrypted = await deps.keys.encrypt(scope, headBytes);
@@ -564,7 +601,20 @@ async function publishStream(
       profile: head.profile,
       isNewVersion: true,
     });
-    return { stream, outcome: "published", watermark };
+    return {
+      stream,
+      outcome: "published",
+      watermark,
+      publication: {
+        connectionId,
+        connector: connection.connector,
+        ns: connection.ns,
+        stream,
+        head: { version: newVersion, generation: headGeneration, dataHash },
+        watermark: watermark ?? 0,
+        runIds: plan.steps.map((step) => step.runId),
+      },
+    };
   }
 
   return { stream, outcome: "backoff", watermark };
