@@ -89,3 +89,9 @@ export {
   createLinkedRecordQuery,
   type ConnectionLink,
 } from "./connection-link.js";
+// PS-3 interface-only ports (F.2-F.5). Existing exports are unchanged.
+export type * from "./legacy-import-types.js";
+export * from "./import-ledger.js";
+export * from "./legacy-import.js";
+export * from "./import-readback.js";
+export * from "./legacy-retire.js";
