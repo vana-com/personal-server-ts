@@ -6,3 +6,4 @@ export * from "./scope-routing.js";
 export * from "./intake.js";
 export * from "./artifacts.js";
 export * from "./memory-registry.js";
+export * from "./seed-staging.js";

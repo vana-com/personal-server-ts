@@ -101,3 +101,5 @@ export * from "./import-readback.js";
 export * from "./legacy-retire.js";
 
 export * from "./import-fingerprint.js";
+
+export * from "./seed.js";

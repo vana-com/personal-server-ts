@@ -1,3 +1,4 @@
+import { createPsLiteSeedStaging } from "./seed-staging.js";
 import {
   LEGACY_SCOPE_BINDINGS,
   legacyAliasScopes,
@@ -10,6 +11,10 @@ import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import {
   connectionQueue,
   createLocalSync,
+  createLocalSeed,
+  createSeedIntake,
+  type LocalSyncDeps,
+  type SeedIntake,
   type LocalSync,
   type SqlDriver,
 } from "@opendatalabs/personal-server-ts-core/localdb";
@@ -143,7 +148,8 @@ export interface PsLiteSyncOptions {
    */
   streamSyncDeclaredStreams: (connector: string) => readonly string[];
   /**
-   * The manifest documents the host retains, read at delete time. A connection
+   * Verified manifests retained for seed-descriptor admission and deletion.
+   * Seed profiles and primary keys must match one of these documents. A connection
    * delete also fences the streams these declare, so a host that passes no
    * `streamSyncDeclaredStreams` names for a connector with rows still deletes
    * it. Default: none.
@@ -392,6 +398,7 @@ export async function createPsLiteSyncManager(
   closeStreamSync(): Promise<void>;
   /** In-process database intake, admitted only after Account says On. */
   streamSyncIntake: RunIntake | null;
+  streamSyncSeed: SeedIntake | null;
   streamSyncRead?: StreamSyncReadPort;
   getLocalSync(): Promise<LocalSync>;
 }> {
@@ -552,6 +559,7 @@ export async function createPsLiteSyncManager(
   };
   let localDb: SqlDriver | null = null;
   let localSync: LocalSync | null = null;
+  let localSyncDeps: LocalSyncDeps | null = null;
   async function closeDatabase() {
     if (localSync) await localSync.close();
     else await localDb?.close();
@@ -569,40 +577,38 @@ export async function createPsLiteSyncManager(
         deviceId: options.localDbDeviceId ?? options.serverAccount.address,
       });
       if (localDb) {
-        localSync = createLocalSync(
-          {
-            db: localDb,
-            queue: connectionQueue(),
-            ownerAddress: serverOwner.toLowerCase() as `0x${string}`,
-            registry:
-              options.streamSyncRegistry ??
-              createGatewayStreamSyncRegistry({
-                gatewayUrl: options.config.gateway.url,
-                ownerAddress: serverOwner,
-              }),
-            blobs:
-              options.streamSyncBlobs ??
-              createStorageStreamSyncBlobs(storageAdapter),
-            keys: createStreamSyncKeyPorts(options.ownerSignature),
-            signer,
-            logger,
-            now: Date.now,
-            newOp: () => globalThis.crypto.randomUUID(),
-            partTargetBytes: LITE_PART_TARGET_BYTES,
-          },
-          {
-            aliasScopes: () => LEGACY_SCOPE_BINDINGS.keys(),
-            aliasTargets: legacyAliasScopes,
-            resolveArtifact: options.streamSyncDeclarations ?? (() => null),
-            declaredStreams: options.streamSyncDeclaredStreams,
-            retainedManifests: options.streamSyncRetainedManifests,
-            eraseLegacy: (connector) =>
-              eraseLegacyScopesOf(connector, options.storage),
-            olderVersionReads:
-              options.olderVersionReads ??
-              (() => options.config.olderVersionReads),
-          },
-        );
+        localSyncDeps = {
+          db: localDb,
+          queue: connectionQueue(),
+          ownerAddress: serverOwner.toLowerCase() as `0x${string}`,
+          registry:
+            options.streamSyncRegistry ??
+            createGatewayStreamSyncRegistry({
+              gatewayUrl: options.config.gateway.url,
+              ownerAddress: serverOwner,
+            }),
+          blobs:
+            options.streamSyncBlobs ??
+            createStorageStreamSyncBlobs(storageAdapter),
+          keys: createStreamSyncKeyPorts(options.ownerSignature),
+          signer,
+          logger,
+          now: Date.now,
+          newOp: () => globalThis.crypto.randomUUID(),
+          partTargetBytes: LITE_PART_TARGET_BYTES,
+        };
+        localSync = createLocalSync(localSyncDeps, {
+          aliasScopes: () => LEGACY_SCOPE_BINDINGS.keys(),
+          aliasTargets: legacyAliasScopes,
+          resolveArtifact: options.streamSyncDeclarations ?? (() => null),
+          declaredStreams: options.streamSyncDeclaredStreams,
+          retainedManifests: options.streamSyncRetainedManifests,
+          eraseLegacy: (connector) =>
+            eraseLegacyScopesOf(connector, options.storage),
+          olderVersionReads:
+            options.olderVersionReads ??
+            (() => options.config.olderVersionReads),
+        });
       }
       return localSync;
     }
@@ -644,6 +650,20 @@ export async function createPsLiteSyncManager(
       return sync;
     }
     if (mode.read() === "switched") await openDatabase();
+    const streamSyncSeed = createSeedIntake(
+      createLocalSeed({
+        getDeps: async () => {
+          await getLocalSync();
+          return localSyncDeps!;
+        },
+        manifests: options.streamSyncRetainedManifests ?? (() => []),
+        staging: createPsLiteSeedStaging(
+          options.stateStore,
+          serverOwner,
+          streamSyncNet,
+        ),
+      }),
+    );
     const streamSyncIntake: RunIntake = {
       begin: async (...args) => (await getLocalSync()).intake.begin(...args),
       batch: async (...args) => (await getLocalSync()).intake.batch(...args),
@@ -732,6 +752,7 @@ export async function createPsLiteSyncManager(
         await closeDatabase();
       },
       streamSyncIntake,
+      streamSyncSeed,
       streamSyncRead: {
         resolve: async (input) =>
           (await getLocalSync()).resolver.resolve(input),

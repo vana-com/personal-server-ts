@@ -1,6 +1,9 @@
 import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
 import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
-import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
+import type {
+  LocalSync,
+  SeedIntake,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
 import { resolveLiteReplication } from "./replication-door.js";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
@@ -207,6 +210,7 @@ export interface IndexedDbPsLiteRuntime {
    * The database run intake for host code; admission follows Account mode.
    */
   streamSyncIntake: RunIntake | null;
+  streamSyncSeed: SeedIntake | null;
   /** The compute layer; hosts call `scheduler.stop()` on teardown. */
   derivatives: PsLiteRuntimeOptions["derivatives"];
   /** This boot's replication door, from `resolveLiteReplication`. */
@@ -350,6 +354,7 @@ export async function createIndexedDbPsLiteRuntime(
   let additions = options.additions;
   let streamSyncRead = options.streamSyncRead;
   let streamSyncIntake: RunIntake | null = null;
+  let streamSyncSeed: SeedIntake | null = null;
   let syncRuntime:
     Awaited<ReturnType<typeof createPsLiteSyncManager>> | undefined;
   let closeStreamSync = async () => {};
@@ -433,6 +438,7 @@ export async function createIndexedDbPsLiteRuntime(
     closeStreamSync = sync.closeStreamSync;
     streamSyncRead = sync.streamSyncRead;
     streamSyncIntake = sync.streamSyncIntake;
+    streamSyncSeed = sync.streamSyncSeed;
   }
   const replicationHost = options.replicaHost
     ? await createLiteReplication({
@@ -532,6 +538,7 @@ export async function createIndexedDbPsLiteRuntime(
     scopeDeletions,
     streamSyncRead,
     localSync: syncRuntime?.getLocalSync,
+    streamSyncSeed,
     history: syncRuntime
       ? {
           additions: async (input) =>
@@ -586,6 +593,7 @@ export async function createIndexedDbPsLiteRuntime(
     getLocalSync: syncRuntime?.getLocalSync,
     closeStreamSync,
     streamSyncIntake,
+    streamSyncSeed,
     derivatives,
     replication,
     replicationHost,

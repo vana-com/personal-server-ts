@@ -1,3 +1,4 @@
+import type { SeedIntake } from "@opendatalabs/personal-server-ts-core/localdb";
 import type {
   LocalSync,
   LocalHistory,
@@ -166,6 +167,7 @@ export interface PsLiteAuthAdapter extends PersonalServerApiAuthPort {
 
 export interface PsLiteRuntimeOptions {
   localSync?: () => Promise<LocalSync>;
+  streamSyncSeed?: SeedIntake | null;
   history?: LocalHistory;
 
   /**
@@ -330,6 +332,8 @@ interface PsLiteRuntimeStoreCapabilities {
 
 export interface PsLiteRuntime extends RuntimeAvailabilityPort {
   readonly kind: "ps-lite";
+  /** Descriptor-first streamed snapshot intake, admitted by Account mode. */
+  readonly streamSyncSeed?: SeedIntake | null;
   readonly storage: PsLiteStorageAdapter | DataStoragePort;
   activate(): void;
   deactivate(): void;
@@ -1208,6 +1212,7 @@ export function createPsLiteRuntime(
 
   return {
     kind: "ps-lite",
+    streamSyncSeed: options.streamSyncSeed ?? null,
     storage: options.storage,
     activate() {
       active = true;
