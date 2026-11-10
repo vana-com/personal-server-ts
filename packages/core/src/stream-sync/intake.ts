@@ -709,6 +709,12 @@ export class StreamSyncIntake implements RunIntake {
 
 export function createStreamSyncIntake(
   options: StreamSyncIntakeOptions,
-): StreamSyncIntake {
-  return new StreamSyncIntake(options);
+): StreamSyncIntake;
+export function createStreamSyncIntake(options: {
+  readonly intake: RunIntake;
+}): RunIntake;
+export function createStreamSyncIntake(
+  options: StreamSyncIntakeOptions | { readonly intake: RunIntake },
+): RunIntake {
+  return "intake" in options ? options.intake : new StreamSyncIntake(options);
 }
