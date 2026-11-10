@@ -6,7 +6,7 @@ import { syncBeforeBegin } from "./bootstrap.js";
 import { TEMP_TABLES, mergeIncoming, withOrigin } from "./merge.js";
 import {
   stageImportSnapshot,
-  snapshotRows,
+  canonicalImportRow,
   clearImportSnapshot,
   type ImportRow,
 } from "./import-snapshot.js";
@@ -42,7 +42,9 @@ export type LegacyImportResult =
  * registry refresh, and again inside every merge batch: refresh cannot undo
  * a local delete. Never reconnect. Require known generation 1. Merge with
  * origin import, stamp (0,'seed'), first_o NULL, one row per merge batch. Check
- * per-stream delete floor too. Replays/crash retries add no rows or changes.
+ * per-stream delete floor too. Stage sorted digests only, then replay source
+ * rows and check each digest before merging. Missing/extra/changed rows cannot
+ * earn a receipt. Replays/crash retries add no rows or changes.
  * Receipt and last merge commit atomically; highestSeq includes earlier crash
  * batches (conservatively use the stream change high-water mark). Empty,
  * invalid, changed or excluded sources never prove delivery. No frame codec.
@@ -99,9 +101,11 @@ export async function importLegacySource(
         [connectionId, stream],
       );
       let lastRow: ImportRow | null = null;
+      const guard = guardImport(source, op);
+      const merge = mergeIncoming(op, connectionId);
       const mergeBatch = (row: ImportRow): SqlStatement[] =>
         withOrigin("import", [
-          ...guardImport(source, op),
+          ...guard,
           {
             sql: `INSERT INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o) VALUES (?, ?, ?, ?, 0, 'seed', ?, ?, NULL)`,
             params: [
@@ -113,30 +117,38 @@ export async function importLegacySource(
               row.body_sha256,
             ],
           },
-          ...mergeIncoming(op, connectionId),
+          ...merge,
           { sql: "UPDATE write_ctx SET origin = 'local' WHERE id = 1" },
         ]);
-      for await (const row of snapshotRows(deps.db, op)) {
+      for await (const record of source.records()) {
+        const row = await canonicalImportRow(record, source.target.primaryKey);
+        const [expected] = await deps.db.query<{
+          body_sha256: string;
+          seen: number;
+        }>(
+          "SELECT body_sha256, seen FROM import_snapshot WHERE op = ? AND pk_hash = ?",
+          [op, row.pk_hash],
+        );
+        if (!expected || expected.body_sha256 !== row.body_sha256)
+          return { kind: "refused", reason: "source_changed" };
+        if (expected.seen) continue;
         const fence = await importFence(deps, source);
         if (fence) return { kind: "refused", reason: fence };
-        await deps.db.batch(mergeBatch(row));
+        await deps.db.batch([
+          ...mergeBatch(row),
+          {
+            sql: "UPDATE import_snapshot SET seen = 1 WHERE op = ? AND pk_hash = ?",
+            params: [op, row.pk_hash],
+          },
+        ]);
         lastRow = row;
       }
-      const verificationOp = deps.newOp();
-      try {
-        const verified = await stageImportSnapshot(
-          deps.db,
-          source,
-          verificationOp,
-        );
-        if (
-          verified.rows !== fingerprint.rows ||
-          verified.fingerprint !== fingerprint.fingerprint
-        )
-          return { kind: "refused", reason: "source_changed" };
-      } finally {
-        await clearImportSnapshot(deps.db, verificationOp);
-      }
+      const [remaining] = await deps.db.query<{ n: number }>(
+        "SELECT count(*) AS n FROM import_snapshot WHERE op = ? AND seen = 0",
+        [op],
+      );
+      if (remaining!.n !== 0)
+        return { kind: "refused", reason: "source_changed" };
       const fence = await importFence(deps, source);
       if (fence) return { kind: "refused", reason: fence };
       const [high] = await deps.db.query<{ seq: number }>(

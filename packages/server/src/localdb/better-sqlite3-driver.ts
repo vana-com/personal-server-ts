@@ -8,13 +8,12 @@ import type {
 const bind = (params: readonly SqlValue[] = []) =>
   params.map((v) => (v instanceof Uint8Array ? Buffer.from(v) : v));
 
-/**
- * Node and Desktop driver. `batch` is a synchronous BEGIN IMMEDIATE ... COMMIT.
- * The process holds the file exclusively (`locking_mode=EXCLUSIVE`).
- * `path` is a file path, or `:memory:`.
- */
-export function openBetterSqlite3(path: string): SqlDriver {
-  const db = new Database(path);
+/** Shared bounded native-statement owner for local SQL and borrowed legacy
+ * handles. Callers clear the cache when their access lifetime ends. */
+export function createStatementCache(db: Database.Database): {
+  prepare(sql: string): Database.Statement;
+  clear(): void;
+} {
   // Recompiling every row's SQL leaves native statement allocations waiting
   // for V8 collection through long synchronous merge loops. Reuse a bounded,
   // connection-local set; run/all reset statements and clear their bindings.
@@ -32,6 +31,18 @@ export function openBetterSqlite3(path: string): SqlDriver {
       statements.delete(statements.keys().next().value!);
     return statement;
   };
+  return { prepare, clear: () => statements.clear() };
+}
+
+/**
+ * Node and Desktop driver. `batch` is a synchronous BEGIN IMMEDIATE ... COMMIT.
+ * The process holds the file exclusively (`locking_mode=EXCLUSIVE`).
+ * `path` is a file path, or `:memory:`.
+ */
+export function openBetterSqlite3(path: string): SqlDriver {
+  const db = new Database(path);
+  const cache = createStatementCache(db);
+  const { prepare } = cache;
   db.pragma("locking_mode = EXCLUSIVE");
   const { v } = db.prepare("SELECT sqlite_version() AS v").get() as {
     v: string;
@@ -68,7 +79,7 @@ export function openBetterSqlite3(path: string): SqlDriver {
       }
     },
     async close() {
-      statements.clear();
+      cache.clear();
       db.close();
     },
   };

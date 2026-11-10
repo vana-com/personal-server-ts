@@ -71,7 +71,7 @@ export interface MemoryRun<R = unknown> {
 
 const LINE_PREFIX = "MEMORY_ORACLE ";
 const CHILD = fileURLToPath(
-  new URL("./memory-oracle-child.ts", import.meta.url),
+  new URL("./memory-oracle-child.mjs", import.meta.url),
 );
 
 interface ChildReport {
@@ -83,8 +83,9 @@ interface ChildReport {
 function spawnChild(workload: Workload, gc: GcMode): Promise<ChildReport> {
   const heap = workload.heapLimitMiB ?? 2048;
   const args = [
-    "--import",
-    "tsx",
+    // A compiled workload needs no loader realm or TypeScript compiler.
+    // Keep the existing loader for source workloads, including on Node 20.
+    ...(/\.(?:[cm]?ts|tsx)$/.test(workload.module) ? ["--import", "tsx"] : []),
     "--expose-gc",
     `--max-old-space-size=${heap}`,
     CHILD,

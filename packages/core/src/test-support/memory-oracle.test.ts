@@ -5,6 +5,9 @@
  * sampler misses.
  */
 
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { run } from "./memory-oracle.js";
@@ -16,6 +19,23 @@ const MiB = 1024 * 1024;
 const HELD_MiB = 256;
 
 describe("memory-oracle calibration", () => {
+  it("runs compiled JavaScript without a TypeScript loader", async () => {
+    const temporary = join(homedir(), ".tmp");
+    mkdirSync(temporary, { recursive: true });
+    const root = mkdtempSync(join(temporary, "memory-oracle-js-"));
+    try {
+      const module = join(root, "workload.mjs");
+      writeFileSync(
+        module,
+        "export function args() { return process.execArgv; }",
+      );
+      const measured = await run<string[]>({ module, exportName: "args" });
+      expect(measured.result).not.toContain("tsx");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   // The bounded case churns the same total through short-lived buffers, paced.
   // Its peak must stay well below a retained accumulation of that size.
   it("reads a bounded churn well below a retained accumulation", async () => {

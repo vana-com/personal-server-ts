@@ -181,6 +181,10 @@ export async function* createCanonicalImportSource(options: {
             yield record;
           }
           cursor = page.next;
+          // A native reader can resolve every page synchronously. Let host
+          // tasks and collection run before allocating the next decoded page.
+          if (cursor !== null)
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
         } while (cursor !== null);
         await check();
       },

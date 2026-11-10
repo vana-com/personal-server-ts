@@ -55,7 +55,7 @@ export async function queryMemoryWorkload(input: {
   }
 }
 
-if (!process.argv[1]?.endsWith("/memory-oracle-child.ts")) {
+if (!process.argv[1]?.endsWith("/memory-oracle-child.mjs")) {
   const { afterEach, describe, expect, it } = await import("vitest");
   const { openLocalDb } =
     await import("@opendatalabs/personal-server-ts-core/localdb");

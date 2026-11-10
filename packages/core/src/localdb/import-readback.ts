@@ -3,7 +3,7 @@ import { importFingerprint } from "./import-fingerprint.js";
 import { createImportLedger } from "./import-ledger.js";
 import {
   stageImportSnapshot,
-  snapshotRows,
+  snapshotDigests,
   clearImportSnapshot,
   canonicalImportRow,
 } from "./import-snapshot.js";
@@ -58,7 +58,7 @@ export async function readBackLegacyImport(
     let mismatch = false;
     actual = await importFingerprint(
       (async function* () {
-        for await (const expectedRow of snapshotRows(deps.db, op)) {
+        for await (const expectedRow of snapshotDigests(deps.db, op)) {
           const [row] = await deps.db.query<{
             pk_hash: string;
             record_key: string;

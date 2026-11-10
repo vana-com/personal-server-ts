@@ -12,6 +12,7 @@
   "exclude": [
     "src/**/*.test.ts",
     "src/**/*.test-utils.ts",
+    "src/localdb/import-memory.child.ts",
     "src/**/*.workload.ts",
     "src/**/*.harness.ts"
   ],

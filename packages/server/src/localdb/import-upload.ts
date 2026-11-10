@@ -318,8 +318,12 @@ async function fileHash(path: string) {
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const hash = createHash("sha256");
-    for await (const chunk of file.createReadStream({ autoClose: false }))
-      hash.update(chunk);
+    const bytes = Buffer.allocUnsafe(64 * 1024);
+    for (;;) {
+      const { bytesRead } = await file.read(bytes, 0, bytes.length, null);
+      if (!bytesRead) break;
+      hash.update(bytes.subarray(0, bytesRead));
+    }
     return hash.digest("hex");
   } finally {
     await file.close();
