@@ -17,7 +17,8 @@
     "access": "public"
   },
   "files": [
-    "dist"
+    "dist",
+    "dist-test"
   ],
   "exports": {
     "./config": {
@@ -45,8 +46,8 @@
       "import": "./dist/localdb/index.js"
     },
     "./localdb/conformance": {
-      "types": "./dist/localdb/conformance.d.ts",
-      "import": "./dist/localdb/conformance.js"
+      "types": "./dist-test/localdb/conformance.d.ts",
+      "import": "./dist-test/localdb/conformance.js"
     },
     "./logger": {
       "types": "./dist/logger/index.d.ts",
@@ -250,7 +251,7 @@
     }
   },
   "scripts": {
-    "build": "tsc --build"
+    "build": "tsc --build && tsc --build tsconfig.test-support.json"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -264,5 +265,13 @@
     "@noble/ciphers": "1.3.0",
     "@noble/hashes": "1.8.0",
     "@opendatalabs/personal-server-ts-stream-sync": "*"
+  },
+  "peerDependencies": {
+    "vitest": ">=4"
+  },
+  "peerDependenciesMeta": {
+    "vitest": {
+      "optional": true
+    }
   }
 }
