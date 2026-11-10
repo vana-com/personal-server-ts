@@ -142,9 +142,9 @@ export function createRecordQuery(db: SqlDriver): RecordQuery {
         stamp_o: number | null;
       }>(
         `WITH floor AS (
-           SELECT COALESCE(MIN(seq) - 1,
+           SELECT MAX(COALESCE((SELECT change_floor FROM db_meta WHERE id=1),0), COALESCE(MIN(seq) - 1,
              (SELECT seq FROM sqlite_sequence WHERE name = 'record_changes'),
-             0) AS floor FROM record_changes
+             0)) AS floor FROM record_changes
          ), page AS (
            SELECT seq, op, record_key, pk_hash FROM record_changes
            WHERE connection_id = ? AND stream = ? AND seq > ?
@@ -250,7 +250,7 @@ export function createGrantHistory(db: SqlDriver, link: ConnectionLink) {
         seq: number;
         floor: number;
       }>(`SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='record_changes'),0) AS seq,
-        COALESCE((SELECT MIN(seq)-1 FROM record_changes),(SELECT seq FROM sqlite_sequence WHERE name='record_changes'),0) AS floor`);
+        MAX(COALESCE((SELECT change_floor FROM db_meta WHERE id=1),0),COALESCE((SELECT MIN(seq)-1 FROM record_changes),(SELECT seq FROM sqlite_sequence WHERE name='record_changes'),0)) AS floor`);
       return row!;
     };
     const now = await clock();

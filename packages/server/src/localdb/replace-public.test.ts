@@ -48,8 +48,8 @@ async function world() {
         newOp: () => `${deviceId}-${++op}`,
       },
       {
-        resolveArtifact: () => ({
-          connector: "fixture",
+        resolveArtifact: (digest) => ({
+          connector: digest === "other" ? "other" : "fixture",
           version: "1",
           streams: [
             { name: "items", semantics: "mutable_state", primaryKey: ["id"] },
@@ -65,12 +65,16 @@ async function world() {
       async run(
         id: string,
         rows: string[],
-        options: { restricted?: boolean; proven?: boolean } = {},
+        options: {
+          restricted?: boolean;
+          proven?: boolean;
+          connector?: string;
+        } = {},
       ) {
         now++;
         await sync.intake.begin(id, {
-          connector: "fixture",
-          artifactDigest: "fixture",
+          connector: options.connector ?? "fixture",
+          artifactDigest: options.connector ?? "fixture",
           wantFull: true,
           owner: { address: owner, leaseId: null },
           ...(options.restricted
@@ -93,9 +97,9 @@ async function world() {
         });
       },
       async publish() {
-        expect((await sync.cycle()).connections.map((c) => c.error)).toEqual([
-          null,
-        ]);
+        expect(
+          (await sync.cycle()).connections.every((c) => c.error === null),
+        ).toBe(true);
       },
       async keys() {
         return (
@@ -135,4 +139,20 @@ it("a proven full empty run removes stale rows on both devices", async () => {
   await b.sync.apply();
   expect(await b.keys()).toEqual([]);
   expect(await a.keys()).toEqual([]);
+});
+
+it("compaction expires a changes cursor even when an unrelated connection retains older events", async () => {
+  const { a, b } = await world();
+  await b.run("other-seed", ["elsewhere"], { connector: "other" });
+  await b.publish();
+  await a.sync.apply();
+  await a.run("seed", ["old"]);
+  await a.publish();
+  expect(
+    await a.sync.query.changesSince({
+      connectionId,
+      stream: "items",
+      cursor: 0,
+    }),
+  ).toBe("gone");
 });
