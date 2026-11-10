@@ -1,4 +1,3 @@
-import type { OwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
 import { Hono } from "hono";
 import { randomUUID } from "node:crypto";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
@@ -9,16 +8,9 @@ import {
 
 interface InstanceBindingStore {
   getInstanceBinding(instance: string): PdppInstanceBinding;
-  resetInstanceBinding(input: {
-    instance: string;
-    expectedMethod: string | null;
-    expectedGeneration: number;
-    nextMethod: string | null;
-  }): { binding: PdppInstanceBinding; alreadyReset: boolean };
 }
 
 export interface PdppInstanceBindingRouteDeps {
-  accountStorageMode?: OwnedAccountStorageMode;
   store: InstanceBindingStore;
   auth: PdppAuthorizationService;
   ownerSubjectId: string;
@@ -250,92 +242,6 @@ export function pdppInstanceBindingRoutes(
         409,
       );
     return c.json({ status: await deps.stravaTransitionStatus(instance) });
-  });
-
-  app.post("/pdpp/instances/:instance/reset", async (c) => {
-    const owner = await ownerContext(c.req.raw);
-    if ("error" in owner) return owner.error;
-    const instance = c.req.param("instance");
-    if (!canAccessInstance(instance, owner)) {
-      return errorResponse(
-        "authentication_error",
-        "Instance is not owned",
-        401,
-      );
-    }
-    // Handles share one sync account. A global reset needs the owner's
-    // account-wide deletion decision; the legacy per-handle reset cannot do it.
-    const mode = deps.accountStorageMode?.read() ?? "unknown";
-    if (mode === "unknown")
-      return errorResponse(
-        "ACCOUNT_MODE_UNKNOWN",
-        "The account mode is not known yet",
-        503,
-      );
-    if (mode === "switched")
-      return errorResponse(
-        "RESET_NOT_AVAILABLE",
-        "Reset is not available for this connection yet",
-        409,
-      );
-    let body: unknown;
-    try {
-      body = await c.req.json();
-    } catch {
-      return errorResponse("invalid_request", "Reset body must be JSON", 400);
-    }
-    if (!body || typeof body !== "object" || Array.isArray(body)) {
-      return errorResponse(
-        "invalid_request",
-        "Reset body must be an object",
-        400,
-      );
-    }
-    const input = body as Record<string, unknown>;
-    if (
-      !(
-        typeof input.expected_method === "string" ||
-        input.expected_method === null
-      ) ||
-      !Number.isSafeInteger(input.expected_generation) ||
-      typeof input.expected_generation !== "number" ||
-      input.expected_generation < 1 ||
-      !(typeof input.next_method === "string" || input.next_method === null)
-    ) {
-      return errorResponse("invalid_request", "Reset fields are invalid", 400);
-    }
-    // Reject malformed method ids here. Registered connections also enforce
-    // their fixed method in the store; the reset route cannot switch them.
-    if (
-      typeof input.next_method === "string" &&
-      (!input.next_method.trim() ||
-        input.next_method !== input.next_method.trim())
-    ) {
-      return errorResponse(
-        "invalid_request",
-        "next_method must be null or an unpadded, non-empty method id",
-        400,
-      );
-    }
-    try {
-      const result = deps.store.resetInstanceBinding({
-        instance,
-        expectedMethod: input.expected_method as string | null,
-        expectedGeneration: input.expected_generation as number,
-        nextMethod: input.next_method as string | null,
-      });
-      return c.json({
-        method: result.binding.method,
-        generation: result.binding.generation,
-        reset_clock: result.binding.resetClock,
-        ...(result.alreadyReset && { status: "already_reset" }),
-      });
-    } catch (err) {
-      if (err instanceof PdppBindingError) {
-        return errorResponse(err.reason, err.reason, 409);
-      }
-      throw err;
-    }
   });
 
   return app;

@@ -545,13 +545,12 @@ export function createApp(deps: AppDeps): Hono {
   }
 
   if (deps.pdpp) {
-    // Not a reader surface: `empty` is the binding/reset precondition the
+    // Not a reader surface: `empty` is the binding precondition the
     // store itself enforces (no canonical row or history), so it reads the
     // store, never `reads`. A pending or conflict-hidden row does not change it.
     app.route(
       "/",
       pdppInstanceBindingRoutes({
-        accountStorageMode,
         store: deps.pdpp.bindingStore,
         auth: deps.pdpp.auth,
         ownerSubjectId: deps.serverOwner!,

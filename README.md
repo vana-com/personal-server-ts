@@ -118,8 +118,7 @@ All authenticated endpoints use `Authorization: Web3Signed <base64url(json)>.<si
 
 The owner-only `POST /pdpp/instances/:instance/transition-claude-live` accepts
 `{ "expected_generation": N }` for the single registered Claude connection,
-configured as `anthropic` or `anthropic-live`. It is deliberately separate from
-reset: reset still cannot change a registered connection's method.
+configured as `anthropic` or `anthropic-live`. It cannot change an unrelated registered connection's method.
 
 The transition captures currently readable conversations and projects, archives
 the old canonical rows/history/blob claims, and binds `anthropic-live` at N+1 in
@@ -133,7 +132,7 @@ The previous public bodies remain readable while live collection is incomplete.
 Conversations take over only after covering the saved messages in the same
 organization; a later regression refuses instead of resurrecting the old export.
 Saved projects remain available, but the live connector does not refresh them.
-Deletion/reset removes the corresponding saved baseline and archived data. This
+Connection deletion removes the corresponding saved baseline and archived data. This
 is a one-way method transition, not an arbitrary method-switching API. Saved
 provider sessions stay at their existing host-owned credential boundary.
 
@@ -155,7 +154,7 @@ reports `none`, `pending`, `account_mismatch` or `covered`, so a host can tell
 the owner the signed-in account does not match the saved data. After the
 handover, `strava.activities` follows the normal legacy view. The saved
 `strava.coverage_diagnostics` body stays readable and frozen; the browser
-method does not collect diagnostics. Reset or deletion removes the saved bodies
+method does not collect diagnostics. Connection deletion removes the saved bodies
 and archive. The server exports `STRAVA_BROWSER_TRANSITION_CONTRACT`
 (`strava-browser-transition-v1`) for hosts to check before use.
 

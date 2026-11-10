@@ -254,7 +254,7 @@ describe("createApp with an enabled replica receiver", () => {
     ).toEqual([]);
     expect((await h.get("app", `/v1/blobs/${h.blobId}`)).status).toBe(404);
 
-    // `empty` is the binding/reset precondition the store enforces, not
+    // `empty` is the binding precondition the store enforces, not
     // visible existence: a pending-only connection holds no canonical row.
     expect(
       (await h.get("owner", `/pdpp/instances/${instance}/binding`)).body,

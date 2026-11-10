@@ -1137,72 +1137,6 @@ describe("legacy scope view over the real SQLite record store", () => {
     ]);
   });
 
-  it("requires fresh completion after generation replacement before replacing the unchanged head", async () => {
-    connect(store, "conn_a", "oura");
-    replace(store, "conn_a", "activity", ["a1"], {
-      collectedAt: "2026-10-02T00:00:00.000Z",
-    });
-    const projected = await view.readLatest("oura.activity");
-    expect(projected.kind).toBe("canonical");
-    if (projected.kind !== "canonical") return;
-    db.prepare(
-      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
-    ).run(
-      "oura/activity/old.json",
-      "oura.activity",
-      "2026-10-01T00:00:00.000Z",
-      1,
-    );
-    const parityView = createLegacyScopeView({
-      authority: createLegacyScopeAuthority(db),
-      records: store,
-      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
-      readLegacyHead: async () => projected.envelope,
-    });
-
-    expect((await parityView.readLatest("oura.activity")).kind).toBe(
-      "canonical",
-    );
-    store.resetInstanceBinding({
-      instance: "conn_a",
-      expectedMethod: "oura",
-      expectedGeneration: 1,
-      nextMethod: "oura",
-    });
-    expect((await parityView.readLatest("oura.activity")).kind).toBe("refused");
-    expect(parityView.listingFor("oura.activity")).toEqual({ kind: "refused" });
-    replace(store, "conn_a", "activity", ["a1"], {
-      score: 91,
-      generation: 2,
-    });
-    expect((await parityView.readLatest("oura.activity")).kind).toBe("refused");
-    const staleVerdicts = parityView.verdictFor("oura.activity");
-    expect(staleVerdicts).toMatchObject([
-      { instance: "conn_a", generation: 2, verdict: "not_covered" },
-    ]);
-    replace(store, "conn_a", "activity", ["a1"], {
-      score: 91,
-      generation: 2,
-      collectedAt: "2026-10-03T00:00:00.000Z",
-    });
-
-    const fresh = await parityView.readLatest("oura.activity");
-    expect(fresh.kind).toBe("canonical");
-    if (fresh.kind !== "canonical")
-      throw new Error("Expected freshly completed generation");
-    expect(fresh.envelope.data).toMatchObject({
-      days: [{ id: "a1", score: 91 }],
-    });
-    expect(parityView.verdictFor("oura.activity")).toEqual(staleVerdicts);
-    expect(
-      db
-        .prepare(
-          "SELECT generation FROM legacy_scope_takeovers WHERE scope = ? AND instance = ? ORDER BY generation",
-        )
-        .all("oura.activity", "conn_a"),
-    ).toEqual([{ generation: 1 }, { generation: 2 }]);
-  });
-
   it("requires the replacement account to complete its own sync before replacing the old head", async () => {
     connect(store, "conn_a", "oura");
     replace(store, "conn_a", "activity", ["a1"], {
@@ -1752,19 +1686,10 @@ describe("legacy scope view over the real SQLite record store", () => {
     });
   });
 
-  it("keeps a reset or deleted connection's scopes canonical, never back to the file", async () => {
+  it("keeps a deleted connection's scopes canonical, never back to the file", async () => {
     connect(store, "conn_a", "oura");
     replace(store, "conn_a", "activity", ["a1"]);
-    store.resetInstanceBinding({
-      instance: "conn_a",
-      expectedMethod: "oura",
-      expectedGeneration: 1,
-      nextMethod: "oura",
-    });
-    // Reset erased the rows that showed ownership; ownership stays.
     expect(view.ownsScope("oura.activity")).toBe(true);
-    expect((await view.readLatest("oura.activity")).kind).toBe("refused");
-
     store.deleteConnection("conn_a");
     expect(await view.readLatest("oura.activity")).toEqual({
       kind: "refused",
@@ -2529,64 +2454,6 @@ describe("legacy scope view over the real SQLite record store", () => {
     connect(store, "conn_b", "oura");
     expect((await view.readLatest("oura.activity")).kind).toBe("refused");
     expect(view.listingFor("oura.activity")).toEqual({ kind: "refused" });
-  });
-
-  it("keeps legacy reads and listing after a reset before first takeover", async () => {
-    db.prepare(
-      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
-    ).run(
-      "oura/activity/old.json",
-      "oura.activity",
-      "2026-01-01T00:00:00.000Z",
-      12,
-    );
-    connect(store, "conn_a", "oura");
-    store.resetInstanceBinding({
-      instance: "conn_a",
-      expectedMethod: "oura",
-      expectedGeneration: 1,
-      nextMethod: "oura",
-    });
-    expect(await view.readLatest("oura.activity")).toEqual({
-      kind: "file",
-      deletion: "canonical",
-    });
-    expect(view.listingFor("oura.activity")).toEqual({
-      kind: "file",
-      deletion: "canonical",
-    });
-    expect(view.ownsScope("oura.activity")).toBe(true);
-    expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
-      [],
-    );
-  });
-
-  it("refuses legacy fallback after reset has erased a successful takeover", async () => {
-    db.prepare(
-      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
-    ).run(
-      "oura/activity/old.json",
-      "oura.activity",
-      "2026-01-01T00:00:00.000Z",
-      12,
-    );
-    connect(store, "conn_a", "oura");
-    replace(store, "conn_a", "activity", ["a1"]);
-    expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
-    expect(
-      db.prepare("SELECT * FROM legacy_scope_takeovers").all(),
-    ).not.toEqual([]);
-
-    store.resetInstanceBinding({
-      instance: "conn_a",
-      expectedMethod: "oura",
-      expectedGeneration: 1,
-      nextMethod: "oura",
-    });
-
-    expect((await view.readLatest("oura.activity")).kind).toBe("refused");
-    expect(view.listingFor("oura.activity")).toEqual({ kind: "refused" });
-    expect(view.ownsScope("oura.activity")).toBe(true);
   });
 
   it("does not classify an explicitly produced legacy row as an old connector file", async () => {

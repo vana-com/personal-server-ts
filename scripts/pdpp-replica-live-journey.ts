@@ -685,7 +685,7 @@ export async function openReplicaRuntime(init: Init) {
     command: string,
     args: Record<string, unknown> = {},
   ): Promise<T> {
-    if (source && ["put", "blob", "delete", "reset"].includes(command))
+    if (source && ["put", "blob", "delete"].includes(command))
       throw new Error(
         "Real-source runtime refuses synthetic mutation commands",
       );
@@ -759,13 +759,6 @@ export async function openReplicaRuntime(init: Init) {
         new Date().toISOString(),
         "mutable_state",
       );
-    else if (command === "reset")
-      result = store.resetInstanceBinding({
-        instance: "conn",
-        expectedMethod: "export",
-        expectedGeneration: store.getInstanceBinding("conn").generation,
-        nextMethod: "export",
-      });
     else throw new Error("Unknown harness command");
     return result as T;
   }
@@ -1579,57 +1572,14 @@ async function main() {
         "Deletion checkpoint must retain the canonical tombstone",
       );
     }
-    await b.call("reset");
-    const reset = await settle(
-      "reset",
-      (x, y) =>
-        x.generation === 2 &&
-        y.generation === 2 &&
-        Object.keys(x.records).length === 0 &&
-        Object.keys(y.records).length === 0 &&
-        canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
-        y.pending === 0,
-    );
-    await a.call("cycle");
-    await b.call("cycle");
-    const resetA = await a.call<Snapshot>("snapshot");
-    const resetB = await b.call<Snapshot>("snapshot");
-    assert.deepEqual(resetA.records, {});
-    assert.deepEqual(resetB.records, {});
-    assertCanonicalRecordsEqual(
-      resetA.canonicalRecords,
-      resetB.canonicalRecords,
-    );
-    assert.deepEqual(resetA.canonicalRecords, []);
-    assert.deepEqual(resetB.canonicalRecords, []);
-    await a.call("put", { id: "generation2", text: "after reset" });
-    const generation2 = await settle(
-      "generation 2",
-      (x, y) =>
-        x.generation === 2 &&
-        y.generation === 2 &&
-        !!y.records.generation2 &&
-        canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
-        x.pending === 0,
-    );
-    assert.deepEqual(generation2.A.records, generation2.B.records);
-    assertCanonicalRecordsEqual(
-      generation2.A.canonicalRecords,
-      generation2.B.canonicalRecords,
-    );
-    assert.deepEqual(Object.keys(generation2.A.records), ["generation2"]);
     cases.push({
       case: 5,
       status: "passed",
-      resetClaim:
-        "Live canonical view and generation converge; retained transport/history bytes are not erased",
       counterTie: true,
       revisions: contenders.map((op) => op.revision),
       winner: winner.revision,
       conflict,
       deletion,
-      reset,
-      generation2,
     });
     for (const d of devices) {
       const final = await d.call("snapshot");

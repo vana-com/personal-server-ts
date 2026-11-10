@@ -234,7 +234,7 @@ CREATE TABLE IF NOT EXISTS pdpp_blob_bytes (
 );
 `,
   // v4: persist the method generation and generation-scoped blob claims.
-  // Existing instances remain unbound until their owner resets them.
+  // Existing instances begin with an unbound method.
   `
 CREATE TABLE IF NOT EXISTS pdpp_instance_binding (
   instance TEXT PRIMARY KEY,
@@ -743,12 +743,6 @@ export function createSqliteRecordStore(
     instance: string,
     stream: string,
   ): { data: Record<string, unknown>; emittedAt: string }[];
-  resetInstanceBinding(input: {
-    instance: string;
-    expectedMethod: string | null;
-    expectedGeneration: number;
-    nextMethod: string | null;
-  }): { binding: PdppInstanceBinding; alreadyReset: boolean };
   storeBlobBytesForInstance(input: {
     instance: string;
     method: string;
@@ -1417,59 +1411,6 @@ export function createSqliteRecordStore(
       ...toBinding(row),
       empty: !instanceHasRecords(db, instance),
     };
-  }
-
-  function resetInstanceBinding(input: {
-    instance: string;
-    expectedMethod: string | null;
-    expectedGeneration: number;
-    nextMethod: string | null;
-  }): { binding: PdppInstanceBinding; alreadyReset: boolean } {
-    return connectionMutation(input.instance, () => {
-      const current = ensureBinding(db, input.instance);
-      if (current.deleted_at !== null) {
-        throw new PdppBindingError("connection_deleted");
-      }
-      if (input.instance.startsWith("conn_") && current.source_id === null) {
-        throw new PdppBindingError("connection_required");
-      }
-      if (
-        current.method !== input.expectedMethod ||
-        current.generation !== input.expectedGeneration
-      ) {
-        const alreadyReset =
-          current.method === input.nextMethod &&
-          current.generation === input.expectedGeneration + 1 &&
-          !instanceHasRecords(db, input.instance);
-        if (alreadyReset)
-          return { binding: toBinding(current), alreadyReset: true };
-        throw new PdppBindingError("binding_generation_mismatch");
-      }
-
-      // A registered connection has one method for its lifetime. Reset may
-      // erase its data and advance the generation, but it cannot rebind the
-      // connection to another method.
-      if (current.source_id !== null && current.method !== input.nextMethod) {
-        throw new PdppBindingError("connection_conflict");
-      }
-
-      eraseInstanceData(input.instance);
-      const resetClock = (nextWriteSeq.get() as { value: number }).value;
-      db.prepare(
-        "UPDATE pdpp_instance_binding SET method = ?, generation = ?, reset_clock = ? WHERE instance = ?",
-      ).run(
-        input.nextMethod,
-        input.expectedGeneration + 1,
-        resetClock,
-        input.instance,
-      );
-      replica?.captureLifecycle(input.instance, "connection-reset");
-      replica?.notifyVisibility();
-      return {
-        binding: toBinding(ensureBinding(db, input.instance)),
-        alreadyReset: false,
-      };
-    });
   }
 
   function transitionWriteClock(): number {
@@ -2147,8 +2088,8 @@ export function createSqliteRecordStore(
   }
 
   // P10c: a token whose horizon is below the reset_clock of any instance it
-  // reads spans a reset. `null` means the token predates horizons, so any
-  // reset of a read instance expires it.
+  // reads spans a generation change. `null` means the token predates horizons,
+  // so any generation change of a read instance expires it.
   function assertNotResetSince(
     instanceIds: string[],
     horizons: Array<number | null>,
@@ -2741,7 +2682,6 @@ export function createSqliteRecordStore(
       replica ? replica.snapshot(read) : db.transaction(read).deferred(),
     writeTransaction: <T>(write: () => T): T =>
       replica ? replica.exclusive(write) : db.transaction(write).immediate(),
-    resetInstanceBinding,
     storeBlobBytesForInstance,
     replaceStream,
     replaceStreams: (inputs) => {

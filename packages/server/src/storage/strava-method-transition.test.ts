@@ -424,12 +424,6 @@ describe("Strava export-to-browser transition", () => {
       });
     return {
       post: () => send("transition-strava-browser", { expected_generation: 1 }),
-      reset: () =>
-        send("reset", {
-          expected_method: "strava-browser",
-          expected_generation: 2,
-          next_method: "strava-browser",
-        }),
     };
   }
 
@@ -448,17 +442,6 @@ describe("Strava export-to-browser transition", () => {
     expect(await replay.json()).toEqual(await first.json());
     expect(store.stravaTransition(INSTANCE)?.archiveInstance).toBe(archive);
     expect(store.getRecord(archive, "activities", "a")?.data.id).toBe("a");
-  });
-
-  it("clears the transition archive on reset", async () => {
-    seedExport(store, ["a"]);
-    const { post, reset } = routes(create());
-    await post();
-    const archive = store.stravaTransition(INSTANCE)!.archiveInstance;
-
-    expect((await reset()).status).toBe(200);
-    expect(store.stravaTransition(INSTANCE)).toBeNull();
-    expect(store.getRecord(archive, "activities", "a")).toBeUndefined();
   });
 
   it("refuses over the route when saved activities are not readable", async () => {

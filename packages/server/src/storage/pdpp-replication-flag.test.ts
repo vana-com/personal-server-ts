@@ -509,16 +509,6 @@ describe("replication flag on", () => {
     });
     const before = state();
     const mutations: [string, () => unknown][] = [
-      [
-        "resetInstanceBinding",
-        () =>
-          store.resetInstanceBinding({
-            instance: "conn_a",
-            expectedMethod: "collector",
-            expectedGeneration: 1,
-            nextMethod: "collector",
-          }),
-      ],
       ["deleteConnection", () => store.deleteConnection("conn_a")],
       ["registerConnection", () => register(store)],
       [
