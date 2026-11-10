@@ -1,3 +1,10 @@
+import type { LegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
+import { createPersistentPsLiteStorage } from "./storage.js";
+import {
+  createMemoryPsLitePersistence,
+  createMemoryPsLiteStagedFileStore,
+} from "./test-support/memory.js";
+import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import { openBetterSqlite3 } from "../../server/src/localdb/better-sqlite3-driver.js";
 /**
  * Proves `createIndexedDbPsLiteRuntime` composes its identity/config/sync/auth
@@ -93,6 +100,53 @@ function build(bundle: PsLitePersistenceBundle) {
 }
 
 describe("createIndexedDbPsLiteRuntime persistence injection", () => {
+  it("seals host storage with the runtime account mode", async () => {
+    const bundle = memoryBundle();
+    const { storage: _storage, ...hostBundle } = bundle;
+    const factory = vi.fn(async (seal: LegacyWriteSeal) =>
+      createPersistentPsLiteStorage(
+        { kind: "custom" },
+        createMemoryPsLitePersistence(),
+        createMemoryPsLiteStagedFileStore(),
+        seal,
+      ),
+    );
+    const built = await createIndexedDbPsLiteRuntime({
+      ownerAddress,
+      ownerSignature,
+      persistence: hostBundle,
+      storageFactory: factory,
+      streamSyncDeclaredStreams: () => [],
+      gateway: createMockPsLiteGateway(),
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    });
+    expect(factory).toHaveBeenCalledOnce();
+    await built.accountModeAuthority.submitEvidence({
+      owner: ownerAddress,
+      state: "off",
+    });
+    await built.storage.writeEnvelope(
+      createDataFileEnvelope("notes.entries", "2026-01-01T00:00:00.000Z", {
+        entry: 1,
+      }),
+    );
+    await built.accountModeAuthority.submitEvidence({
+      owner: ownerAddress,
+      state: "on",
+    });
+    await expect(
+      built.storage.writeEnvelope(
+        createDataFileEnvelope("notes.entries", "2026-01-02T00:00:00.000Z", {
+          entry: 2,
+        }),
+      ),
+    ).rejects.toThrow();
+    await built.accountModeAuthority.close();
+  });
+
   it("rejects a partial bundle instead of mixing native and IndexedDB stores", async () => {
     await expect(
       createIndexedDbPsLiteRuntime({
