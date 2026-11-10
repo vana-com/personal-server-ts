@@ -118,4 +118,26 @@ END;`,
       copy_key TEXT PRIMARY KEY, descriptor TEXT NOT NULL, at INTEGER NOT NULL
     ) WITHOUT ROWID;`,
   ],
+  [
+    // A connection can compact newer events while another retains older ones.
+    // MIN(seq) alone cannot detect those holes. Retain only the deletion floor.
+    `ALTER TABLE db_meta ADD COLUMN change_floor INTEGER NOT NULL DEFAULT 0`,
+    `UPDATE db_meta SET change_floor=COALESCE((SELECT seq FROM sqlite_sequence WHERE name='record_changes'),0)`,
+    `CREATE TRIGGER record_changes_compacted AFTER DELETE ON record_changes BEGIN
+      UPDATE db_meta SET change_floor=MAX(change_floor,OLD.seq) WHERE id=1;
+    END`,
+  ],
+  [`ALTER TABLE run_streams ADD COLUMN coverage_strategy TEXT`],
+  [
+    `ALTER TABLE run_rows ADD COLUMN op TEXT NOT NULL DEFAULT 'upsert' CHECK(op IN ('upsert','delete'))`,
+    `ALTER TABLE run_streams ADD COLUMN semantics TEXT`,
+    `UPDATE run_streams SET semantics=(SELECT s.semantics FROM stream_state s JOIN runs r ON r.connection_id=s.connection_id WHERE r.run_id=run_streams.run_id AND s.stream=run_streams.stream)`,
+    `ALTER TABLE record_changes ADD COLUMN explicit_delete INTEGER NOT NULL DEFAULT 0`,
+  ],
+  [
+    `ALTER TABLE runs ADD COLUMN begin_control_version INTEGER`,
+    `ALTER TABLE runs ADD COLUMN begin_request TEXT`,
+    `ALTER TABLE runs ADD COLUMN begin_response TEXT`,
+    `ALTER TABLE runs ADD COLUMN end_response TEXT`,
+  ],
 ];

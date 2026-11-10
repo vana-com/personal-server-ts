@@ -302,3 +302,76 @@ describe("P06 database apply", () => {
     expect(await f.rows()).toEqual([]);
   });
 });
+
+it("a pending delete intent stops apply without claiming an authoritative purge", async () => {
+  const f = await fixture();
+  await f.head("items", [{ id: "remote" }]);
+  await applyConnection(f.deps, f.id);
+  await f.insert({ id: "local" }, "local");
+  // Crash boundary: the durable intent landed before its local purge.
+  await f.db.batch([
+    {
+      sql: "INSERT INTO delete_intents VALUES ('fixture-source','delete','{}')",
+    },
+  ]);
+  expect((await applyConnection(f.deps, f.id)).map((r) => r.outcome)).toEqual([
+    "gone",
+  ]);
+  expect((await f.rows()).map((r) => r.record_key)).toEqual([
+    "local",
+    "remote",
+  ]);
+  expect(await f.db.query("SELECT control_state FROM connections")).toEqual([
+    { control_state: "deleted" },
+  ]);
+});
+
+it("a stream tombstone invalidates the connection checkpoint", async () => {
+  const f = await fixture();
+  const h = await f.head("items", [{ id: "remote" }]);
+  await applyConnection(f.deps, f.id);
+  await f.db.batch([
+    {
+      sql: "UPDATE connections SET checkpoint='stale-cursor' WHERE connection_id=?",
+      params: [f.id],
+    },
+  ]);
+  f.reads.set(h.scope, {
+    found: true,
+    version: 2,
+    dataHash: f.hashes.tombstoneData,
+    metadataHash: f.hashes.tombstoneMetadata,
+    deleted: true,
+  });
+  expect(await applyStream(f.deps, f.id, "items")).toMatchObject({
+    outcome: "purged",
+  });
+  expect(await f.db.query("SELECT checkpoint FROM connections")).toEqual([
+    { checkpoint: null },
+  ]);
+});
+
+it("a pending old delete intent cannot purge a reconnected generation", async () => {
+  const f = await fixture();
+  f.setControl(3);
+  await f.head("items", [{ id: "reconnected" }], { generation: 3 });
+  await applyConnection(f.deps, f.id);
+  // The delete planner pinned generation 1 before another device reconnected.
+  // Its intent can land after the new generation was applied locally.
+  await f.db.batch([
+    {
+      sql: "INSERT INTO delete_intents VALUES ('fixture-source','old-delete',?)",
+      params: [
+        JSON.stringify({
+          id: "old-delete",
+          pins: [{ ns: "", version: 1 }],
+          streams: [],
+        }),
+      ],
+    },
+  ]);
+  expect
+    .soft((await applyConnection(f.deps, f.id)).map((r) => r.outcome))
+    .toEqual(["gone"]);
+  expect((await f.rows()).map((r) => r.record_key)).toEqual(["reconnected"]);
+});

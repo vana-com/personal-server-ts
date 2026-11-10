@@ -3243,12 +3243,6 @@ it("account conflict keeps local tombstones, current-generation identity, and in
       .readStore({ reader: "owner" })
       .getRecord("conn_a", "messages", "a"),
   ).toBeUndefined();
-  d.store.resetInstanceBinding({
-    instance: "conn_a",
-    expectedMethod: "collector",
-    expectedGeneration: 1,
-    nextMethod: "collector",
-  });
   d.store.ingestBatch(
     [
       {
@@ -3261,7 +3255,7 @@ it("account conflict keeps local tombstones, current-generation identity, and in
     ],
     () => "mutable_state",
     () => ["id"],
-    { method: "collector", generation: 2 },
+    { method: "collector", generation: 1 },
   );
   const local = d.store.getRecord("conn_a", "messages", "b")!;
   d.db

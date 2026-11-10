@@ -163,8 +163,8 @@ describe("stream-sync run intake route", () => {
     });
     expect(batch.status).toBe(200);
     expect(await batch.json()).toMatchObject({
-      accepted: 1,
-      deletesSkipped: 1,
+      accepted: 2,
+      deletesSkipped: 0,
     });
     const ended = await call("POST", "r1/end", {
       outcome: "succeeded",
@@ -180,6 +180,35 @@ describe("stream-sync run intake route", () => {
         .map((r) => r.outcome),
     ).toEqual(["published"]);
     expect([...(await read(body.connector)).keys()]).toEqual(["a"]);
+  });
+
+  it("replays local end acknowledgements and exposes the retry-basis refusal", async () => {
+    const { sync, call } = await build("route-receipts");
+    const body = beginBody({ expectedControlVersion: 0 });
+    expect((await call("PUT", "receipt", body)).status).toBe(200);
+    await call("POST", "receipt/batches", {
+      batch: 0,
+      records: [{ stream: "items", data: { id: "kept" } }],
+    });
+    const end = {
+      outcome: "succeeded",
+      coveredStreams: ["items"],
+      lastBatch: 0,
+    };
+    const first = await call("POST", "receipt/end", end);
+    expect(first.status).toBe(200);
+    const receipt = await first.json();
+    expect(receipt.result).toBe("queued");
+    await sync.cycle();
+    const replay = await call("PUT", "receipt", body);
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({ status: "ended", receipt });
+    expect(await (await call("POST", "receipt/end", end)).json()).toEqual(
+      receipt,
+    );
+    const stale = await call("PUT", "new-retry", { ...body, connect: true });
+    expect(stale.status).toBe(409);
+    expect((await stale.json()).error).toBe("control_basis_mismatch");
   });
 
   it("answers each error with its contract status and name (§2.6)", async () => {

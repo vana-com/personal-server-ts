@@ -142,7 +142,7 @@ describe("local database bootstrap", () => {
         params: [scope],
       },
       {
-        sql: "INSERT INTO run_rows VALUES ('run', 'items', 'pk', 'key', '{}', 'digest')",
+        sql: "INSERT INTO run_rows(run_id,stream,pk_hash,record_key,body,body_sha256) VALUES ('run', 'items', 'pk', 'key', '{}', 'digest')",
       },
     ]);
     const d = deps(db, registry);

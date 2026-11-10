@@ -90,7 +90,7 @@ export function streamSyncRunsRoutes(deps: StreamSyncRunsRouteDeps): Hono {
               ? { nextBatch: error.nextBatch }
               : {}),
           },
-          error.status as 400 | 409 | 410 | 422,
+          error.status as 400 | 409 | 410 | 422 | 503,
         );
       }
       throw error;

@@ -312,12 +312,10 @@ describe("own-write log (replication enabled)", () => {
   );
 
   it("captures ingest deletes, blob references, and the actual generation", () => {
-    store.resetInstanceBinding({
-      instance: "account-a",
-      expectedMethod: "collector",
-      expectedGeneration: 1,
-      nextMethod: "collector",
-    });
+    // An older database can already contain a later generation.
+    db.prepare(
+      "UPDATE pdpp_instance_binding SET generation=2 WHERE instance='account-a'",
+    ).run();
     const current = { method: "collector", generation: 2 };
     const blob = store.storeBlobBytesForInstance({
       instance: "account-a",
@@ -366,16 +364,10 @@ describe("own-write log (replication enabled)", () => {
     expect(() => db.exec("DELETE FROM pdpp_replica_own_writes")).toThrow(
       "append-only",
     );
-    store.resetInstanceBinding({
-      instance: "account-a",
-      expectedMethod: "collector",
-      expectedGeneration: 1,
-      nextMethod: "collector",
-    });
+    store.deleteConnection("account-a");
     expect(
       db.prepare("SELECT COUNT(*) AS n FROM pdpp_record_changes").get(),
     ).toEqual({ n: 0 });
-    store.deleteConnection("account-a");
     expect(ownWrites(db)).toEqual(before);
   });
 

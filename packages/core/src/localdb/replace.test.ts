@@ -38,7 +38,13 @@ it("pins all 18 historical producer cases and #560 cases 1-5", () => {
 
 describe("decideReplace sourced conformance", () => {
   it.each(fixture.cases)("$id", (c) =>
-    expect(decideReplace(c.input)).toBe(c.replace),
+    expect(
+      decideReplace({
+        ...c.input,
+        coverageStrategy: "full_inventory",
+        semantics: "mutable_state",
+      }),
+    ).toBe(c.replace),
   );
 });
 
@@ -48,6 +54,8 @@ it.each(["failed", "cancelled", "retry_pending"] as const)(
     expect(
       decideReplace({
         stream: "items",
+        coverageStrategy: "full_inventory",
+        semantics: "mutable_state",
         outcome,
         collectionMode: "full_refresh",
         coveredStreams: ["items"],
@@ -60,6 +68,8 @@ it.each(["failed", "cancelled", "retry_pending"] as const)(
 it("requires the same stream in both coverage and this run's proof", () => {
   const input: ReplaceInput = {
     stream: "items",
+    coverageStrategy: "full_inventory",
+    semantics: "mutable_state",
     outcome: "partial",
     collectionMode: "full_refresh",
     coveredStreams: ["items"],

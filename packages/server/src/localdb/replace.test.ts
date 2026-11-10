@@ -56,6 +56,7 @@ async function world(seed = true) {
         streams: ["A", "B"].map((name) => ({
           name,
           primaryKey: ["id"],
+          coverageStrategy: "full_inventory",
           semantics: "mutable_state",
         })),
       }),
@@ -369,14 +370,14 @@ it("an offline unknown basis merges; a later verified basis can replace", async 
   expect(await b.rows("A")).toEqual(["a"]);
 });
 
-it("r5 covered-empty-proven keeps the old image even if the producer lists proof", async () => {
+it("a declared full-inventory empty proof replaces the old image", async () => {
   const { a, b } = await world();
   await a.collect("empty", 5000, { rows: {}, covered: ["A"], proven: ["A"] });
   expect(
     await a.db.query(
       "SELECT replace FROM run_streams WHERE run_id='empty' AND stream='A'",
     ),
-  ).toEqual([{ replace: 0 }]);
+  ).toEqual([{ replace: 1 }]);
   await b.sync.apply();
-  expect(await b.rows("A")).toEqual(["a", "b"]);
+  expect(await b.rows("A")).toEqual([]);
 });

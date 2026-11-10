@@ -107,7 +107,7 @@ export function runDriverConformance(
       ).toEqual([{ connection_id: "c1" }]);
     });
 
-    it("upgrades a version-1 database through migrations 2 and 3 in order", async () => {
+    it("upgrades a version-1 database in order while preserving receipt and erase-intent migrations", async () => {
       const driver = await opts.fresh();
       const steps: {
         version: number;
@@ -155,6 +155,11 @@ export function runDriverConformance(
         { version: 1, receiptRevision: false, eraseIntents: false },
         { version: 2, receiptRevision: true, eraseIntents: false },
         { version: 3, receiptRevision: true, eraseIntents: true },
+        ...MIGRATIONS.slice(3).map((_, index) => ({
+          version: index + 4,
+          receiptRevision: true,
+          eraseIntents: true,
+        })),
       ]);
       expect(
         await driver.query(

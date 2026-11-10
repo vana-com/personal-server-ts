@@ -112,17 +112,6 @@ describe.each([false, true])(
         "CREATE TRIGGER fail BEFORE UPDATE ON pdpp_instance_binding WHEN NEW.deleted_at IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
       ],
       [
-        "resetInstanceBinding",
-        (store: Store) =>
-          store.resetInstanceBinding({
-            instance: "conn_a",
-            expectedMethod: "collector",
-            expectedGeneration: 1,
-            nextMethod: "collector",
-          }),
-        "CREATE TRIGGER fail BEFORE UPDATE ON pdpp_instance_binding WHEN NEW.generation > OLD.generation BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
-      ],
-      [
         "replaceStream",
         (store: Store) =>
           store.replaceStream({

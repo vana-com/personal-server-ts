@@ -1,3 +1,4 @@
+import { readEndReceipt } from "./run-receipts.js";
 import {
   checkpointDecision,
   type StreamRunResult,
@@ -15,7 +16,7 @@ import {
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { checkRunFence } from "./fence.js";
-import { mergeIncoming, withOrigin } from "./merge.js";
+import { deleteRunRecords, mergeIncoming, withOrigin } from "./merge.js";
 import { decideReplace } from "./replace.js";
 
 /**
@@ -50,6 +51,8 @@ type Stream = {
   profile_key: string | null;
   profile_version: string | null;
   full_read: number;
+  coverage_strategy: string | null;
+  semantics: string | null;
   foreign_checkpoint: number;
   seed: "none" | "merged" | "unresolved";
   local_primary_key: string | null;
@@ -81,13 +84,17 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           "SELECT * FROM runs WHERE run_id = ?",
           [runId],
         );
-        if (!run || run.state !== "collecting")
+        if (!run) throw new RunIntakeError("gone");
+        if (run.state !== "collecting") {
+          const receipt = await readEndReceipt(db, runId);
+          if (receipt) return receipt;
           throw new RunIntakeError("gone");
-        const cleanup: SqlStatement[] = [
+        }
+        const cleanup = (receipt: RunEndResponse): SqlStatement[] => [
           { sql: "DELETE FROM run_rows WHERE run_id = ?", params: [runId] },
           {
-            sql: "UPDATE runs SET state = 'ended' WHERE run_id = ?",
-            params: [runId],
+            sql: "UPDATE runs SET state = 'ended',end_response=? WHERE run_id = ?",
+            params: [JSON.stringify(receipt), runId],
           },
         ];
         if (req.outcome === "failed" || req.outcome === "cancelled") {
@@ -96,7 +103,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               sql: "UPDATE run_streams SET decision = 'discarded', reason = ?, replace = 0 WHERE run_id = ?",
               params: [req.outcome, runId],
             },
-            ...cleanup,
+            ...cleanup({ result: "aborted", updateRequired: false }),
           ]);
           return { result: "aborted", updateRequired: false };
         }
@@ -127,7 +134,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               WHERE connection_id = ? AND stream IN (SELECT stream FROM run_streams WHERE run_id = ?)`,
               params: [run.connection_id, runId],
             },
-            ...cleanup,
+            ...cleanup({ result: "discarded", updateRequired: false }),
           ]);
           return { result: "discarded", updateRequired: false };
         }
@@ -143,7 +150,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         if (!connection) throw new RunIntakeError("gone");
         const streams = await db.query<Stream>(
           `SELECT rs.stream, rs.primary_key, rs.profile_key, rs.profile_version,
-                rs.full_read, rs.foreign_checkpoint, rs.seed,
+                rs.full_read, rs.coverage_strategy, rs.semantics, rs.foreign_checkpoint, rs.seed,
                 s.primary_key AS local_primary_key, s.profile_key AS local_profile_key,
                 s.profile_version AS local_profile_version, s.complete,
                 s.head_version, s.head_generation, s.floor_version, s.floor_o, s.floor_r,
@@ -152,6 +159,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
              ON s.connection_id = ? AND s.stream = rs.stream
           WHERE rs.run_id = ? ORDER BY rs.stream`,
           [run.connection_id, runId],
+        );
+        const [before] = await db.query<{ seq: number }>(
+          "SELECT COALESCE(MAX(seq),0) AS seq FROM record_changes",
         );
         const op = deps.newOp();
         const statements: SqlStatement[] = [];
@@ -223,10 +233,11 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           const accepted = decision.kind !== "refused";
           const replace =
             accepted &&
-            !retry &&
-            stream.row_count > 0 &&
+            full &&
             decideReplace({
               stream: stream.stream,
+              coverageStrategy: stream.coverage_strategy,
+              semantics: stream.semantics,
               outcome: req.outcome,
               collectionMode: run.collection_mode,
               coveredStreams: req.coveredStreams,
@@ -250,9 +261,18 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           statements.push({
             sql: `INSERT INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
               SELECT ?, stream, pk_hash, record_key, ?, ?, body, body_sha256, ?
-                FROM run_rows WHERE run_id = ? AND stream = ?`,
+                FROM run_rows WHERE run_id = ? AND stream = ? AND op = 'upsert'`,
             params: [op, run.o, runId, run.o, runId, stream.stream],
           });
+          statements.push(
+            ...deleteRunRecords(
+              run.connection_id,
+              stream.stream,
+              runId,
+              run.o,
+              before!.seq,
+            ),
+          );
           merged ||= stream.row_count > 0;
           const nextVersion =
             stream.floor_version === null ||
@@ -348,9 +368,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             params: [JSON.stringify(candidate), run.connection_id],
           });
         }
-        statements.push(...cleanup);
-        await db.batch(withOrigin("local", statements));
-        return {
+        const response: RunEndResponse = {
           result: merged
             ? "queued"
             : saved
@@ -358,6 +376,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               : "no_checkpoint",
           updateRequired,
         };
+        statements.push(...cleanup(response));
+        await db.batch(withOrigin("local", statements));
+        return response;
       },
     );
   };

@@ -14,8 +14,6 @@ import { streamSyncRunsRoutes } from "./routes/stream-sync-runs.js";
 import { streamSyncReadStatusRoutes } from "./routes/stream-sync-read-status.js";
 import { ownerConnectorsRoutes } from "./routes/owner-connectors.js";
 import { accountModeRoutes } from "./routes/account-mode.js";
-import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
-import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
 import { randomUUID } from "node:crypto";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import { Hono } from "hono";
@@ -501,24 +499,7 @@ export function createApp(deps: AppDeps): Hono {
       : cors(c, next),
   );
 
-  const claudeTransition =
-    deps.pdpp && deps.legacyScopeView && deps.dataStorage
-      ? createClaudeMethodTransition(
-          deps.pdpp.bindingStore,
-          deps.legacyScopeView,
-          deps.dataStorage,
-        )
-      : undefined;
-  const claudeView = claudeTransition?.view ?? deps.legacyScopeView;
-  const stravaTransition =
-    deps.pdpp && claudeView && deps.dataStorage
-      ? createStravaMethodTransition(
-          deps.pdpp.bindingStore,
-          claudeView,
-          deps.dataStorage,
-        )
-      : undefined;
-  const legacyScopeView = stravaTransition?.view ?? claudeView;
+  const legacyScopeView = deps.legacyScopeView;
 
   // Mount health route
   app.route(
@@ -545,22 +526,18 @@ export function createApp(deps: AppDeps): Hono {
   }
 
   if (deps.pdpp) {
-    // Not a reader surface: `empty` is the binding/reset precondition the
+    // Not a reader surface: `empty` is the binding precondition the
     // store itself enforces (no canonical row or history), so it reads the
     // store, never `reads`. A pending or conflict-hidden row does not change it.
     app.route(
       "/",
       pdppInstanceBindingRoutes({
-        accountStorageMode,
         store: deps.pdpp.bindingStore,
         auth: deps.pdpp.auth,
         ownerSubjectId: deps.serverOwner!,
         instancesForSubject: deps.pdpp.instancesForSubject!,
         instancesForSource: deps.pdpp.instancesForSource,
         configuredMethods: deps.pdpp.configuredMethods,
-        transitionClaude: claudeTransition?.transition,
-        transitionStrava: stravaTransition?.transition,
-        stravaTransitionStatus: stravaTransition?.status,
       }),
     );
     app.route(

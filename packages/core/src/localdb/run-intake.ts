@@ -1,3 +1,5 @@
+import { readBeginReceipt } from "./run-receipts.js";
+import { RegistryRefusedError } from "../stream-sync/ports.js";
 import { sha256 } from "@noble/hashes/sha2";
 import { keccak_256 } from "@noble/hashes/sha3";
 import {
@@ -12,7 +14,10 @@ import {
   toHex,
   type JsonValue,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
+import {
+  computeRecordKeyFromData,
+  keyMatchesData,
+} from "../storage/pdpp-records/record-key.js";
 import {
   RunIntakeError,
   type BatchRequest,
@@ -170,6 +175,14 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           (!Number.isFinite(req.observedAt) || req.observedAt < 0)
         )
           throw invalid("invalid observedAt");
+        if (
+          req.expectedControlVersion !== undefined &&
+          (!Number.isSafeInteger(req.expectedControlVersion) ||
+            req.expectedControlVersion < 0)
+        )
+          throw invalid("invalid expectedControlVersion");
+        const receipt = await readBeginReceipt(db, runId, req);
+        if (receipt) return receipt;
         if (declarations.connector !== req.connector)
           throw invalid("connector does not match artifact");
         const seen = new Set<string>();
@@ -233,6 +246,16 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
         )
           throw new RunIntakeError("connection_stopped");
         let synced = await syncBeforeBegin(deps, req.connector);
+        if (req.expectedControlVersion !== undefined) {
+          if (synced.unreachable)
+            throw new RunIntakeError("control_basis_unavailable");
+          if (
+            (synced.connection?.controlVersion ?? 0) !==
+            req.expectedControlVersion
+          )
+            throw new RunIntakeError("control_basis_mismatch");
+        }
+        let admittedControlVersion = synced.connection?.controlVersion ?? 0;
         if (
           synced.connection?.controlState === "deleted" &&
           req.connect === true &&
@@ -250,15 +273,28 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             metadataHash: hashes.activeMetadata,
             expectedVersion: BigInt(version),
           });
-          await deps.registry.post({
-            ownerAddress: deps.ownerAddress,
-            scope: id,
-            dataHash: hashes.activeData,
-            metadataHash: hashes.activeMetadata,
-            expectedVersion: String(version),
-            signature,
-          });
+          try {
+            const posted = await deps.registry.post({
+              ownerAddress: deps.ownerAddress,
+              scope: id,
+              dataHash: hashes.activeData,
+              metadataHash: hashes.activeMetadata,
+              expectedVersion: String(version),
+              signature,
+            });
+            if (posted.kind === "conflict")
+              throw new RunIntakeError("control_basis_mismatch");
+          } catch (error) {
+            if (error instanceof RegistryRefusedError && error.status === 409)
+              throw new RunIntakeError("control_basis_mismatch");
+            throw error;
+          }
+          admittedControlVersion = version;
           synced = await syncBeforeBegin(deps, req.connector);
+          if (synced.unreachable)
+            throw new RunIntakeError("control_basis_unavailable");
+          if (synced.connection?.controlVersion !== admittedControlVersion)
+            throw new RunIntakeError("control_basis_mismatch");
         }
         if (await stopped(id)) throw new RunIntakeError("connection_stopped");
         const [cached] = await db.query<{
@@ -303,16 +339,32 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
         const keyCheck = await deriveKeyCheck((m) =>
           deps.keys.namespaceHmac(m),
         );
+        const response: BeginResponse = {
+          runId,
+          status: "collecting",
+          discardReason: null,
+          stuck: false,
+          binding: { keyCheck },
+          start: { collection_mode: collection, state },
+          streams: declarations.streams.map((d) => ({
+            ...d,
+            incremental: d.incremental !== false,
+            mode: modes.get(d.name)!,
+          })),
+        };
         const statements: SqlStatement[] = [
           {
             sql: "INSERT OR IGNORE INTO connections(connection_id,connector,ns) VALUES (?,?,'')",
             params: [id, req.connector],
           },
           {
-            sql: `CREATE TEMP TRIGGER intake_begin_check BEFORE INSERT ON main.runs BEGIN SELECT RAISE(ABORT,'connection_stopped') WHERE ${STOPPED}; END`,
+            sql: `CREATE TEMP TRIGGER intake_begin_check BEFORE INSERT ON main.runs BEGIN
+              SELECT RAISE(ABORT,'control_basis_mismatch') WHERE NEW.begin_control_version IS NOT NULL
+                AND EXISTS (SELECT 1 FROM connections c WHERE c.connection_id=NEW.connection_id AND c.control_version<>NEW.begin_control_version);
+              SELECT RAISE(ABORT,'connection_stopped') WHERE ${STOPPED}; END`,
           },
           {
-            sql: "INSERT INTO runs(run_id,connection_id,o,generation,artifact_version,collection_mode,state) VALUES (?,?,?,?,?,?,'collecting')",
+            sql: "INSERT INTO runs(run_id,connection_id,o,generation,artifact_version,collection_mode,state,begin_control_version,begin_request,begin_response) VALUES (?,?,?,?,?,?,'collecting',?,?,?)",
             params: [
               runId,
               id,
@@ -320,6 +372,9 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
               generation,
               declarations.version,
               collection,
+              admittedControlVersion,
+              text,
+              JSON.stringify(response),
             ],
           },
         ];
@@ -336,8 +391,8 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
               ],
             },
             {
-              sql: `INSERT INTO run_streams(run_id,stream,delete_snapshot,basis_version,basis_generation,basis_data_hash,primary_key,profile_key,profile_version,full_read)
-            SELECT ?,stream,last_delete_version,CASE WHEN head_version>0 THEN head_version ELSE NULL END,CASE WHEN head_version>0 THEN head_generation ELSE ? END,head_data_hash,?,NULL,?,?
+              sql: `INSERT INTO run_streams(run_id,stream,delete_snapshot,basis_version,basis_generation,basis_data_hash,primary_key,profile_key,profile_version,full_read,coverage_strategy,semantics)
+            SELECT ?,stream,last_delete_version,CASE WHEN head_version>0 THEN head_version ELSE NULL END,CASE WHEN head_version>0 THEN head_generation ELSE ? END,head_data_hash,?,NULL,?,?,?,?
             FROM stream_state WHERE connection_id=? AND stream=?`,
               params: [
                 runId,
@@ -352,6 +407,8 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
                 )
                   ? 1
                   : 0,
+                d.coverageStrategy ?? null,
+                d.semantics,
                 id,
                 d.name,
               ],
@@ -362,23 +419,12 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
         try {
           await db.batch(statements);
         } catch (error) {
+          if (String(error).includes("control_basis_mismatch"))
+            throw new RunIntakeError("control_basis_mismatch");
           if (String(error).includes("connection_stopped"))
             throw new RunIntakeError("connection_stopped");
           throw error;
         }
-        const response: BeginResponse = {
-          runId,
-          status: "collecting",
-          discardReason: null,
-          stuck: false,
-          binding: { keyCheck },
-          start: { collection_mode: collection, state },
-          streams: declarations.streams.map((d) => ({
-            ...d,
-            incremental: d.incremental !== false,
-            mode: modes.get(d.name)!,
-          })),
-        };
         active.set(runId, { request: text, response });
         return response;
       }),
@@ -401,15 +447,24 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           );
         const streams = new Map(
           (
-            await db.query<{ stream: string; primary_key: string }>(
-              "SELECT stream,primary_key FROM run_streams WHERE run_id=?",
+            await db.query<{
+              stream: string;
+              primary_key: string;
+              semantics: string | null;
+            }>(
+              "SELECT stream,primary_key,semantics FROM run_streams WHERE run_id=?",
               [runId],
             )
-          ).map((s) => [s.stream, JSON.parse(s.primary_key) as string[]]),
+          ).map((s) => [
+            s.stream,
+            {
+              primaryKey: JSON.parse(s.primary_key) as string[],
+              semantics: s.semantics,
+            },
+          ]),
         );
         const rows: SqlStatement[] = [];
         let accepted = 0;
-        let deletesSkipped = 0;
         for (const record of req.records) {
           if (
             !isPlainObject(record as unknown) ||
@@ -423,17 +478,24 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             record.op !== "delete"
           )
             throw invalid("invalid record op");
-          if (record.op === "delete") {
-            deletesSkipped++;
-            continue;
-          }
-          const primaryKey = streams.get(record.stream)!;
+          const declaration = streams.get(record.stream)!;
+          if (
+            record.op === "delete" &&
+            declaration.semantics !== "mutable_state"
+          )
+            throw invalid("delete requires a mutable_state stream");
+          const primaryKey = declaration.primaryKey;
           let body: string;
           let recordKey: string;
           let hash: string;
           try {
             primaryKeyValues(record.data, primaryKey);
             recordKey = computeRecordKeyFromData(record.data, primaryKey);
+            if (
+              record.key !== undefined &&
+              !keyMatchesData(record.key, record.data, primaryKey)
+            )
+              throw invalid("record key does not match data");
             body = canonicalJson(record.data);
             hash = await pkHash(
               async (b) => sha256(b),
@@ -444,8 +506,8 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             throw invalid("invalid record or primary key");
           }
           rows.push({
-            sql: `INSERT OR REPLACE INTO run_rows(run_id,stream,pk_hash,record_key,body,body_sha256)
-          SELECT ?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM runs WHERE run_id=? AND state='collecting' AND last_batch=?)`,
+            sql: `INSERT OR REPLACE INTO run_rows(run_id,stream,pk_hash,record_key,body,body_sha256,op)
+          SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM runs WHERE run_id=? AND state='collecting' AND last_batch=?)`,
             params: [
               runId,
               record.stream,
@@ -453,6 +515,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
               recordKey,
               body,
               toHex(sha256(new TextEncoder().encode(body))),
+              record.op === "delete" ? "delete" : "upsert",
               runId,
               run.last_batch,
             ],
@@ -484,7 +547,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           }
           throw error;
         }
-        return { applied: true, accepted, deletesSkipped };
+        return { applied: true, accepted, deletesSkipped: 0 };
       }),
   };
 }

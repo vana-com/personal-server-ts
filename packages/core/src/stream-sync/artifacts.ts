@@ -15,6 +15,7 @@
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex } from "@noble/hashes/utils";
 import type {
+  CoverageStrategy,
   IntakeDeclarations,
   IntakeStreamDeclaration,
   ResolveArtifact,
@@ -44,11 +45,22 @@ export function artifactResolver(
     table.get(digest.replace(/^sha256:/, "").toLowerCase()) ?? null;
 }
 
+function isCoverageStrategy(value: unknown): value is CoverageStrategy {
+  return [
+    "checkpoint_window",
+    "full_inventory",
+    "parent_detail_accounting",
+    "snapshot_import_receipt",
+    "singleton_presence",
+  ].includes(value as string);
+}
+
 interface DeclaredStreamShape {
   readonly name: string;
   readonly semantics?: string;
   readonly primary_key: readonly string[];
   readonly incremental?: unknown;
+  readonly coverage_strategy?: CoverageStrategy;
   readonly consent_time_field?: unknown;
 }
 
@@ -60,6 +72,9 @@ function streamDeclaration(
     semantics:
       stream.semantics === "append_only" ? "append_only" : "mutable_state",
     primaryKey: stream.primary_key,
+    ...(stream.coverage_strategy
+      ? { coverageStrategy: stream.coverage_strategy }
+      : {}),
     ...(stream.incremental === false ? { incremental: false } : {}),
     ...(typeof stream.consent_time_field === "string" &&
     stream.consent_time_field !== ""
@@ -114,6 +129,8 @@ export function manifestArtifact(document: string): VerifiedArtifact | null {
       stream.name === "" ||
       seen.has(stream.name) ||
       !nonEmptyStrings(stream.primary_key) ||
+      (stream.coverage_strategy !== undefined &&
+        !isCoverageStrategy(stream.coverage_strategy)) ||
       (stream.semantics !== undefined &&
         stream.semantics !== "mutable_state" &&
         stream.semantics !== "append_only")
@@ -127,6 +144,8 @@ export function manifestArtifact(document: string): VerifiedArtifact | null {
         semantics: stream.semantics,
         primary_key: stream.primary_key,
         incremental: stream.incremental,
+        coverage_strategy: stream.coverage_strategy as
+          CoverageStrategy | undefined,
         consent_time_field: stream.consent_time_field,
       }),
     );

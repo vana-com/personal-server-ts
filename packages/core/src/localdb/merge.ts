@@ -45,6 +45,19 @@ export function mergeIncoming(
     `(SELECT i.${f} FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash)`;
   return [
     {
+      // Until publication acknowledges an explicit delete, an older downloaded
+      // row must not recreate it. Newer writes still win by the normal stamp.
+      sql: `DELETE FROM temp.incoming WHERE op=? AND EXISTS (
+        SELECT 1 FROM record_changes ch WHERE ch.connection_id=?
+          AND ch.stream=incoming.stream AND ch.pk_hash=incoming.pk_hash
+          AND ch.explicit_delete=1
+          AND ch.seq>COALESCE((SELECT publish_watermark FROM stream_state
+            WHERE connection_id=? AND stream=incoming.stream),0)
+          AND (ch.stamp_o>incoming.stamp_o OR
+            (ch.stamp_o=incoming.stamp_o AND ch.stamp_r>=incoming.stamp_r)))`,
+      params: [op, connectionId, connectionId],
+    },
+    {
       // This statement must not assign a column watched by records_au.
       sql: `UPDATE records SET first_o = CASE
    WHEN (SELECT origin FROM write_ctx WHERE id = 1) = 'import'
@@ -117,4 +130,44 @@ export function replaceDelete(
    AND (stamp_o < ? OR (stamp_o = ? AND stamp_r < ?))`,
     params: [connectionId, stream, stampO, stampO, stampR],
   };
+}
+
+/** Explicit PDPP deletes commit with their run, including a tombstone for a missing key. */
+export function deleteRunRecords(
+  connectionId: string,
+  stream: string,
+  runId: string,
+  observedAt: number,
+  afterSeq: number,
+): SqlStatement[] {
+  return [
+    {
+      sql: `INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin,explicit_delete)
+        SELECT ?,r.stream,r.pk_hash,r.record_key,'remove',?,?,'local',1 FROM run_rows r
+        WHERE r.run_id=? AND r.stream=? AND r.op='delete'
+          AND NOT EXISTS (SELECT 1 FROM records x WHERE x.connection_id=? AND x.stream=r.stream AND x.pk_hash=r.pk_hash)`,
+      params: [connectionId, observedAt, runId, runId, stream, connectionId],
+    },
+    {
+      sql: `DELETE FROM records WHERE connection_id=? AND stream=?
+        AND pk_hash IN (SELECT pk_hash FROM run_rows WHERE run_id=? AND stream=? AND op='delete')
+        AND (stamp_o < ? OR (stamp_o=? AND stamp_r<=?))`,
+      params: [
+        connectionId,
+        stream,
+        runId,
+        stream,
+        observedAt,
+        observedAt,
+        runId,
+      ],
+    },
+    {
+      // The DELETE trigger logs the prior row stamp. Publish/apply need the
+      // deletion's stamp; readers see only this transaction's final event.
+      sql: `UPDATE record_changes SET stamp_o=?,stamp_r=?,explicit_delete=1
+        WHERE connection_id=? AND stream=? AND seq>? AND op='remove'`,
+      params: [observedAt, runId, connectionId, stream, afterSeq],
+    },
+  ];
 }

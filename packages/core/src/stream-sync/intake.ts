@@ -17,7 +17,9 @@ export type RunIntakeErrorName =
   | "run_conflict"
   | "unknown_artifact"
   | "batch_gap"
-  | "restricted_scope_unsupported";
+  | "restricted_scope_unsupported"
+  | "control_basis_mismatch"
+  | "control_basis_unavailable";
 
 const STATUS: Record<RunIntakeErrorName, number> = {
   invalid_request: 400,
@@ -30,6 +32,8 @@ const STATUS: Record<RunIntakeErrorName, number> = {
   unknown_artifact: 422,
   batch_gap: 409,
   restricted_scope_unsupported: 422,
+  control_basis_mismatch: 409,
+  control_basis_unavailable: 503,
 };
 
 export class RunIntakeError extends Error {
@@ -45,6 +49,13 @@ export class RunIntakeError extends Error {
   }
 }
 
+export type CoverageStrategy =
+  | "checkpoint_window"
+  | "full_inventory"
+  | "parent_detail_accounting"
+  | "snapshot_import_receipt"
+  | "singleton_presence";
+
 /** One stream of a verified connector artifact. */
 export interface IntakeStreamDeclaration {
   readonly name: string;
@@ -53,6 +64,8 @@ export interface IntakeStreamDeclaration {
   /** `false` = every run reads the whole stream (§3.0). Default `true`. */
   readonly incremental?: boolean;
   readonly consentTimeField?: string;
+  /** Collection profile §3.5. Missing declarations never authorize deletion. */
+  readonly coverageStrategy?: CoverageStrategy;
 }
 
 export interface IntakeDeclarations {
@@ -85,6 +98,8 @@ export interface BeginRequest {
    * starts a connection the device saw deleted (§2.4 `stopped`).
    */
   readonly connect?: boolean;
+  /** Control-row version observed by a retry caller; 0 means authoritative absence. */
+  readonly expectedControlVersion?: number;
   readonly observedAt?: number;
   /**
    * The scope the producer will put in START, per stream. Used only to
@@ -100,7 +115,9 @@ export interface BeginRequest {
 
 export interface BeginResponse {
   readonly runId: string;
-  readonly status: "collecting" | "will_discard";
+  readonly status: "collecting" | "will_discard" | "ended";
+  /** Original local end acknowledgement. Remote publication is confirmed separately. */
+  readonly receipt?: EndResponse;
   readonly discardReason: "registry_unreachable" | null;
   readonly stuck: boolean;
   readonly binding: { readonly keyCheck: string };
@@ -114,6 +131,8 @@ export interface BeginResponse {
     readonly primaryKey: readonly string[];
     readonly incremental: boolean;
     readonly consentTimeField?: string;
+    /** Collection profile §3.5. Missing declarations never authorize deletion. */
+    readonly coverageStrategy?: CoverageStrategy;
     readonly mode: "full_refresh" | "incremental";
   }[];
 }
@@ -123,6 +142,7 @@ export interface BatchRequest {
   readonly records: readonly {
     readonly stream: string;
     readonly op?: string;
+    readonly key?: string | string[];
     readonly data: unknown;
   }[];
 }
@@ -130,6 +150,7 @@ export interface BatchRequest {
 export interface BatchResponse {
   readonly applied: boolean;
   readonly accepted: number;
+  /** Compatibility count: explicit deletes are accepted, so this is always zero. */
   readonly deletesSkipped: number;
 }
 

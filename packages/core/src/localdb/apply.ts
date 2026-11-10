@@ -36,7 +36,11 @@ export interface ApplyResult {
   readonly partsKept: number;
 }
 
-type Connection = { connector: string; ns: string; generation: number };
+type Connection = {
+  connector: string;
+  ns: string;
+  generation: number;
+};
 type State = {
   primary_key: string;
   last_delete_version: number;
@@ -108,6 +112,8 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
           )
         ).length
       ) {
+        // Only the pinned delete owner may purge this intent. Another device
+        // can have reconnected after its pins were captured.
         await deps.db.batch([
           {
             sql: "UPDATE connections SET control_state='deleted',checkpoint=NULL WHERE connection_id=?",
@@ -120,7 +126,7 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
             [id],
           ))
             flight.streams.add(row.stream);
-        return [...flight.streams].map((s) => result(s, "purged"));
+        return [...flight.streams].map((s) => result(s, "gone"));
       }
       const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
       const hashes = await controlHashes(keccak, keyCheck);
@@ -282,6 +288,10 @@ async function applyOne(
         {
           sql: "UPDATE stream_state SET complete=0, head_version=0, head_blob=NULL, head_data_hash=NULL, last_delete_version=? WHERE connection_id=? AND stream=?",
           params: [read.version, id, stream],
+        },
+        {
+          sql: "UPDATE connections SET checkpoint=NULL WHERE connection_id=?",
+          params: [id],
         },
       ]),
     );

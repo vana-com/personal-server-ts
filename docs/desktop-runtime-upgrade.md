@@ -89,12 +89,9 @@ must roll back the index migration and preserve history before retry.
 `desktop-dde-upgrade.test.ts` uses a second frozen fixture written by the
 current `dde4ed94` runtime. Its two legacy file metadata rows are synthetic SQL
 seeds; records, history, blobs and transition state use the historical APIs.
-It checks its saved Strava export-to-browser
-transition across migration, completion and reopen. The test preserves the
-transition snapshots, archived records, history and blob state, and verifies
-that stale-generation writes stay refused.
-Startup preserves Strava archive claims through their transition ledger,
-using the same rule as Claude archives. Owner erasure removes the ledger,
-archived records and claims before collecting the unreferenced blobs.
-A takeover reset drops only that scope's archive and unreferenced claims.
+It checks that schema migration and reopen preserve the historical transition
+ledger, archived records, history, blob claims and bytes. The transition API
+and its saved-body overlay have been removed. Startup still preserves archive
+custody, stale-generation writes stay refused, and explicit connection deletion
+removes the ledger and archived records before collecting unreferenced blobs.
 Unreadable retained history keeps ambiguous blobs until that history is removed.
