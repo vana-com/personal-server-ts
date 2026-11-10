@@ -74,7 +74,7 @@ it.each([1, 2])(
     // The user's delete wins: one delete head on top of the other device's rows.
     expect(await r.registeredVersion()).toBe(moved + 1);
     expect(await r.registeredHead()).toMatchObject({
-      format: 3,
+      format: 4,
       lastDeleteVersion: moved + 1,
       recordCount: 0,
     });
@@ -146,7 +146,7 @@ it("a stream only another device wrote is deleted (mutant: UNSEEN_STREAM_SURVIVE
   await r.writer.deleteConnection(CONNECTOR);
   for (const stream of ["items", "extra"]) {
     expect(await r.registeredHead(stream)).toMatchObject({
-      format: 3,
+      format: 4,
       recordCount: 0,
       lastDeleteVersion: 2,
     });
@@ -384,7 +384,7 @@ it("a declared stream with no registry row gets a delete head, so an old record 
   // fence stands between the old record and the registry.
   await r.deleteStreamHeadsOnly(r.other);
   expect(await r.registeredHead("extra")).toMatchObject({
-    format: 3,
+    format: 4,
     recordCount: 0,
     lastDeleteVersion: 1,
   });
@@ -418,7 +418,7 @@ it("the rowless streams come from the verified manifest: an old record of one ca
   expect(await r.registeredHead("extra")).toBeNull();
   await r.deleteStreamHeadsOnly(r.other);
   expect(await r.registeredHead("extra")).toMatchObject({
-    format: 3,
+    format: 4,
     lastDeleteVersion: 1,
   });
   await r.sync();

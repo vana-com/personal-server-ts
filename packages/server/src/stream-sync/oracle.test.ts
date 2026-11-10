@@ -519,7 +519,7 @@ describe.each(matrix)(
         expect(canonicalJson(view.records.get("huge"))).toBe(
           canonicalJson(huge),
         );
-        expect(view.head.format).toBe(3);
+        expect(view.head.format).toBe(4);
         expect(view.head.recordCount).toBe(2);
         // The long record is alone in parts of at most the piece size.
         for (const part of view.head.parts) {

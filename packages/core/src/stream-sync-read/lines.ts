@@ -12,6 +12,7 @@
 import {
   canonicalJsonChunks,
   compareStamp,
+  framesCarryFirstSeen,
   framesOfParts,
   linesOfParts,
   pkHash,
@@ -181,7 +182,10 @@ async function* partBodies(
       keys.hashes.sha256,
       head.parts,
       (part) => read(part),
-      { verify: false },
+      {
+        verify: false,
+        generation: framesCarryFirstSeen(head.format) ? "v3" : "v2",
+      },
     )) {
       yield {
         k: frame.envelope.k,

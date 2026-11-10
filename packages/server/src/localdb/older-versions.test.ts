@@ -119,7 +119,7 @@ async function fixture() {
     const head = encodeHead({
       complete: true,
       connector,
-      format: 3,
+      format: 4,
       generation,
       lastDeleteVersion: 0,
       keyCheck: "0000000000000000",
@@ -135,7 +135,7 @@ async function fixture() {
     blobs.set(`${scope}/${blobName}`, head);
     await db.batch([
       {
-        sql: "INSERT INTO stream_versions(connection_id, stream, version, generation, head_blob, head_format, record_count, observed_at, complete, kind) VALUES (?, ?, ?, ?, ?, 3, ?, ?, 1, 'applied')",
+        sql: "INSERT INTO stream_versions(connection_id, stream, version, generation, head_blob, head_format, record_count, observed_at, complete, kind) VALUES (?, ?, ?, ?, ?, 4, ?, ?, 1, 'applied')",
         params: [
           "c1",
           stream,

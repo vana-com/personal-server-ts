@@ -63,12 +63,12 @@ function randomHead(random: () => number): Head {
 }
 
 describe("head", () => {
-  it("head-formats-1-to-4-accepted-and-encoded", () => {
-    expect(HEAD_FORMAT).toBe(3);
-    const encoded = encodeHead({ ...head, format: 4 });
+  it("head-format-4-emitted-and-1-to-4-accepted", () => {
+    expect(HEAD_FORMAT).toBe(4);
+    const encoded = encodeHead(head);
     expect(JSON.parse(new TextDecoder().decode(encoded)).format).toBe(4);
 
-    // Build legacy wire fixtures without the writer.
+    // Build legacy wire fixtures without the writer, which emits format 4.
     const legacy = { ...head };
     delete legacy.lastDeleteVersion;
     for (const format of [1, 2, 3, 4] as const) {

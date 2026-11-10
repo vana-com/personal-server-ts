@@ -62,7 +62,7 @@ it("the landing runs after the answer and clears its intent", async () => {
   await r.writer.requestConnectionDelete(CONNECTOR);
   await r.publish();
   expect(await r.registeredHead()).toMatchObject({
-    format: 3,
+    format: 4,
     recordCount: 0,
   });
   expect((await persistedState(r)).deletes ?? {}).toEqual({});
@@ -134,7 +134,7 @@ it("the owner delete also fences a declared stream with no registry row (mutant:
   await r.writer.requestConnectionDelete(CONNECTOR);
   await r.publish();
   expect(await r.registeredHead("extra")).toMatchObject({
-    format: 3,
+    format: 4,
     recordCount: 0,
     lastDeleteVersion: 1,
   });

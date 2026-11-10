@@ -181,7 +181,7 @@ it("a stream delete head reads as deleted while the control row is active", asyn
     reason: "deleted",
   });
   expect(await r.registeredHead()).toMatchObject({
-    format: 3,
+    format: 4,
     lastDeleteVersion: 2,
     recordCount: 0,
   });

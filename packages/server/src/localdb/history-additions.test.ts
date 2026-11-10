@@ -170,6 +170,17 @@ async function collect(
 }
 
 describe("local history additions", () => {
+  it("invalid-additions-days-are-client-errors-before-any-query", async () => {
+    const db = await fresh();
+    const query = vi.spyOn(db, "query");
+    const reader = history(db);
+    for (const days of [0, -1, 32, 999, 1.5, Number.NaN, Infinity]) {
+      await expect(reader.additions({ timezone: "UTC", days }))
+        .rejects.toMatchObject({ code: 400 });
+    }
+    expect(query).not.toHaveBeenCalled();
+  });
+
   it("additions-total-counts-rows-of-active-connections", async () => {
     const db = await fresh();
     await connection(db);

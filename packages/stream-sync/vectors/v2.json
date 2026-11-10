@@ -1774,6 +1774,37 @@
         "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":4,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":2,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
         "dataHash": "0x1bccdfecc3d2668f17e03959ccec624034e6b1680e4dfee7df469951e100066e",
         "blobName": "h-1bccdfecc3d2668f17e03959ccec624034e6b1680e4dfee7df469951e100066e"
+      },
+      {
+        "name": "format 4 head with v3 part hashes",
+        "head": {
+          "complete": true,
+          "connector": "chatgpt",
+          "format": 4,
+          "generation": "3",
+          "keyCheck": "94e0f0e1aa1f8175",
+          "ns": "834ab4c2636bcdd5",
+          "observedAt": 1700000000000,
+          "parts": [
+            {
+              "bytes": 621,
+              "count": 3,
+              "hash": "a3b3429511d947666730c527ba9dfd631dbe35628822245f74edcecc556a20a9",
+              "prefix": ""
+            }
+          ],
+          "primaryKey": ["id"],
+          "profile": {
+            "key": "conversations",
+            "version": "1.4.0"
+          },
+          "recordCount": 3,
+          "stream": "conversations",
+          "lastDeleteVersion": 2
+        },
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":4,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":2,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":621,\"count\":3,\"hash\":\"a3b3429511d947666730c527ba9dfd631dbe35628822245f74edcecc556a20a9\",\"prefix\":\"\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "dataHash": "0x03b99049af442bbc6bae540d6d1a6b0d0458f8c8925b9682ea9fd3e22ee319df",
+        "blobName": "h-03b99049af442bbc6bae540d6d1a6b0d0458f8c8925b9682ea9fd3e22ee319df"
       }
     ],
     "decode": [
@@ -4749,5 +4780,187 @@
       },
       "ready": false
     }
-  ]
+  ],
+  "framesV3": {
+    "description": "Format 4 head parts hold v3 frames: envelope {f,h,k,n,o,r}, f = first-seen checkpoint (integer) or null. A reader picks the frame generation from the head format: format 4 reads v3, formats 2 and 3 read v2. Format 1-3 lines read with f null. A v2 frame in a format 4 head, or a v3 frame in a format 2 or 3 head, is refused.",
+    "cases": [
+      {
+        "name": "unknown first seen",
+        "primaryKey": ["id"],
+        "record": {
+          "id": "é",
+          "t": "日本語"
+        },
+        "o": 5,
+        "r": "r",
+        "f": null,
+        "bodyBytes": 27,
+        "envelope": "{\"f\":null,\"h\":\"709e86674171c242f279aa714a62d71346d6c785505b108149cb548405c1e435\",\"k\":\"0b657be394b1d432f8d1942406ed09c213604cbcd87b299641cf994bcaf84b11\",\"n\":27,\"o\":5,\"r\":\"r\"}",
+        "frame": "{\"f\":null,\"h\":\"709e86674171c242f279aa714a62d71346d6c785505b108149cb548405c1e435\",\"k\":\"0b657be394b1d432f8d1942406ed09c213604cbcd87b299641cf994bcaf84b11\",\"n\":27,\"o\":5,\"r\":\"r\"}\n{\"id\":\"é\",\"t\":\"日本語\"}\n"
+      },
+      {
+        "name": "first seen",
+        "primaryKey": ["id"],
+        "record": {
+          "id": "a",
+          "body": 1
+        },
+        "o": 1700000000000,
+        "r": "run-1",
+        "f": 1699999990000,
+        "bodyBytes": 19,
+        "envelope": "{\"f\":1699999990000,\"h\":\"6511b6213cd8003d68b52a49f42a68900679578cc248952fc936cfe83717f778\",\"k\":\"0eb5b8d6f81bc677da8a08567cc4fa9a06a57e9ec8da85ed73a7f62727996002\",\"n\":19,\"o\":1700000000000,\"r\":\"run-1\"}",
+        "frame": "{\"f\":1699999990000,\"h\":\"6511b6213cd8003d68b52a49f42a68900679578cc248952fc936cfe83717f778\",\"k\":\"0eb5b8d6f81bc677da8a08567cc4fa9a06a57e9ec8da85ed73a7f62727996002\",\"n\":19,\"o\":1700000000000,\"r\":\"run-1\"}\n{\"body\":1,\"id\":\"a\"}\n"
+      },
+      {
+        "name": "zero first seen",
+        "primaryKey": ["a", "b"],
+        "record": {
+          "b": 2,
+          "a": "x",
+          "c": true
+        },
+        "o": 0,
+        "r": "run-2",
+        "f": 0,
+        "bodyBytes": 24,
+        "envelope": "{\"f\":0,\"h\":\"2e6c6b7e3652ea85c432e0cfcff6dc1409948f6efe93177553c1899c7d0772a7\",\"k\":\"9ca894e6afeeab81977088382cb4b4657275cb44206d9105a5c5f0c135b81eb3\",\"n\":24,\"o\":0,\"r\":\"run-2\"}",
+        "frame": "{\"f\":0,\"h\":\"2e6c6b7e3652ea85c432e0cfcff6dc1409948f6efe93177553c1899c7d0772a7\",\"k\":\"9ca894e6afeeab81977088382cb4b4657275cb44206d9105a5c5f0c135b81eb3\",\"n\":24,\"o\":0,\"r\":\"run-2\"}\n{\"a\":\"x\",\"b\":2,\"c\":true}\n"
+      }
+    ],
+    "part": {
+      "prefix": "",
+      "frames": ["unknown first seen", "first seen", "zero first seen"],
+      "text": "{\"f\":null,\"h\":\"709e86674171c242f279aa714a62d71346d6c785505b108149cb548405c1e435\",\"k\":\"0b657be394b1d432f8d1942406ed09c213604cbcd87b299641cf994bcaf84b11\",\"n\":27,\"o\":5,\"r\":\"r\"}\n{\"id\":\"é\",\"t\":\"日本語\"}\n{\"f\":1699999990000,\"h\":\"6511b6213cd8003d68b52a49f42a68900679578cc248952fc936cfe83717f778\",\"k\":\"0eb5b8d6f81bc677da8a08567cc4fa9a06a57e9ec8da85ed73a7f62727996002\",\"n\":19,\"o\":1700000000000,\"r\":\"run-1\"}\n{\"body\":1,\"id\":\"a\"}\n{\"f\":0,\"h\":\"2e6c6b7e3652ea85c432e0cfcff6dc1409948f6efe93177553c1899c7d0772a7\",\"k\":\"9ca894e6afeeab81977088382cb4b4657275cb44206d9105a5c5f0c135b81eb3\",\"n\":24,\"o\":0,\"r\":\"run-2\"}\n{\"a\":\"x\",\"b\":2,\"c\":true}\n",
+      "bytes": 621,
+      "hash": "a3b3429511d947666730c527ba9dfd631dbe35628822245f74edcecc556a20a9",
+      "count": 3
+    },
+    "envelopeErrors": [
+      {
+        "text": "{\"h\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"k\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"n\":1,\"o\":1,\"r\":\"r\"}",
+        "why": "v2 envelope under v3"
+      },
+      {
+        "text": "{\"f\":\"1\",\"h\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"k\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"n\":1,\"o\":1,\"r\":\"r\"}",
+        "why": "f is a string"
+      },
+      {
+        "text": "{\"f\":1.5,\"h\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"k\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"n\":1,\"o\":1,\"r\":\"r\"}",
+        "why": "f is not an integer"
+      },
+      {
+        "text": "{\"h\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"k\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"n\":1,\"o\":1,\"r\":\"r\",\"f\":null}",
+        "why": "f out of canonical order"
+      }
+    ],
+    "readCases": [
+      {
+        "name": "format 4 reads v3 frames",
+        "headFormat": 4,
+        "primaryKey": ["id"],
+        "part": {
+          "text": "{\"f\":null,\"h\":\"709e86674171c242f279aa714a62d71346d6c785505b108149cb548405c1e435\",\"k\":\"0b657be394b1d432f8d1942406ed09c213604cbcd87b299641cf994bcaf84b11\",\"n\":27,\"o\":5,\"r\":\"r\"}\n{\"id\":\"é\",\"t\":\"日本語\"}\n{\"f\":1699999990000,\"h\":\"6511b6213cd8003d68b52a49f42a68900679578cc248952fc936cfe83717f778\",\"k\":\"0eb5b8d6f81bc677da8a08567cc4fa9a06a57e9ec8da85ed73a7f62727996002\",\"n\":19,\"o\":1700000000000,\"r\":\"run-1\"}\n{\"body\":1,\"id\":\"a\"}\n{\"f\":0,\"h\":\"2e6c6b7e3652ea85c432e0cfcff6dc1409948f6efe93177553c1899c7d0772a7\",\"k\":\"9ca894e6afeeab81977088382cb4b4657275cb44206d9105a5c5f0c135b81eb3\",\"n\":24,\"o\":0,\"r\":\"run-2\"}\n{\"a\":\"x\",\"b\":2,\"c\":true}\n",
+          "bytes": 621,
+          "hash": "a3b3429511d947666730c527ba9dfd631dbe35628822245f74edcecc556a20a9",
+          "count": 3
+        },
+        "expected": [
+          {
+            "o": 5,
+            "r": "r",
+            "f": null,
+            "v": {
+              "id": "é",
+              "t": "日本語"
+            }
+          },
+          {
+            "o": 1700000000000,
+            "r": "run-1",
+            "f": 1699999990000,
+            "v": {
+              "id": "a",
+              "body": 1
+            }
+          },
+          {
+            "o": 0,
+            "r": "run-2",
+            "f": 0,
+            "v": {
+              "b": 2,
+              "a": "x",
+              "c": true
+            }
+          }
+        ]
+      },
+      {
+        "name": "format 3 reads unknown first seen",
+        "headFormat": 3,
+        "primaryKey": ["id"],
+        "part": {
+          "text": "{\"h\":\"709e86674171c242f279aa714a62d71346d6c785505b108149cb548405c1e435\",\"k\":\"0b657be394b1d432f8d1942406ed09c213604cbcd87b299641cf994bcaf84b11\",\"n\":27,\"o\":5,\"r\":\"r\"}\n{\"id\":\"é\",\"t\":\"日本語\"}\n{\"h\":\"6511b6213cd8003d68b52a49f42a68900679578cc248952fc936cfe83717f778\",\"k\":\"0eb5b8d6f81bc677da8a08567cc4fa9a06a57e9ec8da85ed73a7f62727996002\",\"n\":19,\"o\":1700000000000,\"r\":\"run-1\"}\n{\"body\":1,\"id\":\"a\"}\n{\"h\":\"2e6c6b7e3652ea85c432e0cfcff6dc1409948f6efe93177553c1899c7d0772a7\",\"k\":\"9ca894e6afeeab81977088382cb4b4657275cb44206d9105a5c5f0c135b81eb3\",\"n\":24,\"o\":0,\"r\":\"run-2\"}\n{\"a\":\"x\",\"b\":2,\"c\":true}\n",
+          "bytes": 588,
+          "hash": "34e00c608df055c13f9d0853910d51c9e70af302cd4fe5cacd1258049854dae6",
+          "count": 3
+        },
+        "expected": [
+          {
+            "o": 5,
+            "r": "r",
+            "f": null,
+            "v": {
+              "id": "é",
+              "t": "日本語"
+            }
+          },
+          {
+            "o": 1700000000000,
+            "r": "run-1",
+            "f": null,
+            "v": {
+              "id": "a",
+              "body": 1
+            }
+          },
+          {
+            "o": 0,
+            "r": "run-2",
+            "f": null,
+            "v": {
+              "b": 2,
+              "a": "x",
+              "c": true
+            }
+          }
+        ]
+      },
+      {
+        "name": "format 4 refuses a v2 frame",
+        "headFormat": 4,
+        "primaryKey": ["id"],
+        "part": {
+          "text": "{\"h\":\"709e86674171c242f279aa714a62d71346d6c785505b108149cb548405c1e435\",\"k\":\"0b657be394b1d432f8d1942406ed09c213604cbcd87b299641cf994bcaf84b11\",\"n\":27,\"o\":5,\"r\":\"r\"}\n{\"id\":\"é\",\"t\":\"日本語\"}\n{\"h\":\"6511b6213cd8003d68b52a49f42a68900679578cc248952fc936cfe83717f778\",\"k\":\"0eb5b8d6f81bc677da8a08567cc4fa9a06a57e9ec8da85ed73a7f62727996002\",\"n\":19,\"o\":1700000000000,\"r\":\"run-1\"}\n{\"body\":1,\"id\":\"a\"}\n{\"h\":\"2e6c6b7e3652ea85c432e0cfcff6dc1409948f6efe93177553c1899c7d0772a7\",\"k\":\"9ca894e6afeeab81977088382cb4b4657275cb44206d9105a5c5f0c135b81eb3\",\"n\":24,\"o\":0,\"r\":\"run-2\"}\n{\"a\":\"x\",\"b\":2,\"c\":true}\n",
+          "bytes": 588,
+          "hash": "34e00c608df055c13f9d0853910d51c9e70af302cd4fe5cacd1258049854dae6",
+          "count": 3
+        },
+        "error": true
+      },
+      {
+        "name": "format 3 refuses a v3 frame",
+        "headFormat": 3,
+        "primaryKey": ["id"],
+        "part": {
+          "text": "{\"f\":null,\"h\":\"709e86674171c242f279aa714a62d71346d6c785505b108149cb548405c1e435\",\"k\":\"0b657be394b1d432f8d1942406ed09c213604cbcd87b299641cf994bcaf84b11\",\"n\":27,\"o\":5,\"r\":\"r\"}\n{\"id\":\"é\",\"t\":\"日本語\"}\n{\"f\":1699999990000,\"h\":\"6511b6213cd8003d68b52a49f42a68900679578cc248952fc936cfe83717f778\",\"k\":\"0eb5b8d6f81bc677da8a08567cc4fa9a06a57e9ec8da85ed73a7f62727996002\",\"n\":19,\"o\":1700000000000,\"r\":\"run-1\"}\n{\"body\":1,\"id\":\"a\"}\n{\"f\":0,\"h\":\"2e6c6b7e3652ea85c432e0cfcff6dc1409948f6efe93177553c1899c7d0772a7\",\"k\":\"9ca894e6afeeab81977088382cb4b4657275cb44206d9105a5c5f0c135b81eb3\",\"n\":24,\"o\":0,\"r\":\"run-2\"}\n{\"a\":\"x\",\"b\":2,\"c\":true}\n",
+          "bytes": 621,
+          "hash": "a3b3429511d947666730c527ba9dfd631dbe35628822245f74edcecc556a20a9",
+          "count": 3
+        },
+        "error": true
+      }
+    ]
+  }
 }
