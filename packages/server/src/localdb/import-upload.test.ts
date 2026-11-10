@@ -1,4 +1,3 @@
-import { fixtureProjections } from "./import-projection.test-utils.js";
 import { createHash } from "node:crypto";
 import {
   mkdtempSync,
@@ -20,12 +19,9 @@ import {
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
-import {
-  readBackLegacyImport,
-  createImportProjectionReader,
-} from "../../../core/src/localdb/import-readback.js";
+import { readBackLegacyImport } from "../../../core/src/localdb/import-readback.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
-import type { ImportProjectionDeps } from "../../../core/src/localdb/import-readback.js";
+import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 const dirs: string[] = [];
 const dbs: SqlDriver[] = [];
 afterEach(async () => {
@@ -258,8 +254,7 @@ it("upload-d6-p7-close-reopen-readback", async () => {
     throw new Error("unexpected external call");
   };
   let op = 0;
-  const deps: ImportProjectionDeps = {
-    importProjection: fixtureProjections,
+  const deps: LocalSyncDeps = {
     db,
     queue: connectionQueue(),
     ownerAddress: "0xabc",
@@ -301,16 +296,7 @@ it("upload-d6-p7-close-reopen-readback", async () => {
     dbs.push(db);
     Object.assign(deps, { db });
     const reopened = await openStagedLegacyImportUpload(options);
-    const projection = createImportProjectionReader(
-      deps,
-      "2026-01-01T00:00:00Z",
-      async function* () {
-        yield reopened;
-      },
-    );
-    expect(
-      (await readBackLegacyImport(deps, reopened, projection, null)).pass,
-    ).toBe(true);
+    expect((await readBackLegacyImport(deps, reopened)).pass).toBe(true);
     expect((await acceptLegacyImportUpload(deps, reopened)).kind).toBe(
       "already-imported",
     );

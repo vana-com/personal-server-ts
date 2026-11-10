@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { retireLegacyCopies } from "../../../core/src/localdb/legacy-retire.js";
 import type { LegacyRetireAccess } from "../../../core/src/localdb/legacy-retire.js";
 import { createImportLedger } from "../../../core/src/localdb/import-ledger.js";
@@ -135,7 +135,7 @@ async function fixture(
   };
   let present: LegacyCopy | null = copy;
   const reports: LegacyRetireFileReport[] = [];
-  const proof = async (exactCopy = copy): Promise<ImportReadback[]> =>
+  const proof = async (): Promise<ImportReadback[]> =>
     Promise.all(
       sources.map(async (source) => {
         const receipt = await ledger.get(
@@ -147,17 +147,8 @@ async function fixture(
         return {
           receipt,
           actual: { rows: receipt.rows, fingerprint: receipt.fingerprint },
-          copy: exactCopy,
           pass: true,
           reason: null,
-          projections: [
-            {
-              dataSet: copy.dataSet,
-              expectedHash: copy.contentHash,
-              actualHash: copy.contentHash,
-              pass: true,
-            },
-          ],
         };
       }),
     );
@@ -165,7 +156,7 @@ async function fixture(
     copies: async function* () {
       if (present) yield present;
     },
-    readBack: vi.fn(async (exactCopy) => proof(exactCopy)),
+    readBack: vi.fn(async () => proof()),
     erase: vi.fn(async (exactCopy) => {
       if (!present || identityCopy(present) !== identityCopy(exactCopy))
         return false;
@@ -215,322 +206,86 @@ function identityCopy(copy: LegacyCopy): string {
   ]);
 }
 
-describe("legacy retirement", () => {
-  it.each([
-    { name: "below", watermarks: [9, 10], deleted: 0 },
-    { name: "equal", watermarks: [10, 10], deleted: 1 },
-    { name: "above", watermarks: [11, 12], deleted: 1 },
-    { name: "every stream", watermarks: [10, 9], deleted: 0 },
-  ])(
-    "retire-watermark-covers-import-highest-seq: $name",
-    async ({ watermarks, deleted }) => {
-      const f = await fixture([
-        {
-          source: "source-a",
-          connectionId: "connection-a",
-          stream: "stream-a",
-        },
-        {
-          source: "source-b",
-          connectionId: "connection-a",
-          stream: "stream-b",
-        },
-      ]);
-      await f.db.batch(
-        f.copy.sources.map((source, i) => ({
-          sql: "UPDATE stream_state SET publish_watermark = ? WHERE connection_id = ? AND stream = ?",
-          params: [watermarks[i]!, source.connectionId, source.stream],
-        })),
-      );
-      expect(await f.run()).toEqual({
-        mode: "delete",
-        files: 1,
-        ready: deleted,
-        deleted,
-      });
-      expect(f.access.erase).toHaveBeenCalledTimes(deleted);
-      expect(await f.states()).toEqual([
-        { state: deleted ? "retired" : "imported" },
-        { state: deleted ? "retired" : "imported" },
-      ]);
-    },
-  );
-
-  it("retire-default-off", async () => {
-    for (const options of [
-      {},
-      { streamSync: {} },
-      { streamSync: { retireLegacy: false } },
-    ]) {
-      const f = await fixture();
-      expect(await f.run(options)).toEqual({
-        mode: "readback-only",
-        files: 1,
-        ready: 1,
-        deleted: 0,
-      });
-      expect(f.access.readBack).toHaveBeenCalledTimes(1);
-      expect(f.access.erase).not.toHaveBeenCalled();
-      expect(f.ledger.statements).not.toHaveBeenCalled();
-      expect(await f.states()).toEqual([{ state: "imported" }]);
-    }
-  });
-
-  it("retire-fresh-proof-only", async () => {
+it("read-back bugs are reported and do not block enabled replacement", async () => {
+  const f = await fixture();
+  f.access.readBack = async () => [
+    { ...(await f.proof())[0]!, pass: false, reason: "record_mismatch" },
+  ];
+  expect(await f.run()).toMatchObject({ deleted: 1 });
+  expect(f.present()).toBeNull();
+});
+it("removal stays off by default and dry runs cannot erase", async () => {
+  for (const options of [
+    {},
+    { streamSync: { retireLegacy: false } },
+    { dryRun: true, streamSync: { retireLegacy: true } },
+  ]) {
     const f = await fixture();
-    await f.db.batch([
-      { sql: "UPDATE fixture_receipts SET state = 'verified'" },
-    ]);
-    expect((await f.run({})).ready).toBe(1);
-    vi.mocked(f.access.readBack).mockImplementation(async (copy) =>
-      (await f.proof(copy)).map((proof) => ({
-        ...proof,
-        pass: false,
-        reason: "fixture-mismatch",
-      })),
-    );
-    expect((await f.run()).deleted).toBe(0);
-    expect(f.access.readBack).toHaveBeenCalledTimes(2);
+    expect(await f.run(options)).toMatchObject({ ready: 1, deleted: 0 });
     expect(f.access.erase).not.toHaveBeenCalled();
-    expect(await f.states()).toEqual([{ state: "verified" }]);
-  });
-
-  it("retire-changed-copy-kept", async () => {
-    for (const change of ["hash", "revision", "path", "replacement"] as const) {
-      const f = await fixture();
-      vi.mocked(f.access.readBack).mockImplementation(async (copy) => {
-        const changed = {
-          ...copy,
-          ...(change === "path"
-            ? { path: "fixture/other" }
-            : change === "revision"
-              ? { revision: "revision-2" }
-              : { contentHash: "replacement-hash" }),
-        };
-        if (change === "replacement") {
-          const proofs = await f.proof(copy);
-          f.replace(changed);
-          return proofs;
-        }
-        return f.proof(changed);
-      });
-      expect((await f.run()).deleted, change).toBe(0);
-      expect(f.present(), change).not.toBeNull();
-      expect(await f.states(), change).toEqual([{ state: "imported" }]);
-      expect(f.reports.at(-1)?.decision, change).toBe(
-        change === "replacement" ? "held" : "changed",
-      );
-    }
-  });
-
-  it("retire-excluded-or-empty-held", async () => {
-    for (const variant of [
-      "excluded",
-      "empty",
-      "missing-receipt",
-      "no-proof",
-      "no-sources",
-      "duplicate-source",
-      "no-projection",
-      "fingerprint-mismatch",
-    ]) {
-      const f = await fixture();
-      if (variant === "excluded") {
-        await f.db.batch([
-          { sql: "UPDATE fixture_receipts SET state = 'excluded'" },
-        ]);
-      } else if (variant === "empty") {
-        const receipt = f.receipts.get(identity(f.copy.sources[0]!))!;
-        f.receipts.set(identity(receipt), {
-          ...receipt,
-          rows: 0,
-          highestSeq: 0,
-        });
-      } else if (variant === "missing-receipt") {
-        const proofs = await f.proof();
-        vi.mocked(f.access.readBack).mockResolvedValue(proofs);
-        vi.mocked(f.ledger.get).mockResolvedValue(null);
-      } else if (variant === "no-proof") {
-        vi.mocked(f.access.readBack).mockResolvedValue([]);
-      } else if (variant === "no-sources" || variant === "duplicate-source") {
-        f.access.copies = async function* () {
-          yield {
-            ...f.copy,
-            sources:
-              variant === "no-sources"
-                ? []
-                : [f.copy.sources[0]!, f.copy.sources[0]!],
-          };
-        };
-      } else {
-        vi.mocked(f.access.readBack).mockImplementation(async (copy) =>
-          (await f.proof(copy)).map((proof) => ({
-            ...proof,
-            ...(variant === "no-projection"
-              ? { projections: [] }
-              : {
-                  actual: { rows: proof.actual.rows, fingerprint: "different" },
-                }),
-          })),
-        );
-      }
-      expect((await f.run()).deleted, variant).toBe(0);
-      expect(f.access.erase, variant).not.toHaveBeenCalled();
-      expect(f.ledger.statements, variant).not.toHaveBeenCalled();
-      expect(f.reports.at(-1)?.decision, variant).toBe("held");
-    }
-  });
-
-  it("retire-delete-race-kept", async () => {
-    for (const sql of [
-      "INSERT INTO delete_intents SELECT connector, 'delete-id', '{}' FROM connections",
-      "UPDATE connections SET control_state = 'deleted'",
-      "UPDATE connections SET deleted_at = 123",
-      "UPDATE connections SET generation = 2",
-      "UPDATE stream_state SET last_delete_version = 1",
-      "UPDATE stream_state SET floor_o = 1, floor_r = 'delete', floor_version = '1'",
-      "UPDATE stream_state SET publish_watermark = 9",
-    ]) {
-      const f = await fixture();
-      vi.mocked(f.access.readBack).mockImplementation(async (copy) => {
-        const proofs = await f.proof(copy);
-        await f.db.batch([{ sql }]);
-        return proofs;
-      });
-      expect((await f.run()).deleted).toBe(0);
-      expect(f.access.erase).not.toHaveBeenCalled();
-      expect(await f.states()).toEqual([{ state: "imported" }]);
-      expect(f.reports.at(-1)?.decision).toBe("held");
-    }
-  });
-
-  it("retire-missing-receipt-holds", async () => {
-    const f = await fixture();
-    const proofs = await f.proof();
-    f.access.readBack = vi.fn(async () =>
-      proofs.map((p) => ({ ...p, receipt: null })),
-    );
-    expect((await f.run()).deleted).toBe(0);
-    expect(f.access.erase).not.toHaveBeenCalled();
-  });
-
-  it("retire-free-text-reason-is-not-proof-metadata", async () => {
-    const f = await fixture();
-    for (const r of f.receipts.values())
-      f.receipts.set(identity(r), { ...r, reason: "Import complete" });
-    expect((await f.run()).deleted).toBe(1);
-  });
-
-  it("retire-crash-after-erase", async () => {
-    const f = await fixture();
-    const batch = vi
-      .spyOn(f.db, "batch")
-      .mockRejectedValueOnce(new Error("fixture crash after erase"));
-    await expect(f.run()).rejects.toThrow("fixture crash after erase");
-    expect(f.present()).toBeNull();
-    expect(f.access.erase).toHaveBeenCalledTimes(1);
     expect(await f.states()).toEqual([{ state: "imported" }]);
-    batch.mockRestore();
-    // The failed pre-crash transaction attempted a receipt write. Only new
-    // attempts below must refrain from writing retirement state.
-    vi.mocked(f.ledger.statements).mockClear();
-
-    // A retained old identity may be replayed, but a replacement at its path
-    // is not the erased copy. Even a fresh old-copy proof cannot erase it.
-    const replacement = { ...f.copy, contentHash: "replacement-hash" };
-    f.replace(replacement);
-    f.access.copies = async function* () {
-      yield f.copy;
-    };
-    expect((await f.run()).deleted).toBe(0);
-    expect(f.present()).toEqual(replacement);
-    expect(f.access.erase).toHaveBeenCalledTimes(2);
-    expect(await f.states()).toEqual([{ state: "imported" }]);
-    expect(f.reports.at(-1)).toEqual({
-      file: f.copy.id,
-      decision: "held",
-      reason: "erase-not-confirmed",
-    });
-
-    // Absence alone is not inferred from the boolean false result.
-    f.replace(null);
-    expect((await f.run()).deleted).toBe(0);
-    expect(await f.states()).toEqual([{ state: "imported" }]);
-    expect(f.reports.at(-1)).toEqual({
-      file: f.copy.id,
-      decision: "held",
-      reason: "erase-not-confirmed",
-    });
-    expect(f.ledger.statements).not.toHaveBeenCalled();
+  }
+});
+it("unimported copies are counted and removed with the rest", async () => {
+  const f = await fixture([]);
+  expect(await f.run()).toMatchObject({
+    deleted: 1,
+    unimported: 1,
+    readbackFailures: 0,
   });
-
-  it("retire-dry-run-flag-on-no-delete", async () => {
-    const f = await fixture();
-    expect(
-      await f.run({ streamSync: { retireLegacy: true }, dryRun: true }),
-    ).toEqual({
-      mode: "dry-run",
-      files: 1,
-      ready: 1,
-      deleted: 0,
-    });
-    expect(f.access.readBack).toHaveBeenCalledTimes(1);
-    expect(f.access.erase).not.toHaveBeenCalled();
-    expect(f.ledger.statements).not.toHaveBeenCalled();
-    expect(f.present()).toEqual(f.copy);
-    expect(await f.states()).toEqual([{ state: "imported" }]);
-    expect(f.reports).toEqual([
-      { file: f.copy.id, decision: "ready", reason: null },
-    ]);
+  expect(f.present()).toBeNull();
+});
+it("missing import proof is reported without blocking removal", async () => {
+  const f = await fixture();
+  f.access.readBack = async () => [];
+  expect(await f.run()).toMatchObject({ deleted: 1, readbackFailures: 1 });
+  expect(f.reports[0]).toMatchObject({
+    decision: "retired",
+    reason: "missing-import-proof",
   });
-
-  it("retire-sorted-queues-held-through-readback-and-erase", async () => {
-    const f = await fixture([
-      { source: "source-b", connectionId: "connection-b", stream: "stream-b" },
-      { source: "source-a", connectionId: "connection-a", stream: "stream-a" },
-      { source: "source-c", connectionId: "connection-a", stream: "stream-c" },
-    ]);
-    const held: string[] = [];
-    const acquired: string[] = [];
-    const queue: LocalSyncDeps["queue"] = {
-      run<T>(
-        connectionId: string,
-        kind: Parameters<LocalSyncDeps["queue"]["run"]>[1],
-        fn: () => Promise<T>,
-      ): Promise<T> {
-        expect(kind).toBe("end");
-        return f.deps.queue.run(connectionId, kind, async () => {
-          expect(held).not.toContain(connectionId);
-          acquired.push(connectionId);
-          held.push(connectionId);
-          try {
-            return await fn();
-          } finally {
-            expect(held.pop()).toBe(connectionId);
-          }
-        });
-      },
-    };
-    vi.mocked(f.access.readBack).mockImplementation(async (copy) => {
-      expect(held).toEqual(["connection-a", "connection-b"]);
-      return f.proof(copy);
-    });
-    const erase = f.access.erase;
-    f.access.erase = vi.fn(async (copy) => {
-      expect(held).toEqual(["connection-a", "connection-b"]);
-      return erase(copy);
-    });
-    const result = await retireLegacyCopies({ ...f.deps, queue }, f.access, {
-      streamSync: { retireLegacy: true },
-      reportFile: (report) => f.reports.push(report),
-    });
-    expect(result.deleted).toBe(1);
-    expect(acquired).toEqual(["connection-a", "connection-b"]);
-    expect(held).toEqual([]);
-    expect(await f.states()).toEqual([
-      { state: "retired" },
-      { state: "retired" },
-      { state: "retired" },
-    ]);
+});
+it("a deleted connection and an unpublished stream do not retain obsolete files", async () => {
+  const f = await fixture();
+  await f.db.batch([
+    { sql: "UPDATE connections SET control_state = 'deleted', deleted_at = 1" },
+    { sql: "UPDATE stream_state SET publish_watermark = 0" },
+  ]);
+  expect(await f.run()).toMatchObject({ deleted: 1 });
+  expect(await f.db.query("SELECT control_state FROM connections")).toEqual([
+    { control_state: "deleted" },
+  ]);
+});
+it("the exact-copy compare fence preserves a replacement", async () => {
+  const f = await fixture();
+  f.access.erase = async () => false;
+  expect(await f.run()).toMatchObject({ deleted: 0 });
+  expect(f.present()).not.toBeNull();
+  expect(f.reports[0]).toMatchObject({ decision: "changed" });
+});
+it("absence is reconciled only by its exact durable intent, without read-back", async () => {
+  const f = await fixture();
+  f.access.erasedWithIntent = async () => true;
+  f.access.finishErase = vi.fn(async () => {});
+  f.access.readBack = vi.fn(async () => {
+    throw new Error("absent");
+  });
+  expect(await f.run()).toMatchObject({
+    ready: 1,
+    deleted: 0,
+    readbackFailures: 0,
+  });
+  expect(f.access.readBack).not.toHaveBeenCalled();
+  expect(f.access.erase).not.toHaveBeenCalled();
+  expect(f.access.finishErase).toHaveBeenCalledOnce();
+  expect(await f.states()).toEqual([{ state: "retired" }]);
+});
+it("missing files with no content proof are counted without synthesizing intent", async () => {
+  const f = await fixture();
+  f.replace({ ...f.copy, contentHash: "" });
+  expect(await f.run()).toMatchObject({ missing: 1, deleted: 0 });
+  expect(f.access.erase).not.toHaveBeenCalled();
+  expect(f.reports[0]).toMatchObject({
+    decision: "skipped",
+    reason: "missing-copy-proof",
   });
 });

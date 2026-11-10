@@ -2,7 +2,6 @@ import { createLocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   LEGACY_SCOPE_BINDINGS,
   legacyAliasScopes,
-  projectPdppRecordsToLegacyPayload,
 } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { legacyConnectorKey } from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
 import type { ImportProjectionPort } from "@opendatalabs/personal-server-ts-core/localdb";
@@ -17,23 +16,9 @@ export const importProjection: ImportProjectionPort = {
       {
         connector: legacyConnectorKey(binding.pdppSource),
         streams: binding.pdppStreams,
-        primaryKey: binding.primaryKey,
-        rowOrder: binding.rowOrder,
       },
     ]),
   ),
-  project(name, records, options) {
-    const result = projectPdppRecordsToLegacyPayload(
-      name,
-      [...records],
-      options,
-    );
-    return result.ok &&
-      !result.diagnostics?.length &&
-      !result.projectionOmissions?.length
-      ? result.payload
-      : null;
-  },
 };
 
 export function createServerLocalSync(

@@ -184,7 +184,7 @@ describe("import ledger", () => {
     }
   });
 
-  it("ledger-null-or-malformed-holds", async () => {
+  it("ledger-null-or-malformed-is-not-a-receipt", async () => {
     const { db } = await fresh();
     const ledger = createImportLedger(db);
     const invalid: readonly [string, SqlValue][] = [
