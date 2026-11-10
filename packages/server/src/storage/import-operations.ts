@@ -113,13 +113,12 @@ export function createImportOperations(
    * Finish interrupted work. Cleaning up a retired operation is a removal and
    * needs nothing; finishing a prepared one publishes a legacy file, so it
    * happens only for a caller that holds the seal (`hold`). Without a hold
-   * prepared operations are left as they are, and so are those `spare` names.
+   * prepared operations are left as they are.
    */
   function recover(
     hold: LegacyWriteHold | undefined,
     own?: ReturnType<typeof key>,
     replicaPath?: string,
-    spare?: (row: OperationRow) => boolean,
   ): void {
     const rows = db
       .prepare(
@@ -127,7 +126,7 @@ export function createImportOperations(
       )
       .all() as OperationRow[];
     for (const row of rows) {
-      if (row.state === "prepared" && (!hold || spare?.(row))) continue;
+      if (row.state === "prepared" && !hold) continue;
       try {
         recoverRow(row, hold);
       } catch (error) {
@@ -391,6 +390,27 @@ export function createImportOperations(
   }
 
   /**
+   * Cancels the prepared operations an erase targets, before it finishes the
+   * publications other operations are owed. A cancelled operation is never
+   * published, so the erase's target is not made readable, not even for the
+   * moment before the removal. A removal: it publishes nothing.
+   */
+  function cancelTargets(
+    hold: LegacyWriteHold | undefined,
+    scope: string,
+    where: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    return removal(hold, scope, () =>
+      immediate(() => {
+        db.prepare(
+          `UPDATE owner_import_operations SET state = 'cancelled', metadata_json = COALESCE(metadata_json, '{}') WHERE ${where} AND state = 'prepared'`,
+        ).run(params);
+      }),
+    );
+  }
+
+  /**
    * A pure removal of one scope's data: under the seal's lock, or inside the
    * caller's own commit, and under that scope's lock taken inside the seal.
    */
@@ -409,16 +429,13 @@ export function createImportOperations(
    * its own, run before and apart from the removal (the lock is not
    * re-entrant): a removal never publishes. A caller that already holds the
    * seal publishes under its own hold. A refusal leaves those operations
-   * prepared; the erase itself is never refused. The operations the erase
-   * targets (`spare`) stay prepared: the erase retires them, so they are never
-   * published, not even for the moment before the removal.
+   * prepared; the erase itself is never refused.
    */
   async function finishOwedPublications(
     hold: LegacyWriteHold | undefined,
-    spare?: (row: OperationRow) => boolean,
   ): Promise<void> {
     if (hold) {
-      immediate(() => recover(hold, undefined, undefined, spare));
+      immediate(() => recover(hold));
       return;
     }
     const owed = db
@@ -428,9 +445,7 @@ export function createImportOperations(
       .get();
     if (!owed) return;
     try {
-      await seal.commit((sealed) =>
-        immediate(() => recover(sealed, undefined, undefined, spare)),
-      );
+      await seal.commit((sealed) => immediate(() => recover(sealed)));
     } catch (error) {
       if (!(error instanceof LegacyWriteRefusedError)) throw error;
     }
@@ -474,7 +489,8 @@ export function createImportOperations(
     commitVersion,
     recoverAtBoot,
     async deleteScope(scope: string, hold?: LegacyWriteHold): Promise<number> {
-      await finishOwedPublications(hold, (row) => row.scope === scope);
+      await cancelTargets(hold, scope, "scope = @scope", { scope });
+      await finishOwedPublications(hold);
       return removal(hold, scope, () => {
         const snapshot = immediate(() => {
           deleteFirstSeenLedgerSync(options, scope);
@@ -590,10 +606,13 @@ export function createImportOperations(
       indexedPath?: string,
       hold?: LegacyWriteHold,
     ): Promise<boolean> {
-      await finishOwedPublications(
+      await cancelTargets(
         hold,
-        (row) => row.scope === scope && row.collected_at === collectedAt,
+        scope,
+        "scope = @scope AND collected_at = @collectedAt",
+        { scope, collectedAt },
       );
+      await finishOwedPublications(hold);
       return removal(hold, scope, () => {
         immediate(() => {
           retire("scope = @scope AND collected_at = @collectedAt", {
