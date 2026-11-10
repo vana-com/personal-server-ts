@@ -1,9 +1,8 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
+  attachPersonalServerReadGranteeObserver,
   handlePersonalServerDataRequest,
-  PS_GRANTEE_REF_HEADER,
-  PS_LITE_RELAY_READ_HEADER,
   type PersonalServerDataApiDeps,
   type PersonalServerReadAuthResult,
 } from "./index.js";
@@ -40,44 +39,79 @@ function read(headers: Record<string, string> = {}) {
   });
 }
 
-describe("relay grantee ref header", () => {
-  it("labels a relay-forwarded builder read with a truncated sha256 of the lowercased builder", async () => {
-    const deps = await fixture({ builder: BUILDER, grantId: "grant-1" });
-    const response = await handlePersonalServerDataRequest(
-      read({ [PS_LITE_RELAY_READ_HEADER]: "1" }),
-      deps,
-    );
+async function observedRead(
+  readResult: PersonalServerReadAuthResult | void,
+  observer?: (ref: Promise<string | undefined>) => void,
+) {
+  const deps = await fixture(readResult);
+  const request = read();
+  const refs: Array<Promise<string | undefined>> = [];
+  attachPersonalServerReadGranteeObserver(
+    request,
+    observer ?? ((ref) => refs.push(ref)),
+  );
+  const response = await handlePersonalServerDataRequest(request, deps);
+  return { response, refs };
+}
+
+describe("read grantee observer", () => {
+  it("reports a truncated sha256 of the lowercased builder for an attached observer", async () => {
+    const { response, refs } = await observedRead({
+      builder: BUILDER,
+      grantId: "grant-1",
+    });
     expect(response.status).toBe(200);
     const expected = createHash("sha256")
       .update(BUILDER.toLowerCase())
       .digest("hex")
       .slice(0, 12);
-    expect(response.headers.get(PS_GRANTEE_REF_HEADER)).toBe(expected);
+    expect(refs).toHaveLength(1);
+    await expect(refs[0]).resolves.toBe(expected);
   });
 
-  it("does not add the header when the request is not relay-forwarded", async () => {
+  it("never exposes the label as a response header, even when a requester asks via the old wire header", async () => {
     const deps = await fixture({ builder: BUILDER, grantId: "grant-1" });
-    const response = await handlePersonalServerDataRequest(read(), deps);
-    expect(response.status).toBe(200);
-    expect(response.headers.get(PS_GRANTEE_REF_HEADER)).toBeNull();
-  });
-
-  it("labels owner reads as owner, never hashing an address", async () => {
-    const deps = await fixture({ builder: BUILDER, grantId: "owner" });
     const response = await handlePersonalServerDataRequest(
-      read({ [PS_LITE_RELAY_READ_HEADER]: "1" }),
-      deps,
-    );
-    expect(response.headers.get(PS_GRANTEE_REF_HEADER)).toBe("owner");
-  });
-
-  it("omits the header when auth resolves no builder address", async () => {
-    const deps = await fixture({ grantId: "grant-1" });
-    const response = await handlePersonalServerDataRequest(
-      read({ [PS_LITE_RELAY_READ_HEADER]: "1" }),
+      read({ "x-ps-lite-relay-read": "1" }),
       deps,
     );
     expect(response.status).toBe(200);
-    expect(response.headers.get(PS_GRANTEE_REF_HEADER)).toBeNull();
+    expect(response.headers.get("x-ps-grantee-ref")).toBeNull();
+    expect([...response.headers.keys()].join(",")).not.toContain("grantee");
+  });
+
+  it("labels owner reads as owner", async () => {
+    const { refs } = await observedRead({ builder: BUILDER, grantId: "owner" });
+    await expect(refs[0]).resolves.toBe("owner");
+  });
+
+  it("reports undefined when auth resolves no builder address", async () => {
+    const { response, refs } = await observedRead({ grantId: "grant-1" });
+    expect(response.status).toBe(200);
+    await expect(refs[0]).resolves.toBeUndefined();
+  });
+
+  it("never fails the read when the observer throws or hashing fails", async () => {
+    const { response } = await observedRead(
+      { builder: BUILDER, grantId: "grant-1" },
+      () => {
+        throw new Error("observer fault");
+      },
+    );
+    expect(response.status).toBe(200);
+
+    const digest = vi
+      .spyOn(crypto.subtle, "digest")
+      .mockRejectedValue(new Error("no subtle"));
+    try {
+      const { response: hashed, refs } = await observedRead({
+        builder: BUILDER,
+        grantId: "grant-1",
+      });
+      expect(hashed.status).toBe(200);
+      await expect(refs[0]).resolves.toBeUndefined();
+    } finally {
+      digest.mockRestore();
+    }
   });
 });
