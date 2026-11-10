@@ -1327,8 +1327,10 @@ describe("read-reliability events", () => {
       method: "POST",
       streamId: 3,
     });
-    await sendRequest(sockets[0], "/v1/data/a.b", { streamId: 4 });
-    expect(observed).toEqual([false, false, false, true]);
+    await sendRequest(sockets[0], "/v1/data/a.b/versions", { streamId: 5 });
+    await sendRequest(sockets[0], "/v1/data/a.b/lineage/3", { streamId: 6 });
+    await sendRequest(sockets[0], "/v1/data/a.b?grantId=g1", { streamId: 4 });
+    expect(observed).toEqual([false, false, false, false, false, true]);
     expect(events.map((event) => event.type)).toEqual([
       "ps_read_received",
       "ps_read_finished",
