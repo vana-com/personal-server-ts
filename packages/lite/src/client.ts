@@ -1,3 +1,4 @@
+import { DisposalScope } from "./lifecycle.js";
 import {
   accessLogsListPath,
   createOwnerSignedPersonalServerRequest,
@@ -49,8 +50,8 @@ import {
   type RegisterServerResult,
 } from "@opendatalabs/vana-sdk/browser";
 import {
-  createIndexedDbPsLiteRuntime,
-  type IndexedDbPsLiteRuntime,
+  prepareIndexedDbPsLiteRuntime,
+  type PreparedIndexedDbPsLiteRuntime,
   type IndexedDbPsLiteRuntimeOptions,
 } from "./browser-runtime.js";
 import {
@@ -151,9 +152,9 @@ export async function startPersonalServer(
           () => relayClientForDrain,
         )
       : options.readFulfillmentReporter;
-  const runtimeBundle: IndexedDbPsLiteRuntime | null = options.runtime
+  const runtimeBundle: PreparedIndexedDbPsLiteRuntime | null = options.runtime
     ? null
-    : await createIndexedDbPsLiteRuntime({
+    : await prepareIndexedDbPsLiteRuntime({
         ...options,
         readFulfillmentReporter,
         ownerSignature: requiredOwnerSignature(options.ownerSignature),
@@ -166,9 +167,13 @@ export async function startPersonalServer(
       });
   const runtime = options.runtime ?? runtimeBundle!.runtime;
 
-  if (options.active ?? true) {
-    runtime.activate();
-  }
+  const scope = new DisposalScope();
+  scope.defer(() => {
+    relayClient = undefined;
+    setStatus("stopped");
+  });
+  if (runtimeBundle) scope.defer(() => runtimeBundle.dispose());
+  else scope.defer(() => runtime.deactivate());
 
   let status: PersonalServerStatus = "ready";
   let relayStatus: PsLiteRelayStatus = "closed";
@@ -183,23 +188,32 @@ export async function startPersonalServer(
     options.onStatus?.(nextStatus);
   };
 
-  if (resolvedRelayOptions) {
-    relayStatus = "connecting";
-    publicUrl = initialPublicUrl;
-    relayClient = startPsLiteRelayClient({
-      ...resolvedRelayOptions,
-      runtime,
-      origin: runtimeOrigin,
-      tlsIdentityStore:
-        options.persistence?.relayTlsIdentity ??
-        resolvedRelayOptions.tlsIdentityStore,
-      onStatus(nextRelayStatus, detail) {
-        relayStatus = nextRelayStatus;
-        if (nextRelayStatus === "error") setStatus("error");
-        resolvedRelayOptions.onStatus?.(nextRelayStatus, detail);
-      },
-    });
-    relayClientForDrain = relayClient;
+  try {
+    if (resolvedRelayOptions) {
+      relayStatus = "connecting";
+      publicUrl = initialPublicUrl;
+      relayClient = startPsLiteRelayClient({
+        ...resolvedRelayOptions,
+        runtime,
+        origin: runtimeOrigin,
+        tlsIdentityStore:
+          options.persistence?.relayTlsIdentity ??
+          resolvedRelayOptions.tlsIdentityStore,
+        onStatus(nextRelayStatus, detail) {
+          relayStatus = nextRelayStatus;
+          if (nextRelayStatus === "error") setStatus("error");
+          resolvedRelayOptions.onStatus?.(nextRelayStatus, detail);
+        },
+      });
+      const ownedRelay = relayClient;
+      scope.defer(() => ownedRelay.close("personal-server-stop"));
+      relayClientForDrain = relayClient;
+    }
+
+    if (runtimeBundle) await runtimeBundle.start();
+    else if (options.active ?? true) runtime.activate();
+  } catch (error) {
+    return scope.fail(error);
   }
 
   async function info(): Promise<PersonalServerInfo> {
@@ -677,13 +691,8 @@ export async function startPersonalServer(
     });
   }
 
-  async function stop(): Promise<void> {
-    if (status === "stopped") return;
-    relayClient?.close("personal-server-stop");
-    relayClient = undefined;
-    runtime.deactivate();
-    await runtimeBundle?.syncManager?.stop?.();
-    setStatus("stopped");
+  function stop(): Promise<void> {
+    return scope.dispose();
   }
 
   // Only a runtime this function built has passed the door. A supplied

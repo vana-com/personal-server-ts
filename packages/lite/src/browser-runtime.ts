@@ -1,3 +1,4 @@
+import { DisposalScope } from "./lifecycle.js";
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
 import { resolveLiteReplication } from "./replication-door.js";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
@@ -143,7 +144,7 @@ export interface IndexedDbPsLiteRuntime {
   tokenStore: PsLiteRuntimeOptions["tokenStore"];
   accessLogStore: AccessLogReader & AccessLogWriter;
   syncManager: PsLiteRuntimeOptions["syncManager"];
-  /** The compute layer; hosts call `scheduler.stop()` on teardown. */
+  /** The compute layer; the prepared bundle owns its started lifecycle. */
   derivatives: PsLiteRuntimeOptions["derivatives"];
   /** This boot's replication door, from `resolveLiteReplication`. */
   replication: ReplicationDoorStatus;
@@ -151,9 +152,33 @@ export interface IndexedDbPsLiteRuntime {
   replicationHost?: LiteReplication;
 }
 
+export interface PreparedIndexedDbPsLiteRuntime extends IndexedDbPsLiteRuntime {
+  /** Start once. Supplied services transfer lifecycle control when started. */
+  start(): Promise<void>;
+  /** Terminal, shared disposal. Host persistence is never closed. */
+  dispose(): Promise<void>;
+}
+
+/** Compatibility entry point: prepare, then start, with rollback on failure. */
 export async function createIndexedDbPsLiteRuntime(
   options: IndexedDbPsLiteRuntimeOptions,
-): Promise<IndexedDbPsLiteRuntime> {
+): Promise<PreparedIndexedDbPsLiteRuntime> {
+  const bundle = await prepareIndexedDbPsLiteRuntime(options);
+  await bundle.start();
+  return bundle;
+}
+
+/**
+ * Assemble without starting sync, schedulers, replication, or admission.
+ * start() takes lifecycle control of supplied background services, too; supply
+ * stopped services. Host-owned persistence remains open after dispose().
+ * As in the legacy factory, enabled sync runs after start even with active:
+ * false; active gates admission, derivatives and replication only.
+ */
+export async function prepareIndexedDbPsLiteRuntime(
+  options: IndexedDbPsLiteRuntimeOptions,
+): Promise<PreparedIndexedDbPsLiteRuntime> {
+  const scope = new DisposalScope();
   const dbName = options.dbName ?? "personal-server-lite";
   const injected = options.persistence;
   if (injected !== undefined) assertCompletePsLitePersistenceBundle(injected);
@@ -269,6 +294,7 @@ export async function createIndexedDbPsLiteRuntime(
   }
   if (!syncManager && config.sync.enabled) {
     const sync = await createPsLiteSyncManager({
+      autoStartSync: false,
       config,
       stateStore,
       storage,
@@ -371,6 +397,7 @@ export async function createIndexedDbPsLiteRuntime(
     });
   const runtime = createPsLiteRuntime({
     ...options,
+    active: false,
     replication: replicationHost?.runtime ?? options.replication,
     auth,
     serverOrigin,
@@ -407,7 +434,46 @@ export async function createIndexedDbPsLiteRuntime(
   });
   runtimeRef = runtime;
 
+  let starting: Promise<void> | undefined;
+  let disposed = false;
   return {
+    start() {
+      if (disposed) return Promise.reject(new Error("Runtime is disposed"));
+      return (starting ??= Promise.resolve().then(async () => {
+        if (disposed) throw new Error("Runtime is disposed");
+        try {
+          // Register rollback before each start, including partial starts.
+          scope.defer(() => syncManager?.stop?.());
+          syncManager?.start?.();
+          if (options.active ?? false) {
+            scope.defer(async () => {
+              try {
+                derivatives?.scheduler.stop();
+              } finally {
+                await derivatives?.scheduler.whenIdle();
+              }
+            });
+            derivatives?.scheduler.start();
+            const replica = replicationHost?.runtime ?? options.replication;
+            scope.defer(async () => {
+              if (replica && !(await replica.stop(Infinity))) {
+                throw new Error("Replication did not stop");
+              }
+            });
+            replica?.resume();
+            scope.defer(() => runtime.setAvailable(false));
+            runtime.setAvailable(true);
+          }
+        } catch (error) {
+          disposed = true;
+          return scope.fail(error);
+        }
+      }));
+    },
+    dispose() {
+      disposed = true;
+      return scope.dispose();
+    },
     runtime,
     config,
     identity,

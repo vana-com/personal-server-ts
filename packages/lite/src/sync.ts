@@ -1,3 +1,4 @@
+import { DisposalScope } from "./lifecycle.js";
 import {
   createVersionInventoryClient,
   type DurableAdditionsService,
@@ -457,6 +458,14 @@ export async function createPsLiteSyncManager(
       },
     },
   );
-  if (options.autoStartSync !== false) syncManager.start();
+  if (options.autoStartSync !== false) {
+    const scope = new DisposalScope();
+    scope.defer(() => syncManager.stop());
+    try {
+      syncManager.start();
+    } catch (error) {
+      return scope.fail(error);
+    }
+  }
   return { syncManager, additions, serverOwner, dataPointFeed, scopeDeletions };
 }

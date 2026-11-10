@@ -983,3 +983,23 @@ describe("whenDrained + drain-gated read fulfillment", () => {
     client.close();
   });
 });
+
+describe("relay disposal while waiting for drain", () => {
+  it("settles drain waiters and clears their timers on close", async () => {
+    vi.useFakeTimers();
+    const socket = new FakeRelayWebSocket();
+    socket.bufferedAmount = 1;
+    const client = startPsLiteRelayClient({
+      sessionId: "drain-disposal",
+      runtime: createTestRuntime(),
+      tls: false,
+      webSocketFactory: () => socket,
+    });
+    const drained = client.whenDrained();
+    expect(vi.getTimerCount()).toBe(1);
+    client.close();
+    expect(vi.getTimerCount()).toBe(0);
+    await drained;
+    vi.useRealTimers();
+  });
+});
