@@ -259,12 +259,9 @@ export function createGrantHistory(db: SqlDriver, link: ConnectionLink) {
       offset = 0;
     const token = options.cursor ?? options.changesSince;
     if (token) {
-      let payload;
-      try {
-        payload = decodeCursor(token);
-      } catch {
-        throw new CursorExpiredError();
-      }
+      // Malformed syntax keeps the protocol's 400; a valid but obsolete
+      // snapshot below is 410 and requires a fresh listing.
+      const payload = decodeCursor(token);
       if (
         payload.kind !== "changes_since" ||
         payload.epoch !== "ps2-current" ||

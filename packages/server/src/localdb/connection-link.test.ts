@@ -375,6 +375,14 @@ describe("grant reads through database HTTP ports", () => {
         (await app.request("/streams/selected/records/0-hidden", { headers }))
           .status,
       ).toBe(404);
+      for (const query of ["cursor=not-a-token", "changes_since=not-a-token"]) {
+        const malformed = await app.request(
+          `/streams/selected/records?${query}`,
+          { headers },
+        );
+        expect(malformed.status).toBe(400);
+        expect((await malformed.json()).error.code).toBe("invalid_cursor");
+      }
       await run(
         db,
         "UPDATE records SET stamp_o=3,body_sha256='replacement' WHERE stream='selected' AND record_key='z-visible'",
