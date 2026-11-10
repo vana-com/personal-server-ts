@@ -287,8 +287,28 @@ export function createGrantHistory(db: SqlDriver, link: ConnectionLink) {
         throw new CursorExpiredError();
     }
     const assertExact = async () => {
+      const currentClock = await clock();
+      if (
+        horizon < currentClock.floor ||
+        (since !== null && since < currentClock.floor)
+      )
+        throw new CursorExpiredError();
       for (const target of targets) {
-        if (!link(target.instance, stream)) throw new CursorExpiredError();
+        const resolved = link(target.instance, stream);
+        if (
+          !resolved ||
+          controlScope(resolved.connector, resolved.namespace) !== target.id
+        )
+          throw new CursorExpiredError();
+        if (currentClock.floor > 0) {
+          // Compaction removed the proof that a changed key was absent at the
+          // earlier horizon. Current bodies cannot establish that old visibility.
+          const uncertain = await db.query<{ seq: number }>(
+            "SELECT seq FROM record_changes WHERE connection_id=? AND stream=? AND seq>? LIMIT 1",
+            [target.id, stream, since ?? horizon],
+          );
+          if (uncertain.length) throw new CursorExpiredError();
+        }
         const [state] = await db.query<{
           generation: number;
           control_state: string;
@@ -318,52 +338,49 @@ export function createGrantHistory(db: SqlDriver, link: ConnectionLink) {
     const rows: PdppStoredRecord[] = [];
     let visibleCount = 0;
     const limit = Math.max(1, Math.min(100, options.limit));
-    for (const target of targets) {
-      let after = "";
-      for (;;) {
-        const current = await db.query<{
-          record_key: string;
-          body: string;
-          stamp_o: number;
-        }>(
-          `SELECT r.record_key,r.body,r.stamp_o FROM records r
-        WHERE r.connection_id=? AND r.stream=? AND r.record_key>? AND EXISTS (SELECT 1 FROM record_changes c WHERE c.connection_id=r.connection_id AND c.stream=r.stream AND c.pk_hash=r.pk_hash AND c.seq<=? ${since === null ? "" : "AND c.seq>?"})
-        AND NOT EXISTS (SELECT 1 FROM record_changes c WHERE c.connection_id=r.connection_id AND c.stream=r.stream AND c.pk_hash=r.pk_hash AND c.seq>?) ORDER BY r.record_key LIMIT 100`,
-          since === null
-            ? [target.id, stream, after, horizon, horizon]
-            : [target.id, stream, after, horizon, since, horizon],
-        );
-        for (const row of current) {
-          const value: PdppStoredRecord = {
-            instance: target.instance,
-            stream,
-            recordKey: row.record_key,
-            data: JSON.parse(row.body),
-            emittedAt: new Date(row.stamp_o).toISOString(),
-            version: 1,
-            deleted: false,
-          };
-          if (!options.isVisible || options.isVisible(value)) {
-            if (visibleCount++ >= offset && rows.length <= limit)
-              rows.push(value);
-          }
+    let after: [string, string, string] | undefined;
+    while (targets.length > 0) {
+      const current = await db.query<{
+        instance: string;
+        record_key: string;
+        pk_hash: string;
+        body: string;
+        stamp_o: number;
+      }>(
+        `WITH targets(instance,connection_id) AS (VALUES ${targets.map(() => "(?,?)").join(",")})
+         SELECT t.instance,r.record_key,r.pk_hash,r.body,r.stamp_o FROM records r JOIN targets t ON t.connection_id=r.connection_id
+         WHERE r.stream=? ${after ? "AND (r.record_key,t.instance,r.pk_hash)>(?,?,?)" : ""}
+         ${since === null ? "" : "AND EXISTS (SELECT 1 FROM record_changes c WHERE c.connection_id=r.connection_id AND c.stream=r.stream AND c.pk_hash=r.pk_hash AND c.seq<=? AND c.seq>?)"}
+         AND NOT EXISTS (SELECT 1 FROM record_changes c WHERE c.connection_id=r.connection_id AND c.stream=r.stream AND c.pk_hash=r.pk_hash AND c.seq>?)
+         ORDER BY r.record_key,t.instance,r.pk_hash LIMIT 100`,
+        [
+          ...targets.flatMap((t) => [t.instance, t.id]),
+          stream,
+          ...(after ?? []),
+          ...(since === null ? [] : [horizon, since]),
+          horizon,
+        ],
+      );
+      for (const row of current) {
+        const value: PdppStoredRecord = {
+          instance: row.instance,
+          stream,
+          recordKey: row.record_key,
+          data: JSON.parse(row.body),
+          emittedAt: new Date(row.stamp_o).toISOString(),
+          version: 1,
+          deleted: false,
+        };
+        if (!options.isVisible || options.isVisible(value)) {
+          if (visibleCount++ >= offset && rows.length <= limit)
+            rows.push(value);
         }
-        if (current.length < 100) break;
-        after = current.at(-1)!.record_key;
       }
+      if (current.length < 100) break;
+      const last = current.at(-1)!;
+      after = [last.record_key, last.instance, last.pk_hash];
     }
     await assertExact();
-    rows.sort((a, b) =>
-      a.instance < b.instance
-        ? -1
-        : a.instance > b.instance
-          ? 1
-          : a.recordKey < b.recordKey
-            ? -1
-            : a.recordKey > b.recordKey
-              ? 1
-              : 0,
-    );
     const data = rows.slice(0, limit),
       hasMore = visibleCount > offset + limit;
     const cursor = encodeCursor({

@@ -16,6 +16,7 @@ import {
   createLinkedRecordQuery,
   openLocalDb,
   type SqlDriver,
+  type SqlValue,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
@@ -334,10 +335,15 @@ describe("grant reads through database HTTP ports", () => {
       !deleted.has(instance) && instance === "handle-a" && stream === "selected"
         ? { connector: "fixture", namespace: "" }
         : null;
+    let removeReference = false;
     const local = {
       recordsFor: () => query,
       blobs: {
-        get: async () => ({ bytes, mimeType: "application/octet-stream" }),
+        get: async () => {
+          if (removeReference)
+            await run(db, "DELETE FROM records WHERE stream='selected'");
+          return { bytes, mimeType: "application/octet-stream" };
+        },
       },
     } as unknown as LocalSync;
     const auth = createFixtureAuthorizationService({
@@ -380,6 +386,15 @@ describe("grant reads through database HTTP ports", () => {
           })
         ).status,
       ).toBe(404);
+      removeReference = true;
+      expect(
+        (
+          await app.request(`/${blobId}`, {
+            method: "HEAD",
+            headers: { Authorization: "Bearer token" },
+          })
+        ).status,
+      ).toBe(404);
       deleted.add("handle-a");
       expect(
         (
@@ -392,4 +407,70 @@ describe("grant reads through database HTTP ports", () => {
       store.close();
     }
   });
+});
+
+describe("grant change history after compaction", () => {
+  it("fresh listing still returns current records when the old change log is compacted", async () => {
+    const { db } = await fixture();
+    await run(db, "DELETE FROM record_changes");
+    const read = createGrantHistory(db, () => ({
+      connector: "fixture",
+      namespace: "",
+    }));
+    expect(
+      (
+        await read("selected", { instanceIds: ["handle-a"], limit: 10 })
+      ).data.map((r) => r.recordKey),
+    ).toEqual(["allowed"]);
+  });
+  it("orders multiple handles by record identity without retaining the full bodies", async () => {
+    const { db, id } = await fixture();
+    await run(
+      db,
+      "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,'selected','empty','',2,'next','{}','h')",
+      [id],
+    );
+    const read = createGrantHistory(db, () => ({
+      connector: "fixture",
+      namespace: "",
+    }));
+    const opts = { instanceIds: ["handle-b", "handle-a"], limit: 1 };
+    let page = await read("selected", opts);
+    const values = page.data.map((r) => [r.recordKey, r.instance]);
+    while (page.nextCursor) {
+      page = await read("selected", { ...opts, cursor: page.nextCursor });
+      values.push(...page.data.map((r) => [r.recordKey, r.instance]));
+    }
+    expect(values).toEqual([
+      ["", "handle-a"],
+      ["", "handle-b"],
+      ["allowed", "handle-a"],
+      ["allowed", "handle-b"],
+    ]);
+  });
+});
+
+it("rechecks binding authority after the database query resolves", async () => {
+  const { db, deleted } = await fixture();
+  const guarded: SqlDriver = {
+    ...db,
+    query: async <R extends Record<string, SqlValue>>(
+      sql: string,
+      params?: readonly SqlValue[],
+    ) => {
+      const rows = await db.query<R>(sql, params);
+      if (sql.includes("FROM records")) deleted.add("handle-a");
+      return rows;
+    },
+  };
+  const query = createLinkedRecordQuery(guarded, (instance) =>
+    deleted.has(instance) ? null : { connector: "fixture", namespace: "" },
+  );
+  expect(
+    await query.getRecord({
+      connectionId: "handle-a",
+      stream: "selected",
+      recordKey: "allowed",
+    }),
+  ).toBeNull();
 });

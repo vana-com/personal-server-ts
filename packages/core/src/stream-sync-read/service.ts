@@ -58,7 +58,7 @@ export interface ResolveInput {
 }
 
 /**
- * A local run whose rows the view does not show, and why (fold.ts): the
+ * A local run whose rows the view does not show, and why: the
  * writer's publish plan refuses or defers it, or the read does not show it
  * before it is imported. Carried to the owner only.
  */

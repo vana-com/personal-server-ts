@@ -214,7 +214,10 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     };
     const inSnapshot = <T>(read: () => T) =>
       store.withReadSnapshot ? store.withReadSnapshot(read) : read();
-    const meta = inSnapshot(authorizedMeta);
+    const meta =
+      store.validate && !(await store.validate())
+        ? undefined
+        : inSnapshot(authorizedMeta);
     const notFound = () =>
       jsonError(
         c,

@@ -29,8 +29,7 @@ import { createRunIntakeStore } from "./run-intake.js";
 
 /**
  * The one facade a host holds for a switched owner's stream sync on the
- * database: it replaces `StreamSyncWriter` + `StreamSyncReadService` in
- * `server/src/bootstrap.ts` and `lite/src/sync.ts`. Hosts build it from deps
+ * database. Node bootstrap and Lite sync build it from deps
  * and wire its parts to the existing routes; nothing else reaches the modules.
  */
 export interface LocalSync {
