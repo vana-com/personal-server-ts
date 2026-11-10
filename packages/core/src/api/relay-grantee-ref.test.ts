@@ -116,4 +116,43 @@ describe("read grantee observer", () => {
       digest.mockRestore();
     }
   });
+  it("labels a switched-account read once, although the read authorizes twice (check, then settle)", async () => {
+    const authorizeBuilderRead = vi.fn(async () => ({
+      builder: BUILDER,
+      grantId: "grant-1",
+    }));
+    const deps: PersonalServerDataApiDeps = {
+      storage: createMemoryDataStorage(),
+      accountStorageMode: fixedOwnedAccountStorageMode("switched"),
+      streamSyncRead: {
+        resolve: vi.fn(async () => ({
+          kind: "view" as const,
+          connector: "fixture",
+          ns: "",
+          cursor: "head",
+          served: { scope: "example.items", version: 1 },
+          body: new Response(JSON.stringify({ data: { records: [] } })).body!,
+        })),
+      },
+      auth: {
+        authorizeOwner: vi.fn(async () => undefined),
+        authorizeBuilderList: vi.fn(async () => undefined),
+        authorizeBuilderRead,
+      },
+      accessLogWriter: { write: vi.fn(async () => undefined) },
+    } as never;
+    const request = read();
+    const refs: Array<Promise<string | undefined>> = [];
+    attachPersonalServerReadGranteeObserver(request, (ref) => refs.push(ref));
+    const response = await handlePersonalServerDataRequest(request, deps);
+    await response.text();
+    expect(response.status).toBe(200);
+    expect(authorizeBuilderRead).toHaveBeenCalledTimes(2);
+    const expected = createHash("sha256")
+      .update(BUILDER.toLowerCase())
+      .digest("hex")
+      .slice(0, 12);
+    expect(refs).toHaveLength(1);
+    await expect(refs[0]).resolves.toBe(expected);
+  });
 });
