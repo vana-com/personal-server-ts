@@ -1,5 +1,7 @@
 import type { ReplicaFinalityHints } from "./finality.js";
 export { createReplicaFinalityHints } from "./finality.js";
+import type { ReplicaCompatibilityRoster } from "./compatibility.js";
+import { assertReplicaPublicationCompatible } from "./compatibility.js";
 import {
   deriveScopeKey,
   encryptWithPassword,
@@ -31,6 +33,7 @@ import type { DataPointFeedPort } from "../ports/index.js";
 import type { ServerSigner } from "../signing/signer.js";
 import {
   replicaFragmentKey,
+  replicaLegacyFragmentKey,
   replicaManifestKey,
   type PreparedFragment,
   type PreparedManifest,
@@ -115,6 +118,11 @@ export interface ReplicaTransportPort {
   /** The owner whose keys and signer this port uses. A worker refuses any other binding. */
   owner?: string;
   finality?: ReplicaFinalityHints;
+  /** Fresh, complete gateway roster checked before every new-format object write. */
+  assertPublicationCompatible(): Promise<{
+    epoch: number;
+    format: "fragments-v2";
+  }>;
   encrypt(scope: string, plaintext: Uint8Array): Promise<Uint8Array>;
   /** Exact size for this uncompressed codec, independent of content and randomness.
    * Without this capability, aggregate attribution stays Retry rather than
@@ -185,22 +193,35 @@ export function createDpv2ReplicaTransport(deps: {
   storage: BoundedStorageAdapter;
   gateway: Pick<GatewayClient, "registerDataPoint">;
   feed: DataPointFeedPort;
-  signer: Pick<ServerSigner, "signAddData">;
+  signer: Pick<ServerSigner, "signAddData" | "signMessage" | "address">;
+  registerReplicaDataPoint?: (input: {
+    ownerAddress: string;
+    scope: string;
+    dataHash: string;
+    metadataHash: string;
+    expectedVersion: string;
+    signature: string;
+    replicaAuthorization: Record<string, string>;
+  }) => Promise<unknown>;
   /** Host verifies a slot against a pinned finalized DataRegistryV2 commitment.
    * SDK head-only lookup cannot implement this port. No production fallback is allowed. */
   evidence: (
     scope: string,
     version: number,
   ) => Promise<ReplicaRegistrationEvidence>;
+  /** Must fetch and validate the gateway's complete active roster; errors fail closed. */
+  compatibilityRoster: () => Promise<ReplicaCompatibilityRoster>;
+  gatewayOrigin?: string;
+  chainId?: bigint;
 }): ReplicaTransportPort {
   if (typeof deps.storage.downloadBounded !== "function")
     throw new TypeError(
       "replication needs a storage adapter with bounded reads",
     );
+  const assertPublicationCompatible = async () =>
+    assertReplicaPublicationCompatible(await deps.compatibilityRoster());
   const password = (scope: string) =>
     bytesToHex(deriveScopeKey(deps.masterKey, scope)).slice(2);
-  const fragmentUrl = (scope: string, digest: string) =>
-    deps.storage.urlForKey(replicaFragmentKey(scope, digest));
   async function download(url: string, read: ReplicaRead) {
     const timeout = AbortSignal.timeout(REPLICA_RECEIVE_TIMEOUT_MS);
     const signal = read.signal
@@ -225,27 +246,54 @@ export function createDpv2ReplicaTransport(deps: {
       throw new ReplicaObjectRefused("oversize");
     return bytes;
   }
+  async function downloadFragment(
+    scope: string,
+    digest: string,
+    read: ReplicaRead,
+  ) {
+    // Both addresses share one deadline and caller cancellation. Only a
+    // definitive absence permits the single historical-address read.
+    const timeout = AbortSignal.timeout(REPLICA_RECEIVE_TIMEOUT_MS);
+    const signal = read.signal
+      ? AbortSignal.any([read.signal, timeout])
+      : timeout;
+    const bounded = { ...read, signal };
+    try {
+      return await download(
+        deps.storage.urlForKey(replicaFragmentKey(scope, digest)),
+        bounded,
+      );
+    } catch (error) {
+      signal.throwIfAborted();
+      if (!isDefinitiveNotFound(error)) throw error;
+      return download(
+        deps.storage.urlForKey(replicaLegacyFragmentKey(scope, digest)),
+        bounded,
+      );
+    }
+  }
   return {
     owner: deps.owner,
     finality: deps.finality,
+    assertPublicationCompatible,
     encrypt: (scope, bytes) => encryptWithPassword(bytes, password(scope)),
     encryptedByteLength: replicaOpenPgpCiphertextByteLength,
     decrypt: (scope, bytes) => decryptUncompressed(bytes, password(scope)),
     evidence: deps.evidence,
     async putFragment(fragment, signal) {
+      await assertPublicationCompatible();
       await deps.storage.upload(
         replicaFragmentKey(fragment.scope, fragment.digest),
         fragment.encrypted,
         signal,
       );
     },
-    getFragment: (scope, digest, read) =>
-      download(fragmentUrl(scope, digest), read),
+    getFragment: (scope, digest, read) => downloadFragment(scope, digest, read),
     async hasFragment(scope, digest, signal) {
       try {
         // A zero-byte bounded probe proves presence as soon as bytes arrive.
         // StorageAdapter.exists may hide a full SDK download; never call it.
-        await download(fragmentUrl(scope, digest), { maxBytes: 0, signal });
+        await downloadFragment(scope, digest, { maxBytes: 0, signal });
         return true;
       } catch (error) {
         if (error instanceof ReplicaObjectRefused) return true;
@@ -254,6 +302,7 @@ export function createDpv2ReplicaTransport(deps: {
       }
     },
     async put(manifest, signal) {
+      await assertPublicationCompatible();
       await deps.storage.upload(
         replicaManifestKey(manifest.scope, manifest.version),
         manifest.encrypted,
@@ -261,6 +310,16 @@ export function createDpv2ReplicaTransport(deps: {
       );
     },
     async register(manifest) {
+      await this.assertPublicationCompatible();
+      const roster = await deps.compatibilityRoster();
+      const decision = assertReplicaPublicationCompatible(roster);
+      const registration = roster.devices.find(
+        (device) =>
+          device.address.toLowerCase() === deps.signer.address.toLowerCase() &&
+          device.revokedAt === null,
+      );
+      if (!registration || !deps.gatewayOrigin || deps.chainId === undefined)
+        throw new Error("replica_publication_authorization_invalid");
       const msg = {
         ownerAddress: deps.owner,
         scope: manifest.scope,
@@ -268,11 +327,38 @@ export function createDpv2ReplicaTransport(deps: {
         metadataHash: manifest.metadataHash,
         expectedVersion: BigInt(manifest.version),
       };
-      await deps.gateway.registerDataPoint({
+      const bytes = crypto.getRandomValues(new Uint8Array(32));
+      const nonce =
+        `0x${[...bytes].map((value) => value.toString(16).padStart(2, "0")).join("")}` as `0x${string}`;
+      const authorization = {
+        owner: deps.owner,
+        server: deps.signer.address,
+        registrationId: registration.registrationId,
+        expectedEpoch: String(decision.epoch),
+        writeFormat: decision.format,
+        gatewayOrigin: deps.gatewayOrigin,
+        chainId: String(deps.chainId),
+        scope: manifest.scope,
+        expectedVersion: String(manifest.version),
+        dataHash: manifest.dataHash,
+        metadataHash: manifest.metadataHash,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        nonce,
+      };
+      const request = {
         ...msg,
         expectedVersion: String(manifest.version),
         signature: await deps.signer.signAddData(msg),
-      });
+        replicaAuthorization: {
+          ...authorization,
+          signature: await deps.signer.signMessage(
+            `vana.replica-publication-authorization.v1\n${JSON.stringify(authorization)}`,
+          ),
+        },
+      };
+      if (deps.registerReplicaDataPoint)
+        await deps.registerReplicaDataPoint(request);
+      else await deps.gateway.registerDataPoint(request as never);
     },
     get: (scope, version, read) =>
       download(

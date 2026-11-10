@@ -136,6 +136,19 @@ function transport() {
       exists: async () => false,
       downloadBounded: async () => new Uint8Array(),
     },
+    compatibilityRoster: async () => ({
+      complete: true,
+      epoch: 1,
+      devices: [
+        {
+          address: owner,
+          registrationId: owner,
+          revokedAt: null,
+          readerFormats: ["fragments-v2"],
+          capabilityValid: true,
+        },
+      ],
+    }),
     gateway: { registerDataPoint: async () => ({}) as never },
     feed: {
       listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),

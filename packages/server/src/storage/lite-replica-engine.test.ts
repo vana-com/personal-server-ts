@@ -7,8 +7,12 @@
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createDpv2ReplicaTransport } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
+import { canonicalJson } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { ReplicaTransportPort } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import type { ReplicaEngine } from "@opendatalabs/personal-server-ts-core/replication/engine";
+import type { ReplicaPendingBudgetLimits } from "@opendatalabs/personal-server-ts-core/replication/pending-budget";
+import { ReplicaPendingCapacityError } from "@opendatalabs/personal-server-ts-core/replication/pending-budget";
+import { ReplicaPublicationBlockedError } from "@opendatalabs/personal-server-ts-core/replication/compatibility";
 import {
   REPLICA_DEFAULT_FRAGMENT_BYTES,
   REPLICA_LIMITS_VERSION,
@@ -20,6 +24,7 @@ import {
   createLiteReplicationRuntime,
   LITE_CANONICAL_MAX_OPERATION_BYTES,
   LITE_REPLICATION_LIMITS,
+  type LiteCanonicalPersistence,
   type LiteReplicaPersistence,
 } from "@opendatalabs/personal-server-ts-lite";
 import { createMemoryReplicaObjectTransfers } from "../../../lite/src/test-support/replication.js";
@@ -150,7 +155,11 @@ function crashable(inner: LiteReplicaPersistence) {
  */
 async function liteDevice(
   net: Network,
-  opts: { enabled?: boolean; maxBlobBytes?: number } = {},
+  opts: {
+    enabled?: boolean;
+    maxBlobBytes?: number;
+    pendingBudget?: ReplicaPendingBudgetLimits;
+  } = {},
 ) {
   const path = join(scratchDirectory("lite-engine"), "native.sqlite");
   const context = () => ({
@@ -171,8 +180,27 @@ async function liteDevice(
   let offline = false;
   const open = () => {
     const persistence = process.port;
+    const canonicalPersistence: LiteCanonicalPersistence = {
+      transaction: (work) =>
+        persistence.transaction((tx) =>
+          work({
+            get: (key) => tx.get(key),
+            put: (key, value) => tx.put(key, value),
+            delete: (key) => tx.delete(key),
+            scan: (prefix, after) => tx.scan(prefix, after),
+            attachBlob: (id, expected) => tx.attachBlob(id, expected),
+            blob: (id) => tx.blob(id),
+            replicaEvidence: {
+              all: (statement, params) => tx.sql.all(statement, params),
+            },
+          }),
+        ),
+      stageBlob: (descriptor, chunks) =>
+        persistence.stageBlob(descriptor, chunks),
+      readBlob: (blobId) => persistence.readBlob(blobId),
+    };
     const canonical = createLiteCanonicalStore({
-      persistence,
+      persistence: canonicalPersistence,
       enabled: true,
       context,
       authenticateReplica,
@@ -206,6 +234,22 @@ async function liteDevice(
         getDataPoint: () => Promise.reject(new Error("unused")),
       },
       signer: { signAddData: () => Promise.reject(new Error("unused")) },
+      compatibilityRoster: async () => {
+        const authorization = await net.port.assertPublicationCompatible();
+        return {
+          complete: true,
+          epoch: authorization.epoch,
+          devices: [
+            {
+              address: authority.signer.address,
+              registrationId: owner,
+              revokedAt: null,
+              readerFormats: [authorization.format],
+              capabilityValid: true,
+            },
+          ],
+        };
+      },
       evidence: () => Promise.reject(new Error("unused")),
     });
     // Gateway calls stay in JS core (the network's gateway); object bytes
@@ -248,6 +292,8 @@ async function liteDevice(
     return { canonical, engine };
   };
   let { canonical, engine } = open();
+  if (opts.enabled !== false)
+    await canonical.activatePendingBudget(opts.pendingBudget);
   await canonical.provisionConnection("conn", {
     sourceId,
     methodId: "export",
@@ -299,6 +345,20 @@ async function liteDevice(
           blobs: [],
         },
       ]),
+    activateBudget: (limits?: ReplicaPendingBudgetLimits) =>
+      canonical.activatePendingBudget(limits),
+    outboxEntries: () => canonical.readOutboxPage(0),
+    acknowledgeBudget: (
+      operations: { writerId: string; operationId: string }[],
+    ) =>
+      canonical.acknowledgePublished(null, {
+        batch: "upgrade-drain",
+        slot: "scope/2",
+        scope: "scope",
+        version: 2,
+        commitment: `0x${"3".repeat(64)}`,
+        operations,
+      }),
     async get(id = "a") {
       return (await canonical.readRecord("conn", "messages", id))?.data;
     },
@@ -356,6 +416,367 @@ async function converged(node: TransportDevice, lite: LiteDevice) {
 }
 
 describe("PS-Lite replication engine with a Node writer", () => {
+  it("rebuilds old published SQL history, an unpublished tail and unsupported debt", async () => {
+    const net = network();
+    const lite = await liteDevice(net, { enabled: false });
+    await lite.put("published history", "history");
+    await lite.put("unpublished tail", "tail");
+    const entries = (await lite.outboxEntries()).entries;
+    const published = entries.slice(0, 2).map(({ operation }) => operation);
+    const unsupported = structuredClone(entries[2]!.operation);
+    unsupported.revision.operationId = "unsupported-retained-operation";
+    const db = lite.native().db;
+    db.exec(`CREATE TABLE pdpp_transport_manifests_out (
+      batch TEXT PRIMARY KEY, scope TEXT NOT NULL, version INTEGER NOT NULL,
+      data_hash TEXT NOT NULL, metadata_hash TEXT NOT NULL, state TEXT NOT NULL
+    );
+    CREATE TABLE pdpp_transport_operation_outcomes (
+      batch TEXT NOT NULL, position INTEGER NOT NULL, operation_json TEXT,
+      writer_id TEXT, operation_id TEXT, outcome TEXT, encoding_failed INTEGER NOT NULL DEFAULT 0
+    );`);
+    db.prepare(
+      "INSERT INTO pdpp_transport_manifests_out VALUES (?,?,?,?,?,'published')",
+    ).run(
+      "old-published",
+      "scope",
+      1,
+      `0x${"1".repeat(64)}`,
+      `0x${"2".repeat(64)}`,
+    );
+    const publishedOutcome = db.prepare(
+      "INSERT INTO pdpp_transport_operation_outcomes (batch,position,operation_json,writer_id,operation_id,outcome,encoding_failed) VALUES (?,?,?,?,?,NULL,0)",
+    );
+    published.forEach((operation, position) =>
+      publishedOutcome.run(
+        "old-published",
+        position,
+        canonicalJson(operation),
+        operation.revision.writerId,
+        operation.revision.operationId,
+      ),
+    );
+    db.prepare(
+      "INSERT INTO pdpp_transport_operation_outcomes (batch,position,operation_json,writer_id,operation_id,outcome,encoding_failed) VALUES ('old-unsupported',0,?,?,?,'unsupported',0)",
+    ).run(
+      canonicalJson(unsupported),
+      unsupported.revision.writerId,
+      unsupported.revision.operationId,
+    );
+    db.prepare("DELETE FROM lite_kv WHERE key LIKE 'pending-budget/%'").run();
+
+    await lite.activateBudget({ operations: 2, logicalBytes: 1_000_000 });
+    const state = JSON.parse(
+      db
+        .prepare("SELECT value FROM lite_kv WHERE key='pending-budget/state'")
+        .get()!.value as string,
+    ) as { operations: number };
+    expect(
+      state.operations,
+      JSON.stringify({
+        entries: entries.map(({ operation }) => operation.revision),
+        released: db
+          .prepare(
+            "SELECT key,value FROM lite_kv WHERE key LIKE 'pending-budget/released/%'",
+          )
+          .all(),
+        sql: db
+          .prepare(
+            "SELECT batch,position,writer_id,operation_id,outcome FROM pdpp_transport_operation_outcomes",
+          )
+          .all(),
+      }),
+    ).toBe(2);
+    expect(await lite.get("history")).toEqual({
+      id: "history",
+      text: "published history",
+    });
+    await lite.activateBudget({ operations: 2, logicalBytes: 1_000_000 });
+    await expect(lite.put("blocked", "blocked")).rejects.toBeInstanceOf(
+      ReplicaPendingCapacityError,
+    );
+
+    const debt = [entries[2]!.operation, unsupported].map((operation) => ({
+      writerId: operation.revision.writerId,
+      operationId: operation.revision.operationId,
+    }));
+    await lite.acknowledgeBudget(debt);
+    await expect(lite.put("after drain", "after-drain")).resolves.toBeDefined();
+    lite.close();
+  });
+
+  it("holds both hosts at capacity until exact finalized survivors release their debt", async () => {
+    const net = network({ holdFinality: true });
+    const limits = { operations: 3, logicalBytes: 1_000_000 };
+    const node = transportDevice(net, { pendingBudget: limits });
+    const lite = await liteDevice(net, {
+      pendingBudget: { operations: 2, logicalBytes: 1_000_000 },
+    });
+    await run([node, lite], 5);
+
+    const blobBytes = new Uint8Array([3, 1, 4, 1, 5, 9]);
+    const blob = node.store.storeBlobBytesForInstance({
+      instance: "conn",
+      method: "export",
+      generation: 1,
+      bytes: blobBytes,
+      mimeType: "application/octet-stream",
+    });
+    const blobData = {
+      id: "node-blob",
+      blob_ref: { blob_id: blob.blobId, mime_type: blob.mimeType },
+    };
+    expect(
+      node.store.ingestBatch(
+        [
+          {
+            instance: "conn",
+            stream: "messages",
+            key: "node-blob",
+            data: blobData,
+            emitted_at: at,
+          },
+        ],
+        () => "mutable_state",
+        () => ["id"],
+        { method: "export", generation: 1 },
+      ).accepted,
+    ).toBe(1);
+    await lite.put("lite pending", "lite-pending");
+
+    const nodeBefore = node.db
+      .prepare(
+        "SELECT operations,logical_bytes FROM pdpp_replica_pending_budget WHERE id=1",
+      )
+      .get() as { operations: number; logical_bytes: number };
+    const liteBefore = JSON.parse(
+      (
+        lite
+          .native()
+          .db.prepare(
+            "SELECT value FROM lite_kv WHERE key='pending-budget/state'",
+          )
+          .get() as { value: string }
+      ).value,
+    ) as { operations: number; logicalBytes: number };
+    expect(nodeBefore.operations).toBe(3);
+    expect(liteBefore.operations).toBe(2);
+    expect(() => node.put("refused at capacity", "node-refused")).toThrow(
+      ReplicaPendingCapacityError,
+    );
+    await expect(
+      lite.put("refused at capacity", "lite-refused"),
+    ).rejects.toBeInstanceOf(ReplicaPendingCapacityError);
+    node.reopen();
+    await lite.crashReopen();
+
+    await run([node, lite], 5);
+    expect(net.pending.size).toBeGreaterThan(0);
+    expect(net.calls.registrations.length).toBeGreaterThan(0);
+    expect(net.head.size).toBeGreaterThan(net.chain.size);
+    expect(
+      node.db
+        .prepare(
+          "SELECT operations FROM pdpp_replica_pending_budget WHERE id=1",
+        )
+        .get(),
+    ).toEqual({ operations: 3 });
+    expect(
+      JSON.parse(
+        (
+          lite
+            .native()
+            .db.prepare(
+              "SELECT value FROM lite_kv WHERE key='pending-budget/state'",
+            )
+            .get() as { value: string }
+        ).value,
+      ),
+    ).toMatchObject({ operations: 2 });
+
+    for (let i = 0; i < 64; i++) {
+      net.finalizeAll();
+      clock.advance(10_000);
+      await node.cycle();
+      await lite.cycle();
+      const nodePending = (
+        node.db
+          .prepare(
+            "SELECT operations FROM pdpp_replica_pending_budget WHERE id=1",
+          )
+          .get() as { operations: number }
+      ).operations;
+      const litePending = JSON.parse(
+        (
+          lite
+            .native()
+            .db.prepare(
+              "SELECT value FROM lite_kv WHERE key='pending-budget/state'",
+            )
+            .get() as { value: string }
+        ).value,
+      ).operations as number;
+      if (nodePending === 0 && litePending === 0) break;
+    }
+    expect(
+      node.db
+        .prepare(
+          "SELECT operations FROM pdpp_replica_pending_budget WHERE id=1",
+        )
+        .get(),
+    ).toEqual({ operations: 0 });
+    expect(
+      JSON.parse(
+        (
+          lite
+            .native()
+            .db.prepare(
+              "SELECT value FROM lite_kv WHERE key='pending-budget/state'",
+            )
+            .get() as { value: string }
+        ).value,
+      ),
+    ).toMatchObject({ operations: 0 });
+
+    expect(() => node.put("node after finality", "node-after")).not.toThrow();
+    await expect(
+      lite.put("lite after finality", "lite-after"),
+    ).resolves.toBeDefined();
+    for (let i = 0; i < 64; i++) {
+      net.finalizeAll();
+      clock.advance(10_000);
+      await node.cycle();
+      await lite.cycle();
+      const nodePending = (
+        node.db
+          .prepare(
+            "SELECT operations FROM pdpp_replica_pending_budget WHERE id=1",
+          )
+          .get() as { operations: number }
+      ).operations;
+      const litePending = JSON.parse(
+        (
+          lite
+            .native()
+            .db.prepare(
+              "SELECT value FROM lite_kv WHERE key='pending-budget/state'",
+            )
+            .get() as { value: string }
+        ).value,
+      ).operations as number;
+      if (nodePending === 0 && litePending === 0) break;
+    }
+    expect(node.get("node-blob")).toEqual(blobData);
+    expect(node.get("lite-pending")).toEqual({
+      id: "lite-pending",
+      text: "lite pending",
+    });
+    expect(node.get("lite-after")).toEqual({
+      id: "lite-after",
+      text: "lite after finality",
+    });
+    expect(await lite.get("node-blob")).toEqual(blobData);
+    expect(await lite.blob(blob.blobId)).toEqual(blobBytes);
+    expect(await lite.get("node-after")).toEqual({
+      id: "node-after",
+      text: "node after finality",
+    });
+    expect(await lite.get("lite-pending")).toEqual({
+      id: "lite-pending",
+      text: "lite pending",
+    });
+    expect(await lite.get("lite-after")).toEqual({
+      id: "lite-after",
+      text: "lite after finality",
+    });
+    expect(
+      node.db
+        .prepare("SELECT count(*) AS n FROM pdpp_replica_operations")
+        .get(),
+    ).not.toEqual({ n: 0 });
+    expect(
+      lite
+        .native()
+        .db.prepare("SELECT count(*) AS n FROM lite_kv WHERE key LIKE 'log/%'")
+        .get(),
+    ).not.toEqual({ n: 0 });
+    node.close();
+    lite.close();
+  });
+
+  it("reports missing Lite reader capability and retains work without uploading", async () => {
+    const net = network();
+    (
+      net.port as unknown as { assertPublicationCompatible?: unknown }
+    ).assertPublicationCompatible = undefined;
+    const lite = await liteDevice(net);
+    await lite.put("host capability missing", "missing-reader-gate");
+
+    let report = await lite.engine.step();
+    for (let attempt = 0; attempt < 12; attempt++) {
+      if (
+        report.problems.some(
+          (problem) =>
+            problem.cause?.code ===
+            "replica_publication_capability_unavailable",
+        )
+      )
+        break;
+      clock.advance(10_000);
+      report = await lite.engine.step();
+    }
+
+    expect(
+      report.problems.some(
+        (problem) =>
+          problem.problem === "publication_blocked" &&
+          problem.cause?.code === "replica_publication_capability_unavailable",
+      ),
+    ).toBe(true);
+    expect(
+      [...net.blobs.keys()].filter((key) => key.includes("/fragments-")),
+    ).toEqual([]);
+    expect((lite.outbox() as { n: number }).n).toBeGreaterThan(0);
+  }, 60_000);
+
+  it("holds a batch before fragment PUT while its reader capability is blocked, then resumes", async () => {
+    const net = network();
+    let blocked = true;
+    const assertCompatible = net.port.assertPublicationCompatible;
+    net.port.assertPublicationCompatible = async () => {
+      if (blocked)
+        throw new ReplicaPublicationBlockedError([
+          {
+            address: "0x0000000000000000000000000000000000000002",
+            name: "older reader",
+            reason: "reader_format_unsupported",
+          },
+        ]);
+      return assertCompatible();
+    };
+    const lite = await liteDevice(net);
+    await lite.put("retained while blocked", "format-gate");
+
+    await lite.cycle();
+
+    expect(
+      [...net.blobs.keys()].filter((key) => key.includes("/fragments-")),
+    ).toEqual([]);
+    expect((lite.outbox() as { n: number }).n).toBeGreaterThan(0);
+
+    blocked = false;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      clock.advance(60_000);
+      await lite.engine.step();
+      if ((lite.outbox() as { n: number }).n === 0) break;
+    }
+
+    expect(
+      [...net.blobs.keys()].filter((key) => key.includes("/fragments-")).length,
+    ).toBeGreaterThan(0);
+    expect(net.calls.registrations.length).toBeGreaterThan(0);
+    expect((lite.outbox() as { n: number }).n).toBe(0);
+  }, 60_000);
+
   it("converges a Node writer and a Lite writer", async () => {
     const net = network();
     const node = transportDevice(net);

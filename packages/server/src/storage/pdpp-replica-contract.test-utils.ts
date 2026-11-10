@@ -33,6 +33,7 @@ import {
   type DeclarationBinding,
   type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import type { ReplicaPendingBudgetLimits } from "@opendatalabs/personal-server-ts-core/replication/pending-budget";
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import {
   decodeReplicaManifest,
@@ -282,7 +283,12 @@ const slotParts = (slot: string) => {
  * and fragments at `<scope>/fragments/<sha256>`.
  */
 export function network(
-  opts: { cap?: number; crash?: CrashController; realCrypto?: boolean } = {},
+  opts: {
+    cap?: number;
+    crash?: CrashController;
+    realCrypto?: boolean;
+    holdFinality?: boolean;
+  } = {},
 ) {
   const cap = opts.cap ?? 8192;
   const crash = opts.crash;
@@ -372,11 +378,31 @@ export function network(
     delete: async () => false,
     exists: async (key: string) => blobs.has(key),
   };
+  const compatibilityRoster = async () => ({
+    complete: true,
+    epoch: 1,
+    devices: [
+      {
+        address: `0x${"22".repeat(20)}`,
+        registrationId: `0x${"33".repeat(32)}`,
+        revokedAt: null,
+        readerFormats: ["fragments-v2"],
+        capabilityValid: true,
+      },
+    ],
+  });
   const adapter = createDpv2ReplicaTransport({
     owner,
     masterKey: new Uint8Array(32).fill(5),
     storage,
-    signer: { signAddData: async () => "0x1234" as const },
+    gatewayOrigin: "https://gateway.invalid",
+    chainId: 14800n,
+    compatibilityRoster,
+    signer: {
+      signAddData: async () => "0x1234" as const,
+      signMessage: async () => `0x${"11".repeat(65)}` as `0x${string}`,
+      address: `0x${"22".repeat(20)}` as `0x${string}`,
+    },
     gateway: {
       async registerDataPoint(input) {
         const slot = slotKey(input.scope, input.expectedVersion);
@@ -399,6 +425,7 @@ export function network(
           deleted: false,
         };
         head.set(slot, row);
+        if (opts.holdFinality) pending.add(slot);
         if (!pending.has(slot)) chain.set(slot, chainRow(slot, row));
         crash?.point(`net-after-register:${slot}`);
         if (faults.loseRegistrationResponse) {
@@ -494,6 +521,7 @@ export function network(
   };
   return {
     port,
+    compatibilityRoster,
     /** The owner's gateway server roster. */
     roster: createTestReplicaRoster(),
     blobs,
@@ -655,6 +683,7 @@ export function transportDevice(
       binding: DeclarationBinding,
       data: Record<string, unknown>,
     ) => boolean;
+    pendingBudget?: ReplicaPendingBudgetLimits;
     /** Extra worker deps, passed through (e.g. coordinator quanta). */
     worker?: Record<string, unknown>;
   } = {},
@@ -698,6 +727,7 @@ export function transportDevice(
     serverId: `0x${randomBytes(32).toString("hex")}`,
     nonce: `0x${randomBytes(16).toString("hex")}`,
   });
+  store.replication.activatePendingBudget(opts.pendingBudget);
   if (opts.preexisting) put(opts.preexisting);
   let declarations = opts.declarations ?? expected.declarations;
   store.replication.beginBaseline({ owner, declarations });

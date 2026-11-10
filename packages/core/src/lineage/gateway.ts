@@ -69,6 +69,22 @@ export interface RegisterDataPointWithLineageParams {
   lineage: readonly string[];
   /** LineageAttestation signature over (owner, scope, version, dataHash, lineage). */
   lineageSignature: string;
+  replicaAuthorization?: {
+    owner: string;
+    server: string;
+    registrationId: string;
+    expectedEpoch: string;
+    writeFormat: "fragments-v2";
+    gatewayOrigin: string;
+    chainId: string;
+    scope: string;
+    expectedVersion: string;
+    dataHash: string;
+    metadataHash: string;
+    expiresAt: string;
+    nonce: string;
+    signature: string;
+  };
 }
 
 export interface RegisterDataPointWithLineageResult {
@@ -351,6 +367,9 @@ export function createGatewayLineageClient(
           expectedVersion: params.expectedVersion,
           lineage: [...params.lineage],
           lineageSignature: params.lineageSignature,
+          ...(params.replicaAuthorization
+            ? { replicaAuthorization: params.replicaAuthorization }
+            : {}),
         }),
       });
       if (!res.ok) {

@@ -229,6 +229,9 @@ export function createLiteReplicaEngine(
         delete: (key) => tx.delete(key),
         scan: (prefix, after) => tx.scan(prefix, after),
         blob: (blobId) => tx.blob(blobId),
+        replicaEvidence: {
+          all: (statement, params) => tx.sql.all(statement, params),
+        },
         attachBlob: (bytesId, expected) => tx.publishBlob(bytesId, expected),
       };
       receiving.set(tx, view);
@@ -651,8 +654,8 @@ export function createLiteReplicaEngine(
       *declarationHistory() {
         return [];
       },
-      acknowledgePublished: (next) =>
-        store((s) => s.acknowledgePublished(next)),
+      acknowledgePublished: (next, finalized) =>
+        store((s) => s.acknowledgePublished(next, finalized)),
       readPinnedBlobChunks: (blobId) => persistence.readBlob(blobId),
     },
     receiver: {

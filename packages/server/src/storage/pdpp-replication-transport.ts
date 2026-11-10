@@ -239,9 +239,10 @@ export function createReplicaTransportWorker(
           ),
         ),
       declarationHistory: () => sync(() => exporter.declarationHistory()),
-      // Node's journal is append-only and stays: rebaseline and completion
-      // dependencies read it (`pdpp-replication-sqlite.ts`).
-      acknowledgePublished: () => sync(() => undefined),
+      // Preserve the journal, but release exact pending obligations after the
+      // shared engine proves this manifest finalized.
+      acknowledgePublished: (next, finalized) =>
+        sync(() => exporter.acknowledgePublished(next, finalized)),
       readPinnedBlobChunks: (blobId) => exporter.readPinnedBlobChunks(blobId),
     },
     receiver: {

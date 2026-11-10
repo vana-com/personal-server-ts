@@ -51,6 +51,14 @@ import {
   type LiteBlobDescriptor,
   type LiteStagingId,
 } from "./canonical-persistence.js";
+import {
+  assertReplicaPendingCapacity,
+  REPLICA_PENDING_BUDGET_DEFAULTS,
+  validateReplicaPendingBudgetLimits,
+  type ReplicaPendingBudgetLimits,
+  type ReplicaPublishedBatch,
+} from "@opendatalabs/personal-server-ts-core/replication/pending-budget";
+import { replicaChainCommitment } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 
 /**
  * A refusal that the batch's content or the store's immutable state decides:
@@ -216,6 +224,7 @@ function trackViews(base: LiteCanonicalTransaction): LiteCanonicalTransaction {
     scan: (prefix, after) => base.scan(prefix, after),
     attachBlob: (stagingId, expected) => base.attachBlob(stagingId, expected),
     blob: (blobId) => base.blob(blobId),
+    ...(base.replicaEvidence ? { replicaEvidence: base.replicaEvidence } : {}),
   };
   viewWrites.set(tx, { base, first });
   return tx;
@@ -399,6 +408,8 @@ export function createLiteCanonicalStore(deps: {
   newId?: () => string;
   /** Called after each local batch commits, so replication steps soon. */
   localCommitted?: () => void;
+  /** Explicitly set only by the network-replication host, not canonical mode. */
+  pendingBudget?: ReplicaPendingBudgetLimits;
 }) {
   // Every transaction checks the stored layout first, so no reader or
   // writer can reach entries of another layout.
@@ -416,6 +427,234 @@ export function createLiteCanonicalStore(deps: {
   function enabled() {
     if (deps.enabled !== true)
       throw new Error("Lite canonical replication disabled");
+  }
+  const pendingBudgetStateKey = "pending-budget/state";
+  const pendingBudgetOperationKey = (op: ReplicaOperation) =>
+    `pending-budget/operations/${operationId(op)}`;
+  const pendingBudgetBlobKey = (blobId: string) =>
+    `pending-budget/blobs/${keyDigest(blobId)}`;
+  const pendingBudgetPublicationKey = (batch: string) =>
+    `pending-budget/publications/${keyDigest(batch)}`;
+  const pendingBudgetReleasedKey = (writerId: string, opId: string) =>
+    `pending-budget/released/${keyDigest([writerId, opId])}`;
+  const pendingBlobs = (op: ReplicaOperation) => [
+    ...new Map(
+      (op.kind === "blob-claim"
+        ? [op.blob]
+        : op.kind === "upsert"
+          ? op.blobs
+          : []
+      ).map((blob) => [blob.blobId, blob.sizeBytes] as const),
+    ),
+  ];
+  async function reservePendingOperation(
+    tx: LiteCanonicalTransaction,
+    op: ReplicaOperation,
+    rebuilding = false,
+  ) {
+    const state = await get<{
+      limits: ReplicaPendingBudgetLimits;
+      operations: number;
+      logicalBytes: number;
+    }>(tx, pendingBudgetStateKey);
+    if (!state) return;
+    const operationKey = pendingBudgetOperationKey(op);
+    if (await tx.get(operationKey)) return;
+    if (
+      await tx.get(
+        pendingBudgetReleasedKey(op.revision.writerId, op.revision.operationId),
+      )
+    )
+      return;
+    const operationBytes = encoder.encode(canonicalJson(op)).byteLength;
+    const blobs = pendingBlobs(op);
+    let requestedBytes = operationBytes;
+    for (const [blobId, sizeBytes] of blobs) {
+      if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 0)
+        throw new RangeError("invalid replica pending blob size");
+      const prior = await get<{ sizeBytes: number; references: number }>(
+        tx,
+        pendingBudgetBlobKey(blobId),
+      );
+      if (prior && prior.sizeBytes !== sizeBytes)
+        throw new Error("replica pending blob size changed");
+      if (
+        prior &&
+        (!Number.isSafeInteger(prior.references) ||
+          prior.references < 1 ||
+          prior.references >= Number.MAX_SAFE_INTEGER)
+      )
+        throw new RangeError(
+          "replica pending blob reference counter exhausted",
+        );
+      if (!prior) requestedBytes += sizeBytes;
+    }
+    if (
+      !Number.isSafeInteger(requestedBytes) ||
+      !Number.isSafeInteger(state.operations + 1) ||
+      !Number.isSafeInteger(state.logicalBytes + requestedBytes)
+    )
+      throw new RangeError("replica pending byte counter exhausted");
+    if (!rebuilding)
+      assertReplicaPendingCapacity({
+        limits: state.limits,
+        used: {
+          operations: state.operations,
+          logicalBytes: state.logicalBytes,
+        },
+        requested: { operations: 1, logicalBytes: requestedBytes },
+      });
+    await put(tx, operationKey, {
+      writerId: op.revision.writerId,
+      operationId: op.revision.operationId,
+      operationBytes,
+      blobIds: blobs.map(([id]) => id),
+    });
+    for (const [blobId, sizeBytes] of blobs) {
+      const key = pendingBudgetBlobKey(blobId);
+      const prior = await get<{ sizeBytes: number; references: number }>(
+        tx,
+        key,
+      );
+      if (
+        prior &&
+        (!Number.isSafeInteger(prior.references) ||
+          prior.references < 1 ||
+          prior.references >= Number.MAX_SAFE_INTEGER)
+      )
+        throw new RangeError(
+          "replica pending blob reference counter exhausted",
+        );
+      await put(tx, key, {
+        sizeBytes,
+        references: (prior?.references ?? 0) + 1,
+      });
+    }
+    await put(tx, pendingBudgetStateKey, {
+      ...state,
+      operations: state.operations + 1,
+      logicalBytes: state.logicalBytes + requestedBytes,
+    });
+  }
+  async function activatePendingBudget(
+    tx: LiteCanonicalTransaction,
+    requested = deps.pendingBudget ?? REPLICA_PENDING_BUDGET_DEFAULTS,
+  ) {
+    const limits = validateReplicaPendingBudgetLimits(requested);
+    const prior = await get<{
+      limits: ReplicaPendingBudgetLimits;
+      operations: number;
+      logicalBytes: number;
+    }>(tx, pendingBudgetStateKey);
+    if (prior) {
+      await put(tx, pendingBudgetStateKey, { ...prior, limits });
+      return;
+    }
+    await put(tx, pendingBudgetStateKey, {
+      limits,
+      operations: 0,
+      logicalBytes: 0,
+    });
+    // Reconstruct facts the old engine still retained. Only a published
+    // manifest plus its null-outcome survivors proves finality; the legacy
+    // outbox cursor alone does not prove that every operation survived.
+    const evidence = tx.replicaEvidence;
+    if (evidence) {
+      const schema = await evidence.all(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name IN
+         ('pdpp_transport_operation_outcomes','pdpp_transport_manifests_out')`,
+        [],
+      );
+      const tables = new Set(schema.map((row) => row.name as string));
+      const hasOutcomes = tables.has("pdpp_transport_operation_outcomes");
+      const hasManifests = tables.has("pdpp_transport_manifests_out");
+      if (hasOutcomes && hasManifests) {
+        let after = "";
+        for (;;) {
+          const manifests = await evidence.all(
+            `SELECT batch,scope,version,data_hash,metadata_hash FROM pdpp_transport_manifests_out
+           WHERE state='published' AND batch>? ORDER BY batch LIMIT 100`,
+            [after],
+          );
+          if (!manifests.length) break;
+          for (const row of manifests) {
+            const batch = row.batch as string;
+            const operations = await evidence.all(
+              `SELECT writer_id,operation_id FROM pdpp_transport_operation_outcomes
+             WHERE batch=? AND outcome IS NULL AND encoding_failed=0
+               AND writer_id IS NOT NULL AND operation_id IS NOT NULL ORDER BY position`,
+              [batch],
+            );
+            const witness: ReplicaPublishedBatch = {
+              batch,
+              slot: `${row.scope as string}/${row.version as number}`,
+              scope: row.scope as string,
+              version: row.version as number,
+              commitment: replicaChainCommitment(
+                row.data_hash as `0x${string}`,
+                row.metadata_hash as `0x${string}`,
+              ).toLowerCase(),
+              operations: operations.map((operation) => ({
+                writerId: operation.writer_id as string,
+                operationId: operation.operation_id as string,
+              })),
+            };
+            await put(tx, pendingBudgetPublicationKey(batch), witness);
+            for (const identity of witness.operations)
+              await put(
+                tx,
+                pendingBudgetReleasedKey(
+                  identity.writerId,
+                  identity.operationId,
+                ),
+                witness,
+              );
+          }
+          after = manifests.at(-1)!.batch as string;
+        }
+      }
+      if (hasOutcomes) {
+        let batch = "";
+        let position = -1;
+        for (;;) {
+          const rows = await evidence.all(
+            hasManifests
+              ? `SELECT o.batch,o.position,o.operation_json,o.writer_id,o.operation_id
+                 FROM pdpp_transport_operation_outcomes o
+                 LEFT JOIN pdpp_transport_manifests_out m ON m.batch=o.batch
+                 WHERE (o.batch>? OR (o.batch=? AND o.position>?))
+                   AND o.operation_json IS NOT NULL
+                   AND (o.outcome='unsupported' OR coalesce(m.state,'ready')<>'published')
+                 ORDER BY o.batch,o.position LIMIT 100`
+              : `SELECT batch,position,operation_json,writer_id,operation_id
+                 FROM pdpp_transport_operation_outcomes
+                 WHERE (batch>? OR (batch=? AND position>?))
+                   AND operation_json IS NOT NULL
+                 ORDER BY batch,position LIMIT 100`,
+            [batch, batch, position],
+          );
+          if (!rows.length) break;
+          for (const row of rows) {
+            const op = replicaOperationSchema.parse(
+              JSON.parse(row.operation_json as string),
+            );
+            await reservePendingOperation(tx, op, true);
+          }
+          batch = rows.at(-1)!.batch as string;
+          position = rows.at(-1)!.position as number;
+        }
+      }
+    }
+    for await (const entry of scan(tx, "log/")) {
+      const log = JSON.parse(entry.value) as LogEntry;
+      const encoded = await tx.get(log.operationKey);
+      if (encoded === undefined)
+        throw new Error(
+          "missing retained replica operation while rebuilding pending budget",
+        );
+      const op = replicaOperationSchema.parse(JSON.parse(encoded));
+      await reservePendingOperation(tx, op, true);
+    }
   }
   async function clock(
     tx: LiteCanonicalTransaction,
@@ -929,6 +1168,9 @@ export function createLiteCanonicalStore(deps: {
           ...(kept && { origin: kept.revision.origin }),
         },
       });
+      // Rebaseline copies already retained canonical state. Keep it drainable
+      // even when migration found that the old accepted debt is over limit.
+      await reservePendingOperation(tx, op, true);
       current.counter = Math.max(current.counter, counter);
       current.sequence += 1;
       const sequence = String(current.sequence).padStart(16, "0");
@@ -1162,11 +1404,17 @@ export function createLiteCanonicalStore(deps: {
         // exact operations again is idempotent; canonical writes compare content.
       }
       const newlyConfirmed: string[] = [];
-      for (const blob of input.blobs ?? []) {
-        await tx.attachBlob(blob.stagingId, blob.descriptor);
-        if (await confirmBlob(tx, blob.descriptor.blobId))
-          newlyConfirmed.push(blob.descriptor.blobId);
-      }
+      const stagedByBlob = new Map(
+        (input.blobs ?? []).map((blob) => [blob.descriptor.blobId, blob]),
+      );
+      const attachedBlobs = new Set<string>();
+      if (!local)
+        for (const blob of input.blobs ?? []) {
+          await tx.attachBlob(blob.stagingId, blob.descriptor);
+          attachedBlobs.add(blob.descriptor.blobId);
+          if (await confirmBlob(tx, blob.descriptor.blobId))
+            newlyConfirmed.push(blob.descriptor.blobId);
+        }
       const dirty = new Set<string>();
       const changed = new Map<
         string,
@@ -1180,11 +1428,12 @@ export function createLiteCanonicalStore(deps: {
         ))
           if (await confirmBlob(tx, blob.blobId))
             newlyConfirmed.push(blob.blobId);
-      for (const blobId of newlyConfirmed)
-        for (const id of await claimants(tx, blobId)) {
-          dirty.add(id);
-          full.add(id);
-        }
+      if (!local)
+        for (const blobId of newlyConfirmed)
+          for (const id of await claimants(tx, blobId)) {
+            dirty.add(id);
+            full.add(id);
+          }
       const accepted: ReplicaOperation[] = [];
       for (const raw of local ? input.operations! : envelope!.operations) {
         let op: ReplicaOperation;
@@ -1273,8 +1522,38 @@ export function createLiteCanonicalStore(deps: {
           if (decision.outcome.outcome === "rejected")
             throw new Error(decision.outcome.reason);
           if (decision.outcome.outcome === "unchanged") continue;
+          await reservePendingOperation(tx, op);
+          for (const blob of op.kind === "upsert" ? op.blobs : []) {
+            const staged = stagedByBlob.get(blob.blobId);
+            if (staged && !attachedBlobs.has(blob.blobId)) {
+              await tx.attachBlob(staged.stagingId, staged.descriptor);
+              attachedBlobs.add(blob.blobId);
+              if (await confirmBlob(tx, blob.blobId))
+                newlyConfirmed.push(blob.blobId);
+              for (const id of await claimants(tx, blob.blobId)) {
+                dirty.add(id);
+                full.add(id);
+              }
+            }
+          }
           if (op.kind === "upsert" && !(await blobReady(tx, op)))
             throw new Error("missing_or_invalid_blob");
+        }
+        if (local && op.kind !== "upsert" && op.kind !== "delete") {
+          await reservePendingOperation(tx, op);
+          if (op.kind === "blob-claim") {
+            const staged = stagedByBlob.get(op.blob.blobId);
+            if (staged && !attachedBlobs.has(op.blob.blobId)) {
+              await tx.attachBlob(staged.stagingId, staged.descriptor);
+              attachedBlobs.add(op.blob.blobId);
+              if (await confirmBlob(tx, op.blob.blobId))
+                newlyConfirmed.push(op.blob.blobId);
+              for (const id of await claimants(tx, op.blob.blobId)) {
+                dirty.add(id);
+                full.add(id);
+              }
+            }
+          }
         }
         const confirmedBlobs =
           op.kind === "blob-claim"
@@ -2089,6 +2368,16 @@ export function createLiteCanonicalStore(deps: {
         deps.localCommitted?.();
         return receipt;
       }),
+    async activatePendingBudget(
+      limits = deps.pendingBudget ?? REPLICA_PENDING_BUDGET_DEFAULTS,
+    ) {
+      enabled();
+      await persistence.transaction(async (base) => {
+        const tx = trackViews(base);
+        await clock(tx);
+        await activatePendingBudget(tx, limits);
+      });
+    },
     import: (input: {
       id: string;
       envelope: unknown;
@@ -2322,17 +2611,85 @@ export function createLiteCanonicalStore(deps: {
      * keeps every entry. Monotonic; a lower or repeated acknowledgment is a
      * no-op.
      */
-    async acknowledgePublished(next: number) {
+    async acknowledgePublished(
+      next: number | null,
+      finalized?: ReplicaPublishedBatch,
+    ) {
       enabled();
-      if (!Number.isSafeInteger(next) || next < 0)
+      if (next !== null && (!Number.isSafeInteger(next) || next < 0))
         throw new Error("invalid outbox acknowledgment");
+      if (
+        finalized &&
+        finalized.slot !== `${finalized.scope}/${finalized.version}`
+      )
+        throw new Error("replica publication slot witness changed");
       await persistence.transaction(async (base) => {
         const tx = trackViews(base);
         const current = await clock(tx);
-        if (next > current.sequence)
+        if (next !== null && next > current.sequence)
           throw new Error("outbox acknowledgment conflict");
-        if (next <= ((await get<number>(tx, "outbox-ack")) ?? 0)) return;
-        await put(tx, "outbox-ack", next);
+        if (finalized) {
+          const ackKey = pendingBudgetPublicationKey(finalized.batch);
+          const prior = await get<
+            Omit<ReplicaPublishedBatch, "operations"> & {
+              operations: ReplicaPublishedBatch["operations"];
+            }
+          >(tx, ackKey);
+          if (prior && canonicalJson(prior) !== canonicalJson(finalized))
+            throw new Error("replica publication witness changed");
+          if (!prior) await put(tx, ackKey, finalized);
+          for (const identity of finalized.operations) {
+            const opKey = `pending-budget/operations/${keyDigest([identity.writerId, identity.operationId])}`;
+            const charge = await get<{
+              operationBytes: number;
+              blobIds: string[];
+            }>(tx, opKey);
+            if (!charge) continue;
+            let releasedBytes = charge.operationBytes;
+            for (const blobId of charge.blobIds) {
+              const blobKey = pendingBudgetBlobKey(blobId);
+              const blob = await get<{ sizeBytes: number; references: number }>(
+                tx,
+                blobKey,
+              );
+              if (!blob || blob.references < 1)
+                throw new Error("replica pending blob reference missing");
+              if (blob.references === 1) {
+                releasedBytes += blob.sizeBytes;
+                await tx.delete(blobKey);
+              } else
+                await put(tx, blobKey, {
+                  ...blob,
+                  references: blob.references - 1,
+                });
+            }
+            const state = await get<{
+              limits: ReplicaPendingBudgetLimits;
+              operations: number;
+              logicalBytes: number;
+            }>(tx, pendingBudgetStateKey);
+            if (state) {
+              if (state.operations < 1 || state.logicalBytes < releasedBytes)
+                throw new Error("replica pending counters are inconsistent");
+              await put(tx, pendingBudgetStateKey, {
+                ...state,
+                operations: state.operations - 1,
+                logicalBytes: state.logicalBytes - releasedBytes,
+              });
+            }
+            await tx.delete(opKey);
+            await put(
+              tx,
+              pendingBudgetReleasedKey(identity.writerId, identity.operationId),
+              finalized,
+            );
+          }
+        }
+        if (
+          next !== null &&
+          next > ((await get<number>(tx, "outbox-ack")) ?? 0)
+        )
+          await put(tx, "outbox-ack", next);
       });
     },
     async stageBlob(

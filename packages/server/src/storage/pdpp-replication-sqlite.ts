@@ -26,6 +26,13 @@ import {
   type StreamSemantics,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { liveSnapshotDigest } from "./pdpp-stream-completion.js";
+import {
+  assertReplicaPendingCapacity,
+  REPLICA_PENDING_BUDGET_DEFAULTS,
+  validateReplicaPendingBudgetLimits,
+  type ReplicaPendingBudgetLimits,
+  type ReplicaPublishedBatch,
+} from "@opendatalabs/personal-server-ts-core/replication/pending-budget";
 
 /** Inert until beginBaseline commits; only `createNodeReplication` begins it. */
 export const REPLICATION_MIGRATION =
@@ -40,6 +47,14 @@ CREATE TABLE IF NOT EXISTS pdpp_replica_blob_bytes (blob_id TEXT PRIMARY KEY, by
 CREATE TRIGGER IF NOT EXISTS pdpp_replica_no_update BEFORE UPDATE ON pdpp_replica_operations BEGIN SELECT RAISE(ABORT, 'replica journal is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS pdpp_replica_no_delete BEFORE DELETE ON pdpp_replica_operations BEGIN SELECT RAISE(ABORT, 'replica journal is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS pdpp_replica_no_replace BEFORE INSERT ON pdpp_replica_operations WHEN EXISTS (SELECT 1 FROM pdpp_replica_operations WHERE sequence = NEW.sequence) BEGIN SELECT RAISE(ABORT, 'replica journal is append-only'); END;
+`;
+export const REPLICA_PENDING_BUDGET_MIGRATION = `
+CREATE TABLE IF NOT EXISTS pdpp_replica_pending_budget (id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL, limits_json TEXT NOT NULL, operations INTEGER NOT NULL, logical_bytes INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS pdpp_replica_pending_operations (writer_id TEXT NOT NULL, operation_id TEXT NOT NULL, operation_bytes INTEGER NOT NULL, PRIMARY KEY(writer_id,operation_id));
+CREATE TABLE IF NOT EXISTS pdpp_replica_pending_operation_blobs (writer_id TEXT NOT NULL, operation_id TEXT NOT NULL, blob_id TEXT NOT NULL, PRIMARY KEY(writer_id,operation_id,blob_id));
+CREATE TABLE IF NOT EXISTS pdpp_replica_pending_blobs (blob_id TEXT PRIMARY KEY, size_bytes INTEGER NOT NULL, references_count INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS pdpp_replica_pending_released (writer_id TEXT NOT NULL, operation_id TEXT NOT NULL, batch TEXT NOT NULL, slot TEXT NOT NULL, scope TEXT NOT NULL, version INTEGER NOT NULL, commitment TEXT NOT NULL, PRIMARY KEY(writer_id,operation_id));
+CREATE TABLE IF NOT EXISTS pdpp_replica_pending_publications (batch TEXT PRIMARY KEY, slot TEXT NOT NULL, scope TEXT NOT NULL, version INTEGER NOT NULL, commitment TEXT NOT NULL, operations_json TEXT NOT NULL);
 `;
 /**
  * Its own migration: a database already past REPLICATION_MIGRATION must still
@@ -93,6 +108,16 @@ export interface ReplicaPage {
   hasMore: boolean;
 }
 export interface ReplicationExport {
+  /** Activate the owner-local logical backlog budget when replication starts. */
+  activatePendingBudget(limits?: ReplicaPendingBudgetLimits): {
+    operations: number;
+    logicalBytes: number;
+  };
+  /** Exact finalized survivor acknowledgment, in the engine commit transaction. */
+  acknowledgePublished(
+    next: number | null,
+    finalized: ReplicaPublishedBatch,
+  ): void;
   /**
    * The first call baselines. A later call with another binding set rebinds
    * (`planReplicaRebinding`): a new binding generation, no operations. A
@@ -181,6 +206,317 @@ export function createReplicationJournal(
   /** Called after each own operation is appended, inside its transaction. */
   appended?: () => void,
 ) {
+  let rebuildingBaseline = false;
+  const tableExists = (name: string) =>
+    db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?")
+      .get(name) !== undefined;
+  const pendingState = () =>
+    db.prepare("SELECT * FROM pdpp_replica_pending_budget WHERE id=1").get() as
+      | {
+          enabled: number;
+          limits_json: string;
+          operations: number;
+          logical_bytes: number;
+        }
+      | undefined;
+  const operationBlobs = (operation: ReplicaOperation) => [
+    ...new Map(
+      (operation.kind === "blob-claim"
+        ? [operation.blob]
+        : operation.kind === "upsert"
+          ? operation.blobs
+          : []
+      ).map((blob) => [blob.blobId, blob.sizeBytes] as const),
+    ),
+  ];
+  function reservePending(
+    operation: ReplicaOperation,
+    encoded: string,
+    rebuilding = false,
+  ) {
+    const state = pendingState();
+    if (!state?.enabled) return;
+    const identity = operation.revision;
+    if (
+      db
+        .prepare(
+          "SELECT 1 FROM pdpp_replica_pending_operations WHERE writer_id=? AND operation_id=?",
+        )
+        .get(identity.writerId, identity.operationId)
+    )
+      return;
+    const blobs = operationBlobs(operation);
+    let requestedBytes = Buffer.byteLength(encoded, "utf8");
+    for (const [blobId, size] of blobs) {
+      if (!Number.isSafeInteger(size) || size < 0)
+        throw new RangeError("invalid replica pending blob size");
+      const prior = db
+        .prepare(
+          "SELECT size_bytes,references_count FROM pdpp_replica_pending_blobs WHERE blob_id=?",
+        )
+        .get(blobId) as
+        { size_bytes: number; references_count: number } | undefined;
+      if (prior && prior.size_bytes !== size)
+        throw new Error("replica pending blob size changed");
+      if (
+        prior &&
+        (!Number.isSafeInteger(prior.references_count) ||
+          prior.references_count < 1 ||
+          prior.references_count >= Number.MAX_SAFE_INTEGER)
+      )
+        throw new RangeError(
+          "replica pending blob reference counter exhausted",
+        );
+      if (!prior) requestedBytes += size;
+    }
+    const limits = JSON.parse(state.limits_json) as ReplicaPendingBudgetLimits;
+    if (
+      !Number.isSafeInteger(requestedBytes) ||
+      !Number.isSafeInteger(state.operations + 1) ||
+      !Number.isSafeInteger(state.logical_bytes + requestedBytes)
+    )
+      throw new RangeError("replica pending byte counter exhausted");
+    if (!rebuilding)
+      assertReplicaPendingCapacity({
+        limits,
+        used: {
+          operations: state.operations,
+          logicalBytes: state.logical_bytes,
+        },
+        requested: { operations: 1, logicalBytes: requestedBytes },
+      });
+    db.prepare(
+      "INSERT INTO pdpp_replica_pending_operations VALUES (?,?,?)",
+    ).run(
+      identity.writerId,
+      identity.operationId,
+      Buffer.byteLength(encoded, "utf8"),
+    );
+    for (const [blobId, size] of blobs) {
+      db.prepare(
+        "INSERT INTO pdpp_replica_pending_operation_blobs VALUES (?,?,?)",
+      ).run(identity.writerId, identity.operationId, blobId);
+      db.prepare(
+        "INSERT INTO pdpp_replica_pending_blobs VALUES (?,?,1) ON CONFLICT(blob_id) DO UPDATE SET references_count=references_count+1",
+      ).run(blobId, size);
+    }
+    db.prepare(
+      "UPDATE pdpp_replica_pending_budget SET operations=operations+1,logical_bytes=logical_bytes+? WHERE id=1",
+    ).run(requestedBytes);
+  }
+  function chargeExisting(operation: ReplicaOperation) {
+    const encoded = canonicalJson(operation);
+    reservePending(operation, encoded, true);
+  }
+  function activatePendingBudget(
+    limitsInput: ReplicaPendingBudgetLimits = REPLICA_PENDING_BUDGET_DEFAULTS,
+  ) {
+    const limits = validateReplicaPendingBudgetLimits(limitsInput);
+    const activate = db.transaction(() => {
+      const existing = pendingState();
+      if (!existing) {
+        db.prepare(
+          "INSERT INTO pdpp_replica_pending_budget VALUES (1,1,?,0,0)",
+        ).run(canonicalJson(limits));
+        const candidates = new Map<string, ReplicaOperation>();
+        const hasOutcomes = tableExists("pdpp_transport_operation_outcomes");
+        const hasManifests = tableExists("pdpp_transport_manifests_out");
+        const finalized = new Set<string>();
+        if (hasOutcomes) {
+          if (hasManifests) {
+            const survivors = db
+              .prepare(
+                `SELECT o.writer_id,o.operation_id
+                 FROM pdpp_transport_operation_outcomes o
+                 JOIN pdpp_transport_manifests_out m ON m.batch=o.batch
+                 WHERE m.state='published' AND o.outcome IS NULL
+                   AND o.encoding_failed=0 AND o.writer_id IS NOT NULL
+                   AND o.operation_id IS NOT NULL`,
+              )
+              .all() as { writer_id: string; operation_id: string }[];
+            for (const survivor of survivors)
+              finalized.add(
+                `${survivor.writer_id}\u0000${survivor.operation_id}`,
+              );
+          }
+          const rows = db
+            .prepare(
+              hasManifests
+                ? `SELECT o.operation_json FROM pdpp_transport_operation_outcomes o
+                   LEFT JOIN pdpp_transport_manifests_out m ON m.batch=o.batch
+                   WHERE o.operation_json IS NOT NULL AND (o.outcome='unsupported' OR (o.outcome IS NULL AND coalesce(m.state,'ready')<>'published'))`
+                : `SELECT operation_json FROM pdpp_transport_operation_outcomes
+                   WHERE operation_json IS NOT NULL`,
+            )
+            .all() as { operation_json: string }[];
+          for (const row of rows) {
+            const operation = replicaOperationSchema.parse(
+              JSON.parse(row.operation_json),
+            );
+            const identity = `${operation.revision.writerId}\u0000${operation.revision.operationId}`;
+            if (finalized.has(identity)) continue;
+            candidates.set(identity, operation);
+          }
+        }
+        const hasState = tableExists("pdpp_transport_state");
+        const hasSettings = tableExists("pdpp_replica_settings");
+        const settings = hasSettings
+          ? (db
+              .prepare(
+                "SELECT watermark,checkpoint FROM pdpp_replica_settings WHERE id=1",
+              )
+              .get() as { watermark: number; checkpoint: number } | undefined)
+          : undefined;
+        const hasJournal = tableExists("pdpp_replica_operations");
+        const hasBaseline = tableExists("pdpp_replica_baseline");
+        if (hasJournal) {
+          const state = hasState
+            ? (db
+                .prepare(
+                  "SELECT baseline_cursor,baseline_done,tail_cursor FROM pdpp_transport_state WHERE id=1",
+                )
+                .get() as
+                | {
+                    baseline_cursor: number;
+                    baseline_done: number;
+                    tail_cursor: number | null;
+                  }
+                | undefined)
+            : undefined;
+          // Without both retained outcome evidence and an engine cursor, no
+          // journal row is known to be settled. Charging the journal is the
+          // only safe upgrade when the engine schema is still lazy.
+          const conservativeAll =
+            !hasOutcomes || !state || !settings || !hasBaseline;
+          const baselineAfter = conservativeAll
+            ? 0
+            : (state?.baseline_cursor ?? settings?.checkpoint ?? 0);
+          const watermark = settings?.watermark ?? 0;
+          const tailAfter = conservativeAll
+            ? watermark
+            : (state?.tail_cursor ?? watermark);
+          const rows = conservativeAll
+            ? (db
+                .prepare("SELECT operation_json FROM pdpp_replica_operations")
+                .all() as { operation_json: string }[])
+            : (db
+                .prepare(
+                  `SELECT o.operation_json FROM pdpp_replica_operations o
+                   WHERE (o.sequence>? AND o.sequence IN (SELECT sequence FROM pdpp_replica_baseline))
+                     OR (o.sequence>? AND o.sequence>?)`,
+                )
+                .all(baselineAfter, tailAfter, watermark) as {
+                operation_json: string;
+              }[]);
+          for (const row of rows) {
+            const operation = replicaOperationSchema.parse(
+              JSON.parse(row.operation_json),
+            );
+            const identity = `${operation.revision.writerId}\u0000${operation.revision.operationId}`;
+            if (!finalized.has(identity)) candidates.set(identity, operation);
+          }
+        }
+        for (const operation of candidates.values()) chargeExisting(operation);
+      }
+      const used = pendingState()!;
+      db.prepare(
+        "UPDATE pdpp_replica_pending_budget SET enabled=1,limits_json=? WHERE id=1",
+      ).run(canonicalJson(limits));
+      return { operations: used.operations, logicalBytes: used.logical_bytes };
+    });
+    return db.inTransaction ? activate() : activate.immediate();
+  }
+  function acknowledgePublished(
+    next: number | null,
+    finalized: ReplicaPublishedBatch,
+  ) {
+    if (!db.inTransaction)
+      throw new Error(
+        "replica publication acknowledgment requires engine transaction",
+      );
+    if (finalized.slot !== `${finalized.scope}/${finalized.version}`)
+      throw new Error("replica publication slot witness changed");
+    const prior = db
+      .prepare(
+        "SELECT slot,scope,version,commitment,operations_json FROM pdpp_replica_pending_publications WHERE batch=?",
+      )
+      .get(finalized.batch) as
+      | {
+          slot: string;
+          scope: string;
+          version: number;
+          commitment: string;
+          operations_json: string;
+        }
+      | undefined;
+    if (
+      prior &&
+      (prior.slot !== finalized.slot ||
+        prior.scope !== finalized.scope ||
+        prior.version !== finalized.version ||
+        prior.commitment !== finalized.commitment ||
+        prior.operations_json !== canonicalJson(finalized.operations))
+    )
+      throw new Error("replica publication witness changed");
+    db.prepare(
+      "INSERT OR IGNORE INTO pdpp_replica_pending_publications VALUES (?,?,?,?,?,?)",
+    ).run(
+      finalized.batch,
+      finalized.slot,
+      finalized.scope,
+      finalized.version,
+      finalized.commitment,
+      canonicalJson(finalized.operations),
+    );
+    const release = db.prepare(
+      "DELETE FROM pdpp_replica_pending_operations WHERE writer_id=? AND operation_id=? RETURNING operation_bytes",
+    );
+    const opBlob = db.prepare(
+      "DELETE FROM pdpp_replica_pending_operation_blobs WHERE writer_id=? AND operation_id=? RETURNING blob_id",
+    );
+    for (const identity of finalized.operations) {
+      const operation = release.get(identity.writerId, identity.operationId) as
+        { operation_bytes: number } | undefined;
+      if (!operation) continue;
+      let bytes = operation.operation_bytes;
+      for (const { blob_id } of opBlob.all(
+        identity.writerId,
+        identity.operationId,
+      ) as { blob_id: string }[]) {
+        const blob = db
+          .prepare(
+            "SELECT size_bytes,references_count FROM pdpp_replica_pending_blobs WHERE blob_id=?",
+          )
+          .get(blob_id) as { size_bytes: number; references_count: number };
+        if (blob.references_count <= 1) {
+          bytes += blob.size_bytes;
+          db.prepare(
+            "DELETE FROM pdpp_replica_pending_blobs WHERE blob_id=?",
+          ).run(blob_id);
+        } else
+          db.prepare(
+            "UPDATE pdpp_replica_pending_blobs SET references_count=references_count-1 WHERE blob_id=?",
+          ).run(blob_id);
+      }
+      db.prepare(
+        "INSERT OR IGNORE INTO pdpp_replica_pending_released VALUES (?,?,?,?,?,?,?)",
+      ).run(
+        identity.writerId,
+        identity.operationId,
+        finalized.batch,
+        finalized.slot,
+        finalized.scope,
+        finalized.version,
+        finalized.commitment,
+      );
+      db.prepare(
+        "UPDATE pdpp_replica_pending_budget SET operations=operations-1,logical_bytes=logical_bytes-? WHERE id=1 AND operations>0 AND logical_bytes>=?",
+      ).run(bytes, bytes);
+    }
+    if (next !== null && (!Number.isSafeInteger(next) || next < 0))
+      throw new Error("invalid replica publication cursor");
+  }
   const settings = () =>
     db.prepare("SELECT * FROM pdpp_replica_settings WHERE id = 1").get() as
       | { config_json: string; watermark: number; checkpoint: number }
@@ -272,12 +608,14 @@ export function createReplicationJournal(
         ...copy?.revision,
       },
     });
+    const encoded = canonicalJson(operation);
+    reservePending(operation, encoded, rebuildingBaseline);
     db.prepare("UPDATE pdpp_replica_clock SET counter = ? WHERE id = 1").run(
       counter,
     );
     db.prepare("INSERT INTO pdpp_replica_operations VALUES (?, ?, ?)").run(
       counter,
-      canonicalJson(operation),
+      encoded,
       replicaOperationDigest(operation),
     );
     appended?.();
@@ -325,6 +663,15 @@ export function createReplicationJournal(
     const blob = blobDescriptor(blobId);
     if (!verifyBinary(db, "canonical", blobId, blob.sha256, blob.sizeBytes))
       throw new Error("unverified replication blob bytes");
+    // Admission and the operation clock happen before a potentially large copy.
+    // Both are in the caller's canonical transaction, so any later copy error
+    // rolls the reservation back with the write.
+    const previous = db
+      .prepare(
+        "SELECT 1 FROM pdpp_replica_operations WHERE json_extract(operation_json, '$.kind') = 'blob-claim' AND json_extract(operation_json, '$.connectionId') = ? AND json_extract(operation_json, '$.generation') = ? AND json_extract(operation_json, '$.blob.blobId') = ? AND json_extract(operation_json, '$.revision.writerId') = ? LIMIT 1",
+      )
+      .get(instance, identity.generation, blobId, writerId());
+    if (!previous) append({ ...identity, kind: "blob-claim", blob });
     // A large canonical blob is chunks only; the pin references them, and
     // they become the pinned copy if canonical storage drops the blob
     // (`pinReferenceKeepsBytes`). A pinned copy of such a blob, left when
@@ -339,13 +686,6 @@ export function createReplicationJournal(
       copyBinary(db, "canonical", blobId, "pinned");
     else if (!verifyBinary(db, "pinned", blobId, blob.sha256, blob.sizeBytes))
       throw new Error("corrupt pinned replica bytes");
-    // Indexed by pdpp_replica_blob_claim_idx; the predicate must match it.
-    const previous = db
-      .prepare(
-        "SELECT 1 FROM pdpp_replica_operations WHERE json_extract(operation_json, '$.kind') = 'blob-claim' AND json_extract(operation_json, '$.connectionId') = ? AND json_extract(operation_json, '$.generation') = ? AND json_extract(operation_json, '$.blob.blobId') = ? AND json_extract(operation_json, '$.revision.writerId') = ? LIMIT 1",
-      )
-      .get(instance, identity.generation, blobId, writerId());
-    if (!previous) append({ ...identity, kind: "blob-claim", blob });
   }
   function captureRecord(
     instance: string,
@@ -692,7 +1032,12 @@ export function createReplicationJournal(
           )
           .get();
         if (orphan) throw new Error("unbound baseline records");
-        captureCurrentState();
+        rebuildingBaseline = true;
+        try {
+          captureCurrentState();
+        } finally {
+          rebuildingBaseline = false;
+        }
         const { counter } = db
           .prepare("SELECT counter FROM pdpp_replica_clock")
           .get() as { counter: number };
@@ -735,9 +1080,11 @@ export function createReplicationJournal(
       const key = reissueKey(op);
       if (key !== undefined && "declaration" in op) reissue.set(key, op);
     }
+    rebuildingBaseline = true;
     try {
       captureCurrentState();
     } finally {
+      rebuildingBaseline = false;
       reissue = undefined;
     }
     const { counter } = db
@@ -782,6 +1129,8 @@ export function createReplicationJournal(
     };
   }
   const exporter: ReplicationExport = {
+    activatePendingBudget,
+    acknowledgePublished,
     beginBaseline,
     declarationHistory,
     bindingGeneration,

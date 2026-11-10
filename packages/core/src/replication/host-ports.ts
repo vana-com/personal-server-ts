@@ -19,6 +19,7 @@ import {
   type ReplicaTransportPort,
 } from "./dpv2.js";
 import { createReplicaEvidenceAdapter } from "./evidence.js";
+import { createGatewayReplicaCompatibility } from "./compatibility.js";
 import { createReplicaFinalityHints } from "./finality.js";
 import {
   replicaDeclarationContext,
@@ -45,7 +46,8 @@ export function createReplicationNetworkPorts(input: {
   storage: BoundedStorageAdapter;
   gateway: Pick<GatewayClient, "registerDataPoint">;
   feed: DataPointFeedPort;
-  signer: Pick<ServerSigner, "signAddData">;
+  signer: Pick<ServerSigner, "signAddData" | "signMessage" | "address">;
+  compatibilityFetch?: typeof fetch;
 }): ReplicationNetworkPorts {
   const { gateway } = input.config;
   const chain = getChainConfig(gateway.chainId);
@@ -59,6 +61,15 @@ export function createReplicationNetworkPorts(input: {
       gateway: input.gateway,
       feed: input.feed,
       signer: input.signer,
+      compatibilityRoster: createGatewayReplicaCompatibility({
+        gatewayUrl: gateway.url,
+        chainId: gateway.chainId,
+        owner: input.owner,
+        signer: input.signer,
+        fetch: input.compatibilityFetch,
+      }),
+      gatewayOrigin: new URL(gateway.url).origin,
+      chainId: BigInt(gateway.chainId),
       finality: createReplicaFinalityHints({ rpc }),
       evidence: createReplicaEvidenceAdapter({
         owner: input.owner,

@@ -26,6 +26,8 @@ import {
 export interface ServerSigner {
   /** Address that signs (the server account). */
   readonly address: `0x${string}`;
+  /** Domain-separated statements for gateway capabilities and other host protocols. */
+  signMessage(message: string): Promise<`0x${string}`>;
   signGrantRegistration(msg: GrantRegistrationMessage): Promise<`0x${string}`>;
   signGrantRevocation(msg: GrantRevocationMessage): Promise<`0x${string}`>;
   /**
@@ -62,6 +64,7 @@ export function createServerSigner(
 ): ServerSigner {
   return {
     address: account.address,
+    signMessage: (message) => account.signMessage(message),
 
     async signGrantRegistration(
       msg: GrantRegistrationMessage,
