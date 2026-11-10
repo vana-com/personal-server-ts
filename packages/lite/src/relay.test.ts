@@ -13,6 +13,7 @@ import {
   encodeDataFrame,
   psLiteRelayControlUrl,
   startPsLiteRelayClient,
+  type PsLiteReadEvent,
   type PsLiteRelayClientOptions,
   type PsLiteRelayWebSocket,
 } from "./relay.js";
@@ -312,7 +313,9 @@ describe("startPsLiteRelayClient", () => {
       controlUrl: "wss://relay.example",
       tls: false,
       webSocketFactory(url) {
-        expect(url).toBe("wss://relay.example/browser/session123");
+        expect(url).toMatch(
+          /^wss:\/\/relay\.example\/browser\/session123\?tag=[0-9a-f]{16}$/,
+        );
         const socket = new FakeRelayWebSocket();
         sockets.push(socket);
         return socket;
@@ -1002,5 +1005,344 @@ describe("buildHttpResponse framing", () => {
     expect(head).not.toContain("transfer-encoding");
     expect(head).toContain(`content-length: ${json.length}`);
     expect(wire.slice(wire.indexOf("\r\n\r\n") + 4)).toBe(json);
+  });
+});
+
+describe("read-reliability events", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  type FetchFn = (request: Request) => Promise<Response>;
+
+  function startEventClient(
+    fetch: FetchFn,
+    extra: Partial<PsLiteRelayClientOptions> = {},
+  ) {
+    const sockets: FakeRelayWebSocket[] = [];
+    const urls: string[] = [];
+    const events: PsLiteReadEvent[] = [];
+    const client = startPsLiteRelayClient({
+      sessionId: "evt1",
+      runtime: { fetch } as unknown as ReturnType<typeof createTestRuntime>,
+      controlUrl: "wss://relay.example",
+      tls: false,
+      reconnectInitialDelayMs: 1_000,
+      onReadEvent: (event) => events.push(event),
+      webSocketFactory(url) {
+        urls.push(url);
+        const socket = new FakeRelayWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      ...extra,
+    });
+    sockets[0].receive(JSON.stringify({ type: "session.ready" }));
+    return { client, sockets, urls, events };
+  }
+
+  async function sendRequest(
+    socket: FakeRelayWebSocket,
+    target: string,
+    {
+      method = "GET",
+      headers = {},
+      streamId = 1,
+      streamRef,
+    }: {
+      method?: string;
+      headers?: Record<string, string>;
+      streamId?: number;
+      streamRef?: unknown;
+    } = {},
+  ) {
+    socket.receive(
+      JSON.stringify({
+        type: "stream.open",
+        streamId,
+        ...(streamRef !== undefined ? { streamRef } : {}),
+      }),
+    );
+    socket.receive(
+      encodeDataFrame(streamId, httpRequest(method, target, headers)),
+    );
+    await flushRelayTasks();
+    await flushRelayTasks();
+  }
+
+  function wireText(socket: FakeRelayWebSocket, streamId = 1): string {
+    return new TextDecoder().decode(
+      concatBytes(
+        sentDataFrames(socket)
+          .filter((frame) => frame.streamId === streamId)
+          .map((frame) => frame.payload),
+      ),
+    );
+  }
+
+  const json = (body: unknown, status = 200, headers = {}) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { "content-type": "application/json", ...headers },
+    });
+
+  it("sends a fresh 16-hex ?tag= per connection and reports it in onStatus", () => {
+    vi.useFakeTimers();
+    try {
+      const statuses: Array<{ status: string; connTag?: string }> = [];
+      const { sockets, urls } = startEventClient(async () => json({}), {
+        onStatus: (status, detail) =>
+          statuses.push({ status, connTag: detail?.connTag }),
+      });
+      sockets[0].onopen?.();
+      sockets[0].close(1006, "abnormal");
+      vi.advanceTimersByTime(1_000);
+      expect(urls).toHaveLength(2);
+      const tags = urls.map((url) =>
+        new URL(url.replace(/^wss:/, "https:")).searchParams.get("tag"),
+      );
+      for (const [index, url] of urls.entries()) {
+        expect(url.startsWith("wss://relay.example/browser/evt1?tag=")).toBe(
+          true,
+        );
+        expect(tags[index]).toMatch(/^[0-9a-f]{16}$/);
+      }
+      expect(tags[0]).not.toBe(tags[1]);
+      expect(statuses[0]).toEqual({ status: "connecting", connTag: tags[0] });
+      expect(statuses).toContainEqual({
+        status: "disconnected",
+        connTag: tags[0],
+      });
+      expect(statuses.at(-1)).toEqual({
+        status: "connecting",
+        connTag: tags[1],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps psLiteRelayControlUrl compatible and appends an optional tag", () => {
+    expect(psLiteRelayControlUrl("abc", "wss://r.example/")).toBe(
+      "wss://r.example/browser/abc",
+    );
+    expect(psLiteRelayControlUrl("abc", "wss://r.example", "00ff")).toBe(
+      "wss://r.example/browser/abc?tag=00ff",
+    );
+  });
+
+  it("emits received + finished once for a data read, keyed on the relay streamRef", async () => {
+    const { sockets, urls, events } = startEventClient(async () =>
+      json({ data: { username: "a" } }),
+    );
+    const streamRef = "3f2b8c1e-0000-4000-8000-000000000001";
+    await sendRequest(sockets[0], "/v1/data/instagram.profile?grantId=g-1", {
+      streamRef,
+    });
+    const connTag = new URL(
+      urls[0].replace(/^wss:/, "https:"),
+    ).searchParams.get("tag");
+    expect(events.map((event) => event.type)).toEqual([
+      "ps_read_received",
+      "ps_read_finished",
+    ]);
+    expect(events[0]).toEqual({
+      type: "ps_read_received",
+      readRef: `${streamRef}:0`,
+      streamRef,
+      connTag,
+      scope: "instagram.profile",
+      method: "GET",
+      appVisibility: "unknown",
+    });
+    const finished = events[1];
+    expect(finished).toMatchObject({
+      type: "ps_read_finished",
+      readRef: `${streamRef}:0`,
+      streamRef,
+      connTag,
+      scope: "instagram.profile",
+      method: "GET",
+      status: 200,
+      outcome: "ok",
+      gzip: false,
+      hiddenDuring: false,
+    });
+    if (finished.type !== "ps_read_finished") throw new Error("unreachable");
+    expect(finished.bytesOut).toBe(
+      new TextEncoder().encode(wireText(sockets[0])).length,
+    );
+    expect(finished.durationMs).toBeGreaterThanOrEqual(0);
+    expect(JSON.stringify(events)).not.toContain("g-1");
+  });
+
+  it("falls back to a local uuid read ref when the relay sends no (or a bad) streamRef", async () => {
+    const { sockets, events } = startEventClient(async () => json({ data: 1 }));
+    await sendRequest(sockets[0], "/v1/data/a.b", { streamRef: { bad: 1 } });
+    expect(events[0].readRef).toMatch(/^[0-9a-f-]{36}:0$/);
+    expect("streamRef" in events[0]).toBe(false);
+    expect(events[1].readRef).toBe(events[0].readRef);
+  });
+
+  it.each([
+    ["ok", 200, { data: { items: [1] } }],
+    ["empty", 200, { data: [] }],
+    ["empty", 200, { data: { sleep: [], readiness: [] } }],
+    ["empty", 200, []],
+    ["denied", 403, { error: "forbidden" }],
+    ["denied", 401, { error: "unauthorized" }],
+    ["payment_required", 402, { accepts: [] }],
+    ["not_found", 404, { error: "missing" }],
+    ["error", 500, { error: "boom" }],
+  ] as const)("classifies %s for status %i", async (outcome, status, body) => {
+    const { sockets, events } = startEventClient(async () =>
+      json(body, status),
+    );
+    await sendRequest(sockets[0], "/v1/data/oura.sleep");
+    expect(events).toHaveLength(2);
+    expect(events[1]).toMatchObject({ outcome, status });
+  });
+
+  it("treats a non-JSON 2xx body as ok", async () => {
+    const { sockets, events } = startEventClient(
+      async () =>
+        new Response(new Uint8Array([0x7b, 0x7d]), {
+          headers: { "content-type": "application/octet-stream" },
+        }),
+    );
+    await sendRequest(sockets[0], "/v1/data/files.doc?content=raw");
+    expect(events[1]).toMatchObject({ outcome: "ok", scope: "files.doc" });
+  });
+
+  it("reports handler_error once when the runtime throws", async () => {
+    const { sockets, events } = startEventClient(async () => {
+      throw new Error("runtime exploded");
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    expect(events.map((event) => event.type)).toEqual([
+      "ps_read_received",
+      "ps_read_finished",
+    ]);
+    expect(events[1]).toMatchObject({ outcome: "handler_error", bytesOut: 0 });
+    expect("status" in events[1]).toBe(false);
+  });
+
+  it("reports stream_closed when the relay closes the stream mid-read", async () => {
+    let release!: (response: Response) => void;
+    const { sockets, events } = startEventClient(
+      () =>
+        new Promise<Response>((resolve) => {
+          release = resolve;
+        }),
+    );
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    sockets[0].receive(JSON.stringify({ type: "stream.close", streamId: 1 }));
+    expect(events[1]).toMatchObject({ outcome: "stream_closed", bytesOut: 0 });
+    release(json({ data: 1 }));
+    await flushRelayTasks();
+    expect(events).toHaveLength(2);
+    expect(sentDataFrames(sockets[0])).toHaveLength(0);
+  });
+
+  it("marks hiddenDuring when the page goes hidden mid-read", async () => {
+    const listeners = new Set<() => void>();
+    const fakeDocument = {
+      visibilityState: "visible",
+      addEventListener: (_: string, listener: () => void) =>
+        listeners.add(listener),
+      removeEventListener: (_: string, listener: () => void) =>
+        listeners.delete(listener),
+    };
+    vi.stubGlobal("document", fakeDocument);
+    let release!: (response: Response) => void;
+    const { client, sockets, events } = startEventClient(
+      () =>
+        new Promise<Response>((resolve) => {
+          release = resolve;
+        }),
+    );
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    expect(events[0]).toMatchObject({ appVisibility: "visible" });
+    fakeDocument.visibilityState = "hidden";
+    for (const listener of listeners) listener();
+    fakeDocument.visibilityState = "visible";
+    for (const listener of listeners) listener();
+    release(json({ data: 1 }));
+    await flushRelayTasks();
+    await flushRelayTasks();
+    expect(events[1]).toMatchObject({ outcome: "ok", hiddenDuring: true });
+    client.close();
+    expect(listeners.size).toBe(0);
+  });
+
+  it("reports gzip and the compressed wire size for large accepted-gzip reads", async () => {
+    const big = { data: { text: "x".repeat(10_000) } };
+    const { sockets, events } = startEventClient(async () => json(big));
+    await sendRequest(sockets[0], "/v1/data/a.b", {
+      headers: { "accept-encoding": "gzip" },
+    });
+    const wireBytes = concatBytes(
+      sentDataFrames(sockets[0]).map((frame) => frame.payload),
+    );
+    expect(events[1]).toMatchObject({
+      outcome: "ok",
+      gzip: true,
+      bytesOut: wireBytes.length,
+    });
+    expect(wireBytes.length).toBeLessThan(10_000);
+  });
+
+  it("passes the internal read header, takes the grantee ref and keeps both off the wire", async () => {
+    const seen: Request[] = [];
+    const { sockets, events } = startEventClient(async (request) => {
+      seen.push(request);
+      return json({ data: { a: 1 } }, 200, {
+        "x-ps-grantee-ref": "0123456789ab",
+      });
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b", {
+      headers: {
+        "x-ps-grantee-ref": "spoofed",
+        "x-ps-lite-relay-read": "spoofed",
+      },
+    });
+    expect(seen[0].headers.get("x-ps-lite-relay-read")).toBe("1");
+    expect(seen[0].headers.get("x-ps-grantee-ref")).toBeNull();
+    expect(wireText(sockets[0]).toLowerCase()).not.toContain(
+      "x-ps-grantee-ref",
+    );
+    expect(events[1]).toMatchObject({ granteeRef: "0123456789ab" });
+  });
+
+  it("emits nothing for non-read routes and strips the internal headers there too", async () => {
+    const seen: Request[] = [];
+    const { sockets, events } = startEventClient(async (request) => {
+      seen.push(request);
+      return json({ ok: true }, 200, { "x-ps-grantee-ref": "0123456789ab" });
+    });
+    await sendRequest(sockets[0], "/health", {
+      headers: { "x-ps-lite-relay-read": "1" },
+    });
+    await sendRequest(sockets[0], "/v1/data", { streamId: 2 });
+    await sendRequest(sockets[0], "/v1/data/a.b", {
+      method: "POST",
+      streamId: 3,
+    });
+    expect(events).toEqual([]);
+    expect(seen[0].headers.get("x-ps-lite-relay-read")).toBeNull();
+    expect(wireText(sockets[0], 1).toLowerCase()).not.toContain(
+      "x-ps-grantee-ref",
+    );
+  });
+
+  it("keeps serving when the read hook throws", async () => {
+    const logs: string[] = [];
+    const { sockets } = startEventClient(async () => json({ data: 1 }), {
+      onReadEvent: () => {
+        throw new Error("analytics down");
+      },
+      logger: (line) => logs.push(line),
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    expect(wireText(sockets[0])).toContain("HTTP/1.1 200 OK");
+    expect(logs.some((line) => line.includes("analytics down"))).toBe(true);
   });
 });

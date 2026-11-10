@@ -2238,11 +2238,45 @@ export async function handlePersonalServerScopeUploadAppend(
   });
 }
 
+/**
+ * Internal request header the PS-Lite relay client sets on reads it forwards.
+ * When present, the data read handler answers with {@link
+ * PS_GRANTEE_REF_HEADER} so the relay can label its read telemetry. The relay
+ * strips both headers at the wire; neither is part of the public API.
+ */
+export const PS_LITE_RELAY_READ_HEADER = "x-ps-lite-relay-read";
+/**
+ * Response header carrying a non-reversible grantee label: the first 12 hex
+ * chars of sha256(lowercased builder address), or "owner" for owner reads.
+ */
+export const PS_GRANTEE_REF_HEADER = "x-ps-grantee-ref";
+
+async function granteeRefFor(
+  authResult: PersonalServerReadAuthResult | void,
+): Promise<string | undefined> {
+  if (
+    authResult?.grantId === "owner" ||
+    authResult?.grantId === "policy-bypass"
+  ) {
+    return "owner";
+  }
+  const builder = authResult?.builder;
+  if (typeof builder !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(builder)) {
+    return undefined;
+  }
+  const digest = await sha256Hex(
+    new TextEncoder().encode(builder.toLowerCase()),
+  );
+  return digest.slice(2, 14);
+}
+
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
   options: PersonalServerApiDispatchOptions = {},
 ): Promise<Response> {
+  // Set once the builder read is authorized, only for relay-forwarded reads.
+  let relayGranteeRef: string | undefined;
   // Filled in as the dispatch narrows, so a 500 thrown deep in a read is
   // logged against the route that served it rather than a generic label. It
   // is mutable for exactly that reason: the route is not known until the path
@@ -2252,7 +2286,7 @@ export async function handlePersonalServerDataRequest(
     route: `${request.method} ${options.basePath ?? "/v1/data"}`,
     requestId: crypto.randomUUID(),
   };
-  return withApiErrors(async () => {
+  const response = await withApiErrors(async () => {
     const url = new URL(request.url);
     const pathname = stripBasePath(url.pathname, options.basePath);
 
@@ -2573,6 +2607,9 @@ export async function handlePersonalServerDataRequest(
         fileId: fileIdParam ?? selectedEntry?.fileId ?? undefined,
         at: atParam,
       });
+      if (request.headers.get(PS_LITE_RELAY_READ_HEADER) === "1") {
+        relayGranteeRef = await granteeRefFor(authResult);
+      }
 
       // Select the body after auth and before deletion or payment. A file's
       // version and re-add marker authorize that file, not canonical rows.
@@ -3213,6 +3250,15 @@ export async function handlePersonalServerDataRequest(
 
     return methodNotAllowed();
   }, logContext);
+  if (relayGranteeRef) {
+    try {
+      response.headers.set(PS_GRANTEE_REF_HEADER, relayGranteeRef);
+    } catch {
+      // Immutable headers (never the case for responses built here): the
+      // relay simply reports no grantee for this read.
+    }
+  }
+  return response;
 }
 
 export async function handlePersonalServerAccessLogsRequest(
