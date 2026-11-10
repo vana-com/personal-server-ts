@@ -60,7 +60,7 @@ const GOLDEN = [
 ];
 const PATHS = ["/additions", `/${SCOPE}/versions`, `/${SCOPE}/lineage`];
 
-function fixture(mode: "switched" | "unswitched") {
+function fixture(mode: "switched" | "unswitched" | "unknown") {
   const events: string[] = [];
   const auth = {
     authorizeOwner: vi.fn(async () => {
@@ -89,7 +89,7 @@ function fixture(mode: "switched" | "unswitched") {
         events.push("history-versions");
         return {
           ok: true,
-          value: { scope, versions: [], total: 0, limit, offset },
+          value: { scope, versions: [], total: 0, limit, offset, nextCursor: null },
         };
       },
     ),
@@ -136,6 +136,80 @@ function request(path: string, deps: PersonalServerDataApiDeps) {
 }
 
 describe("history routes", () => {
+
+  it("unknown-account-mode-never-falls-through-to-legacy-history", async () => {
+    for (const missing of [false, true]) {
+      const { deps, history, events } = fixture("unknown");
+      if (missing) delete deps.accountMode;
+      for (const [index, path] of PATHS.entries()) {
+        events.length = 0;
+        const response = await request(path, deps);
+        expect(response.status).toBe(503);
+        expect((await response.json()).error.errorCode).toBe("ACCOUNT_MODE_UNKNOWN");
+        expect(events).toEqual([["owner-auth", "versions-auth", "read-auth"][index]]);
+      }
+      expect(history.additions).not.toHaveBeenCalled();
+      expect(history.versions).not.toHaveBeenCalled();
+      expect(history.lineage).not.toHaveBeenCalled();
+      expect(legacy.additions).not.toHaveBeenCalled();
+      expect(legacy.versions).not.toHaveBeenCalled();
+      expect(deps.lineageGateway!.getLineage).not.toHaveBeenCalled();
+    }
+  });
+
+  it("invalid-additions-days-return-400-invalid-request", async () => {
+    for (const mode of ["switched", "unswitched"] as const) {
+      const { deps, history } = fixture(mode);
+      for (const days of ["", "0", "-1", "32", "999", "1.5", "1e1", "0x7", "%207", "1000"]) {
+        const response = await request("/additions?days=" + days, deps);
+        expect(response.status).toBe(400);
+        expect((await response.json()).error.errorCode).toBe("invalid_request");
+      }
+      expect(history.additions).not.toHaveBeenCalled();
+      expect(legacy.additions).not.toHaveBeenCalled();
+      for (const days of [1, 31]) {
+        expect((await request("/additions?days=" + days, deps)).status).toBe(200);
+      }
+    }
+  });
+
+  it("pagination-rejects-unsafe-integers-and-caps-page-size", async () => {
+    for (const mode of ["switched", "unswitched"] as const) {
+      const { deps, history } = fixture(mode);
+      for (const query of [
+        "limit=9007199254740992", "offset=9007199254740992",
+        "cursor=9007199254740992", "limit=1e3", "offset=1.5",
+        "limit=-1", "offset=-1", "limit=0", "limit=", "cursor=0",
+      ]) {
+        const response = await request(`/${SCOPE}/versions?${query}`, deps);
+        expect(response.status).toBe(400);
+        expect((await response.json()).error.errorCode).toBe("invalid_request");
+      }
+      expect(history.versions).not.toHaveBeenCalled();
+      expect(legacy.versions).not.toHaveBeenCalled();
+      expect((await request(`/${SCOPE}/versions?limit=9007199254740991`, deps)).status).toBe(200);
+      if (mode === "switched") {
+        expect(history.versions).toHaveBeenLastCalledWith({
+          scope: SCOPE, limit: 1000, offset: 0,
+        });
+        expect((await request(`/${SCOPE}/versions?offset=1`, deps)).status).toBe(400);
+        await request(`/${SCOPE}/versions?cursor=9007199254740991`, deps);
+        expect(history.versions).toHaveBeenLastCalledWith({
+          scope: SCOPE, limit: 20, offset: 0, cursor: Number.MAX_SAFE_INTEGER,
+        });
+      } else {
+        expect(legacy.versions).toHaveBeenLastCalledWith(expect.objectContaining({
+          limit: 1000, offset: 0,
+        }));
+        await request(`/${SCOPE}/versions?offset=9007199254740991`, deps);
+        expect(legacy.versions).toHaveBeenLastCalledWith(expect.objectContaining({
+          offset: Number.MAX_SAFE_INTEGER,
+        }));
+        expect((await request(`/${SCOPE}/versions?cursor=5`, deps)).status).toBe(400);
+      }
+    }
+  });
+
   it("unswitched-history-routes-unchanged", async () => {
     const { deps, history } = fixture("unswitched");
     const bytes: string[] = [];
@@ -193,30 +267,13 @@ describe("history routes", () => {
     expect(legacy.versions).not.toHaveBeenCalled();
     expect(deps.lineageGateway!.getLineage).not.toHaveBeenCalled();
 
-    for (const [suffix, timezone, days] of [
-      ["?tz=America%2FNew_York&days=007", "America/New_York", 7],
-      ["?tz=&days=0", "", 0],
-      ["?days=999", "UTC", 999],
-      ["?days=", "UTC", Number.NaN],
-      ["?days=1e1", "UTC", Number.NaN],
-      ["?days=0x7", "UTC", Number.NaN],
-      ["?days=%207", "UTC", Number.NaN],
-      ["?days=1000", "UTC", Number.NaN],
-    ] as const) {
-      expect((await request(`/additions${suffix}`, deps)).status).toBe(200);
-      expect(history.additions).toHaveBeenLastCalledWith({ timezone, days });
-    }
-    await request(`/${SCOPE}/versions?limit=5&offset=3`, deps);
-    expect(history.versions).toHaveBeenLastCalledWith({
-      scope: SCOPE,
-      limit: 5,
-      offset: 3,
+    await request("/additions?tz=America%2FNew_York&days=007", deps);
+    expect(history.additions).toHaveBeenLastCalledWith({
+      timezone: "America/New_York", days: 7,
     });
-    await request(`/${SCOPE}/versions?limit=-1&offset=oops`, deps);
+    await request(`/${SCOPE}/versions?limit=5&cursor=3`, deps);
     expect(history.versions).toHaveBeenLastCalledWith({
-      scope: SCOPE,
-      limit: 20,
-      offset: 0,
+      scope: SCOPE, limit: 5, offset: 0, cursor: 3,
     });
     await request(`/${SCOPE}/lineage/4`, deps);
     expect(history.lineage).toHaveBeenLastCalledWith({

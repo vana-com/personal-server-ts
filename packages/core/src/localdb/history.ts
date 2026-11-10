@@ -4,7 +4,10 @@ import {
   bucketAdditionsByLocalDay,
   type AdditionsSummary,
 } from "../additions/summary.js";
+import { ProtocolError } from "../errors/catalog.js";
 import type { LocalSyncDeps } from "./deps.js";
+
+export const HISTORY_PAGE_LIMIT = 1000;
 
 /** 404 (`not_found`) and 410 (`deleted`) as the other D.1 reads answer them. */
 export type HistoryResult<T> =
@@ -29,6 +32,8 @@ export interface HistoryVersionsPage {
   readonly total: number;
   readonly limit: number;
   readonly offset: number;
+  /** Exclusive version cursor for the next page, or null when exhausted. */
+  readonly nextCursor: number | null;
 }
 
 /** `/lineage` on a switched owner: no sources, by construction (r5.2 1.6). */
@@ -55,7 +60,9 @@ export interface LocalHistory {
   versions(input: {
     readonly scope: string;
     readonly limit: number;
+    /** Only zero is accepted; continue with cursor instead of an offset. */
     readonly offset: number;
+    readonly cursor?: number;
   }): Promise<HistoryResult<HistoryVersionsPage>>;
   lineage(input: {
     readonly scope: string;
@@ -107,7 +114,11 @@ export function createLocalHistory(
   return {
     async additions({ timezone, days }) {
       if (!Number.isInteger(days) || days < 1 || days > 31) {
-        throw new RangeError("days must be an integer from 1 to 31");
+        throw new ProtocolError(
+          400,
+          "invalid_request",
+          "days must be an integer from 1 to 31",
+        );
       }
       const now = new Date(deps.now());
       // Validate the timezone before querying and reuse calendar-day arithmetic.
@@ -213,70 +224,96 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
           })),
       };
     },
-    async versions({ scope, limit, offset }) {
-      // Logical scopes name the identity-less namespace; physical scopes
-      // additionally identify the namespace stored on the connection.
+    async versions({ scope, limit, offset, cursor }) {
+      if (
+        !Number.isSafeInteger(limit) ||
+        limit < 1 ||
+        !Number.isSafeInteger(offset) ||
+        offset !== 0 ||
+        (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 1))
+      ) {
+        throw new ProtocolError(
+          400,
+          "invalid_request",
+          "Use a positive safe limit and cursor; offset must be zero",
+        );
+      }
+      limit = Math.min(limit, HISTORY_PAGE_LIMIT);
       const name = scope.startsWith("pdpp.") ? scope.slice(5) : scope;
       const match = /^([^.~]+)(?:~([a-f0-9]{16}|))?\.(.+)$/.exec(name);
       const connector = match?.[1];
       const stream = match?.[3];
       if (!connector || !stream) return { ok: false, reason: "not_found" };
-      const [connection] = await deps.db.query<{
-        connection_id: string;
-        generation: number;
+      // One statement gives control, frontier, total and page one snapshot.
+      const rows = await deps.db.query<{
         control_state: string;
+        head_version: number | null;
+        total: number;
+        head_blob: string | null;
+        observed_at: number | null;
+        version: number | null;
       }>(
-        "SELECT connection_id, generation, control_state FROM connections WHERE connector = ? AND ns = ? ORDER BY connection_id LIMIT 1",
-        [connector, match?.[2] ?? ""],
+        `WITH context AS (
+           SELECT c.connection_id, c.generation, c.control_state,
+                  s.head_version, s.last_delete_version
+           FROM (SELECT * FROM connections WHERE connector = ? AND ns = ?
+                 ORDER BY connection_id LIMIT 1) c
+           LEFT JOIN stream_state s ON s.connection_id = c.connection_id
+             AND s.stream = ?
+         ), visible AS (
+           SELECT v.head_blob, v.observed_at, v.version
+           FROM context c JOIN stream_versions v
+             ON v.connection_id = c.connection_id AND v.stream = ?
+           WHERE c.control_state = 'active' AND v.generation = c.generation
+             AND v.version > c.last_delete_version
+             AND v.kind IN ('published', 'applied')
+             AND (? = 1 OR v.version = c.head_version)
+         ), page AS (
+           SELECT * FROM visible WHERE (? IS NULL OR version < ?)
+           ORDER BY version DESC LIMIT ?
+         )
+         SELECT c.control_state, c.head_version,
+                (SELECT COUNT(*) FROM visible) AS total,
+                p.head_blob, p.observed_at, p.version
+         FROM context c LEFT JOIN page p ON 1 = 1
+         ORDER BY p.version DESC`,
+        [
+          connector,
+          match?.[2] ?? "",
+          stream,
+          stream,
+          options.olderVersionReads() ? 1 : 0,
+          cursor ?? null,
+          cursor ?? null,
+          limit + 1,
+        ],
       );
-      if (!connection) return { ok: false, reason: "not_found" };
-      if (connection.control_state === "deleted") {
+      const context = rows[0];
+      if (context?.control_state === "deleted") {
         return { ok: false, reason: "deleted" };
       }
-      const [state] = await deps.db.query<{ head_version: number }>(
-        "SELECT head_version FROM stream_state WHERE connection_id = ? AND stream = ?",
-        [connection.connection_id, stream],
-      );
-      if (!state) return { ok: false, reason: "not_found" };
-
-      const params = [
-        connection.connection_id,
-        stream,
-        connection.generation,
-        options.olderVersionReads() ? 1 : 0,
-        state.head_version,
-      ];
-      const predicate =
-        "connection_id = ? AND stream = ? AND generation = ? AND kind IN ('published', 'applied') AND (? = 1 OR version = ?)";
-      const [count] = await deps.db.query<{ total: number }>(
-        "SELECT COUNT(*) AS total FROM stream_versions WHERE " + predicate,
-        params,
-      );
-      const rows = await deps.db.query<{
-        head_blob: string;
-        observed_at: number;
-        version: number;
-      }>(
-        "SELECT head_blob, observed_at, version FROM stream_versions WHERE " +
-          predicate +
-          " ORDER BY version DESC LIMIT ? OFFSET ?",
-        [...params, limit, offset],
-      );
+      if (context?.control_state !== "active" || context.head_version === null) {
+        return { ok: false, reason: "not_found" };
+      }
+      const versions = rows.filter((row) => row.version !== null);
+      const page = versions.slice(0, limit);
       return {
         ok: true,
         value: {
           scope,
-          versions: rows.map((row) => ({
+          versions: page.map((row) => ({
             fileId: row.head_blob,
             schemaId: null,
-            collectedAt: new Date(row.observed_at).toISOString(),
-            version: row.version,
+            collectedAt: new Date(row.observed_at!).toISOString(),
+            version: row.version!,
             producer: null,
             producer_provenance: null,
           })),
-          total: count?.total ?? 0,
+          total: context.total,
           limit,
-          offset,
+          offset: 0,
+          nextCursor:
+            versions.length > limit ? page[page.length - 1]!.version : null,
         },
       };
     },
@@ -286,43 +323,35 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
       const connector = match?.[1];
       const stream = match?.[3];
       if (!connector || !stream) return { ok: false, reason: "not_found" };
-      const [connection] = await deps.db.query<{
-        connection_id: string;
-        generation: number;
+      const [row] = await deps.db.query<{
         control_state: string;
+        version: number | null;
       }>(
-        "SELECT connection_id, generation, control_state FROM connections WHERE connector = ? AND ns = ? ORDER BY connection_id LIMIT 1",
-        [connector, match?.[2] ?? ""],
+        `SELECT c.control_state, v.version
+         FROM (SELECT * FROM connections WHERE connector = ? AND ns = ?
+               ORDER BY connection_id LIMIT 1) c
+         LEFT JOIN stream_state s ON s.connection_id = c.connection_id
+           AND s.stream = ?
+         LEFT JOIN stream_versions v ON v.connection_id = c.connection_id
+           AND v.stream = s.stream AND v.generation = c.generation
+           AND c.control_state = 'active'
+           AND v.version = COALESCE(?, s.head_version)
+           AND v.version > s.last_delete_version
+           AND v.kind IN ('published', 'applied')
+           AND (? IS NOT NULL OR s.head_generation = c.generation)`,
+        [connector, match?.[2] ?? "", stream, version ?? null, version ?? null],
       );
-      if (!connection) return { ok: false, reason: "not_found" };
-      if (connection.control_state === "deleted") {
+      if (row?.control_state === "deleted") {
         return { ok: false, reason: "deleted" };
       }
-      const [state] = await deps.db.query<{
-        head_version: number;
-        head_generation: number | null;
-      }>(
-        "SELECT head_version, head_generation FROM stream_state WHERE connection_id = ? AND stream = ?",
-        [connection.connection_id, stream],
-      );
-      if (!state) return { ok: false, reason: "not_found" };
-      const selected = version ?? state.head_version;
-      if (version === undefined) {
-        if (selected <= 0 || state.head_generation !== connection.generation) {
-          return { ok: false, reason: "not_found" };
-        }
-      } else {
-        const [retained] = await deps.db.query<{ version: number }>(
-          "SELECT version FROM stream_versions WHERE connection_id = ? AND stream = ? AND generation = ? AND version = ? AND kind IN ('published', 'applied')",
-          [connection.connection_id, stream, connection.generation, selected],
-        );
-        if (!retained) return { ok: false, reason: "not_found" };
+      if (!row || row.version === null) {
+        return { ok: false, reason: "not_found" };
       }
       // The gateway proof requires gateway/user signatures unavailable in
       // this database. A local root has no sources and no fabricated proof.
       return {
         ok: true,
-        value: { scope, version: selected, sources: [], proof: null },
+        value: { scope, version: row.version, sources: [], proof: null },
       };
     },
   };

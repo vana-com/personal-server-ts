@@ -1,6 +1,6 @@
 import { isOwnAppRead } from "../payment/own-app.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
-import type { LocalHistory } from "../localdb/history.js";
+import { HISTORY_PAGE_LIMIT, type LocalHistory } from "../localdb/history.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import {
   DataDeletedError,
@@ -2490,6 +2490,23 @@ export async function handlePersonalServerScopeUploadAppend(
   });
 }
 
+function historyInteger(
+  value: string | null,
+  fallback: number,
+  name: string,
+): number {
+  if (value === null) return fallback;
+  const parsed = /^\d+$/.test(value) ? Number(value) : Number.NaN;
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new ProtocolError(
+      400,
+      "invalid_request",
+      name + " must be a safe non-negative decimal integer",
+    );
+  }
+  return parsed;
+}
+
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
@@ -2559,7 +2576,18 @@ export async function handlePersonalServerDataRequest(
           : /^\d{1,3}$/.test(daysRaw)
             ? Number(daysRaw)
             : Number.NaN;
-      if (deps.accountMode?.read(deps.serverOwner) === "switched") {
+      const historyMode = deps.accountMode?.read(deps.serverOwner);
+      if (historyMode !== "switched" && historyMode !== "unswitched") {
+        return accountModeUnknownResponse();
+      }
+      if (!Number.isInteger(days) || days < 1 || days > 31) {
+        return errorResponse(
+          400,
+          "invalid_request",
+          "days must be an integer from 1 to 31",
+        );
+      }
+      if (historyMode === "switched") {
         if (!deps.history) {
           return errorResponse(
             503,
@@ -2691,7 +2719,31 @@ export async function handlePersonalServerDataRequest(
           requestedScope: scopeResult.scope,
         });
       }
-      if (deps.accountMode?.read(deps.serverOwner) === "switched") {
+      const historyMode = deps.accountMode?.read(deps.serverOwner);
+      if (historyMode !== "switched" && historyMode !== "unswitched") {
+        return accountModeUnknownResponse();
+      }
+      const limit = Math.min(
+        historyInteger(url.searchParams.get("limit"), 20, "limit"),
+        HISTORY_PAGE_LIMIT,
+      );
+      const offset = historyInteger(url.searchParams.get("offset"), 0, "offset");
+      const cursorRaw = url.searchParams.get("cursor");
+      const cursor =
+        cursorRaw === null ? undefined : historyInteger(cursorRaw, 0, "cursor");
+      if (
+        limit < 1 ||
+        cursor === 0 ||
+        (historyMode === "switched" && offset !== 0) ||
+        (historyMode === "unswitched" && cursor !== undefined)
+      ) {
+        return errorResponse(
+          400,
+          "invalid_request",
+          "Use a positive limit; switched history continues with cursor, not offset",
+        );
+      }
+      if (historyMode === "switched") {
         if (!scopeResult.ok) return contractErrorResponse(scopeResult);
         if (!deps.history) {
           return errorResponse(
@@ -2702,8 +2754,9 @@ export async function handlePersonalServerDataRequest(
         }
         const result = await deps.history.versions({
           scope: scopeResult.scope,
-          limit: normalizeLimit(url.searchParams.get("limit"), 20),
-          offset: normalizeLimit(url.searchParams.get("offset"), 0),
+          limit,
+          offset,
+          ...(cursor === undefined ? {} : { cursor }),
         });
         if (!result.ok) {
           if (result.reason === "deleted") {
@@ -2720,8 +2773,8 @@ export async function handlePersonalServerDataRequest(
       const result = await listDataVersionsContract({
         storage: deps.storage,
         scopeParam: decodePathPart(parts[0]),
-        limit: normalizeLimit(url.searchParams.get("limit"), 20),
-        offset: normalizeLimit(url.searchParams.get("offset"), 0),
+        limit,
+        offset,
         isVisible: discoveryVisibility(deps),
       });
       if (!result.ok) return contractErrorResponse(result);
@@ -2772,7 +2825,11 @@ export async function handlePersonalServerDataRequest(
         scope: scopeResult.scope,
         grantId: selectedGrantId(request, url),
       });
-      if (deps.accountMode?.read(deps.serverOwner) === "switched") {
+      const historyMode = deps.accountMode?.read(deps.serverOwner);
+      if (historyMode !== "switched" && historyMode !== "unswitched") {
+        return accountModeUnknownResponse();
+      }
+      if (historyMode === "switched") {
         resolveLineageGrantView(authResult);
         const historyVersion =
           version === undefined ? undefined : Number(version);
