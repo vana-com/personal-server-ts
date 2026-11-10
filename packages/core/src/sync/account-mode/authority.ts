@@ -5,6 +5,9 @@
  * - `read` is synchronous and never waits: before the first answer it is
  *   `unknown` (reads stay legacy, legacy writes pause), after it `streams` or
  *   `legacy`.
+ * - A load that fails leaves the authority unloaded: `read` stays `unknown`
+ *   for every owner, `submitEvidence` saves nothing, and the next
+ *   `submitEvidence` retries the load before judging the evidence.
  * - `submitEvidence` takes the lock exclusively, saves the new record, then
  *   publishes it. A save that fails throws and changes nothing in memory.
  * - `commitLegacy` takes the lock shared and reads the record inside it with no
@@ -71,21 +74,39 @@ export function createModeAuthority(
   const records = new Map<string, AccountModeRecord>();
   const lock = createRwLock();
   let loaded = false;
+  let loadFailed = false;
   let closed = false;
+  /** One retry in flight, shared so concurrent evidence does not reload twice. */
+  let reloadInFlight: Promise<void> | null = null;
 
-  const ready = options.store.load().then(
-    (saved) => {
+  async function attemptLoad(): Promise<void> {
+    try {
+      const saved = await options.store.load();
+      records.clear();
       for (const [owner, record] of saved)
         records.set(normalizeOwner(owner), record);
       loaded = true;
-    },
-    (error: unknown) => {
-      // Fail closed for writes: with no record the owner is unknown until the
-      // Account answers again.
+      loadFailed = false;
+    } catch (error: unknown) {
+      // A failed load is a distinct state, not an empty record set: the
+      // records stay unloaded, reads stay unknown, and evidence saves nothing
+      // until a later submit retries the load.
       warn("account mode records could not be loaded", error);
-      loaded = true;
-    },
-  );
+      loadFailed = true;
+    }
+  }
+
+  const ready = attemptLoad();
+
+  async function retryLoadIfFailed(): Promise<void> {
+    if (!loadFailed) return;
+    if (!reloadInFlight) {
+      reloadInFlight = attemptLoad().finally(() => {
+        reloadInFlight = null;
+      });
+    }
+    await reloadInFlight;
+  }
 
   function read(owner: string): ModeDecision {
     const record =
@@ -105,6 +126,14 @@ export function createModeAuthority(
       if (input.state === "on" || input.state === "off") {
         const release = await lock.exclusive();
         try {
+          // Retried under the lock, so the exclusive request is queued before
+          // the load starts: an On still waits for legacy writes in flight,
+          // and no legacy write starts after it.
+          await retryLoadIfFailed();
+          if (loadFailed) {
+            // Still no records to judge against: save nothing, change nothing.
+            return read(owner);
+          }
           const prev = records.get(owner);
           const next = applyAnswer(
             prev,
@@ -119,6 +148,8 @@ export function createModeAuthority(
         } finally {
           release();
         }
+      } else {
+        await retryLoadIfFailed();
       }
       const decision = read(owner);
       if (decision.kind === "streams") {
