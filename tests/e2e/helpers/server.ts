@@ -8,7 +8,7 @@ import { Hono } from "hono";
 import { vi } from "vitest";
 import { ServerConfigSchema } from "../../../packages/core/src/schemas/server-config.js";
 import type { GatewayConfig } from "../../../packages/core/src/schemas/server-config.js";
-import { createServer } from "../../../packages/server/src/bootstrap.js";
+import { createUnswitchedServer } from "../../../packages/server/src/account-mode/unswitched-server.test-utils.js";
 
 export interface TestServer {
   url: string;
@@ -67,7 +67,10 @@ export async function startTestServer(options?: {
 
   const config = ServerConfigSchema.parse(configInput);
 
-  const context = await createServer(config, { serverDir, dataDir });
+  const context = await createUnswitchedServer(config, {
+    serverDir,
+    dataDir,
+  });
 
   const server: ServerType = serve({
     fetch: context.app.fetch,
