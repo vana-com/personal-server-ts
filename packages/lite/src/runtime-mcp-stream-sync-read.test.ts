@@ -1,3 +1,7 @@
+import {
+  createModeAuthority,
+  createMemoryModeRecordStore,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 /**
  * The MCP read and the HTTP data read serve the same stream-sync view in the
  * Lite runtime (the browser Personal Server).
@@ -23,7 +27,6 @@ import { testOwnerKey } from "@opendatalabs/personal-server-ts-core/stream-sync-
 import {
   createTestWallet,
   buildWeb3SignedHeader,
-  fixedModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type {
   Builder,
@@ -184,8 +187,12 @@ describe("Lite MCP and HTTP reads serve the same stream-sync view", () => {
   let runtime: ReturnType<typeof createPsLiteRuntime>;
   let accessLog: AccessLogEntry[];
   let token: string;
+  let authority: ReturnType<typeof createModeAuthority>;
 
   beforeEach(async () => {
+    authority = createModeAuthority({ store: createMemoryModeRecordStore() });
+    await authority.ready;
+    await authority.submitEvidence({ owner: owner.address, state: "off" });
     store = createInMemoryMcpConnectionStore();
     const created = await createMcpConnection(
       { displayName: "Claude" },
@@ -212,7 +219,7 @@ describe("Lite MCP and HTTP reads serve the same stream-sync view", () => {
       grantVerifier: gateway,
     };
     runtime = createPsLiteRuntime({
-      accountModeAuthority: fixedModeAuthority("unswitched"),
+      accountModeAuthority: authority,
       active: true,
       storage: createMemoryPsLiteStorage(),
       config: { gateway: gatewayConfig },
@@ -246,6 +253,7 @@ describe("Lite MCP and HTTP reads serve the same stream-sync view", () => {
   });
 
   async function httpRead(): Promise<unknown> {
+    await authority.submitEvidence({ owner: owner.address, state: "on" });
     const res = await runtime.fetch(
       await ownerSigned("GET", `/v1/data/${SCOPE}`),
     );
@@ -258,6 +266,7 @@ describe("Lite MCP and HTTP reads serve the same stream-sync view", () => {
     name: string,
     args: Record<string, unknown>,
   ): Promise<{ text: string; isError: boolean }> {
+    await authority.submitEvidence({ owner: owner.address, state: "on" });
     const res = await runtime.fetch(
       new Request(`${SERVER_ORIGIN}/mcp/${encodeURIComponent(token)}`, {
         method: "POST",

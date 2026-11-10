@@ -1,3 +1,4 @@
+import { openBetterSqlite3 } from "../../server/src/localdb/better-sqlite3-driver.js";
 /**
  * Proves `createIndexedDbPsLiteRuntime` composes its identity/config/sync/auth
  * over INJECTED persistence ports (the Mobile native path) instead of the
@@ -274,9 +275,10 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
     const resolve = vi.fn((d: string) =>
       d === digest ? { connector: "c", version: "1", streams: [] } : null,
     );
-    const { streamSyncIntake } = await createUnswitchedIndexedDbPsLiteRuntime(
+    const context = await createSwitchedIndexedDbPsLiteRuntime(
       options({
         streamSyncDeclarations: resolve,
+        localDb: { openDriver: async () => openBetterSqlite3(":memory:") },
         streamSyncFiles: () =>
           createIndexedDbStreamSyncFiles({
             dbName: "intake-files",
@@ -290,15 +292,18 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
         },
       }),
     );
+    const { streamSyncIntake } = context;
     expect(streamSyncIntake).not.toBeNull();
     const unknown = `sha256:${"cd".repeat(32)}`;
     await expect(
       begin(ownerAddress, streamSyncIntake!, unknown),
     ).rejects.toMatchObject({ code: "unknown_artifact" });
     expect(resolve).toHaveBeenCalledWith(unknown);
+    await context.syncManager?.stop();
+    await context.closeStreamSync?.();
   });
 
-  it("is null with streamSync.write off", async () => {
+  it("refuses intake while Account is Off regardless of the old write flag", async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());
     const { streamSyncIntake } = await createUnswitchedIndexedDbPsLiteRuntime(
       options({
@@ -308,7 +313,13 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
         },
       }),
     );
-    expect(streamSyncIntake).toBeNull();
+    expect(streamSyncIntake).not.toBeNull();
+    await expect(
+      begin(ownerAddress, streamSyncIntake!, digest),
+    ).rejects.toMatchObject({
+      code: 409,
+      errorCode: "STREAM_SYNC_NOT_ENABLED",
+    });
   });
 });
 

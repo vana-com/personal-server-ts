@@ -1,5 +1,29 @@
+import type * as LocalDbModule from "@opendatalabs/personal-server-ts-core/localdb";
+import type { OwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
 import "fake-indexeddb/auto";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  createLocalSync,
+  localDatabaseName,
+  openLocalDb,
+  type LocalSync,
+  type SqlDriver,
+} from "@opendatalabs/personal-server-ts-core/localdb";
+import { openLiteLocalDb, type LiteLocalDbOptions } from "./localdb-port.js";
+
+// The local facade is a declared stub at this base. Test Lite composition,
+// while leaving the real database module contracts available to the adapter.
+vi.mock(
+  "@opendatalabs/personal-server-ts-core/localdb",
+  async (importOriginal) => {
+    const actual = await importOriginal<typeof LocalDbModule>();
+    return {
+      ...actual,
+      createLocalSync: vi.fn(),
+      openLocalDb: vi.fn(async (driver: SqlDriver) => driver),
+    };
+  },
+);
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { uploadAttemptKey } from "@opendatalabs/personal-server-ts-core/sync";
 import { createMemoryStreamSyncReadFiles } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
@@ -135,6 +159,8 @@ async function openLite(opts: {
     cursor: string | null;
   };
   readFiles?: ReturnType<typeof createMemoryStreamSyncReadFiles>;
+  localDb?: LiteLocalDbOptions;
+  accountStorageMode?: OwnedAccountStorageMode;
 }) {
   return createPsLiteSyncManager({
     streamSyncDeclaredStreams: () => [],
@@ -142,6 +168,8 @@ async function openLite(opts: {
       sync: { enabled: true },
       streamSync: { read: true, write: true },
     }),
+    localDb: opts.localDb,
+    accountStorageMode: opts.accountStorageMode,
     stateStore: opts.stateStore,
     storage: opts.storage,
     ownerSignature: OWNER_SIGNATURE,
@@ -436,6 +464,190 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
       expect(await stateStore.get(SYNC_CURSOR_KEY)).toEqual({
         lastProcessedTimestamp: "page-2",
       });
+    } finally {
+      await lite.syncManager.stop();
+      await lite.closeStreamSync();
+    }
+  });
+});
+
+describe("PS Lite local database composition", () => {
+  beforeEach(() => {
+    vi.mocked(createLocalSync).mockReset();
+    vi.mocked(openLocalDb).mockReset();
+    vi.mocked(openLocalDb).mockImplementation(async (driver) => driver);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function driver(): SqlDriver {
+    return {
+      info: { sqliteVersion: "3.22.0", host: "web", persistent: true },
+      query: vi.fn().mockResolvedValue([]),
+      batch: vi.fn().mockResolvedValue({ changes: [] }),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+  }
+
+  function facade(db: SqlDriver) {
+    const intake = { begin: vi.fn().mockResolvedValue({ ok: false }) };
+    const localSync = {
+      intake,
+      cycle: vi.fn().mockResolvedValue({ connections: [] }),
+      apply: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn(() => db.close()),
+    } as unknown as LocalSync;
+    vi.mocked(createLocalSync).mockReturnValue(localSync);
+    return { localSync, intake };
+  }
+
+  async function setup(
+    localDb: LiteLocalDbOptions,
+    readMode: () => "switched" | "unswitched" | "unknown" = () => "switched",
+  ) {
+    const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
+    const stateStore = namedState("indexeddb:localdb-composition/state");
+    const { identity, gateway } = await fixture(stateStore, owner);
+    const lite = await openLite({
+      stateStore,
+      storage: createMemoryPsLiteStorage(),
+      identity,
+      gateway,
+      localDb,
+      accountStorageMode: { owner, read: readMode },
+    });
+    return { lite, owner };
+  }
+
+  it("opens Lite's database through the host factory and shared initializer", async () => {
+    const db = driver();
+    const openDriver = vi.fn().mockResolvedValue(db);
+    const identity = {
+      owner: "0xABCD",
+      network: "test-network",
+      deviceId: "device-one",
+    };
+    expect(await openLiteLocalDb({ openDriver }, identity)).toBe(db);
+    expect(openDriver).toHaveBeenCalledTimes(1);
+    expect(openDriver).toHaveBeenCalledWith({
+      name: localDatabaseName(identity.owner, identity.network),
+      owner: identity.owner.toLowerCase(),
+      network: identity.network,
+    });
+    expect(openLocalDb).toHaveBeenCalledTimes(1);
+    expect(openLocalDb).toHaveBeenCalledWith(db, {
+      ...identity,
+      owner: identity.owner.toLowerCase(),
+    });
+    expect(db.close).not.toHaveBeenCalled();
+
+    const failure = new Error("database identity mismatch");
+    vi.mocked(openLocalDb).mockRejectedValueOnce(failure);
+    await expect(openLiteLocalDb({ openDriver }, identity)).rejects.toBe(
+      failure,
+    );
+    expect(db.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a null host driver as stream sync unavailable in this process", async () => {
+    const locks = stubBrowserLocks();
+    const openDriver = vi.fn().mockResolvedValue(null);
+    const { lite } = await setup({ openDriver });
+    try {
+      expect(openDriver).toHaveBeenCalledTimes(1);
+      expect(openLocalDb).not.toHaveBeenCalled();
+      expect(createLocalSync).not.toHaveBeenCalled();
+      expect(lite.localSync).toBeNull();
+      expect(lite.streamSyncIntake).not.toBeNull();
+      expect(lite.streamSyncWriter).toBeNull();
+      await expect(
+        lite.streamSyncRead!.resolve({} as never),
+      ).rejects.toMatchObject({
+        code: 503,
+        errorCode: "STREAM_READ_UNAVAILABLE",
+      });
+      expect(locks).toEqual([]);
+    } finally {
+      await lite.syncManager.stop();
+      await lite.closeStreamSync();
+    }
+  });
+
+  it("routes Lite intake through createLocalSync over the opened database", async () => {
+    const db = driver();
+    const { localSync, intake } = facade(db);
+    const { lite, owner } = await setup({
+      openDriver: vi.fn().mockResolvedValue(db),
+    });
+    try {
+      expect(createLocalSync).toHaveBeenCalledTimes(1);
+      expect(createLocalSync).toHaveBeenCalledWith(
+        expect.objectContaining({
+          db,
+          ownerAddress: owner,
+          queue: { run: expect.any(Function) },
+        }),
+        expect.objectContaining({
+          resolveArtifact: expect.any(Function),
+          declaredStreams: expect.any(Function),
+          olderVersionReads: expect.any(Function),
+        }),
+      );
+      expect(lite.localSync).toBe(localSync);
+      expect(lite.streamSyncIntake).not.toBeNull();
+      const request = {} as Parameters<
+        NonNullable<typeof lite.streamSyncIntake>["begin"]
+      >[0];
+      await lite.streamSyncIntake!.begin(request);
+      expect(intake.begin).toHaveBeenCalledTimes(1);
+      expect(intake.begin).toHaveBeenCalledWith(request);
+    } finally {
+      await lite.syncManager.stop();
+      await lite.closeStreamSync();
+    }
+    expect(localSync.close).toHaveBeenCalledTimes(1);
+    expect(db.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens no database until Account is On, then uses its cycle and pauses again on unknown", async () => {
+    const db = driver();
+    const { localSync } = facade(db);
+    let mode: "unknown" | "switched" = "unknown";
+    const openDriver = vi.fn().mockResolvedValue(db);
+    const { lite } = await setup({ openDriver }, () => mode);
+    try {
+      expect(openDriver).not.toHaveBeenCalled();
+      await expect(lite.getLocalSync()).rejects.toMatchObject({
+        errorCode: "ACCOUNT_MODE_UNKNOWN",
+      });
+      mode = "switched";
+      await lite.syncManager.trigger();
+      expect(openDriver).toHaveBeenCalledTimes(1);
+      expect(localSync.cycle).toHaveBeenCalledTimes(1);
+      mode = "unknown";
+      await lite.syncManager.trigger();
+      expect(localSync.cycle).toHaveBeenCalledTimes(1);
+    } finally {
+      await lite.syncManager.stop();
+      await lite.closeStreamSync();
+    }
+  });
+
+  it("keeps the sync manager's default sixty-second interval without another timer", async () => {
+    const db = driver();
+    facade(db);
+    const interval = vi.spyOn(globalThis, "setInterval");
+    const { lite } = await setup({
+      openDriver: vi.fn().mockResolvedValue(db),
+    });
+    try {
+      expect(interval).not.toHaveBeenCalled();
+      lite.syncManager.start();
+      expect(interval).toHaveBeenCalledTimes(1);
+      expect(interval).toHaveBeenCalledWith(expect.any(Function), 60_000);
     } finally {
       await lite.syncManager.stop();
       await lite.closeStreamSync();

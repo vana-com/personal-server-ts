@@ -3,10 +3,13 @@ import {
   type ResolveArtifact,
   type RunIntake,
 } from "../stream-sync/intake.js";
+import { applyConnection } from "./apply.js";
+import { bootstrapConnections } from "./bootstrap.js";
 import { createBlobStore, type BlobStore } from "./blobs.js";
 import { runCycle, syncConnection, type CycleReport } from "./cycle.js";
 import { createConnectionDeleter, type ConnectionDeleter } from "./delete.js";
 import type { LocalSyncDeps } from "./deps.js";
+import { createLocalHistory, type LocalHistory } from "./history.js";
 import { createLocalListing, type LocalListing } from "./listing.js";
 import { createOlderVersions, type OlderVersions } from "./older-versions.js";
 import { createRecordQuery, type RecordQuery } from "./query.js";
@@ -30,10 +33,13 @@ export interface LocalSync {
   readonly resolver: LocalResolver;
   readonly listing: LocalListing;
   readonly query: RecordQuery;
+  readonly history: LocalHistory;
   readonly olderVersions: OlderVersions;
   readonly blobs: BlobStore;
   /** `/sync/trigger` and the timer: C.4 order, apply then publish. */
   cycle(): Promise<CycleReport>;
+  /** Apply remote heads without publishing (download hook). */
+  apply(): Promise<void>;
   /** `/sync/file/:id`: apply and publish that connection, then read. */
   syncConnection(
     connectionId: string,
@@ -54,7 +60,8 @@ export function createLocalSync(
     readonly currentLease?: () => string | null;
   },
 ): LocalSync {
-  const intakeStore = createRunIntakeStore(deps);
+  let intakeStore: ReturnType<typeof createRunIntakeStore> | undefined;
+  const intake = () => (intakeStore ??= createRunIntakeStore(deps));
   const endStore = createRunEndStore(deps);
   const bindings = new Map<
     string,
@@ -76,7 +83,7 @@ export function createLocalSync(
     if (!binding) throw new RunIntakeError("gone");
     await checkBinding(binding);
   };
-  const intake: RunIntake = {
+  const runIntake: RunIntake = {
     async begin(runId, req) {
       if (
         !req ||
@@ -98,13 +105,13 @@ export function createLocalSync(
       if (!declarations) throw new RunIntakeError("unknown_artifact");
       // Artifact resolution can yield while the owner changes the write lease.
       await checkBinding(binding);
-      const response = await intakeStore.begin(runId, req, declarations);
+      const response = await intake().begin(runId, req, declarations);
       bindings.set(runId, binding);
       return response;
     },
     async batch(runId, req) {
       await checkRun(runId);
-      return intakeStore.batch(runId, req);
+      return intake().batch(runId, req);
     },
     async end(runId, req) {
       await checkRun(runId);
@@ -123,16 +130,24 @@ export function createLocalSync(
   const olderVersions = createOlderVersions(deps, {
     enabled: options.olderVersionReads,
   });
-  const deleter = createConnectionDeleter(deps, {
-    declaredStreams: options.declaredStreams,
-    ...(options.retainedManifests && {
-      retainedManifests: options.retainedManifests,
-    }),
-    ...(options.eraseLegacy && { eraseLegacy: options.eraseLegacy }),
-  });
+  const makeDeleter = () =>
+    createConnectionDeleter(deps, {
+      declaredStreams: options.declaredStreams,
+      ...(options.retainedManifests && {
+        retainedManifests: options.retainedManifests,
+      }),
+      ...(options.eraseLegacy && { eraseLegacy: options.eraseLegacy }),
+    });
+  let deleteStore: ConnectionDeleter | undefined;
+  const deletes = () => (deleteStore ??= makeDeleter());
+  const deleter: ConnectionDeleter = {
+    requestConnectionDelete: (connector) =>
+      deletes().requestConnectionDelete(connector),
+    resumeDeletes: () => deletes().resumeDeletes(),
+  };
   let closing: Promise<void> | undefined;
   return {
-    intake,
+    intake: runIntake,
     deleter,
     resolver: createLocalResolver(deps, {
       query,
@@ -141,9 +156,17 @@ export function createLocalSync(
     }),
     listing: createLocalListing(deps, () => olderVersions.counts()),
     query,
+    history: createLocalHistory(deps, {
+      olderVersionReads: options.olderVersionReads,
+    }),
     olderVersions,
     blobs: createBlobStore(deps),
     cycle: () => runCycle(deps),
+    async apply() {
+      for (const connection of await bootstrapConnections(deps)) {
+        await applyConnection(deps, connection.connectionId);
+      }
+    },
     syncConnection: (connectionId) => syncConnection(deps, connectionId),
     close: () => (closing ??= deps.db.close()),
   };

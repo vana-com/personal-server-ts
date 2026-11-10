@@ -1,3 +1,4 @@
+import type { OwnedAccountStorageMode } from "../../api/account-storage-mode.js";
 import type { UploadWorkerDeps } from "../workers/upload.js";
 import type { DownloadWorkerDeps } from "../workers/download.js";
 import type { SyncStatus, SyncError, SyncBlockedReason } from "../types.js";
@@ -25,6 +26,10 @@ import type {
 import type { LegacyWriteSeal } from "../../storage/legacy-write-seal.js";
 
 export interface SyncManagerOptions {
+  /** Personal Server hosts always supply their owner-bound Account mode. */
+  accountStorageMode?: Pick<OwnedAccountStorageMode, "read">;
+  localSync?: { cycle(): Promise<unknown> };
+
   /** Polling interval in milliseconds (default: 60_000 = 1 minute) */
   pollInterval?: number;
   /** Max upload batch size per cycle (default: 50) */
@@ -231,6 +236,25 @@ export function createSyncManager(
           continue;
         }
         blocked = null;
+        // canSync can yield while Account changes. Sample only after it returns.
+        if (options?.accountStorageMode) {
+          const mode = options.accountStorageMode.read();
+          if (mode !== "unswitched") {
+            if (mode === "switched" && options.localSync) {
+              await options.localSync.cycle();
+              lastSync = new Date().toISOString();
+            } else {
+              blocked = {
+                reason:
+                  mode === "unknown"
+                    ? "account_mode_unknown"
+                    : "stream_sync_unavailable",
+                message: "Waiting for the account or its stream database",
+              };
+            }
+            continue;
+          }
+        }
 
         if (needsStartupHydration) {
           try {
@@ -547,7 +571,11 @@ export function createSyncManager(
     },
 
     getStatus(): SyncStatus {
-      const pendingFiles = uploadDeps.storage.findUnsynced().length;
+      const pendingFiles =
+        options?.accountStorageMode &&
+        options.accountStorageMode.read() !== "unswitched"
+          ? 0
+          : uploadDeps.storage.findUnsynced().length;
 
       return {
         enabled: true,
@@ -573,6 +601,19 @@ export function createSyncManager(
           return;
         }
         blocked = null;
+        if (options?.accountStorageMode) {
+          const mode = options.accountStorageMode.read();
+          if (mode !== "unswitched") {
+            if (mode === "switched" && options.localSync)
+              await options.localSync.cycle();
+            else
+              blocked = {
+                reason: "account_mode_unknown",
+                message: "Waiting for the account or its stream database",
+              };
+            return;
+          }
+        }
         await hydrateScopesExclusive(scopes);
       });
     },

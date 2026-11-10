@@ -1,3 +1,6 @@
+import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
+import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
 import { resolveLiteReplication } from "./replication-door.js";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
@@ -103,6 +106,10 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   | "tokenStore"
 > {
   ownerAddress?: `0x${string}`;
+  /** Host-owned local database, shared by stream intake and reads. */
+  localDb?: PsLiteSyncOptions["localDb"];
+  localDbDeviceId?: PsLiteSyncOptions["localDbDeviceId"];
+  olderVersionReads?: PsLiteSyncOptions["olderVersionReads"];
   /**
    * Where the account-mode module keeps its per-owner records. Default: its
    * own IndexedDB database next to the data store's. A host with another
@@ -199,6 +206,10 @@ export interface IndexedDbPsLiteRuntime {
   tokenStore: PsLiteRuntimeOptions["tokenStore"];
   accessLogStore: AccessLogReader & AccessLogWriter;
   syncManager: PsLiteRuntimeOptions["syncManager"];
+  /** Database facade when a host driver is supplied and available. */
+  localSync?: LocalSync | null;
+  /** Stop the sync manager before releasing its database or file home. */
+  closeStreamSync?(): Promise<void>;
   /**
    * The run intake over the stream-sync writer, for host code to call in
    * process. `null` unless `config.streamSync.write` is on.
@@ -342,6 +353,9 @@ export async function createIndexedDbPsLiteRuntime(
   let streamSyncRead = options.streamSyncRead;
   let streamSyncIntake: RunIntake | null = null;
   let streamSyncWriter: StreamSyncWriter | null = null;
+  let syncRuntime:
+    Awaited<ReturnType<typeof createPsLiteSyncManager>> | undefined;
+  let closeStreamSync = async () => {};
   let runtimeRef: PsLiteRuntime | null = null;
   // Derivative compute: built before sync so downloads can mark questions
   // stale; it reaches the sync manager lazily to upload its results.
@@ -380,12 +394,20 @@ export async function createIndexedDbPsLiteRuntime(
       "Derivative compute disabled: inference.baseUrl is the direct-provider default; point it at the Vana inference relay",
     );
   }
-  if (!syncManager && config.sync.enabled) {
+  if (!syncManager && (config.sync.enabled || options.localDb)) {
     const sync = await createPsLiteSyncManager({
       config,
+      autoStartSync: config.sync.enabled,
+      localDb: options.localDb,
+      localDbDeviceId: options.localDbDeviceId,
+      olderVersionReads: options.olderVersionReads,
       stateStore,
       storage,
       ownerSignature: options.ownerSignature,
+      accountStorageMode: accountStorageModeFor(
+        accountStorageModeOf(accountModeAuthority),
+        serverOwner,
+      ),
       ownerAddress: options.ownerAddress,
       ownerSyncSigner: options.ownerSyncSigner,
       additionsWorkerFactory: options.additionsWorkerFactory,
@@ -419,7 +441,9 @@ export async function createIndexedDbPsLiteRuntime(
     syncManager = sync.syncManager;
     scopeDeletions = sync.scopeDeletions;
     dataPointFeed = sync.dataPointFeed;
-    streamSyncRead = sync.streamSyncRead ?? streamSyncRead;
+    syncRuntime = sync;
+    closeStreamSync = sync.closeStreamSync;
+    streamSyncRead = sync.streamSyncRead;
     streamSyncIntake = sync.streamSyncIntake;
     streamSyncWriter = sync.streamSyncWriter;
   }
@@ -520,7 +544,25 @@ export async function createIndexedDbPsLiteRuntime(
     additions,
     scopeDeletions,
     streamSyncRead,
-    streamSyncConnectionDelete: streamSyncWriter,
+    localSync: syncRuntime?.getLocalSync,
+    history: syncRuntime
+      ? {
+          additions: async (input) =>
+            (await syncRuntime!.getLocalSync()).history.additions(input),
+          versions: async (input) =>
+            (await syncRuntime!.getLocalSync()).history.versions(input),
+          lineage: async (input) =>
+            (await syncRuntime!.getLocalSync()).history.lineage(input),
+        }
+      : undefined,
+    streamSyncConnectionDelete: syncRuntime
+      ? {
+          requestConnectionDelete: async (connector) =>
+            (await syncRuntime!.getLocalSync()).deleter.requestConnectionDelete(
+              connector,
+            ),
+        }
+      : null,
     diagnostics,
     lineageGateway,
     derivatives,
@@ -551,6 +593,10 @@ export async function createIndexedDbPsLiteRuntime(
     tokenStore,
     accessLogStore,
     syncManager,
+    get localSync() {
+      return syncRuntime?.localSync ?? null;
+    },
+    closeStreamSync,
     streamSyncIntake,
     streamSyncWriter,
     derivatives,

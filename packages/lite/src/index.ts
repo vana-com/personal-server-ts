@@ -79,10 +79,17 @@ export {
 export {
   createPsLitePendingBlobDeletionStore,
   createPsLiteSyncCursor,
+  createPsLiteUploadAttemptStore,
   createPsLiteSyncManager,
   type PsLiteSyncOptions,
   type PsLiteOwnerSyncSigner,
 } from "./sync.js";
+
+export {
+  openLiteLocalDb,
+  type LiteLocalDbOptions,
+  type LiteSqlDriverFactory,
+} from "./localdb-port.js";
 
 export {
   resolvePsLiteOwner,

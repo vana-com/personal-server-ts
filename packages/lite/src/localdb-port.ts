@@ -1,4 +1,8 @@
-import type { SqlDriver } from "@opendatalabs/personal-server-ts-core/localdb";
+import {
+  localDatabaseName,
+  openLocalDb,
+  type SqlDriver,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 
 /**
  * Lite's database port (PS-2, B.3/B.4). The host (Web Worker, phone `psSql`
@@ -11,9 +15,10 @@ export type LiteSqlDriverFactory = (request: {
   readonly name: string;
   readonly owner: string;
   readonly network: string;
-}) => Promise<SqlDriver>;
+}) => Promise<SqlDriver | null>;
 
 export interface LiteLocalDbOptions {
+  /** The host holds the database exclusively until the driver is closed. */
   readonly openDriver: LiteSqlDriverFactory;
 }
 
@@ -30,7 +35,22 @@ export async function openLiteLocalDb(
     readonly deviceId: string;
   },
 ): Promise<SqlDriver | null> {
-  void options;
-  void identity;
-  throw new Error("PS-2: not built");
+  const owner = identity.owner.toLowerCase();
+  const driver = await options.openDriver({
+    name: localDatabaseName(owner, identity.network),
+    owner,
+    network: identity.network,
+  });
+  if (driver === null) return null;
+  try {
+    return await openLocalDb(driver, { ...identity, owner });
+  } catch (error) {
+    // Release the host lock even when migration or identity checks fail.
+    try {
+      await driver.close();
+    } catch {
+      // Preserve the error that prevented the database from opening.
+    }
+    throw error;
+  }
 }

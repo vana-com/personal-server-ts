@@ -77,6 +77,32 @@ export function alternateLegacyBindingsForScope(
   );
 }
 
+/** Host-facing adapter for retained legacy grant scopes. The database only
+ * receives this port; it never knows the binding catalogue or its shapes. */
+export function legacyAliasScopes(scope: string) {
+  const targets = new Map(alternateLegacyBindingsForScope(scope));
+  const original = LEGACY_SCOPE_BINDINGS.get(scope);
+  if (original) {
+    const connector = original.pdppSource.slice(
+      original.pdppSource.lastIndexOf("/") + 1,
+    );
+    if (!targets.has(connector)) targets.set(connector, original);
+  }
+  return [...targets].map(([connector, binding]) => ({
+    connector,
+    streams: binding.pdppStreams,
+    servedStream: binding.window?.parentStream,
+    windowed: Boolean(binding.window),
+    project: (records: readonly PdppRecord[], now: string) =>
+      projectPdppRecordsToLegacyPayload(scope, [...records], {
+        fetchedStreams: [...binding.pdppStreams],
+        profileKey: connector,
+        orderByPrimaryKey: true,
+        now,
+      }),
+  }));
+}
+
 /** Only declaration-reviewed profile keys may project into retained scopes. */
 export function legacyBindingsForProfile(
   profileKey: string,

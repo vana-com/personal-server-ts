@@ -130,6 +130,7 @@ export interface DownloadWorkerDeps {
    * import runs after the page; an import failure never blocks the cursor.
    */
   streamSync?: StreamSyncListingObserver;
+  localSync?: { apply(): Promise<void> };
 }
 
 export interface StreamSyncListingObserver {
@@ -187,6 +188,10 @@ export async function downloadScopes(
   scopes: string[],
   options: DownloadScopesOptions = {},
 ): Promise<DownloadResult[]> {
+  if (deps.localSync) {
+    await deps.localSync.apply();
+    return [];
+  }
   const feed = deps.dataPointFeed ?? feedFromGatewayClient(deps.gateway);
   const results: DownloadResult[] = [];
 
@@ -649,6 +654,10 @@ export async function downloadAll(
   deps: DownloadWorkerDeps,
   options: DownloadAllOptions = {},
 ): Promise<DownloadResult[]> {
+  if (deps.localSync) {
+    await deps.localSync.apply();
+    return [];
+  }
   const { gateway, cursor, serverOwner, logger } = deps;
   const syncRunId = createSyncRunId();
 
