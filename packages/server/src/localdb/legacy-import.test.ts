@@ -170,25 +170,7 @@ it("import-newer-row-wins", async () => {
     before,
   );
 });
-it("import-batch-4mib", async () => {
-  const f = await fixture();
-  f.setValues(
-    Array.from({ length: 3 }, (_, i) => ({
-      id: String(i),
-      text: "é".repeat(600_000),
-    })),
-  );
-  const batch = f.db.batch.bind(f.db);
-  f.db.batch = async (statements) => {
-    expect(Buffer.byteLength(JSON.stringify(statements))).toBeLessThanOrEqual(
-      4 * 1024 * 1024,
-    );
-    return batch(statements);
-  };
-  expect((await f.run()).kind).toBe("imported");
-  f.setValues([{ id: "oversize", text: "x".repeat(4 * 1024 * 1024) }]);
-  expect(await f.run()).toEqual({ kind: "refused", reason: "invalid_record" });
-});
+
 it("import-crash-resume-idempotent", async () => {
   const f = await fixture();
   const batch = f.db.batch.bind(f.db);

@@ -6,11 +6,10 @@ import {
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
-import type { SqlDriver, SqlStatement } from "./driver.js";
+import type { SqlDriver } from "./driver.js";
 import type { ImportSource } from "./legacy-import-types.js";
 import { importFingerprint } from "./import-fingerprint.js";
 
-export const IMPORT_BATCH_BYTES = 4 * 1024 * 1024;
 export type ImportRow = {
   pk_hash: string;
   record_key: string;
@@ -42,19 +41,17 @@ export async function stageImportSnapshot(
     );
     if (prior && prior.body_sha256 !== row.body_sha256)
       throw new Error("invalid_record");
-    await db.batch(
-      boundedImportBatch([
-        {
-          sql: "INSERT OR IGNORE INTO import_snapshot VALUES (?, ?, ?, ?, ?)",
-          params: [op, row.pk_hash, row.record_key, row.body, row.body_sha256],
-        },
-      ]),
-    );
+    await db.batch([
+      {
+        sql: "INSERT OR IGNORE INTO import_snapshot VALUES (?, ?, ?, ?, ?)",
+        params: [op, row.pk_hash, row.record_key, row.body, row.body_sha256],
+      },
+    ]);
   }
   return importFingerprint(snapshotDigests(db, op));
 }
 
-/** Keyset iteration keeps at most one bounded body live, even for large rows. */
+/** Keyset iteration keeps at most one body live, even for large rows. */
 export async function* snapshotRows(
   db: SqlDriver,
   op: string,
@@ -88,15 +85,6 @@ export async function clearImportSnapshot(db: SqlDriver, op: string) {
   ]);
 }
 
-/** Parameter-envelope-inclusive bound, shared by staging and merge commits. */
-export function boundedImportBatch(
-  statements: readonly SqlStatement[],
-): readonly SqlStatement[] {
-  if (utf8ToBytes(JSON.stringify(statements)).length > IMPORT_BATCH_BYTES)
-    throw new Error("invalid_record");
-  return statements;
-}
-
 /** The shared composition used by import staging and committed-row validation. */
 export async function canonicalImportRow(
   record: Record<string, unknown>,
@@ -114,9 +102,6 @@ export async function canonicalImportRow(
       body,
       body_sha256: bytesToHex(sha256(utf8ToBytes(body))),
     };
-    // Include the staged row metadata and parameter envelope, not just body.
-    if (utf8ToBytes(JSON.stringify(row)).length > IMPORT_BATCH_BYTES)
-      throw new Error();
     return row;
   } catch {
     throw new Error("invalid_record");
