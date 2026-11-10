@@ -11,9 +11,8 @@
  *
  * Only the owner may call it; Desktop uses the sidecar access token it
  * already sends. The body is streamed to disk, so memory stays bounded by one
- * record. The writer merges the staged rows into the first publish to (seed
- * target, generation 1) and records the receipt that makes a later PUT a
- * no-op.
+ * record. The host imports the staged rows through the shared database importer
+ * with the seed stamp and records the receipt that makes a later PUT a no-op.
  */
 
 import { Hono } from "hono";
@@ -37,9 +36,10 @@ export interface StreamSyncSeedRouteDeps {
   devToken?: string;
   accessToken?: string;
   tokenStore?: TokenStore;
-  /** Null when `streamSync.write` is off: every call answers 404. */
+  /** Null on hosts without a database capability. Account mode gates admission. */
   streamSyncSeed: {
     writer: {
+      importStaged(connector: string): Promise<void>;
       seedStatus(connector: string): Promise<{
         targetKnown: boolean;
         receipts: Readonly<Record<string, SeedReceipt>>;
@@ -141,6 +141,7 @@ export function streamSyncSeedRoutes(deps: StreamSyncSeedRouteDeps): Hono {
     }
     try {
       const staged = await seed.staging.stage(connector, stream!, chunks(body));
+      await seed.writer.importStaged(connector);
       return c.json(
         {
           state: "staged",

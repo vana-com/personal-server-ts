@@ -178,7 +178,7 @@ export interface AppDeps {
   accessToken?: string;
   configPath?: string;
   syncManager?: SyncManager | null;
-  /** Desktop seed intake (§2.9); null or absent when stream sync writing is off. */
+  /** Desktop seed intake (§2.9); Account mode gates the host database capability. */
   streamSyncSeed?: StreamSyncSeedRouteDeps["streamSyncSeed"];
   /** Run intake (V2 §2); absent when stream sync writing is off. */
   streamSyncIntake?: RunIntake;

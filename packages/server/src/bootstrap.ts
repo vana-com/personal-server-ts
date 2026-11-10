@@ -3,12 +3,16 @@ import {
   openLocalDb,
   connectionQueue,
   type LocalSync,
+  type LocalSyncDeps,
   type SqlDriver,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
 import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { createServerLocalSync } from "./localdb/sync.js";
+import { createLocalSeed } from "./localdb/seed.js";
+import { createSeedStaging } from "./stream-sync/seed-staging.js";
+import { createFsStreamSyncFiles } from "./stream-sync/fs-files.js";
 import { openBetterSqlite3 } from "./localdb/better-sqlite3-driver.js";
 import type { DurableAdditionsOptions } from "@opendatalabs/personal-server-ts-core/additions";
 import {
@@ -807,7 +811,7 @@ async function bootstrapServer(
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
   const streamSyncWriter = null;
-  const streamSyncSeed = null;
+  let localSyncDeps: LocalSyncDeps | undefined;
   let backgroundClosed = false;
   let localSync: LocalSync | undefined;
   let localDb: SqlDriver | undefined;
@@ -875,40 +879,37 @@ async function bootstrapServer(
           serverAccount: serverAccount!,
           reads: "signed",
         });
-        const facade = createServerLocalSync(
-          {
-            db: driver,
-            ownerAddress: serverOwner!,
-            queue: connectionQueue(),
-            registry:
-              options?.streamSyncRegistry ??
-              createGatewayStreamSyncRegistry({
-                gatewayUrl: config.gateway.url,
-                ownerAddress: serverOwner!,
-              }),
-            blobs:
-              options?.streamSyncBlobs ?? createStorageStreamSyncBlobs(storage),
-            keys: createStreamSyncKeyPorts(masterKeySignature!),
-            signer: serverSigner!,
-            logger,
-            now: Date.now,
-            newOp: randomUUID,
-          },
-          {
-            resolveArtifact: (digest) =>
-              manifestArtifactResolver(pdppAuth?.retainedManifests ?? [])(
-                digest,
-              ),
-            declaredStreams: options?.declaredStreams ?? (() => []),
-            retainedManifests: () => pdppAuth?.retainedManifests ?? [],
-            eraseLegacy: (connector) =>
-              eraseConnectorLeftovers(connector, {
-                storage: rawDataStorage,
-                pdpp: pdppConnections,
-              }),
-            olderVersionReads: () => config.olderVersionReads,
-          },
-        );
+        const deps: LocalSyncDeps = {
+          db: driver,
+          ownerAddress: serverOwner!,
+          queue: connectionQueue(),
+          registry:
+            options?.streamSyncRegistry ??
+            createGatewayStreamSyncRegistry({
+              gatewayUrl: config.gateway.url,
+              ownerAddress: serverOwner!,
+            }),
+          blobs:
+            options?.streamSyncBlobs ?? createStorageStreamSyncBlobs(storage),
+          keys: createStreamSyncKeyPorts(masterKeySignature!),
+          signer: serverSigner!,
+          logger,
+          now: Date.now,
+          newOp: randomUUID,
+        };
+        const facade = createServerLocalSync(deps, {
+          resolveArtifact: (digest) =>
+            manifestArtifactResolver(pdppAuth?.retainedManifests ?? [])(digest),
+          declaredStreams: options?.declaredStreams ?? (() => []),
+          retainedManifests: () => pdppAuth?.retainedManifests ?? [],
+          eraseLegacy: (connector) =>
+            eraseConnectorLeftovers(connector, {
+              storage: rawDataStorage,
+              pdpp: pdppConnections,
+            }),
+          olderVersionReads: () => config.olderVersionReads,
+        });
+        localSyncDeps = deps;
         localDb = driver;
         localSync = facade;
         return facade;
@@ -1479,6 +1480,19 @@ async function bootstrapServer(
           (await localSyncSource()).intake.abort(...args),
       }
     : undefined;
+
+  const streamSyncSeed = localSyncSource
+    ? createLocalSeed({
+        getDeps: async () => {
+          await localSyncSource();
+          return localSyncDeps!;
+        },
+        manifests: () => pdppAuth?.retainedManifests ?? [],
+        staging: createSeedStaging(
+          createFsStreamSyncFiles(join(storageRoot, "stream-sync", "seed")),
+        ),
+      })
+    : null;
 
   const app = createApp({
     accountModeAuthority,
