@@ -31,7 +31,10 @@ import {
   type ModeAuthority,
   type ModeRecordStore,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
-import { createLegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
+import {
+  createLegacyWriteSeal,
+  type LegacyWriteSeal,
+} from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 import { createIndexedDbModeRecordStore } from "./account-mode-store.js";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import type { InferenceProvider } from "@opendatalabs/personal-server-ts-core/derivatives";
@@ -175,11 +178,14 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    * either omit it for the default Web IndexedDB/OPFS path, or provide every
    * port for a host-owned persistence implementation.
    *
-   * The seal over the account-mode module is built here and given only to the
-   * default storage. An injected `storage` is the host's own and must seal its
-   * own legacy writes: this factory cannot reach into it.
+   * A host may supply storageFactory to construct storage using the runtime seal.
    */
-  persistence?: PsLitePersistenceBundle;
+  persistence?: Omit<PsLitePersistenceBundle, "storage"> &
+    Partial<Pick<PsLitePersistenceBundle, "storage">>;
+  /** Constructs host storage with the runtime's account-mode seal. */
+  storageFactory?: (
+    seal: LegacyWriteSeal,
+  ) => DataStoragePort | Promise<DataStoragePort>;
 }
 
 export interface IndexedDbPsLiteRuntime {
@@ -220,7 +226,11 @@ export async function createIndexedDbPsLiteRuntime(
 ): Promise<IndexedDbPsLiteRuntime> {
   const dbName = options.dbName ?? "personal-server-lite";
   const injected = options.persistence;
-  if (injected !== undefined) assertCompletePsLitePersistenceBundle(injected);
+  if (injected !== undefined)
+    assertCompletePsLitePersistenceBundle(
+      injected,
+      Boolean(options.storageFactory),
+    );
   // No bundle preserves the Web IndexedDB/OPFS path. A supplied bundle has
   // already been validated as complete, so hosts never silently mix native and
   // browser persistence. Config, identity, and sync remain generic over state.
@@ -291,18 +301,22 @@ export async function createIndexedDbPsLiteRuntime(
     authority: accountModeAuthority,
     owner: serverOwner,
   });
-  const storage =
-    injected?.storage ??
-    (await createPersistentPsLiteStorage(
-      { kind: "indexeddb" },
-      createIndexedDbPsLitePersistence({
-        dbName: options.storageDbName ?? `${dbName}-storage`,
-        storeName: options.storageStoreName ?? "state",
-        key: options.storageKey ?? "data-storage-v1",
-      }),
-      options.dataFileStore,
-      legacyWriteSeal,
-    ));
+  const storageFactory =
+    options.storageFactory ??
+    (injected?.storage
+      ? () => injected.storage!
+      : (seal: LegacyWriteSeal) =>
+          createPersistentPsLiteStorage(
+            { kind: "indexeddb" },
+            createIndexedDbPsLitePersistence({
+              dbName: options.storageDbName ?? `${dbName}-storage`,
+              storeName: options.storageStoreName ?? "state",
+              key: options.storageKey ?? "data-storage-v1",
+            }),
+            options.dataFileStore,
+            seal,
+          ));
+  const storage = await storageFactory(legacyWriteSeal);
   const gateway =
     options.gateway ??
     withCancellableRegistration(
