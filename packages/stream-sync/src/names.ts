@@ -6,7 +6,7 @@
  *   head blob:     h-<keccak-256 hex of the clear head>
  *   part blob:     g<generation>-p-<sha-256 hex of the clear part>
  *
- * `c` is the manifest connector key and never contains `~`. `ns` is 16
+ * `c` is the manifest connector key; builders refuse `~` and `.`, and parse still reads a name with a dotted `c`, so a name an older client stored stays readable. `ns` is 16
  * lowercase hex characters, or empty for identity-less connectors. Parse
  * takes `c` up to the first `~`, then `ns` = `([0-9a-f]{16})?`, then the end
  * (control scope) or `.` and a non-empty `s` (stream scope). A scope over 256
@@ -40,10 +40,12 @@ export type ParsedBlobName =
       readonly sha256: string;
     };
 
+const CONNECTOR = /^[^.~]+$/;
+
 function checkConnector(connector: string): void {
-  if (connector === "" || connector.includes("~")) {
+  if (!CONNECTOR.test(connector)) {
     throw new InvalidNameError(
-      `connector key must be non-empty and contain no "~": ${JSON.stringify(connector)}`,
+      `connector key must be non-empty and contain no "~" or ".": ${JSON.stringify(connector)}`,
     );
   }
 }
