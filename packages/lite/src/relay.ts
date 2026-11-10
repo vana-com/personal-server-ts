@@ -45,17 +45,36 @@ export interface PsLiteRelayClientOptions {
   reconnectMaxDelayMs?: number;
   /**
    * Read-reliability telemetry hook: one `ps_read_received` and one
-   * `ps_read_finished` per relayed `/v1/data/<scope>` read. Hosts forward the
-   * events to their analytics; a throwing hook never affects the relay.
+   * `ps_read_finished` per relayed `/v1/data/<scope>` HTTP request. Hosts
+   * forward the events to their analytics; a throwing hook never affects the
+   * relay.
+   *
+   * These count HTTP requests (attempts), not logical reads. A paid builder
+   * read is at least two requests: the first answers 402 (`payment_required`)
+   * and the paid retry answers 200; a requester's transport retry repeats the
+   * whole exchange. Dashboards must treat `payment_required` as a step, not a
+   * failure, and take the number of logical reads from the requester side.
    */
   onReadEvent?: (event: PsLiteReadEvent) => void;
+  /**
+   * Where the app's visibility comes from, for `appVisibility` and
+   * `hiddenDuring`. Default: `document.visibilityState` and its
+   * `visibilitychange` events. A host whose document does not reflect the app
+   * (PS-Lite in a headless WebView on mobile, where the document is never the
+   * screen) must pass its own source, or `() => "unknown"`; the events then
+   * omit `hiddenDuring` and carry `appVisibility: "unknown"` instead of a
+   * value that is constant and wrong.
+   */
+  appVisibility?: () => PsLiteAppVisibility;
 }
 
 /**
  * How a relayed read ended, as seen by the PS-Lite relay client. `ok` and
  * `empty` mean the response was handed to the socket, not that the requester
  * received it: delivery comes from joining the relay's `relay_stream_ended`
- * on streamRef.
+ * on streamRef (`bytes_unflushed` there is what the requester never got).
+ * `payment_required` is the expected first answer of a paid read, a step on
+ * the way to `ok`, not a failed read.
  */
 export type PsLiteReadOutcome =
   | "ok"
