@@ -290,10 +290,11 @@ describe("publishConnection", () => {
 
     const results = await publishConnection(world.deps, CONNECTION_ID);
     expect(results).toHaveLength(1);
-    expect(results[0]).toEqual({
+    expect(results[0]).toMatchObject({
       stream: STREAM,
       outcome: "published",
       watermark: W,
+      publication: { stream: STREAM, watermark: W, runIds: ["r1"] },
     });
 
     const [state] = await world.deps.db.query<{
