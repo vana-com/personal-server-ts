@@ -44,6 +44,10 @@
       "types": "./dist/localdb/index.d.ts",
       "import": "./dist/localdb/index.js"
     },
+    "./localdb/conformance": {
+      "types": "./dist/localdb/conformance.d.ts",
+      "import": "./dist/localdb/conformance.js"
+    },
     "./logger": {
       "types": "./dist/logger/index.d.ts",
       "import": "./dist/logger/index.js"
