@@ -1545,6 +1545,25 @@ describe("read-reliability events", () => {
     expect(events).toEqual([]);
   });
 
+  it("drops an in-flight event whose grantee lookup resolves after close", async () => {
+    let resolveGrantee: (value: string | undefined) => void = () => {};
+    const { client, sockets, events } = startEventClient(async (request) => {
+      granteeObserverOf(request)?.(
+        new Promise<string | undefined>((resolve) => {
+          resolveGrantee = resolve;
+        }),
+      );
+      return json({ data: 1 });
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    // The finished event is already flushed and waiting on the lookup.
+    expect(events.map((event) => event.type)).toEqual(["ps_read_received"]);
+    client.close();
+    resolveGrantee("0123456789ab");
+    await flushEvents();
+    expect(events.map((event) => event.type)).toEqual(["ps_read_received"]);
+  });
+
   it("keeps serving when the read hook throws", async () => {
     const logs: string[] = [];
     const { sockets } = startEventClient(async () => json({ data: 1 }), {
