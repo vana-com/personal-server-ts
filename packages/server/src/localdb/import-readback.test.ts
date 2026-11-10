@@ -1,4 +1,6 @@
-import { afterEach, expect, it } from "vitest";
+import type * as LegacyProjection from "../../../core/src/legacy-projection/index.js";
+import "./legacy-projection.test-utils.js";
+import { afterEach, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
@@ -45,7 +47,7 @@ async function fixture(path = ":memory:") {
   dbs.add(db);
   await db.batch([
     {
-      sql: "INSERT OR IGNORE INTO connections (connection_id,connector,ns,generation,control_state) VALUES ('connection','spotify','known',1,'active')",
+      sql: "INSERT OR IGNORE INTO connections (connection_id,connector,ns,generation,control_state) VALUES ('connection','profile-source','known',1,'active')",
     },
   ]);
   const unexpected = async (): Promise<never> => {
@@ -81,7 +83,7 @@ async function fixture(path = ":memory:") {
     revision: "revision",
     target: {
       connectionId: "connection",
-      connector: "spotify",
+      connector: "profile-source",
       stream: "profile",
       primaryKey: ["id"],
       semantics: "mutable_state",
@@ -97,7 +99,7 @@ async function fixture(path = ":memory:") {
     path: "fixture/copy.json",
     contentHash: "f".repeat(64),
     revision: "revision",
-    dataSet: "spotify.profile",
+    dataSet: "fixture.profile",
     sources: [
       { source: source.source, connectionId: "connection", stream: "profile" },
     ],
@@ -219,60 +221,76 @@ it("readback-newer-different-row-holds", async () => {
 });
 it("readback-every-legacy-data-set", async () => {
   const f = await fixture();
-  for (const [name, binding] of LEGACY_SCOPE_BINDINGS) {
-    const source: ImportSource = {
-      ...f.source,
-      target: {
-        ...f.source.target,
-        connector: legacyConnectorKey(binding.pdppSource),
-        stream: binding.pdppStreams[0]!,
-        primaryKey: binding.primaryKey[binding.pdppStreams[0]!]!,
-      },
-      async *records() {},
-    };
-    const reader = createImportProjectionReader(
-      f.deps,
-      time,
-      async function* () {
-        yield source;
-      },
-    );
-    const results = await reader.compare(source, null);
-    expect(
-      results.some((p) => p.dataSet === name),
-      name,
-    ).toBe(true);
-    const names = [...LEGACY_SCOPE_BINDINGS]
-      .filter(
-        ([, b]) =>
-          legacyConnectorKey(b.pdppSource) === source.target.connector &&
-          b.pdppStreams.includes(source.target.stream),
-      )
-      .map(([n]) => n)
-      .sort();
-    expect(results.map((p) => p.dataSet).sort()).toEqual(names);
+  const saved = [...LEGACY_SCOPE_BINDINGS];
+  const real = await vi.importActual<typeof LegacyProjection>(
+    "../../../core/src/legacy-projection/index.js",
+  );
+  const bindings = LEGACY_SCOPE_BINDINGS as Map<
+    string,
+    (typeof saved)[number][1]
+  >;
+  bindings.clear();
+  for (const [name, value] of real.LEGACY_SCOPE_BINDINGS)
+    bindings.set(name, value);
+  try {
+    for (const [name, binding] of LEGACY_SCOPE_BINDINGS) {
+      const source: ImportSource = {
+        ...f.source,
+        target: {
+          ...f.source.target,
+          connector: legacyConnectorKey(binding.pdppSource),
+          stream: binding.pdppStreams[0]!,
+          primaryKey: binding.primaryKey[binding.pdppStreams[0]!]!,
+        },
+        async *records() {},
+      };
+      const reader = createImportProjectionReader(
+        f.deps,
+        time,
+        async function* () {
+          yield source;
+        },
+      );
+      const results = await reader.compare(source, null);
+      expect(
+        results.some((p) => p.dataSet === name),
+        name,
+      ).toBe(true);
+      const names = [...LEGACY_SCOPE_BINDINGS]
+        .filter(
+          ([, b]) =>
+            legacyConnectorKey(b.pdppSource) === source.target.connector &&
+            b.pdppStreams.includes(source.target.stream),
+        )
+        .map(([n]) => n)
+        .sort();
+      expect(results.map((p) => p.dataSet).sort()).toEqual(names);
+    }
+  } finally {
+    bindings.clear();
+    for (const [name, value] of saved) bindings.set(name, value);
   }
 });
 it("readback-fixed-projection-time", async () => {
   const f = await fixture();
   const source: ImportSource = {
     ...f.source,
-    target: { ...f.source.target, connector: "chatgpt", stream: "memories" },
+    target: { ...f.source.target, connector: "time-source", stream: "entries" },
     async *records() {
       yield { id: "m", content: "memory", created_at: null };
     },
   };
-  await f.db.batch([{ sql: "UPDATE connections SET connector = 'chatgpt'" }]);
+  await f.db.batch([
+    { sql: "UPDATE connections SET connector = 'time-source'" },
+  ]);
   await importLegacySource(f.deps, createImportLedger(f.db), source);
   const expected = {
-    memories: [
-      { id: "m", content: "memory", created_at: time, type: "memory" },
-    ],
+    entries: [{ id: "m", content: "memory", created_at: time, type: "entry" }],
     total: 1,
   };
   const copy = {
     ...f.copy,
-    dataSet: "chatgpt.memories",
+    dataSet: "fixture-time.entries",
     sources: [
       {
         source: source.source,
@@ -347,7 +365,9 @@ it("readback-projection-bound-retains-large-copy", async () => {
 
 it("readback-order-independent-and-equal-count-different-body-fails", async () => {
   const f = await fixture();
-  await f.db.batch([{ sql: "UPDATE connections SET connector = 'chatgpt'" }]);
+  await f.db.batch([
+    { sql: "UPDATE connections SET connector = 'time-source'" },
+  ]);
   let pass = 0;
   const values = [
     { id: "a", content: "first", created_at: time },
@@ -355,7 +375,7 @@ it("readback-order-independent-and-equal-count-different-body-fails", async () =
   ];
   const source: ImportSource = {
     ...f.source,
-    target: { ...f.source.target, connector: "chatgpt", stream: "memories" },
+    target: { ...f.source.target, connector: "time-source", stream: "entries" },
     async *records() {
       yield* ++pass % 2 ? values : [...values].reverse();
     },
@@ -384,14 +404,10 @@ it("readback-order-independent-and-equal-count-different-body-fails", async () =
     await readBackLegacyImport(f.deps, source, reader, null),
   ).toMatchObject({ pass: false, reason: "record_mismatch" });
 });
-it("readback-missing-joined-peer-and-arrival-evidence-hold", async () => {
+it("readback-missing-joined-peer-holds", async () => {
   const f = await fixture();
-  for (const name of [
-    "icloud_notes.notes",
-    "wholefoods.nutrition",
-    "strava.activities",
-  ]) {
-    const binding = LEGACY_SCOPE_BINDINGS.get(name)!;
+  for (const [name, binding] of LEGACY_SCOPE_BINDINGS) {
+    if (binding.pdppStreams.length < 2) continue;
     const stream = binding.pdppStreams[0]!;
     const source: ImportSource = {
       ...f.source,
@@ -405,6 +421,13 @@ it("readback-missing-joined-peer-and-arrival-evidence-hold", async () => {
         yield { id: "one" };
       },
     };
+    await f.db.batch([
+      {
+        sql: "UPDATE connections SET connector = ?",
+        params: [source.target.connector],
+      },
+    ]);
+    await importLegacySource(f.deps, createImportLedger(f.db), source);
     const reader = createImportProjectionReader(
       f.deps,
       time,
@@ -415,9 +438,52 @@ it("readback-missing-joined-peer-and-arrival-evidence-hold", async () => {
     expect(
       (await reader.compare(source, null)).find((p) => p.dataSet === name)
         ?.pass,
-      name,
     ).toBe(false);
   }
+});
+it("readback-arrival-evidence-is-the-only-missing-proof", async () => {
+  const f = await fixture();
+  const [name, binding] = [...LEGACY_SCOPE_BINDINGS].find(
+    ([, value]) => value.rowOrder === "arrival",
+  )!;
+  const stream = binding.pdppStreams[0]!;
+  const connector = legacyConnectorKey(binding.pdppSource);
+  await f.db.batch([
+    { sql: "UPDATE connections SET connector = ?", params: [connector] },
+  ]);
+  let values = [
+    { id: "a", value: 1 },
+    { id: "b", value: 2 },
+  ];
+  const source: ImportSource = {
+    ...f.source,
+    target: { ...f.source.target, connector, stream, primaryKey: ["id"] },
+    async *records() {
+      yield* values;
+    },
+  };
+  await importLegacySource(f.deps, createImportLedger(f.db), source);
+  const stored = await f.db.query<{ body: string }>(
+    "SELECT body FROM records ORDER BY pk_hash",
+  );
+  values = stored.map((row) => JSON.parse(row.body)).reverse();
+  expect(values).toHaveLength(2);
+  expect([...values].sort((a, b) => a.id.localeCompare(b.id))).toEqual(
+    stored
+      .map((row) => JSON.parse(row.body))
+      .sort((a, b) => a.id.localeCompare(b.id)),
+  );
+  expect(values).not.toEqual(stored.map((row) => JSON.parse(row.body)));
+  const reader = createImportProjectionReader(f.deps, time, async function* () {
+    yield source;
+  });
+  expect(
+    (await reader.compare(source, null)).find((p) => p.dataSet === name)?.pass,
+  ).toBe(false);
+  // All row identities, bodies, receipts, declarations and peer coverage match.
+  expect(
+    await readBackLegacyImport(f.deps, source, reader, null),
+  ).toMatchObject({ pass: false, reason: "projection_unproven" });
 });
 it("readback-missing-row-and-incomplete-projection-coverage-hold", async () => {
   const f = await fixture();

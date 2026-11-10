@@ -1,3 +1,4 @@
+import "./legacy-projection.test-utils.js";
 import {
   createImportProjectionReader,
   readBackLegacyImport,
@@ -69,7 +70,7 @@ async function fixture() {
   store.registerConnection({
     instance: "instance",
     sourceId: "urn:fixture",
-    method: "spotify",
+    method: "profile-source",
     label: "Test",
   });
   expect(
@@ -85,14 +86,14 @@ async function fixture() {
       ],
       () => "mutable_state",
       () => ["id"],
-      { method: "spotify", generation: 1 },
+      { method: "profile-source", generation: 1 },
     ).accepted,
   ).toBe(1);
   const file = join(root, "data", "copy.json");
   writeFileSync(
     file,
     JSON.stringify({
-      scope: "spotify.profile",
+      scope: "fixture.profile",
       collectedAt: "2026-01-01T00:00:00.000Z",
       data: body,
     }),
@@ -101,7 +102,7 @@ async function fixture() {
   index.insert({} as LegacyWriteHold, {
     fileId: null,
     path: "copy.json",
-    scope: "spotify.profile",
+    scope: "fixture.profile",
     collectedAt: "2026-01-01T00:00:00.000Z",
     sizeBytes: 100,
   });
@@ -137,7 +138,7 @@ async function fixture() {
   ];
   const target = {
     connectionId: "control",
-    connector: "spotify",
+    connector: "profile-source",
     stream: "profile",
     primaryKey: ["id"],
     semantics: "mutable_state" as const,
@@ -218,7 +219,7 @@ it("legacy-access-hash-fenced-erase", async () => {
   expect(copy).toBeDefined();
   expect(await collect(access.copyRecords(copy!))).toEqual([body]);
   const replacement = JSON.stringify({
-    scope: "spotify.profile",
+    scope: "fixture.profile",
     data: { ...body, extra: "retained" },
   });
   writeFileSync(f.file, replacement);
@@ -290,7 +291,7 @@ it("legacy-access-symlink-and-orphan-held", async () => {
   const access = await openLegacyAccess(f.options);
   writeFileSync(
     join(f.root, "data", "orphan.json"),
-    JSON.stringify({ scope: "spotify.profile", data: body }),
+    JSON.stringify({ scope: "fixture.profile", data: body }),
   );
   expect(
     (await collect(access.copies())).find((c) => c.path.endsWith("orphan.json"))
@@ -308,7 +309,7 @@ it.each(["after-unlink", "before-receipt"])(
     const [copy] = await collect(access.copies());
     await f.local.batch([
       {
-        sql: "INSERT INTO connections (connection_id,connector,ns,generation,control_state) VALUES ('control','spotify','known',1,'active')",
+        sql: "INSERT INTO connections (connection_id,connector,ns,generation,control_state) VALUES ('control','profile-source','known',1,'active')",
       },
     ]);
     const unexpected = async (): Promise<never> => {

@@ -1,3 +1,4 @@
+import "./legacy-projection.test-utils.js";
 import { createHash } from "node:crypto";
 import {
   mkdtempSync,
@@ -55,7 +56,7 @@ function fixture(text = JSON.stringify({ id: "one", text: "é" }) + "\n") {
     resolveArtifact: async (digest: string) =>
       digest === "retained"
         ? {
-            connector: "spotify",
+            connector: "profile-source",
             version: "1",
             streams: [
               {
@@ -68,7 +69,7 @@ function fixture(text = JSON.stringify({ id: "one", text: "é" }) + "\n") {
         : null,
     resolveTarget: async () => ({
       connectionId: "control",
-      connector: "spotify",
+      connector: "profile-source",
       stream: "profile",
       primaryKey: ["id"],
       semantics: "mutable_state" as const,
@@ -250,7 +251,7 @@ it("upload-d6-p7-close-reopen-readback", async () => {
   dbs.push(db);
   await db.batch([
     {
-      sql: "INSERT INTO connections (connection_id,connector,ns,generation,control_state) VALUES ('control','spotify','known',1,'active')",
+      sql: "INSERT INTO connections (connection_id,connector,ns,generation,control_state) VALUES ('control','profile-source','known',1,'active')",
     },
   ]);
   const unused = async (): Promise<never> => {
