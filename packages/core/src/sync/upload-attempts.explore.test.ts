@@ -27,7 +27,7 @@
  *    when its stored count reached the threshold, and never without enough
  *    events that could leave a marker (a body that entered and never settled,
  *    an abrupt crash that held an admission, or a stop that gave up).
- * 6. A stop rejects only after its repair window has passed; a clean stop
+ * 6. A stop rejects only when its next retry would pass the deadline; a clean stop
  *    leaves no marker behind, however many admissions it refused.
  * Liveness: once faults stop and held writes are released, every operation
  * finishes, a stop that failed hands the store over by itself, and a clean
@@ -37,7 +37,7 @@
  * abrupt-crash exemptions: its bodies and refused admissions are counted only
  * by what storage could still hold.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   acquireProcessLock,
@@ -58,6 +58,24 @@ const FIRST = Number(process.env.UPLOAD_ATTEMPT_FIRST_SEED ?? 1);
 /** Retry base and stop window the explored ledgers use (real time). */
 const RETRY_MS = 1;
 const STOP_WINDOW = 40;
+
+/** Earliest final retry across nonnegative storage and scheduler latency. */
+function earliestStopFailure(grace: number): number {
+  const giveUpAt = (start: number) => {
+    let earliest = Infinity;
+    let elapsed = start;
+    let delay = RETRY_MS;
+    while (elapsed <= STOP_WINDOW) {
+      // A failed write may finish later than it started. The next sleep is
+      // refused once its end would exceed the deadline (integer milliseconds).
+      earliest = Math.min(earliest, Math.max(elapsed, STOP_WINDOW - delay + 1));
+      elapsed += delay;
+      delay *= 2;
+    }
+    return earliest;
+  };
+  return Math.min(giveUpAt(0), giveUpAt(grace));
+}
 
 function entry(n: number): IndexEntry {
   const collectedAt = `2026-11-07T10:0${n}:00Z`;
@@ -370,32 +388,18 @@ async function runSeed(seed: number, maxSteps = Infinity) {
       (b) => b.entry === n && !b.counted && b.settle !== "ok" && !b.cleared,
     );
   /**
-   * Where the retry schedule gives up: sleeps double from the base while the
-   * next one still ends inside the window. A repair starts at `start` (0, or
-   * the grace when attempts were live).
-   */
-  const giveUpAt = (start: number) => {
-    let t = start;
-    let delay = RETRY_MS;
-    while (t + delay <= STOP_WINDOW) {
-      t += delay;
-      delay *= 2;
-    }
-    return t;
-  };
-  /**
-   * A stop rejects only at the schedule's last step inside the window, so no
-   * earlier than the earliest such step (repair started at 0 or after grace),
-   * and not after the window.
+   * Storage and timer latency can move the final retry earlier than the
+   * zero-latency schedule: its next doubled sleep no longer fits. Retain a
+   * lower bound across those schedules and an allowance for host stalls.
    */
   const stopGaveUp = (started: number, rejected: boolean, grace: number) => {
     if (!rejected) return;
     const elapsed = Date.now() - started;
-    const earliest = Math.min(giveUpAt(0), giveUpAt(grace));
+    const earliest = earliestStopFailure(grace);
     if (elapsed + 2 < earliest)
       flag(
         "6",
-        `a stop gave up at ${elapsed} ms, before its window's last retry`,
+        `a stop gave up at ${elapsed} ms, before its earliest valid final retry`,
       );
     if (elapsed > STOP_WINDOW + 500)
       flag(
@@ -878,6 +882,48 @@ async function runSeed(seed: number, maxSteps = Infinity) {
 }
 
 describe("upload attempt ledger: seeded schedule exploration", () => {
+  it("accepts the final retry when a failed storage write consumes time", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    let fault = false;
+    let writes = 0;
+    const store: UploadAttemptStore = {
+      namespace: "explorer-storage-latency",
+      read: async () => null,
+      preserveCorrupt: async () => undefined,
+      write: async () => {
+        if (!fault) return;
+        writes++;
+        if (writes === 4)
+          await new Promise<void>((resolve) => setTimeout(resolve, 11));
+        throw new UploadAttemptWriteUncertainError("injected write failure");
+      },
+    };
+    const ledger = createUploadAttemptLedger(store, OWNER, {
+      repairRetryMs: RETRY_MS,
+      stopRepairWindowMs: STOP_WINDOW,
+    });
+    try {
+      await ledger.recover();
+      fault = true;
+      await expect(ledger.begin(entry(1))).rejects.toThrow();
+      writes = 0;
+      let rejectedAt: number | undefined;
+      const stopped = ledger.close(0).catch(() => {
+        rejectedAt = Date.now();
+      });
+      await vi.advanceTimersByTimeAsync(26);
+      await stopped;
+      expect(rejectedAt).toBe(26);
+      expect(rejectedAt! + 2).toBeGreaterThanOrEqual(earliestStopFailure(0));
+    } finally {
+      fault = false;
+      await vi.runAllTimersAsync();
+      await ledger.close(0);
+      vi.useRealTimers();
+    }
+  });
+
   it(`keeps its invariants across ${SEEDS} seeded schedules`, async () => {
     const started = Date.now();
     for (let seed = FIRST; seed <= SEEDS; seed++) {
