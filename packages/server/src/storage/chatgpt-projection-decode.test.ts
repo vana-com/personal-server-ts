@@ -126,13 +126,13 @@ describe("canonical ChatGPT declared text over SQLite", () => {
             count: 1,
             reasons: ["invalid_encoded_text: tool_calls"],
           });
-          expect(result.diagnostics.omissions).toContainEqual({
-            stream: "conversations",
-            count: 1,
-            reasons: [
-              "Current branch message count does not match conversation",
-            ],
-          });
+          expect(result.chatgptCoverageGaps).toContainEqual(
+            expect.objectContaining({
+              reason: "current_node_not_stored/flag_fallback_count_mismatch",
+              declaredCount: 1,
+              walkedCount: 0,
+            }),
+          );
         } else expect(result.diagnostics.omissions).toEqual([]);
         // Projection is read-only: encoded strings and absent optional fields remain stored.
         const stored = store.listRecords("messages", {

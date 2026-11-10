@@ -2,8 +2,8 @@
  * Contract suite, S2b: attempt-scoped results, the coordinator's clock and
  * eligibility, and bounded hints, proven on the real transport worker.
  *
- * Each case is an adapter-level reproduction of a finding in the cross-family
- * review of dab96705 (S2-REVIEW-DOT-R1.md).
+ * Adapter-level cases cover stale attempts, settlement-time backoff and
+ * progress reporting when evidence is unavailable.
  */
 import { afterEach, expect, it } from "vitest";
 import type { ProgressReport } from "@opendatalabs/personal-server-ts-core/replication/coordinator";

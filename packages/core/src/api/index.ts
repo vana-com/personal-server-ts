@@ -2356,10 +2356,19 @@ export async function handlePersonalServerDataRequest(
 
       // A canonical scope's latest body is the canonical view, and only it:
       // a refusal is answered, never replaced by the legacy file. Explicit
-      // versions stay legacy history. Read before payment, so a builder is
+      // versions stay legacy history, subject to retained row tombstones.
+      // Read before payment, so a builder is
       // never challenged or charged for a read that is then refused.
       if (latest?.kind === "refused") {
         return legacyViewRefusalResponse(scopeResult.scope, latest.refusal);
+      }
+      if (latest?.kind !== "canonical") {
+        const refusal = deps.legacyScopeView?.legacyFileReadRefusal(
+          scopeResult.scope,
+        );
+        if (refusal) {
+          return legacyViewRefusalResponse(scopeResult.scope, refusal);
+        }
       }
 
       // X402 payment dance for builder reads. Owner-exempt reads (the
@@ -2495,6 +2504,13 @@ export async function handlePersonalServerDataRequest(
         }
         envelope = result.envelope;
         servedFileId = fileIdParam ?? selectedEntry?.fileId ?? undefined;
+        // A row deletion may have arrived while the stored body was read.
+        const refusal = deps.legacyScopeView?.legacyFileReadRefusal(
+          scopeResult.scope,
+        );
+        if (refusal) {
+          return legacyViewRefusalResponse(scopeResult.scope, refusal);
+        }
       }
 
       const servedEnvelope = isOwnerView(authResult)
