@@ -1,3 +1,4 @@
+import { disposeAll } from "./lifecycle.js";
 import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
 import {
   handlePsLiteBridgeRequest,
@@ -248,6 +249,8 @@ export function startPsLiteRelayClient(
   const reconnectMaxDelayMs = options.reconnectMaxDelayMs ?? 30_000;
   let issueToken: string | undefined;
   let closed = false;
+  let disposed = false;
+  const drainWaiters = new Set<() => void>();
   // Every stream and callback belongs to one socket, never its replacement.
   let socket: PsLiteRelayWebSocket;
   let reconnectAttempts = 0;
@@ -309,8 +312,9 @@ export function startPsLiteRelayClient(
   };
 
   const disposeStreams = () => {
-    for (const stream of [...streams.values()]) disposeStream(stream);
+    const owned = [...streams.values()];
     pendingStreamData.clear();
+    disposeAll(owned.map((stream) => () => disposeStream(stream)));
   };
 
   const writePlaintextResponse = (
@@ -441,7 +445,7 @@ export function startPsLiteRelayClient(
   const handleControl = (message: ControlMessage) => {
     if (message.type === "session.ready") {
       issueToken = message.issueToken;
-      options.onStatus?.("connected");
+      notify("connected");
       if (tls && tls.prepare) {
         void tls
           .prepare({
@@ -579,6 +583,52 @@ export function startPsLiteRelayClient(
     }, delay);
   };
 
+  function close(reason = "closed", reportClosed = false): void {
+    if (disposed) return;
+    disposed = true;
+    closed = true;
+    stopHeartbeat();
+    if (reconnectTimer !== undefined) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
+    }
+    disposeAll([
+      ...drainWaiters,
+      disposeStreams,
+      () => {
+        if (!socket) return;
+        socket.onopen =
+          socket.onmessage =
+          socket.onclose =
+          socket.onerror =
+            null;
+        socket.close(1000, reason);
+      },
+      () => {
+        if (reportClosed) notify("closed", { code: 1000, reason });
+      },
+    ]);
+  }
+
+  function notify(
+    ...args: Parameters<NonNullable<PsLiteRelayClientOptions["onStatus"]>>
+  ): void {
+    try {
+      options.onStatus?.(...args);
+    } catch (error) {
+      try {
+        close("status-handler-threw");
+      } catch (cleanup) {
+        throw new AggregateError(
+          [error, ...(cleanup as AggregateError).errors],
+          "Relay callback and disposal failed",
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+  }
+
   function connect(): void {
     // Terminal states (intentional close, or a 1012 session takeover) must
     // never re-open a socket, even if a stale timer or event slips through.
@@ -592,13 +642,13 @@ export function startPsLiteRelayClient(
     const acceptsFrames = () =>
       isCurrent() && currentSocket.readyState === currentSocket.OPEN;
     socket.binaryType = "arraybuffer";
-    options.onStatus?.("connecting");
+    notify("connecting");
 
     socket.onopen = () => {
       if (!acceptsFrames()) return;
       reconnectAttempts = 0;
       startHeartbeat();
-      options.onStatus?.("connected");
+      notify("connected");
     };
     socket.onmessage = (event) => {
       if (!acceptsFrames()) return;
@@ -616,7 +666,7 @@ export function startPsLiteRelayClient(
       issueToken = undefined;
       const detail = { code: event?.code, reason: event?.reason };
       if (closed) {
-        options.onStatus?.("closed", detail);
+        notify("closed", detail);
         return;
       }
       if (event?.code === RELAY_CLOSE_SESSION_REPLACED) {
@@ -631,21 +681,34 @@ export function startPsLiteRelayClient(
           reconnectTimer = undefined;
         }
         log("relay session replaced by another connection — not reconnecting");
-        options.onStatus?.("replaced", detail);
+        notify("replaced", detail);
         return;
       }
-      options.onStatus?.("disconnected", detail);
+      notify("disconnected", detail);
       scheduleReconnect();
     };
     socket.onerror = () => {
       if (!isCurrent() || currentSocket.readyState > currentSocket.OPEN) {
         return;
       }
-      options.onStatus?.("error");
+      notify("error");
     };
   }
 
-  connect();
+  try {
+    connect();
+  } catch (error) {
+    try {
+      close("relay-start-failed");
+    } catch (cleanup) {
+      throw new AggregateError(
+        [error, ...(cleanup as AggregateError).errors],
+        "Relay startup and disposal failed",
+        { cause: error },
+      );
+    }
+    throw error;
+  }
 
   // Drained = no HTTP streams in flight and nothing queued in the socket's
   // send buffer. Only an OPEN socket can still be flushing; a closed or
@@ -666,20 +729,18 @@ export function startPsLiteRelayClient(
     async whenDrained({ timeoutMs = 20_000, pollIntervalMs = 50 } = {}) {
       const deadline = Date.now() + timeoutMs;
       while (!isDrained() && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+        await new Promise<void>((resolve) => {
+          const done = () => {
+            clearTimeout(timer);
+            drainWaiters.delete(done);
+            resolve();
+          };
+          const timer = setTimeout(done, pollIntervalMs);
+          drainWaiters.add(done);
+        });
       }
     },
-    close(reason = "closed") {
-      if (closed) return;
-      closed = true;
-      stopHeartbeat();
-      if (reconnectTimer !== undefined) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = undefined;
-      }
-      disposeStreams();
-      socket.close(1000, reason);
-    },
+    close: (reason) => close(reason, true),
   };
 }
 

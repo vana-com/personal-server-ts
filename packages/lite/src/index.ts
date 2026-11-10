@@ -1,5 +1,7 @@
 export {
   createIndexedDbPsLiteRuntime,
+  prepareIndexedDbPsLiteRuntime,
+  type PreparedIndexedDbPsLiteRuntime,
   type IndexedDbPsLiteRuntime,
   type IndexedDbPsLiteRuntimeOptions,
 } from "./browser-runtime.js";

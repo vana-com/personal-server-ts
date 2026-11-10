@@ -321,6 +321,30 @@ describe("createReplicationDriver", () => {
     expect(clock.armed()).toEqual([]);
   });
 
+  it("unbounded teardown waits for a late step after an earlier bounded stop", async () => {
+    const clock = fakeTimers();
+    const { stepper, steps } = manualStepper();
+    const driver = createReplicationDriver({
+      stepper,
+      budget,
+      timers: clock.timers,
+    });
+    driver.start();
+    const bounded = driver.stop(5_000);
+    clock.advance(5_000);
+    expect(await bounded).toBe(false);
+    let settled = false;
+    const disposal = driver.stop(Infinity).then((result) => {
+      settled = true;
+      return result;
+    });
+    await flush();
+    expect(settled).toBe(false);
+    steps[0]!.done.resolve(report(T0));
+    expect(await disposal).toBe(true);
+    expect(clock.armed()).toEqual([]);
+  });
+
   it("stop while idle clears the timer", async () => {
     const clock = fakeTimers();
     const { stepper, steps } = manualStepper();

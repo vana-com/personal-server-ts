@@ -798,7 +798,10 @@ function warnLegacyProjectionIssue(issue: LegacyProjectionIssue): void {
 
 export function createPsLiteRuntime(
   options: PsLiteRuntimeOptions,
-): PsLiteRuntime {
+): PsLiteRuntime & {
+  /** Gate admission only; managed hosts own background lifecycle separately. */
+  setAvailable(available: boolean): void;
+} {
   let active = options.active ?? false;
   const now = options.now ?? (() => new Date());
   const auth = options.auth ?? createMissingAuthAdapter();
@@ -1035,6 +1038,9 @@ export function createPsLiteRuntime(
   return {
     kind: "ps-lite",
     storage: options.storage,
+    setAvailable(available) {
+      active = available;
+    },
     activate() {
       active = true;
       options.syncManager?.start?.();

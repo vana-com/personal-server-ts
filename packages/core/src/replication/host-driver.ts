@@ -81,7 +81,8 @@ export interface ReplicationDriver {
   status(): ReplicationDriverStatus;
   /**
    * Stop scheduling, abort the running step and wait at most `graceMs` for
-   * it to settle. Resolves true when nothing is still running.
+   * it to settle. Resolves true when nothing is still running. Infinity waits
+   * for quiescence, including after an earlier timed-out stop.
    */
   stop(graceMs: number): Promise<boolean>;
 }
@@ -257,9 +258,9 @@ export function createReplicationDriver(input: {
       ...(lastError !== undefined && { lastError }),
     }),
     async stop(graceMs) {
-      if (!Number.isFinite(graceMs) || graceMs < 0)
+      if (graceMs !== Infinity && (!Number.isFinite(graceMs) || graceMs < 0))
         throw new RangeError("invalid replication stop grace");
-      if (state === "stopped") return running === undefined;
+      if (state === "stopped" && running === undefined) return true;
       state = "stopping";
       again = false;
       if (timer !== undefined) timers.clearTimeout(timer);
@@ -270,7 +271,10 @@ export function createReplicationDriver(input: {
       const current = running;
       controller?.abort(new DOMException("replication stopped", "AbortError"));
       let settled = current === undefined;
-      if (current) {
+      if (current && graceMs === Infinity) {
+        await current;
+        settled = true;
+      } else if (current) {
         let grace: unknown;
         settled = await Promise.race([
           current.then(() => true),
