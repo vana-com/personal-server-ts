@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Writes vectors/v1.json. Byte outputs (HMAC, SHA-256, Keccak-256, canonical
+ * Writes vectors/v1.json (frozen: format 4 heads are unsupported) and
+ * vectors/v2.json (current: head format 4 is supported, format 5 is not). Byte outputs (HMAC, SHA-256, Keccak-256, canonical
  * text) are computed here with node:crypto and @noble/hashes, independently of
  * the package code. Logic expectations (decide, checkpoint, needsFull,
  * eligible, ...) are written by hand from the design tables, not computed
@@ -18,6 +19,7 @@ import { keccak_256 } from "@noble/hashes/sha3";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const out = join(here, "..", "vectors", "v1.json");
+const outV2 = join(here, "..", "vectors", "v2.json");
 
 // ---------- independent primitives ----------
 
@@ -2025,15 +2027,77 @@ const vectors = {
   eligible: eligibleCases,
 };
 
-const text = JSON.stringify(vectors, null, 2) + "\n";
+// ---------- v2: head format 4 ----------
+// Every v1 case is kept. Only the two format-4 head cases change (format 5 is
+// now the unsupported one), and one format-4 head is added to encode and verify.
+const f4 = { ...baseHead, format: 4, lastDeleteVersion: 2 };
+const f4Text = cj(f4);
+const f5Text = mutate({ format: 5, lastDeleteVersion: 2 });
+const vectorsV2 = {
+  ...vectors,
+  version: 2,
+  heads: {
+    ...vectors.heads,
+    encode: [
+      ...vectors.heads.encode,
+      {
+        name: "format 4 with delete version",
+        head: f4,
+        text: f4Text,
+        dataHash: keccak(f4Text),
+        blobName: `h-${keccak(f4Text).slice(2)}`,
+      },
+    ],
+    decode: [
+      ...vectors.heads.decode.map((c) =>
+        c.name === "format 4"
+          ? { name: "format 4", text: f4Text, expected: "ok" }
+          : c,
+      ),
+      { name: "format 5", text: f5Text, expected: "unsupported_format" },
+      {
+        name: "format 4 missing delete version",
+        text: mutate({ format: 4 }),
+        expected: "malformed",
+      },
+    ],
+    verify: [
+      ...vectors.heads.verify.map((c) =>
+        c.name === "unsupported format is reported before name and key"
+          ? {
+              ...c,
+              text: f5Text,
+              expect: { ...c.expect, dataHash: keccak(f5Text) },
+            }
+          : c,
+      ),
+      {
+        name: "format 4 head verifies",
+        text: f4Text,
+        expect: { ...verifyExpect, dataHash: keccak(f4Text) },
+        result: "ok",
+      },
+    ],
+  },
+};
+
+const files = [
+  [out, vectors, "v1"],
+  [outV2, vectorsV2, "v2"],
+];
 if (process.argv.includes("--check")) {
-  const current = readFileSync(out, "utf8");
-  if (JSON.stringify(JSON.parse(current)) !== JSON.stringify(vectors)) {
-    console.error("vectors/v1.json is stale: run generate-vectors.mjs");
-    process.exit(1);
+  let stale = false;
+  for (const [file, v, name] of files) {
+    const current = readFileSync(file, "utf8");
+    if (JSON.stringify(JSON.parse(current)) !== JSON.stringify(v)) {
+      console.error(`vectors/${name}.json is stale: run generate-vectors.mjs`);
+      stale = true;
+    } else console.log(`vectors/${name}.json is current`);
   }
-  console.log("vectors/v1.json is current");
+  if (stale) process.exit(1);
 } else {
-  writeFileSync(out, text);
-  console.log(`wrote ${out}`);
+  // v1.json is frozen: it is only ever checked, never rewritten. Format the
+  // output with prettier to match the checked-in style.
+  writeFileSync(outV2, JSON.stringify(vectorsV2, null, 2) + "\n");
+  console.log(`wrote ${outV2} (v1.json is frozen and was not touched)`);
 }

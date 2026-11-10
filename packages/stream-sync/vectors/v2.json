@@ -1,0 +1,4753 @@
+{
+  "format": "pdpp-stream-sync-vectors",
+  "version": 2,
+  "design": "Whole-file stream sync, revision 4.1, section 2",
+  "notes": [
+    "All text is UTF-8. Hashes: SHA-256 and Keccak-256 as lowercase hex; registry hashes (dataHash, control hashes) are 0x-prefixed.",
+    "Canonical JSON: object keys sorted by UTF-16 code unit, no whitespace, ECMAScript number and string printing.",
+    "A part is the canonical lines of its winners, sorted by pkHash, each followed by \\n.",
+    "Head text is the canonical JSON of the head; generation is a decimal string.",
+    "Control states: {kind:absent} | {kind:active,generation} | {kind:deleted,version} | {kind:foreign,version}; start state adds {kind:unknown}.",
+    "Cases with a `question` field follow a provisional reading; see DESIGN-QUESTIONS.md."
+  ],
+  "namespace": {
+    "description": "K_ns is the HMAC key. ns = first 8 bytes of HMAC-SHA256(K_ns, utf8(message)); keyCheck = first 8 bytes of HMAC-SHA256(K_ns, utf8('key-check')). Registry hashes are keccak256 of the UTF-8 labels, 0x + lowercase hex.",
+    "kNsHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "keyCheck": "94e0f0e1aa1f8175",
+    "controlHashes": {
+      "activeData": "0xe1b947c9cba2c3f3e74c210e7edda035fc9c1c3dfc5e3d7747097a8a3be7ccda",
+      "activeMetadata": "0xafa8b31cfb00809840b3b21d2f492fa5c4de03e6eb33e5a2abb62fa617731ea2",
+      "tombstoneData": "0x30c45ee72fe56d1927701316925ab7ceacd3b6f9267061735d59396f075c6222",
+      "tombstoneMetadata": "0xc5255a141acd6a2ae55971b62c0a85977c2511989dc114ad2abc2b7644f57d90"
+    },
+    "cases": [
+      {
+        "connector": "chatgpt",
+        "accountId": "user-123",
+        "message": "[\"chatgpt\",\"user-123\"]",
+        "ns": "834ab4c2636bcdd5"
+      },
+      {
+        "connector": "chatgpt",
+        "accountId": "user-124",
+        "message": "[\"chatgpt\",\"user-124\"]",
+        "ns": "c2ae18eeb7243a1a"
+      },
+      {
+        "connector": "spotify",
+        "accountId": "user-123",
+        "message": "[\"spotify\",\"user-123\"]",
+        "ns": "572102d2f61c4542"
+      },
+      {
+        "connector": "github",
+        "accountId": "Ünïcödé ✓ \"quoted\" \\ slash",
+        "message": "[\"github\",\"Ünïcödé ✓ \\\"quoted\\\" \\\\ slash\"]",
+        "ns": "f4ee5287a78faa37"
+      },
+      {
+        "connector": "linkedin",
+        "accountId": "42",
+        "message": "[\"linkedin\",\"42\"]",
+        "ns": "96a9e9acebf93337"
+      }
+    ]
+  },
+  "streamMasterKey": {
+    "description": "The stream-sync master key is the 65-byte owner signature as r, low s and v = 27/28. Every encoding gives the same key, so the same K_ns = HKDF-SHA256(masterKey, salt 'vana', info 'scope:' + NAMESPACE_KEY_LABEL, 32), ns and keyCheck. Legacy scope keys keep the raw signature.",
+    "encodings": [
+      {
+        "name": "v 27/28, low s",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51b"
+      },
+      {
+        "name": "v 0/1, low s",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d500"
+      },
+      {
+        "name": "v 27/28, high s",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7dbd555e6d21a3207991a060a0c6afd5992e4183bad14f5218f2fd6dc20cf515f6c1c"
+      },
+      {
+        "name": "v 0/1, high s",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7dbd555e6d21a3207991a060a0c6afd5992e4183bad14f5218f2fd6dc20cf515f6c01"
+      }
+    ],
+    "masterKeyHex": "1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51b",
+    "kNsHex": "bf838c4611a9db905be4deb87716cc3303bb8f749c33655a474b8eb35457bc3f",
+    "keyCheck": "0984460d571fb7ff",
+    "ns": {
+      "connector": "chatgpt",
+      "accountId": "user-123",
+      "ns": "e36378891a6e2cfb"
+    },
+    "invalid": [
+      {
+        "name": "64 bytes",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d5"
+      },
+      {
+        "name": "66 bytes",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51b00"
+      },
+      {
+        "name": "v = 29",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51d"
+      },
+      {
+        "name": "v = 2",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d502"
+      },
+      {
+        "name": "s = 0",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db00000000000000000000000000000000000000000000000000000000000000001b"
+      },
+      {
+        "name": "s = n",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7dbfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd03641411b"
+      },
+      {
+        "name": "r = 0",
+        "signature": "0x00000000000000000000000000000000000000000000000000000000000000002aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51b"
+      },
+      {
+        "name": "no 0x prefix",
+        "signature": "1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51b"
+      }
+    ]
+  },
+  "scopes": {
+    "build": [
+      {
+        "connector": "chatgpt",
+        "ns": "834ab4c2636bcdd5",
+        "stream": "conversations",
+        "scope": "pdpp.chatgpt~834ab4c2636bcdd5.conversations"
+      },
+      {
+        "connector": "chatgpt",
+        "ns": "834ab4c2636bcdd5",
+        "scope": "pdpp.chatgpt~834ab4c2636bcdd5"
+      },
+      {
+        "connector": "weather",
+        "ns": "",
+        "stream": "daily",
+        "scope": "pdpp.weather~.daily"
+      },
+      {
+        "connector": "weather",
+        "ns": "",
+        "scope": "pdpp.weather~"
+      },
+      {
+        "connector": "c",
+        "ns": "",
+        "stream": "a.b~c",
+        "scope": "pdpp.c~.a.b~c"
+      },
+      {
+        "connector": "c",
+        "ns": "",
+        "stream": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+        "scope": "pdpp.c~.ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"
+      }
+    ],
+    "buildErrors": [
+      {
+        "connector": "",
+        "ns": "",
+        "stream": "s",
+        "why": "empty connector"
+      },
+      {
+        "connector": "a~b",
+        "ns": "",
+        "stream": "s",
+        "why": "connector contains ~"
+      },
+      {
+        "connector": "c",
+        "ns": "ABCDEF0123456789",
+        "stream": "s",
+        "why": "uppercase ns"
+      },
+      {
+        "connector": "c",
+        "ns": "0123",
+        "stream": "s",
+        "why": "short ns"
+      },
+      {
+        "connector": "c",
+        "ns": "",
+        "stream": "",
+        "why": "empty stream"
+      },
+      {
+        "connector": "c",
+        "ns": "",
+        "stream": "sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+        "why": "257 bytes"
+      },
+      {
+        "connector": "c",
+        "ns": "",
+        "stream": "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+        "why": "over 256 UTF-8 bytes, under 256 code units"
+      }
+    ],
+    "parse": [
+      {
+        "name": "pdpp.chatgpt~834ab4c2636bcdd5.conversations",
+        "parsed": {
+          "kind": "stream",
+          "connector": "chatgpt",
+          "ns": "834ab4c2636bcdd5",
+          "stream": "conversations"
+        }
+      },
+      {
+        "name": "pdpp.chatgpt~834ab4c2636bcdd5",
+        "parsed": {
+          "kind": "control",
+          "connector": "chatgpt",
+          "ns": "834ab4c2636bcdd5"
+        }
+      },
+      {
+        "name": "pdpp.weather~.daily",
+        "parsed": {
+          "kind": "stream",
+          "connector": "weather",
+          "ns": "",
+          "stream": "daily"
+        }
+      },
+      {
+        "name": "pdpp.weather~",
+        "parsed": {
+          "kind": "control",
+          "connector": "weather",
+          "ns": ""
+        }
+      },
+      {
+        "name": "pdpp.c~.a.b~c",
+        "parsed": {
+          "kind": "stream",
+          "connector": "c",
+          "ns": "",
+          "stream": "a.b~c"
+        }
+      },
+      {
+        "name": "pdpp.c~834ab4c2636bcdd5.x.y",
+        "parsed": {
+          "kind": "stream",
+          "connector": "c",
+          "ns": "834ab4c2636bcdd5",
+          "stream": "x.y"
+        }
+      },
+      {
+        "name": "pdpp.a.b~",
+        "parsed": {
+          "kind": "control",
+          "connector": "a.b",
+          "ns": ""
+        }
+      },
+      {
+        "name": "pdpp.c~.ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+        "parsed": {
+          "kind": "stream",
+          "connector": "c",
+          "ns": "",
+          "stream": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"
+        }
+      },
+      {
+        "name": "pdpp.chatgpt.conversations",
+        "parsed": null,
+        "why": "old raw name: no ~"
+      },
+      {
+        "name": "pdpp.chatgpt",
+        "parsed": null,
+        "why": "no ~"
+      },
+      {
+        "name": "pdpp.~0123456789abcdef.s",
+        "parsed": null,
+        "why": "empty connector"
+      },
+      {
+        "name": "other.c~.s",
+        "parsed": null,
+        "why": "not pdpp."
+      },
+      {
+        "name": "pdpp.c~0123456789ABCDEF.s",
+        "parsed": null,
+        "why": "uppercase ns"
+      },
+      {
+        "name": "pdpp.c~0123456789abcde.s",
+        "parsed": null,
+        "why": "15 hex ns"
+      },
+      {
+        "name": "pdpp.c~0123456789abcdef0.s",
+        "parsed": null,
+        "why": "17 hex ns"
+      },
+      {
+        "name": "pdpp.c~0123456789abcdef.",
+        "parsed": null,
+        "why": "empty stream"
+      },
+      {
+        "name": "pdpp.c~.",
+        "parsed": null,
+        "why": "empty stream, empty ns"
+      },
+      {
+        "name": "pdpp.c~xyz",
+        "parsed": null,
+        "why": "ns not hex and no ."
+      },
+      {
+        "name": "pdpp.c~.sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+        "parsed": null,
+        "why": "257 bytes"
+      }
+    ],
+    "blobs": [
+      {
+        "kind": "head",
+        "hash": "7521d1cadbcfa91eec65aa16715b94ffc1c9654ba57ea2ef1a2127bca1127a83",
+        "name": "h-7521d1cadbcfa91eec65aa16715b94ffc1c9654ba57ea2ef1a2127bca1127a83"
+      },
+      {
+        "kind": "part",
+        "generation": 1,
+        "hash": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+        "name": "g1-p-2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+      },
+      {
+        "kind": "part",
+        "generation": 12,
+        "hash": "a1fce4363854ff888cff4b8e7875d600c2682390412a8cf79b37d0b11148b0fa",
+        "name": "g12-p-a1fce4363854ff888cff4b8e7875d600c2682390412a8cf79b37d0b11148b0fa"
+      }
+    ],
+    "blobParse": [
+      {
+        "name": "h-7521d1cadbcfa91eec65aa16715b94ffc1c9654ba57ea2ef1a2127bca1127a83",
+        "parsed": {
+          "kind": "head",
+          "keccak": "7521d1cadbcfa91eec65aa16715b94ffc1c9654ba57ea2ef1a2127bca1127a83"
+        }
+      },
+      {
+        "name": "g3-p-2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+        "parsed": {
+          "kind": "part",
+          "generation": 3,
+          "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+        }
+      },
+      {
+        "name": "g0-p-2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+        "parsed": null,
+        "why": "generation 0"
+      },
+      {
+        "name": "g01-p-2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+        "parsed": null,
+        "why": "leading zero"
+      },
+      {
+        "name": "h-7521D1CADBCFA91EEC65AA16715B94FFC1C9654BA57EA2EF1A2127BCA1127A83",
+        "parsed": null,
+        "why": "uppercase"
+      },
+      {
+        "name": "p-2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+        "parsed": null,
+        "why": "no generation"
+      },
+      {
+        "name": "h-0x7521d1cadbcfa91eec65aa16715b94ffc1c9654ba57ea2ef1a2127bca1127a83",
+        "parsed": null,
+        "why": "0x in blob name"
+      }
+    ]
+  },
+  "pkHash": [
+    {
+      "primaryKey": ["id"],
+      "record": {
+        "id": "a",
+        "body": 1
+      },
+      "keyJson": "[\"a\"]",
+      "pkHash": "0eb5b8d6f81bc677da8a08567cc4fa9a06a57e9ec8da85ed73a7f62727996002",
+      "shard": 14,
+      "bits16": "0000111010110101"
+    },
+    {
+      "primaryKey": ["id"],
+      "record": {
+        "id": 7
+      },
+      "keyJson": "[7]",
+      "pkHash": "589ffd3acf522ae81192579f297589e93b0c41f748b224d1b4bb5c857a2f70cb",
+      "shard": 88,
+      "bits16": "0101100010011111"
+    },
+    {
+      "primaryKey": ["id"],
+      "record": {
+        "id": null
+      },
+      "keyJson": "[null]",
+      "pkHash": "1d8fc6ceb1f94c6326d6d5483d258fcb2e179e9869325b245d105c2219bf69fd",
+      "shard": 29,
+      "bits16": "0001110110001111"
+    },
+    {
+      "primaryKey": ["a", "b"],
+      "record": {
+        "b": 2,
+        "a": "x",
+        "c": true
+      },
+      "keyJson": "[\"x\",2]",
+      "pkHash": "9ca894e6afeeab81977088382cb4b4657275cb44206d9105a5c5f0c135b81eb3",
+      "shard": 156,
+      "bits16": "1001110010101000"
+    },
+    {
+      "primaryKey": ["id"],
+      "record": {
+        "id": {
+          "z": 1,
+          "a": [1, "é"]
+        }
+      },
+      "keyJson": "[{\"a\":[1,\"é\"],\"z\":1}]",
+      "pkHash": "79a63e1aef310b68a3ca69bd67dee1ba42f54683ab84021b6a46a3536c0a4b4c",
+      "shard": 121,
+      "bits16": "0111100110100110"
+    }
+  ],
+  "lines": {
+    "encode": [
+      {
+        "line": {
+          "o": 1700000000000,
+          "r": "run-1",
+          "v": {
+            "id": "a",
+            "n": 1
+          }
+        },
+        "text": "{\"o\":1700000000000,\"r\":\"run-1\",\"v\":{\"id\":\"a\",\"n\":1}}"
+      },
+      {
+        "line": {
+          "o": 0,
+          "r": "seed",
+          "v": {
+            "z": 1,
+            "a": {
+              "y": [2, 1],
+              "b": null
+            }
+          }
+        },
+        "text": "{\"o\":0,\"r\":\"seed\",\"v\":{\"a\":{\"b\":null,\"y\":[2,1]},\"z\":1}}"
+      },
+      {
+        "line": {
+          "o": 5,
+          "r": "r",
+          "v": {
+            "s": "é\u0000\n\""
+          }
+        },
+        "text": "{\"o\":5,\"r\":\"r\",\"v\":{\"s\":\"é\\u0000\\n\\\"\"}}"
+      }
+    ],
+    "decodeErrors": [
+      {
+        "text": "{\"r\":\"x\",\"o\":1,\"v\":{}}",
+        "why": "keys not sorted (not canonical)"
+      },
+      {
+        "text": "{\"o\":1,\"r\":\"x\",\"v\":{}} ",
+        "why": "trailing space"
+      },
+      {
+        "text": "{\"o\":-1,\"r\":\"x\",\"v\":{}}",
+        "why": "negative o"
+      },
+      {
+        "text": "{\"o\":1.5,\"r\":\"x\",\"v\":{}}",
+        "why": "fractional o"
+      },
+      {
+        "text": "{\"o\":1,\"r\":\"\",\"v\":{}}",
+        "why": "empty r"
+      },
+      {
+        "text": "{\"o\":1,\"r\":\"x\",\"v\":[]}",
+        "why": "v not an object"
+      },
+      {
+        "text": "{\"o\":1,\"r\":\"x\",\"v\":{},\"w\":1}",
+        "why": "extra field"
+      },
+      {
+        "text": "{\"o\":1,\"r\":\"x\"}",
+        "why": "missing v"
+      },
+      {
+        "text": "not json",
+        "why": "not JSON"
+      }
+    ]
+  },
+  "frames": {
+    "description": "Format 2 frame = envelope LF body LF. Envelope = canonical JSON {h: sha256(body) hex, k: pkHash, n: body bytes, o, r}; body = canonical JSON of the record. A part is frames sorted strictly by k (or the pieces of one long frame). No record size limit.",
+    "cases": [
+      {
+        "name": "unicode",
+        "primaryKey": ["id"],
+        "record": {
+          "id": "é",
+          "t": "日本語"
+        },
+        "o": 5,
+        "r": "r",
+        "bodyBytes": 27,
+        "envelope": "{\"h\":\"709e86674171c242f279aa714a62d71346d6c785505b108149cb548405c1e435\",\"k\":\"0b657be394b1d432f8d1942406ed09c213604cbcd87b299641cf994bcaf84b11\",\"n\":27,\"o\":5,\"r\":\"r\"}",
+        "frame": "{\"h\":\"709e86674171c242f279aa714a62d71346d6c785505b108149cb548405c1e435\",\"k\":\"0b657be394b1d432f8d1942406ed09c213604cbcd87b299641cf994bcaf84b11\",\"n\":27,\"o\":5,\"r\":\"r\"}\n{\"id\":\"é\",\"t\":\"日本語\"}\n"
+      },
+      {
+        "name": "small",
+        "primaryKey": ["id"],
+        "record": {
+          "id": "a",
+          "body": 1
+        },
+        "o": 1700000000000,
+        "r": "run-1",
+        "bodyBytes": 19,
+        "envelope": "{\"h\":\"6511b6213cd8003d68b52a49f42a68900679578cc248952fc936cfe83717f778\",\"k\":\"0eb5b8d6f81bc677da8a08567cc4fa9a06a57e9ec8da85ed73a7f62727996002\",\"n\":19,\"o\":1700000000000,\"r\":\"run-1\"}",
+        "frame": "{\"h\":\"6511b6213cd8003d68b52a49f42a68900679578cc248952fc936cfe83717f778\",\"k\":\"0eb5b8d6f81bc677da8a08567cc4fa9a06a57e9ec8da85ed73a7f62727996002\",\"n\":19,\"o\":1700000000000,\"r\":\"run-1\"}\n{\"body\":1,\"id\":\"a\"}\n"
+      },
+      {
+        "name": "composite key",
+        "primaryKey": ["a", "b"],
+        "record": {
+          "b": 2,
+          "a": "x",
+          "c": true
+        },
+        "o": 0,
+        "r": "run-2",
+        "bodyBytes": 24,
+        "envelope": "{\"h\":\"2e6c6b7e3652ea85c432e0cfcff6dc1409948f6efe93177553c1899c7d0772a7\",\"k\":\"9ca894e6afeeab81977088382cb4b4657275cb44206d9105a5c5f0c135b81eb3\",\"n\":24,\"o\":0,\"r\":\"run-2\"}",
+        "frame": "{\"h\":\"2e6c6b7e3652ea85c432e0cfcff6dc1409948f6efe93177553c1899c7d0772a7\",\"k\":\"9ca894e6afeeab81977088382cb4b4657275cb44206d9105a5c5f0c135b81eb3\",\"n\":24,\"o\":0,\"r\":\"run-2\"}\n{\"a\":\"x\",\"b\":2,\"c\":true}\n"
+      }
+    ],
+    "part": {
+      "prefix": "",
+      "frames": ["unicode", "small", "composite key"],
+      "text": "{\"h\":\"709e86674171c242f279aa714a62d71346d6c785505b108149cb548405c1e435\",\"k\":\"0b657be394b1d432f8d1942406ed09c213604cbcd87b299641cf994bcaf84b11\",\"n\":27,\"o\":5,\"r\":\"r\"}\n{\"id\":\"é\",\"t\":\"日本語\"}\n{\"h\":\"6511b6213cd8003d68b52a49f42a68900679578cc248952fc936cfe83717f778\",\"k\":\"0eb5b8d6f81bc677da8a08567cc4fa9a06a57e9ec8da85ed73a7f62727996002\",\"n\":19,\"o\":1700000000000,\"r\":\"run-1\"}\n{\"body\":1,\"id\":\"a\"}\n{\"h\":\"2e6c6b7e3652ea85c432e0cfcff6dc1409948f6efe93177553c1899c7d0772a7\",\"k\":\"9ca894e6afeeab81977088382cb4b4657275cb44206d9105a5c5f0c135b81eb3\",\"n\":24,\"o\":0,\"r\":\"run-2\"}\n{\"a\":\"x\",\"b\":2,\"c\":true}\n",
+      "bytes": 588,
+      "count": 3,
+      "hash": "34e00c608df055c13f9d0853910d51c9e70af302cd4fe5cacd1258049854dae6"
+    },
+    "long": {
+      "description": "Record {\"id\":\"big\",\"x\":<count x \"a\">} as a frame; only digests are listed.",
+      "primaryKey": ["id"],
+      "count": 1048581,
+      "o": 9,
+      "r": "run-long",
+      "bodyBytes": 1048600,
+      "bodyHash": "6a76dd4d65eb5356eeb09a5ea54f6b4daaafc822051ac7ad46c635c01eebe4d5",
+      "k": "8ce95d9409fd5d37ac975b5c82daebe4244657aa9e1397b5db2304253f6873d5",
+      "envelope": "{\"h\":\"6a76dd4d65eb5356eeb09a5ea54f6b4daaafc822051ac7ad46c635c01eebe4d5\",\"k\":\"8ce95d9409fd5d37ac975b5c82daebe4244657aa9e1397b5db2304253f6873d5\",\"n\":1048600,\"o\":9,\"r\":\"run-long\"}"
+    },
+    "envelopeErrors": [
+      {
+        "text": "{\"h\":\"x\",\"k\":\"y\",\"n\":1,\"o\":1,\"r\":\"r\"}",
+        "why": "hash not hex64"
+      },
+      {
+        "text": "{\"h\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"k\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"n\":-1,\"o\":1,\"r\":\"r\"}",
+        "why": "negative n"
+      },
+      {
+        "text": "{\"k\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"h\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"n\":1,\"o\":1,\"r\":\"r\"}",
+        "why": "not canonical order"
+      },
+      {
+        "text": "{\"h\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"k\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"n\":1,\"o\":1,\"r\":\"\"}",
+        "why": "empty r"
+      },
+      {
+        "text": "{\"h\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"k\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"n\":1,\"o\":1,\"r\":\"r\",\"z\":1}",
+        "why": "extra field"
+      },
+      {
+        "text": "not json",
+        "why": "not JSON"
+      }
+    ]
+  },
+  "merge": [
+    {
+      "name": "newer o wins over older",
+      "primaryKey": ["id"],
+      "prefix": "",
+      "feed": [
+        {
+          "o": 10,
+          "r": "a",
+          "v": {
+            "id": 1,
+            "x": "old"
+          }
+        },
+        {
+          "o": 20,
+          "r": "a",
+          "v": {
+            "id": 1,
+            "x": "new"
+          }
+        }
+      ],
+      "expected": {
+        "winners": [
+          {
+            "pkHash": "080a9ed428559ef602668b4c00f114f1a11c3f6b02a435f0bdc154578e4d7f22",
+            "text": "{\"o\":20,\"r\":\"a\",\"v\":{\"id\":1,\"x\":\"new\"}}"
+          }
+        ],
+        "bytes": 40,
+        "partText": "{\"o\":20,\"r\":\"a\",\"v\":{\"id\":1,\"x\":\"new\"}}\n",
+        "sha256": "70b8bc59a89211e16d53abb30fe2448f81e3c1f2be6cc9693f7f3d5b8d847eba"
+      }
+    },
+    {
+      "name": "older line fed later loses",
+      "primaryKey": ["id"],
+      "prefix": "",
+      "feed": [
+        {
+          "o": 20,
+          "r": "a",
+          "v": {
+            "id": 1,
+            "x": "new"
+          }
+        },
+        {
+          "o": 10,
+          "r": "z",
+          "v": {
+            "id": 1,
+            "x": "old"
+          }
+        }
+      ],
+      "expected": {
+        "winners": [
+          {
+            "pkHash": "080a9ed428559ef602668b4c00f114f1a11c3f6b02a435f0bdc154578e4d7f22",
+            "text": "{\"o\":20,\"r\":\"a\",\"v\":{\"id\":1,\"x\":\"new\"}}"
+          }
+        ],
+        "bytes": 40,
+        "partText": "{\"o\":20,\"r\":\"a\",\"v\":{\"id\":1,\"x\":\"new\"}}\n",
+        "sha256": "70b8bc59a89211e16d53abb30fe2448f81e3c1f2be6cc9693f7f3d5b8d847eba"
+      }
+    },
+    {
+      "name": "equal o: greater r wins",
+      "primaryKey": ["id"],
+      "prefix": "",
+      "feed": [
+        {
+          "o": 10,
+          "r": "run-b",
+          "v": {
+            "id": 1,
+            "x": "b"
+          }
+        },
+        {
+          "o": 10,
+          "r": "run-a",
+          "v": {
+            "id": 1,
+            "x": "a"
+          }
+        }
+      ],
+      "expected": {
+        "winners": [
+          {
+            "pkHash": "080a9ed428559ef602668b4c00f114f1a11c3f6b02a435f0bdc154578e4d7f22",
+            "text": "{\"o\":10,\"r\":\"run-b\",\"v\":{\"id\":1,\"x\":\"b\"}}"
+          }
+        ],
+        "bytes": 42,
+        "partText": "{\"o\":10,\"r\":\"run-b\",\"v\":{\"id\":1,\"x\":\"b\"}}\n",
+        "sha256": "9a5acbbf93fbb4b0079facbe5f24f83744c9c519e147607ea4e498363f5cf0f3"
+      }
+    },
+    {
+      "name": "equal (o, r): later line wins",
+      "primaryKey": ["id"],
+      "prefix": "",
+      "feed": [
+        {
+          "o": 10,
+          "r": "run-a",
+          "v": {
+            "id": 1,
+            "x": "first"
+          }
+        },
+        {
+          "o": 10,
+          "r": "run-a",
+          "v": {
+            "id": 1,
+            "x": "second"
+          }
+        }
+      ],
+      "expected": {
+        "winners": [
+          {
+            "pkHash": "080a9ed428559ef602668b4c00f114f1a11c3f6b02a435f0bdc154578e4d7f22",
+            "text": "{\"o\":10,\"r\":\"run-a\",\"v\":{\"id\":1,\"x\":\"second\"}}"
+          }
+        ],
+        "bytes": 47,
+        "partText": "{\"o\":10,\"r\":\"run-a\",\"v\":{\"id\":1,\"x\":\"second\"}}\n",
+        "sha256": "0094e54c42c222a775b8264e47d8e17a1721f37ae5582c1f9979006eca173161"
+      }
+    },
+    {
+      "name": "seed line (o = 0) loses to any run line",
+      "primaryKey": ["id"],
+      "prefix": "",
+      "feed": [
+        {
+          "o": 0,
+          "r": "seed",
+          "v": {
+            "id": 1,
+            "x": "seed"
+          }
+        },
+        {
+          "o": 1,
+          "r": "a",
+          "v": {
+            "id": 1,
+            "x": "run"
+          }
+        },
+        {
+          "o": 0,
+          "r": "seed",
+          "v": {
+            "id": 2,
+            "x": "seed only"
+          }
+        }
+      ],
+      "expected": {
+        "winners": [
+          {
+            "pkHash": "038966de9f6b9a901b20b4c6ca8b2a46009feebe031babc842d43690c0bc222b",
+            "text": "{\"o\":0,\"r\":\"seed\",\"v\":{\"id\":2,\"x\":\"seed only\"}}"
+          },
+          {
+            "pkHash": "080a9ed428559ef602668b4c00f114f1a11c3f6b02a435f0bdc154578e4d7f22",
+            "text": "{\"o\":1,\"r\":\"a\",\"v\":{\"id\":1,\"x\":\"run\"}}"
+          }
+        ],
+        "bytes": 87,
+        "partText": "{\"o\":0,\"r\":\"seed\",\"v\":{\"id\":2,\"x\":\"seed only\"}}\n{\"o\":1,\"r\":\"a\",\"v\":{\"id\":1,\"x\":\"run\"}}\n",
+        "sha256": "d3d83c5179d1d5f6a2aa0fcd37459d2a41ac6431226662bfcdde7475d0d84da3"
+      }
+    },
+    {
+      "name": "many versions of one key: greatest (o, r)",
+      "primaryKey": ["id"],
+      "prefix": "",
+      "feed": [
+        {
+          "o": 1000,
+          "r": "run-0",
+          "v": {
+            "id": "k",
+            "value": 0
+          }
+        },
+        {
+          "o": 1006,
+          "r": "run-6",
+          "v": {
+            "id": "k",
+            "value": 6
+          }
+        },
+        {
+          "o": 1012,
+          "r": "run-12",
+          "v": {
+            "id": "k",
+            "value": 12
+          }
+        },
+        {
+          "o": 1018,
+          "r": "run-18",
+          "v": {
+            "id": "k",
+            "value": 18
+          }
+        },
+        {
+          "o": 1024,
+          "r": "run-24",
+          "v": {
+            "id": "k",
+            "value": 24
+          }
+        },
+        {
+          "o": 1030,
+          "r": "run-30",
+          "v": {
+            "id": "k",
+            "value": 30
+          }
+        },
+        {
+          "o": 1036,
+          "r": "run-36",
+          "v": {
+            "id": "k",
+            "value": 36
+          }
+        },
+        {
+          "o": 1001,
+          "r": "run-1",
+          "v": {
+            "id": "k",
+            "value": 1
+          }
+        },
+        {
+          "o": 1007,
+          "r": "run-7",
+          "v": {
+            "id": "k",
+            "value": 7
+          }
+        },
+        {
+          "o": 1013,
+          "r": "run-13",
+          "v": {
+            "id": "k",
+            "value": 13
+          }
+        },
+        {
+          "o": 1019,
+          "r": "run-19",
+          "v": {
+            "id": "k",
+            "value": 19
+          }
+        },
+        {
+          "o": 1025,
+          "r": "run-25",
+          "v": {
+            "id": "k",
+            "value": 25
+          }
+        },
+        {
+          "o": 1031,
+          "r": "run-31",
+          "v": {
+            "id": "k",
+            "value": 31
+          }
+        },
+        {
+          "o": 1037,
+          "r": "run-37",
+          "v": {
+            "id": "k",
+            "value": 37
+          }
+        },
+        {
+          "o": 1002,
+          "r": "run-2",
+          "v": {
+            "id": "k",
+            "value": 2
+          }
+        },
+        {
+          "o": 1008,
+          "r": "run-8",
+          "v": {
+            "id": "k",
+            "value": 8
+          }
+        },
+        {
+          "o": 1014,
+          "r": "run-14",
+          "v": {
+            "id": "k",
+            "value": 14
+          }
+        },
+        {
+          "o": 1020,
+          "r": "run-20",
+          "v": {
+            "id": "k",
+            "value": 20
+          }
+        },
+        {
+          "o": 1026,
+          "r": "run-26",
+          "v": {
+            "id": "k",
+            "value": 26
+          }
+        },
+        {
+          "o": 1032,
+          "r": "run-32",
+          "v": {
+            "id": "k",
+            "value": 32
+          }
+        },
+        {
+          "o": 1038,
+          "r": "run-38",
+          "v": {
+            "id": "k",
+            "value": 38
+          }
+        },
+        {
+          "o": 1003,
+          "r": "run-3",
+          "v": {
+            "id": "k",
+            "value": 3
+          }
+        },
+        {
+          "o": 1009,
+          "r": "run-9",
+          "v": {
+            "id": "k",
+            "value": 9
+          }
+        },
+        {
+          "o": 1015,
+          "r": "run-15",
+          "v": {
+            "id": "k",
+            "value": 15
+          }
+        },
+        {
+          "o": 1021,
+          "r": "run-21",
+          "v": {
+            "id": "k",
+            "value": 21
+          }
+        },
+        {
+          "o": 1027,
+          "r": "run-27",
+          "v": {
+            "id": "k",
+            "value": 27
+          }
+        },
+        {
+          "o": 1033,
+          "r": "run-33",
+          "v": {
+            "id": "k",
+            "value": 33
+          }
+        },
+        {
+          "o": 1039,
+          "r": "run-39",
+          "v": {
+            "id": "k",
+            "value": 39
+          }
+        },
+        {
+          "o": 1004,
+          "r": "run-4",
+          "v": {
+            "id": "k",
+            "value": 4
+          }
+        },
+        {
+          "o": 1010,
+          "r": "run-10",
+          "v": {
+            "id": "k",
+            "value": 10
+          }
+        },
+        {
+          "o": 1016,
+          "r": "run-16",
+          "v": {
+            "id": "k",
+            "value": 16
+          }
+        },
+        {
+          "o": 1022,
+          "r": "run-22",
+          "v": {
+            "id": "k",
+            "value": 22
+          }
+        },
+        {
+          "o": 1028,
+          "r": "run-28",
+          "v": {
+            "id": "k",
+            "value": 28
+          }
+        },
+        {
+          "o": 1034,
+          "r": "run-34",
+          "v": {
+            "id": "k",
+            "value": 34
+          }
+        },
+        {
+          "o": 1040,
+          "r": "run-40",
+          "v": {
+            "id": "k",
+            "value": 40
+          }
+        },
+        {
+          "o": 1005,
+          "r": "run-5",
+          "v": {
+            "id": "k",
+            "value": 5
+          }
+        },
+        {
+          "o": 1011,
+          "r": "run-11",
+          "v": {
+            "id": "k",
+            "value": 11
+          }
+        },
+        {
+          "o": 1017,
+          "r": "run-17",
+          "v": {
+            "id": "k",
+            "value": 17
+          }
+        },
+        {
+          "o": 1023,
+          "r": "run-23",
+          "v": {
+            "id": "k",
+            "value": 23
+          }
+        },
+        {
+          "o": 1029,
+          "r": "run-29",
+          "v": {
+            "id": "k",
+            "value": 29
+          }
+        }
+      ],
+      "expected": {
+        "winners": [
+          {
+            "pkHash": "33e16bc480019ee4a86b6fb0c02650dad76f1f880c37c0f56aed865a18a7fcca",
+            "text": "{\"o\":1040,\"r\":\"run-40\",\"v\":{\"id\":\"k\",\"value\":40}}"
+          }
+        ],
+        "bytes": 50,
+        "partText": "{\"o\":1040,\"r\":\"run-40\",\"v\":{\"id\":\"k\",\"value\":40}}\n",
+        "sha256": "50003f14767c2278864bd838b4bd3903206f708c1cb6c451eda36e9900921cb9"
+      }
+    },
+    {
+      "name": "distinct keys kept, sorted by pkHash",
+      "primaryKey": ["a", "b"],
+      "prefix": "",
+      "feed": [
+        {
+          "o": 1,
+          "r": "r",
+          "v": {
+            "a": 1,
+            "b": 1
+          }
+        },
+        {
+          "o": 1,
+          "r": "r",
+          "v": {
+            "a": 1,
+            "b": 2
+          }
+        },
+        {
+          "o": 1,
+          "r": "r",
+          "v": {
+            "a": 2,
+            "b": 1
+          }
+        },
+        {
+          "o": 2,
+          "r": "r",
+          "v": {
+            "a": 1,
+            "b": 2,
+            "extra": true
+          }
+        }
+      ],
+      "expected": {
+        "winners": [
+          {
+            "pkHash": "49a64717d5d4cb19952e6eac2946415cf6879adacf9908e7d872332d32c6e684",
+            "text": "{\"o\":2,\"r\":\"r\",\"v\":{\"a\":1,\"b\":2,\"extra\":true}}"
+          },
+          {
+            "pkHash": "af1a1fc110b6094c48582b0ef83553cb7908d7a4365424eef28e76ef6c88d630",
+            "text": "{\"o\":1,\"r\":\"r\",\"v\":{\"a\":2,\"b\":1}}"
+          },
+          {
+            "pkHash": "e61b9f584dbe27741cef6e9ee440831d7d94470c0871b0871541f0308916efea",
+            "text": "{\"o\":1,\"r\":\"r\",\"v\":{\"a\":1,\"b\":1}}"
+          }
+        ],
+        "bytes": 115,
+        "partText": "{\"o\":2,\"r\":\"r\",\"v\":{\"a\":1,\"b\":2,\"extra\":true}}\n{\"o\":1,\"r\":\"r\",\"v\":{\"a\":2,\"b\":1}}\n{\"o\":1,\"r\":\"r\",\"v\":{\"a\":1,\"b\":1}}\n",
+        "sha256": "f955123828e6737051dd23caccb856f1e65567b373e0799a16e57194a0454a92"
+      }
+    },
+    {
+      "name": "empty feed: no part",
+      "primaryKey": ["id"],
+      "prefix": "",
+      "feed": [],
+      "expected": {
+        "winners": [],
+        "bytes": 0,
+        "partText": "",
+        "sha256": null
+      }
+    },
+    {
+      "name": "over the limit below the cap: split (Q4)",
+      "primaryKey": ["id"],
+      "prefix": "",
+      "limitBytes": 300,
+      "feed": [
+        {
+          "o": 1,
+          "r": "r",
+          "v": {
+            "id": 1,
+            "pad": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          }
+        },
+        {
+          "o": 1,
+          "r": "r",
+          "v": {
+            "id": 2,
+            "pad": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+          }
+        }
+      ],
+      "expected": {
+        "kind": "split",
+        "prefix": "",
+        "bytes": 476
+      }
+    },
+    {
+      "name": "over the limit at the 16-bit cap: bucket_too_large (Q4)",
+      "primaryKey": ["id"],
+      "prefix": "0000100000001010",
+      "limitBytes": 100,
+      "feed": [
+        {
+          "o": 1,
+          "r": "r",
+          "v": {
+            "id": 1,
+            "pad": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          }
+        }
+      ],
+      "expected": {
+        "kind": "bucket_too_large",
+        "prefix": "0000100000001010",
+        "bytes": 238
+      }
+    },
+    {
+      "name": "at the limit exactly: ok",
+      "primaryKey": ["id"],
+      "prefix": "",
+      "limitBytes": 29,
+      "feed": [
+        {
+          "o": 1,
+          "r": "r",
+          "v": {
+            "id": 1
+          }
+        }
+      ],
+      "expected": {
+        "winners": [
+          {
+            "pkHash": "080a9ed428559ef602668b4c00f114f1a11c3f6b02a435f0bdc154578e4d7f22",
+            "text": "{\"o\":1,\"r\":\"r\",\"v\":{\"id\":1}}"
+          }
+        ],
+        "bytes": 29,
+        "partText": "{\"o\":1,\"r\":\"r\",\"v\":{\"id\":1}}\n",
+        "sha256": "956134a8180c658b3caea56475cc04cff6c32be3a97a37f2fdbde764be236de8"
+      }
+    }
+  ],
+  "planner": [
+    {
+      "name": "empty stream: no buckets",
+      "input": {
+        "targetBytes": 4194304,
+        "baseParts": [],
+        "shardBytes": [
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0
+        ]
+      },
+      "expected": {
+        "kind": "plan",
+        "buckets": []
+      }
+    },
+    {
+      "name": "small stream: one root bucket",
+      "input": {
+        "targetBytes": 4194304,
+        "baseParts": [],
+        "shardBytes": [
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000
+        ]
+      },
+      "expected": {
+        "kind": "plan",
+        "buckets": [
+          {
+            "prefix": "",
+            "estimate": 256000,
+            "capped": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "uniform: split to 2 bits",
+      "input": {
+        "targetBytes": 64000,
+        "baseParts": [],
+        "shardBytes": [
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+          1000, 1000, 1000
+        ]
+      },
+      "expected": {
+        "kind": "plan",
+        "buckets": [
+          {
+            "prefix": "00",
+            "estimate": 64000,
+            "capped": false
+          },
+          {
+            "prefix": "01",
+            "estimate": 64000,
+            "capped": false
+          },
+          {
+            "prefix": "10",
+            "estimate": 64000,
+            "capped": false
+          },
+          {
+            "prefix": "11",
+            "estimate": 64000,
+            "capped": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "skewed: needs a counting pass for shard 0",
+      "input": {
+        "targetBytes": 4194304,
+        "baseParts": [],
+        "shardBytes": [
+          10000000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0
+        ]
+      },
+      "expected": {
+        "kind": "needs_counts",
+        "shards": [0]
+      }
+    },
+    {
+      "name": "skewed with counts: split to the 16-bit cap",
+      "input": {
+        "targetBytes": 4194304,
+        "baseParts": [],
+        "shardBytes": [
+          10000000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0
+        ],
+        "prefix16Bytes": {
+          "0": [
+            6000000, 4000000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0
+          ]
+        }
+      },
+      "expected": {
+        "kind": "plan",
+        "buckets": [
+          {
+            "prefix": "0000000000000000",
+            "estimate": 6000000,
+            "capped": true
+          },
+          {
+            "prefix": "0000000000000001",
+            "estimate": 4000000,
+            "capped": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "two hot shards: one counting pass each",
+      "input": {
+        "targetBytes": 4194304,
+        "baseParts": [],
+        "shardBytes": [
+          5000000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 5000000
+        ]
+      },
+      "expected": {
+        "kind": "needs_counts",
+        "shards": [0, 255]
+      }
+    },
+    {
+      "name": "coarse base parts count in proportion",
+      "question": "Q3",
+      "input": {
+        "targetBytes": 4194304,
+        "baseParts": [
+          {
+            "prefix": "0",
+            "bytes": 3000000
+          },
+          {
+            "prefix": "1",
+            "bytes": 1000000
+          }
+        ],
+        "shardBytes": [
+          2000000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0
+        ]
+      },
+      "expected": {
+        "kind": "plan",
+        "buckets": [
+          {
+            "prefix": "00",
+            "estimate": 3500000,
+            "capped": false
+          },
+          {
+            "prefix": "01",
+            "estimate": 1500000,
+            "capped": false
+          },
+          {
+            "prefix": "1",
+            "estimate": 1000000,
+            "capped": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "fine base parts sum into a coarse bucket",
+      "input": {
+        "targetBytes": 4194304,
+        "baseParts": [
+          {
+            "prefix": "00",
+            "bytes": 100
+          },
+          {
+            "prefix": "01",
+            "bytes": 200
+          }
+        ],
+        "shardBytes": [
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0
+        ]
+      },
+      "expected": {
+        "kind": "plan",
+        "buckets": [
+          {
+            "prefix": "",
+            "estimate": 300,
+            "capped": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "counting pass that does not sum to its shard is rejected",
+      "input": {
+        "targetBytes": 4194304,
+        "baseParts": [],
+        "shardBytes": [
+          10000000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0
+        ],
+        "prefix16Bytes": {
+          "0": [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0
+          ]
+        }
+      },
+      "expected": {
+        "kind": "error"
+      }
+    }
+  ],
+  "heads": {
+    "encode": [
+      {
+        "name": "two parts",
+        "head": {
+          "complete": true,
+          "connector": "chatgpt",
+          "format": 1,
+          "generation": "3",
+          "keyCheck": "94e0f0e1aa1f8175",
+          "ns": "834ab4c2636bcdd5",
+          "observedAt": 1700000000000,
+          "parts": [
+            {
+              "bytes": 120,
+              "count": 2,
+              "hash": "169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0",
+              "prefix": "0"
+            },
+            {
+              "bytes": 64,
+              "count": 1,
+              "hash": "f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a",
+              "prefix": "10"
+            }
+          ],
+          "primaryKey": ["id"],
+          "profile": {
+            "key": "conversations",
+            "version": "1.4.0"
+          },
+          "recordCount": 3,
+          "stream": "conversations"
+        },
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "dataHash": "0x4743ff7734972fc20c1df3547f60c4194ec39ddad2ac350c30bc315550b8230e",
+        "blobName": "h-4743ff7734972fc20c1df3547f60c4194ec39ddad2ac350c30bc315550b8230e"
+      },
+      {
+        "name": "identity-less, no records",
+        "head": {
+          "complete": false,
+          "connector": "weather",
+          "format": 1,
+          "generation": "1",
+          "keyCheck": "94e0f0e1aa1f8175",
+          "ns": "",
+          "observedAt": 1700000000000,
+          "parts": [],
+          "primaryKey": ["id"],
+          "profile": {
+            "key": null,
+            "version": "0.1.0"
+          },
+          "recordCount": 0,
+          "stream": "daily"
+        },
+        "text": "{\"complete\":false,\"connector\":\"weather\",\"format\":1,\"generation\":\"1\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"\",\"observedAt\":1700000000000,\"parts\":[],\"primaryKey\":[\"id\"],\"profile\":{\"key\":null,\"version\":\"0.1.0\"},\"recordCount\":0,\"stream\":\"daily\"}",
+        "dataHash": "0xd9d16653d5b12653104cc5239c7eb744131cf86ddb75bed09ec709cf38044ad4",
+        "blobName": "h-d9d16653d5b12653104cc5239c7eb744131cf86ddb75bed09ec709cf38044ad4"
+      },
+      {
+        "name": "fenced format 3",
+        "head": {
+          "complete": true,
+          "connector": "chatgpt",
+          "format": 3,
+          "generation": "3",
+          "keyCheck": "94e0f0e1aa1f8175",
+          "ns": "834ab4c2636bcdd5",
+          "observedAt": 1700000000000,
+          "parts": [
+            {
+              "bytes": 120,
+              "count": 2,
+              "hash": "169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0",
+              "prefix": "0"
+            },
+            {
+              "bytes": 64,
+              "count": 1,
+              "hash": "f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a",
+              "prefix": "10"
+            }
+          ],
+          "primaryKey": ["id"],
+          "profile": {
+            "key": "conversations",
+            "version": "1.4.0"
+          },
+          "recordCount": 3,
+          "stream": "conversations",
+          "lastDeleteVersion": 2
+        },
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":3,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":2,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "dataHash": "0x57eccce62913908b9f706070b1b1eeb558f88d6492ea6dc29a911da72f08b98b",
+        "blobName": "h-57eccce62913908b9f706070b1b1eeb558f88d6492ea6dc29a911da72f08b98b"
+      },
+      {
+        "name": "format 4 with delete version",
+        "head": {
+          "complete": true,
+          "connector": "chatgpt",
+          "format": 4,
+          "generation": "3",
+          "keyCheck": "94e0f0e1aa1f8175",
+          "ns": "834ab4c2636bcdd5",
+          "observedAt": 1700000000000,
+          "parts": [
+            {
+              "bytes": 120,
+              "count": 2,
+              "hash": "169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0",
+              "prefix": "0"
+            },
+            {
+              "bytes": 64,
+              "count": 1,
+              "hash": "f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a",
+              "prefix": "10"
+            }
+          ],
+          "primaryKey": ["id"],
+          "profile": {
+            "key": "conversations",
+            "version": "1.4.0"
+          },
+          "recordCount": 3,
+          "stream": "conversations",
+          "lastDeleteVersion": 2
+        },
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":4,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":2,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "dataHash": "0x1bccdfecc3d2668f17e03959ccec624034e6b1680e4dfee7df469951e100066e",
+        "blobName": "h-1bccdfecc3d2668f17e03959ccec624034e6b1680e4dfee7df469951e100066e"
+      }
+    ],
+    "decode": [
+      {
+        "name": "valid",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "ok"
+      },
+      {
+        "name": "format 2",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":2,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "ok"
+      },
+      {
+        "name": "format 3",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":3,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":2,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "ok"
+      },
+      {
+        "name": "format 3 missing delete version",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":3,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "format 3 negative delete version",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":3,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":-1,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "format 4",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":4,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":2,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "ok"
+      },
+      {
+        "name": "format missing",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "unsupported_format"
+      },
+      {
+        "name": "format \"1\" string",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":\"1\",\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "unsupported_format"
+      },
+      {
+        "name": "not canonical (spaces)",
+        "text": "{\n \"complete\": true,\n \"connector\": \"chatgpt\",\n \"format\": 1,\n \"generation\": \"3\",\n \"keyCheck\": \"94e0f0e1aa1f8175\",\n \"ns\": \"834ab4c2636bcdd5\",\n \"observedAt\": 1700000000000,\n \"parts\": [\n  {\n   \"bytes\": 120,\n   \"count\": 2,\n   \"hash\": \"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\n   \"prefix\": \"0\"\n  },\n  {\n   \"bytes\": 64,\n   \"count\": 1,\n   \"hash\": \"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\n   \"prefix\": \"10\"\n  }\n ],\n \"primaryKey\": [\n  \"id\"\n ],\n \"profile\": {\n  \"key\": \"conversations\",\n  \"version\": \"1.4.0\"\n },\n \"recordCount\": 3,\n \"stream\": \"conversations\"\n}",
+        "expected": "malformed"
+      },
+      {
+        "name": "extra field",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"extra\":1,\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "generation as number",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":3,\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "generation 0",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"0\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "generation leading zero",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"03\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "recordCount mismatch",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":4,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "parts not sorted",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"},{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "parts not prefix-free",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"1\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "empty part entry",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":0,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":0,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "prefix over 16 bits",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"00000000000000000\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":2,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "part over 16 MiB",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":16777217,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":2,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "bad keyCheck",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"XYZ\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "profile missing version",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":null},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "connector with ~",
+        "text": "{\"complete\":true,\"connector\":\"a~b\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "not JSON",
+        "text": "{",
+        "expected": "malformed"
+      },
+      {
+        "name": "format 5",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":5,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":2,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "unsupported_format"
+      },
+      {
+        "name": "format 4 missing delete version",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":4,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      }
+    ],
+    "verify": [
+      {
+        "name": "ok",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expect": {
+          "dataHash": "0x4743ff7734972fc20c1df3547f60c4194ec39ddad2ac350c30bc315550b8230e",
+          "connector": "chatgpt",
+          "ns": "834ab4c2636bcdd5",
+          "stream": "conversations",
+          "keyCheck": "94e0f0e1aa1f8175"
+        },
+        "result": "ok"
+      },
+      {
+        "name": "hash mismatch",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expect": {
+          "dataHash": "0x26b60b6bee32c2d284da42d089b795640a977077a3c25b246fe0448f42ce4ec0",
+          "connector": "chatgpt",
+          "ns": "834ab4c2636bcdd5",
+          "stream": "conversations",
+          "keyCheck": "94e0f0e1aa1f8175"
+        },
+        "result": "hash_mismatch"
+      },
+      {
+        "name": "stream mismatch",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expect": {
+          "dataHash": "0x4743ff7734972fc20c1df3547f60c4194ec39ddad2ac350c30bc315550b8230e",
+          "connector": "chatgpt",
+          "ns": "834ab4c2636bcdd5",
+          "stream": "messages",
+          "keyCheck": "94e0f0e1aa1f8175"
+        },
+        "result": "name_mismatch"
+      },
+      {
+        "name": "ns mismatch",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expect": {
+          "dataHash": "0x4743ff7734972fc20c1df3547f60c4194ec39ddad2ac350c30bc315550b8230e",
+          "connector": "chatgpt",
+          "ns": "c2ae18eeb7243a1a",
+          "stream": "conversations",
+          "keyCheck": "94e0f0e1aa1f8175"
+        },
+        "result": "name_mismatch"
+      },
+      {
+        "name": "key mismatch",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":1,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expect": {
+          "dataHash": "0x4743ff7734972fc20c1df3547f60c4194ec39ddad2ac350c30bc315550b8230e",
+          "connector": "chatgpt",
+          "ns": "834ab4c2636bcdd5",
+          "stream": "conversations",
+          "keyCheck": "ffffffffffffffff"
+        },
+        "result": "key_mismatch"
+      },
+      {
+        "name": "unsupported format is reported before name and key",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":5,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":2,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expect": {
+          "dataHash": "0x161e8a137762aa0827c7d6dcd0337a16ecd907a6093809cbab5bd4e78ca608b7",
+          "connector": "chatgpt",
+          "ns": "834ab4c2636bcdd5",
+          "stream": "conversations",
+          "keyCheck": "ffffffffffffffff"
+        },
+        "result": "unsupported_format"
+      },
+      {
+        "name": "format 4 head verifies",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":4,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":2,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expect": {
+          "dataHash": "0x1bccdfecc3d2668f17e03959ccec624034e6b1680e4dfee7df469951e100066e",
+          "connector": "chatgpt",
+          "ns": "834ab4c2636bcdd5",
+          "stream": "conversations",
+          "keyCheck": "94e0f0e1aa1f8175"
+        },
+        "result": "ok"
+      }
+    ],
+    "base": {
+      "complete": true,
+      "connector": "chatgpt",
+      "format": 1,
+      "generation": "3",
+      "keyCheck": "94e0f0e1aa1f8175",
+      "ns": "834ab4c2636bcdd5",
+      "observedAt": 1700000000000,
+      "parts": [
+        {
+          "bytes": 120,
+          "count": 2,
+          "hash": "169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0",
+          "prefix": "0"
+        },
+        {
+          "bytes": 64,
+          "count": 1,
+          "hash": "f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a",
+          "prefix": "10"
+        }
+      ],
+      "primaryKey": ["id"],
+      "profile": {
+        "key": "conversations",
+        "version": "1.4.0"
+      },
+      "recordCount": 3,
+      "stream": "conversations"
+    }
+  },
+  "headRules": {
+    "liveness": [
+      {
+        "control": {
+          "kind": "active",
+          "generation": 3
+        },
+        "streamRow": "present",
+        "headGeneration": 3,
+        "live": true
+      },
+      {
+        "control": {
+          "kind": "active",
+          "generation": 3
+        },
+        "streamRow": "present",
+        "headGeneration": 1,
+        "live": false
+      },
+      {
+        "control": {
+          "kind": "active",
+          "generation": 3
+        },
+        "streamRow": "tombstoned",
+        "headGeneration": 3,
+        "live": false
+      },
+      {
+        "control": {
+          "kind": "active",
+          "generation": 3
+        },
+        "streamRow": "absent",
+        "headGeneration": null,
+        "live": false
+      },
+      {
+        "control": {
+          "kind": "deleted",
+          "version": 4
+        },
+        "streamRow": "present",
+        "headGeneration": 3,
+        "live": false
+      },
+      {
+        "control": {
+          "kind": "foreign",
+          "version": 3
+        },
+        "streamRow": "present",
+        "headGeneration": 3,
+        "live": false
+      },
+      {
+        "control": {
+          "kind": "absent"
+        },
+        "streamRow": "present",
+        "headGeneration": 1,
+        "live": false
+      }
+    ],
+    "chooseBase": [
+      {
+        "streamRow": "present",
+        "headGeneration": 3,
+        "target": 3,
+        "base": "base"
+      },
+      {
+        "streamRow": "present",
+        "headGeneration": 1,
+        "target": 3,
+        "base": "empty"
+      },
+      {
+        "streamRow": "present",
+        "headGeneration": 3,
+        "target": 1,
+        "base": "stale_generation"
+      },
+      {
+        "streamRow": "present",
+        "headGeneration": 4,
+        "target": 3,
+        "base": "stale_generation"
+      },
+      {
+        "streamRow": "tombstoned",
+        "headGeneration": 3,
+        "target": 3,
+        "base": "empty"
+      },
+      {
+        "streamRow": "tombstoned",
+        "headGeneration": 5,
+        "target": 3,
+        "base": "empty"
+      },
+      {
+        "streamRow": "absent",
+        "headGeneration": null,
+        "target": 1,
+        "base": "empty"
+      }
+    ],
+    "writerCompatibility": [
+      {
+        "basePrimaryKey": null,
+        "writerPrimaryKey": ["id"],
+        "writerVersusBase": "lower",
+        "result": "use_base"
+      },
+      {
+        "basePrimaryKey": ["id"],
+        "writerPrimaryKey": ["id"],
+        "writerVersusBase": "lower",
+        "result": "use_base"
+      },
+      {
+        "basePrimaryKey": ["id"],
+        "writerPrimaryKey": ["id"],
+        "writerVersusBase": "higher",
+        "result": "use_base"
+      },
+      {
+        "basePrimaryKey": ["id"],
+        "writerPrimaryKey": ["id", "ts"],
+        "writerVersusBase": "higher",
+        "result": "empty_base"
+      },
+      {
+        "basePrimaryKey": ["id", "ts"],
+        "writerPrimaryKey": ["id"],
+        "writerVersusBase": "lower",
+        "result": "connector_update_required"
+      },
+      {
+        "basePrimaryKey": ["a", "b"],
+        "writerPrimaryKey": ["b", "a"],
+        "writerVersusBase": "equal",
+        "result": "connector_update_required",
+        "question": "Q5"
+      }
+    ],
+    "complete": [
+      {
+        "full": true,
+        "baseComplete": false,
+        "seedMerged": false,
+        "complete": true
+      },
+      {
+        "full": false,
+        "baseComplete": true,
+        "seedMerged": false,
+        "complete": true
+      },
+      {
+        "full": false,
+        "baseComplete": false,
+        "seedMerged": true,
+        "complete": true
+      },
+      {
+        "full": false,
+        "baseComplete": false,
+        "seedMerged": false,
+        "complete": false
+      }
+    ],
+    "noop": [
+      {
+        "name": "same parts and complete",
+        "base": "baseHead",
+        "parts": [
+          {
+            "bytes": 120,
+            "count": 2,
+            "hash": "169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0",
+            "prefix": "0"
+          },
+          {
+            "bytes": 64,
+            "count": 1,
+            "hash": "f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a",
+            "prefix": "10"
+          }
+        ],
+        "complete": true,
+        "noop": true
+      },
+      {
+        "name": "complete changed",
+        "base": "baseHead",
+        "parts": [
+          {
+            "bytes": 120,
+            "count": 2,
+            "hash": "169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0",
+            "prefix": "0"
+          },
+          {
+            "bytes": 64,
+            "count": 1,
+            "hash": "f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a",
+            "prefix": "10"
+          }
+        ],
+        "complete": false,
+        "noop": false
+      },
+      {
+        "name": "a part changed",
+        "base": "baseHead",
+        "parts": [
+          {
+            "bytes": 120,
+            "count": 2,
+            "hash": "169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0",
+            "prefix": "0"
+          },
+          {
+            "bytes": 64,
+            "count": 1,
+            "hash": "3946ca64ff78d93ca61090a437cbb6b3d2ca0d488f5f9ccf3059608368b27693",
+            "prefix": "10"
+          }
+        ],
+        "complete": true,
+        "noop": false
+      },
+      {
+        "name": "a part added",
+        "base": "baseHead",
+        "parts": [
+          {
+            "bytes": 120,
+            "count": 2,
+            "hash": "169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0",
+            "prefix": "0"
+          },
+          {
+            "bytes": 64,
+            "count": 1,
+            "hash": "f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a",
+            "prefix": "10"
+          },
+          {
+            "bytes": 1,
+            "count": 1,
+            "hash": "43bb00d0ce7790a53b91256b370c887b24791a5539a6fbfb70c5870e8c91ae5d",
+            "prefix": "11"
+          }
+        ],
+        "complete": true,
+        "noop": false
+      },
+      {
+        "name": "no base",
+        "base": null,
+        "parts": [],
+        "complete": false,
+        "noop": false
+      }
+    ]
+  },
+  "control": {
+    "controlHashes": {
+      "activeData": "0xe1b947c9cba2c3f3e74c210e7edda035fc9c1c3dfc5e3d7747097a8a3be7ccda",
+      "activeMetadata": "0xafa8b31cfb00809840b3b21d2f492fa5c4de03e6eb33e5a2abb62fa617731ea2",
+      "tombstoneData": "0x30c45ee72fe56d1927701316925ab7ceacd3b6f9267061735d59396f075c6222",
+      "tombstoneMetadata": "0xc5255a141acd6a2ae55971b62c0a85977c2511989dc114ad2abc2b7644f57d90"
+    },
+    "cases": [
+      {
+        "name": "no row",
+        "read": {
+          "found": false
+        },
+        "expected": {
+          "kind": "absent"
+        }
+      },
+      {
+        "name": "own active",
+        "read": {
+          "found": true,
+          "version": 1,
+          "dataHash": "0xe1b947c9cba2c3f3e74c210e7edda035fc9c1c3dfc5e3d7747097a8a3be7ccda",
+          "metadataHash": "0xafa8b31cfb00809840b3b21d2f492fa5c4de03e6eb33e5a2abb62fa617731ea2",
+          "deleted": false
+        },
+        "expected": {
+          "kind": "active",
+          "generation": 1
+        }
+      },
+      {
+        "name": "own active, uppercase hex",
+        "read": {
+          "found": true,
+          "version": 5,
+          "dataHash": "0xE1B947C9CBA2C3F3E74C210E7EDDA035FC9C1C3DFC5E3D7747097A8A3BE7CCDA",
+          "metadataHash": "0xafa8b31cfb00809840b3b21d2f492fa5c4de03e6eb33e5a2abb62fa617731ea2",
+          "deleted": false
+        },
+        "expected": {
+          "kind": "active",
+          "generation": 5
+        }
+      },
+      {
+        "name": "tombstone",
+        "read": {
+          "found": true,
+          "version": 2,
+          "dataHash": "0x30c45ee72fe56d1927701316925ab7ceacd3b6f9267061735d59396f075c6222",
+          "metadataHash": "0xc5255a141acd6a2ae55971b62c0a85977c2511989dc114ad2abc2b7644f57d90",
+          "deleted": true
+        },
+        "expected": {
+          "kind": "deleted",
+          "version": 2
+        }
+      },
+      {
+        "name": "tombstone hashes, deleted flag not yet set",
+        "read": {
+          "found": true,
+          "version": 2,
+          "dataHash": "0x30c45ee72fe56d1927701316925ab7ceacd3b6f9267061735d59396f075c6222",
+          "metadataHash": "0xc5255a141acd6a2ae55971b62c0a85977c2511989dc114ad2abc2b7644f57d90",
+          "deleted": false
+        },
+        "expected": {
+          "kind": "deleted",
+          "version": 2
+        }
+      },
+      {
+        "name": "another key's active row",
+        "read": {
+          "found": true,
+          "version": 3,
+          "dataHash": "0x8dabeba53d603257a2fedaacd8adaa36a3650b54e3c12c44c1fbdf1f10502940",
+          "metadataHash": "0xafa8b31cfb00809840b3b21d2f492fa5c4de03e6eb33e5a2abb62fa617731ea2",
+          "deleted": false
+        },
+        "expected": {
+          "kind": "foreign",
+          "version": 3
+        }
+      }
+    ]
+  },
+  "startState": [
+    {
+      "start": null,
+      "ns": "834ab4c2636bcdd5",
+      "expected": {
+        "kind": "unknown"
+      }
+    },
+    {
+      "start": {},
+      "ns": "834ab4c2636bcdd5",
+      "expected": {
+        "kind": "absent"
+      }
+    },
+    {
+      "start": {
+        "c2ae18eeb7243a1a": {
+          "kind": "active",
+          "generation": 4
+        }
+      },
+      "ns": "834ab4c2636bcdd5",
+      "expected": {
+        "kind": "absent"
+      }
+    },
+    {
+      "start": {
+        "834ab4c2636bcdd5": {
+          "kind": "active",
+          "generation": 4
+        },
+        "c2ae18eeb7243a1a": {
+          "kind": "deleted",
+          "version": 2
+        }
+      },
+      "ns": "834ab4c2636bcdd5",
+      "expected": {
+        "kind": "active",
+        "generation": 4
+      }
+    },
+    {
+      "start": {
+        "834ab4c2636bcdd5": {
+          "kind": "deleted",
+          "version": 2
+        }
+      },
+      "ns": "834ab4c2636bcdd5",
+      "expected": {
+        "kind": "deleted",
+        "version": 2
+      }
+    },
+    {
+      "start": {
+        "": {
+          "kind": "active",
+          "generation": 1
+        }
+      },
+      "ns": "",
+      "expected": {
+        "kind": "active",
+        "generation": 1
+      }
+    }
+  ],
+  "decide": [
+    {
+      "row": "unknown | any → discard, recollect",
+      "start": {
+        "kind": "unknown"
+      },
+      "current": {
+        "kind": "absent"
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": true,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "unknown | any → discard, recollect",
+      "start": {
+        "kind": "unknown"
+      },
+      "current": {
+        "kind": "active",
+        "generation": 1
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": true,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "unknown | any → discard, recollect",
+      "start": {
+        "kind": "unknown"
+      },
+      "current": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": true,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "absent | absent → create v1",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "absent"
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "first",
+      "expected": {
+        "kind": "create",
+        "target": 1
+      }
+    },
+    {
+      "row": "absent | active(1) → T = 1",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "active",
+        "generation": 1
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "first",
+      "expected": {
+        "kind": "publish",
+        "target": 1
+      }
+    },
+    {
+      "row": "absent | other → discard",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "active",
+        "generation": 2
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "absent | other → discard",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "active(g0) | active(g0) → T = g0",
+      "start": {
+        "kind": "active",
+        "generation": 3
+      },
+      "current": {
+        "kind": "active",
+        "generation": 3
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "first",
+      "expected": {
+        "kind": "publish",
+        "target": 3
+      }
+    },
+    {
+      "row": "active(g0) | absent → re-read once",
+      "start": {
+        "kind": "active",
+        "generation": 3
+      },
+      "current": {
+        "kind": "absent"
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "first",
+      "expected": {
+        "kind": "reread"
+      }
+    },
+    {
+      "row": "active(g0) | absent, still so → keep pending, registry_inconsistent",
+      "start": {
+        "kind": "active",
+        "generation": 3
+      },
+      "current": {
+        "kind": "absent"
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "reread",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "registry_inconsistent"
+      }
+    },
+    {
+      "row": "active(g0) | active(g < g0) → re-read once",
+      "start": {
+        "kind": "active",
+        "generation": 3
+      },
+      "current": {
+        "kind": "active",
+        "generation": 1
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "first",
+      "expected": {
+        "kind": "reread"
+      }
+    },
+    {
+      "row": "active(g0) | active(g < g0), still so → keep pending, registry_inconsistent",
+      "start": {
+        "kind": "active",
+        "generation": 3
+      },
+      "current": {
+        "kind": "active",
+        "generation": 1
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "reread",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "registry_inconsistent"
+      }
+    },
+    {
+      "row": "active(g0) | other → discard, clear checkpoints",
+      "start": {
+        "kind": "active",
+        "generation": 3
+      },
+      "current": {
+        "kind": "deleted",
+        "version": 4
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": true,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "active(g0) | other → discard, clear checkpoints",
+      "start": {
+        "kind": "active",
+        "generation": 1
+      },
+      "current": {
+        "kind": "active",
+        "generation": 5
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": true,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "deleted(v0) | deleted(v0), userConnect and full → reconnect v0+1",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "first",
+      "expected": {
+        "kind": "reconnect",
+        "target": 3
+      }
+    },
+    {
+      "row": "deleted(v0) | active(v0+1), userConnect and full → T = v0+1",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "active",
+        "generation": 3
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "first",
+      "expected": {
+        "kind": "publish",
+        "target": 3
+      }
+    },
+    {
+      "row": "deleted(v0) | not userConnect → discard",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "userConnect": false,
+      "full": true,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "deleted(v0) | not userConnect → discard",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "active",
+        "generation": 3
+      },
+      "userConnect": false,
+      "full": true,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "deleted(v0) | not full → discard, host restarts a full run",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "userConnect": true,
+      "full": false,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": true
+      }
+    },
+    {
+      "row": "deleted(v0) | not full → discard, host restarts a full run",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "active",
+        "generation": 3
+      },
+      "userConnect": true,
+      "full": false,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": true
+      }
+    },
+    {
+      "row": "deleted(v0) | other → discard",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "deleted",
+        "version": 4
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "deleted(v0) | other → discard",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "active",
+        "generation": 5
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "deleted(v0) | other → discard",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "deleted",
+        "version": 4
+      },
+      "userConnect": true,
+      "full": false,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "any | foreign → keep pending, key_mismatch",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "foreign",
+        "version": 1
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "first",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "key_mismatch"
+      }
+    },
+    {
+      "row": "any | foreign → keep pending, key_mismatch",
+      "start": {
+        "kind": "active",
+        "generation": 3
+      },
+      "current": {
+        "kind": "foreign",
+        "version": 5
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "first",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "key_mismatch"
+      }
+    },
+    {
+      "row": "any | foreign → keep pending, key_mismatch",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "foreign",
+        "version": 3
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "first",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "key_mismatch"
+      }
+    },
+    {
+      "row": "any | foreign → keep pending, key_mismatch (S unknown)",
+      "start": {
+        "kind": "unknown"
+      },
+      "current": {
+        "kind": "foreign",
+        "version": 1
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "first",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "key_mismatch"
+      },
+      "question": "Q1"
+    },
+    {
+      "row": "S foreign: no table row → discard",
+      "start": {
+        "kind": "foreign",
+        "version": 1
+      },
+      "current": {
+        "kind": "active",
+        "generation": 3
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "first",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      },
+      "question": "Q2"
+    },
+    {
+      "row": "after create: C re-reads active(T) → publish",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "active",
+        "generation": 1
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "after_write",
+      "expected": {
+        "kind": "publish",
+        "target": 1
+      }
+    },
+    {
+      "row": "after create: C still absent → discard",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "absent"
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "after_write",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "after create replayed, C deleted → discard (trace A)",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "after_write",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "after create: C foreign → discard",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "foreign",
+        "version": 1
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "after_write",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      },
+      "question": "Q8"
+    },
+    {
+      "row": "after reconnect: C re-reads active(T) → publish",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "active",
+        "generation": 3
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "after_write",
+      "expected": {
+        "kind": "publish",
+        "target": 3
+      }
+    },
+    {
+      "row": "after reconnect: C deleted again → discard",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "deleted",
+        "version": 4
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "after_write",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "after reconnect: C still deleted(v0) → discard",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "after_write",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "stale base: start older than control → discard by the table",
+      "start": {
+        "kind": "active",
+        "generation": 1
+      },
+      "current": {
+        "kind": "active",
+        "generation": 3
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "stale_base",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": true,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "stale base: start older than control → discard by the table",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "active",
+        "generation": 3
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "stale_base",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "stale base: control still admits T → keep pending, registry_inconsistent",
+      "start": {
+        "kind": "active",
+        "generation": 3
+      },
+      "current": {
+        "kind": "active",
+        "generation": 3
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "stale_base",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "registry_inconsistent"
+      }
+    },
+    {
+      "row": "stale base: control still admits T → keep pending, registry_inconsistent",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "active",
+        "generation": 1
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "stale_base",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "registry_inconsistent"
+      }
+    },
+    {
+      "row": "stale base: control would create or reconnect → keep pending, registry_inconsistent",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "absent"
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "stale_base",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "registry_inconsistent"
+      }
+    },
+    {
+      "row": "stale base: control would create or reconnect → keep pending, registry_inconsistent",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "stale_base",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "registry_inconsistent"
+      }
+    },
+    {
+      "row": "stale base: foreign → keep pending, key_mismatch",
+      "start": {
+        "kind": "active",
+        "generation": 1
+      },
+      "current": {
+        "kind": "foreign",
+        "version": 3
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "stale_base",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "key_mismatch"
+      }
+    }
+  ],
+  "traces": [
+    {
+      "name": "late head from an older generation (F1)",
+      "description": "A run admitted at g=1 resumes after a delete (v2) and a reconnect elsewhere that committed a g=3 head. chooseBase returns stale_generation; the re-read decides discard and clears checkpoints. Nothing is published, so the g=3 keys stay intact.",
+      "start": {
+        "834ab4c2636bcdd5": {
+          "kind": "active",
+          "generation": 1
+        }
+      },
+      "ns": "834ab4c2636bcdd5",
+      "userConnect": false,
+      "full": false,
+      "steps": [
+        {
+          "op": "decide",
+          "current": {
+            "kind": "active",
+            "generation": 1
+          },
+          "phase": "first",
+          "expected": {
+            "kind": "publish",
+            "target": 1
+          }
+        },
+        {
+          "op": "chooseBase",
+          "streamRow": "present",
+          "headGeneration": 3,
+          "target": 1,
+          "expected": "stale_generation"
+        },
+        {
+          "op": "decide",
+          "current": {
+            "kind": "active",
+            "generation": 3
+          },
+          "phase": "stale_base",
+          "expected": {
+            "kind": "discard",
+            "recollect": false,
+            "clearCheckpoints": true,
+            "restartFull": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "replay after delete (trace A)",
+      "description": "Create v1 reply is lost. Another device deletes (v2). The resend is `replayed`. Re-read shows deleted(2): discard, no publish.",
+      "start": {},
+      "ns": "834ab4c2636bcdd5",
+      "userConnect": true,
+      "full": true,
+      "steps": [
+        {
+          "op": "decide",
+          "current": {
+            "kind": "absent"
+          },
+          "phase": "first",
+          "expected": {
+            "kind": "create",
+            "target": 1
+          }
+        },
+        {
+          "op": "decide",
+          "current": {
+            "kind": "deleted",
+            "version": 2
+          },
+          "phase": "after_write",
+          "expected": {
+            "kind": "discard",
+            "recollect": false,
+            "clearCheckpoints": false,
+            "restartFull": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "split run",
+      "description": "First connect. Stream s1 creates and commits at g=1. Another device deletes (v2), then a reconnect elsewhere makes active(3). Stream s2 must not reconnect or commit at a new generation, and the run saves no checkpoint.",
+      "start": {},
+      "ns": "834ab4c2636bcdd5",
+      "userConnect": true,
+      "full": true,
+      "steps": [
+        {
+          "op": "decide",
+          "stream": "s1",
+          "current": {
+            "kind": "absent"
+          },
+          "phase": "first",
+          "expected": {
+            "kind": "create",
+            "target": 1
+          }
+        },
+        {
+          "op": "decide",
+          "stream": "s1",
+          "current": {
+            "kind": "active",
+            "generation": 1
+          },
+          "phase": "after_write",
+          "expected": {
+            "kind": "publish",
+            "target": 1
+          }
+        },
+        {
+          "op": "decide",
+          "stream": "s2",
+          "current": {
+            "kind": "deleted",
+            "version": 2
+          },
+          "phase": "first",
+          "expected": {
+            "kind": "discard",
+            "recollect": false,
+            "clearCheckpoints": false,
+            "restartFull": false
+          }
+        },
+        {
+          "op": "decide",
+          "stream": "s2",
+          "current": {
+            "kind": "active",
+            "generation": 3
+          },
+          "phase": "first",
+          "expected": {
+            "kind": "discard",
+            "recollect": false,
+            "clearCheckpoints": false,
+            "restartFull": false
+          }
+        },
+        {
+          "op": "checkpoint",
+          "target": 1,
+          "streams": {
+            "s1": {
+              "state": "committed",
+              "generation": 1,
+              "complete": true
+            },
+            "s2": {
+              "state": "discarded"
+            }
+          },
+          "control": {
+            "kind": "deleted",
+            "version": 2
+          },
+          "seedReceiptsPending": false,
+          "expected": {
+            "kind": "skip",
+            "reason": "stream_not_committed"
+          }
+        },
+        {
+          "op": "checkpoint",
+          "target": 1,
+          "streams": {
+            "s1": {
+              "state": "committed",
+              "generation": 1,
+              "complete": true
+            },
+            "s2": {
+              "state": "discarded"
+            }
+          },
+          "control": {
+            "kind": "active",
+            "generation": 3
+          },
+          "seedReceiptsPending": false,
+          "expected": {
+            "kind": "skip",
+            "reason": "stream_not_committed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "split run, delete between streams of a run at g0",
+      "description": "Run starts with active(1). s1 commits at 1. Another device deletes (v2). s2 discards and clears checkpoints; no checkpoint is saved.",
+      "start": {
+        "834ab4c2636bcdd5": {
+          "kind": "active",
+          "generation": 1
+        }
+      },
+      "ns": "834ab4c2636bcdd5",
+      "userConnect": false,
+      "full": false,
+      "steps": [
+        {
+          "op": "decide",
+          "stream": "s1",
+          "current": {
+            "kind": "active",
+            "generation": 1
+          },
+          "phase": "first",
+          "expected": {
+            "kind": "publish",
+            "target": 1
+          }
+        },
+        {
+          "op": "decide",
+          "stream": "s2",
+          "current": {
+            "kind": "deleted",
+            "version": 2
+          },
+          "phase": "first",
+          "expected": {
+            "kind": "discard",
+            "recollect": false,
+            "clearCheckpoints": true,
+            "restartFull": false
+          }
+        },
+        {
+          "op": "checkpoint",
+          "target": 1,
+          "streams": {
+            "s1": {
+              "state": "committed",
+              "generation": 1,
+              "complete": false
+            },
+            "s2": {
+              "state": "discarded"
+            }
+          },
+          "control": {
+            "kind": "deleted",
+            "version": 2
+          },
+          "seedReceiptsPending": false,
+          "expected": {
+            "kind": "skip",
+            "reason": "stream_not_committed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "stale userConnect entry (trace B)",
+      "description": "A userConnect run started at deleted(2). Before it publishes, another device reconnects (3) and deletes again (4). The stale entry discards.",
+      "start": {
+        "834ab4c2636bcdd5": {
+          "kind": "deleted",
+          "version": 2
+        }
+      },
+      "ns": "834ab4c2636bcdd5",
+      "userConnect": true,
+      "full": true,
+      "steps": [
+        {
+          "op": "decide",
+          "current": {
+            "kind": "deleted",
+            "version": 4
+          },
+          "phase": "first",
+          "expected": {
+            "kind": "discard",
+            "recollect": false,
+            "clearCheckpoints": false,
+            "restartFull": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "reconnect happy path",
+      "start": {
+        "834ab4c2636bcdd5": {
+          "kind": "deleted",
+          "version": 2
+        }
+      },
+      "ns": "834ab4c2636bcdd5",
+      "userConnect": true,
+      "full": true,
+      "steps": [
+        {
+          "op": "decide",
+          "stream": "s1",
+          "current": {
+            "kind": "deleted",
+            "version": 2
+          },
+          "phase": "first",
+          "expected": {
+            "kind": "reconnect",
+            "target": 3
+          }
+        },
+        {
+          "op": "decide",
+          "stream": "s1",
+          "current": {
+            "kind": "active",
+            "generation": 3
+          },
+          "phase": "after_write",
+          "expected": {
+            "kind": "publish",
+            "target": 3
+          }
+        },
+        {
+          "op": "decide",
+          "stream": "s2",
+          "current": {
+            "kind": "active",
+            "generation": 3
+          },
+          "phase": "first",
+          "expected": {
+            "kind": "publish",
+            "target": 3
+          }
+        },
+        {
+          "op": "checkpoint",
+          "target": 3,
+          "streams": {
+            "s1": {
+              "state": "committed",
+              "generation": 3,
+              "complete": true
+            },
+            "s2": {
+              "state": "noop",
+              "generation": 3,
+              "complete": true
+            }
+          },
+          "control": {
+            "kind": "active",
+            "generation": 3
+          },
+          "seedReceiptsPending": false,
+          "expected": {
+            "kind": "save",
+            "generation": 3
+          }
+        }
+      ]
+    },
+    {
+      "name": "offline run at g=1 against active(5)",
+      "start": {
+        "834ab4c2636bcdd5": {
+          "kind": "active",
+          "generation": 1
+        }
+      },
+      "ns": "834ab4c2636bcdd5",
+      "userConnect": false,
+      "full": false,
+      "steps": [
+        {
+          "op": "decide",
+          "current": {
+            "kind": "active",
+            "generation": 5
+          },
+          "phase": "first",
+          "expected": {
+            "kind": "discard",
+            "recollect": false,
+            "clearCheckpoints": true,
+            "restartFull": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "registry read behind the listing",
+      "start": {
+        "834ab4c2636bcdd5": {
+          "kind": "active",
+          "generation": 3
+        }
+      },
+      "ns": "834ab4c2636bcdd5",
+      "userConnect": false,
+      "full": false,
+      "steps": [
+        {
+          "op": "decide",
+          "current": {
+            "kind": "active",
+            "generation": 2
+          },
+          "phase": "first",
+          "expected": {
+            "kind": "reread"
+          }
+        },
+        {
+          "op": "decide",
+          "current": {
+            "kind": "active",
+            "generation": 3
+          },
+          "phase": "reread",
+          "expected": {
+            "kind": "publish",
+            "target": 3
+          }
+        }
+      ]
+    },
+    {
+      "name": "no listing in this app session",
+      "start": null,
+      "ns": "834ab4c2636bcdd5",
+      "userConnect": true,
+      "full": true,
+      "steps": [
+        {
+          "op": "decide",
+          "current": {
+            "kind": "active",
+            "generation": 1
+          },
+          "phase": "first",
+          "expected": {
+            "kind": "discard",
+            "recollect": true,
+            "clearCheckpoints": false,
+            "restartFull": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "no-op onto a complete:false base (ruling Q9)",
+      "description": "An old DELETE tombstoned s; another device published an empty complete:false head at g=1 and left. This device's incremental run finds nothing new: its parts equal the base and complete stays false, so it is a no-op. The no-op sets needsFull and saves no checkpoint. The next run is full, publishes complete:true, clears needsFull and saves the checkpoint.",
+      "start": {
+        "834ab4c2636bcdd5": {
+          "kind": "active",
+          "generation": 1
+        }
+      },
+      "ns": "834ab4c2636bcdd5",
+      "userConnect": false,
+      "full": false,
+      "needsFull": [],
+      "steps": [
+        {
+          "op": "noop",
+          "baseComplete": false,
+          "complete": false,
+          "expected": true
+        },
+        {
+          "op": "afterCommit",
+          "commit": {
+            "connector": "chatgpt",
+            "ns": "834ab4c2636bcdd5",
+            "stream": "s",
+            "complete": false,
+            "runFull": false
+          },
+          "expected": {
+            "needsFull": [
+              {
+                "connector": "chatgpt",
+                "ns": "834ab4c2636bcdd5",
+                "stream": "s"
+              }
+            ],
+            "clearCheckpoint": true
+          },
+          "mustBeFull": {
+            "chatgpt": true
+          }
+        },
+        {
+          "op": "checkpoint",
+          "target": 1,
+          "streams": {
+            "s": {
+              "state": "noop",
+              "generation": 1,
+              "complete": false
+            }
+          },
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "seedReceiptsPending": false,
+          "expected": {
+            "kind": "skip",
+            "reason": "published_incomplete"
+          }
+        },
+        {
+          "op": "afterCommit",
+          "commit": {
+            "connector": "chatgpt",
+            "ns": "834ab4c2636bcdd5",
+            "stream": "s",
+            "complete": true,
+            "runFull": true
+          },
+          "expected": {
+            "needsFull": [],
+            "clearCheckpoint": false
+          },
+          "mustBeFull": {
+            "chatgpt": false
+          }
+        },
+        {
+          "op": "checkpoint",
+          "target": 1,
+          "streams": {
+            "s": {
+              "state": "committed",
+              "generation": 1,
+              "complete": true
+            }
+          },
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "seedReceiptsPending": false,
+          "expected": {
+            "kind": "save",
+            "generation": 1
+          }
+        }
+      ]
+    }
+  ],
+  "checkpoint": [
+    {
+      "name": "all committed complete, control active(T)",
+      "target": 2,
+      "streams": {
+        "a": {
+          "state": "committed",
+          "generation": 2,
+          "complete": true
+        },
+        "b": {
+          "state": "noop",
+          "generation": 2,
+          "complete": true
+        }
+      },
+      "control": {
+        "kind": "active",
+        "generation": 2
+      },
+      "seedReceiptsPending": false,
+      "expected": {
+        "kind": "save",
+        "generation": 2
+      }
+    },
+    {
+      "name": "no-op of an incomplete head blocks (ruling Q9)",
+      "target": 2,
+      "streams": {
+        "a": {
+          "state": "noop",
+          "generation": 2,
+          "complete": false
+        }
+      },
+      "control": {
+        "kind": "active",
+        "generation": 2
+      },
+      "seedReceiptsPending": false,
+      "expected": {
+        "kind": "skip",
+        "reason": "published_incomplete"
+      }
+    },
+    {
+      "name": "a stream published complete:false",
+      "target": 2,
+      "streams": {
+        "a": {
+          "state": "committed",
+          "generation": 2,
+          "complete": true
+        },
+        "b": {
+          "state": "committed",
+          "generation": 2,
+          "complete": false
+        }
+      },
+      "control": {
+        "kind": "active",
+        "generation": 2
+      },
+      "seedReceiptsPending": false,
+      "expected": {
+        "kind": "skip",
+        "reason": "published_incomplete"
+      }
+    },
+    {
+      "name": "a stream still pending (e.g. bucket_too_large)",
+      "target": 2,
+      "streams": {
+        "a": {
+          "state": "committed",
+          "generation": 2,
+          "complete": true
+        },
+        "b": {
+          "state": "pending"
+        }
+      },
+      "control": {
+        "kind": "active",
+        "generation": 2
+      },
+      "seedReceiptsPending": false,
+      "expected": {
+        "kind": "skip",
+        "reason": "stream_not_committed"
+      }
+    },
+    {
+      "name": "a stream committed at another generation",
+      "target": 2,
+      "streams": {
+        "a": {
+          "state": "committed",
+          "generation": 2,
+          "complete": true
+        },
+        "b": {
+          "state": "committed",
+          "generation": 3,
+          "complete": true
+        }
+      },
+      "control": {
+        "kind": "active",
+        "generation": 2
+      },
+      "seedReceiptsPending": false,
+      "expected": {
+        "kind": "skip",
+        "reason": "stream_not_committed"
+      }
+    },
+    {
+      "name": "control changed after the last commit",
+      "target": 2,
+      "streams": {
+        "a": {
+          "state": "committed",
+          "generation": 2,
+          "complete": true
+        }
+      },
+      "control": {
+        "kind": "deleted",
+        "version": 3
+      },
+      "seedReceiptsPending": false,
+      "expected": {
+        "kind": "skip",
+        "reason": "control_changed"
+      }
+    },
+    {
+      "name": "control reconnected after the last commit",
+      "target": 2,
+      "streams": {
+        "a": {
+          "state": "committed",
+          "generation": 2,
+          "complete": true
+        }
+      },
+      "control": {
+        "kind": "active",
+        "generation": 4
+      },
+      "seedReceiptsPending": false,
+      "expected": {
+        "kind": "skip",
+        "reason": "control_changed"
+      }
+    },
+    {
+      "name": "seed receipts pending",
+      "target": 1,
+      "streams": {
+        "a": {
+          "state": "committed",
+          "generation": 1,
+          "complete": true
+        }
+      },
+      "control": {
+        "kind": "active",
+        "generation": 1
+      },
+      "seedReceiptsPending": true,
+      "expected": {
+        "kind": "skip",
+        "reason": "seed_receipts_pending"
+      }
+    }
+  ],
+  "needsFull": [
+    {
+      "name": "incomplete publish sets it; full complete run clears it",
+      "initial": [],
+      "steps": [
+        {
+          "commit": {
+            "connector": "chatgpt",
+            "ns": "834ab4c2636bcdd5",
+            "stream": "s1",
+            "complete": false,
+            "runFull": false
+          },
+          "needsFull": [
+            {
+              "connector": "chatgpt",
+              "ns": "834ab4c2636bcdd5",
+              "stream": "s1"
+            }
+          ],
+          "clearCheckpoint": true,
+          "mustBeFull": {
+            "chatgpt": true,
+            "spotify": false
+          }
+        },
+        {
+          "commit": {
+            "connector": "chatgpt",
+            "ns": "834ab4c2636bcdd5",
+            "stream": "s1",
+            "complete": true,
+            "runFull": true
+          },
+          "needsFull": [],
+          "clearCheckpoint": false,
+          "mustBeFull": {
+            "chatgpt": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "a non-full complete commit does not clear it",
+      "initial": [
+        {
+          "connector": "chatgpt",
+          "ns": "834ab4c2636bcdd5",
+          "stream": "s1"
+        }
+      ],
+      "steps": [
+        {
+          "commit": {
+            "connector": "chatgpt",
+            "ns": "834ab4c2636bcdd5",
+            "stream": "s1",
+            "complete": true,
+            "runFull": false
+          },
+          "needsFull": [
+            {
+              "connector": "chatgpt",
+              "ns": "834ab4c2636bcdd5",
+              "stream": "s1"
+            }
+          ],
+          "clearCheckpoint": false,
+          "mustBeFull": {
+            "chatgpt": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "setting twice keeps one entry; set stays sorted",
+      "initial": [
+        {
+          "connector": "chatgpt",
+          "ns": "834ab4c2636bcdd5",
+          "stream": "s2"
+        }
+      ],
+      "steps": [
+        {
+          "commit": {
+            "connector": "chatgpt",
+            "ns": "834ab4c2636bcdd5",
+            "stream": "s1",
+            "complete": false,
+            "runFull": true
+          },
+          "needsFull": [
+            {
+              "connector": "chatgpt",
+              "ns": "834ab4c2636bcdd5",
+              "stream": "s1"
+            },
+            {
+              "connector": "chatgpt",
+              "ns": "834ab4c2636bcdd5",
+              "stream": "s2"
+            }
+          ],
+          "clearCheckpoint": true,
+          "mustBeFull": {
+            "chatgpt": true
+          }
+        },
+        {
+          "commit": {
+            "connector": "chatgpt",
+            "ns": "834ab4c2636bcdd5",
+            "stream": "s1",
+            "complete": false,
+            "runFull": true
+          },
+          "needsFull": [
+            {
+              "connector": "chatgpt",
+              "ns": "834ab4c2636bcdd5",
+              "stream": "s1"
+            },
+            {
+              "connector": "chatgpt",
+              "ns": "834ab4c2636bcdd5",
+              "stream": "s2"
+            }
+          ],
+          "clearCheckpoint": true,
+          "mustBeFull": {
+            "chatgpt": true
+          }
+        },
+        {
+          "commit": {
+            "connector": "chatgpt",
+            "ns": "834ab4c2636bcdd5",
+            "stream": "s2",
+            "complete": true,
+            "runFull": true
+          },
+          "needsFull": [
+            {
+              "connector": "chatgpt",
+              "ns": "834ab4c2636bcdd5",
+              "stream": "s1"
+            }
+          ],
+          "clearCheckpoint": false,
+          "mustBeFull": {
+            "chatgpt": true
+          }
+        },
+        {
+          "commit": {
+            "connector": "chatgpt",
+            "ns": "834ab4c2636bcdd5",
+            "stream": "s1",
+            "complete": true,
+            "runFull": true
+          },
+          "needsFull": [],
+          "clearCheckpoint": false,
+          "mustBeFull": {
+            "chatgpt": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "entries are per (connector, ns, stream)",
+      "initial": [
+        {
+          "connector": "chatgpt",
+          "ns": "c2ae18eeb7243a1a",
+          "stream": "s1"
+        }
+      ],
+      "steps": [
+        {
+          "commit": {
+            "connector": "chatgpt",
+            "ns": "834ab4c2636bcdd5",
+            "stream": "s1",
+            "complete": true,
+            "runFull": true
+          },
+          "needsFull": [
+            {
+              "connector": "chatgpt",
+              "ns": "c2ae18eeb7243a1a",
+              "stream": "s1"
+            }
+          ],
+          "clearCheckpoint": false,
+          "mustBeFull": {
+            "chatgpt": true
+          }
+        }
+      ]
+    }
+  ],
+  "eligible": [
+    {
+      "name": "complete view is served",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 10,
+          "streams": {
+            "s": {
+              "live": true,
+              "complete": true
+            }
+          }
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["s"]
+      },
+      "legacyFile": false,
+      "expected": {
+        "kind": "view",
+        "ns": "834ab4c2636bcdd5"
+      },
+      "ready": true
+    },
+    {
+      "name": "one-way: complete view beats a legacy file",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 10,
+          "streams": {
+            "s": {
+              "live": true,
+              "complete": true
+            }
+          }
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["s"]
+      },
+      "legacyFile": true,
+      "expected": {
+        "kind": "view",
+        "ns": "834ab4c2636bcdd5"
+      },
+      "ready": true
+    },
+    {
+      "name": "incomplete view falls back to legacy",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 10,
+          "streams": {
+            "s": {
+              "live": true,
+              "complete": false
+            }
+          }
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["s"]
+      },
+      "legacyFile": true,
+      "expected": {
+        "kind": "legacy"
+      },
+      "ready": true
+    },
+    {
+      "name": "join: one needed stream missing → legacy",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 10,
+          "streams": {
+            "a": {
+              "live": true,
+              "complete": true
+            }
+          }
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["a", "b"]
+      },
+      "legacyFile": true,
+      "expected": {
+        "kind": "legacy"
+      },
+      "ready": true
+    },
+    {
+      "name": "join: every needed stream live and complete",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 10,
+          "streams": {
+            "a": {
+              "live": true,
+              "complete": true
+            },
+            "b": {
+              "live": true,
+              "complete": true
+            }
+          }
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["a", "b"]
+      },
+      "legacyFile": true,
+      "expected": {
+        "kind": "view",
+        "ns": "834ab4c2636bcdd5"
+      },
+      "ready": true
+    },
+    {
+      "name": "not live (old generation head) → legacy",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "active",
+            "generation": 2
+          },
+          "latestHeadRegistration": 10,
+          "streams": {
+            "s": {
+              "live": false,
+              "complete": true
+            }
+          }
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["s"]
+      },
+      "legacyFile": true,
+      "expected": {
+        "kind": "legacy"
+      },
+      "ready": true
+    },
+    {
+      "name": "deleted connection suppresses legacy",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "deleted",
+            "version": 2
+          },
+          "latestHeadRegistration": null,
+          "streams": {}
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["s"]
+      },
+      "legacyFile": true,
+      "expected": {
+        "kind": "unavailable",
+        "reason": "deleted"
+      },
+      "ready": false
+    },
+    {
+      "name": "deleted account B suppresses legacy while live A is incomplete",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 10,
+          "streams": {
+            "s": {
+              "live": true,
+              "complete": false
+            }
+          }
+        },
+        {
+          "ns": "c2ae18eeb7243a1a",
+          "control": {
+            "kind": "deleted",
+            "version": 2
+          },
+          "latestHeadRegistration": null,
+          "streams": {}
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["s"]
+      },
+      "legacyFile": true,
+      "expected": {
+        "kind": "unavailable",
+        "reason": "deleted"
+      },
+      "ready": false
+    },
+    {
+      "name": "deleted account B does not hide live complete A",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 10,
+          "streams": {
+            "s": {
+              "live": true,
+              "complete": true
+            }
+          }
+        },
+        {
+          "ns": "c2ae18eeb7243a1a",
+          "control": {
+            "kind": "deleted",
+            "version": 2
+          },
+          "latestHeadRegistration": null,
+          "streams": {}
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["s"]
+      },
+      "legacyFile": true,
+      "expected": {
+        "kind": "view",
+        "ns": "834ab4c2636bcdd5"
+      },
+      "ready": true
+    },
+    {
+      "name": "reconnected connection no longer suppresses",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "active",
+            "generation": 3
+          },
+          "latestHeadRegistration": null,
+          "streams": {}
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["s"]
+      },
+      "legacyFile": true,
+      "expected": {
+        "kind": "legacy"
+      },
+      "ready": true
+    },
+    {
+      "name": "nothing at all",
+      "connections": [],
+      "target": {
+        "kind": "logical",
+        "streams": ["s"]
+      },
+      "legacyFile": false,
+      "expected": {
+        "kind": "unavailable",
+        "reason": "no_data"
+      },
+      "ready": false
+    },
+    {
+      "name": "legacy only",
+      "connections": [],
+      "target": {
+        "kind": "logical",
+        "streams": ["s"]
+      },
+      "legacyFile": true,
+      "expected": {
+        "kind": "legacy"
+      },
+      "ready": true
+    },
+    {
+      "name": "most recently registered connection is selected",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 10,
+          "streams": {
+            "s": {
+              "live": true,
+              "complete": true
+            }
+          }
+        },
+        {
+          "ns": "c2ae18eeb7243a1a",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 20,
+          "streams": {
+            "s": {
+              "live": true,
+              "complete": true
+            }
+          }
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["s"]
+      },
+      "legacyFile": false,
+      "expected": {
+        "kind": "view",
+        "ns": "c2ae18eeb7243a1a"
+      },
+      "ready": true
+    },
+    {
+      "name": "selected connection incomplete: no fall-through to another connection",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 10,
+          "streams": {
+            "s": {
+              "live": true,
+              "complete": true
+            }
+          }
+        },
+        {
+          "ns": "c2ae18eeb7243a1a",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 20,
+          "streams": {
+            "s": {
+              "live": true,
+              "complete": false
+            }
+          }
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["s"]
+      },
+      "legacyFile": true,
+      "expected": {
+        "kind": "legacy"
+      },
+      "ready": true
+    },
+    {
+      "name": "foreign connection is never selected",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "foreign",
+            "version": 1
+          },
+          "latestHeadRegistration": 99,
+          "streams": {
+            "s": {
+              "live": true,
+              "complete": true
+            }
+          }
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["s"]
+      },
+      "legacyFile": true,
+      "expected": {
+        "kind": "legacy"
+      },
+      "ready": true
+    },
+    {
+      "name": "tie on registration: lowest ns",
+      "connections": [
+        {
+          "ns": "c2ae18eeb7243a1a",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 10,
+          "streams": {
+            "s": {
+              "live": true,
+              "complete": true
+            }
+          }
+        },
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 10,
+          "streams": {
+            "s": {
+              "live": true,
+              "complete": true
+            }
+          }
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["s"]
+      },
+      "legacyFile": false,
+      "expected": {
+        "kind": "view",
+        "ns": "834ab4c2636bcdd5"
+      },
+      "question": "Q6",
+      "ready": true
+    },
+    {
+      "name": "physical name selects its own connection",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 10,
+          "streams": {
+            "s": {
+              "live": true,
+              "complete": true
+            }
+          }
+        },
+        {
+          "ns": "c2ae18eeb7243a1a",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 20,
+          "streams": {
+            "s": {
+              "live": true,
+              "complete": true
+            }
+          }
+        }
+      ],
+      "target": {
+        "kind": "physical",
+        "ns": "834ab4c2636bcdd5",
+        "streams": ["s"]
+      },
+      "legacyFile": false,
+      "expected": {
+        "kind": "view",
+        "ns": "834ab4c2636bcdd5"
+      },
+      "ready": true
+    },
+    {
+      "name": "physical name of a deleted connection",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "deleted",
+            "version": 2
+          },
+          "latestHeadRegistration": null,
+          "streams": {}
+        }
+      ],
+      "target": {
+        "kind": "physical",
+        "ns": "834ab4c2636bcdd5",
+        "streams": ["s"]
+      },
+      "legacyFile": false,
+      "expected": {
+        "kind": "unavailable",
+        "reason": "deleted"
+      },
+      "ready": false
+    },
+    {
+      "name": "prototype names are not streams",
+      "connections": [
+        {
+          "ns": "834ab4c2636bcdd5",
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "latestHeadRegistration": 10,
+          "streams": {}
+        }
+      ],
+      "target": {
+        "kind": "logical",
+        "streams": ["constructor"]
+      },
+      "legacyFile": false,
+      "expected": {
+        "kind": "unavailable",
+        "reason": "no_data"
+      },
+      "ready": false
+    }
+  ]
+}

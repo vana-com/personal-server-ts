@@ -7,10 +7,22 @@ import { runVectors } from "./vectors.js";
 import { nodePorts } from "./test-support/ports.js";
 
 const vectors = JSON.parse(
-  readFileSync(new URL("../vectors/v1.json", import.meta.url), "utf8"),
+  readFileSync(new URL("../vectors/v2.json", import.meta.url), "utf8"),
 );
 
+// v1.json records the v1 truth (head format 4 is unsupported) for
+// implementations still on v1. It stays byte-for-byte frozen.
+const V1_SHA256 =
+  "a6423885d8d98c6e20ced252a2a2d44f2de7478ea06060758649dec543c78d1b";
+
 describe("vectors/v1.json", () => {
+  it("is frozen", () => {
+    const bytes = readFileSync(new URL("../vectors/v1.json", import.meta.url));
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe(V1_SHA256);
+  });
+});
+
+describe("vectors/v2.json", () => {
   it("passes every check with node:crypto and @noble/hashes ports", async () => {
     const report = await runVectors(vectors, nodePorts);
     expect(report.failures).toEqual([]);

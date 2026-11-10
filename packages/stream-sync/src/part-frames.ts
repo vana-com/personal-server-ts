@@ -297,7 +297,7 @@ const textDecoder = new TextDecoder();
 export async function* linesOfParts(
   sha256: Sha256,
   head: {
-    readonly format: 1 | 2 | 3;
+    readonly format: 1 | 2 | 3 | 4;
     readonly parts: readonly HeadPart[];
     readonly primaryKey: readonly string[];
   },
@@ -317,6 +317,11 @@ export async function* linesOfParts(
       }
     }
     return;
+  }
+  // Format 4 parts carry v3 envelopes; this v2 reader refuses them rather than
+  // misreading them. The v3 part reader lands with the first-seen wiring.
+  if (head.format === 4) {
+    throw new InvalidPartError("format 4 parts need the v3 frame reader");
   }
   for await (const frame of framesOfParts(sha256, head.parts, load, options)) {
     const pieces: Uint8Array[] = [];

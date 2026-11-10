@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- vectors are untyped JSON */
 /**
- * Conformance runner for `vectors/v1.json`. A host loads the JSON itself and
+ * Conformance runner for `vectors/v2.json`. A host loads the JSON itself and
  * passes its own crypto ports, so the same file checks this package and each
  * host's adapters (for example an HMAC port that keeps `K_ns` in a closure).
  * The runner does no I/O.
@@ -103,8 +103,8 @@ export async function runVectors(
     }
   };
 
-  if (vectors?.format !== "pdpp-stream-sync-vectors" || vectors.version !== 1) {
-    return { checks: 1, failures: ["not a version-1 stream-sync vector file"] };
+  if (vectors?.format !== "pdpp-stream-sync-vectors" || vectors.version !== 2) {
+    return { checks: 1, failures: ["not a version-2 stream-sync vector file"] };
   }
 
   // namespace

@@ -1,10 +1,10 @@
 /**
- * §2.5 head format 3, and the head rules of §2.4, §2.5, §2.6 and §2.7:
+ * §2.5 head format 4, and the head rules of §2.4, §2.5, §2.6 and §2.7:
  * liveness, base choice, the compatible-writer rule, `complete` and no-op.
  *
  * Clear head bytes are canonical JSON:
  *
- *   {"complete":bool,"connector":c,"format":3,"generation":"<dec>",
+ *   {"complete":bool,"connector":c,"format":4,"generation":"<dec>",
  *    "keyCheck":"<16 hex>","lastDeleteVersion":n,"ns":ns,"observedAt":<ms>,
  *    "parts":[{"bytes":n,"count":n,"hash":"<sha256>","prefix":"<bits>"}],
  *    "primaryKey":[...],"profile":{"key":<string|null>,"version":"<v>"},
@@ -30,12 +30,21 @@ import { headBlobName } from "./names.js";
 import type { HeadPart } from "./parts.js";
 import type { ControlState } from "./control.js";
 
-/** Writers emit fenced heads; readers also accept the pre-fence formats 1 and 2. */
+/**
+ * The format writers build new heads with. Readers and `encodeHead` already
+ * handle formats 1-4; this moves to 4 in the slice where the writer emits v3
+ * (first-seen) frames, because a format-4 head must carry v3 frames.
+ */
 export const HEAD_FORMAT = 3;
 /** Parts are NDJSON lines (§2.2). Readers still accept it; writers no longer write it. */
 export const HEAD_FORMAT_PREVIOUS = 1;
 
-export type HeadFormat = 1 | 2 | 3;
+export type HeadFormat = 1 | 2 | 3 | 4;
+
+/** Format 4 and later carry the first-seen checkpoint in each record frame. */
+export function framesCarryFirstSeen(format: number): boolean {
+  return format >= 4;
+}
 
 export interface HeadProfile {
   /** The legacy projector's profile key, or `null`. */
@@ -99,12 +108,12 @@ function headProblem(
   format: HeadFormat,
 ): string | null {
   const fields =
-    format === 3 ? [...HEAD_FIELDS, "lastDeleteVersion"].sort() : HEAD_FIELDS;
+    format >= 3 ? [...HEAD_FIELDS, "lastDeleteVersion"].sort() : HEAD_FIELDS;
   if (!exactKeys(value, fields)) {
     return `fields must be exactly: ${fields.join(", ")}`;
   }
   const v = value;
-  if (format === 3 && !isCount(v["lastDeleteVersion"], 0))
+  if (format >= 3 && !isCount(v["lastDeleteVersion"], 0))
     return "lastDeleteVersion must be a non-negative safe integer";
   if (typeof v["complete"] !== "boolean") return "complete must be a boolean";
   const connector = v["connector"];
@@ -209,7 +218,7 @@ function toWire(head: Head): Record<string, unknown> {
     connector: head.connector,
     format: head.format,
     generation: String(head.generation),
-    ...(head.format === 3 ? { lastDeleteVersion: head.lastDeleteVersion } : {}),
+    ...(head.format >= 3 ? { lastDeleteVersion: head.lastDeleteVersion } : {}),
     keyCheck: head.keyCheck,
     ns: head.ns,
     observedAt: head.observedAt,
@@ -226,12 +235,14 @@ function toWire(head: Head): Record<string, unknown> {
   };
 }
 
-/** Canonical clear head bytes. Throws on a head this package would reject. */
+/**
+ * Canonical head bytes in the format the head carries (1–4), so frozen
+ * older-format vectors re-encode byte for byte. Writers build new heads with
+ * `HEAD_FORMAT`.
+ */
 export function encodeHead(head: Head): Uint8Array {
-  if (head.format !== 1 && head.format !== 2 && head.format !== 3) {
-    throw new InvalidArgumentError(
-      "only format 1, 2 and 3 heads can be written",
-    );
+  if (![1, 2, 3, 4].includes(head.format)) {
+    throw new InvalidArgumentError(`unsupported head format: ${head.format}`);
   }
   if (!Number.isSafeInteger(head.generation) || head.generation < 1) {
     throw new InvalidArgumentError(
@@ -271,7 +282,7 @@ export type DecodedHead =
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 /**
- * Parse clear head bytes. Any `format` other than 1, 2 or 3 is `unsupported_format`.
+ * Parse clear head bytes. Formats outside 1–4 are `unsupported_format`.
  * A head must be canonical, so every host derives the same hash.
  */
 export function decodeHead(bytes: Uint8Array): DecodedHead {
@@ -292,7 +303,7 @@ export function decodeHead(bytes: Uint8Array): DecodedHead {
   if (!isPlainObject(parsed))
     return { kind: "malformed", reason: "head is not an object" };
   const format = hasOwn(parsed, "format") ? parsed["format"] : undefined;
-  if (format !== 1 && format !== 2 && format !== 3) {
+  if (format !== 1 && format !== 2 && format !== 3 && format !== 4) {
     return { kind: "unsupported_format", format };
   }
   const problem = headProblem(parsed, format);
@@ -311,7 +322,7 @@ export function decodeHead(bytes: Uint8Array): DecodedHead {
       connector: p["connector"] as string,
       format,
       generation: Number(p["generation"]),
-      ...(format === 3
+      ...(format >= 3
         ? { lastDeleteVersion: p["lastDeleteVersion"] as number }
         : {}),
       keyCheck: p["keyCheck"] as string,
