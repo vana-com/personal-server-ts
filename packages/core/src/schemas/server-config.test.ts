@@ -35,12 +35,12 @@ describe("ServerConfigSchema — streamSync.retireLegacy", () => {
 
   it("retire-legacy-explicit-true-only", () => {
     expect(
-      ServerConfigSchema.parse({ streamSync: { retireLegacy: true } }).streamSync
-        .retireLegacy,
+      ServerConfigSchema.parse({ streamSync: { retireLegacy: true } })
+        .streamSync.retireLegacy,
     ).toBe(true);
     expect(
-      ServerConfigSchema.parse({ streamSync: { retireLegacy: false } }).streamSync
-        .retireLegacy,
+      ServerConfigSchema.parse({ streamSync: { retireLegacy: false } })
+        .streamSync.retireLegacy,
     ).toBe(false);
 
     for (const retireLegacy of ["true", "false", "", 1, 0, null, {}, []]) {
