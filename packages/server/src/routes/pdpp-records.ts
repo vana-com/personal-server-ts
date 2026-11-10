@@ -868,6 +868,52 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       );
     }
 
+    const localQuery = localRecords();
+    if (localQuery) {
+      const names =
+        context.tokenKind === "owner"
+          ? deps.declarations.list().map((d) => d.name)
+          : (context.grant?.streams.map((s) => s.name) ?? []);
+      const data = [];
+      for (const stream of new Set(names)) {
+        const { declaration, ownerInstanceIds } = readDeclaration(
+          context,
+          stream,
+        );
+        const scope = resolveReadScope(context, stream, declaration);
+        let count = 0,
+          scanned = 0,
+          latest: number | null = null;
+        for (const instance of context.tokenKind === "owner"
+          ? ownerInstanceIds
+          : scope.instanceIds) {
+          for await (const row of localQuery.streamRecords(instance, stream)) {
+            if (++scanned > STREAM_COUNT_CAP) break;
+            const body = JSON.parse(row.body);
+            if (
+              !recordKeyWithinGrantResources(
+                row.recordKey,
+                scope.streamGrant,
+              ) ||
+              !recordWithinGrantTimeConstraint(body, scope.streamGrant)
+            )
+              continue;
+            count++;
+            latest = Math.max(latest ?? row.emittedAt, row.emittedAt);
+          }
+        }
+        data.push({
+          object: "stream",
+          name: stream,
+          record_count: scanned > STREAM_COUNT_CAP ? null : count,
+          last_updated: latest === null ? null : new Date(latest).toISOString(),
+        });
+      }
+      return c.json({ object: "list", data }, 200, {
+        "Request-Id": reqId,
+        "PDPP-Version": PDPP_VERSION,
+      });
+    }
     const streams = reads(context).listStreams(instanceIds);
 
     // A client token gets a closed projection: only the streams its grant

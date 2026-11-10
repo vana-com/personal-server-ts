@@ -1,3 +1,13 @@
+import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import { encodeCursor, decodeCursor } from "../storage/pdpp-records/cursor.js";
+import {
+  CursorExpiredError,
+  type ChangesSinceOptions,
+  type ChangesSincePage,
+  type PdppStoredRecord,
+} from "../storage/pdpp-records/types.js";
+import type { ConnectionLink } from "./connection-link.js";
+
 import type { SqlDriver } from "./driver.js";
 
 /** One stored record as reads see it. `emittedAt` is `stamp_o`. */
@@ -190,5 +200,186 @@ export function createRecordQuery(db: SqlDriver): RecordQuery {
         cursor = page[page.length - 1]!.pk_hash;
       }
     },
+  };
+}
+
+/** Frozen grant projections over the current table. Lost bodies expire the cursor;
+ * published older bodies remain owned by older-versions, never a local archive.
+ */
+export function createGrantHistory(db: SqlDriver, link: ConnectionLink) {
+  return async (
+    stream: string,
+    options: ChangesSinceOptions,
+  ): Promise<ChangesSincePage> => {
+    const instances = [...new Set(options.instanceIds)].sort();
+    const targets: { instance: string; id: string; generation: number }[] = [];
+    for (const instance of instances) {
+      const resolved = link(instance, stream);
+      if (!resolved) throw new CursorExpiredError();
+      const id = controlScope(resolved.connector, resolved.namespace);
+      const [row] = await db.query<{ generation: number }>(
+        `SELECT generation FROM connections WHERE connection_id=? AND control_state='active'
+        AND NOT EXISTS (SELECT 1 FROM delete_intents WHERE connector=connections.connector)`,
+        [id],
+      );
+      if (!row) throw new CursorExpiredError();
+      targets.push({ instance, id, generation: row.generation });
+    }
+    const [meta] = await db.query<{
+      owner: string;
+      network: string;
+      created_at: number;
+    }>("SELECT owner,network,created_at FROM db_meta WHERE id=1");
+    const signature = JSON.stringify([
+      meta,
+      stream,
+      targets,
+      options.fields?.slice().sort() ?? null,
+    ]);
+    const clock = async () => {
+      const [row] = await db.query<{
+        seq: number;
+        floor: number;
+      }>(`SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='record_changes'),0) AS seq,
+        COALESCE((SELECT MIN(seq)-1 FROM record_changes),(SELECT seq FROM sqlite_sequence WHERE name='record_changes'),0) AS floor`);
+      return row!;
+    };
+    const now = await clock();
+    let horizon = now.seq,
+      since: number | null = null,
+      offset = 0;
+    const token = options.cursor ?? options.changesSince;
+    if (token) {
+      let payload;
+      try {
+        payload = decodeCursor(token);
+      } catch {
+        throw new CursorExpiredError();
+      }
+      if (
+        payload.kind !== "changes_since" ||
+        payload.epoch !== "ps2-current" ||
+        payload.query !== signature ||
+        payload.stream !== stream
+      )
+        throw new CursorExpiredError();
+      const pinned = Number(payload.horizon);
+      if (
+        !Number.isSafeInteger(pinned) ||
+        pinned < now.floor ||
+        pinned > now.seq
+      )
+        throw new CursorExpiredError();
+      if (options.cursor) {
+        horizon = pinned;
+        since =
+          payload.sinceHorizon === null ? null : Number(payload.sinceHorizon);
+        offset = payload.offset;
+      } else since = pinned;
+      if (
+        !Number.isSafeInteger(offset) ||
+        offset < 0 ||
+        (since !== null &&
+          (!Number.isSafeInteger(since) ||
+            since < now.floor ||
+            since > horizon))
+      )
+        throw new CursorExpiredError();
+    }
+    const assertExact = async () => {
+      for (const target of targets) {
+        if (!link(target.instance, stream)) throw new CursorExpiredError();
+        const [state] = await db.query<{
+          generation: number;
+          control_state: string;
+        }>(
+          "SELECT generation,control_state FROM connections WHERE connection_id=?",
+          [target.id],
+        );
+        if (
+          !state ||
+          state.generation !== target.generation ||
+          state.control_state !== "active"
+        )
+          throw new CursorExpiredError();
+        // An overwrite or removal destroyed a body required at either frozen horizon.
+        const missing = await db.query<{ seq: number }>(
+          `SELECT later.seq FROM record_changes later WHERE later.connection_id=? AND later.stream=?
+          AND ((later.seq>? AND EXISTS (SELECT 1 FROM record_changes prior WHERE prior.connection_id=later.connection_id AND prior.stream=later.stream AND prior.pk_hash=later.pk_hash AND prior.seq<=?))
+          ${since === null ? "" : "OR (later.seq>? AND later.seq<=? AND EXISTS (SELECT 1 FROM record_changes prior WHERE prior.connection_id=later.connection_id AND prior.stream=later.stream AND prior.pk_hash=later.pk_hash AND prior.seq<=?))"}) LIMIT 1`,
+          since === null
+            ? [target.id, stream, horizon, horizon]
+            : [target.id, stream, horizon, horizon, since, horizon, since],
+        );
+        if (missing.length) throw new CursorExpiredError();
+      }
+    };
+    await assertExact();
+    const rows: PdppStoredRecord[] = [];
+    let visibleCount = 0;
+    const limit = Math.max(1, Math.min(100, options.limit));
+    for (const target of targets) {
+      let after = "";
+      for (;;) {
+        const current = await db.query<{
+          record_key: string;
+          body: string;
+          stamp_o: number;
+        }>(
+          `SELECT r.record_key,r.body,r.stamp_o FROM records r
+        WHERE r.connection_id=? AND r.stream=? AND r.record_key>? AND EXISTS (SELECT 1 FROM record_changes c WHERE c.connection_id=r.connection_id AND c.stream=r.stream AND c.pk_hash=r.pk_hash AND c.seq<=? ${since === null ? "" : "AND c.seq>?"})
+        AND NOT EXISTS (SELECT 1 FROM record_changes c WHERE c.connection_id=r.connection_id AND c.stream=r.stream AND c.pk_hash=r.pk_hash AND c.seq>?) ORDER BY r.record_key LIMIT 100`,
+          since === null
+            ? [target.id, stream, after, horizon, horizon]
+            : [target.id, stream, after, horizon, since, horizon],
+        );
+        for (const row of current) {
+          const value: PdppStoredRecord = {
+            instance: target.instance,
+            stream,
+            recordKey: row.record_key,
+            data: JSON.parse(row.body),
+            emittedAt: new Date(row.stamp_o).toISOString(),
+            version: 1,
+            deleted: false,
+          };
+          if (!options.isVisible || options.isVisible(value)) {
+            if (visibleCount++ >= offset && rows.length <= limit)
+              rows.push(value);
+          }
+        }
+        if (current.length < 100) break;
+        after = current.at(-1)!.record_key;
+      }
+    }
+    await assertExact();
+    rows.sort((a, b) =>
+      a.instance < b.instance
+        ? -1
+        : a.instance > b.instance
+          ? 1
+          : a.recordKey < b.recordKey
+            ? -1
+            : a.recordKey > b.recordKey
+              ? 1
+              : 0,
+    );
+    const data = rows.slice(0, limit),
+      hasMore = visibleCount > offset + limit;
+    const cursor = encodeCursor({
+      kind: "changes_since",
+      epoch: "ps2-current",
+      query: signature,
+      stream,
+      horizon: String(horizon),
+      sinceHorizon: since === null ? null : String(since),
+      offset: hasMore ? offset + limit : 0,
+      orderKey: "code-point",
+    });
+    return {
+      data,
+      hasMore,
+      ...(hasMore ? { nextCursor: cursor } : { nextChangesSince: cursor }),
+    };
   };
 }

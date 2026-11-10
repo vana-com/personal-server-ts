@@ -1,3 +1,4 @@
+import { createGrantHistory } from "./query.js";
 import {
   createLinkedRecordQuery,
   type ConnectionLink,
@@ -39,6 +40,7 @@ export interface LocalSync {
   readonly listing: LocalListing;
   readonly query: RecordQuery;
   recordsFor(link: ConnectionLink): RecordQuery;
+  changesFor(link: ConnectionLink): ReturnType<typeof createGrantHistory>;
   readonly history: LocalHistory;
   readonly olderVersions: OlderVersions;
   readonly blobs: BlobStore;
@@ -174,6 +176,7 @@ export function createLocalSync(
     listing: createLocalListing(listingDeps, () => olderVersions.counts()),
     query,
     recordsFor: (link) => createLinkedRecordQuery(deps.db, link),
+    changesFor: (link) => createGrantHistory(deps.db, link),
     history: createLocalHistory(deps, {
       olderVersionReads: options.olderVersionReads,
     }),

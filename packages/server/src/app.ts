@@ -1,3 +1,4 @@
+import { grantBlobStore } from "./localdb/grant-blobs.js";
 import type {
   LocalSync,
   LocalHistory,
@@ -567,6 +568,12 @@ export function createApp(deps: AppDeps): Hono {
         store: deps.pdpp.store,
         accountStorageMode,
         recordQuery,
+        recordHistory: localSync
+          ? async (stream, options) =>
+              (await localSync()).changesFor(
+                deps.pdpp?.connectionLink ?? (() => null),
+              )(stream, options)
+          : undefined,
         reads: deps.pdpp.reads,
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
@@ -611,6 +618,35 @@ export function createApp(deps: AppDeps): Hono {
       "/v1/blobs",
       pdppBlobsRoutes({
         store: deps.pdpp.store,
+        prepareReads: async (context, blobId) => {
+          const mode = accountStorageMode.read();
+          if (mode === "unknown")
+            throw new PdppError(
+              "ACCOUNT_MODE_UNKNOWN",
+              "Account mode is unavailable",
+            );
+          if (mode === "unswitched")
+            return deps.pdpp!.reads(
+              context.tokenKind === "owner" ? "owner" : "grant",
+            );
+          if (!localSync)
+            throw new PdppError(
+              "STREAM_READ_UNAVAILABLE",
+              "Database is unavailable",
+            );
+          const subject = context.subjectId ?? "";
+          return grantBlobStore({
+            local: await localSync(),
+            link: deps.pdpp!.connectionLink ?? (() => null),
+            context,
+            blobId,
+            declarations: deps.pdpp!.declarations,
+            ownerInstances: context.sourceId
+              ? (deps.pdpp!.instancesForSource?.(subject, context.sourceId) ??
+                [])
+              : (deps.pdpp!.instancesForSubject?.(subject) ?? []),
+          });
+        },
         reads: (reader) => {
           const mode = accountStorageMode.read();
           if (mode !== "unswitched")
