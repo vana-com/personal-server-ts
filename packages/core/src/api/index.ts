@@ -1,5 +1,6 @@
 import { isOwnAppRead } from "../payment/own-app.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
+import type { LocalHistory } from "../localdb/history.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import {
   DataDeletedError,
@@ -113,6 +114,7 @@ import {
   LegacyWriteRefusedError,
   refuseLegacyWrite,
 } from "./legacy-write-gate.js";
+import type { StorageModeRead } from "./owner-connector-delete.js";
 import { switchedDeleteRefusalResponse } from "./switched-delete-refusal.js";
 import type { LegacyWriteSeal } from "../storage/legacy-write-seal.js";
 import {
@@ -367,7 +369,14 @@ export interface PersonalServerDataApiDeps {
    * legacy write is refused with a retryable 503.
    */
   accountStorageMode?: OwnedAccountStorageMode;
+  /**
+   * The account's storage mode, sampled once per data request. Switched
+   * accounts read stream data from the database. Absent preserves the legacy path.
+   */
+  accountMode?: StorageModeRead;
   additions?: DurableAdditionsService;
+  /** Database history, constructed by the host for this owner and network. */
+  history?: LocalHistory;
   storage: DataStoragePort;
   /**
    * Latest bodies of connector scopes the owner collects into the canonical
@@ -2542,18 +2551,30 @@ export async function handlePersonalServerDataRequest(
       // The counts span every scope, so only the owner may read them.
       await deps.auth.authorizeOwner(request);
       const daysRaw = url.searchParams.get("days");
+      const timezone = url.searchParams.get("tz") ?? "UTC";
+      // Digits only: Number() would also accept "", "1e1", "0x7" and " 7".
+      const days =
+        daysRaw === null
+          ? 7
+          : /^\d{1,3}$/.test(daysRaw)
+            ? Number(daysRaw)
+            : Number.NaN;
+      if (deps.accountMode?.read(deps.serverOwner) === "switched") {
+        if (!deps.history) {
+          return errorResponse(
+            503,
+            "STREAM_SYNC_UNAVAILABLE",
+            "Local history is not available on this server.",
+          );
+        }
+        return jsonResponse(await deps.history.additions({ timezone, days }));
+      }
       const result = await summarizeDataAdditionsContract({
         additions: deps.additions,
         storage: deps.storage,
         isVisible: discoveryVisibility(deps),
-        timezone: url.searchParams.get("tz") ?? "UTC",
-        // Digits only: Number() would also accept "", "1e1", "0x7" and " 7".
-        days:
-          daysRaw === null
-            ? 7
-            : /^\d{1,3}$/.test(daysRaw)
-              ? Number(daysRaw)
-              : Number.NaN,
+        timezone,
+        days,
         now: (deps.now ?? (() => new Date()))(),
       });
       if ("ok" in result) return contractErrorResponse(result);
@@ -2670,6 +2691,32 @@ export async function handlePersonalServerDataRequest(
           requestedScope: scopeResult.scope,
         });
       }
+      if (deps.accountMode?.read(deps.serverOwner) === "switched") {
+        if (!scopeResult.ok) return contractErrorResponse(scopeResult);
+        if (!deps.history) {
+          return errorResponse(
+            503,
+            "STREAM_SYNC_UNAVAILABLE",
+            "Local history is not available on this server.",
+          );
+        }
+        const result = await deps.history.versions({
+          scope: scopeResult.scope,
+          limit: normalizeLimit(url.searchParams.get("limit"), 20),
+          offset: normalizeLimit(url.searchParams.get("offset"), 0),
+        });
+        if (!result.ok) {
+          if (result.reason === "deleted") {
+            throw new DataDeletedError({ scope: scopeResult.scope });
+          }
+          return errorResponse(
+            404,
+            "NOT_FOUND",
+            `Scope "${scopeResult.scope}" has no history`,
+          );
+        }
+        return jsonResponse(result.value);
+      }
       const result = await listDataVersionsContract({
         storage: deps.storage,
         scopeParam: decodePathPart(parts[0]),
@@ -2725,6 +2772,57 @@ export async function handlePersonalServerDataRequest(
         scope: scopeResult.scope,
         grantId: selectedGrantId(request, url),
       });
+      if (deps.accountMode?.read(deps.serverOwner) === "switched") {
+        resolveLineageGrantView(authResult);
+        const historyVersion =
+          version === undefined ? undefined : Number(version);
+        if (
+          historyVersion !== undefined &&
+          !Number.isSafeInteger(historyVersion)
+        ) {
+          return errorResponse(
+            400,
+            "INVALID_VERSION",
+            "version must be a safe positive decimal integer",
+          );
+        }
+        if (!deps.history) {
+          return errorResponse(
+            503,
+            "STREAM_SYNC_UNAVAILABLE",
+            "Local history is not available on this server.",
+          );
+        }
+        const result = await deps.history.lineage({
+          scope: scopeResult.scope,
+          version: historyVersion,
+        });
+        if (!result.ok) {
+          if (result.reason === "deleted") {
+            throw new DataDeletedError({ scope: scopeResult.scope });
+          }
+          return errorResponse(
+            404,
+            "NOT_FOUND",
+            `Scope "${scopeResult.scope}" has no history`,
+          );
+        }
+        await deps.accessLogWriter.write({
+          logId: deps.createLogId?.() ?? crypto.randomUUID(),
+          grantId: authResult?.grantId ?? "owner",
+          builder: authResult?.builder ?? "unknown",
+          action: "lineage",
+          scope: scopeResult.scope,
+          timestamp: (deps.now ?? (() => new Date()))().toISOString(),
+          ipAddress:
+            request.headers.get("x-forwarded-for") ??
+            request.headers.get("x-real-ip") ??
+            "unknown",
+          userAgent: request.headers.get("user-agent") ?? "unknown",
+        });
+        const { proof, ...data } = result.value;
+        return jsonResponse({ data, proof });
+      }
       if (!deps.serverOwner) {
         throw new ServerNotConfiguredError({
           reason: "serverOwner is required to resolve the data point id",
