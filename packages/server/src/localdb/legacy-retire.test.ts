@@ -317,7 +317,9 @@ describe("legacy retirement", () => {
       expect((await f.run()).deleted, change).toBe(0);
       expect(f.present(), change).not.toBeNull();
       expect(await f.states(), change).toEqual([{ state: "imported" }]);
-      expect(f.reports.at(-1)?.decision, change).toBe("changed");
+      expect(f.reports.at(-1)?.decision, change).toBe(
+        change === "replacement" ? "held" : "changed",
+      );
     }
   });
 
@@ -429,6 +431,9 @@ describe("legacy retirement", () => {
     expect(f.access.erase).toHaveBeenCalledTimes(1);
     expect(await f.states()).toEqual([{ state: "imported" }]);
     batch.mockRestore();
+    // The failed pre-crash transaction attempted a receipt write. Only new
+    // attempts below must refrain from writing retirement state.
+    vi.mocked(f.ledger.statements).mockClear();
 
     // A retained old identity may be replayed, but a replacement at its path
     // is not the erased copy. Even a fresh old-copy proof cannot erase it.
@@ -443,14 +448,20 @@ describe("legacy retirement", () => {
     expect(await f.states()).toEqual([{ state: "imported" }]);
     expect(f.reports.at(-1)).toEqual({
       file: f.copy.id,
-      decision: "changed",
-      reason: "copy-changed",
+      decision: "held",
+      reason: "erase-not-confirmed",
     });
 
     // Absence alone is not inferred from the boolean false result.
     f.replace(null);
     expect((await f.run()).deleted).toBe(0);
     expect(await f.states()).toEqual([{ state: "imported" }]);
+    expect(f.reports.at(-1)).toEqual({
+      file: f.copy.id,
+      decision: "held",
+      reason: "erase-not-confirmed",
+    });
+    expect(f.ledger.statements).not.toHaveBeenCalled();
   });
 
   it("retire-dry-run-flag-on-no-delete", async () => {

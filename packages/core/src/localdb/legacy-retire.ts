@@ -35,6 +35,11 @@ export interface LegacyRetireOptions {
  * a crash after erase may leave the receipt unretired. Generic ENOENT or
  * erase(false) is not proof of exact-copy absence. Without durable host intent,
  * leave this unknown; never erase a replacement to reconcile old state.
+ * import_ledger has no exact-copy erase intent (id/path/contentHash/revision).
+ * Its source receipt and free-text reason cannot stand in for such intent.
+ * An unconfirmed erase is reported held/erase-not-confirmed, never retired.
+ * Successful absence reconciliation requires a future durable intent contract;
+ * this implementation deliberately grants no authority from ENOENT alone.
  */
 export async function retireLegacyCopies(
   deps: LocalSyncDeps,
@@ -167,7 +172,7 @@ export async function retireLegacyCopies(
       // The storage adapter compares id/path/hash/revision under its own lock.
       // False is never treated as absence: a replacement must survive a retry.
       if (!(await access.erase(copy))) {
-        report("changed", "copy-changed");
+        report("held", "erase-not-confirmed");
         return;
       }
       // Erase first. Failure here leaves the receipt unretired, so recovery must
