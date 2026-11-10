@@ -124,3 +124,15 @@ it("a producer proof cannot replace rows from a server-restricted full run on ei
   expect(await b.keys()).toEqual(["new", "old"]);
   expect(await a.keys()).toEqual(["new", "old"]);
 });
+
+it("a proven full empty run removes stale rows on both devices", async () => {
+  const { a, b } = await world();
+  await a.run("seed", ["old"]);
+  await a.publish();
+  await b.sync.apply();
+  await a.run("empty", [], { proven: true });
+  await a.publish();
+  await b.sync.apply();
+  expect(await b.keys()).toEqual([]);
+  expect(await a.keys()).toEqual([]);
+});

@@ -224,7 +224,6 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           const replace =
             accepted &&
             full &&
-            stream.row_count > 0 &&
             decideReplace({
               stream: stream.stream,
               outcome: req.outcome,
