@@ -1,13 +1,12 @@
 import { readFileSync } from "node:fs";
 import { expect, it } from "vitest";
-import { LEGACY_SCOPE_BINDINGS } from "../../../core/src/legacy-projection/index.js";
-import { legacyConnectorKey } from "../../../core/src/storage/canonical-legacy-projection.js";
+import { importProjection } from "./sync.js";
 
 it("localdb fixtures contain no connector or legacy data-set names", () => {
   const forbidden = new Set(
-    [...LEGACY_SCOPE_BINDINGS].flatMap(([scope, binding]) => [
+    [...importProjection.bindings].flatMap(([scope, binding]) => [
       scope,
-      legacyConnectorKey(binding.pdppSource),
+      binding.connector,
     ]),
   );
   for (const name of [

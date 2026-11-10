@@ -74,6 +74,33 @@ export interface ProjectionProof {
   readonly pass: boolean;
 }
 
+/** The host supplies the frozen compatibility catalogue. Database modules
+ * treat names as opaque and never discover or import connector projections. */
+export interface ImportProjectionBinding {
+  readonly connector: string;
+  readonly streams: readonly string[];
+  readonly primaryKey: Readonly<Record<string, readonly string[]>>;
+  readonly rowOrder?: "arrival";
+}
+export interface ImportProjectionRecord {
+  readonly stream: string;
+  readonly data: Record<string, unknown>;
+}
+export interface ImportProjectionPort {
+  readonly bindings: ReadonlyMap<string, ImportProjectionBinding>;
+  /** Null means unavailable, incomplete or lossy. The host delegates to its
+   * existing projector; neither binding rules nor omission policy live here. */
+  project(
+    dataSet: string,
+    records: readonly ImportProjectionRecord[],
+    options: {
+      fetchedStreams: string[];
+      now: string;
+      orderByPrimaryKey: true;
+    },
+  ): Record<string, unknown> | null;
+}
+
 /** Fresh read-back of a source revision and optionally one exact local copy. F.2. */
 export interface ImportReadback {
   readonly receipt: ImportReceipt | null;

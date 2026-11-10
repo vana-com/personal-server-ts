@@ -1,4 +1,4 @@
-import "./legacy-projection.test-utils.js";
+import { fixtureProjections } from "./import-projection.test-utils.js";
 import {
   createImportProjectionReader,
   readBackLegacyImport,
@@ -38,7 +38,7 @@ import type {
 } from "../../../core/src/storage/legacy-write-seal.js";
 import type { DeclarationSnapshot } from "../../../core/src/pdpp/types.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
-import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
+import type { ImportProjectionDeps } from "../../../core/src/localdb/import-readback.js";
 import type {
   ImportSource,
   LegacyRetireFileReport,
@@ -145,6 +145,7 @@ async function fixture() {
     incremental: true,
   };
   const options = {
+    importProjection: fixtureProjections,
     db,
     owner: "0xabc",
     network: "test",
@@ -316,7 +317,8 @@ it.each(["after-unlink", "before-receipt"])(
       throw new Error("unexpected external call");
     };
     let op = 0;
-    const deps: LocalSyncDeps = {
+    const deps: ImportProjectionDeps = {
+      importProjection: fixtureProjections,
       db: f.local,
       queue: connectionQueue(),
       ownerAddress: "0xabc",

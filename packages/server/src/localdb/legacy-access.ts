@@ -3,8 +3,6 @@ import { constants } from "node:fs";
 import { open, opendir, lstat, realpath, unlink } from "node:fs/promises";
 import { resolve, join, relative, dirname, sep } from "node:path";
 import { canonicalJson } from "@opendatalabs/personal-server-ts-stream-sync";
-import { LEGACY_SCOPE_BINDINGS } from "@opendatalabs/personal-server-ts-core/legacy-projection";
-import { legacyConnectorKey } from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 import { retireReplication } from "../storage/pdpp-replication-door.js";
 import { openRecordStore } from "../pdpp/records-bootstrap.js";
@@ -22,10 +20,12 @@ import type {
   LegacyCopy,
   ImportTarget,
   LegacyEraseLedger,
+  ImportProjectionPort,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 
 /** F.4: scoped to the verified switched owner and the same local database/network. */
 export interface LegacyAccessOptions {
+  readonly importProjection: ImportProjectionPort;
   /** Borrowed native handle for root/index.db, NOT LocalSyncDeps.db. */
   readonly db: Database;
   readonly eraseLedger: LegacyEraseLedger;
@@ -357,7 +357,7 @@ export async function openLegacyAccess(
     const dataSet =
       entry?.scope ??
       (typeof envelope?.scope === "string" ? envelope.scope : "");
-    const binding = LEGACY_SCOPE_BINDINGS.get(dataSet);
+    const binding = options.importProjection.bindings.get(dataSet);
     const dependencies: LegacyCopy["sources"][number][] = [];
     let excluded = false;
     if (entry && binding) {
@@ -366,9 +366,8 @@ export async function openLegacyAccess(
       for await (const candidate of sources()) {
         if (
           !("kind" in candidate) &&
-          candidate.target.connector ===
-            legacyConnectorKey(binding.pdppSource) &&
-          binding.pdppStreams.includes(candidate.target.stream)
+          candidate.target.connector === binding.connector &&
+          binding.streams.includes(candidate.target.stream)
         ) {
           if (
             selected.some((s) => s.target.stream === candidate.target.stream)
@@ -383,7 +382,7 @@ export async function openLegacyAccess(
       for await (const candidate of sources())
         if ("kind" in candidate && identities.has(candidate.source))
           excluded = true;
-      for (const stream of binding.pdppStreams) {
+      for (const stream of binding.streams) {
         const matches = selected.filter((s) => s.target.stream === stream);
         if (matches.length !== 1) {
           excluded = true;

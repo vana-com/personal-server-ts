@@ -1,4 +1,4 @@
-import "./legacy-projection.test-utils.js";
+import { fixtureProjections } from "./import-projection.test-utils.js";
 import { createHash } from "node:crypto";
 import {
   mkdtempSync,
@@ -25,7 +25,7 @@ import {
   createImportProjectionReader,
 } from "../../../core/src/localdb/import-readback.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
-import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
+import type { ImportProjectionDeps } from "../../../core/src/localdb/import-readback.js";
 const dirs: string[] = [];
 const dbs: SqlDriver[] = [];
 afterEach(async () => {
@@ -258,7 +258,8 @@ it("upload-d6-p7-close-reopen-readback", async () => {
     throw new Error("unexpected external call");
   };
   let op = 0;
-  const deps: LocalSyncDeps = {
+  const deps: ImportProjectionDeps = {
+    importProjection: fixtureProjections,
     db,
     queue: connectionQueue(),
     ownerAddress: "0xabc",

@@ -1,3 +1,4 @@
+import { importProjection } from "./sync.js";
 import { afterEach, expect, it } from "vitest";
 import { mkdtempSync, mkdirSync, cpSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -62,6 +63,7 @@ it.each([false, true])(
       owner: "0xabc",
       network: "test",
       declarations: [],
+      importProjection,
       isSwitched: async () => true,
       isQuiescent: async () => true,
       verifyBinding: async () => true,

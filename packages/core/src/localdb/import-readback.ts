@@ -4,12 +4,6 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
-import {
-  LEGACY_SCOPE_BINDINGS,
-  projectPdppRecordsToLegacyPayload,
-  type PdppRecord,
-} from "../legacy-projection/index.js";
-import { legacyConnectorKey } from "../storage/canonical-legacy-projection.js";
 import { importFingerprint } from "./import-fingerprint.js";
 import { createImportLedger } from "./import-ledger.js";
 import {
@@ -26,7 +20,13 @@ import type {
   ProjectionProof,
   CopyRecords,
   ImportFingerprint,
+  ImportProjectionPort,
+  ImportProjectionRecord,
 } from "./legacy-import-types.js";
+
+export type ImportProjectionDeps = LocalSyncDeps & {
+  readonly importProjection: ImportProjectionPort;
+};
 
 export interface ImportProjectionReader {
   /** Every applicable frozen binding, including held/unsupported bindings. */
@@ -40,7 +40,7 @@ export interface ImportProjectionReader {
  * durable proof writes. Source and actual SQL rows are independently staged;
  * actual bodies, keys and hashes are validated, not trusted as cached hashes. */
 export async function readBackLegacyImport(
-  deps: LocalSyncDeps,
+  deps: ImportProjectionDeps,
   source: ImportSource,
   projections: ImportProjectionReader,
   copy: LegacyCopy | null,
@@ -93,7 +93,9 @@ export async function readBackLegacyImport(
     )
       return result("record_mismatch");
     proofs = await projections.compare(source, copy);
-    const names = applicable(source).map(([name]) => name);
+    const names = applicable(deps.importProjection, source).map(
+      ([name]) => name,
+    );
     if (
       !names.length ||
       proofs.length !== names.length ||
@@ -159,11 +161,11 @@ export async function readBackLegacyImport(
 function sameFingerprint(a: ImportFingerprint, b: ImportFingerprint) {
   return a.rows === b.rows && a.fingerprint === b.fingerprint;
 }
-function applicable(source: ImportSource) {
-  return [...LEGACY_SCOPE_BINDINGS].filter(
+function applicable(projection: ImportProjectionPort, source: ImportSource) {
+  return [...projection.bindings].filter(
     ([, binding]) =>
-      legacyConnectorKey(binding.pdppSource) === source.target.connector &&
-      binding.pdppStreams.includes(source.target.stream),
+      binding.connector === source.target.connector &&
+      binding.streams.includes(source.target.stream),
   );
 }
 function databaseSource(
@@ -208,7 +210,7 @@ function databaseSource(
  * and blob-backed content lack evidence at this port and remain held.
  * sourcesFor supplies immutable peers, never expected values from SQL. */
 export function createImportProjectionReader(
-  deps: LocalSyncDeps,
+  deps: ImportProjectionDeps,
   projectionTime: string,
   sourcesFor: (source: ImportSource) => AsyncIterable<ImportSource>,
   copyRecords?: CopyRecords,
@@ -218,7 +220,12 @@ export function createImportProjectionReader(
       if (copy && !copyRecords) throw new Error("copy_unreadable");
       if (copy && !copyIdentityMatches(copy, source))
         throw new Error("copy_changed");
-      if (copy && !applicable(source).some(([name]) => name === copy.dataSet))
+      if (
+        copy &&
+        !applicable(deps.importProjection, source).some(
+          ([name]) => name === copy.dataSet,
+        )
+      )
         throw new Error("copy_uncovered");
       const peers: ImportSource[] = [];
       for await (const peer of sourcesFor(source)) {
@@ -235,7 +242,7 @@ export function createImportProjectionReader(
         if (count !== 1) throw new Error("copy_unreadable");
       }
       const proofs: ProjectionProof[] = [];
-      for (const [name, binding] of applicable(source)) {
+      for (const [name, binding] of applicable(deps.importProjection, source)) {
         const failed: ProjectionProof = {
           dataSet: name,
           expectedHash: "",
@@ -247,7 +254,7 @@ export function createImportProjectionReader(
           continue;
         }
         const selected: ImportSource[] = [];
-        for (const stream of binding.pdppStreams) {
+        for (const stream of binding.streams) {
           const candidates = peers.filter(
             (p) =>
               p.target.stream === stream &&
@@ -263,7 +270,7 @@ export function createImportProjectionReader(
           if (candidates.length === 1) selected.push(candidates[0]!);
         }
         if (
-          selected.length !== binding.pdppStreams.length ||
+          selected.length !== binding.streams.length ||
           !selected.some(
             (p) =>
               p.source === source.source &&
@@ -283,8 +290,8 @@ export function createImportProjectionReader(
             continue;
           }
         }
-        const expected: PdppRecord[] = [];
-        const actual: PdppRecord[] = [];
+        const expected: ImportProjectionRecord[] = [];
+        const actual: ImportProjectionRecord[] = [];
         let bytes = 0;
         let unsupported = false;
         for (const peer of selected) {
@@ -307,25 +314,18 @@ export function createImportProjectionReader(
           continue;
         }
         const options = {
-          fetchedStreams: [...binding.pdppStreams],
+          fetchedStreams: [...binding.streams],
           now: projectionTime,
-          orderByPrimaryKey: true,
+          orderByPrimaryKey: true as const,
         };
-        const left = projectPdppRecordsToLegacyPayload(name, expected, options);
-        const right = projectPdppRecordsToLegacyPayload(name, actual, options);
-        if (
-          !left.ok ||
-          !right.ok ||
-          left.diagnostics?.length ||
-          right.diagnostics?.length ||
-          left.projectionOmissions?.length ||
-          right.projectionOmissions?.length
-        ) {
+        const left = deps.importProjection.project(name, expected, options);
+        const right = deps.importProjection.project(name, actual, options);
+        if (!left || !right) {
           proofs.push(failed);
           continue;
         }
-        const expectedHash = payloadHash(left.payload);
-        const actualHash = payloadHash(right.payload);
+        const expectedHash = payloadHash(left);
+        const actualHash = payloadHash(right);
         proofs.push({
           dataSet: name,
           expectedHash,

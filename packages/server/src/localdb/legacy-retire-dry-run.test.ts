@@ -1,3 +1,4 @@
+import { importProjection } from "./sync.js";
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import {
@@ -93,6 +94,7 @@ async function fixture(missing = false, createTemp = mkdtempSync) {
     owner: "0xabc",
     network: "test",
     declarations: [],
+    importProjection,
     isSwitched: async () => true,
     isQuiescent: async () => true,
     verifyBinding: async () => true,

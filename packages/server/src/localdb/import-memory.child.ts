@@ -1,3 +1,4 @@
+import { importProjection } from "./sync.js";
 import { join } from "node:path";
 import { createReadStream } from "node:fs";
 import {
@@ -132,6 +133,7 @@ export async function importMemoryWorkload(input: {
     memory.beforeSource = process.memoryUsage();
     if (native) {
       access = await openLegacyAccess({
+        importProjection,
         db: native,
         root: nativeRoot,
         owner: identity.owner,

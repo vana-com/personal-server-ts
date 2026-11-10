@@ -1,6 +1,9 @@
-import type * as LegacyProjection from "../../../core/src/legacy-projection/index.js";
-import "./legacy-projection.test-utils.js";
-import { afterEach, expect, it, vi } from "vitest";
+import {
+  fixtureBindings,
+  fixtureProjections,
+} from "./import-projection.test-utils.js";
+import { importProjection } from "./sync.js";
+import { afterEach, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
@@ -12,9 +15,7 @@ import {
   readBackLegacyImport,
   createImportProjectionReader,
 } from "../../../core/src/localdb/import-readback.js";
-import { LEGACY_SCOPE_BINDINGS } from "../../../core/src/legacy-projection/index.js";
-import { legacyConnectorKey } from "../../../core/src/storage/canonical-legacy-projection.js";
-import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
+import type { ImportProjectionDeps } from "../../../core/src/localdb/import-readback.js";
 import type {
   ImportSource,
   CopyRecords,
@@ -54,7 +55,8 @@ async function fixture(path = ":memory:") {
     throw new Error("unexpected external call");
   };
   let op = 0;
-  const deps: LocalSyncDeps = {
+  const deps: ImportProjectionDeps = {
+    importProjection: fixtureProjections,
     db,
     queue: connectionQueue(),
     ownerAddress: "0xabc",
@@ -221,54 +223,35 @@ it("readback-newer-different-row-holds", async () => {
 });
 it("readback-every-legacy-data-set", async () => {
   const f = await fixture();
-  const saved = [...LEGACY_SCOPE_BINDINGS];
-  const real = await vi.importActual<typeof LegacyProjection>(
-    "../../../core/src/legacy-projection/index.js",
-  );
-  const bindings = LEGACY_SCOPE_BINDINGS as Map<
-    string,
-    (typeof saved)[number][1]
-  >;
-  bindings.clear();
-  for (const [name, value] of real.LEGACY_SCOPE_BINDINGS)
-    bindings.set(name, value);
-  try {
-    for (const [name, binding] of LEGACY_SCOPE_BINDINGS) {
-      const source: ImportSource = {
-        ...f.source,
-        target: {
-          ...f.source.target,
-          connector: legacyConnectorKey(binding.pdppSource),
-          stream: binding.pdppStreams[0]!,
-          primaryKey: binding.primaryKey[binding.pdppStreams[0]!]!,
-        },
-        async *records() {},
-      };
-      const reader = createImportProjectionReader(
-        f.deps,
-        time,
-        async function* () {
-          yield source;
-        },
-      );
-      const results = await reader.compare(source, null);
-      expect(
-        results.some((p) => p.dataSet === name),
-        name,
-      ).toBe(true);
-      const names = [...LEGACY_SCOPE_BINDINGS]
-        .filter(
-          ([, b]) =>
-            legacyConnectorKey(b.pdppSource) === source.target.connector &&
-            b.pdppStreams.includes(source.target.stream),
-        )
-        .map(([n]) => n)
-        .sort();
-      expect(results.map((p) => p.dataSet).sort()).toEqual(names);
-    }
-  } finally {
-    bindings.clear();
-    for (const [name, value] of saved) bindings.set(name, value);
+  const deps = { ...f.deps, importProjection };
+  for (const [name, binding] of importProjection.bindings) {
+    const source: ImportSource = {
+      ...f.source,
+      target: {
+        ...f.source.target,
+        connector: binding.connector,
+        stream: binding.streams[0]!,
+        primaryKey: binding.primaryKey[binding.streams[0]!]!,
+      },
+      async *records() {},
+    };
+    const reader = createImportProjectionReader(deps, time, async function* () {
+      yield source;
+    });
+    const results = await reader.compare(source, null);
+    expect(
+      results.some((p) => p.dataSet === name),
+      name,
+    ).toBe(true);
+    const names = [...importProjection.bindings]
+      .filter(
+        ([, b]) =>
+          b.connector === source.target.connector &&
+          b.streams.includes(source.target.stream),
+      )
+      .map(([n]) => n)
+      .sort();
+    expect(results.map((p) => p.dataSet).sort()).toEqual(names);
   }
 });
 it("readback-fixed-projection-time", async () => {
@@ -406,14 +389,14 @@ it("readback-order-independent-and-equal-count-different-body-fails", async () =
 });
 it("readback-missing-joined-peer-holds", async () => {
   const f = await fixture();
-  for (const [name, binding] of LEGACY_SCOPE_BINDINGS) {
-    if (binding.pdppStreams.length < 2) continue;
-    const stream = binding.pdppStreams[0]!;
+  for (const [name, binding] of fixtureBindings) {
+    if (binding.streams.length < 2) continue;
+    const stream = binding.streams[0]!;
     const source: ImportSource = {
       ...f.source,
       target: {
         ...f.source.target,
-        connector: legacyConnectorKey(binding.pdppSource),
+        connector: binding.connector,
         stream,
         primaryKey: binding.primaryKey[stream]!,
       },
@@ -443,11 +426,11 @@ it("readback-missing-joined-peer-holds", async () => {
 });
 it("readback-arrival-evidence-is-the-only-missing-proof", async () => {
   const f = await fixture();
-  const [name, binding] = [...LEGACY_SCOPE_BINDINGS].find(
+  const [name, binding] = [...fixtureBindings].find(
     ([, value]) => value.rowOrder === "arrival",
   )!;
-  const stream = binding.pdppStreams[0]!;
-  const connector = legacyConnectorKey(binding.pdppSource);
+  const stream = binding.streams[0]!;
+  const connector = binding.connector;
   await f.db.batch([
     { sql: "UPDATE connections SET connector = ?", params: [connector] },
   ]);
