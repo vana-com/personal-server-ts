@@ -1097,8 +1097,11 @@ function relayReadScope(request: ParsedHttpRequest): string | undefined {
   const method = request.method.toUpperCase();
   if (method !== "GET" && method !== "HEAD") return undefined;
   if (!request.path.startsWith(DATA_PATH_PREFIX)) return undefined;
-  const segment = request.path.slice(DATA_PATH_PREFIX.length).split("/")[0];
-  if (!segment) return undefined;
+  // Only the data read itself (`/v1/data/<scope>`) counts. Sub-routes such as
+  // `/versions` and `/lineage` are metadata reads and would skew read rates.
+  const rest = request.path.slice(DATA_PATH_PREFIX.length).split("?")[0];
+  if (!rest || rest.includes("/")) return undefined;
+  const segment = rest;
   let scope: string;
   try {
     scope = decodeURIComponent(segment);
