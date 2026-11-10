@@ -174,7 +174,7 @@ describe("run end", () => {
             request(row.outcome, row.name === "checkpoint"),
           ),
           row.name,
-        ).toEqual({ result: row.expected });
+        ).toEqual({ result: row.expected, updateRequired: false });
       }
       expect(await db.query("SELECT state FROM runs"), row.name).toEqual([
         { state: "ended" },
@@ -213,7 +213,7 @@ describe("run end", () => {
         checkpointCandidate: { s: "C50" },
         lastBatch: 0,
       }),
-    ).toEqual({ result: "queued" });
+    ).toEqual({ result: "queued", updateRequired: false });
     const endBatch = batches.mock.calls.at(-1)![0];
     expect(
       endBatch.some((statement) =>
@@ -252,7 +252,7 @@ describe("run end", () => {
         checkpointCandidate: { s: "C60" },
         lastBatch: 0,
       }),
-    ).toEqual({ result: "queued" });
+    ).toEqual({ result: "queued", updateRequired: false });
     expect(await keys(db)).toEqual(
       Array.from({ length: 60 }, (_, index) => `r${index + 1}`),
     );
@@ -282,6 +282,7 @@ describe("run end", () => {
     await begin(db, "old-version", 1, 1);
     expect(await store.end("old-version", request("succeeded", true))).toEqual({
       result: "no_checkpoint",
+      updateRequired: true,
     });
     expect(await db.query("SELECT decision, reason FROM run_streams")).toEqual([
       { decision: "refused", reason: "connector_update_required" },

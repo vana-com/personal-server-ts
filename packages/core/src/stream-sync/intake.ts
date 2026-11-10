@@ -178,6 +178,8 @@ export interface EndRequest {
 export interface EndResponse {
   readonly result: EndResult;
   readonly stuck: boolean;
+  /** At least one stream was refused because this app needs an update. */
+  readonly updateRequired: boolean;
 }
 
 export interface RunIntake {
@@ -559,7 +561,11 @@ export class StreamSyncIntake implements RunIntake {
       case "failed":
       case "cancelled":
         await this.finishWithout(runId, run, req.outcome);
-        return { result: "aborted", stuck: await writer.stuck(run.connector) };
+        return {
+          result: "aborted",
+          stuck: await writer.stuck(run.connector),
+          updateRequired: false,
+        };
       case "retry_pending":
         for (const key of keys) {
           if (!run.decl.has(key))
@@ -584,7 +590,11 @@ export class StreamSyncIntake implements RunIntake {
       // Never reached the writer: count it for the stuck check and forget it.
       await writer.noteDropped(run.connector);
       this.forget(runId);
-      return { result: "discarded", stuck: await writer.stuck(run.connector) };
+      return {
+        result: "discarded",
+        stuck: await writer.stuck(run.connector),
+        updateRequired: false,
+      };
     }
 
     if (req.outcome === "retry_pending") {
@@ -602,6 +612,7 @@ export class StreamSyncIntake implements RunIntake {
               ? "no_checkpoint"
               : "discarded",
         stuck: await writer.stuck(run.connector),
+        updateRequired: false,
       };
     }
 
@@ -611,6 +622,7 @@ export class StreamSyncIntake implements RunIntake {
       return {
         result: "no_checkpoint",
         stuck: await writer.stuck(run.connector),
+        updateRequired: false,
       };
     }
     for (const name of covered) {
@@ -629,6 +641,7 @@ export class StreamSyncIntake implements RunIntake {
     return {
       result: status.phase === "ready" ? "queued" : "discarded",
       stuck: await writer.stuck(run.connector),
+      updateRequired: false,
     };
   }
 

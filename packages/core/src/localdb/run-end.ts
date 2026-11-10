@@ -5,7 +5,7 @@ import {
 import {
   RunIntakeError,
   type EndRequest,
-  type EndResult,
+  type EndResponse,
 } from "../stream-sync/intake.js";
 import {
   compareConnectorVersions,
@@ -27,8 +27,10 @@ import { decideReplace } from "./replace.js";
  * candidate stream); then the EndResult table. The result of `end` is
  * `EndResult`; `stuck` stays false until publish says otherwise.
  */
+type RunEndResponse = Pick<EndResponse, "result" | "updateRequired">;
+
 export interface RunEndStore {
-  end(runId: string, req: EndRequest): Promise<{ readonly result: EndResult }>;
+  end(runId: string, req: EndRequest): Promise<RunEndResponse>;
   abort(runId: string, reason: "failed" | "cancelled"): Promise<void>;
 }
 
@@ -73,7 +75,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
     return queue.run(
       binding.connection_id,
       "end",
-      async (): Promise<{ readonly result: EndResult }> => {
+      async (): Promise<RunEndResponse> => {
         // Re-read after acquiring the queue: an earlier end or delete may have won.
         const [run] = await db.query<Run>(
           "SELECT * FROM runs WHERE run_id = ?",
@@ -96,7 +98,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             },
             ...cleanup,
           ]);
-          return { result: "aborted" };
+          return { result: "aborted", updateRequired: false };
         }
         if (req.lastBatch !== run.last_batch) {
           throw new RunIntakeError(
@@ -127,7 +129,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             },
             ...cleanup,
           ]);
-          return { result: "discarded" };
+          return { result: "discarded", updateRequired: false };
         }
         const [connection] = await db.query<{
           connector: string;
@@ -154,6 +156,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         const statements: SqlStatement[] = [];
         const results: Record<string, StreamRunResult> = Object.create(null);
         let merged = false;
+        let updateRequired = false;
         const retry = req.outcome === "retry_pending";
         for (const stream of streams) {
           if (stream.local_primary_key === null) {
@@ -207,6 +210,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               seed: stream.seed,
             },
           );
+          updateRequired ||=
+            decision.kind === "refused" &&
+            decision.reason === "connector_update_required";
           const accepted = decision.kind !== "refused";
           const replace =
             accepted &&
@@ -321,6 +327,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             : saved
               ? "checkpoint_only"
               : "no_checkpoint",
+          updateRequired,
         };
       },
     );
