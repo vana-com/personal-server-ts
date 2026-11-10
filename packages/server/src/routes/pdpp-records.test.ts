@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import {
   createRecordQuery,
+  openLocalDb,
   type SqlDriver,
   type SqlValue,
 } from "@opendatalabs/personal-server-ts-core/localdb";
@@ -45,19 +46,39 @@ describe("PS-2 D.8 local record routes", () => {
   it("reads keys and stamps through RecordQuery, expires old changes, and refuses switched writes", async () => {
     const db = new Database(":memory:");
     try {
-      db.exec(`
-        CREATE TABLE records (
-          connection_id TEXT, stream TEXT, record_key TEXT, pk_hash TEXT,
-          body TEXT, stamp_o INTEGER
-        );
-        CREATE TABLE record_changes (
-          seq INTEGER PRIMARY KEY AUTOINCREMENT,
-          connection_id TEXT, stream TEXT, record_key TEXT, pk_hash TEXT, op TEXT
-        );
-      `);
+      const driver: SqlDriver = {
+        info: { sqliteVersion: "3.22.0", host: "node", persistent: false },
+        async query<R extends Record<string, SqlValue>>(
+          sql: string,
+          params: readonly SqlValue[] = [],
+        ) {
+          const stmt = db.prepare(sql);
+          if (stmt.reader) return stmt.all(...params) as R[];
+          stmt.run(...params);
+          return [];
+        },
+        async batch(statements) {
+          return db.transaction(() => ({
+            changes: statements.map(({ sql, params = [] }) => {
+              const stmt = db.prepare(sql);
+              return stmt.reader
+                ? (stmt.all(...params), 0)
+                : stmt.run(...params).changes;
+            }),
+          }))();
+        },
+        async close() {
+          db.close();
+        },
+      };
+      await openLocalDb(driver, {
+        owner: "0xowner",
+        network: "test",
+        deviceId: "record-route",
+      });
       const stamp = Date.parse("2026-09-02T00:00:00Z");
       const insert = db.prepare(
-        "INSERT INTO records VALUES (?, 'playlists', ?, ?, ?, ?)",
+        "INSERT INTO records(connection_id,stream,record_key,pk_hash,body,stamp_o,stamp_r,body_sha256) VALUES (?, 'playlists', ?, ?, ?, ?, 'fixture', 'fixture')",
       );
       for (const [key, time] of [
         ["b", stamp],
@@ -71,29 +92,7 @@ describe("PS-2 D.8 local record routes", () => {
           JSON.stringify({ id: key, name: key, private_field: "hidden" }),
           time,
         );
-        db.prepare(
-          "INSERT INTO record_changes(connection_id, stream, record_key, pk_hash, op) VALUES (?, 'playlists', ?, ?, 'upsert')",
-        ).run("inst_1", key, key);
       }
-      const driver: SqlDriver = {
-        info: { sqliteVersion: "3.22.0", host: "node", persistent: false },
-        async query<R extends Record<string, SqlValue>>(
-          sql: string,
-          params: readonly SqlValue[] = [],
-        ) {
-          return db.prepare(sql).all(...params) as R[];
-        },
-        async batch(statements) {
-          return db.transaction(() => ({
-            changes: statements.map(
-              ({ sql, params = [] }) => db.prepare(sql).run(...params).changes,
-            ),
-          }))();
-        },
-        async close() {
-          db.close();
-        },
-      };
       const recordQuery = createRecordQuery(driver);
       const listRecords = vi.spyOn(recordQuery, "listRecords");
       const getRecord = vi.spyOn(recordQuery, "getRecord");
@@ -205,7 +204,7 @@ describe("PS-2 D.8 local record routes", () => {
         (await rest.json()).data.map((row: { id: string }) => row.id),
       ).toEqual(["c"]);
       db.prepare(
-        "INSERT INTO record_changes(connection_id, stream, record_key, pk_hash, op) VALUES ('inst_1', 'playlists', 'removed', 'removed', 'remove')",
+        "INSERT INTO record_changes(connection_id, stream, record_key, pk_hash, op, stamp_o, stamp_r, origin) VALUES ('inst_1', 'playlists', 'removed', 'removed', 'remove', 0, 'fixture', 'local')",
       ).run();
       const removal = await app.request(path + "?changes_since=3", { headers });
       const removed = (await removal.json()).data[0];
