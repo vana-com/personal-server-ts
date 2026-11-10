@@ -13,9 +13,10 @@ it("database path names no connector", () => {
     .map((entry) => entry.name)
     .sort();
 
-  expect(sourceFiles.length, "localdb source files must be present").toBeGreaterThan(
-    0,
-  );
+  expect(
+    sourceFiles.length,
+    "localdb source files must be present",
+  ).toBeGreaterThan(0);
 
   const forbiddenModules = [
     "legacy-projection",

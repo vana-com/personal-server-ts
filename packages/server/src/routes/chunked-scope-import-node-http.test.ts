@@ -30,7 +30,7 @@ import { dataRoutes } from "./data.js";
 import { SCOPE_IMPORT_CHUNK_BYTES } from "./chunked-scope-import.js";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const actual = await importOriginal<typeof fs>();
   return {
     ...actual,
     stat: vi.fn(actual.stat),
@@ -307,10 +307,7 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
       const released = new Promise<void>((resolve) => {
         releaseIo = resolve;
       });
-      const actualFs =
-        await vi.importActual<typeof import("node:fs/promises")>(
-          "node:fs/promises",
-        );
+      const actualFs = await vi.importActual<typeof fs>("node:fs/promises");
       let pending: Promise<{ status: number; body: string }> | undefined;
       try {
         const begin = await sendHttp(address.port, {
