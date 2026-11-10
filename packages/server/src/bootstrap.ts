@@ -1,3 +1,15 @@
+import {
+  localDatabaseName,
+  openLocalDb,
+  connectionQueue,
+  type LocalSync,
+  type SqlDriver,
+} from "@opendatalabs/personal-server-ts-core/localdb";
+import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
+import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
+import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import { createServerLocalSync } from "./localdb/sync.js";
+import { openBetterSqlite3 } from "./localdb/better-sqlite3-driver.js";
 import type { DurableAdditionsOptions } from "@opendatalabs/personal-server-ts-core/additions";
 import {
   createDurableAdditions,
@@ -115,12 +127,6 @@ import {
   resolveReplication,
 } from "./pdpp/records-bootstrap.js";
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
-import {
-  createStorageBlobReader,
-  createStreamSyncReadKeys,
-  StreamSyncReadService,
-} from "@opendatalabs/personal-server-ts-core/stream-sync-read";
-import { createFsStreamSyncReadFiles } from "./stream-sync-read/fs-files.js";
 import { createReplicationNetworkPorts } from "@opendatalabs/personal-server-ts-core/replication/host-ports";
 import {
   createNodeReplication,
@@ -144,10 +150,8 @@ import {
 } from "./storage/node-data-storage.js";
 import { createSqliteQuestionStore } from "./storage/question-store.js";
 import {
-  StreamSyncWriter,
-  createWriterOverlaySource,
-  createStreamSyncIntake,
-  type StreamSyncIntake,
+  type StreamSyncWriter,
+  type RunIntake,
   type StreamSyncBlobs,
   type StreamSyncRegistry,
   createGatewayStreamSyncRegistry,
@@ -156,12 +160,7 @@ import {
   createStreamSyncKeyPorts,
   streamSyncNetwork,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
-import { openFsStreamSyncHome } from "./stream-sync/fs-home.js";
 import { eraseConnectorLeftovers } from "./stream-sync/erase-connector-leftovers.js";
-import {
-  createSeedStaging,
-  type SeedStaging,
-} from "./stream-sync/seed-staging.js";
 import {
   computeQuestion,
   createOpenAiCompatibleInferenceProvider,
@@ -188,6 +187,8 @@ export interface ServerContext {
   syncManager: SyncManager | null;
   /** Whole-file stream sync writer; `null` unless `streamSync.write` is on. */
   streamSyncWriter: StreamSyncWriter | null;
+  /** Owner/network database composition; absent for enclaves and unconfigured owners. */
+  getLocalSync?: () => Promise<LocalSync>;
   tunnelManager?: TunnelManager;
   tunnelUrl?: string;
   isServerRegistered: () => boolean;
@@ -806,13 +807,125 @@ async function bootstrapServer(
 
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
-  let streamSyncWriter: StreamSyncWriter | null = null;
-  let releaseStreamSyncHome: (() => Promise<void>) | null = null;
-  let streamSyncRead: StreamSyncReadService | undefined;
-  let streamSyncSeed: {
-    writer: StreamSyncWriter;
-    staging: SeedStaging;
-  } | null = null;
+  const streamSyncWriter: StreamSyncWriter | null = null;
+  const streamSyncSeed = null;
+  let backgroundClosed = false;
+  let localSync: LocalSync | undefined;
+  let localDb: SqlDriver | undefined;
+  let openingLocalSync: Promise<LocalSync> | undefined;
+  const accountStorageMode = accountStorageModeFor(
+    accountStorageModeOf(accountModeAuthority),
+    serverOwner,
+  );
+  function requireStreamMode() {
+    if (backgroundClosed)
+      throw new ProtocolError(
+        503,
+        "STREAM_READ_UNAVAILABLE",
+        "Stream sync is unavailable",
+      );
+    const mode = accountStorageMode.read();
+    if (mode === "unknown")
+      throw new ProtocolError(
+        503,
+        "ACCOUNT_MODE_UNKNOWN",
+        "Waiting for the account storage mode",
+      );
+    if (mode !== "switched")
+      throw new ProtocolError(
+        409,
+        "STREAM_SYNC_NOT_ENABLED",
+        "Stream sync is not enabled for this account",
+      );
+    if (
+      isEnclave ||
+      !masterKeySignature ||
+      !serverOwner ||
+      !serverAccount ||
+      !serverSigner
+    )
+      throw new ProtocolError(
+        503,
+        "STREAM_READ_UNAVAILABLE",
+        "Stream sync is unavailable on this server",
+      );
+  }
+  async function getLocalSync(): Promise<LocalSync> {
+    requireStreamMode();
+    if (localSync) return localSync;
+    openingLocalSync ??= (async () => {
+      const directory = join(storageRoot, "localdb");
+      await mkdir(directory, { recursive: true });
+      const network = streamSyncNetwork(config.gateway);
+      const driver = openBetterSqlite3(
+        join(
+          directory,
+          encodeURIComponent(localDatabaseName(serverOwner!, network)) +
+            ".sqlite",
+        ),
+      );
+      try {
+        await openLocalDb(driver, {
+          owner: serverOwner!,
+          network,
+          deviceId: serverAccount!.address,
+        });
+        const storage = createVanaSyncStorageAdapter({
+          config,
+          serverOwner: serverOwner!,
+          serverAccount: serverAccount!,
+          reads: "signed",
+        });
+        const facade = createServerLocalSync(
+          {
+            db: driver,
+            ownerAddress: serverOwner!,
+            queue: connectionQueue(),
+            registry:
+              options?.streamSyncRegistry ??
+              createGatewayStreamSyncRegistry({
+                gatewayUrl: config.gateway.url,
+                ownerAddress: serverOwner!,
+              }),
+            blobs:
+              options?.streamSyncBlobs ?? createStorageStreamSyncBlobs(storage),
+            keys: createStreamSyncKeyPorts(masterKeySignature!),
+            signer: serverSigner!,
+            logger,
+            now: Date.now,
+            newOp: randomUUID,
+          },
+          {
+            resolveArtifact: (digest) =>
+              manifestArtifactResolver(pdppAuth?.retainedManifests ?? [])(
+                digest,
+              ),
+            declaredStreams: options?.declaredStreams ?? (() => []),
+            retainedManifests: () => pdppAuth?.retainedManifests ?? [],
+            eraseLegacy: (connector) =>
+              eraseConnectorLeftovers(connector, {
+                storage: rawDataStorage,
+                pdpp: pdppConnections,
+              }),
+            olderVersionReads: () => config.olderVersionReads,
+          },
+        );
+        localDb = driver;
+        localSync = facade;
+        return facade;
+      } catch (error) {
+        await driver.close();
+        throw error;
+      }
+    })().finally(() => {
+      openingLocalSync = undefined;
+    });
+    const result = await openingLocalSync;
+    requireStreamMode();
+    return result;
+  }
+  const localSyncSource =
+    !isEnclave && serverOwner && masterKeySignature ? getLocalSync : undefined;
   /**
    * Late-bound PDPP importer.
    *
@@ -1064,86 +1177,10 @@ async function bootstrapServer(
       );
     }
 
-    // Whole-file stream sync publishes beside the legacy upload, only when
-    // `streamSync.write` is on. Legacy uploads run unchanged either way.
-    if (config.streamSync.write && !isEnclave) {
-      let writerForSeed: StreamSyncWriter | null = null;
-      const streamSyncHome = await openFsStreamSyncHome({
-        root: storageRoot,
-        ownerAddress: serverOwner,
-        network: streamSyncNetwork(config.gateway),
-      });
-      if (!streamSyncHome) {
-        logger.warn(
-          "Stream sync is off in this process: another process holds this owner's stream-sync storage",
-        );
-      } else {
-        releaseStreamSyncHome = () => streamSyncHome.close();
-        // Desktop seed intake (§2.9): retained rows staged by the seed route,
-        // kept in this owner's home so another owner never merges them.
-        // The receipts lookup binds late because the writer owns the receipts.
-        const seedStaging = createSeedStaging(streamSyncHome.seedFiles);
-        const seedSource = seedStaging.source(
-          await seedStaging.installId(),
-          async (connector) =>
-            writerForSeed
-              ? await writerForSeed.seedStatus(connector)
-              : { receipts: {}, skipped: [] },
-        );
-        streamSyncWriter = new StreamSyncWriter({
-          ownerAddress: serverOwner,
-          registry:
-            options?.streamSyncRegistry ??
-            createGatewayStreamSyncRegistry({
-              gatewayUrl: config.gateway.url,
-              ownerAddress: serverOwner,
-            }),
-          blobs:
-            options?.streamSyncBlobs ??
-            createStorageStreamSyncBlobs(storageAdapter),
-          home: streamSyncHome.home,
-          keys: createStreamSyncKeyPorts(masterKeySignature),
-          signer: serverSigner,
-          seed: seedSource,
-          // The writer unions these with the retained manifests below, read at
-          // delete time. Empty for a connector with neither: the delete of a
-          // connector that has registry rows then refuses
-          // (CONNECTOR_NOT_VERIFIED).
-          declaredStreams: options?.declaredStreams ?? (() => []),
-          retainedManifests: () => pdppAuth?.retainedManifests ?? [],
-          // A connection delete also erases this device's legacy leftovers of
-          // the connector: its scope files and its pdpp_records rows. Read
-          // when the delete runs, after this block has set `pdppConnections`.
-          eraseLegacy: (connector) =>
-            eraseConnectorLeftovers(connector, {
-              storage: rawDataStorage,
-              pdpp: pdppConnections,
-            }),
-        });
-        writerForSeed = streamSyncWriter;
-        streamSyncSeed = { writer: streamSyncWriter, staging: seedStaging };
-      }
-    }
-
-    // The read service opens after the writer, so an owner's own publications
-    // can overlay its reads and the reader can acknowledge what it installed.
-    if (config.streamSync.read) {
-      streamSyncRead = await StreamSyncReadService.open({
-        files: await createFsStreamSyncReadFiles(
-          join(storageRoot, "stream-sync-read"),
-        ),
-        blobs: createStorageBlobReader(storageAdapter),
-        keys: await createStreamSyncReadKeys(masterKey),
-        logger,
-        durable: true,
-        ...(streamSyncWriter
-          ? { overlay: createWriterOverlaySource(streamSyncWriter) }
-          : {}),
-      });
-    }
-
     const downloadDeps = {
-      streamSync: streamSyncRead,
+      ...(localSyncSource && {
+        localSync: { apply: async () => (await localSyncSource()).apply() },
+      }),
       storage: rawDataStorage,
       storageAdapter,
       gateway: gatewayClient,
@@ -1164,9 +1201,10 @@ async function bootstrapServer(
     };
 
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
-      streamSync: streamSyncWriter
-        ? { write: true, publisher: streamSyncWriter }
-        : null,
+      accountStorageMode,
+      ...(localSyncSource && {
+        localSync: { cycle: async () => (await localSyncSource()).cycle() },
+      }),
       deleteData,
       hydrateScopes: options?.hydrateScopes,
       pendingBlobDeletions,
@@ -1237,7 +1275,6 @@ async function bootstrapServer(
   // holds no timer handle, so clearing the timer alone cannot stop it — and
   // a reserved-but-never-connected TunnelManager would happily spawn frpc
   // from an orphaned poll after shutdown. Every deferred path checks this.
-  let backgroundClosed = false;
   const clearRegistrationPoll = () => {
     if (registrationPollTimer) {
       clearTimeout(registrationPollTimer);
@@ -1429,18 +1466,20 @@ async function bootstrapServer(
         })
       : undefined;
 
-  // Run intake (V2 §2): mounted only with `streamSync.write`. An artifact
+  // Database intake is available for an Account that answered On. An artifact
   // digest resolves only to a pinned connector manifest whose bytes this boot
   // verified (§6); an unknown digest answers `unknown_artifact`.
-  const streamSyncIntake: StreamSyncIntake | undefined =
-    streamSyncWriter && !isEnclave
-      ? createStreamSyncIntake({
-          writer: streamSyncWriter,
-          resolveArtifact: manifestArtifactResolver(
-            pdppAuth?.retainedManifests ?? [],
-          ),
-        })
-      : undefined;
+  const streamSyncIntake: RunIntake | undefined = localSyncSource
+    ? {
+        begin: async (...args) =>
+          (await localSyncSource()).intake.begin(...args),
+        batch: async (...args) =>
+          (await localSyncSource()).intake.batch(...args),
+        end: async (...args) => (await localSyncSource()).intake.end(...args),
+        abort: async (...args) =>
+          (await localSyncSource()).intake.abort(...args),
+      }
+    : undefined;
 
   const app = createApp({
     accountModeAuthority,
@@ -1494,7 +1533,47 @@ async function bootstrapServer(
     readFulfillmentReporter: options?.readFulfillmentReporter,
     dataStorage,
     additions,
-    streamSyncRead,
+    localSync: localSyncSource,
+    localFile: localSyncSource
+      ? async (id) => {
+          const local = await localSyncSource();
+          const [row] = await localDb!.query<{
+            connection_id: string;
+            connector: string;
+            ns: string;
+            stream: string;
+          }>(
+            `SELECT s.connection_id, c.connector, c.ns, s.stream FROM stream_state s
+         JOIN connections c ON c.connection_id = s.connection_id
+         WHERE s.head_blob = ? AND c.control_state = 'active'
+           AND c.deleted_at IS NULL AND s.head_generation = c.generation
+           AND s.head_version > s.last_delete_version`,
+            [id],
+          );
+          if (!row) return null;
+          return {
+            connectionId: row.connection_id,
+            read: async () => {
+              const decision = await local.resolver.resolve({
+                scope: `pdpp.${row.connector}.${row.stream}`,
+                connection: row.ns,
+                cursor: null,
+                legacyFile: false,
+                isOwnerView: true,
+              });
+              if ("body" in decision)
+                return new Response(decision.body, {
+                  headers: { "Content-Type": "application/json" },
+                });
+              throw new ProtocolError(
+                404,
+                "STREAM_DATA_NOT_FOUND",
+                "Stream data is unavailable",
+              );
+            },
+          };
+        }
+      : undefined,
     // Latest legacy reads of connector scopes the owner collects into the
     // record store come from its rows: the same store and the same
     // configured methods the RS enforces. Composed with or without the RS,
@@ -1541,9 +1620,15 @@ async function bootstrapServer(
     syncManager,
     streamSyncSeed,
     streamSyncIntake,
-    streamSyncConnectionDelete:
-      streamSyncWriter && !isEnclave ? streamSyncWriter : null,
-    // Shutdown stops stream-sync requests first; the home then drains.
+    streamSyncConnectionDelete: localSyncSource
+      ? {
+          requestConnectionDelete: async (connector) =>
+            (await localSyncSource()).deleter.requestConnectionDelete(
+              connector,
+            ),
+        }
+      : null,
+    // Shutdown stops admission before the database closes.
     streamSyncAdmitting: () => !backgroundClosed,
     serverSigner,
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
@@ -1577,10 +1662,9 @@ async function bootstrapServer(
       if (syncManager) {
         await syncManager.stop();
       }
-      // Closes the home's lock only after every file operation of the home has
-      // finished (new ones are refused). `backgroundClosed` (set above) already
-      // stops the stream-sync routes from admitting new requests.
-      await releaseStreamSyncHome?.();
+      // Finish an outstanding open before releasing the database lock.
+      await openingLocalSync?.catch(() => undefined);
+      await localSync?.close();
     } finally {
       // However the steps above ended, the authority drains the legacy writes
       // it already admitted (they still need the index, which stays open until
@@ -1605,6 +1689,7 @@ async function bootstrapServer(
     serverSigner,
     syncManager,
     streamSyncWriter,
+    getLocalSync: localSyncSource,
     tunnelManager,
     tunnelUrl: undefined,
     isServerRegistered: () => Boolean(identity?.serverId),

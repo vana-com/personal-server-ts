@@ -1,3 +1,4 @@
+import type { LocalHistory } from "@opendatalabs/personal-server-ts-core/localdb";
 /**
  * MCP routes — both the Claude-facing `/mcp/:token` Streamable HTTP endpoint
  * and the owner-only `/v1/mcp/connections` management surface.
@@ -155,6 +156,7 @@ export interface McpRouteDeps {
   hierarchyOptions?: HierarchyManagerOptions;
   dataStorage?: DataStoragePort;
   streamSyncRead?: StreamSyncReadPort;
+  history?: LocalHistory;
   /** The account's storage mode; every MCP engine reads through this one. */
   accountStorageMode?: OwnedAccountStorageMode;
   runtimeAvailability?: RuntimeAvailabilityPort;
@@ -447,6 +449,7 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
   return {
     storage: dataStorage,
     streamSyncRead: switched ? deps.streamSyncRead : undefined,
+    history: switched ? deps.history : undefined,
     accountStorageMode: {
       owner: deps.accountStorageMode?.owner ?? deps.serverOwner ?? "",
       read: () => mode,

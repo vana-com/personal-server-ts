@@ -189,6 +189,9 @@ export function createSyncManager(
   };
   const workerDownloadDeps: DownloadWorkerDeps = {
     ...downloadDeps,
+    // A mode-aware manager handles On through its cycle above. Its legacy
+    // worker is reached only for Off and must not invoke the database hook.
+    localSync: options?.accountStorageMode ? undefined : downloadDeps.localSync,
     pendingBlobDeletions:
       downloadDeps.pendingBlobDeletions ?? options?.pendingBlobDeletions,
   };

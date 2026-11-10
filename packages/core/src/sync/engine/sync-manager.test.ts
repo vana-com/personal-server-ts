@@ -97,6 +97,27 @@ describe("SyncManager", () => {
     vi.useRealTimers();
   });
 
+  it("keeps an explicit Off on the legacy download path when a database hook exists", async () => {
+    const download = makeMockDownloadDeps();
+    const apply = vi.fn(async () => {});
+    download.localSync = { apply };
+    const cycle = vi.fn(async () => {});
+    const manager = createSyncManager(makeMockUploadDeps(), download, {
+      accountStorageMode: { read: () => "unswitched" },
+      localSync: { cycle },
+      transferMode: "download-only",
+    });
+    try {
+      await manager.trigger();
+      expect(downloadAll).toHaveBeenCalled();
+      expect(vi.mocked(downloadAll).mock.calls[0][0].localSync).toBeUndefined();
+      expect(apply).not.toHaveBeenCalled();
+      expect(cycle).not.toHaveBeenCalled();
+    } finally {
+      await manager.stop();
+    }
+  });
+
   it("start() triggers an immediate sync cycle", async () => {
     const uploadDeps = makeMockUploadDeps();
     const downloadDeps = makeMockDownloadDeps();

@@ -1,3 +1,8 @@
+import type {
+  LocalSync,
+  LocalHistory,
+  RecordQuery,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import { ouraRoutes } from "./routes/oura.js";
 import {
   streamSyncSeedRoutes,
@@ -14,9 +19,10 @@ import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-c
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
+import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import {
   StreamSyncHomeClosedError,
-  type StreamSyncIntake,
+  type RunIntake,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -60,7 +66,7 @@ import {
 import { derivativesRoutes } from "./routes/derivatives.js";
 import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
-import { syncRoutes } from "./routes/sync.js";
+import { syncRoutes, type SyncRouteDeps } from "./routes/sync.js";
 import {
   executeMcpConnectionRequest,
   mcpActivityRoutes,
@@ -176,7 +182,10 @@ export interface AppDeps {
   /** Desktop seed intake (§2.9); null or absent when stream sync writing is off. */
   streamSyncSeed?: StreamSyncSeedRouteDeps["streamSyncSeed"];
   /** Run intake (V2 §2); absent when stream sync writing is off. */
-  streamSyncIntake?: StreamSyncIntake;
+  streamSyncIntake?: RunIntake;
+  localSync?: () => Promise<LocalSync>;
+  localFile?: SyncRouteDeps["localFile"];
+  history?: LocalHistory;
   /** The stream-sync writer's connection delete (`DELETE /v1/owner/connectors/:id`). */
   streamSyncConnectionDelete?: ConnectionDeletePort | null;
   /**
@@ -373,6 +382,52 @@ export function createApp(deps: AppDeps): Hono {
       : { read: () => "unknown" },
     deps.serverOwner,
   );
+  let loadedLocalSync: LocalSync | undefined;
+  const localSync = deps.localSync
+    ? async () => (loadedLocalSync = await deps.localSync!())
+    : undefined;
+  const history: LocalHistory | undefined =
+    deps.history ??
+    (localSync
+      ? {
+          additions: async (input) =>
+            (await localSync()).history.additions(input),
+          versions: async (input) =>
+            (await localSync()).history.versions(input),
+          lineage: async (input) => (await localSync()).history.lineage(input),
+        }
+      : undefined);
+  const recordQuery: RecordQuery | undefined = localSync
+    ? {
+        listRecords: async (input) =>
+          (await localSync()).query.listRecords(input),
+        getRecord: async (input) => (await localSync()).query.getRecord(input),
+        changesSince: async (input) =>
+          (await localSync()).query.changesSince(input),
+        async *streamRecords(connection, stream) {
+          yield* (await localSync()).query.streamRecords(connection, stream);
+        },
+      }
+    : undefined;
+  const streamSyncRead: StreamSyncReadPort | undefined = localSync
+    ? {
+        resolve: async (input) => (await localSync()).resolver.resolve(input),
+        listScopes: async (input) =>
+          (await localSync()).listing.listScopes(input),
+        olderVersions: {
+          read: async (...args) =>
+            (await localSync()).olderVersions.read(...args),
+          list: async (...args) =>
+            (await localSync()).olderVersions.list(...args),
+          counts: () =>
+            loadedLocalSync?.olderVersions.counts() ?? {
+              served: 0,
+              gone: 0,
+              off: 0,
+            },
+        },
+      }
+    : deps.streamSyncRead;
   // The one seal for the legacy writes these routes make durable: the host's
   // own, else one over the host's authority, else a seal that refuses (no
   // authority wired is unknown, never permission).
@@ -508,6 +563,8 @@ export function createApp(deps: AppDeps): Hono {
       "/v1",
       pdppRecordsRoutes({
         store: deps.pdpp.store,
+        accountStorageMode,
+        recordQuery,
         reads: deps.pdpp.reads,
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
@@ -552,7 +609,17 @@ export function createApp(deps: AppDeps): Hono {
       "/v1/blobs",
       pdppBlobsRoutes({
         store: deps.pdpp.store,
-        reads: deps.pdpp.reads,
+        reads: (reader) => {
+          const mode = accountStorageMode.read();
+          if (mode !== "unswitched")
+            throw new PdppError(
+              mode === "unknown"
+                ? "ACCOUNT_MODE_UNKNOWN"
+                : "STREAM_READ_UNAVAILABLE",
+              "Blob authorization is unavailable for this storage mode",
+            );
+          return deps.pdpp!.reads(reader);
+        },
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         instancesForSubject: deps.pdpp.instancesForSubject,
@@ -653,7 +720,9 @@ export function createApp(deps: AppDeps): Hono {
       devToken: deps.devToken,
       accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
-      streamSyncRead: deps.streamSyncRead,
+      streamSyncRead,
+      localSync,
+      accountStorageMode,
     }),
   );
 
@@ -668,6 +737,12 @@ export function createApp(deps: AppDeps): Hono {
         accessToken: deps.accessToken,
         tokenStore: deps.tokenStore,
         intake: deps.streamSyncIntake,
+        blobs: localSync
+          ? {
+              put: async (input) => (await localSync()).blobs.put(input),
+              get: async (id) => (await localSync()).blobs.get(id),
+            }
+          : undefined,
       }),
     );
   }
@@ -694,7 +769,8 @@ export function createApp(deps: AppDeps): Hono {
       dataStorage: deps.dataStorage,
       legacyWriteSeal,
       legacyScopeView,
-      streamSyncRead: deps.streamSyncRead,
+      streamSyncRead,
+      history,
       // The account's storage mode (see the top of createApp).
       accountStorageMode,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
@@ -822,6 +898,9 @@ export function createApp(deps: AppDeps): Hono {
       accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
+      localSync,
+      localFile: deps.localFile,
+      accountStorageMode,
       mountPath: "/v1/sync",
     }),
   );
@@ -857,7 +936,8 @@ export function createApp(deps: AppDeps): Hono {
     hierarchyOptions: deps.hierarchyOptions,
     dataStorage: deps.dataStorage,
     legacyWriteSeal,
-    streamSyncRead: deps.streamSyncRead,
+    streamSyncRead,
+    history,
     accountStorageMode,
     runtimeAvailability: deps.runtimeAvailability,
     connectionStore: mcpConnectionStore,
