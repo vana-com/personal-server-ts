@@ -572,49 +572,13 @@ describe("replication flag on", () => {
             () => ["id"],
           ),
       ],
-      [
-        "transitionClaudeToLive",
-        () =>
-          store.transitionClaudeToLive({
-            instance: "conn_a",
-            expectedGeneration: 1,
-            expectedWriteClock: store.transitionWriteClock(),
-            snapshots: {},
-          }),
-      ],
-      [
-        "transitionStravaToBrowser",
-        () =>
-          store.transitionStravaToBrowser({
-            instance: "conn_a",
-            expectedGeneration: 1,
-            expectedWriteClock: store.transitionWriteClock(),
-            snapshots: {},
-          }),
-      ],
-      [
-        "confirmClaudeTransition",
-        () => store.confirmClaudeTransition("conn_a", 1),
-      ],
-      [
-        "confirmStravaTransition",
-        () => store.confirmStravaTransition("conn_a", 1),
-      ],
-      [
-        "clearClaudeTransitionScope",
-        () => store.clearClaudeTransitionScope("claude.conversations"),
-      ],
-      [
-        "clearStravaTransitionScope",
-        () => store.clearStravaTransitionScope("strava.activities"),
-      ],
     ];
     for (const [name, mutate] of mutations) {
       expect(() => mutate(), name).toThrow("replica_integrity_quarantine");
       expect(state(), name).toEqual(before);
     }
   });
-  describe("method transitions (Strava and Claude) are not journaled", () => {
+  describe("historical transition ledgers block replication baseline", () => {
     const transitionRow = (table: string, archive: string) =>
       `INSERT INTO ${table} (instance, archive_instance, generation, snapshots_json) VALUES ('conn_a', '${archive}', 2, '{}')`;
 
@@ -634,59 +598,6 @@ describe("replication flag on", () => {
           /connection conn_a has a Strava or Claude method transition/,
         );
       }
-    });
-
-    it("refuses re-enabling after a transition made while the flag was off, at the door", () => {
-      const path = file();
-      const first = open(path);
-      const on = createReplicaRecordStore(first);
-      on.registerConnection({
-        instance: "strava_a",
-        sourceId: "https://registry.pdpp.dev/sources/strava",
-        method: "strava",
-        label: "Strava",
-      });
-      on.replication.beginBaseline(baseline);
-      on.close();
-
-      const offDb = open(path);
-      const off = openRecordStore(offDb, false);
-      off.transitionStravaToBrowser({
-        instance: "strava_a",
-        expectedGeneration: 1,
-        expectedWriteClock: off.transitionWriteClock(),
-        snapshots: {},
-      });
-      off.close();
-
-      // The transition wrote fenced tables outside capture, so the door
-      // refuses the open before the baseline's own transition check runs.
-      expect(() => createReplicaRecordStore(open(path))).toThrow(
-        new ReplicationRefusedError("reenable_refused"),
-      );
-    });
-
-    it("refuses new transitions once replication is enabled, leaving canonical state alone", () => {
-      const db = open();
-      const store = createReplicaRecordStore(db);
-      register(store);
-      store.replication.beginBaseline(baseline);
-      const before = db.prepare("SELECT * FROM pdpp_instance_binding").all();
-      const input = {
-        instance: "conn_a",
-        expectedGeneration: 1,
-        expectedWriteClock: store.transitionWriteClock(),
-        snapshots: {},
-      };
-      expect(() => store.transitionClaudeToLive(input)).toThrow(
-        "replica_method_transition_unsupported",
-      );
-      expect(() => store.transitionStravaToBrowser(input)).toThrow(
-        "replica_method_transition_unsupported",
-      );
-      expect(db.prepare("SELECT * FROM pdpp_instance_binding").all()).toEqual(
-        before,
-      );
     });
   });
 

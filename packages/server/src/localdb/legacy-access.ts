@@ -130,7 +130,7 @@ export async function openLegacyAccess(
   // Revision identifies content, not a device's coincidentally equal clock.
   // The clock/data_version are live fences only and never durable identity.
   const dataVersion = db.pragma("data_version", { simple: true }) as number;
-  const clock = store.transitionWriteClock();
+  const clock = store.writeClock();
   const hash = createHash("sha256").update("legacy-canonical-snapshot/1");
   const frame = (value: unknown) => {
     const bytes = Buffer.from(canonicalJson(value));
@@ -185,7 +185,7 @@ export async function openLegacyAccess(
       await authorized();
       if (
         expected !== revision ||
-        store.transitionWriteClock() !== clock ||
+        store.writeClock() !== clock ||
         db.pragma("data_version", { simple: true }) !== dataVersion
       )
         throw new Error("source_changed");

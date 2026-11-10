@@ -4,12 +4,9 @@ import Database from "better-sqlite3";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import { initializeDatabase } from "./index-schema.js";
-import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
-import { createStravaMethodTransition } from "./strava-method-transition.js";
 
 const sql = readFileSync(
   new URL(
@@ -42,8 +39,6 @@ const fixture = JSON.parse(
     "strava.coverage_diagnostics": DataFileEnvelope;
   };
 };
-
-type Store = ReturnType<typeof createSqliteRecordStore>;
 
 function normalizeSqlValue(value: unknown): unknown {
   if (value instanceof Uint8Array) return Array.from(value);
@@ -93,30 +88,6 @@ function expectedUpgradedRows(original: ReturnType<typeof storedRows>) {
   return expected;
 }
 
-function activity(id: string, freshness: string) {
-  return { id, activity_type: id === "b" ? "Run" : "Ride", freshness };
-}
-
-function browserRun(store: Store, ids: string[]) {
-  const emittedAt = "2026-10-22T00:00:00.000Z";
-  return store.replaceStream({
-    instance: fixture.instance,
-    stream: "activities",
-    method: "strava-browser",
-    generation: fixture.generation,
-    primaryKey: ["id"],
-    emittedAt,
-    sourceCollectedAt: emittedAt,
-    envelopes: ids.map((id) => ({
-      instance: fixture.instance,
-      stream: "activities",
-      key: id,
-      data: activity(id, "live"),
-      emitted_at: emittedAt,
-    })),
-  });
-}
-
 describe("Desktop DDE index.db upgrade", () => {
   let dir: string;
   let db: Database.Database | undefined;
@@ -126,7 +97,7 @@ describe("Desktop DDE index.db upgrade", () => {
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
 
-  it("preserves the DDE Strava transition through schema convergence, browser takeover, and reopen", async () => {
+  it("preserves historical archives and blob custody through schema convergence and reopen", async () => {
     expect(createHash("sha256").update(sql).digest("hex")).toBe(
       fixture.provenance.sqlSha256,
     );
@@ -179,12 +150,27 @@ describe("Desktop DDE index.db upgrade", () => {
     expect(storedRows(db)).toEqual(expectedUpgradedRows(original));
 
     const archive = fixture.archiveInstance;
-    const assertArchivedPayload = (activitiesCovered = false) => {
-      expect(store.stravaTransition(fixture.instance)).toMatchObject({
+    const assertArchivedPayload = () => {
+      const historical = db!
+        .prepare("SELECT * FROM pdpp_strava_transition WHERE instance=?")
+        .get(fixture.instance) as {
+        instance: string;
+        archive_instance: string;
+        generation: number;
+        activities_covered: number;
+        snapshots_json: string;
+      };
+      expect({
+        instance: historical.instance,
+        archiveInstance: historical.archive_instance,
+        generation: historical.generation,
+        activitiesCovered: historical.activities_covered === 1,
+        snapshots: JSON.parse(historical.snapshots_json),
+      }).toEqual({
         instance: fixture.instance,
         archiveInstance: archive,
         generation: fixture.generation,
-        activitiesCovered,
+        activitiesCovered: false,
         snapshots: fixture.snapshots,
       });
       expect(store.getInstanceBinding(fixture.instance)).toMatchObject({
@@ -228,59 +214,6 @@ describe("Desktop DDE index.db upgrade", () => {
     };
     assertArchivedPayload();
 
-    const files = {
-      findEntry: () => undefined,
-      readEnvelope: async () => {
-        throw new Error("DDE fixture snapshots are canonical");
-      },
-    } as never;
-    const createTransition = () =>
-      createStravaMethodTransition(
-        store,
-        createLegacyScopeView({
-          authority: createLegacyScopeAuthority(db!),
-          records: store,
-          configuredMethods: () => ["strava-browser"],
-        }),
-        files,
-      );
-    const pending = createTransition();
-    expect(await pending.status(fixture.instance)).toBe("pending");
-    expect(await pending.view.readLatest("strava.activities")).toMatchObject({
-      kind: "canonical",
-      envelope: fixture.snapshots["strava.activities"],
-    });
-    expect(
-      await pending.view.readLatest("strava.coverage_diagnostics"),
-    ).toMatchObject({
-      kind: "canonical",
-      envelope: fixture.snapshots["strava.coverage_diagnostics"],
-    });
-
-    const run = browserRun(store, ["a", "b", "new"]);
-    expect(run.applied).toBe(true);
-    expect(await pending.status(fixture.instance)).toBe("covered");
-    expect(await pending.view.readLatest("strava.activities")).toMatchObject({
-      kind: "canonical",
-      envelope: {
-        data: {
-          activities: [
-            activity("a", "live"),
-            activity("b", "live"),
-            activity("new", "live"),
-          ],
-        },
-      },
-    });
-    expect(
-      await pending.view.readLatest("strava.coverage_diagnostics"),
-    ).toMatchObject({
-      kind: "canonical",
-      envelope: fixture.snapshots["strava.coverage_diagnostics"],
-    });
-    expect(store.stravaTransition(fixture.instance)?.activitiesCovered).toBe(
-      true,
-    );
     expect(() =>
       store.replaceStream({
         instance: fixture.instance,
@@ -298,35 +231,29 @@ describe("Desktop DDE index.db upgrade", () => {
     db = initializeDatabase(path);
     store = createSqliteRecordStore(db);
     expect(storedRows(db)).toEqual(beforeReopen);
-    assertArchivedPayload(true);
-    const reopened = createTransition();
-    expect(await reopened.status(fixture.instance)).toBe("covered");
-    expect(
-      await reopened.view.readLatest("strava.coverage_diagnostics"),
-    ).toMatchObject({
-      kind: "canonical",
-      envelope: fixture.snapshots["strava.coverage_diagnostics"],
-    });
+    assertArchivedPayload();
     expect(db.pragma("integrity_check", { simple: true })).toBe("ok");
 
-    store.clearStravaTransitionScope("strava.activities");
+    store.deleteConnection(fixture.instance);
     store.close();
     db = initializeDatabase(path);
     store = createSqliteRecordStore(db);
     expect(store.getBlobMeta(fixture.blobId)).toBeUndefined();
     expect(store.getBlobBytes(fixture.blobId)).toBeUndefined();
     expect(db.prepare("SELECT * FROM pdpp_blob_claims").all()).toEqual([]);
-    const reset = store.stravaTransition(fixture.instance);
-    expect(reset).not.toBeNull();
-    expect(reset!.snapshots["strava.activities"]).toBeUndefined();
-    expect(reset!.snapshots["strava.coverage_diagnostics"]).toEqual(
-      fixture.snapshots["strava.coverage_diagnostics"],
+    expect(db.prepare("SELECT * FROM pdpp_strava_transition").all()).toEqual(
+      [],
     );
+    expect(
+      db
+        .prepare("SELECT * FROM pdpp_records WHERE instance=?")
+        .all(fixture.archiveInstance),
+    ).toEqual([]);
     store.close();
   });
 
   it("keeps archive claims while unreadable retained history may reference them", () => {
-    dir = mkdtempSync(join(tmpdir(), "ps-desktop-dde-reset-"));
+    dir = mkdtempSync(join(tmpdir(), "ps-desktop-dde-history-"));
     const path = join(dir, "index.db");
     db = new Database(path);
     db.exec(sql);
@@ -341,18 +268,20 @@ describe("Desktop DDE index.db upgrade", () => {
       Buffer.from("bytes possibly referenced by unreadable history"),
       "application/octet-stream",
     );
-    expect(() =>
-      store.clearStravaTransitionScope("strava.activities"),
-    ).not.toThrow();
-    expect(store.getBlobBytes(fixture.blobId)).toBeDefined();
-    expect(store.getBlobBytes(ambiguous.blobId)).toBeDefined();
+    store.close();
+    db = initializeDatabase(path);
+    const reopened = createSqliteRecordStore(db);
+    expect(reopened.getBlobBytes(fixture.blobId)).toBeDefined();
+    expect(reopened.getBlobBytes(ambiguous.blobId)).toBeDefined();
     expect(db.prepare("SELECT * FROM pdpp_blob_claims").all()).toHaveLength(1);
 
-    store.clearStravaTransitionScope("strava.coverage_diagnostics");
-    expect(store.getBlobMeta(fixture.blobId)).toBeUndefined();
-    expect(store.getBlobBytes(fixture.blobId)).toBeUndefined();
-    expect(store.getBlobBytes(ambiguous.blobId)).toBeUndefined();
-    expect(store.stravaTransition(fixture.instance)).not.toBeNull();
-    store.close();
+    reopened.deleteConnection(fixture.instance);
+    expect(reopened.getBlobMeta(fixture.blobId)).toBeUndefined();
+    expect(reopened.getBlobBytes(fixture.blobId)).toBeUndefined();
+    expect(reopened.getBlobBytes(ambiguous.blobId)).toBeUndefined();
+    expect(db.prepare("SELECT * FROM pdpp_strava_transition").all()).toEqual(
+      [],
+    );
+    reopened.close();
   });
 });

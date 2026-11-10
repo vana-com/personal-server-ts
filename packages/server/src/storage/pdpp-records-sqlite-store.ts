@@ -18,7 +18,6 @@ import {
   compareRecordIdentity,
   LIST_ORDER_COLUMNS,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
-import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { Database } from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
@@ -76,43 +75,6 @@ export interface PdppInstanceBinding {
   generation: number;
   resetClock: number;
   empty?: boolean;
-}
-
-export interface ClaudeTransition {
-  instance: string;
-  archiveInstance: string;
-  conversationsCovered: boolean;
-  generation: number;
-  snapshots: Partial<
-    Record<"claude.conversations" | "claude.projects", DataFileEnvelope>
-  >;
-}
-
-export type StravaTransitionScope =
-  "strava.activities" | "strava.coverage_diagnostics";
-
-/** One export-to-browser transition of a Strava connection, converged at v16. */
-export interface StravaTransition {
-  instance: string;
-  archiveInstance: string;
-  /** A completed browser run covered every saved activity id. */
-  activitiesCovered: boolean;
-  generation: number;
-  snapshots: Partial<Record<StravaTransitionScope, DataFileEnvelope>>;
-}
-
-export interface StravaTransitionInput {
-  instance: string;
-  expectedGeneration: number;
-  expectedWriteClock: number;
-  snapshots: StravaTransition["snapshots"];
-}
-
-export interface ClaudeTransitionInput {
-  instance: string;
-  expectedGeneration: number;
-  expectedWriteClock: number;
-  snapshots: ClaudeTransition["snapshots"];
 }
 
 /** Outcome of a P7 stream replace. `applied: false` means nothing was written. */
@@ -483,6 +445,12 @@ function migrate(db: Database): void {
   }
 }
 
+// Historical schemas remain readable and erasable; no API creates new archives.
+const RETIRED_ARCHIVE_TABLES = [
+  "pdpp_claude_transition",
+  "pdpp_strava_transition",
+] as const;
+
 function sweepStaleBlobClaims(db: Database): void {
   db.transaction(() => {
     // A method-transition archive is retained history, not a registered
@@ -495,14 +463,12 @@ function sweepStaleBlobClaims(db: Database): void {
         WHERE b.instance = pdpp_blob_claims.instance
           AND b.generation = pdpp_blob_claims.generation
       )
-      AND NOT EXISTS (
-        SELECT 1 FROM pdpp_claude_transition t
+      ${RETIRED_ARCHIVE_TABLES.map(
+        (table) => `AND NOT EXISTS (
+        SELECT 1 FROM ${table} t
         WHERE t.archive_instance = pdpp_blob_claims.instance
-      )
-      AND NOT EXISTS (
-        SELECT 1 FROM pdpp_strava_transition t
-        WHERE t.archive_instance = pdpp_blob_claims.instance
-      );
+      )`,
+      ).join("\n")};
     `);
     collectStartupUnclaimedBlobs(db);
   })();
@@ -710,17 +676,7 @@ export function createSqliteRecordStore(
   db: Database,
   options: SqliteRecordStoreOptions = {},
 ): PdppRecordStore & {
-  transitionClaudeToLive(input: ClaudeTransitionInput): PdppInstanceBinding;
-  claudeTransition(instance: string): ClaudeTransition | null;
-  listClaudeTransitions(): ClaudeTransition[];
-  clearClaudeTransitionScope(scope: string): void;
-  confirmClaudeTransition(instance: string, generation: number): void;
-  transitionStravaToBrowser(input: StravaTransitionInput): PdppInstanceBinding;
-  stravaTransition(instance: string): StravaTransition | null;
-  listStravaTransitions(): StravaTransition[];
-  clearStravaTransitionScope(scope: string): void;
-  confirmStravaTransition(instance: string, generation: number): void;
-  transitionWriteClock(): number;
+  writeClock(): number;
   listConnections(sourceId: string): PdppInstanceBinding[];
   registerConnection(input: {
     instance: string;
@@ -1413,311 +1369,12 @@ export function createSqliteRecordStore(
     };
   }
 
-  function transitionWriteClock(): number {
+  function writeClock(): number {
     return (
       db.prepare("SELECT value FROM pdpp_write_clock WHERE id = 1").get() as {
         value: number;
       }
     ).value;
-  }
-
-  function claudeTransition(instance: string): ClaudeTransition | null {
-    const row = db
-      .prepare("SELECT * FROM pdpp_claude_transition WHERE instance = ?")
-      .get(instance) as
-      | {
-          instance: string;
-          archive_instance: string;
-          generation: number;
-          snapshots_json: string;
-          conversations_covered: number;
-        }
-      | undefined;
-    return row
-      ? {
-          instance: row.instance,
-          archiveInstance: row.archive_instance,
-          conversationsCovered: row.conversations_covered === 1,
-          generation: row.generation,
-          snapshots: JSON.parse(
-            row.snapshots_json,
-          ) as ClaudeTransition["snapshots"],
-        }
-      : null;
-  }
-
-  function listClaudeTransitions(): ClaudeTransition[] {
-    return (
-      db
-        .prepare(
-          "SELECT instance FROM pdpp_claude_transition ORDER BY instance",
-        )
-        .all() as { instance: string }[]
-    ).map((row) => claudeTransition(row.instance)!);
-  }
-
-  function confirmClaudeTransition(instance: string, generation: number): void {
-    connectionMutation(instance, () =>
-      db
-        .prepare(
-          "UPDATE pdpp_claude_transition SET conversations_covered = 1 WHERE instance = ? AND generation = ?",
-        )
-        .run(instance, generation),
-    );
-  }
-
-  function clearClaudeTransitionScope(scope: string): void {
-    if (scope !== "claude.conversations" && scope !== "claude.projects") return;
-    connectionMutation(
-      () => listClaudeTransitions().map((transition) => transition.instance),
-      () => {
-        for (const transition of listClaudeTransitions()) {
-          delete transition.snapshots[scope];
-          db.prepare(
-            "UPDATE pdpp_claude_transition SET snapshots_json = ? WHERE instance = ?",
-          ).run(JSON.stringify(transition.snapshots), transition.instance);
-          const streams =
-            scope === "claude.conversations"
-              ? ["conversations", "messages"]
-              : ["projects", "project_documents"];
-          if (Object.keys(transition.snapshots).length === 0)
-            streams.push("account_profile");
-          for (const table of [
-            "pdpp_records",
-            "pdpp_record_changes",
-            "pdpp_stream_completion",
-            "pdpp_record_arrival",
-          ]) {
-            for (const stream of streams)
-              db.prepare(
-                `DELETE FROM ${table} WHERE instance = ? AND stream = ?`,
-              ).run(transition.archiveInstance, stream);
-          }
-          db.prepare(
-            `DELETE FROM pdpp_blob_claims WHERE instance = ?
-          AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.instance = pdpp_blob_claims.instance AND r.blob_id = pdpp_blob_claims.blob_id)
-          AND NOT EXISTS (SELECT 1 FROM pdpp_record_changes c WHERE c.instance = pdpp_blob_claims.instance AND json_extract(c.data, '$.blob_ref.blob_id') = pdpp_blob_claims.blob_id)`,
-          ).run(transition.archiveInstance);
-        }
-        deleteUnclaimedBlobs(db);
-      },
-    );
-  }
-
-  const STRAVA_SOURCE = "https://registry.pdpp.dev/sources/strava";
-  const STRAVA_EXPORT_METHOD = "strava";
-  const STRAVA_BROWSER_METHOD = "strava-browser";
-  const STRAVA_SCOPE_STREAMS: Record<StravaTransitionScope, string> = {
-    "strava.activities": "activities",
-    "strava.coverage_diagnostics": "coverage_diagnostics",
-  };
-  /** Tables whose rows move to the archive instance on a method transition. */
-  const ARCHIVED_TABLES = [
-    "pdpp_records",
-    "pdpp_record_changes",
-    "pdpp_blob_claims",
-    "pdpp_stream_completion",
-    "pdpp_record_arrival",
-  ];
-
-  function stravaTransition(instance: string): StravaTransition | null {
-    const row = db
-      .prepare("SELECT * FROM pdpp_strava_transition WHERE instance = ?")
-      .get(instance) as
-      | {
-          instance: string;
-          archive_instance: string;
-          generation: number;
-          snapshots_json: string;
-          activities_covered: number;
-        }
-      | undefined;
-    if (!row) return null;
-    return {
-      instance: row.instance,
-      archiveInstance: row.archive_instance,
-      activitiesCovered: row.activities_covered === 1,
-      generation: row.generation,
-      snapshots: JSON.parse(
-        row.snapshots_json,
-      ) as StravaTransition["snapshots"],
-    };
-  }
-
-  function listStravaTransitions(): StravaTransition[] {
-    return (
-      db
-        .prepare(
-          "SELECT instance FROM pdpp_strava_transition ORDER BY instance",
-        )
-        .all() as { instance: string }[]
-    ).map((row) => stravaTransition(row.instance)!);
-  }
-
-  function confirmStravaTransition(instance: string, generation: number): void {
-    connectionMutation(instance, () =>
-      db
-        .prepare(
-          "UPDATE pdpp_strava_transition SET activities_covered = 1 WHERE instance = ? AND generation = ?",
-        )
-        .run(instance, generation),
-    );
-  }
-
-  /** A takeover reset drops the saved body and its archived rows. */
-  function clearStravaTransitionScope(scope: string): void {
-    if (!(scope in STRAVA_SCOPE_STREAMS)) return;
-    const stream = STRAVA_SCOPE_STREAMS[scope as StravaTransitionScope];
-    connectionMutation(
-      () => listStravaTransitions().map((transition) => transition.instance),
-      () => {
-        for (const transition of listStravaTransitions()) {
-          delete transition.snapshots[scope as StravaTransitionScope];
-          db.prepare(
-            "UPDATE pdpp_strava_transition SET snapshots_json = ? WHERE instance = ?",
-          ).run(JSON.stringify(transition.snapshots), transition.instance);
-          for (const table of ARCHIVED_TABLES) {
-            if (table === "pdpp_blob_claims") continue;
-            db.prepare(
-              `DELETE FROM ${table} WHERE instance = ? AND stream = ?`,
-            ).run(transition.archiveInstance, stream);
-          }
-          // Unreadable retained history may still reference any archived blob.
-          db.prepare(
-            `DELETE FROM pdpp_blob_claims WHERE instance = ?
-          AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.instance = pdpp_blob_claims.instance AND r.blob_id = pdpp_blob_claims.blob_id)
-          AND NOT EXISTS (
-            SELECT 1 FROM pdpp_record_changes c
-            WHERE c.instance = pdpp_blob_claims.instance
-              AND CASE WHEN json_valid(c.data)
-                THEN json_extract(c.data, '$.blob_ref.blob_id') = pdpp_blob_claims.blob_id
-                ELSE c.data IS NOT NULL END
-          )`,
-          ).run(transition.archiveInstance);
-        }
-        // A scope reset must retain blobs that unreadable history may reference.
-        collectStartupUnclaimedBlobs(db);
-      },
-    );
-  }
-
-  /**
-   * Owner-authorized, one-way: archive the export rows and bind the browser
-   * method at the next generation in one transaction. Replaying the same
-   * intent after success returns the current binding and erases nothing.
-   */
-  function transitionStravaToBrowser(
-    input: StravaTransitionInput,
-  ): PdppInstanceBinding {
-    return connectionMutation(input.instance, () => {
-      replica?.assertMethodTransitionAllowed();
-      const current = getInstanceBinding(input.instance);
-      if (current.deletedAt !== null)
-        throw new PdppBindingError("connection_deleted");
-      const previous = stravaTransition(input.instance);
-      if (
-        previous &&
-        previous.generation === input.expectedGeneration + 1 &&
-        current.method === STRAVA_BROWSER_METHOD &&
-        current.generation === previous.generation
-      )
-        return current;
-      if (
-        current.method !== STRAVA_EXPORT_METHOD ||
-        current.sourceId !== STRAVA_SOURCE
-      )
-        throw new PdppBindingError("connection_conflict");
-      if (
-        current.generation !== input.expectedGeneration ||
-        transitionWriteClock() !== input.expectedWriteClock
-      )
-        throw new PdppBindingError("binding_generation_mismatch");
-      if (previous || listConnections(current.sourceId).length !== 1)
-        throw new PdppBindingError("connection_conflict");
-      const archive = `retired-strava:${randomUUID()}`;
-      const generation = current.generation + 1;
-      db.prepare(
-        "INSERT INTO pdpp_strava_transition (instance, archive_instance, generation, snapshots_json) VALUES (?, ?, ?, ?)",
-      ).run(
-        input.instance,
-        archive,
-        generation,
-        JSON.stringify(input.snapshots),
-      );
-      // The archive is not a registered connection: it cannot accept writes.
-      for (const table of ARCHIVED_TABLES) {
-        db.prepare(`UPDATE ${table} SET instance = ? WHERE instance = ?`).run(
-          archive,
-          input.instance,
-        );
-      }
-      const clock = (nextWriteSeq.get() as { value: number }).value;
-      db.prepare(
-        "UPDATE pdpp_instance_binding SET method = ?, generation = ?, reset_clock = ? WHERE instance = ?",
-      ).run(STRAVA_BROWSER_METHOD, generation, clock, input.instance);
-      return getInstanceBinding(input.instance);
-    });
-  }
-
-  function transitionClaudeToLive(
-    input: ClaudeTransitionInput,
-  ): PdppInstanceBinding {
-    return connectionMutation(input.instance, () => {
-      replica?.assertMethodTransitionAllowed();
-      const current = getInstanceBinding(input.instance);
-      if (current.deletedAt !== null)
-        throw new PdppBindingError("connection_deleted");
-      const previous = claudeTransition(input.instance);
-      // Replaying the same intent must not erase a successful live import.
-      if (
-        previous &&
-        previous.generation === input.expectedGeneration + 1 &&
-        current.method === "anthropic-live" &&
-        current.generation === previous.generation
-      )
-        return current;
-      if (
-        current.method !== "anthropic" ||
-        current.sourceId !== "https://registry.pdpp.dev/sources/claude"
-      )
-        throw new PdppBindingError("connection_conflict");
-      if (
-        current.generation !== input.expectedGeneration ||
-        transitionWriteClock() !== input.expectedWriteClock
-      )
-        throw new PdppBindingError("binding_generation_mismatch");
-      if (previous || listConnections(current.sourceId).length !== 1)
-        throw new PdppBindingError("connection_conflict");
-      const archive = `retired-claude:${randomUUID()}`;
-      const generation = current.generation + 1;
-      db.prepare(
-        "INSERT INTO pdpp_claude_transition (instance, archive_instance, generation, snapshots_json) VALUES (?, ?, ?, ?)",
-      ).run(
-        input.instance,
-        archive,
-        generation,
-        JSON.stringify(input.snapshots),
-      );
-      // An archive is deliberately not a registered connection and cannot mint
-      // owner tokens or accept writes. Blob claims keep the old bytes alive.
-      for (const table of [
-        "pdpp_records",
-        "pdpp_record_changes",
-        "pdpp_blob_claims",
-        "pdpp_stream_completion",
-        "pdpp_record_arrival",
-      ]) {
-        db.prepare(`UPDATE ${table} SET instance = ? WHERE instance = ?`).run(
-          archive,
-          input.instance,
-        );
-      }
-      const clock = (nextWriteSeq.get() as { value: number }).value;
-      db.prepare(
-        "UPDATE pdpp_instance_binding SET method = 'anthropic-live', generation = ?, reset_clock = ? WHERE instance = ?",
-      ).run(generation, clock, input.instance);
-      return getInstanceBinding(input.instance);
-    });
   }
 
   function listConnections(sourceId: string): PdppInstanceBinding[] {
@@ -1777,19 +1434,14 @@ export function createSqliteRecordStore(
   }
 
   function eraseInstanceData(instance: string): void {
-    const transition = claudeTransition(instance);
-    if (transition) {
-      db.prepare("DELETE FROM pdpp_claude_transition WHERE instance = ?").run(
-        instance,
-      );
-      eraseInstanceData(transition.archiveInstance);
-    }
-    const strava = stravaTransition(instance);
-    if (strava) {
-      db.prepare("DELETE FROM pdpp_strava_transition WHERE instance = ?").run(
-        instance,
-      );
-      eraseInstanceData(strava.archiveInstance);
+    // Frozen historical archives still belong to the deleted connection.
+    for (const table of RETIRED_ARCHIVE_TABLES) {
+      const archive = db
+        .prepare(`SELECT archive_instance FROM ${table} WHERE instance = ?`)
+        .get(instance) as { archive_instance: string } | undefined;
+      if (!archive) continue;
+      db.prepare(`DELETE FROM ${table} WHERE instance = ?`).run(instance);
+      eraseInstanceData(archive.archive_instance);
     }
     db.prepare("DELETE FROM pdpp_records WHERE instance = ?").run(instance);
     db.prepare("DELETE FROM pdpp_record_changes WHERE instance = ?").run(
@@ -2634,17 +2286,7 @@ export function createSqliteRecordStore(
   }
 
   return {
-    transitionClaudeToLive,
-    claudeTransition,
-    listClaudeTransitions,
-    clearClaudeTransitionScope,
-    confirmClaudeTransition,
-    transitionStravaToBrowser,
-    stravaTransition,
-    listStravaTransitions,
-    clearStravaTransitionScope,
-    confirmStravaTransition,
-    transitionWriteClock,
+    writeClock,
     listConnections,
     registerConnection,
     deleteConnection,

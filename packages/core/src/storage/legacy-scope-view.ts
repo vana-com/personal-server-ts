@@ -108,30 +108,6 @@ async function retainClaudeProfile(
   }
 }
 
-/** An export-to-live transition never treats missing old entities as deletions. */
-export async function coversClaudeTransition(
-  current: { envelope: DataFileEnvelope; revision: string },
-  previous: DataFileEnvelope,
-): Promise<boolean> {
-  if (
-    current.envelope.scope !== "claude.conversations" ||
-    previous.scope !== "claude.conversations" ||
-    typeof previous.data.organizationId !== "string" ||
-    !previous.data.organizationId ||
-    previous.data.organizationId !== current.envelope.data.organizationId
-  )
-    return false;
-  await retainClaudeProfile(current, previous);
-  return compareLegacyCoverage(previous.data, current.envelope.data, {
-    scope: "claude.conversations",
-    entityKeys: LEGACY_SCOPE_ENTITY_KEYS["claude.conversations"],
-    canonicalNewer:
-      Date.parse(current.envelope.collectedAt) >
-      Date.parse(previous.collectedAt),
-    allowProvenDeletion: false,
-  }).covered;
-}
-
 function scopeDeclarationCursor(scope: string): string {
   return JSON.stringify(
     BINDING_PROFILES.flatMap((profile) => [...profile.values()])
