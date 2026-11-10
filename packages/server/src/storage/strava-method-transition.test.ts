@@ -346,6 +346,7 @@ describe("Strava export-to-browser transition", () => {
     seedExport(store, ["a"]);
     const transition = create();
     const app = pdppInstanceBindingRoutes({
+      accountStorageMode: { owner: "0xowner", read: () => "unswitched" },
       store,
       ownerSubjectId: "0xowner",
       configuredMethods: new Map([[INSTANCE, ["strava"]]]),
@@ -395,6 +396,7 @@ describe("Strava export-to-browser transition", () => {
   /** The owner-authenticated binding routes over `transition`. */
   function routes(transition: ReturnType<typeof create>) {
     const app = pdppInstanceBindingRoutes({
+      accountStorageMode: { owner: "0xowner", read: () => "unswitched" },
       store,
       ownerSubjectId: "0xowner",
       configuredMethods: new Map([[INSTANCE, ["strava"]]]),

@@ -551,6 +551,7 @@ export function createApp(deps: AppDeps): Hono {
     app.route(
       "/",
       pdppInstanceBindingRoutes({
+        accountStorageMode,
         store: deps.pdpp.bindingStore,
         auth: deps.pdpp.auth,
         ownerSubjectId: deps.serverOwner!,

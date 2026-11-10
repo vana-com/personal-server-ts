@@ -1,3 +1,4 @@
+import type { OwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
 import { Hono } from "hono";
 import { randomUUID } from "node:crypto";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
@@ -17,6 +18,7 @@ interface InstanceBindingStore {
 }
 
 export interface PdppInstanceBindingRouteDeps {
+  accountStorageMode?: OwnedAccountStorageMode;
   store: InstanceBindingStore;
   auth: PdppAuthorizationService;
   ownerSubjectId: string;
@@ -39,7 +41,7 @@ const STRAVA_METHODS = ["strava", "strava-browser"];
 function errorResponse(
   code: string,
   message: string,
-  status: 400 | 401 | 404 | 409,
+  status: 400 | 401 | 404 | 409 | 503,
 ) {
   return Response.json(
     { error: { code, message }, request_id: `req_${randomUUID()}` },
@@ -261,6 +263,21 @@ export function pdppInstanceBindingRoutes(
         401,
       );
     }
+    // Handles share one sync account. A global reset needs the owner's
+    // account-wide deletion decision; the legacy per-handle reset cannot do it.
+    const mode = deps.accountStorageMode?.read() ?? "unknown";
+    if (mode === "unknown")
+      return errorResponse(
+        "ACCOUNT_MODE_UNKNOWN",
+        "The account mode is not known yet",
+        503,
+      );
+    if (mode === "switched")
+      return errorResponse(
+        "RESET_NOT_AVAILABLE",
+        "Reset is not available for this connection yet",
+        409,
+      );
     let body: unknown;
     try {
       body = await c.req.json();
