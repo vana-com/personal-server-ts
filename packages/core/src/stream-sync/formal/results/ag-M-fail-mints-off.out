@@ -1,0 +1,54 @@
+TLC2 Version 2026.11.06.222357 (rev: d8fb231)
+Running breadth-first search Model-Checking with fp 106 and seed -6749315202809182047 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 384557] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.20.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/tnunamak/.tmp/tla-r5-1109/ps/packages/core/src/stream-sync/formal/AccountGate.tla
+Parsing file /tmp/tlc-16839912612062308132/Naturals.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-16839912612062308132/FiniteSets.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-16839912612062308132/Sequences.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module AccountGate
+Linting of module AccountGate
+Starting... (2026-11-09 17:57:00)
+Computing initial states...
+Computed 2 initial states...
+Finished computing initial states: 4 distinct states generated at 2026-11-09 17:57:01.
+Error: Invariant FailNeverOff is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ acct = "Off"
+/\ hG = [h1 |-> 1, h2 |-> 1]
+/\ ncommit = 0
+/\ nreset = 0
+/\ hS = [h1 |-> "Off", h2 |-> "Off"]
+/\ clean = [h1 |-> TRUE, h2 |-> TRUE]
+/\ bad = FALSE
+/\ staleAdm = FALSE
+/\ psG = 1
+/\ psS = "Off"
+/\ fresh = [h1 |-> TRUE, h2 |-> TRUE]
+/\ agen = 1
+/\ nfail = 0
+/\ infl = [h1 |-> FALSE, h2 |-> FALSE]
+/\ runG = [h1 |-> 0, h2 |-> 0]
+
+State 2: <RereadFail("h1") line 51, col 3 to line 56, col 87 of module AccountGate>
+/\ acct = "Off"
+/\ hG = [h1 |-> 1, h2 |-> 1]
+/\ ncommit = 0
+/\ nreset = 0
+/\ hS = [h1 |-> "Off", h2 |-> "Off"]
+/\ clean = [h1 |-> FALSE, h2 |-> TRUE]
+/\ bad = FALSE
+/\ staleAdm = FALSE
+/\ psG = 1
+/\ psS = "Off"
+/\ fresh = [h1 |-> TRUE, h2 |-> TRUE]
+/\ agen = 1
+/\ nfail = 1
+/\ infl = [h1 |-> FALSE, h2 |-> FALSE]
+/\ runG = [h1 |-> 0, h2 |-> 0]
+
+35 states generated, 19 distinct states found, 11 states left on queue.
+The depth of the complete state graph search is 2.
+Finished in 00s at (2026-11-09 17:57:01)

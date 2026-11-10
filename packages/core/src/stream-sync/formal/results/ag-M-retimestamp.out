@@ -1,0 +1,71 @@
+TLC2 Version 2026.11.06.222357 (rev: d8fb231)
+Running breadth-first search Model-Checking with fp 105 and seed 5432255332003282124 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 384911] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.20.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/tnunamak/.tmp/tla-r5-1109/ps/packages/core/src/stream-sync/formal/AccountGate.tla
+Parsing file /tmp/tlc-10287894176754101366/Naturals.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-10287894176754101366/FiniteSets.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-10287894176754101366/Sequences.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module AccountGate
+Linting of module AccountGate
+Starting... (2026-11-09 17:57:01)
+Computing initial states...
+Computed 2 initial states...
+Finished computing initial states: 4 distinct states generated at 2026-11-09 17:57:01.
+Error: Invariant NoStaleAdmit is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ acct = "Off"
+/\ hG = [h1 |-> 1, h2 |-> 1]
+/\ ncommit = 0
+/\ nreset = 0
+/\ hS = [h1 |-> "Off", h2 |-> "Off"]
+/\ clean = [h1 |-> TRUE, h2 |-> TRUE]
+/\ bad = FALSE
+/\ staleAdm = FALSE
+/\ psG = 1
+/\ psS = "Off"
+/\ fresh = [h1 |-> TRUE, h2 |-> TRUE]
+/\ agen = 1
+/\ nfail = 0
+/\ infl = [h1 |-> FALSE, h2 |-> FALSE]
+/\ runG = [h1 |-> 0, h2 |-> 0]
+
+State 2: <Tick("h1") line 39, col 12 to line 40, col 114 of module AccountGate>
+/\ acct = "Off"
+/\ hG = [h1 |-> 1, h2 |-> 1]
+/\ ncommit = 0
+/\ nreset = 0
+/\ hS = [h1 |-> "Off", h2 |-> "Off"]
+/\ clean = [h1 |-> TRUE, h2 |-> TRUE]
+/\ bad = FALSE
+/\ staleAdm = FALSE
+/\ psG = 1
+/\ psS = "Off"
+/\ fresh = [h1 |-> FALSE, h2 |-> TRUE]
+/\ agen = 1
+/\ nfail = 0
+/\ infl = [h1 |-> FALSE, h2 |-> FALSE]
+/\ runG = [h1 |-> 0, h2 |-> 0]
+
+State 3: <Admit("h1") line 60, col 3 to line 63, col 90 of module AccountGate>
+/\ acct = "Off"
+/\ hG = [h1 |-> 1, h2 |-> 1]
+/\ ncommit = 0
+/\ nreset = 0
+/\ hS = [h1 |-> "Off", h2 |-> "Off"]
+/\ clean = [h1 |-> TRUE, h2 |-> TRUE]
+/\ bad = FALSE
+/\ staleAdm = TRUE
+/\ psG = 1
+/\ psS = "Off"
+/\ fresh = [h1 |-> FALSE, h2 |-> TRUE]
+/\ agen = 1
+/\ nfail = 0
+/\ infl = [h1 |-> TRUE, h2 |-> FALSE]
+/\ runG = [h1 |-> 1, h2 |-> 0]
+
+183 states generated, 65 distinct states found, 44 states left on queue.
+The depth of the complete state graph search is 3.
+Finished in 00s at (2026-11-09 17:57:01)

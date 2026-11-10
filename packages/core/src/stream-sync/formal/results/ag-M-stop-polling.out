@@ -1,0 +1,163 @@
+TLC2 Version 2026.11.06.222357 (rev: d8fb231)
+Running breadth-first search Model-Checking with fp 9 and seed -8719111389534345578 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 382426] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.20.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/tnunamak/.tmp/tla-r5-1109/ps/packages/core/src/stream-sync/formal/AccountGate.tla
+Parsing file /tmp/tlc-1366666096564679901/Naturals.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-1366666096564679901/FiniteSets.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-1366666096564679901/Sequences.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module AccountGate
+Linting of module AccountGate
+Starting... (2026-11-09 17:56:58)
+Implied-temporal checking--satisfiability problem has 1 branches.
+Computing initial states...
+Computed 2 initial states...
+Finished computing initial states: 4 distinct states generated at 2026-11-09 17:56:58.
+Progress(13) at 2026-11-09 17:56:58: 3,544 states generated, 852 distinct states found, 0 states left on queue.
+Checking temporal properties for the complete state space with 852 total distinct states at (2026-11-09 17:56:58)
+Error: Temporal property Final was violated.
+
+Error: The following behavior constitutes a counter-example:
+
+State 1: <Initial predicate>
+/\ acct = "Off"
+/\ hG = [h1 |-> 1, h2 |-> 1]
+/\ ncommit = 0
+/\ nreset = 0
+/\ hS = [h1 |-> "Off", h2 |-> "Off"]
+/\ clean = [h1 |-> TRUE, h2 |-> TRUE]
+/\ bad = FALSE
+/\ staleAdm = FALSE
+/\ psG = 1
+/\ psS = "Off"
+/\ fresh = [h1 |-> TRUE, h2 |-> TRUE]
+/\ agen = 1
+/\ nfail = 0
+/\ infl = [h1 |-> FALSE, h2 |-> FALSE]
+/\ runG = [h1 |-> 0, h2 |-> 0]
+
+State 2: <Admit("h2") line 60, col 3 to line 63, col 90 of module AccountGate>
+/\ acct = "Off"
+/\ hG = [h1 |-> 1, h2 |-> 1]
+/\ ncommit = 0
+/\ nreset = 0
+/\ hS = [h1 |-> "Off", h2 |-> "Off"]
+/\ clean = [h1 |-> TRUE, h2 |-> TRUE]
+/\ bad = FALSE
+/\ staleAdm = FALSE
+/\ psG = 1
+/\ psS = "Off"
+/\ fresh = [h1 |-> TRUE, h2 |-> TRUE]
+/\ agen = 1
+/\ nfail = 0
+/\ infl = [h1 |-> FALSE, h2 |-> TRUE]
+/\ runG = [h1 |-> 0, h2 |-> 1]
+
+State 3: <Commit("h2") line 65, col 3 to line 70, col 92 of module AccountGate>
+/\ acct = "Off"
+/\ hG = [h1 |-> 1, h2 |-> 1]
+/\ ncommit = 1
+/\ nreset = 0
+/\ hS = [h1 |-> "Off", h2 |-> "Off"]
+/\ clean = [h1 |-> TRUE, h2 |-> TRUE]
+/\ bad = FALSE
+/\ staleAdm = FALSE
+/\ psG = 1
+/\ psS = "Off"
+/\ fresh = [h1 |-> TRUE, h2 |-> TRUE]
+/\ agen = 1
+/\ nfail = 0
+/\ infl = [h1 |-> FALSE, h2 |-> FALSE]
+/\ runG = [h1 |-> 0, h2 |-> 1]
+
+State 4: <Admit("h2") line 60, col 3 to line 63, col 90 of module AccountGate>
+/\ acct = "Off"
+/\ hG = [h1 |-> 1, h2 |-> 1]
+/\ ncommit = 1
+/\ nreset = 0
+/\ hS = [h1 |-> "Off", h2 |-> "Off"]
+/\ clean = [h1 |-> TRUE, h2 |-> TRUE]
+/\ bad = FALSE
+/\ staleAdm = FALSE
+/\ psG = 1
+/\ psS = "Off"
+/\ fresh = [h1 |-> TRUE, h2 |-> TRUE]
+/\ agen = 1
+/\ nfail = 0
+/\ infl = [h1 |-> FALSE, h2 |-> TRUE]
+/\ runG = [h1 |-> 0, h2 |-> 1]
+
+State 5: <Tick("h1") line 39, col 12 to line 40, col 114 of module AccountGate>
+/\ acct = "Off"
+/\ hG = [h1 |-> 1, h2 |-> 1]
+/\ ncommit = 1
+/\ nreset = 0
+/\ hS = [h1 |-> "Off", h2 |-> "Off"]
+/\ clean = [h1 |-> TRUE, h2 |-> TRUE]
+/\ bad = FALSE
+/\ staleAdm = FALSE
+/\ psG = 1
+/\ psS = "Off"
+/\ fresh = [h1 |-> FALSE, h2 |-> TRUE]
+/\ agen = 1
+/\ nfail = 0
+/\ infl = [h1 |-> FALSE, h2 |-> TRUE]
+/\ runG = [h1 |-> 0, h2 |-> 1]
+
+State 6: <TurnOn line 35, col 11 to line 36, col 114 of module AccountGate>
+/\ acct = "On"
+/\ hG = [h1 |-> 1, h2 |-> 1]
+/\ ncommit = 1
+/\ nreset = 0
+/\ hS = [h1 |-> "Off", h2 |-> "Off"]
+/\ clean = [h1 |-> TRUE, h2 |-> TRUE]
+/\ bad = FALSE
+/\ staleAdm = FALSE
+/\ psG = 1
+/\ psS = "Off"
+/\ fresh = [h1 |-> FALSE, h2 |-> TRUE]
+/\ agen = 1
+/\ nfail = 0
+/\ infl = [h1 |-> FALSE, h2 |-> TRUE]
+/\ runG = [h1 |-> 0, h2 |-> 1]
+
+State 7: <Tick("h2") line 39, col 12 to line 40, col 114 of module AccountGate>
+/\ acct = "On"
+/\ hG = [h1 |-> 1, h2 |-> 1]
+/\ ncommit = 1
+/\ nreset = 0
+/\ hS = [h1 |-> "Off", h2 |-> "Off"]
+/\ clean = [h1 |-> TRUE, h2 |-> TRUE]
+/\ bad = FALSE
+/\ staleAdm = FALSE
+/\ psG = 1
+/\ psS = "Off"
+/\ fresh = [h1 |-> FALSE, h2 |-> FALSE]
+/\ agen = 1
+/\ nfail = 0
+/\ infl = [h1 |-> FALSE, h2 |-> TRUE]
+/\ runG = [h1 |-> 0, h2 |-> 1]
+
+State 8: <Commit("h2") line 65, col 3 to line 70, col 92 of module AccountGate>
+/\ acct = "On"
+/\ hG = [h1 |-> 1, h2 |-> 1]
+/\ ncommit = 2
+/\ nreset = 0
+/\ hS = [h1 |-> "Off", h2 |-> "Off"]
+/\ clean = [h1 |-> TRUE, h2 |-> TRUE]
+/\ bad = FALSE
+/\ staleAdm = FALSE
+/\ psG = 1
+/\ psS = "Off"
+/\ fresh = [h1 |-> FALSE, h2 |-> FALSE]
+/\ agen = 1
+/\ nfail = 0
+/\ infl = [h1 |-> FALSE, h2 |-> FALSE]
+/\ runG = [h1 |-> 0, h2 |-> 1]
+
+State 9: Stuttering
+Finished checking temporal properties in 00s at 2026-11-09 17:56:58
+3544 states generated, 852 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 13.
+Finished in 00s at (2026-11-09 17:56:58)
