@@ -2194,7 +2194,8 @@ function claudeLiveMetadata(
     !(
       typeof plan.plan_display_name === "string" ||
       plan.plan_display_name === null
-    )
+    ) ||
+    !(typeof plan.plan_type === "string" || plan.plan_type == null)
   ) {
     return {
       ok: false,
@@ -2208,7 +2209,10 @@ function claudeLiveMetadata(
   return {
     ok: true,
     organizationId: plan.account_id,
-    profile: { name: null, plan: plan.plan_display_name },
+    profile: {
+      name: null,
+      plan: plan.plan_display_name ?? plan.plan_type ?? null,
+    },
   };
 }
 
@@ -2227,7 +2231,14 @@ function claudeConversationsBinding(live = false): LegacyScopeBinding {
     legacySchemaPath: "claude.conversations.json",
     fieldsRead: {
       ...(live
-        ? { account_plan: ["id", "account_id", "plan_display_name"] }
+        ? {
+            account_plan: [
+              "id",
+              "account_id",
+              "plan_display_name",
+              "plan_type",
+            ],
+          }
         : {
             account_profile: [
               "id",
