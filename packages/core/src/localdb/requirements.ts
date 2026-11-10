@@ -37,7 +37,79 @@ export function createLocalRequirements(
     readonly source: SinceFieldSource;
   },
 ): LocalRequirements {
-  void deps;
-  void options;
-  throw new Error("PS-2: not built");
+  const cache = new Map<
+    string,
+    { readonly key: string; readonly answer: RequirementsAnswer }
+  >();
+
+  return {
+    async requirements(connectionId) {
+      const fields = Object.entries(
+        await options.source.sinceFields(connectionId),
+      ).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+      const heads = await deps.db.query<{
+        stream: string;
+        head_version: number;
+      }>(
+        "SELECT stream, head_version FROM stream_state WHERE connection_id = ? ORDER BY stream",
+        [connectionId],
+      );
+      // A declaration may change without changing a stream's stored head.
+      const key = JSON.stringify([fields, heads]);
+      const cached = cache.get(connectionId);
+      if (cached?.key === key) return cached.answer;
+
+      const remember = (answer: RequirementsAnswer): RequirementsAnswer => {
+        cache.set(connectionId, { key, answer });
+        return answer;
+      };
+      let since: string | null = null;
+      for (const [stream, field] of fields) {
+        let cursor: string | undefined;
+        do {
+          const page = await options.query.listRecords({
+            connectionId,
+            stream,
+            ...(cursor === undefined ? {} : { cursor }),
+            limit: 100,
+          });
+          for (const record of page.records) {
+            let body: unknown;
+            try {
+              body = JSON.parse(record.body);
+            } catch {
+              return remember({ ok: false, reason: "malformed_day" });
+            }
+            if (
+              body === null ||
+              typeof body !== "object" ||
+              !Object.prototype.hasOwnProperty.call(body, field)
+            ) {
+              continue;
+            }
+            const day = (body as Record<string, unknown>)[field];
+            if (!isCalendarDay(day)) {
+              return remember({ ok: false, reason: "malformed_day" });
+            }
+            if (since === null || day < since) since = day;
+          }
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor !== undefined);
+      }
+      return remember({ ok: true, since });
+    },
+  };
+}
+
+function isCalendarDay(value: unknown): value is string {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return false;
+  }
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(5, 7));
+  const day = Number(value.slice(8, 10));
+  if (year === 0 || month < 1 || month > 12 || day < 1) return false;
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day <= days[month - 1]!;
 }
