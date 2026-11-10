@@ -18,6 +18,10 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { createApp } from "../app.js";
+import {
+  createMemoryModeRecordStore,
+  createModeAuthority,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { initializeDatabase } from "../storage/index-schema.js";
 import {
   createIndexManager,
@@ -26,6 +30,24 @@ import {
 
 const owner = "0x1111111111111111111111111111111111111111";
 const token = "owner-connectors-app-token";
+
+async function modeAuthorityAnswering(
+  owner: string,
+  answer: "switched" | "unswitched" | "unknown",
+) {
+  const authority = createModeAuthority({
+    store: createMemoryModeRecordStore(),
+    onWarning: () => undefined,
+  });
+  await authority.ready;
+  if (answer !== "unknown") {
+    await authority.submitEvidence({
+      owner,
+      state: answer === "switched" ? "on" : "off",
+    });
+  }
+  return authority;
+}
 
 describe("DELETE /v1/owner/connectors/:connectorId", () => {
   let dir: string;
@@ -49,7 +71,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
     },
   };
 
-  function makeApp(opts: {
+  async function makeApp(opts: {
     switched: boolean;
     connectionDelete?: ConnectionDeletePort | null;
     mode?: StorageModeRead;
@@ -78,23 +100,28 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
       streamSyncAdmitting: () => opts.closing !== true,
       streamSyncConnectionDelete:
         opts.connectionDelete === undefined ? writer : opts.connectionDelete,
-      accountStorageMode: opts.unwired
+      accountModeAuthority: opts.unwired
         ? undefined
-        : (opts.mode ?? {
-            read: () => (opts.switched ? "switched" : "unswitched"),
-          }),
+        : await modeAuthorityAnswering(
+            owner,
+            opts.mode
+              ? (opts.mode.read() as "switched" | "unswitched" | "unknown")
+              : opts.switched
+                ? "switched"
+                : "unswitched",
+          ),
     });
   }
 
   const del = (
-    app: ReturnType<typeof makeApp>,
+    app: Awaited<ReturnType<typeof makeApp>>,
     path: string,
     headers: Record<string, string> = { Authorization: `Bearer ${token}` },
   ) => app.request(path, { method: "DELETE", headers });
 
   it("refuses anyone but the owner (mutant: NOT_OWNER_ALLOWED)", async () => {
     const response = await del(
-      makeApp({ switched: true }),
+      await makeApp({ switched: true }),
       "/v1/owner/connectors/github",
       {},
     );
@@ -105,7 +132,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("refuses an unswitched account and deletes nothing (mutant: UNSWITCHED_DELETES_STREAMS)", async () => {
     const response = await del(
-      makeApp({ switched: false }),
+      await makeApp({ switched: false }),
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(409);
@@ -115,7 +142,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("answers 202 with the delete id of a switched account", async () => {
     const response = await del(
-      makeApp({ switched: true }),
+      await makeApp({ switched: true }),
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(202);
@@ -125,7 +152,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("answers 503 when no stream-sync writer is wired (mutant: LITE_UNWIRED)", async () => {
     const response = await del(
-      makeApp({ switched: true, connectionDelete: null }),
+      await makeApp({ switched: true, connectionDelete: null }),
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(503);
@@ -136,7 +163,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("refuses a name that is not a connector key", async () => {
     const response = await del(
-      makeApp({ switched: true }),
+      await makeApp({ switched: true }),
       "/v1/owner/connectors/a~b",
     );
     expect(response.status).toBe(400);
@@ -145,7 +172,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("answers 503, not 409, when no mode is wired, even on a write-only config (mutant: UNWIRED_MODE_FROM_CONFIG)", async () => {
     const response = await del(
-      makeApp({ switched: false, unwired: true }),
+      await makeApp({ switched: false, unwired: true }),
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(503);
@@ -158,7 +185,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
   it("takes the mode from the port, not from the config (mutant: CONNECTOR_ROUTE_READS_CONFIG)", async () => {
     // The config says unswitched; the port says switched.
     const response = await del(
-      makeApp({ switched: false, mode: { read: () => "switched" } }),
+      await makeApp({ switched: false, mode: { read: () => "switched" } }),
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(202);
@@ -167,7 +194,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("answers 503 and deletes nothing while the mode is unknown (mutant: UNKNOWN_MODE_NOT_SWITCHED)", async () => {
     const response = await del(
-      makeApp({ switched: true, mode: { read: () => "unknown" } }),
+      await makeApp({ switched: true, mode: { read: () => "unknown" } }),
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(503);
@@ -179,7 +206,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("asks the unknown mode only of the owner (mutant: MODE_BEFORE_AUTH)", async () => {
     const response = await del(
-      makeApp({ switched: true, mode: { read: () => "unknown" } }),
+      await makeApp({ switched: true, mode: { read: () => "unknown" } }),
       "/v1/owner/connectors/github",
       {},
     );
@@ -189,7 +216,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("tells a caller who is not the owner nothing about shutdown (mutant: CLOSING_BEFORE_AUTH)", async () => {
     const response = await del(
-      makeApp({ switched: true, closing: true }),
+      await makeApp({ switched: true, closing: true }),
       "/v1/owner/connectors/github",
       {},
     );
@@ -200,7 +227,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("answers the owner 503 while stream sync shuts down", async () => {
     const response = await del(
-      makeApp({ switched: true, closing: true }),
+      await makeApp({ switched: true, closing: true }),
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(503);
@@ -210,7 +237,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("refuses a malformed percent-escape as a bad id, not a connector (mutant: RAW_ID_ON_BAD_ESCAPE)", async () => {
     const response = await del(
-      makeApp({ switched: true }),
+      await makeApp({ switched: true }),
       "/v1/owner/connectors/%E0%A4%A",
     );
     expect(response.status).toBe(400);
@@ -220,7 +247,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("asks a bad escape of the owner only", async () => {
     const response = await del(
-      makeApp({ switched: true }),
+      await makeApp({ switched: true }),
       "/v1/owner/connectors/%E0%A4%A",
       {},
     );
@@ -233,18 +260,24 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
       [
         400,
         "INVALID_CONNECTOR",
-        await del(makeApp({ switched: true }), "/v1/owner/connectors/a~b"),
+        await del(
+          await makeApp({ switched: true }),
+          "/v1/owner/connectors/a~b",
+        ),
       ],
       [
         409,
         "NOT_SWITCHED",
-        await del(makeApp({ switched: false }), "/v1/owner/connectors/github"),
+        await del(
+          await makeApp({ switched: false }),
+          "/v1/owner/connectors/github",
+        ),
       ],
       [
         503,
         "ACCOUNT_MODE_UNKNOWN",
         await del(
-          makeApp({ switched: true, mode: { read: () => "unknown" } }),
+          await makeApp({ switched: true, mode: { read: () => "unknown" } }),
           "/v1/owner/connectors/github",
         ),
       ],
@@ -259,7 +292,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("answers 503 CONNECTOR_NOT_VERIFIED when the writer cannot name the streams", async () => {
     const response = await del(
-      makeApp({
+      await makeApp({
         switched: true,
         connectionDelete: {
           requestConnectionDelete: async (connector) => {
@@ -276,7 +309,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
   });
 
   it("answers another method with 405 to the owner only (mutant: METHOD_BEFORE_AUTH)", async () => {
-    const app = makeApp({ switched: true });
+    const app = await makeApp({ switched: true });
     const stranger = await app.request("/v1/owner/connectors/github", {
       method: "GET",
     });

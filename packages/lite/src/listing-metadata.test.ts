@@ -1,10 +1,10 @@
+import { createOpenPersistentPsLiteStorage } from "./test-support/open-storage.js";
 import { afterEach, expect, it, vi } from "vitest";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import { listDataScopesContract } from "@opendatalabs/personal-server-ts-core/contracts";
 import * as projections from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
-import { createPersistentPsLiteStorage } from "./storage.js";
 import {
   createMemoryPsLiteDataFileStore,
   createMemoryPsLitePersistence,
@@ -14,7 +14,7 @@ afterEach(() => vi.restoreAllMocks());
 
 it("lists large stored and same-name projected scopes without reading file bodies", async () => {
   const files = createMemoryPsLiteDataFileStore();
-  const storage = await createPersistentPsLiteStorage(
+  const storage = await createOpenPersistentPsLiteStorage(
     { kind: "custom" },
     createMemoryPsLitePersistence(),
     files,
@@ -75,7 +75,7 @@ it("persists block readiness metadata across reload and removes it with deleted 
   const files = createMemoryPsLiteDataFileStore();
   const persistence = createMemoryPsLitePersistence();
   const create = () =>
-    createPersistentPsLiteStorage({ kind: "custom" }, persistence, files);
+    createOpenPersistentPsLiteStorage({ kind: "custom" }, persistence, files);
   const storage = await create();
   const scope = "notes.documents";
   const collectedAt = "2026-10-20T00:00:00.000Z";
@@ -128,7 +128,7 @@ it.each(["version", "scope"])(
     const files = createMemoryPsLiteDataFileStore();
     const persistence = createMemoryPsLitePersistence();
     const create = () =>
-      createPersistentPsLiteStorage({ kind: "custom" }, persistence, files);
+      createOpenPersistentPsLiteStorage({ kind: "custom" }, persistence, files);
     const storage = await create();
     const scope = "notes.documents";
     const collectedAt = "2026-10-20T00:00:00.000Z";
@@ -176,7 +176,7 @@ it.each(["version", "scope"])(
     const files = createMemoryPsLiteDataFileStore();
     const persistence = createMemoryPsLitePersistence();
     const create = () =>
-      createPersistentPsLiteStorage({ kind: "custom" }, persistence, files);
+      createOpenPersistentPsLiteStorage({ kind: "custom" }, persistence, files);
     const storage = await create();
     const scope = "notes.documents";
     const collectedAt = "2026-10-20T00:00:00.000Z";

@@ -1,11 +1,12 @@
+import { createOpenPersistentPsLiteStorage } from "./test-support/open-storage.js";
 import { describe, expect, it, vi } from "vitest";
+import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
   createScopeDeletionTracker,
   deleteScope,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
-import { createPersistentPsLiteStorage } from "./storage.js";
 import type { PsLiteDataFileStore } from "./storage.js";
 import {
   createMemoryPsLiteAccessLogStore,
@@ -134,7 +135,7 @@ describe("persistent Lite owner POST during a covered delete", () => {
       },
     };
     const createStorage = () =>
-      createPersistentPsLiteStorage({ kind: "custom" }, persistence, files);
+      createOpenPersistentPsLiteStorage({ kind: "custom" }, persistence, files);
     const storage = await createStorage();
     const write = await storage.writeEnvelope(
       createDataFileEnvelope(SCOPE, OLD_STAMP, { value: "covered-old-entry" }),
@@ -154,6 +155,7 @@ describe("persistent Lite owner POST during a covered delete", () => {
     const scopeDeletions = createScopeDeletionTracker();
     const accessLog = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       storage,
       auth: createBearerTokenPsLiteAuth({
         ownerToken: OWNER_TOKEN,
@@ -198,7 +200,7 @@ describe("persistent Lite owner POST during a covered delete", () => {
 
   /** Polls fresh reloads of the persisted storage until the POST's row is on disk. */
   async function waitForPersistedVersion(
-    createStorage: () => ReturnType<typeof createPersistentPsLiteStorage>,
+    createStorage: () => ReturnType<typeof createOpenPersistentPsLiteStorage>,
     collectedAt: string,
   ) {
     const deadline = Date.now() + 2_000;
@@ -361,7 +363,7 @@ describe("lite gateway deletion keeps arrivals made during the remote delete", (
         files.delete(path);
       },
     } as never;
-    const storage = (await createPersistentPsLiteStorage(
+    const storage = (await createOpenPersistentPsLiteStorage(
       { kind: "custom" } as never,
       createMemoryPsLitePersistence(),
       dataFileStore,

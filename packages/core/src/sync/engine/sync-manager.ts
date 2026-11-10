@@ -22,6 +22,7 @@ import type {
   PendingBlobDeletionStore,
   TombstoneFinalityPort,
 } from "../../ports/index.js";
+import type { LegacyWriteSeal } from "../../storage/legacy-write-seal.js";
 
 export interface SyncManagerOptions {
   /** Polling interval in milliseconds (default: 60_000 = 1 minute) */
@@ -99,8 +100,17 @@ export interface SyncManager {
    * local copy (see workers/delete.ts for why that order is the only safe
    * one). Resolves with a per-step result; a gateway failure leaves the
    * local copy in place and is reported as `steps.gateway.status = "failed"`.
+   *
+   * `within` is the legacy-write seal's `commit`. When given, the delete runs
+   * inside it (and a refusal rejects with `LegacyWriteRefusedError` before
+   * anything is sent or removed). It is entered AFTER this manager's mutation
+   * queue: a sync cycle holds the queue and asks the seal, so the seal must be
+   * the innermost lock or a waiting On deadlocks the two.
    */
-  deleteScope(scope: string): Promise<DeleteScopeResult>;
+  deleteScope(
+    scope: string,
+    within?: LegacyWriteSeal["commit"],
+  ): Promise<DeleteScopeResult>;
 
   /** Whether the sync manager is currently running */
   readonly running: boolean;
@@ -578,11 +588,15 @@ export function createSyncManager(
         uploadState.clear(path);
     },
 
-    async deleteScope(scope: string) {
+    async deleteScope(scope: string, within?: LegacyWriteSeal["commit"]) {
       const result = await exclusive(async () => {
         // A delete the user asks for starts a fresh set of re-submissions.
         tombstoneResubmits.reset(scope);
-        const outcome = await deleteScope(deleteScopeDeps(), scope);
+        const outcome = within
+          ? await within((hold) =>
+              deleteScope(deleteScopeDeps(), scope, { hold }),
+            )
+          : await deleteScope(deleteScopeDeps(), scope);
         // Upload state follows the rows. A failed delete removed nothing, so
         // its entries keep their budget and status; entries the delete did
         // remove are forgotten by comparing with what is still unsynced.

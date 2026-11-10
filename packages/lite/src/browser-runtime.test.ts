@@ -5,6 +5,10 @@
  * environment. Browser defaults remain exercised by the existing suite.
  */
 
+import {
+  createSwitchedIndexedDbPsLiteRuntime,
+  createUnswitchedIndexedDbPsLiteRuntime,
+} from "./test-support/unswitched-runtime.js";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
@@ -13,6 +17,11 @@ import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
 import { createIndexedDbStreamSyncFiles } from "./stream-sync-files.js";
 import { startPersonalServer } from "./client.js";
 import { createBearerTokenPsLiteAuth } from "./runtime.js";
+import {
+  createMemoryModeRecordStore,
+  type ImportRunner,
+  type ModeRecordStore,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import type { PsLitePersistenceBundle } from "./persistence.js";
 import {
   createMemoryPsLiteAccessLogStore,
@@ -61,7 +70,7 @@ function memoryBundle(): PsLitePersistenceBundle {
 }
 
 function build(bundle: PsLitePersistenceBundle) {
-  return createIndexedDbPsLiteRuntime({
+  return createUnswitchedIndexedDbPsLiteRuntime({
     streamSyncDeclaredStreams: () => [],
     ownerAddress,
     ownerSignature,
@@ -201,7 +210,7 @@ describe("createIndexedDbPsLiteRuntime browser defaults", () => {
       },
     };
 
-    const first = await createIndexedDbPsLiteRuntime(options);
+    const first = await createUnswitchedIndexedDbPsLiteRuntime(options);
     const write = await first.runtime.fetch(
       new Request("https://ps.local/v1/data/instagram.profile", {
         method: "POST",
@@ -214,7 +223,7 @@ describe("createIndexedDbPsLiteRuntime browser defaults", () => {
     );
     expect(write.status).toBe(201);
 
-    const restarted = await createIndexedDbPsLiteRuntime(options);
+    const restarted = await createUnswitchedIndexedDbPsLiteRuntime(options);
     const list = await restarted.runtime.fetch(
       new Request("https://ps.local/v1/data", {
         headers: { Authorization: "Bearer owner-token" },
@@ -265,7 +274,7 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
     const resolve = vi.fn((d: string) =>
       d === digest ? { connector: "c", version: "1", streams: [] } : null,
     );
-    const { streamSyncIntake } = await createIndexedDbPsLiteRuntime(
+    const { streamSyncIntake } = await createUnswitchedIndexedDbPsLiteRuntime(
       options({
         streamSyncDeclarations: resolve,
         streamSyncFiles: () =>
@@ -291,7 +300,7 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
 
   it("is null with streamSync.write off", async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());
-    const { streamSyncIntake } = await createIndexedDbPsLiteRuntime(
+    const { streamSyncIntake } = await createUnswitchedIndexedDbPsLiteRuntime(
       options({
         configDefaults: {
           gateway: { url: "https://gateway.local" },
@@ -322,30 +331,31 @@ describe("createIndexedDbPsLiteRuntime own-write reads", () => {
       }),
     );
     const dbName = `ps-lite-own-reads-${Math.random()}`;
-    const { runtime, streamSyncWriter } = await createIndexedDbPsLiteRuntime({
-      streamSyncDeclaredStreams: () => [],
-      ownerAddress,
-      ownerSignature,
-      dbName,
-      storageDbName: `${dbName}-storage`,
-      gateway: createMockPsLiteGateway(),
-      auth: createBearerTokenPsLiteAuth({
-        ownerToken: "owner-token",
-        builderToken: "builder-token",
-      }),
-      active: true,
-      streamSyncFiles: () =>
-        createIndexedDbStreamSyncFiles({
-          dbName: `${dbName}-streams`,
-          factory: new IDBFactory(),
-          keyRange: IDBKeyRange,
+    const { runtime, streamSyncWriter } =
+      await createSwitchedIndexedDbPsLiteRuntime({
+        streamSyncDeclaredStreams: () => [],
+        ownerAddress,
+        ownerSignature,
+        dbName,
+        storageDbName: `${dbName}-storage`,
+        gateway: createMockPsLiteGateway(),
+        auth: createBearerTokenPsLiteAuth({
+          ownerToken: "owner-token",
+          builderToken: "builder-token",
         }),
-      configDefaults: {
-        gateway: { url: "https://gateway.local" },
-        sync: { enabled: true },
-        streamSync: { write: true, read: true },
-      },
-    });
+        active: true,
+        streamSyncFiles: () =>
+          createIndexedDbStreamSyncFiles({
+            dbName: `${dbName}-streams`,
+            factory: new IDBFactory(),
+            keyRange: IDBKeyRange,
+          }),
+        configDefaults: {
+          gateway: { url: "https://gateway.local" },
+          sync: { enabled: true },
+          streamSync: { write: true, read: true },
+        },
+      });
     const writer = streamSyncWriter!;
     await writer.refreshControls();
     await writer.beginRun({
@@ -399,7 +409,7 @@ describe("createIndexedDbPsLiteRuntime write sessions", () => {
 
     // Default wiring: the route exists, and refuses an unauthenticated
     // handshake rather than 404ing as if delegated writes were unsupported.
-    const withDefaults = await createIndexedDbPsLiteRuntime({
+    const withDefaults = await createUnswitchedIndexedDbPsLiteRuntime({
       streamSyncDeclaredStreams: () => [],
       ...base,
       dbName: "ps-lite-write-default",
@@ -409,7 +419,7 @@ describe("createIndexedDbPsLiteRuntime write sessions", () => {
 
     // A caller that brings its own auth adapter owns the wiring: we must not
     // mint tokens that adapter has never heard of.
-    const withOwnAuth = await createIndexedDbPsLiteRuntime({
+    const withOwnAuth = await createUnswitchedIndexedDbPsLiteRuntime({
       streamSyncDeclaredStreams: () => [],
       ...base,
       dbName: "ps-lite-write-own-auth",
@@ -459,7 +469,7 @@ describe("createIndexedDbPsLiteRuntime data listings", () => {
       grant({ id: "grant-other", granteeId: "builder-2", scopes: ["*"] }),
     ]);
     const getGrant = vi.fn(async () => null);
-    const { runtime } = await createIndexedDbPsLiteRuntime({
+    const { runtime } = await createUnswitchedIndexedDbPsLiteRuntime({
       streamSyncDeclaredStreams: () => [],
       ownerAddress,
       ownerSignature,
@@ -538,5 +548,186 @@ describe("createIndexedDbPsLiteRuntime data listings", () => {
       total: 2,
     });
     expect(listGrantsByUser).not.toHaveBeenCalled();
+  });
+});
+
+describe("the account-mode records of a runtime over injected persistence", () => {
+  const plain = (
+    bundle: PsLitePersistenceBundle,
+    accountModeStore?: ModeRecordStore,
+  ) =>
+    createIndexedDbPsLiteRuntime({
+      ownerAddress,
+      ownerSignature,
+      persistence: bundle,
+      accountModeStore,
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    });
+  const answer = (
+    runtime: Awaited<ReturnType<typeof plain>>,
+    state: "on" | "off",
+  ) =>
+    runtime.accountModeAuthority.submitEvidence({
+      owner: ownerAddress,
+      state,
+    });
+
+  it("keeps the answer in memory when the host injects persistence but no mode store: the next launch's answer restores it", async () => {
+    const bundle = memoryBundle();
+    const first = await plain(bundle);
+    expect((await answer(first, "on")).kind).toBe("streams");
+    expect(first.accountModeAuthority.read(ownerAddress).kind).toBe("streams");
+    const second = await plain(bundle);
+    expect(second.accountModeAuthority.read(ownerAddress).kind).toBe("refuse");
+  });
+
+  it("keeps an On through a restart when the host injects a durable store, and a later Off is refused", async () => {
+    const store = createMemoryModeRecordStore();
+    const bundle = memoryBundle();
+    const first = await plain(bundle, store);
+    expect((await answer(first, "on")).kind).toBe("streams");
+    await first.accountModeAuthority.close();
+    const second = await plain(bundle, store);
+    expect((await answer(second, "off")).kind).toBe("streams");
+    expect(
+      (await second.accountModeAuthority.commitLegacy(ownerAddress, () => 1))
+        .ok,
+    ).toBe(false);
+  });
+});
+
+describe("the legacy import wake of a runtime", () => {
+  const withImporter = async (store: ModeRecordStore, importer: ImportRunner) =>
+    createIndexedDbPsLiteRuntime({
+      ownerAddress,
+      ownerSignature,
+      persistence: memoryBundle(),
+      accountModeStore: store,
+      legacyImporter: importer,
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    });
+  const runningImporter = () => {
+    const runs: AbortSignal[] = [];
+    const importer: ImportRunner = {
+      run: (signal) =>
+        new Promise<void>((resolve) => {
+          runs.push(signal);
+          signal.addEventListener("abort", () => resolve());
+        }),
+    };
+    return { importer, runs };
+  };
+  const until = async (check: () => boolean) => {
+    for (let i = 0; i < 200 && !check(); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+
+  it("runs the importer when the Account says On, and stop aborts it", async () => {
+    const store = createMemoryModeRecordStore();
+    const { importer, runs } = runningImporter();
+    const runtime = await withImporter(store, importer);
+    await runtime.accountModeAuthority.submitEvidence({
+      owner: ownerAddress,
+      state: "off",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(runs).toHaveLength(0);
+
+    await runtime.accountModeAuthority.submitEvidence({
+      owner: ownerAddress,
+      state: "on",
+    });
+    await until(() => runs.length > 0);
+    expect(runs).toHaveLength(1);
+
+    await runtime.importWaker?.stop();
+    expect(runs[0]?.aborted).toBe(true);
+  });
+
+  it("runs it at boot when the saved answer is already On", async () => {
+    const store = createMemoryModeRecordStore();
+    await store.save(ownerAddress.toLowerCase(), {
+      answer: "on",
+      generation: 0,
+      receivedAt: 1,
+    });
+    const { importer, runs } = runningImporter();
+    const runtime = await withImporter(store, importer);
+    await until(() => runs.length > 0);
+    expect(runs).toHaveLength(1);
+    await runtime.importWaker?.stop();
+  });
+
+  it("startPersonalServer forwards the importer, and its stop aborts the run", async () => {
+    const store = createMemoryModeRecordStore();
+    await store.save(ownerAddress.toLowerCase(), {
+      answer: "on",
+      generation: 0,
+      receivedAt: 1,
+    });
+    const { importer, runs } = runningImporter();
+    const server = await startPersonalServer({
+      ownerAddress,
+      ownerSignature,
+      persistence: memoryBundle(),
+      accountModeStore: store,
+      legacyImporter: importer,
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+      relay: false,
+    });
+    await until(() => runs.length > 0);
+    expect(runs).toHaveLength(1);
+    // Would hang if stop did not abort the run and wait for it.
+    await server.stop();
+    expect(runs[0]?.aborted).toBe(true);
+  });
+
+  it("starts nothing when the host passes no importer", async () => {
+    const runtime = await createIndexedDbPsLiteRuntime({
+      streamSyncDeclaredStreams: () => [],
+      ownerAddress,
+      ownerSignature,
+      persistence: memoryBundle(),
+      accountModeStore: createMemoryModeRecordStore(),
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    });
+    expect(runtime.importWaker).toBeUndefined();
   });
 });

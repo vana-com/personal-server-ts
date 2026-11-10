@@ -7,8 +7,10 @@ import { pino } from "pino";
 import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
 import {
+  fixedLegacyWriteSeal,
   buildWeb3SignedHeader,
   createTestWallet,
+  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   authenticateRequest,
@@ -144,6 +146,8 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
     app.route(
       "/v1/data",
       dataRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+        legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
         indexManager,
         hierarchyOptions,
         logger,
@@ -237,6 +241,8 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
     app.route(
       "/v1/data",
       dataRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+        legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
         indexManager,
         hierarchyOptions: { dataDir },
         logger,
@@ -312,6 +318,8 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
       app.route(
         "/v1/data",
         dataRoutes({
+          accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+          legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
           indexManager,
           hierarchyOptions: { dataDir },
           logger,

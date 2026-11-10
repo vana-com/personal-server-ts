@@ -12,6 +12,7 @@
  * record shape + plaintext-at-rest behavior are preserved.
  */
 
+import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import forge from "node-forge";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
@@ -97,6 +98,7 @@ async function runtimeOverBundle(
 ) {
   const { config: configDefaults, ...runtimeOverrides } = options;
   return createPsLiteRuntime({
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     ...(await psLitePersistenceRuntimeOptions(bundle, configDefaults)),
     auth: ownerAuth(),
     gateway: createMockPsLiteGateway(),

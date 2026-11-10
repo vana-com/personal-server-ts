@@ -16,6 +16,10 @@ import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-c
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { cacheRequestBodyBytes } from "@opendatalabs/personal-server-ts-core/auth";
 import { publishStagedDataFile } from "../storage/hierarchy.js";
+import {
+  LegacyWriteRefusedError,
+  type LegacyWriteSeal,
+} from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 
 export const SCOPE_IMPORT_CHUNK_BYTES = 8 * 1024 * 1024;
 export const SCOPE_IMPORT_MAX_BYTES = 256 * 1024 * 1024;
@@ -294,18 +298,26 @@ interface ImportMetadata {
 export interface ScopeImportDeps {
   hierarchyOptions: HierarchyManagerOptions;
   indexManager: IndexManager;
+  /**
+   * The seal finalize publishes through: the staged file and its index row
+   * become durable in one `commit`, so an account that switched while the
+   * chunks were assembled gets a refusal and nothing published.
+   */
+  legacyWriteSeal: LegacyWriteSeal;
   serverOwner?: string;
   authorizeOwner(request: Request, scope: string): Promise<void>;
   afterTombstoneVersion?(scope: string): Promise<number | null>;
   onDataWritten?(event: { scope: string; collectedAt: string }): void;
   syncManager?: { notifyNewData?(): void; trigger?(): Promise<void> } | null;
   /**
-   * Returns the refusal response while the account's stream-sync switch is on
-   * and the request did not declare a stream-sync client. Checked after owner
-   * authorization by every operation that writes: begin, chunk and finalize.
-   * A session opened before the switch is refused too.
+   * Returns the refusal response while the account's stream-sync switch is on.
+   * Checked after owner authorization by every operation that writes: begin,
+   * chunk and finalize. A session opened before the switch is refused too.
+   * An early courtesy only: nothing depends on it. Finalize publishes through
+   * `legacyWriteSeal`, which refuses even if this check is missing or the
+   * switch lands after it.
    */
-  refuseLegacyWrite?(request: Request): Response | null;
+  refuseLegacyWrite?(): Response | null;
 }
 
 /** Thrown to hand a ready 426 response back through the import route. */
@@ -315,9 +327,47 @@ export class LegacyWriteRefused extends Error {
   }
 }
 
-function refuseIfLegacy(deps: ScopeImportDeps, request: Request): void {
-  const refusal = deps.refuseLegacyWrite?.(request);
-  if (refusal) throw new LegacyWriteRefused(refusal);
+/**
+ * Early refusal. On a switched account (426) the session being refused can
+ * never finish, so its chunks and metadata go with it rather than waiting for
+ * the session to expire.
+ */
+async function refuseIfLegacy(
+  deps: ScopeImportDeps,
+  sessionId?: string,
+): Promise<void> {
+  const refusal = deps.refuseLegacyWrite?.();
+  if (!refusal) return;
+  if (
+    refusal.status === 426 &&
+    sessionId &&
+    IMPORT_ID_PATTERN.test(sessionId)
+  ) {
+    await rm(importPath(deps, sessionId), { recursive: true, force: true });
+  }
+  throw new LegacyWriteRefused(refusal);
+}
+
+const IMPORT_ID_PATTERN = /^[0-9a-f-]{36}$/i;
+
+/**
+ * A refused finalize leaves nothing behind: the staged file, an unindexed
+ * final file and, once the account has switched, the session's chunks and
+ * metadata. While the mode is merely unknown the refusal is retryable (503),
+ * so the chunks stay for the retry (they expire with the session otherwise).
+ */
+async function dropRefusedImport(
+  deps: ImportArtifactDeps,
+  metadata: ImportMetadata,
+  error: unknown,
+): Promise<void> {
+  await removeImportArtifacts(deps, metadata);
+  if (
+    error instanceof LegacyWriteRefusedError &&
+    error.verdict === "switched"
+  ) {
+    await rm(importPath(deps, metadata.id), { recursive: true, force: true });
+  }
 }
 
 export class ScopeImportError extends Error {
@@ -441,24 +491,35 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+type ImportArtifactDeps = Pick<
+  ScopeImportDeps,
+  "hierarchyOptions" | "indexManager" | "legacyWriteSeal"
+>;
+
+/**
+ * Remove a session's staged file and any unindexed final file: a pure
+ * removal, admitted in every mode. Never call it from inside `commit`.
+ */
 async function removeImportArtifacts(
-  deps: Pick<ScopeImportDeps, "hierarchyOptions" | "indexManager">,
+  deps: ImportArtifactDeps,
   metadata: ImportMetadata,
 ): Promise<void> {
-  const finalPath = buildDataFilePath(
-    deps.hierarchyOptions.dataDir,
-    metadata.scope,
-    metadata.collectedAt,
-  );
-  await unlink(`${finalPath}.pending.${metadata.id}`).catch(() => undefined);
-  const relativePath = relative(deps.hierarchyOptions.dataDir, finalPath);
-  if (!deps.indexManager.findByPath(relativePath)) {
-    await unlink(finalPath).catch(() => undefined);
-  }
+  await deps.legacyWriteSeal.remove(async () => {
+    const finalPath = buildDataFilePath(
+      deps.hierarchyOptions.dataDir,
+      metadata.scope,
+      metadata.collectedAt,
+    );
+    await unlink(`${finalPath}.pending.${metadata.id}`).catch(() => undefined);
+    const relativePath = relative(deps.hierarchyOptions.dataDir, finalPath);
+    if (!deps.indexManager.findByPath(relativePath)) {
+      await unlink(finalPath).catch(() => undefined);
+    }
+  });
 }
 
 export async function cleanupExpiredScopeImports(
-  deps: Pick<ScopeImportDeps, "hierarchyOptions" | "indexManager">,
+  deps: ImportArtifactDeps,
   now = Date.now(),
   removeTemps = false,
 ): Promise<void> {
@@ -511,7 +572,7 @@ export async function beginScopeImport(
   body: unknown,
 ): Promise<{ importId: string; chunkBytes: number; expiresAt: string }> {
   await deps.authorizeOwner(request, scope);
-  refuseIfLegacy(deps, request);
+  await refuseIfLegacy(deps);
   if (!deps.serverOwner) {
     throw new ScopeImportError(
       500,
@@ -671,7 +732,7 @@ export async function putScopeImportChunk(
   index: number,
 ): Promise<{ accepted: true; index: number; bytes: number; sha256: string }> {
   await deps.authorizeOwner(request, scope);
-  refuseIfLegacy(deps, request);
+  await refuseIfLegacy(deps, id);
   const bodyBytes = await cacheRequestBodyBytes(
     request,
     SCOPE_IMPORT_CHUNK_BYTES,
@@ -811,7 +872,7 @@ export async function finalizeScopeImport(
   id: string,
 ): Promise<Record<string, unknown>> {
   await deps.authorizeOwner(request, scope);
-  refuseIfLegacy(deps, request);
+  await refuseIfLegacy(deps, id);
   if (abortingImports.has(id)) {
     throw new ScopeImportError(
       409,
@@ -981,7 +1042,26 @@ async function finalizeScopeImportAuthorized(
     committedEntry.collectedAt === metadata.collectedAt
   ) {
     if (!(await pathExists(finalPath)) && (await pathExists(stagePath))) {
-      await publishStagedDataFile(stagePath, finalPath);
+      try {
+        await deps.legacyWriteSeal.commit((hold) =>
+          publishStagedDataFile(hold, stagePath, finalPath),
+        );
+      } catch (error) {
+        // Acknowledged before a crash, never published: on a switched account
+        // it is dropped with its row so it cannot come back. While the mode is
+        // merely unknown the stage and its row stay for the retry, as they do
+        // at boot.
+        if (
+          error instanceof LegacyWriteRefusedError &&
+          error.verdict === "switched"
+        ) {
+          await deps.legacyWriteSeal.remove(() =>
+            deps.indexManager.deleteByPath(relativePath),
+          );
+          await dropRefusedImport(deps, metadata, error);
+        }
+        throw error;
+      }
     }
     if (await pathExists(finalPath)) {
       const receipt = {
@@ -1129,39 +1209,47 @@ async function finalizeScopeImportAuthorized(
     }
     // Publish the complete, fsynced envelope before swapping the SQLite index.
     // Readers continue to resolve the old entry until the new file is ready.
-    await publishStagedDataFile(stagePath, finalPath);
-    let indexed: ReturnType<typeof deps.indexManager.insertIfCurrent>;
-    try {
-      indexed = deps.indexManager.insertIfCurrent(
-        {
-          fileId: null,
-          schemaId: null,
-          path: relativePath,
-          scope,
-          collectedAt: metadata.collectedAt,
-          sizeBytes,
-          dataPointId: null,
-          afterTombstoneVersion,
-          producer: null,
-          producerProvenance: null,
-        },
-        latestAtCommit
-          ? {
-              kind: "match",
-              version: latestAtCommit.casRevision ?? latestAtCommit.version,
-            }
-          : { kind: "none" },
-      );
-    } catch (error) {
-      // The synchronous index API can throw. Keep the data file only if the
-      // transaction committed before the error became observable.
-      if (!deps.indexManager.findByPath(relativePath)) {
-        await unlink(finalPath).catch(() => undefined);
+    // The rename and the row are one sealed commit: the account may have
+    // switched while the chunks were assembled, and a refusal runs neither, so
+    // only the stage exists and the catch below removes it (and, on a
+    // switched account, the session).
+    const indexed = await deps.legacyWriteSeal.commit(async (hold) => {
+      await publishStagedDataFile(hold, stagePath, finalPath);
+      let inserted: ReturnType<typeof deps.indexManager.insertIfCurrent>;
+      try {
+        inserted = deps.indexManager.insertIfCurrent(
+          hold,
+          {
+            fileId: null,
+            schemaId: null,
+            path: relativePath,
+            scope,
+            collectedAt: metadata.collectedAt,
+            sizeBytes,
+            dataPointId: null,
+            afterTombstoneVersion,
+            producer: null,
+            producerProvenance: null,
+          },
+          latestAtCommit
+            ? {
+                kind: "match",
+                version: latestAtCommit.casRevision ?? latestAtCommit.version,
+              }
+            : { kind: "none" },
+        );
+      } catch (error) {
+        // The synchronous index API can throw. Keep the data file only if the
+        // transaction committed before the error became observable.
+        if (!deps.indexManager.findByPath(relativePath)) {
+          await unlink(finalPath).catch(() => undefined);
+        }
+        throw error;
       }
-      throw error;
-    }
+      if (!inserted.ok) await unlink(finalPath).catch(() => undefined);
+      return inserted;
+    });
     if (!indexed.ok) {
-      await unlink(finalPath).catch(() => undefined);
       const latest = deps.indexManager.findLatestByScope(scope);
       if (latest) {
         metadata.collectedAt = new Date(
@@ -1195,7 +1283,7 @@ async function finalizeScopeImportAuthorized(
     notifyCommittedScope(deps, scope, metadata.collectedAt);
     return receipt;
   } catch (error) {
-    await removeImportArtifacts(deps, metadata);
+    await dropRefusedImport(deps, metadata, error);
     throw error;
   }
 }

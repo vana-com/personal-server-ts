@@ -16,12 +16,17 @@ import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logg
 import {
   createTestWallet,
   buildWeb3SignedHeader,
+  fixedModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import pino from "pino";
 import type { TokenStore } from "./token-store.js";
 import { WRITE_SIGNATURE_HEADER } from "@opendatalabs/personal-server-ts-core/write";
+import {
+  createMemoryModeRecordStore,
+  createModeAuthority,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const ownerWallet = createTestWallet(0);
@@ -103,6 +108,16 @@ function createMockTokenStore(tokens: string[] = []): TokenStore {
   };
 }
 
+async function switchedModeAuthority(owner: string) {
+  const authority = createModeAuthority({
+    store: createMemoryModeRecordStore(),
+    onWarning: () => undefined,
+  });
+  await authority.ready;
+  await authority.submitEvidence({ owner, state: "on" });
+  return authority;
+}
+
 describe("createApp", () => {
   let tempDir: string;
   let indexManager: IndexManager;
@@ -121,6 +136,7 @@ describe("createApp", () => {
   function makeApp() {
     const logger = pino({ level: "silent" });
     return createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -137,6 +153,7 @@ describe("createApp", () => {
   function makeAppWithControlPlaneToken() {
     const logger = pino({ level: "silent" });
     return createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -162,6 +179,7 @@ describe("createApp", () => {
   ) {
     const logger = pino({ level: "silent" });
     return createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -220,8 +238,16 @@ describe("createApp", () => {
       accessToken: CONTROL_PLANE_TOKEN,
       jobWorker: vi.fn(),
     };
-    const standard = createApp({ ...common, profile: "standard" });
-    const enclave = createApp({ ...common, profile: "enclave" });
+    const standard = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
+      ...common,
+      profile: "standard",
+    });
+    const enclave = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
+      ...common,
+      profile: "enclave",
+    });
 
     const standardResponse = await standard.request(
       "/enclave/v1/jobs/execute",
@@ -256,7 +282,11 @@ describe("createApp", () => {
       abort: vi.fn(),
     };
     const off = createApp(common);
-    const on = createApp({ ...common, streamSyncIntake: intake });
+    const on = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
+      ...common,
+      streamSyncIntake: intake,
+    });
     const put = (app: ReturnType<typeof createApp>, token?: string) =>
       app.request("/v1/stream-sync/runs/r1", {
         method: "PUT",
@@ -281,6 +311,7 @@ describe("createApp", () => {
       warn,
     } as unknown as ReturnType<typeof pino>;
     const app = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -314,6 +345,7 @@ describe("createApp", () => {
       abort: vi.fn(),
     };
     const app = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger: pino({ level: "silent" }),
       version: "0.0.1",
       startedAt: new Date(),
@@ -355,6 +387,7 @@ describe("createApp", () => {
       abort: vi.fn(),
     };
     const app = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger: pino({ level: "silent" }),
       version: "0.0.1",
       startedAt: new Date(),
@@ -489,7 +522,7 @@ describe("createApp", () => {
     });
   });
 
-  it("DELETE /v1/data/:scope on a switched account → 426 through the app's storage-mode port", async () => {
+  it("DELETE /v1/data/:scope on a switched account → 409 USE_CONNECTOR_DELETE through the account-mode authority", async () => {
     const logger = pino({ level: "silent" });
     const app = createApp({
       logger,
@@ -502,7 +535,7 @@ describe("createApp", () => {
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
       accessLogReader: createMockAccessLogReader(),
-      accountStorageMode: { read: () => "switched" },
+      accountModeAuthority: await switchedModeAuthority(ownerWallet.address),
     });
     const auth = await buildWeb3SignedHeader({
       wallet: ownerWallet,
@@ -514,8 +547,8 @@ describe("createApp", () => {
       method: "DELETE",
       headers: { authorization: auth },
     });
-    expect(res.status).toBe(426);
-    expect((await res.json()).errorCode).toBe("update_required");
+    expect(res.status).toBe(409);
+    expect((await res.json()).error.errorCode).toBe("USE_CONNECTOR_DELETE");
   });
 
   it("GET /v1/grants without auth → 401", async () => {
@@ -865,6 +898,7 @@ describe("createApp", () => {
     const mockSyncManager = createMockSyncManager();
     const logger = pino({ level: "silent" });
     const app = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -899,6 +933,7 @@ describe("createApp", () => {
     const mockSyncManager = createMockSyncManager();
     const logger = pino({ level: "silent" });
     const app = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -938,6 +973,7 @@ describe("createApp", () => {
   it("without syncManager — GET /v1/sync/status returns disabled", async () => {
     const logger = pino({ level: "silent" });
     const app = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -1051,6 +1087,7 @@ describe("createApp", () => {
     );
 
     const app = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -1334,6 +1371,7 @@ describe("dev UI loopback gate", () => {
 
   function makeUiApp(localApprovalPort: number | undefined) {
     return createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger: pino({ level: "silent" }),
       version: "0.0.1",
       startedAt: new Date(),

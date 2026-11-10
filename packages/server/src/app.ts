@@ -6,6 +6,7 @@ import {
 import { streamSyncRunsRoutes } from "./routes/stream-sync-runs.js";
 import { streamSyncReadStatusRoutes } from "./routes/stream-sync-read-status.js";
 import { ownerConnectorsRoutes } from "./routes/owner-connectors.js";
+import { accountModeRoutes } from "./routes/account-mode.js";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
 import { randomUUID } from "node:crypto";
@@ -19,6 +20,11 @@ import {
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import {
+  createLegacyWriteSeal,
+  type LegacyWriteSeal,
+} from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
+import { unwiredLegacyWriteSeal } from "./storage/unwired-legacy-write-seal.js";
 import type {
   DataPortabilityGatewayConfig,
   GatewayClient,
@@ -28,10 +34,14 @@ import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logg
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type {
   ConnectionDeletePort,
-  StorageModeRead,
   PersonalServerReadFulfillmentReporter,
   StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
+import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  accountStorageModeOf,
+  type ModeAuthority,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { corsMiddleware } from "./middleware/cors.js";
 import {
@@ -170,12 +180,6 @@ export interface AppDeps {
   /** The stream-sync writer's connection delete (`DELETE /v1/owner/connectors/:id`). */
   streamSyncConnectionDelete?: ConnectionDeletePort | null;
   /**
-   * The account's storage mode (`AccountStorageMode`). Absent means unknown:
-   * the connector delete answers 503 `ACCOUNT_MODE_UNKNOWN`, never a guess from
-   * the config. A host that calls the route passes its one instance.
-   */
-  accountStorageMode?: StorageModeRead;
-  /**
    * False once the host is shutting down: stream-sync requests then answer
    * 503 before they start a file operation, so the home can close and drain.
    */
@@ -186,6 +190,15 @@ export interface AppDeps {
   tokenStore?: TokenStore;
   runtimeAvailability?: RuntimeAvailabilityPort;
   dataStorage?: DataStoragePort;
+  /**
+   * The seal legacy writes through the routes here become durable behind. The
+   * host passes the seal of its one account-mode authority (the same one its
+   * storage was built with). Without it the app derives one from
+   * `accountModeAuthority`, and with neither it refuses every legacy write as
+   * unknown. Only matters to a route that builds its own fallback storage or
+   * finalizes a chunked import; a given `dataStorage` carries its own seal.
+   */
+  legacyWriteSeal?: LegacyWriteSeal;
   /** Canonical latest bodies for GET /v1/data; absent = file reads only. */
   legacyScopeView?: LegacyScopeViewPort;
   /** Stream-sync reads (`streamSync.read`); absent = reads as before. */
@@ -225,6 +238,15 @@ export interface AppDeps {
    * and `$pdpp` envelopes are stored and indexed exactly as before.
    */
   pdppImporter?: PdppImporter;
+  /**
+   * The account-mode module: the only source of the account's storage mode.
+   * The legacy write gate, the data routes and every MCP engine read the port
+   * derived from it, and no option supplies a mode separately. When wired, the
+   * owner-authenticated `POST /v1/account-mode/evidence` and
+   * `POST /v1/account-mode/import-done` routes mount. Absent = unknown: every
+   * legacy write answers a retryable 503.
+   */
+  accountModeAuthority?: ModeAuthority;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
   /**
    * Invoked when the /ui/api registration route confirms the server is
@@ -340,10 +362,29 @@ function streamSyncClosing(): ProtocolError {
 
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
-  const storageMode: StorageModeRead = deps.accountStorageMode ?? {
-    read: () => "unknown",
-  };
-
+  // One mode for every read and legacy write this server serves, derived
+  // from the account-mode module and nothing else; with no module, the mode
+  // is unknown and legacy writes refuse. Bound to this server's owner once,
+  // here: every consumer below receives the bound view, which cannot be asked
+  // about another account.
+  const accountStorageMode = accountStorageModeFor(
+    deps.accountModeAuthority
+      ? accountStorageModeOf(deps.accountModeAuthority)
+      : { read: () => "unknown" },
+    deps.serverOwner,
+  );
+  // The one seal for the legacy writes these routes make durable: the host's
+  // own, else one over the host's authority, else a seal that refuses (no
+  // authority wired is unknown, never permission).
+  const legacyWriteSeal =
+    deps.legacyWriteSeal ??
+    deps.dataStorage?.legacyWriteSeal ??
+    (deps.accountModeAuthority
+      ? createLegacyWriteSeal({
+          authority: deps.accountModeAuthority,
+          owner: deps.serverOwner,
+        })
+      : unwiredLegacyWriteSeal());
   // One store for mint (POST /v1/write/session) and redeem (data ingest and
   // derivative question registration), and one replay guard for the proofs
   // both redeeming routes verify.
@@ -543,7 +584,25 @@ export function createApp(deps: AppDeps): Hono {
     );
   }
 
-  app.route("/v1/import/oura-browser", ouraRoutes(deps));
+  app.route(
+    "/v1/import/oura-browser",
+    ouraRoutes({ ...deps, legacyWriteSeal, accountStorageMode }),
+  );
+
+  if (deps.accountModeAuthority) {
+    app.route(
+      "/v1/account-mode",
+      accountModeRoutes({
+        serverOrigin: deps.serverOrigin,
+        serverOwner: deps.serverOwner,
+        gateway: deps.gateway,
+        devToken: deps.devToken,
+        accessToken: deps.accessToken,
+        tokenStore: deps.tokenStore,
+        accountModeAuthority: deps.accountModeAuthority,
+      }),
+    );
+  }
 
   app.use("/v1/stream-sync/*", async (_c, next) => {
     if (deps.streamSyncAdmitting && !deps.streamSyncAdmitting()) {
@@ -562,7 +621,7 @@ export function createApp(deps: AppDeps): Hono {
       accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
       connectionDelete: deps.streamSyncConnectionDelete ?? null,
-      mode: storageMode,
+      mode: accountStorageMode,
       // Checked by the route after owner authorization.
       assertAdmitting: () => {
         if (deps.streamSyncAdmitting && !deps.streamSyncAdmitting()) {
@@ -633,15 +692,11 @@ export function createApp(deps: AppDeps): Hono {
       scopeDeletions: deps.scopeDeletions,
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
+      legacyWriteSeal,
       legacyScopeView,
       streamSyncRead: deps.streamSyncRead,
-      // The account's stream-sync switch as this server holds it: its host
-      // sets `streamSync.write` from the Account setting before launch.
-      // Enforcement is its own flag and ships off.
-      legacyWritesRefused: () =>
-        deps.config?.streamSync.write === true &&
-        deps.config.streamSync.refuseLegacyWrites === true,
-      accountMode: storageMode,
+      // The account's storage mode (see the top of createApp).
+      accountStorageMode,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,
@@ -801,7 +856,9 @@ export function createApp(deps: AppDeps): Hono {
     indexManager: deps.indexManager,
     hierarchyOptions: deps.hierarchyOptions,
     dataStorage: deps.dataStorage,
+    legacyWriteSeal,
     streamSyncRead: deps.streamSyncRead,
+    accountStorageMode,
     runtimeAvailability: deps.runtimeAvailability,
     connectionStore: mcpConnectionStore,
     oauthAuthorizationStore: mcpOAuthAuthorizationStore,

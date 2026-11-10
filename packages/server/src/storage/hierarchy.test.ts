@@ -15,6 +15,7 @@ import {
   writeBlockManifest,
 } from "./hierarchy.js";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
+import { HOLD_FOR_TESTS } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 
 describe("HierarchyManager", () => {
@@ -44,14 +45,18 @@ describe("HierarchyManager", () => {
 
   describe("writeDataFile", () => {
     it("creates file at expected path", async () => {
-      const result = await writeDataFile(options, makeEnvelope());
+      const result = await writeDataFile(
+        HOLD_FOR_TESTS,
+        options,
+        makeEnvelope(),
+      );
       const content = await readFile(result.path, "utf-8");
       expect(content).toBeTruthy();
     });
 
     it("written file is valid JSON with correct envelope fields", async () => {
       const envelope = makeEnvelope();
-      const result = await writeDataFile(options, envelope);
+      const result = await writeDataFile(HOLD_FOR_TESTS, options, envelope);
       const content = JSON.parse(await readFile(result.path, "utf-8"));
       expect(content.version).toBe("1.0");
       expect(content.scope).toBe(scope);
@@ -61,21 +66,29 @@ describe("HierarchyManager", () => {
 
     it("creates intermediate directories", async () => {
       const envelope = makeEnvelope("chatgpt.conversations.shared");
-      const result = await writeDataFile(options, envelope);
+      const result = await writeDataFile(HOLD_FOR_TESTS, options, envelope);
       expect(result.path).toContain("chatgpt/conversations/shared");
       const content = await readFile(result.path, "utf-8");
       expect(content).toBeTruthy();
     });
 
     it("returns correct relativePath", async () => {
-      const result = await writeDataFile(options, makeEnvelope());
+      const result = await writeDataFile(
+        HOLD_FOR_TESTS,
+        options,
+        makeEnvelope(),
+      );
       expect(result.relativePath).toBe(
         "instagram/profile/2026-01-21T10-00-00Z.json",
       );
     });
 
     it("returns sizeBytes > 0", async () => {
-      const result = await writeDataFile(options, makeEnvelope());
+      const result = await writeDataFile(
+        HOLD_FOR_TESTS,
+        options,
+        makeEnvelope(),
+      );
       expect(result.sizeBytes).toBeGreaterThan(0);
     });
 
@@ -85,7 +98,7 @@ describe("HierarchyManager", () => {
         largeData[`key_${i}`] = `value_${i}_${"x".repeat(100)}`;
       }
       const envelope = makeEnvelope(scope, collectedAt, largeData);
-      const result = await writeDataFile(options, envelope);
+      const result = await writeDataFile(HOLD_FOR_TESTS, options, envelope);
       const content = await readFile(result.path, "utf-8");
       const parsed = JSON.parse(content);
       expect(parsed.version).toBe("1.0");
@@ -209,7 +222,7 @@ describe("HierarchyManager", () => {
   describe("readDataFile", () => {
     it("returns the envelope written by writeDataFile", async () => {
       const envelope = makeEnvelope();
-      await writeDataFile(options, envelope);
+      await writeDataFile(HOLD_FOR_TESTS, options, envelope);
       const read = await readDataFile(options, scope, collectedAt);
       expect(read).toEqual(envelope);
     });
@@ -395,9 +408,9 @@ describe("HierarchyManager", () => {
       const ts2 = "2026-01-21T10:00:00Z";
       const ts3 = "2026-01-21T12:00:00Z";
 
-      await writeDataFile(options, makeEnvelope(scope, ts1));
-      await writeDataFile(options, makeEnvelope(scope, ts2));
-      await writeDataFile(options, makeEnvelope(scope, ts3));
+      await writeDataFile(HOLD_FOR_TESTS, options, makeEnvelope(scope, ts1));
+      await writeDataFile(HOLD_FOR_TESTS, options, makeEnvelope(scope, ts2));
+      await writeDataFile(HOLD_FOR_TESTS, options, makeEnvelope(scope, ts3));
 
       const versions = await listVersions(options, scope);
       expect(versions).toEqual([ts3, ts2, ts1]);
@@ -411,7 +424,7 @@ describe("HierarchyManager", () => {
 
   describe("deleteDataFile", () => {
     it("removes file; subsequent readDataFile throws ENOENT", async () => {
-      await writeDataFile(options, makeEnvelope());
+      await writeDataFile(HOLD_FOR_TESTS, options, makeEnvelope());
       await deleteDataFile(options, scope, collectedAt);
       await expect(readDataFile(options, scope, collectedAt)).rejects.toThrow(
         /ENOENT/,
@@ -419,7 +432,7 @@ describe("HierarchyManager", () => {
     });
 
     it("removes sidecars for that version", async () => {
-      await writeDataFile(options, makeEnvelope());
+      await writeDataFile(HOLD_FOR_TESTS, options, makeEnvelope());
       await writeBlockManifest(
         options,
         scope,
@@ -462,8 +475,8 @@ describe("HierarchyManager", () => {
     it("deletes scope with 2 versions — files and directory removed", async () => {
       const ts1 = "2026-01-21T08:00:00Z";
       const ts2 = "2026-01-21T10:00:00Z";
-      await writeDataFile(options, makeEnvelope(scope, ts1));
-      await writeDataFile(options, makeEnvelope(scope, ts2));
+      await writeDataFile(HOLD_FOR_TESTS, options, makeEnvelope(scope, ts1));
+      await writeDataFile(HOLD_FOR_TESTS, options, makeEnvelope(scope, ts2));
 
       await deleteAllForScope(options, scope);
 
@@ -476,8 +489,16 @@ describe("HierarchyManager", () => {
     });
 
     it("after delete, listVersions returns empty array", async () => {
-      await writeDataFile(options, makeEnvelope(scope, "2026-01-21T08:00:00Z"));
-      await writeDataFile(options, makeEnvelope(scope, "2026-01-21T10:00:00Z"));
+      await writeDataFile(
+        HOLD_FOR_TESTS,
+        options,
+        makeEnvelope(scope, "2026-01-21T08:00:00Z"),
+      );
+      await writeDataFile(
+        HOLD_FOR_TESTS,
+        options,
+        makeEnvelope(scope, "2026-01-21T10:00:00Z"),
+      );
       await writeBlockManifest(
         options,
         scope,
@@ -513,10 +534,12 @@ describe("HierarchyManager", () => {
     it("deletes scope with nested subcategory — entire subtree removed", async () => {
       const nestedScope = "chatgpt.conversations.shared";
       await writeDataFile(
+        HOLD_FOR_TESTS,
         options,
         makeEnvelope(nestedScope, "2026-01-21T08:00:00Z"),
       );
       await writeDataFile(
+        HOLD_FOR_TESTS,
         options,
         makeEnvelope(nestedScope, "2026-01-21T10:00:00Z"),
       );

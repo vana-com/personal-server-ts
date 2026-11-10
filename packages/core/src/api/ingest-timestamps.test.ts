@@ -4,6 +4,7 @@ import {
   type PersonalServerDataApiDeps,
 } from "./index.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
+import { fixedOwnedAccountStorageMode } from "../test-utils/account-mode.js";
 
 const WALL = "2026-10-18T00:00:00.123Z";
 
@@ -11,6 +12,7 @@ function fixture() {
   const storage = createMemoryDataStorage();
   const deps: PersonalServerDataApiDeps = {
     storage,
+    accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
     now: () => new Date(WALL),
     auth: {
       authorizeOwner: vi.fn(async () => undefined),
