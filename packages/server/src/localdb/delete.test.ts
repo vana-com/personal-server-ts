@@ -409,3 +409,110 @@ it("resumes an intent from a reopened SQLite database after a crash", async () =
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+it("a scheduled run observes a reconnect made on another device", async () => {
+  const f = await world();
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  await applyConnection(f.b.deps, f.control);
+  const { createRunIntakeStore } =
+    await import("../../../core/src/localdb/run-intake.js");
+  const decl = {
+    connector: "fixture-source",
+    version: "1",
+    streams: [
+      {
+        name: "items",
+        semantics: "mutable_state" as const,
+        primaryKey: ["id"],
+      },
+    ],
+  };
+  const request = {
+    connector: "fixture-source",
+    artifactDigest: "fixture",
+    owner: { address: owner, leaseId: null },
+    observedAt: 2000,
+  };
+  await createRunIntakeStore(f.a.deps).begin(
+    "explicit-reconnect",
+    { ...request, connect: true },
+    decl,
+  );
+  const begun = await createRunIntakeStore(f.b.deps).begin(
+    "scheduled-after-peer-connect",
+    request,
+    decl,
+  );
+  expect(begun.status).toBe("collecting");
+  expect(begun.start.collection_mode).toBe("full_refresh");
+  expect(
+    await f.b.db.query("SELECT generation,control_state FROM connections"),
+  ).toEqual([{ generation: 3, control_state: "active" }]);
+  expect(await f.b.db.query("SELECT * FROM records")).toEqual([]);
+});
+
+it("an absent registry answer never clears a local-only delete, but explicit connect does", async () => {
+  const f = await world();
+  const db = await openLocalDb(openBetterSqlite3(":memory:"), {
+    owner,
+    network: "test",
+    deviceId: "offline",
+  });
+  drivers.push(db);
+  const registry = createMemoryStreamSyncRegistry() as MemoryStreamSyncRegistry;
+  const deps = { ...f.a.deps, db, queue: connectionQueue(), registry };
+  const { createRunIntakeStore } =
+    await import("../../../core/src/localdb/run-intake.js");
+  const intake = createRunIntakeStore(deps);
+  const decl = {
+    connector: "fixture-source",
+    version: "1",
+    streams: [
+      {
+        name: "items",
+        semantics: "mutable_state" as const,
+        primaryKey: ["id"],
+      },
+    ],
+  };
+  const request = {
+    connector: "fixture-source",
+    artifactDigest: "fixture",
+    owner: { address: owner, leaseId: null },
+    observedAt: 2000,
+  };
+  registry.beforeRead = async () => {
+    throw new Error("offline fixture");
+  };
+  expect((await intake.begin("offline-run", request, decl)).status).toBe(
+    "collecting",
+  );
+  expect(
+    await db.query("SELECT generation FROM runs WHERE run_id='offline-run'"),
+  ).toEqual([{ generation: null }]);
+  registry.beforeRead = undefined;
+  await createConnectionDeleter(deps, {
+    declaredStreams: () => ["items"],
+  }).requestConnectionDelete("fixture-source");
+  for (const run of ["scheduled-1", "scheduled-2"]) {
+    await applyConnection(deps, f.control);
+    await bootstrapConnections(deps);
+    await expect(intake.begin(run, request, decl)).rejects.toMatchObject({
+      code: "connection_stopped",
+    });
+    expect(await db.query("SELECT control_state FROM connections")).toEqual([
+      { control_state: "deleted" },
+    ]);
+  }
+  expect(registry.log).toEqual([]);
+  expect(
+    (
+      await intake.begin(
+        "explicit-local-reconnect",
+        { ...request, connect: true },
+        decl,
+      )
+    ).status,
+  ).toBe("collecting");
+});

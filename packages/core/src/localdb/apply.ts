@@ -232,14 +232,17 @@ async function control(
       connection.generation = state.generation;
     }
   }
+  // Absence cannot clear a local-only delete; only an observed active row can.
   await deps.db.batch([
     {
-      sql: `UPDATE connections SET control_state=?, control_version=?, generation=? WHERE connection_id=?`,
+      sql: `UPDATE connections SET control_state=?, control_version=?, generation=? WHERE connection_id=?
+        AND NOT (control_state='deleted' AND ?='absent')`,
       params: [
         state.kind,
         read.found ? read.version : 0,
         state.kind === "active" ? state.generation : connection.generation,
         id,
+        state.kind,
       ],
     },
   ]);

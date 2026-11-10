@@ -68,12 +68,22 @@ async function saveControl(
       params: [id, connector, ns, generation, state.kind, version],
     },
     {
-      // Preserve the last active generation, and never regress a newer control.
+      // Preserve the last active generation and newer controls. Absence is
+      // not authority to clear a local-only delete; a fresh active row is.
       sql: `UPDATE connections SET
         generation = CASE WHEN ? = 'active' THEN ? ELSE generation END,
         control_state = ?, control_version = ?
-        WHERE connection_id = ? AND control_version <= ?`,
-      params: [state.kind, generation, state.kind, version, id, version],
+        WHERE connection_id = ? AND control_version <= ?
+          AND NOT (control_state = 'deleted' AND ? = 'absent')`,
+      params: [
+        state.kind,
+        generation,
+        state.kind,
+        version,
+        id,
+        version,
+        state.kind,
+      ],
     },
   ]);
   return (await cachedConnection(deps, id))!;
