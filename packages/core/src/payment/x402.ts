@@ -469,17 +469,10 @@ export async function verifyPayment(
     return { ok: false, reason: "opId does not match the request's grantId" };
   }
 
-  // Amount + asset must match the gateway's canonical values. Re-fetched
-  // per request, so a builder echoing stale amounts gets rejected here
-  // before we hit the gateway.
+  // Asset is part of the signed grant identity. The gateway owns fee checks;
+  // it must see exact retries first so it can return prior settlement.
   if (msg.asset.toLowerCase() !== grant.fee.asset.toLowerCase()) {
     return { ok: false, reason: "asset does not match grant fee asset" };
-  }
-  if (msg.amount !== grant.fee.totalDue) {
-    return {
-      ok: false,
-      reason: `amount ${msg.amount} != grant.fee.totalDue ${grant.fee.totalDue}`,
-    };
   }
 
   // Stateless freshness check: extract the issue-time from the high 32 bits
@@ -554,6 +547,8 @@ export async function verifyPayment(
         reason: "accessRecord.dataPointId does not match entry",
       };
     }
+    // The gateway records but does not check the version, so a first
+    // payment for an older version must be stopped here, before any debit.
     if (ar.version !== String(input.entry.version)) {
       return { ok: false, reason: "accessRecord.version does not match entry" };
     }
