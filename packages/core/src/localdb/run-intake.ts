@@ -61,13 +61,22 @@ const FENCED = `EXISTS (SELECT 1 FROM runs r JOIN connections c ON c.connection_
     OR EXISTS (SELECT 1 FROM run_streams rs JOIN stream_state s
       ON s.connection_id=r.connection_id AND s.stream=rs.stream
       WHERE rs.run_id=r.run_id AND s.last_delete_version > rs.delete_snapshot)))`;
+/**
+ * The two ways a staged row can share a record key with a different
+ * primary-key hash: with a committed record, or with a row staged by any run of
+ * the same connection. Each runs once per staged row inside the batch, so each
+ * must be answered by an index search (`records_by_key`, `run_rows_by_key`).
+ */
+export const STAGED_KEY_CONFLICTS: readonly string[] = [
+  `EXISTS (SELECT 1 FROM records x JOIN runs r ON r.connection_id=x.connection_id
+      WHERE r.run_id=NEW.run_id AND x.stream=NEW.stream AND x.record_key=NEW.record_key AND x.pk_hash<>NEW.pk_hash)`,
+  `EXISTS (SELECT 1 FROM run_rows x JOIN runs r ON r.run_id=x.run_id JOIN runs n ON n.run_id=NEW.run_id
+      WHERE r.connection_id=n.connection_id AND x.stream=NEW.stream AND x.record_key=NEW.record_key AND x.pk_hash<>NEW.pk_hash)`,
+];
 const ROW_CHECK = `CREATE TEMP TRIGGER intake_rows_check BEFORE INSERT ON main.run_rows BEGIN
   SELECT RAISE(ABORT,'connection_stopped') WHERE ${FENCED};
   SELECT RAISE(ABORT,'key_type_conflict') WHERE
-    EXISTS (SELECT 1 FROM records x JOIN runs r ON r.connection_id=x.connection_id
-      WHERE r.run_id=NEW.run_id AND x.stream=NEW.stream AND x.record_key=NEW.record_key AND x.pk_hash<>NEW.pk_hash)
-    OR EXISTS (SELECT 1 FROM run_rows x JOIN runs r ON r.run_id=x.run_id JOIN runs n ON n.run_id=NEW.run_id
-      WHERE r.connection_id=n.connection_id AND x.stream=NEW.stream AND x.record_key=NEW.record_key AND x.pk_hash<>NEW.pk_hash);
+    ${STAGED_KEY_CONFLICTS.join("\n    OR ")};
 END`;
 const BATCH_CHECK = `CREATE TEMP TRIGGER intake_batch_check BEFORE UPDATE OF last_batch ON main.runs BEGIN
   SELECT RAISE(ABORT,'connection_stopped') WHERE ${FENCED};
