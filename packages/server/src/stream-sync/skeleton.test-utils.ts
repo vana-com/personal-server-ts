@@ -1,6 +1,7 @@
 /**
  * Walking skeleton of whole-file stream sync: ONE record flows through the
- * real path on three hosts.
+ * retained wire-protocol ports on three hosts. This is not a proof of the
+ * PS-2 browser/Node database bootstrap; those compositions have separate tests.
  *
  *   connector run -> run intake (begin -> batches -> end) -> publish
  *     -> read on the full server
@@ -18,7 +19,7 @@
  * identity-less name (R23). Stubbed (each marked `SKELETON STUB`): the
  * connector fixture and, without STREAM_SYNC_ORACLE_GATEWAY_URL, the registry
  * (in-memory, gateway rules), its listing feed, and the phone and frame
- * hosts' writers (their reads run through the real PS-Lite startup code).
+ * hosts' writers (their reads use the real PS-Lite runtime and an explicit On answer).
  * With a real gateway the phone and frame publish through PS-Lite's own run
  * intake and writer, list through the gateway, and only the fixture is a stub.
  *
@@ -57,16 +58,27 @@ import {
   createGatewayDataPointFeed,
   downloadAll,
 } from "@opendatalabs/personal-server-ts-core/sync";
-import { createMemoryDataStorage } from "@opendatalabs/personal-server-ts-core/test-utils";
+import {
+  fixedModeAuthority,
+  createMemoryDataStorage,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { StorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
   createBearerTokenPsLiteAuth,
-  createIndexedDbPsLiteRuntime,
+  createPsLiteRuntime,
+  createPsLiteSyncManager,
+  loadOrCreatePsLiteServerIdentity,
   createIndexedDbStreamSyncFiles,
 } from "@opendatalabs/personal-server-ts-lite";
-import { createMockPsLiteGateway } from "../../../lite/src/test-support/gateway.js";
+import {
+  createMemoryPsLiteStateStore,
+  createMemoryPsLiteAccessLogStore,
+  createMemoryPsLiteTokenStore,
+  createMemoryPsLiteStorage,
+} from "../../../lite/src/test-support/memory.js";
+import { createMemoryStreamSyncReadFiles } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import { Hono } from "hono";
 import { streamSyncRunsRoutes } from "../routes/stream-sync-runs.js";
 import { createFsStreamSyncFiles } from "./fs-files.js";
@@ -220,6 +232,7 @@ interface Host {
   }>;
   /** One sync pass: the host's own listing loop. */
   readonly sync: (listing: RegistryListing) => Promise<void>;
+  readonly close?: () => Promise<void>;
 }
 
 /**
@@ -353,9 +366,8 @@ async function makeHost(input: {
       sync: (listing) => syncFullHost(reader, listing, input.gatewayUrl),
     };
   }
-  // Phone and frame READ through the real PS-Lite startup code, flag from
-  // config, listing through its sync manager. Only the registry origin
-  // (listing feed) is injected.
+  // Phone and frame read through the real PS-Lite runtime with explicit
+  // Account mode, listing through its retained file-protocol sync manager.
   // With a real gateway, Lite's own writer talks to it over HTTP, so the
   // phone and frame publish through Lite's run intake and writer. Without
   // one, the in-memory registry has no origin: the writer is built by hand
@@ -384,20 +396,35 @@ async function makeHost(input: {
       "set STREAM_SYNC_ORACLE_GATEWAY_URL (Lite's writer needs a registry over HTTP)",
     );
   }
-  // The runtime opens IndexedDB through the global; stub it once for all hosts
-  // (each host has its own database name).
-  const globals = globalThis as { indexedDB?: unknown; IDBKeyRange?: unknown };
-  globals.indexedDB ??= new IDBFactory();
-  globals.IDBKeyRange ??= IDBKeyRange;
-  const lite = await createIndexedDbPsLiteRuntime({
-    streamSyncDeclaredStreams: () => [],
-    ownerAddress: OWNER,
+  // This retained wire-protocol oracle supplies its runtime ports explicitly.
+  // Browser database composition is verified separately; it no longer creates
+  // the file reader that this protocol oracle exercises.
+  const stateStore = createMemoryPsLiteStateStore();
+  const identity = await loadOrCreatePsLiteServerIdentity({
+    store: stateStore,
     ownerSignature: OWNER_SIGNATURE,
-    dbName: `skeleton-lite-${input.kind}`,
-    gateway: {
-      ...createMockPsLiteGateway(),
-      getServer: async () => ({ id: "server-1" }),
-    } as never,
+  });
+  const localStorage = createMemoryPsLiteStorage();
+  const config = ServerConfigSchema.parse({
+    gateway: { url: input.gatewayUrl ?? "http://registry.invalid" },
+    storage: {
+      backend: "vana",
+      config: { vana: { apiUrl: input.storageUrl } },
+    },
+    sync: { enabled: true },
+    streamSync: { write: viaLite, read: input.config.streamSync.read },
+  });
+  const lite = await createPsLiteSyncManager({
+    config,
+    autoStartSync: false,
+    stateStore,
+    storage: localStorage,
+    ownerSignature: OWNER_SIGNATURE,
+    serverAccount: identity.account,
+    streamSyncDeclaredStreams: () => [],
+    streamSyncRegistry: input.registry,
+    streamSyncRead: { files: createMemoryStreamSyncReadFiles() },
+    gateway: { getServer: async () => ({ id: "server-1" }) } as never,
     dataPointFeed: input.gatewayUrl
       ? createGatewayDataPointFeed({ gatewayUrl: input.gatewayUrl })
       : createGatewayDataPointFeed({
@@ -406,28 +433,27 @@ async function makeHost(input: {
         }),
     ...(viaLite
       ? {
-          // The owner signs registry writes directly, as the hand-built
-          // writer did; the host-verified table is the only artifact source.
           ownerSyncSigner: ownerSyncSigner(),
           streamSyncFiles: () => files,
           streamSyncDeclarations: resolveArtifact,
         }
       : {}),
+    logger: { ...silent, debug() {} } as never,
+  });
+  const accessLog = createMemoryPsLiteAccessLogStore();
+  const runtime = createPsLiteRuntime({
+    accessLogReader: accessLog,
+    accessLogWriter: accessLog,
+    tokenStore: createMemoryPsLiteTokenStore(),
+    saveConfig: async () => {},
+    storage: localStorage,
+    streamSyncRead: lite.streamSyncRead,
+    accountModeAuthority: fixedModeAuthority("switched"),
+    serverOwner: OWNER,
     auth: createBearerTokenPsLiteAuth({ ownerToken: "t", builderToken: "b" }),
     active: true,
+    config,
     logger: { ...silent, debug() {} } as never,
-    configDefaults: {
-      gateway: { url: input.gatewayUrl ?? "http://registry.invalid" },
-      storage: {
-        backend: "vana",
-        config: { vana: { apiUrl: input.storageUrl } },
-      },
-      sync: { enabled: true },
-      streamSync: {
-        write: viaLite,
-        read: input.config.streamSync.read,
-      },
-    } as never,
   });
   const writer = viaLite ? lite.streamSyncWriter : handBuilt;
   if (!writer || (viaLite && !lite.streamSyncIntake)) {
@@ -446,7 +472,7 @@ async function makeHost(input: {
       ];
       const answers: Record<string, unknown>[][] = [];
       for (const name of names) {
-        const res = await lite.runtime.fetch(
+        const res = await runtime.fetch(
           new Request(`https://ps.local/v1/data/${name}`, {
             headers: { Authorization: "Bearer t" },
           }),
@@ -465,7 +491,11 @@ async function makeHost(input: {
       return { kind: "view", records: answers[0]! };
     },
     sync: async () => {
-      await lite.syncManager!.trigger();
+      await lite.syncManager.trigger();
+    },
+    close: async () => {
+      await lite.syncManager.stop();
+      await lite.closeStreamSync?.();
     },
   };
 }
@@ -523,12 +553,13 @@ export async function runSkeleton(): Promise<Hop[]> {
   process.stdout.write(
     `registry: ${gatewayUrl ? "real data-gateway" : "in-memory STUB"}\n`,
   );
+  const hosts: Host[] = [];
   const hops: Hop[] = [];
   const hop = (name: string, pass: boolean, detail: string) =>
     hops.push({ name, pass, detail });
   try {
-    const make = (kind: HostKind) =>
-      makeHost({
+    const make = async (kind: HostKind) => {
+      const host = await makeHost({
         kind,
         config,
         registry,
@@ -537,6 +568,9 @@ export async function runSkeleton(): Promise<Hop[]> {
         listing,
         gatewayUrl,
       });
+      hosts.push(host);
+      return host;
+    };
     const full = await make("full");
     const phone = await make("phone");
     const frame = await make("frame");
@@ -597,6 +631,7 @@ export async function runSkeleton(): Promise<Hop[]> {
     ]);
     return hops;
   } finally {
+    for (const host of hosts) await host.close?.();
     await storage.close();
     await rm(root, { recursive: true, force: true });
   }
