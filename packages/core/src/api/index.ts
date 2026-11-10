@@ -2239,17 +2239,46 @@ export async function handlePersonalServerScopeUploadAppend(
 }
 
 /**
- * Internal request header the PS-Lite relay client sets on reads it forwards.
- * When present, the data read handler answers with {@link
- * PS_GRANTEE_REF_HEADER} so the relay can label its read telemetry. The relay
- * strips both headers at the wire; neither is part of the public API.
+ * Receives the grantee label of an authorized data read: the first 12 hex
+ * chars of sha256(lowercased builder address), "owner" for owner reads, or
+ * undefined. This is a pseudonym, not an anonymous id: builders are a small
+ * public set, so anyone holding their addresses can map it back.
  */
-export const PS_LITE_RELAY_READ_HEADER = "x-ps-lite-relay-read";
+export type PersonalServerReadGranteeObserver = (
+  granteeRef: Promise<string | undefined>,
+) => void;
+
+// Symbol.for, not a module-local symbol: a bundle that loads two copies of
+// core must still find the observer. Nothing on the wire can set it.
+const READ_GRANTEE_OBSERVER = Symbol.for(
+  "@opendatalabs/personal-server-ts-core/read-grantee-observer",
+);
+
 /**
- * Response header carrying a non-reversible grantee label: the first 12 hex
- * chars of sha256(lowercased builder address), or "owner" for owner reads.
+ * In-process only: asks the data read handler to report the grantee label
+ * for this exact Request object. Used by the PS-Lite relay for telemetry; the
+ * Node server never attaches one, so no requester can switch it on.
  */
-export const PS_GRANTEE_REF_HEADER = "x-ps-grantee-ref";
+export function attachPersonalServerReadGranteeObserver(
+  request: Request,
+  observer: PersonalServerReadGranteeObserver,
+): void {
+  Object.defineProperty(request, READ_GRANTEE_OBSERVER, {
+    value: observer,
+    configurable: true,
+  });
+}
+
+function readGranteeObserverOf(
+  request: Request,
+): PersonalServerReadGranteeObserver | undefined {
+  const observer = (request as unknown as Record<symbol, unknown>)[
+    READ_GRANTEE_OBSERVER
+  ];
+  return typeof observer === "function"
+    ? (observer as PersonalServerReadGranteeObserver)
+    : undefined;
+}
 
 async function granteeRefFor(
   authResult: PersonalServerReadAuthResult | void,
@@ -2270,13 +2299,29 @@ async function granteeRefFor(
   return digest.slice(2, 14);
 }
 
+/**
+ * Hands the grantee label to an attached observer without blocking or
+ * failing the read: hashing runs off the response path and every error is
+ * swallowed.
+ */
+function notifyReadGrantee(
+  request: Request,
+  authResult: PersonalServerReadAuthResult | void,
+): void {
+  const observer = readGranteeObserverOf(request);
+  if (!observer) return;
+  try {
+    observer(granteeRefFor(authResult).catch(() => undefined));
+  } catch {
+    // Telemetry only: an observer fault never affects the read.
+  }
+}
+
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
   options: PersonalServerApiDispatchOptions = {},
 ): Promise<Response> {
-  // Set once the builder read is authorized, only for relay-forwarded reads.
-  let relayGranteeRef: string | undefined;
   // Filled in as the dispatch narrows, so a 500 thrown deep in a read is
   // logged against the route that served it rather than a generic label. It
   // is mutable for exactly that reason: the route is not known until the path
@@ -2286,7 +2331,7 @@ export async function handlePersonalServerDataRequest(
     route: `${request.method} ${options.basePath ?? "/v1/data"}`,
     requestId: crypto.randomUUID(),
   };
-  const response = await withApiErrors(async () => {
+  return withApiErrors(async () => {
     const url = new URL(request.url);
     const pathname = stripBasePath(url.pathname, options.basePath);
 
@@ -2607,9 +2652,7 @@ export async function handlePersonalServerDataRequest(
         fileId: fileIdParam ?? selectedEntry?.fileId ?? undefined,
         at: atParam,
       });
-      if (request.headers.get(PS_LITE_RELAY_READ_HEADER) === "1") {
-        relayGranteeRef = await granteeRefFor(authResult);
-      }
+      notifyReadGrantee(request, authResult);
 
       // Select the body after auth and before deletion or payment. A file's
       // version and re-add marker authorize that file, not canonical rows.
@@ -3250,15 +3293,6 @@ export async function handlePersonalServerDataRequest(
 
     return methodNotAllowed();
   }, logContext);
-  if (relayGranteeRef) {
-    try {
-      response.headers.set(PS_GRANTEE_REF_HEADER, relayGranteeRef);
-    } catch {
-      // Immutable headers (never the case for responses built here): the
-      // relay simply reports no grantee for this read.
-    }
-  }
-  return response;
 }
 
 export async function handlePersonalServerAccessLogsRequest(

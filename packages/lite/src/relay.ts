@@ -1,8 +1,5 @@
-import {
-  PS_GRANTEE_REF_HEADER,
-  PS_LITE_RELAY_READ_HEADER,
-  type PersonalServerReadFulfillmentReporter,
-} from "@opendatalabs/personal-server-ts-core/api";
+import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
+import { parseDataScopeContract } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
   handlePsLiteBridgeRequest,
   type PsLiteBridgeRequest,
@@ -54,7 +51,12 @@ export interface PsLiteRelayClientOptions {
   onReadEvent?: (event: PsLiteReadEvent) => void;
 }
 
-/** How a relayed read ended, as seen by the PS-Lite relay client. */
+/**
+ * How a relayed read ended, as seen by the PS-Lite relay client. `ok` and
+ * `empty` mean the response was handed to the socket, not that the requester
+ * received it: delivery comes from joining the relay's `relay_stream_ended`
+ * on streamRef.
+ */
 export type PsLiteReadOutcome =
   | "ok"
   | "empty"
@@ -75,7 +77,11 @@ interface PsLiteReadEventIds {
   streamRef?: string;
   /** Random 16-hex tag of the WebSocket connection that carried the read. */
   connTag: string;
-  /** Scope from the request path (`/v1/data/<scope>`), query dropped. */
+  /**
+   * Scope from the request path (`/v1/data/<scope>`), query dropped. Read
+   * before auth, so anything that is not a valid scope (or is longer than 128
+   * chars) is reported as "invalid".
+   */
   scope: string;
   method: string;
 }
@@ -91,7 +97,11 @@ export type PsLiteReadEvent =
     })
   | (PsLiteReadEventIds & {
       type: "ps_read_finished";
-      /** First 12 hex of sha256(lowercased grantee), "owner", or absent. */
+      /**
+       * First 12 hex of sha256(lowercased grantee address), "owner", or
+       * absent. A pseudonym, not an anonymous id: builders are a small public
+       * set, so their addresses map back to it.
+       */
       granteeRef?: string;
       /** HTTP status written; absent when no response was produced. */
       status?: number;
@@ -243,11 +253,14 @@ interface ReadTracker {
 }
 
 type ReadFinish = {
-  outcome: PsLiteReadOutcome;
+  /** "classify" defers the empty-body check to the async dispatch. */
+  outcome: PsLiteReadOutcome | "classify";
   status?: number;
-  granteeRef?: string;
+  granteeRef?: Promise<string | undefined>;
   bytesOut?: number;
   gzip?: boolean;
+  body?: Uint8Array;
+  contentType?: string;
 };
 
 interface ControlMessage {
@@ -361,15 +374,29 @@ export function startPsLiteRelayClient(
     detail?: PsLiteRelayStatusDetail,
   ) => options.onStatus?.(status, { ...detail, connTag });
 
-  const emitReadEvent = (event: PsLiteReadEvent) => {
-    if (!options.onReadEvent) return;
-    try {
-      options.onReadEvent(event);
-    } catch (error) {
-      log(
-        `relay read event hook failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
+  const logHookError = (error: unknown) =>
+    log(
+      `relay read event hook failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+
+  // Read events never run on the response path: each is built and handed to
+  // the hook in a later macrotask (after the response is written and the
+  // stream closed), in order, and the hook's result is never awaited.
+  let readDispatch: Promise<void> = Promise.resolve();
+  const dispatchReadEvent = (
+    produce: () => PsLiteReadEvent | Promise<PsLiteReadEvent>,
+  ) => {
+    const hook = options.onReadEvent;
+    if (!hook) return;
+    readDispatch = readDispatch
+      .then(() => new Promise<void>((resolve) => setTimeout(resolve, 0)))
+      .then(produce)
+      .then((event) => {
+        void Promise.resolve()
+          .then(() => hook(event))
+          .catch(logHookError);
+      })
+      .catch(logHookError);
   };
 
   const beginRead = (
@@ -394,28 +421,47 @@ export function startPsLiteRelayClient(
       done: false,
     };
     stream.activeRead = tracker;
-    emitReadEvent({
+    const received: PsLiteReadEvent = {
       type: "ps_read_received",
       ...tracker.ids,
       appVisibility: visibility,
-    });
+    };
+    dispatchReadEvent(() => received);
     return tracker;
   };
 
+  /** Records the end synchronously; builds and dispatches the event later. */
   const finishRead = (tracker: ReadTracker | undefined, result: ReadFinish) => {
     if (!tracker || tracker.done) return;
     tracker.done = true;
     if (appVisibility() === "hidden") tracker.hiddenDuring = true;
-    emitReadEvent({
-      type: "ps_read_finished",
-      ...tracker.ids,
-      ...(result.granteeRef ? { granteeRef: result.granteeRef } : {}),
-      ...(result.status !== undefined ? { status: result.status } : {}),
-      outcome: result.outcome,
-      bytesOut: result.bytesOut ?? 0,
-      gzip: result.gzip ?? false,
-      durationMs: Math.max(0, Date.now() - tracker.startedAt),
-      hiddenDuring: tracker.hiddenDuring,
+    const durationMs = Math.max(0, Date.now() - tracker.startedAt);
+    const hiddenDuring = tracker.hiddenDuring;
+    dispatchReadEvent(async () => {
+      const outcome =
+        result.outcome === "classify"
+          ? classifyReadOutcome(
+              result.status ?? 0,
+              result.body ?? new Uint8Array(),
+              result.contentType,
+            )
+          : result.outcome;
+      const granteeRef = validGranteeRef(
+        result.granteeRef
+          ? await withTimeout(result.granteeRef, GRANTEE_REF_WAIT_MS)
+          : undefined,
+      );
+      return {
+        type: "ps_read_finished",
+        ...tracker.ids,
+        ...(granteeRef ? { granteeRef } : {}),
+        ...(result.status !== undefined ? { status: result.status } : {}),
+        outcome,
+        bytesOut: result.bytesOut ?? 0,
+        gzip: result.gzip ?? false,
+        durationMs,
+        hiddenDuring,
+      };
     });
   };
 
@@ -553,7 +599,7 @@ export function startPsLiteRelayClient(
         throw error;
       }
       const { response } = relayed;
-      const finish = (outcome: PsLiteReadOutcome): ReadFinish => ({
+      const finish = (outcome: ReadFinish["outcome"]): ReadFinish => ({
         outcome,
         status: relayed.status,
         granteeRef: relayed.granteeRef,
@@ -582,13 +628,11 @@ export function startPsLiteRelayClient(
       finishRead(
         read,
         written
-          ? finish(
-              classifyReadOutcome(
-                relayed.status,
-                relayed.plainBody,
-                relayed.contentType,
-              ),
-            )
+          ? {
+              ...finish("classify"),
+              body: relayed.plainBody,
+              contentType: relayed.contentType,
+            }
           : finish("stream_closed"),
       );
       closeStream(stream, "http_response_sent");
@@ -930,7 +974,7 @@ interface RelayHttpResult {
   plainBody: Uint8Array;
   contentType?: string;
   gzip: boolean;
-  granteeRef?: string;
+  granteeRef?: Promise<string | undefined>;
 }
 
 async function handleRelayHttpRequest(
@@ -939,40 +983,32 @@ async function handleRelayHttpRequest(
   origin: string,
   isRead: boolean,
 ): Promise<RelayHttpResult> {
-  // The grantee-ref handshake headers are internal: a wire request may never
-  // set them, and the response header never reaches the wire.
-  const headers = { ...request.headers };
-  delete headers[PS_LITE_RELAY_READ_HEADER];
-  delete headers[PS_GRANTEE_REF_HEADER];
-  if (isRead) headers[PS_LITE_RELAY_READ_HEADER] = "1";
   const bridgeRequest: PsLiteBridgeRequest = {
     requestId: crypto.randomUUID(),
     method: request.method,
     path: request.path,
     query: request.query,
-    headers,
+    headers: request.headers,
     body: encodeBase64(request.body),
   };
+  // The grantee label travels in-process (an observer on the Request
+  // object), never as a header a requester could set or read.
+  let granteeRef: Promise<string | undefined> | undefined;
   const bridgeResponse = await handlePsLiteBridgeRequest(
     runtime,
     bridgeRequest,
     {
       origin,
+      ...(isRead
+        ? {
+            onReadGrantee: (ref: Promise<string | undefined>) => {
+              granteeRef = ref;
+            },
+          }
+        : {}),
     },
   );
-  const responseHeaders = { ...bridgeResponse.headers };
-  let granteeRef: string | undefined;
-  for (const key of Object.keys(responseHeaders)) {
-    if (key.toLowerCase() === PS_GRANTEE_REF_HEADER) {
-      granteeRef = responseHeaders[key];
-      delete responseHeaders[key];
-    }
-  }
-  const wireResponse: PsLiteBridgeResponse = {
-    ...bridgeResponse,
-    headers: responseHeaders,
-  };
-  const contentType = headerValue(responseHeaders, "content-type");
+  const contentType = headerValue(bridgeResponse.headers, "content-type");
   // Large exports (e.g. chatgpt.conversations) are big JSON streamed over the
   // relay's WebSocket tunnel; an uncompressed body inflates transfer time and the
   // window for a mid-stream drop (truncated read → UND_ERR_RES_CONTENT_LENGTH_MISMATCH).
@@ -982,7 +1018,7 @@ async function handleRelayHttpRequest(
   const acceptsGzip = (request.headers["accept-encoding"] ?? "").includes(
     "gzip",
   );
-  const alreadyEncoded = Boolean(responseHeaders["content-encoding"]);
+  const alreadyEncoded = Boolean(bridgeResponse.headers?.["content-encoding"]);
   const base = {
     status: bridgeResponse.status,
     plainBody: bodyBytes,
@@ -999,7 +1035,7 @@ async function handleRelayHttpRequest(
     return {
       ...base,
       gzip: true,
-      response: buildHttpResponse(wireResponse, {
+      response: buildHttpResponse(bridgeResponse, {
         bodyOverride: gzipped,
         contentEncoding: "gzip",
       }),
@@ -1008,7 +1044,7 @@ async function handleRelayHttpRequest(
   return {
     ...base,
     gzip: false,
-    response: buildHttpResponse(wireResponse, { bodyOverride: bodyBytes }),
+    response: buildHttpResponse(bridgeResponse, { bodyOverride: bodyBytes }),
   };
 }
 
@@ -1031,10 +1067,43 @@ function relayReadScope(request: ParsedHttpRequest): string | undefined {
   if (!request.path.startsWith(DATA_PATH_PREFIX)) return undefined;
   const segment = request.path.slice(DATA_PATH_PREFIX.length).split("/")[0];
   if (!segment) return undefined;
+  let scope: string;
   try {
-    return decodeURIComponent(segment);
+    scope = decodeURIComponent(segment);
   } catch {
-    return segment;
+    return INVALID_SCOPE;
+  }
+  if (scope.length > MAX_SCOPE_LENGTH) return INVALID_SCOPE;
+  const parsed = parseDataScopeContract(scope);
+  return parsed.ok ? parsed.scope : INVALID_SCOPE;
+}
+
+const INVALID_SCOPE = "invalid";
+const MAX_SCOPE_LENGTH = 128;
+// Hashing resolves in microseconds; the cap only keeps a stuck promise from
+// holding back later events.
+const GRANTEE_REF_WAIT_MS = 1_000;
+
+function validGranteeRef(value: unknown): string | undefined {
+  return typeof value === "string" && /^(owner|[0-9a-f]{12})$/.test(value)
+    ? value
+    : undefined;
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.catch(() => undefined),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 

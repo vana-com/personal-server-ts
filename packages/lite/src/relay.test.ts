@@ -1076,6 +1076,12 @@ describe("read-reliability events", () => {
     for (let tick = 0; tick < 200 && !closedThisStream(); tick += 1) {
       await flushRelayTasks();
     }
+    await flushEvents();
+  }
+
+  // Read events are dispatched in later macrotasks, one per event.
+  async function flushEvents() {
+    for (let tick = 0; tick < 8; tick += 1) await flushRelayTasks();
   }
 
   function wireText(socket: FakeRelayWebSocket, streamId = 1): string {
@@ -1245,9 +1251,10 @@ describe("read-reliability events", () => {
     );
     await sendRequest(sockets[0], "/v1/data/a.b");
     sockets[0].receive(JSON.stringify({ type: "stream.close", streamId: 1 }));
+    await flushEvents();
     expect(events[1]).toMatchObject({ outcome: "stream_closed", bytesOut: 0 });
     release(json({ data: 1 }));
-    await flushRelayTasks();
+    await flushEvents();
     expect(events).toHaveLength(2);
     expect(sentDataFrames(sockets[0])).toHaveLength(0);
   });
@@ -1276,8 +1283,7 @@ describe("read-reliability events", () => {
     fakeDocument.visibilityState = "visible";
     for (const listener of listeners) listener();
     release(json({ data: 1 }));
-    await flushRelayTasks();
-    await flushRelayTasks();
+    await flushEvents();
     expect(events[1]).toMatchObject({ outcome: "ok", hiddenDuring: true });
     client.close();
     expect(listeners.size).toBe(0);
@@ -1300,46 +1306,112 @@ describe("read-reliability events", () => {
     expect(wireBytes.length).toBeLessThan(10_000);
   });
 
-  it("passes the internal read header, takes the grantee ref and keeps both off the wire", async () => {
-    const seen: Request[] = [];
+  const GRANTEE_OBSERVER = Symbol.for(
+    "@opendatalabs/personal-server-ts-core/read-grantee-observer",
+  );
+  const granteeObserverOf = (request: Request) =>
+    (request as unknown as Record<symbol, unknown>)[GRANTEE_OBSERVER] as
+      ((ref: Promise<string | undefined>) => void) | undefined;
+
+  it("takes the grantee ref in-process, never from headers", async () => {
     const { sockets, events } = startEventClient(async (request) => {
-      seen.push(request);
+      granteeObserverOf(request)?.(Promise.resolve("0123456789ab"));
       return json({ data: { a: 1 } }, 200, {
-        "x-ps-grantee-ref": "0123456789ab",
+        "x-ps-grantee-ref": "fedcba987654",
       });
     });
     await sendRequest(sockets[0], "/v1/data/a.b", {
-      headers: {
-        "x-ps-grantee-ref": "spoofed",
-        "x-ps-lite-relay-read": "spoofed",
-      },
+      headers: { "x-ps-grantee-ref": "fedcba987654" },
     });
-    expect(seen[0].headers.get("x-ps-lite-relay-read")).toBe("1");
-    expect(seen[0].headers.get("x-ps-grantee-ref")).toBeNull();
-    expect(wireText(sockets[0]).toLowerCase()).not.toContain(
-      "x-ps-grantee-ref",
-    );
     expect(events[1]).toMatchObject({ granteeRef: "0123456789ab" });
   });
 
-  it("emits nothing for non-read routes and strips the internal headers there too", async () => {
-    const seen: Request[] = [];
+  it("drops a grantee ref that is not owner or 12 lowercase hex", async () => {
     const { sockets, events } = startEventClient(async (request) => {
-      seen.push(request);
-      return json({ ok: true }, 200, { "x-ps-grantee-ref": "0123456789ab" });
+      granteeObserverOf(request)?.(Promise.resolve("0xDEADBEEF-leak"));
+      return json({ data: 1 });
     });
-    await sendRequest(sockets[0], "/health", {
-      headers: { "x-ps-lite-relay-read": "1" },
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    expect(events[1]).toMatchObject({ outcome: "ok" });
+    expect("granteeRef" in events[1]).toBe(false);
+  });
+
+  it("only attaches the grantee observer to reads", async () => {
+    const observed: boolean[] = [];
+    const { sockets, events } = startEventClient(async (request) => {
+      observed.push(Boolean(granteeObserverOf(request)));
+      return json({ ok: true });
     });
+    await sendRequest(sockets[0], "/health");
     await sendRequest(sockets[0], "/v1/data", { streamId: 2 });
     await sendRequest(sockets[0], "/v1/data/a.b", {
       method: "POST",
       streamId: 3,
     });
-    expect(events).toEqual([]);
-    expect(seen[0].headers.get("x-ps-lite-relay-read")).toBeNull();
-    expect(wireText(sockets[0], 1).toLowerCase()).not.toContain(
-      "x-ps-grantee-ref",
+    await sendRequest(sockets[0], "/v1/data/a.b", { streamId: 4 });
+    expect(observed).toEqual([false, false, false, true]);
+    expect(events.map((event) => event.type)).toEqual([
+      "ps_read_received",
+      "ps_read_finished",
+    ]);
+  });
+
+  it.each([
+    ["/v1/data/" + "a".repeat(129)],
+    ["/v1/data/%E0%A4%A"],
+    ["/v1/data/not%20a%20scope"],
+    ["/v1/data/<script>"],
+  ])("reports scope invalid for %s", async (target) => {
+    const { sockets, events } = startEventClient(async () =>
+      json({ error: "bad" }, 400),
+    );
+    await sendRequest(sockets[0], target);
+    expect(events[0]).toMatchObject({ scope: "invalid" });
+    expect(events[1]).toMatchObject({ scope: "invalid", outcome: "error" });
+  });
+
+  it("dispatches events only after the response is written and the stream closed", async () => {
+    const closedWhenHookRan: boolean[] = [];
+    const holder: { socket?: FakeRelayWebSocket } = {};
+    const started = startEventClient(async () => json({ data: 1 }), {
+      onReadEvent: () => {
+        closedWhenHookRan.push(
+          (holder.socket?.sent ?? []).some(
+            (message) =>
+              typeof message === "string" &&
+              JSON.parse(message).type === "stream.close",
+          ),
+        );
+      },
+    });
+    holder.socket = started.sockets[0];
+    await sendRequest(holder.socket, "/v1/data/a.b");
+    expect(closedWhenHookRan).toEqual([true, true]);
+  });
+
+  it("keeps serving and dispatching when the hook never settles or rejects", async () => {
+    const logs: string[] = [];
+    const seen: string[] = [];
+    let calls = 0;
+    const { sockets } = startEventClient(async () => json({ data: 1 }), {
+      onReadEvent: (event) => {
+        seen.push(event.type);
+        calls += 1;
+        return (calls === 1
+          ? new Promise<void>(() => {})
+          : Promise.reject(
+              new Error("async analytics down"),
+            )) as unknown as void;
+      },
+      logger: (line) => logs.push(line),
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    await sendRequest(sockets[0], "/v1/data/a.b", { streamId: 2 });
+    expect(wireText(sockets[0], 1)).toContain("HTTP/1.1 200 OK");
+    expect(wireText(sockets[0], 2)).toContain("HTTP/1.1 200 OK");
+    expect(seen).toHaveLength(4);
+    expect(logs.some((line) => line.includes("async analytics down"))).toBe(
+      true,
     );
   });
 
