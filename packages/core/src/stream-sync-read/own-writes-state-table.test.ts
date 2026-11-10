@@ -13,13 +13,12 @@
  * - the plan's predicted head after each step equals the head the writer
  *   registers, pass after pass, until no pass changes anything, and every
  *   registry publication holds the lines the plan predicted for its step;
- * - every API path carries the owner's markers, and none of a grant's does.
+ * The mixed legacy-file/overlay HTTP response is retired; these cases retain
+ * the writer/fold oracle independently of HTTP account-mode routing.
  */
 
 import { readFileSync } from "node:fs";
-import { describe, expect, it, vi } from "vitest";
-import { handlePersonalServerDataRequest } from "../api/index.js";
-import type { PersonalServerDataApiDeps } from "../api/index.js";
+import { describe, expect, it } from "vitest";
 import {
   compareStamp,
   SEED_OBSERVED_AT,
@@ -27,7 +26,6 @@ import {
   type Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { PlanHead, PlanStep } from "../stream-sync/publish-plan.js";
-import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import { planHeadOf } from "./fold.js";
 import type { ReadDecision } from "./service.js";
 import {
@@ -864,10 +862,6 @@ const ROWS: readonly Row[] = [
   },
 ];
 
-// ---------------------------------------------------------------------------
-
-const BUILDER = "0x000000000000000000000000000000000000bEEF";
-
 function rowScope(row: Row): string {
   return row.scope ?? `pdpp.${row.connector ?? CONNECTOR}.items`;
 }
@@ -1427,92 +1421,6 @@ async function publishUntilStable(
   throw new Error(`${row.id}: the writer did not reach a stable state`);
 }
 
-interface Api {
-  readonly status: number;
-  readonly source: string | null;
-  readonly withheld: string | null;
-  readonly complete: string | null;
-  readonly pending: string | null;
-  readonly awaitingImport: string | null;
-  readonly notReflected: string | null;
-  readonly bodyWithheld: string[] | null;
-  readonly records: Rec[] | null;
-}
-
-async function api(
-  rig: Rig,
-  row: Row,
-  input: { builder: boolean; file: boolean; connection?: boolean },
-): Promise<Api> {
-  const storage = createMemoryDataStorage();
-  if (input.file) {
-    const envelope = {
-      version: "1.0" as const,
-      scope: rowScope(row),
-      collectedAt: "2026-10-01T00:00:00.000Z",
-      data: { records: [{ id: "stored" }] },
-    };
-    const written = await storage.writeEnvelope(envelope);
-    storage.insertEntry({
-      fileId: null,
-      path: written.relativePath,
-      scope: envelope.scope,
-      collectedAt: envelope.collectedAt,
-      sizeBytes: written.sizeBytes,
-    } as never);
-  }
-  const deps: PersonalServerDataApiDeps = {
-    storage,
-    streamSyncRead: rig.service,
-    auth: {
-      authorizeOwner: vi.fn(async () => undefined),
-      authorizeBuilderList: vi.fn(async () => undefined),
-      authorizeBuilderRead: vi.fn(async ({ request }: { request: Request }) =>
-        request.headers.get("x-test-builder")
-          ? { builder: BUILDER, grantId: "grant-1" }
-          : { builder: BUILDER, grantId: "owner" },
-      ),
-    } as never,
-    accessLogWriter: { write: vi.fn(async () => undefined) },
-    now: () => new Date("2026-11-01T00:00:00.000Z"),
-    createLogId: () => "log-1",
-  };
-  const query = input.connection ? "?connection=" : "";
-  const response = await handlePersonalServerDataRequest(
-    new Request(`https://ps.example.com/${rowScope(row)}${query}`, {
-      headers: input.builder ? { "x-test-builder": "1" } : {},
-    }),
-    deps,
-  );
-  const body = (await response.json().catch(() => null)) as {
-    withheld?: { runId: string; reason: string }[];
-    data?: { records?: Rec[] };
-  } | null;
-  return {
-    status: response.status,
-    source: response.headers.get("x-vana-data-source"),
-    withheld: response.headers.get("x-stream-sync-withheld"),
-    complete: response.headers.get("x-stream-sync-complete"),
-    pending: response.headers.get("x-stream-sync-pending"),
-    awaitingImport: response.headers.get("x-stream-sync-awaiting-import"),
-    notReflected: response.headers.get("x-stream-sync-not-reflected"),
-    bodyWithheld: body?.withheld
-      ? body.withheld.map((w) => `${w.runId}:${w.reason}`).sort()
-      : null,
-    records: body?.data?.records ?? null,
-  };
-}
-
-function reasonsHeader(withheld: readonly string[]): string | null {
-  if (withheld.length === 0) return null;
-  return [...new Set(withheld.map((w) => w.slice(w.indexOf(":") + 1)))]
-    .sort()
-    .join(",");
-}
-
-const sortedHeader = (h: string | null) =>
-  h === null ? null : h.split(",").sort().join(",");
-
 describe("own-writes state table", () => {
   for (const row of ROWS) {
     const { expect: want } = row;
@@ -1546,292 +1454,8 @@ describe("own-writes state table", () => {
           }).toEqual(want.head);
         }
       });
-
-      it("every owner response carries the markers; a grant's carries none", async () => {
-        const rig = await open(row);
-        const grantView = want.grant[0] !== null;
-        const plain = await api(rig, row, { builder: false, file: false });
-        const filed = await api(rig, row, { builder: false, file: true });
-        const named = await api(rig, row, {
-          builder: false,
-          file: false,
-          connection: true,
-        });
-        // The stored body answers without projecting: it carries no
-        // projection marker, only what the plan withholds.
-        const unfiled = want.before.withheld.filter(
-          (w) => !w.endsWith(":projection_unavailable"),
-        );
-        for (const [read, withheld] of [
-          [plain, want.before.withheld],
-          [filed, unfiled],
-          [named, want.before.withheld],
-        ] as const) {
-          expect(sortedHeader(read.withheld)).toBe(reasonsHeader(withheld));
-          expect(read.bodyWithheld).toEqual(
-            withheld.length === 0 ? null : [...withheld].sort(),
-          );
-        }
-        if (want.before.rows === null) {
-          // No view: no file is a missing body, a named connection without a
-          // view is a refusal.
-          expect(plain.status).toBe(404);
-          expect(named.status).toBe(404);
-        } else {
-          expect(plain.status).toBe(200);
-          expect(canon(plain.records)).toEqual(canon(want.before.rows));
-          const partial = want.before.complete !== true;
-          expect(plain.complete).toBe(
-            partial ? String(want.before.complete) : plain.complete,
-          );
-        }
-        if (grantView) {
-          // A grant reads the published view, not the stored body, so the
-          // owner does too, whatever is pending (no legacy body over a
-          // pending key reset).
-          expect(filed.source).toBe("stream-sync");
-          expect(canon(filed.records)).toEqual(canon(want.before.rows));
-          expect(filed.pending).toBeNull();
-        } else {
-          // A grant reads the stored body: so does the owner, told how many
-          // runs are not published.
-          expect(filed.source).toBe("legacy");
-          expect(filed.records).toEqual([{ id: "stored" }]);
-          expect(filed.pending).toBe(
-            want.pending > 0 ? String(want.pending) : null,
-          );
-        }
-
-        for (const file of [false, true]) {
-          for (const connection of [false, true]) {
-            const g = await api(rig, row, { builder: true, file, connection });
-            expect(g.withheld).toBeNull();
-            expect(g.bodyWithheld).toBeNull();
-            expect(g.pending).toBeNull();
-            expect(g.complete).toBeNull();
-            if (file && !connection) {
-              if (grantView) {
-                expect(canon(g.records)).toEqual(canon(want.grant[0]));
-              } else {
-                expect(g.records).toEqual([{ id: "stored" }]);
-              }
-            }
-          }
-        }
-      });
     });
   }
-});
-
-// ---------------------------------------------------------------------------
-// Every HTTP response, at every phase: before the writer publishes, after one
-// publish pass the reader has not imported, and after it imports the result.
-
-/** The keys of a response's records; empty when it carries none. */
-const keysOf = (read: Api): Set<string> =>
-  new Set((read.records ?? []).map(keyOf));
-
-/**
- * What the writer holds that the stored body cannot show: the runs with a
- * stream it has not published, and the runs with a stream it published and
- * the reader has not imported. Counted from the writer's own snapshot.
- */
-async function localCounts(
-  rig: Rig,
-  row: Row,
-): Promise<{ unpublished: number; awaiting: number }> {
-  const snapshot = await rig.overlay.snapshot(row.connector ?? CONNECTOR);
-  try {
-    // The streams the scope reads: instagram.posts reads two legacy streams.
-    const read = row.scope ? ["posts", "post_likes"] : ["items"];
-    const states = snapshot.runs.map((r) =>
-      r.streams.filter((s) => read.includes(s.name)).map((s) => s.state),
-    );
-    return {
-      unpublished: states.filter((all) => all.some((x) => x !== "published"))
-        .length,
-      awaiting: states.filter((all) => all.some((x) => x === "published"))
-        .length,
-    };
-  } finally {
-    snapshot.release();
-  }
-}
-
-const count = (n: number): string | null => (n > 0 ? String(n) : null);
-
-async function expectHttp(
-  rig: Rig,
-  row: Row,
-  phase: string,
-  want?: Read,
-): Promise<void> {
-  const seen = await observe(rig, row);
-  if (want) expectRead(seen, want);
-  const header = reasonsHeader(seen.read.withheld);
-  const label = `${row.id} ${phase}`;
-  for (const file of [false, true]) {
-    for (const connection of [false, true]) {
-      const where = `${label} file=${file} connection=${connection}`;
-      const owner = await api(rig, row, { builder: false, file, connection });
-      const grant = await api(rig, row, { builder: true, file, connection });
-      // A grant carries no marker on any path.
-      expect(grant.withheld, where).toBeNull();
-      expect(grant.bodyWithheld, where).toBeNull();
-      expect(grant.pending, where).toBeNull();
-      expect(grant.complete, where).toBeNull();
-      expect(grant.awaitingImport, where).toBeNull();
-      // The owner never reads fewer records than a grant of the same stream.
-      for (const key of keysOf(grant)) {
-        expect(
-          keysOf(owner),
-          `${where} owner covers grant key ${key}`,
-        ).toContain(key);
-      }
-      // The owner is told what the writer will not publish, on every path.
-      if (owner.status === 200 && owner.source === "stream-sync") {
-        expect(canon(owner.records), where).toEqual(canon(seen.read.rows));
-      }
-      if (header !== null && owner.source !== "legacy") {
-        expect(sortedHeader(owner.withheld), where).toBe(header);
-      }
-      const counts = await localCounts(rig, row);
-      if (file && owner.source !== "stream-sync") {
-        // The stored body shows no local run: every run it does not reflect
-        // is counted, unpublished apart from published and awaiting import.
-        expect(owner.pending, `${where} pending`).toBe(
-          count(counts.unpublished),
-        );
-        expect(owner.awaitingImport, `${where} awaiting import`).toBe(
-          count(counts.awaiting),
-        );
-      } else {
-        expect(owner.pending, where).toBeNull();
-        expect(owner.awaitingImport, where).toBeNull();
-      }
-      if (!file && !connection) {
-        expect(owner.status, `${where} status`).toBe(
-          seen.read.rows !== null ? 200 : 404,
-        );
-        if (seen.read.rows !== null) {
-          expect(owner.complete, `${where} complete`).toBe(
-            seen.kind === "local_pending" ? String(seen.read.complete) : null,
-          );
-        }
-        expect(owner.bodyWithheld, `${where} withheld in the body`).toEqual(
-          seen.read.withheld.length === 0
-            ? null
-            : [...seen.read.withheld].sort(),
-        );
-      }
-    }
-  }
-  // A stored body answers the owner wherever it answers a grant.
-  const grantFiled = await api(rig, row, { builder: true, file: true });
-  const ownerFiled = await api(rig, row, { builder: false, file: true });
-  expect(ownerFiled.source, `${label} source`).toBe(grantFiled.source);
-}
-
-describe("owner and grant over HTTP, with a stored body that shares no key", () => {
-  for (const row of ROWS) {
-    it(`${row.id}: before publication, after one pass, after import`, async () => {
-      const rig = await open(row);
-      await expectHttp(rig, row, "before", row.expect.before);
-      await checkedPass(rig, row, {});
-      await expectHttp(rig, row, "published");
-      await publishUntilStable(rig, row);
-      await rig.sync();
-      await expectHttp(rig, row, "imported", row.expect.after);
-    });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// Cases that need more than one read.
-
-describe("a stored body over local runs the response does not reflect", () => {
-  for (const id of ["D5", "N1"]) {
-    it(`${id}: after the publish and before the import, the owner is told the run awaits import`, async () => {
-      const row = ROWS.find((r) => r.id === id)!;
-      const rig = await open(row);
-      const before = await api(rig, row, { builder: false, file: true });
-      expect(before.source).toBe("legacy");
-      expect(before.pending).toBe("1");
-      expect(before.awaitingImport).toBeNull();
-
-      await checkedPass(rig, row, {});
-      const published = await api(rig, row, { builder: false, file: true });
-      expect(published.source).toBe("legacy");
-      expect(published.records).toEqual([{ id: "stored" }]);
-      expect(published.pending).toBeNull();
-      expect(published.awaitingImport).toBe("1");
-
-      await publishUntilStable(rig, row);
-      await rig.sync();
-      const imported = await api(rig, row, { builder: false, file: true });
-      expect(imported.pending).toBeNull();
-      expect(imported.awaitingImport).toBeNull();
-    });
-  }
-});
-
-describe("a stored body over a published head it does not reflect", () => {
-  const S4 = () => ROWS.find((r) => r.id === "S4")!;
-
-  async function settled(): Promise<{ rig: Rig; row: Row }> {
-    const row = S4();
-    const rig = await open(row);
-    await publishUntilStable(rig, row);
-    await rig.sync();
-    return { rig, row };
-  }
-
-  async function expectNoted(rig: Rig, row: Row): Promise<void> {
-    const owner = await api(rig, row, { builder: false, file: true });
-    expect(owner.source).toBe("legacy");
-    expect(owner.records).toEqual([{ id: "stored" }]);
-    expect(owner.notReflected).toBe("1");
-    expect(owner.awaitingImport).toBeNull();
-    const grant = await api(rig, row, { builder: true, file: true });
-    expect(grant.notReflected).toBeNull();
-  }
-
-  it("S4: the note is present after import", async () => {
-    const { rig, row } = await settled();
-    await expectNoted(rig, row);
-  });
-
-  it("S4: the note is present after the run is retired", async () => {
-    const { rig, row } = await settled();
-    const snapshot = await rig.overlay.snapshot(CONNECTOR);
-    expect(snapshot.runs).toEqual([]);
-    snapshot.release();
-    await expectNoted(rig, row);
-  });
-
-  it("S4: the note is present after a restart", async () => {
-    const { rig, row } = await settled();
-    await rig.restart();
-    await rig.sync();
-    await expectNoted(rig, row);
-  });
-
-  it("control: a stored body over no published head carries no note", async () => {
-    const row = S4();
-    const rig = new Rig(row.seed, row.connector);
-    await rig.open();
-    const owner = await api(rig, row, { builder: false, file: true });
-    expect(owner.source).toBe("legacy");
-    expect(owner.notReflected).toBeNull();
-  });
-
-  it("control: a complete head serves its own view, so the stored body carries no note", async () => {
-    const row = S4();
-    const rig = await open(row);
-    const owner = await api(rig, row, { builder: false, file: true });
-    expect(owner.source).toBe("stream-sync");
-    expect(owner.notReflected).toBeNull();
-  });
 });
 
 describe("the oracle catches a deliberately broken model", () => {
@@ -1918,20 +1542,6 @@ describe("an incomplete head's acknowledgment keeps the owner's rows", () => {
     expect(canon(await records(after))).toEqual(canon([A, B, C]));
     // A grant has no view of an incomplete head.
     expect(await records(await resolve(rig, row, { owner: false }))).toBeNull();
-  });
-});
-
-describe("a stored body never answers the owner over a pending key reset", () => {
-  it("the owner reads the published base the grant reads, marked incomplete", async () => {
-    const row = ROWS.find((r) => r.id === "S4")!;
-    const rig = await open(row);
-    const owner = await api(rig, row, { builder: false, file: true });
-    expect(owner.source).toBe("stream-sync");
-    expect(canon(owner.records)).toEqual(canon(AB));
-    expect(owner.complete).toBe("false");
-    expect(owner.withheld).toBe("key_reset_pending");
-    const grant = await api(rig, row, { builder: true, file: true });
-    expect(canon(grant.records)).toEqual(canon(AB));
   });
 });
 

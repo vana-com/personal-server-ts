@@ -843,7 +843,7 @@ function streamSyncRefusal(decision: ReadDecision): Response | null {
  * Without a check the stream passes through unchanged.
  */
 async function validateStreamBody<
-  D extends Extract<ReadDecision, { kind: "view" | "local_pending" }>,
+  D extends Extract<ReadDecision, { kind: "view" }>,
 >(decision: D, inProcess: PersonalServerInProcessRead | undefined): Promise<D> {
   if (!inProcess?.validateBody) return decision;
   const text = await new Response(decision.body).text();
@@ -874,7 +874,7 @@ async function serveStreamSyncView(
     authResult: Awaited<
       ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
     >;
-    decision: Extract<ReadDecision, { kind: "view" | "local_pending" }>;
+    decision: Extract<ReadDecision, { kind: "view" }>;
     paymentResponseHeader: string | undefined;
     inProcess: PersonalServerInProcessRead | undefined;
   },
@@ -945,13 +945,6 @@ async function serveStreamSyncView(
       "Transfer-Encoding": "chunked",
       "X-Vana-Data-Source": "stream-sync",
       "X-Stream-Sync-Cursor": decision.cursor,
-      // An owner-only view built on this device; it may be partial.
-      ...(decision.kind === "local_pending"
-        ? {
-            "X-Stream-Sync-Origin": "local-pending",
-            "X-Stream-Sync-Complete": String(decision.complete),
-          }
-        : {}),
       // Owner only: the service attaches this to no other audience.
       ...(decision.withheld?.length
         ? { "X-Stream-Sync-Withheld": withheldReasons(decision.withheld) }
@@ -3092,15 +3085,12 @@ export async function handlePersonalServerDataRequest(
         view === null
           ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
           : undefined;
-      // Stream-sync (§2.10): the one eligibility rule decides between the
-      // stream view, the existing body and a refusal. Explicit versions stay
-      // legacy history, but a deleted connector serves nothing at all.
+      // On serves database stream views or a refusal, including historical
+      // selectors. Only Off reaches the separate legacy body path below.
       const latestRead =
         fileIdParam === undefined && atParam === undefined && view === null;
-      // What only the owner is told when the existing path answers a stream
-      // read: local runs the writer will not publish.
-      let ownerNotes: OwnerNotes | undefined;
       if (mode === "switched") {
+        let ownerNotes: OwnerNotes | undefined;
         if (!deps.streamSyncRead) {
           return errorResponse(
             503,
@@ -3344,7 +3334,7 @@ export async function handlePersonalServerDataRequest(
         paymentResponseHeader = paid.paymentResponseHeader;
       }
 
-      const headers = ownerNoteHeaders(ownerNotes);
+      const headers: Record<string, string> = {};
       if (ownApp) headers["X-Vana-Payment-Exemption"] = "own-app";
       headers["X-Vana-Data-Source"] =
         latest?.kind === "canonical" ? "canonical" : "legacy";
@@ -3372,7 +3362,7 @@ export async function handlePersonalServerDataRequest(
             // 404, when that is why.
             await assertScopeNotDeleted(deps, scopeResult.scope, undefined);
           }
-          return contractErrorResponse(result, ownerNotes);
+          return contractErrorResponse(result);
         }
         envelope = result.envelope;
         servedFileId = fileIdParam ?? selectedEntry?.fileId ?? undefined;
@@ -3402,12 +3392,9 @@ export async function handlePersonalServerDataRequest(
       }
       // A JSON read is checked against the body it will serve, before it pays.
       if (inProcess && !wantsRawContent) {
-        await inProcess.validateBody?.(
-          withOwnerBody(servedEnvelope, ownerNotes),
-          {
-            fromStreamView: false,
-          },
-        );
+        await inProcess.validateBody?.(servedEnvelope, {
+          fromStreamView: false,
+        });
       }
       // Every refusal above has run; only a read that will be served pays.
       await settle();
@@ -3497,7 +3484,7 @@ export async function handlePersonalServerDataRequest(
         });
         return response;
       }
-      const response = jsonResponse(withOwnerBody(servedEnvelope, ownerNotes), {
+      const response = jsonResponse(servedEnvelope, {
         headers,
       });
       reportReadFulfillment();

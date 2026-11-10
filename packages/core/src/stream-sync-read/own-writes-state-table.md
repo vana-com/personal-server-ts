@@ -1,4 +1,11 @@
-# Own-writes state table
+# Legacy file-writer state table
+
+This is the retained file-writer/fold oracle. The HTTP rules below describe
+its retired mixed file/overlay response, not the PS-2 HTTP contract. PS-2
+serves database stream views for On and legacy bodies only for explicit Off;
+a device-local partial body never reaches the HTTP renderer. The 43 writer,
+fold, cursor and mutation-oracle tests remain; the 82 retired HTTP cases were
+removed with the dead renderer and mixed-file decoration code.
 
 What the reader shows for a person's own collected runs, in every state a run
 can be in. `own-writes-state-table.test.ts` drives the real writer and reads
@@ -42,7 +49,7 @@ the test change together.
    legacy body over a pending key reset. Otherwise the stored body answers
    both, and the owner is told `X-Stream-Sync-Pending`: U. This holds even
    when the owner's own view is complete (D5, N1): a predicted head does not
-   contain a different stored body. The test checks it over HTTP with a stored
+   contain a different stored body. The former HTTP matrix checked it with a stored
    record that shares no key with the rows, before the writer publishes, after
    one pass the reader has not imported, and after the import.
 7. **U counts distinct unpublished runs**: runs with a requested stream that

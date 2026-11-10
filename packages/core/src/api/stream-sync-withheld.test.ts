@@ -181,3 +181,30 @@ describe("switched incomplete reads refuse legacy fallback", () => {
     expect(read.body.withheld).toBeUndefined();
   });
 });
+
+describe("retired mixed HTTP response", () => {
+  it("cancels a device-local partial body without serving it or touching legacy storage", async () => {
+    const cancel = vi.fn();
+    const storage = createMemoryDataStorage();
+    const find = vi.spyOn(storage, "findEntry");
+    const deps = await setupDeps(
+      {
+        resolve: async () => ({
+          kind: "local_pending",
+          connector: "fixture",
+          ns: "",
+          cursor: "fixture",
+          complete: false,
+          body: new ReadableStream<Uint8Array>({ cancel }),
+        }),
+      },
+      storage,
+    );
+    const read = await get(deps, false);
+    expect(read.status).toBe(404);
+    expect(read.source).toBeNull();
+    expect(read.body.error.errorCode).toBe("STREAM_DATA_NOT_FOUND");
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(find).not.toHaveBeenCalled();
+  });
+});
