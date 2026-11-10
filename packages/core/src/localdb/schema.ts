@@ -128,4 +128,10 @@ END;`,
     END`,
   ],
   [`ALTER TABLE run_streams ADD COLUMN coverage_strategy TEXT`],
+  [
+    `ALTER TABLE run_rows ADD COLUMN op TEXT NOT NULL DEFAULT 'upsert' CHECK(op IN ('upsert','delete'))`,
+    `ALTER TABLE run_streams ADD COLUMN semantics TEXT`,
+    `UPDATE run_streams SET semantics=(SELECT s.semantics FROM stream_state s JOIN runs r ON r.connection_id=s.connection_id WHERE r.run_id=run_streams.run_id AND s.stream=run_streams.stream)`,
+    `ALTER TABLE record_changes ADD COLUMN explicit_delete INTEGER NOT NULL DEFAULT 0`,
+  ],
 ];

@@ -12,7 +12,10 @@ import {
   toHex,
   type JsonValue,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
+import {
+  computeRecordKeyFromData,
+  keyMatchesData,
+} from "../storage/pdpp-records/record-key.js";
 import {
   RunIntakeError,
   type BatchRequest,
@@ -336,8 +339,8 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
               ],
             },
             {
-              sql: `INSERT INTO run_streams(run_id,stream,delete_snapshot,basis_version,basis_generation,basis_data_hash,primary_key,profile_key,profile_version,full_read,coverage_strategy)
-            SELECT ?,stream,last_delete_version,CASE WHEN head_version>0 THEN head_version ELSE NULL END,CASE WHEN head_version>0 THEN head_generation ELSE ? END,head_data_hash,?,NULL,?,?,?
+              sql: `INSERT INTO run_streams(run_id,stream,delete_snapshot,basis_version,basis_generation,basis_data_hash,primary_key,profile_key,profile_version,full_read,coverage_strategy,semantics)
+            SELECT ?,stream,last_delete_version,CASE WHEN head_version>0 THEN head_version ELSE NULL END,CASE WHEN head_version>0 THEN head_generation ELSE ? END,head_data_hash,?,NULL,?,?,?,?
             FROM stream_state WHERE connection_id=? AND stream=?`,
               params: [
                 runId,
@@ -353,6 +356,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
                   ? 1
                   : 0,
                 d.coverageStrategy ?? null,
+                d.semantics,
                 id,
                 d.name,
               ],
@@ -402,15 +406,24 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           );
         const streams = new Map(
           (
-            await db.query<{ stream: string; primary_key: string }>(
-              "SELECT stream,primary_key FROM run_streams WHERE run_id=?",
+            await db.query<{
+              stream: string;
+              primary_key: string;
+              semantics: string | null;
+            }>(
+              "SELECT stream,primary_key,semantics FROM run_streams WHERE run_id=?",
               [runId],
             )
-          ).map((s) => [s.stream, JSON.parse(s.primary_key) as string[]]),
+          ).map((s) => [
+            s.stream,
+            {
+              primaryKey: JSON.parse(s.primary_key) as string[],
+              semantics: s.semantics,
+            },
+          ]),
         );
         const rows: SqlStatement[] = [];
         let accepted = 0;
-        let deletesSkipped = 0;
         for (const record of req.records) {
           if (
             !isPlainObject(record as unknown) ||
@@ -424,17 +437,24 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             record.op !== "delete"
           )
             throw invalid("invalid record op");
-          if (record.op === "delete") {
-            deletesSkipped++;
-            continue;
-          }
-          const primaryKey = streams.get(record.stream)!;
+          const declaration = streams.get(record.stream)!;
+          if (
+            record.op === "delete" &&
+            declaration.semantics !== "mutable_state"
+          )
+            throw invalid("delete requires a mutable_state stream");
+          const primaryKey = declaration.primaryKey;
           let body: string;
           let recordKey: string;
           let hash: string;
           try {
             primaryKeyValues(record.data, primaryKey);
             recordKey = computeRecordKeyFromData(record.data, primaryKey);
+            if (
+              record.key !== undefined &&
+              !keyMatchesData(record.key, record.data, primaryKey)
+            )
+              throw invalid("record key does not match data");
             body = canonicalJson(record.data);
             hash = await pkHash(
               async (b) => sha256(b),
@@ -445,8 +465,8 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             throw invalid("invalid record or primary key");
           }
           rows.push({
-            sql: `INSERT OR REPLACE INTO run_rows(run_id,stream,pk_hash,record_key,body,body_sha256)
-          SELECT ?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM runs WHERE run_id=? AND state='collecting' AND last_batch=?)`,
+            sql: `INSERT OR REPLACE INTO run_rows(run_id,stream,pk_hash,record_key,body,body_sha256,op)
+          SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM runs WHERE run_id=? AND state='collecting' AND last_batch=?)`,
             params: [
               runId,
               record.stream,
@@ -454,6 +474,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
               recordKey,
               body,
               toHex(sha256(new TextEncoder().encode(body))),
+              record.op === "delete" ? "delete" : "upsert",
               runId,
               run.last_batch,
             ],
@@ -485,7 +506,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           }
           throw error;
         }
-        return { applied: true, accepted, deletesSkipped };
+        return { applied: true, accepted, deletesSkipped: 0 };
       }),
   };
 }

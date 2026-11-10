@@ -163,8 +163,8 @@ describe("stream-sync run intake route", () => {
     });
     expect(batch.status).toBe(200);
     expect(await batch.json()).toMatchObject({
-      accepted: 1,
-      deletesSkipped: 1,
+      accepted: 2,
+      deletesSkipped: 0,
     });
     const ended = await call("POST", "r1/end", {
       outcome: "succeeded",

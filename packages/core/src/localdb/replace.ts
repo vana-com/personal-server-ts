@@ -9,6 +9,7 @@
 export interface ReplaceInput {
   readonly stream: string;
   readonly coverageStrategy?: string | null;
+  readonly semantics?: string | null;
   readonly outcome:
     "succeeded" | "partial" | "retry_pending" | "failed" | "cancelled";
   readonly collectionMode: "full_refresh" | "incremental";
@@ -19,6 +20,7 @@ export interface ReplaceInput {
 export function decideReplace(input: ReplaceInput): boolean {
   return (
     input.coverageStrategy === "full_inventory" &&
+    input.semantics === "mutable_state" &&
     (input.outcome === "succeeded" || input.outcome === "partial") &&
     input.collectionMode === "full_refresh" &&
     input.coveredStreams.includes(input.stream) &&

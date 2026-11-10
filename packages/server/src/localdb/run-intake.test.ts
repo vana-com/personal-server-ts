@@ -152,7 +152,7 @@ it("checks typed keys across a batch, staged runs, and stored records atomically
   ).toEqual([{ last_batch: -1 }]);
 });
 
-it("skips deletes, upserts duplicate keys, and rejects the whole malformed batch", async () => {
+it("stages deletes, upserts duplicate keys, and rejects the whole malformed batch", async () => {
   const f = await fixture();
   await f.store.begin("run", request, declaration);
   await expect(
@@ -174,9 +174,9 @@ it("skips deletes, upserts duplicate keys, and rejects the whole malformed batch
         { stream: "items", op: "delete", data: { id: "b" } },
       ],
     }),
-  ).toEqual({ applied: true, accepted: 2, deletesSkipped: 1 });
+  ).toEqual({ applied: true, accepted: 3, deletesSkipped: 0 });
   expect(await f.db.query("SELECT count(*) AS n FROM run_rows")).toEqual([
-    { n: 1 },
+    { n: 2 },
   ]);
 });
 

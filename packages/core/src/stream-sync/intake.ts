@@ -134,6 +134,7 @@ export interface BatchRequest {
   readonly records: readonly {
     readonly stream: string;
     readonly op?: string;
+    readonly key?: string | string[];
     readonly data: unknown;
   }[];
 }
@@ -141,6 +142,7 @@ export interface BatchRequest {
 export interface BatchResponse {
   readonly applied: boolean;
   readonly accepted: number;
+  /** Compatibility count: explicit deletes are accepted, so this is always zero. */
   readonly deletesSkipped: number;
 }
 
