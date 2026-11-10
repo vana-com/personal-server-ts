@@ -1,3 +1,13 @@
+import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { mkdir, open, realpath, link, unlink } from "node:fs/promises";
+import { resolve, join } from "node:path";
+import { canonicalJson } from "@opendatalabs/personal-server-ts-stream-sync";
+import { computeRecordKeyFromData } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import {
+  importLegacySource,
+  createImportLedger,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import type { ResolveArtifact } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type {
   ImportSource,
@@ -5,46 +15,339 @@ import type {
   LocalSyncDeps,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 
-/** F.2: D6/P7 upload identity is authenticated owner + network + immutable source revision. */
 export interface LegacyImportUpload {
-  /** Authenticated stable install id, bound by the caller; never a path. This
-   * is provenance only: it MUST NOT select a device-specific sync namespace. */
+  /** Authenticated install provenance; never used to derive a sync namespace. */
   readonly source: string;
-  /** Lowercase SHA-256 of complete uploaded NDJSON bytes. Stage privately,
-   * verify at EOF, then atomically seal. No import before a matching seal.
-   * Same revision with different bytes refuses; partial staging never reopens. */
+  /** Lowercase SHA-256 of the exact complete NDJSON bytes. */
   readonly revision: string;
   readonly artifactDigest: string;
   readonly stream: string;
-  /** Exact bounded NDJSON batches; durable staging permits replay and read-back. */
   readonly body: AsyncIterable<Uint8Array>;
 }
-
-/** Durable replay key is JSON [owner,network,installId,artifactDigest,stream,
- * revision]; local path is a hash of this tuple, never raw input. Re-entering
- * staging with that tuple reopens only a verified sealed file and rehashes it.
- * Returned ledger source is JSON [installId, verified source id, revision].
- * F.2: replaces seed-staging's writer dependency; verifies retained artifact, <=4 MiB batch incl. envelope, backpressure; rejects oversize line. No delete. */
-export function stageLegacyImportUpload(_options: {
+interface UploadOptions {
   readonly owner: string;
   readonly network: string;
   readonly upload: LegacyImportUpload;
   readonly stagingRoot: string;
   readonly resolveArtifact: ResolveArtifact;
-  /** Existing authenticated connection authority, independent of install id.
-   * Refuse null/ambiguous mappings; never derive a connection from install id.
-   * The artifact resolver verifies declarations; it does not prove identity. */
   readonly resolveTarget: (
     upload: LegacyImportUpload,
   ) => Promise<ImportSource["target"] | null>;
-}): Promise<ImportSource> {
-  throw new Error("PS-3: not built");
+}
+const MAX_BYTES = 4 * 1024 * 1024;
+
+/** Only local staging formats change: bytes are fsynced, then installed without
+ * replacing an existing file. A separate atomic seal binds authenticated
+ * identity, verified declaration fields and target. Partial files never reopen.
+ * The source tuple uses the verified connector key; install id is provenance. */
+export async function stageLegacyImportUpload(
+  options: UploadOptions,
+): Promise<ImportSource> {
+  const context = await uploadContext(options);
+  const temporary = join(context.root, `.upload-${randomUUID()}.pending`);
+  const file = await open(temporary, "wx", 0o600);
+  const hash = createHash("sha256");
+  try {
+    async function* persisted() {
+      for await (const chunk of options.upload.body) {
+        if (chunk.byteLength > MAX_BYTES) throw new Error("upload_oversize");
+        let offset = 0;
+        while (offset < chunk.byteLength) {
+          const result = await file.write(
+            chunk,
+            offset,
+            chunk.byteLength - offset,
+            null,
+          );
+          if (!result.bytesWritten) throw new Error("upload_write_failed");
+          offset += result.bytesWritten;
+        }
+        hash.update(chunk);
+        yield chunk;
+      }
+    }
+    for await (const record of decodeRecords(persisted(), context.overhead)) {
+      try {
+        computeRecordKeyFromData(record, [...context.target.primaryKey]);
+      } catch {
+        throw new Error("invalid_record");
+      }
+    }
+    if (hash.digest("hex") !== context.revision)
+      throw new Error("source_changed");
+    await file.sync();
+    await file.close();
+    try {
+      await link(temporary, context.data);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    // Check any existing bytes before allowing a new seal to reference them.
+    if ((await fileHash(context.data)) !== context.revision)
+      throw new Error("source_changed");
+    const sealTemporary = join(context.root, `.seal-${randomUUID()}.pending`);
+    try {
+      const seal = await open(sealTemporary, "wx", 0o600);
+      try {
+        await seal.writeFile(context.seal);
+        await seal.sync();
+      } finally {
+        await seal.close();
+      }
+      try {
+        await link(sealTemporary, context.sealPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      const directory = await open(context.root, "r");
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
+    } finally {
+      await removeTemporary(sealTemporary);
+    }
+    return await sealedSource(options, context);
+  } finally {
+    await file.close().catch(() => {});
+    await removeTemporary(temporary);
+  }
 }
 
-/** F.2/C.0: authenticated switched-owner adapter calls staging then SQL import; retries preserve identity. No writer/spool/frame dependency. */
+/** Reopen by authenticated tuple after restart, without a new upload or writer.
+ * The resolver must still verify the retained artifact and the same target. */
+export async function openStagedLegacyImportUpload(
+  options: Omit<UploadOptions, "upload"> & {
+    readonly upload: Omit<LegacyImportUpload, "body">;
+  },
+): Promise<ImportSource> {
+  const complete = {
+    ...options,
+    upload: { ...options.upload, body: (async function* () {})() },
+  };
+  return sealedSource(complete, await uploadContext(complete));
+}
+
+/** Caller owns authentication and switched-owner admission; SQL import owns
+ * owner/network, generation, deletion and publication-proof boundaries. */
 export function acceptLegacyImportUpload(
-  _deps: LocalSyncDeps,
-  _source: ImportSource,
+  deps: LocalSyncDeps,
+  source: ImportSource,
 ): Promise<LegacyImportResult> {
-  throw new Error("PS-3: not built");
+  return importLegacySource(deps, createImportLedger(deps.db), source);
+}
+async function uploadContext(options: UploadOptions) {
+  const { upload } = options;
+  if (
+    !options.owner.trim() ||
+    !options.network.trim() ||
+    !upload.source.trim() ||
+    !upload.stream ||
+    !/^[0-9a-f]{64}$/.test(upload.revision)
+  )
+    throw new Error("upload_identity_invalid");
+  const declarations = await options.resolveArtifact(upload.artifactDigest);
+  const streams =
+    declarations?.streams.filter((s) => s.name === upload.stream) ?? [];
+  if (!declarations || streams.length !== 1 || !streams[0]!.primaryKey.length)
+    throw new Error("upload_artifact_unverified");
+  const resolved = await options.resolveTarget(upload);
+  if (
+    !resolved ||
+    !resolved.connectionId ||
+    resolved.connector !== declarations.connector ||
+    resolved.stream !== upload.stream
+  )
+    throw new Error("upload_identity_invalid");
+  const stream = streams[0]!;
+  const target = Object.freeze({
+    ...resolved,
+    primaryKey: Object.freeze([...stream.primaryKey]),
+    semantics: stream.semantics,
+    incremental: stream.incremental !== false,
+  });
+  const identity = {
+    owner: options.owner.toLowerCase(),
+    network: options.network,
+    installId: upload.source,
+    artifactDigest: upload.artifactDigest,
+    stream: upload.stream,
+    revision: upload.revision,
+    target,
+  };
+  const seal = canonicalJson(identity);
+  const overhead =
+    Buffer.byteLength(
+      canonicalJson({
+        source: upload.source,
+        revision: upload.revision,
+        artifactDigest: upload.artifactDigest,
+        stream: upload.stream,
+      }),
+    ) + 1;
+  if (overhead >= MAX_BYTES) throw new Error("upload_oversize");
+  // Reject a symlinked existing ancestor before recursive mkdir can follow it.
+  let ancestor = resolve(options.stagingRoot);
+  for (;;) {
+    try {
+      if ((await realpath(ancestor)) !== ancestor)
+        throw new Error("upload_path_refused");
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = resolve(ancestor, "..");
+      if (parent === ancestor) throw error;
+      ancestor = parent;
+    }
+  }
+  await mkdir(options.stagingRoot, { recursive: true });
+  const root = await realpath(options.stagingRoot);
+  if (root !== resolve(options.stagingRoot))
+    throw new Error("upload_path_refused");
+  const key = createHash("sha256")
+    .update(
+      canonicalJson([
+        identity.owner,
+        identity.network,
+        identity.installId,
+        identity.artifactDigest,
+        identity.stream,
+        identity.revision,
+      ]),
+    )
+    .digest("hex");
+  return {
+    root,
+    data: join(root, `${key}.ndjson`),
+    sealPath: join(root, `${key}.seal.json`),
+    seal,
+    target,
+    overhead,
+    connector: declarations.connector,
+    revision: identity.revision,
+    owner: identity.owner,
+    network: identity.network,
+    installId: identity.installId,
+  };
+}
+async function sealedSource(
+  options: UploadOptions,
+  context: Awaited<ReturnType<typeof uploadContext>>,
+): Promise<ImportSource> {
+  const checkSeal = async () => {
+    const file = await open(
+      context.sealPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+    try {
+      const stat = await file.stat();
+      if (
+        stat.size > MAX_BYTES ||
+        (await file.readFile("utf8")) !== context.seal
+      )
+        throw new Error("upload_identity_changed");
+    } finally {
+      await file.close();
+    }
+  };
+  await checkSeal();
+  if ((await fileHash(context.data)) !== context.revision)
+    throw new Error("source_changed");
+  return {
+    source: JSON.stringify([
+      context.installId,
+      context.connector,
+      context.revision,
+    ]),
+    owner: context.owner,
+    network: context.network,
+    revision: context.revision,
+    target: context.target,
+    exclusions: [],
+    async *records() {
+      await checkSeal();
+      // Validate before yielding as well as at EOF. Consumers must never see
+      // a changed sealed file as the start of the claimed revision.
+      if ((await fileHash(context.data)) !== context.revision)
+        throw new Error("source_changed");
+      const file = await open(
+        context.data,
+        constants.O_RDONLY | constants.O_NOFOLLOW,
+      );
+      const hash = createHash("sha256");
+      try {
+        async function* chunks() {
+          for await (const chunk of file.createReadStream({
+            autoClose: false,
+          })) {
+            hash.update(chunk);
+            yield chunk as Uint8Array;
+          }
+        }
+        for await (const record of decodeRecords(chunks(), context.overhead))
+          yield record;
+        if (hash.digest("hex") !== context.revision)
+          throw new Error("source_changed");
+        await checkSeal();
+      } finally {
+        await file.close();
+      }
+    },
+  };
+}
+async function* decodeRecords(
+  chunks: AsyncIterable<Uint8Array>,
+  overhead: number,
+): AsyncIterable<Record<string, unknown>> {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let pending = "";
+  const parse = (line: string) => {
+    if (Buffer.byteLength(line) + overhead > MAX_BYTES)
+      throw new Error("upload_oversize");
+    try {
+      const record: unknown = JSON.parse(line);
+      if (!record || typeof record !== "object" || Array.isArray(record))
+        throw new Error();
+      return record as Record<string, unknown>;
+    } catch {
+      throw new Error("invalid_record");
+    }
+  };
+  try {
+    for await (const chunk of chunks) {
+      pending += decoder.decode(chunk, { stream: true });
+      let newline: number;
+      while ((newline = pending.indexOf("\n")) !== -1) {
+        const line = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        yield parse(line);
+      }
+      if (Buffer.byteLength(pending) + overhead > MAX_BYTES)
+        throw new Error("upload_oversize");
+    }
+    pending += decoder.decode();
+    if (pending) yield parse(pending);
+  } catch (error) {
+    if (error instanceof TypeError) throw new Error("invalid_record");
+    throw error;
+  }
+}
+async function fileHash(path: string) {
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const hash = createHash("sha256");
+    for await (const chunk of file.createReadStream({ autoClose: false }))
+      hash.update(chunk);
+    return hash.digest("hex");
+  } finally {
+    await file.close();
+  }
+}
+async function removeTemporary(path: string) {
+  try {
+    await unlink(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
 }
