@@ -1,18 +1,18 @@
 TLC2 Version 2026.11.06.222357 (rev: d8fb231)
-Running breadth-first search Model-Checking with fp 22 and seed 2968841731653315458 with 4 workers on 24 cores with 5461MB heap and 64MB offheap memory [pid: 1974105] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.20.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 46 and seed -8420604766448733349 with 4 workers on 24 cores with 5461MB heap and 64MB offheap memory [pid: 3850923] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.20.1 64bit, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/tnunamak/.tmp/tla-r5-1109/ps/packages/core/src/stream-sync/formal/StreamSyncR5.tla
-Parsing file /tmp/tlc-5524586826123553688/Naturals.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
-Parsing file /tmp/tlc-5524586826123553688/Sequences.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
-Parsing file /tmp/tlc-5524586826123553688/FiniteSets.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-8477202171958127040/Naturals.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-8477202171958127040/Sequences.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-8477202171958127040/FiniteSets.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module StreamSyncR5
 Linting of module StreamSyncR5
-Starting... (2026-11-09 18:21:30)
+Starting... (2026-11-09 19:02:10)
 Computing initial states...
 Computed 2 initial states...
-Finished computing initial states: 4 distinct states generated at 2026-11-09 18:21:30.
+Finished computing initial states: 4 distinct states generated at 2026-11-09 19:02:10.
 Error: Invariant WitnessDeleteDone is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -63,9 +63,10 @@ State 1: <Initial predicate>
 /\ wm = [d1 |-> 0, d2 |-> 0]
 /\ pRep = [d1 |-> FALSE, d2 |-> FALSE]
 /\ basis = <<0, 0>>
+/\ hold = [d1 |-> <<{}, {}>>, d2 |-> <<{}, {}>>]
 /\ dint = [d1 |-> "none", d2 |-> "none"]
 
-State 2: <RBegin(1) line 87, col 3 to line 97, col 103 of module StreamSyncR5>
+State 2: <RBegin(1) line 95, col 3 to line 106, col 109 of module StreamSyncR5>
 /\ hver = [d1 |-> 0, d2 |-> 0]
 /\ pEnc = [d1 |-> <<0, 0>>, d2 |-> <<0, 0>>]
 /\ rpub = <<FALSE, FALSE>>
@@ -113,9 +114,10 @@ State 2: <RBegin(1) line 87, col 3 to line 97, col 103 of module StreamSyncR5>
 /\ wm = [d1 |-> 0, d2 |-> 0]
 /\ pRep = [d1 |-> FALSE, d2 |-> FALSE]
 /\ basis = <<0, 0>>
+/\ hold = [d1 |-> <<{}, {}>>, d2 |-> <<{}, {}>>]
 /\ dint = [d1 |-> "none", d2 |-> "none"]
 
-State 3: <REndMerge(1) line 117, col 3 to line 123, col 128 of module StreamSyncR5>
+State 3: <REndMerge(1) line 141, col 3 to line 152, col 128 of module StreamSyncR5>
 /\ hver = [d1 |-> 0, d2 |-> 0]
 /\ pEnc = [d1 |-> <<0, 0>>, d2 |-> <<0, 0>>]
 /\ rpub = <<FALSE, FALSE>>
@@ -163,9 +165,10 @@ State 3: <REndMerge(1) line 117, col 3 to line 123, col 128 of module StreamSync
 /\ wm = [d1 |-> 0, d2 |-> 0]
 /\ pRep = [d1 |-> FALSE, d2 |-> FALSE]
 /\ basis = <<0, 0>>
+/\ hold = [d1 |-> <<{}, {}>>, d2 |-> <<{}, {}>>]
 /\ dint = [d1 |-> "none", d2 |-> "none"]
 
-State 4: <DelLocal("d1") line 275, col 3 to line 279, col 130 of module StreamSyncR5>
+State 4: <DelLocal("d1") line 309, col 3 to line 313, col 130 of module StreamSyncR5>
 /\ hver = [d1 |-> 0, d2 |-> 0]
 /\ pEnc = [d1 |-> <<0, 0>>, d2 |-> <<0, 0>>]
 /\ rpub = <<FALSE, FALSE>>
@@ -213,9 +216,10 @@ State 4: <DelLocal("d1") line 275, col 3 to line 279, col 130 of module StreamSy
 /\ wm = [d1 |-> 1, d2 |-> 0]
 /\ pRep = [d1 |-> FALSE, d2 |-> FALSE]
 /\ basis = <<0, 0>>
+/\ hold = [d1 |-> <<{}, {}>>, d2 |-> <<{}, {}>>]
 /\ dint = [d1 |-> "saved", d2 |-> "none"]
 
-State 5: <RBeginRefused(2) line 100, col 3 to line 102, col 91 of module StreamSyncR5>
+State 5: <RBeginRefused(2) line 109, col 3 to line 111, col 91 of module StreamSyncR5>
 /\ hver = [d1 |-> 0, d2 |-> 0]
 /\ pEnc = [d1 |-> <<0, 0>>, d2 |-> <<0, 0>>]
 /\ rpub = <<FALSE, FALSE>>
@@ -263,9 +267,10 @@ State 5: <RBeginRefused(2) line 100, col 3 to line 102, col 91 of module StreamS
 /\ wm = [d1 |-> 1, d2 |-> 0]
 /\ pRep = [d1 |-> FALSE, d2 |-> FALSE]
 /\ basis = <<0, 0>>
+/\ hold = [d1 |-> <<{}, {}>>, d2 |-> <<{}, {}>>]
 /\ dint = [d1 |-> "saved", d2 |-> "none"]
 
-State 6: <DelCtl("d1") line 288, col 3 to line 293, col 134 of module StreamSyncR5>
+State 6: <DelCtl("d1") line 322, col 3 to line 327, col 140 of module StreamSyncR5>
 /\ hver = [d1 |-> 0, d2 |-> 0]
 /\ pEnc = [d1 |-> <<0, 0>>, d2 |-> <<0, 0>>]
 /\ rpub = <<FALSE, FALSE>>
@@ -313,9 +318,10 @@ State 6: <DelCtl("d1") line 288, col 3 to line 293, col 134 of module StreamSync
 /\ wm = [d1 |-> 1, d2 |-> 0]
 /\ pRep = [d1 |-> FALSE, d2 |-> FALSE]
 /\ basis = <<0, 0>>
+/\ hold = [d1 |-> <<{}, {}>>, d2 |-> <<{}, {}>>]
 /\ dint = [d1 |-> "done", d2 |-> "none"]
 
-State 7: <RefreshDeleted("d2") line 146, col 3 to line 149, col 108 of module StreamSyncR5>
+State 7: <RefreshDeleted("d2") line 175, col 3 to line 178, col 108 of module StreamSyncR5>
 /\ hver = [d1 |-> 0, d2 |-> 0]
 /\ pEnc = [d1 |-> <<0, 0>>, d2 |-> <<0, 0>>]
 /\ rpub = <<FALSE, FALSE>>
@@ -363,8 +369,9 @@ State 7: <RefreshDeleted("d2") line 146, col 3 to line 149, col 108 of module St
 /\ wm = [d1 |-> 1, d2 |-> 0]
 /\ pRep = [d1 |-> FALSE, d2 |-> FALSE]
 /\ basis = <<0, 0>>
+/\ hold = [d1 |-> <<{}, {}>>, d2 |-> <<{}, {}>>]
 /\ dint = [d1 |-> "done", d2 |-> "none"]
 
-2036 states generated, 1222 distinct states found, 692 states left on queue.
+2102 states generated, 1267 distinct states found, 719 states left on queue.
 The depth of the complete state graph search is 7.
-Finished in 01s at (2026-11-09 18:21:30)
+Finished in 00s at (2026-11-09 19:02:10)

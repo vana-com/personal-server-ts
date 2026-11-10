@@ -20,6 +20,8 @@ Mx(a, b) == IF a > b THEN a ELSE b
 
 CONSTANTS OWN, COV, CV, RET, CONT, SEEDS          \* sets TLC chooses from
 CONSTANTS MaxDel, MaxRecon, MaxCrash, AllowImport
+CONSTANTS SeqRuns,   \* scenario limit: a replica runs one run at a time, in stamp order
+          BodyKeep    \* "off" | "all" | "overwrittenOnly"   keep losers of the stamp merge while the winner is unpublished
 CONSTANT MonoCV   \* scenario limit: one replica never runs an older connector version after a newer one
 \* Mutant switches. The r5 value is first.
 CONSTANTS WmAt,            \* "start" | "commit"
@@ -32,19 +34,20 @@ CONSTANTS WmAt,            \* "start" | "commit"
           DelFence,        \* TRUE | FALSE   run fence checks delete
           SeedGenOnly,     \* TRUE | FALSE   seeds publish only into generation 1
           TombAbsent,      \* TRUE | FALSE   delete writes a tombstone even with no control row
-          ImpChecksLocal   \* TRUE | FALSE   import refuses on a locally deleted connection
+          ImpChecksLocal,  \* TRUE | FALSE   import refuses on a locally deleted connection
+          EndRefuse        \* "both" | "none" | "head" | "local"   refuse an older connector version at end
 
 VARIABLES own, cov, cv, ret, content, sd,
           rctl, rgen, rver, rhead, rhcv, hvk,
           dcount, nrec, ncrash, lostN, rep, imported,
-          rec, log, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, dint, redel,
+          rec, log, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, dint, redel, hold,
           pph, pW, pBase, pPr, pEnc, pRep, apl, aVer, aHead, aCv,
           rs, basis, gen0, dsnap, ep0, dc, rseq, rpub
 
 fixedv == <<own, cov, cv, ret, content, sd>>
 regv   == <<rctl, rgen, rver, rhead, rhcv, hvk>>
 ghostv == <<dcount, nrec, ncrash, lostN, rep, imported>>
-locv   == <<rec, log, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, dint, redel>>
+locv   == <<rec, log, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, dint, redel, hold>>
 phv    == <<pph, pW, pBase, pPr, pEnc, pRep, apl, aVer, aHead, aCv>>
 runv   == <<rs, basis, gen0, dsnap, ep0, dc, rseq, rpub>>
 vars == <<fixedv, regv, ghostv, locv, phv, runv>>
@@ -61,6 +64,11 @@ AppEnt(lg, ch, s, o) ==
   lg \o (IF 1 \in ch THEN <<[k |-> 1, s |-> s, o |-> o]>> ELSE <<>>)
      \o (IF 2 \in ch THEN <<[k |-> 2, s |-> s, o |-> o]>> ELSE <<>>)
 
+AppF(lg, f, o) ==
+  lg \o (IF f[1] > 0 THEN <<[k |-> 1, s |-> f[1], o |-> o]>> ELSE <<>>)
+     \o (IF f[2] > 0 THEN <<[k |-> 2, s |-> f[2], o |-> o]>> ELSE <<>>)
+MaxSet(S) == IF S = {} THEN 0 ELSE CHOOSE m \in S : \A x \in S : x <= m
+
 ECov(r) == cov[r] /\ ~ret[r]
 Guarded(d, k) == \E i \in (wm[d] + 1)..Len(log[d]) : log[d][i].k = k /\ log[d][i].o \in Pub
 
@@ -73,7 +81,7 @@ Init ==
   /\ rec = [d \in Devs |-> Z] /\ log = [d \in Devs |-> <<>>] /\ wm = [d \in Devs |-> 0]
   /\ hver = [d \in Devs |-> 0] /\ hc = [d \in Devs |-> Z] /\ hpe = [d \in Devs |-> FALSE]
   /\ hcv = [d \in Devs |-> 0] /\ lctl = [d \in Devs |-> "none"] /\ lgen = [d \in Devs |-> 0]
-  /\ ldelv = [d \in Devs |-> 0] /\ dint = [d \in Devs |-> "none"] /\ redel = [d \in Devs |-> {}]
+  /\ hold = [d \in Devs |-> [k \in Keys |-> {}]] /\ ldelv = [d \in Devs |-> 0] /\ dint = [d \in Devs |-> "none"] /\ redel = [d \in Devs |-> {}]
   /\ pph = [d \in Devs |-> "idle"] /\ pW = [d \in Devs |-> 0] /\ pBase = [d \in Devs |-> 0]
   /\ pPr = [d \in Devs |-> 0] /\ pEnc = [d \in Devs |-> Z] /\ pRep = [d \in Devs |-> FALSE]
   /\ apl = [d \in Devs |-> "idle"] /\ aVer = [d \in Devs |-> 0] /\ aHead = [d \in Devs |-> Z]
@@ -85,6 +93,7 @@ Init ==
 \* ---------- intake ----------
 RBegin(r) == LET d == own[r] IN
   /\ rs[r] = "new" /\ lctl[d] # "deleted" /\ rctl # "deleted"
+  /\ SeqRuns => \A x \in Runs : own[x] = d => (rs[x] # "begun" /\ (x < r => rs[x] # "new"))
   /\ rctl = "live" => (lctl[d] = "live" /\ lgen[d] = rgen /\ hver[d] = rver /\ ~hpe[d])
   /\ rs' = [rs EXCEPT ![r] = "begun"]
   /\ basis' = [basis EXCEPT ![r] = hver[d]]
@@ -94,7 +103,7 @@ RBegin(r) == LET d == own[r] IN
   /\ dsnap' = [dsnap EXCEPT ![r] = ldelv[d]] /\ ep0' = [ep0 EXCEPT ![r] = dcount]
   /\ dc' = [dc EXCEPT ![r] = content[r] \cup redel[d]]
   /\ redel' = [redel EXCEPT ![d] = {}]
-  /\ UNCHANGED <<fixedv, regv, ghostv, phv, rec, log, wm, hver, hc, hpe, hcv, ldelv, dint, rseq, rpub>>
+  /\ UNCHANGED <<fixedv, regv, ghostv, phv, rec, log, wm, hver, hc, hpe, hcv, ldelv, dint, rseq, rpub, hold>>
 
 RBeginRefused(r) == LET d == own[r] IN
   /\ rs[r] = "new" /\ lctl[d] = "deleted"
@@ -109,15 +118,35 @@ REndDisc(r) ==
   /\ rs' = [rs EXCEPT ![r] = "disc"]
   /\ UNCHANGED <<fixedv, regv, ghostv, locv, phv, basis, gen0, dsnap, ep0, dc, rseq, rpub>>
 
+\* End-time refusal: a run older than an unpublished run on this replica, or older than the head it knows,
+\* is refused before its merge, so it never overwrites an unpublished row.
+LocalMaxCv(d) == LET U == {x \in Runs : own[x] = d /\ rs[x] = "merged" /\ ~rpub[x]}
+                 IN IF U = {} THEN 0 ELSE CHOOSE m \in {cv[x] : x \in U} : \A y \in {cv[x] : x \in U} : y <= m
+EndRefused(r) == LET d == own[r]
+                     lim == IF EndRefuse = "both" THEN Mx(LocalMaxCv(d), hcv[d])
+                            ELSE IF EndRefuse = "head" THEN hcv[d]
+                            ELSE IF EndRefuse = "local" THEN LocalMaxCv(d) ELSE 0
+                 IN cv[r] < lim
+
+REndRefuse(r) ==
+  /\ rs[r] = "begun" /\ ~RunFenced(r) /\ EndRefused(r)
+  /\ rs' = [rs EXCEPT ![r] = "ref"]
+  /\ UNCHANGED <<fixedv, regv, ghostv, locv, phv, basis, gen0, dsnap, ep0, dc, rseq, rpub>>
+
 REndMerge(r) == LET d == own[r]
     ks == IF RetryMode = "dropRows" /\ ret[r] THEN {} ELSE dc[r]
     ch == {k \in ks : St(r) > rec[d][k]}
     nl == AppEnt(log[d], ch, St(r), "L")
   IN
-  /\ rs[r] = "begun" /\ ~RunFenced(r)
+  /\ rs[r] = "begun" /\ ~RunFenced(r) /\ ~EndRefused(r)
   /\ rec' = [rec EXCEPT ![d] = [k \in Keys |-> IF k \in ch THEN St(r) ELSE rec[d][k]]]
   /\ log' = [log EXCEPT ![d] = nl]
   /\ rseq' = [rseq EXCEPT ![r] = Len(nl)]
+  /\ hold' = [hold EXCEPT ![d] = [k \in Keys |->
+        IF BodyKeep = "off" THEN hold[d][k]
+        ELSE IF k \in ch /\ rec[d][k] > 0 /\ Guarded(d, k) THEN hold[d][k] \cup {rec[d][k]}
+        ELSE IF BodyKeep = "all" /\ k \in ks /\ k \notin ch /\ rec[d][k] > St(r) /\ Guarded(d, k) THEN hold[d][k] \cup {St(r)}
+        ELSE hold[d][k]]]
   /\ redel' = [redel EXCEPT ![d] = IF RetryMode = "noCursor" /\ ret[r] THEN redel[d] \cup dc[r] ELSE redel[d]]
   /\ rs' = [rs EXCEPT ![r] = "merged"]
   /\ UNCHANGED <<fixedv, regv, ghostv, phv, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, dint, basis, gen0, dsnap, ep0, dc, rpub>>
@@ -132,14 +161,14 @@ Import(d) ==
   /\ lctl' = [lctl EXCEPT ![d] = IF lctl[d] = "none" THEN "live" ELSE lctl[d]]
   /\ lgen' = [lgen EXCEPT ![d] = IF lctl[d] = "none" THEN (IF rctl = "live" THEN rgen ELSE 1) ELSE lgen[d]]
   /\ imported' = imported \cup {d}
-  /\ UNCHANGED <<fixedv, regv, dcount, nrec, ncrash, lostN, rep, wm, hver, hc, hpe, hcv, ldelv, dint, redel, phv, runv>>
+  /\ UNCHANGED <<fixedv, regv, dcount, nrec, ncrash, lostN, rep, wm, hver, hc, hpe, hcv, ldelv, dint, redel, phv, runv, hold>>
 
 \* ---------- bootstrap from the registry (C.0) ----------
 LocalPurge(d) ==
   /\ rec' = [rec EXCEPT ![d] = Z] /\ wm' = [wm EXCEPT ![d] = Len(log[d])]
   /\ hver' = [hver EXCEPT ![d] = 0] /\ hc' = [hc EXCEPT ![d] = Z] /\ hpe' = [hpe EXCEPT ![d] = FALSE]
   /\ hcv' = [hcv EXCEPT ![d] = 0] /\ ldelv' = [ldelv EXCEPT ![d] = ldelv[d] + 1]
-  /\ redel' = [redel EXCEPT ![d] = {}]
+  /\ redel' = [redel EXCEPT ![d] = {}] /\ hold' = [hold EXCEPT ![d] = [k \in Keys |-> {}]]
   /\ pph' = [pph EXCEPT ![d] = "idle"] /\ apl' = [apl EXCEPT ![d] = "idle"]
 
 RefreshDeleted(d) ==
@@ -152,7 +181,7 @@ RefreshLive(d) ==
   /\ rctl = "live" /\ (lctl[d] # "live" \/ lgen[d] # rgen)
   /\ IF lgen[d] < rgen /\ lctl[d] # "none"
        THEN LocalPurge(d)
-       ELSE UNCHANGED <<rec, wm, hver, hc, hpe, hcv, ldelv, redel, pph, apl>>
+       ELSE UNCHANGED <<rec, wm, hver, hc, hpe, hcv, ldelv, redel, hold, pph, apl>>
   /\ lctl' = [lctl EXCEPT ![d] = "live"] /\ lgen' = [lgen EXCEPT ![d] = rgen]
   /\ UNCHANGED <<fixedv, regv, ghostv, log, dint, pW, pBase, pPr, pEnc, pRep, aVer, aHead, aCv, runv>>
 
@@ -163,7 +192,7 @@ ApplyStart(d) ==
   /\ aVer' = [aVer EXCEPT ![d] = rver] /\ aHead' = [aHead EXCEPT ![d] = rhead] /\ aCv' = [aCv EXCEPT ![d] = rhcv]
   /\ rec' = [rec EXCEPT ![d] = [k \in Keys |-> Mx(rec[d][k], rhead[k])]]
   /\ apl' = [apl EXCEPT ![d] = "merged"]
-  /\ UNCHANGED <<fixedv, regv, ghostv, log, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, dint, redel, pph, pW, pBase, pPr, pEnc, pRep, runv>>
+  /\ UNCHANGED <<fixedv, regv, ghostv, log, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, dint, redel, pph, pW, pBase, pPr, pEnc, pRep, runv, hold>>
 
 ApplyFinish(d) ==
   /\ apl[d] = "merged" /\ lctl[d] = "live"
@@ -172,7 +201,7 @@ ApplyFinish(d) ==
   /\ hver' = [hver EXCEPT ![d] = aVer[d]] /\ hc' = [hc EXCEPT ![d] = aHead[d]]
   /\ hpe' = [hpe EXCEPT ![d] = FALSE] /\ hcv' = [hcv EXCEPT ![d] = aCv[d]]
   /\ apl' = [apl EXCEPT ![d] = "idle"]
-  /\ UNCHANGED <<fixedv, regv, ghostv, log, wm, lctl, lgen, ldelv, dint, redel, pph, pW, pBase, pPr, pEnc, pRep, aVer, aHead, aCv, runv>>
+  /\ UNCHANGED <<fixedv, regv, ghostv, log, wm, lctl, lgen, ldelv, dint, redel, pph, pW, pBase, pPr, pEnc, pRep, aVer, aHead, aCv, runv, hold>>
 
 \* ---------- publish (C.2) ----------
 PSnap(d) ==
@@ -196,12 +225,16 @@ SeedRows(d) == {k \in Keys : rec[d][k] = SEED}
 \* Step 3a: a refused run is un-written; its stream's head_parts go too.
 PUnwrite(d) ==
   /\ pph[d] = "snap" /\ Aligned(d) /\ Refused(d) # {}
-  /\ LET r == CHOOSE x \in Refused(d) : TRUE IN
-     /\ rec' = [rec EXCEPT ![d] = [k \in Keys |-> IF rec[d][k] = St(r) THEN 0 ELSE rec[d][k]]]
-     /\ rs' = [rs EXCEPT ![r] = "unw"]
+  /\ LET r == CHOOSE x \in Refused(d) : TRUE
+         back == [k \in Keys |-> IF rec[d][k] = St(r) /\ BodyKeep # "off" THEN MaxSet(hold[d][k] \ {St(r)}) ELSE 0]
+         newrec == [k \in Keys |-> IF rec[d][k] = St(r) THEN back[k] ELSE rec[d][k]]
+     IN /\ rec' = [rec EXCEPT ![d] = newrec]
+        /\ log' = [log EXCEPT ![d] = AppF(log[d], back, "L")]
+        /\ hold' = [hold EXCEPT ![d] = [k \in Keys |-> (hold[d][k] \ {St(r)}) \ {back[k]}]]
+        /\ rs' = [rs EXCEPT ![r] = "unw"]
   /\ hpe' = [hpe EXCEPT ![d] = IF UnwDropsParts THEN TRUE ELSE hpe[d]]
   /\ pph' = [pph EXCEPT ![d] = "idle"]
-  /\ UNCHANGED <<fixedv, regv, ghostv, log, wm, hver, hc, hcv, lctl, lgen, ldelv, dint, redel, pW, pBase, pPr, pEnc, pRep, apl, aVer, aHead, aCv, basis, gen0, dsnap, ep0, dc, rseq, rpub>>
+  /\ UNCHANGED <<fixedv, regv, ghostv, wm, hver, hc, hcv, lctl, lgen, ldelv, dint, redel, pW, pBase, pPr, pEnc, pRep, apl, aVer, aHead, aCv, basis, gen0, dsnap, ep0, dc, rseq, rpub>>
 
 \* Seeds publish only into generation 1; otherwise they are purged.
 PSeedPurge(d) ==
@@ -209,7 +242,7 @@ PSeedPurge(d) ==
   /\ SeedGenOnly /\ lgen[d] # 1 /\ SeedRows(d) # {}
   /\ rec' = [rec EXCEPT ![d] = [k \in Keys |-> IF rec[d][k] = SEED THEN 0 ELSE rec[d][k]]]
   /\ pph' = [pph EXCEPT ![d] = "idle"]
-  /\ UNCHANGED <<fixedv, regv, ghostv, log, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, dint, redel, pW, pBase, pPr, pEnc, pRep, apl, aVer, aHead, aCv, runv>>
+  /\ UNCHANGED <<fixedv, regv, ghostv, log, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, dint, redel, pW, pBase, pPr, pEnc, pRep, apl, aVer, aHead, aCv, runv, hold>>
 
 PPlan(d) ==
   /\ pph[d] = "snap" /\ Aligned(d) /\ Refused(d) = {}
@@ -250,6 +283,7 @@ PCasOK(d) ==
         /\ rep' = IF pRep[d] /\ basis[pr] = rver THEN rep \cup {pr} ELSE rep
         /\ rec' = [rec EXCEPT ![d] = IF pRep[d] THEN [k \in Keys |-> IF rec[d][k] < St(pr) THEN 0 ELSE rec[d][k]] ELSE rec[d]]
         /\ wm' = [wm EXCEPT ![d] = wmNew]
+        /\ hold' = [hold EXCEPT ![d] = [k \in Keys |-> {x \in hold[d][k] : x > pEnc[d][k]}]]
         /\ hver' = [hver EXCEPT ![d] = newv] /\ hc' = [hc EXCEPT ![d] = pEnc[d]]
         /\ hpe' = [hpe EXCEPT ![d] = FALSE] /\ hcv' = [hcv EXCEPT ![d] = Mx(rhcv, mcv)]
         /\ rpub' = [r \in Runs |-> IF r \in P THEN TRUE ELSE rpub[r]]
@@ -282,7 +316,7 @@ DelHeads(d) ==
   /\ dint[d] = "saved" /\ rctl = "live"
   /\ rhead' = Z /\ rver' = rver + 1 /\ hvk' = [k \in Keys |-> rver + 1]
   /\ dint' = [dint EXCEPT ![d] = "heads"]
-  /\ UNCHANGED <<fixedv, rctl, rgen, rhcv, ghostv, rec, log, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, redel, phv, runv>>
+  /\ UNCHANGED <<fixedv, rctl, rgen, rhcv, ghostv, rec, log, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, redel, phv, runv, hold>>
 
 DelCtl(d) ==
   /\ \/ dint[d] = "heads"
@@ -290,7 +324,7 @@ DelCtl(d) ==
   /\ rctl' = IF rctl = "live" THEN "deleted"
              ELSE IF rctl = "none" /\ TombAbsent THEN "deleted" ELSE rctl
   /\ dint' = [dint EXCEPT ![d] = "done"]
-  /\ UNCHANGED <<fixedv, rgen, rver, rhead, rhcv, hvk, ghostv, rec, log, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, redel, phv, runv>>
+  /\ UNCHANGED <<fixedv, rgen, rver, rhead, rhcv, hvk, ghostv, rec, log, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, redel, phv, runv, hold>>
 
 Reconnect(d) ==
   /\ nrec < MaxRecon /\ rctl = "deleted" /\ lctl[d] = "deleted" /\ dint[d] \in {"none", "done"}
@@ -299,16 +333,16 @@ Reconnect(d) ==
   /\ nrec' = nrec + 1
   /\ lctl' = [lctl EXCEPT ![d] = "live"] /\ lgen' = [lgen EXCEPT ![d] = rgen + 1]
   /\ hver' = [hver EXCEPT ![d] = rver + 1] /\ hc' = [hc EXCEPT ![d] = Z]
-  /\ UNCHANGED <<fixedv, dcount, ncrash, lostN, rep, imported, rec, log, wm, hpe, hcv, ldelv, dint, redel, phv, runv>>
+  /\ UNCHANGED <<fixedv, dcount, ncrash, lostN, rep, imported, rec, log, wm, hpe, hcv, ldelv, dint, redel, phv, runv, hold>>
 
 Crash(d) ==
   /\ ncrash < MaxCrash
   /\ pph' = [pph EXCEPT ![d] = "idle"] /\ apl' = [apl EXCEPT ![d] = "idle"]
   /\ dint' = [dint EXCEPT ![d] = IF ~DelIntentFirst /\ dint[d] \in {"saved", "heads"} THEN "none" ELSE dint[d]]
   /\ ncrash' = ncrash + 1
-  /\ UNCHANGED <<fixedv, regv, dcount, nrec, lostN, rep, imported, rec, log, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, redel, pW, pBase, pPr, pEnc, pRep, aVer, aHead, aCv, runv>>
+  /\ UNCHANGED <<fixedv, regv, dcount, nrec, lostN, rep, imported, rec, log, wm, hver, hc, hpe, hcv, lctl, lgen, ldelv, redel, pW, pBase, pPr, pEnc, pRep, aVer, aHead, aCv, runv, hold>>
 
-Terminal(r) == rs[r] \in {"merged", "disc", "unw"}
+Terminal(r) == rs[r] \in {"merged", "disc", "unw", "ref"}
 Pending(d) == lctl[d] = "live" /\ Len(log[d]) > wm[d]
 AlignedQ(d) ==
   IF rctl = "live" THEN lctl[d] = "live" /\ lgen[d] = rgen /\ hver[d] = rver /\ ~hpe[d]
@@ -317,7 +351,7 @@ AlignedQ(d) ==
 Q == /\ \A r \in Runs : Terminal(r)
      /\ \A d \in Devs : pph[d] = "idle" /\ apl[d] = "idle" /\ ~Pending(d) /\ dint[d] \in {"none", "done"} /\ AlignedQ(d)
 
-Next == \/ \E r \in Runs : RBegin(r) \/ RBeginRefused(r) \/ REndDisc(r) \/ REndMerge(r)
+Next == \/ \E r \in Runs : RBegin(r) \/ RBeginRefused(r) \/ REndDisc(r) \/ REndRefuse(r) \/ REndMerge(r)
         \/ \E d \in Devs : Import(d) \/ RefreshDeleted(d) \/ RefreshLive(d) \/ ApplyStart(d) \/ ApplyFinish(d)
                            \/ PSnap(d) \/ PAbort(d) \/ PUnwrite(d) \/ PSeedPurge(d) \/ PPlan(d) \/ PEnc(d)
                            \/ PCasOK(d) \/ PCasLost(d) \/ PCasStop(d)

@@ -34,37 +34,72 @@ Mutant switches (cfg constants): `WmAt="commit"`, `ApplyGuard=FALSE`, `LoserAppl
 
 ## Results
 
-| cfg | expectation | result | distinct states |
+| cfg | what | result | distinct states |
 |---|---|---|---|
-| `pub` | pass | pass | 538,002 |
-| `pub-witnessQ`, `pub-witnessCas` | violated (non-vacuity) | violated | 128,598 / 92,460 |
-| `pub-M-wm-at-commit` | caught | `NoLostWrite` violated | 137,191 |
-| `pub-M-apply-no-guard` | caught | `NoLostWrite` violated | 322,486 |
-| `pub-M-loser-overwrites` | caught | `NoLostWrite` violated | 369,717 |
-| `rep` | pass | pass | 10,784,840 |
-| `rep-witness` | violated | violated | 117,311 |
-| `rep-M-no-fence` | caught | `ReplaceFenced` violated | 1,556,002 |
-| `rep-M-no-fence-oracle` | caught | `NoLostWrite` violated | 5,231,186 |
-| `unw` | pass | **`NoLostWrite` violated (counterexample in r5)** | 4,260,842 |
-| `unw-mono` | pass | pass | 3,252,312 |
-| `unw-witness`, `unw-mono-witness` | violated | violated | 489,773 / 330,934 |
-| `unw-mono-M-keeps-parts` | caught | `NoLostWrite` violated | 2,130,036 |
-| `ret` | pass | pass | 4,304,016 |
-| `ret-M-drop-rows` | caught | `NoLostWrite` violated | 81,596 |
-| `ret-noCursor-harmless` | pass | pass | 5,866,954 |
-| `del` | pass | pass | 17,943,719 |
-| `del-crash` (one crash) | pass | pass | 46,901,133 |
-| `del-witness` | violated | violated | 1,222 |
-| `del-M-no-run-fence` | caught | `NoResurrection` violated | 1,497 |
-| `del-M-seed-any-gen` | caught | `NoResurrection` violated | 175,548 |
-| `del-M-no-intent` | caught | `DeleteDurable` violated | 873 |
-| `del-impcheck-off` | finding | `NoResurrection` violated | 3,143 |
-| `del-noctl-tomb-off-res` | finding | `NoResurrection` violated | 49,979 |
-| `del-noctl-tomb-off` (and `-impcheck-off`) | finding | `DeleteDurable` violated | 564 / 507 |
-| `del-noctl-tomb-off-lost` | pass | pass | 17,773,056 |
+| `pub` | publish/apply/CAS: baseline | pass | 538,002 |
+| `pub-witnessQ` | witness: quiescence with rows | violated: WitnessQ | 127,780 |
+| `pub-witnessCas` | witness: CAS lost | violated: WitnessCasLost | 92,874 |
+| `pub-M-wm-at-commit` | mutant: watermark taken at commit | violated: NoLostWrite | 136,740 |
+| `pub-M-apply-no-guard` | mutant: apply drops unpublished-rows guard | violated: NoLostWrite | 322,793 |
+| `pub-M-loser-overwrites` | mutant: CAS loser overwrites without applying | violated: NoLostWrite | 370,119 |
+| `rep` | replace behind fence: baseline | pass | 10,784,840 |
+| `rep-witness` | witness: a replace passes the fence | violated: WitnessReplace | 117,403 |
+| `rep-M-no-fence` | mutant: no fence (ghost counter) | violated: ReplaceFenced | 1,556,468 |
+| `rep-M-no-fence-oracle` | mutant: no fence (oracle) | violated: NoLostWrite | 5,231,563 |
+| `unw` | un-write as r5 states it (overlapping runs allowed, no end refusal) | violated: NoLostWrite | 4,261,356 |
+| `unw-witness` | witness: un-write happens | violated: WitnessUnwrite | 490,105 |
+| `unw-M-keeps-parts` | mutant: un-write keeps head_parts (r5 as stated) | violated: NoLostWrite | 3,284,805 |
+| `unw-mono` | un-write, one replica never runs an older connector after a newer one | pass | 3,252,312 |
+| `unw-mono-witness` | witness | violated: WitnessUnwrite | 330,633 |
+| `unw-mono-M-keeps-parts` | mutant: un-write keeps head_parts | violated: NoLostWrite | 2,130,137 |
+| `unw-end` | (a) end-time refusal, overlapping runs allowed | violated: NoLostWrite | 3,016,614 |
+| `unw-seq` | (a) end-time refusal, one run at a time per replica | pass | 1,802,646 |
+| `unw-seq-witness` | witness | violated: WitnessUnwrite | 377,789 |
+| `unw-seq-M-none` | mutant: no end-time refusal | violated: NoLostWrite | 1,995,287 |
+| `unw-seq-M-head` | mutant: refuse only against the head | violated: NoLostWrite | 1,816,831 |
+| `unw-seq-M-local` | mutant: refuse only against local unpublished runs | pass | 2,364,180 |
+| `unw-seq-M-keeps-parts` | mutant: un-write keeps head_parts | violated: NoLostWrite | 1,220,836 |
+| `unw-body` | body retention (keeps overwritten and shadowed rows), overlapping runs allowed | pass | 5,522,500 |
+| `unw-body-witness` | witness | violated: WitnessUnwrite | 490,185 |
+| `unw-body-M-overwritten-only` | mutant: retain overwritten rows but not shadowed ones | violated: NoLostWrite | 4,319,859 |
+| `unw-body-M-keeps-parts` | mutant: un-write keeps head_parts | violated: NoLostWrite | 3,306,053 |
+| `ret` | retry keeps rows and cursor: baseline | pass | 4,304,016 |
+| `ret-M-drop-rows` | mutant: cursor saved, rows dropped | violated: NoLostWrite | 81,595 |
+| `ret-noCursor-harmless` | old R19 shape (rows merged, cursor not saved): harmless | pass | 5,866,954 |
+| `del` | delete, (b) tombstone always, (c) import refuses on local deleted | pass | 17,943,719 |
+| `del-crash` | same with one crash | pass | 46,901,133 |
+| `del-witness` | witness: delete completes | violated: WitnessDeleteDone | 1,267 |
+| `del-M-no-run-fence` | mutant: run fence ignores delete | violated: NoResurrection | 1,678 |
+| `del-M-seed-any-gen` | mutant: seeds publish into any generation | violated: NoResurrection | 174,586 |
+| `del-M-no-intent` | mutant: intent not durable first | violated: DeleteDurable | 893 |
+| `del-impcheck-off` | mutant (c): import ignores local deleted | violated: NoResurrection | 3,039 |
+| `del-noctl-tomb-off-res` | mutant (b): no tombstone when no control row (NoResurrection) | violated: NoResurrection | 53,133 |
+| `del-noctl-tomb-off` | mutant (b) (DeleteDurable) | violated: DeleteDurable | 503 |
+| `del-noctl-tomb-off-impcheck-off` | mutants (b)+(c) (DeleteDurable) | violated: DeleteDurable | 538 |
 
-`unw-mono` limits one replica to non-decreasing connector versions (`MonoCV`); it is the un-write
-scenario without the counterexample below.
+Rows are from the final run on the final spec (raw output in `results/`). Switches added in this
+revision: `EndRefuse` (`none|both|head|local`), `SeqRuns` (one run at a time per replica), `BodyKeep`
+(`none|overwritten|all`); delete configs model (b) tombstone always and (c) import refuses on local `deleted`.
+
+`unw-mono` limits one replica to non-decreasing connector versions (`MonoCV`).
+
+### End-time refusal (a) versus body retention
+
+- `unw-end`: refusing a run at `end` when its connector version is below any unpublished local run or the
+  known head does NOT restore `NoLostWrite` if runs may overlap on one replica. A lower-version run that
+  ends after a higher-version run is shadowed silently (its rows lose the stamp comparison), and the
+  refusal never fires for it. Un-write then drops the head parts and the shadowed unpublished rows are gone.
+- `unw-seq`: with one active run per connection per replica (`SeqRuns`), (a) restores `NoLostWrite`.
+  Mutants: no refusal and head-only are caught; **local-only is NOT caught** (`unw-seq-M-local` passes): with
+  `SeqRuns` the local clause carries the property and the head clause is redundant for `NoLostWrite`.
+- `unw-body`: body retention (`BodyKeep="all"`) restores it with overlapping runs; retaining only
+  overwritten rows (`unw-body-M-overwritten-only`) fails.
+
+### Publish upload (C.2 step 4)
+
+A merge during the upload is safe with the watermark taken at publish start: `pub` passes, and
+`pub-M-wm-at-commit` is the only watermark variant that fails. The build need not hold the per-connection
+queue across the upload. This assumes at most one publish per device and connection at a time.
 
 ## AccountGate ("Off then On must reach sync")
 

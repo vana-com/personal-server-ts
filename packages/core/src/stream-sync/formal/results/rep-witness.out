@@ -1,15 +1,15 @@
 TLC2 Version 2026.11.06.222357 (rev: d8fb231)
-Running breadth-first search Model-Checking with fp 122 and seed -673407378800968030 with 4 workers on 24 cores with 5461MB heap and 64MB offheap memory [pid: 2892049] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.20.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 43 and seed 7338962980510376991 with 4 workers on 24 cores with 5461MB heap and 64MB offheap memory [pid: 354724] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.20.1 64bit, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/tnunamak/.tmp/tla-r5-1109/ps/packages/core/src/stream-sync/formal/StreamSyncR5.tla
-Parsing file /tmp/tlc-16429999091917585748/Naturals.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
-Parsing file /tmp/tlc-16429999091917585748/Sequences.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
-Parsing file /tmp/tlc-16429999091917585748/FiniteSets.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-10084574616709344463/Naturals.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-10084574616709344463/Sequences.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-10084574616709344463/FiniteSets.tla (jar:file:/home/tnunamak/.tmp/f1fence-1108/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module StreamSyncR5
 Linting of module StreamSyncR5
-Starting... (2026-11-09 18:41:19)
+Starting... (2026-11-09 19:18:52)
 Computing initial states...
 Computed 2 initial states...
 Computed 4 initial states...
@@ -21,8 +21,7 @@ Computed 128 initial states...
 Computed 256 initial states...
 Computed 512 initial states...
 Computed 1024 initial states...
-Finished computing initial states: 1728 distinct states generated at 2026-11-09 18:41:19.
-Progress(6) at 2026-11-09 18:41:22: 117,322 states generated (117,322 s/min), 71,182 distinct states found (71,182 ds/min), 33,309 states left on queue.
+Finished computing initial states: 1728 distinct states generated at 2026-11-09 19:18:52.
 Error: Invariant WitnessReplace is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -32,7 +31,7 @@ State 1: <Initial predicate>
 /\ imported = {}
 /\ aCv = [d1 |-> 0, d2 |-> 0]
 /\ gen0 = <<0, 0, 0>>
-/\ content = <<{1}, {1}, {2}>>
+/\ content = <<{1}, {1}, {1}>>
 /\ rhead = <<0, 0>>
 /\ rgen = 1
 /\ pBase = [d1 |-> 0, d2 |-> 0]
@@ -73,16 +72,17 @@ State 1: <Initial predicate>
 /\ wm = [d1 |-> 0, d2 |-> 0]
 /\ pRep = [d1 |-> FALSE, d2 |-> FALSE]
 /\ basis = <<0, 0, 0>>
+/\ hold = [d1 |-> <<{}, {}>>, d2 |-> <<{}, {}>>]
 /\ dint = [d1 |-> "none", d2 |-> "none"]
 
-State 2: <RBegin(3) line 87, col 3 to line 97, col 103 of module StreamSyncR5>
+State 2: <RBegin(3) line 95, col 3 to line 106, col 109 of module StreamSyncR5>
 /\ hver = [d1 |-> 0, d2 |-> 0]
 /\ pEnc = [d1 |-> <<0, 0>>, d2 |-> <<0, 0>>]
 /\ rpub = <<FALSE, FALSE, FALSE>>
 /\ imported = {}
 /\ aCv = [d1 |-> 0, d2 |-> 0]
 /\ gen0 = <<0, 0, 1>>
-/\ content = <<{1}, {1}, {2}>>
+/\ content = <<{1}, {1}, {1}>>
 /\ rhead = <<0, 0>>
 /\ rgen = 1
 /\ pBase = [d1 |-> 0, d2 |-> 0]
@@ -95,7 +95,7 @@ State 2: <RBegin(3) line 87, col 3 to line 97, col 103 of module StreamSyncR5>
 /\ pW = [d1 |-> 0, d2 |-> 0]
 /\ rseq = <<0, 0, 0>>
 /\ cv = <<1, 1, 1>>
-/\ dc = <<{}, {}, {2}>>
+/\ dc = <<{}, {}, {1}>>
 /\ pph = [d1 |-> "idle", d2 |-> "idle"]
 /\ rctl = "none"
 /\ dsnap = <<0, 0, 0>>
@@ -123,21 +123,22 @@ State 2: <RBegin(3) line 87, col 3 to line 97, col 103 of module StreamSyncR5>
 /\ wm = [d1 |-> 0, d2 |-> 0]
 /\ pRep = [d1 |-> FALSE, d2 |-> FALSE]
 /\ basis = <<0, 0, 0>>
+/\ hold = [d1 |-> <<{}, {}>>, d2 |-> <<{}, {}>>]
 /\ dint = [d1 |-> "none", d2 |-> "none"]
 
-State 3: <REndMerge(3) line 117, col 3 to line 123, col 128 of module StreamSyncR5>
+State 3: <REndMerge(3) line 141, col 3 to line 152, col 128 of module StreamSyncR5>
 /\ hver = [d1 |-> 0, d2 |-> 0]
 /\ pEnc = [d1 |-> <<0, 0>>, d2 |-> <<0, 0>>]
 /\ rpub = <<FALSE, FALSE, FALSE>>
 /\ imported = {}
 /\ aCv = [d1 |-> 0, d2 |-> 0]
 /\ gen0 = <<0, 0, 1>>
-/\ content = <<{1}, {1}, {2}>>
+/\ content = <<{1}, {1}, {1}>>
 /\ rhead = <<0, 0>>
 /\ rgen = 1
 /\ pBase = [d1 |-> 0, d2 |-> 0]
 /\ aVer = [d1 |-> 0, d2 |-> 0]
-/\ log = [d1 |-> <<[k |-> 2, s |-> 4, o |-> "L"]>>, d2 |-> <<>>]
+/\ log = [d1 |-> <<[k |-> 1, s |-> 4, o |-> "L"]>>, d2 |-> <<>>]
 /\ ldelv = [d1 |-> 0, d2 |-> 0]
 /\ hcv = [d1 |-> 0, d2 |-> 0]
 /\ hpe = [d1 |-> FALSE, d2 |-> FALSE]
@@ -145,12 +146,12 @@ State 3: <REndMerge(3) line 117, col 3 to line 123, col 128 of module StreamSync
 /\ pW = [d1 |-> 0, d2 |-> 0]
 /\ rseq = <<0, 0, 1>>
 /\ cv = <<1, 1, 1>>
-/\ dc = <<{}, {}, {2}>>
+/\ dc = <<{}, {}, {1}>>
 /\ pph = [d1 |-> "idle", d2 |-> "idle"]
 /\ rctl = "none"
 /\ dsnap = <<0, 0, 0>>
 /\ own = <<"d1", "d1", "d1">>
-/\ rec = [d1 |-> <<0, 4>>, d2 |-> <<0, 0>>]
+/\ rec = [d1 |-> <<4, 0>>, d2 |-> <<0, 0>>]
 /\ lgen = [d1 |-> 1, d2 |-> 0]
 /\ rep = {}
 /\ ret = <<FALSE, FALSE, FALSE>>
@@ -173,21 +174,22 @@ State 3: <REndMerge(3) line 117, col 3 to line 123, col 128 of module StreamSync
 /\ wm = [d1 |-> 0, d2 |-> 0]
 /\ pRep = [d1 |-> FALSE, d2 |-> FALSE]
 /\ basis = <<0, 0, 0>>
+/\ hold = [d1 |-> <<{}, {}>>, d2 |-> <<{}, {}>>]
 /\ dint = [d1 |-> "none", d2 |-> "none"]
 
-State 4: <PSnap("d1") line 179, col 3 to line 181, col 98 of module StreamSyncR5>
+State 4: <PSnap("d1") line 208, col 3 to line 210, col 98 of module StreamSyncR5>
 /\ hver = [d1 |-> 0, d2 |-> 0]
 /\ pEnc = [d1 |-> <<0, 0>>, d2 |-> <<0, 0>>]
 /\ rpub = <<FALSE, FALSE, FALSE>>
 /\ imported = {}
 /\ aCv = [d1 |-> 0, d2 |-> 0]
 /\ gen0 = <<0, 0, 1>>
-/\ content = <<{1}, {1}, {2}>>
+/\ content = <<{1}, {1}, {1}>>
 /\ rhead = <<0, 0>>
 /\ rgen = 1
 /\ pBase = [d1 |-> 0, d2 |-> 0]
 /\ aVer = [d1 |-> 0, d2 |-> 0]
-/\ log = [d1 |-> <<[k |-> 2, s |-> 4, o |-> "L"]>>, d2 |-> <<>>]
+/\ log = [d1 |-> <<[k |-> 1, s |-> 4, o |-> "L"]>>, d2 |-> <<>>]
 /\ ldelv = [d1 |-> 0, d2 |-> 0]
 /\ hcv = [d1 |-> 0, d2 |-> 0]
 /\ hpe = [d1 |-> FALSE, d2 |-> FALSE]
@@ -195,12 +197,12 @@ State 4: <PSnap("d1") line 179, col 3 to line 181, col 98 of module StreamSyncR5
 /\ pW = [d1 |-> 1, d2 |-> 0]
 /\ rseq = <<0, 0, 1>>
 /\ cv = <<1, 1, 1>>
-/\ dc = <<{}, {}, {2}>>
+/\ dc = <<{}, {}, {1}>>
 /\ pph = [d1 |-> "snap", d2 |-> "idle"]
 /\ rctl = "none"
 /\ dsnap = <<0, 0, 0>>
 /\ own = <<"d1", "d1", "d1">>
-/\ rec = [d1 |-> <<0, 4>>, d2 |-> <<0, 0>>]
+/\ rec = [d1 |-> <<4, 0>>, d2 |-> <<0, 0>>]
 /\ lgen = [d1 |-> 1, d2 |-> 0]
 /\ rep = {}
 /\ ret = <<FALSE, FALSE, FALSE>>
@@ -223,21 +225,22 @@ State 4: <PSnap("d1") line 179, col 3 to line 181, col 98 of module StreamSyncR5
 /\ wm = [d1 |-> 0, d2 |-> 0]
 /\ pRep = [d1 |-> FALSE, d2 |-> FALSE]
 /\ basis = <<0, 0, 0>>
+/\ hold = [d1 |-> <<{}, {}>>, d2 |-> <<{}, {}>>]
 /\ dint = [d1 |-> "none", d2 |-> "none"]
 
-State 5: <PPlan("d1") line 215, col 3 to line 221, col 90 of module StreamSyncR5>
+State 5: <PPlan("d1") line 248, col 3 to line 254, col 90 of module StreamSyncR5>
 /\ hver = [d1 |-> 0, d2 |-> 0]
 /\ pEnc = [d1 |-> <<0, 0>>, d2 |-> <<0, 0>>]
 /\ rpub = <<FALSE, FALSE, FALSE>>
 /\ imported = {}
 /\ aCv = [d1 |-> 0, d2 |-> 0]
 /\ gen0 = <<0, 0, 1>>
-/\ content = <<{1}, {1}, {2}>>
+/\ content = <<{1}, {1}, {1}>>
 /\ rhead = <<0, 0>>
 /\ rgen = 1
 /\ pBase = [d1 |-> 0, d2 |-> 0]
 /\ aVer = [d1 |-> 0, d2 |-> 0]
-/\ log = [d1 |-> <<[k |-> 2, s |-> 4, o |-> "L"]>>, d2 |-> <<>>]
+/\ log = [d1 |-> <<[k |-> 1, s |-> 4, o |-> "L"]>>, d2 |-> <<>>]
 /\ ldelv = [d1 |-> 0, d2 |-> 0]
 /\ hcv = [d1 |-> 0, d2 |-> 0]
 /\ hpe = [d1 |-> FALSE, d2 |-> FALSE]
@@ -245,12 +248,12 @@ State 5: <PPlan("d1") line 215, col 3 to line 221, col 90 of module StreamSyncR5
 /\ pW = [d1 |-> 1, d2 |-> 0]
 /\ rseq = <<0, 0, 1>>
 /\ cv = <<1, 1, 1>>
-/\ dc = <<{}, {}, {2}>>
+/\ dc = <<{}, {}, {1}>>
 /\ pph = [d1 |-> "enc", d2 |-> "idle"]
 /\ rctl = "none"
 /\ dsnap = <<0, 0, 0>>
 /\ own = <<"d1", "d1", "d1">>
-/\ rec = [d1 |-> <<0, 4>>, d2 |-> <<0, 0>>]
+/\ rec = [d1 |-> <<4, 0>>, d2 |-> <<0, 0>>]
 /\ lgen = [d1 |-> 1, d2 |-> 0]
 /\ rep = {}
 /\ ret = <<FALSE, FALSE, FALSE>>
@@ -273,21 +276,22 @@ State 5: <PPlan("d1") line 215, col 3 to line 221, col 90 of module StreamSyncR5
 /\ wm = [d1 |-> 0, d2 |-> 0]
 /\ pRep = [d1 |-> FALSE, d2 |-> FALSE]
 /\ basis = <<0, 0, 0>>
+/\ hold = [d1 |-> <<{}, {}>>, d2 |-> <<{}, {}>>]
 /\ dint = [d1 |-> "none", d2 |-> "none"]
 
-State 6: <PEnc("d1") line 224, col 3 to line 234, col 90 of module StreamSyncR5>
+State 6: <PEnc("d1") line 257, col 3 to line 267, col 90 of module StreamSyncR5>
 /\ hver = [d1 |-> 0, d2 |-> 0]
-/\ pEnc = [d1 |-> <<0, 4>>, d2 |-> <<0, 0>>]
+/\ pEnc = [d1 |-> <<4, 0>>, d2 |-> <<0, 0>>]
 /\ rpub = <<FALSE, FALSE, FALSE>>
 /\ imported = {}
 /\ aCv = [d1 |-> 0, d2 |-> 0]
 /\ gen0 = <<0, 0, 1>>
-/\ content = <<{1}, {1}, {2}>>
+/\ content = <<{1}, {1}, {1}>>
 /\ rhead = <<0, 0>>
 /\ rgen = 1
 /\ pBase = [d1 |-> 0, d2 |-> 0]
 /\ aVer = [d1 |-> 0, d2 |-> 0]
-/\ log = [d1 |-> <<[k |-> 2, s |-> 4, o |-> "L"]>>, d2 |-> <<>>]
+/\ log = [d1 |-> <<[k |-> 1, s |-> 4, o |-> "L"]>>, d2 |-> <<>>]
 /\ ldelv = [d1 |-> 0, d2 |-> 0]
 /\ hcv = [d1 |-> 0, d2 |-> 0]
 /\ hpe = [d1 |-> FALSE, d2 |-> FALSE]
@@ -295,12 +299,12 @@ State 6: <PEnc("d1") line 224, col 3 to line 234, col 90 of module StreamSyncR5>
 /\ pW = [d1 |-> 1, d2 |-> 0]
 /\ rseq = <<0, 0, 1>>
 /\ cv = <<1, 1, 1>>
-/\ dc = <<{}, {}, {2}>>
+/\ dc = <<{}, {}, {1}>>
 /\ pph = [d1 |-> "cas", d2 |-> "idle"]
 /\ rctl = "none"
 /\ dsnap = <<0, 0, 0>>
 /\ own = <<"d1", "d1", "d1">>
-/\ rec = [d1 |-> <<0, 4>>, d2 |-> <<0, 0>>]
+/\ rec = [d1 |-> <<4, 0>>, d2 |-> <<0, 0>>]
 /\ lgen = [d1 |-> 1, d2 |-> 0]
 /\ rep = {}
 /\ ret = <<FALSE, FALSE, FALSE>>
@@ -323,21 +327,22 @@ State 6: <PEnc("d1") line 224, col 3 to line 234, col 90 of module StreamSyncR5>
 /\ wm = [d1 |-> 0, d2 |-> 0]
 /\ pRep = [d1 |-> TRUE, d2 |-> FALSE]
 /\ basis = <<0, 0, 0>>
+/\ hold = [d1 |-> <<{}, {}>>, d2 |-> <<{}, {}>>]
 /\ dint = [d1 |-> "none", d2 |-> "none"]
 
-State 7: <PCasOK("d1") line 237, col 3 to line 257, col 190 of module StreamSyncR5>
+State 7: <PCasOK("d1") line 270, col 3 to line 291, col 190 of module StreamSyncR5>
 /\ hver = [d1 |-> 1, d2 |-> 0]
-/\ pEnc = [d1 |-> <<0, 4>>, d2 |-> <<0, 0>>]
+/\ pEnc = [d1 |-> <<4, 0>>, d2 |-> <<0, 0>>]
 /\ rpub = <<FALSE, FALSE, TRUE>>
 /\ imported = {}
 /\ aCv = [d1 |-> 0, d2 |-> 0]
 /\ gen0 = <<0, 0, 1>>
-/\ content = <<{1}, {1}, {2}>>
-/\ rhead = <<0, 4>>
+/\ content = <<{1}, {1}, {1}>>
+/\ rhead = <<4, 0>>
 /\ rgen = 1
 /\ pBase = [d1 |-> 0, d2 |-> 0]
 /\ aVer = [d1 |-> 0, d2 |-> 0]
-/\ log = [d1 |-> <<[k |-> 2, s |-> 4, o |-> "L"]>>, d2 |-> <<>>]
+/\ log = [d1 |-> <<[k |-> 1, s |-> 4, o |-> "L"]>>, d2 |-> <<>>]
 /\ ldelv = [d1 |-> 0, d2 |-> 0]
 /\ hcv = [d1 |-> 1, d2 |-> 0]
 /\ hpe = [d1 |-> FALSE, d2 |-> FALSE]
@@ -345,12 +350,12 @@ State 7: <PCasOK("d1") line 237, col 3 to line 257, col 190 of module StreamSync
 /\ pW = [d1 |-> 1, d2 |-> 0]
 /\ rseq = <<0, 0, 1>>
 /\ cv = <<1, 1, 1>>
-/\ dc = <<{}, {}, {2}>>
+/\ dc = <<{}, {}, {1}>>
 /\ pph = [d1 |-> "idle", d2 |-> "idle"]
 /\ rctl = "live"
 /\ dsnap = <<0, 0, 0>>
 /\ own = <<"d1", "d1", "d1">>
-/\ rec = [d1 |-> <<0, 4>>, d2 |-> <<0, 0>>]
+/\ rec = [d1 |-> <<4, 0>>, d2 |-> <<0, 0>>]
 /\ lgen = [d1 |-> 1, d2 |-> 0]
 /\ rep = {3}
 /\ ret = <<FALSE, FALSE, FALSE>>
@@ -362,10 +367,10 @@ State 7: <PCasOK("d1") line 237, col 3 to line 257, col 190 of module StreamSync
 /\ redel = [d1 |-> {}, d2 |-> {}]
 /\ nrec = 0
 /\ lctl = [d1 |-> "live", d2 |-> "none"]
-/\ hc = [d1 |-> <<0, 4>>, d2 |-> <<0, 0>>]
+/\ hc = [d1 |-> <<4, 0>>, d2 |-> <<0, 0>>]
 /\ cov = <<FALSE, FALSE, TRUE>>
 /\ apl = [d1 |-> "idle", d2 |-> "idle"]
-/\ hvk = <<0, 1>>
+/\ hvk = <<1, 0>>
 /\ pPr = [d1 |-> 3, d2 |-> 0]
 /\ ncrash = 0
 /\ rver = 1
@@ -373,8 +378,9 @@ State 7: <PCasOK("d1") line 237, col 3 to line 257, col 190 of module StreamSync
 /\ wm = [d1 |-> 1, d2 |-> 0]
 /\ pRep = [d1 |-> TRUE, d2 |-> FALSE]
 /\ basis = <<0, 0, 0>>
+/\ hold = [d1 |-> <<{}, {}>>, d2 |-> <<{}, {}>>]
 /\ dint = [d1 |-> "none", d2 |-> "none"]
 
-203535 states generated, 117311 distinct states found, 50738 states left on queue.
+203697 states generated, 117403 distinct states found, 50769 states left on queue.
 The depth of the complete state graph search is 7.
-Finished in 04s at (2026-11-09 18:41:23)
+Finished in 03s at (2026-11-09 19:18:55)
