@@ -17,7 +17,10 @@ afterEach(async () => {
 });
 const owner = `0x${"11".repeat(20)}` as const;
 const connectionId = "pdpp.fixture~";
-async function world() {
+async function world(
+  coverageStrategy:
+    "full_inventory" | "checkpoint_window" | null = "full_inventory",
+) {
   const registry = createMemoryStreamSyncRegistry();
   const blobs = createMemoryStreamSyncBlobs();
   let now = 1000;
@@ -52,7 +55,12 @@ async function world() {
           connector: digest === "other" ? "other" : "fixture",
           version: "1",
           streams: [
-            { name: "items", semantics: "mutable_state", primaryKey: ["id"] },
+            {
+              name: "items",
+              semantics: "mutable_state",
+              primaryKey: ["id"],
+              coverageStrategy: coverageStrategy ?? undefined,
+            },
           ],
         }),
         declaredStreams: () => ["items"],
@@ -155,4 +163,48 @@ it("compaction expires a changes cursor even when an unrelated connection retain
       cursor: 0,
     }),
   ).toBe("gone");
+});
+
+it.each(["checkpoint_window", "unknown"])(
+  "%s declarations cannot replace even with producer full proof",
+  async (strategy) => {
+    const { a, b } = await world(
+      strategy === "unknown" ? null : "checkpoint_window",
+    );
+    await a.run("seed", ["old", "keep"]);
+    await a.publish();
+    await b.sync.apply();
+    await a.run("window", ["keep"], { proven: true });
+    await a.publish();
+    await b.sync.apply();
+    expect(await b.keys()).toEqual(["keep", "old"]);
+    expect(await a.keys()).toEqual(["keep", "old"]);
+  },
+);
+it("full_inventory omission becomes a changes_since tombstone on another device", async () => {
+  const { a, b } = await world();
+  await a.run("seed", ["old", "keep"]);
+  await a.publish();
+  await b.sync.apply();
+  const before = await b.sync.query.changesSince({
+    connectionId,
+    stream: "items",
+    cursor: 0,
+  });
+  if (before === "gone") throw new Error("fixture cursor expired");
+  const cursor = before.changes.at(-1)!.seq;
+  await a.run("inventory", ["keep"], { proven: true });
+  await a.publish();
+  await b.sync.apply();
+  const after = await b.sync.query.changesSince({
+    connectionId,
+    stream: "items",
+    cursor,
+  });
+  if (after === "gone") throw new Error("fixture cursor expired");
+  expect(
+    after.changes
+      .filter((c) => c.op === "remove")
+      .map((c) => ({ key: c.recordKey, record: c.record })),
+  ).toEqual([{ key: "old", record: null }]);
 });

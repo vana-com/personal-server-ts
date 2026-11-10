@@ -50,6 +50,7 @@ type Stream = {
   profile_key: string | null;
   profile_version: string | null;
   full_read: number;
+  coverage_strategy: string | null;
   foreign_checkpoint: number;
   seed: "none" | "merged" | "unresolved";
   local_primary_key: string | null;
@@ -143,7 +144,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         if (!connection) throw new RunIntakeError("gone");
         const streams = await db.query<Stream>(
           `SELECT rs.stream, rs.primary_key, rs.profile_key, rs.profile_version,
-                rs.full_read, rs.foreign_checkpoint, rs.seed,
+                rs.full_read, rs.coverage_strategy, rs.foreign_checkpoint, rs.seed,
                 s.primary_key AS local_primary_key, s.profile_key AS local_profile_key,
                 s.profile_version AS local_profile_version, s.complete,
                 s.head_version, s.head_generation, s.floor_version, s.floor_o, s.floor_r,
@@ -226,6 +227,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             full &&
             decideReplace({
               stream: stream.stream,
+              coverageStrategy: stream.coverage_strategy,
               outcome: req.outcome,
               collectionMode: run.collection_mode,
               coveredStreams: req.coveredStreams,

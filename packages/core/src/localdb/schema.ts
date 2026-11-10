@@ -127,4 +127,5 @@ END;`,
       UPDATE db_meta SET change_floor=MAX(change_floor,OLD.seq) WHERE id=1;
     END`,
   ],
+  [`ALTER TABLE run_streams ADD COLUMN coverage_strategy TEXT`],
 ];

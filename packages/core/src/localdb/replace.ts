@@ -1,12 +1,14 @@
 /**
- * H: full refresh replaces. Pure decision, no I/O. `replace = 1` only for a
- * stream in `coveredStreams` AND `provenFullStreams`, with
+ * Collection profile §3.5 + r5 H: only a declared full_inventory can
+ * replace. Pure decision, no I/O. Run end supplies the server full-read fact;
+ * this predicate also requires coverage AND complete producer evidence, with
  * `collection_mode='full_refresh'` and that stream succeeded. A partial
  * run can certify its successful streams; an errored/gapped sibling has no
  * proof. Spec: H, the conformance table (one JSON file, SHA-256 pinned).
  */
 export interface ReplaceInput {
   readonly stream: string;
+  readonly coverageStrategy?: string | null;
   readonly outcome:
     "succeeded" | "partial" | "retry_pending" | "failed" | "cancelled";
   readonly collectionMode: "full_refresh" | "incremental";
@@ -16,6 +18,7 @@ export interface ReplaceInput {
 
 export function decideReplace(input: ReplaceInput): boolean {
   return (
+    input.coverageStrategy === "full_inventory" &&
     (input.outcome === "succeeded" || input.outcome === "partial") &&
     input.collectionMode === "full_refresh" &&
     input.coveredStreams.includes(input.stream) &&

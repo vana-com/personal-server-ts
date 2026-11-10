@@ -45,6 +45,13 @@ export class RunIntakeError extends Error {
   }
 }
 
+export type CoverageStrategy =
+  | "checkpoint_window"
+  | "full_inventory"
+  | "parent_detail_accounting"
+  | "snapshot_import_receipt"
+  | "singleton_presence";
+
 /** One stream of a verified connector artifact. */
 export interface IntakeStreamDeclaration {
   readonly name: string;
@@ -53,6 +60,8 @@ export interface IntakeStreamDeclaration {
   /** `false` = every run reads the whole stream (§3.0). Default `true`. */
   readonly incremental?: boolean;
   readonly consentTimeField?: string;
+  /** Collection profile §3.5. Missing declarations never authorize deletion. */
+  readonly coverageStrategy?: CoverageStrategy;
 }
 
 export interface IntakeDeclarations {
@@ -114,6 +123,8 @@ export interface BeginResponse {
     readonly primaryKey: readonly string[];
     readonly incremental: boolean;
     readonly consentTimeField?: string;
+    /** Collection profile §3.5. Missing declarations never authorize deletion. */
+    readonly coverageStrategy?: CoverageStrategy;
     readonly mode: "full_refresh" | "incremental";
   }[];
 }
