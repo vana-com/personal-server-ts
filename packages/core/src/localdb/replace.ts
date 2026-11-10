@@ -30,7 +30,10 @@ export function replaceMayApply(
   },
   registryHead: { readonly version: number; readonly dataHash: string } | null,
 ): boolean {
-  void basis;
-  void registryHead;
-  throw new Error("PS-2: not built");
+  if (registryHead === null)
+    return basis.basisVersion === null && basis.basisDataHash === null;
+  return (
+    basis.basisVersion === registryHead.version &&
+    basis.basisDataHash?.toLowerCase() === registryHead.dataHash.toLowerCase()
+  );
 }
