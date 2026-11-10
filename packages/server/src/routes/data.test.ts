@@ -1635,6 +1635,30 @@ describe("GET /v1/data/:scope", () => {
     expect(json.data).toEqual({ username: "test_user" });
   });
 
+  it("never emits a grantee label, whatever headers the requester sends", async () => {
+    const app = createApp();
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+    const header = await buildWeb3SignedHeader({
+      wallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/instagram.profile",
+      grantId: "grant-123",
+    });
+
+    const res = await app.request("/instagram.profile", {
+      headers: {
+        Authorization: header,
+        "x-ps-lite-relay-read": "1",
+        "x-ps-grantee-ref": "spoofed",
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-ps-grantee-ref")).toBeNull();
+    expect([...res.headers.keys()].join(",")).not.toContain("grantee");
+  });
+
   it("serves an attributed projection to a grantee without changing data bytes", async () => {
     const app = createApp();
     const data = { username: "test_user" };
