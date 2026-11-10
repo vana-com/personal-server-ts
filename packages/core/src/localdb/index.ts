@@ -27,7 +27,11 @@ export {
   type ReplaceInput,
 } from "./replace.js";
 export { applyConnection, applyStream, type ApplyResult } from "./apply.js";
-export { publishConnection, type PublishResult } from "./publish.js";
+export {
+  publishConnection,
+  type PublishResult,
+  type PublicationReceipt,
+} from "./publish.js";
 export { encodePrefixes, type EncodedPart } from "./encode.js";
 export { unwriteRefusedRun } from "./unwrite.js";
 export { runCycle, syncConnection, type CycleReport } from "./cycle.js";

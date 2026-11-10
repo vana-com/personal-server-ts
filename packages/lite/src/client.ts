@@ -1,3 +1,4 @@
+import type { PublicationReceipt } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   accessLogsListPath,
   createOwnerSignedPersonalServerRequest,
@@ -97,10 +98,20 @@ export interface StartPersonalServerLiteOptions extends Omit<
   onStatus?: (status: PersonalServerStatus) => void;
 }
 
+export type PersonalServerLitePublicationResult = {
+  readonly outcome: "published" | "noop";
+  readonly publications: readonly PublicationReceipt[];
+};
+
 /** The Lite handle: the shared handle plus the host's run-intake door. */
 export type PersonalServerLiteHandle = PersonalServerHandle & {
   /** In-process run intake; `null` unless `config.streamSync.write` is on. */
   readonly streamSyncIntake: RunIntake | null;
+  /** Await a database publication cycle. Rejects if any stream cannot confirm publication.
+   * Receipts cover individual streams, not every stream of a connection.
+   * A noop contains no new coverage. Unavailable or stopped runtimes reject.
+   */
+  publish(): Promise<PersonalServerLitePublicationResult>;
 };
 
 export async function startPersonalServer(
@@ -684,14 +695,49 @@ export async function startPersonalServer(
     });
   }
 
+  const publishing = new Set<Promise<PersonalServerLitePublicationResult>>();
+  let stopping = false;
+  function publish(): Promise<PersonalServerLitePublicationResult> {
+    if (stopping)
+      return Promise.reject(new Error("Stream publication is unavailable"));
+    const operation = publishCycle();
+    publishing.add(operation);
+    void operation.finally(() => publishing.delete(operation)).catch(() => {});
+    return operation;
+  }
+
+  async function publishCycle(): Promise<PersonalServerLitePublicationResult> {
+    if (status === "stopped" || !runtimeBundle?.getLocalSync)
+      throw new Error("Stream publication is unavailable");
+    const report = await (await runtimeBundle.getLocalSync()).cycle();
+    const publications: PublicationReceipt[] = [];
+    for (const connection of report.connections) {
+      if (connection.error) throw new Error(connection.error);
+      for (const result of connection.published) {
+        if (result.outcome !== "published" && result.outcome !== "noop")
+          throw new Error(
+            `Stream publication ${result.outcome}: ${connection.connectionId}/${result.stream}`,
+          );
+        if (result.publication) publications.push(result.publication);
+      }
+    }
+    return {
+      outcome: publications.length ? "published" : "noop",
+      publications,
+    };
+  }
+
   async function stop(): Promise<void> {
     if (status === "stopped") return;
+    stopping = true;
     relayClient?.close("personal-server-stop");
     relayClient = undefined;
     runtime.deactivate();
     // The importer writes through the stores; stop it before they wind down.
     await runtimeBundle?.importWaker?.stop();
     await runtimeBundle?.syncManager?.stop?.();
+    await Promise.allSettled([...publishing]);
+    await runtimeBundle?.closeStreamSync?.();
     setStatus("stopped");
   }
 
@@ -720,6 +766,7 @@ export async function startPersonalServer(
     syncStatus,
     syncNow,
     streamSyncIntake: runtimeBundle?.streamSyncIntake ?? null,
+    publish,
     stop,
   };
 }
