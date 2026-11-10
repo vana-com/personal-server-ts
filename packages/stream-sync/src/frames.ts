@@ -1,9 +1,9 @@
 /**
- * Record frames (head format 2).
+ * Record frames (v2 and v3 envelopes).
  *
  *   frame    = envelope LF body LF
  *   envelope = canonicalJson({"h": sha256(body), "k": pkHash, "n": body bytes,
- *                             "o": run start ms, "r": runId})
+ *                             "o": run start ms, "r": runId, "f"?: first run ms})
  *   body     = canonicalJson(record), exactly `n` bytes, with no raw LF
  *
  * Merge, overlay and delete read the envelope only. A body is opaque bytes:
@@ -13,7 +13,7 @@
 
 import { HEX64, toHex, utf8, type Sha256StreamFactory } from "./bytes.js";
 import { InvalidPartError } from "./errors.js";
-import { canonicalJson, isPlainObject } from "./json.js";
+import { canonicalJson, hasOwn, isPlainObject } from "./json.js";
 
 export interface Envelope {
   /** SHA-256 of the body bytes, 64 lowercase hex. */
@@ -27,8 +27,8 @@ export interface Envelope {
   /** Run id. */
   readonly r: string;
   /**
-   * v3 frames only: `first_o` as an integer, or `null`. Type only until the
-   * v3 frame slice makes it part of the envelope. Spec: r5.2 1.3.
+   * v3 frames only: `first_o` as a safe integer, or `null` when unknown.
+   * Presence selects v3 encoding; omission keeps the v2 envelope.
    */
   readonly f?: number | null;
 }
@@ -37,12 +37,23 @@ const LF = 0x0a;
 /** An envelope is far smaller than this; a longer first line is corrupt. */
 export const ENVELOPE_LIMIT_BYTES = 4096;
 
-function checkEnvelope(e: unknown): asserts e is Envelope {
+function checkEnvelope(
+  e: unknown,
+  generation: "v2" | "v3",
+): asserts e is Envelope {
   if (!isPlainObject(e))
     throw new InvalidPartError("envelope is not an object");
   const keys = Object.keys(e).sort().join(",");
-  if (keys !== "h,k,n,o,r") {
-    throw new InvalidPartError("envelope fields must be exactly h, k, n, o, r");
+  const expected = generation === "v3" ? "f,h,k,n,o,r" : "h,k,n,o,r";
+  if (keys !== expected) {
+    throw new InvalidPartError(`envelope fields must be exactly ${expected}`);
+  }
+  if (
+    generation === "v3" &&
+    e.f !== null &&
+    (typeof e.f !== "number" || !Number.isSafeInteger(e.f))
+  ) {
+    throw new InvalidPartError("envelope f is not an integer or null");
   }
   if (typeof e.h !== "string" || !HEX64.test(e.h)) {
     throw new InvalidPartError("envelope h is not 64 lowercase hex");
@@ -63,9 +74,12 @@ function checkEnvelope(e: unknown): asserts e is Envelope {
 
 /** Envelope bytes, without the LF. */
 export function encodeEnvelope(envelope: Envelope): Uint8Array {
-  checkEnvelope(envelope);
-  return utf8(
+  const generation =
+    isPlainObject(envelope) && hasOwn(envelope, "f") ? "v3" : "v2";
+  checkEnvelope(envelope, generation);
+  const bytes = utf8(
     canonicalJson({
+      ...(generation === "v3" ? { f: envelope.f } : {}),
       h: envelope.h,
       k: envelope.k,
       n: envelope.n,
@@ -73,12 +87,22 @@ export function encodeEnvelope(envelope: Envelope): Uint8Array {
       r: envelope.r,
     }),
   );
+  if (bytes.length > ENVELOPE_LIMIT_BYTES) {
+    throw new InvalidPartError("envelope line is too long");
+  }
+  return bytes;
 }
 
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
 /** Parse envelope bytes (no LF). Fails unless they are exactly canonical. */
-export function decodeEnvelope(bytes: Uint8Array): Envelope {
+export function decodeEnvelope(
+  bytes: Uint8Array,
+  generation: "v2" | "v3" = "v2",
+): Envelope {
+  if (bytes.length > ENVELOPE_LIMIT_BYTES) {
+    throw new InvalidPartError("envelope line is too long");
+  }
   let text: string;
   let parsed: unknown;
   try {
@@ -87,7 +111,7 @@ export function decodeEnvelope(bytes: Uint8Array): Envelope {
   } catch {
     throw new InvalidPartError("envelope is not valid JSON");
   }
-  checkEnvelope(parsed);
+  checkEnvelope(parsed, generation);
   if (canonicalJson(parsed) !== text) {
     throw new InvalidPartError("envelope is not in canonical form");
   }
@@ -224,10 +248,14 @@ class ByteSource {
 export async function* readFrames(
   source: AsyncIterable<Uint8Array>,
   makeSha256?: Sha256StreamFactory,
+  generation: "v2" | "v3" = "v2",
 ): AsyncGenerator<Frame> {
   const input = new ByteSource(source);
   while (!(await input.atEnd())) {
-    const envelope = decodeEnvelope(await input.line(ENVELOPE_LIMIT_BYTES));
+    const envelope = decodeEnvelope(
+      await input.line(ENVELOPE_LIMIT_BYTES),
+      generation,
+    );
     // The reader owns this generator. The consumer sees only a handle whose
     // `return` does nothing, so leaving a loop early cannot end the body and
     // leave the next frame to start inside it.
