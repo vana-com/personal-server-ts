@@ -337,10 +337,13 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             },
             {
               sql: `INSERT INTO run_streams(run_id,stream,delete_snapshot,basis_version,basis_generation,basis_data_hash,primary_key,profile_key,profile_version,full_read)
-            SELECT ?,stream,last_delete_version,CASE WHEN head_version>0 THEN head_version ELSE NULL END,head_generation,head_data_hash,?,NULL,?,?
+            SELECT ?,stream,last_delete_version,CASE WHEN head_version>0 THEN head_version ELSE NULL END,CASE WHEN head_version>0 THEN head_generation ELSE ? END,head_data_hash,?,NULL,?,?
             FROM stream_state WHERE connection_id=? AND stream=?`,
               params: [
                 runId,
+                synced.unreachable
+                  ? null
+                  : (synced.connection?.generation ?? null),
                 JSON.stringify(d.primaryKey),
                 declarations.version,
                 modes.get(d.name) === "full_refresh" &&

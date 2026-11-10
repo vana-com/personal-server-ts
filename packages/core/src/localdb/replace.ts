@@ -1,8 +1,9 @@
 /**
  * H: full refresh replaces. Pure decision, no I/O. `replace = 1` only for a
  * stream in `coveredStreams` AND `provenFullStreams`, with
- * `collection_mode='full_refresh'` and outcome `succeeded`. Spec: H, the
- * conformance table (one JSON file, SHA-256 pinned).
+ * `collection_mode='full_refresh'` and that stream succeeded. A partial
+ * run can certify its successful streams; an errored/gapped sibling has no
+ * proof. Spec: H, the conformance table (one JSON file, SHA-256 pinned).
  */
 export interface ReplaceInput {
   readonly stream: string;
@@ -14,8 +15,12 @@ export interface ReplaceInput {
 }
 
 export function decideReplace(input: ReplaceInput): boolean {
-  void input;
-  throw new Error("PS-2: not built");
+  return (
+    (input.outcome === "succeeded" || input.outcome === "partial") &&
+    input.collectionMode === "full_refresh" &&
+    input.coveredStreams.includes(input.stream) &&
+    input.provenFullStreams.includes(input.stream)
+  );
 }
 
 /**
@@ -27,11 +32,17 @@ export function replaceMayApply(
   basis: {
     readonly basisVersion: number | null;
     readonly basisDataHash: string | null;
+    /** For an absent head, true only after an authoritative begin read. */
+    readonly basisKnown?: boolean;
   },
   registryHead: { readonly version: number; readonly dataHash: string } | null,
 ): boolean {
   if (registryHead === null)
-    return basis.basisVersion === null && basis.basisDataHash === null;
+    return (
+      basis.basisKnown === true &&
+      basis.basisVersion === null &&
+      basis.basisDataHash === null
+    );
   return (
     basis.basisVersion === registryHead.version &&
     basis.basisDataHash?.toLowerCase() === registryHead.dataHash.toLowerCase()

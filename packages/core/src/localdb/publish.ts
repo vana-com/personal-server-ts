@@ -178,6 +178,7 @@ type RetainedRun = {
   decision: string;
   replace: number;
   basis_version: number | null;
+  basis_generation: number | null;
   basis_data_hash: string | null;
   row_count: number;
 };
@@ -666,7 +667,7 @@ async function planStream(
     `SELECT r.run_id, r.o, r.generation, r.artifact_version,
             rs.primary_key, rs.profile_key, rs.profile_version,
             rs.full_read, rs.foreign_checkpoint, rs.seed, rs.decision,
-            rs.replace, rs.basis_version, rs.basis_data_hash,
+            rs.replace, rs.basis_version, rs.basis_generation, rs.basis_data_hash,
             (SELECT COUNT(*) FROM run_rows rr
               WHERE rr.run_id = r.run_id AND rr.stream = rs.stream) AS row_count
        FROM runs r JOIN run_streams rs ON rs.run_id = r.run_id
@@ -770,6 +771,7 @@ async function planStream(
       {
         basisVersion: run.basis_version,
         basisDataHash: run.basis_data_hash,
+        basisKnown: run.basis_generation !== null,
       },
       registryDataHash === null
         ? null

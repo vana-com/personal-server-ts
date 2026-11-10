@@ -223,5 +223,74 @@ describe("Node database composition", () => {
     expect(await resumed.json()).toMatchObject({
       start: { collection_mode: "incremental", state: { items: "C1" } },
     });
+    // Finish the resumed increment, then prove a full snapshot through the
+    // same Node HTTP port and real P03/P05/P06/P09 database composition.
+    await send("/v1/stream-sync/runs/resumed/batches", "POST", {
+      batch: 0,
+      records: [{ stream: "items", data: { id: "from-resume" } }],
+    });
+    expect(
+      (
+        await send("/v1/stream-sync/runs/resumed/end", "POST", {
+          outcome: "succeeded",
+          coveredStreams: ["items"],
+          provenFullStreams: ["items"],
+          lastBatch: 0,
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await send("/v1/stream-sync/runs/zz-full", "PUT", {
+          connector: "fixture-source",
+          artifactDigest: digest,
+          owner: { address: context.serverOwner!, leaseId: null },
+          wantFull: true,
+          observedAt: Date.now() + 100,
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await send("/v1/stream-sync/runs/zz-full/batches", "POST", {
+          batch: 0,
+          records: [{ stream: "items", data: { id: "live-full" } }],
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await send("/v1/stream-sync/runs/zz-full/end", "POST", {
+          outcome: "succeeded",
+          coveredStreams: ["items"],
+          provenFullStreams: ["items"],
+          lastBatch: 0,
+        })
+      ).status,
+    ).toBe(200);
+    remote.registry.post = async (post) => {
+      const prior = remote.reads.get(post.scope);
+      const version = prior?.found ? prior.version + 1 : 1;
+      if (String(version) !== post.expectedVersion)
+        return { kind: "conflict", latestVersion: String(version - 1) };
+      remote.reads.set(post.scope, {
+        found: true,
+        version,
+        dataHash: post.dataHash,
+        metadataHash: post.metadataHash,
+        deleted: false,
+      });
+      return { kind: "committed" };
+    };
+    const report = await (await context.getLocalSync!()).cycle();
+    expect(report.connections.map((c) => c.error)).toEqual([null]);
+    const read = await context.app.request(
+      "/v1/data/pdpp.fixture-source.items",
+      { headers },
+    );
+    expect(read.status).toBe(200);
+    expect(await read.json()).toMatchObject({
+      data: { records: [{ id: "live-full" }] },
+    });
   });
 });

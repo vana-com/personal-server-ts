@@ -185,6 +185,15 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
                   complete: stream.complete === 1,
                 }
               : null;
+          // A partial run proves success per stream (r5 H), not for every
+          // stream it initially requested whole. Publish must replay this
+          // result, never the optimistic mode recorded at begin.
+          const full =
+            !retry &&
+            req.coveredStreams.includes(stream.stream) &&
+            stream.full_read === 1 &&
+            (req.outcome === "succeeded" ||
+              (req.provenFullStreams ?? []).includes(stream.stream));
           const decision = planStreamStep(
             {
               head,
@@ -202,10 +211,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               generation: run.generation,
               primaryKey,
               profile,
-              full:
-                !retry &&
-                req.coveredStreams.includes(stream.stream) &&
-                stream.full_read === 1,
+              full,
               foreignCheckpoint: stream.foreign_checkpoint === 1,
               empty: stream.row_count === 0,
               seed: stream.seed,
@@ -227,11 +233,12 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               provenFullStreams: req.provenFullStreams ?? [],
             });
           statements.push({
-            sql: "UPDATE run_streams SET decision = ?, reason = ?, replace = ? WHERE run_id = ? AND stream = ?",
+            sql: "UPDATE run_streams SET decision = ?, reason = ?, replace = ?, full_read = ? WHERE run_id = ? AND stream = ?",
             params: [
               decision.kind,
               "reason" in decision ? decision.reason : null,
               replace ? 1 : 0,
+              full ? 1 : 0,
               runId,
               stream.stream,
             ],

@@ -1,0 +1,724 @@
+{
+  "version": 1,
+  "contract": "SPECS-r5.md H (lines 804-824); partial proven-stream ruling confirmed 2026-11-10",
+  "sourceTableSha256": "497d62c3490cb197641bcf3488bafeaaabb5f31ac1edb8a1432c40c832a86fc2",
+  "proofPort": "provenFullStreams certifies this run's whole-stream success: completed, mutable state, nonempty snapshot, matching records, no time range, skipped delete, own error, or gap. The source proof field alone was not that certification. Oversize is not a skip in PS-2.",
+  "retired560SurfaceDetail": "Case 5 keeps the published key set until CAS; legacy withheld metadata is retired by the PS-2 database read contract.",
+  "cases": [
+    {
+      "id": "2208-covered-full-refresh",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "covered-full-refresh",
+        "original": {
+          "outcome": "succeeded",
+          "mode": "completed",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": true,
+          "detailGap": false,
+          "proof": "matching",
+          "retainedState": true,
+          "producer": "replace",
+          "intake": "replace",
+          "producerOnly": false,
+          "safe": true,
+          "id": "covered-full-refresh"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": ["items"]
+      },
+      "replace": true
+    },
+    {
+      "id": "2208-partial-outcome-other-stream-uncovered",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "partial-outcome-other-stream-uncovered",
+        "original": {
+          "outcome": "partial",
+          "mode": "completed",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": true,
+          "detailGap": false,
+          "proof": "matching",
+          "retainedState": true,
+          "producer": "replace",
+          "intake": "merge",
+          "producerOnly": false,
+          "safe": true,
+          "id": "partial-outcome-other-stream-uncovered"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "partial",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": ["items"]
+      },
+      "replace": true
+    },
+    {
+      "id": "2208-certified-failed-done",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "certified-failed-done",
+        "original": {
+          "outcome": "partial",
+          "mode": "certified_failed_done",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": true,
+          "detailGap": false,
+          "proof": "matching",
+          "retainedState": true,
+          "producer": "replace",
+          "intake": "merge",
+          "producerOnly": false,
+          "safe": true,
+          "id": "certified-failed-done"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "partial",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": []
+      },
+      "replace": false
+    },
+    {
+      "id": "2208-failed-done-upsert-only",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "failed-done-upsert-only",
+        "original": {
+          "outcome": "partial",
+          "mode": "failed_done_upsert_only",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": false,
+          "detailGap": false,
+          "proof": "matching",
+          "retainedState": true,
+          "producer": "merge",
+          "intake": "merge",
+          "producerOnly": false,
+          "safe": true,
+          "id": "failed-done-upsert-only"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "partial",
+        "collectionMode": "full_refresh",
+        "coveredStreams": [],
+        "provenFullStreams": []
+      },
+      "replace": false
+    },
+    {
+      "id": "2208-retry-pending",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "retry-pending",
+        "original": {
+          "outcome": "retry_pending",
+          "mode": "completed",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": false,
+          "detailGap": false,
+          "proof": "matching",
+          "retainedState": true,
+          "producer": "replace",
+          "intake": "merge",
+          "producerOnly": false,
+          "safe": true,
+          "id": "retry-pending"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "retry_pending",
+        "collectionMode": "full_refresh",
+        "coveredStreams": [],
+        "provenFullStreams": ["items"]
+      },
+      "replace": false
+    },
+    {
+      "id": "2208-incremental-with-retained-state",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "incremental-with-retained-state",
+        "original": {
+          "outcome": "succeeded",
+          "mode": "completed",
+          "collection": "incremental",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": true,
+          "detailGap": false,
+          "proof": "matching",
+          "retainedState": true,
+          "producer": "merge",
+          "intake": "merge",
+          "producerOnly": false,
+          "safe": true,
+          "id": "incremental-with-retained-state"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "incremental",
+        "coveredStreams": ["items"],
+        "provenFullStreams": ["items"]
+      },
+      "replace": false
+    },
+    {
+      "id": "2208-incremental-without-state",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "incremental-without-state",
+        "original": {
+          "outcome": "succeeded",
+          "mode": "completed",
+          "collection": "incremental",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": true,
+          "detailGap": false,
+          "proof": "matching",
+          "retainedState": false,
+          "producer": "replace",
+          "intake": "merge",
+          "producerOnly": false,
+          "safe": true,
+          "id": "incremental-without-state"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "incremental",
+        "coveredStreams": ["items"],
+        "provenFullStreams": ["items"]
+      },
+      "replace": false
+    },
+    {
+      "id": "2208-time-range",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "time-range",
+        "original": {
+          "outcome": "succeeded",
+          "mode": "completed",
+          "collection": "full_refresh",
+          "timeRange": true,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": true,
+          "detailGap": false,
+          "proof": "matching",
+          "retainedState": true,
+          "producer": "merge",
+          "intake": "merge",
+          "producerOnly": false,
+          "safe": true,
+          "id": "time-range"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": []
+      },
+      "replace": false
+    },
+    {
+      "id": "2208-skipped-delete",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "skipped-delete",
+        "original": {
+          "outcome": "succeeded",
+          "mode": "completed",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": true,
+          "oversize": false,
+          "covered": true,
+          "detailGap": false,
+          "proof": "matching",
+          "retainedState": true,
+          "producer": "merge",
+          "intake": "merge",
+          "producerOnly": false,
+          "safe": true,
+          "id": "skipped-delete"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": []
+      },
+      "replace": false
+    },
+    {
+      "id": "2208-oversize-record",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "oversize-record",
+        "original": {
+          "outcome": "succeeded",
+          "mode": "completed",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": true,
+          "covered": true,
+          "detailGap": false,
+          "proof": "matching",
+          "retainedState": true,
+          "producer": "replace",
+          "intake": "merge",
+          "producerOnly": true,
+          "safe": true,
+          "id": "oversize-record"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": ["items"]
+      },
+      "replace": true
+    },
+    {
+      "id": "2208-covered-empty-proven",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "covered-empty-proven",
+        "original": {
+          "outcome": "succeeded",
+          "mode": "completed",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 0,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": true,
+          "detailGap": false,
+          "proof": "matching",
+          "retainedState": true,
+          "producer": "replace",
+          "intake": "merge",
+          "producerOnly": true,
+          "safe": true,
+          "id": "covered-empty-proven"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": []
+      },
+      "replace": false
+    },
+    {
+      "id": "2208-unproven-empty",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "unproven-empty",
+        "original": {
+          "outcome": "succeeded",
+          "mode": "completed",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 0,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": true,
+          "detailGap": false,
+          "proof": "none",
+          "retainedState": true,
+          "producer": "merge",
+          "intake": "merge",
+          "producerOnly": false,
+          "safe": true,
+          "id": "unproven-empty"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": []
+      },
+      "replace": false
+    },
+    {
+      "id": "2208-append-only-stream",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "append-only-stream",
+        "original": {
+          "outcome": "succeeded",
+          "mode": "completed",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "append_only",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": true,
+          "detailGap": false,
+          "proof": "matching",
+          "retainedState": true,
+          "producer": "merge",
+          "intake": "merge",
+          "producerOnly": false,
+          "safe": true,
+          "id": "append-only-stream"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": []
+      },
+      "replace": false
+    },
+    {
+      "id": "2208-detail-gap-no-proof",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "detail-gap-no-proof",
+        "original": {
+          "outcome": "succeeded",
+          "mode": "completed",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": false,
+          "detailGap": true,
+          "proof": "none",
+          "retainedState": true,
+          "producer": "merge",
+          "intake": "merge",
+          "producerOnly": false,
+          "safe": true,
+          "id": "detail-gap-no-proof"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": [],
+        "provenFullStreams": []
+      },
+      "replace": false
+    },
+    {
+      "id": "2208-detail-gap-with-proof",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "detail-gap-with-proof",
+        "original": {
+          "outcome": "succeeded",
+          "mode": "completed",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": false,
+          "detailGap": true,
+          "proof": "matching",
+          "retainedState": true,
+          "producer": "merge",
+          "intake": "merge",
+          "producerOnly": false,
+          "safe": true,
+          "id": "detail-gap-with-proof"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": [],
+        "provenFullStreams": []
+      },
+      "replace": false
+    },
+    {
+      "id": "2208-stream-not-covered",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "stream-not-covered",
+        "original": {
+          "outcome": "succeeded",
+          "mode": "completed",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": false,
+          "detailGap": false,
+          "proof": "none",
+          "retainedState": true,
+          "producer": "merge",
+          "intake": "merge",
+          "producerOnly": false,
+          "safe": true,
+          "id": "stream-not-covered"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": [],
+        "provenFullStreams": []
+      },
+      "replace": false
+    },
+    {
+      "id": "2208-no-completion-proof",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "no-completion-proof",
+        "original": {
+          "outcome": "succeeded",
+          "mode": "completed",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": true,
+          "detailGap": false,
+          "proof": "none",
+          "retainedState": true,
+          "producer": "merge",
+          "intake": "replace",
+          "producerOnly": true,
+          "safe": false,
+          "id": "no-completion-proof"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": []
+      },
+      "replace": false
+    },
+    {
+      "id": "2208-proof-does-not-match-records",
+      "source": {
+        "commit": "7c6c7b843cdd2be5530ada351a241920b8539303",
+        "path": "packages/server/src/stream-sync/replace-conformance.cases.json",
+        "case": "proof-does-not-match-records",
+        "original": {
+          "outcome": "succeeded",
+          "mode": "completed",
+          "collection": "full_refresh",
+          "timeRange": false,
+          "semantics": "mutable_state",
+          "records": 2,
+          "skippedDelete": false,
+          "oversize": false,
+          "covered": true,
+          "detailGap": false,
+          "proof": "mismatched",
+          "retainedState": true,
+          "producer": "merge",
+          "intake": "replace",
+          "producerOnly": true,
+          "safe": false,
+          "id": "proof-does-not-match-records"
+        }
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": []
+      },
+      "replace": false
+    },
+    {
+      "id": "560-case-1",
+      "source": {
+        "commit": "879b2eb8f17a60d01750fac6991c96f637bfa64d",
+        "path": "packages/core/src/stream-sync-read/covered-replace.test.ts",
+        "test": "drops a record the refresh omits, on the owner's other device"
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": ["items"]
+      },
+      "replace": true,
+      "publishedKeys": ["a"]
+    },
+    {
+      "id": "560-case-2",
+      "source": {
+        "commit": "879b2eb8f17a60d01750fac6991c96f637bfa64d",
+        "path": "packages/core/src/stream-sync-read/covered-replace.test.ts",
+        "test": "keeps a record when the same run is not marked covered"
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": [],
+        "provenFullStreams": []
+      },
+      "replace": false,
+      "publishedKeys": ["a", "b"]
+    },
+    {
+      "id": "560-case-3",
+      "source": {
+        "commit": "879b2eb8f17a60d01750fac6991c96f637bfa64d",
+        "path": "packages/core/src/stream-sync-read/covered-replace.test.ts",
+        "test": "keeps a record written after the refresh was collected, and drops an older one"
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": ["items"]
+      },
+      "replace": true,
+      "publishedKeys": ["a", "c"]
+    },
+    {
+      "id": "560-case-4",
+      "source": {
+        "commit": "879b2eb8f17a60d01750fac6991c96f637bfa64d",
+        "path": "packages/core/src/stream-sync-read/covered-replace.test.ts",
+        "test": "a refresh older than the head's newest write cannot remove it, and a merge run after it adds"
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": ["items"]
+      },
+      "replace": true,
+      "publishedKeys": ["a", "c"]
+    },
+    {
+      "id": "560-case-5",
+      "source": {
+        "commit": "879b2eb8f17a60d01750fac6991c96f637bfa64d",
+        "path": "packages/core/src/stream-sync-read/covered-replace.test.ts",
+        "test": "shows the old set, with the run withheld, until the owner's own refresh is imported"
+      },
+      "input": {
+        "stream": "items",
+        "outcome": "succeeded",
+        "collectionMode": "full_refresh",
+        "coveredStreams": ["items"],
+        "provenFullStreams": ["items"]
+      },
+      "replace": true,
+      "publishedKeys": ["a"]
+    }
+  ]
+}
