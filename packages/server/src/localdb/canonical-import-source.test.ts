@@ -39,14 +39,23 @@ function fixture() {
         stream: unknown ? "unknown" : "items",
         rows: 2,
       };
+      if (ambiguous)
+        yield {
+          sourceId: "urn:fixture",
+          instance: "other",
+          stream: "items",
+          rows: 2,
+        };
     },
     async assertRevision() {
       if (changed) throw new Error("source_changed");
     },
     async connections() {
       return [
-        { instance: "local", deleted: false },
-        ...(ambiguous ? [{ instance: "other", deleted: false }] : []),
+        { instance: "local", deleted: false, lastActive: 10 },
+        ...(ambiguous
+          ? [{ instance: "other", deleted: false, lastActive: 20 }]
+          : []),
       ];
     },
     async page(_instance, _stream, after, limit, maxBytes) {
@@ -62,6 +71,16 @@ function fixture() {
     owner: "owner",
     network: "network",
     revision: "revision",
+    bindings: new Map([
+      [
+        "fixture.items",
+        {
+          connector: "verified-connector",
+          streams: ["items"],
+          primaryKey: { items: ["id"] },
+        },
+      ],
+    ]),
     reader,
     resolveTarget: async () => ({
       connectionId: "known-control",
@@ -116,14 +135,30 @@ it("canonical-limit-pages", async () => {
   expect(await collect(s.records())).toEqual([{ id: "a" }, { id: "b" }]);
   expect(f.calls).toEqual(Array(4).fill(4 * 1024 * 1024));
 });
-it("canonical-ambiguous-instance-holds", async () => {
+it("canonical-selects-the-most-recently-active-instance", async () => {
   const f = fixture();
   f.ambiguous();
-  expect(await collect(createCanonicalImportSource(f.options))).toMatchObject([
-    { kind: "excluded", reason: "ambiguous_instance" },
-  ]);
+  const inventory = await collect(createCanonicalImportSource(f.options));
+  expect(inventory).toHaveLength(2);
+  expect(inventory[0]).toMatchObject({
+    kind: "excluded",
+    reason: "older_instance",
+    rows: 2,
+  });
+  expect(inventory[1]).not.toHaveProperty("kind");
+  expect(JSON.parse(inventory[1]!.source)[0]).toBe("other");
 });
-it("canonical-unkeyed-and-undeclared-hold", async () => {
+it("canonical-counts-stores-outside-the-frozen-bindings-without-reading", async () => {
+  const f = fixture();
+  expect(
+    await collect(
+      createCanonicalImportSource({ ...f.options, bindings: new Map() }),
+    ),
+  ).toMatchObject([{ kind: "excluded", reason: "unbound_store", rows: 2 }]);
+  expect(f.calls).toHaveLength(0);
+});
+
+it("canonical-unkeyed-and-undeclared-counted", async () => {
   const f = fixture();
   f.unknown();
   expect(await collect(createCanonicalImportSource(f.options))).toMatchObject([
@@ -182,7 +217,7 @@ it("canonical-iteration-is-backpressured", async () => {
   await iterator.return?.();
   expect(f.calls).toHaveLength(1);
 });
-it("canonical-unknown-target-holds-without-reading", async () => {
+it("canonical-unknown-target-counted-without-reading", async () => {
   const f = fixture();
   expect(
     await collect(

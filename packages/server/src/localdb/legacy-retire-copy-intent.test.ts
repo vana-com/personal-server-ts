@@ -123,11 +123,11 @@ it.each([false, true])(
       expect(await runLegacyRetireDryRun(options)).toMatchObject({
         mode: "dry-run",
         files: 1,
-        ready: 0,
+        ready: 1,
         deleted: 0,
       });
       expect(reports).toEqual([
-        expect.objectContaining({ file: "opaque", decision: "held" }),
+        expect.objectContaining({ file: "opaque", decision: "ready" }),
       ]);
     }
     expect(readFileSync(join(input, "local.sqlite"))).toEqual(before);

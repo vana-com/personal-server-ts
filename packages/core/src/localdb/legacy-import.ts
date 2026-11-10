@@ -16,7 +16,7 @@ import type { LocalSyncDeps } from "./deps.js";
 import type { ImportLedger } from "./import-ledger.js";
 import type { ImportReceipt, ImportSource } from "./legacy-import-types.js";
 
-/** F.2/C.0/F.5: refused/excluded never means the source is safe to erase. */
+/** Import refusals are diagnostics; copy removal has its own exact-byte fence. */
 export type LegacyImportResult =
   | {
       readonly kind: "imported" | "already-imported";

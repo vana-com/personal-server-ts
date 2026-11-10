@@ -180,9 +180,8 @@ export function createLegacyEraseLedger(
     nonempty(copy.contentHash) &&
     /^[0-9a-f]{64}$/.test(copy.contentHash) &&
     nonempty(copy.revision) &&
-    nonempty(copy.dataSet) &&
+    typeof copy.dataSet === "string" &&
     Array.isArray(copy.sources) &&
-    copy.sources.length > 0 &&
     copy.sources.every(
       (s) =>
         !!s &&

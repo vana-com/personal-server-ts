@@ -16,7 +16,7 @@ export interface ImportSource {
   readonly network: string;
   readonly revision: string;
   readonly target: ImportTarget;
-  /** Any exclusion holds all dependent legacy copies; never silently discard. */
+  /** Exclusions are counted and not imported; they never delay removal. */
   readonly exclusions: readonly { reason: string; rows: number }[];
   /** Replayable data objects, NOT PDPP envelopes. Use computeRecordKeyFromData
    * (storage/pdpp-records) for record_key, stream-sync pkHash for typed pk_hash,
@@ -51,7 +51,7 @@ export interface ImportReceipt extends ImportFingerprint {
   readonly at: number;
 }
 
-/** Exact local copy; erase must compare all fields under its storage lock. F.2. */
+/** Exact local copy; erase compares id/path/hash under its storage lock. F.2. */
 export interface LegacyCopy {
   readonly id: string;
   readonly path: string;
@@ -66,47 +66,20 @@ export interface LegacyCopy {
   }[];
 }
 
-/** F.2: compare every frozen bindings.ts data-set name, using a fixed projection time. */
-export interface ProjectionProof {
-  readonly dataSet: string;
-  readonly expectedHash: string;
-  readonly actualHash: string | null;
-  readonly pass: boolean;
-}
-
 /** The host supplies the frozen compatibility catalogue. Database modules
  * treat names as opaque and never discover or import connector projections. */
 export interface ImportProjectionBinding {
   readonly connector: string;
   readonly streams: readonly string[];
-  readonly primaryKey: Readonly<Record<string, readonly string[]>>;
-  readonly rowOrder?: "arrival";
-}
-export interface ImportProjectionRecord {
-  readonly stream: string;
-  readonly data: Record<string, unknown>;
 }
 export interface ImportProjectionPort {
   readonly bindings: ReadonlyMap<string, ImportProjectionBinding>;
-  /** Null means unavailable, incomplete or lossy. The host delegates to its
-   * existing projector; neither binding rules nor omission policy live here. */
-  project(
-    dataSet: string,
-    records: readonly ImportProjectionRecord[],
-    options: {
-      fetchedStreams: string[];
-      now: string;
-      orderByPrimaryKey: true;
-    },
-  ): Record<string, unknown> | null;
 }
 
-/** Fresh read-back of a source revision and optionally one exact local copy. F.2. */
+/** Diagnostic read-back of an imported source revision. F.2. */
 export interface ImportReadback {
   readonly receipt: ImportReceipt | null;
   readonly actual: ImportFingerprint;
-  readonly projections: readonly ProjectionProof[];
-  readonly copy: LegacyCopy | null;
   readonly pass: boolean;
   readonly reason: string | null;
 }
@@ -114,7 +87,7 @@ export interface ImportReadback {
 /** Per-copy report contains opaque ids and reasons, never paths or bodies. F.2/F.4. */
 export interface LegacyRetireFileReport {
   readonly file: string;
-  readonly decision: "held" | "ready" | "retired" | "changed";
+  readonly decision: "skipped" | "ready" | "retired" | "changed";
   readonly reason: string | null;
 }
 
@@ -124,10 +97,14 @@ export interface LegacyRetireReport {
   readonly files: number;
   readonly ready: number;
   readonly deleted: number;
+  /** Copies without an importable source. */
+  readonly unimported: number;
+  readonly readbackFailures: number;
+  readonly missing: number;
 }
 
 /** Undeclared/unbound inventory cannot invent an ImportTarget. Never import it;
- * every dependent copy remains held. Counts are inventory counts, not proof. */
+ * removal still includes these old stores. Counts are inventory counts, not proof. */
 export interface ImportExclusion {
   readonly kind: "excluded";
   readonly source: string;
@@ -136,10 +113,3 @@ export interface ImportExclusion {
   readonly rows: number;
 }
 export type ImportInventoryEntry = ImportSource | ImportExclusion;
-/** Yields exactly one complete stored legacy payload object (the envelope's
- * data, not its scope/time metadata and not individual projected entities).
- * Host rechecks id/path/raw hash before reading and at EOF; mutation refuses.
- * Missing, oversized or unparseable payload fails copy_unreadable. */
-export type CopyRecords = (
-  copy: LegacyCopy,
-) => AsyncIterable<Record<string, unknown>>;

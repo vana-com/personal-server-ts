@@ -20,7 +20,7 @@ export type ImportRow = {
 
 /** One operation's disk-sortable source view. Owns canonical row composition,
  * not key/hash algorithms: those stay at their existing PDPP/stream-sync owners.
- * Conflicting duplicates hold instead of choosing a record by device/order. */
+ * Conflicting duplicates refuse the import instead of choosing by device/order. */
 export async function stageImportSnapshot(
   db: SqlDriver,
   source: ImportSource,

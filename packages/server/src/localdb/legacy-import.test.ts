@@ -241,7 +241,7 @@ it("import-delete-between-batches-refuses", async () => {
   ]);
   expect(await f.db.query("SELECT * FROM import_ledger")).toEqual([]);
 });
-it("import-source-revision-changed-holds", async () => {
+it("import-source-revision-changed-refuses", async () => {
   const f = await fixture();
   let passes = 0;
   f.source.records = async function* () {
@@ -326,7 +326,7 @@ it("import-reopen-replay-preserves-receipt-and-sequence", async () => {
     await reopened.db.query("SELECT count(*) AS n FROM record_changes"),
   ).toEqual([{ n: 2 }]);
 });
-it("import-conflicting-duplicates-hold-and-identical-deduplicate", async () => {
+it("import-conflicting-duplicates-refuse-and-identical-deduplicate", async () => {
   const f = await fixture();
   f.setValues([
     { id: "a", value: 1 },
@@ -366,7 +366,7 @@ it("import-transaction-fence-closes-check-commit-race", async () => {
   expect(await f.db.query("SELECT * FROM records")).toEqual([]);
   expect(await f.db.query("SELECT * FROM import_ledger")).toEqual([]);
 });
-it("import-declaration-drift-holds", async () => {
+it("import-declaration-drift-refuses", async () => {
   const f = await fixture();
   await f.run();
   const changed = {

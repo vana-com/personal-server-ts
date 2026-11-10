@@ -29,7 +29,6 @@ import type {
   LegacyRetireOptions,
   LegacyRetireFileReport,
   LegacyRetireReport,
-  ImportProjectionDeps,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import type { LegacyAccess, LegacyAccessOptions } from "./legacy-access.js";
 
@@ -64,14 +63,11 @@ export interface LegacyRetireDryRunOptions {
     close(): Promise<void>;
   }>;
   readonly openAccess: (options: LegacyAccessOptions) => Promise<LegacyAccess>;
-  /** Caller composes fresh read-back with immutable peer sources and copyRecords.
+  /** Caller composes diagnostic read-back from immutable sources.
    * This capability cannot erase. All SQL reads use scratch deps. */
   readonly readBack: (
-    deps: ImportProjectionDeps,
-    access: Pick<
-      LegacyAccess,
-      "owner" | "network" | "sources" | "copies" | "copyRecords"
-    >,
+    deps: LocalSyncDeps,
+    access: Pick<LegacyAccess, "owner" | "network" | "sources" | "copies">,
   ) => LegacyRetireAccess["readBack"];
   readonly retire: (
     deps: LocalSyncDeps,
@@ -188,9 +184,8 @@ export async function runLegacyRetireDryRun(
     const unavailable = async (): Promise<never> => {
       throw new Error("dry_run_external_capability_refused");
     };
-    const deps: ImportProjectionDeps = {
+    const deps: LocalSyncDeps = {
       ...opened.deps,
-      importProjection: options.importProjection,
       registry: {
         read: unavailable,
         post: unavailable,
@@ -259,7 +254,6 @@ export async function runLegacyRetireDryRun(
       network: access.network,
       sources: access.sources.bind(access),
       copies: access.copies.bind(access),
-      copyRecords: access.copyRecords.bind(access),
     };
     const readBack = options.readBack(deps, readOnly);
     return await options.retire(
