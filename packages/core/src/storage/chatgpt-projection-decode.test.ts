@@ -355,6 +355,7 @@ function viewFixture(
   const authority: LegacyScopeAuthority = {
     listMethodConnections: () => [store.getInstanceBinding("test")],
     hasHeldData: () => true,
+    heldDataAvailable: () => true,
     readSnapshot: (read) => read(),
     writeClock: () => 1,
     arrivalRevision: () => 1,

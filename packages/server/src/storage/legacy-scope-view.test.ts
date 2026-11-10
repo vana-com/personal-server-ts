@@ -231,6 +231,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         },
       });
       expect(view.listingFor(scope)).toEqual({ kind: "refused" });
+      expect(view.ownsScope(scope)).toBe(true);
     }
   });
 
@@ -1761,11 +1762,14 @@ describe("legacy scope view over the real SQLite record store", () => {
       expectedGeneration: 1,
       nextMethod: "oura",
     });
-    // Reset erased the rows that showed ownership; ownership stays.
+    // Historical ownership must still protect callers outside scope deletion.
     expect(view.ownsScope("oura.activity")).toBe(true);
+    expect(view.blocksScopeDeletion("oura.activity")).toBe(false);
     expect((await view.readLatest("oura.activity")).kind).toBe("refused");
 
     store.deleteConnection("conn_a");
+    expect(view.ownsScope("oura.activity")).toBe(true);
+    expect(view.blocksScopeDeletion("oura.activity")).toBe(false);
     expect(await view.readLatest("oura.activity")).toEqual({
       kind: "refused",
       refusal: {
@@ -1774,6 +1778,29 @@ describe("legacy scope view over the real SQLite record store", () => {
         candidates: 0,
       },
     });
+  });
+
+  it("keeps a second scope protected when another connection is reset", () => {
+    connect(store, "conn_a", "oura");
+    connect(store, "conn_b", "oura-browser");
+    replace(store, "conn_a", "activity", ["a1"]);
+    replace(store, "conn_b", "readiness", ["b1"], { method: "oura-browser" });
+    store.resetInstanceBinding({
+      instance: "conn_a",
+      expectedMethod: "oura",
+      expectedGeneration: 1,
+      nextMethod: "oura",
+    });
+    expect(view.ownsScope("oura.readiness")).toBe(true);
+  });
+
+  it("protects rows retained by a deleted connection", () => {
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    db.prepare(
+      "UPDATE pdpp_instance_binding SET deleted_at = ? WHERE instance = ?",
+    ).run("2026-09-11T00:00:00Z", "conn_a");
+    expect(view.ownsScope("oura.activity")).toBe(true);
   });
 
   it("routes a shared public source by the configured method, not by a source name", async () => {
@@ -1836,6 +1863,7 @@ describe("legacy scope view over the real SQLite record store", () => {
       configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
     });
     for (const other of [unconfigured, unmounted]) {
+      expect(other.ownsScope("oura.activity")).toBe(true);
       expect(await other.readLatest("oura.activity")).toEqual({
         kind: "refused",
         refusal: {
@@ -2556,6 +2584,7 @@ describe("legacy scope view over the real SQLite record store", () => {
       deletion: "canonical",
     });
     expect(view.ownsScope("oura.activity")).toBe(true);
+    expect(view.blocksScopeDeletion("oura.activity")).toBe(false);
     expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
       [],
     );
@@ -2587,6 +2616,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect((await view.readLatest("oura.activity")).kind).toBe("refused");
     expect(view.listingFor("oura.activity")).toEqual({ kind: "refused" });
     expect(view.ownsScope("oura.activity")).toBe(true);
+    expect(view.blocksScopeDeletion("oura.activity")).toBe(false);
   });
 
   it("does not classify an explicitly produced legacy row as an old connector file", async () => {

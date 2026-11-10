@@ -108,7 +108,10 @@ import {
 import type { ReplicaWriterRotation } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
 import { rotateReplicaWriterIdentityAtBoot } from "./storage/pdpp-replica-writer-identity.js";
 import { createLegacyScopeAuthority } from "./storage/legacy-scope-authority.js";
-import { createScopeDeletionHistory } from "./storage/scope-deletion-history.js";
+import {
+  createScopeDeletionHistory,
+  migrateScopeDeletionHistory,
+} from "./storage/scope-deletion-history.js";
 import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
@@ -630,6 +633,8 @@ export async function createServer(
    * did before this existed.
    */
   let pdppImporterImpl: PdppImporter | null = null;
+  let deletionRecordStore: ReturnType<typeof openRecordStore> | undefined =
+    undefined;
   const pdppImporter: PdppImporter = {
     importEnvelope: (envelope) =>
       pdppImporterImpl?.importEnvelope(envelope) ?? { status: "skipped" },
@@ -649,12 +654,22 @@ export async function createServer(
     });
   // Read-side memory of tombstones, shared by the sync workers (which feed
   // it) and the data route (which consults it on every read).
+  // The replication door, once per boot and before any record store opens.
+  // A refused re-enable keeps the server ready, with the flag off.
+  const replication = resolveReplication(
+    db,
+    config.replication.enabled,
+    logger,
+  );
   const scopeDeletions = createScopeDeletionTracker({
     feed: dataPointFeed,
     serverOwner,
     logger,
     deletionHistory: serverOwner
-      ? createScopeDeletionHistory(db, serverOwner)
+      ? createScopeDeletionHistory(db, serverOwner, () => deletionRecordStore, {
+          replicationEnabled: replication.enabled,
+          logger,
+        })
       : undefined,
   });
 
@@ -907,8 +922,6 @@ export async function createServer(
         }
       },
     });
-    syncManager.start();
-    logger.info("Sync engine started");
   } else if (config.sync.enabled) {
     logger.warn(
       "Sync enabled in config but VANA_MASTER_KEY_SIGNATURE not set — sync disabled",
@@ -997,13 +1010,6 @@ export async function createServer(
     tokenStore,
   });
 
-  // The replication door, once per boot and before any record store opens.
-  // A refused re-enable keeps the server ready, with the flag off.
-  const replication = resolveReplication(
-    db,
-    config.replication.enabled,
-    logger,
-  );
   // A copied database must not continue its original's writer sequences.
   // Before any store of this boot captures a write.
   const replicaWriterRotation = rotateReplicaWriterIdentityAtBoot(db, {
@@ -1129,6 +1135,30 @@ export async function createServer(
       logger,
     }) ?? null;
 
+  const hasRecordRegistry =
+    db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pdpp_instance_binding'",
+      )
+      .get() !== undefined;
+  // Even a PDPP-disabled boot must apply deletion history to a retained registry.
+  // Opening the store runs its schema migration and stale-claim sweep before erasure.
+  deletionRecordStore =
+    pdppRecords?.bindingStore ??
+    (hasRecordRegistry
+      ? (replicaHost?.store ?? openRecordStore(db, replication.enabled))
+      : undefined);
+  if (serverOwner) {
+    migrateScopeDeletionHistory(db, serverOwner, deletionRecordStore, logger, {
+      dryRun: process.env.PS_SCOPE_DELETION_MIGRATION_DRY_RUN === "true",
+      replicationEnabled: replication.enabled,
+    });
+  }
+  if (syncManager) {
+    syncManager.start();
+    logger.info("Sync engine started");
+  }
+
   // Standard mode keeps MCP clients (e.g. a claude.ai connector) signed in
   // across restarts. Enclaves use the TEE ingress's own sealed state.
   const mcpState =
@@ -1141,6 +1171,7 @@ export async function createServer(
       : undefined;
 
   const app = createApp({
+    replicationEnabled: replication.enabled,
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
     // deployment already uses for operator surfaces (`PS_ACCESS_TOKEN`).

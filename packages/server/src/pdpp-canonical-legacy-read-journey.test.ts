@@ -13,6 +13,9 @@
 
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
 import type {
@@ -41,6 +44,8 @@ import {
   type ServerContext,
 } from "./bootstrap.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
+
+import * as deletedScopePolicy from "@opendatalabs/personal-server-ts-core/sync/deleted-scope-policy";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
@@ -135,6 +140,7 @@ interface BootOptions {
   payment?: boolean;
   dataPointFeed?: CreateServerOptions["dataPointFeed"];
   pdppEnabled?: boolean;
+  syncEnabled?: boolean;
 }
 
 async function boot(
@@ -144,6 +150,7 @@ async function boot(
     payment = false,
     dataPointFeed,
     pdppEnabled = true,
+    syncEnabled = false,
   }: BootOptions = {},
 ) {
   const dir = join(tempDir, "declarations");
@@ -160,10 +167,12 @@ async function boot(
       addedAt: "2026-01-21T10:00:00.000Z",
     } satisfies Builder),
     getGrant: vi.fn().mockResolvedValue(grant()),
+    getServer: vi.fn().mockResolvedValue(null),
   } as unknown as GatewayClient;
   return createServer(
     ServerConfigSchema.parse({
       tunnel: { enabled: false },
+      sync: { enabled: syncEnabled },
       payment: { enabled: payment },
       pdpp: {
         enabled: pdppEnabled,
@@ -222,9 +231,10 @@ async function replace(
   rows: Record<string, unknown>[],
   sourceCollectedAt: string | undefined,
   instance = accountOne,
+  generation = 1,
 ) {
   const response = await ctx!.app.request(
-    `/v1/streams/${stream}/records/replace?method=oura&binding_generation=1`,
+    `/v1/streams/${stream}/records/replace?method=oura&binding_generation=${generation}`,
     {
       method: "POST",
       headers: {
@@ -245,7 +255,7 @@ async function replace(
       }),
     },
   );
-  expect(response.status).toBe(200);
+  expect(response.status, await response.clone().text()).toBe(200);
 }
 
 async function upsert(token: string, data: Record<string, unknown>) {
@@ -682,6 +692,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
   it.each(["1", "0", "9007199254740992"])(
     "does not let a file-only re-add resurrect deleted canonical data or discovery (tombstone %s)",
     async (tombstoneVersion) => {
+      vi.stubEnv("PS_SCOPE_DELETION_MIGRATION_DRY_RUN", "true");
       let deleted = false;
       let registeredFile = false;
       let offline = false;
@@ -727,6 +738,26 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
         return response.json();
       };
       const before = await nativeRows();
+      // Simulate pre-upgrade history newer than this stale gateway observation.
+      // An equal known version now intentionally retries erasure (covered separately).
+      // This journey retains its old-history and file-only re-add assertions.
+      const historyDb = new Database(join(tempDir, "index.db"));
+      try {
+        historyDb
+          .prepare(
+            `INSERT INTO vana_scope_deletion_history (owner_address, scope, deleted_at, tombstone_version) VALUES (?, ?, ?, ?)`,
+          )
+          .run(
+            owner,
+            "oura.activity",
+            "2026-09-11T00:00:00Z",
+            tombstoneVersion === "0"
+              ? "0"
+              : String(BigInt(tombstoneVersion) + 1n),
+          );
+      } finally {
+        historyDb.close();
+      }
       deleted = true;
       expect((await ownerGet("/v1/data/oura.activity")).status).toBe(410);
 
@@ -837,21 +868,137 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     expect((await ownerGet("/v1/data/oura.activity")).status).toBe(200);
     await legacyWrite("oura.readiness", { readiness: [] });
     const token = await ownerPdppToken();
+    const bindingDb = new Database(join(tempDir, "index.db"), {
+      readonly: true,
+    });
+    const binding = bindingDb
+      .prepare(
+        "SELECT generation FROM pdpp_instance_binding WHERE instance = ?",
+      )
+      .get(accountOne) as { generation: number };
+    bindingDb.close();
     await replace(
       token,
       "activity",
-      [day("canonical-without-readd", "2026-09-10")],
+      [day("fresh-collection", "2026-09-10")],
       "2026-09-10T06:00:00Z",
+      accountOne,
+      binding.generation,
     );
-    expect((await ownerGet("/v1/data/oura.activity")).status).toBe(410);
-    expect((await builderGet("oura.activity")).status).toBe(410);
+    expect((await ownerGet("/v1/data/oura.activity")).status).toBe(200);
+    expect((await builderGet("oura.activity")).status).toBe(200);
     expect((await ownerGet("/v1/data/notes.manual")).status).toBe(200);
     expect((await ownerGet("/v1/data/oura.readiness")).status).toBe(200);
     expect(
       JSON.parse((await ownerGet("/v1/data")).text).scopes.map(
         (row: { scope: string }) => row.scope,
       ),
-    ).toEqual(["notes.manual", "oura.readiness"]);
+    ).toEqual(["notes.manual", "oura.activity", "oura.readiness"]);
+  });
+
+  it("requires a gateway re-add under erase-and-stop policy for reads and listing, even after reset", async () => {
+    const actualPolicy = deletedScopePolicy.deletedScopeNeedsGatewayReadd;
+    const override = vi
+      .spyOn(deletedScopePolicy, "deletedScopeNeedsGatewayReadd")
+      .mockImplementation(() => actualPolicy("erase-and-stop"));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let state: "deleted" | "missing" | "live" = "deleted";
+    let gatewayVersion = "1";
+    const scope = "oura.activity";
+    const dataPointFeed: NonNullable<CreateServerOptions["dataPointFeed"]> = {
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      getDataPoint: async ({ ownerAddress, scope: requested }) =>
+        requested !== scope || state === "missing"
+          ? null
+          : {
+              id: "policy-point",
+              ownerAddress,
+              scope,
+              dataHash: `0x${(state === "deleted" ? "00" : "11").repeat(32)}`,
+              metadataHash: `0x${(state === "deleted" ? "00" : "11").repeat(32)}`,
+              expectedVersion: gatewayVersion,
+              addedAt: "2026-09-01T00:00:00Z",
+              deletedAt: state === "deleted" ? "2026-09-11T00:00:00Z" : null,
+            },
+    };
+    try {
+      await ctx!.cleanup();
+      ctx = await boot("oura", { dataPointFeed });
+      const token = await ownerPdppToken();
+      expect((await ownerGet(`/v1/data/${scope}`)).status).toBe(410);
+      const bindingDb = new Database(join(tempDir, "index.db"), {
+        readonly: true,
+      });
+      const { generation } = bindingDb
+        .prepare(
+          "SELECT generation FROM pdpp_instance_binding WHERE instance = ?",
+        )
+        .get(accountOne) as { generation: number };
+      bindingDb.close();
+      await replace(
+        token,
+        "activity",
+        [day("recollected", "2026-09-15")],
+        "2026-09-15T06:00:00Z",
+        accountOne,
+        generation,
+      );
+      const assertHidden = async () => {
+        expect((await ownerGet(`/v1/data/${scope}`)).status).toBe(410);
+        expect((await builderGet(scope)).status).toBe(410);
+        const listing = await ownerGet("/v1/data");
+        expect(listing.status).toBe(200);
+        expect(
+          JSON.parse(listing.text).scopes.map(
+            (row: { scope: string }) => row.scope,
+          ),
+        ).not.toContain(scope);
+      };
+      await assertHidden();
+      const reset = await ctx!.app.request(
+        `/pdpp/instances/${encodeURIComponent(accountOne)}/reset`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            expected_method: "oura",
+            expected_generation: generation,
+            next_method: "oura",
+          }),
+        },
+      );
+      expect(reset.status).toBe(200);
+      await replace(
+        token,
+        "activity",
+        [day("after-reset", "2026-09-15")],
+        "2026-09-15T06:00:00Z",
+        accountOne,
+        generation + 1,
+      );
+      await assertHidden();
+      state = "missing";
+      vi.setSystemTime(Date.now() + 120_001);
+      await assertHidden();
+      state = "live";
+      vi.setSystemTime(Date.now() + 120_001);
+      await assertHidden(); // A live response at the deleted version is not a re-add.
+      gatewayVersion = "2";
+      vi.setSystemTime(Date.now() + 120_001);
+      expect((await ownerGet(`/v1/data/${scope}`)).status).toBe(200);
+      expect((await builderGet(scope)).status).toBe(200);
+      const listed = JSON.parse((await ownerGet("/v1/data")).text).scopes.map(
+        (row: { scope: string }) => row.scope,
+      );
+      expect(listed).toContain(scope);
+      expect(override).toHaveBeenCalled();
+    } finally {
+      override.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("serves canonical rows to a legacy grant and the owner after coverage", async () => {
@@ -1723,6 +1870,540 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     ]);
   });
 
+  it.each(["between entries", "inside transaction"])(
+    "keeps an unmarked scope hidden after a process kill %s and resumes on restart",
+    async (mode) => {
+      const token = await collectActivity();
+      await replace(
+        token,
+        "readiness",
+        [day("sibling", "2026-09-02")],
+        "2026-09-10T06:00:00Z",
+      );
+      await ctx!.cleanup();
+      ctx = undefined;
+      const dbPath = join(tempDir, "index.db");
+      const fixtureDb = new Database(dbPath);
+      try {
+        const insert = fixtureDb.prepare(
+          "INSERT INTO vana_scope_deletion_history (owner_address, scope, deleted_at, tombstone_version) VALUES (?, ?, ?, ?)",
+        );
+        insert.run(owner, "oura.activity", "2026-09-11T00:00:00Z", "2");
+        insert.run(owner, "oura.readiness", "2026-09-11T00:00:00Z", "2");
+        if (mode === "inside transaction")
+          fixtureDb.exec(
+            "CREATE TRIGGER interrupt_scope_erase BEFORE UPDATE OF generation ON pdpp_instance_binding WHEN OLD.generation = 2 BEGIN SELECT pause_test(); END",
+          );
+      } finally {
+        fixtureDb.close();
+      }
+      const base = join(process.cwd(), "packages/server/src/storage");
+      const storeUrl = pathToFileURL(
+        join(base, "pdpp-records-sqlite-store.ts"),
+      ).href;
+      const historyUrl = pathToFileURL(
+        join(base, "scope-deletion-history.ts"),
+      ).href;
+      const script = `
+        import Database from 'better-sqlite3';
+        import { writeSync } from 'node:fs';
+        import { createSqliteRecordStore } from ${JSON.stringify(storeUrl)};
+        import { migrateScopeDeletionHistory } from ${JSON.stringify(historyUrl)};
+        const db = new Database(${JSON.stringify(dbPath)});
+        const pause = () => { writeSync(1, 'READY\\n'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0); return 0; };
+        db.function('pause_test', pause);
+        const store = createSqliteRecordStore(db);
+        migrateScopeDeletionHistory(db, ${JSON.stringify(owner)}, store, {info(fields) { if (${JSON.stringify(mode)} === 'between entries' && fields.scope === 'oura.readiness') pause(); }, error() {}});
+      `;
+      const child = spawn(
+        process.execPath,
+        ["--import", "tsx", "--input-type=module", "--eval", script],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let errors = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (data: string) => {
+        errors += data;
+      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error(`migration child did not pause: ${errors}`)),
+            15_000,
+          );
+          child.stdout.setEncoding("utf8");
+          child.stdout.on("data", (data: string) => {
+            if (data.includes("READY")) {
+              clearTimeout(timer);
+              resolve();
+            }
+          });
+          child.once("error", (error) => {
+            clearTimeout(timer);
+            reject(error);
+          });
+          child.once("exit", () => {
+            clearTimeout(timer);
+            reject(new Error(`migration child exited: ${errors}`));
+          });
+        });
+      } finally {
+        if (child.exitCode === null && child.signalCode === null) {
+          const closed = once(child, "close");
+          child.kill("SIGKILL");
+          await closed;
+        }
+      }
+      vi.stubEnv("PS_SCOPE_DELETION_MIGRATION_DRY_RUN", "true");
+      ctx = await boot();
+      expect((await ownerGet("/v1/data/oura.readiness")).status).toBe(410);
+      await ctx.cleanup();
+      ctx = undefined;
+      const checkDb = new Database(dbPath);
+      try {
+        expect(
+          checkDb
+            .prepare(
+              "SELECT scope, erase_applied FROM vana_scope_deletion_history WHERE owner_address = ? ORDER BY scope",
+            )
+            .all(owner),
+        ).toEqual([
+          { scope: "oura.activity", erase_applied: 1 },
+          { scope: "oura.readiness", erase_applied: 0 },
+        ]);
+        expect(
+          checkDb
+            .prepare(
+              "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = 'readiness'",
+            )
+            .get(accountOne),
+        ).toEqual({ n: 1 });
+        if (mode === "inside transaction")
+          checkDb.exec("DROP TRIGGER interrupt_scope_erase");
+      } finally {
+        checkDb.close();
+      }
+      vi.stubEnv("PS_SCOPE_DELETION_MIGRATION_DRY_RUN", "false");
+      ctx = await boot();
+      const resumedDb = new Database(dbPath, { readonly: true });
+      try {
+        expect(
+          resumedDb
+            .prepare(
+              "SELECT erase_applied FROM vana_scope_deletion_history WHERE owner_address = ? AND scope = ?",
+            )
+            .get(owner, "oura.readiness"),
+        ).toEqual({ erase_applied: 1 });
+        expect(
+          resumedDb
+            .prepare(
+              "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = 'readiness'",
+            )
+            .get(accountOne),
+        ).toEqual({ n: 0 });
+      } finally {
+        resumedDb.close();
+      }
+    },
+    30_000,
+  );
+
+  it("keeps an interrupted migration hidden and resumes it after restart", async () => {
+    const token = await collectActivity();
+    await replace(
+      token,
+      "readiness",
+      [day("sibling", "2026-09-02")],
+      "2026-09-10T06:00:00Z",
+    );
+    const fixtureDb = new Database(join(tempDir, "index.db"));
+    try {
+      fixtureDb
+        .prepare(
+          "INSERT INTO vana_scope_deletion_history (owner_address, scope, deleted_at, tombstone_version) VALUES (?, ?, ?, ?)",
+        )
+        .run(owner, "oura.activity", "2026-09-11T00:00:00Z", "2");
+      fixtureDb.exec(
+        "CREATE TRIGGER interrupt_scope_erase BEFORE UPDATE OF generation ON pdpp_instance_binding BEGIN SELECT RAISE(ABORT, 'interrupted migration'); END",
+      );
+    } finally {
+      fixtureDb.close();
+    }
+    await ctx!.cleanup();
+    ctx = await boot();
+    expect((await ownerGet("/v1/data/oura.activity")).status).toBe(410);
+    const afterFailure = new Database(join(tempDir, "index.db"));
+    try {
+      expect(
+        afterFailure
+          .prepare(
+            "SELECT erase_applied FROM vana_scope_deletion_history WHERE owner_address = ? AND scope = ?",
+          )
+          .get(owner, "oura.activity"),
+      ).toEqual({ erase_applied: 0 });
+      expect(
+        afterFailure
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = 'activity'",
+          )
+          .get(accountOne),
+      ).toEqual({ n: 1 });
+      afterFailure.exec("DROP TRIGGER interrupt_scope_erase");
+    } finally {
+      afterFailure.close();
+    }
+    await ctx.cleanup();
+    ctx = await boot();
+    const afterRestart = new Database(join(tempDir, "index.db"), {
+      readonly: true,
+    });
+    try {
+      expect(
+        afterRestart
+          .prepare(
+            "SELECT erase_applied FROM vana_scope_deletion_history WHERE owner_address = ? AND scope = ?",
+          )
+          .get(owner, "oura.activity"),
+      ).toEqual({ erase_applied: 1 });
+      expect(
+        afterRestart
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = 'activity'",
+          )
+          .get(accountOne),
+      ).toEqual({ n: 0 });
+      expect(
+        afterRestart
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = 'readiness'",
+          )
+          .get(accountOne),
+      ).toEqual({ n: 1 });
+    } finally {
+      afterRestart.close();
+    }
+  });
+
+  it("keeps pre-upgrade unmarked deletion history hidden", async () => {
+    await collectActivity();
+    const db = new Database(join(tempDir, "index.db"));
+    try {
+      db.prepare(
+        `INSERT INTO vana_scope_deletion_history (owner_address, scope, deleted_at, tombstone_version) VALUES (?, ?, ?, ?)`,
+      ).run(owner, "oura.activity", "2026-09-11T00:00:00Z", "2");
+    } finally {
+      db.close();
+    }
+    const read = await ownerGet("/v1/data/oura.activity");
+    expect(read.status).toBe(410);
+    const listing = await ownerGet("/v1/data");
+    const body = JSON.parse(listing.text) as { scopes: { scope: string }[] };
+    expect(body.scopes.some((scope) => scope.scope === "oura.activity")).toBe(
+      false,
+    );
+  });
+
+  it("erases a newly observed deletion and keeps sibling records", async () => {
+    let deleted = false;
+    const dataPointFeed: NonNullable<CreateServerOptions["dataPointFeed"]> = {
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      getDataPoint: async ({ ownerAddress, scope }) =>
+        !deleted || scope !== "oura.activity"
+          ? null
+          : {
+              id: "point",
+              ownerAddress,
+              scope,
+              dataHash: `0x${"11".repeat(32)}`,
+              metadataHash: `0x${"22".repeat(32)}`,
+              expectedVersion: "2",
+              addedAt: "2026-09-01T00:00:00Z",
+              deletedAt: "2026-09-11T00:00:00Z",
+            },
+    };
+    await ctx!.cleanup();
+    ctx = await boot("oura", { dataPointFeed });
+    const token = await collectActivity();
+    await replace(
+      token,
+      "readiness",
+      [day("sibling", "2026-09-02")],
+      "2026-09-10T06:00:00Z",
+    );
+    deleted = true;
+    const listing = await ownerGet("/v1/data");
+    expect(JSON.parse(listing.text).scopes).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ scope: "oura.activity" }),
+      ]),
+    );
+    const read = await ownerGet("/v1/data/oura.activity");
+    const db = new Database(join(tempDir, "index.db"), { readonly: true });
+    try {
+      expect(
+        db
+          .prepare(
+            "SELECT erase_applied FROM vana_scope_deletion_history WHERE owner_address = ? AND scope = ?",
+          )
+          .get(owner, "oura.activity"),
+      ).toEqual({ erase_applied: 1 });
+      expect(
+        db
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = 'activity'",
+          )
+          .get(accountOne),
+      ).toEqual({ n: 0 });
+      expect(
+        db
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = 'readiness'",
+          )
+          .get(accountOne),
+      ).toEqual({ n: 1 });
+    } finally {
+      db.close();
+    }
+    expect(read.status, read.text).toBe(410);
+  });
+
+  it("serves new canonical records after durable scope deletion", async () => {
+    let deleted = false;
+    const dataPointFeed: NonNullable<CreateServerOptions["dataPointFeed"]> = {
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      getDataPoint: async ({ ownerAddress, scope }) => ({
+        id: "point",
+        ownerAddress,
+        scope,
+        dataHash: `0x${"11".repeat(32)}`,
+        metadataHash: `0x${"22".repeat(32)}`,
+        expectedVersion: deleted ? "2" : "1",
+        addedAt: "2026-09-01T00:00:00Z",
+        deletedAt: deleted ? "2026-09-11T00:00:00Z" : null,
+      }),
+    };
+    await ctx!.cleanup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (init?.method === "GET") {
+          const request = new URL(url);
+          return new Response(
+            JSON.stringify({
+              data: {
+                dataPointId: request.pathname.split("/")[3],
+                ownerAddress: owner,
+                scope: request.searchParams.get("scope"),
+                head: null,
+                versions: [],
+              },
+              pagination: {
+                limit: Number(request.searchParams.get("limit")),
+                hasMore: false,
+                nextAfter: null,
+              },
+            }),
+          );
+        }
+        deleted = true;
+        return new Response(
+          JSON.stringify({
+            expectedVersion: "2",
+            deletedAt: "2026-09-11T00:00:00Z",
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+    try {
+      ctx = await boot("oura", { dataPointFeed, syncEnabled: true });
+      expect(ctx.syncManager).not.toBeNull();
+      await legacyWrite("oura.activity", COVERED_A1);
+      const token = await collectActivity();
+      const reset = await ctx.app.request(
+        `/pdpp/instances/${encodeURIComponent(accountOne)}/reset`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            expected_method: "oura",
+            expected_generation: 1,
+            next_method: "oura",
+          }),
+        },
+      );
+      expect(reset.status).toBe(200);
+      const deletion = await ctx.app.request("/v1/data/oura.activity", {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+      });
+      expect(deletion.status).toBe(200);
+      expect(await deletion.json()).toMatchObject({
+        durable: true,
+        steps: { gateway: { status: "ok" } },
+      });
+      const write = await ctx.app.request(
+        "/v1/streams/activity/records/replace?method=oura&binding_generation=3",
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            instance: accountOne,
+            emitted_at: "2026-09-12T12:00:00Z",
+            source_collected_at: "2026-09-12T06:00:00Z",
+            records: [
+              {
+                key: "fresh",
+                data: day("fresh", "2026-09-12"),
+                emitted_at: "2026-09-12T07:00:00Z",
+              },
+            ],
+          }),
+        },
+      );
+      expect(write.status).toBe(200);
+      const read = await ownerGet("/v1/data/oura.activity");
+      expect(read.status).toBe(200);
+      expect(ids(read.text)).toEqual(["fresh"]);
+      const listing = await ownerGet("/v1/data");
+      expect(JSON.parse(listing.text).scopes).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ scope: "oura.activity" }),
+        ]),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each(["reset", "delete"])(
+    "deletes the scope file after connection %s erases its rows",
+    async (action) => {
+      await legacyWrite("oura.activity", COVERED_A1);
+      const file = ctx!.indexManager.findLatestByScope("oura.activity")!;
+      const token = await collectActivity();
+      const erasure =
+        action === "reset"
+          ? await ctx!.app.request(
+              `/pdpp/instances/${encodeURIComponent(accountOne)}/reset`,
+              {
+                method: "POST",
+                headers: {
+                  authorization: `Bearer ${token}`,
+                  "content-type": "application/json",
+                },
+                body: JSON.stringify({
+                  expected_method: "oura",
+                  expected_generation: 1,
+                  next_method: "oura",
+                }),
+              },
+            )
+          : await ctx!.app.request(
+              `/pdpp/connections/${encodeURIComponent(accountOne)}`,
+              {
+                method: "DELETE",
+                headers: { authorization: `Bearer ${token}` },
+              },
+            );
+      expect(erasure.status).toBe(200);
+      const deletion = await ctx!.app.request("/v1/data/oura.activity", {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+      });
+      expect(deletion.status).toBe(200);
+      expect(
+        ctx!.indexManager.findLatestByScope("oura.activity"),
+      ).toBeUndefined();
+      await expect(
+        readFile(join(tempDir, "data", file.path)),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      const versions = await ownerGet("/v1/data/oura.activity/versions");
+      expect([200, 410]).toContain(versions.status);
+      if (versions.status === 200)
+        expect(JSON.parse(versions.text).versions).toEqual([]);
+
+      if (action === "reset") {
+        const write = await ctx!.app.request(
+          "/v1/streams/activity/records/replace?method=oura&binding_generation=2",
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${token}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              instance: accountOne,
+              emitted_at: "2026-09-11T12:00:00Z",
+              source_collected_at: "2026-09-11T06:00:00Z",
+              records: [
+                {
+                  key: "a2",
+                  data: day("a2", "2026-09-02"),
+                  emitted_at: "2026-09-11T07:00:00Z",
+                },
+              ],
+            }),
+          },
+        );
+        expect(write.status).toBe(200);
+        const read = await ownerGet("/v1/data/oura.activity");
+        expect(read.status).toBe(200);
+        expect(ids(read.text)).toEqual(["a2"]);
+        expect(
+          (
+            await ctx!.app.request("/v1/data/oura.activity", {
+              method: "DELETE",
+              headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+            })
+          ).status,
+        ).toBe(409);
+      }
+    },
+  );
+
+  it("keeps the scope file when another connection still holds rows", async () => {
+    await legacyWrite("oura.activity", COVERED_A1);
+    const token = await collectActivity();
+    await registerSecondAccount(token);
+    const secondToken = await ownerPdppToken(SECOND_ACCOUNT);
+    await replace(
+      secondToken,
+      "activity",
+      [day("b1", "2026-09-02")],
+      "2026-09-10T06:00:00Z",
+      SECOND_ACCOUNT,
+    );
+    const reset = await ctx!.app.request(
+      `/pdpp/instances/${encodeURIComponent(accountOne)}/reset`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          expected_method: "oura",
+          expected_generation: 1,
+          next_method: "oura",
+        }),
+      },
+    );
+    expect(reset.status).toBe(200);
+    const deletion = await ctx!.app.request("/v1/data/oura.activity", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+    expect(deletion.status).toBe(409);
+    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toBeDefined();
+  });
+
   it("refuses a local DELETE of a canonical scope and changes nothing", async () => {
     await legacyWrite("oura.activity", COVERED_A1);
     await legacyWrite("notes.manual", { text: "kept" });
@@ -1738,6 +2419,8 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     expect(await deletion.json()).toMatchObject({
       error: "CANONICAL_DELETE_UNSUPPORTED",
       scope: "oura.activity",
+      message:
+        'Scope "oura.activity" has connector records that this route cannot delete. Nothing was deleted. Reset or delete the connection to erase its records, then delete the scope.',
     });
     // Nothing was deleted, and nothing claims it was: the legacy history
     // and the canonical latest body are both as before.

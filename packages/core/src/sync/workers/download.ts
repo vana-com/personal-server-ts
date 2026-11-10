@@ -633,6 +633,8 @@ export async function downloadAll(
     { includeDeleted: true },
   );
 
+  let failed = false;
+
   // Feed the read-side deletion memory before any per-record work so a
   // tombstone is refused by reads even if its local reconcile below fails.
   // Only a listing with no further pages proves the memory complete: a
@@ -641,17 +643,32 @@ export async function downloadAll(
   // what re-validates remembered tombstones; an incremental pass does not.
   if (deps.scopeDeletions) {
     for (const dataPoint of dataPoints) {
-      const deletedAt = deletionTimestamp(dataPoint);
-      if (deletedAt !== null) {
-        deps.scopeDeletions.markDeleted(dataPoint.scope, {
-          deletedAt,
-          version: tombstoneVersion(dataPoint),
-        });
-      } else {
-        deps.scopeDeletions.markLive(dataPoint.scope);
+      try {
+        const deletedAt = deletionTimestamp(dataPoint);
+        if (deletedAt !== null) {
+          deps.scopeDeletions.markDeleted(dataPoint.scope, {
+            deletedAt,
+            version: tombstoneVersion(dataPoint),
+          });
+        } else {
+          deps.scopeDeletions.markLive(dataPoint.scope);
+        }
+      } catch (error) {
+        // Only a successfully persisted observation may be passed by the cursor.
+        // Continue the page so a broken scope does not starve the other scopes.
+        failed = true;
+        logger.error(
+          {
+            scope: dataPoint.scope,
+            instance: (error as { instance?: string } | null)?.instance,
+            stream: (error as { stream?: string } | null)?.stream,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          "Failed to persist scope deletion observation",
+        );
       }
     }
-    if (nextCursor === null) {
+    if (nextCursor === null && !failed) {
       deps.scopeDeletions.noteFeedSynced(undefined, {
         full: lastCursor === null,
       });
@@ -659,7 +676,6 @@ export async function downloadAll(
   }
 
   const results: DownloadResult[] = [];
-  let failed = false;
 
   // 3. Process each data point record
   for (const dataPoint of dataPoints) {
