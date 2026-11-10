@@ -2,7 +2,6 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { StreamSyncHomeClosedError } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createApp } from "./app.js";
 import { MissingAuthError } from "@opendatalabs/personal-server-ts-core/errors";
 import { initializeDatabase } from "./storage/index-schema.js";
@@ -377,37 +376,6 @@ describe("createApp", () => {
     expect((await refused.json()).error.errorCode).toBe("STREAM_SYNC_CLOSING");
     expect((await seed()).status).toBe(503);
     expect(intake.begin).not.toHaveBeenCalled();
-  });
-
-  it("answers 503 when the stream-sync home closes under a request already admitted", async () => {
-    const intake = {
-      begin: vi.fn().mockRejectedValue(new StreamSyncHomeClosedError()),
-      batch: vi.fn(),
-      end: vi.fn(),
-      abort: vi.fn(),
-    };
-    const app = createApp({
-      accountModeAuthority: fixedModeAuthority("unswitched"),
-      logger: pino({ level: "silent" }),
-      version: "0.0.1",
-      startedAt: new Date(),
-      indexManager,
-      hierarchyOptions: { dataDir: join(tempDir, "data") },
-      serverOrigin: SERVER_ORIGIN,
-      serverOwner: ownerWallet.address,
-      gateway: createMockGateway(),
-      accessLogWriter: createMockAccessLogWriter(),
-      accessLogReader: createMockAccessLogReader(),
-      accessToken: CONTROL_PLANE_TOKEN,
-      streamSyncIntake: intake,
-    });
-    const res = await app.request("/v1/stream-sync/runs/r1", {
-      method: "PUT",
-      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
-      body: "{}",
-    });
-    expect(res.status).toBe(503);
-    expect((await res.json()).error.errorCode).toBe("STREAM_SYNC_CLOSING");
   });
 
   it("GET /v1/mcp/activity returns the owner activity snapshot", async () => {

@@ -1,31 +1,25 @@
 /**
  * Run intake over HTTP (contract v2 §2): the route over the real adapter and
- * the real writer, with the in-memory exclusive-version registry and local
- * storage. Status codes are §2.6.
+ * the real SQLite intake/apply/publish owners and exclusive-version registry. Status codes are §2.6.
  */
 
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import {
-  createStreamSyncIntake,
+  createLocalSync,
+  openLocalDb,
+  connectionQueue,
+  type SqlDriver,
+} from "@opendatalabs/personal-server-ts-core/localdb";
+import {
+  createMemoryStreamSyncRegistry,
+  createMemoryStreamSyncBlobs,
   type IntakeDeclarations,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
-import {
-  OWNER,
-  activateControl,
-  createOracleEnv,
-  deleteConnection,
-  finishedOutcome,
-  artifactFor,
-  freshConnector,
-  readStream,
-  resolveTestArtifact,
-  startLocalStorage,
-  type OracleEnv,
-} from "../stream-sync/oracle.test-utils.js";
 import { canonicalJson } from "@opendatalabs/personal-server-ts-stream-sync";
+import { openBetterSqlite3 } from "../localdb/better-sqlite3-driver.js";
 import {
   MAX_BATCH_REQUEST_BYTES,
   streamSyncRunsRoutes,
@@ -38,28 +32,70 @@ const DECLARATIONS: Omit<IntakeDeclarations, "connector"> = {
 };
 const T0 = Date.UTC(2026, 10, 1);
 
-let storage: Awaited<ReturnType<typeof startLocalStorage>>;
-let env: OracleEnv;
-
-beforeAll(async () => {
-  storage = await startLocalStorage();
-  env = await createOracleEnv({
-    surface: "full",
-    backend: "fake",
-    storageUrl: storage.url,
-  });
+const OWNER = `0x${"12".repeat(20)}` as const;
+const drivers: SqlDriver[] = [];
+afterEach(async () => {
+  for (const db of drivers.splice(0)) await db.close();
 });
-afterAll(async () => {
-  await env.cleanup();
-  await storage.close();
-});
-
+let nextConnector = 0;
+const declarations = new Map<string, IntakeDeclarations>();
+const freshConnector = (_label: string) => `fixture-${++nextConnector}`;
+const artifactFor = (
+  connector: string,
+  shape: Omit<IntakeDeclarations, "connector">,
+) => {
+  const digest = `fixture-${connector}`;
+  declarations.set(digest, { connector, ...shape });
+  return digest;
+};
 async function build(device: string) {
-  const writer = await env.writer(device);
-  const intake = createStreamSyncIntake({
-    writer,
-    resolveArtifact: resolveTestArtifact,
-  });
+  const registry = createMemoryStreamSyncRegistry(),
+    blobs = createMemoryStreamSyncBlobs();
+  const open = async (name: string) => {
+    const db = await openLocalDb(openBetterSqlite3(":memory:"), {
+      owner: OWNER,
+      network: "test",
+      deviceId: name,
+    });
+    drivers.push(db);
+    return createLocalSync(
+      {
+        db,
+        queue: connectionQueue(),
+        ownerAddress: OWNER,
+        registry,
+        blobs,
+        keys: {
+          namespaceHmac: async () => new Uint8Array(32),
+          encrypt: async (_s, b) => b,
+          encryptPart: async (_s, b) => b,
+          decrypt: async (_s, b) => b,
+        },
+        signer: { signAddData: async () => "0x00" },
+        logger: { info: vi.fn(), warn: vi.fn() },
+        now: () => T0,
+        newOp: () => crypto.randomUUID(),
+      },
+      {
+        resolveArtifact: (d) => declarations.get(d) ?? null,
+        declaredStreams: () => ["items"],
+        olderVersionReads: () => true,
+      },
+    );
+  };
+  const sync = await open(device);
+  const intake = sync.intake;
+  const read = async (connector: string) => {
+    const peer = await open(device + "-peer");
+    await peer.apply();
+    const rows = new Map<string, unknown>();
+    for await (const record of peer.query.streamRecords(
+      `pdpp.${connector}~`,
+      "items",
+    ))
+      rows.set(record.recordKey, JSON.parse(record.body));
+    return rows;
+  };
   const outer = new Hono();
   outer.route(
     "/v1/stream-sync/runs",
@@ -94,7 +130,7 @@ async function build(device: string) {
       },
       body: typeof json === "string" ? json : JSON.stringify(json),
     });
-  return { writer, call };
+  return { sync, call, read };
 }
 
 const beginBody = (extra: Record<string, unknown> = {}) => {
@@ -110,7 +146,7 @@ const beginBody = (extra: Record<string, unknown> = {}) => {
 
 describe("stream-sync run intake route", () => {
   it("takes a run from begin to a published, readable stream", async () => {
-    const { writer, call } = await build("route-flow");
+    const { sync, call, read } = await build("route-flow");
     const body = beginBody();
     const begun = await call("PUT", "r1", body);
     expect(begun.status).toBe(200);
@@ -138,20 +174,12 @@ describe("stream-sync run intake route", () => {
     });
     expect(ended.status).toBe(200);
     expect(await ended.json()).toMatchObject({ result: "queued" });
-    await writer.cycle();
-    expect(finishedOutcome(await writer.status(), "r1")?.outcome?.kind).toBe(
-      "checkpointed",
-    );
-    const view = await readStream(
-      env.registry,
-      env.blobs,
-      body.connector,
-      "",
-      "items",
-    );
-    expect([
-      ...(view as { records: Map<string, unknown> }).records.keys(),
-    ]).toEqual(["a"]);
+    expect(
+      (await sync.cycle()).connections
+        .flatMap((c) => c.published)
+        .map((r) => r.outcome),
+    ).toEqual(["published"]);
+    expect([...(await read(body.connector)).keys()]).toEqual(["a"]);
   });
 
   it("answers each error with its contract status and name (§2.6)", async () => {
@@ -206,18 +234,19 @@ describe("stream-sync run intake route", () => {
   });
 
   it("answers a scheduled begin of a deleted connection 409 connection_stopped over HTTP (review P2-3)", async () => {
-    const { call } = await build("route-stopped");
+    const { sync, call } = await build("route-stopped");
     const body = beginBody();
     const connector = body.connector;
-    await activateControl(env.registry, connector, "");
-    await deleteConnection(env.registry, connector, "", []);
+    await sync.intake.begin("delete-setup", body);
+    await sync.deleter.requestConnectionDelete(connector);
+    expect(await sync.deleter.resumeDeletes()).toEqual([]);
     const res = await call("PUT", "stopped-1", body);
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ error: "connection_stopped" });
   });
 
   it("takes a 30 MiB record through the batch route and reads it back byte-exact", async () => {
-    const { writer, call } = await build("route-30mib");
+    const { sync, call, read } = await build("route-30mib");
     const body = beginBody();
     await call("PUT", "big1", body);
     const huge = { id: "huge", pad: 'é"\\}{'.repeat(5 * 1024 * 1024) };
@@ -239,20 +268,14 @@ describe("stream-sync run intake route", () => {
       lastBatch: 0,
     });
     expect(ended.status).toBe(200);
-    await writer.cycle();
-    expect(finishedOutcome(await writer.status(), "big1")?.outcome?.kind).toBe(
-      "checkpointed",
-    );
-    const view = await readStream(
-      env.registry,
-      env.blobs,
-      body.connector,
-      "",
-      "items",
-    );
-    if (!view || view === "tombstoned") throw new Error("stream missing");
-    expect([...view.records.keys()].sort()).toEqual(["huge", "small", "tail"]);
-    expect(canonicalJson(view.records.get("huge"))).toBe(canonicalJson(huge));
+    expect(
+      (await sync.cycle()).connections
+        .flatMap((c) => c.published)
+        .map((r) => r.outcome),
+    ).toEqual(["published"]);
+    const view = await read(body.connector);
+    expect([...view.keys()].sort()).toEqual(["huge", "small", "tail"]);
+    expect(canonicalJson(view.get("huge"))).toBe(canonicalJson(huge));
   }, 120_000);
 
   it("refuses a request that declares a body over the ceiling", async () => {

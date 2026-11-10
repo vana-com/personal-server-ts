@@ -1,43 +1,31 @@
 /**
- * The Desktop seed route (§2.9) over the real staging files and the real
- * writer, with the in-memory exclusive-version registry and local storage.
+ * The Desktop seed route (§2.9) over the real staging files and its
+ * seed-status port. Database generation-1 publication is covered by P09.
  */
 
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
-import {
-  afterAll,
-  afterEach,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
-import type { StreamSyncWriter } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import type { SeedReceipt } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createFsStreamSyncFiles } from "../stream-sync/fs-files.js";
 import {
   createSeedStaging,
   type SeedStaging,
 } from "../stream-sync/seed-staging.js";
 import {
-  OWNER,
-  collect,
-  createOracleEnv,
-  freshConnector,
-  readStream,
-  startLocalStorage,
-  type OracleEnv,
-} from "../stream-sync/oracle.test-utils.js";
-import { streamSyncSeedRoutes } from "./stream-sync-seed.js";
+  streamSyncSeedRoutes,
+  type StreamSyncSeedRouteDeps,
+} from "./stream-sync-seed.js";
+const OWNER = `0x${"12".repeat(20)}` as const;
+type SeedStatusPort = NonNullable<
+  StreamSyncSeedRouteDeps["streamSyncSeed"]
+>["writer"];
 
 const TOKEN = "seed-route-test-token";
-const T0 = Date.UTC(2026, 10, 1);
 
 function gateway(): GatewayClient {
   return {
@@ -45,7 +33,7 @@ function gateway(): GatewayClient {
   } as unknown as GatewayClient;
 }
 
-function app(seed: { writer: StreamSyncWriter; staging: SeedStaging } | null) {
+function app(seed: { writer: SeedStatusPort; staging: SeedStaging } | null) {
   const outer = new Hono();
   outer.route(
     "/v1/stream-sync/seed",
@@ -100,38 +88,17 @@ function get(target: Hono, connector: string) {
 }
 
 describe("stream-sync seed route", () => {
-  let storage: Awaited<ReturnType<typeof startLocalStorage>>;
-  let env: OracleEnv;
   let root: string;
   let staging: SeedStaging;
-  let writer: StreamSyncWriter;
+  let writer: SeedStatusPort;
+  let status: { targetKnown: boolean; receipts: Record<string, SeedReceipt> };
   let routes: Hono;
-
-  beforeAll(async () => {
-    storage = await startLocalStorage();
-    env = await createOracleEnv({
-      surface: "full",
-      backend: "fake",
-      storageUrl: storage.url,
-    });
-  });
-
-  afterAll(async () => {
-    await env.cleanup();
-    await storage.close();
-  });
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "stream-sync-seed-route-"));
     staging = createSeedStaging(createFsStreamSyncFiles(join(root, "seed")));
-    let late: StreamSyncWriter | null = null;
-    writer = await env.writer(`desktop-${root.slice(-6)}`, {
-      seed: staging.source(await staging.installId(), async (c) =>
-        late ? await late.seedStatus(c) : { receipts: {}, skipped: [] },
-      ),
-    });
-    late = writer;
-    await writer.refreshControls();
+    status = { targetKnown: false, receipts: {} };
+    writer = { seedStatus: async () => status };
     routes = app({ writer, staging });
   });
 
@@ -217,28 +184,18 @@ describe("stream-sync seed route", () => {
     });
   });
 
-  it("merges the staged rows into the first generation-1 publish, then answers with the receipt", async () => {
-    const c = freshConnector("seed-route");
-    const staged = await put(
-      routes,
-      `${c}/history`,
-      body({ ...DESCRIPTOR, records: 2 }, ['{"id":"h1"}', '{"id":"h2"}']),
-    );
-    expect(staged.status).toBe(202);
-    // The run emits nothing for `history` (zero emission) and one row elsewhere.
-    await collect(writer, {
-      runId: "run-1",
-      connector: c,
-      observedAt: T0,
-      streams: { live: [{ id: "l1" }] },
-    });
-    await writer.publishPending();
-    const view = await readStream(env.registry, env.blobs, c, "", "history");
-    if (!view || view === "tombstoned")
-      throw new Error("seeded stream missing");
-    expect([...view.records.keys()].sort()).toEqual(["h1", "h2"]);
-    expect(view.head.complete).toBe(true);
-
+  it("returns an acknowledged receipt and removes its staged upload", async () => {
+    const c = "fixture";
+    expect(
+      (
+        await put(
+          routes,
+          `${c}/history`,
+          body({ ...DESCRIPTOR, records: 2 }, ['{"id":"h1"}', '{"id":"h2"}']),
+        )
+      ).status,
+    ).toBe(202);
+    status = { targetKnown: true, receipts: { history: "merged" } };
     const again = await put(
       routes,
       `${c}/history`,
@@ -246,7 +203,6 @@ describe("stream-sync seed route", () => {
     );
     expect(again.status).toBe(200);
     expect(await again.json()).toEqual({ state: "merged" });
-    // The receipt dropped the staged rows on the next listing.
     expect(await (await get(routes, c)).json()).toEqual({
       targetKnown: true,
       streams: { history: { state: "merged" } },

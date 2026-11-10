@@ -11,6 +11,7 @@ import {
   createMemoryStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
   createStreamSyncKeyPorts,
+  streamSyncNetwork,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { openBetterSqlite3 } from "../../server/src/localdb/better-sqlite3-driver.js";
@@ -57,10 +58,11 @@ async function fixture(
   const openDriver = vi.fn(async () =>
     available ? openBetterSqlite3(":memory:") : null,
   );
+  const config = ServerConfigSchema.parse({
+    streamSync: { write: false, read: false },
+  });
   const lite = await createPsLiteSyncManager({
-    config: ServerConfigSchema.parse({
-      streamSync: { write: false, read: false },
-    }),
+    config,
     autoStartSync: false,
     localDb: { openDriver },
     accountStorageMode: { owner: account.address, read: mode },
@@ -87,7 +89,7 @@ async function fixture(
   managers.push(lite);
   const db = await openLocalDb(openBetterSqlite3(":memory:"), {
     owner: account.address,
-    network: "test",
+    network: streamSyncNetwork(config.gateway),
     deviceId: "node",
   });
   drivers.push(db);

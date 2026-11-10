@@ -20,10 +20,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
-import {
-  StreamSyncHomeClosedError,
-  type RunIntake,
-} from "@opendatalabs/personal-server-ts-core/stream-sync";
+import type { RunIntake } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import {
@@ -1105,8 +1102,6 @@ export function createApp(deps: AppDeps): Hono {
 
   // Global error handler
   app.onError((err, c) => {
-    // A request admitted just before shutdown can meet the closed home.
-    if (err instanceof StreamSyncHomeClosedError) err = streamSyncClosing();
     if (err instanceof ProtocolError) {
       deps.logger.warn({ err }, err.message);
       return c.json(err.toJSON(), err.code as 401 | 403 | 413 | 503);

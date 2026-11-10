@@ -150,7 +150,6 @@ import {
 } from "./storage/node-data-storage.js";
 import { createSqliteQuestionStore } from "./storage/question-store.js";
 import {
-  type StreamSyncWriter,
   type RunIntake,
   type StreamSyncBlobs,
   type StreamSyncRegistry,
@@ -185,8 +184,8 @@ export interface ServerContext {
   serverAccount?: ServerAccount;
   serverSigner?: ServerSigner;
   syncManager: SyncManager | null;
-  /** Whole-file stream sync writer; `null` unless `streamSync.write` is on. */
-  streamSyncWriter: StreamSyncWriter | null;
+  /** Retired writer capability; database callers use getLocalSync. */
+  streamSyncWriter: null;
   /** Owner/network database composition; absent for enclaves and unconfigured owners. */
   getLocalSync?: () => Promise<LocalSync>;
   tunnelManager?: TunnelManager;
@@ -807,7 +806,7 @@ async function bootstrapServer(
 
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
-  const streamSyncWriter: StreamSyncWriter | null = null;
+  const streamSyncWriter = null;
   const streamSyncSeed = null;
   let backgroundClosed = false;
   let localSync: LocalSync | undefined;

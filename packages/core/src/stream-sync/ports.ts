@@ -10,6 +10,17 @@
 
 import type { ControlRead } from "@opendatalabs/personal-server-ts-stream-sync";
 
+/** The network a gateway deployment names: `vana:<chainId>:<origin>`. */
+export function streamSyncNetwork(gateway: {
+  readonly chainId: number;
+  readonly url: string;
+}): string {
+  return `vana:${gateway.chainId}:${new URL(gateway.url).origin}`;
+}
+
+/** Receipt contract retained for PS-3 seed staging, independent of the retired writer. */
+export type SeedReceipt = "merged";
+
 /** The body of an exclusive `POST /v1/data`, persisted byte-for-byte. */
 export interface SignedRegistryPost {
   readonly ownerAddress: string;

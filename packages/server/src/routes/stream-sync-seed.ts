@@ -19,7 +19,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
-import type { StreamSyncWriter } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import type { SeedReceipt } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { TokenStore } from "../token-store.js";
 import { createServerApiAuth } from "../api-auth.js";
@@ -39,7 +39,12 @@ export interface StreamSyncSeedRouteDeps {
   tokenStore?: TokenStore;
   /** Null when `streamSync.write` is off: every call answers 404. */
   streamSyncSeed: {
-    writer: StreamSyncWriter;
+    writer: {
+      seedStatus(connector: string): Promise<{
+        targetKnown: boolean;
+        receipts: Readonly<Record<string, SeedReceipt>>;
+      }>;
+    };
     staging: SeedStaging;
   } | null;
 }

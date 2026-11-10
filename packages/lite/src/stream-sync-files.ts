@@ -8,12 +8,7 @@
  * completes is durable, so both resolve only after `oncomplete`.
  */
 
-import {
-  bindStreamSyncHome,
-  createStreamSyncIoBarrier,
-  type StreamSyncFiles,
-  type StreamSyncHome,
-} from "@opendatalabs/personal-server-ts-core/stream-sync";
+import type { StreamSyncFiles } from "@opendatalabs/personal-server-ts-core/stream-sync";
 
 const STORE = "chunks";
 const SEP = "\u0001";
@@ -307,97 +302,6 @@ export function createIndexedDbStreamSyncFiles(
       store.delete(fileRange(prefix));
       store.delete(dirRange(prefix));
       await done(tx);
-    },
-  };
-}
-
-/** The part of `navigator.locks` the home needs. */
-export interface StreamSyncLocks {
-  request(
-    name: string,
-    options: { mode: "exclusive"; ifAvailable: true },
-    callback: (lock: unknown) => Promise<unknown>,
-  ): Promise<unknown>;
-}
-
-export interface IndexedDbStreamSyncHomeOptions {
-  readonly ownerAddress: `0x${string}`;
-  /** See `streamSyncNetwork`. */
-  readonly network: string;
-  readonly factory?: IDBFactory;
-  readonly keyRange?: typeof IDBKeyRange;
-  /** Defaults to `navigator.locks`. */
-  readonly locks?: StreamSyncLocks;
-}
-
-export interface IndexedDbStreamSyncHome {
-  readonly home: StreamSyncHome;
-  /**
-   * Release the lock once every file operation of the home (including open
-   * `readChunks` iterators) has finished, then close the database.
-   * Operations that start after `close` begins reject. Safe to call twice.
-   */
-  close(): Promise<void>;
-}
-
-/**
- * The stream-sync home of one (owner, network) on this origin: an IndexedDB
- * named after the home, and an exclusive Web Lock of the same name that stays
- * held until `close`. Resolves `null`, and holds nothing, when another
- * instance holds the lock or `navigator.locks` is missing: that instance runs
- * no stream sync (its legacy sync is unaffected). The old unbound database
- * ("ps-lite-stream-sync") is not read, migrated or deleted.
- */
-export async function openIndexedDbStreamSyncHome(
-  options: IndexedDbStreamSyncHomeOptions,
-): Promise<IndexedDbStreamSyncHome | null> {
-  const locks =
-    options.locks ??
-    (globalThis.navigator?.locks as StreamSyncLocks | undefined);
-  if (!locks) return null;
-  let files: (StreamSyncFiles & { close(): void }) | null = null;
-  // Every file operation of the home passes through this barrier, so none
-  // starts or ends after the lock is released (see core's io-barrier.ts).
-  const barrier = createStreamSyncIoBarrier();
-  const home = bindStreamSyncHome({
-    ownerAddress: options.ownerAddress,
-    network: options.network,
-    open: (id) => {
-      files = createIndexedDbStreamSyncFiles({
-        dbName: `ps-lite-stream-sync-${id}`,
-        factory: options.factory,
-        keyRange: options.keyRange,
-      });
-      return barrier.guard(files);
-    },
-  });
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const acquired = await new Promise<boolean>((resolve, reject) => {
-    locks
-      .request(
-        `ps-lite-stream-sync-${home.id}`,
-        { mode: "exclusive", ifAvailable: true },
-        async (lock) => {
-          resolve(lock !== null);
-          if (lock !== null) await held;
-        },
-      )
-      .catch(reject);
-  });
-  if (!acquired) {
-    (files as { close(): void } | null)?.close();
-    return null;
-  }
-  return {
-    home,
-    async close() {
-      // Drain first: the lock stays held while any file operation runs.
-      await barrier.shut();
-      (files as { close(): void } | null)?.close();
-      release();
     },
   };
 }
