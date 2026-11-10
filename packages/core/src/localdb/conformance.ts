@@ -14,6 +14,8 @@ import {
 } from "./index.js";
 import { MIGRATIONS } from "./schema.js";
 
+import { MIGRATIONS } from "./schema.js";
+
 const ID = { owner: "0xAbC", network: "moksha", deviceId: "dev-1" };
 
 /**
