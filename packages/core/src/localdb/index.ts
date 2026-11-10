@@ -58,6 +58,7 @@ export {
   type LocalAliasTarget,
   type LocalAliasRecord,
   type AliasScopes,
+  type AliasTargets,
 } from "./resolve.js";
 export {
   createLocalListing,

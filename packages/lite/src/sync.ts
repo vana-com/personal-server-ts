@@ -1,4 +1,7 @@
-import { legacyAliasScopes } from "@opendatalabs/personal-server-ts-core/legacy-projection";
+import {
+  LEGACY_SCOPE_BINDINGS,
+  legacyAliasScopes,
+} from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import type {
   OwnedAccountStorageMode,
   StreamSyncReadPort,
@@ -655,7 +658,8 @@ export async function createPsLiteSyncManager(
             partTargetBytes: LITE_PART_TARGET_BYTES,
           },
           {
-            aliasScopes: legacyAliasScopes,
+            aliasScopes: () => LEGACY_SCOPE_BINDINGS.keys(),
+            aliasTargets: legacyAliasScopes,
             resolveArtifact: options.streamSyncDeclarations ?? (() => null),
             declaredStreams: options.streamSyncDeclaredStreams,
             retainedManifests: options.streamSyncRetainedManifests,

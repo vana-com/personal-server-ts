@@ -17,6 +17,8 @@ const ports = vi.hoisted(() => ({
   cycle: vi.fn(),
   connection: vi.fn(),
   replace: vi.fn(() => false),
+  listing: vi.fn(),
+  resolver: vi.fn(),
 }));
 vi.mock("../../../core/src/localdb/run-intake.js", () => ({
   createRunIntakeStore: ports.intake,
@@ -45,14 +47,16 @@ vi.mock("../../../core/src/localdb/older-versions.js", () => ({
   }),
 }));
 vi.mock("../../../core/src/localdb/listing.js", () => ({
-  createLocalListing: () => ({
-    listScopes: vi.fn(),
-    status: vi.fn(),
-    cacheKey: vi.fn(),
-  }),
+  createLocalListing: (...args: unknown[]) => {
+    ports.listing(...args);
+    return { listScopes: vi.fn(), status: vi.fn(), cacheKey: vi.fn() };
+  },
 }));
 vi.mock("../../../core/src/localdb/resolve.js", () => ({
-  createLocalResolver: () => ({ resolve: vi.fn() }),
+  createLocalResolver: (...args: unknown[]) => {
+    ports.resolver(...args);
+    return { resolve: vi.fn() };
+  },
 }));
 
 const owner = ("0x" + "11".repeat(20)) as `0x${string}`;
@@ -135,7 +139,12 @@ describe("local sync intake adapter", () => {
     for (const db of drivers.splice(0)) await db.close();
   });
 
-  async function setup() {
+  async function setup(
+    aliases: Pick<
+      Parameters<typeof createLocalSync>[1],
+      "aliasScopes" | "aliasTargets"
+    > = {},
+  ) {
     const db = openBetterSqlite3(":memory:");
     drivers.push(db);
     await openLocalDb(db, { owner, network: "test", deviceId: "fixture" });
@@ -180,6 +189,7 @@ describe("local sync intake adapter", () => {
       resolveArtifact: () => declaration,
       declaredStreams: () => ["items"],
       olderVersionReads: () => true,
+      ...aliases,
     });
     return { db, deps, sync };
   }
@@ -189,6 +199,19 @@ describe("local sync intake adapter", () => {
       stream: "items",
       data: { id: `r${first + i}` },
     }));
+
+  it("forwards the host name enumerator to both resolver and pending listing dependency", async () => {
+    const aliasScopes = () => new Set(["fixture.alias"]).keys();
+    const aliasTargets = () => [];
+    await setup({ aliasScopes, aliasTargets });
+    const listingDeps = ports.listing.mock.calls[0][0];
+    const resolverParts = ports.resolver.mock.calls[0][1];
+    expect(listingDeps.aliasScopes).toBe(aliasScopes);
+    expect(resolverParts.aliasScopes).toBe(aliasScopes);
+    expect(resolverParts.aliasTargets).toBe(aliasTargets);
+    expect([...listingDeps.aliasScopes()]).toEqual(["fixture.alias"]);
+    expect([...listingDeps.aliasScopes()]).toEqual(["fixture.alias"]);
+  });
 
   it("uses the same HTTP-facing factory for a local intake without a file writer", async () => {
     const { sync } = await setup();

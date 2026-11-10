@@ -38,7 +38,10 @@ export interface LocalAliasRecord {
   readonly stream: string;
   readonly data: Record<string, unknown>;
 }
-export type AliasScopes = (scope: string) => readonly LocalAliasTarget[];
+/** Names admitted by the host; absent means no legacy aliases. */
+export type AliasScopes = () => Iterable<string>;
+/** The host supplies projection knowledge separately from name discovery. */
+export type AliasTargets = (scope: string) => readonly LocalAliasTarget[];
 type Target = {
   readonly connector: string;
   readonly streams: readonly string[];
@@ -220,6 +223,7 @@ export function createLocalResolver(
     readonly query: RecordQuery;
     readonly olderVersions: OlderVersions;
     readonly aliasScopes?: AliasScopes;
+    readonly aliasTargets?: AliasTargets;
   },
 ): LocalResolver {
   const completeReads = createOlderVersions(deps, { enabled: () => true });
@@ -382,9 +386,13 @@ export function createLocalResolver(
         return { kind: "invalid_cursor" };
       const scope = streamReadScope(input.scope) ?? input.scope;
       const logical = logicalStreamScopeParts(streamReadScope(scope) ?? "");
+      const aliases =
+        !logical && new Set(parts.aliasScopes?.() ?? []).has(scope)
+          ? (parts.aliasTargets?.(scope) ?? [])
+          : [];
       const targets: readonly Target[] = logical
         ? [{ connector: logical.connector, streams: [logical.stream] }]
-        : (parts.aliasScopes?.(scope) ?? []).map((alias) => ({
+        : aliases.map((alias) => ({
             connector: alias.connector,
             streams: alias.streams,
             alias,

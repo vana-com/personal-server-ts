@@ -155,7 +155,7 @@ async function fixture() {
     now: () => 5000,
     newOp: () => "test",
   } as unknown as LocalSyncDeps;
-  const aliasScopes = (scope: string) =>
+  const aliasTargets = (scope: string) =>
     mocked
       .targets(scope)
       .filter((target: { binding?: unknown }) => target.binding)
@@ -176,7 +176,8 @@ async function fixture() {
   const resolver = createLocalResolver(deps, {
     query,
     olderVersions,
-    aliasScopes,
+    aliasScopes: () => ["fixture.alias", "fixture.unsupported"].values(),
+    aliasTargets,
   });
   async function connection(
     control = "active",
@@ -302,6 +303,9 @@ describe("local resolve", () => {
     const isolated = createLocalResolver(f.deps, {
       query: f.query,
       olderVersions: f.olderVersions,
+      aliasTargets: () => {
+        throw new Error("Unlisted alias target consulted");
+      },
     });
     expect(verdict(await isolated.resolve(input("fixture.alias")))).toBe(
       "no_data",

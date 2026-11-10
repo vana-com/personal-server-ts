@@ -17,6 +17,7 @@ import {
   createLocalResolver,
   type LocalResolver,
   type AliasScopes,
+  type AliasTargets,
 } from "./resolve.js";
 import { createRunEndStore } from "./run-end.js";
 import { createRunIntakeStore } from "./run-intake.js";
@@ -51,6 +52,7 @@ export function createLocalSync(
   deps: LocalSyncDeps,
   options: {
     readonly aliasScopes?: AliasScopes;
+    readonly aliasTargets?: AliasTargets;
     readonly resolveArtifact: ResolveArtifact;
     readonly declaredStreams: (connector: string) => readonly string[];
     readonly retainedManifests?: () => readonly string[];
@@ -145,6 +147,11 @@ export function createLocalSync(
       deletes().requestConnectionDelete(connector),
     resumeDeletes: () => deletes().resumeDeletes(),
   };
+  const listingDeps = {
+    ...deps,
+    aliasScopes: options.aliasScopes,
+    aliasTargets: options.aliasTargets,
+  };
   let closing: Promise<void> | undefined;
   return {
     intake: runIntake,
@@ -153,8 +160,10 @@ export function createLocalSync(
       query,
       olderVersions,
       aliasScopes: options.aliasScopes,
+      aliasTargets: options.aliasTargets,
     }),
-    listing: createLocalListing(deps, () => olderVersions.counts()),
+    // wired with the listing alias port
+    listing: createLocalListing(listingDeps, () => olderVersions.counts()),
     query,
     history: createLocalHistory(deps, {
       olderVersionReads: options.olderVersionReads,
