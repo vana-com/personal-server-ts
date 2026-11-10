@@ -9,13 +9,22 @@ import {
   mkdtemp,
   rm,
 } from "node:fs/promises";
-import { resolve, join, dirname, relative, sep, basename } from "node:path";
+import {
+  resolve,
+  join,
+  dirname,
+  relative,
+  sep,
+  basename,
+  isAbsolute,
+} from "node:path";
 import { homedir } from "node:os";
 import { createLegacyEraseLedger } from "@opendatalabs/personal-server-ts-core/localdb";
 import type { Database } from "better-sqlite3";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type {
   LocalSyncDeps,
+  LegacyCopy,
   LegacyRetireAccess,
   LegacyRetireOptions,
   LegacyRetireFileReport,
@@ -27,6 +36,9 @@ import type { LegacyAccess, LegacyAccessOptions } from "./legacy-access.js";
 export interface LegacyRetireDryRunOptions {
   readonly copyRoot: string;
   readonly scratchRoot: string;
+  /** Trusted provenance of absolute intent paths in a byte copy. Defaults to
+   * the copied legacy store root. This path is mapped, never opened. */
+  readonly originalStoreRoot?: string;
   readonly owner: string;
   readonly network: string;
   readonly declarations: readonly DeclarationSnapshot[];
@@ -191,6 +203,24 @@ export async function runLegacyRetireDryRun(
       },
       signer: { signAddData: unavailable },
     };
+    const scratchStoreRoot = dirname(join(scratch, relative(input, legacy)));
+    const originalStoreRoot = resolve(
+      options.originalStoreRoot ?? dirname(legacy),
+    );
+    const journal = createLegacyEraseLedger(deps.db, deps.now);
+    const rebaseIntent = (copy: LegacyCopy, from: string, to: string) => {
+      const path = resolve(copy.path);
+      const suffix = relative(from, path);
+      if (
+        !isAbsolute(copy.path) ||
+        !suffix ||
+        suffix === ".." ||
+        suffix.startsWith(".." + sep) ||
+        isAbsolute(suffix)
+      )
+        throw new Error("dry_run_intent_path_refused");
+      return { ...copy, path: resolve(to, suffix) };
+    };
     access = await options.openAccess({
       db: opened.legacyDb,
       root: dirname(join(scratch, relative(input, legacy))),
@@ -201,7 +231,23 @@ export async function runLegacyRetireDryRun(
       isQuiescent: options.isQuiescent,
       verifyBinding: options.verifyBinding,
       legacyWriteSeal: options.legacyWriteSeal,
-      eraseLedger: createLegacyEraseLedger(deps.db, deps.now),
+      // Rebase only the copy's read capability. Never rewrite the input
+      // journal, and never grant journal mutation to a dry-run access adapter.
+      eraseLedger: {
+        belongsTo: (owner, network) => journal.belongsTo(owner, network),
+        has: (copy) =>
+          journal.has(rebaseIntent(copy, scratchStoreRoot, originalStoreRoot)),
+        async *pending() {
+          for await (const copy of journal.pending())
+            yield rebaseIntent(copy, originalStoreRoot, scratchStoreRoot);
+        },
+        record: async () => {
+          throw new Error("dry_run_erase_refused");
+        },
+        finish: async () => {
+          throw new Error("dry_run_erase_refused");
+        },
+      },
       resolveTarget: options.resolveTarget,
     });
     const readOnly = {
