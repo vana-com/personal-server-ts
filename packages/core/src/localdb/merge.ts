@@ -21,7 +21,7 @@ export function withOrigin(
  */
 export const TEMP_TABLES: readonly string[] = [
   `CREATE TEMP TABLE IF NOT EXISTS incoming (op TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL,
-    record_key TEXT NOT NULL, stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL, body TEXT NOT NULL, body_sha256 TEXT NOT NULL,
+    record_key TEXT NOT NULL, stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL, body TEXT NOT NULL, body_sha256 TEXT NOT NULL, first_o INTEGER,
     PRIMARY KEY (op, stream, pk_hash)) WITHOUT ROWID`,
   `CREATE TEMP TABLE IF NOT EXISTS apply_keys (op TEXT NOT NULL, pk_hash TEXT NOT NULL,
     PRIMARY KEY (op, pk_hash)) WITHOUT ROWID`,
@@ -33,7 +33,9 @@ const FIELDS = ["record_key", "stamp_o", "stamp_r", "body", "body_sha256"];
 /**
  * The only way rows enter `records`: rows staged in `incoming` under `op`.
  * A strictly newer stamp (o, then r) wins; an equal or older one changes
- * nothing and logs nothing. Clears the operation's `incoming` rows.
+ * no stamped fields and logs nothing. Independently, first_o is the minimum
+ * checkpoint with NULL as the bottom; imported rows have an unknown checkpoint.
+ * Clears the operation's `incoming` rows.
  */
 export function mergeIncoming(
   op: string,
@@ -43,6 +45,17 @@ export function mergeIncoming(
     `(SELECT i.${f} FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash)`;
   return [
     {
+      // This statement must not assign a column watched by records_au.
+      sql: `UPDATE records SET first_o = CASE
+   WHEN (SELECT origin FROM write_ctx WHERE id = 1) = 'import'
+     OR first_o IS NULL OR ${pick("first_o")} IS NULL THEN NULL
+   WHEN ${pick("first_o")} < first_o THEN ${pick("first_o")}
+   ELSE first_o END
+ WHERE connection_id = ?
+   AND EXISTS (SELECT 1 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash)`,
+      params: [op, op, op, connectionId, op],
+    },
+    {
       sql: `UPDATE records SET ${FIELDS.map((f) => `${f} = ${pick(f)}`).join(", ")}
  WHERE connection_id = ?
    AND EXISTS (SELECT 1 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash
@@ -50,8 +63,10 @@ export function mergeIncoming(
       params: [...FIELDS.map(() => op), connectionId, op],
     },
     {
-      sql: `INSERT INTO records (connection_id, stream, pk_hash, ${FIELDS.join(", ")})
-SELECT ?, i.stream, i.pk_hash, ${FIELDS.map((f) => `i.${f}`).join(", ")} FROM incoming i
+      sql: `INSERT INTO records (connection_id, stream, pk_hash, ${FIELDS.join(", ")}, first_o)
+SELECT ?, i.stream, i.pk_hash, ${FIELDS.map((f) => `i.${f}`).join(", ")},
+       CASE WHEN (SELECT origin FROM write_ctx WHERE id = 1) = 'import' THEN NULL ELSE i.first_o END
+ FROM incoming i
  WHERE i.op = ? AND NOT EXISTS (SELECT 1 FROM records r WHERE r.connection_id = ? AND r.stream = i.stream AND r.pk_hash = i.pk_hash)`,
       params: [connectionId, op, connectionId],
     },
