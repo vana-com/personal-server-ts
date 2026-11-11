@@ -193,4 +193,45 @@ describe("local database cycle", () => {
       ],
     ]);
   });
+
+  it("publishes the other connections while one is still failing", async () => {
+    const deps = dependencies();
+    vi.mocked(bootstrapConnections).mockResolvedValue(
+      ["slow-failure", "healthy"].map(connection),
+    );
+    vi.mocked(applyConnection).mockImplementation(async (_deps, id) =>
+      applied(id),
+    );
+    const healthyPublished = deferred();
+    vi.mocked(publishConnection).mockImplementation(async (_deps, id) => {
+      if (id === "healthy") {
+        healthyPublished.resolve();
+        return published(id);
+      }
+      // Storage keeps refusing this connection's reads; it fails late.
+      await healthyPublished.promise;
+      throw new Error(
+        "vana-storage download failed: 500 Internal Server Error",
+      );
+    });
+
+    const report = await runCycle(deps);
+
+    expect(report.connections).toEqual([
+      expect.objectContaining({
+        connectionId: "slow-failure",
+        published: [],
+        error: "vana-storage download failed: 500 Internal Server Error",
+      }),
+      expect.objectContaining({
+        connectionId: "healthy",
+        published: published("healthy"),
+        error: null,
+      }),
+    ]);
+    // The healthy connection published before the failing one gave up.
+    expect(vi.mocked(publishConnection).mock.calls.map(([, id]) => id)).toEqual(
+      ["slow-failure", "healthy"],
+    );
+  });
 });

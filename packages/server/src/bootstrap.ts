@@ -319,6 +319,11 @@ export interface CreateServerOptions {
    */
   streamSyncBlobs?: StreamSyncBlobs;
   /**
+   * Part size, in bytes, for published stream heads. Default: 4 MiB. A test
+   * lowers it to get a head of many parts from a small fixture.
+   */
+  streamSyncPartTargetBytes?: number;
+  /**
    * Rotate the replica writer identity before this boot writes anything
    * (host contract §3.2). A host sets it when this database may be a copy:
    * a restore, a clone, or a reinstall onto existing data. PS cannot detect
@@ -896,6 +901,9 @@ async function bootstrapServer(
           logger,
           now: Date.now,
           newOp: randomUUID,
+          ...(options?.streamSyncPartTargetBytes === undefined
+            ? {}
+            : { partTargetBytes: options.streamSyncPartTargetBytes }),
         };
         const facade = createServerLocalSync(deps, {
           resolveArtifact: (digest) =>
