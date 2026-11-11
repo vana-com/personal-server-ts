@@ -1,7 +1,10 @@
 import Database from "better-sqlite3";
 import { afterEach, expect, it, vi } from "vitest";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
-import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import {
+  createStatementCache,
+  openBetterSqlite3,
+} from "./better-sqlite3-driver.js";
 
 const opened: SqlDriver[] = [];
 afterEach(async () => {
@@ -14,34 +17,45 @@ function fixture() {
   return db;
 }
 
-it("reuses prepared reads and writes while rebinding every call", async () => {
+// The worker thread runs this same cache, so its reuse and eviction rules are
+// checked on the shared function, where Database.prototype can be spied on.
+function cacheFixture() {
+  const native = new Database(":memory:");
+  const cache = createStatementCache(native);
+  const run = (sql: string, ...params: unknown[]) => {
+    const stmt = cache.prepare(sql);
+    return stmt.reader ? stmt.all(...params) : stmt.run(...params);
+  };
+  return { run, close: () => native.close() };
+}
+
+it("reuses prepared reads and writes while rebinding every call", () => {
   const prepare = vi.spyOn(Database.prototype, "prepare");
-  const db = fixture();
-  await db.batch([
-    { sql: "CREATE TABLE items (id INTEGER PRIMARY KEY, body TEXT)" },
-  ]);
+  const { run, close } = cacheFixture();
+  run("CREATE TABLE items (id INTEGER PRIMARY KEY, body TEXT)");
   const insert = "INSERT INTO items VALUES (?, ?)";
   const select = "SELECT body FROM items WHERE id = ?";
   for (let i = 0; i < 500; i++) {
-    await db.batch([{ sql: insert, params: [i, `body-${i}`] }]);
-    expect(await db.query(select, [i])).toEqual([{ body: `body-${i}` }]);
+    run(insert, i, `body-${i}`);
+    expect(run(select, i)).toEqual([{ body: `body-${i}` }]);
   }
   expect(prepare.mock.calls.filter(([sql]) => sql === insert)).toHaveLength(1);
   expect(prepare.mock.calls.filter(([sql]) => sql === select)).toHaveLength(1);
+  close();
 });
 
-it("evicts old SQL instead of retaining every distinct statement", async () => {
+it("evicts old SQL instead of retaining every distinct statement", () => {
   const prepare = vi.spyOn(Database.prototype, "prepare");
-  const db = fixture();
+  const { run, close } = cacheFixture();
   const oldest = "SELECT ? AS value /* oldest */";
-  await db.query(oldest, [0]);
-  for (let i = 0; i < 256; i++)
-    await db.query(`SELECT ? AS value /* ${i} */`, [i]);
+  run(oldest, 0);
+  for (let i = 0; i < 256; i++) run(`SELECT ? AS value /* ${i} */`, i);
   const recent = "SELECT ? AS value /* 255 */";
-  expect(await db.query(recent, [1000])).toEqual([{ value: 1000 }]);
-  expect(await db.query(oldest, [2000])).toEqual([{ value: 2000 }]);
+  expect(run(recent, 1000)).toEqual([{ value: 1000 }]);
+  expect(run(oldest, 2000)).toEqual([{ value: 2000 }]);
   expect(prepare.mock.calls.filter(([sql]) => sql === recent)).toHaveLength(1);
   expect(prepare.mock.calls.filter(([sql]) => sql === oldest)).toHaveLength(2);
+  close();
 });
 
 it("keeps statement ownership local to each connection", async () => {
@@ -99,4 +113,43 @@ it("rolls back a failed batch and reuses its statements on the next batch", asyn
     { id: 2 },
     { id: 3 },
   ]);
+});
+
+it("hands blobs back as Buffers and keeps a native error's code", async () => {
+  const db = fixture();
+  await db.batch([
+    { sql: "CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB)" },
+    {
+      sql: "INSERT INTO blobs VALUES (1, ?)",
+      params: [new Uint8Array([1, 2])],
+    },
+  ]);
+  const [row] = await db.query<{ data: Uint8Array }>("SELECT data FROM blobs");
+  expect(Buffer.isBuffer(row!.data)).toBe(true);
+  expect([...row!.data]).toEqual([1, 2]);
+  await expect(
+    db.batch([{ sql: "INSERT INTO blobs VALUES (1, NULL)" }]),
+  ).rejects.toMatchObject({ code: "SQLITE_CONSTRAINT_PRIMARYKEY" });
+});
+
+it("runs calls made without awaiting in the order they were made", async () => {
+  const db = fixture();
+  await db.batch([{ sql: "CREATE TABLE log (n INTEGER)" }]);
+  await Promise.all(
+    Array.from({ length: 50 }, (_, n) =>
+      db.batch([{ sql: "INSERT INTO log VALUES (?)", params: [n] }]),
+    ),
+  );
+  const rows = await db.query<{ n: number }>(
+    "SELECT n FROM log ORDER BY rowid",
+  );
+  expect(rows.map((r) => r.n)).toEqual(Array.from({ length: 50 }, (_, n) => n));
+});
+
+it("rejects calls after close and reports a database that cannot open", async () => {
+  const db = openBetterSqlite3(":memory:");
+  await db.close();
+  await expect(db.query("SELECT 1")).rejects.toThrow("sqlite_driver_closed");
+  const broken = openBetterSqlite3("/nonexistent-directory/x.sqlite");
+  await expect(broken.query("SELECT 1")).rejects.toThrow();
 });

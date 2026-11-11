@@ -17,6 +17,8 @@ export default tseslint.config(
       "**/dist/**",
       "**/node_modules/**",
       "**/*.d.ts",
+      // Plain CommonJS the SQLite worker thread loads without a build step.
+      "packages/server/src/localdb/*.cjs",
       // Offline parity generator; never built or published.
       "packages/core/parity-oracle/**",
     ],

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   closeSync,
+  copyFileSync,
   mkdirSync,
   openSync,
   writeSync,
@@ -37,6 +38,13 @@ export function buildImportMemoryChild(root: string): string {
     target: "node22",
     logLevel: "silent",
   });
+  // The driver starts its SQLite worker from a file beside the code that runs
+  // it; a bundle has no such file, so place the worker next to the artifact.
+  for (const worker of ["better-sqlite3-worker.cjs", "statement-cache.cjs"])
+    copyFileSync(
+      fileURLToPath(new URL(`./${worker}`, import.meta.url)),
+      join(root, worker),
+    );
   return output;
 }
 
