@@ -57,6 +57,13 @@ export async function syncConnection(
     });
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause);
+    // The timer and `/sync/trigger` drop the report. A connection whose
+    // publish keeps failing would otherwise stay unpublished with no trace:
+    // its run ended as accepted, but nothing it holds becomes readable.
+    deps.logger.warn(
+      { connectionId, error },
+      "Stream sync cycle failed for a connection",
+    );
   }
   return { connectionId, applied, published, error };
 }

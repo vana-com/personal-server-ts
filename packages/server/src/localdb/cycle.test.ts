@@ -42,7 +42,11 @@ const published = (id: string) => [
   { stream: id, outcome: "published" as const, watermark: 1 },
 ];
 // The mocked siblings only need the real queue, not database or network ports.
-const dependencies = () => ({ queue: connectionQueue() }) as LocalSyncDeps;
+const dependencies = () =>
+  ({
+    queue: connectionQueue(),
+    logger: { info: vi.fn(), warn: vi.fn() },
+  }) as unknown as LocalSyncDeps;
 
 beforeEach(() => vi.resetAllMocks());
 
@@ -177,5 +181,16 @@ describe("local database cycle", () => {
     expect(vi.mocked(publishConnection).mock.calls.map(([, id]) => id)).toEqual(
       ["publish-fails", "succeeds"],
     );
+    // The failure is logged, not only returned: the timer drops the report.
+    expect(vi.mocked(deps.logger.warn).mock.calls).toEqual([
+      [
+        { connectionId: "apply-fails", error: "apply failed" },
+        "Stream sync cycle failed for a connection",
+      ],
+      [
+        { connectionId: "publish-fails", error: "publish failed" },
+        "Stream sync cycle failed for a connection",
+      ],
+    ]);
   });
 });
