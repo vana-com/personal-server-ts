@@ -91,6 +91,13 @@ export interface McpToolContext {
    * `request_scope_access`. Off: output is unchanged.
    */
   scopeRequestGuidance?: boolean;
+  /**
+   * Host option `mcpRequestableScopes`. Static scope ids Vana supports; with
+   * `scopeRequestGuidance` they are listed in the `request_scope_access`
+   * description. The same list for every owner, so it says nothing about
+   * what this user has.
+   */
+  requestableScopes?: string[];
 }
 
 export type McpToolResultContent =
@@ -794,6 +801,22 @@ async function resolveSearchScopes({
     skippedScopes: Array.from(new Set(skippedScopes)),
     errors,
   };
+}
+
+/**
+ * Under `scopeRequestGuidance`: appended to the server instructions and the
+ * `request_scope_access` description. Identical for every owner.
+ */
+export const SCOPE_REQUEST_GUIDANCE_TEXT =
+  " If the user's question needs data you were not granted, call request_scope_access with the scope ids you need. " +
+  "The user chooses in Vana; the response does not tell you whether that data exists.";
+
+/** Appended to the `request_scope_access` description with a host scope list. */
+export function requestableScopesDescription(scopes: string[]): string {
+  const ids = [...new Set(scopes)].sort();
+  return ids.length === 0
+    ? ""
+    : ` Scope ids Vana supports (not a list of what this user has): ${ids.join(", ")}`;
 }
 
 /** Appended to the `list_granted_scopes` description when `notShared` is on. */

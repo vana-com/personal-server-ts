@@ -256,6 +256,12 @@ export interface CreateServerOptions {
    */
   mcpScopeRequestGuidance?: boolean;
   /**
+   * Static scope ids Vana supports, listed in the `request_scope_access`
+   * description when `mcpScopeRequestGuidance` is on. Not a list of what the
+   * owner has.
+   */
+  mcpRequestableScopes?: string[];
+  /**
    * Lifetime in seconds of grants the server signs itself for MCP
    * connections: the OAuth approve path and a scope-request approve with no
    * live grant to inherit an expiry from (a live grant's expiry is always
@@ -1373,6 +1379,7 @@ export async function createServer(
     mcpScopeRequestApprovalUrl: options?.mcpScopeRequestApprovalUrl,
     mcpExposeUnsharedScopes: options?.mcpExposeUnsharedScopes,
     mcpScopeRequestGuidance: options?.mcpScopeRequestGuidance,
+    mcpRequestableScopes: options?.mcpRequestableScopes,
     mcpGrantTtlSeconds: options?.mcpGrantTtlSeconds,
     mcpConnectionStore: mcpState?.connections,
     mcpOAuthAuthorizationStore: mcpState?.authorizations,

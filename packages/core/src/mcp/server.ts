@@ -22,7 +22,9 @@ import {
   MAX_MCP_TOOL_TIMEOUT_MS,
   MCP_TOOLS,
   resolveGrantForScope,
+  SCOPE_REQUEST_GUIDANCE_TEXT,
   UNSHARED_SCOPES_INSTRUCTIONS,
+  requestableScopesDescription,
   UNSHARED_SCOPES_TOOL_DESCRIPTION,
   type McpToolContext,
   type McpToolResultContent,
@@ -53,6 +55,8 @@ export interface HandleMcpRequestOptions {
   verifyGrantsLive?: McpToolContext["verifyGrantsLive"];
   /** Host option; see `McpToolContext.scopeRequestGuidance`. Default off. */
   scopeRequestGuidance?: McpToolContext["scopeRequestGuidance"];
+  /** Host option; see `McpToolContext.requestableScopes`. */
+  requestableScopes?: McpToolContext["requestableScopes"];
   /** Emits one access record per denied data tool call; see reportToolDenial. */
   reporterDeps?: PersonalServerReadReporterDeps;
   serverName?: string;
@@ -416,14 +420,22 @@ function markResponsePreparing(
 /** What a client sees of a tool in `tools/list`: owner-independent metadata. */
 function toolConfig(
   tool: (typeof MCP_TOOLS)[number],
-  exposeUnsharedScopes = false,
+  flags: {
+    exposeUnsharedScopes?: boolean;
+    scopeRequestGuidance?: boolean;
+    requestableScopes?: string[];
+  } = {},
 ) {
+  let description = tool.description;
+  if (flags.exposeUnsharedScopes && tool.name === "list_granted_scopes")
+    description += UNSHARED_SCOPES_TOOL_DESCRIPTION;
+  if (flags.scopeRequestGuidance && tool.name === "request_scope_access") {
+    description += SCOPE_REQUEST_GUIDANCE_TEXT;
+    description += requestableScopesDescription(flags.requestableScopes ?? []);
+  }
   return {
     title: tool.title,
-    description:
-      exposeUnsharedScopes && tool.name === "list_granted_scopes"
-        ? tool.description + UNSHARED_SCOPES_TOOL_DESCRIPTION
-        : tool.description,
+    description,
     inputSchema: tool.inputSchema,
   };
 }
@@ -449,9 +461,10 @@ export function createMcpServerForConnection(
       version: options.serverVersion ?? DEFAULT_SERVER_VERSION,
     },
     {
-      instructions: options.exposeUnsharedScopes
-        ? MCP_SERVER_INSTRUCTIONS + UNSHARED_SCOPES_INSTRUCTIONS
-        : MCP_SERVER_INSTRUCTIONS,
+      instructions:
+        MCP_SERVER_INSTRUCTIONS +
+        (options.exposeUnsharedScopes ? UNSHARED_SCOPES_INSTRUCTIONS : "") +
+        (options.scopeRequestGuidance ? SCOPE_REQUEST_GUIDANCE_TEXT : ""),
     },
   );
   const pendingActivityFinishes = new Map<string, PendingActivityFinish>();
@@ -467,12 +480,17 @@ export function createMcpServerForConnection(
     exposeUnsharedScopes: options.exposeUnsharedScopes,
     verifyGrantsLive: options.verifyGrantsLive,
     scopeRequestGuidance: options.scopeRequestGuidance,
+    requestableScopes: options.requestableScopes,
   };
 
   for (const tool of MCP_TOOLS) {
     server.registerTool(
       tool.name,
-      toolConfig(tool, options.exposeUnsharedScopes),
+      toolConfig(tool, {
+        exposeUnsharedScopes: options.exposeUnsharedScopes,
+        scopeRequestGuidance: options.scopeRequestGuidance,
+        requestableScopes: options.requestableScopes,
+      }),
       async (args: Record<string, unknown>) => {
         const recorder = options.activityRecorder;
         const activityId = recorder

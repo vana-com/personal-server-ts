@@ -260,6 +260,8 @@ export interface AppDeps {
   mcpExposeUnsharedScopes?: boolean;
   /** See `CreateServerOptions.mcpScopeRequestGuidance`. */
   mcpScopeRequestGuidance?: boolean;
+  /** See `CreateServerOptions.mcpRequestableScopes`. */
+  mcpRequestableScopes?: string[];
   mcpActivityRecorder?: McpActivityRecorder;
   mcpHydrateScopes?: (scopes: string[]) => Promise<void>;
   /**
@@ -776,6 +778,7 @@ export function createApp(deps: AppDeps): Hono {
       serverOwner: deps.serverOwner,
     },
     mcpScopeRequestGuidance: deps.mcpScopeRequestGuidance,
+    mcpRequestableScopes: deps.mcpRequestableScopes,
     activityRecorder: mcpActivityRecorder,
     localApprovalPort: deps.localApprovalPort,
     serverPort: deps.serverPort,

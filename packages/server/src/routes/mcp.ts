@@ -196,6 +196,8 @@ export interface McpRouteDeps {
   >;
   /** Opt-in `nextAction` on read-side `scope_not_granted`. */
   mcpScopeRequestGuidance?: boolean;
+  /** Static scope ids listed in `request_scope_access` under guidance. */
+  mcpRequestableScopes?: string[];
   /**
    * MCP writes (`remember`): the store the data route redeems write sessions
    * from, and a dispatcher into the mounted data route. Absent: MCP stays
@@ -1190,6 +1192,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
           }
         : {}),
       scopeRequestGuidance: deps.mcpScopeRequestGuidance,
+      requestableScopes: deps.mcpRequestableScopes,
     });
     void store
       .update(record.id, { lastUsedAt: new Date().toISOString() })
