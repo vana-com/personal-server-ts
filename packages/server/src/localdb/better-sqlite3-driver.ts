@@ -1,3 +1,4 @@
+import { Worker } from "node:worker_threads";
 import Database from "better-sqlite3";
 import type {
   SqlDriver,
@@ -5,48 +6,100 @@ import type {
   SqlValue,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 
-const bind = (params: readonly SqlValue[] = []) =>
-  params.map((v) => (v instanceof Uint8Array ? Buffer.from(v) : v));
+export { createStatementCache } from "./statement-cache.cjs";
 
-/** Shared bounded native-statement owner for local SQL and borrowed legacy
- * handles. Callers clear the cache when their access lifetime ends. */
-export function createStatementCache(db: Database.Database): {
-  prepare(sql: string): Database.Statement;
-  clear(): void;
-} {
-  // Recompiling every row's SQL leaves native statement allocations waiting
-  // for V8 collection through long synchronous merge loops. Reuse a bounded,
-  // connection-local set; run/all reset statements and clear their bindings.
-  const statements = new Map<string, Database.Statement>();
-  const prepare = (sql: string) => {
-    let statement = statements.get(sql);
-    if (statement && !statement.busy) {
-      statements.delete(sql);
-      statements.set(sql, statement);
-      return statement;
-    }
-    statement = db.prepare(sql);
-    statements.set(sql, statement);
-    if (statements.size > 64)
-      statements.delete(statements.keys().next().value!);
-    return statement;
+interface WorkerReply {
+  readonly id: number;
+  readonly ok: boolean;
+  readonly result?: unknown;
+  readonly error?: {
+    name: string;
+    message: string;
+    stack?: string;
+    code?: string;
   };
-  return { prepare, clear: () => statements.clear() };
 }
 
+/** Structured clone turns a Buffer into a plain Uint8Array; callers read
+ * blobs as Buffers from the native driver, so restore that type. */
+const asBuffers = <R extends Record<string, SqlValue>>(rows: R[]): R[] => {
+  for (const row of rows)
+    for (const key in row) {
+      const v = row[key];
+      if (v instanceof Uint8Array && !Buffer.isBuffer(v))
+        (row as Record<string, SqlValue>)[key] = Buffer.from(
+          v.buffer,
+          v.byteOffset,
+          v.byteLength,
+        );
+    }
+  return rows;
+};
+
 /**
- * Node and Desktop driver. `batch` is a synchronous BEGIN IMMEDIATE ... COMMIT.
+ * Node and Desktop driver. A worker thread owns the one connection, so a
+ * long `batch` (a synchronous BEGIN IMMEDIATE ... COMMIT) never holds this
+ * thread's event loop, and every statement runs in order on one connection.
  * The process holds the file exclusively (`locking_mode=EXCLUSIVE`).
  * `path` is a file path, or `:memory:`.
  */
 export function openBetterSqlite3(path: string): SqlDriver {
-  const db = new Database(path);
-  const cache = createStatementCache(db);
-  const { prepare } = cache;
-  db.pragma("locking_mode = EXCLUSIVE");
-  const { v } = db.prepare("SELECT sqlite_version() AS v").get() as {
+  // Read the version here: `info` is synchronous and the worker is not up yet.
+  const probe = new Database(":memory:");
+  const { v } = probe.prepare("SELECT sqlite_version() AS v").get() as {
     v: string;
   };
+  probe.close();
+
+  const worker = new Worker(
+    new URL("./better-sqlite3-worker.cjs", import.meta.url),
+    {
+      workerData: { path },
+      // A small young generation makes V8 reclaim received messages early.
+      resourceLimits: { maxYoungGenerationSizeMb: 2 },
+    },
+  );
+  // An idle worker must not keep the process alive; pending calls re-ref it.
+  worker.unref();
+  const pending = new Map<
+    number,
+    { resolve(value: unknown): void; reject(error: Error): void }
+  >();
+  let nextId = 0;
+  let failure: Error | undefined;
+  const settle = (id: number, reply: WorkerReply) => {
+    const call = pending.get(id);
+    if (!call) return;
+    pending.delete(id);
+    if (pending.size === 0) worker.unref();
+    if (reply.ok) return call.resolve(reply.result);
+    const { name, message, stack, code } = reply.error!;
+    call.reject(Object.assign(new Error(message), { name, stack, code }));
+  };
+  worker.on("message", (reply: WorkerReply) => settle(reply.id, reply));
+  const fail = (error: Error) => {
+    failure ??= error;
+    for (const [id, call] of pending) {
+      pending.delete(id);
+      call.reject(error);
+    }
+  };
+  worker.on("error", fail);
+  worker.on("exit", (code) => {
+    if (!closed) fail(new Error(`sqlite_worker_exited_${code}`));
+  });
+  let closed = false;
+  const call = <T>(message: Record<string, unknown>): Promise<T> => {
+    if (failure) return Promise.reject(failure);
+    if (closed) return Promise.reject(new Error("sqlite_driver_closed"));
+    return new Promise<T>((resolve, reject) => {
+      const id = nextId++;
+      pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+      worker.ref();
+      worker.postMessage({ id, ...message });
+    });
+  };
+
   return {
     info: {
       sqliteVersion: v,
@@ -57,30 +110,18 @@ export function openBetterSqlite3(path: string): SqlDriver {
       sql: string,
       params?: readonly SqlValue[],
     ) {
-      const stmt = prepare(sql);
-      if (stmt.reader) return stmt.all(...bind(params)) as R[];
-      stmt.run(...bind(params));
-      return [];
+      return asBuffers(await call<R[]>({ op: "query", sql, params }));
     },
-    async batch(statements: readonly SqlStatement[]) {
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        const changes = statements.map((s) => {
-          const stmt = prepare(s.sql);
-          return stmt.reader
-            ? (stmt.all(...bind(s.params)), 0)
-            : stmt.run(...bind(s.params)).changes;
-        });
-        db.exec("COMMIT");
-        return { changes };
-      } catch (error) {
-        if (db.inTransaction) db.exec("ROLLBACK");
-        throw error;
-      }
+    batch(statements: readonly SqlStatement[]) {
+      return call<{ changes: readonly number[] }>({
+        op: "batch",
+        statements,
+      });
     },
     async close() {
-      cache.clear();
-      db.close();
+      await call({ op: "close" });
+      closed = true;
+      await worker.terminate();
     },
   };
 }
