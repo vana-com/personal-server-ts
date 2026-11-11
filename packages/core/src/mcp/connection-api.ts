@@ -11,6 +11,7 @@
  *
  *   POST   /v1/mcp/connections/:id/scope-request/approve
  *   POST   /v1/mcp/connections/:id/scope-request/deny
+ *   PUT    /v1/mcp/connections/:id/access (opt-in owner narrowing)
  *
  * and one read that is NOT owner-signed, because the owner's page needs it
  * before it asks for any signature:
@@ -23,6 +24,7 @@
  * approves them, and mark connections revoked.
  */
 
+import { McpGrantRegistrationError } from "./grant-registration.js";
 import { generateMcpGrantee } from "./grantee.js";
 import { createGrantContract } from "../contracts/index.js";
 import { isWriteScopeEntry, WRITE_SCOPE_PREFIX } from "../policy/data-write.js";
@@ -575,6 +577,7 @@ export interface ApproveMcpScopeAccessRequestInput {
 
 export interface ApproveMcpScopeAccessRequestOptions {
   store: McpConnectionStore;
+  /** Registration must reject failed writes; wrap SDK clients with withStrictMcpGrantRegistration. */
   gateway: Pick<GatewayClient, "getBuilder" | "getGrant" | "createGrant">;
   serverOwner?: `0x${string}`;
   serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
@@ -621,10 +624,55 @@ export async function approveMcpScopeAccessRequest(
     options.now,
   );
   const grantedScopes = sortedUnique([...live.scopes, ...approvedScopes]);
+
+  const decidedAt = nowIso(options.now);
+  const deniedScopes = pending.scopes.filter(
+    (scope) => !approvedScopes.includes(scope),
+  );
+  const { connection: updated, grantId } = await writeConnectionGrantScopes(
+    connection,
+    grantedScopes,
+    options,
+    live,
+    (latest) => ({
+      ...latest,
+      scopeAccessRequest: undefined,
+      scopeAccessDecision: {
+        decision: "approved",
+        approvedScopes,
+        deniedScopes,
+        requestedAt: pending.requestedAt,
+        decidedAt,
+      },
+    }),
+  );
+  return {
+    connection: updated,
+    grantId,
+    grantedScopes,
+    approvedScopes,
+    deniedScopes,
+  };
+}
+
+/** Register exact scopes, then commit only over the record version read before signing. */
+async function writeConnectionGrantScopes(
+  connection: McpConnectionRecord,
+  exactScopes: string[],
+  options: ApproveMcpScopeAccessRequestOptions,
+  liveState?: LiveGrantState,
+  finish: (record: McpConnectionRecord) => McpConnectionRecord = (record) =>
+    record,
+): Promise<{ connection: McpConnectionRecord; grantId: string }> {
+  // Approve supplies the snapshot used for its union: never re-read a newer
+  // version and sign it with scopes computed from an older gateway state.
+  const live =
+    liveState ??
+    (await readLiveGrantState(connection, options.gateway, options.now));
   // The gateway's scopes are inherited, not trusted: the whole array that
   // will be stored must pass, before any gateway call or store write.
   try {
-    assertStorableScopes(grantedScopes);
+    assertStorableScopes(exactScopes);
   } catch (err) {
     if (err instanceof McpInvalidScopeError) {
       throw new McpScopeRequestError("INVALID_SCOPE", err.message, 400);
@@ -647,21 +695,23 @@ export async function approveMcpScopeAccessRequest(
       serverSigner: options.serverSigner,
       body: {
         granteeAddress: connection.granteeAddress,
-        scopes: grantedScopes,
+        scopes: exactScopes,
         grantVersion: live.nextGrantVersion,
         ...(expiresAt !== undefined ? { expiresAt } : {}),
       },
     });
   } catch (err) {
     throw new McpScopeRequestError(
-      "GRANT_CREATION_FAILED",
+      err instanceof McpGrantRegistrationError && err.retryable
+        ? "RETRY"
+        : "GRANT_CREATION_FAILED",
       err instanceof Error ? err.message : String(err),
-      502,
+      err instanceof McpGrantRegistrationError && err.retryable ? 409 : 502,
     );
   }
   if (!grantResult.ok) {
     throw new McpScopeRequestError(
-      "GRANT_CREATION_FAILED",
+      grantResult.status === 409 ? "RETRY" : "GRANT_CREATION_FAILED",
       extractGrantErrorMessage(grantResult.body),
       grantResult.status >= 500 ? 502 : grantResult.status === 409 ? 409 : 400,
       grantResult.body,
@@ -677,48 +727,62 @@ export async function approveMcpScopeAccessRequest(
     );
   }
 
-  const decidedAt = nowIso(options.now);
-  const deniedScopes = pending.scopes.filter(
-    (scope) => !approvedScopes.includes(scope),
-  );
-  const updated = await options.store.mutate(input.connectionId, (latest) => {
-    // The grant above was signed from the state read before the gateway
-    // round trip; refuse to store it over a change made in between.
-    requirePendingScopeRequest(latest);
-    if (JSON.stringify(latest.grants) !== JSON.stringify(connection.grants)) {
+  const updated = await options.store.mutate(connection.id, (latest) => {
+    if (
+      (latest.revision ?? 0) !== (connection.revision ?? 0) ||
+      JSON.stringify(latest) !== JSON.stringify(connection)
+    ) {
       throw new McpScopeRequestError(
         "CONCURRENT_UPDATE",
-        "The connection's grants changed during approval; retry.",
+        "The connection changed during the grant write; retry.",
         409,
       );
     }
-    const decision: McpScopeAccessDecision = {
-      decision: "approved",
-      approvedScopes,
-      deniedScopes,
-      requestedAt: pending.requestedAt,
-      decidedAt,
-    };
-    return {
-      ...latest,
-      grants: [
-        {
-          grantId,
-          scopes: grantedScopes,
-        },
-      ],
-      scopeAccessRequest: undefined,
-      scopeAccessDecision: decision,
-    };
+    return finish({ ...latest, grants: [{ grantId, scopes: exactScopes }] });
   });
-  if (!updated) throw new McpConnectionNotFoundError(input.connectionId);
-  return {
-    connection: updated,
-    grantId,
-    grantedScopes,
-    approvedScopes,
-    deniedScopes,
-  };
+  if (!updated) throw new McpConnectionNotFoundError(connection.id);
+  return { connection: updated, grantId };
+}
+
+/** Owner replaces an approved connection's access with a non-empty subset. */
+export async function editMcpConnectionAccess(
+  input: { connectionId: string; scopes: unknown },
+  options: ApproveMcpScopeAccessRequestOptions,
+): Promise<McpConnectionRecord> {
+  const connection = await options.store.getById(input.connectionId);
+  if (!connection) throw new McpConnectionNotFoundError(input.connectionId);
+  if (connection.status !== "approved") {
+    throw new McpConnectionStateError(
+      connection.id,
+      connection.status,
+      "approved",
+    );
+  }
+  if (
+    !Array.isArray(input.scopes) ||
+    input.scopes.length === 0 ||
+    !input.scopes.every(
+      (scope) => typeof scope === "string" && scope.length > 0,
+    )
+  ) {
+    throw new McpScopeRequestError(
+      "INVALID_SCOPE",
+      "Provide a non-empty scopes array. Use Disconnect to remove all access.",
+    );
+  }
+  const scopes = sortedUnique(input.scopes as string[]);
+  const stored = sortedUnique(
+    connection.grants.flatMap((grant) => grant.scopes),
+  );
+  if (scopes.some((scope) => !stored.includes(scope))) {
+    throw new McpScopeRequestError(
+      "INVALID_SCOPE",
+      "Edits may only remove stored scopes. Request access to add a scope.",
+    );
+  }
+  if (JSON.stringify(scopes) === JSON.stringify(stored)) return connection;
+  return (await writeConnectionGrantScopes(connection, scopes, options))
+    .connection;
 }
 
 /** Owner declines the pending request; the decision stays for the client. */

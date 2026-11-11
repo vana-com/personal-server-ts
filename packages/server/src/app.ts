@@ -1,3 +1,4 @@
+import { withStrictMcpGrantRegistration } from "@opendatalabs/personal-server-ts-core/mcp";
 import { ouraRoutes } from "./routes/oura.js";
 import {
   streamSyncSeedRoutes,
@@ -260,6 +261,8 @@ export interface AppDeps {
   mcpExposeUnsharedScopes?: boolean;
   /** See `CreateServerOptions.mcpScopeRequestGuidance`. */
   mcpScopeRequestGuidance?: boolean;
+  /** Allow the owner to narrow connection scopes; default off. */
+  mcpOwnerAccessEdit?: boolean;
   /** See `CreateServerOptions.mcpRequestableScopes`. */
   mcpRequestableScopes?: string[];
   mcpActivityRecorder?: McpActivityRecorder;
@@ -753,7 +756,9 @@ export function createApp(deps: AppDeps): Hono {
     serverOwner: deps.serverOwner,
     serverAddress: deps.identity?.address,
     serverSigner: deps.serverSigner,
-    gateway: deps.gateway,
+    gateway: deps.gatewayConfig?.url
+      ? withStrictMcpGrantRegistration(deps.gateway, deps.gatewayConfig.url)
+      : deps.gateway,
     gatewayConfig: deps.gatewayConfig,
     paymentEnabled: deps.paymentEnabled,
     ownAppAccountUrl: deps.ownAppAccountUrl,
@@ -777,6 +782,7 @@ export function createApp(deps: AppDeps): Hono {
       scopeDeletions: deps.scopeDeletions,
       serverOwner: deps.serverOwner,
     },
+    mcpOwnerAccessEdit: deps.mcpOwnerAccessEdit,
     mcpScopeRequestGuidance: deps.mcpScopeRequestGuidance,
     mcpRequestableScopes: deps.mcpRequestableScopes,
     activityRecorder: mcpActivityRecorder,

@@ -497,13 +497,20 @@ export async function openMcpDurableState(options: {
         mutate((draft) => {
           const record = draft.connections[id];
           if (!record) return null;
-          return (draft.connections[id] = update(structuredClone(record)));
+          return (draft.connections[id] = {
+            ...update(structuredClone(record)),
+            revision: (record.revision ?? 0) + 1,
+          });
         }),
       update: (id, patch) =>
         mutate((draft) => {
           const record = draft.connections[id];
           if (!record) return null;
-          return (draft.connections[id] = { ...record, ...patch });
+          return (draft.connections[id] = {
+            ...record,
+            ...patch,
+            revision: (record.revision ?? 0) + 1,
+          });
         }),
     },
     authorizations: {

@@ -255,6 +255,8 @@ export interface CreateServerOptions {
    * `nextAction` telling the agent to call `request_scope_access`.
    */
   mcpScopeRequestGuidance?: boolean;
+  /** Allow the owner to narrow connection scopes; default off. */
+  mcpOwnerAccessEdit?: boolean;
   /**
    * Static scope ids Vana supports, listed in the `request_scope_access`
    * description when `mcpScopeRequestGuidance` is on. Not a list of what the
@@ -1378,6 +1380,7 @@ export async function createServer(
     mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,
     mcpScopeRequestApprovalUrl: options?.mcpScopeRequestApprovalUrl,
     mcpExposeUnsharedScopes: options?.mcpExposeUnsharedScopes,
+    mcpOwnerAccessEdit: options?.mcpOwnerAccessEdit,
     mcpScopeRequestGuidance: options?.mcpScopeRequestGuidance,
     mcpRequestableScopes: options?.mcpRequestableScopes,
     mcpGrantTtlSeconds: options?.mcpGrantTtlSeconds,

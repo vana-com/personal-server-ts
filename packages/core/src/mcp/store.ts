@@ -91,7 +91,10 @@ export function createInMemoryMcpConnectionStore(): McpConnectionStore {
     async mutate(id, update) {
       const record = byId.get(id);
       if (!record) return null;
-      const updated = update(structuredClone(record));
+      const updated = {
+        ...update(structuredClone(record)),
+        revision: (record.revision ?? 0) + 1,
+      };
       if (updated.tokenHash !== record.tokenHash) {
         byTokenHash.delete(record.tokenHash);
         byTokenHash.set(updated.tokenHash, id);
@@ -107,7 +110,11 @@ export function createInMemoryMcpConnectionStore(): McpConnectionStore {
         byTokenHash.delete(record.tokenHash);
         byTokenHash.set(patch.tokenHash, id);
       }
-      const updated = { ...record, ...patch };
+      const updated = {
+        ...record,
+        ...patch,
+        revision: (record.revision ?? 0) + 1,
+      };
       byId.set(id, updated);
       return { ...updated };
     },
