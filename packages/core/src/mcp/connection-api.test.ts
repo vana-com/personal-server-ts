@@ -883,6 +883,32 @@ describe("mcp/connection-api scope request answers", () => {
     );
   });
 
+  it("judges an inherited grant's expiry by the clock after its lookup returns", async () => {
+    const { store, id } = await connectionWithRequest([
+      { grantId: "0xgrant1", scopes: ["instagram.profile"] },
+      { grantId: "0xgrant-a", scopes: ["youtube.history"] },
+    ]);
+    let clockMs = Date.parse(DECIDED_AT);
+    const expiresAt = String(Math.floor(clockMs / 1000) + 1);
+    const gateway = gatewayMock();
+    gateway.getGrant.mockImplementation(async (grantId: string) => {
+      if (grantId !== "0xgrant-a") return liveGrant();
+      clockMs += 2000; // the lookup takes two seconds
+      return liveGrant({ id: grantId, scopes: ["youtube.history"], expiresAt });
+    });
+
+    await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["spotify.profile"] },
+      { ...approveOptions(store, gateway), now: () => new Date(clockMs) },
+    );
+
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopes: ["instagram.profile", "spotify.profile"],
+      }),
+    );
+  });
+
   it("signs a perpetual grant by default when there is no live grant to inherit from", async () => {
     const { store, id } = await connectionWithRequest();
     const gateway = gatewayMock(null);

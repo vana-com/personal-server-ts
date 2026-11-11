@@ -842,7 +842,6 @@ async function readLiveGrantState(
   gateway: Pick<GatewayClient, "getGrant">,
   now?: () => Date,
 ): Promise<LiveGrantState> {
-  const nowSeconds = Math.floor(nowMs(now) / 1000);
   const grantIds = sortedUnique(
     connection.grants.map((grant) => grant.grantId),
   );
@@ -868,6 +867,8 @@ async function readLiveGrantState(
     const liveExpiry = parseExpirySeconds(live.expiresAt);
     // Only a grant that is live now passes its scopes on; a revoked, expired
     // or missing one counts as never granted.
+    // The clock is read after this lookup returned, not before it started.
+    const nowSeconds = Math.floor(nowMs(now) / 1000);
     if (live.revokedAt || isGrantExpired(live, nowSeconds)) continue;
     for (const scope of live.scopes) scopes.add(scope);
     anyLive = true;
