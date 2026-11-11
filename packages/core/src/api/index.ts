@@ -1980,6 +1980,33 @@ function notifyReadGrantee(
   }
 }
 
+/**
+ * One page of every scope this server holds data for, under the filters the
+ * `GET /v1/data` listing applies (tombstones, canonical-only scopes, system
+ * scopes) but with no grant filter. In-process only: the caller must itself
+ * decide who may see the result (MCP exposes it only through `notShared`).
+ */
+export async function listOwnerVisibleScopes(
+  deps: PersonalServerDataApiDeps,
+  page: { limit: number; offset: number },
+): Promise<{ scopes: ScopeSummary[]; total: number }> {
+  const deletionDeadlineAtMs = Date.now() + 250;
+  const result = await listDataScopesContract({
+    storage: deps.storage,
+    limit: page.limit,
+    offset: page.offset,
+    isVisible: listingVisibility(deps, deletionDeadlineAtMs),
+    isListable: (scope) => !isSystemScope(scope),
+    extraScopes: canonicalOnlyScopes(deps, deletionDeadlineAtMs),
+  });
+  return {
+    scopes: result.response.scopes.map((summary) =>
+      withCanonicalListing(deps, summary),
+    ),
+    total: result.response.total,
+  };
+}
+
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,

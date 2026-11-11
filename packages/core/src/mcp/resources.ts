@@ -19,6 +19,8 @@ export interface RawScopeResourceParams {
 export interface RawScopeResourceContext {
   connection: McpConnectionRecord;
   readClient: McpDataReadClient;
+  /** Host option `mcpScopeRequestGuidance`: add `nextAction` to the refusal. */
+  scopeRequestGuidance?: boolean;
 }
 
 export function rawScopeResourceUri(params: RawScopeResourceParams): string {
@@ -91,6 +93,11 @@ export async function readRawScopeResource(
     throw new McpDataReadError(403, {
       error: "scope_not_granted",
       message: `Scope '${params.scope}' is not covered by this MCP connection.`,
+      ...(ctx.scopeRequestGuidance
+        ? {
+            nextAction: `Call request_scope_access with scopes ${JSON.stringify([params.scope])}, then ask the user to approve it in Vana.`,
+          }
+        : {}),
     });
   }
 

@@ -132,3 +132,34 @@ export function vanaWebMcpScopeRequestApprovalUrl(
       readToken: context.readToken,
     });
 }
+
+/**
+ * Hook from a host-supplied URL template such as
+ * `vana://mcp-scope-request?connection={connectionId}#t={token}`.
+ * `{connectionId}` is URL-encoded wherever it appears. `{token}` is allowed
+ * only after the `#`, so the read token never reaches a query, path or log
+ * line; the fragment is dropped when the request has no token. Throws on a
+ * template that puts `{token}` before the `#`.
+ */
+export function templateMcpScopeRequestApprovalUrl(
+  template: string,
+): McpScopeRequestApprovalUrlHook {
+  const hashAt = template.indexOf("#");
+  const base = hashAt === -1 ? template : template.slice(0, hashAt);
+  const fragment = hashAt === -1 ? "" : template.slice(hashAt + 1);
+  if (base.includes("{token}")) {
+    throw new Error(
+      "MCP scope request approval URL template may use {token} only after '#'",
+    );
+  }
+  return (connectionId, context) => {
+    const encodedId = encodeURIComponent(connectionId);
+    const url = base.replaceAll("{connectionId}", encodedId);
+    if (!fragment) return url;
+    if (fragment.includes("{token}") && !context.readToken) return url;
+    const filled = fragment
+      .replaceAll("{connectionId}", encodedId)
+      .replaceAll("{token}", encodeURIComponent(context.readToken ?? ""));
+    return `${url}#${filled}`;
+  };
+}

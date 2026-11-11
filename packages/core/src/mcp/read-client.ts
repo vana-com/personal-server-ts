@@ -37,6 +37,7 @@ import {
   assertScopeNotDeleted,
   handlePersonalServerDataRequest,
   isOwnerView,
+  listOwnerVisibleScopes,
   reportPersonalServerReadFulfillment,
   resolveReadDeletion,
   type PersonalServerDataApiDeps,
@@ -334,6 +335,15 @@ export interface McpDataReadClient {
   }): Promise<McpDataListResult>;
 
   /**
+   * Every scope this server holds data for, owner-wide and in process (no
+   * grantee signature, no grant filter): tombstoned and system scopes are
+   * left out, as in the data listing. Only `list_granted_scopes` calls it,
+   * and only when the host turned on `mcpExposeUnsharedScopes`. Optional:
+   * a client without it yields an empty `notShared`.
+   */
+  listOwnerScopes?(): Promise<ScopeSummary[]>;
+
+  /**
    * Return lightweight planning metadata for a scope using the storage index
    * only — no network call, no block read, no auth. Used by list_granted_scopes
    * to populate sizeBytes/sizeClass/recommendedAccess without reading data.
@@ -414,6 +424,10 @@ export interface McpDataReadClient {
       }
   >;
 }
+
+const OWNER_SCOPE_PAGE_SIZE = 200;
+/** Safety bound on one owner-wide enumeration. */
+const OWNER_SCOPE_LISTING_CAP = 5000;
 
 export interface McpDataListResult {
   status: number;
@@ -642,6 +656,20 @@ export function createMcpDataReadClient(
       }
 
       return { status: response.status, ...normalizeListScopesPayload(body) };
+    },
+
+    async listOwnerScopes() {
+      const all: ScopeSummary[] = [];
+      for (let offset = 0; all.length < OWNER_SCOPE_LISTING_CAP;) {
+        const page = await listOwnerVisibleScopes(options.dataApiDeps, {
+          limit: OWNER_SCOPE_PAGE_SIZE,
+          offset,
+        });
+        all.push(...page.scopes);
+        offset += OWNER_SCOPE_PAGE_SIZE;
+        if (offset >= page.total || page.scopes.length === 0) break;
+      }
+      return all;
     },
 
     async getScopeMetadata(scope: string): Promise<McpScopeMetadata | null> {

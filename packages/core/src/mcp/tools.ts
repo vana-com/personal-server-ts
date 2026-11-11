@@ -71,6 +71,19 @@ export interface McpToolContext {
    * the link can name the server that holds the request.
    */
   serverOrigin?: string;
+  /**
+   * Host option `mcpExposeUnsharedScopes`. On: `list_granted_scopes` adds
+   * `notShared`, the owner's scopes this connection holds no grant for. That
+   * tells an already-approved client which sources the owner has, so it is
+   * opt-in. Off: output is unchanged and no owner-wide listing is read.
+   */
+  exposeUnsharedScopes?: boolean;
+  /**
+   * Host option `mcpScopeRequestGuidance`. On: every read-side
+   * `scope_not_granted` carries a `nextAction` that names
+   * `request_scope_access`. Off: output is unchanged.
+   */
+  scopeRequestGuidance?: boolean;
 }
 
 export type McpToolResultContent =
@@ -776,6 +789,61 @@ async function resolveSearchScopes({
   };
 }
 
+/** Appended to the `list_granted_scopes` description when `notShared` is on. */
+export const UNSHARED_SCOPES_TOOL_DESCRIPTION =
+  " Also lists notShared: data the user has but has not shared with this client.";
+
+/** Appended to the server instructions when `notShared` is on. */
+export const UNSHARED_SCOPES_INSTRUCTIONS =
+  " list_granted_scopes also returns notShared: data the user has but has not shared with you. " +
+  "When the user asks about data in notShared, offer request_scope_access for it.";
+
+const DEFAULT_OWNER_SCOPE_TIMEOUT_MS = 5_000;
+
+/**
+ * Owner scopes with local data that no grant on the connection covers.
+ * Reserved, system, memory and write scopes never appear. Empty when the read
+ * client cannot list owner-wide or the listing fails: `notShared` is a hint
+ * and must not fail the tool.
+ */
+async function listNotSharedScopes(
+  connection: McpConnectionRecord,
+  readClient: McpDataReadClient,
+) {
+  if (typeof readClient.listOwnerScopes !== "function") return [];
+  let owned: Awaited<
+    ReturnType<NonNullable<typeof readClient.listOwnerScopes>>
+  >;
+  try {
+    owned = await withTimeout(
+      readClient.listOwnerScopes(),
+      DEFAULT_OWNER_SCOPE_TIMEOUT_MS,
+      "owner scope listing",
+    );
+  } catch {
+    return [];
+  }
+  return owned
+    .filter(
+      (summary) =>
+        isReadableScopeEntry(summary.scope) &&
+        !isMemoryScope(summary.scope) &&
+        !resolveGrantForScope(connection, summary.scope),
+    )
+    .sort((a, b) => (a.scope < b.scope ? -1 : a.scope > b.scope ? 1 : 0))
+    .map((summary) => ({
+      scope: summary.scope,
+      source: summary.scope.split(".")[0],
+      collectedAt: summary.latestCollectedAt,
+      dataStatus: summary.dataStatus ?? ("indexing" as const),
+    }));
+}
+
+/** The `nextAction` a read-side `scope_not_granted` carries under guidance. */
+function requestAccessNextAction(scopes: readonly string[]): string {
+  return `Call request_scope_access with scopes ${JSON.stringify(scopes)}, then ask the user to approve it in Vana.`;
+}
+
 const listGrantedSources: McpToolDefinition = {
   name: "list_granted_sources",
   title: "List granted sources",
@@ -793,7 +861,7 @@ const listGrantedScopes: McpToolDefinition = {
   description:
     "List granted scopes, readiness, size, and recommendedAccess. Call first.",
   inputSchema: {},
-  async handler(_args, { connection, readClient }) {
+  async handler(_args, { connection, readClient, exposeUnsharedScopes }) {
     const grantedScopes = uniqueScopes(connection);
     const scopeEntries = await Promise.all(
       grantedScopes.map(async (scope) => {
@@ -848,8 +916,12 @@ const listGrantedScopes: McpToolDefinition = {
     // Lets an agent that asked for more scopes see whether the owner has
     // answered yet without re-recording the request.
     const writableScopes = uniqueWritableScopes(connection);
+    const notShared = exposeUnsharedScopes
+      ? await listNotSharedScopes(connection, readClient)
+      : undefined;
     return textResult({
       scopes: scopeEntries,
+      ...(notShared ? { notShared } : {}),
       ...(writableScopes.length > 0 ? { writableScopes } : {}),
       ...(connection.scopeAccessRequest
         ? {
@@ -1015,7 +1087,7 @@ const readScope: McpToolDefinition = {
         "Base64 X-PAYMENT proof (x402). Provide it after a prior call returned payment_required.",
       ),
   },
-  async handler(args, { connection, readClient }) {
+  async handler(args, { connection, readClient, scopeRequestGuidance }) {
     const scope = typeof args.scope === "string" ? args.scope : null;
     if (!scope) {
       return textResult(
@@ -1030,6 +1102,9 @@ const readScope: McpToolDefinition = {
           error: "scope_not_granted",
           message: `Scope '${scope}' is not covered by any grant on this MCP connection.`,
           grantedScopes: uniqueScopes(connection),
+          ...(scopeRequestGuidance
+            ? { nextAction: requestAccessNextAction([scope]) }
+            : {}),
         },
         true,
       );
@@ -1217,7 +1292,7 @@ const listScopeBlocks: McpToolDefinition = {
     offset: z.number().int().min(0).optional(),
     limit: z.number().int().min(1).max(MAX_LIST_BLOCKS_LIMIT).optional(),
   },
-  async handler(args, { connection, readClient }) {
+  async handler(args, { connection, readClient, scopeRequestGuidance }) {
     const scope = typeof args.scope === "string" ? args.scope : null;
     if (!scope) {
       return textResult(
@@ -1232,6 +1307,9 @@ const listScopeBlocks: McpToolDefinition = {
           error: "scope_not_granted",
           message: `Scope '${scope}' is not covered by any grant on this MCP connection.`,
           grantedScopes: uniqueScopes(connection),
+          ...(scopeRequestGuidance
+            ? { nextAction: requestAccessNextAction([scope]) }
+            : {}),
         },
         true,
       );
@@ -1398,7 +1476,7 @@ const searchPersonalContext: McpToolDefinition = {
     timeoutMs: z.number().int().min(1000).max(MAX_SEARCH_TIMEOUT_MS).optional(),
     maxBytes: z.number().int().min(1).max(MAX_SEARCH_MAX_BYTES).optional(),
   },
-  async handler(args, { connection, readClient }) {
+  async handler(args, { connection, readClient, scopeRequestGuidance }) {
     const query = typeof args.query === "string" ? args.query.trim() : "";
     if (!query) {
       return textResult(
@@ -1481,6 +1559,9 @@ const searchPersonalContext: McpToolDefinition = {
     // `payment` proof, instead of burying the 402 as an opaque scope error.
     const paymentRequiredScopes: string[] = [];
     const errors = [...resolved.errors];
+    const deniedScopes = resolved.errors
+      .filter((e) => e.error === "scope_not_granted")
+      .map((e) => e.scope);
 
     // When resuming, start from the scope index encoded in the cursor
     const startScopeIndex = resumeCursor
@@ -1744,6 +1825,9 @@ const searchPersonalContext: McpToolDefinition = {
       ],
       truncatedScopes,
       errors,
+      ...(scopeRequestGuidance && deniedScopes.length > 0
+        ? { nextAction: requestAccessNextAction(deniedScopes) }
+        : {}),
       ...(paymentRequiredScopes.length > 0
         ? {
             payment_required: true,
@@ -1787,7 +1871,7 @@ const getScopeFile: McpToolDefinition = {
       .max(MAX_READ_FILE_TIMEOUT_MS)
       .optional(),
   },
-  async handler(args, { connection, readClient }) {
+  async handler(args, { connection, readClient, scopeRequestGuidance }) {
     const scope = typeof args.scope === "string" ? args.scope : null;
     if (!scope) {
       return textResult(
@@ -1802,6 +1886,9 @@ const getScopeFile: McpToolDefinition = {
           error: "scope_not_granted",
           message: `Scope '${scope}' is not covered by any grant on this MCP connection.`,
           grantedScopes: uniqueScopes(connection),
+          ...(scopeRequestGuidance
+            ? { nextAction: requestAccessNextAction([scope]) }
+            : {}),
         },
         true,
       );
