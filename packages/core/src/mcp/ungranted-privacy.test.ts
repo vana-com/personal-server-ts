@@ -5,6 +5,8 @@ import {
 } from "./server.js";
 import { MCP_TOOLS } from "./tools.js";
 import { liveMcpGrantIds } from "./connection-api.js";
+import { createMcpDataReadClient } from "./read-client.js";
+import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import type { McpDataReadClient } from "./read-client.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { ScopeSummary } from "../storage/index/types.js";
@@ -518,5 +520,63 @@ describe("only the dead grants are dropped", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("a held scope cannot read another scope's file by file id", () => {
+  async function setup() {
+    const storage = createMemoryDataStorage();
+    for (const [scope, fileId] of [
+      ["chatgpt.conversations", "file-chatgpt"],
+      ["youtube.history", "file-youtube"],
+    ] as const) {
+      await storage.insertEntry({
+        fileId,
+        path: `${scope}/2026-11-01.json`,
+        scope,
+        collectedAt: "2026-11-01T00:00:00Z",
+        sizeBytes: 10,
+      });
+    }
+    const readEnvelope = vi.spyOn(storage, "readEnvelope");
+    const client = createMcpDataReadClient({
+      serverOrigin: "https://personal-server.test",
+      granteeAccount: {
+        address: "0x1111111111111111111111111111111111111111",
+        publicKey: "0x04deadbeef",
+        signTypedData: vi.fn(),
+        signMessage: vi.fn().mockResolvedValue(`0x${"11".repeat(65)}`),
+      } as never,
+      dataApiDeps: {
+        storage,
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead: vi
+            .fn()
+            .mockResolvedValue({ grantId: "grant-1", builder: "0x2222" }),
+        },
+        accessLogWriter: { write: vi.fn() },
+      } as never,
+    });
+    return { client, readEnvelope };
+  }
+
+  it("get_scope_file answers another scope's file id exactly as a missing one, and reads no other-scope bytes", async () => {
+    const run = async (fileId: string) => {
+      const { client, readEnvelope } = await setup();
+      const body = await rpc(
+        client,
+        "tools/call",
+        tool("get_scope_file", { scope: "chatgpt.conversations", fileId })
+          .params,
+      );
+      return { body: normalize(body), readEnvelope };
+    };
+    const other = await run("file-youtube");
+    const missing = await run("file-does-not-exist");
+    expect(other.body).toBe(missing.body);
+    expect(other.body).not.toContain("youtube");
+    expect(other.readEnvelope).not.toHaveBeenCalled();
   });
 });
