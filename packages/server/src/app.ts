@@ -256,6 +256,10 @@ export interface AppDeps {
   };
   /** See `CreateServerOptions.mcpScopeRequestApprovalUrl`. */
   mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /** See `CreateServerOptions.mcpExposeUnsharedScopes`. */
+  mcpExposeUnsharedScopes?: boolean;
+  /** See `CreateServerOptions.mcpScopeRequestGuidance`. */
+  mcpScopeRequestGuidance?: boolean;
   mcpActivityRecorder?: McpActivityRecorder;
   mcpHydrateScopes?: (scopes: string[]) => Promise<void>;
   /**
@@ -766,6 +770,8 @@ export function createApp(deps: AppDeps): Hono {
     oauthClientStore: deps.mcpOAuthClientStore,
     oauthApprovalUrl: deps.mcpOAuthApprovalUrl,
     scopeRequestApprovalUrl: deps.mcpScopeRequestApprovalUrl,
+    mcpExposeUnsharedScopes: deps.mcpExposeUnsharedScopes,
+    mcpScopeRequestGuidance: deps.mcpScopeRequestGuidance,
     activityRecorder: mcpActivityRecorder,
     localApprovalPort: deps.localApprovalPort,
     serverPort: deps.serverPort,

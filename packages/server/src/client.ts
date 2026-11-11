@@ -58,6 +58,8 @@ export interface StartPersonalServerNodeOptions
       | "readFulfillmentReporter"
       | "mcpOAuthApprovalUrl"
       | "mcpScopeRequestApprovalUrl"
+      | "mcpExposeUnsharedScopes"
+      | "mcpScopeRequestGuidance"
       | "mcpGrantTtlSeconds"
       | "rotateReplicaWriterIdentity"
     >,
@@ -99,6 +101,8 @@ export async function startPersonalServer(
     readFulfillmentReporter: options.readFulfillmentReporter,
     mcpOAuthApprovalUrl: options.mcpOAuthApprovalUrl,
     mcpScopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
+    mcpExposeUnsharedScopes: options.mcpExposeUnsharedScopes,
+    mcpScopeRequestGuidance: options.mcpScopeRequestGuidance,
     mcpGrantTtlSeconds: options.mcpGrantTtlSeconds,
     rotateReplicaWriterIdentity: options.rotateReplicaWriterIdentity,
   });
