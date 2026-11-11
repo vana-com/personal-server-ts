@@ -82,6 +82,7 @@ import {
   approveMcpConnection,
   approveMcpScopeAccessRequest,
   areMcpConnectionGrantsLive,
+  setMcpConnectionAccess,
   buildMcpProtectedResourceMetadataUrl,
   buildStableMcpUrl,
   createInMemoryMcpOAuthAuthorizationStore,
@@ -244,6 +245,8 @@ export interface PsLiteRuntimeOptions {
   mcpExposeUnsharedScopes?: boolean;
   /** Default off. Read-side `scope_not_granted` adds `nextAction`. */
   mcpScopeRequestGuidance?: boolean;
+  /** Default off. Enables owner `PUT /v1/mcp/connections/:id/access`. */
+  mcpOwnerAccessEdit?: boolean;
   /**
    * Lifetime in seconds of grants this runtime signs itself for MCP
    * connections (OAuth approve, scope-request approve with no live grant to
@@ -1476,6 +1479,7 @@ export function createPsLiteRuntime(
             scopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
             exposeUnsharedScopes: options.mcpExposeUnsharedScopes,
             scopeRequestGuidance: options.mcpScopeRequestGuidance,
+            ownerAccessEdit: options.mcpOwnerAccessEdit,
             auth,
             dataStorage,
             accessLogWriter,
@@ -1520,6 +1524,7 @@ async function handleMcpRoute(input: {
   scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   exposeUnsharedScopes?: boolean;
   scopeRequestGuidance?: boolean;
+  ownerAccessEdit?: boolean;
   auth: PsLiteAuthAdapter;
   dataStorage: DataStoragePort;
   accessLogWriter: AccessLogWriter;
@@ -1915,6 +1920,15 @@ async function handleMcpRoute(input: {
     if (!id) {
       return errorResponse(404, "NOT_FOUND", "Not found");
     }
+    if (action === "access" && input.ownerAccessEdit) {
+      if (subAction !== undefined || rest.length > 0) {
+        return errorResponse(404, "NOT_FOUND", "Not found");
+      }
+      if (input.request.method !== "PUT") {
+        return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+      }
+      return handleAccessEdit(id);
+    }
     if (action === "scope-request") {
       if (
         rest.length > 0 ||
@@ -1990,6 +2004,81 @@ async function handleMcpRoute(input: {
       return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
     }
     return errorResponse(404, "NOT_FOUND", "Not found");
+  }
+
+  async function handleAccessEdit(id: string): Promise<Response> {
+    let scopes: unknown;
+    try {
+      scopes = ((await input.request.json()) as { scopes?: unknown }).scopes;
+    } catch {
+      return errorResponse(400, "INVALID_BODY", "Body must be JSON");
+    }
+    const gateway = input.gateway;
+    if (!gateway) {
+      return errorResponse(
+        500,
+        "SERVER_NOT_CONFIGURED",
+        "Gateway is not configured",
+      );
+    }
+    const activityId = input.activityRecorder?.start({
+      tool: "owner.access.edit",
+      ...(Array.isArray(scopes)
+        ? {
+            scopes: scopes.filter(
+              (scope): scope is string => typeof scope === "string",
+            ),
+          }
+        : {}),
+    });
+    const finish = (status: "succeeded" | "failed", errorCode?: string) => {
+      if (activityId) {
+        input.activityRecorder?.finish(activityId, {
+          status,
+          ...(errorCode ? { errorCode } : {}),
+        });
+      }
+    };
+    try {
+      const result = await setMcpConnectionAccess(
+        { connectionId: id, scopes },
+        {
+          store: input.store,
+          gateway,
+          serverOwner: input.serverOwner,
+          serverSigner: input.serverSigner,
+          now: input.now,
+          grantTtlSeconds: input.grantTtlSeconds,
+        },
+      );
+      for (const failure of result.revokeFailures) {
+        console.warn(
+          "[mcp] access edit: superseded grant revoke failed",
+          id,
+          failure,
+        );
+      }
+      finish("succeeded");
+      return jsonResponse({
+        ...toMcpConnectionView(result.connection),
+        revokeFailures: result.revokeFailures,
+      });
+    } catch (err) {
+      if (err instanceof McpConnectionNotFoundError) {
+        finish("failed", MCP_CONNECTION_NOT_FOUND);
+        return errorResponse(404, MCP_CONNECTION_NOT_FOUND, err.message);
+      }
+      if (err instanceof McpConnectionStateError) {
+        finish("failed", "INVALID_STATE");
+        return errorResponse(409, "INVALID_STATE", err.message);
+      }
+      if (err instanceof McpScopeRequestError) {
+        finish("failed", err.code);
+        return errorResponse(err.status, err.code, err.message);
+      }
+      finish("failed", "INTERNAL");
+      throw err;
+    }
   }
 
   async function handleScopeRequestAnswer(

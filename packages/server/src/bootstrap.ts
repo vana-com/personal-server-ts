@@ -230,6 +230,12 @@ export interface CreateServerOptions {
    */
   mcpScopeRequestGuidance?: boolean;
   /**
+   * Default off. When on, the owner-only route
+   * `PUT /v1/mcp/connections/:id/access` sets a client's access to an exact
+   * scope list; when off it answers 404 as if absent.
+   */
+  mcpOwnerAccessEdit?: boolean;
+  /**
    * Lifetime in seconds of grants the server signs itself for MCP
    * connections: the OAuth approve path and a scope-request approve with no
    * live grant to inherit an expiry from (a live grant's expiry is always
@@ -1251,6 +1257,7 @@ export async function createServer(
     mcpScopeRequestApprovalUrl: options?.mcpScopeRequestApprovalUrl,
     mcpExposeUnsharedScopes: options?.mcpExposeUnsharedScopes,
     mcpScopeRequestGuidance: options?.mcpScopeRequestGuidance,
+    mcpOwnerAccessEdit: options?.mcpOwnerAccessEdit,
     mcpGrantTtlSeconds: options?.mcpGrantTtlSeconds,
     mcpConnectionStore: mcpState?.connections,
     mcpOAuthAuthorizationStore: mcpState?.authorizations,

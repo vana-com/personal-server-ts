@@ -60,6 +60,7 @@ export interface StartPersonalServerNodeOptions
       | "mcpScopeRequestApprovalUrl"
       | "mcpExposeUnsharedScopes"
       | "mcpScopeRequestGuidance"
+      | "mcpOwnerAccessEdit"
       | "mcpGrantTtlSeconds"
       | "rotateReplicaWriterIdentity"
     >,
@@ -103,6 +104,7 @@ export async function startPersonalServer(
     mcpScopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
     mcpExposeUnsharedScopes: options.mcpExposeUnsharedScopes,
     mcpScopeRequestGuidance: options.mcpScopeRequestGuidance,
+    mcpOwnerAccessEdit: options.mcpOwnerAccessEdit,
     mcpGrantTtlSeconds: options.mcpGrantTtlSeconds,
     rotateReplicaWriterIdentity: options.rotateReplicaWriterIdentity,
   });

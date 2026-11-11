@@ -7,6 +7,7 @@ export interface McpEnvOptions {
   mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   mcpExposeUnsharedScopes?: boolean;
   mcpScopeRequestGuidance?: boolean;
+  mcpOwnerAccessEdit?: boolean;
 }
 
 /**
@@ -16,6 +17,7 @@ export interface McpEnvOptions {
  *   `vana://mcp-scope-request?connection={connectionId}#t={token}`
  * - VANA_MCP_EXPOSE_UNSHARED=1  (`notShared` on list_granted_scopes)
  * - VANA_MCP_SCOPE_REQUEST_GUIDANCE=1  (`nextAction` on scope_not_granted)
+ * - VANA_MCP_OWNER_ACCESS_EDIT=1  (owner `PUT /v1/mcp/connections/:id/access`)
  */
 export function mcpOptionsFromEnv(
   env: Record<string, string | undefined>,
@@ -33,6 +35,9 @@ export function mcpOptionsFromEnv(
       : {}),
     ...(env.VANA_MCP_SCOPE_REQUEST_GUIDANCE === "1"
       ? { mcpScopeRequestGuidance: true }
+      : {}),
+    ...(env.VANA_MCP_OWNER_ACCESS_EDIT === "1"
+      ? { mcpOwnerAccessEdit: true }
       : {}),
   };
 }

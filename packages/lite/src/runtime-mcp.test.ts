@@ -175,6 +175,7 @@ function buildRuntime(
     approvalUrl?: string;
     scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
     exposeUnshared?: boolean;
+    ownerAccessEdit?: boolean;
   } = {},
 ): RuntimeBundle {
   const gateway = makeMockGateway({
@@ -195,7 +196,11 @@ function buildRuntime(
       signGrantRegistration: vi
         .fn()
         .mockResolvedValue("0xgrantsig" as `0x${string}`),
+      signGrantRevocation: vi
+        .fn()
+        .mockResolvedValue("0xrevsig" as `0x${string}`),
     },
+    mcpOwnerAccessEdit: opts.ownerAccessEdit,
     accessLogReader: accessLog,
     accessLogWriter: accessLog,
     tokenStore: createMemoryPsLiteTokenStore(),
@@ -219,7 +224,7 @@ function buildRuntime(
 }
 
 async function ownerSigned(
-  method: "GET" | "POST" | "DELETE",
+  method: "GET" | "POST" | "PUT" | "DELETE",
   path: string,
   body?: unknown,
 ): Promise<Request> {
@@ -991,5 +996,70 @@ describe("createPsLiteRuntime + notShared grant liveness", () => {
   it("omits notShared when the option is off", async () => {
     const bundle = buildRuntime();
     expect(await listGrantedScopes(bundle)).not.toHaveProperty("notShared");
+  });
+});
+
+describe("createPsLiteRuntime + owner access edit", () => {
+  async function approved(bundle: RuntimeBundle) {
+    const created = await createMcpConnection(
+      { displayName: "Maple" },
+      { store: bundle.store, publicOrigin: SERVER_ORIGIN },
+    );
+    await bundle.runtime.fetch(
+      await ownerSigned(
+        "POST",
+        `/v1/mcp/connections/${created.connectionId}/approve`,
+        { grants: [{ grantId: "0xold", scopes: ["instagram.profile"] }] },
+      ),
+    );
+    return created.connectionId;
+  }
+  const put = async (bundle: RuntimeBundle, id: string, scopes: string[]) =>
+    bundle.runtime.fetch(
+      await ownerSigned("PUT", `/v1/mcp/connections/${id}/access`, { scopes }),
+    );
+
+  it("answers 404 when the option is off", async () => {
+    const bundle = buildRuntime({ grantId: "0xnew" });
+    const id = await approved(bundle);
+    const res = await put(bundle, id, ["instagram.profile"]);
+    expect(res.status).toBe(404);
+    expect(bundle.gateway.createGrant).not.toHaveBeenCalled();
+  });
+
+  it("sets the exact scopes, keeps the id, revokes the old grant", async () => {
+    const bundle = buildRuntime({ grantId: "0xnew", ownerAccessEdit: true });
+    const id = await approved(bundle);
+    const before = await bundle.store.getById(id);
+
+    const res = await put(bundle, id, ["instagram.profile", "youtube.history"]);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      id,
+      grantedScopes: ["instagram.profile", "youtube.history"],
+      revokeFailures: [],
+    });
+    expect(bundle.gateway.createGrant).toHaveBeenCalledTimes(1);
+    expect(bundle.gateway.revokeGrant).toHaveBeenCalledTimes(1);
+    const after = await bundle.store.getById(id);
+    expect(after?.tokenHash).toBe(before?.tokenHash);
+    expect(after?.grants).toEqual([
+      { grantId: "0xnew", scopes: ["instagram.profile", "youtube.history"] },
+    ]);
+  });
+
+  it("rejects an unsigned caller and a bad body", async () => {
+    const bundle = buildRuntime({ grantId: "0xnew", ownerAccessEdit: true });
+    const id = await approved(bundle);
+    const unsigned = await bundle.runtime.fetch(
+      new Request(`${SERVER_ORIGIN}/v1/mcp/connections/${id}/access`, {
+        method: "PUT",
+        body: JSON.stringify({ scopes: ["instagram.profile"] }),
+      }),
+    );
+    expect(unsigned.status).toBeGreaterThanOrEqual(401);
+    expect((await put(bundle, id, [])).status).toBe(400);
+    expect((await put(bundle, id, ["vana.system.state"])).status).toBe(400);
+    expect(bundle.gateway.createGrant).not.toHaveBeenCalled();
   });
 });

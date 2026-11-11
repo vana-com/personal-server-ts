@@ -31,6 +31,7 @@ import {
   approveMcpConnection,
   approveMcpScopeAccessRequest,
   areMcpConnectionGrantsLive,
+  setMcpConnectionAccess,
   buildMcpProtectedResourceMetadataUrl,
   buildMcpUrl,
   buildStableMcpUrl,
@@ -125,7 +126,8 @@ export interface McpRouteDeps {
   serverSigner?: Pick<
     ServerSigner,
     "signGrantRegistration" | "signRecordDataAccess"
-  >;
+  > &
+    Partial<Pick<ServerSigner, "signGrantRevocation">>;
   gateway: GatewayClient;
   gatewayConfig?: (DataPortabilityGatewayConfig & { url?: string }) | null;
   /**
@@ -195,6 +197,11 @@ export interface McpRouteDeps {
   >;
   /** Opt-in `nextAction` on read-side `scope_not_granted`. */
   mcpScopeRequestGuidance?: boolean;
+  /**
+   * Mounts owner-only `PUT /v1/mcp/connections/:id/access`. Default off: the
+   * route answers 404 as if absent.
+   */
+  mcpOwnerAccessEdit?: boolean;
   /**
    * MCP writes (`remember`): the store the data route redeems write sessions
    * from, and a dispatcher into the mounted data route. Absent: MCP stays
@@ -480,6 +487,7 @@ export function executeMcpConnectionRequest(
 /** Activity-log tool names for owner answers to a client's scope request. */
 const SCOPE_REQUEST_APPROVE_ACTIVITY = "owner.scope_request.approve";
 const SCOPE_REQUEST_DENY_ACTIVITY = "owner.scope_request.deny";
+const ACCESS_EDIT_ACTIVITY = "owner.access.edit";
 
 function scopeRequestErrorCode(err: unknown): string {
   if (err instanceof McpScopeRequestError) return err.code;
@@ -676,6 +684,75 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
         grantedScopes: approved.grantedScopes,
         approvedScopes: approved.approvedScopes,
         deniedScopes: approved.deniedScopes,
+      });
+    } catch (caught) {
+      const response = scopeRequestErrorResponse(c, caught);
+      if (activityId) {
+        deps.activityRecorder?.finish(activityId, {
+          status: "failed",
+          errorCode: response ? scopeRequestErrorCode(caught) : "INTERNAL",
+        });
+      }
+      if (response) return response;
+      throw caught;
+    }
+  });
+
+  // Owner sets a client's access to exactly `scopes` (widen or narrow): one new
+  // server-signed grant replaces the connection's grants and the superseded
+  // ones are revoked. Off unless `mcpOwnerAccessEdit` is set.
+  app.put("/:id/access", async (c) => {
+    if (!deps.mcpOwnerAccessEdit) {
+      return c.json(jsonError(404, "NOT_FOUND", "Not found"), 404);
+    }
+    const err = await requireOwner(c);
+    if (err) return err;
+    const id = c.req.param("id");
+    let body: { scopes?: unknown } = {};
+    try {
+      body = (await c.req.json()) as { scopes?: unknown };
+    } catch {
+      return c.json(jsonError(400, "INVALID_BODY", "Body must be JSON"), 400);
+    }
+    if (!deps.gatewayConfig?.url) {
+      return c.json(
+        jsonError(
+          500,
+          "SERVER_NOT_CONFIGURED",
+          "Gateway config is not configured",
+        ),
+        500,
+      );
+    }
+    const activityId = deps.activityRecorder?.start({
+      tool: ACCESS_EDIT_ACTIVITY,
+      scopes: Array.isArray(body.scopes)
+        ? body.scopes.filter((s): s is string => typeof s === "string")
+        : undefined,
+    });
+    try {
+      const result = await setMcpConnectionAccess(
+        { connectionId: id, scopes: body.scopes },
+        {
+          store,
+          gateway: deps.gateway,
+          serverOwner: deps.serverOwner,
+          serverSigner: deps.serverSigner,
+          grantTtlSeconds: deps.mcpGrantTtlSeconds,
+        },
+      );
+      for (const failure of result.revokeFailures) {
+        deps.logger.warn(
+          { connectionId: id, ...failure },
+          "mcp access edit: superseded grant revoke failed",
+        );
+      }
+      if (activityId) {
+        deps.activityRecorder?.finish(activityId, { status: "succeeded" });
+      }
+      return c.json({
+        ...toMcpConnectionView(result.connection),
+        revokeFailures: result.revokeFailures,
       });
     } catch (caught) {
       const response = scopeRequestErrorResponse(c, caught);

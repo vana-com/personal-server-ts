@@ -11,8 +11,13 @@ describe("mcpOptionsFromEnv", () => {
       mcpOptionsFromEnv({
         VANA_MCP_EXPOSE_UNSHARED: "1",
         VANA_MCP_SCOPE_REQUEST_GUIDANCE: "1",
+        VANA_MCP_OWNER_ACCESS_EDIT: "1",
       }),
-    ).toEqual({ mcpExposeUnsharedScopes: true, mcpScopeRequestGuidance: true });
+    ).toEqual({
+      mcpExposeUnsharedScopes: true,
+      mcpScopeRequestGuidance: true,
+      mcpOwnerAccessEdit: true,
+    });
     expect(
       mcpOptionsFromEnv({
         VANA_MCP_EXPOSE_UNSHARED: "true",
