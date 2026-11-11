@@ -78,12 +78,14 @@ async function seed(db: SqlDriver, control: "active" | "absent" = "active") {
   });
 }
 
+const iso = (ms: number) => new Date(ms).toISOString();
 const the = (updatedAt = 1234) => ({
   scope: "pdpp.sample.items",
   connector: "sample",
   ns: "",
   records: 1,
   updatedAt,
+  latestCollectedAt: iso(updatedAt),
 });
 
 beforeEach(() => {
@@ -112,6 +114,7 @@ describe("local listing #597", () => {
         ns: "",
         records: null,
         updatedAt: 1234,
+        latestCollectedAt: iso(1234),
       },
       the(),
     ];
@@ -242,6 +245,7 @@ describe("local listing #597", () => {
         ns: "",
         records: null,
         updatedAt: 1234,
+        latestCollectedAt: iso(1234),
       },
     ]);
     expect(project.mock.calls[0]?.[0]).toEqual([

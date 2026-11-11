@@ -155,6 +155,9 @@ async function seedBusyHost(db: SqlDriver) {
 }
 
 const everything = () => true;
+/** The old list predates `latestCollectedAt`; compare everything else. */
+const withoutIso = (listed: readonly ListedScope[]) =>
+  listed.map(({ latestCollectedAt: _iso, ...rest }) => rest);
 const scopesOf = (listed: readonly ListedScope[]) => listed.map((s) => s.scope);
 
 describe("bounded local scope list", () => {
@@ -163,9 +166,9 @@ describe("bounded local scope list", () => {
     await seedBusyHost(f.db);
     const expected = await referenceListScopes(f.deps, everything);
     const listed = await f.listing.listScopes({ canRead: everything });
-    expect(listed).toEqual(expected);
+    expect(withoutIso(listed)).toEqual(expected);
     // Not vacuous: the fixture lists real scopes and leaves the rest out.
-    expect(listed).toEqual([
+    expect(withoutIso(listed)).toEqual([
       {
         scope: "fixture.summary",
         connector: "alpha",
@@ -209,7 +212,7 @@ describe("bounded local scope list", () => {
     const f = await fixture();
     await seedBusyHost(f.db);
     const canRead = (scope: string) => scope.startsWith("pdpp.alpha.");
-    expect(await f.listing.listScopes({ canRead })).toEqual(
+    expect(withoutIso(await f.listing.listScopes({ canRead }))).toEqual(
       await referenceListScopes(f.deps, canRead),
     );
     expect(f.project).not.toHaveBeenCalled();
@@ -288,7 +291,9 @@ describe("bounded local scope list", () => {
       ),
     );
     expect(f.queries.length).toBe(perCall);
-    expect(results[0]).toEqual(await referenceListScopes(f.deps, everything));
+    expect(withoutIso(results[0]!)).toEqual(
+      await referenceListScopes(f.deps, everything),
+    );
     expect(scopesOf(results[1]!)).toEqual(["pdpp.alpha.a1", "pdpp.alpha.a2"]);
     expect(results[2]).toEqual(results[0]);
 
@@ -340,5 +345,41 @@ describe("bounded local scope list", () => {
     expect(f.portCalls).toEqual([]);
     // Aliases are listed without projecting records a read would not serve.
     expect(f.project).not.toHaveBeenCalled();
+  });
+
+  it("carries latestCollectedAt as the ISO form of updatedAt, and omits it with no times", async () => {
+    const f = await fixture();
+    await seedBusyHost(f.db);
+    const listed = await f.listing.listScopes({ canRead: everything });
+    expect(listed.length).toBeGreaterThan(0);
+    for (const entry of listed) {
+      expect(entry.updatedAt).not.toBeNull();
+      expect(entry.latestCollectedAt).toBe(
+        new Date(entry.updatedAt!).toISOString(),
+      );
+    }
+    expect(
+      listed.find((s) => s.scope === "pdpp.beta.b1")?.latestCollectedAt,
+    ).toBe("1970-01-01T00:00:09.000Z");
+
+    // A served stream with no record and no installed-head time has no time.
+    await addConnection(f.db, "bare1", "bare");
+    await addStream(f.db, "bare1", "b1", { records: 0, version: 3 });
+    await f.db.batch([
+      {
+        sql: "UPDATE stream_state SET head_version = 2 WHERE connection_id = 'bare1'",
+      },
+    ]);
+    const bare = (await f.listing.listScopes({ canRead: everything })).find(
+      (s) => s.scope === "pdpp.bare.b1",
+    );
+    expect(bare).toEqual({
+      scope: "pdpp.bare.b1",
+      connector: "bare",
+      ns: "",
+      records: 0,
+      updatedAt: null,
+    });
+    expect(bare).not.toHaveProperty("latestCollectedAt");
   });
 });

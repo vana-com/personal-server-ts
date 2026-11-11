@@ -22,7 +22,22 @@ export interface ListedScope {
   readonly connector: string;
   readonly ns: string;
   readonly records: number | null;
+  /** Epoch ms of the newest observation of the scope's records or head; null when none. */
   readonly updatedAt: number | null;
+  /**
+   * `updatedAt` as an ISO-8601 string: the list contract's field, which the
+   * legacy summaries carry and clients read. Absent when `updatedAt` is null.
+   */
+  readonly latestCollectedAt?: string;
+}
+
+function collectedAt(updatedAt: number | null): { latestCollectedAt?: string } {
+  if (updatedAt === null) return {};
+  const date = new Date(updatedAt);
+  // A stored stamp outside the Date range must not fail the whole list.
+  return Number.isNaN(date.getTime())
+    ? {}
+    : { latestCollectedAt: date.toISOString() };
 }
 
 /**
@@ -225,6 +240,7 @@ export function createLocalListing(
         const head = headTimes.get(key(owner, stream));
         if (head !== undefined) times.push(head);
       }
+      const updatedAt = times.length === 0 ? null : Math.max(...times);
       let projection: Promise<boolean> | undefined;
       entries.push({
         scope,
@@ -233,7 +249,8 @@ export function createLocalListing(
           connector: owner.connector,
           ns: owner.ns,
           records: logicalStreamScopeParts(scope) ? records : null,
-          updatedAt: times.length === 0 ? null : Math.max(...times),
+          updatedAt,
+          ...collectedAt(updatedAt),
         },
         bodyBuilds: () => (projection ??= aliasBodyBuilds(target, chosen)),
       });
