@@ -2,16 +2,19 @@ import { sha256 } from "@noble/hashes/sha2";
 import type { StreamSyncReadStatus } from "../stream-sync-read/service.js";
 import { logicalStreamScopeParts } from "../stream-sync-read/routing.js";
 import type { LocalSyncDeps } from "./deps.js";
-import {
-  createOlderVersions,
-  type OlderVersionCounts,
-} from "./older-versions.js";
+import type { OlderVersionCounts } from "./older-versions.js";
 import { createRecordQuery } from "./query.js";
 import {
-  createLocalResolver,
-  type AliasScopes,
-  type AliasTargets,
-} from "./resolve.js";
+  chooseCandidate,
+  loadStreams,
+  projectAlias,
+  selectForTarget,
+  type Candidate,
+  type Connection as SelectionConnection,
+  type Stream,
+  type Target,
+} from "./read-selection.js";
+import type { AliasScopes, AliasTargets } from "./resolve.js";
 
 /** One listed scope of `GET /v1/data` (D.2). */
 export interface ListedScope {
@@ -19,15 +22,35 @@ export interface ListedScope {
   readonly connector: string;
   readonly ns: string;
   readonly records: number | null;
+  /** Epoch ms of the newest observation of the scope's records or head; null when none. */
   readonly updatedAt: number | null;
+  /**
+   * `updatedAt` as an ISO-8601 string: the list contract's field, which the
+   * legacy summaries carry and clients read. Absent when `updatedAt` is null.
+   */
+  readonly latestCollectedAt?: string;
+}
+
+function collectedAt(updatedAt: number | null): { latestCollectedAt?: string } {
+  if (updatedAt === null) return {};
+  const date = new Date(updatedAt);
+  // A stored stamp outside the Date range must not fail the whole list.
+  return Number.isNaN(date.getTime())
+    ? {}
+    : { latestCollectedAt: date.toISOString() };
 }
 
 /**
  * D.2 listing and D.4 status, from `connections` + `stream_state`. The
- * listing is filtered by `canRead` FIRST (grant filter); a scope whose check
- * throws is skipped and logged; the owner's local-only scopes are included; an
- * alias is listed only if its body can be built; the cache key changes on any
- * control-row change. `status()` is `StreamSyncReadStatus` plus the D.3 counts.
+ * listing answers from local state only, in a fixed number of queries: it
+ * applies the resolver's selection rule (`read-selection.ts`) to what is
+ * stored now and never applies registry heads, fetches blobs or reads a
+ * record body. Bringing local state up to date is the sync loop's job. Every
+ * scope is filtered by `canRead` FIRST (grant filter); a scope whose check
+ * throws is skipped and logged; an alias is listed only if its installed
+ * records project (checked after the grant filter); overlapping calls share
+ * one in-flight read of local state; the cache key changes on any control-row
+ * change. `status()` is `StreamSyncReadStatus` plus the D.3 counts.
  */
 export interface LocalListing {
   listScopes(input: {
@@ -59,6 +82,17 @@ type StreamState = {
   records: number;
 };
 
+/** One candidate scope, computed from local state; `canRead` is not applied. */
+interface Entry {
+  readonly scope: string;
+  /** Null when a read of the scope would serve nothing. */
+  readonly listed: ListedScope | null;
+  /** Memoized for the snapshot: can the alias body be built from local records? */
+  readonly bodyBuilds: () => Promise<boolean>;
+}
+
+type Count = { records: number; stampedAt: number | null };
+
 export function createLocalListing(
   deps: LocalSyncDeps & {
     readonly aliasScopes?: AliasScopes;
@@ -66,103 +100,211 @@ export function createLocalListing(
   },
   counts: () => OlderVersionCounts,
 ): LocalListing {
-  // Construct the read path only after the first successful grant check.
-  const latest = (aliasNames: readonly string[]) =>
-    createLocalResolver(deps, {
-      query: createRecordQuery(deps.db),
-      // ResolveInput has no historical selector: listing probes latest only.
-      olderVersions: createOlderVersions(deps, { enabled: () => false }),
-      aliasScopes: () => aliasNames,
-      aliasTargets: deps.aliasTargets,
-    });
-
   const connections = () =>
     deps.db.query<Connection>(
       "SELECT connection_id, connector, ns, generation, control_state FROM connections ORDER BY connector, ns, connection_id",
     );
 
+  /**
+   * Everything `listScopes` needs short of `canRead`, read from local state:
+   * five queries however many scopes there are. Nothing here depends on the
+   * caller's authority, so overlapping callers share one.
+   */
+  async function readSnapshot(): Promise<readonly Entry[]> {
+    const rows = await deps.db.query<SelectionConnection>(
+      "SELECT connection_id, connector, ns, generation, control_state, deleted_at FROM connections ORDER BY connector, ns, connection_id",
+    );
+    const streams = await loadStreams(deps);
+    const stamps = await deps.db.query<{
+      connection_id: string;
+      stream: string;
+      records: number;
+      stamped_at: number | null;
+    }>(
+      "SELECT connection_id, stream, COUNT(*) AS records, MAX(stamp_o) AS stamped_at FROM records GROUP BY connection_id, stream",
+    );
+    const heads = await deps.db.query<{
+      connection_id: string;
+      stream: string;
+      observed_at: number;
+    }>(
+      "SELECT s.connection_id, s.stream, v.observed_at FROM connections c JOIN stream_state s ON s.connection_id = c.connection_id JOIN stream_versions v ON v.connection_id = s.connection_id AND v.stream = s.stream AND v.version = s.head_version AND v.generation = c.generation",
+    );
+
+    const streamsOf = new Map<string, Stream[]>();
+    for (const stream of streams) {
+      const list = streamsOf.get(stream.connection_id) ?? [];
+      list.push(stream);
+      streamsOf.set(stream.connection_id, list);
+    }
+    const byConnector = new Map<string, SelectionConnection[]>();
+    for (const row of rows) {
+      const list = byConnector.get(row.connector) ?? [];
+      list.push(row);
+      byConnector.set(row.connector, list);
+    }
+    // Per connector, namespace and stream, as the old per-scope queries joined
+    // `connections` on connector and namespace.
+    const key = (c: { connector: string; ns: string }, stream: string) =>
+      JSON.stringify([c.connector, c.ns, stream]);
+    const connectionById = new Map(rows.map((c) => [c.connection_id, c]));
+    const recordTotals = new Map<string, Count>();
+    for (const row of stamps) {
+      const c = connectionById.get(row.connection_id);
+      if (!c) continue;
+      const total = recordTotals.get(key(c, row.stream)) ?? {
+        records: 0,
+        stampedAt: null,
+      };
+      total.records += row.records;
+      if (row.stamped_at !== null) {
+        total.stampedAt = Math.max(
+          total.stampedAt ?? row.stamped_at,
+          row.stamped_at,
+        );
+      }
+      recordTotals.set(key(c, row.stream), total);
+    }
+    const headTimes = new Map<string, number>();
+    for (const row of heads) {
+      const c = connectionById.get(row.connection_id);
+      if (!c) continue;
+      headTimes.set(
+        key(c, row.stream),
+        Math.max(
+          headTimes.get(key(c, row.stream)) ?? row.observed_at,
+          row.observed_at,
+        ),
+      );
+    }
+
+    const candidates = new Set<string>();
+    for (const c of rows) {
+      for (const stream of streamsOf.get(c.connection_id) ?? []) {
+        candidates.add(`pdpp.${c.connector}.${stream.stream}`);
+      }
+    }
+    const aliasNames = new Set(deps.aliasScopes?.() ?? []);
+    const targets = (scope: string): readonly Target[] => {
+      const logical = logicalStreamScopeParts(scope);
+      if (logical) {
+        return [{ connector: logical.connector, streams: [logical.stream] }];
+      }
+      if (!aliasNames.has(scope)) return [];
+      return (deps.aliasTargets?.(scope) ?? []).map((alias) => ({
+        connector: alias.connector,
+        streams: alias.streams,
+        alias,
+      }));
+    };
+    for (const scope of aliasNames) {
+      const logical = logicalStreamScopeParts(scope);
+      const wanted = logical
+        ? [logical.connector]
+        : (deps.aliasTargets?.(scope) ?? []).map((t) => t.connector);
+      if (wanted.some((connector) => byConnector.has(connector))) {
+        candidates.add(scope);
+      }
+    }
+
+    const entries: Entry[] = [];
+    for (const scope of [...candidates].sort()) {
+      const picks: Candidate[] = [];
+      for (const target of targets(scope)) {
+        const picked = selectForTarget(
+          target,
+          (byConnector.get(target.connector) ?? []).map((connection) => ({
+            connection,
+            streams: streamsOf.get(connection.connection_id) ?? [],
+          })),
+        );
+        if (picked.candidate) picks.push(picked.candidate);
+      }
+      const chosen = chooseCandidate(picks);
+      const target = chosen
+        ? targets(scope).find(
+            (entry) => entry.connector === chosen.connection.connector,
+          )
+        : undefined;
+      if (!chosen || !target || target.streams.length === 0) {
+        entries.push({ scope, listed: null, bodyBuilds: async () => false });
+        continue;
+      }
+      const owner = chosen.connection;
+      let records = 0;
+      const times: number[] = [];
+      for (const stream of target.streams) {
+        const total = recordTotals.get(key(owner, stream));
+        records += total?.records ?? 0;
+        if (total?.stampedAt != null) times.push(total.stampedAt);
+        const head = headTimes.get(key(owner, stream));
+        if (head !== undefined) times.push(head);
+      }
+      const updatedAt = times.length === 0 ? null : Math.max(...times);
+      let projection: Promise<boolean> | undefined;
+      entries.push({
+        scope,
+        listed: {
+          scope,
+          connector: owner.connector,
+          ns: owner.ns,
+          records: logicalStreamScopeParts(scope) ? records : null,
+          updatedAt,
+          ...collectedAt(updatedAt),
+        },
+        bodyBuilds: () => (projection ??= aliasBodyBuilds(target, chosen)),
+      });
+    }
+    return entries;
+  }
+
+  /**
+   * Can a read build this alias body from the records installed now? A read
+   * whose installed head lags the newest complete head would fetch the
+   * retained head over the network; the listing does not, so it lists the
+   * scope without projecting.
+   */
+  async function aliasBodyBuilds(
+    target: Target,
+    chosen: Candidate,
+  ): Promise<boolean> {
+    if (!target.alias) return true;
+    if (chosen.streams.some((s) => s.head_version !== s.installed_version)) {
+      return true;
+    }
+    const projected = await projectAlias(
+      target.alias,
+      chosen,
+      createRecordQuery(deps.db),
+      new Date(deps.now()).toISOString(),
+    );
+    return projected.kind === "ok";
+  }
+
+  // Overlapping calls share one read of local state; the next call after it
+  // settles starts a new one, so nothing is served from a cache.
+  let inflight: Promise<readonly Entry[]> | undefined;
+  const snapshot = () => {
+    const running = (inflight ??= readSnapshot().finally(() => {
+      if (inflight === running) inflight = undefined;
+    }));
+    return running;
+  };
+
   return {
     async listScopes({ canRead }) {
-      const known = new Set((await connections()).map((row) => row.connector));
-      const streams = await deps.db.query<{
-        connector: string;
-        stream: string;
-      }>(
-        "SELECT DISTINCT c.connector, s.stream FROM connections c JOIN stream_state s ON s.connection_id = c.connection_id ORDER BY c.connector, s.stream",
-      );
-      const candidates = new Set(
-        streams.map((row) => `pdpp.${row.connector}.${row.stream}`),
-      );
-      const aliasNames = [...(deps.aliasScopes?.() ?? [])];
-      const targets = (scope: string) => {
-        const logical = logicalStreamScopeParts(scope);
-        return logical
-          ? [{ connector: logical.connector, streams: [logical.stream] }]
-          : (deps.aliasTargets?.(scope) ?? []);
-      };
-      for (const scope of aliasNames) {
-        if (targets(scope).some((target) => known.has(target.connector))) {
-          candidates.add(scope);
-        }
-      }
-
       const out: ListedScope[] = [];
-      let resolver: ReturnType<typeof createLocalResolver> | undefined;
-      for (const scope of [...candidates].sort()) {
+      for (const entry of await snapshot()) {
         try {
-          if (!(await canRead(scope))) continue;
-          const decision = await (resolver ??= latest(aliasNames)).resolve({
-            scope,
-            connection: null,
-            cursor: null,
-            legacyFile: false,
-            isOwnerView: true,
-          });
-          if (decision.kind !== "view" && decision.kind !== "local_pending") {
-            continue;
-          }
-          // Projection can fail lazily. Drain without retaining record bytes,
-          // and let the resolver release its snapshot before listing the scope.
-          const reader = decision.body.getReader();
-          try {
-            while (!(await reader.read()).done) {
-              // Discard each chunk.
-            }
-          } finally {
-            reader.releaseLock();
-          }
-          const target = targets(scope).find(
-            (entry) => entry.connector === decision.connector,
-          );
-          if (!target || target.streams.length === 0) continue;
-          const placeholders = target.streams.map(() => "?").join(", ");
-          const params = [decision.connector, decision.ns, ...target.streams];
-          const [records] = await deps.db.query<{
-            records: number;
-            updated_at: number | null;
-          }>(
-            `SELECT COUNT(*) AS records, MAX(r.stamp_o) AS updated_at FROM records r JOIN connections c ON c.connection_id = r.connection_id WHERE c.connector = ? AND c.ns = ? AND r.stream IN (${placeholders})`,
-            params,
-          );
-          const [head] = await deps.db.query<{ updated_at: number | null }>(
-            `SELECT MAX(v.observed_at) AS updated_at FROM connections c JOIN stream_state s ON s.connection_id = c.connection_id JOIN stream_versions v ON v.connection_id = s.connection_id AND v.stream = s.stream AND v.version = s.head_version AND v.generation = c.generation WHERE c.connector = ? AND c.ns = ? AND s.stream IN (${placeholders})`,
-            params,
-          );
-          const times = [records?.updated_at, head?.updated_at].filter(
-            (time): time is number => typeof time === "number",
-          );
-          out.push({
-            scope,
-            connector: decision.connector,
-            ns: decision.ns,
-            records: logicalStreamScopeParts(scope)
-              ? (records?.records ?? 0)
-              : null,
-            updatedAt: times.length === 0 ? null : Math.max(...times),
-          });
+          if (!(await canRead(entry.scope))) continue;
+          if (!entry.listed || !(await entry.bodyBuilds())) continue;
+          out.push(entry.listed);
         } catch {
           // Exceptions may embed record contents or keys; never log them.
-          deps.logger.warn({ scope }, "localdb listing: scope check failed");
+          deps.logger.warn(
+            { scope: entry.scope },
+            "localdb listing: scope check failed",
+          );
         }
       }
       return out;
