@@ -6,6 +6,16 @@ import {
 } from "../additions/summary.js";
 import { ProtocolError } from "../errors/catalog.js";
 import type { LocalSyncDeps } from "./deps.js";
+import {
+  chooseCandidate,
+  connectionsOf,
+  loadStreams,
+  selectForTarget,
+  servedStreamOf,
+  targetsForScope,
+  type Candidate,
+} from "./read-selection.js";
+import type { AliasScopes, AliasTargets } from "./resolve.js";
 
 export const HISTORY_PAGE_LIMIT = 1000;
 
@@ -109,8 +119,66 @@ export function createLocalHistory(
     readonly olderVersionReads: () => boolean;
     /** Registry freshness is not persisted by the current local database schema. */
     readonly behind?: (connectionId: string) => boolean;
+    /** The host's legacy alias ports; the ones the read route resolves with. */
+    readonly aliasScopes?: AliasScopes;
+    readonly aliasTargets?: AliasTargets;
   },
 ): LocalHistory {
+  type Located =
+    | {
+        readonly connector: string;
+        readonly ns: string;
+        readonly stream: string;
+      }
+    | { readonly gone: "not_found" | "deleted" };
+
+  /**
+   * The stream a history route reads for `scope`. A legacy alias reads the
+   * stream its read serves, from the connection its read picks: the same name
+   * rule and the same selection (`read-selection.ts`) as the resolver. Any
+   * other name is `<connector>[~<ns>].<stream>`, with or without `pdpp.`.
+   */
+  async function locate(scope: string): Promise<Located> {
+    const targets = targetsForScope(
+      scope,
+      new Set(options.aliasScopes?.() ?? []),
+      options.aliasTargets,
+    ).filter((target) => target.alias);
+    if (targets.length === 0) {
+      const name = scope.startsWith("pdpp.") ? scope.slice(5) : scope;
+      const match = /^([^.~]+)(?:~([a-f0-9]{16}|))?\.(.+)$/.exec(name);
+      return match
+        ? { connector: match[1]!, ns: match[2] ?? "", stream: match[3]! }
+        : { gone: "not_found" };
+    }
+    const picks: Candidate[] = [];
+    let sawDeleted = false;
+    for (const target of targets) {
+      const rows = await connectionsOf(deps, target.connector);
+      sawDeleted ||= rows.some(
+        (c) => c.control_state === "deleted" || c.deleted_at !== null,
+      );
+      const picked = selectForTarget(
+        target,
+        await Promise.all(
+          rows.map(async (connection) => ({
+            connection,
+            streams: await loadStreams(deps, connection.connection_id),
+          })),
+        ),
+      );
+      sawDeleted ||= picked.tombstoned;
+      if (picked.candidate) picks.push(picked.candidate);
+    }
+    const chosen = chooseCandidate(picks);
+    if (!chosen) return { gone: sawDeleted ? "deleted" : "not_found" };
+    return {
+      connector: chosen.connection.connector,
+      ns: chosen.connection.ns,
+      stream: servedStreamOf(chosen.target),
+    };
+  }
+
   return {
     async additions({ timezone, days }) {
       if (!Number.isInteger(days) || days < 1 || days > 31) {
@@ -239,11 +307,9 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
         );
       }
       limit = Math.min(limit, HISTORY_PAGE_LIMIT);
-      const name = scope.startsWith("pdpp.") ? scope.slice(5) : scope;
-      const match = /^([^.~]+)(?:~([a-f0-9]{16}|))?\.(.+)$/.exec(name);
-      const connector = match?.[1];
-      const stream = match?.[3];
-      if (!connector || !stream) return { ok: false, reason: "not_found" };
+      const located = await locate(scope);
+      if ("gone" in located) return { ok: false, reason: located.gone };
+      const { connector, ns, stream } = located;
       // One statement gives control, frontier, total and page one snapshot.
       const rows = await deps.db.query<{
         control_state: string;
@@ -279,7 +345,7 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
          ORDER BY p.version DESC`,
         [
           connector,
-          match?.[2] ?? "",
+          ns,
           stream,
           stream,
           options.olderVersionReads() ? 1 : 0,
@@ -321,11 +387,9 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
       };
     },
     async lineage({ scope, version }) {
-      const name = scope.startsWith("pdpp.") ? scope.slice(5) : scope;
-      const match = /^([^.~]+)(?:~([a-f0-9]{16}|))?\.(.+)$/.exec(name);
-      const connector = match?.[1];
-      const stream = match?.[3];
-      if (!connector || !stream) return { ok: false, reason: "not_found" };
+      const located = await locate(scope);
+      if ("gone" in located) return { ok: false, reason: located.gone };
+      const { connector, ns, stream } = located;
       const [row] = await deps.db.query<{
         control_state: string;
         version: number | null;
@@ -342,7 +406,7 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
            AND v.version > s.last_delete_version
            AND v.kind IN ('published', 'applied')
            AND (? IS NOT NULL OR s.head_generation = c.generation)`,
-        [connector, match?.[2] ?? "", stream, version ?? null, version ?? null],
+        [connector, ns, stream, version ?? null, version ?? null],
       );
       if (row?.control_state === "deleted") {
         return { ok: false, reason: "deleted" };

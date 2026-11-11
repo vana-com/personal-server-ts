@@ -2930,7 +2930,11 @@ export async function handlePersonalServerDataRequest(
 
     if ((parts.length === 2 || parts.length === 3) && parts[1] === "lineage") {
       if (request.method !== "GET") return methodNotAllowed();
-      const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
+      // Like versions: switched lineage names the streams the read route does.
+      const scopeResult =
+        mode === "switched"
+          ? parseDataReadScopeContract(decodePathPart(parts[0]))
+          : parseDataScopeContract(decodePathPart(parts[0]));
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
       // The version is a PATH segment (/v1/data/:scope/lineage/:version), so
       // it is inside the signed request uri: a builder's signature for one

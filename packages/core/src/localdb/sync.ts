@@ -183,6 +183,8 @@ export function createLocalSync(
     changesFor: (link) => createGrantHistory(deps.db, link),
     history: createLocalHistory(deps, {
       olderVersionReads: options.olderVersionReads,
+      aliasScopes: options.aliasScopes,
+      aliasTargets: options.aliasTargets,
     }),
     olderVersions,
     blobs: createBlobStore(deps),

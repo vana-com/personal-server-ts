@@ -1,6 +1,14 @@
+import {
+  logicalStreamScopeParts,
+  streamReadScope,
+} from "../stream-sync-read/routing.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { RecordQuery } from "./query.js";
-import type { LocalAliasRecord, LocalAliasTarget } from "./resolve.js";
+import type {
+  AliasTargets,
+  LocalAliasRecord,
+  LocalAliasTarget,
+} from "./resolve.js";
 
 /**
  * The rule that decides which connection and head a read serves, shared by
@@ -46,6 +54,47 @@ export type Candidate = {
   streams: Stream[];
   registered: number;
 };
+
+/**
+ * The name rule: which connector streams a scope name reads. A logical
+ * stream name (`pdpp.<connector>.<stream>`) names one stream of one
+ * connector; a name the host admits as a legacy alias names what the host
+ * binds it to; any other name reads nothing. The resolver, the scope listing
+ * and the history routes all answer from this one rule, so a name that one
+ * lists is a name the others serve.
+ */
+export function targetsForScope(
+  scope: string,
+  aliasNames: ReadonlySet<string>,
+  aliasTargets: AliasTargets | undefined,
+): readonly Target[] {
+  const logical = logicalStreamScopeParts(streamReadScope(scope) ?? "");
+  if (logical) {
+    return [{ connector: logical.connector, streams: [logical.stream] }];
+  }
+  if (!aliasNames.has(scope)) return [];
+  return (aliasTargets?.(scope) ?? []).map((alias) => ({
+    connector: alias.connector,
+    streams: alias.streams,
+    alias,
+  }));
+}
+
+/** The stream whose head a read of `target` serves: its parent, if windowed. */
+export const servedStreamOf = (target: Target): string =>
+  target.alias?.servedStream ?? target.streams[0]!;
+
+/** Every connection of one connector, by namespace. */
+export function connectionsOf(
+  deps: Pick<LocalSyncDeps, "db">,
+  connector: string,
+): Promise<Connection[]> {
+  return deps.db.query<Connection>(
+    `SELECT connection_id, connector, ns, generation, control_state, deleted_at
+     FROM connections WHERE connector = ? ORDER BY ns`,
+    [connector],
+  );
+}
 
 export const tombstoned = (s: Stream) =>
   s.last_delete_version > 0 && s.head_version <= s.last_delete_version;
