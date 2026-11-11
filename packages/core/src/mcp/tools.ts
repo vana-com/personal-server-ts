@@ -872,6 +872,31 @@ async function listNotSharedScopes(
     }));
 }
 
+/**
+ * `notShared` for a connection, or undefined when the option is off or the
+ * grants are not provably live. One path for every tool that shows it, so the
+ * liveness, readiness and tombstone filters cannot drift apart.
+ */
+async function notSharedFor(input: {
+  connection: McpConnectionRecord;
+  readClient: McpDataReadClient;
+  exposeUnsharedScopes?: boolean;
+  verifyGrantsLive?: McpToolContext["verifyGrantsLive"];
+}) {
+  if (!input.exposeUnsharedScopes) return undefined;
+  if (!(await grantsStillLive(input.verifyGrantsLive))) return undefined;
+  return listNotSharedScopes(input.connection, input.readClient);
+}
+
+const SEARCH_UNSHARED_HINT_MAX_SCOPES = 5;
+
+/** The line a default-sweep search adds when the user has unshared data. */
+function searchUnsharedHint(scopes: readonly string[]): string {
+  const shown = scopes.slice(0, SEARCH_UNSHARED_HINT_MAX_SCOPES);
+  const more = scopes.length - shown.length;
+  return `This search covers shared data only. The user also has: ${shown.join(", ")}${more > 0 ? `, +${more} more` : ""}. To use it, call request_scope_access with those scopes, then ask the user to approve it in Vana.`;
+}
+
 /** The `nextAction` a read-side `scope_not_granted` carries under guidance. */
 function requestAccessNextAction(scopes: readonly string[]): string {
   return `Call request_scope_access with scopes ${JSON.stringify(scopes)}, then ask the user to approve it in Vana.`;
@@ -952,10 +977,12 @@ const listGrantedScopes: McpToolDefinition = {
     // Lets an agent that asked for more scopes see whether the owner has
     // answered yet without re-recording the request.
     const writableScopes = uniqueWritableScopes(connection);
-    const notShared =
-      exposeUnsharedScopes && (await grantsStillLive(verifyGrantsLive))
-        ? await listNotSharedScopes(connection, readClient)
-        : undefined;
+    const notShared = await notSharedFor({
+      connection,
+      readClient,
+      exposeUnsharedScopes,
+      verifyGrantsLive,
+    });
     return textResult({
       scopes: scopeEntries,
       ...(notShared ? { notShared } : {}),
@@ -1513,7 +1540,16 @@ const searchPersonalContext: McpToolDefinition = {
     timeoutMs: z.number().int().min(1000).max(MAX_SEARCH_TIMEOUT_MS).optional(),
     maxBytes: z.number().int().min(1).max(MAX_SEARCH_MAX_BYTES).optional(),
   },
-  async handler(args, { connection, readClient, scopeRequestGuidance }) {
+  async handler(
+    args,
+    {
+      connection,
+      readClient,
+      scopeRequestGuidance,
+      exposeUnsharedScopes,
+      verifyGrantsLive,
+    },
+  ) {
     const query = typeof args.query === "string" ? args.query.trim() : "";
     if (!query) {
       return textResult(
@@ -1849,7 +1885,26 @@ const searchPersonalContext: McpToolDefinition = {
     // relative order at the end.
     matches.sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
 
-    return textResult({
+    // A default sweep covers shared data only; tell the agent what else the
+    // user has. Fails closed to today's output: a slow or failing listing adds
+    // nothing and never fails the search.
+    const unsharedScopes =
+      scopeRequestGuidance && exposeUnsharedScopes && args.scopes === undefined
+        ? (
+            await notSharedFor({
+              connection,
+              readClient,
+              exposeUnsharedScopes,
+              verifyGrantsLive,
+            }).catch(() => undefined)
+          )?.map((entry) => entry.scope)
+        : undefined;
+    const unsharedHint =
+      unsharedScopes && unsharedScopes.length > 0
+        ? searchUnsharedHint(unsharedScopes)
+        : undefined;
+
+    const result = textResult({
       query,
       results: matches,
       // Backward-compatible alias for existing clients/tests. `results` is the
@@ -1874,6 +1929,7 @@ const searchPersonalContext: McpToolDefinition = {
           }
         : {}),
       ...(nextSearchCursor ? { nextSearchCursor } : {}),
+      ...(unsharedHint ? { unsharedHint } : {}),
       elapsedMs,
       limits: {
         maxResults: limit,
@@ -1889,6 +1945,14 @@ const searchPersonalContext: McpToolDefinition = {
         totalTimeoutMs,
       },
     });
+    // The same line as its own text block, so a client that shows only text
+    // content still sees it without re-parsing the JSON.
+    return unsharedHint
+      ? {
+          ...result,
+          content: [...result.content, { type: "text", text: unsharedHint }],
+        }
+      : result;
   },
 };
 

@@ -547,3 +547,152 @@ describe("templateMcpScopeRequestApprovalUrl", () => {
     ).toThrow(/after '#'/);
   });
 });
+
+describe("search_personal_context unshared hint (default sweep)", () => {
+  const LINE =
+    "This search covers shared data only. The user also has: youtube.history. To use it, call request_scope_access with those scopes, then ask the user to approve it in Vana.";
+  const live = async () => true;
+
+  const search = async (
+    ctx: Partial<McpToolContext>,
+    args: Record<string, unknown> = {},
+    rc = readClient({
+      listOwnerScopes: vi.fn().mockResolvedValue([owned("youtube.history")]),
+    }),
+  ) =>
+    tool("search_personal_context").handler(
+      { query: "x", ...args },
+      { connection: connection(), readClient: rc, ...ctx },
+    );
+  // elapsedMs differs between runs; everything else must match exactly.
+  const stable = (result: Awaited<ReturnType<typeof search>>) =>
+    JSON.stringify(result).replace(/elapsedMs\\*":\d+/gu, "ELAPSED");
+
+  it("both options on + an unshared ready scope: the line is added", async () => {
+    const result = await search({
+      scopeRequestGuidance: true,
+      exposeUnsharedScopes: true,
+      verifyGrantsLive: live,
+    });
+    expect(result.content.at(-1)).toEqual({ type: "text", text: LINE });
+    expect(parse(result).unsharedHint).toBe(LINE);
+  });
+
+  it("lists at most 5 scopes, then +N more", async () => {
+    const many = ["a", "b", "c", "d", "e", "f", "g"].map((n) =>
+      owned(`${n}.data`),
+    );
+    const result = await search(
+      {
+        scopeRequestGuidance: true,
+        exposeUnsharedScopes: true,
+        verifyGrantsLive: live,
+      },
+      {},
+      readClient({ listOwnerScopes: vi.fn().mockResolvedValue(many) }),
+    );
+    expect(parse(result).unsharedHint).toContain(
+      "The user also has: a.data, b.data, c.data, d.data, e.data, +2 more.",
+    );
+  });
+
+  it("explicit scopes: no line and the owner listing is not read", async () => {
+    const listOwnerScopes = vi
+      .fn()
+      .mockResolvedValue([owned("youtube.history")]);
+    const result = await search(
+      {
+        scopeRequestGuidance: true,
+        exposeUnsharedScopes: true,
+        verifyGrantsLive: live,
+      },
+      { scopes: ["instagram.profile"] },
+      readClient({ listOwnerScopes }),
+    );
+    expect(result.content).toHaveLength(1);
+    expect("unsharedHint" in parse(result)).toBe(false);
+    expect(listOwnerScopes).not.toHaveBeenCalled();
+  });
+
+  it("notShared empty: no line", async () => {
+    const result = await search(
+      {
+        scopeRequestGuidance: true,
+        exposeUnsharedScopes: true,
+        verifyGrantsLive: live,
+      },
+      {},
+      readClient({ listOwnerScopes: vi.fn().mockResolvedValue([]) }),
+    );
+    expect(result.content).toHaveLength(1);
+    expect("unsharedHint" in parse(result)).toBe(false);
+  });
+
+  it("a scope that is not ready for bounded read is not mentioned", async () => {
+    const result = await search(
+      {
+        scopeRequestGuidance: true,
+        exposeUnsharedScopes: true,
+        verifyGrantsLive: live,
+      },
+      {},
+      readClient({
+        listOwnerScopes: vi
+          .fn()
+          .mockResolvedValue([
+            { ...owned("youtube.history"), dataStatus: "indexing" },
+          ]),
+      }),
+    );
+    expect("unsharedHint" in parse(result)).toBe(false);
+  });
+
+  it.each([
+    ["guidance off", { exposeUnsharedScopes: true }],
+    ["unshared off", { scopeRequestGuidance: true }],
+    ["both off", {}],
+  ])(
+    "%s: output is byte-identical to today and nothing is read",
+    async (_n, flags) => {
+      const listOwnerScopes = vi
+        .fn()
+        .mockResolvedValue([owned("youtube.history")]);
+      const verifyGrantsLive = vi.fn().mockResolvedValue(true);
+      const rc = readClient({ listOwnerScopes });
+      const withFlags = await search({ ...flags, verifyGrantsLive }, {}, rc);
+      const baseline = await search({}, {}, readClient());
+      expect(stable(withFlags)).toBe(stable(baseline));
+      if (!(
+        "exposeUnsharedScopes" in flags && "scopeRequestGuidance" in flags
+      )) {
+        expect(listOwnerScopes).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("a failing listing adds no line and the search still succeeds", async () => {
+    const result = await search(
+      {
+        scopeRequestGuidance: true,
+        exposeUnsharedScopes: true,
+        verifyGrantsLive: live,
+      },
+      {},
+      readClient({
+        listOwnerScopes: vi.fn().mockRejectedValue(new Error("x")),
+      }),
+    );
+    expect(result.isError).not.toBe(true);
+    expect(result.content).toHaveLength(1);
+    expect("unsharedHint" in parse(result)).toBe(false);
+  });
+
+  it("dead grants add no line", async () => {
+    const result = await search({
+      scopeRequestGuidance: true,
+      exposeUnsharedScopes: true,
+      verifyGrantsLive: async () => false,
+    });
+    expect("unsharedHint" in parse(result)).toBe(false);
+  });
+});
