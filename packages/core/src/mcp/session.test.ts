@@ -151,6 +151,38 @@ describe("createMcpSession", () => {
     expect(await replayStore.consume(proof.id, proof.expiresAtMs)).toBe(false);
   });
 
+  it.each([
+    ["the gateway flags it expired", { expired: true }],
+    ["its expiresAt is in the past", { expired: false, expiresAt: "1000" }],
+  ])(
+    "mints no session for an expired grant (%s), stores nothing and keeps the proof",
+    async (_label, overrides) => {
+      const store = createInMemoryMcpSessionStore();
+      const replayStore = createInMemoryMcpProofReplayStore();
+      const gw = fakeGateway(grant(overrides));
+      const proof = { id: "proof-exp", expiresAtMs: Date.now() + 60_000 };
+      await expect(
+        createMcpSession(
+          { builderAddress: BUILDER, grantId: "grant_1", proof },
+          {
+            store,
+            authSessionVerifier: gw,
+            grantVerifier: gw,
+            serverOwner: OWNER,
+            randomToken: () => "tok_exp",
+            replayStore,
+          },
+        ),
+      ).rejects.toMatchObject({ errorCode: "GRANT_REVOKED", code: 403 });
+      expect(
+        await store.getByTokenHash(await hashConnectionToken("tok_exp")),
+      ).toBeNull();
+      expect(await replayStore.consume(proof.id, proof.expiresAtMs)).toBe(
+        false,
+      );
+    },
+  );
+
   it("rejects a revoked grant", async () => {
     const gw = fakeGateway(grant({ revokedAt: "2020-01-01T00:00:00Z" }));
     await expect(

@@ -868,13 +868,7 @@ async function readLiveGrantState(
     const liveExpiry = parseExpirySeconds(live.expiresAt);
     // Only a grant that is live now passes its scopes on; a revoked, expired
     // or missing one counts as never granted.
-    if (
-      live.revokedAt ||
-      live.expired ||
-      (liveExpiry !== undefined && liveExpiry <= nowSeconds)
-    ) {
-      continue;
-    }
+    if (live.revokedAt || isGrantExpired(live, nowSeconds)) continue;
     for (const scope of live.scopes) scopes.add(scope);
     anyLive = true;
     if (liveExpiry === undefined) {
@@ -911,6 +905,18 @@ function parseExpirySeconds(value: string | null): number | undefined {
   return Number.isFinite(ms) ? Math.floor(ms / 1000) : undefined;
 }
 
+/** The one expiry rule: the gateway's `expired` flag, or `expiresAt` reached. */
+export function isGrantExpired(
+  grant: { expired?: boolean; expiresAt: string | null },
+  nowSeconds: number,
+): boolean {
+  const expiresAt = parseExpirySeconds(grant.expiresAt);
+  return (
+    Boolean(grant.expired) ||
+    (expiresAt !== undefined && expiresAt <= nowSeconds)
+  );
+}
+
 /**
  * The connection's grants that are still live at the gateway (present, not
  * revoked, not expired), each with the scopes the gateway holds for it now.
@@ -928,18 +934,19 @@ export async function liveMcpGrants(
     connection.grants.map((grant) => grant.grantId),
   );
   if (connection.status !== "approved") return [];
-  const nowSeconds = Math.floor(now().getTime() / 1000);
   // No gateway means no authority to say a grant still stands: no grants.
   if (!gateway) return [];
   try {
     const checked = await Promise.all(
       grantIds.map(async (grantId) => {
         const live = await gateway.getGrant(grantId);
-        if (!live || live.revokedAt || live.expired) return null;
-        const expiresAt = parseExpirySeconds(live.expiresAt);
-        return expiresAt !== undefined && expiresAt <= nowSeconds
-          ? null
-          : { grantId, scopes: [...live.scopes] };
+        // Read the clock after the lookup: a slow answer must not be judged
+        // by the time it was asked.
+        const nowSeconds = Math.floor(now().getTime() / 1000);
+        if (!live || live.revokedAt || isGrantExpired(live, nowSeconds)) {
+          return null;
+        }
+        return { grantId, scopes: [...live.scopes] };
       }),
     );
     return checked.filter((grant): grant is LiveGrant => grant !== null);

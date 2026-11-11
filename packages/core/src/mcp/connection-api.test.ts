@@ -34,6 +34,7 @@ import {
   toMcpConnectionView,
   DEFAULT_MCP_GRANT_TTL_SECONDS,
   mcpGrantDefaultExpiry,
+  liveMcpGrants,
 } from "./connection-api.js";
 import { MCP_REFRESH_TTL_MS, MCP_TOKEN_TTL_MS } from "./token-expiry.js";
 import { ensureMcpGranteeRegistered } from "./builder-registration.js";
@@ -1192,6 +1193,22 @@ describe("mcp/connection-api scope request read token", () => {
     );
     // youtube.history was narrowed away; spotify.library was never stored.
     expect(view?.grantedScopes).toEqual(["instagram.profile"]);
+  });
+
+  it("judges expiry by the clock after the lookup returns, not before it started", async () => {
+    const { store, connectionId } = await connectionWithRequest();
+    const connection = (await store.getById(connectionId))!;
+    let nowMs = Date.parse("2026-10-07T10:00:00.000Z");
+    const expiresAt = String(Math.floor(nowMs / 1000) + 1);
+    const gateway = {
+      getGrant: async () => {
+        nowMs += 2000; // the lookup takes two seconds
+        return grantState({ expiresAt });
+      },
+    } as never;
+    expect(
+      await liveMcpGrants(connection, gateway, () => new Date(nowMs)),
+    ).toEqual([]);
   });
 
   it("names no scope from a revoked, expired, missing or unverifiable grant", async () => {

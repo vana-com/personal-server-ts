@@ -18,6 +18,7 @@ import { GRANT_LIVENESS_TIMEOUT_MS, withTimeout } from "./tools.js";
 import {
   assertStorableScopes,
   hashConnectionToken,
+  isGrantExpired,
   McpInvalidScopeError,
 } from "./connection-api.js";
 import type { McpConnectionRecord } from "./types.js";
@@ -212,6 +213,12 @@ export async function createMcpSession(
     });
   }
   if (grant.revokedAt !== null) {
+    throw new GrantRevokedError({ grantId: grant.id });
+  }
+  // An expired grant counts as never granted: no session, no scopes back.
+  if (
+    isGrantExpired(grant, Math.floor((options.now?.() ?? Date.now()) / 1000))
+  ) {
     throw new GrantRevokedError({ grantId: grant.id });
   }
   if (builder.id.toLowerCase() !== grant.granteeId.toLowerCase()) {
