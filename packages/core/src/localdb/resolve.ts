@@ -3,10 +3,7 @@ import {
   type ReadDecision,
   type ResolveInput,
 } from "../stream-sync-read/service.js";
-import {
-  logicalStreamScopeParts,
-  streamReadScope,
-} from "../stream-sync-read/routing.js";
+import { streamReadScope } from "../stream-sync-read/routing.js";
 import { applyConnection } from "./apply.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { createOlderVersions, type OlderVersions } from "./older-versions.js";
@@ -14,14 +11,16 @@ import type { RecordQuery } from "./query.js";
 import {
   chooseCandidate,
   complete,
+  connectionsOf,
   loadStreams,
   projectAlias,
   selectForTarget,
+  servedStreamOf,
+  targetsForScope,
   tombstoned,
   type Candidate,
   type Connection,
   type Stream,
-  type Target,
 } from "./read-selection.js";
 
 /**
@@ -186,13 +185,8 @@ export function createLocalResolver(
   const streams = (connectionId: string): Promise<Stream[]> =>
     loadStreams(deps, connectionId);
 
-  async function connections(connector: string): Promise<Connection[]> {
-    return deps.db.query<Connection>(
-      `SELECT connection_id, connector, ns, generation, control_state, deleted_at
-       FROM connections WHERE connector = ? ORDER BY ns`,
-      [connector],
-    );
-  }
+  const connections = (connector: string): Promise<Connection[]> =>
+    connectionsOf(deps, connector);
 
   async function build(
     input: ResolveInput,
@@ -274,7 +268,7 @@ export function createLocalResolver(
       if (projected.kind === "no_data") return noData();
       payload = single(JSON.stringify(projected.payload));
     }
-    const servedStream = binding?.servedStream ?? candidate.target.streams[0]!;
+    const servedStream = servedStreamOf(candidate.target);
     const head = installed.find((s) => s.stream === servedStream)!;
     return {
       kind: "view",
@@ -307,18 +301,11 @@ export function createLocalResolver(
       if (input.cursor !== null && !validCursor(input.cursor))
         return { kind: "invalid_cursor" };
       const scope = streamReadScope(input.scope) ?? input.scope;
-      const logical = logicalStreamScopeParts(streamReadScope(scope) ?? "");
-      const aliases =
-        !logical && new Set(parts.aliasScopes?.() ?? []).has(scope)
-          ? (parts.aliasTargets?.(scope) ?? [])
-          : [];
-      const targets: readonly Target[] = logical
-        ? [{ connector: logical.connector, streams: [logical.stream] }]
-        : aliases.map((alias) => ({
-            connector: alias.connector,
-            streams: alias.streams,
-            alias,
-          }));
+      const targets = targetsForScope(
+        scope,
+        new Set(parts.aliasScopes?.() ?? []),
+        parts.aliasTargets,
+      );
       const candidates: Candidate[] = [];
       let sawDeleted = false;
       let sawForeign = false;

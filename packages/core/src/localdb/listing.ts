@@ -9,6 +9,7 @@ import {
   loadStreams,
   projectAlias,
   selectForTarget,
+  targetsForScope,
   type Candidate,
   type Connection as SelectionConnection,
   type Stream,
@@ -185,18 +186,8 @@ export function createLocalListing(
       }
     }
     const aliasNames = new Set(deps.aliasScopes?.() ?? []);
-    const targets = (scope: string): readonly Target[] => {
-      const logical = logicalStreamScopeParts(scope);
-      if (logical) {
-        return [{ connector: logical.connector, streams: [logical.stream] }];
-      }
-      if (!aliasNames.has(scope)) return [];
-      return (deps.aliasTargets?.(scope) ?? []).map((alias) => ({
-        connector: alias.connector,
-        streams: alias.streams,
-        alias,
-      }));
-    };
+    const targets = (scope: string): readonly Target[] =>
+      targetsForScope(scope, aliasNames, deps.aliasTargets);
     for (const scope of aliasNames) {
       const logical = logicalStreamScopeParts(scope);
       const wanted = logical
