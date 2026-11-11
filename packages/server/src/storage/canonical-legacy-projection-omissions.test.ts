@@ -94,15 +94,8 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
     expect(result.rejected).toEqual([]);
   }
 
-  // A browser connection shares no source key with its profile, so it is
-  // read by method; every other selection here is read by source.
   const read = (selection: CanonicalConnectionSelection, scope: string) =>
-    readCanonicalLegacyScope({
-      store,
-      scope,
-      selection,
-      profileBy: selection.method === "oura-browser" ? "method" : "source",
-    });
+    readCanonicalLegacyScope({ store, scope, selection });
 
   const writes = () =>
     (db.prepare("SELECT total_changes() AS n").get() as { n: number }).n;
@@ -376,7 +369,7 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
       });
 
       it(`${c.scope}: keeps integer, rounded and null scores; drops absent, malformed and impossible-day rows`, async () => {
-        const a = connect("conn_a", "oura_pat");
+        const a = connect("conn_a", "oura");
         put(a, c.stream, [
           row("good", "2026-02-01", 80),
           row("null", "2026-02-02", null),
@@ -404,7 +397,7 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
       });
 
       it(`${c.scope}: refuses nonempty rows that all lack a score`, async () => {
-        const a = connect("conn_a", "oura_pat");
+        const a = connect("conn_a", "oura");
         put(a, c.stream, [
           row("a", "2026-02-01", absent),
           row("b", "2026-02-02", absent),
@@ -414,7 +407,7 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
     }
 
     it("selects the base profile by source identity, not by a browser-looking method", async () => {
-      const a = connect("conn_a", "oura_pat", "browser");
+      const a = connect("conn_a", "oura", "browser");
       // A base sleep row has no record_type; the Browser profile would refuse it.
       put(a, "sleep", [{ id: "s1", day: "2026-02-01", sleep_score: 70 }]);
       const result = okBody(await read(a, "oura.sleep"));
@@ -426,7 +419,7 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
     });
 
     it("keeps PAT sleep periods when sleep_score is null", async () => {
-      const a = connect("conn_a", "oura_pat");
+      const a = connect("conn_a", "oura");
       put(a, "sleep", [
         {
           id: "s-null",
@@ -453,7 +446,7 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
     });
 
     it("carries Oura omission provenance beside the projected payload", async () => {
-      const a = connect("conn_a", "oura", "oura-browser");
+      const a = connect("conn_a", "oura-browser");
       put(a, "sleep", [
         {
           id: "d1",
@@ -517,7 +510,7 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
       });
 
       it("keeps null daily scores in an otherwise valid score-only stream", async () => {
-        const a = connect("conn_a", "oura", "oura-browser");
+        const a = connect("conn_a", "oura-browser");
         put(a, "sleep", [
           score("d1", "2026-02-01", 70),
           score("d2", "2026-02-02", null),
@@ -536,7 +529,7 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
       });
 
       it("drops daily scores with an impossible day, an absent score or a malformed score", async () => {
-        const a = connect("conn_a", "oura", "oura-browser");
+        const a = connect("conn_a", "oura-browser");
         put(a, "sleep", [
           score("d1", "2026-02-01", 70),
           score("feb-30", "2026-02-30", 70),
@@ -562,7 +555,7 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
       });
 
       it("refuses a stream whose every row is dropped", async () => {
-        const a = connect("conn_a", "oura", "oura-browser");
+        const a = connect("conn_a", "oura-browser");
         put(a, "sleep", [
           score("feb-30", "2026-02-30", 70),
           score("absent", "2026-02-03", absent),
@@ -571,7 +564,7 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
       });
 
       it("applies the same day and score rules to activity", async () => {
-        const a = connect("conn_a", "oura", "oura-browser");
+        const a = connect("conn_a", "oura-browser");
         put(a, "activity", [
           { id: "a1", day: "2026-02-01", score: 60 },
           { id: "a2", day: "2026-02-02" },

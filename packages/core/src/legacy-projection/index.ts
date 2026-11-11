@@ -3,7 +3,6 @@ import {
   ANTHROPIC_LIVE_BINDINGS,
   GROCERY_INVALID_ORDER,
   LEGACY_SCOPE_BINDINGS,
-  publicSourceForConnector,
 } from "./bindings.js";
 import { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 import { META_040_BINDINGS } from "./meta-040-bindings.js";
@@ -24,7 +23,7 @@ import type {
 } from "./types.js";
 
 export { ANTHROPIC_LIVE_BINDINGS } from "./bindings.js";
-export { LEGACY_SCOPE_BINDINGS, publicSourceForConnector } from "./bindings.js";
+export { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
 export { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 export { META_040_BINDINGS } from "./meta-040-bindings.js";
 export {
@@ -62,26 +61,6 @@ const ALTERNATE_PROFILE_BINDINGS: ReadonlyMap<
   ["oura-browser", OURA_BROWSER_BINDINGS],
   ["strava-browser", STRAVA_BROWSER_BINDINGS],
 ]);
-
-/**
- * Legacy scope namespaces (`claude` in `claude.conversations`) whose bindings
- * read the given public source. A source id does not spell its namespace.
- */
-export function legacyNamespacesOfSource(sourceId: string): string[] {
-  const namespaces = new Set<string>();
-  const profiles = [
-    LEGACY_SCOPE_BINDINGS,
-    ...ALTERNATE_PROFILE_BINDINGS.values(),
-  ];
-  for (const profile of profiles) {
-    for (const [scope, binding] of profile) {
-      if (publicSourceForConnector(binding.pdppSource) === sourceId) {
-        namespaces.add(scope.split(".", 1)[0] ?? "");
-      }
-    }
-  }
-  return [...namespaces];
-}
 
 export function hasAlternateLegacyProfile(profileKey: string): boolean {
   return ALTERNATE_PROFILE_BINDINGS.has(profileKey);

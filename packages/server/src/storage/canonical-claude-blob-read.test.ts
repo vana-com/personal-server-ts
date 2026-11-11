@@ -7,7 +7,7 @@ import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 
 const selection = {
   instance: "claude-test",
-  sourceId: "https://registry.pdpp.dev/sources/claude_export",
+  sourceId: "https://registry.pdpp.dev/sources/claude",
   method: "anthropic",
 };
 const collected = "2026-09-01T12:00:00.000Z";

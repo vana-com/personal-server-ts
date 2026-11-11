@@ -10,7 +10,6 @@ import type {
   PersonalServerScopeAuthInput,
   PersonalServerWriteAuthInput,
 } from "@opendatalabs/personal-server-ts-core/api";
-import { legacyNamespacesOfSource } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import {
   resolveDataListGrantScopes,
   verifyDataReadPolicy,
@@ -208,11 +207,7 @@ export function createServerApiAuth(
       const configured = bridge.configuredMethods.get(context.sourceId) ?? [];
       const sourceNamespace =
         context.sourceId.split("/").filter(Boolean).at(-1) ?? context.sourceId;
-      if (
-        (namespace !== sourceNamespace &&
-          !legacyNamespacesOfSource(context.sourceId).includes(namespace)) ||
-        configured.length !== 1
-      ) {
+      if (namespace !== sourceNamespace || configured.length !== 1) {
         throw pdppBridgeError(
           "PDPP_OWNER_BEARER_SCOPE_MISMATCH",
           "PDPP owner bearer token is not scoped to the requested legacy source namespace",
@@ -267,12 +262,8 @@ export function createServerApiAuth(
     }
     const namespace = legacyNamespace(scope);
     const [liveInstance] = liveInstanceIds;
-    const instancePrefix = liveInstance.split(":", 1)[0] ?? "";
     const matchesScope =
-      (instancePrefix === namespace ||
-        legacyNamespacesOfSource(
-          `https://registry.pdpp.dev/sources/${instancePrefix}`,
-        ).includes(namespace)) &&
+      liveInstance.split(":", 1)[0] === namespace &&
       bridge.configuredMethods.has(liveInstance);
 
     if (!matchesScope) {
