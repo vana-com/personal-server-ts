@@ -3447,3 +3447,82 @@ describe("MCP notShared owner listing deps (route level)", () => {
     expect(normalize(withView)).toEqual(normalize(without));
   });
 });
+
+describe("MCP scope-request opener route", () => {
+  const ID = "0b9f3c1e-6d2a-4a52-9a53-1f7e2c3d4e5f";
+  const buildApp = (hook?: (id: string) => string | undefined) => {
+    const root = new Hono();
+    root.route(
+      "/mcp",
+      mcpStreamableHttpRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway: makeGatewayForGrantee({
+          granteeAddress: "0x0000000000000000000000000000000000000002",
+        }).gateway,
+        gatewayConfig,
+        serverSigner: {
+          signGrantRegistration: vi
+            .fn()
+            .mockResolvedValue("0xgrantsig" as `0x${string}`),
+        },
+        accessLogWriter: createMockAccessLogWriter(),
+        connectionStore: createInMemoryMcpConnectionStore(),
+        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        hierarchyOptions: { dataDir: "/tmp" },
+        scopeRequestApprovalUrl: hook,
+        localApprovalPort: LOOPBACK_PORT,
+        serverPort: MAIN_PORT,
+      }),
+    );
+    return root;
+  };
+  const open = (app: Hono, query: string, localPort: number = LOOPBACK_PORT) =>
+    app.request(
+      `/mcp/scope-request/open${query}`,
+      {},
+      { incoming: { socket: { localPort, localAddress: "127.0.0.1" } } },
+    );
+  const hook = (id: string) => `vana://mcp-scope-request?connection=${id}`;
+
+  it("redirects a valid id to the host's URL without caching or referrer", async () => {
+    const res = await open(buildApp(hook), `?connection=${ID}`);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(hook(ID));
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(res.headers.get("referrer-policy")).toBe("no-referrer");
+  });
+
+  it.each([
+    "",
+    "?connection=",
+    "?connection=../x",
+    "?connection=a%0d%0ab",
+    `?connection=${ID}x`,
+  ])("rejects %j with 400 and no redirect", async (query) => {
+    const res = await open(buildApp(hook), query);
+    expect(res.status).toBe(400);
+    expect(res.headers.get("location")).toBeNull();
+  });
+
+  it("answers 404 when the host has no approval URL hook", async () => {
+    const res = await open(buildApp(), `?connection=${ID}`);
+    expect(res.status).toBe(404);
+    expect(res.headers.get("location")).toBeNull();
+  });
+
+  it("answers 404 when the hook gives no URL", async () => {
+    const res = await open(
+      buildApp(() => undefined),
+      `?connection=${ID}`,
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("is invisible on the public (tunnel) ingress", async () => {
+    const res = await open(buildApp(hook), `?connection=${ID}`, MAIN_PORT);
+    expect(res.status).toBe(404);
+    expect(res.headers.get("location")).toBeNull();
+  });
+});

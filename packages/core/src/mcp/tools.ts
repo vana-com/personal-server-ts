@@ -35,10 +35,12 @@ import {
   type LiveGrant,
 } from "./connection-api.js";
 import type { McpActivityRecorder } from "./activity.js";
-import type {
-  McpScopeRequestApprovalUrlContext,
-  McpScopeRequestApprovalUrlHook,
+import {
+  buildMcpScopeRequestOpenerUrl,
+  isOpenerEligibleApprovalUrl,
+  resolveMcpScopeRequestApprovalUrl,
 } from "./approval-url.js";
+import type { McpScopeRequestApprovalUrlHook } from "./approval-url.js";
 import { MiniSearchIndex, type SearchDocument } from "./search/index.js";
 import { MAX_SELECTED_BLOCK_IDS } from "../storage/blocks/index.js";
 import {
@@ -84,6 +86,12 @@ export interface McpToolContext {
    * the link can name the server that holds the request.
    */
   serverOrigin?: string;
+  /**
+   * The loopback origin the calling client used. Set only when the call
+   * arrived on the loopback listener. Lets the reply offer an http opener
+   * link that Maple-style hosts can open in a browser.
+   */
+  loopbackOrigin?: string;
   /**
    * Host option `mcpExposeUnsharedScopes`. On: `list_granted_scopes` adds
    * `notShared`, the owner's scopes this connection holds no grant for. That
@@ -1063,6 +1071,7 @@ const requestScopeAccess: McpToolDefinition = {
       scopeRequestApprovalUrl,
       scopeRequestReviewHint,
       serverOrigin,
+      loopbackOrigin,
     },
   ) {
     const requestedScopes = normalizeScopeListInput(args.scopes);
@@ -1103,12 +1112,33 @@ const requestScopeAccess: McpToolDefinition = {
     }
     const finalApprovalRequired = missingScopes.length > 0;
     const recorded = finalApprovalRequired && requestRecorded;
-    const approvalUrl = recorded
-      ? resolveScopeRequestApprovalUrl(scopeRequestApprovalUrl, connection.id, {
-          serverOrigin,
-          ...(readToken ? { readToken } : {}),
-        })
+    const hostApprovalUrl = recorded
+      ? resolveMcpScopeRequestApprovalUrl(
+          scopeRequestApprovalUrl,
+          connection.id,
+          {
+            serverOrigin,
+            ...(readToken ? { readToken } : {}),
+          },
+        )
       : undefined;
+    const useOpener =
+      hostApprovalUrl !== undefined &&
+      loopbackOrigin !== undefined &&
+      isOpenerEligibleApprovalUrl(
+        hostApprovalUrl,
+        resolveMcpScopeRequestApprovalUrl(
+          scopeRequestApprovalUrl,
+          connection.id,
+          {
+            serverOrigin,
+          },
+        ),
+      );
+    const approvalUrl =
+      useOpener && loopbackOrigin
+        ? buildMcpScopeRequestOpenerUrl(loopbackOrigin, connection.id)
+        : hostApprovalUrl;
     const declinedScopes =
       previousDecision?.deniedScopes.filter((scope) =>
         missingScopes.includes(scope),
@@ -1133,6 +1163,7 @@ const requestScopeAccess: McpToolDefinition = {
         finalApprovalRequired,
         recorded,
         approvalUrl,
+        approvalUrlIsOpener: useOpener,
         scopeRequestReviewHint,
         declinedScopes,
       }),
@@ -1140,25 +1171,11 @@ const requestScopeAccess: McpToolDefinition = {
   },
 };
 
-function resolveScopeRequestApprovalUrl(
-  hook: McpToolContext["scopeRequestApprovalUrl"],
-  connectionId: string,
-  context: McpScopeRequestApprovalUrlContext,
-): string | undefined {
-  if (!hook) return undefined;
-  try {
-    const url = hook(connectionId, context);
-    return typeof url === "string" && url.trim() ? url.trim() : undefined;
-  } catch {
-    // A broken host hook must not fail the request itself; fall back to Vana.
-    return undefined;
-  }
-}
-
 function scopeRequestNextAction(input: {
   finalApprovalRequired: boolean;
   recorded: boolean;
   approvalUrl?: string;
+  approvalUrlIsOpener?: boolean;
   scopeRequestReviewHint?: string;
   declinedScopes: string[];
 }): string {
@@ -1175,6 +1192,9 @@ function scopeRequestNextAction(input: {
   const reviewHint = input.scopeRequestReviewHint
     ? ` ${input.scopeRequestReviewHint}`
     : "";
+  if (input.approvalUrl && input.approvalUrlIsOpener) {
+    return `${declined}Show the user this link as a markdown link, [Review the request in Vana](${input.approvalUrl}), to review the request. Ask them to approve or decline it there and to tell you when they are done, then call list_granted_scopes to see what was granted. Access remains unchanged until the owner approves.${reviewHint}`;
+  }
   if (input.approvalUrl) {
     return `${declined}Show the user this link to review the request: ${input.approvalUrl} . Ask them to approve or decline it there and to tell you when they are done, then call list_granted_scopes to see what was granted. Access remains unchanged until the owner approves.${reviewHint}`;
   }

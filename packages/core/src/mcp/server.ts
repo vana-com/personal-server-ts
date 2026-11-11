@@ -52,6 +52,7 @@ export interface HandleMcpRequestOptions {
   scopeRequestApprovalUrl?: McpToolContext["scopeRequestApprovalUrl"];
   scopeRequestReviewHint?: string;
   serverOrigin?: McpToolContext["serverOrigin"];
+  loopbackOrigin?: McpToolContext["loopbackOrigin"];
   /** Host option; see `McpToolContext.exposeUnsharedScopes`. Default off. */
   exposeUnsharedScopes?: McpToolContext["exposeUnsharedScopes"];
   /**
@@ -488,6 +489,7 @@ export function createMcpServerForConnection(
     scopeRequestApprovalUrl: options.scopeRequestApprovalUrl,
     scopeRequestReviewHint: options.scopeRequestReviewHint,
     serverOrigin: options.serverOrigin,
+    loopbackOrigin: options.loopbackOrigin,
     exposeUnsharedScopes: options.exposeUnsharedScopes,
     verifyGrantsLive: options.verifyGrantsLive,
     scopeRequestGuidance: options.scopeRequestGuidance,
