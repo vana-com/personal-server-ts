@@ -13,7 +13,7 @@ import {
   StreamCompletionError,
 } from "./pdpp-stream-completion.js";
 
-const SOURCE = "https://registry.pdpp.dev/sources/claude";
+const SOURCE = "https://registry.pdpp.dev/sources/claude_export";
 const OTHER_SOURCE = "https://registry.pdpp.dev/sources/oura";
 const METHOD = "anthropic";
 const INSTANCE = "conn_a";

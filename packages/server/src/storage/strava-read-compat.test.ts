@@ -18,7 +18,7 @@ import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
  * producer (sha256:b330…7c82c). Nothing here says a real account holds them.
  */
 
-const SOURCE = "https://registry.pdpp.dev/sources/strava";
+const SOURCE = "https://registry.pdpp.dev/sources/strava_api";
 const METHOD = "strava_export";
 const COLLECTED = "2026-09-10T08:30:00+02:00";
 const COLLECTED_ISO = "2026-09-10T06:30:00.000Z";
@@ -322,7 +322,7 @@ describe("strava legacy scopes over the real SQLite record store", () => {
   it("leaves the result shape of an unrelated scope unchanged", async () => {
     store.registerConnection({
       instance: "conn_oura",
-      sourceId: "https://registry.pdpp.dev/sources/oura",
+      sourceId: "https://registry.pdpp.dev/sources/oura_pat",
       method: METHOD,
       label: "oura",
     });
@@ -352,7 +352,7 @@ describe("strava legacy scopes over the real SQLite record store", () => {
       scope: "oura.activity",
       selection: {
         instance: "conn_oura",
-        sourceId: "https://registry.pdpp.dev/sources/oura",
+        sourceId: "https://registry.pdpp.dev/sources/oura_pat",
         method: METHOD,
       },
     });

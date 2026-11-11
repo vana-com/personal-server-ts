@@ -2110,8 +2110,42 @@ function primaryKeyOrder(
 // decision; this local manifest hash is not the signed OCI artifact digest.
 export const ANTHROPIC_CONNECTOR_ID =
   "https://registry.pdpp.dev/connectors/anthropic";
-// Connector/method identity differs from the public source in the admitted declaration.
+// Each connector collects its own public source, so no source has two methods.
+// Admitted declarations name these sources; they are not derived from the
+// connector key. Connectors absent here use `/connectors/` -> `/sources/`.
 export const CLAUDE_SOURCE_ID = "https://registry.pdpp.dev/sources/claude";
+export const CLAUDE_EXPORT_SOURCE_ID =
+  "https://registry.pdpp.dev/sources/claude_export";
+export const PUBLIC_SOURCE_BY_CONNECTOR: ReadonlyMap<string, string> = new Map([
+  [ANTHROPIC_CONNECTOR_ID, CLAUDE_EXPORT_SOURCE_ID],
+  ["https://registry.pdpp.dev/connectors/anthropic-live", CLAUDE_SOURCE_ID],
+  [
+    "https://registry.pdpp.dev/connectors/oura",
+    "https://registry.pdpp.dev/sources/oura_pat",
+  ],
+  [
+    "https://registry.pdpp.dev/connectors/oura-browser",
+    "https://registry.pdpp.dev/sources/oura",
+  ],
+  [
+    "https://registry.pdpp.dev/connectors/strava",
+    "https://registry.pdpp.dev/sources/strava_api",
+  ],
+  [
+    "https://registry.pdpp.dev/connectors/strava-browser",
+    "https://registry.pdpp.dev/sources/strava",
+  ],
+]);
+
+/** The public source a binding's connector collects. */
+export function publicSourceForConnector(pdppSource: string): string {
+  const named = PUBLIC_SOURCE_BY_CONNECTOR.get(pdppSource);
+  if (named !== undefined) return named;
+  return pdppSource.replace(
+    "https://registry.pdpp.dev/connectors/",
+    "https://registry.pdpp.dev/sources/",
+  );
+}
 const anthropicProjectionProvenance: LegacyScopeBindingProvenance[] = [
   {
     kind: "collection-profile",

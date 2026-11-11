@@ -12,17 +12,34 @@ import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
 import { initializeDatabase } from "./index-schema.js";
 
+// Every connector collects its own source: no source has two methods.
 const OURA = "https://registry.pdpp.dev/sources/oura";
+const OURA_PAT = "https://registry.pdpp.dev/sources/oura_pat";
 const GITHUB = "https://registry.pdpp.dev/sources/github";
 const CLAUDE = "https://registry.pdpp.dev/sources/claude";
+const CLAUDE_EXPORT = "https://registry.pdpp.dev/sources/claude_export";
 const STRAVA = "https://registry.pdpp.dev/sources/strava";
+const STRAVA_API = "https://registry.pdpp.dev/sources/strava_api";
 
 /** The (source, method) pairs a boot configures, as Desktop names them. */
 const CONFIGURED: Record<string, string[]> = {
-  [OURA]: ["oura", "oura-browser"],
+  [OURA]: ["oura-browser"],
+  [OURA_PAT]: ["oura"],
   [GITHUB]: ["github-browser"],
-  [CLAUDE]: ["anthropic"],
-  [STRAVA]: ["strava", "strava-browser"],
+  [CLAUDE]: ["anthropic-live"],
+  [CLAUDE_EXPORT]: ["anthropic"],
+  [STRAVA]: ["strava-browser"],
+  [STRAVA_API]: ["strava"],
+};
+
+const SOURCE_OF_METHOD: Record<string, string> = {
+  oura: OURA_PAT,
+  "oura-browser": OURA,
+  anthropic: CLAUDE_EXPORT,
+  "anthropic-live": CLAUDE,
+  strava: STRAVA_API,
+  "strava-browser": STRAVA,
+  "github-browser": GITHUB,
 };
 
 const CLAUDE_PROFILE = {
@@ -41,7 +58,7 @@ function connect(
   store: Store,
   instance: string,
   method = "oura",
-  source = OURA,
+  source = SOURCE_OF_METHOD[method] ?? OURA_PAT,
 ) {
   store.registerConnection({ instance, sourceId: source, method, label: "" });
 }
@@ -767,7 +784,7 @@ describe("legacy scope view over the real SQLite record store", () => {
   });
 
   it("compares the projected Claude conversation joined from three streams", async () => {
-    connect(store, "conn_claude", "anthropic", CLAUDE);
+    connect(store, "conn_claude", "anthropic", CLAUDE_EXPORT);
     const rows = [
       ["account_profile", CLAUDE_PROFILE],
       [
@@ -825,7 +842,7 @@ describe("legacy scope view over the real SQLite record store", () => {
   });
 
   it("keeps Claude legacy authoritative when a conversation lacks its raw blob reference", async () => {
-    connect(store, "conn_claude", "anthropic", CLAUDE);
+    connect(store, "conn_claude", "anthropic", CLAUDE_EXPORT);
     const rows = [
       ["account_profile", CLAUDE_PROFILE],
       [
@@ -906,7 +923,7 @@ describe("legacy scope view over the real SQLite record store", () => {
   });
 
   it("counts missing Claude raw blobs across mixed populations without relabeling mismatches", async () => {
-    connect(store, "conn_claude", "anthropic", CLAUDE);
+    connect(store, "conn_claude", "anthropic", CLAUDE_EXPORT);
     const validProjects = addClaudeProjects(store);
     const validProject = validProjects[0]!;
     const put = (
@@ -1007,7 +1024,7 @@ describe("legacy scope view over the real SQLite record store", () => {
       },
     ]);
 
-    connect(store, "conn_strava", "strava", STRAVA);
+    connect(store, "conn_strava", "strava", STRAVA_API);
     replace(store, "conn_strava", "activities", ["same-id"], {
       method: "strava",
     });
@@ -1051,7 +1068,7 @@ describe("legacy scope view over the real SQLite record store", () => {
   });
 
   it("keeps covering Claude project rows with their raw blob references", async () => {
-    connect(store, "conn_claude", "anthropic", CLAUDE);
+    connect(store, "conn_claude", "anthropic", CLAUDE_EXPORT);
     addClaudeProjects(store);
     const projected = await view.readLatest("claude.projects");
     expect(projected.kind).toBe("canonical");
@@ -1345,7 +1362,7 @@ describe("legacy scope view over the real SQLite record store", () => {
   });
 
   it("refreshes a covered projection after an unchanged re-delivery changes arrival order", async () => {
-    connect(store, "conn_a", "strava", STRAVA);
+    connect(store, "conn_a", "strava", STRAVA_API);
     replace(store, "conn_a", "activities", ["a", "b"], { method: "strava" });
     const initialProjection = await view.readLatest("strava.activities");
     expect(initialProjection.kind).toBe("canonical");
@@ -1402,7 +1419,7 @@ describe("legacy scope view over the real SQLite record store", () => {
   });
 
   it("refreshes a covered projection after an unchanged replacement reorders records", async () => {
-    connect(store, "conn_a", "strava", STRAVA);
+    connect(store, "conn_a", "strava", STRAVA_API);
     replace(store, "conn_a", "activities", ["a", "b"], { method: "strava" });
     const initialProjection = await view.readLatest("strava.activities");
     expect(initialProjection.kind).toBe("canonical");
@@ -1438,7 +1455,7 @@ describe("legacy scope view over the real SQLite record store", () => {
   });
 
   it("re-evaluates a same-time parity verdict after only arrival order changes", async () => {
-    connect(store, "conn_a", "strava", STRAVA);
+    connect(store, "conn_a", "strava", STRAVA_API);
     replace(store, "conn_a", "activities", ["a", "b"], { method: "strava" });
     const initialProjection = await view.readLatest("strava.activities");
     expect(initialProjection.kind).toBe("canonical");
@@ -2185,7 +2202,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     async (failure) => {
       addLegacyClaudeHead(db);
       const legacyRows = db.prepare("SELECT * FROM data_files").all();
-      connect(store, "conn_claude", "anthropic", CLAUDE);
+      connect(store, "conn_claude", "anthropic", CLAUDE_EXPORT);
       const blobs = addClaudeProjects(store, failure === "budget" ? 3 : 1);
       const oversized = 22 * 1024 * 1024;
 
@@ -2818,7 +2835,7 @@ describe("legacy scope view over the real SQLite record store", () => {
 
     // Never a mix of two producers: the owner must hold one Strava method.
     it("refuses activities, not diagnostics, while both methods hold data", async () => {
-      connect(store, "conn_export", "strava", STRAVA);
+      connect(store, "conn_export", "strava", STRAVA_API);
       connect(store, "conn_live", "strava-browser", STRAVA);
       replace(store, "conn_export", "activities", ["a1"], { method: "strava" });
       replace(store, "conn_export", "coverage_diagnostics", ["d1"], {

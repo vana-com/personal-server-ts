@@ -21,7 +21,7 @@ import { createReplicaReceiver } from "./storage/pdpp-replication-receiver.js";
 // The host composes an enabled receiver with the real app. Every
 // canonical-derived HTTP response must come from the reader the token selects.
 const owner = "owner-a";
-const sourceId = "https://registry.pdpp.dev/sources/oura";
+const sourceId = "https://registry.pdpp.dev/sources/oura_pat";
 const method = "oura";
 const instance = "conn_a";
 const stream = "activity";
