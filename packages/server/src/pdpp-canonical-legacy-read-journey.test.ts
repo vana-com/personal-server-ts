@@ -36,18 +36,13 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
-import { publicSourceForConnector } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { type CreateServerOptions, type ServerContext } from "./bootstrap.js";
-import {
-  legacyTestConnectionId,
-  registerTestConnection,
-} from "./pdpp/test-connections.js";
+import { registerTestConnection } from "./pdpp/test-connections.js";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
 const CONTROL_PLANE_TOKEN = "canonical-read-journey-control-plane";
-const OURA = "https://registry.pdpp.dev/sources/oura_pat";
-const OURA_BROWSER = "https://registry.pdpp.dev/sources/oura";
+const OURA = "https://registry.pdpp.dev/sources/oura";
 const SECOND_ACCOUNT = "conn_123e4567-e89b-42d3-a456-426614174000";
 // X402 pays against the grant id as an opId, so it must be bytes32.
 const GRANT_ID = `0x${"11".repeat(32)}`;
@@ -78,27 +73,25 @@ const READINESS_FIELDS = [
   "temperature_trend_deviation",
   "contributors",
 ];
-const ouraDeclaration = (sourceId: string) =>
-  JSON.stringify({
-    source_id: sourceId,
-    source_kind: "connector",
-    version: "1",
-    streams: [
-      {
-        name: "activity",
-        fields: ACTIVITY_FIELDS,
-        required_fields: ["id"],
-        primary_key: ["id"],
-      },
-      {
-        name: "readiness",
-        fields: READINESS_FIELDS,
-        required_fields: ["id"],
-        primary_key: ["id"],
-      },
-    ],
-  });
-const OURA_DECLARATION = ouraDeclaration(OURA);
+const OURA_DECLARATION = JSON.stringify({
+  source_id: OURA,
+  source_kind: "connector",
+  version: "1",
+  streams: [
+    {
+      name: "activity",
+      fields: ACTIVITY_FIELDS,
+      required_fields: ["id"],
+      primary_key: ["id"],
+    },
+    {
+      name: "readiness",
+      fields: READINESS_FIELDS,
+      required_fields: ["id"],
+      primary_key: ["id"],
+    },
+  ],
+});
 
 let tempDir: string;
 let ctx: ServerContext | undefined;
@@ -186,13 +179,7 @@ async function boot(
 
 async function ownerPdppToken(instanceId?: string): Promise<string> {
   if (!instanceId) {
-    return registerTestConnection(
-      ctx!.app,
-      ctx!.devToken!,
-      owner,
-      OURA,
-      "oura",
-    );
+    return registerTestConnection(ctx!.app, ctx!.devToken!, owner, OURA);
   }
   const response = await ctx!.app.request("/pdpp/v1/owner/token", {
     method: "POST",
@@ -339,7 +326,7 @@ beforeEach(async () => {
   vi.stubEnv("VANA_MASTER_KEY_SIGNATURE", KNOWN_SIG);
   vi.stubEnv("PS_ACCESS_TOKEN", CONTROL_PLANE_TOKEN);
   owner = (await recoverServerOwner(KNOWN_SIG)).toLowerCase();
-  accountOne = legacyTestConnectionId(owner, OURA);
+  accountOne = `oura:${owner}`;
   ctx = await boot();
 });
 
@@ -1859,14 +1846,13 @@ describe("configured methods that share one public source", () => {
   });
 
   it("serves an Oura scope from an oura-browser connection on source oura", async () => {
-    // The default boot registered account one on the PAT source; start over
-    // with the browser connector's own source.
+    // The default boot registered account one with method oura; start over.
+    // Registration accepts one configured method per source, so this boot
+    // configures oura-browser alone for source oura.
     await ctx!.cleanup();
     await rm(tempDir, { recursive: true, force: true });
     await mkdir(tempDir);
-    ctx = await boot("oura-browser", {
-      declaration: ouraDeclaration(OURA_BROWSER),
-    });
+    ctx = await boot("oura-browser");
     await legacyWrite("oura.activity", {
       days: [{ id: "b1", day: "2026-09-01", score: 80 }],
     });
@@ -1874,7 +1860,7 @@ describe("configured methods that share one public source", () => {
       ctx.app,
       ctx.devToken!,
       owner,
-      OURA_BROWSER,
+      OURA,
       "oura-browser",
     );
     const write = await ctx.app.request(
@@ -1886,7 +1872,7 @@ describe("configured methods that share one public source", () => {
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          instance: legacyTestConnectionId(owner, OURA_BROWSER),
+          instance: accountOne,
           emitted_at: "2026-09-10T12:00:00Z",
           source_collected_at: "2026-09-10T06:00:00Z",
           records: [
@@ -1978,9 +1964,7 @@ describe.each([
         }
       }
       const method = fixture.profileKey ?? scope.split(".")[0]!;
-      const source = publicSourceForConnector(
-        `https://registry.pdpp.dev/connectors/${method}`,
-      );
+      const source = `https://registry.pdpp.dev/sources/${method}`;
       // A profile fixture may include other scopes' input streams.
       const streams = scope.endsWith("profile")
         ? { profile: fixture.streams.profile! }

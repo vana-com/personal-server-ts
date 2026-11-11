@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { PdppRecordEnvelopeInput } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 
-const SOURCE = "https://registry.pdpp.dev/sources/claude_export";
+const SOURCE = "https://registry.pdpp.dev/sources/claude";
 const METHOD = "anthropic";
 const INSTANCE = "conn_a";
 const T1 = "2026-09-10T06:30:00.000Z";

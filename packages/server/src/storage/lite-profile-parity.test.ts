@@ -4,7 +4,6 @@ import { describe, expect, it } from "vitest";
 import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   LEGACY_SCOPE_BINDINGS,
-  publicSourceForConnector,
   legacyBindingsForProfile,
 } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { readCanonicalLegacyScope } from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
@@ -127,14 +126,8 @@ describe("Lite and Desktop legacy profile parity", () => {
       expect(binding).toBeDefined();
       if (!binding) return;
       const method = profileKey ?? binding.pdppSource.split("/").at(-1)!;
-      // The store names a connector's own source; Lite rows carry the
-      // connector-key tag the stored-file projector compares.
       const sourceId = binding.pdppSource.replace("/connectors/", "/sources/");
-      const selection = {
-        instance: "conn",
-        sourceId: publicSourceForConnector(binding.pdppSource),
-        method,
-      };
+      const selection = { instance: "conn", sourceId, method };
 
       const db = new Database(":memory:");
       const store = createSqliteRecordStore(db);
