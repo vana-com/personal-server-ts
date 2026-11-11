@@ -40,6 +40,12 @@ export interface McpConnectionGrant {
   grantId: string;
   scopes: string[];
   sourceId?: string;
+  /**
+   * Epoch seconds at which the grant expires, when known at approval. Absent
+   * for a perpetual grant or one stored before this field. A host with no
+   * gateway to ask treats a grant past this time as dead.
+   */
+  expiresAt?: number;
 }
 
 export interface McpScopeAccessRequest {

@@ -1230,21 +1230,6 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       );
     }
 
-    // Revocation is checked on every session request, not only on data reads:
-    // the listing tools (list_granted_scopes, list_granted_sources,
-    // request_scope_access) answer from the session record and would keep
-    // describing a revoked grant's scopes until the token expired. A failed
-    // lookup is left to the per-read checks, which fail closed on their own.
-    const liveGrant = await deps.gateway
-      .getGrant(session.grantId)
-      .catch(() => undefined);
-    if (liveGrant === null || liveGrant?.revokedAt || liveGrant?.expired) {
-      return c.json(
-        jsonError(403, "GRANT_REVOKED", "Grant has been revoked or expired"),
-        403,
-      );
-    }
-
     const baseDeps = dataApiDepsOrError(c);
     if (baseDeps instanceof Response) return baseDeps;
 
@@ -1281,6 +1266,16 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       payment,
     });
     const { connection, account } = buildMcpSessionConnection(session);
+    // Revocation is checked on every session request, not only on data reads:
+    // the listing tools answer from the session record and would keep
+    // describing a revoked grant's scopes until the token expired. A failed
+    // lookup counts as not live, never as "continue".
+    if ((await liveMcpGrantIds(connection, deps.gateway)).length === 0) {
+      return c.json(
+        jsonError(403, "GRANT_REVOKED", "Grant has been revoked or expired"),
+        403,
+      );
+    }
     const readClient = createMcpDataReadClient({
       serverOrigin: resolveOrigin(deps.serverOrigin),
       granteeAccount: account,
@@ -1293,6 +1288,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       connection,
       readClient,
       activityRecorder: deps.activityRecorder,
+      verifyGrantsLive: () => liveMcpGrantIds(connection, deps.gateway),
     });
   }
 

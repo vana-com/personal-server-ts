@@ -400,16 +400,18 @@ describe("mcp/tools", () => {
       grantedRequestedScopes: ["instagram.profile", "chatgpt.history"],
       missingScopes: ["chatgpt.conversations"],
       requestRecorded: true,
-      nextAction: expect.stringContaining("owner approval"),
+      nextAction: expect.stringContaining("approve or decline it"),
     });
     expect(result.structuredContent).toMatchObject({
       approvalRequired: true,
       missingScopes: ["chatgpt.conversations"],
     });
-    expect(requestScopeAccess).toHaveBeenCalledWith({
-      scopes: ["chatgpt.conversations"],
-      reason: "Use ChatGPT history for the requested analysis.",
-    });
+    expect(requestScopeAccess).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopes: ["chatgpt.conversations"],
+        reason: "Use ChatGPT history for the requested analysis.",
+      }),
+    );
   });
 
   it("request_scope_access reports when requested scopes are already granted", async () => {
@@ -534,7 +536,7 @@ describe("mcp/tools", () => {
       const body = JSON.parse(result.content[0].text);
       expect(body).not.toHaveProperty("approvalUrl");
       expect(body.nextAction).toBe(
-        "The request is waiting for owner approval in Vana. Access remains unchanged until the owner approves it.",
+        "Ask the user to review this request in Vana and approve or decline it. Access remains unchanged until the owner approves it.",
       );
     });
 

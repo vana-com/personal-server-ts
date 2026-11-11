@@ -2669,7 +2669,10 @@ export async function handlePersonalServerDataRequest(
         request,
         scope: scopeResult.scope,
         grantId,
-        fileId: fileIdParam ?? selectedEntry?.fileId ?? undefined,
+        // Only a file id that resolved inside this scope reaches policy. A
+        // wrong-scope id and a nonexistent one both resolve to nothing, so
+        // neither takes a different path and no foreign id leaves the process.
+        fileId: selectedEntry?.fileId ?? undefined,
         at: atParam,
       });
 

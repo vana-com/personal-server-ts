@@ -54,7 +54,16 @@ export interface McpToolContext {
    */
   writeClient?: McpDataWriteClient;
   activityRecorder?: McpActivityRecorder;
-  requestScopeAccess?(input: { scopes: string[]; reason?: string }): Promise<{
+  requestScopeAccess?(input: {
+    scopes: string[];
+    reason?: string;
+    /**
+     * The grants live for this call. The request is filtered against these,
+     * not the stored record, whose grants may include ones the gateway no
+     * longer honours.
+     */
+    liveGrants?: McpConnectionRecord["grants"];
+  }): Promise<{
     connection: McpConnectionRecord;
     requestRecorded: boolean;
     /** Raw read token for the request just written; goes into the link. */
@@ -811,6 +820,14 @@ export const SCOPE_REQUEST_GUIDANCE_TEXT =
   " If the user's question needs data you were not granted, call request_scope_access with the scope ids you need. " +
   "The user chooses in Vana; the response does not tell you whether that data exists.";
 
+/**
+ * Under `scopeRequestGuidance`: added to every `search_personal_context`
+ * result, empty ones too. Static: it never depends on hits, counts or which
+ * scopes the connection holds.
+ */
+export const SEARCH_COVERAGE_NOTE =
+  "Results cover only scopes granted to you; to search other data, call request_scope_access.";
+
 /** Appended to the `request_scope_access` description with a host scope list. */
 export function requestableScopesDescription(scopes: string[]): string {
   const ids = [...new Set(scopes)].sort();
@@ -907,7 +924,7 @@ async function listNotSharedScopes(
 
 /** The `nextAction` a read-side `scope_not_granted` carries under guidance. */
 function requestAccessNextAction(scopes: readonly string[]): string {
-  return `Call request_scope_access with scopes ${JSON.stringify(scopes)}, then ask the user to approve it in Vana.`;
+  return `Call request_scope_access with scopes ${JSON.stringify(scopes)}, then ask the user to approve it in Vana. This does not indicate whether the data exists.`;
 }
 
 const listGrantedSources: McpToolDefinition = {
@@ -925,7 +942,7 @@ const listGrantedScopes: McpToolDefinition = {
   name: "list_granted_scopes",
   title: "List granted scopes",
   description:
-    "List granted scopes, readiness, size, and recommendedAccess. Call first.",
+    "List granted scopes, readiness, size, and recommendedAccess. Call first. Omitted scopes have unknown data availability.",
   inputSchema: {},
   async handler(
     _args,
@@ -1012,7 +1029,7 @@ const requestScopeAccess: McpToolDefinition = {
   name: "request_scope_access",
   title: "Request scope access",
   description:
-    "Record missing scopes on this MCP connection for explicit owner approval in Vana.",
+    "Record scopes not yet granted on this MCP connection for explicit owner approval in Vana.",
   inputSchema: scopeAccessRequestInputShape,
   async handler(
     args,
@@ -1042,6 +1059,7 @@ const requestScopeAccess: McpToolDefinition = {
       const outcome = await requestScopeAccess({
         scopes: missingScopes,
         ...(reason ? { reason } : {}),
+        liveGrants: connection.grants,
       });
       effectiveConnection = outcome.connection;
       requestRecorded = outcome.requestRecorded;
@@ -1125,7 +1143,7 @@ function scopeRequestNextAction(input: {
   if (input.approvalUrl) {
     return `${declined}Show the user this link to review the request: ${input.approvalUrl} . Ask them to approve or decline it there and to tell you when they are done, then call list_granted_scopes to see what was granted. Access remains unchanged until the owner approves.`;
   }
-  return `${declined}The request is waiting for owner approval in Vana. Access remains unchanged until the owner approves it.`;
+  return `${declined}Ask the user to review this request in Vana and approve or decline it. Access remains unchanged until the owner approves it.`;
 }
 
 const readScope: McpToolDefinition = {
@@ -1533,7 +1551,7 @@ const searchPersonalContext: McpToolDefinition = {
   name: SEARCH_PERSONAL_CONTEXT_TOOL,
   title: "Search personal context",
   description:
-    "Search approved scopes. Omit scopes for default sweep; name scopes for targeted search. Continue with nextSearchCursor. Free discovery/preview — it does not settle payments; chargeable scopes are returned in paymentRequiredScopes, fetch those via read_scope with a `payment` proof.",
+    "Search approved scopes. Omit scopes for a sweep of granted scopes only; name scopes for targeted search. Continue with nextSearchCursor. Free discovery/preview — it does not settle payments; chargeable scopes are returned in paymentRequiredScopes, fetch those via read_scope with a `payment` proof.",
   inputSchema: {
     query: z.string().min(1).max(SEARCH_QUERY_MAX_CHARS),
     scopes: z
@@ -1899,6 +1917,7 @@ const searchPersonalContext: McpToolDefinition = {
       ...(scopeRequestGuidance && deniedScopes.length > 0
         ? { nextAction: requestAccessNextAction(deniedScopes) }
         : {}),
+      ...(scopeRequestGuidance ? { coverageNote: SEARCH_COVERAGE_NOTE } : {}),
       ...(paymentRequiredScopes.length > 0
         ? {
             payment_required: true,

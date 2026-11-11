@@ -2142,12 +2142,7 @@ async function handleMcpRoute(input: {
       },
       scopeRequestApprovalUrl: input.scopeRequestApprovalUrl,
       exposeUnsharedScopes: input.exposeUnsharedScopes,
-      ...(input.gateway
-        ? {
-            verifyGrantsLive: () =>
-              liveMcpGrantIds(record, input.gateway!, input.now),
-          }
-        : {}),
+      verifyGrantsLive: () => liveMcpGrantIds(record, input.gateway, input.now),
       scopeRequestGuidance: input.scopeRequestGuidance,
       serverOrigin: input.serverOrigin,
     });

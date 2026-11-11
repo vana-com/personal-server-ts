@@ -2977,6 +2977,61 @@ describe("MCP /mcp/session (self-signing handshake)", () => {
     expect((await res.json()).error.errorCode).toBe("GRANT_OWNER_MISMATCH");
   });
 
+  it("refuses a session call when the grant lookup fails or the grant is past its expiry", async () => {
+    const { gateway, grant } = makeGatewayForGrantee({
+      granteeAddress: appWallet.address,
+      grantId: GRANT_ID,
+      scopes: ["instagram.profile"],
+    });
+    const app = new Hono();
+    app.route(
+      "/mcp",
+      mcpStreamableHttpRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        gatewayConfig,
+        accessLogWriter: createMockAccessLogWriter(),
+        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        hierarchyOptions: { dataDir: "/tmp" },
+      }),
+    );
+    const minted = (await (
+      await app.request("/mcp/session", {
+        method: "POST",
+        headers: { Authorization: await sessionProof() },
+      })
+    ).json()) as { access_token: string };
+    const call = () =>
+      app.request("/mcp", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${minted.access_token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "list_granted_scopes", arguments: {} },
+        }),
+      });
+    expect((await call()).status).toBe(200);
+
+    const original = gateway.getGrant as ReturnType<typeof vi.fn>;
+    const lookup = original.getMockImplementation();
+    original.mockRejectedValue(new Error("gateway down"));
+    const failed = await call();
+    expect(failed.status).toBe(403);
+    expect((await failed.json()).error.errorCode).toBe("GRANT_REVOKED");
+
+    original.mockImplementation(lookup!);
+    (grant as { expiresAt: string | null }).expiresAt = "1000";
+    expect((await call()).status).toBe(403);
+  });
+
   it("stops an open session on any tool call once the grant is revoked", async () => {
     const { gateway, grant } = makeGatewayForGrantee({
       granteeAddress: appWallet.address,

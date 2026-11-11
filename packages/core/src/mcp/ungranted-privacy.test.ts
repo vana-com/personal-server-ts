@@ -4,7 +4,8 @@ import {
   type HandleMcpRequestOptions,
 } from "./server.js";
 import { MCP_TOOLS } from "./tools.js";
-import { liveMcpGrantIds } from "./connection-api.js";
+import { liveMcpGrantIds, requestMcpScopeAccess } from "./connection-api.js";
+import { rawScopeResourceUri } from "./resources.js";
 import { createMcpDataReadClient } from "./read-client.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import type { McpDataReadClient } from "./read-client.js";
@@ -244,9 +245,9 @@ describe("ungranted data is invisible to a connected client (mcpExposeUnsharedSc
     const owned = await run("youtube.history", ownerA());
     const notOwned = await run("youtube.history", ownerB());
     const other = await run("spotify.library", ownerA());
-    expect(owned.requestScopeAccess).toHaveBeenCalledWith({
-      scopes: ["youtube.history"],
-    });
+    expect(owned.requestScopeAccess).toHaveBeenCalledWith(
+      expect.objectContaining({ scopes: ["youtube.history"] }),
+    );
     expect(notOwned.requestScopeAccess).toHaveBeenCalledTimes(1);
     expect(owned.body).toBe(notOwned.body);
     // Not owned by either owner: same shape, only the echoed scope id differs.
@@ -578,5 +579,140 @@ describe("a held scope cannot read another scope's file by file id", () => {
     expect(other.body).toBe(missing.body);
     expect(other.body).not.toContain("youtube");
     expect(other.readEnvelope).not.toHaveBeenCalled();
+  });
+});
+
+describe("revocation, timeouts and the request path", () => {
+  const revoked = { verifyGrantsLive: async () => [] as string[] };
+  const never = (): McpConnectionRecord => ({ ...connection(), grants: [] });
+
+  it("a liveness check that never settles answers as with no grants", async () => {
+    vi.useFakeTimers();
+    try {
+      const owner = ownerA();
+      const pending = rpc(
+        owner,
+        "tools/call",
+        tool("list_granted_scopes", {}).params,
+        { verifyGrantsLive: () => new Promise<string[]>(() => {}) },
+      );
+      await vi.advanceTimersByTimeAsync(3100);
+      const body = normalize(await pending);
+      const none = normalize(
+        await rpc(
+          ownerA(),
+          "tools/call",
+          tool("list_granted_scopes", {}).params,
+          {},
+          never(),
+        ),
+      );
+      expect(body).toBe(none);
+      expect(owner.getScopeMetadata).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a raw resource read after revocation answers as never granted, with no owner read", async () => {
+    const params = {
+      uri: rawScopeResourceUri({ scope: "chatgpt.conversations" }),
+    };
+    const owner = ownerA();
+    const gone = normalize(await rpc(owner, "resources/read", params, revoked));
+    const none = normalize(
+      await rpc(ownerB(), "resources/read", params, {}, never()),
+    );
+    expect(gone).toBe(none);
+    expect(owner.readRawScopeFile).not.toHaveBeenCalled();
+    expect(owner.getScopeMetadata).not.toHaveBeenCalled();
+  });
+
+  it("request_scope_access after revocation records the request and answers as never granted", async () => {
+    const asked = ["memory.app", "write:memory.app"];
+    const run = async (stored: McpConnectionRecord, verify: boolean) => {
+      let record = stored;
+      const store = {
+        mutate: async (
+          _id: string,
+          fn: (r: McpConnectionRecord) => McpConnectionRecord,
+        ) => (record = fn(record)),
+      } as never;
+      const body = await rpc(
+        ownerA(),
+        "tools/call",
+        tool("request_scope_access", { scopes: asked }).params,
+        {
+          ...(verify ? revoked : {}),
+          requestScopeAccess: (input) =>
+            requestMcpScopeAccess(
+              { connectionId: stored.id, ...input },
+              { store },
+            ),
+        },
+        stored,
+      );
+      return { body: normalize(body), record };
+    };
+    const held: McpConnectionRecord = {
+      ...connection(),
+      grants: [{ grantId: "g", scopes: asked }],
+    };
+    const gone = await run(held, true);
+    const never_ = await run(never(), false);
+    expect(gone.record.scopeAccessRequest?.scopes).toEqual([...asked].sort());
+    expect(gone.body).toBe(never_.body);
+    expect(gone.body).not.toContain("already");
+  });
+
+  it("forget without a covering read grant answers byte-identically to a never-granted scope", async () => {
+    const run = async (conn: McpConnectionRecord) => {
+      const result = await MCP_TOOLS.find((t) => t.name === "forget")!.handler(
+        { scope: "memory.app", key: "k" },
+        { connection: conn, readClient: ownerA() },
+      );
+      return result.content[0]!.text as string;
+    };
+    const writeOnly: McpConnectionRecord = {
+      ...connection(),
+      grants: [{ grantId: "g", scopes: ["write:memory.app"] }],
+    };
+    expect(await run(writeOnly)).toBe(await run(never()));
+  });
+});
+
+describe("search results say what they cover", () => {
+  const SENTENCE =
+    "Results cover only scopes granted to you; to search other data, call request_scope_access.";
+  const searches = [
+    tool("search_personal_context", { query: "videos" }).params,
+    tool("search_personal_context", {
+      query: "videos",
+      scopes: ["chatgpt.conversations"],
+    }).params,
+    tool("search_personal_context", {
+      query: "videos",
+      scopes: ["youtube.history"],
+    }).params,
+  ];
+
+  it.each(searches)(
+    "adds the same sentence for two owners with different data",
+    async (params) => {
+      const a = normalize(await rpc(ownerA(), "tools/call", params));
+      const b = normalize(await rpc(ownerB(), "tools/call", params));
+      expect(a).toBe(b);
+      expect(a).toContain(SENTENCE);
+    },
+  );
+
+  it("is absent with guidance off", async () => {
+    for (const params of searches) {
+      const body = await rpc(ownerA(), "tools/call", params, {
+        scopeRequestGuidance: false,
+      });
+      expect(body).not.toContain("coverageNote");
+      expect(body).not.toContain(SENTENCE);
+    }
   });
 });

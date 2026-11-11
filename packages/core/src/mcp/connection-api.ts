@@ -367,7 +367,13 @@ export interface RequestMcpScopeAccessOutput {
 }
 
 export async function requestMcpScopeAccess(
-  input: { connectionId: string; scopes: string[]; reason?: string },
+  input: {
+    connectionId: string;
+    scopes: string[];
+    reason?: string;
+    /** Grants live now; filters the request instead of the stored grants. */
+    liveGrants?: McpConnectionRecord["grants"];
+  },
   options: { store: McpConnectionStore; now?: () => Date },
 ): Promise<RequestMcpScopeAccessOutput> {
   const requestedAt = nowIso(options.now);
@@ -379,7 +385,9 @@ export async function requestMcpScopeAccess(
   const inputScopes = Array.from(
     new Set(input.scopes.map((scope) => scope.trim()).filter(Boolean)),
   ).sort();
+  let storedGrantIds = new Set<string>();
   const updated = await options.store.mutate(input.connectionId, (existing) => {
+    storedGrantIds = new Set(existing.grants.map((grant) => grant.grantId));
     if (existing.status !== "approved") {
       throw new McpConnectionStateError(
         input.connectionId,
@@ -394,7 +402,9 @@ export async function requestMcpScopeAccess(
           .filter(
             (scope) =>
               scope.length > 0 &&
-              !existing.grants.some((grant) => grantCoversScope(grant, scope)),
+              !(input.liveGrants ?? existing.grants).some((grant) =>
+                grantCoversScope(grant, scope),
+              ),
           ),
       ),
     ).sort();
@@ -412,10 +422,26 @@ export async function requestMcpScopeAccess(
   });
   if (!updated) throw new McpConnectionNotFoundError(input.connectionId);
   const missingInputScopes = inputScopes.filter(
-    (scope) => !updated.grants.some((grant) => grantCoversScope(grant, scope)),
+    (scope) =>
+      !(input.liveGrants ?? updated.grants).some((grant) =>
+        grantCoversScope(grant, scope),
+      ),
   );
+  // Grants the caller found dead stay out of the answer, so it does not call
+  // them granted; a grant added while the request was written still counts.
+  const liveIds = input.liveGrants
+    ? new Set(input.liveGrants.map((grant) => grant.grantId))
+    : undefined;
   return {
-    connection: updated,
+    connection: liveIds
+      ? {
+          ...updated,
+          grants: updated.grants.filter(
+            (grant) =>
+              liveIds.has(grant.grantId) || !storedGrantIds.has(grant.grantId),
+          ),
+        }
+      : updated,
     requestRecorded:
       missingInputScopes.length > 0 &&
       missingInputScopes.every((scope) =>
@@ -615,7 +641,13 @@ export async function approveMcpScopeAccessRequest(
     };
     return {
       ...latest,
-      grants: [{ grantId, scopes: grantedScopes }],
+      grants: [
+        {
+          grantId,
+          scopes: grantedScopes,
+          ...(expiresAt !== undefined ? { expiresAt } : {}),
+        },
+      ],
       scopeAccessRequest: undefined,
       scopeAccessDecision: decision,
     };
@@ -827,7 +859,7 @@ function parseExpirySeconds(value: string | null): number | undefined {
  */
 export async function liveMcpGrantIds(
   connection: McpConnectionRecord,
-  gateway: Pick<GatewayClient, "getGrant">,
+  gateway: Pick<GatewayClient, "getGrant"> | undefined,
   now: () => Date = () => new Date(),
 ): Promise<string[]> {
   const grantIds = sortedUnique(
@@ -835,6 +867,18 @@ export async function liveMcpGrantIds(
   );
   if (connection.status !== "approved") return [];
   const nowSeconds = Math.floor(now().getTime() / 1000);
+  if (!gateway) {
+    // No gateway to ask: a grant is live only if the stored record does not
+    // show it expired.
+    return sortedUnique(
+      connection.grants
+        .filter(
+          (grant) =>
+            grant.expiresAt === undefined || grant.expiresAt > nowSeconds,
+        )
+        .map((grant) => grant.grantId),
+    );
+  }
   try {
     const checked = await Promise.all(
       grantIds.map(async (grantId) => {
@@ -1302,6 +1346,17 @@ export async function approveMcpOAuthAuthorizationWithScopes(
   // Read entries are signed as before. A `write:` entry follows the same rule
   // as a scope-request approval: one concrete scope, never a wildcard, since
   // `remember` makes a write grant on this connection usable.
+  // A bare "*" or an empty entry names no source; it must never be stored.
+  const badRead = input.scopes.find(
+    (scope) =>
+      typeof scope !== "string" || scope.trim() === "" || scope === "*",
+  );
+  if (badRead !== undefined) {
+    throw new McpOAuthAuthorizationError(
+      "invalid_scope",
+      `Invalid scope: ${JSON.stringify(badRead)}`,
+    );
+  }
   const badWrite = input.scopes.find(
     (scope) =>
       typeof scope === "string" &&
@@ -1382,7 +1437,13 @@ export async function approveMcpOAuthAuthorizationWithScopes(
   return approveMcpOAuthAuthorization(
     {
       authorizationId: input.authorizationId,
-      grants: [{ grantId, scopes: input.scopes }],
+      grants: [
+        {
+          grantId,
+          scopes: input.scopes,
+          ...(expiresAt !== undefined ? { expiresAt } : {}),
+        },
+      ],
     },
     options,
   );

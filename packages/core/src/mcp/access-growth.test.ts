@@ -401,7 +401,7 @@ describe("listOwnerScopes (read client)", () => {
 
 describe("scope request guidance (mcpScopeRequestGuidance)", () => {
   const expected = (scope: string) =>
-    `Call request_scope_access with scopes ["${scope}"], then ask the user to approve it in Vana.`;
+    `Call request_scope_access with scopes ["${scope}"], then ask the user to approve it in Vana. This does not indicate whether the data exists.`;
 
   it.each(["read_scope", "list_scope_blocks", "get_scope_file"])(
     "%s: nextAction only when on",
@@ -444,7 +444,7 @@ describe("scope request guidance (mcpScopeRequestGuidance)", () => {
     const on = await run(true);
     expect("nextAction" in off).toBe(false);
     expect(on.nextAction).toBe(
-      `Call request_scope_access with scopes ["youtube.history","spotify.library"], then ask the user to approve it in Vana.`,
+      `Call request_scope_access with scopes ["youtube.history","spotify.library"], then ask the user to approve it in Vana. This does not indicate whether the data exists.`,
     );
   });
 

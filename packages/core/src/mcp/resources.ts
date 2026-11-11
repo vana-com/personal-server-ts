@@ -102,7 +102,7 @@ export async function readRawScopeResource(
       // The SDK sends a client only an error's message and `data`, and only
       // when the error carries a numeric `code`; a McpDataReadError's body
       // never reaches the wire. Raise a protocol error that carries both.
-      const nextAction = `Call request_scope_access with scopes ${JSON.stringify([params.scope])}, then ask the user to approve it in Vana.`;
+      const nextAction = `Call request_scope_access with scopes ${JSON.stringify([params.scope])}, then ask the user to approve it in Vana. This does not indicate whether the data exists.`;
       throw new McpError(
         ErrorCode.InvalidParams,
         `${body.message} ${nextAction}`,

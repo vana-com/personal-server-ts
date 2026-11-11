@@ -951,6 +951,23 @@ describe("mcp/connection-api scope request answers", () => {
     ]);
   });
 
+  it("refuses a bare wildcard, an empty scope or a source wildcard at scope-request approval", async () => {
+    const { store, id } = await connectionWithRequest(
+      [{ grantId: "0xgrant1", scopes: ["chatgpt.conversations"] }],
+      ["*", "youtube.*"],
+    );
+    const gateway = gatewayMock();
+    for (const scopes of [["*"], [""], ["youtube.*"]]) {
+      await expect(
+        approveMcpScopeAccessRequest(
+          { connectionId: id, scopes },
+          approveOptions(store, gateway),
+        ),
+      ).rejects.toMatchObject({ status: 400 });
+    }
+    expect(gateway.createGrant).not.toHaveBeenCalled();
+  });
+
   it("records an exact write: request when only a write wildcard is held", async () => {
     // remember ignores write wildcards, so the exact grant must stay requestable.
     const { store, id } = await connectionWithRequest(
@@ -1407,6 +1424,36 @@ describe("mcp/connection-api superseded OAuth authorizations", () => {
             authorizationId: created.authorizationId,
             scopes: ["chatgpt.history", writeScope],
           },
+          {
+            ...stores,
+            gateway: gateway as never,
+            gatewayConfig: GATEWAY_CONFIG as never,
+            gatewayUrl: "https://gateway.test",
+            serverOwner: "0x00000000000000000000000000000000000000aa",
+            serverSigner: {
+              signGrantRegistration: vi.fn(
+                async () => "0xsig" as `0x${string}`,
+              ),
+            },
+          },
+        ),
+      ).rejects.toMatchObject({ code: "invalid_scope", status: 400 });
+    }
+    expect(gateway.createGrant).not.toHaveBeenCalled();
+  });
+
+  it("signs no grant for a bare wildcard or an empty scope", async () => {
+    const stores = newStores();
+    const created = await authorize(stores, "client-a");
+    const gateway = {
+      getBuilder: vi.fn(async () => ({ id: "0xbuilder" })),
+      createGrant: vi.fn(async () => ({ grantId: "0xgrant" })),
+    };
+
+    for (const scopes of [["*"], [""], ["chatgpt.history", "*"], ["  "]]) {
+      await expect(
+        approveMcpOAuthAuthorizationWithScopes(
+          { authorizationId: created.authorizationId, scopes },
           {
             ...stores,
             gateway: gateway as never,
