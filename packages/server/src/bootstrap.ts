@@ -243,6 +243,8 @@ export interface CreateServerOptions {
    * builds the Vana Web link (`/mcp/requests/<id>?ps_origin=<origin>`).
    */
   mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /** Host sentence naming where to review a scope request (at most 200 characters). */
+  mcpScopeRequestReviewHint?: string;
   /**
    * Default off. When on, `list_granted_scopes` also returns `notShared`:
    * the owner's scopes that have local data and no grant on the connection.
@@ -1379,6 +1381,7 @@ export async function createServer(
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
     mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,
     mcpScopeRequestApprovalUrl: options?.mcpScopeRequestApprovalUrl,
+    mcpScopeRequestReviewHint: options?.mcpScopeRequestReviewHint,
     mcpExposeUnsharedScopes: options?.mcpExposeUnsharedScopes,
     mcpOwnerAccessEdit: options?.mcpOwnerAccessEdit,
     mcpScopeRequestGuidance: options?.mcpScopeRequestGuidance,

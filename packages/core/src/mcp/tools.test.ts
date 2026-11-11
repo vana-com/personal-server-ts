@@ -496,6 +496,52 @@ describe("mcp/tools", () => {
       expect(body.nextAction).toContain("tell you when they are done");
     });
 
+    it.each([undefined, "vana://approve/conn-1"])(
+      "appends the review hint once when approvalUrl is %s",
+      async (approvalUrl) => {
+        const connection = createConnection();
+        const hint =
+          "In Vana, open Settings → Server and choose Review next to this client.";
+        const result = await getTool("request_scope_access").handler(
+          { scopes: ["chatgpt.conversations"] },
+          {
+            connection,
+            readClient: createMinimalReadClient(),
+            requestScopeAccess: recordedRequest(connection),
+            scopeRequestApprovalUrl: () => approvalUrl,
+            scopeRequestReviewHint: hint,
+          },
+        );
+        const { nextAction } = JSON.parse(result.content[0].text);
+        const original = approvalUrl
+          ? `Show the user this link to review the request: ${approvalUrl} . Ask them to approve or decline it there and to tell you when they are done, then call list_granted_scopes to see what was granted. Access remains unchanged until the owner approves.`
+          : "Ask the user to review this request in Vana and approve or decline it. Access remains unchanged until the owner approves it.";
+        expect(nextAction).toBe(`${original} ${hint}`);
+        expect(nextAction.split(hint)).toHaveLength(2);
+      },
+    );
+
+    it.each([
+      ["instagram.profile", "No new grant is needed for the requested scopes."],
+      [
+        "chatgpt.conversations",
+        "Ask the user to open Vana's Personal Server page and add the missing scopes to this MCP client. This tool cannot grant access by itself.",
+      ],
+    ])(
+      "does not append the hint without a recorded request for %s",
+      async (scope, expected) => {
+        const result = await getTool("request_scope_access").handler(
+          { scopes: [scope] },
+          {
+            connection: createConnection(),
+            readClient: createMinimalReadClient(),
+            scopeRequestReviewHint: "In Vana, open Settings → Server.",
+          },
+        );
+        expect(JSON.parse(result.content[0].text).nextAction).toBe(expected);
+      },
+    );
+
     it("puts the request's read token in the Vana Web link fragment", async () => {
       const connection = createConnection();
       const requestScopeAccess = vi.fn().mockResolvedValue({

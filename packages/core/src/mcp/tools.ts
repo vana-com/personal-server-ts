@@ -78,6 +78,7 @@ export interface McpToolContext {
    * agent to show the user; when absent, the owner is pointed at Vana.
    */
   scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  scopeRequestReviewHint?: string;
   /**
    * This server's current public origin, handed to the approval-URL hook so
    * the link can name the server that holds the request.
@@ -1056,7 +1057,13 @@ const requestScopeAccess: McpToolDefinition = {
   inputSchema: scopeAccessRequestInputShape,
   async handler(
     args,
-    { connection, requestScopeAccess, scopeRequestApprovalUrl, serverOrigin },
+    {
+      connection,
+      requestScopeAccess,
+      scopeRequestApprovalUrl,
+      scopeRequestReviewHint,
+      serverOrigin,
+    },
   ) {
     const requestedScopes = normalizeScopeListInput(args.scopes);
     // Read before recording: a new request must not hide the owner's last
@@ -1126,6 +1133,7 @@ const requestScopeAccess: McpToolDefinition = {
         finalApprovalRequired,
         recorded,
         approvalUrl,
+        scopeRequestReviewHint,
         declinedScopes,
       }),
     });
@@ -1151,6 +1159,7 @@ function scopeRequestNextAction(input: {
   finalApprovalRequired: boolean;
   recorded: boolean;
   approvalUrl?: string;
+  scopeRequestReviewHint?: string;
   declinedScopes: string[];
 }): string {
   if (!input.finalApprovalRequired) {
@@ -1163,10 +1172,13 @@ function scopeRequestNextAction(input: {
   if (!input.recorded) {
     return `${declined}Ask the user to open Vana's Personal Server page and add the missing scopes to this MCP client. This tool cannot grant access by itself.`;
   }
+  const reviewHint = input.scopeRequestReviewHint
+    ? ` ${input.scopeRequestReviewHint}`
+    : "";
   if (input.approvalUrl) {
-    return `${declined}Show the user this link to review the request: ${input.approvalUrl} . Ask them to approve or decline it there and to tell you when they are done, then call list_granted_scopes to see what was granted. Access remains unchanged until the owner approves.`;
+    return `${declined}Show the user this link to review the request: ${input.approvalUrl} . Ask them to approve or decline it there and to tell you when they are done, then call list_granted_scopes to see what was granted. Access remains unchanged until the owner approves.${reviewHint}`;
   }
-  return `${declined}Ask the user to review this request in Vana and approve or decline it. Access remains unchanged until the owner approves it.`;
+  return `${declined}Ask the user to review this request in Vana and approve or decline it. Access remains unchanged until the owner approves it.${reviewHint}`;
 }
 
 const readScope: McpToolDefinition = {

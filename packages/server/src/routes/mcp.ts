@@ -186,6 +186,7 @@ export interface McpRouteDeps {
    * user. Absent: the agent is told to wait for approval in Vana.
    */
   scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  scopeRequestReviewHint?: string;
   /** Opt-in `notShared` on `list_granted_scopes`; see McpToolContext. */
   mcpExposeUnsharedScopes?: boolean;
   /**
@@ -1222,6 +1223,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
         );
       },
       scopeRequestApprovalUrl: deps.scopeRequestApprovalUrl,
+      scopeRequestReviewHint: deps.scopeRequestReviewHint,
       serverOrigin: resolveOrigin(deps.serverOrigin),
       exposeUnsharedScopes: deps.mcpExposeUnsharedScopes,
       verifyGrantsLive: () => liveMcpGrants(record, deps.gateway),
