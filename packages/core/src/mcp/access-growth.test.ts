@@ -91,6 +91,27 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
     owned("vana.system.state"), // system: excluded
   ];
 
+  it("lists only scopes bounded read can serve: indexing or unknown readiness is omitted", async () => {
+    const listOwnerScopes = vi
+      .fn()
+      .mockResolvedValue([
+        owned("youtube.history"),
+        { ...owned("spotify.library"), dataStatus: "indexing" },
+        { ...owned("netflix.views"), dataStatus: undefined },
+      ]);
+    const body = await listGranted({
+      rc: readClient({ listOwnerScopes }),
+      exposeUnsharedScopes: true,
+      verifyGrantsLive: async () => true,
+    });
+    expect(body.notShared).toEqual([
+      expect.objectContaining({
+        scope: "youtube.history",
+        dataStatus: "ready",
+      }),
+    ]);
+  });
+
   it("off: output has no notShared and the owner listing is never read", async () => {
     const listOwnerScopes = vi.fn().mockResolvedValue(ownerScopes);
     const rc = readClient({ listOwnerScopes });

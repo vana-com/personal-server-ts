@@ -3171,6 +3171,22 @@ describe("MCP notShared owner listing deps (route level)", () => {
     expect(body.notShared ?? []).toEqual([]);
   });
 
+  it("does not list a legacy scope with no block sidecars (indexing): read_scope would answer 503", async () => {
+    const { call } = await setup({
+      legacyScopes: ["instagram.profile", "youtube.history", "spotify.library"],
+      listingDeps: { serverOwner: ownerWallet.address },
+    });
+    // A streamed upload commits the file without sidecars.
+    await rm(join(dataDir, "blocks", "spotify"), {
+      recursive: true,
+      force: true,
+    });
+    const body = await call("list_granted_scopes", {});
+    expect(body.notShared.map((s: { scope: string }) => s.scope)).toEqual([
+      "youtube.history",
+    ]);
+  });
+
   it("lists a scope with a ready legacy file as ready", async () => {
     const { call } = await setup({
       legacyScopes: ["instagram.profile", "youtube.history"],
