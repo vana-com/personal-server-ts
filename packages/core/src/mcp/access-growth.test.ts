@@ -4,12 +4,15 @@ import {
   handleMcpStreamableHttpRequest,
   MCP_SERVER_INSTRUCTIONS,
 } from "./server.js";
-import type { McpDataReadError } from "./read-client.js";
+
 import {
   createMcpDataReadClient,
+  McpDataReadError,
   type McpDataReadClient,
 } from "./read-client.js";
+import { McpError } from "@modelcontextprotocol/sdk/types.js";
 import { readRawScopeResource } from "./resources.js";
+import { areMcpConnectionGrantsLive } from "./connection-api.js";
 import { templateMcpScopeRequestApprovalUrl } from "./approval-url.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { ScopeSummary } from "../storage/index/types.js";
@@ -100,7 +103,11 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
     const rc = readClient({
       listOwnerScopes: vi.fn().mockResolvedValue(ownerScopes),
     });
-    const body = await listGranted({ rc, exposeUnsharedScopes: true });
+    const body = await listGranted({
+      rc,
+      exposeUnsharedScopes: true,
+      verifyGrantsLive: async () => true,
+    });
     expect(body.notShared).toEqual([
       {
         scope: "spotify.library",
@@ -119,15 +126,25 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
 
   it("on: a read client without listOwnerScopes, or one that fails, gives an empty list", async () => {
     expect(
-      (await listGranted({ rc: readClient(), exposeUnsharedScopes: true }))
-        .notShared,
+      (
+        await listGranted({
+          rc: readClient(),
+          exposeUnsharedScopes: true,
+          verifyGrantsLive: async () => true,
+        })
+      ).notShared,
     ).toEqual([]);
     const failing = readClient({
       listOwnerScopes: vi.fn().mockRejectedValue(new Error("boom")),
     });
     expect(
-      (await listGranted({ rc: failing, exposeUnsharedScopes: true }))
-        .notShared,
+      (
+        await listGranted({
+          rc: failing,
+          exposeUnsharedScopes: true,
+          verifyGrantsLive: async () => true,
+        })
+      ).notShared,
     ).toEqual([]);
   });
 
@@ -176,6 +193,73 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
     expect(on.instructions).toContain("notShared");
     expect(on.instructions).toContain("request_scope_access");
     expect(on.description).toContain("notShared");
+  });
+});
+
+describe("notShared fails closed on dead grants", () => {
+  const ownerScopes = [owned("youtube.history")];
+
+  const gatewayWith = (grant: Record<string, unknown> | null) =>
+    ({ getGrant: vi.fn().mockResolvedValue(grant) }) as never;
+
+  const live = {
+    id: "grant-1",
+    scopes: ["instagram.*"],
+    grantVersion: "1",
+    expiresAt: null,
+    revokedAt: null,
+    expired: false,
+  };
+
+  it.each([
+    ["live", live, true],
+    ["revoked", { ...live, revokedAt: "2026-11-01T00:00:00Z" }, false],
+    ["expired flag", { ...live, expired: true }, false],
+    ["past expiresAt", { ...live, expiresAt: "1000" }, false],
+    ["unknown at gateway", null, false],
+  ])("%s grant", async (_name, grant, shown) => {
+    const listOwnerScopes = vi.fn().mockResolvedValue(ownerScopes);
+    const rc = readClient({ listOwnerScopes });
+    const gateway = gatewayWith(grant);
+    const body = await listGranted({
+      rc,
+      exposeUnsharedScopes: true,
+      verifyGrantsLive: () => areMcpConnectionGrantsLive(connection(), gateway),
+    });
+    if (shown) {
+      expect(body.notShared).toHaveLength(1);
+      expect(listOwnerScopes).toHaveBeenCalledTimes(1);
+    } else {
+      expect("notShared" in body).toBe(false);
+      expect(listOwnerScopes).not.toHaveBeenCalled();
+    }
+  });
+
+  it("omits notShared when the gateway lookup fails or no check is wired", async () => {
+    const listOwnerScopes = vi.fn().mockResolvedValue(ownerScopes);
+    const rc = readClient({ listOwnerScopes });
+    const failing = {
+      getGrant: vi.fn().mockRejectedValue(new Error("down")),
+    } as never;
+    for (const verifyGrantsLive of [
+      () => areMcpConnectionGrantsLive(connection(), failing),
+      undefined,
+    ]) {
+      const body = await listGranted({
+        rc,
+        exposeUnsharedScopes: true,
+        verifyGrantsLive,
+      });
+      expect("notShared" in body).toBe(false);
+    }
+    expect(listOwnerScopes).not.toHaveBeenCalled();
+  });
+
+  it("a connection with no grants is not live", async () => {
+    const empty = { ...connection(), grants: [] };
+    expect(await areMcpConnectionGrantsLive(empty, gatewayWith(live))).toBe(
+      false,
+    );
   });
 });
 
@@ -278,7 +362,7 @@ describe("scope request guidance (mcpScopeRequestGuidance)", () => {
     );
   });
 
-  it("resource read: nextAction only when on", async () => {
+  it("resource read: guidance only when on, as a protocol error with data", async () => {
     const uri = new URL("vana://scope/youtube.history/raw");
     const attempt = async (scopeRequestGuidance?: boolean) => {
       try {
@@ -288,14 +372,59 @@ describe("scope request guidance (mcpScopeRequestGuidance)", () => {
           scopeRequestGuidance,
         });
       } catch (err) {
-        return (err as McpDataReadError).body as Record<string, unknown>;
+        return err;
       }
       throw new Error("expected refusal");
     };
-    const off = await attempt();
-    const on = await attempt(true);
-    expect("nextAction" in off).toBe(false);
-    expect(on.nextAction).toBe(expected("youtube.history"));
+    const off = (await attempt()) as McpDataReadError;
+    expect(off).toBeInstanceOf(McpDataReadError);
+    expect("nextAction" in (off.body as object)).toBe(false);
+    const on = (await attempt(true)) as McpError;
+    expect(on).toBeInstanceOf(McpError);
+    expect(on.message).toContain(expected("youtube.history"));
+    expect(on.data).toMatchObject({
+      error: "scope_not_granted",
+      nextAction: expected("youtube.history"),
+    });
+  });
+
+  it("resources/read over the transport: the client sees nextAction only when on", async () => {
+    const read = async (scopeRequestGuidance?: boolean) => {
+      const response = await handleMcpStreamableHttpRequest(
+        new Request("http://localhost/mcp/t", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "resources/read",
+            params: { uri: "vana://scope/youtube.history/raw" },
+          }),
+        }),
+        {
+          connection: connection(),
+          readClient: readClient(),
+          scopeRequestGuidance,
+        },
+      );
+      return (await response.json()) as {
+        error?: { message: string; data?: Record<string, unknown> };
+      };
+    };
+    const off = await read();
+    expect(off.error).toBeDefined();
+    expect(JSON.stringify(off)).not.toContain("nextAction");
+    expect(JSON.stringify(off)).not.toContain("request_scope_access");
+    const on = await read(true);
+    expect(on.error?.message).toContain(expected("youtube.history"));
+    expect(on.error?.data).toMatchObject({
+      error: "scope_not_granted",
+      scope: "youtube.history",
+      nextAction: expected("youtube.history"),
+    });
   });
 
   it("request_scope_access text is unchanged by the option", async () => {

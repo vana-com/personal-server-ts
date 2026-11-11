@@ -809,6 +809,36 @@ function parseExpirySeconds(value: string | null): number | undefined {
   return Number.isFinite(ms) ? Math.floor(ms / 1000) : undefined;
 }
 
+/**
+ * True when every grant the connection holds is still live at the gateway:
+ * present, not revoked and not expired. A connection with no grants, a missing
+ * grant or a failed lookup is not live, so callers fail closed. An owner
+ * connection's token outlives its grants, so a feature that reveals more than
+ * the grants cover must check this first.
+ */
+export async function areMcpConnectionGrantsLive(
+  connection: McpConnectionRecord,
+  gateway: Pick<GatewayClient, "getGrant">,
+  now: () => Date = () => new Date(),
+): Promise<boolean> {
+  const grantIds = sortedUnique(
+    connection.grants.map((grant) => grant.grantId),
+  );
+  if (connection.status !== "approved" || grantIds.length === 0) return false;
+  const nowSeconds = Math.floor(now().getTime() / 1000);
+  try {
+    for (const grantId of grantIds) {
+      const live = await gateway.getGrant(grantId);
+      if (!live || live.revokedAt || live.expired) return false;
+      const expiresAt = parseExpirySeconds(live.expiresAt);
+      if (expiresAt !== undefined && expiresAt <= nowSeconds) return false;
+    }
+  } catch {
+    return false;
+  }
+  return true;
+}
+
 function sortedUnique(values: Iterable<string>): string[] {
   return Array.from(new Set(values)).sort();
 }
