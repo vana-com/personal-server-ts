@@ -62,6 +62,9 @@ import {
   McpConnectionNotFoundError,
   McpConnectionStateError,
   McpIngress,
+  MCP_SCOPE_REQUEST_OPEN_CONNECTION_PARAM,
+  isMcpConnectionId,
+  resolveMcpScopeRequestApprovalUrl,
   McpOAuthAuthorizationError,
   isAllowedOAuthRedirectUri,
   McpScopeRequestError,
@@ -251,6 +254,16 @@ function requestOrigin(c: Context, deps: ListenerDeps): string {
     return resolveOrigin(deps.serverOrigin);
   }
   return new URL(c.req.url).origin;
+}
+
+/** The origin the caller used, only when the call arrived on the loopback listener. */
+function loopbackOriginOption(
+  c: Context,
+  deps: ListenerDeps,
+): { loopbackOrigin: string } | Record<string, never> {
+  return requestIngress(c, deps) === McpIngress.Loopback
+    ? { loopbackOrigin: requestOrigin(c, deps) }
+    : {};
 }
 
 function jsonError(status: number, errorCode: string, message: string) {
@@ -1225,6 +1238,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       scopeRequestApprovalUrl: deps.scopeRequestApprovalUrl,
       scopeRequestReviewHint: deps.scopeRequestReviewHint,
       serverOrigin: resolveOrigin(deps.serverOrigin),
+      ...loopbackOriginOption(c, deps),
       exposeUnsharedScopes: deps.mcpExposeUnsharedScopes,
       verifyGrantsLive: () => liveMcpGrants(record, deps.gateway),
       scopeRequestGuidance: deps.mcpScopeRequestGuidance,
@@ -1476,6 +1490,26 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
         400,
       );
     }
+  });
+
+  // Chat clients open links in a browser, which ignores a bare `vana://` URL.
+  // This http link on the loopback listener redirects to the host's approval
+  // URL for one connection id, so the browser hands it to the OS. Only what the
+  // host hook returns is ever a redirect target. Same answer whether or not
+  // the connection exists. Not served through the tunnel.
+  app.get("/scope-request/open", (c) => {
+    if (requestIngress(c, deps) !== McpIngress.Loopback) return c.notFound();
+    c.header("Cache-Control", "no-store");
+    c.header("Referrer-Policy", "no-referrer");
+    const id = c.req.query(MCP_SCOPE_REQUEST_OPEN_CONNECTION_PARAM) ?? "";
+    if (!isMcpConnectionId(id)) return c.text("Invalid connection", 400);
+    const target = resolveMcpScopeRequestApprovalUrl(
+      deps.scopeRequestApprovalUrl,
+      id,
+      { serverOrigin: resolveOrigin(deps.serverOrigin) },
+    );
+    if (!target) return c.notFound();
+    return c.redirect(target, 302);
   });
 
   app.all("/", async (c) =>

@@ -496,6 +496,80 @@ describe("mcp/tools", () => {
       expect(body.nextAction).toContain("tell you when they are done");
     });
 
+    describe("http opener link on the loopback ingress", () => {
+      const LOOPBACK = "http://127.0.0.1:47321";
+      const call = async (
+        hook: (id: string, ctx: { readToken?: string }) => string | undefined,
+        loopbackOrigin: string | null = LOOPBACK,
+      ) => {
+        const connection = createConnection();
+        const result = await getTool("request_scope_access").handler(
+          { scopes: ["chatgpt.conversations"] },
+          {
+            connection,
+            readClient: createMinimalReadClient(),
+            requestScopeAccess: vi.fn().mockResolvedValue({
+              connection: {
+                ...connection,
+                scopeAccessRequest: {
+                  scopes: ["chatgpt.conversations"],
+                  requestedAt: "2026-10-07T10:00:00.000Z",
+                },
+              },
+              requestRecorded: true,
+              readToken: "tok",
+            }),
+            scopeRequestApprovalUrl: hook,
+            serverOrigin: "https://ps.example.com",
+            ...(loopbackOrigin ? { loopbackOrigin } : {}),
+          },
+        );
+        return JSON.parse(result.content[0].text);
+      };
+
+      it("replaces a custom-scheme URL with the loopback opener as a markdown link", async () => {
+        const body = await call(
+          (id) => `vana://mcp-scope-request?connection=${id}`,
+        );
+        const url = `${LOOPBACK}/mcp/scope-request/open?connection=conn-1`;
+        expect(body.approvalUrl).toBe(url);
+        expect(body.nextAction).toContain(
+          `Show the user this link as a markdown link, [Review the request in Vana](${url})`,
+        );
+        expect(body.nextAction).toContain("tell you when they are done");
+        expect(body.nextAction).not.toContain("vana://");
+      });
+
+      it("keeps today's URL when the host URL depends on the read token", async () => {
+        const body = await call((id, ctx) =>
+          ctx.readToken
+            ? `vana://mcp-scope-request?connection=${id}#t=${ctx.readToken}`
+            : `vana://mcp-scope-request?connection=${id}`,
+        );
+        expect(body.approvalUrl).toBe(
+          "vana://mcp-scope-request?connection=conn-1#t=tok",
+        );
+        expect(body.nextAction).toContain(
+          "Show the user this link to review the request: vana://",
+        );
+      });
+
+      it("keeps today's URL without a loopback origin", async () => {
+        const body = await call(
+          (id) => `vana://mcp-scope-request?connection=${id}`,
+          null,
+        );
+        expect(body.approvalUrl).toBe(
+          "vana://mcp-scope-request?connection=conn-1",
+        );
+      });
+
+      it("keeps an http(s) host URL as is", async () => {
+        const body = await call((id) => `https://app.vana.org/x/${id}`);
+        expect(body.approvalUrl).toBe("https://app.vana.org/x/conn-1");
+      });
+    });
+
     it.each([undefined, "vana://approve/conn-1"])(
       "appends the review hint once when approvalUrl is %s",
       async (approvalUrl) => {
