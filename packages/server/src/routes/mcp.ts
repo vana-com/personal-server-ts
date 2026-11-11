@@ -183,6 +183,16 @@ export interface McpRouteDeps {
   scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   /** Opt-in `notShared` on `list_granted_scopes`; see McpToolContext. */
   mcpExposeUnsharedScopes?: boolean;
+  /**
+   * The deletion tracker and owner the ordinary data route gets; used only
+   * by the owner-wide `notShared` listing, never by reads. No canonical view:
+   * canonical-only scopes join `notShared` together with moving MCP reads to
+   * the canonical view (follow-up after the demo).
+   */
+  mcpOwnerListingDeps?: Pick<
+    PersonalServerDataApiDeps,
+    "scopeDeletions" | "serverOwner"
+  >;
   /** Opt-in `nextAction` on read-side `scope_not_granted`. */
   mcpScopeRequestGuidance?: boolean;
   /**
@@ -1156,6 +1166,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       serverOrigin: resolveOrigin(deps.serverOrigin),
       granteeAccount,
       dataApiDeps,
+      ownerListingDeps: deps.mcpOwnerListingDeps,
     });
     const response = await handleMcpStreamableHttpRequest(c.req.raw, {
       connection: record,
