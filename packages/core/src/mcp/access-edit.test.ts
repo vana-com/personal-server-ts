@@ -322,6 +322,17 @@ it.each(["cas", "crash"])(
           : { message: "process stopped before commit" },
       );
       expect((await store.getById(id))!.grants[0].scopes).toEqual([A, B]);
+      // Gateway now holds [A]@5 while local still says [A, B]: a follow-up
+      // edit to [B] must not re-sign a scope the gateway already removed.
+      const createCalls = gateway.createGrant.mock.calls.length;
+      http.mockClear();
+      store.mutate = mutation;
+      await expect(
+        editMcpConnectionAccess({ connectionId: id, scopes: [B] }, options),
+      ).rejects.toMatchObject({ status: 409 });
+      expect(gateway.createGrant.mock.calls.length).toBe(createCalls);
+      expect(http).not.toHaveBeenCalled();
+      expect((await store.getById(id))!.grants[0].scopes).toEqual([A, B]);
     } finally {
       proceed.resolve();
       await edit;
@@ -329,3 +340,39 @@ it.each(["cas", "crash"])(
     }
   },
 );
+
+it("rejects an edit to a scope the gateway no longer holds even though the stored grant still lists it", async () => {
+  const { id, options, gateway, store } = await setup();
+  gateway.getGrant.mockImplementation(async () => ({
+    id: "0xgrant",
+    scopes: [A],
+    grantVersion: "5",
+    expiresAt: null,
+    revokedAt: null,
+    expired: false,
+  }));
+  await expect(
+    editMcpConnectionAccess({ connectionId: id, scopes: [B] }, options),
+  ).rejects.toMatchObject({ status: 409 });
+  expect(gateway.createGrant).not.toHaveBeenCalled();
+  expect((await store.getById(id))!.grants[0].scopes).toEqual([A, B]);
+});
+
+it.each([
+  { revokedAt: "2026-01-01T00:00:00Z", expired: false },
+  { revokedAt: null, expired: true },
+])("rejects an edit when the live grant is not live %j", async (state) => {
+  const { id, options, gateway, store } = await setup();
+  gateway.getGrant.mockImplementation(async () => ({
+    id: "0xgrant",
+    scopes: [A, B],
+    grantVersion: "4",
+    expiresAt: state.expired ? "1" : null,
+    ...state,
+  }));
+  await expect(
+    editMcpConnectionAccess({ connectionId: id, scopes: [A] }, options),
+  ).rejects.toMatchObject({ status: 409 });
+  expect(gateway.createGrant).not.toHaveBeenCalled();
+  expect((await store.getById(id))!.grants[0].scopes).toEqual([A, B]);
+});

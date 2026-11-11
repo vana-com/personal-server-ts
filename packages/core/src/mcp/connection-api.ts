@@ -781,7 +781,27 @@ export async function editMcpConnectionAccess(
     );
   }
   if (JSON.stringify(scopes) === JSON.stringify(stored)) return connection;
-  return (await writeConnectionGrantScopes(connection, scopes, options))
+  // The stored grant can lag the gateway (a gateway write accepted, the local
+  // commit lost). Judge the edit against the gateway's scopes at the version
+  // the write will advance past: the gateway's version check then guarantees
+  // nothing lands in between, so an edit can never re-sign a removed scope.
+  const live = await readLiveGrantState(
+    connection,
+    options.gateway,
+    options.now,
+  );
+  const effective =
+    live.expiry.kind === "none"
+      ? []
+      : stored.filter((scope) => live.scopes.includes(scope));
+  if (scopes.some((scope) => !effective.includes(scope))) {
+    throw new McpScopeRequestError(
+      "RETRY",
+      "The connection's access changed on the gateway. Refresh and try again.",
+      409,
+    );
+  }
+  return (await writeConnectionGrantScopes(connection, scopes, options, live))
     .connection;
 }
 
