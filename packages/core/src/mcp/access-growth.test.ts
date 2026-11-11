@@ -255,6 +255,67 @@ describe("notShared fails closed on dead grants", () => {
     expect(listOwnerScopes).not.toHaveBeenCalled();
   });
 
+  it("mixed live and revoked grants are not live", async () => {
+    const two = {
+      ...connection(),
+      grants: [
+        { grantId: "grant-1", scopes: ["instagram.*"] },
+        { grantId: "grant-2", scopes: ["spotify.*"] },
+      ],
+    };
+    const gateway = {
+      getGrant: vi.fn(async (id: string) =>
+        id === "grant-2"
+          ? { ...live, id, revokedAt: "2026-11-01T00:00:00Z" }
+          : live,
+      ),
+    } as never;
+    expect(await areMcpConnectionGrantsLive(two, gateway)).toBe(false);
+    const listOwnerScopes = vi.fn().mockResolvedValue(ownerScopes);
+    const body = await listGranted({
+      rc: readClient({ listOwnerScopes }),
+      exposeUnsharedScopes: true,
+      verifyGrantsLive: () => areMcpConnectionGrantsLive(two, gateway),
+    });
+    expect("notShared" in body).toBe(false);
+    expect(listOwnerScopes).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, false])(
+    "option %s: the liveness check and owner listing are never called",
+    async (flag) => {
+      const verifyGrantsLive = vi.fn().mockResolvedValue(true);
+      const listOwnerScopes = vi.fn().mockResolvedValue(ownerScopes);
+      const body = await listGranted({
+        rc: readClient({ listOwnerScopes }),
+        exposeUnsharedScopes: flag,
+        verifyGrantsLive,
+      });
+      expect("notShared" in body).toBe(false);
+      expect(verifyGrantsLive).not.toHaveBeenCalled();
+      expect(listOwnerScopes).not.toHaveBeenCalled();
+    },
+  );
+
+  it("a liveness check that never settles times out: granted scopes return, notShared is omitted", async () => {
+    vi.useFakeTimers();
+    try {
+      const listOwnerScopes = vi.fn().mockResolvedValue(ownerScopes);
+      const pending = listGranted({
+        rc: readClient({ listOwnerScopes }),
+        exposeUnsharedScopes: true,
+        verifyGrantsLive: () => new Promise<boolean>(() => {}),
+      });
+      await vi.advanceTimersByTimeAsync(3_500);
+      const body = await pending;
+      expect(body.scopes).toBeDefined();
+      expect("notShared" in body).toBe(false);
+      expect(listOwnerScopes).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a connection with no grants is not live", async () => {
     const empty = { ...connection(), grants: [] };
     expect(await areMcpConnectionGrantsLive(empty, gatewayWith(live))).toBe(

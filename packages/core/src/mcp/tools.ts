@@ -806,14 +806,23 @@ export const UNSHARED_SCOPES_INSTRUCTIONS =
   "When the user asks about data in notShared, offer request_scope_access for it.";
 
 const DEFAULT_OWNER_SCOPE_TIMEOUT_MS = 5_000;
+// The liveness check is optional enrichment: a slow gateway must not cost the
+// caller the whole listing, so it is bounded well below the tool timeout.
+const GRANT_LIVENESS_TIMEOUT_MS = 3_000;
 
-/** Fail closed: no check, a failed check or a "no" all mean not live. */
+/** Fail closed: no check, a failed or slow check, or a "no" all mean not live. */
 async function grantsStillLive(
   verify: McpToolContext["verifyGrantsLive"],
 ): Promise<boolean> {
   if (!verify) return false;
   try {
-    return (await verify()) === true;
+    return (
+      (await withTimeout(
+        verify(),
+        GRANT_LIVENESS_TIMEOUT_MS,
+        "grant liveness check",
+      )) === true
+    );
   } catch {
     return false;
   }
