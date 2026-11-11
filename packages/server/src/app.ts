@@ -771,6 +771,10 @@ export function createApp(deps: AppDeps): Hono {
     oauthApprovalUrl: deps.mcpOAuthApprovalUrl,
     scopeRequestApprovalUrl: deps.mcpScopeRequestApprovalUrl,
     mcpExposeUnsharedScopes: deps.mcpExposeUnsharedScopes,
+    mcpOwnerListingDeps: {
+      scopeDeletions: deps.scopeDeletions,
+      serverOwner: deps.serverOwner,
+    },
     mcpScopeRequestGuidance: deps.mcpScopeRequestGuidance,
     activityRecorder: mcpActivityRecorder,
     localApprovalPort: deps.localApprovalPort,

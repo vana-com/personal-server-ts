@@ -483,6 +483,21 @@ export interface CreateMcpDataReadClientOptions {
    */
   dataApiDeps: PersonalServerDataApiDeps;
   /**
+   * Deps for the owner-wide listing (`listOwnerScopes`) only: the deletion
+   * tracker and owner the ordinary `GET /v1/data` listing receives, so a
+   * deleted scope is never listed. Kept apart from `dataApiDeps` so MCP reads
+   * keep serving exactly what they serve today.
+   *
+   * Deliberately no `legacyScopeView`: MCP reads serve the legacy file, and
+   * `notShared` lists only scopes `read_scope` can serve after approval.
+   * Canonical-only scopes join `notShared` together with moving MCP reads to
+   * the canonical view (follow-up after the demo).
+   */
+  ownerListingDeps?: Pick<
+    PersonalServerDataApiDeps,
+    "scopeDeletions" | "serverOwner"
+  >;
+  /**
    * Base path the data API was mounted under externally — required so the
    * Web3Signed signature URI matches what `handlePersonalServerDataRequest`
    * expects after strip-base-path. Defaults to `/v1/data`.
@@ -661,10 +676,19 @@ export function createMcpDataReadClient(
     async listOwnerScopes() {
       const all: ScopeSummary[] = [];
       for (let offset = 0; all.length < OWNER_SCOPE_LISTING_CAP;) {
-        const page = await listOwnerVisibleScopes(options.dataApiDeps, {
-          limit: OWNER_SCOPE_PAGE_SIZE,
-          offset,
-        });
+        const page = await listOwnerVisibleScopes(
+          {
+            ...options.dataApiDeps,
+            ...(options.ownerListingDeps && {
+              scopeDeletions: options.ownerListingDeps.scopeDeletions,
+              serverOwner: options.ownerListingDeps.serverOwner,
+            }),
+          },
+          {
+            limit: OWNER_SCOPE_PAGE_SIZE,
+            offset,
+          },
+        );
         all.push(...page.scopes);
         offset += OWNER_SCOPE_PAGE_SIZE;
         if (offset >= page.total || page.scopes.length === 0) break;

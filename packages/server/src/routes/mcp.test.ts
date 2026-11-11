@@ -3046,3 +3046,193 @@ describe("MCP /mcp/session (self-signing handshake)", () => {
     expect((await read.json()).error.errorCode).toBe("SERVER_NOT_CONFIGURED");
   });
 });
+
+describe("MCP notShared owner listing deps (route level)", () => {
+  let dataDir: string;
+  let hierarchyOptions: HierarchyManagerOptions;
+  let indexManager: IndexManager;
+
+  beforeEach(async () => {
+    dataDir = await mkdtemp(join(tmpdir(), "mcp-owner-listing-"));
+    hierarchyOptions = { dataDir };
+    indexManager = createIndexManager(initializeDatabase(":memory:"));
+  });
+
+  afterEach(async () => {
+    indexManager.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  /** A canonical view that serves `canonical` scopes; everything else is a file. */
+  const canonicalView = (canonical: string[]) =>
+    ({
+      listingFor: (scope: string) =>
+        canonical.includes(scope)
+          ? { kind: "canonical", collectedAt: "2026-11-02T00:00:00Z" }
+          : { kind: "file", deletion: "file" },
+      listCanonicalScopes: () =>
+        canonical.map((scope) => ({
+          scope,
+          collectedAt: "2026-11-02T00:00:00Z",
+        })),
+    }) as never;
+
+  async function setup(opts: {
+    legacyScopes: string[];
+    listingDeps?: Record<string, unknown>;
+  }) {
+    const store = createInMemoryMcpConnectionStore();
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    const record = (await store.getById(created.connectionId))!;
+    const { gateway } = makeGatewayForGrantee({
+      granteeAddress: record.granteeAddress,
+      grantId: "grant-mcp-1",
+      scopes: ["instagram.*"],
+    });
+    const accessLogWriter = createMockAccessLogWriter();
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-mcp-1", scopes: ["instagram.*"] }],
+      },
+      { store },
+    );
+    for (const scope of opts.legacyScopes) {
+      await ingestScope({
+        scope,
+        data: { username: "mcp_user" },
+        indexManager,
+        hierarchyOptions,
+        gateway,
+        accessLogWriter,
+      });
+    }
+    const root = new Hono();
+    root.route(
+      "/mcp",
+      mcpStreamableHttpRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        gatewayConfig,
+        serverSigner: {
+          signGrantRegistration: vi
+            .fn()
+            .mockResolvedValue("0xgrantsig" as `0x${string}`),
+        },
+        accessLogWriter,
+        connectionStore: store,
+        indexManager,
+        hierarchyOptions,
+        mcpExposeUnsharedScopes: true,
+        mcpOwnerListingDeps: opts.listingDeps as never,
+        localApprovalPort: LOOPBACK_PORT,
+        serverPort: MAIN_PORT,
+      }),
+    );
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const res = await root.request(
+        `/mcp/${encodeURIComponent(created.connectionToken)}`,
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json, text/event-stream",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: "1",
+            method: "tools/call",
+            params: { name, arguments: args },
+          }),
+        },
+      );
+      return JSON.parse((await res.json()).result.content[0].text);
+    };
+    return { call };
+  }
+
+  it("does not list a canonical-only scope: notShared lists only what read_scope can serve", async () => {
+    // Canonical-only scopes join notShared together with moving MCP reads to
+    // the canonical view (follow-up after the demo). Even a view handed to
+    // the listing deps must not add them.
+    const { call } = await setup({
+      legacyScopes: ["instagram.profile"],
+      listingDeps: {
+        serverOwner: ownerWallet.address,
+        legacyScopeView: canonicalView(["youtube.history"]),
+      },
+    });
+    const body = await call("list_granted_scopes", {});
+    expect(body.notShared ?? []).toEqual([]);
+  });
+
+  it("lists a scope with a ready legacy file as ready", async () => {
+    const { call } = await setup({
+      legacyScopes: ["instagram.profile", "youtube.history"],
+      listingDeps: { serverOwner: ownerWallet.address },
+    });
+    const body = await call("list_granted_scopes", {});
+    expect(body.notShared).toEqual([
+      expect.objectContaining({
+        scope: "youtube.history",
+        source: "youtube",
+        dataStatus: "ready",
+      }),
+    ]);
+  });
+
+  it("does not list a tombstoned scope in notShared", async () => {
+    const scopeDeletions = {
+      resolve: async (scope: string) =>
+        scope === "spotify.library"
+          ? { deleted: true, deletedAt: "2099-01-01T00:00:00Z" }
+          : { deleted: false },
+    };
+    const { call } = await setup({
+      legacyScopes: ["instagram.profile", "spotify.library", "youtube.history"],
+      listingDeps: {
+        serverOwner: ownerWallet.address,
+        scopeDeletions,
+      },
+    });
+    const body = await call("list_granted_scopes", {});
+    expect(body.notShared.map((s: { scope: string }) => s.scope)).toEqual([
+      "youtube.history",
+    ]);
+  });
+
+  it("read_scope output for a legacy+canonical scope is unchanged by the listing deps", async () => {
+    const read = async (listingDeps?: Record<string, unknown>) => {
+      const { call } = await setup({
+        legacyScopes: ["instagram.profile"],
+        listingDeps,
+      });
+      return call("read_scope", { scope: "instagram.profile" });
+    };
+    const without = await read(undefined);
+    const withView = await read({
+      serverOwner: ownerWallet.address,
+      scopeDeletions: { resolve: async () => ({ deleted: false }) },
+    });
+    // Reads still serve the legacy file, as before this change.
+    expect(withView.blocks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "$.data",
+          value: { username: "mcp_user" },
+        }),
+      ]),
+    );
+    // Ingest time differs per run; everything else must be identical.
+    const normalize = (value: unknown) =>
+      JSON.parse(
+        JSON.stringify(value).replace(/\d{4}-\d\d-\d\dT[\d:.]+Z/gu, "<ts>"),
+      );
+    expect(normalize(withView)).toEqual(normalize(without));
+  });
+});
