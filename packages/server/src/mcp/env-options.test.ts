@@ -21,6 +21,16 @@ describe("mcpOptionsFromEnv", () => {
     ).toEqual({});
   });
 
+  it("enables owner access editing only for 1", () => {
+    expect(mcpOptionsFromEnv({ VANA_MCP_OWNER_ACCESS_EDIT: "1" })).toEqual({
+      mcpOwnerAccessEdit: true,
+    });
+    expect(mcpOptionsFromEnv({ VANA_MCP_OWNER_ACCESS_EDIT: "true" })).toEqual(
+      {},
+    );
+    expect(mcpOptionsFromEnv({ VANA_MCP_OWNER_ACCESS_EDIT: "0" })).toEqual({});
+  });
+
   it("builds the approval URL hook from the template", () => {
     const { mcpScopeRequestApprovalUrl } = mcpOptionsFromEnv({
       VANA_MCP_SCOPE_REQUEST_APPROVAL_URL_TEMPLATE:

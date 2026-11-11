@@ -30,6 +30,7 @@ import {
   approveMcpOAuthAuthorizationWithScopes,
   approveMcpConnection,
   approveMcpScopeAccessRequest,
+  editMcpConnectionAccess,
   liveGrants,
   liveMcpGrants,
   narrowGrants,
@@ -199,6 +200,8 @@ export interface McpRouteDeps {
   >;
   /** Opt-in `nextAction` on read-side `scope_not_granted`. */
   mcpScopeRequestGuidance?: boolean;
+  /** Allow the owner to narrow connection scopes; default off. */
+  mcpOwnerAccessEdit?: boolean;
   /** Static scope ids listed in `request_scope_access` under guidance. */
   mcpRequestableScopes?: string[];
   /**
@@ -634,6 +637,35 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
       if (caught instanceof McpInvalidScopeError) {
         return c.json(jsonError(400, caught.code, caught.message), 400);
       }
+      throw caught;
+    }
+  });
+
+  app.put("/:id/access", async (c) => {
+    if (!deps.mcpOwnerAccessEdit) return c.notFound();
+    const err = await requireOwner(c);
+    if (err) return err;
+    let body: { scopes?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json(jsonError(400, "INVALID_BODY", "Body must be JSON"), 400);
+    }
+    try {
+      const connection = await editMcpConnectionAccess(
+        { connectionId: c.req.param("id"), scopes: body?.scopes },
+        {
+          store,
+          gateway: deps.gateway,
+          serverOwner: deps.serverOwner,
+          serverSigner: deps.serverSigner,
+          grantTtlSeconds: deps.mcpGrantTtlSeconds,
+        },
+      );
+      return c.json({ connection: toMcpConnectionView(connection) });
+    } catch (caught) {
+      const response = scopeRequestErrorResponse(c, caught);
+      if (response) return response;
       throw caught;
     }
   });

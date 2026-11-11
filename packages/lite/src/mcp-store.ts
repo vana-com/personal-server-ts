@@ -231,7 +231,10 @@ function mutateConnectionRecord(
         request.onsuccess = () => {
           if (!request.result) return;
           try {
-            result = update(structuredClone(request.result));
+            result = {
+              ...update(structuredClone(request.result)),
+              revision: (request.result.revision ?? 0) + 1,
+            };
             store.put(result);
           } catch (error) {
             try {

@@ -6,6 +6,8 @@ import {
 export interface McpEnvOptions {
   mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   mcpExposeUnsharedScopes?: boolean;
+  /** Allow the owner to narrow connection scopes; default off. */
+  mcpOwnerAccessEdit?: boolean;
   mcpScopeRequestGuidance?: boolean;
 }
 
@@ -15,6 +17,7 @@ export interface McpEnvOptions {
  * - VANA_MCP_SCOPE_REQUEST_APPROVAL_URL_TEMPLATE, e.g.
  *   `vana://mcp-scope-request?connection={connectionId}#t={token}`
  * - VANA_MCP_EXPOSE_UNSHARED=1  (`notShared` on list_granted_scopes)
+ * - VANA_MCP_OWNER_ACCESS_EDIT=1 (owner can remove connection permissions)
  * - VANA_MCP_SCOPE_REQUEST_GUIDANCE=1  (`nextAction` on scope_not_granted)
  */
 export function mcpOptionsFromEnv(
@@ -30,6 +33,9 @@ export function mcpOptionsFromEnv(
       : {}),
     ...(env.VANA_MCP_EXPOSE_UNSHARED === "1"
       ? { mcpExposeUnsharedScopes: true }
+      : {}),
+    ...(env.VANA_MCP_OWNER_ACCESS_EDIT === "1"
+      ? { mcpOwnerAccessEdit: true }
       : {}),
     ...(env.VANA_MCP_SCOPE_REQUEST_GUIDANCE === "1"
       ? { mcpScopeRequestGuidance: true }

@@ -59,6 +59,7 @@ export interface StartPersonalServerNodeOptions
       | "mcpOAuthApprovalUrl"
       | "mcpScopeRequestApprovalUrl"
       | "mcpExposeUnsharedScopes"
+      | "mcpOwnerAccessEdit"
       | "mcpScopeRequestGuidance"
       | "mcpRequestableScopes"
       | "mcpGrantTtlSeconds"
@@ -103,6 +104,7 @@ export async function startPersonalServer(
     mcpOAuthApprovalUrl: options.mcpOAuthApprovalUrl,
     mcpScopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
     mcpExposeUnsharedScopes: options.mcpExposeUnsharedScopes,
+    mcpOwnerAccessEdit: options.mcpOwnerAccessEdit,
     mcpScopeRequestGuidance: options.mcpScopeRequestGuidance,
     mcpRequestableScopes: options.mcpRequestableScopes,
     mcpGrantTtlSeconds: options.mcpGrantTtlSeconds,
