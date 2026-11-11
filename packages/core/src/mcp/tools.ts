@@ -2284,7 +2284,7 @@ function resolveMemoryTarget(
           writableScopes,
           message:
             writableScopes.length === 0
-              ? 'This connection cannot save memories. Call request_scope_access with scopes ["write:memory.<app>"] and ask the user to approve it.'
+              ? 'This connection cannot save memories. Call request_scope_access with scopes ["memory.<app>", "write:memory.<app>"] and ask the user to approve it.'
               : "Name the scope; this connection can write to more than one.",
         },
         true,
@@ -2318,8 +2318,9 @@ function resolveMemoryTarget(
           error: "scope_not_granted",
           scope,
           requestScope,
-          writableScopes,
-          message: `This connection may not write to ${scope}. Call request_scope_access with scopes ["${requestScope}"] and ask the user to approve it.`,
+          requestScopes: [scope, requestScope],
+          nextAction: requestAccessNextAction([scope, requestScope]),
+          message: `This connection may not write to ${scope}. Call request_scope_access with scopes ${JSON.stringify([scope, requestScope])} and ask the user to approve it.`,
         },
         true,
       ),

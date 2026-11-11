@@ -379,4 +379,27 @@ describe("a write-only memory grant is not a read oracle", () => {
       expect(writer.calls).toEqual([]);
     },
   );
+
+  it("the write-only remember error names the read and write scopes and equals the never-granted error", async () => {
+    const run = async (conn: McpConnectionRecord) => {
+      const result = await MCP_TOOLS.find(
+        (t) => t.name === "remember",
+      )!.handler(
+        { scope: "memory.app", text: "probe" },
+        { connection: conn, readClient: ownerA() },
+      );
+      return result.content[0]!.text as string;
+    };
+    const writeOnlyBody = await run(writeOnly());
+    const never = await run({ ...connection(), grants: [] });
+    expect(writeOnlyBody).toBe(never);
+    const parsed = JSON.parse(writeOnlyBody) as {
+      nextAction: string;
+      requestScopes: string[];
+    };
+    expect(parsed.requestScopes).toEqual(["memory.app", "write:memory.app"]);
+    expect(parsed.nextAction).toContain(
+      JSON.stringify(["memory.app", "write:memory.app"]),
+    );
+  });
 });
