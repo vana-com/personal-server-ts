@@ -11,6 +11,18 @@ import { applyConnection } from "./apply.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { createOlderVersions, type OlderVersions } from "./older-versions.js";
 import type { RecordQuery } from "./query.js";
+import {
+  chooseCandidate,
+  complete,
+  loadStreams,
+  projectAlias,
+  selectForTarget,
+  tombstoned,
+  type Candidate,
+  type Connection,
+  type Stream,
+  type Target,
+} from "./read-selection.js";
 
 /**
  * D.1: serve the latest complete head above the deletion floor. When the
@@ -42,68 +54,12 @@ export interface LocalAliasRecord {
 export type AliasScopes = () => Iterable<string>;
 /** The host supplies projection knowledge separately from name discovery. */
 export type AliasTargets = (scope: string) => readonly LocalAliasTarget[];
-type Target = {
-  readonly connector: string;
-  readonly streams: readonly string[];
-  readonly alias?: LocalAliasTarget;
-};
-type Connection = {
-  connection_id: string;
-  connector: string;
-  ns: string;
-  generation: number;
-  control_state: string;
-  deleted_at: number | null;
-};
-type Stream = {
-  installed_version: number;
-  stream: string;
-  profile_key: string | null;
-  profile_version: string | null;
-  primary_key: string;
-  complete: number;
-  last_delete_version: number;
-  head_version: number;
-  head_generation: number | null;
-  head_data_hash: string | null;
-  head_blob: string | null;
-  version: number | null;
-  generation: number | null;
-  version_blob: string | null;
-  version_complete: number | null;
-  observed_at: number | null;
-  kind: string | null;
-};
-type Candidate = {
-  target: Target;
-  connection: Connection;
-  streams: Stream[];
-  registered: number;
-};
-
 const encoder = new TextEncoder();
-const ARRAY_BUDGET = 64 * 1024 * 1024;
 const noData = (): ReadDecision => ({ kind: "unavailable", reason: "no_data" });
 const deleted = (): ReadDecision => ({
   kind: "unavailable",
   reason: "deleted",
 });
-const tombstoned = (s: Stream) =>
-  s.last_delete_version > 0 && s.head_version <= s.last_delete_version;
-const live = (s: Stream, c: Connection) =>
-  c.control_state === "active" &&
-  c.deleted_at === null &&
-  s.head_version > s.last_delete_version &&
-  s.head_generation === c.generation &&
-  s.generation === c.generation &&
-  s.version === s.head_version &&
-  s.kind !== "delete" &&
-  s.head_blob !== null &&
-  s.version_blob === s.head_blob &&
-  s.head_data_hash !== null;
-const complete = (s: Stream, c: Connection) =>
-  live(s, c) && s.complete === 1 && s.version_complete === 1;
-
 function cursorFor(c: Candidate): string {
   const json = JSON.stringify({
     c: c.connection.connector,
@@ -227,26 +183,8 @@ export function createLocalResolver(
   },
 ): LocalResolver {
   const completeReads = createOlderVersions(deps, { enabled: () => true });
-  async function streams(connectionId: string): Promise<Stream[]> {
-    return deps.db.query<Stream>(
-      `SELECT s.head_version AS installed_version, s.stream, s.profile_key, s.profile_version, s.primary_key,
-              coalesce(v.complete, 0) AS complete, s.last_delete_version, coalesce(v.version, s.head_version) AS head_version,
-              v.generation AS head_generation, s.head_data_hash, v.head_blob,
-              v.version, v.generation, v.head_blob AS version_blob,
-              v.complete AS version_complete, v.observed_at, v.kind
-       FROM stream_state s
-       LEFT JOIN stream_versions v ON v.connection_id = s.connection_id
-         AND v.stream = s.stream AND v.version = (
-           SELECT max(h.version) FROM stream_versions h
-           JOIN connections c ON c.connection_id = h.connection_id
-           WHERE h.connection_id = s.connection_id AND h.stream = s.stream
-             AND h.generation = c.generation AND h.complete = 1
-             AND h.kind != 'delete' AND h.version > s.last_delete_version
-         )
-       WHERE s.connection_id = ? ORDER BY s.stream`,
-      [connectionId],
-    );
-  }
+  const streams = (connectionId: string): Promise<Stream[]> =>
+    loadStreams(deps, connectionId);
 
   async function connections(connector: string): Promise<Connection[]> {
     return deps.db.query<Connection>(
@@ -324,32 +262,16 @@ export function createLocalResolver(
         installed[0]!.stream,
       );
     } else {
-      // Check all input heads, before reading even one record or creating a body.
-      if (installed.some((s) => s.profile_key !== candidate.target.connector)) {
-        return noData();
+      const projected = await projectAlias(
+        binding,
+        current,
+        readQuery,
+        new Date(deps.now()).toISOString(),
+      );
+      if (projected.kind === "too_large") {
+        return { kind: "too_large", bytes: projected.bytes };
       }
-      const now = new Date(deps.now()).toISOString();
-      if (binding.windowed) {
-        const probe = binding.project([], now);
-        if (!probe.ok && probe.error.kind.includes("profile")) return noData();
-      }
-      const records: LocalAliasRecord[] = [];
-      let bytes = 0;
-      for (const stream of candidate.target.streams) {
-        for await (const record of readQuery.streamRecords(
-          connection.connection_id,
-          stream,
-        )) {
-          bytes += encoder.encode(record.body).byteLength;
-          if (bytes > ARRAY_BUDGET) return { kind: "too_large", bytes };
-          records.push({
-            stream,
-            data: JSON.parse(record.body) as Record<string, unknown>,
-          });
-        }
-      }
-      const projected = binding.project(records, now);
-      if (!projected.ok) return noData();
+      if (projected.kind === "no_data") return noData();
       payload = single(JSON.stringify(projected.payload));
     }
     const servedStream = binding?.servedStream ?? candidate.target.streams[0]!;
@@ -426,48 +348,23 @@ export function createLocalResolver(
         sawActive ||= rows.some(
           (c) => c.control_state === "active" && c.deleted_at === null,
         );
-        const active: Candidate[] = [];
-        for (const c of rows.filter(
-          (c) => c.control_state === "active" && c.deleted_at === null,
-        )) {
-          const all = await streams(c.connection_id);
-          const rank = all
-            .filter((s) => live(s, c))
-            .map((s) => s.observed_at ?? 0);
-          active.push({
-            target,
-            connection: c,
-            streams: target.streams.flatMap((name) => {
-              const s = all.find((s) => s.stream === name);
-              return s ? [s] : [];
-            }),
-            registered: rank.length ? Math.max(...rank) : -Infinity,
+        const loaded: { connection: Connection; streams: Stream[] }[] = [];
+        for (const connection of rows) {
+          if (
+            connection.control_state !== "active" ||
+            connection.deleted_at !== null
+          )
+            continue;
+          loaded.push({
+            connection,
+            streams: await streams(connection.connection_id),
           });
         }
-        active.sort(
-          (a, b) =>
-            b.registered - a.registered ||
-            a.connection.ns.localeCompare(b.connection.ns),
-        );
-        const selected = active[0];
-        if (!selected) continue;
-        if (selected.streams.some(tombstoned)) {
-          sawDeleted = true;
-          continue;
-        }
-        if (
-          selected.streams.length === target.streams.length &&
-          selected.streams.every((s) => complete(s, selected.connection))
-        ) {
-          candidates.push(selected);
-        }
+        const picked = selectForTarget(target, loaded);
+        if (picked.tombstoned) sawDeleted = true;
+        if (picked.candidate) candidates.push(picked.candidate);
       }
-      candidates.sort(
-        (a, b) =>
-          b.registered - a.registered ||
-          a.target.connector.localeCompare(b.target.connector),
-      );
-      const chosen = candidates[0];
+      const chosen = chooseCandidate(candidates);
       if (!chosen) {
         if (sawDeleted) return deleted();
         if (sawForeign && !sawActive) return { kind: "key_mismatch" };

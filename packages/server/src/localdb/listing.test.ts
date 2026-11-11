@@ -5,28 +5,8 @@ import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import type { SqlDriver, SqlValue } from "../../../core/src/localdb/driver.js";
 import { createLocalListing } from "../../../core/src/localdb/listing.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
-import type {
-  ReadDecision,
-  ResolveInput,
-} from "../../../core/src/stream-sync-read/service.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
-
-const mocks = vi.hoisted(() => ({
-  resolve: vi.fn<(input: ResolveInput) => Promise<ReadDecision>>(),
-  query: vi.fn(() => ({})),
-  older: vi.fn(() => ({})),
-}));
-
-// These tests isolate listing policy; listing-alias-integration uses the real resolver.
-vi.mock("../../../core/src/localdb/resolve.js", () => ({
-  createLocalResolver: () => ({ resolve: mocks.resolve }),
-}));
-vi.mock("../../../core/src/localdb/query.js", () => ({
-  createRecordQuery: mocks.query,
-}));
-vi.mock("../../../core/src/localdb/older-versions.js", () => ({
-  createOlderVersions: mocks.older,
-}));
+import { addConnection, addStream } from "./local-state-fixture.js";
 
 const opened: SqlDriver[] = [];
 const dirs: string[] = [];
@@ -55,10 +35,15 @@ async function fresh(
     newOp: () => "listing-op",
   } as unknown as LocalSyncDeps;
   const counts = vi.fn(() => olderCounts);
+  const project = vi.fn<(records: readonly unknown[]) => unknown>(() => ({
+    ok: true as const,
+    payload: {},
+  }));
   return {
     db,
     warn,
     counts,
+    project,
     listing: createLocalListing(
       {
         ...deps,
@@ -67,8 +52,8 @@ async function fresh(
             ? [
                 {
                   connector: "sample",
-                  streams: ["items", "details"],
-                  project: () => ({ ok: true as const, payload: {} }),
+                  streams: ["items"],
+                  project: project as never,
                 },
               ]
             : [],
@@ -81,44 +66,28 @@ async function fresh(
 
 async function seed(db: SqlDriver, control: "active" | "absent" = "active") {
   const local = control === "absent";
-  await db.batch([
-    {
-      sql: "INSERT INTO connections(connection_id, connector, ns, control_state, control_version) VALUES ('c1', 'sample', '', ?, ?)",
-      params: [control, local ? 0 : 2],
-    },
-    {
-      sql: "INSERT INTO stream_state(connection_id, stream, primary_key, semantics, incremental, complete, head_version, head_generation, head_blob) VALUES ('c1', 'items', '[\"id\"]', 'mutable_state', 0, ?, ?, ?, ?)",
-      params: [
-        local ? 0 : 1,
-        local ? 0 : 3,
-        local ? null : 1,
-        local ? null : "head",
-      ],
-    },
-    {
-      sql: "INSERT INTO records(connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256) VALUES ('c1', 'items', '01', 'one', 1234, 'run', '{}', 'fixture')",
-    },
-  ]);
+  await addConnection(db, "c1", "sample", { control, generation: 1 });
+  await addStream(db, "c1", "items", {
+    generation: 1,
+    version: local ? 0 : 3,
+    complete: !local,
+    observedAt: 1000,
+    stampBase: 1234,
+    records: 1,
+    profile: "sample",
+  });
 }
 
-function view(
-  kind: "view" | "local_pending" = "view",
-  body = new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(new TextEncoder().encode("{}"));
-      controller.close();
-    },
-  }),
-): ReadDecision {
-  const common = { connector: "sample", ns: "", cursor: "cursor", body };
-  return kind === "view"
-    ? { ...common, kind, served: { scope: "pdpp.sample~.items", version: 3 } }
-    : { ...common, kind, complete: false };
-}
+const the = (updatedAt = 1234) => ({
+  scope: "pdpp.sample.items",
+  connector: "sample",
+  ns: "",
+  records: 1,
+  updatedAt,
+});
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mocks.resolve.mockReset().mockResolvedValue({ kind: "pass" });
 });
 
 afterEach(async () => {
@@ -135,7 +104,6 @@ describe("local listing #597", () => {
     });
     const { db, listing } = await fresh({ aliasScopes });
     await seed(db);
-    mocks.resolve.mockImplementation(async () => view());
     const canRead = vi.fn(() => true);
     const expected = [
       {
@@ -145,13 +113,7 @@ describe("local listing #597", () => {
         records: null,
         updatedAt: 1234,
       },
-      {
-        scope: "pdpp.sample.items",
-        connector: "sample",
-        ns: "",
-        records: 1,
-        updatedAt: 1234,
-      },
+      the(),
     ];
 
     expect(aliasScopes).not.toHaveBeenCalled();
@@ -165,26 +127,17 @@ describe("local listing #597", () => {
   });
 
   it("listing-no-alias-without-caller", async () => {
-    const { db, listing } = await fresh({});
+    const { db, listing, project } = await fresh({});
     await seed(db);
-    mocks.resolve.mockImplementation(async () => view());
     const canRead = vi.fn(() => true);
 
-    expect(await listing.listScopes({ canRead })).toEqual([
-      {
-        scope: "pdpp.sample.items",
-        connector: "sample",
-        ns: "",
-        records: 1,
-        updatedAt: 1234,
-      },
-    ]);
+    expect(await listing.listScopes({ canRead })).toEqual([the()]);
     expect(canRead.mock.calls).toEqual([["pdpp.sample.items"]]);
-    expect(mocks.resolve).toHaveBeenCalledTimes(1);
+    expect(project).not.toHaveBeenCalled();
   });
 
-  it("lists readable scopes only, with the grant filter before all checks", async () => {
-    const { db, listing } = await fresh();
+  it("lists readable scopes only, with the grant filter before the alias projection", async () => {
+    const { db, listing, project } = await fresh();
     await seed(db);
     const events: string[] = [];
     const allow = vi.fn(async (scope: string) => {
@@ -192,48 +145,25 @@ describe("local listing #597", () => {
       await Promise.resolve();
       return scope === "pdpp.sample.items";
     });
-    mocks.resolve.mockImplementation(async ({ scope }) => {
-      events.push("resolve:" + scope);
-      return view();
-    });
 
     expect(await listing.listScopes({ canRead: async () => false })).toEqual(
       [],
     );
-    expect(mocks.resolve).not.toHaveBeenCalled();
-    expect(mocks.query).not.toHaveBeenCalled();
-    expect(mocks.older).not.toHaveBeenCalled();
+    expect(project).not.toHaveBeenCalled();
 
-    expect(await listing.listScopes({ canRead: allow })).toEqual([
-      {
-        scope: "pdpp.sample.items",
-        connector: "sample",
-        ns: "",
-        records: 1,
-        updatedAt: 1234,
-      },
-    ]);
+    expect(await listing.listScopes({ canRead: allow })).toEqual([the()]);
     expect(events).toEqual([
       "grant:example.summary",
       "grant:pdpp.sample.items",
-      "resolve:pdpp.sample.items",
     ]);
-    expect(mocks.resolve).toHaveBeenCalledTimes(1);
-    expect(mocks.resolve).toHaveBeenCalledWith({
-      scope: "pdpp.sample.items",
-      connection: null,
-      cursor: null,
-      legacyFile: false,
-      isOwnerView: true,
-    });
+    expect(project).not.toHaveBeenCalled();
   });
 
   it("skips and logs a throwing covered check while continuing other scopes", async () => {
-    const { db, listing, warn } = await fresh();
+    const { db, listing, warn, project } = await fresh();
     await seed(db);
-    mocks.resolve.mockImplementation(async ({ scope }) => {
-      if (scope === "example.summary") throw new Error("projection failed");
-      return view();
+    project.mockImplementation(() => {
+      throw new Error("projection failed");
     });
     expect(
       (await listing.listScopes({ canRead: () => true })).map((s) => s.scope),
@@ -244,7 +174,7 @@ describe("local listing #597", () => {
       "localdb listing: scope check failed",
     );
     warn.mockClear();
-    mocks.resolve.mockClear();
+    project.mockClear();
     expect(
       await listing.listScopes({
         canRead: (scope) => {
@@ -253,7 +183,7 @@ describe("local listing #597", () => {
         },
       }),
     ).toEqual([]);
-    expect(mocks.resolve).not.toHaveBeenCalled();
+    expect(project).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(
       { scope: "pdpp.sample.items" },
@@ -261,24 +191,10 @@ describe("local listing #597", () => {
     );
   });
 
-  it("includes the owner's local-only scopes without registry heads", async () => {
+  it("lists no scope for a connection with no applied head, as a read serves none", async () => {
     const { db, listing, counts } = await fresh();
     await seed(db, "absent");
-    mocks.resolve.mockImplementation(async () => view("local_pending"));
-    expect(
-      await listing.listScopes({
-        canRead: (scope) => scope === "pdpp.sample.items",
-      }),
-    ).toEqual([
-      {
-        scope: "pdpp.sample.items",
-        connector: "sample",
-        ns: "",
-        records: 1,
-        updatedAt: 1234,
-      },
-    ]);
-    expect(mocks.resolve.mock.calls[0]?.[0].isOwnerView).toBe(true);
+    expect(await listing.listScopes({ canRead: () => true })).toEqual([]);
     expect(await listing.status()).toEqual({
       listed: true,
       connections: [
@@ -303,32 +219,22 @@ describe("local listing #597", () => {
     expect(counts).toHaveBeenCalledTimes(1);
   });
 
-  it("lists an alias only when its entire body can be built", async () => {
-    const { db, listing, warn } = await fresh();
+  it("lists an alias only when its installed records project", async () => {
+    const { db, listing, warn, project } = await fresh();
     await seed(db);
     const canRead = (scope: string) => scope === "example.summary";
-    const makeBody = (fail: boolean) => {
-      let part = 0;
-      return new ReadableStream<Uint8Array>({
-        pull(controller) {
-          if (part++ === 0) {
-            controller.enqueue(new TextEncoder().encode("{"));
-          } else if (fail) {
-            controller.error(new Error("late projection failure"));
-          } else {
-            controller.enqueue(new TextEncoder().encode("}"));
-            controller.close();
-          }
-        },
-      });
-    };
-    mocks.resolve.mockImplementation(async () => view("view", makeBody(true)));
+    project.mockImplementation(() => {
+      throw new Error("late projection failure");
+    });
     expect(await listing.listScopes({ canRead })).toEqual([]);
     expect(warn).toHaveBeenCalledTimes(1);
 
-    mocks.resolve.mockResolvedValue({ kind: "unavailable", reason: "no_data" });
+    project.mockImplementation(() => ({
+      ok: false,
+      error: { kind: "unsupported" },
+    }));
     expect(await listing.listScopes({ canRead })).toEqual([]);
-    mocks.resolve.mockImplementation(async () => view("view", makeBody(false)));
+    project.mockImplementation(() => ({ ok: true, payload: {} }));
     expect(await listing.listScopes({ canRead })).toEqual([
       {
         scope: "example.summary",
@@ -337,6 +243,9 @@ describe("local listing #597", () => {
         records: null,
         updatedAt: 1234,
       },
+    ]);
+    expect(project.mock.calls[0]?.[0]).toEqual([
+      { stream: "items", data: { id: "0", stream: "items" } },
     ]);
   });
 
