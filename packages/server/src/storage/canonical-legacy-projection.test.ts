@@ -311,8 +311,8 @@ describe("canonical legacy projection over the real SQLite record store", () => 
 
   describe("connection selection", () => {
     it("reads only the selected connection when two accounts share a source", async () => {
-      const a = connect("conn_a", "oura");
-      const b = connect("conn_b", "oura");
+      const a = connect("conn_a", "oura_pat");
+      const b = connect("conn_b", "oura_pat");
       put("conn_a", "activity", [activity("a1", "2026-08-01")]);
       put("conn_b", "activity", [
         activity("b1", "2026-08-02"),
@@ -342,10 +342,10 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("fails when several connections match and none was chosen", () => {
-      connect("conn_a", "oura");
-      connect("conn_b", "oura");
+      connect("conn_a", "oura_pat");
+      connect("conn_b", "oura_pat");
       expect(
-        resolveCanonicalConnection(store, { sourceId: SRC("oura") }),
+        resolveCanonicalConnection(store, { sourceId: SRC("oura_pat") }),
       ).toMatchObject({
         ok: false,
         reason: "ambiguous_connection",
@@ -353,7 +353,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       });
       expect(
         resolveCanonicalConnection(store, {
-          sourceId: SRC("oura"),
+          sourceId: SRC("oura_pat"),
           instance: "conn_b",
         }),
       ).toMatchObject({
@@ -369,7 +369,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("refuses a selection that disagrees with the store binding or the scope's source", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       put("conn_a", "activity", [activity("a1", "2026-08-01")]);
       expect(
         await readCanonicalLegacyScope({
@@ -415,7 +415,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("leaves manual and unbound scope files to the file path", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       expect(
         await readCanonicalLegacyScope({
           store,
@@ -428,7 +428,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
 
   describe("paging", () => {
     it("returns every row when the scope spans many pages", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       const rows = Array.from({ length: 23 }, (_, i) =>
         activity(
           `a${String(i).padStart(2, "0")}`,
@@ -490,7 +490,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     function seedSix() {
       fileStore.registerConnection({
         instance: "conn_a",
-        sourceId: SRC("oura"),
+        sourceId: SRC("oura_pat"),
         method: METHOD,
         label: "a",
       });
@@ -504,7 +504,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       );
       return {
         instance: "conn_a",
-        sourceId: SRC("oura"),
+        sourceId: SRC("oura_pat"),
         method: METHOD,
       };
     }
@@ -561,7 +561,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     it("reads receipts in the same snapshot as the rows", async () => {
       fileStore.registerConnection({
         instance: "conn_a",
-        sourceId: SRC("oura"),
+        sourceId: SRC("oura_pat"),
         method: METHOD,
         label: "a",
       });
@@ -581,7 +581,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       );
       const selection = {
         instance: "conn_a",
-        sourceId: SRC("oura"),
+        sourceId: SRC("oura_pat"),
         method: METHOD,
       };
       // Another process commits an empty replace with its receipt after the
@@ -704,7 +704,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
 
   describe("real source shapes", () => {
     it("keeps null and integer Oura scores", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       put("conn_a", "activity", [
         activity("a1", "2026-08-01", null),
         activity("a2", "2026-08-02", 77),
@@ -862,7 +862,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("does not treat a fully tombstoned stream as proof of an empty fetch", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       put("conn_a", "activity", [activity("a1", "2026-08-01")]);
       put("conn_a", "sleep", [{ id: "s1", day: "2026-08-01" }]);
       store.deleteRecord(
@@ -943,7 +943,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
 
   describe("rows the legacy schema cannot hold", () => {
     it("never emits Oura rows with invalid days and keeps nullable scores", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       put("conn_a", "activity", [
         activity("good1", "2026-08-01", null),
         activity("nullday", null as unknown as string),
@@ -976,7 +976,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("fails, not empty, when every nonempty Oura row is invalid", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       put("conn_a", "activity", [
         activity("x1", null as unknown as string),
         activity("x2", "yesterday"),
@@ -1085,7 +1085,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("joins messages to their conversation within the selected connection", async () => {
-      const a = connect("conn_a", "claude");
+      const a = connect("conn_a", "claude_export");
       put("conn_a", "account_profile", [profile]);
       put("conn_a", "conversations", [conversation(1)]);
       put("conn_a", "messages", [message("m1")]);
@@ -1103,7 +1103,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("reports incomplete, not empty or short, when the detail rows are missing", async () => {
-      const a = connect("conn_a", "claude");
+      const a = connect("conn_a", "claude_export");
       put("conn_a", "account_profile", [profile]);
       put("conn_a", "conversations", [conversation(2)]);
       put("conn_a", "messages", [message("m1")]);
@@ -1122,8 +1122,8 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("never joins detail rows from another connection", async () => {
-      const a = connect("conn_a", "claude");
-      connect("conn_b", "claude");
+      const a = connect("conn_a", "claude_export");
+      connect("conn_b", "claude_export");
       put("conn_a", "account_profile", [profile]);
       put("conn_a", "conversations", [conversation(1)]);
       put("conn_a", "messages", [
@@ -1144,7 +1144,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("fails explicitly for blob-backed rows instead of serving them empty", async () => {
-      const a = connect("conn_a", "claude");
+      const a = connect("conn_a", "claude_export");
       put("conn_a", "account_profile", [profile]);
       put("conn_a", "conversations", [conversation(1)]);
       const blob = store.storeBlobBytesForInstance({
@@ -1183,7 +1183,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
 
   describe("repeat reads", () => {
     it("is read-only and returns identical bytes and revision until the source changes", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       put("conn_a", "activity", [activity("a1", "2026-08-01")]);
       const calls: string[] = [];
       const spy = new Proxy(store, {
@@ -1221,7 +1221,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       expect(JSON.stringify(second)).toBe(JSON.stringify(first));
 
       // Unrelated connection writes do not move this view; its own writes do.
-      connect("conn_other", "oura");
+      connect("conn_other", "oura_pat");
       put("conn_other", "activity", [activity("o1", "2026-08-05")]);
       const unrelated = await readCanonicalLegacyScope({
         store,
@@ -1298,7 +1298,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("excludes tombstoned rows", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       put("conn_a", "activity", [
         activity("a1", "2026-08-01"),
         activity("a2", "2026-08-02"),
@@ -1368,7 +1368,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       readCanonicalLegacyScope({ store, scope: "oura.activity", selection });
 
     it("serves a genuine empty replace as an empty stream stamped with the source time", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       expect(replace("conn_a", "activity", [], COLLECTED).applied).toBe(true);
 
       const read = await readOura(a);
@@ -1405,7 +1405,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("keeps a never-collected stream unavailable", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       replace("conn_a", "sleep", [], COLLECTED);
       expect(await readOura(a)).toMatchObject({
         ok: false,
@@ -1420,7 +1420,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("writes no receipt for a replace without a source time and drops the older one", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       put("conn_a", "sleep", [{ id: "s1", day: "2026-08-01" }]);
       expect(replace("conn_a", "activity", []).applied).toBe(true);
       expect(receipts()).toEqual([]);
@@ -1440,7 +1440,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("refuses an invalid source time and keeps the rows and the prior receipt", () => {
-      connect("conn_a", "oura");
+      connect("conn_a", "oura_pat");
       replace("conn_a", "activity", [activity("a1", "2026-08-01")], COLLECTED);
       const before = {
         receipts: receipts(),
@@ -1466,7 +1466,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("rolls back rows and the prior receipt together when the replace is rejected", () => {
-      connect("conn_a", "oura");
+      connect("conn_a", "oura_pat");
       replace("conn_a", "activity", [activity("a1", "2026-08-01")], COLLECTED);
       const before = {
         receipts: receipts(),
@@ -1514,7 +1514,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("ignores foreign receipts and erases receipts on connection delete", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       expect(receipts()).toEqual([]);
       expect(await readOura(a)).toMatchObject({ reason: "no_synced_data" });
 
@@ -1536,7 +1536,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("does not let incremental writes or deletes stand in for a full refresh", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       put("conn_a", "sleep", [{ id: "s1", day: "2026-08-01" }]);
 
       // An empty or unchanged ingest is not a completion.
@@ -1606,8 +1606,8 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("never lends one account's receipt to another", async () => {
-      connect("conn_a", "oura");
-      const b = connect("conn_b", "oura");
+      connect("conn_a", "oura_pat");
+      const b = connect("conn_b", "oura_pat");
       replace("conn_a", "activity", [], COLLECTED);
       put("conn_b", "sleep", [{ id: "s1", day: "2026-08-01" }]);
       expect(await readOura(b)).toMatchObject({
@@ -1617,14 +1617,14 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("keeps bytes and revision stable across wall-clock changes and unrelated writes", async () => {
-      const a = connect("conn_a", "oura");
+      const a = connect("conn_a", "oura_pat");
       replace("conn_a", "activity", [], COLLECTED);
       vi.useFakeTimers();
       try {
         vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
         const first = await readOura(a);
         vi.setSystemTime(new Date("2031-06-01T00:00:00.000Z"));
-        connect("conn_b", "oura");
+        connect("conn_b", "oura_pat");
         replace("conn_b", "activity", [], "2026-09-20T00:00:00Z");
         put("conn_a", "sleep", [{ id: "s1", day: "2026-08-01" }]);
         const second = await readOura(a);
@@ -1688,7 +1688,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       const days = [activity("a1", "2026-08-01"), activity("a2", "2026-08-02")];
 
       it("advances collectedAt and revision when an unchanged full replace is collected again", async () => {
-        const a = connect("conn_a", "oura");
+        const a = connect("conn_a", "oura_pat");
         collect("conn_a", "activity", days, SEPT_1);
         const first = await readOura(a);
         expect(first.ok && first.envelope.collectedAt).toBe(SEPT_1);
@@ -1711,8 +1711,8 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       });
 
       it("keeps bytes and revision when the same collection is replayed, also after another account's writes", async () => {
-        const a = connect("conn_a", "oura");
-        connect("conn_b", "oura");
+        const a = connect("conn_a", "oura_pat");
+        connect("conn_b", "oura_pat");
         collect("conn_a", "activity", days, SEPT_11);
         const first = await readOura(a);
 
@@ -1724,7 +1724,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       });
 
       it("uses only a receipt of the current method and generation that counts the live rows", async () => {
-        const a = connect("conn_a", "oura");
+        const a = connect("conn_a", "oura_pat");
         collect("conn_a", "activity", days, SEPT_1);
         const insert = db.prepare(
           "INSERT INTO pdpp_stream_completion (instance, stream, method, generation, source_collected_at, write_seq, live_count) VALUES ('conn_a', 'activity', ?, ?, ?, 0, ?)",
@@ -1743,7 +1743,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       });
 
       it("falls back to row timestamps for an older client that sends no source time", async () => {
-        const a = connect("conn_a", "oura");
+        const a = connect("conn_a", "oura_pat");
         collect("conn_a", "activity", days, SEPT_1, null);
         const first = await readOura(a);
         expect(first.ok && first.envelope.collectedAt).toBe(SEPT_1);
@@ -1757,7 +1757,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       });
 
       it("takes the newest stream collection across nonempty and empty streams", async () => {
-        const a = connect("conn_a", "claude");
+        const a = connect("conn_a", "claude_export");
         const profile = {
           id: "org1",
           organization_id: "org1",
@@ -1798,7 +1798,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       });
 
       it("keeps omission diagnostics: a receipt does not prove every row mapped", async () => {
-        const a = connect("conn_a", "oura");
+        const a = connect("conn_a", "oura_pat");
         collect(
           "conn_a",
           "activity",

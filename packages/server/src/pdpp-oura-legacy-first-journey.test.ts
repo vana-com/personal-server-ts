@@ -43,7 +43,10 @@ import {
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { type CreateServerOptions, type ServerContext } from "./bootstrap.js";
-import { registerTestConnection } from "./pdpp/test-connections.js";
+import {
+  legacyTestConnectionId,
+  registerTestConnection,
+} from "./pdpp/test-connections.js";
 import type * as LegacyScopeViewModule from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 
 /**
@@ -86,6 +89,9 @@ const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
 const CONTROL_PLANE_TOKEN = "oura-legacy-first-control-plane";
 const OURA = "https://registry.pdpp.dev/sources/oura";
+const OURA_PAT = "https://registry.pdpp.dev/sources/oura_pat";
+/** Each connector collects its own source. */
+const sourceOf = (method: string) => (method === "oura" ? OURA_PAT : OURA);
 const SECOND_ACCOUNT = "conn_123e4567-e89b-42d3-a456-426614174000";
 const PAT_ACCOUNT = "conn_323e4567-e89b-42d3-a456-426614174002";
 const GRANT_ID = `0x${"11".repeat(32)}`;
@@ -134,7 +140,7 @@ async function declarationFor(method: string): Promise<string> {
     }[];
   };
   return JSON.stringify({
-    source_id: OURA,
+    source_id: sourceOf(method),
     source_kind: "connector",
     version: manifest.version,
     streams: manifest.streams.map((stream) => ({
@@ -232,14 +238,17 @@ async function boot(
   );
 }
 
-async function ownerPdppToken(instanceId?: string): Promise<string> {
+async function ownerPdppToken(
+  instanceId?: string,
+  method = "oura-browser",
+): Promise<string> {
   if (!instanceId) {
     return registerTestConnection(
       ctx!.app,
       ctx!.devToken!,
       owner,
-      OURA,
-      "oura-browser",
+      sourceOf(method),
+      method,
     );
   }
   const response = await ctx!.app.request("/pdpp/v1/owner/token", {
@@ -248,21 +257,24 @@ async function ownerPdppToken(instanceId?: string): Promise<string> {
       authorization: `Bearer ${ctx!.devToken}`,
       "content-type": "application/json",
     },
-    body: JSON.stringify({ source_id: OURA, instance_id: instanceId }),
+    body: JSON.stringify({
+      source_id: sourceOf(method),
+      instance_id: instanceId,
+    }),
   });
   expect(response.status).toBe(200);
   return ((await response.json()) as { access_token: string }).access_token;
 }
 
 /** Mint a source-level owner token without registering any connection. */
-async function mintSourceToken(): Promise<string> {
+async function mintSourceToken(method = "oura-browser"): Promise<string> {
   const response = await ctx!.app.request("/pdpp/v1/owner/token", {
     method: "POST",
     headers: {
       authorization: `Bearer ${ctx!.devToken}`,
       "content-type": "application/json",
     },
-    body: JSON.stringify({ source_id: OURA }),
+    body: JSON.stringify({ source_id: sourceOf(method) }),
   });
   expect(response.status).toBe(200);
   return ((await response.json()) as { access_token: string }).access_token;
@@ -282,7 +294,7 @@ async function registerAccount(
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        source_id: OURA,
+        source_id: sourceOf(method),
         method_id: method,
         label: "Second",
       }),
@@ -801,12 +813,13 @@ describe("an owner with a legacy Oura file and an oura-browser connection", () =
         ctx!.app,
         ctx!.devToken!,
         owner,
-        OURA,
+        OURA_PAT,
         "oura",
       );
       // The PAT method is not gated: it alone is a candidate, and with the
       // browser method out of the count it is the one that serves.
       await replace(pat, "activity", [pdppActivity(DAYS[0]!)], T_PDPP, {
+        instance: legacyTestConnectionId(owner, OURA_PAT),
         method: "oura",
       });
       await restartWithMethods(["oura-browser"]);
@@ -1080,9 +1093,9 @@ describe("an owner with the PAT `oura` and the `oura-browser` method both config
     await writeLegacy(DAYS, T_LEGACY);
     vi.setSystemTime(new Date(T_PDPP));
     // The PAT connection's activity covers the file's two days.
-    await registerAccount(await mintSourceToken(), PAT_ACCOUNT, "oura");
+    await registerAccount(await mintSourceToken("oura"), PAT_ACCOUNT, "oura");
     await replace(
-      await ownerPdppToken(PAT_ACCOUNT),
+      await ownerPdppToken(PAT_ACCOUNT, "oura"),
       "activity",
       DAYS.map(pdppActivity),
       T_PDPP,

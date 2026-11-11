@@ -1,7 +1,9 @@
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
-  ANTHROPIC_CONNECTOR_ID,
+  CLAUDE_EXPORT_SOURCE_ID,
   CLAUDE_SOURCE_ID,
+  PUBLIC_SOURCE_BY_CONNECTOR,
+  publicSourceForConnector,
 } from "../legacy-projection/bindings.js";
 import {
   hasAlternateLegacyProfile,
@@ -58,8 +60,6 @@ export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/9";
 
 const DEFAULT_PAGE_SIZE = 500;
 const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
-const SOURCE_ID_PREFIX = "https://registry.pdpp.dev/sources/";
-const CONNECTOR_ID_PREFIX = "https://registry.pdpp.dev/connectors/";
 
 export interface CanonicalConnectionBinding {
   instance: string;
@@ -259,8 +259,9 @@ export interface ReadCanonicalLegacyScopeInput {
    * `"source"` (default): from the last segment of the source id.
    * `"method"`: the method id is the profile key, as in Desktop's trusted
    * method configuration, where one public source has several methods
-   * (`oura` and `oura-browser` both collect `sources/oura`). The binding
-   * must then belong to that method; the source id is not derived from it.
+   * (`oura` collects `sources/oura_pat`, `oura-browser` collects
+   * `sources/oura`). The binding must then belong to that method; the source
+   * id is not derived from it.
    */
   profileBy?: "source" | "method";
   /**
@@ -346,12 +347,12 @@ export async function readCanonicalLegacyScope(
       lookup: lookup.ok ? { kind: "unknown_scope", scope } : lookup.error,
     });
   }
+  const sourceFor = PUBLIC_SOURCE_BY_CONNECTOR.get(binding.pdppSource);
   if (
-    (binding.pdppSource === ANTHROPIC_CONNECTOR_ID &&
-      selection.sourceId !== CLAUDE_SOURCE_ID) ||
+    (sourceFor !== undefined && selection.sourceId !== sourceFor) ||
     (byMethod
       ? legacyConnectorKey(binding.pdppSource) !== selection.method
-      : canonicalSourceId(binding.pdppSource) !== selection.sourceId)
+      : publicSourceForConnector(binding.pdppSource) !== selection.sourceId)
   ) {
     return unavailable({ reason: "scope_source_mismatch", scope });
   }
@@ -514,7 +515,7 @@ function collectSnapshot(
     const projectedField = declaredBlobField(streamSchemas[stream]);
     if (
       !projectedField &&
-      (selection.sourceId !== CLAUDE_SOURCE_ID ||
+      (!isClaudeSource(selection.sourceId) ||
         (stream !== "conversations" && stream !== "projects"))
     ) {
       return {
@@ -706,7 +707,7 @@ async function projectSnapshot(
 
   const expanded = [];
   const canExpandClaude =
-    selection.sourceId === CLAUDE_SOURCE_ID &&
+    selection.sourceId === CLAUDE_EXPORT_SOURCE_ID &&
     selection.method === "anthropic" &&
     (scope === "claude.conversations" || scope === "claude.projects");
   if (canExpandClaude && input.requireClaudeRawBlobs) {
@@ -1214,14 +1215,6 @@ export function legacyConnectorKey(pdppSource: string): string {
   return pdppSource.slice(pdppSource.lastIndexOf("/") + 1);
 }
 
-/** Most connector keys match their public source; Anthropic collects Claude. */
-function canonicalSourceId(pdppSource: string): string {
-  if (
-    pdppSource === ANTHROPIC_CONNECTOR_ID ||
-    pdppSource === "https://registry.pdpp.dev/connectors/anthropic-live"
-  )
-    return CLAUDE_SOURCE_ID;
-  return pdppSource.startsWith(CONNECTOR_ID_PREFIX)
-    ? SOURCE_ID_PREFIX + pdppSource.slice(CONNECTOR_ID_PREFIX.length)
-    : pdppSource;
+function isClaudeSource(sourceId: string): boolean {
+  return sourceId === CLAUDE_SOURCE_ID || sourceId === CLAUDE_EXPORT_SOURCE_ID;
 }

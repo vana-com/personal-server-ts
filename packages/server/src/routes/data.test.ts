@@ -1541,7 +1541,7 @@ describe("GET /v1/data/:scope", () => {
     const store = createSqliteRecordStore(db);
     store.registerConnection({
       instance: "conn_claude",
-      sourceId: "https://registry.pdpp.dev/sources/claude",
+      sourceId: "https://registry.pdpp.dev/sources/claude_export",
       method: "anthropic",
       label: "Claude",
     });
@@ -1591,7 +1591,7 @@ describe("GET /v1/data/:scope", () => {
       authority: createLegacyScopeAuthority(db),
       records: store,
       configuredMethods: (sourceId) =>
-        sourceId === "https://registry.pdpp.dev/sources/claude"
+        sourceId === "https://registry.pdpp.dev/sources/claude_export"
           ? ["anthropic"]
           : [],
       readLegacyHead,
@@ -1615,7 +1615,7 @@ describe("GET /v1/data/:scope", () => {
       authority: createLegacyScopeAuthority(reopenedDb),
       records: reopenedStore,
       configuredMethods: (sourceId) =>
-        sourceId === "https://registry.pdpp.dev/sources/claude"
+        sourceId === "https://registry.pdpp.dev/sources/claude_export"
           ? ["anthropic"]
           : [],
       readLegacyHead,
