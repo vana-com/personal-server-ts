@@ -82,7 +82,7 @@ import {
   approveMcpOAuthAuthorizationWithScopes,
   approveMcpConnection,
   approveMcpScopeAccessRequest,
-  liveMcpGrantIds,
+  liveMcpGrants,
   buildMcpProtectedResourceMetadataUrl,
   buildStableMcpUrl,
   createInMemoryMcpOAuthAuthorizationStore,
@@ -2146,7 +2146,7 @@ async function handleMcpRoute(input: {
       },
       scopeRequestApprovalUrl: input.scopeRequestApprovalUrl,
       exposeUnsharedScopes: input.exposeUnsharedScopes,
-      verifyGrantsLive: () => liveMcpGrantIds(record, input.gateway, input.now),
+      verifyGrantsLive: () => liveMcpGrants(record, input.gateway, input.now),
       scopeRequestGuidance: input.scopeRequestGuidance,
       serverOrigin: input.serverOrigin,
     });

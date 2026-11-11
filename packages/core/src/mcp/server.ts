@@ -16,6 +16,7 @@ import {
   ResourceTemplate,
 } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { narrowGrants } from "./connection-api.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
 import {
@@ -23,7 +24,7 @@ import {
   MCP_TOOLS,
   resolveGrantForScope,
   SCOPE_REQUEST_GUIDANCE_TEXT,
-  liveGrantIds,
+  liveGrants,
   UNSHARED_SCOPES_INSTRUCTIONS,
   requestableScopesDescription,
   UNSHARED_SCOPES_TOOL_DESCRIPTION,
@@ -498,13 +499,21 @@ export function createMcpServerForConnection(
    * then answers as it does for a scope never granted, before any read.
    */
   async function liveContext(): Promise<McpToolContext> {
-    const live = await liveGrantIds(options.verifyGrantsLive);
-    const grants = ctx.connection.grants.filter((g) =>
-      live.includes(g.grantId),
-    );
+    const live = await liveGrants(options.verifyGrantsLive);
+    // The gateway keeps a live id while its scopes change, so the stored
+    // scopes are cut down to what the gateway holds now.
+    const stored = ctx.connection.grants;
+    const grants = narrowGrants(stored, live);
     // Verified now: `notShared` must not ask the gateway again, and it stays
-    // all-or-nothing, so it sees no live grants unless every one is live.
-    const allLive = grants.length === ctx.connection.grants.length;
+    // all-or-nothing: it sees no live grants unless every grant is live with
+    // every scope it was stored with.
+    const allLive =
+      grants.length === stored.length &&
+      grants.every(
+        (grant, i) =>
+          grant.scopes.length === stored[i]!.scopes.length &&
+          grant.scopes.every((scope) => stored[i]!.scopes.includes(scope)),
+      );
     return {
       ...ctx,
       connection: { ...ctx.connection, grants },

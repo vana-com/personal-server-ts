@@ -30,7 +30,10 @@ import {
   writeScopePatterns,
   WRITE_SCOPE_PREFIX,
 } from "../policy/data-write.js";
-import { toMcpScopeAccessRequestView } from "./connection-api.js";
+import {
+  toMcpScopeAccessRequestView,
+  type LiveGrant,
+} from "./connection-api.js";
 import type { McpActivityRecorder } from "./activity.js";
 import type {
   McpScopeRequestApprovalUrlContext,
@@ -93,7 +96,7 @@ export interface McpToolContext {
    * it is absent or answers false, so an owner connection whose grant expired
    * or was revoked learns nothing about the owner's other sources.
    */
-  verifyGrantsLive?(): Promise<string[]>;
+  verifyGrantsLive?(): Promise<LiveGrant[]>;
   /**
    * Host option `mcpScopeRequestGuidance`. On: every read-side
    * `scope_not_granted` carries a `nextAction` that names
@@ -579,7 +582,7 @@ function miniSearchMatchIndex(text: string, terms: readonly string[]): number {
   return 0;
 }
 
-async function withTimeout<T>(
+export async function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
   operation: string,
@@ -848,12 +851,12 @@ export const UNSHARED_SCOPES_INSTRUCTIONS =
 const DEFAULT_OWNER_SCOPE_TIMEOUT_MS = 5_000;
 // The liveness check is optional enrichment: a slow gateway must not cost the
 // caller the whole listing, so it is bounded well below the tool timeout.
-const GRANT_LIVENESS_TIMEOUT_MS = 3_000;
+export const GRANT_LIVENESS_TIMEOUT_MS = 3_000;
 
-/** Ids of the live grants. Fail closed: no check, a failed or slow check gives none. */
-export async function liveGrantIds(
+/** The live grants. Fail closed: no check, a failed or slow check gives none. */
+export async function liveGrants(
   verify: McpToolContext["verifyGrantsLive"],
-): Promise<string[]> {
+): Promise<LiveGrant[]> {
   if (!verify) return [];
   try {
     return await withTimeout(
@@ -871,7 +874,9 @@ async function grantsStillLive(
   connection: McpConnectionRecord,
   verify: McpToolContext["verifyGrantsLive"],
 ): Promise<boolean> {
-  const live = new Set(await liveGrantIds(verify));
+  const live = new Set(
+    (await liveGrants(verify)).map((grant) => grant.grantId),
+  );
   return (
     connection.grants.length > 0 &&
     connection.grants.every((grant) => live.has(grant.grantId))

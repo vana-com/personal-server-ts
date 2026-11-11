@@ -355,6 +355,41 @@ function grantCoversScope(grant: McpConnectionGrant, scope: string): boolean {
   );
 }
 
+/** A grant the gateway holds live now, with the scopes it holds for it. */
+export interface LiveGrant {
+  grantId: string;
+  scopes: string[];
+}
+
+/**
+ * The stored grants, cut down to what the gateway says is live now. The
+ * gateway keeps one grant id per (owner, grantee) and a re-registration
+ * replaces its scopes under the same id, so a live id says nothing about
+ * which scopes still stand. A scope survives only when both the record and
+ * the gateway name it (a wildcard on one side covers a narrower scope on the
+ * other); a scope only the gateway names is never added; a grant left with no
+ * scope, or not live, is dropped.
+ */
+export function narrowGrants(
+  stored: readonly McpConnectionGrant[],
+  live: readonly LiveGrant[],
+): McpConnectionGrant[] {
+  const current = new Map(live.map((grant) => [grant.grantId, grant.scopes]));
+  return stored.flatMap((grant) => {
+    const gateway = current.get(grant.grantId);
+    if (!gateway) return [];
+    const scopes = Array.from(
+      new Set([
+        ...grant.scopes.filter((scope) =>
+          grantCoversScope({ ...grant, scopes: gateway }, scope),
+        ),
+        ...gateway.filter((scope) => grantCoversScope(grant, scope)),
+      ]),
+    );
+    return scopes.length > 0 ? [{ ...grant, scopes }] : [];
+  });
+}
+
 export interface RequestMcpScopeAccessOutput {
   connection: McpConnectionRecord;
   requestRecorded: boolean;
@@ -430,17 +465,18 @@ export async function requestMcpScopeAccess(
   );
   // Grants the caller found dead stay out of the answer, so it does not call
   // them granted; a grant added while the request was written still counts.
-  const liveIds = input.liveGrants
-    ? new Set(input.liveGrants.map((grant) => grant.grantId))
+  const liveById = input.liveGrants
+    ? new Map(input.liveGrants.map((grant) => [grant.grantId, grant]))
     : undefined;
   return {
-    connection: liveIds
+    connection: liveById
       ? {
           ...updated,
-          grants: updated.grants.filter(
-            (grant) =>
-              liveIds.has(grant.grantId) || !storedGrantIds.has(grant.grantId),
-          ),
+          grants: updated.grants.flatMap((grant) => {
+            if (!storedGrantIds.has(grant.grantId)) return [grant];
+            const live = liveById.get(grant.grantId);
+            return live ? [live] : [];
+          }),
         }
       : updated,
     requestRecorded:
@@ -506,18 +542,15 @@ export async function readMcpScopeRequestWithToken(
     return null;
   }
   if (request.scopes.length === 0) return null;
-  const liveIds = new Set(
-    await liveMcpGrantIds(record, options.gateway, options.now),
+  const liveGrants = narrowGrants(
+    record.grants,
+    await liveMcpGrants(record, options.gateway, options.now),
   );
   return {
     id: record.id,
     displayName: record.displayName,
     scopeAccessRequest: toMcpScopeAccessRequestView(request),
-    grantedScopes: sortedUnique(
-      record.grants
-        .filter((grant) => liveIds.has(grant.grantId))
-        .flatMap((grant) => grant.scopes),
-    ),
+    grantedScopes: sortedUnique(liveGrants.flatMap((grant) => grant.scopes)),
   };
 }
 
@@ -588,6 +621,16 @@ export async function approveMcpScopeAccessRequest(
     options.now,
   );
   const grantedScopes = sortedUnique([...live.scopes, ...approvedScopes]);
+  // The gateway's scopes are inherited, not trusted: the whole array that
+  // will be stored must pass, before any gateway call or store write.
+  try {
+    assertStorableScopes(grantedScopes);
+  } catch (err) {
+    if (err instanceof McpInvalidScopeError) {
+      throw new McpScopeRequestError("INVALID_SCOPE", err.message, 400);
+    }
+    throw err;
+  }
   // Keep the live grant's expiry so approval never extends it (a perpetual
   // live grant stays perpetual). Only a connection with no live grant gets
   // the default lifetime from now.
@@ -869,17 +912,18 @@ function parseExpirySeconds(value: string | null): number | undefined {
 }
 
 /**
- * The ids of the connection's grants that are still live at the gateway:
- * present, not revoked and not expired. Looked up in parallel. Not approved,
- * no grants, or any failed lookup gives none, so callers fail closed. An
- * owner connection's token outlives its grants, so a feature that reveals
- * data must check this first.
+ * The connection's grants that are still live at the gateway (present, not
+ * revoked, not expired), each with the scopes the gateway holds for it now.
+ * Looked up in parallel, one `getGrant` per grant. Not approved, no grants, or
+ * any failed lookup gives none, so callers fail closed. A connection token
+ * outlives its grants, so a feature that reveals data must check this first
+ * and cut the stored scopes down with `narrowGrants`.
  */
-export async function liveMcpGrantIds(
+export async function liveMcpGrants(
   connection: McpConnectionRecord,
   gateway: Pick<GatewayClient, "getGrant"> | undefined,
   now: () => Date = () => new Date(),
-): Promise<string[]> {
+): Promise<LiveGrant[]> {
   const grantIds = sortedUnique(
     connection.grants.map((grant) => grant.grantId),
   );
@@ -895,10 +939,10 @@ export async function liveMcpGrantIds(
         const expiresAt = parseExpirySeconds(live.expiresAt);
         return expiresAt !== undefined && expiresAt <= nowSeconds
           ? null
-          : grantId;
+          : { grantId, scopes: [...live.scopes] };
       }),
     );
-    return checked.filter((id): id is string => id !== null);
+    return checked.filter((grant): grant is LiveGrant => grant !== null);
   } catch {
     return [];
   }
@@ -910,7 +954,7 @@ export async function areMcpConnectionGrantsLive(
   gateway: Pick<GatewayClient, "getGrant">,
   now: () => Date = () => new Date(),
 ): Promise<boolean> {
-  const live = await liveMcpGrantIds(connection, gateway, now);
+  const live = await liveMcpGrants(connection, gateway, now);
   return (
     live.length > 0 &&
     live.length === sortedUnique(connection.grants.map((g) => g.grantId)).length
@@ -1451,7 +1495,6 @@ export async function approveMcpOAuthAuthorizationWithScopes(
         {
           grantId,
           scopes: input.scopes,
-          ...(expiresAt !== undefined ? { expiresAt } : {}),
         },
       ],
     },

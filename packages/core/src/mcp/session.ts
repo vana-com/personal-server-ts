@@ -14,7 +14,12 @@
  */
 
 import { generateMcpGrantee } from "./grantee.js";
-import { hashConnectionToken } from "./connection-api.js";
+import { GRANT_LIVENESS_TIMEOUT_MS, withTimeout } from "./tools.js";
+import {
+  assertStorableScopes,
+  hashConnectionToken,
+  McpInvalidScopeError,
+} from "./connection-api.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { ServerAccount } from "../keys/server-account.js";
 import {
@@ -164,6 +169,8 @@ export interface CreateMcpSessionOptions {
   now?: () => number;
   /** Optional replay guard for the handshake proof (see `input.proof`). */
   replayStore?: McpProofReplayStore;
+  /** Bound on each gateway lookup; defaults to the live-grant check's 3 s. */
+  lookupTimeoutMs?: number;
 }
 
 export interface CreateMcpSessionResult {
@@ -183,12 +190,21 @@ export async function createMcpSession(
   input: CreateMcpSessionInput,
   options: CreateMcpSessionOptions,
 ): Promise<CreateMcpSessionResult> {
-  const builder = await options.authSessionVerifier.getBuilder(
-    input.builderAddress,
+  // A slow gateway fails the mint (nothing stored, proof untouched), as a
+  // throwing one does.
+  const lookupMs = options.lookupTimeoutMs ?? GRANT_LIVENESS_TIMEOUT_MS;
+  const builder = await withTimeout(
+    options.authSessionVerifier.getBuilder(input.builderAddress),
+    lookupMs,
+    "session builder lookup",
   );
   if (!builder) throw new UnregisteredBuilderError();
 
-  const grant = await options.grantVerifier.getGrant(input.grantId);
+  const grant = await withTimeout(
+    options.grantVerifier.getGrant(input.grantId),
+    lookupMs,
+    "session grant lookup",
+  );
   if (!grant) {
     throw new GrantRequiredError({
       reason: "Grant not found",
@@ -220,6 +236,18 @@ export async function createMcpSession(
       expected: options.serverOwner,
       actual: grant.grantorAddress ?? null,
     });
+  }
+
+  // The owner may have signed a grant carrying a scope no session may store
+  // (a bare "*", a blank entry, a non-memory write:). Refuse before the proof
+  // is reserved, so the rejection never burns a valid proof.
+  try {
+    assertStorableScopes(grant.scopes ?? []);
+  } catch (err) {
+    if (err instanceof McpInvalidScopeError) {
+      throw new ProtocolError(400, "invalid_scope", err.message);
+    }
+    throw err;
   }
 
   // Prepare the token first (deterministic, can't meaningfully fail) so the

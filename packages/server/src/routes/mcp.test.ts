@@ -151,9 +151,14 @@ function makeGatewayForGrantee(opts: {
     getSchema: vi.fn().mockResolvedValue(null),
     registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
     registerDataPoint: vi.fn().mockResolvedValue({ dataPointId: "0xdp" }),
-    createGrant: vi.fn().mockResolvedValue({
-      grantId: opts.grantId ?? "grant-mcp-1",
-    }),
+    // A re-registration replaces the scopes under the same grant id, as the
+    // real gateway does.
+    createGrant: vi
+      .fn()
+      .mockImplementation(async (request: { scopes: string[] }) => {
+        (grant as { scopes: string[] }).scopes = request.scopes;
+        return { grantId: opts.grantId ?? "grant-mcp-1" };
+      }),
     revokeGrant: vi.fn().mockResolvedValue(undefined),
   };
   return { gateway, grant };
@@ -475,6 +480,63 @@ describe("MCP owner scope-request answers", () => {
     );
     return { ...created, requested };
   }
+
+  it("serves a live grant id only for the scopes the gateway still holds for it", async () => {
+    // The gateway keeps one id per grantee; a re-registration under the same
+    // id narrows what it covers. The real verifier (the gateway mock) reports
+    // that, with no verifyGrantsLive stub.
+    const connect = async (scopes: string[]) => {
+      const created = await createMcpConnection(
+        { displayName: "Claude" },
+        { store, publicOrigin: SERVER_ORIGIN },
+      );
+      await approveMcpConnection(
+        {
+          connectionId: created.connectionId,
+          grants: [{ grantId: "grant-1", scopes }],
+        },
+        { store },
+      );
+      return created.connectionToken;
+    };
+    const gatewayGrant = (await gateway.getGrant("grant-1")) as unknown as {
+      scopes: string[];
+    };
+    const read = async (token: string) => {
+      const res = await app.request(`/mcp/${encodeURIComponent(token)}`, {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: {
+            name: "read_scope",
+            arguments: { scope: "youtube.history" },
+          },
+        }),
+      });
+      return res.text();
+    };
+    const approved = ["chatgpt.conversations", "youtube.history"];
+    const token = await connect(approved);
+    gatewayGrant.scopes = approved;
+    const neverGranted = await read(await connect(["chatgpt.conversations"]));
+    const before = await callTool(token, "list_granted_scopes", {});
+    expect(before.scopes.map((e: { scope: string }) => e.scope)).toContain(
+      "youtube.history",
+    );
+
+    gatewayGrant.scopes = ["chatgpt.conversations"];
+    const after = await callTool(token, "list_granted_scopes", {});
+    expect(after.scopes.map((e: { scope: string }) => e.scope)).toEqual([
+      "chatgpt.conversations",
+    ]);
+    expect(await read(token)).toBe(neverGranted);
+  });
 
   it("gives the agent the host approval link, then grants the union on approve", async () => {
     const { connectionId, connectionToken, requested } =

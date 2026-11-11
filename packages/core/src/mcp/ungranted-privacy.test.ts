@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { alwaysLive } from "../test-utils/live-grants.js";
+import { alwaysLive, liveOnly } from "../test-utils/live-grants.js";
 import {
   handleMcpStreamableHttpRequest,
   type HandleMcpRequestOptions,
 } from "./server.js";
 import { MCP_TOOLS } from "./tools.js";
-import { liveMcpGrantIds, requestMcpScopeAccess } from "./connection-api.js";
+import { liveMcpGrants, requestMcpScopeAccess } from "./connection-api.js";
 import { rawScopeResourceUri } from "./resources.js";
 import { createMcpDataReadClient } from "./read-client.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
@@ -332,7 +332,7 @@ describe("a grant the gateway no longer honours reveals nothing new", () => {
   it("a live grant still reads normally", async () => {
     const client = ownerA();
     await rpc(client, "tools/call", tool("list_granted_scopes", {}).params, {
-      verifyGrantsLive: async () => ["grant-1"],
+      verifyGrantsLive: liveOnly(connection(), ["grant-1"]),
     });
     expect(client.getScopeMetadata).toHaveBeenCalledWith(
       "chatgpt.conversations",
@@ -431,7 +431,7 @@ describe("only the dead grants are dropped", () => {
         owner,
         "tools/call",
         tool("list_granted_scopes", {}).params,
-        { verifyGrantsLive: async () => ["g-live"] },
+        { verifyGrantsLive: liveOnly(twoGrants(), ["g-live"]) },
         twoGrants(),
       ),
     ) as {
@@ -451,7 +451,7 @@ describe("only the dead grants are dropped", () => {
         probe,
         "tools/call",
         readYoutube,
-        { verifyGrantsLive: async () => ["g-live"] },
+        { verifyGrantsLive: liveOnly(twoGrants(), ["g-live"]) },
         twoGrants(),
       ),
     );
@@ -480,7 +480,7 @@ describe("only the dead grants are dropped", () => {
       owner,
       "tools/call",
       tool("list_granted_scopes", {}).params,
-      { verifyGrantsLive: () => liveMcpGrantIds(twoGrants(), gateway) },
+      { verifyGrantsLive: () => liveMcpGrants(twoGrants(), gateway) },
       twoGrants(),
     );
     const none = await rpc(
@@ -498,21 +498,29 @@ describe("only the dead grants are dropped", () => {
     vi.useFakeTimers();
     try {
       const gateway = {
-        getGrant: vi
-          .fn()
-          .mockImplementation(
-            (id: string) =>
-              new Promise((resolve) =>
-                setTimeout(() => resolve({ grantId: id }), 2000),
+        getGrant: vi.fn().mockImplementation(
+          (id: string) =>
+            new Promise((resolve) =>
+              setTimeout(
+                () =>
+                  resolve({
+                    grantId: id,
+                    scopes:
+                      id === "g-live"
+                        ? ["chatgpt.conversations"]
+                        : ["youtube.history"],
+                  }),
+                2000,
               ),
-          ),
+            ),
+        ),
       } as never;
       const owner = ownerA();
       const pending = rpc(
         owner,
         "tools/call",
         tool("list_granted_scopes", {}).params,
-        { verifyGrantsLive: () => liveMcpGrantIds(twoGrants(), gateway) },
+        { verifyGrantsLive: () => liveMcpGrants(twoGrants(), gateway) },
         twoGrants(),
       );
       await vi.advanceTimersByTimeAsync(2000);
@@ -585,7 +593,7 @@ describe("a held scope cannot read another scope's file by file id", () => {
 });
 
 describe("revocation, timeouts and the request path", () => {
-  const revoked = { verifyGrantsLive: async () => [] as string[] };
+  const revoked = { verifyGrantsLive: async () => [] };
   const never = (): McpConnectionRecord => ({ ...connection(), grants: [] });
 
   it("a liveness check that never settles answers as with no grants", async () => {
@@ -596,7 +604,7 @@ describe("revocation, timeouts and the request path", () => {
         owner,
         "tools/call",
         tool("list_granted_scopes", {}).params,
-        { verifyGrantsLive: () => new Promise<string[]>(() => {}) },
+        { verifyGrantsLive: () => new Promise<never[]>(() => {}) },
       );
       await vi.advanceTimersByTimeAsync(3100);
       const body = normalize(await pending);
@@ -739,7 +747,7 @@ describe("the owner's last answer after a grant dies", () => {
     ...connection(),
     grants: [{ grantId: "g-live", scopes: ["chatgpt.conversations"] }],
   });
-  const onlyLive = { verifyGrantsLive: async () => ["g-live"] };
+  const onlyLive = { verifyGrantsLive: liveOnly(withDead(), ["g-live"]) };
 
   it.each([
     ["list_granted_scopes", {}],
@@ -773,5 +781,121 @@ describe("the owner's last answer after a grant dies", () => {
     const gone = await call(withDead(), onlyLive);
     expect(gone).toBe(await call(neverGranted(), {}));
     expect(gone).not.toContain("youtube.history");
+  });
+});
+
+describe("a live grant id whose scopes the gateway narrowed", () => {
+  // The gateway keeps one grant id per grantee and a re-registration replaces
+  // its scopes under that id, so a live id says nothing about its scopes.
+  const stored = (): McpConnectionRecord => ({
+    ...connection(),
+    grants: [
+      {
+        grantId: "g",
+        scopes: ["chatgpt.conversations", "youtube.history"],
+      },
+    ],
+  });
+  const neverYoutube = (): McpConnectionRecord => ({
+    ...connection(),
+    grants: [{ grantId: "g", scopes: ["chatgpt.conversations"] }],
+  });
+  const gatewayHolding = (scopes: string[]) =>
+    ({
+      getGrant: async (id: string) => ({
+        id,
+        scopes,
+        grantVersion: "2",
+        expiresAt: null,
+        revokedAt: null,
+        expired: false,
+      }),
+    }) as never;
+  const narrowed = () => ({
+    verifyGrantsLive: () =>
+      liveMcpGrants(stored(), gatewayHolding(["chatgpt.conversations"])),
+  });
+
+  it.each([
+    ["list_granted_scopes", tool("list_granted_scopes", {}).params],
+    [
+      "read_scope youtube.history",
+      tool("read_scope", { scope: "youtube.history" }).params,
+    ],
+    [
+      "search_personal_context, explicit scope",
+      tool("search_personal_context", {
+        query: "videos",
+        scopes: ["youtube.history"],
+      }).params,
+    ],
+    [
+      "search_personal_context, sweep",
+      tool("search_personal_context", { query: "videos" }).params,
+    ],
+  ])(
+    "%s answers as if youtube.history was never granted",
+    async (_n, params) => {
+      const probe = ownerA();
+      const narrowedBody = normalize(
+        await rpc(probe, "tools/call", params, narrowed(), stored()),
+      );
+      const never = normalize(
+        await rpc(ownerB(), "tools/call", params, {}, neverYoutube()),
+      );
+      expect(narrowedBody).toBe(never);
+      expect(probe.getScopeMetadata).not.toHaveBeenCalledWith(
+        "youtube.history",
+      );
+      expect(
+        JSON.stringify(vi.mocked(probe.readScopeBlocks).mock.calls),
+      ).not.toContain("youtube.history");
+    },
+  );
+
+  it("never adds a scope the gateway holds and the record does not", async () => {
+    const wider = () => ({
+      verifyGrantsLive: () =>
+        liveMcpGrants(
+          neverYoutube(),
+          gatewayHolding(["chatgpt.conversations", "youtube.history"]),
+        ),
+    });
+    const list = JSON.parse(
+      await rpc(
+        ownerA(),
+        "tools/call",
+        tool("list_granted_scopes", {}).params,
+        wider(),
+        neverYoutube(),
+      ),
+    ) as {
+      result: { structuredContent: { scopes: Array<{ scope: string }> } };
+    };
+    expect(list.result.structuredContent.scopes.map((x) => x.scope)).toEqual([
+      "chatgpt.conversations",
+    ]);
+    const probe = ownerA();
+    const read = normalize(
+      await rpc(
+        probe,
+        "tools/call",
+        tool("read_scope", { scope: "youtube.history" }).params,
+        wider(),
+        neverYoutube(),
+      ),
+    );
+    expect(read).toBe(
+      normalize(
+        await rpc(
+          ownerB(),
+          "tools/call",
+          tool("read_scope", { scope: "youtube.history" }).params,
+          {},
+          neverYoutube(),
+        ),
+      ),
+    );
+    expect(probe.readScopeBlocks).not.toHaveBeenCalled();
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { alwaysLive } from "../test-utils/live-grants.js";
+import { alwaysLive, liveOnly } from "../test-utils/live-grants.js";
 import { MCP_TOOLS, type McpToolContext } from "./tools.js";
 import {
   handleMcpStreamableHttpRequest,
@@ -13,10 +13,7 @@ import {
 } from "./read-client.js";
 import { McpError } from "@modelcontextprotocol/sdk/types.js";
 import { readRawScopeResource } from "./resources.js";
-import {
-  areMcpConnectionGrantsLive,
-  liveMcpGrantIds,
-} from "./connection-api.js";
+import { areMcpConnectionGrantsLive, liveMcpGrants } from "./connection-api.js";
 import { templateMcpScopeRequestApprovalUrl } from "./approval-url.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { ScopeSummary } from "../storage/index/types.js";
@@ -106,7 +103,7 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
     const body = await listGranted({
       rc: readClient({ listOwnerScopes }),
       exposeUnsharedScopes: true,
-      verifyGrantsLive: async () => ["grant-1"],
+      verifyGrantsLive: liveOnly(connection(), ["grant-1"]),
     });
     expect(body.notShared).toEqual([
       expect.objectContaining({
@@ -131,7 +128,7 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
     const body = await listGranted({
       rc,
       exposeUnsharedScopes: true,
-      verifyGrantsLive: async () => ["grant-1"],
+      verifyGrantsLive: liveOnly(connection(), ["grant-1"]),
     });
     expect(body.notShared).toEqual([
       {
@@ -155,7 +152,7 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
         await listGranted({
           rc: readClient(),
           exposeUnsharedScopes: true,
-          verifyGrantsLive: async () => ["grant-1"],
+          verifyGrantsLive: liveOnly(connection(), ["grant-1"]),
         })
       ).notShared,
     ).toEqual([]);
@@ -167,7 +164,7 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
         await listGranted({
           rc: failing,
           exposeUnsharedScopes: true,
-          verifyGrantsLive: async () => ["grant-1"],
+          verifyGrantsLive: liveOnly(connection(), ["grant-1"]),
         })
       ).notShared,
     ).toEqual([]);
@@ -250,7 +247,7 @@ describe("notShared fails closed on dead grants", () => {
     const body = await listGranted({
       rc,
       exposeUnsharedScopes: true,
-      verifyGrantsLive: () => liveMcpGrantIds(connection(), gateway),
+      verifyGrantsLive: () => liveMcpGrants(connection(), gateway),
     });
     if (shown) {
       expect(body.notShared).toHaveLength(1);
@@ -268,7 +265,7 @@ describe("notShared fails closed on dead grants", () => {
       getGrant: vi.fn().mockRejectedValue(new Error("down")),
     } as never;
     for (const verifyGrantsLive of [
-      () => liveMcpGrantIds(connection(), failing),
+      () => liveMcpGrants(connection(), failing),
       undefined,
     ]) {
       const body = await listGranted({
@@ -302,7 +299,7 @@ describe("notShared fails closed on dead grants", () => {
       rc: readClient({ listOwnerScopes }),
       connection: two,
       exposeUnsharedScopes: true,
-      verifyGrantsLive: () => liveMcpGrantIds(two, gateway),
+      verifyGrantsLive: () => liveMcpGrants(two, gateway),
     });
     expect("notShared" in body).toBe(false);
     expect(listOwnerScopes).not.toHaveBeenCalled();
@@ -311,7 +308,9 @@ describe("notShared fails closed on dead grants", () => {
   it.each([undefined, false])(
     "option %s: the liveness check and owner listing are never called",
     async (flag) => {
-      const verifyGrantsLive = vi.fn().mockResolvedValue(["grant-1"]);
+      const verifyGrantsLive = vi
+        .fn()
+        .mockResolvedValue([{ grantId: "grant-1", scopes: ["instagram.*"] }]);
       const listOwnerScopes = vi.fn().mockResolvedValue(ownerScopes);
       const body = await listGranted({
         rc: readClient({ listOwnerScopes }),
@@ -331,7 +330,7 @@ describe("notShared fails closed on dead grants", () => {
       const pending = listGranted({
         rc: readClient({ listOwnerScopes }),
         exposeUnsharedScopes: true,
-        verifyGrantsLive: () => new Promise<string[]>(() => {}),
+        verifyGrantsLive: () => new Promise<never[]>(() => {}),
       });
       await vi.advanceTimersByTimeAsync(3_500);
       const body = await pending;

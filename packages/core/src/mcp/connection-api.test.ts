@@ -27,6 +27,7 @@ import {
   McpScopeRequestError,
   redeemMcpOAuthAuthorizationCode,
   refreshMcpOAuthToken,
+  narrowGrants,
   readMcpScopeRequestWithToken,
   requestMcpScopeAccess,
   revokeMcpConnection,
@@ -851,6 +852,36 @@ describe("mcp/connection-api scope request answers", () => {
     );
   });
 
+  it("does not carry an expired grant's scopes into the new grant when a perpetual one is live", async () => {
+    const { store, id } = await connectionWithRequest([
+      { grantId: "0xgrant1", scopes: ["instagram.profile"] },
+      { grantId: "0xgrant-old", scopes: ["youtube.history"] },
+    ]);
+    const gateway = gatewayMock();
+    gateway.getGrant.mockImplementation(async (grantId: string) =>
+      grantId === "0xgrant-old"
+        ? liveGrant({
+            id: grantId,
+            scopes: ["youtube.history"],
+            expiresAt: "1000",
+            expired: true,
+          })
+        : liveGrant({ expiresAt: null }),
+    );
+
+    await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["spotify.profile"] },
+      approveOptions(store, gateway),
+    );
+
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopes: ["instagram.profile", "spotify.profile"],
+        expiresAt: "0",
+      }),
+    );
+  });
+
   it("signs a perpetual grant by default when there is no live grant to inherit from", async () => {
     const { store, id } = await connectionWithRequest();
     const gateway = gatewayMock(null);
@@ -985,7 +1016,7 @@ describe("mcp/connection-api scope request answers", () => {
     ]);
   });
 
-  it("records and approves a write: scope even when a read wildcard is held, but never a write wildcard", async () => {
+  it("never approves a write: scope while the live grant holds a bare wildcard, and never a write wildcard", async () => {
     // A read grant of "*" must not count as covering a write request.
     const { store, id } = await connectionWithRequest(
       [{ grantId: "0xgrant1", scopes: ["*"] }],
@@ -1012,16 +1043,32 @@ describe("mcp/connection-api scope request answers", () => {
     ).rejects.toMatchObject({ status: 400 });
     expect(gateway.createGrant).not.toHaveBeenCalled();
 
-    const result = await approveMcpScopeAccessRequest(
-      { connectionId: id, scopes: ["write:memory.claude"] },
-      approveOptions(store, gateway),
-    );
+    // The merged array keeps the gateway's "*", which is never storable.
+    await expect(
+      approveMcpScopeAccessRequest(
+        { connectionId: id, scopes: ["write:memory.claude"] },
+        approveOptions(store, gateway),
+      ),
+    ).rejects.toMatchObject({ code: "INVALID_SCOPE", status: 400 });
+    expect(gateway.createGrant).not.toHaveBeenCalled();
+  });
 
-    expect(gateway.createGrant).toHaveBeenCalledWith(
-      expect.objectContaining({ scopes: ["*", "write:memory.claude"] }),
+  it("refuses a scope-request approval whose merged scopes include a gateway wildcard, and stores nothing", async () => {
+    const { store, id } = await connectionWithRequest(
+      [{ grantId: "0xgrant1", scopes: ["chatgpt.conversations"] }],
+      ["write:memory.app"],
     );
-    expect(result.approvedScopes).toEqual(["write:memory.claude"]);
-    expect(result.deniedScopes).toEqual(["write:memory.*"]);
+    const before = await store.getById(id);
+    // The live gateway grant holds "*", whatever the record says.
+    const gateway = gatewayMock(liveGrant({ scopes: ["*"] }));
+    await expect(
+      approveMcpScopeAccessRequest(
+        { connectionId: id, scopes: ["write:memory.app"] },
+        approveOptions(store, gateway),
+      ),
+    ).rejects.toMatchObject({ code: "INVALID_SCOPE", status: 400 });
+    expect(gateway.createGrant).not.toHaveBeenCalled();
+    expect(await store.getById(id)).toEqual(before);
   });
 
   it("leaves the request pending when the gateway refuses the grant", async () => {
@@ -1127,6 +1174,25 @@ describe("mcp/connection-api scope request read token", () => {
     ...overrides,
   });
   const liveG1 = { getGrant: async () => grantState() } as never;
+
+  it("names only the scopes the gateway still holds for a live grant id", async () => {
+    const { store, connectionId, requested } = await connectionWithRequest();
+    await store.update(connectionId, {
+      grants: [
+        { grantId: "g1", scopes: ["instagram.profile", "youtube.history"] },
+      ],
+    });
+    const gateway = {
+      getGrant: async () =>
+        grantState({ scopes: ["instagram.profile", "spotify.library"] }),
+    } as never;
+    const view = await readMcpScopeRequestWithToken(
+      { connectionId, token: requested.readToken },
+      { store, gateway, now: () => T0 },
+    );
+    // youtube.history was narrowed away; spotify.library was never stored.
+    expect(view?.grantedScopes).toEqual(["instagram.profile"]);
+  });
 
   it("names no scope from a revoked, expired, missing or unverifiable grant", async () => {
     const { store, connectionId, requested } = await connectionWithRequest();
@@ -1537,6 +1603,39 @@ describe("mcp/connection-api superseded OAuth authorizations", () => {
     ).rejects.toMatchObject({ code: "invalid_state" });
     expect(gateway.createGrant).not.toHaveBeenCalled();
   });
+
+  it("signs the expiry at the gateway but stores no expiresAt on the grant", async () => {
+    const stores = newStores();
+    const created = await authorize(stores, "client-a");
+    const gateway = {
+      getBuilder: vi.fn(async () => ({ id: "0xbuilder" })),
+      createGrant: vi.fn(async () => ({ grantId: "0xgrant" })),
+    };
+    await approveMcpOAuthAuthorizationWithScopes(
+      { authorizationId: created.authorizationId, scopes: ["chatgpt.history"] },
+      {
+        ...stores,
+        gateway: gateway as never,
+        gatewayConfig: GATEWAY_CONFIG as never,
+        gatewayUrl: "https://gateway.test",
+        serverOwner: "0x00000000000000000000000000000000000000aa",
+        serverSigner: {
+          signGrantRegistration: vi.fn(async () => "0xsig" as `0x${string}`),
+        },
+        grantTtlSeconds: 3600,
+        now: () => START,
+      },
+    );
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({ expiresAt: expect.any(String) }),
+    );
+    const grants = (await stores.connectionStore.getById(created.connectionId))
+      ?.grants;
+    expect(grants).toEqual([
+      { grantId: "0xgrant", scopes: ["chatgpt.history"] },
+    ]);
+    expect(Object.keys(grants![0]!)).not.toContain("expiresAt");
+  });
 });
 
 describe("mcp/connection-api grants never resurrect and never store a bare wildcard", () => {
@@ -1616,5 +1715,26 @@ describe("mcp/connection-api grants never resurrect and never store a bare wildc
       ).rejects.toMatchObject({ code: "invalid_scope", status: 400 });
       expect((await store.getById(created.connectionId))?.grants).toEqual([]);
     }
+  });
+});
+
+describe("mcp/connection-api narrowGrants", () => {
+  const stored = [{ grantId: "g", scopes: ["a.one", "b.two", "c.*"] }];
+  it.each([
+    [
+      [{ grantId: "g", scopes: ["a.one", "b.two", "c.*"] }],
+      ["a.one", "b.two", "c.*"],
+    ],
+    [[{ grantId: "g", scopes: ["a.one"] }], ["a.one"]],
+    // A narrower gateway scope under a stored wildcard stands; the wildcard does not.
+    [[{ grantId: "g", scopes: ["c.x"] }], ["c.x"]],
+    // A scope only the gateway names is never added.
+    [[{ grantId: "g", scopes: ["a.one", "z.new"] }], ["a.one"]],
+    [[{ grantId: "g", scopes: ["z.new"] }], undefined],
+    [[], undefined],
+  ])("gateway %j leaves %j", (live, expected) => {
+    const out = narrowGrants(stored, live);
+    expect(out.flatMap((grant) => grant.scopes)).toEqual(expected ?? []);
+    expect(out).toHaveLength(expected ? 1 : 0);
   });
 });

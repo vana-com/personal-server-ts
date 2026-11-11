@@ -140,7 +140,14 @@ function makeMockGateway(opts: {
     getSchema: vi.fn().mockResolvedValue(null),
     registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
     registerDataPoint: vi.fn().mockResolvedValue({ dataPointId: "0xdp" }),
-    createGrant: vi.fn().mockResolvedValue({ grantId: opts.grantId }),
+    // A re-registration replaces the scopes under the same grant id, as the
+    // real gateway does.
+    createGrant: vi
+      .fn()
+      .mockImplementation(async (request: { scopes: string[] }) => {
+        (grant as { scopes: string[] }).scopes = request.scopes;
+        return { grantId: opts.grantId };
+      }),
     revokeGrant: vi.fn().mockResolvedValue(undefined),
   } as unknown as GatewayClient;
 }
@@ -368,6 +375,19 @@ describe("createPsLiteRuntime + /mcp/:token route", () => {
       reason: "Answer from prior chats.",
     });
 
+    // The gateway holds each signed grant with its own scopes.
+    vi.mocked(bundle.gateway.getGrant).mockImplementation(
+      async (id: string) =>
+        ({
+          id,
+          scopes:
+            id === "grant-2" ? ["chatgpt.history"] : ["instagram.profile"],
+          grantVersion: "1",
+          expiresAt: null,
+          revokedAt: null,
+          expired: false,
+        }) as never,
+    );
     const widened = await bundle.runtime.fetch(
       await ownerSigned(
         "POST",

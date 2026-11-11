@@ -30,7 +30,9 @@ import {
   approveMcpOAuthAuthorizationWithScopes,
   approveMcpConnection,
   approveMcpScopeAccessRequest,
-  liveMcpGrantIds,
+  liveGrants,
+  liveMcpGrants,
+  narrowGrants,
   buildMcpProtectedResourceMetadataUrl,
   buildMcpUrl,
   buildStableMcpUrl,
@@ -473,7 +475,7 @@ export function executeMcpConnectionRequest(
     }),
     writeClient: buildWriteClient(deps, granteeAccount, dataApiDeps.storage),
     activityRecorder: deps.activityRecorder,
-    verifyGrantsLive: () => liveMcpGrantIds(connection, deps.gateway),
+    verifyGrantsLive: () => liveMcpGrants(connection, deps.gateway),
     // Denied tool calls are recorded by the wrapper, not the read path.
     reporterDeps: {
       readFulfillmentReporter: deps.readFulfillmentReporter,
@@ -1190,7 +1192,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       scopeRequestApprovalUrl: deps.scopeRequestApprovalUrl,
       serverOrigin: resolveOrigin(deps.serverOrigin),
       exposeUnsharedScopes: deps.mcpExposeUnsharedScopes,
-      verifyGrantsLive: () => liveMcpGrantIds(record, deps.gateway),
+      verifyGrantsLive: () => liveMcpGrants(record, deps.gateway),
       scopeRequestGuidance: deps.mcpScopeRequestGuidance,
       requestableScopes: deps.mcpRequestableScopes,
     });
@@ -1275,7 +1277,10 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
     // the listing tools answer from the session record and would keep
     // describing a revoked grant's scopes until the token expired. A failed
     // lookup counts as not live, never as "continue".
-    if ((await liveMcpGrantIds(connection, deps.gateway)).length === 0) {
+    const live = await liveGrants(() =>
+      liveMcpGrants(connection, deps.gateway),
+    );
+    if (narrowGrants(connection.grants, live).length === 0) {
       return c.json(
         jsonError(403, "GRANT_REVOKED", "Grant has been revoked or expired"),
         403,
@@ -1293,7 +1298,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       connection,
       readClient,
       activityRecorder: deps.activityRecorder,
-      verifyGrantsLive: () => liveMcpGrantIds(connection, deps.gateway),
+      verifyGrantsLive: () => liveMcpGrants(connection, deps.gateway),
     });
   }
 
