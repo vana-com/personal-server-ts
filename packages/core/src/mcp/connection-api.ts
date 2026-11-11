@@ -24,7 +24,10 @@
  */
 
 import { generateMcpGrantee } from "./grantee.js";
-import { createGrantContract } from "../contracts/index.js";
+import {
+  createGrantContract,
+  revokeGrantContract,
+} from "../contracts/index.js";
 import { isWriteScopeEntry, WRITE_SCOPE_PREFIX } from "../policy/data-write.js";
 import { isMemoryScope, isSystemScope } from "../policy/reserved-scopes.js";
 import {
@@ -623,6 +626,234 @@ export async function approveMcpScopeAccessRequest(
     grantedScopes,
     approvedScopes,
     deniedScopes,
+  };
+}
+
+export interface SetMcpConnectionAccessInput {
+  connectionId: string;
+  /** The exact scope set the connection should hold afterwards. */
+  scopes: unknown;
+}
+
+export interface SetMcpConnectionAccessOptions {
+  store: McpConnectionStore;
+  gateway: Pick<
+    GatewayClient,
+    "getBuilder" | "getGrant" | "createGrant" | "revokeGrant"
+  >;
+  serverOwner?: `0x${string}`;
+  serverSigner?: Pick<ServerSigner, "signGrantRegistration"> &
+    Partial<Pick<ServerSigner, "signGrantRevocation">>;
+  now?: () => Date;
+  /** Same lifetime rule as {@link ApproveMcpScopeAccessRequestOptions}. */
+  grantTtlSeconds?: number;
+}
+
+export interface McpRevokeFailure {
+  grantId: string;
+  error: string;
+}
+
+export interface SetMcpConnectionAccessOutput {
+  connection: McpConnectionRecord;
+  grantId: string;
+  grantedScopes: string[];
+  /** Superseded grants that were revoked at the gateway. */
+  revokedGrantIds: string[];
+  /** Superseded grants whose revoke failed; the new grant stays in force. */
+  revokeFailures: McpRevokeFailure[];
+}
+
+/**
+ * Validate the owner's exact scope set for a connection. No new write access
+ * comes through here: a `write:` entry must already be on a grant of the
+ * connection. Read scopes must pass the SDK scope schema (or already be on a
+ * grant of the connection, so an existing wildcard survives an edit) and not
+ * be system scopes.
+ */
+function parseExactAccessScopes(
+  value: unknown,
+  connection: McpConnectionRecord,
+): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new McpScopeRequestError(
+      "SCOPES_REQUIRED",
+      "Access requires a non-empty scopes array; revoke the connection to remove all access.",
+    );
+  }
+  const scopes = new Set<string>();
+  for (const raw of value) {
+    const scope = typeof raw === "string" ? raw.trim() : "";
+    if (isWriteScopeEntry(scope)) {
+      if (!connection.grants.some((grant) => grant.scopes.includes(scope))) {
+        throw new McpScopeRequestError(
+          "WRITE_SCOPE_NOT_GRANTED",
+          `Write scope ${scope} is not already granted; this route cannot add write access`,
+        );
+      }
+    } else if (
+      !scope ||
+      isSystemScope(scope) ||
+      // An entry the connection already holds (e.g. a legacy `instagram.*`)
+      // may be kept as is; nothing new may bypass the scope schema.
+      (!connection.grants.some((grant) => grant.scopes.includes(scope)) &&
+        !ScopeSchema.safeParse(scope).success)
+    ) {
+      throw new McpScopeRequestError(
+        "INVALID_SCOPE",
+        `Invalid scope: ${JSON.stringify(raw)}`,
+      );
+    }
+    scopes.add(scope);
+  }
+  return Array.from(scopes).sort();
+}
+
+/**
+ * Owner sets a connection's access to exactly `scopes` (widen or narrow).
+ *
+ * The server signs ONE new grant over exactly that set, stores it as the
+ * connection's only grant, then revokes every superseded grant at the
+ * gateway. The connection id and the client's token do not change, so the
+ * agent sees the new set on its next call. A failed revoke never rolls the
+ * new grant back: the failure is returned for the caller to log.
+ */
+export async function setMcpConnectionAccess(
+  input: SetMcpConnectionAccessInput,
+  options: SetMcpConnectionAccessOptions,
+): Promise<SetMcpConnectionAccessOutput> {
+  const connection = await options.store.getById(input.connectionId);
+  if (!connection) throw new McpConnectionNotFoundError(input.connectionId);
+  if (connection.status !== "approved") {
+    throw new McpConnectionStateError(
+      connection.id,
+      connection.status,
+      "approved",
+    );
+  }
+  const scopes = parseExactAccessScopes(input.scopes, connection);
+
+  const live = await readLiveGrantState(connection, options.gateway);
+  const expiresAt =
+    live.expiry.kind === "inherit"
+      ? live.expiry.expiresAt
+      : mcpGrantDefaultExpiry(options.grantTtlSeconds, options.now);
+
+  let grantResult: Awaited<ReturnType<typeof createGrantContract>>;
+  try {
+    grantResult = await createGrantContract({
+      gateway: options.gateway,
+      serverOwner: options.serverOwner,
+      serverSigner: options.serverSigner,
+      body: {
+        granteeAddress: connection.granteeAddress,
+        scopes,
+        grantVersion: live.nextGrantVersion,
+        ...(expiresAt !== undefined ? { expiresAt } : {}),
+      },
+    });
+  } catch (err) {
+    throw new McpScopeRequestError(
+      "GRANT_CREATION_FAILED",
+      err instanceof Error ? err.message : String(err),
+      502,
+    );
+  }
+  if (!grantResult.ok) {
+    throw new McpScopeRequestError(
+      "GRANT_CREATION_FAILED",
+      extractGrantErrorMessage(grantResult.body),
+      grantResult.status >= 500 ? 502 : grantResult.status === 409 ? 409 : 400,
+      grantResult.body,
+    );
+  }
+  const grantId = (grantResult.body as { grantId?: string }).grantId;
+  if (!grantId) {
+    throw new McpScopeRequestError(
+      "GRANT_CREATION_FAILED",
+      "Gateway did not return a grant id.",
+      502,
+      grantResult.body,
+    );
+  }
+
+  const decidedAt = nowIso(options.now);
+  const updated = await options.store.mutate(input.connectionId, (latest) => {
+    if (latest.status !== "approved") {
+      throw new McpConnectionStateError(latest.id, latest.status, "approved");
+    }
+    if (JSON.stringify(latest.grants) !== JSON.stringify(connection.grants)) {
+      throw new McpScopeRequestError(
+        "CONCURRENT_UPDATE",
+        "The connection's grants changed during the update; retry.",
+        409,
+      );
+    }
+    const next: McpConnectionGrant = { grantId, scopes };
+    const covers = (scope: string) => grantCoversScope(next, scope);
+    const pending = latest.scopeAccessRequest;
+    const stillMissing =
+      pending?.scopes.filter((scope) => !covers(scope)) ?? [];
+    const addedScopes = scopes.filter(
+      (scope) => !latest.grants.some((grant) => grantCoversScope(grant, scope)),
+    );
+    const decision: McpScopeAccessDecision = {
+      decision: "approved",
+      approvedScopes: addedScopes,
+      deniedScopes: stillMissing,
+      requestedAt: pending?.requestedAt ?? decidedAt,
+      decidedAt,
+    };
+    return {
+      ...latest,
+      grants: [next],
+      // Cleared only when the new set covers every requested scope; a
+      // narrower answer keeps the remainder pending, as approve does.
+      scopeAccessRequest:
+        pending && stillMissing.length > 0
+          ? { ...pending, scopes: stillMissing }
+          : undefined,
+      scopeAccessDecision: decision,
+    };
+  });
+  if (!updated) throw new McpConnectionNotFoundError(input.connectionId);
+
+  const supersededIds = sortedUnique(
+    connection.grants
+      .map((grant) => grant.grantId)
+      .filter((id) => id !== grantId),
+  );
+  const revokedGrantIds: string[] = [];
+  const revokeFailures: McpRevokeFailure[] = [];
+  for (const supersededId of supersededIds) {
+    try {
+      const revoked = await revokeGrantContract({
+        gateway: options.gateway,
+        serverOwner: options.serverOwner,
+        serverSigner: options.serverSigner,
+        grantId: supersededId,
+      });
+      if (revoked.ok) {
+        revokedGrantIds.push(supersededId);
+      } else {
+        revokeFailures.push({
+          grantId: supersededId,
+          error: `revoke failed with status ${revoked.status}`,
+        });
+      }
+    } catch (err) {
+      revokeFailures.push({
+        grantId: supersededId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return {
+    connection: updated,
+    grantId,
+    grantedScopes: scopes,
+    revokedGrantIds,
+    revokeFailures,
   };
 }
 
