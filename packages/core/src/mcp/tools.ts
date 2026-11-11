@@ -79,6 +79,13 @@ export interface McpToolContext {
    */
   exposeUnsharedScopes?: boolean;
   /**
+   * Whether every grant on the connection is still live at the gateway. The
+   * host supplies it with `exposeUnsharedScopes`; `notShared` is omitted when
+   * it is absent or answers false, so an owner connection whose grant expired
+   * or was revoked learns nothing about the owner's other sources.
+   */
+  verifyGrantsLive?(): Promise<boolean>;
+  /**
    * Host option `mcpScopeRequestGuidance`. On: every read-side
    * `scope_not_granted` carries a `nextAction` that names
    * `request_scope_access`. Off: output is unchanged.
@@ -800,6 +807,18 @@ export const UNSHARED_SCOPES_INSTRUCTIONS =
 
 const DEFAULT_OWNER_SCOPE_TIMEOUT_MS = 5_000;
 
+/** Fail closed: no check, a failed check or a "no" all mean not live. */
+async function grantsStillLive(
+  verify: McpToolContext["verifyGrantsLive"],
+): Promise<boolean> {
+  if (!verify) return false;
+  try {
+    return (await verify()) === true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Owner scopes with local data that no grant on the connection covers.
  * Reserved, system, memory and write scopes never appear. Empty when the read
@@ -861,7 +880,10 @@ const listGrantedScopes: McpToolDefinition = {
   description:
     "List granted scopes, readiness, size, and recommendedAccess. Call first.",
   inputSchema: {},
-  async handler(_args, { connection, readClient, exposeUnsharedScopes }) {
+  async handler(
+    _args,
+    { connection, readClient, exposeUnsharedScopes, verifyGrantsLive },
+  ) {
     const grantedScopes = uniqueScopes(connection);
     const scopeEntries = await Promise.all(
       grantedScopes.map(async (scope) => {
@@ -916,9 +938,10 @@ const listGrantedScopes: McpToolDefinition = {
     // Lets an agent that asked for more scopes see whether the owner has
     // answered yet without re-recording the request.
     const writableScopes = uniqueWritableScopes(connection);
-    const notShared = exposeUnsharedScopes
-      ? await listNotSharedScopes(connection, readClient)
-      : undefined;
+    const notShared =
+      exposeUnsharedScopes && (await grantsStillLive(verifyGrantsLive))
+        ? await listNotSharedScopes(connection, readClient)
+        : undefined;
     return textResult({
       scopes: scopeEntries,
       ...(notShared ? { notShared } : {}),

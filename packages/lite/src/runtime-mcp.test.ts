@@ -174,6 +174,7 @@ function buildRuntime(
     scopes?: string[];
     approvalUrl?: string;
     scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+    exposeUnshared?: boolean;
   } = {},
 ): RuntimeBundle {
   const gateway = makeMockGateway({
@@ -204,6 +205,7 @@ function buildRuntime(
     mcpConnectionStore: store,
     mcpOAuthApprovalUrl: opts.approvalUrl,
     mcpScopeRequestApprovalUrl: opts.scopeRequestApprovalUrl,
+    mcpExposeUnsharedScopes: opts.exposeUnshared,
     auth: createWeb3SignedPsLiteAuth({
       origin: SERVER_ORIGIN,
       ownerAddress: owner.address,
@@ -932,5 +934,62 @@ describe("MCP read_scope tool through Lite runtime", () => {
     expect(readEntry!.builder).not.toBe(owner.address);
     expect(readEntry!.grantId).toBe("grant-mcp-1");
     expect(readEntry!.scope).toBe("instagram.profile");
+  });
+});
+
+describe("createPsLiteRuntime + notShared grant liveness", () => {
+  async function listGrantedScopes(bundle: RuntimeBundle) {
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store: bundle.store, publicOrigin: SERVER_ORIGIN },
+    );
+    await bundle.runtime.fetch(
+      await ownerSigned(
+        "POST",
+        `/v1/mcp/connections/${created.connectionId}/approve`,
+        { grants: [{ grantId: "grant-mcp-1", scopes: ["instagram.profile"] }] },
+      ),
+    );
+    const res = await bundle.runtime.fetch(
+      new Request(
+        `${SERVER_ORIGIN}/mcp/${encodeURIComponent(created.connectionToken)}`,
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json, text/event-stream",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "list_granted_scopes", arguments: {} },
+          }),
+        },
+      ),
+    );
+    return JSON.parse((await res.json()).result.content[0].text);
+  }
+
+  it("lists notShared while the grant is live", async () => {
+    const bundle = buildRuntime({ exposeUnshared: true });
+    expect(await listGrantedScopes(bundle)).toHaveProperty("notShared");
+  });
+
+  it("omits notShared once the grant is revoked at the gateway", async () => {
+    const bundle = buildRuntime({ exposeUnshared: true });
+    vi.mocked(bundle.gateway.getGrant).mockResolvedValue({
+      id: "grant-mcp-1",
+      revokedAt: "2026-11-01T00:00:00.000Z",
+      scopes: ["instagram.profile"],
+      grantVersion: "1",
+      expiresAt: null,
+    } as never);
+    expect(await listGrantedScopes(bundle)).not.toHaveProperty("notShared");
+  });
+
+  it("omits notShared when the option is off", async () => {
+    const bundle = buildRuntime();
+    expect(await listGrantedScopes(bundle)).not.toHaveProperty("notShared");
   });
 });

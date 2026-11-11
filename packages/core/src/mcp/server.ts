@@ -49,6 +49,8 @@ export interface HandleMcpRequestOptions {
   serverOrigin?: McpToolContext["serverOrigin"];
   /** Host option; see `McpToolContext.exposeUnsharedScopes`. Default off. */
   exposeUnsharedScopes?: McpToolContext["exposeUnsharedScopes"];
+  /** Required for `notShared`; see `McpToolContext.verifyGrantsLive`. */
+  verifyGrantsLive?: McpToolContext["verifyGrantsLive"];
   /** Host option; see `McpToolContext.scopeRequestGuidance`. Default off. */
   scopeRequestGuidance?: McpToolContext["scopeRequestGuidance"];
   /** Emits one access record per denied data tool call; see reportToolDenial. */
@@ -463,6 +465,7 @@ export function createMcpServerForConnection(
     scopeRequestApprovalUrl: options.scopeRequestApprovalUrl,
     serverOrigin: options.serverOrigin,
     exposeUnsharedScopes: options.exposeUnsharedScopes,
+    verifyGrantsLive: options.verifyGrantsLive,
     scopeRequestGuidance: options.scopeRequestGuidance,
   };
 
