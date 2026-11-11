@@ -218,6 +218,18 @@ export interface CreateServerOptions {
    */
   mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   /**
+   * Default off. When on, `list_granted_scopes` also returns `notShared`:
+   * the owner's scopes that have local data and no grant on the connection.
+   * This tells an already-approved MCP client which sources the owner has,
+   * which is why it is opt-in.
+   */
+  mcpExposeUnsharedScopes?: boolean;
+  /**
+   * Default off. When on, every read-side `scope_not_granted` carries a
+   * `nextAction` telling the agent to call `request_scope_access`.
+   */
+  mcpScopeRequestGuidance?: boolean;
+  /**
    * Lifetime in seconds of grants the server signs itself for MCP
    * connections: the OAuth approve path and a scope-request approve with no
    * live grant to inherit an expiry from (a live grant's expiry is always
@@ -1237,6 +1249,8 @@ export async function createServer(
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
     mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,
     mcpScopeRequestApprovalUrl: options?.mcpScopeRequestApprovalUrl,
+    mcpExposeUnsharedScopes: options?.mcpExposeUnsharedScopes,
+    mcpScopeRequestGuidance: options?.mcpScopeRequestGuidance,
     mcpGrantTtlSeconds: options?.mcpGrantTtlSeconds,
     mcpConnectionStore: mcpState?.connections,
     mcpOAuthAuthorizationStore: mcpState?.authorizations,

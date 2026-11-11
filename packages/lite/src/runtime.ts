@@ -239,6 +239,10 @@ export interface PsLiteRuntimeOptions {
    * pointing the owner at Vana.
    */
   mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /** Default off. `list_granted_scopes` adds `notShared`; see the server option. */
+  mcpExposeUnsharedScopes?: boolean;
+  /** Default off. Read-side `scope_not_granted` adds `nextAction`. */
+  mcpScopeRequestGuidance?: boolean;
   /**
    * Lifetime in seconds of grants this runtime signs itself for MCP
    * connections (OAuth approve, scope-request approve with no live grant to
@@ -1469,6 +1473,8 @@ export function createPsLiteRuntime(
             authorizationStore: mcpOAuthAuthorizationStore,
             approvalUrl: options.mcpOAuthApprovalUrl,
             scopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
+            exposeUnsharedScopes: options.mcpExposeUnsharedScopes,
+            scopeRequestGuidance: options.mcpScopeRequestGuidance,
             auth,
             dataStorage,
             accessLogWriter,
@@ -1511,6 +1517,8 @@ async function handleMcpRoute(input: {
   authorizationStore: McpOAuthAuthorizationStore;
   approvalUrl?: string | (() => string);
   scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  exposeUnsharedScopes?: boolean;
+  scopeRequestGuidance?: boolean;
   auth: PsLiteAuthAdapter;
   dataStorage: DataStoragePort;
   accessLogWriter: AccessLogWriter;
@@ -2125,6 +2133,8 @@ async function handleMcpRoute(input: {
         );
       },
       scopeRequestApprovalUrl: input.scopeRequestApprovalUrl,
+      exposeUnsharedScopes: input.exposeUnsharedScopes,
+      scopeRequestGuidance: input.scopeRequestGuidance,
       serverOrigin: input.serverOrigin,
     });
     void input.store

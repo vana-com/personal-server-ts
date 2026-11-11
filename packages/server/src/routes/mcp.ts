@@ -180,6 +180,10 @@ export interface McpRouteDeps {
    * user. Absent: the agent is told to wait for approval in Vana.
    */
   scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /** Opt-in `notShared` on `list_granted_scopes`; see McpToolContext. */
+  mcpExposeUnsharedScopes?: boolean;
+  /** Opt-in `nextAction` on read-side `scope_not_granted`. */
+  mcpScopeRequestGuidance?: boolean;
   /**
    * MCP writes (`remember`): the store the data route redeems write sessions
    * from, and a dispatcher into the mounted data route. Absent: MCP stays
@@ -1165,6 +1169,8 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       },
       scopeRequestApprovalUrl: deps.scopeRequestApprovalUrl,
       serverOrigin: resolveOrigin(deps.serverOrigin),
+      exposeUnsharedScopes: deps.mcpExposeUnsharedScopes,
+      scopeRequestGuidance: deps.mcpScopeRequestGuidance,
     });
     void store
       .update(record.id, { lastUsedAt: new Date().toISOString() })
