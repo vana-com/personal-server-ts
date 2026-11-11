@@ -50,6 +50,7 @@ export interface HandleMcpRequestOptions {
   activityRecorder?: McpActivityRecorder;
   requestScopeAccess?: McpToolContext["requestScopeAccess"];
   scopeRequestApprovalUrl?: McpToolContext["scopeRequestApprovalUrl"];
+  scopeRequestReviewHint?: string;
   serverOrigin?: McpToolContext["serverOrigin"];
   /** Host option; see `McpToolContext.exposeUnsharedScopes`. Default off. */
   exposeUnsharedScopes?: McpToolContext["exposeUnsharedScopes"];
@@ -485,6 +486,7 @@ export function createMcpServerForConnection(
     activityRecorder: options.activityRecorder,
     requestScopeAccess: options.requestScopeAccess,
     scopeRequestApprovalUrl: options.scopeRequestApprovalUrl,
+    scopeRequestReviewHint: options.scopeRequestReviewHint,
     serverOrigin: options.serverOrigin,
     exposeUnsharedScopes: options.exposeUnsharedScopes,
     verifyGrantsLive: options.verifyGrantsLive,
