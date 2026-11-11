@@ -856,14 +856,19 @@ async function listNotSharedScopes(
       (summary) =>
         isReadableScopeEntry(summary.scope) &&
         !isMemoryScope(summary.scope) &&
-        !resolveGrantForScope(connection, summary.scope),
+        !resolveGrantForScope(connection, summary.scope) &&
+        // Only what bounded read can serve after approval. "ready" is the
+        // listing's own readiness (`storage.hasScopeBlocks`, the same check
+        // `getScopeMetadata` reports as `hasBlocks`); an "indexing" scope has
+        // no block sidecars and `read_scope` answers 503 for it.
+        summary.dataStatus === "ready",
     )
     .sort((a, b) => (a.scope < b.scope ? -1 : a.scope > b.scope ? 1 : 0))
     .map((summary) => ({
       scope: summary.scope,
       source: summary.scope.split(".")[0],
       collectedAt: summary.latestCollectedAt,
-      dataStatus: summary.dataStatus ?? ("indexing" as const),
+      dataStatus: "ready" as const,
     }));
 }
 
