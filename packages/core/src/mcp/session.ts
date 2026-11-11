@@ -269,6 +269,13 @@ export async function createMcpSession(
   // persistence fails — so a transient failure never burns a valid proof.
   // consume() is an atomic check-and-set, so concurrent duplicates still
   // resolve to exactly one winner.
+  // The grant may have expired while the token was prepared: check once more
+  // with a fresh clock, before the proof is reserved.
+  if (
+    isGrantExpired(grant, Math.floor((options.now?.() ?? Date.now()) / 1000))
+  ) {
+    throw new GrantRevokedError({ grantId: grant.id });
+  }
   const usingReplayGuard = Boolean(input.proof && options.replayStore);
   if (input.proof && options.replayStore) {
     const replayed = await options.replayStore.consume(

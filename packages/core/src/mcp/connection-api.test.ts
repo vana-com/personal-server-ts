@@ -34,6 +34,7 @@ import {
   toMcpConnectionView,
   DEFAULT_MCP_GRANT_TTL_SECONDS,
   mcpGrantDefaultExpiry,
+  isGrantExpired,
   liveMcpGrants,
 } from "./connection-api.js";
 import { MCP_REFRESH_TTL_MS, MCP_TOKEN_TTL_MS } from "./token-expiry.js";
@@ -909,6 +910,40 @@ describe("mcp/connection-api scope request answers", () => {
     );
   });
 
+  it("drops a grant that expired while a later grant's lookup ran, so its scopes are not signed", async () => {
+    const { store, id } = await connectionWithRequest([
+      { grantId: "0xgrant-a", scopes: ["youtube.history"] },
+      { grantId: "0xgrant-b", scopes: ["instagram.profile"] },
+    ]);
+    let clockMs = Date.parse(DECIDED_AT);
+    const expiresAt = String(Math.floor(clockMs / 1000) + 1);
+    const gateway = gatewayMock();
+    gateway.getGrant.mockImplementation(async (grantId: string) => {
+      if (grantId === "0xgrant-a") {
+        // A answers at once, still live.
+        return liveGrant({
+          id: grantId,
+          scopes: ["youtube.history"],
+          expiresAt,
+        });
+      }
+      clockMs += 2000; // B's lookup runs past A's expiry
+      return liveGrant({ id: grantId, expiresAt: null });
+    });
+
+    await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["spotify.profile"] },
+      { ...approveOptions(store, gateway), now: () => new Date(clockMs) },
+    );
+
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopes: ["instagram.profile", "spotify.profile"],
+        expiresAt: "0",
+      }),
+    );
+  });
+
   it("signs a perpetual grant by default when there is no live grant to inherit from", async () => {
     const { store, id } = await connectionWithRequest();
     const gateway = gatewayMock(null);
@@ -1235,6 +1270,32 @@ describe("mcp/connection-api scope request read token", () => {
     expect(
       await liveMcpGrants(connection, gateway, () => new Date(nowMs)),
     ).toEqual([]);
+  });
+
+  it("does not return a grant that expired while a later grant's lookup ran", async () => {
+    const { store, connectionId } = await connectionWithRequest();
+    await store.update(connectionId, {
+      grants: [
+        { grantId: "ga", scopes: ["instagram.profile"] },
+        { grantId: "gb", scopes: ["spotify.profile"] },
+      ],
+    });
+    const connection = (await store.getById(connectionId))!;
+    let nowMs = Date.parse("2026-10-07T10:00:00.000Z");
+    const expiresAt = String(Math.floor(nowMs / 1000) + 1);
+    const gateway = {
+      getGrant: async (grantId: string) => {
+        if (grantId === "ga") return grantState({ id: "ga", expiresAt });
+        // gb answers later, after ga already came back, and the clock has
+        // passed ga's expiry by then.
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        nowMs += 2000;
+        return grantState({ id: "gb", scopes: ["spotify.profile"] });
+      },
+    } as never;
+    expect(
+      await liveMcpGrants(connection, gateway, () => new Date(nowMs)),
+    ).toEqual([{ grantId: "gb", scopes: ["spotify.profile"] }]);
   });
 
   it("names no scope from a revoked, expired, missing or unverifiable grant", async () => {
@@ -1779,5 +1840,34 @@ describe("mcp/connection-api narrowGrants", () => {
     const out = narrowGrants(stored, live);
     expect(out.flatMap((grant) => grant.scopes)).toEqual(expected ?? []);
     expect(out).toHaveLength(expected ? 1 : 0);
+  });
+});
+
+describe("mcp/connection-api isGrantExpired", () => {
+  const NOW = 1_800_000_000;
+  it.each([
+    ["", true],
+    ["abc", true],
+    ["2026", true],
+    ["1731300000000", true],
+    ["Infinity", true],
+    ["9".repeat(400), true],
+    ["2020-01-01T00:00:00Z", true],
+    ["2020-01-01", true],
+    ["2030-01-01T00:00:00Z", false],
+    ["2030-01-01T00:00:00.500+02:00", false],
+    ["0", false],
+    [null, false],
+    [undefined, false],
+    ["1900000000", false],
+    ["1700000000", true],
+    [1900000000, true],
+    [Number.NaN, true],
+  ])("expiresAt %j is expired: %s", (expiresAt, expired) => {
+    expect(isGrantExpired({ expiresAt } as never, NOW)).toBe(expired);
+  });
+
+  it("keeps the gateway's expired flag authoritative", () => {
+    expect(isGrantExpired({ expired: true, expiresAt: null }, NOW)).toBe(true);
   });
 });

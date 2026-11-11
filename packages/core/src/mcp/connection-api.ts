@@ -850,6 +850,8 @@ async function readLiveGrantState(
   let anyLive = false;
   let anyPerpetual = false;
   let expiresAt: number | undefined;
+  const looked: NonNullable<Awaited<ReturnType<typeof gateway.getGrant>>>[] =
+    [];
   for (const grantId of grantIds) {
     let live: Awaited<ReturnType<typeof gateway.getGrant>>;
     try {
@@ -864,12 +866,15 @@ async function readLiveGrantState(
     if (!live) continue;
     const version = parseUint(live.grantVersion);
     if (version !== null && version > maxVersion) maxVersion = version;
-    const liveExpiry = parseExpirySeconds(live.expiresAt);
-    // Only a grant that is live now passes its scopes on; a revoked, expired
-    // or missing one counts as never granted.
-    // The clock is read after this lookup returned, not before it started.
-    const nowSeconds = Math.floor(nowMs(now) / 1000);
+    looked.push(live);
+  }
+  // One clock reading after ALL the lookups: a grant that expired while a
+  // later lookup ran must not pass its scopes on. Only a grant that is live
+  // now does; a revoked, expired or missing one counts as never granted.
+  const nowSeconds = Math.floor(nowMs(now) / 1000);
+  for (const live of looked) {
     if (live.revokedAt || isGrantExpired(live, nowSeconds)) continue;
+    const liveExpiry = parseExpirySeconds(live.expiresAt);
     for (const scope of live.scopes) scopes.add(scope);
     anyLive = true;
     if (liveExpiry === undefined) {
@@ -895,20 +900,36 @@ function parseUint(value: unknown): bigint | null {
   return BigInt(value);
 }
 
-/** Gateway expiry may be unix seconds or an ISO date; 0/null means perpetual. */
-function parseExpirySeconds(value: string | null): number | undefined {
-  if (!value) return undefined;
+/** Parsed as already expired: anything we cannot read is never "perpetual". */
+const EXPIRED_AT_SECONDS = 0;
+/** Unix seconds above this (year 5138) are really milliseconds. */
+const MAX_UNIX_SECONDS = 1e11;
+const ISO_DATE_TIME =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/u;
+
+/**
+ * The gateway's expiry (data-gateway lib/grants.ts: `expiresAt` is an ISO 8601
+ * string or null; the uint256 form is unix seconds, "0" meaning no expiry), as
+ * unix seconds. `undefined` is perpetual and only null, undefined or "0" give
+ * it. Anything unreadable fails closed as already expired.
+ */
+function parseExpirySeconds(value: unknown): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value !== "string") return EXPIRED_AT_SECONDS;
   if (/^\d+$/u.test(value)) {
     const seconds = Number(value);
-    return seconds > 0 ? seconds : undefined;
+    if (seconds === 0) return undefined;
+    return Number.isFinite(seconds) && seconds <= MAX_UNIX_SECONDS
+      ? seconds
+      : EXPIRED_AT_SECONDS;
   }
-  const ms = Date.parse(value);
-  return Number.isFinite(ms) ? Math.floor(ms / 1000) : undefined;
+  const ms = ISO_DATE_TIME.test(value) ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : EXPIRED_AT_SECONDS;
 }
 
 /** The one expiry rule: the gateway's `expired` flag, or `expiresAt` reached. */
 export function isGrantExpired(
-  grant: { expired?: boolean; expiresAt: string | null },
+  grant: { expired?: boolean; expiresAt?: unknown },
   nowSeconds: number,
 ): boolean {
   const expiresAt = parseExpirySeconds(grant.expiresAt);
@@ -938,19 +959,20 @@ export async function liveMcpGrants(
   // No gateway means no authority to say a grant still stands: no grants.
   if (!gateway) return [];
   try {
-    const checked = await Promise.all(
-      grantIds.map(async (grantId) => {
-        const live = await gateway.getGrant(grantId);
-        // Read the clock after the lookup: a slow answer must not be judged
-        // by the time it was asked.
-        const nowSeconds = Math.floor(now().getTime() / 1000);
-        if (!live || live.revokedAt || isGrantExpired(live, nowSeconds)) {
-          return null;
-        }
-        return { grantId, scopes: [...live.scopes] };
-      }),
+    const looked = await Promise.all(
+      grantIds.map(async (grantId) => ({
+        grantId,
+        live: await gateway.getGrant(grantId),
+      })),
     );
-    return checked.filter((grant): grant is LiveGrant => grant !== null);
+    // One clock reading after ALL the lookups: a grant that expired while a
+    // later lookup ran is not live.
+    const nowSeconds = Math.floor(now().getTime() / 1000);
+    return looked.flatMap(({ grantId, live }) =>
+      !live || live.revokedAt || isGrantExpired(live, nowSeconds)
+        ? []
+        : [{ grantId, scopes: [...live.scopes] }],
+    );
   } catch {
     return [];
   }
