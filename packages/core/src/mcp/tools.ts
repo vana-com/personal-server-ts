@@ -40,10 +40,7 @@ import {
   isOpenerEligibleApprovalUrl,
   resolveMcpScopeRequestApprovalUrl,
 } from "./approval-url.js";
-import type {
-  McpScopeRequestApprovalUrlContext,
-  McpScopeRequestApprovalUrlHook,
-} from "./approval-url.js";
+import type { McpScopeRequestApprovalUrlHook } from "./approval-url.js";
 import { MiniSearchIndex, type SearchDocument } from "./search/index.js";
 import { MAX_SELECTED_BLOCK_IDS } from "../storage/blocks/index.js";
 import {
