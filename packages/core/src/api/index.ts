@@ -2841,7 +2841,13 @@ export async function handlePersonalServerDataRequest(
           });
       // A scope's version history is as much its data as its content is, so
       // a non-owner needs a grant covering it, exactly like a read.
-      const scopeResult = parseDataScopeContract(versionsScopeParam);
+      // Switched history reads the stream-sync stream the read route names
+      // (`pdpp.<connector>.<stream>`), so it uses the read rule; legacy history
+      // keeps the strict rule.
+      const scopeResult =
+        mode === "switched"
+          ? parseDataReadScopeContract(versionsScopeParam)
+          : parseDataScopeContract(versionsScopeParam);
       if (
         scopeResult.ok &&
         listAuth &&
