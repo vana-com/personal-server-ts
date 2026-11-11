@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { handleMcpStreamableHttpRequest } from "./server.js";
+import {
+  handleMcpStreamableHttpRequest,
+  type HandleMcpRequestOptions,
+} from "./server.js";
+import { MCP_TOOLS } from "./tools.js";
 import type { McpDataReadClient } from "./read-client.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { ScopeSummary } from "../storage/index/types.js";
@@ -71,6 +75,8 @@ async function rpc(
   readClient: McpDataReadClient,
   method: string,
   params: unknown,
+  extra: Partial<HandleMcpRequestOptions> = {},
+  conn: McpConnectionRecord = connection(),
 ): Promise<string> {
   const response = await handleMcpStreamableHttpRequest(
     new Request("http://localhost/mcp/t", {
@@ -82,11 +88,12 @@ async function rpc(
       body: JSON.stringify({ jsonrpc: "2.0", id: ++nextId, method, params }),
     }),
     {
-      connection: connection(),
+      connection: conn,
       readClient,
       exposeUnsharedScopes: false,
       scopeRequestGuidance: true,
       requestableScopes: CATALOG,
+      ...extra,
     },
   );
   return response.text();
@@ -126,6 +133,16 @@ const CASES: Array<{
   },
   { name: "tools/list", method: "tools/list", params: {} },
   { name: "list_granted_scopes", ...tool("list_granted_scopes", {}) },
+  { name: "resources/list", method: "resources/list", params: {} },
+  {
+    name: "resources/templates/list",
+    method: "resources/templates/list",
+    params: {},
+  },
+  {
+    name: "search_personal_context(no scopes)",
+    ...tool("search_personal_context", { query: "videos" }),
+  },
   {
     name: 'request_scope_access(["youtube.history"])',
     ...tool("request_scope_access", { scopes: ["youtube.history"] }),
@@ -206,4 +223,160 @@ describe("ungranted data is invisible to a connected client (mcpExposeUnsharedSc
       " Scope ids Vana supports (not a list of what this user has): chatgpt.conversations, spotify.library, youtube.history",
     );
   });
+
+  it("request_scope_access records the request, and answers the same for an owned and a not-owned scope", async () => {
+    const run = async (scope: string, owner: McpDataReadClient) => {
+      const requestScopeAccess = vi.fn().mockImplementation(async () => ({
+        connection: connection(),
+        requestRecorded: true,
+      }));
+      const body = await rpc(
+        owner,
+        "tools/call",
+        tool("request_scope_access", { scopes: [scope] }).params,
+        { requestScopeAccess },
+      );
+      return { body: normalize(body), requestScopeAccess };
+    };
+    const owned = await run("youtube.history", ownerA());
+    const notOwned = await run("youtube.history", ownerB());
+    const other = await run("spotify.library", ownerA());
+    expect(owned.requestScopeAccess).toHaveBeenCalledWith({
+      scopes: ["youtube.history"],
+    });
+    expect(notOwned.requestScopeAccess).toHaveBeenCalledTimes(1);
+    expect(owned.body).toBe(notOwned.body);
+    // Not owned by either owner: same shape, only the echoed scope id differs.
+    expect(other.body.replaceAll("spotify.library", "youtube.history")).toBe(
+      owned.body,
+    );
+  });
+});
+
+describe("a grant the gateway no longer honours reveals nothing new", () => {
+  const revoked = { verifyGrantsLive: async () => false };
+  const neverGranted = (): McpConnectionRecord => ({
+    ...connection(),
+    grants: [],
+  });
+  const REVOKED_CASES = [
+    tool("list_granted_scopes", {}),
+    tool("read_scope", { scope: "chatgpt.conversations" }),
+    tool("list_scope_blocks", { scope: "chatgpt.conversations" }),
+    tool("search_personal_context", {
+      query: "x",
+      scopes: ["chatgpt.conversations"],
+    }),
+    tool("get_scope_file", {
+      scope: "chatgpt.conversations",
+      path: "manifest.json",
+    }),
+    { method: "resources/list", params: {} },
+  ];
+
+  it.each(REVOKED_CASES)(
+    "$params.name after revocation: byte-identical with or without newly imported data, and no owner read",
+    async ({ method, params }) => {
+      const before = ownerClient([]);
+      const after = ownerA(); // new data imported after the grant ended
+      const a = normalize(await rpc(before, method, params, revoked));
+      const b = normalize(await rpc(after, method, params, revoked));
+      expect(a).toBe(b);
+      for (const client of [before, after]) {
+        for (const read of [
+          "listScopes",
+          "getScopeMetadata",
+          "readScopeBlocks",
+          "readRawScopeFile",
+          "listOwnerScopes",
+        ] as const)
+          expect(client[read]).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("a revoked grant answers exactly as a connection that never had one", async () => {
+    for (const { method, params } of REVOKED_CASES) {
+      const gone = normalize(
+        await rpc(ownerA(), method, params, revoked, connection()),
+      );
+      const never = normalize(
+        await rpc(ownerA(), method, params, {}, neverGranted()),
+      );
+      expect(gone).toBe(never);
+    }
+  });
+
+  it("fails closed when the liveness check throws", async () => {
+    const client = ownerA();
+    const body = await rpc(
+      client,
+      "tools/call",
+      tool("list_granted_scopes", {}).params,
+      {
+        verifyGrantsLive: async () => {
+          throw new Error("gateway down");
+        },
+      },
+    );
+    expect(body).not.toContain("collectedAt");
+    expect(client.getScopeMetadata).not.toHaveBeenCalled();
+  });
+
+  it("a live grant still reads normally", async () => {
+    const client = ownerA();
+    await rpc(client, "tools/call", tool("list_granted_scopes", {}).params, {
+      verifyGrantsLive: async () => true,
+    });
+    expect(client.getScopeMetadata).toHaveBeenCalledWith(
+      "chatgpt.conversations",
+    );
+  });
+});
+
+describe("a write-only memory grant is not a read oracle", () => {
+  const writeOnly = (): McpConnectionRecord => ({
+    ...connection(),
+    grants: [{ grantId: "g", scopes: ["write:memory.app"] }],
+  });
+  const writeClient = () => {
+    const calls: string[] = [];
+    const proxy = new Proxy(
+      {},
+      {
+        get: (_t, prop) => {
+          calls.push(String(prop));
+          return () => {
+            throw new Error("write client used");
+          };
+        },
+      },
+    );
+    return { proxy: proxy as never, calls };
+  };
+
+  it.each([
+    ["remember", { scope: "memory.app", text: "probe", key: "k" }],
+    ["forget", { scope: "memory.app", key: "k" }],
+  ])(
+    "%s without a covering read grant is refused as never granted, before any owner access",
+    async (name, args) => {
+      const writer = writeClient();
+      const client = ownerA();
+      const result = await MCP_TOOLS.find((t) => t.name === name)!.handler(
+        args,
+        {
+          connection: writeOnly(),
+          readClient: client,
+          writeClient: writer.proxy,
+        },
+      );
+      const body = JSON.parse(result.content[0]!.text as string) as {
+        error: string;
+      };
+      expect(result.isError).toBe(true);
+      expect(body.error).toBe("scope_not_granted");
+      expect(writer.calls).toEqual([]);
+    },
+  );
 });

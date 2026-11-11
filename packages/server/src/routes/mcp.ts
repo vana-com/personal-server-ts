@@ -1185,12 +1185,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       scopeRequestApprovalUrl: deps.scopeRequestApprovalUrl,
       serverOrigin: resolveOrigin(deps.serverOrigin),
       exposeUnsharedScopes: deps.mcpExposeUnsharedScopes,
-      ...(deps.mcpExposeUnsharedScopes
-        ? {
-            verifyGrantsLive: () =>
-              areMcpConnectionGrantsLive(record, deps.gateway),
-          }
-        : {}),
+      verifyGrantsLive: () => areMcpConnectionGrantsLive(record, deps.gateway),
       scopeRequestGuidance: deps.mcpScopeRequestGuidance,
       requestableScopes: deps.mcpRequestableScopes,
     });

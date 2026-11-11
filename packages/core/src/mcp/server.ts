@@ -23,6 +23,7 @@ import {
   MCP_TOOLS,
   resolveGrantForScope,
   SCOPE_REQUEST_GUIDANCE_TEXT,
+  grantsStillLive,
   UNSHARED_SCOPES_INSTRUCTIONS,
   requestableScopesDescription,
   UNSHARED_SCOPES_TOOL_DESCRIPTION,
@@ -51,7 +52,13 @@ export interface HandleMcpRequestOptions {
   serverOrigin?: McpToolContext["serverOrigin"];
   /** Host option; see `McpToolContext.exposeUnsharedScopes`. Default off. */
   exposeUnsharedScopes?: McpToolContext["exposeUnsharedScopes"];
-  /** Required for `notShared`; see `McpToolContext.verifyGrantsLive`. */
+  /**
+   * Live-grant check, run before every tool call and resource read. A
+   * connection token outlives its grants, so when it answers false (or fails,
+   * or times out) the call runs as if the connection held no grant at all.
+   * Absent: no check (tests and hosts without a gateway). See
+   * `McpToolContext.verifyGrantsLive`.
+   */
   verifyGrantsLive?: McpToolContext["verifyGrantsLive"];
   /** Host option; see `McpToolContext.scopeRequestGuidance`. Default off. */
   scopeRequestGuidance?: McpToolContext["scopeRequestGuidance"];
@@ -483,6 +490,21 @@ export function createMcpServerForConnection(
     requestableScopes: options.requestableScopes,
   };
 
+  /**
+   * The context a call runs with. Owner data must not be observed on the
+   * strength of a grant the gateway no longer honours, so the check comes
+   * first and a failed one yields a connection with no grants: every tool
+   * then answers as it does for a scope never granted, before any read.
+   */
+  async function liveContext(): Promise<McpToolContext> {
+    if (!options.verifyGrantsLive) return ctx;
+    if (await grantsStillLive(options.verifyGrantsLive)) {
+      // Verified now; `notShared` need not ask the gateway again.
+      return { ...ctx, verifyGrantsLive: async () => true };
+    }
+    return { ...ctx, connection: { ...ctx.connection, grants: [] } };
+  }
+
   for (const tool of MCP_TOOLS) {
     server.registerTool(
       tool.name,
@@ -499,8 +521,9 @@ export function createMcpServerForConnection(
         const handlerStartedAt = performance.now();
         try {
           const timeoutMs = toolTimeoutMs(tool.name, args);
+          const callCtx = await liveContext();
           const result = await withToolTimeout(
-            tool.handler(args as Record<string, unknown>, ctx),
+            tool.handler(args as Record<string, unknown>, callCtx),
             tool.name,
             timeoutMs,
           );
@@ -570,7 +593,7 @@ export function createMcpServerForConnection(
       `raw-scope-file-${index}`,
       new ResourceTemplate(template, { list: undefined }),
       RAW_SCOPE_RESOURCE_CONFIG,
-      async (uri) => readRawScopeResource(uri, ctx),
+      async (uri) => readRawScopeResource(uri, await liveContext()),
     );
   });
 

@@ -834,7 +834,7 @@ const DEFAULT_OWNER_SCOPE_TIMEOUT_MS = 5_000;
 const GRANT_LIVENESS_TIMEOUT_MS = 3_000;
 
 /** Fail closed: no check, a failed or slow check, or a "no" all mean not live. */
-async function grantsStillLive(
+export async function grantsStillLive(
   verify: McpToolContext["verifyGrantsLive"],
 ): Promise<boolean> {
   if (!verify) return false;
@@ -2303,7 +2303,13 @@ function resolveMemoryTarget(
       ),
     };
   }
-  const grant = resolveWriteGrantForScope(connection, scope);
+  // `remember` and `forget` read the scope's existing memories to decide and
+  // report (duplicates, counts, ids). A write-only grant must not turn that
+  // into a read, so a covering read grant is required too, and its absence
+  // answers exactly as a scope never granted.
+  const grant = resolveGrantForScope(connection, scope)
+    ? resolveWriteGrantForScope(connection, scope)
+    : null;
   if (!grant) {
     const requestScope = `${WRITE_SCOPE_PREFIX}${scope}`;
     return {

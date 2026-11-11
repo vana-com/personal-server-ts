@@ -238,7 +238,7 @@ describe("MCP remember tool", () => {
   }
 
   it("saves a memory as the connection grantee with a verifiable $writtenBy", async () => {
-    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    const t = await setup([`write:${MEMORY_SCOPE}`, MEMORY_SCOPE]);
 
     const result = await t.callTool("remember", {
       scope: MEMORY_SCOPE,
@@ -289,7 +289,7 @@ describe("MCP remember tool", () => {
   });
 
   it("appends memories and replaces one saved again under the same key", async () => {
-    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    const t = await setup([`write:${MEMORY_SCOPE}`, MEMORY_SCOPE]);
 
     await t.callTool("remember", {
       scope: MEMORY_SCOPE,
@@ -318,7 +318,7 @@ describe("MCP remember tool", () => {
   });
 
   it("keeps a memory's id when a save under the same key replaces it", async () => {
-    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    const t = await setup([`write:${MEMORY_SCOPE}`, MEMORY_SCOPE]);
 
     const first = await t.callTool("remember", {
       scope: MEMORY_SCOPE,
@@ -335,7 +335,7 @@ describe("MCP remember tool", () => {
   });
 
   it("does not save the same memory twice", async () => {
-    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    const t = await setup([`write:${MEMORY_SCOPE}`, MEMORY_SCOPE]);
     const first = await t.callTool("remember", { text: "Lives in Poland." });
 
     const again = await t.callTool("remember", { text: "Lives in Poland." });
@@ -353,7 +353,7 @@ describe("MCP remember tool", () => {
   });
 
   it("forgets a memory by key, and reports a miss without writing", async () => {
-    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    const t = await setup([`write:${MEMORY_SCOPE}`, MEMORY_SCOPE]);
     await t.callTool("remember", { text: "Editor: Zed.", key: "editor" });
     const kept = await t.callTool("remember", { text: "Lives in Poland." });
 
@@ -385,7 +385,7 @@ describe("MCP remember tool", () => {
   });
 
   it("forgets only the record matching both id and key when both are given", async () => {
-    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    const t = await setup([`write:${MEMORY_SCOPE}`, MEMORY_SCOPE]);
     const editor = await t.callTool("remember", {
       text: "Editor: Zed.",
       key: "editor",
@@ -412,7 +412,7 @@ describe("MCP remember tool", () => {
   });
 
   it("converts an earlier memories list to records, keeping ids", async () => {
-    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    const t = await setup([`write:${MEMORY_SCOPE}`, MEMORY_SCOPE]);
     expect(
       (
         await t.ownerWrite(MEMORY_SCOPE, {
@@ -439,7 +439,7 @@ describe("MCP remember tool", () => {
   });
 
   it("defaults to the only writable scope when the agent names none", async () => {
-    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    const t = await setup([`write:${MEMORY_SCOPE}`, MEMORY_SCOPE]);
 
     const result = await t.callTool("remember", { text: "Lives in Poland." });
 
@@ -464,7 +464,7 @@ describe("MCP remember tool", () => {
   });
 
   it("re-checks the live grant, so a revoked grant stops the next save", async () => {
-    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    const t = await setup([`write:${MEMORY_SCOPE}`, MEMORY_SCOPE]);
     t.revoke();
 
     const result = await t.callTool("remember", {
@@ -473,12 +473,12 @@ describe("MCP remember tool", () => {
     });
 
     expect(result.isError).toBe(true);
-    expect(result.payload.error).toBe("unauthorized");
+    expect(result.payload.error).toBe("scope_not_granted");
     expect((await t.ownerRead(MEMORY_SCOPE)).status).toBe(404);
   });
 
   it("checks the live grant before reading, so a revoked grant learns nothing about the scope", async () => {
-    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    const t = await setup([`write:${MEMORY_SCOPE}`, MEMORY_SCOPE]);
     expect(
       (await t.ownerWrite(MEMORY_SCOPE, { notes: "owner data" })).status,
     ).toBe(201);
@@ -491,7 +491,7 @@ describe("MCP remember tool", () => {
 
     expect(result.isError).toBe(true);
     // Not scope_not_memory: that would reveal what the scope holds.
-    expect(result.payload.error).toBe("unauthorized");
+    expect(result.payload.error).toBe("scope_not_granted");
   });
 
   it("honors only an exact write grant, never a write wildcard", async () => {
@@ -508,7 +508,7 @@ describe("MCP remember tool", () => {
   });
 
   it("will not overwrite a scope that does not hold memories", async () => {
-    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    const t = await setup([`write:${MEMORY_SCOPE}`, MEMORY_SCOPE]);
     await t.callTool("remember", { scope: MEMORY_SCOPE, text: "first" });
     // The owner replaces the scope with something that is not a memory list.
     const ownerWrite = await t.ownerWrite(MEMORY_SCOPE, {
