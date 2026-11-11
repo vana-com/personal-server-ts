@@ -22,6 +22,8 @@ import {
   MAX_MCP_TOOL_TIMEOUT_MS,
   MCP_TOOLS,
   resolveGrantForScope,
+  UNSHARED_SCOPES_INSTRUCTIONS,
+  UNSHARED_SCOPES_TOOL_DESCRIPTION,
   type McpToolContext,
   type McpToolResultContent,
 } from "./tools.js";
@@ -45,6 +47,10 @@ export interface HandleMcpRequestOptions {
   requestScopeAccess?: McpToolContext["requestScopeAccess"];
   scopeRequestApprovalUrl?: McpToolContext["scopeRequestApprovalUrl"];
   serverOrigin?: McpToolContext["serverOrigin"];
+  /** Host option; see `McpToolContext.exposeUnsharedScopes`. Default off. */
+  exposeUnsharedScopes?: McpToolContext["exposeUnsharedScopes"];
+  /** Host option; see `McpToolContext.scopeRequestGuidance`. Default off. */
+  scopeRequestGuidance?: McpToolContext["scopeRequestGuidance"];
   /** Emits one access record per denied data tool call; see reportToolDenial. */
   reporterDeps?: PersonalServerReadReporterDeps;
   serverName?: string;
@@ -406,10 +412,16 @@ function markResponsePreparing(
 }
 
 /** What a client sees of a tool in `tools/list`: owner-independent metadata. */
-function toolConfig(tool: (typeof MCP_TOOLS)[number]) {
+function toolConfig(
+  tool: (typeof MCP_TOOLS)[number],
+  exposeUnsharedScopes = false,
+) {
   return {
     title: tool.title,
-    description: tool.description,
+    description:
+      exposeUnsharedScopes && tool.name === "list_granted_scopes"
+        ? tool.description + UNSHARED_SCOPES_TOOL_DESCRIPTION
+        : tool.description,
     inputSchema: tool.inputSchema,
   };
 }
@@ -434,7 +446,11 @@ export function createMcpServerForConnection(
       name: options.serverName ?? DEFAULT_SERVER_NAME,
       version: options.serverVersion ?? DEFAULT_SERVER_VERSION,
     },
-    { instructions: MCP_SERVER_INSTRUCTIONS },
+    {
+      instructions: options.exposeUnsharedScopes
+        ? MCP_SERVER_INSTRUCTIONS + UNSHARED_SCOPES_INSTRUCTIONS
+        : MCP_SERVER_INSTRUCTIONS,
+    },
   );
   const pendingActivityFinishes = new Map<string, PendingActivityFinish>();
 
@@ -446,12 +462,14 @@ export function createMcpServerForConnection(
     requestScopeAccess: options.requestScopeAccess,
     scopeRequestApprovalUrl: options.scopeRequestApprovalUrl,
     serverOrigin: options.serverOrigin,
+    exposeUnsharedScopes: options.exposeUnsharedScopes,
+    scopeRequestGuidance: options.scopeRequestGuidance,
   };
 
   for (const tool of MCP_TOOLS) {
     server.registerTool(
       tool.name,
-      toolConfig(tool),
+      toolConfig(tool, options.exposeUnsharedScopes),
       async (args: Record<string, unknown>) => {
         const recorder = options.activityRecorder;
         const activityId = recorder
