@@ -4,8 +4,7 @@ import {
   handleMcpStreamableHttpRequest,
   MCP_SERVER_INSTRUCTIONS,
 } from "./server.js";
-import type {
-  McpDataReadError} from "./read-client.js";
+import type { McpDataReadError } from "./read-client.js";
 import {
   createMcpDataReadClient,
   type McpDataReadClient,
