@@ -43,6 +43,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import {
   createTestWallet,
+  createFakeGrantGateway,
   buildWeb3SignedHeader,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createWeb3SignedPsLiteAuth } from "./runtime.js";
@@ -176,6 +177,8 @@ function buildRuntime(
     scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
     exposeUnshared?: boolean;
     ownerAccessEdit?: boolean;
+    /** Stateful grant lifecycle (shared counter, swallowed 409s). */
+    fakeGrantGateway?: ReturnType<typeof createFakeGrantGateway>;
   } = {},
 ): RuntimeBundle {
   const gateway = makeMockGateway({
@@ -184,6 +187,11 @@ function buildRuntime(
     grantId: opts.grantId ?? "grant-mcp-1",
     scopes: opts.scopes ?? ["instagram.profile"],
   });
+  if (opts.fakeGrantGateway) {
+    const { getBuilder, getGrant, createGrant, revokeGrant } =
+      opts.fakeGrantGateway.gateway;
+    Object.assign(gateway, { getBuilder, getGrant, createGrant, revokeGrant });
+  }
   const accessLog = createMockAccessLog();
   const storage = createMemoryPsLiteStorage();
   const store = createInMemoryMcpConnectionStore();
@@ -1000,6 +1008,11 @@ describe("createPsLiteRuntime + notShared grant liveness", () => {
 });
 
 describe("createPsLiteRuntime + owner access edit", () => {
+  const freshFake = () => {
+    const fake = createFakeGrantGateway();
+    fake.seed("0xold", ["instagram.profile"]);
+    return fake;
+  };
   async function approved(bundle: RuntimeBundle) {
     const created = await createMcpConnection(
       { displayName: "Maple" },
@@ -1019,16 +1032,44 @@ describe("createPsLiteRuntime + owner access edit", () => {
       await ownerSigned("PUT", `/v1/mcp/connections/${id}/access`, { scopes }),
     );
 
-  it("answers 404 when the option is off", async () => {
-    const bundle = buildRuntime({ grantId: "0xnew" });
+  it("answers 404 when the option is off, for signed, unsigned and non-owner callers", async () => {
+    const fake = freshFake();
+    const bundle = buildRuntime({ fakeGrantGateway: fake });
     const id = await approved(bundle);
-    const res = await put(bundle, id, ["instagram.profile"]);
-    expect(res.status).toBe(404);
-    expect(bundle.gateway.createGrant).not.toHaveBeenCalled();
+    expect((await put(bundle, id, ["instagram.profile"])).status).toBe(404);
+    const unsigned = await bundle.runtime.fetch(
+      new Request(`${SERVER_ORIGIN}/v1/mcp/connections/${id}/access`, {
+        method: "PUT",
+        body: JSON.stringify({ scopes: ["instagram.profile"] }),
+      }),
+    );
+    expect(unsigned.status).toBe(404);
+    const stranger = await buildWeb3SignedHeader({
+      wallet: createTestWallet(77),
+      aud: SERVER_ORIGIN,
+      method: "PUT",
+      uri: `/v1/mcp/connections/${id}/access`,
+      body: new TextEncoder().encode(
+        JSON.stringify({ scopes: ["instagram.profile"] }),
+      ),
+    });
+    const nonOwner = await bundle.runtime.fetch(
+      new Request(`${SERVER_ORIGIN}/v1/mcp/connections/${id}/access`, {
+        method: "PUT",
+        headers: { Authorization: stranger },
+        body: JSON.stringify({ scopes: ["instagram.profile"] }),
+      }),
+    );
+    expect(nonOwner.status).toBe(404);
+    expect(fake.counter()).toBe(1n);
   });
 
-  it("sets the exact scopes, keeps the id, revokes the old grant", async () => {
-    const bundle = buildRuntime({ grantId: "0xnew", ownerAccessEdit: true });
+  it("sets the exact scopes, keeps the id, and proves the old grant revoked", async () => {
+    const fake = freshFake();
+    const bundle = buildRuntime({
+      ownerAccessEdit: true,
+      fakeGrantGateway: fake,
+    });
     const id = await approved(bundle);
     const before = await bundle.store.getById(id);
 
@@ -1039,17 +1080,39 @@ describe("createPsLiteRuntime + owner access edit", () => {
       grantedScopes: ["instagram.profile", "youtube.history"],
       revokeFailures: [],
     });
-    expect(bundle.gateway.createGrant).toHaveBeenCalledTimes(1);
-    expect(bundle.gateway.revokeGrant).toHaveBeenCalledTimes(1);
+    expect(fake.grants.get("0xold")?.revokedAt).toBeTruthy();
     const after = await bundle.store.getById(id);
     expect(after?.tokenHash).toBe(before?.tokenHash);
     expect(after?.grants).toEqual([
-      { grantId: "0xnew", scopes: ["instagram.profile", "youtube.history"] },
+      { grantId: "0xnew1", scopes: ["instagram.profile", "youtube.history"] },
+    ]);
+  });
+
+  it("answers 202 and keeps the old id retryable when a revoke is not proven", async () => {
+    const fake = createFakeGrantGateway({ throwOnRevoke: () => true });
+    fake.seed("0xold", ["instagram.profile"]);
+    const bundle = buildRuntime({
+      ownerAccessEdit: true,
+      fakeGrantGateway: fake,
+    });
+    const id = await approved(bundle);
+    const res = await put(bundle, id, ["instagram.profile", "youtube.history"]);
+    expect(res.status).toBe(202);
+    expect(await res.json()).toMatchObject({
+      revokeFailures: [{ grantId: "0xold", error: "gateway down" }],
+      pendingRevocations: ["0xold"],
+    });
+    expect((await bundle.store.getById(id))?.pendingRevocations).toEqual([
+      "0xold",
     ]);
   });
 
   it("rejects an unsigned caller and a bad body", async () => {
-    const bundle = buildRuntime({ grantId: "0xnew", ownerAccessEdit: true });
+    const fake = freshFake();
+    const bundle = buildRuntime({
+      ownerAccessEdit: true,
+      fakeGrantGateway: fake,
+    });
     const id = await approved(bundle);
     const unsigned = await bundle.runtime.fetch(
       new Request(`${SERVER_ORIGIN}/v1/mcp/connections/${id}/access`, {
@@ -1060,6 +1123,6 @@ describe("createPsLiteRuntime + owner access edit", () => {
     expect(unsigned.status).toBeGreaterThanOrEqual(401);
     expect((await put(bundle, id, [])).status).toBe(400);
     expect((await put(bundle, id, ["vana.system.state"])).status).toBe(400);
-    expect(bundle.gateway.createGrant).not.toHaveBeenCalled();
+    expect(fake.counter()).toBe(1n);
   });
 });

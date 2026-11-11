@@ -132,6 +132,25 @@ export interface McpConnectionRecord {
   scopeAccessRequest?: McpScopeAccessRequest;
   /** Owner's answer to the most recent scope access request. */
   scopeAccessDecision?: McpScopeAccessDecision;
+  /**
+   * Set while an owner access edit is in flight, before anything is
+   * registered at the gateway. A second edit (or approve) sees it and backs
+   * off, so two edits cannot both register a grant.
+   */
+  accessEdit?: { claimId: string; startedAt: string };
+  /**
+   * Gateway grants that are no longer this connection's access but are not
+   * proven revoked (a revoke failed, or the gateway did not confirm it). They
+   * are retried on the next edit and shown to the owner.
+   */
+  pendingRevocations?: string[];
+  /**
+   * Highest gateway version this server has signed for the connection's
+   * (owner, grantee) pair, by registration or revocation. The gateway counter
+   * is shared by both and no grant records a revocation's version, so the next
+   * registration must start above this, not above the highest grant.
+   */
+  grantVersionFloor?: string;
   createdAt: string;
   approvedAt?: string;
   revokedAt?: string;

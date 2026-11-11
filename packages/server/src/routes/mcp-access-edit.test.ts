@@ -11,7 +11,10 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
-import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
+import {
+  createFakeGrantGateway,
+  type FakeGrantGatewayOptions,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
 import { mcpConnectionsRoutes } from "./mcp.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
@@ -28,35 +31,24 @@ const gatewayConfig = {
   },
 } as const;
 
-function makeGateway(revokeGrant = vi.fn().mockResolvedValue(undefined)) {
-  return {
-    isRegisteredBuilder: vi.fn().mockResolvedValue(true),
-    getBuilder: vi.fn().mockResolvedValue({ id: "0xbuilder" }),
-    getGrant: vi.fn().mockResolvedValue({
-      id: "0xold",
-      scopes: ["instagram.profile"],
-      grantVersion: "1",
-      expiresAt: null,
-      revokedAt: null,
-    }),
-    listGrantsByUser: vi.fn().mockResolvedValue([]),
-    createGrant: vi.fn().mockResolvedValue({ grantId: "0xnew" }),
-    revokeGrant,
-  } as unknown as GatewayClient;
+function makeGateway(options: FakeGrantGatewayOptions = {}) {
+  const fake = createFakeGrantGateway(options);
+  fake.seed("0xold", ["instagram.profile"]);
+  return fake;
 }
 
 describe("PUT /v1/mcp/connections/:id/access", () => {
   let store: McpConnectionStore;
-  let gateway: GatewayClient;
+  let fake: ReturnType<typeof makeGateway>;
   let connectionId: string;
   let tokenHash: string;
 
-  async function build(ownerAccessEdit: boolean, g = gateway) {
+  async function build(ownerAccessEdit: boolean, g = fake) {
     const deps = {
       logger: pino({ level: "silent" }),
       serverOrigin: SERVER_ORIGIN,
       serverOwner: ownerWallet.address,
-      gateway: g,
+      gateway: g.gateway,
       gatewayConfig,
       serverSigner: {
         signGrantRegistration: vi.fn().mockResolvedValue("0xsig"),
@@ -100,7 +92,7 @@ describe("PUT /v1/mcp/connections/:id/access", () => {
 
   beforeEach(async () => {
     store = createInMemoryMcpConnectionStore();
-    gateway = makeGateway();
+    fake = makeGateway();
     const created = await createMcpConnection(
       { displayName: "Maple" },
       { store, publicOrigin: SERVER_ORIGIN },
@@ -121,7 +113,14 @@ describe("PUT /v1/mcp/connections/:id/access", () => {
       scopes: ["instagram.profile"],
     });
     expect(res.status).toBe(404);
-    expect(gateway.createGrant).not.toHaveBeenCalled();
+    expect(fake.counter()).toBe(1n);
+  });
+
+  it("answers 404 when the option is off, for unsigned and non-owner callers too", async () => {
+    const app = await build(false);
+    const scopes = ["instagram.profile"];
+    expect((await put(app, { scopes }, null)).status).toBe(404);
+    expect((await put(app, { scopes }, otherWallet)).status).toBe(404);
   });
 
   it("rejects a non-owner and an unsigned caller", async () => {
@@ -133,7 +132,7 @@ describe("PUT /v1/mcp/connections/:id/access", () => {
     expect((await put(app, { scopes }, null)).status).toBeGreaterThanOrEqual(
       401,
     );
-    expect(gateway.createGrant).not.toHaveBeenCalled();
+    expect(fake.counter()).toBe(1n);
     expect((await store.getById(connectionId))?.grants[0].grantId).toBe(
       "0xold",
     );
@@ -150,13 +149,12 @@ describe("PUT /v1/mcp/connections/:id/access", () => {
       grantedScopes: ["instagram.profile", "youtube.history"],
       revokeFailures: [],
     });
-    expect(gateway.createGrant).toHaveBeenCalledTimes(1);
-    expect(gateway.revokeGrant).toHaveBeenCalledTimes(1);
+    expect(fake.grants.get("0xold")?.revokedAt).toBeTruthy();
     const after = await store.getById(connectionId);
     expect(after?.tokenHash).toBe(tokenHash);
     expect(after?.grants).toEqual([
       {
-        grantId: "0xnew",
+        grantId: "0xnew1",
         scopes: ["instagram.profile", "youtube.history"],
       },
     ]);
@@ -171,18 +169,20 @@ describe("PUT /v1/mcp/connections/:id/access", () => {
     expect((await res.json()).grantedScopes).toEqual(["youtube.history"]);
   });
 
-  it("returns a revoke failure and keeps the new grant", async () => {
-    const failing = makeGateway(vi.fn().mockRejectedValue(new Error("down")));
+  it("answers 202 with the failure and keeps the old id retryable when a revoke is not proven", async () => {
+    const failing = makeGateway({ throwOnRevoke: () => true });
     const res = await put(await build(true, failing), {
       scopes: ["instagram.profile", "youtube.history"],
     });
-    expect(res.status).toBe(200);
-    expect((await res.json()).revokeFailures).toEqual([
-      { grantId: "0xold", error: "down" },
+    expect(res.status).toBe(202);
+    const body = await res.json();
+    expect(body.revokeFailures).toEqual([
+      { grantId: "0xold", error: "gateway down" },
     ]);
-    expect((await store.getById(connectionId))?.grants[0].grantId).toBe(
-      "0xnew",
-    );
+    expect(body.pendingRevocations).toEqual(["0xold"]);
+    const after = await store.getById(connectionId);
+    expect(after?.grants[0].grantId).toBe("0xnew1");
+    expect(after?.pendingRevocations).toEqual(["0xold"]);
   });
 
   it("rejects invalid bodies with 400", async () => {
@@ -191,6 +191,6 @@ describe("PUT /v1/mcp/connections/:id/access", () => {
       const res = await put(app, { scopes });
       expect(res.status).toBe(400);
     }
-    expect(gateway.createGrant).not.toHaveBeenCalled();
+    expect(fake.counter()).toBe(1n);
   });
 });

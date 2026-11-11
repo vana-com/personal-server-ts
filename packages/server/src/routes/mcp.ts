@@ -750,10 +750,16 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
       if (activityId) {
         deps.activityRecorder?.finish(activityId, { status: "succeeded" });
       }
-      return c.json({
-        ...toMcpConnectionView(result.connection),
-        revokeFailures: result.revokeFailures,
-      });
+      // 202, not a plain 200, while a superseded grant is not proven revoked:
+      // the new access is in force on MCP but the gateway may still hold the
+      // old grant. The ids stay on the connection and retry on the next edit.
+      return c.json(
+        {
+          ...toMcpConnectionView(result.connection),
+          revokeFailures: result.revokeFailures,
+        },
+        result.revokeFailures.length > 0 ? 202 : 200,
+      );
     } catch (caught) {
       const response = scopeRequestErrorResponse(c, caught);
       if (activityId) {

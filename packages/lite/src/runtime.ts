@@ -1880,6 +1880,15 @@ async function handleMcpRoute(input: {
 
   // Owner management endpoints
   if (pathname === ownerPrefix || pathname.startsWith(`${ownerPrefix}/`)) {
+    // With the option off the access route does not exist: 404 before auth,
+    // exactly as the Node server answers, so an unsigned or non-owner caller
+    // cannot tell the route from a missing one.
+    if (
+      !input.ownerAccessEdit &&
+      pathname.slice(ownerPrefix.length + 1).split("/")[1] === "access"
+    ) {
+      return errorResponse(404, "NOT_FOUND", "Not found");
+    }
     try {
       await input.auth.authorizeOwner(input.request);
     } catch (err) {
@@ -2059,10 +2068,14 @@ async function handleMcpRoute(input: {
         );
       }
       finish("succeeded");
-      return jsonResponse({
-        ...toMcpConnectionView(result.connection),
-        revokeFailures: result.revokeFailures,
-      });
+      // 202 while a superseded grant is not proven revoked; see the Node route.
+      return jsonResponse(
+        {
+          ...toMcpConnectionView(result.connection),
+          revokeFailures: result.revokeFailures,
+        },
+        { status: result.revokeFailures.length > 0 ? 202 : 200 },
+      );
     } catch (err) {
       if (err instanceof McpConnectionNotFoundError) {
         finish("failed", MCP_CONNECTION_NOT_FOUND);

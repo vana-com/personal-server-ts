@@ -55,6 +55,8 @@ export interface RevokeGrantContractInput {
   serverOwner?: `0x${string}`;
   serverSigner?: Partial<Pick<ServerSigner, "signGrantRevocation">>;
   grantId: string;
+  /** Lowest version to sign the revocation at; see `revokeGrantContract`. */
+  minRevocationVersion?: bigint;
 }
 
 export interface ListGrantsContractInput {
@@ -260,7 +262,11 @@ export async function revokeGrantContract(
       `Grant ${input.grantId} has unparseable grantVersion`,
     );
   }
-  const nextVersion = currentVersion + 1n;
+  // A caller that knows the pair's counter has moved past this grant (a
+  // replacement was registered) passes a floor, so the revocation is signed
+  // above the counter rather than at this grant's own version + 1.
+  const floor = input.minRevocationVersion ?? 0n;
+  const nextVersion = currentVersion + 1n > floor ? currentVersion + 1n : floor;
 
   const signature = await input.serverSigner.signGrantRevocation({
     grantorAddress: input.serverOwner,

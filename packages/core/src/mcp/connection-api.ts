@@ -542,6 +542,13 @@ export async function approveMcpScopeAccessRequest(
   const pending = requirePendingScopeRequest(connection);
   const approvedScopes = parseApprovedScopes(input.scopes, pending);
 
+  if (connection.accessEdit) {
+    throw new McpScopeRequestError(
+      "CONCURRENT_UPDATE",
+      "An access edit is in progress; retry.",
+      409,
+    );
+  }
   const live = await readLiveGrantState(connection, options.gateway);
   const grantedScopes = sortedUnique([...live.scopes, ...approvedScopes]);
   // Keep the live grant's expiry so approval never extends it (a perpetual
@@ -658,10 +665,23 @@ export interface SetMcpConnectionAccessOutput {
   connection: McpConnectionRecord;
   grantId: string;
   grantedScopes: string[];
-  /** Superseded grants that were revoked at the gateway. */
+  /** Superseded grants the gateway confirmed revoked (re-read, not assumed). */
   revokedGrantIds: string[];
-  /** Superseded grants whose revoke failed; the new grant stays in force. */
+  /**
+   * Superseded grants not proven revoked. They stay on the connection as
+   * `pendingRevocations` and are retried on the next edit; until then the
+   * narrowing is enforced on the MCP path only, not at the gateway.
+   */
   revokeFailures: McpRevokeFailure[];
+}
+
+/** An edit claim older than this is treated as abandoned (a crashed edit). */
+const ACCESS_EDIT_CLAIM_TTL_MS = 2 * 60 * 1000;
+
+function sameScopeSet(a: readonly string[], b: readonly string[]): boolean {
+  const left = sortedUnique(a);
+  const right = sortedUnique(b);
+  return left.length === right.length && left.every((v, i) => v === right[i]);
 }
 
 /**
@@ -674,6 +694,7 @@ export interface SetMcpConnectionAccessOutput {
 function parseExactAccessScopes(
   value: unknown,
   connection: McpConnectionRecord,
+  liveGatewayScopes: ReadonlySet<string>,
 ): string[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new McpScopeRequestError(
@@ -685,10 +706,13 @@ function parseExactAccessScopes(
   for (const raw of value) {
     const scope = typeof raw === "string" ? raw.trim() : "";
     if (isWriteScopeEntry(scope)) {
-      if (!connection.grants.some((grant) => grant.scopes.includes(scope))) {
+      // Kept only if a LIVE gateway grant holds it: the local record alone
+      // can name a revoked or expired grant. It must also be a concrete
+      // memory target, as approval requires.
+      if (!liveGatewayScopes.has(scope) || !isApprovableScope(scope)) {
         throw new McpScopeRequestError(
           "WRITE_SCOPE_NOT_GRANTED",
-          `Write scope ${scope} is not already granted; this route cannot add write access`,
+          `Write scope ${scope} is not held by a live grant; this route cannot add write access`,
         );
       }
     } else if (
@@ -712,149 +736,351 @@ function parseExactAccessScopes(
 /**
  * Owner sets a connection's access to exactly `scopes` (widen or narrow).
  *
- * The server signs ONE new grant over exactly that set, stores it as the
- * connection's only grant, then revokes every superseded grant at the
- * gateway. The connection id and the client's token do not change, so the
- * agent sees the new set on its next call. A failed revoke never rolls the
- * new grant back: the failure is returned for the caller to log.
+ * The gateway keeps ONE grant per (owner, grantee) and one version counter
+ * shared by registration and revocation, and the SDK swallows HTTP 409 on both
+ * `createGrant` and `revokeGrant`. So no gateway call here is trusted on its
+ * return value; each is followed by a re-read:
+ *
+ * 1. Claim the connection locally BEFORE registering, so two edits cannot both
+ *    register a grant.
+ * 2. Register ONE new grant, re-read it, and require its scopes to equal the
+ *    request and its id to be a new one. A lost local commit records the
+ *    registered grant for revocation instead of leaking it.
+ * 3. Revoke each superseded grant signed ABOVE the pair's counter, re-read it
+ *    and require `revokedAt`; re-read the new grant and require it to be
+ *    untouched. Anything unproven stays in `pendingRevocations`, is returned
+ *    as a failure and is retried on the next edit.
+ *
+ * The connection id and the client's token do not change.
  */
 export async function setMcpConnectionAccess(
   input: SetMcpConnectionAccessInput,
   options: SetMcpConnectionAccessOptions,
 ): Promise<SetMcpConnectionAccessOutput> {
-  const connection = await options.store.getById(input.connectionId);
-  if (!connection) throw new McpConnectionNotFoundError(input.connectionId);
-  if (connection.status !== "approved") {
-    throw new McpConnectionStateError(
-      connection.id,
-      connection.status,
-      "approved",
-    );
+  const first = await options.store.getById(input.connectionId);
+  if (!first) throw new McpConnectionNotFoundError(input.connectionId);
+  if (first.status !== "approved") {
+    throw new McpConnectionStateError(first.id, first.status, "approved");
   }
-  const scopes = parseExactAccessScopes(input.scopes, connection);
+  const live = await readLiveGrantState(first, options.gateway, options.now);
+  const scopes = parseExactAccessScopes(input.scopes, first, live.liveScopes);
+  // Revocations advance the shared counter without showing on any grant.
+  const floor = parseUint(first.grantVersionFloor) ?? 0n;
+  const nextVersion = (
+    BigInt(live.nextGrantVersion) > floor + 1n
+      ? BigInt(live.nextGrantVersion)
+      : floor + 1n
+  ).toString();
 
-  const live = await readLiveGrantState(connection, options.gateway);
+  // (1) Claim before any gateway write.
+  const claimId = crypto.randomUUID();
+  const claimed = await options.store.mutate(input.connectionId, (latest) => {
+    if (latest.status !== "approved") {
+      throw new McpConnectionStateError(latest.id, latest.status, "approved");
+    }
+    const held = latest.accessEdit;
+    if (
+      held &&
+      Date.parse(nowIso(options.now)) - Date.parse(held.startedAt) <
+        ACCESS_EDIT_CLAIM_TTL_MS
+    ) {
+      throw new McpScopeRequestError(
+        "CONCURRENT_UPDATE",
+        "Another access edit is in progress; retry.",
+        409,
+      );
+    }
+    if (JSON.stringify(latest.grants) !== JSON.stringify(first.grants)) {
+      throw new McpScopeRequestError(
+        "CONCURRENT_UPDATE",
+        "The connection's grants changed; retry.",
+        409,
+      );
+    }
+    return {
+      ...latest,
+      accessEdit: { claimId, startedAt: nowIso(options.now) },
+    };
+  });
+  if (!claimed) throw new McpConnectionNotFoundError(input.connectionId);
+  const connection = claimed;
+
+  /** Drop our claim and optionally park grants that must be revoked later. */
+  const release = async (park: readonly string[] = []) => {
+    await options.store.mutate(input.connectionId, (latest) => {
+      if (latest.accessEdit?.claimId !== claimId) return latest;
+      const pending = sortedUnique([
+        ...(latest.pendingRevocations ?? []),
+        ...park,
+      ]);
+      return {
+        ...latest,
+        accessEdit: undefined,
+        pendingRevocations: pending.length > 0 ? pending : undefined,
+      };
+    });
+  };
+
+  const oldIds = sortedUnique(connection.grants.map((g) => g.grantId));
   const expiresAt =
     live.expiry.kind === "inherit"
       ? live.expiry.expiresAt
       : mcpGrantDefaultExpiry(options.grantTtlSeconds, options.now);
 
-  let grantResult: Awaited<ReturnType<typeof createGrantContract>>;
+  // (2) Register, then check what the gateway actually holds.
+  let grantId: string;
   try {
-    grantResult = await createGrantContract({
-      gateway: options.gateway,
-      serverOwner: options.serverOwner,
-      serverSigner: options.serverSigner,
-      body: {
-        granteeAddress: connection.granteeAddress,
-        scopes,
-        grantVersion: live.nextGrantVersion,
-        ...(expiresAt !== undefined ? { expiresAt } : {}),
-      },
-    });
-  } catch (err) {
-    throw new McpScopeRequestError(
-      "GRANT_CREATION_FAILED",
-      err instanceof Error ? err.message : String(err),
-      502,
-    );
-  }
-  if (!grantResult.ok) {
-    throw new McpScopeRequestError(
-      "GRANT_CREATION_FAILED",
-      extractGrantErrorMessage(grantResult.body),
-      grantResult.status >= 500 ? 502 : grantResult.status === 409 ? 409 : 400,
-      grantResult.body,
-    );
-  }
-  const grantId = (grantResult.body as { grantId?: string }).grantId;
-  if (!grantId) {
-    throw new McpScopeRequestError(
-      "GRANT_CREATION_FAILED",
-      "Gateway did not return a grant id.",
-      502,
-      grantResult.body,
-    );
-  }
-
-  const decidedAt = nowIso(options.now);
-  const updated = await options.store.mutate(input.connectionId, (latest) => {
-    if (latest.status !== "approved") {
-      throw new McpConnectionStateError(latest.id, latest.status, "approved");
-    }
-    if (JSON.stringify(latest.grants) !== JSON.stringify(connection.grants)) {
-      throw new McpScopeRequestError(
-        "CONCURRENT_UPDATE",
-        "The connection's grants changed during the update; retry.",
-        409,
-      );
-    }
-    const next: McpConnectionGrant = { grantId, scopes };
-    const covers = (scope: string) => grantCoversScope(next, scope);
-    const pending = latest.scopeAccessRequest;
-    const stillMissing =
-      pending?.scopes.filter((scope) => !covers(scope)) ?? [];
-    const addedScopes = scopes.filter(
-      (scope) => !latest.grants.some((grant) => grantCoversScope(grant, scope)),
-    );
-    const decision: McpScopeAccessDecision = {
-      decision: "approved",
-      approvedScopes: addedScopes,
-      deniedScopes: stillMissing,
-      requestedAt: pending?.requestedAt ?? decidedAt,
-      decidedAt,
-    };
-    return {
-      ...latest,
-      grants: [next],
-      // Cleared only when the new set covers every requested scope; a
-      // narrower answer keeps the remainder pending, as approve does.
-      scopeAccessRequest:
-        pending && stillMissing.length > 0
-          ? { ...pending, scopes: stillMissing }
-          : undefined,
-      scopeAccessDecision: decision,
-    };
-  });
-  if (!updated) throw new McpConnectionNotFoundError(input.connectionId);
-
-  const supersededIds = sortedUnique(
-    connection.grants
-      .map((grant) => grant.grantId)
-      .filter((id) => id !== grantId),
-  );
-  const revokedGrantIds: string[] = [];
-  const revokeFailures: McpRevokeFailure[] = [];
-  for (const supersededId of supersededIds) {
+    let grantResult: Awaited<ReturnType<typeof createGrantContract>>;
     try {
-      const revoked = await revokeGrantContract({
+      grantResult = await createGrantContract({
         gateway: options.gateway,
         serverOwner: options.serverOwner,
         serverSigner: options.serverSigner,
-        grantId: supersededId,
+        body: {
+          granteeAddress: connection.granteeAddress,
+          scopes,
+          grantVersion: nextVersion,
+          ...(expiresAt !== undefined ? { expiresAt } : {}),
+        },
       });
-      if (revoked.ok) {
-        revokedGrantIds.push(supersededId);
-      } else {
-        revokeFailures.push({
-          grantId: supersededId,
-          error: `revoke failed with status ${revoked.status}`,
-        });
-      }
     } catch (err) {
-      revokeFailures.push({
-        grantId: supersededId,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      throw new McpScopeRequestError(
+        "GRANT_CREATION_FAILED",
+        err instanceof Error ? err.message : String(err),
+        502,
+      );
     }
+    if (!grantResult.ok) {
+      throw new McpScopeRequestError(
+        "GRANT_CREATION_FAILED",
+        extractGrantErrorMessage(grantResult.body),
+        grantResult.status >= 500
+          ? 502
+          : grantResult.status === 409
+            ? 409
+            : 400,
+        grantResult.body,
+      );
+    }
+    const returned = (grantResult.body as { grantId?: string }).grantId;
+    if (!returned) {
+      throw new McpScopeRequestError(
+        "GRANT_CREATION_FAILED",
+        "Gateway did not return a grant id.",
+        502,
+        grantResult.body,
+      );
+    }
+    grantId = returned;
+  } catch (err) {
+    await release();
+    throw err;
   }
+
+  const registered = await readGrant(options.gateway, grantId);
+  const registeredVersion = parseUint(registered?.grantVersion);
+  if (
+    !registered ||
+    registered.revokedAt ||
+    oldIds.includes(grantId) ||
+    !sameScopeSet(registered.scopes, scopes) ||
+    registeredVersion === null ||
+    registeredVersion < BigInt(nextVersion)
+  ) {
+    // The SDK treats a 409 on create as success and hands back an existing
+    // id. Never store that against the owner's requested set. A grant that is
+    // live and not already tracked is parked so it is revoked, not leaked.
+    await release(registered && !oldIds.includes(grantId) ? [grantId] : []);
+    throw new McpScopeRequestError(
+      "GRANT_CREATION_FAILED",
+      "The gateway did not register a grant with exactly the requested scopes; nothing was changed.",
+      409,
+    );
+  }
+
+  // (3a) Commit locally.
+  const decidedAt = nowIso(options.now);
+  let updated: McpConnectionRecord | null;
+  try {
+    updated = await options.store.mutate(input.connectionId, (latest) => {
+      if (latest.accessEdit?.claimId !== claimId) {
+        throw new McpScopeRequestError(
+          "CONCURRENT_UPDATE",
+          "The access edit was superseded; retry.",
+          409,
+        );
+      }
+      if (latest.status !== "approved") {
+        throw new McpConnectionStateError(latest.id, latest.status, "approved");
+      }
+      if (JSON.stringify(latest.grants) !== JSON.stringify(connection.grants)) {
+        throw new McpScopeRequestError(
+          "CONCURRENT_UPDATE",
+          "The connection's grants changed during the update; retry.",
+          409,
+        );
+      }
+      const next: McpConnectionGrant = { grantId, scopes };
+      const pending = latest.scopeAccessRequest;
+      const stillMissing =
+        pending?.scopes.filter((scope) => !grantCoversScope(next, scope)) ?? [];
+      const addedScopes = scopes.filter(
+        (scope) =>
+          !latest.grants.some((grant) => grantCoversScope(grant, scope)),
+      );
+      const decision: McpScopeAccessDecision = {
+        decision: "approved",
+        approvedScopes: addedScopes,
+        deniedScopes: stillMissing,
+        requestedAt: pending?.requestedAt ?? decidedAt,
+        decidedAt,
+      };
+      return {
+        ...latest,
+        grants: [next],
+        accessEdit: undefined,
+        grantVersionFloor: registeredVersion.toString(),
+        // Cleared only when the new set covers every requested scope; a
+        // narrower answer keeps the remainder pending, as approve does.
+        scopeAccessRequest:
+          pending && stillMissing.length > 0
+            ? { ...pending, scopes: stillMissing }
+            : undefined,
+        scopeAccessDecision: decision,
+        // Old grants stay recorded until proven revoked below.
+        pendingRevocations: sortedUnique([
+          ...(latest.pendingRevocations ?? []),
+          ...oldIds,
+        ]).filter((id) => id !== grantId),
+      };
+    });
+  } catch (err) {
+    // The grant is registered but the connection will not use it: park it.
+    await release([grantId]);
+    throw err;
+  }
+  if (!updated) {
+    throw new McpConnectionNotFoundError(input.connectionId);
+  }
+
+  // (3b) Revoke what was superseded, proving each step by re-reading.
+  const toRevoke = updated.pendingRevocations ?? [];
+  const revokedGrantIds: string[] = [];
+  const revokeFailures: McpRevokeFailure[] = [];
+  // The counter is shared: each revoke needs a version above the last one
+  // signed, starting above the new grant's own.
+  let signed = registeredVersion;
+  for (const oldId of toRevoke) {
+    signed += 1n;
+    const outcome = await revokeSuperseded({
+      options,
+      oldId,
+      newGrantId: grantId,
+      newScopes: scopes,
+      revocationVersion: signed,
+    });
+    if (outcome.ok) revokedGrantIds.push(oldId);
+    else revokeFailures.push({ grantId: oldId, error: outcome.error });
+  }
+  // Merge, do not overwrite: a later edit may have parked ids or raised the
+  // floor while the revokes above were running.
+  const final = await options.store.mutate(input.connectionId, (latest) => {
+    const remaining = (latest.pendingRevocations ?? []).filter(
+      (id) => !revokedGrantIds.includes(id),
+    );
+    const latestFloor = parseUint(latest.grantVersionFloor) ?? 0n;
+    return {
+      ...latest,
+      grantVersionFloor: (latestFloor > signed
+        ? latestFloor
+        : signed
+      ).toString(),
+      pendingRevocations: remaining.length > 0 ? remaining : undefined,
+    };
+  });
   return {
-    connection: updated,
+    connection: final ?? updated,
     grantId,
     grantedScopes: scopes,
     revokedGrantIds,
     revokeFailures,
   };
+}
+
+async function readGrant(
+  gateway: Pick<GatewayClient, "getGrant">,
+  grantId: string,
+) {
+  try {
+    return await gateway.getGrant(grantId);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Revoke one superseded grant without ever touching the new one, and trust
+ * only a re-read of the gateway. `revokeGrant` returns normally on a 409, and
+ * the revocation signs the old grant's version + 1, which after a replacement
+ * equals the new grant's version; so the revocation is signed above the
+ * counter and the result is verified, never assumed.
+ */
+async function revokeSuperseded(args: {
+  options: SetMcpConnectionAccessOptions;
+  oldId: string;
+  newGrantId: string;
+  newScopes: readonly string[];
+  /** Strictly above the pair's counter: see the caller. */
+  revocationVersion: bigint;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const { options, oldId, newGrantId, newScopes } = args;
+  if (oldId === newGrantId) {
+    return { ok: false, error: "refused: id is the new grant" };
+  }
+  try {
+    const before = await options.gateway.getGrant(oldId);
+    if (!before || before.revokedAt) return { ok: true };
+    const current = await options.gateway.getGrant(newGrantId);
+    const counter = parseUint(current?.grantVersion);
+    if (
+      !current ||
+      current.revokedAt ||
+      counter === null ||
+      !sameScopeSet(current.scopes, newScopes)
+    ) {
+      return { ok: false, error: "new grant not confirmed live; not revoking" };
+    }
+    const revoked = await revokeGrantContract({
+      gateway: options.gateway,
+      serverOwner: options.serverOwner,
+      serverSigner: options.serverSigner,
+      grantId: oldId,
+      minRevocationVersion:
+        args.revocationVersion > counter
+          ? args.revocationVersion
+          : counter + 1n,
+    });
+    if (!revoked.ok) {
+      return {
+        ok: false,
+        error: `revoke failed with status ${revoked.status}`,
+      };
+    }
+    const after = await options.gateway.getGrant(oldId);
+    if (after && !after.revokedAt) {
+      return { ok: false, error: "gateway still shows the grant live" };
+    }
+    const newAfter = await options.gateway.getGrant(newGrantId);
+    if (!newAfter || newAfter.revokedAt) {
+      return { ok: false, error: "new grant no longer live after the revoke" };
+    }
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 /** Owner declines the pending request; the decision stays for the client. */
@@ -952,6 +1178,8 @@ function parseApprovedScopes(
 interface LiveGrantState {
   /** Scopes the connection holds now: its record plus the live gateway grant. */
   scopes: string[];
+  /** Scopes held by an unrevoked, unexpired gateway grant only. */
+  liveScopes: Set<string>;
   nextGrantVersion: string;
   /**
    * The expiry approval must carry over so it never extends access:
@@ -971,7 +1199,10 @@ interface LiveGrantState {
 async function readLiveGrantState(
   connection: McpConnectionRecord,
   gateway: Pick<GatewayClient, "getGrant">,
+  now: () => Date = () => new Date(),
 ): Promise<LiveGrantState> {
+  const nowSeconds = Math.floor(now().getTime() / 1000);
+  const liveScopes = new Set<string>();
   const grantIds = sortedUnique(
     connection.grants.map((grant) => grant.grantId),
   );
@@ -1002,6 +1233,12 @@ async function readLiveGrantState(
     for (const scope of live.scopes) scopes.add(scope);
     anyLive = true;
     const liveExpiry = parseExpirySeconds(live.expiresAt);
+    if (
+      !live.expired &&
+      (liveExpiry === undefined || liveExpiry > nowSeconds)
+    ) {
+      for (const scope of live.scopes) liveScopes.add(scope);
+    }
     if (liveExpiry === undefined) {
       anyPerpetual = true;
     } else {
@@ -1015,6 +1252,7 @@ async function readLiveGrantState(
   }
   return {
     scopes: sortedUnique(scopes),
+    liveScopes,
     nextGrantVersion: (maxVersion + 1n).toString(),
     expiry: !anyLive
       ? { kind: "none" }
@@ -1114,6 +1352,8 @@ export interface McpConnectionView {
   scopeAccessRequest?: McpScopeAccessRequestView;
   /** Owner's answer to the most recent scope request. */
   scopeAccessDecision?: McpScopeAccessDecision;
+  /** Superseded gateway grants not yet proven revoked; see the edit route. */
+  pendingRevocations?: string[];
   createdAt: string;
   approvedAt?: string;
   revokedAt?: string;
@@ -1145,6 +1385,9 @@ export function toMcpConnectionView(
       ? toMcpScopeAccessRequestView(record.scopeAccessRequest)
       : undefined,
     scopeAccessDecision: record.scopeAccessDecision,
+    ...(record.pendingRevocations?.length
+      ? { pendingRevocations: record.pendingRevocations }
+      : {}),
     createdAt: record.createdAt,
     approvedAt: record.approvedAt,
     revokedAt: record.revokedAt,
