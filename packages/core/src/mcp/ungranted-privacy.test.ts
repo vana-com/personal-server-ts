@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { alwaysLive } from "../test-utils/live-grants.js";
 import {
   handleMcpStreamableHttpRequest,
   type HandleMcpRequestOptions,
@@ -94,6 +95,7 @@ async function rpc(
     {
       connection: conn,
       readClient,
+      verifyGrantsLive: alwaysLive(conn),
       exposeUnsharedScopes: false,
       scopeRequestGuidance: true,
       requestableScopes: CATALOG,
@@ -714,5 +716,62 @@ describe("search results say what they cover", () => {
       expect(body).not.toContain("coverageNote");
       expect(body).not.toContain(SENTENCE);
     }
+  });
+});
+
+describe("the owner's last answer after a grant dies", () => {
+  const decision = {
+    decision: "approved" as const,
+    approvedScopes: ["youtube.history"],
+    deniedScopes: [],
+    requestedAt: "2026-06-05T00:00:00Z",
+    decidedAt: "2026-06-05T00:01:00Z",
+  };
+  const withDead = (): McpConnectionRecord => ({
+    ...connection(),
+    grants: [
+      { grantId: "g-live", scopes: ["chatgpt.conversations"] },
+      { grantId: "g-dead", scopes: ["youtube.history"] },
+    ],
+    scopeAccessDecision: decision,
+  });
+  const neverGranted = (): McpConnectionRecord => ({
+    ...connection(),
+    grants: [{ grantId: "g-live", scopes: ["chatgpt.conversations"] }],
+  });
+  const onlyLive = { verifyGrantsLive: async () => ["g-live"] };
+
+  it.each([
+    ["list_granted_scopes", {}],
+    ["request_scope_access", { scopes: ["spotify.library"] }],
+  ])("%s does not echo an approval whose grant is gone", async (name, args) => {
+    const call = async (conn: McpConnectionRecord, extra: object) =>
+      normalize(
+        await rpc(
+          ownerA(),
+          "tools/call",
+          tool(name, args).params,
+          {
+            ...extra,
+            requestScopeAccess: (input: never) => {
+              let record = conn;
+              const store = {
+                mutate: async (
+                  _id: string,
+                  fn: (r: McpConnectionRecord) => McpConnectionRecord,
+                ) => (record = fn(record)),
+              } as never;
+              return requestMcpScopeAccess(
+                { connectionId: conn.id, ...(input as object) },
+                { store },
+              );
+            },
+          },
+          conn,
+        ),
+      );
+    const gone = await call(withDead(), onlyLive);
+    expect(gone).toBe(await call(neverGranted(), {}));
+    expect(gone).not.toContain("youtube.history");
   });
 });

@@ -97,6 +97,7 @@ import {
   MCP_CONNECTION_NOT_FOUND,
   MCP_SCOPE_REQUEST_NOT_FOUND,
   MCP_SCOPE_REQUEST_TOKEN_HEADER,
+  McpInvalidScopeError,
   readMcpScopeRequestWithToken,
   getMcpConnectionView,
   McpConnectionNotFoundError,
@@ -1866,7 +1867,7 @@ async function handleMcpRoute(input: {
         connectionId,
         token: input.request.headers.get(MCP_SCOPE_REQUEST_TOKEN_HEADER),
       },
-      { store: input.store, now: input.now },
+      { store: input.store, gateway: input.gateway, now: input.now },
     );
     if (!view) {
       const notFound = errorResponse(
@@ -1965,6 +1966,9 @@ async function handleMcpRoute(input: {
         }
         if (err instanceof McpConnectionStateError) {
           return errorResponse(409, "INVALID_STATE", err.message);
+        }
+        if (err instanceof McpInvalidScopeError) {
+          return errorResponse(400, err.code, err.message);
         }
         throw err;
       }

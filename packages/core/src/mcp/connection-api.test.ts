@@ -672,10 +672,15 @@ describe("mcp/connection-api scope request answers", () => {
       { displayName: "Claude" },
       { store, publicOrigin: PUBLIC_ORIGIN },
     );
+    // Seeded straight into the store: some tests need a grant approval refuses.
     await approveMcpConnection(
-      { connectionId: created.connectionId, grants },
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "seed", scopes: ["instagram.profile"] }],
+      },
       { store },
     );
+    await store.update(created.connectionId, { grants });
     await requestMcpScopeAccess(
       {
         connectionId: created.connectionId,
@@ -1113,6 +1118,40 @@ describe("mcp/connection-api scope request answers", () => {
 
 describe("mcp/connection-api scope request read token", () => {
   const T0 = new Date("2026-10-07T10:00:00.000Z");
+  const grantState = (overrides: Record<string, unknown> = {}) => ({
+    id: "g1",
+    scopes: ["instagram.profile"],
+    grantVersion: "1",
+    expiresAt: null,
+    revokedAt: null,
+    ...overrides,
+  });
+  const liveG1 = { getGrant: async () => grantState() } as never;
+
+  it("names no scope from a revoked, expired, missing or unverifiable grant", async () => {
+    const { store, connectionId, requested } = await connectionWithRequest();
+    const names = async (gateway: unknown) =>
+      (
+        await readMcpScopeRequestWithToken(
+          { connectionId, token: requested.readToken },
+          { store, gateway: gateway as never, now: () => T0 },
+        )
+      )?.grantedScopes;
+    expect(await names(liveG1)).toEqual(["instagram.profile"]);
+    for (const dead of [
+      { getGrant: async () => grantState({ revokedAt: "2026-10-01" }) },
+      { getGrant: async () => grantState({ expired: true }) },
+      { getGrant: async () => null },
+      {
+        getGrant: async () => {
+          throw new Error("down");
+        },
+      },
+      undefined,
+    ]) {
+      expect(await names(dead)).toEqual([]);
+    }
+  });
 
   async function connectionWithRequest() {
     const store = createInMemoryMcpConnectionStore();
@@ -1162,7 +1201,7 @@ describe("mcp/connection-api scope request read token", () => {
     const read = (at: number, token = requested.readToken) =>
       readMcpScopeRequestWithToken(
         { connectionId, token },
-        { store, now: () => new Date(at) },
+        { store, gateway: liveG1, now: () => new Date(at) },
       );
     const view = await read(T0.getTime());
     expect(view).toEqual({
@@ -1195,7 +1234,7 @@ describe("mcp/connection-api scope request read token", () => {
           connectionId: denied.connectionId,
           token: denied.requested.readToken,
         },
-        { store: denied.store, now: () => T0 },
+        { store: denied.store, gateway: liveG1, now: () => T0 },
       ),
     ).toBeNull();
 
@@ -1219,14 +1258,14 @@ describe("mcp/connection-api scope request read token", () => {
     const replaced = await connectionWithRequest();
     const again = await requestMcpScopeAccess(
       { connectionId: replaced.connectionId, scopes: ["github.profile"] },
-      { store: replaced.store, now: () => T0 },
+      { store: replaced.store, gateway: liveG1, now: () => T0 },
     );
     expect(again.readToken).toBeDefined();
     expect(again.readToken).not.toBe(replaced.requested.readToken);
     const readReplaced = (token?: string) =>
       readMcpScopeRequestWithToken(
         { connectionId: replaced.connectionId, token },
-        { store: replaced.store, now: () => T0 },
+        { store: replaced.store, gateway: liveG1, now: () => T0 },
       );
     expect(await readReplaced(replaced.requested.readToken)).toBeNull();
     expect(await readReplaced(again.readToken)).not.toBeNull();
@@ -1247,7 +1286,7 @@ describe("mcp/connection-api scope request read token", () => {
     expect(
       await readMcpScopeRequestWithToken(
         { connectionId, token: requested.readToken },
-        { store, now: () => T0 },
+        { store, gateway: liveG1, now: () => T0 },
       ),
     ).not.toBeNull();
   });
@@ -1497,5 +1536,85 @@ describe("mcp/connection-api superseded OAuth authorizations", () => {
       ),
     ).rejects.toMatchObject({ code: "invalid_state" });
     expect(gateway.createGrant).not.toHaveBeenCalled();
+  });
+});
+
+describe("mcp/connection-api grants never resurrect and never store a bare wildcard", () => {
+  const T0 = new Date("2026-10-07T10:00:00.000Z");
+  const PUBLIC_ORIGIN = "https://ps.example";
+  const dead = [
+    ["revoked", { revokedAt: "2026-10-01T00:00:00Z" }],
+    ["expired", { expired: true }],
+    ["past its expiry", { expiresAt: "1000" }],
+  ] as const;
+
+  it.each(dead)(
+    "approving a new scope does not carry the scopes of a %s grant",
+    async (_name, state) => {
+      const store = createInMemoryMcpConnectionStore();
+      const created = await createMcpConnection(
+        { displayName: "Claude" },
+        { store, publicOrigin: PUBLIC_ORIGIN },
+      );
+      await approveMcpConnection(
+        {
+          connectionId: created.connectionId,
+          grants: [{ grantId: "g-old", scopes: ["youtube.history"] }],
+        },
+        { store },
+      );
+      await requestMcpScopeAccess(
+        { connectionId: created.connectionId, scopes: ["spotify.profile"] },
+        { store, publicOrigin: PUBLIC_ORIGIN, now: () => T0 },
+      );
+      const gateway = {
+        getBuilder: vi.fn(async () => ({ id: "0xbuilder" })),
+        getGrant: vi.fn(async () => ({
+          id: "g-old",
+          scopes: ["youtube.history"],
+          grantVersion: "3",
+          expiresAt: null,
+          revokedAt: null,
+          ...state,
+        })),
+        createGrant: vi.fn(async () => ({ grantId: "g-new" })),
+      };
+      const out = await approveMcpScopeAccessRequest(
+        { connectionId: created.connectionId, scopes: ["spotify.profile"] },
+        {
+          store,
+          gateway: gateway as never,
+          serverOwner: "0xowner" as `0x${string}`,
+          serverSigner: {
+            signGrantRegistration: vi.fn(async () => "0xsig" as `0x${string}`),
+          } as never,
+          now: () => T0,
+        },
+      );
+      expect(out.grantedScopes).toEqual(["spotify.profile"]);
+      expect((await store.getById(created.connectionId))?.grants).toEqual([
+        { grantId: "g-new", scopes: ["spotify.profile"] },
+      ]);
+    },
+  );
+
+  it("the owner approve refuses a bare wildcard, an empty scope and a wildcard write", async () => {
+    for (const scopes of [["*"], [""], ["write:memory.*"], ["ok.scope", "*"]]) {
+      const store = createInMemoryMcpConnectionStore();
+      const created = await createMcpConnection(
+        { displayName: "Claude" },
+        { store, publicOrigin: PUBLIC_ORIGIN },
+      );
+      await expect(
+        approveMcpConnection(
+          {
+            connectionId: created.connectionId,
+            grants: [{ grantId: "g", scopes }],
+          },
+          { store },
+        ),
+      ).rejects.toMatchObject({ code: "invalid_scope", status: 400 });
+      expect((await store.getById(created.connectionId))?.grants).toEqual([]);
+    }
   });
 });

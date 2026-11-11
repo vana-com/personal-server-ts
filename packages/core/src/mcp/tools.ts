@@ -1018,12 +1018,30 @@ const listGrantedScopes: McpToolDefinition = {
             ),
           }
         : {}),
-      ...(connection.scopeAccessDecision
-        ? { lastScopeDecision: connection.scopeAccessDecision }
+      ...(liveDecision(connection)
+        ? { lastScopeDecision: liveDecision(connection) }
         : {}),
     });
   },
 };
+
+/**
+ * The owner's last answer, as the client may see it. An approval names only
+ * scopes this connection still holds live; one whose grants are gone reads as
+ * no decision at all, the same as a connection never granted.
+ */
+function liveDecision(
+  connection: McpConnectionRecord,
+): McpConnectionRecord["scopeAccessDecision"] {
+  const decision = connection.scopeAccessDecision;
+  if (decision?.decision !== "approved") return decision;
+  const approvedScopes = decision.approvedScopes.filter((scope) =>
+    resolveGrantForScope(connection, scope),
+  );
+  return approvedScopes.length > 0
+    ? { ...decision, approvedScopes }
+    : undefined;
+}
 
 const requestScopeAccess: McpToolDefinition = {
   name: "request_scope_access",
@@ -1038,7 +1056,7 @@ const requestScopeAccess: McpToolDefinition = {
     const requestedScopes = normalizeScopeListInput(args.scopes);
     // Read before recording: a new request must not hide the owner's last
     // answer from the agent that is checking back.
-    const previousDecision = connection.scopeAccessDecision;
+    const previousDecision = liveDecision(connection);
     let effectiveConnection = connection;
     let grantedRequestedScopes = requestedScopes.filter((scope) =>
       connectionCoversRequestedScope(effectiveConnection, scope),

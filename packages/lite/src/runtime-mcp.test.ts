@@ -612,6 +612,49 @@ describe("createPsLiteRuntime + scope-request answers", () => {
     );
     expect((await read(token)).status).toBe(404);
   });
+
+  it("names no granted scope on the approval link once the grant is revoked", async () => {
+    const bundle = buildRuntime({
+      grantId: "grant-mcp-1",
+      scopeRequestApprovalUrl: vanaWebMcpScopeRequestApprovalUrl(),
+    });
+    const { id, tool } = await requested(bundle);
+    const token =
+      new URLSearchParams(new URL(tool.approvalUrl).hash.slice(1)).get("t") ??
+      "";
+    vi.mocked(bundle.gateway.getGrant).mockResolvedValue({
+      id: "grant-mcp-1",
+      revokedAt: "2026-11-01T00:00:00.000Z",
+      scopes: ["instagram.profile"],
+      grantVersion: "1",
+      expiresAt: null,
+    } as never);
+    const res = await bundle.runtime.fetch(
+      new Request(`${SERVER_ORIGIN}/v1/mcp/connections/${id}/scope-request`, {
+        headers: { [MCP_SCOPE_REQUEST_TOKEN_HEADER]: token },
+      }),
+    );
+    expect((await res.json()).grantedScopes).toEqual([]);
+  });
+
+  it("the owner approve refuses a bare wildcard grant with a 400", async () => {
+    const bundle = buildRuntime({});
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store: bundle.store, publicOrigin: SERVER_ORIGIN },
+    );
+    const res = await bundle.runtime.fetch(
+      await ownerSigned(
+        "POST",
+        `/v1/mcp/connections/${created.connectionId}/approve`,
+        { grants: [{ grantId: "g", scopes: ["*", ""] }] },
+      ),
+    );
+    expect(res.status).toBe(400);
+    expect((await bundle.store.getById(created.connectionId))?.grants).toEqual(
+      [],
+    );
+  });
 });
 
 describe("createPsLiteRuntime + MCP OAuth routes", () => {
@@ -939,10 +982,7 @@ describe("MCP read_scope tool through Lite runtime", () => {
 });
 
 describe("createPsLiteRuntime + notShared grant liveness", () => {
-  async function listGrantedScopes(
-    bundle: RuntimeBundle,
-    grant: { expiresAt?: number } = {},
-  ) {
+  async function listGrantedScopes(bundle: RuntimeBundle) {
     const created = await createMcpConnection(
       { displayName: "Claude" },
       { store: bundle.store, publicOrigin: SERVER_ORIGIN },
@@ -954,17 +994,6 @@ describe("createPsLiteRuntime + notShared grant liveness", () => {
         { grants: [{ grantId: "grant-mcp-1", scopes: ["instagram.profile"] }] },
       ),
     );
-    if (grant.expiresAt !== undefined) {
-      await bundle.store.update(created.connectionId, {
-        grants: [
-          {
-            grantId: "grant-mcp-1",
-            scopes: ["instagram.profile"],
-            expiresAt: grant.expiresAt,
-          },
-        ],
-      });
-    }
     const res = await bundle.runtime.fetch(
       new Request(
         `${SERVER_ORIGIN}/mcp/${encodeURIComponent(created.connectionToken)}`,
@@ -1020,18 +1049,8 @@ describe("createPsLiteRuntime + notShared grant liveness", () => {
     expect((await listGrantedScopes(bundle)).scopes).toEqual([]);
   });
 
-  it("without a gateway, serves a grant the record shows unexpired", async () => {
+  it("without a gateway, serves no scope, whatever the record shows", async () => {
     const bundle = buildRuntime({ noGateway: true });
-    const body = await listGrantedScopes(bundle);
-    expect(body.scopes.map((s: { scope: string }) => s.scope)).toEqual([
-      "instagram.profile",
-    ]);
-  });
-
-  it("without a gateway, serves nothing for a grant the record shows expired", async () => {
-    const bundle = buildRuntime({ noGateway: true });
-    expect(
-      (await listGrantedScopes(bundle, { expiresAt: 1000 })).scopes,
-    ).toEqual([]);
+    expect((await listGrantedScopes(bundle)).scopes).toEqual([]);
   });
 });

@@ -1,4 +1,5 @@
 import { resolveGrantForRawScopeResource } from "./resources.js";
+import { alwaysLive } from "../test-utils/live-grants.js";
 import { describe, expect, it, vi } from "vitest";
 import { McpActivityRecorder } from "./activity.js";
 import {
@@ -10,6 +11,7 @@ import {
 import {
   handleMcpHandshake,
   handleMcpStreamableHttpRequest,
+  type HandleMcpRequestOptions,
   MCP_SERVER_INSTRUCTIONS,
 } from "./server.js";
 import type { McpConnectionRecord } from "./types.js";
@@ -63,6 +65,18 @@ function createMinimalReadClient(
   };
 }
 
+/** The server requires a verifier; these tests are not about liveness. */
+function handle(
+  request: Request,
+  options: Omit<HandleMcpRequestOptions, "verifyGrantsLive"> &
+    Partial<Pick<HandleMcpRequestOptions, "verifyGrantsLive">>,
+) {
+  return handleMcpStreamableHttpRequest(request, {
+    verifyGrantsLive: alwaysLive(options.connection),
+    ...options,
+  });
+}
+
 describe("mcp/tools", () => {
   it("names the data scope behind each write grant, so hydration fetches what remember rewrites", () => {
     const connection = {
@@ -81,7 +95,7 @@ describe("mcp/tools", () => {
   });
 
   it("keeps the MCP tools/list response parseable and under the tunnel budget", async () => {
-    const response = await handleMcpStreamableHttpRequest(
+    const response = await handle(
       new Request("http://localhost/mcp/test-token", {
         method: "POST",
         headers: {
@@ -131,9 +145,10 @@ describe("mcp/tools", () => {
         }),
       });
 
-    const full = await handleMcpStreamableHttpRequest(initialize(), {
+    const full = await handle(initialize(), {
       connection: createConnection(),
       readClient: createMinimalReadClient(),
+      verifyGrantsLive: async () => [],
     });
     const handshake = await handleMcpHandshake(initialize());
 
@@ -162,7 +177,7 @@ describe("mcp/tools", () => {
   });
 
   it("advertises no timeoutMs larger than the dispatcher will allow", async () => {
-    const response = await handleMcpStreamableHttpRequest(
+    const response = await handle(
       new Request("http://localhost/mcp/test-token", {
         method: "POST",
         headers: {
@@ -206,7 +221,7 @@ describe("mcp/tools", () => {
 
   it("records activity for MCP HTTP tool calls", async () => {
     const activityRecorder = new McpActivityRecorder();
-    const response = await handleMcpStreamableHttpRequest(
+    const response = await handle(
       new Request("http://localhost/mcp/test-token", {
         method: "POST",
         headers: {
@@ -245,7 +260,7 @@ describe("mcp/tools", () => {
   });
 
   it("serves raw scope files through MCP resources/read", async () => {
-    const response = await handleMcpStreamableHttpRequest(
+    const response = await handle(
       new Request("http://localhost/mcp/test-token", {
         method: "POST",
         headers: {
@@ -302,7 +317,7 @@ describe("mcp/tools", () => {
     });
 
     const started = Date.now();
-    const response = await handleMcpStreamableHttpRequest(
+    const response = await handle(
       new Request("http://localhost/mcp/test-token", {
         method: "POST",
         headers: {

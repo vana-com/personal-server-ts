@@ -64,6 +64,7 @@ import {
   McpScopeRequestError,
   MCP_SCOPE_REQUEST_NOT_FOUND,
   MCP_SCOPE_REQUEST_TOKEN_HEADER,
+  McpInvalidScopeError,
   readMcpScopeRequestWithToken,
   redeemMcpOAuthAuthorizationCode,
   refreshMcpOAuthToken,
@@ -472,6 +473,7 @@ export function executeMcpConnectionRequest(
     }),
     writeClient: buildWriteClient(deps, granteeAccount, dataApiDeps.storage),
     activityRecorder: deps.activityRecorder,
+    verifyGrantsLive: () => liveMcpGrantIds(connection, deps.gateway),
     // Denied tool calls are recorded by the wrapper, not the read path.
     reporterDeps: {
       readFulfillmentReporter: deps.readFulfillmentReporter,
@@ -582,7 +584,7 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
         connectionId: c.req.param("id"),
         token: c.req.header(MCP_SCOPE_REQUEST_TOKEN_HEADER),
       },
-      { store },
+      { store, gateway: deps.gateway },
     );
     c.header("Cache-Control", "no-store");
     if (!view) {
@@ -626,6 +628,9 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
       }
       if (caught instanceof McpConnectionStateError) {
         return c.json(jsonError(409, "INVALID_STATE", caught.message), 409);
+      }
+      if (caught instanceof McpInvalidScopeError) {
+        return c.json(jsonError(400, caught.code, caught.message), 400);
       }
       throw caught;
     }

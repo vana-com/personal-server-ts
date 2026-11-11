@@ -125,13 +125,17 @@ describe("MCP remember tool", () => {
     );
     const record = (await store.getById(created.connectionId))!;
     const { gateway, revoke } = makeGateway(record.granteeAddress, scopes);
+    // Seeded into the store: some cases hold a grant approval itself refuses.
     await approveMcpConnection(
       {
         connectionId: created.connectionId,
-        grants: [{ grantId: GRANT_ID, scopes }],
+        grants: [{ grantId: GRANT_ID, scopes: ["seed.scope"] }],
       },
       { store },
     );
+    await store.update(created.connectionId, {
+      grants: [{ grantId: GRANT_ID, scopes }],
+    });
     const accessLogWriter = createAccessLog();
     // Mounted like createApp: the data route redeems write sessions from the
     // same store the MCP write client puts its session into.

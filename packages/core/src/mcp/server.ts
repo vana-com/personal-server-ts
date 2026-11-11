@@ -57,10 +57,10 @@ export interface HandleMcpRequestOptions {
    * connection token outlives its grants. It answers the live grant ids; the
    * call keeps only those grants, and if the check fails or times out the
    * call runs as if the connection held no grant at all.
-   * Absent: no check (tests and hosts without a gateway). See
+   * Required: a serving path that forgets it must not compile. See
    * `McpToolContext.verifyGrantsLive`.
    */
-  verifyGrantsLive?: McpToolContext["verifyGrantsLive"];
+  verifyGrantsLive: NonNullable<McpToolContext["verifyGrantsLive"]>;
   /** Host option; see `McpToolContext.scopeRequestGuidance`. Default off. */
   scopeRequestGuidance?: McpToolContext["scopeRequestGuidance"];
   /** Host option; see `McpToolContext.requestableScopes`. */
@@ -498,7 +498,6 @@ export function createMcpServerForConnection(
    * then answers as it does for a scope never granted, before any read.
    */
   async function liveContext(): Promise<McpToolContext> {
-    if (!options.verifyGrantsLive) return ctx;
     const live = await liveGrantIds(options.verifyGrantsLive);
     const grants = ctx.connection.grants.filter((g) =>
       live.includes(g.grantId),

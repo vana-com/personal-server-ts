@@ -354,6 +354,18 @@ describe("MCP owner connection routes", () => {
     expect(res.status).toBe(400);
     expect((await res.json()).error.errorCode).toBe("GRANTS_REQUIRED");
   });
+
+  it("rejects approve with a bare wildcard or an empty scope (400 invalid_scope)", async () => {
+    const create = await postOwner("/v1/mcp/connections", {});
+    const created = await create.json();
+    const res = await postOwner(
+      `/v1/mcp/connections/${created.connectionId}/approve`,
+      { grants: [{ grantId: "g", scopes: ["*", ""] }] },
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error.errorCode).toBe("invalid_scope");
+    expect((await store.getById(created.connectionId))?.grants).toEqual([]);
+  });
 });
 
 describe("MCP owner scope-request answers", () => {
@@ -716,6 +728,20 @@ describe("MCP owner scope-request answers", () => {
     ]);
   });
 
+  it("GET /:id/scope-request names no granted scope once the grant is revoked", async () => {
+    const { connectionId } = await connectionWithRequest();
+    vi.mocked(gateway.getGrant).mockResolvedValue({
+      id: "grant-1",
+      scopes: ["instagram.profile"],
+      grantVersion: "1",
+      expiresAt: null,
+      revokedAt: "2026-11-01T00:00:00.000Z",
+    } as never);
+    const res = await tokenRead(connectionId, lastReadToken());
+    expect(res.status).toBe(200);
+    expect((await res.json()).grantedScopes).toEqual([]);
+  });
+
   it("GET /:id/scope-request answers one 404 for a wrong, missing or misplaced token", async () => {
     const first = await connectionWithRequest();
     const firstToken = lastReadToken();
@@ -968,6 +994,58 @@ describe("MCP /mcp/:token route", () => {
 
     expect(response.status).toBe(200);
     expect(await response.text()).toContain('"requestRecorded":true');
+  });
+
+  it("serves no scope on the enclave dispatch path once the grant is revoked", async () => {
+    const created = await createMcpConnection(
+      { displayName: "TEE Claude" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-1", scopes: ["instagram.profile"] }],
+      },
+      { store },
+    );
+    const connection = (await store.getById(created.connectionId))!;
+    const { gateway: revoked, grant } = makeGatewayForGrantee({
+      granteeAddress: connection.granteeAddress,
+      grantId: "grant-1",
+      scopes: ["instagram.profile"],
+    });
+    (grant as { revokedAt: string | null }).revokedAt =
+      "2026-11-01T00:00:00.000Z";
+    const response = await executeMcpConnectionRequest(
+      new Request("https://worker.local/mcp", {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "list_granted_scopes", arguments: {} },
+        }),
+      }),
+      connection,
+      {
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway: revoked,
+        accessLogWriter: createMockAccessLogWriter(),
+        connectionStore: createInMemoryMcpConnectionStore(),
+        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        hierarchyOptions: { dataDir: "/tmp" },
+      },
+    );
+    const body = (await response.json()) as {
+      result: { content: Array<{ text: string }> };
+    };
+    expect(JSON.parse(body.result.content[0]!.text).scopes).toEqual([]);
   });
 
   it("returns OAuth discovery challenge on stable /mcp without bearer token", async () => {

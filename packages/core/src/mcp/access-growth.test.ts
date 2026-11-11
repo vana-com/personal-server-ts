@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { alwaysLive } from "../test-utils/live-grants.js";
 import { MCP_TOOLS, type McpToolContext } from "./tools.js";
 import {
   handleMcpStreamableHttpRequest,
@@ -186,6 +187,7 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
       const options = {
         connection: connection(),
         readClient: readClient(),
+        verifyGrantsLive: alwaysLive(connection()),
         exposeUnsharedScopes,
       };
       const init = (await (
@@ -455,6 +457,7 @@ describe("scope request guidance (mcpScopeRequestGuidance)", () => {
         await readRawScopeResource(uri, {
           connection: connection(),
           readClient: readClient(),
+          verifyGrantsLive: alwaysLive(connection()),
           scopeRequestGuidance,
         });
       } catch (err) {
