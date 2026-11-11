@@ -23,7 +23,7 @@ import {
   MCP_TOOLS,
   resolveGrantForScope,
   SCOPE_REQUEST_GUIDANCE_TEXT,
-  grantsStillLive,
+  liveGrantIds,
   UNSHARED_SCOPES_INSTRUCTIONS,
   requestableScopesDescription,
   UNSHARED_SCOPES_TOOL_DESCRIPTION,
@@ -54,8 +54,9 @@ export interface HandleMcpRequestOptions {
   exposeUnsharedScopes?: McpToolContext["exposeUnsharedScopes"];
   /**
    * Live-grant check, run before every tool call and resource read. A
-   * connection token outlives its grants, so when it answers false (or fails,
-   * or times out) the call runs as if the connection held no grant at all.
+   * connection token outlives its grants. It answers the live grant ids; the
+   * call keeps only those grants, and if the check fails or times out the
+   * call runs as if the connection held no grant at all.
    * Absent: no check (tests and hosts without a gateway). See
    * `McpToolContext.verifyGrantsLive`.
    */
@@ -498,11 +499,18 @@ export function createMcpServerForConnection(
    */
   async function liveContext(): Promise<McpToolContext> {
     if (!options.verifyGrantsLive) return ctx;
-    if (await grantsStillLive(options.verifyGrantsLive)) {
-      // Verified now; `notShared` need not ask the gateway again.
-      return { ...ctx, verifyGrantsLive: async () => true };
-    }
-    return { ...ctx, connection: { ...ctx.connection, grants: [] } };
+    const live = await liveGrantIds(options.verifyGrantsLive);
+    const grants = ctx.connection.grants.filter((g) =>
+      live.includes(g.grantId),
+    );
+    // Verified now: `notShared` must not ask the gateway again, and it stays
+    // all-or-nothing, so it sees no live grants unless every one is live.
+    const allLive = grants.length === ctx.connection.grants.length;
+    return {
+      ...ctx,
+      connection: { ...ctx.connection, grants },
+      verifyGrantsLive: async () => (allLive ? live : []),
+    };
   }
 
   for (const tool of MCP_TOOLS) {

@@ -30,7 +30,7 @@ import {
   approveMcpOAuthAuthorizationWithScopes,
   approveMcpConnection,
   approveMcpScopeAccessRequest,
-  areMcpConnectionGrantsLive,
+  liveMcpGrantIds,
   buildMcpProtectedResourceMetadataUrl,
   buildMcpUrl,
   buildStableMcpUrl,
@@ -1185,7 +1185,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       scopeRequestApprovalUrl: deps.scopeRequestApprovalUrl,
       serverOrigin: resolveOrigin(deps.serverOrigin),
       exposeUnsharedScopes: deps.mcpExposeUnsharedScopes,
-      verifyGrantsLive: () => areMcpConnectionGrantsLive(record, deps.gateway),
+      verifyGrantsLive: () => liveMcpGrantIds(record, deps.gateway),
       scopeRequestGuidance: deps.mcpScopeRequestGuidance,
       requestableScopes: deps.mcpRequestableScopes,
     });

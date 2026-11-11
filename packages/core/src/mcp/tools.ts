@@ -84,7 +84,7 @@ export interface McpToolContext {
    * it is absent or answers false, so an owner connection whose grant expired
    * or was revoked learns nothing about the owner's other sources.
    */
-  verifyGrantsLive?(): Promise<boolean>;
+  verifyGrantsLive?(): Promise<string[]>;
   /**
    * Host option `mcpScopeRequestGuidance`. On: every read-side
    * `scope_not_granted` carries a `nextAction` that names
@@ -833,22 +833,32 @@ const DEFAULT_OWNER_SCOPE_TIMEOUT_MS = 5_000;
 // caller the whole listing, so it is bounded well below the tool timeout.
 const GRANT_LIVENESS_TIMEOUT_MS = 3_000;
 
-/** Fail closed: no check, a failed or slow check, or a "no" all mean not live. */
-export async function grantsStillLive(
+/** Ids of the live grants. Fail closed: no check, a failed or slow check gives none. */
+export async function liveGrantIds(
   verify: McpToolContext["verifyGrantsLive"],
-): Promise<boolean> {
-  if (!verify) return false;
+): Promise<string[]> {
+  if (!verify) return [];
   try {
-    return (
-      (await withTimeout(
-        verify(),
-        GRANT_LIVENESS_TIMEOUT_MS,
-        "grant liveness check",
-      )) === true
+    return await withTimeout(
+      verify(),
+      GRANT_LIVENESS_TIMEOUT_MS,
+      "grant liveness check",
     );
   } catch {
-    return false;
+    return [];
   }
+}
+
+/** True when the connection has grants and every one of them is live. */
+async function grantsStillLive(
+  connection: McpConnectionRecord,
+  verify: McpToolContext["verifyGrantsLive"],
+): Promise<boolean> {
+  const live = new Set(await liveGrantIds(verify));
+  return (
+    connection.grants.length > 0 &&
+    connection.grants.every((grant) => live.has(grant.grantId))
+  );
 }
 
 /**
@@ -976,7 +986,8 @@ const listGrantedScopes: McpToolDefinition = {
     // answered yet without re-recording the request.
     const writableScopes = uniqueWritableScopes(connection);
     const notShared =
-      exposeUnsharedScopes && (await grantsStillLive(verifyGrantsLive))
+      exposeUnsharedScopes &&
+      (await grantsStillLive(connection, verifyGrantsLive))
         ? await listNotSharedScopes(connection, readClient)
         : undefined;
     return textResult({

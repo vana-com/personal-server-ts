@@ -12,7 +12,10 @@ import {
 } from "./read-client.js";
 import { McpError } from "@modelcontextprotocol/sdk/types.js";
 import { readRawScopeResource } from "./resources.js";
-import { areMcpConnectionGrantsLive } from "./connection-api.js";
+import {
+  areMcpConnectionGrantsLive,
+  liveMcpGrantIds,
+} from "./connection-api.js";
 import { templateMcpScopeRequestApprovalUrl } from "./approval-url.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { ScopeSummary } from "../storage/index/types.js";
@@ -102,7 +105,7 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
     const body = await listGranted({
       rc: readClient({ listOwnerScopes }),
       exposeUnsharedScopes: true,
-      verifyGrantsLive: async () => true,
+      verifyGrantsLive: async () => ["grant-1"],
     });
     expect(body.notShared).toEqual([
       expect.objectContaining({
@@ -127,7 +130,7 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
     const body = await listGranted({
       rc,
       exposeUnsharedScopes: true,
-      verifyGrantsLive: async () => true,
+      verifyGrantsLive: async () => ["grant-1"],
     });
     expect(body.notShared).toEqual([
       {
@@ -151,7 +154,7 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
         await listGranted({
           rc: readClient(),
           exposeUnsharedScopes: true,
-          verifyGrantsLive: async () => true,
+          verifyGrantsLive: async () => ["grant-1"],
         })
       ).notShared,
     ).toEqual([]);
@@ -163,7 +166,7 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
         await listGranted({
           rc: failing,
           exposeUnsharedScopes: true,
-          verifyGrantsLive: async () => true,
+          verifyGrantsLive: async () => ["grant-1"],
         })
       ).notShared,
     ).toEqual([]);
@@ -245,7 +248,7 @@ describe("notShared fails closed on dead grants", () => {
     const body = await listGranted({
       rc,
       exposeUnsharedScopes: true,
-      verifyGrantsLive: () => areMcpConnectionGrantsLive(connection(), gateway),
+      verifyGrantsLive: () => liveMcpGrantIds(connection(), gateway),
     });
     if (shown) {
       expect(body.notShared).toHaveLength(1);
@@ -263,7 +266,7 @@ describe("notShared fails closed on dead grants", () => {
       getGrant: vi.fn().mockRejectedValue(new Error("down")),
     } as never;
     for (const verifyGrantsLive of [
-      () => areMcpConnectionGrantsLive(connection(), failing),
+      () => liveMcpGrantIds(connection(), failing),
       undefined,
     ]) {
       const body = await listGranted({
@@ -295,8 +298,9 @@ describe("notShared fails closed on dead grants", () => {
     const listOwnerScopes = vi.fn().mockResolvedValue(ownerScopes);
     const body = await listGranted({
       rc: readClient({ listOwnerScopes }),
+      connection: two,
       exposeUnsharedScopes: true,
-      verifyGrantsLive: () => areMcpConnectionGrantsLive(two, gateway),
+      verifyGrantsLive: () => liveMcpGrantIds(two, gateway),
     });
     expect("notShared" in body).toBe(false);
     expect(listOwnerScopes).not.toHaveBeenCalled();
@@ -305,7 +309,7 @@ describe("notShared fails closed on dead grants", () => {
   it.each([undefined, false])(
     "option %s: the liveness check and owner listing are never called",
     async (flag) => {
-      const verifyGrantsLive = vi.fn().mockResolvedValue(true);
+      const verifyGrantsLive = vi.fn().mockResolvedValue(["grant-1"]);
       const listOwnerScopes = vi.fn().mockResolvedValue(ownerScopes);
       const body = await listGranted({
         rc: readClient({ listOwnerScopes }),
@@ -325,7 +329,7 @@ describe("notShared fails closed on dead grants", () => {
       const pending = listGranted({
         rc: readClient({ listOwnerScopes }),
         exposeUnsharedScopes: true,
-        verifyGrantsLive: () => new Promise<boolean>(() => {}),
+        verifyGrantsLive: () => new Promise<string[]>(() => {}),
       });
       await vi.advanceTimersByTimeAsync(3_500);
       const body = await pending;

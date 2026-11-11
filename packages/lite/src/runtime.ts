@@ -82,7 +82,7 @@ import {
   approveMcpOAuthAuthorizationWithScopes,
   approveMcpConnection,
   approveMcpScopeAccessRequest,
-  areMcpConnectionGrantsLive,
+  liveMcpGrantIds,
   buildMcpProtectedResourceMetadataUrl,
   buildStableMcpUrl,
   createInMemoryMcpOAuthAuthorizationStore,
@@ -2145,7 +2145,7 @@ async function handleMcpRoute(input: {
       ...(input.gateway
         ? {
             verifyGrantsLive: () =>
-              areMcpConnectionGrantsLive(record, input.gateway!, input.now),
+              liveMcpGrantIds(record, input.gateway!, input.now),
           }
         : {}),
       scopeRequestGuidance: input.scopeRequestGuidance,

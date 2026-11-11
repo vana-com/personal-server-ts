@@ -4,6 +4,7 @@ import {
   type HandleMcpRequestOptions,
 } from "./server.js";
 import { MCP_TOOLS } from "./tools.js";
+import { liveMcpGrantIds } from "./connection-api.js";
 import type { McpDataReadClient } from "./read-client.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { ScopeSummary } from "../storage/index/types.js";
@@ -254,7 +255,7 @@ describe("ungranted data is invisible to a connected client (mcpExposeUnsharedSc
 });
 
 describe("a grant the gateway no longer honours reveals nothing new", () => {
-  const revoked = { verifyGrantsLive: async () => false };
+  const revoked = { verifyGrantsLive: async () => [] };
   const neverGranted = (): McpConnectionRecord => ({
     ...connection(),
     grants: [],
@@ -326,7 +327,7 @@ describe("a grant the gateway no longer honours reveals nothing new", () => {
   it("a live grant still reads normally", async () => {
     const client = ownerA();
     await rpc(client, "tools/call", tool("list_granted_scopes", {}).params, {
-      verifyGrantsLive: async () => true,
+      verifyGrantsLive: async () => ["grant-1"],
     });
     expect(client.getScopeMetadata).toHaveBeenCalledWith(
       "chatgpt.conversations",
@@ -401,5 +402,121 @@ describe("a write-only memory grant is not a read oracle", () => {
     expect(parsed.nextAction).toContain(
       JSON.stringify(["memory.app", "write:memory.app"]),
     );
+  });
+});
+
+describe("only the dead grants are dropped", () => {
+  const twoGrants = (): McpConnectionRecord => ({
+    ...connection(),
+    grants: [
+      { grantId: "g-live", scopes: ["chatgpt.conversations"] },
+      { grantId: "g-dead", scopes: ["youtube.history"] },
+    ],
+  });
+  const oneGrant = (): McpConnectionRecord => ({
+    ...connection(),
+    grants: [{ grantId: "g-live", scopes: ["chatgpt.conversations"] }],
+  });
+  const readYoutube = tool("read_scope", { scope: "youtube.history" }).params;
+
+  it("keeps the live grant, and the revoked one answers as never granted with no owner read", async () => {
+    const owner = ownerA();
+    const listed = JSON.parse(
+      await rpc(
+        owner,
+        "tools/call",
+        tool("list_granted_scopes", {}).params,
+        { verifyGrantsLive: async () => ["g-live"] },
+        twoGrants(),
+      ),
+    ) as {
+      result: { structuredContent: { scopes: Array<{ scope: string }> } };
+    };
+    expect(listed.result.structuredContent.scopes.map((x) => x.scope)).toEqual([
+      "chatgpt.conversations",
+    ]);
+    expect(owner.getScopeMetadata).toHaveBeenCalledTimes(1);
+    expect(owner.getScopeMetadata).toHaveBeenCalledWith(
+      "chatgpt.conversations",
+    );
+
+    const probe = ownerA();
+    const dead = normalize(
+      await rpc(
+        probe,
+        "tools/call",
+        readYoutube,
+        { verifyGrantsLive: async () => ["g-live"] },
+        twoGrants(),
+      ),
+    );
+    const never = normalize(
+      await rpc(ownerB(), "tools/call", readYoutube, {}, oneGrant()),
+    );
+    expect(dead).toBe(never);
+    for (const read of [
+      "listScopes",
+      "getScopeMetadata",
+      "readScopeBlocks",
+      "readRawScopeFile",
+    ] as const)
+      expect(probe[read]).not.toHaveBeenCalled();
+  });
+
+  it("a lookup that throws answers as with no grants", async () => {
+    const gateway = {
+      getGrant: vi.fn().mockImplementation(async (id: string) => {
+        if (id === "g-dead") throw new Error("gateway down");
+        return { grantId: id };
+      }),
+    } as never;
+    const owner = ownerA();
+    const body = await rpc(
+      owner,
+      "tools/call",
+      tool("list_granted_scopes", {}).params,
+      { verifyGrantsLive: () => liveMcpGrantIds(twoGrants(), gateway) },
+      twoGrants(),
+    );
+    const none = await rpc(
+      ownerA(),
+      "tools/call",
+      tool("list_granted_scopes", {}).params,
+      {},
+      { ...twoGrants(), grants: [] },
+    );
+    expect(normalize(body)).toBe(normalize(none));
+    expect(owner.getScopeMetadata).not.toHaveBeenCalled();
+  });
+
+  it("looks the grants up concurrently: two 2 s lookups fit the 3 s budget", async () => {
+    vi.useFakeTimers();
+    try {
+      const gateway = {
+        getGrant: vi
+          .fn()
+          .mockImplementation(
+            (id: string) =>
+              new Promise((resolve) =>
+                setTimeout(() => resolve({ grantId: id }), 2000),
+              ),
+          ),
+      } as never;
+      const owner = ownerA();
+      const pending = rpc(
+        owner,
+        "tools/call",
+        tool("list_granted_scopes", {}).params,
+        { verifyGrantsLive: () => liveMcpGrantIds(twoGrants(), gateway) },
+        twoGrants(),
+      );
+      await vi.advanceTimersByTimeAsync(2000);
+      const body = await pending;
+      expect(body).toContain("chatgpt.conversations");
+      expect(body).toContain("youtube.history");
+      expect(owner.getScopeMetadata).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

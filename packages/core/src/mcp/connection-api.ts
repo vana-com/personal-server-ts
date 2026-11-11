@@ -819,33 +819,50 @@ function parseExpirySeconds(value: string | null): number | undefined {
 }
 
 /**
- * True when every grant the connection holds is still live at the gateway:
- * present, not revoked and not expired. A connection with no grants, a missing
- * grant or a failed lookup is not live, so callers fail closed. An owner
- * connection's token outlives its grants, so a feature that reveals more than
- * the grants cover must check this first.
+ * The ids of the connection's grants that are still live at the gateway:
+ * present, not revoked and not expired. Looked up in parallel. Not approved,
+ * no grants, or any failed lookup gives none, so callers fail closed. An
+ * owner connection's token outlives its grants, so a feature that reveals
+ * data must check this first.
  */
+export async function liveMcpGrantIds(
+  connection: McpConnectionRecord,
+  gateway: Pick<GatewayClient, "getGrant">,
+  now: () => Date = () => new Date(),
+): Promise<string[]> {
+  const grantIds = sortedUnique(
+    connection.grants.map((grant) => grant.grantId),
+  );
+  if (connection.status !== "approved") return [];
+  const nowSeconds = Math.floor(now().getTime() / 1000);
+  try {
+    const checked = await Promise.all(
+      grantIds.map(async (grantId) => {
+        const live = await gateway.getGrant(grantId);
+        if (!live || live.revokedAt || live.expired) return null;
+        const expiresAt = parseExpirySeconds(live.expiresAt);
+        return expiresAt !== undefined && expiresAt <= nowSeconds
+          ? null
+          : grantId;
+      }),
+    );
+    return checked.filter((id): id is string => id !== null);
+  } catch {
+    return [];
+  }
+}
+
+/** True when the connection has grants and every one is live. */
 export async function areMcpConnectionGrantsLive(
   connection: McpConnectionRecord,
   gateway: Pick<GatewayClient, "getGrant">,
   now: () => Date = () => new Date(),
 ): Promise<boolean> {
-  const grantIds = sortedUnique(
-    connection.grants.map((grant) => grant.grantId),
+  const live = await liveMcpGrantIds(connection, gateway, now);
+  return (
+    live.length > 0 &&
+    live.length === sortedUnique(connection.grants.map((g) => g.grantId)).length
   );
-  if (connection.status !== "approved" || grantIds.length === 0) return false;
-  const nowSeconds = Math.floor(now().getTime() / 1000);
-  try {
-    for (const grantId of grantIds) {
-      const live = await gateway.getGrant(grantId);
-      if (!live || live.revokedAt || live.expired) return false;
-      const expiresAt = parseExpirySeconds(live.expiresAt);
-      if (expiresAt !== undefined && expiresAt <= nowSeconds) return false;
-    }
-  } catch {
-    return false;
-  }
-  return true;
 }
 
 function sortedUnique(values: Iterable<string>): string[] {
