@@ -52,12 +52,15 @@ const gatewayConfig = {
   },
 } as const;
 
-function gatewayWithGrant(granteeAddress: `0x${string}`): GatewayClient {
+function gatewayWithGrant(
+  granteeAddress: `0x${string}`,
+  grantedScope: string = SCOPE,
+): GatewayClient {
   const grant = {
     id: "grant-mcp-1",
     grantorAddress: ownerWallet.address,
     granteeId: granteeAddress,
-    scopes: [SCOPE],
+    scopes: [grantedScope],
     status: "confirmed",
     addedAt: "2026-01-21T10:00:00.000Z",
     expiresAt: null,
@@ -392,5 +395,148 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
     expect(httpCaptions).toEqual(["from the stream view"]);
     const mcpCaptions = captionsIn(JSON.parse(await mcpRead()));
     expect(mcpCaptions).toEqual(httpCaptions);
+  });
+});
+
+/**
+ * `notShared` owner-wide discovery for a switched account. The grant covers
+ * `other.thing`. The stream listing holds `youtube.history` (live, ungranted)
+ * and omits every other scope. No legacy storage exists to read from.
+ */
+describe("MCP notShared lists from the stream listing for a switched account", () => {
+  let dataDir: string;
+
+  beforeEach(async () => {
+    dataDir = await mkdtemp(join(tmpdir(), "mcp-notshared-stream-"));
+  });
+  afterEach(async () => {
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  async function setup(mode: "switched" | "unknown", listing: boolean) {
+    const indexManager = createIndexManager(initializeDatabase(":memory:"));
+    const store = createInMemoryMcpConnectionStore();
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    const gateway = gatewayWithGrant(created.granteeAddress, "other.thing");
+    const listScopes = vi.fn(
+      async ({
+        canRead,
+      }: {
+        canRead: (scope: string) => boolean | Promise<boolean>;
+      }) =>
+        (await canRead("youtube.history"))
+          ? [
+              {
+                scope: "youtube.history",
+                connector: "youtube",
+                ns: "",
+                records: 3,
+                updatedAt: Date.parse("2026-11-01T00:00:00Z"),
+                latestCollectedAt: "2026-11-01T00:00:00.000Z",
+              },
+            ]
+          : [],
+    );
+    const view = {
+      resolve: async () => {
+        throw new Error("unexpected resolve");
+      },
+      ...(listing && { listScopes }),
+    } as unknown as StreamSyncReadPort;
+    const mcp = new Hono();
+    mcp.route(
+      "/mcp",
+      mcpStreamableHttpRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        gatewayConfig,
+        serverSigner: {
+          signGrantRegistration: vi
+            .fn()
+            .mockResolvedValue("0xgrantsig" as `0x${string}`),
+        },
+        accessLogWriter: accessLog(),
+        connectionStore: store,
+        indexManager,
+        hierarchyOptions: { dataDir },
+        mcpExposeUnsharedScopes: true,
+        accountStorageMode: {
+          owner: ownerWallet.address,
+          read: () => mode,
+        },
+        streamSyncRead: view,
+        oauthApprovalUrl: "https://app-dev.vana.org/mcp/connect/claude",
+        localApprovalPort: LOOPBACK_PORT,
+        serverPort: MAIN_PORT,
+      }),
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-mcp-1", scopes: ["other.thing"] }],
+      },
+      { store },
+    );
+    const listGranted = async () => {
+      const res = await mcp.request(
+        `/mcp/${encodeURIComponent(created.connectionToken)}`,
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json, text/event-stream",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: "call",
+            method: "tools/call",
+            params: { name: "list_granted_scopes", arguments: {} },
+          }),
+        },
+      );
+      expect(res.status).toBe(200);
+      const payload = (await res.json()) as {
+        result: { content: { text: string }[] };
+      };
+      return JSON.parse(payload.result.content[0]!.text) as {
+        notShared?: { scope: string; dataStatus: string }[];
+        notSharedUnavailable?: boolean;
+      };
+    };
+    return { listGranted, listScopes };
+  }
+
+  it("lists a live ungranted stream-only scope as ready, and no legacy-only scope", async () => {
+    const { listGranted } = await setup("switched", true);
+    const body = await listGranted();
+    expect(body.notShared).toEqual([
+      expect.objectContaining({
+        scope: "youtube.history",
+        source: "youtube",
+        collectedAt: "2026-11-01T00:00:00.000Z",
+        dataStatus: "ready",
+      }),
+    ]);
+    expect(body.notSharedUnavailable).toBeUndefined();
+  });
+
+  it("reports discovery unavailable, not empty, when a switched account has no stream listing", async () => {
+    const { listGranted } = await setup("switched", false);
+    const body = await listGranted();
+    expect(body.notShared).toBeUndefined();
+    expect(body.notSharedUnavailable).toBe(true);
+  });
+
+  it("reports discovery unavailable, not empty, for an unknown account, and never lists", async () => {
+    const { listGranted, listScopes } = await setup("unknown", true);
+    const body = await listGranted();
+    expect(body.notShared).toBeUndefined();
+    expect(body.notSharedUnavailable).toBe(true);
+    expect(listScopes).not.toHaveBeenCalled();
   });
 });

@@ -892,16 +892,24 @@ async function grantsStillLive(
   );
 }
 
+interface NotSharedScopeEntry {
+  scope: string;
+  source: string;
+  collectedAt: string | undefined;
+  dataStatus: "ready";
+}
+
 /**
  * Owner scopes with local data that no grant on the connection covers.
- * Reserved, system, memory and write scopes never appear. Empty when the read
- * client cannot list owner-wide or the listing fails: `notShared` is a hint
- * and must not fail the tool.
+ * Reserved, system, memory and write scopes never appear. `[]` when the read
+ * client cannot list owner-wide; `null` when the listing failed (unknown
+ * account mode, no stream listing, timeout), which is not the same as empty.
+ * `notShared` is a hint and must not fail the tool.
  */
 async function listNotSharedScopes(
   connection: McpConnectionRecord,
   readClient: McpDataReadClient,
-) {
+): Promise<NotSharedScopeEntry[] | null> {
   if (typeof readClient.listOwnerScopes !== "function") return [];
   let owned: Awaited<
     ReturnType<NonNullable<typeof readClient.listOwnerScopes>>
@@ -913,7 +921,7 @@ async function listNotSharedScopes(
       "owner scope listing",
     );
   } catch {
-    return [];
+    return null;
   }
   return owned
     .filter(
@@ -922,9 +930,10 @@ async function listNotSharedScopes(
         !isMemoryScope(summary.scope) &&
         !resolveGrantForScope(connection, summary.scope) &&
         // Only what bounded read can serve after approval. "ready" is the
-        // listing's own readiness (`storage.hasScopeBlocks`, the same check
-        // `getScopeMetadata` reports as `hasBlocks`); an "indexing" scope has
-        // no block sidecars and `read_scope` answers 503 for it.
+        // listing's own readiness: legacy `storage.hasScopeBlocks`, or, for a
+        // switched account, a scope the stream listing selected (the
+        // resolver's rule). An "indexing" scope has no block sidecars and
+        // `read_scope` answers 503 for it.
         summary.dataStatus === "ready",
     )
     .sort((a, b) => (a.scope < b.scope ? -1 : a.scope > b.scope ? 1 : 0))
@@ -1027,6 +1036,7 @@ const listGrantedScopes: McpToolDefinition = {
     return textResult({
       scopes: scopeEntries,
       ...(notShared ? { notShared } : {}),
+      ...(notShared === null ? { notSharedUnavailable: true } : {}),
       ...(writableScopes.length > 0 ? { writableScopes } : {}),
       ...(connection.scopeAccessRequest
         ? {

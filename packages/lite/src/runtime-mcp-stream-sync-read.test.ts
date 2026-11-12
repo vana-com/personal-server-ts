@@ -63,12 +63,15 @@ const gatewayConfig = {
   },
 } as const;
 
-function gatewayFor(granteeAddress: `0x${string}`): GatewayClient {
+function gatewayFor(
+  granteeAddress: `0x${string}`,
+  grantedScopes: string[] = [SCOPE],
+): GatewayClient {
   const grant = {
     id: "grant-mcp-1",
     grantorAddress: owner.address,
     granteeId: granteeAddress,
-    scopes: [SCOPE],
+    scopes: grantedScopes,
     status: "confirmed",
     addedAt: "2026-01-21T10:00:00.000Z",
     expiresAt: null,
@@ -369,5 +372,145 @@ describe("Lite MCP and HTTP reads serve the same stream-sync view", () => {
     expect(raw.isError).toBe(true);
     expect(raw.text).toContain("STREAM_VIEW_NOT_RAW");
     expect(raw.text).not.toContain("stale legacy");
+  });
+});
+
+/**
+ * `notShared` owner-wide discovery for a switched account. The grant covers
+ * `other.thing`; the stream view holds `instagram.posts`, which no grant
+ * covers. The legacy store holds a stale scope the stream view does not.
+ */
+describe("Lite MCP notShared lists from the stream view for a switched account", () => {
+  async function setup(mode: "off" | "unknown") {
+    const authority = createModeAuthority({
+      store: createMemoryModeRecordStore(),
+    });
+    await authority.ready;
+    if (mode !== "unknown") {
+      await authority.submitEvidence({ owner: owner.address, state: mode });
+    }
+    const store = createInMemoryMcpConnectionStore();
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    const gateway = gatewayFor(created.granteeAddress, ["other.thing"]);
+    const accessLogSink = {
+      async write() {},
+      async read() {
+        return { logs: [], total: 0, limit: 50, offset: 0 };
+      },
+    };
+    const gatewayPorts = {
+      authSessionVerifier: gateway,
+      grantVerifier: gateway,
+    };
+    const memory = createMemoryPsLiteStorage();
+    // Every legacy-storage operation is recorded: a switched or unknown
+    // account must make none, not even a read that returns nothing.
+    const legacyCalls: string[] = [];
+    const legacy = new Proxy(memory, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function"
+          ? (...args: unknown[]) => {
+              legacyCalls.push(String(prop));
+              return value.apply(target, args);
+            }
+          : value;
+      },
+    });
+    const runtime = createPsLiteRuntime({
+      accountModeAuthority: authority,
+      active: true,
+      storage: legacy,
+      config: { gateway: gatewayConfig },
+      gateway,
+      serverSigner: {
+        signGrantRegistration: vi
+          .fn()
+          .mockResolvedValue("0xgrantsig" as `0x${string}`),
+      },
+      accessLogReader: accessLogSink,
+      accessLogWriter: accessLogSink,
+      tokenStore: createMemoryPsLiteTokenStore(),
+      saveConfig: async () => {},
+      stateCapabilities: { config: "memory" },
+      serverOwner: owner.address,
+      mcpConnectionStore: store,
+      mcpExposeUnsharedScopes: true,
+      streamSyncRead: await streamView(),
+      auth: createWeb3SignedPsLiteAuth({
+        origin: SERVER_ORIGIN,
+        ownerAddress: owner.address,
+        dataReadPolicyPorts: gatewayPorts,
+      }),
+    });
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-mcp-1", scopes: ["other.thing"] }],
+      },
+      { store },
+    );
+    const listGranted = async () => {
+      const res = await runtime.fetch(
+        new Request(
+          `${SERVER_ORIGIN}/mcp/${encodeURIComponent(created.connectionToken)}`,
+          {
+            method: "POST",
+            headers: {
+              Accept: "application/json, text/event-stream",
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: "call",
+              method: "tools/call",
+              params: { name: "list_granted_scopes", arguments: {} },
+            }),
+          },
+        ),
+      );
+      expect(res.status).toBe(200);
+      const payload = (await res.json()) as {
+        result: { content: { text: string }[] };
+      };
+      return JSON.parse(payload.result.content[0]!.text) as {
+        notShared?: { scope: string; dataStatus: string }[];
+        notSharedUnavailable?: boolean;
+      };
+    };
+    const ingestLegacy = async (scope: string) => {
+      const res = await runtime.fetch(
+        await ownerSigned("POST", `/v1/data/${scope}`, {
+          records: [{ id: "legacy" }],
+        }),
+      );
+      expect(res.ok, await res.clone().text()).toBe(true);
+    };
+    return { listGranted, authority, legacyCalls, ingestLegacy };
+  }
+
+  it("lists a live ungranted stream scope, not a stale legacy one, with no legacy storage call", async () => {
+    const { listGranted, authority, legacyCalls, ingestLegacy } =
+      await setup("off");
+    await ingestLegacy("stale.legacy");
+    await authority.submitEvidence({ owner: owner.address, state: "on" });
+    legacyCalls.length = 0;
+    const body = await listGranted();
+    expect(body.notShared?.map((s) => s.scope)).toContain("instagram.posts");
+    expect(body.notShared?.map((s) => s.scope)).not.toContain("stale.legacy");
+    expect(body.notShared?.every((s) => s.dataStatus === "ready")).toBe(true);
+    expect(body.notSharedUnavailable).toBeUndefined();
+    expect(legacyCalls).toEqual([]);
+  });
+
+  it("an unknown account mode reports discovery unavailable, not empty, with no legacy storage call", async () => {
+    const { listGranted, legacyCalls } = await setup("unknown");
+    const body = await listGranted();
+    expect(body.notShared).toBeUndefined();
+    expect(body.notSharedUnavailable).toBe(true);
+    expect(legacyCalls).toEqual([]);
   });
 });

@@ -146,7 +146,7 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
     ]);
   });
 
-  it("on: a read client without listOwnerScopes, or one that fails, gives an empty list", async () => {
+  it("on: a read client without listOwnerScopes gives an empty list", async () => {
     expect(
       (
         await listGranted({
@@ -156,18 +156,19 @@ describe("notShared (mcpExposeUnsharedScopes)", () => {
         })
       ).notShared,
     ).toEqual([]);
+  });
+
+  it("on: a failing listing is reported unavailable, never as an empty list", async () => {
     const failing = readClient({
       listOwnerScopes: vi.fn().mockRejectedValue(new Error("boom")),
     });
-    expect(
-      (
-        await listGranted({
-          rc: failing,
-          exposeUnsharedScopes: true,
-          verifyGrantsLive: liveOnly(connection(), ["grant-1"]),
-        })
-      ).notShared,
-    ).toEqual([]);
+    const body = await listGranted({
+      rc: failing,
+      exposeUnsharedScopes: true,
+      verifyGrantsLive: liveOnly(connection(), ["grant-1"]),
+    });
+    expect("notShared" in body).toBe(false);
+    expect(body.notSharedUnavailable).toBe(true);
   });
 
   it("adds the description and instruction sentence only when on", async () => {
@@ -381,6 +382,7 @@ describe("listOwnerScopes (read client)", () => {
           authorizeBuilderRead: vi.fn(),
         },
         accessLogWriter: { write: vi.fn() },
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
       },
     });
     return { client, listScopes };
@@ -551,5 +553,148 @@ describe("templateMcpScopeRequestApprovalUrl", () => {
     expect(() =>
       templateMcpScopeRequestApprovalUrl("vana://x?t={token}"),
     ).toThrow(/after '#'/);
+  });
+});
+
+describe("listOwnerScopes by account mode (read client)", () => {
+  /** Legacy storage that records every operation: none may run off an unswitched account. */
+  function recordingStorage(scopes: string[]) {
+    const calls: string[] = [];
+    const storage = new Proxy({} as never, {
+      get:
+        (_t, prop) =>
+        (...args: unknown[]) => {
+          calls.push(String(prop));
+          void args;
+          return prop === "listScopes"
+            ? {
+                scopes: scopes.map((scope) => owned(scope)),
+                total: scopes.length,
+              }
+            : undefined;
+        },
+    });
+    return { storage, calls };
+  }
+
+  const listed = (scope: string, latestCollectedAt?: string) => ({
+    scope,
+    connector: scope.split(".")[0]!,
+    ns: "",
+    records: 1,
+    updatedAt: null,
+    ...(latestCollectedAt && { latestCollectedAt }),
+  });
+
+  function clientFor(
+    mode: "switched" | "unswitched" | "unknown",
+    options: {
+      stream?: unknown[] | "absent";
+      legacy?: string[];
+    } = {},
+  ) {
+    const { storage, calls } = recordingStorage(options.legacy ?? []);
+    const listScopes = vi.fn(
+      async ({ canRead }: { canRead: (s: string) => boolean }) =>
+        ((options.stream as ReturnType<typeof listed>[]) ?? []).filter((row) =>
+          canRead(row.scope),
+        ),
+    );
+    const client = createMcpDataReadClient({
+      serverOrigin: "https://ps.test",
+      granteeAccount: {} as never,
+      dataApiDeps: {
+        storage,
+        streamSyncRead:
+          options.stream === "absent"
+            ? ({ resolve: vi.fn() } as never)
+            : ({ resolve: vi.fn(), listScopes } as never),
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead: vi.fn(),
+        },
+        accessLogWriter: { write: vi.fn() },
+        accountStorageMode: { owner: "fixture", read: () => mode },
+      },
+    });
+    return { client, calls, listScopes };
+  }
+
+  it("switched: lists the stream listing, drops system scopes, and runs no legacy operation", async () => {
+    const { client, calls } = clientFor("switched", {
+      stream: [
+        listed("youtube.history", "2026-11-01T00:00:00.000Z"),
+        listed("vana.system.state"),
+      ],
+      legacy: ["stale.legacy"],
+    });
+    expect(await client.listOwnerScopes!()).toEqual([
+      {
+        scope: "youtube.history",
+        latestCollectedAt: "2026-11-01T00:00:00.000Z",
+        dataStatus: "ready",
+      },
+    ]);
+    expect(calls).toEqual([]);
+  });
+
+  it("switched: a scope the stream listing omits (deleted) stays absent despite a stale legacy entry", async () => {
+    const { client, calls } = clientFor("switched", {
+      stream: [listed("youtube.history")],
+      legacy: ["spotify.library"],
+    });
+    const scopes = (await client.listOwnerScopes!()).map((s) => s.scope);
+    expect(scopes).toEqual(["youtube.history"]);
+    expect(calls).toEqual([]);
+  });
+
+  it("switched: a stream-only scope is listed with no legacy index or block sidecars", async () => {
+    const { client, calls } = clientFor("switched", {
+      stream: [listed("netflix.views")],
+    });
+    expect((await client.listOwnerScopes!()).map((s) => s.scope)).toEqual([
+      "netflix.views",
+    ]);
+    expect(calls).toEqual([]);
+  });
+
+  it("switched: pages past one page and stops at the listing cap", async () => {
+    const stream = Array.from({ length: 450 }, (_, i) =>
+      listed(`src${String(i).padStart(4, "0")}.data`),
+    );
+    const { client } = clientFor("switched", { stream });
+    expect(await client.listOwnerScopes!()).toHaveLength(450);
+  });
+
+  it("switched with no stream listing throws and never falls back to legacy", async () => {
+    const { client, calls } = clientFor("switched", {
+      stream: "absent",
+      legacy: ["stale.legacy"],
+    });
+    await expect(client.listOwnerScopes!()).rejects.toThrow(/unavailable/u);
+    expect(calls).toEqual([]);
+  });
+
+  it("unknown mode throws, touching neither the stream listing nor legacy storage", async () => {
+    const { client, calls, listScopes } = clientFor("unknown", {
+      stream: [listed("youtube.history")],
+      legacy: ["stale.legacy"],
+    });
+    await expect(client.listOwnerScopes!()).rejects.toThrow(/unavailable/u);
+    expect(calls).toEqual([]);
+    expect(listScopes).not.toHaveBeenCalled();
+  });
+
+  it("unswitched: keeps the legacy listing and never consults the stream listing", async () => {
+    const { client, calls, listScopes } = clientFor("unswitched", {
+      stream: [listed("youtube.history")],
+      legacy: ["spotify.library"],
+    });
+    expect((await client.listOwnerScopes!()).map((s) => s.scope)).toEqual([
+      "spotify.library",
+    ]);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(listScopes).not.toHaveBeenCalled();
   });
 });
