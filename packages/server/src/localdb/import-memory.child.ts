@@ -1,5 +1,7 @@
 import { join } from "node:path";
 import { createReadStream } from "node:fs";
+import { monitorEventLoopDelay } from "node:perf_hooks";
+import { Worker } from "node:worker_threads";
 import {
   openLocalDb,
   type LocalDbIdentity,
@@ -44,7 +46,23 @@ export interface ImportMemoryResult {
   retainedPayloadBytes: number;
   memory: Record<string, NodeJS.MemoryUsage>;
   rssSnapshots: Record<string, NodeJS.MemoryUsage>;
+  /** Driver calls the import made; only filled by an attribution run. */
+  traffic?: DriverTraffic;
   sqliteVersion: string;
+}
+
+/** What crossed the driver boundary, in calls and bytes (attribution only). */
+export interface DriverTraffic {
+  queries: number;
+  batches: number;
+  statements: number;
+  sqlBytes: number;
+  paramBytes: number;
+  /** Messages posted to the SQLite worker and the SQL text they carried. */
+  wireMessages: number;
+  wireSqlBytes: number;
+  /** Longest event-loop stall during the import, in milliseconds. */
+  maxLoopStallMs?: number;
 }
 
 // LOAD_WHOLE negative control: actual source objects stay reachable through
@@ -75,6 +93,41 @@ export async function importMemoryWorkload(input: {
   };
   let phase = "setup";
   let batches = 0;
+  const traffic: DriverTraffic = {
+    queries: 0,
+    batches: 0,
+    statements: 0,
+    sqlBytes: 0,
+    paramBytes: 0,
+    wireMessages: 0,
+    wireSqlBytes: 0,
+  };
+  const loop = monitorEventLoopDelay({ resolution: 10 });
+  if (input.diagnostics) {
+    loop.enable();
+    const post = Worker.prototype.postMessage;
+    Worker.prototype.postMessage = function (
+      this: Worker,
+      message: {
+        sql?: string;
+        statements?: readonly { sql?: string }[];
+      },
+      ...rest: []
+    ) {
+      traffic.wireMessages++;
+      traffic.wireSqlBytes += message.sql?.length ?? 0;
+      for (const s of message.statements ?? [])
+        traffic.wireSqlBytes += s.sql?.length ?? 0;
+      return post.call(this, message, ...rest);
+    } as typeof post;
+  }
+  const count = (sql: string, params: readonly unknown[] = []) => {
+    traffic.statements++;
+    traffic.sqlBytes += sql.length;
+    for (const v of params)
+      traffic.paramBytes +=
+        typeof v === "string" || v instanceof Uint8Array ? v.length : 8;
+  };
   const driver = openBetterSqlite3(
     join(workRoot, `${input.path}-${input.loadWhole}.sqlite`),
   );
@@ -82,7 +135,14 @@ export async function importMemoryWorkload(input: {
     input.diagnostics
       ? {
           ...driver,
+          async query(sql, params) {
+            traffic.queries++;
+            count(sql, params);
+            return driver.query(sql, params);
+          },
           async batch(statements) {
+            traffic.batches++;
+            for (const s of statements) count(s.sql, s.params);
             const result = await driver.batch(statements);
             // Bounded diagnostic snapshots, not a second acceptance oracle. Only
             // the existing child's kernel HWM determines the test's peak/bound.
@@ -274,6 +334,9 @@ export async function importMemoryWorkload(input: {
       ),
       memory,
       rssSnapshots,
+      traffic: input.diagnostics
+        ? { ...traffic, maxLoopStallMs: Math.round(loop.max / 1e6) }
+        : undefined,
       sqliteVersion: db.info.sqliteVersion,
     };
   } finally {

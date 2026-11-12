@@ -10,6 +10,9 @@ import type { SqlDriver } from "./driver.js";
 import type { ImportSource } from "./legacy-import-types.js";
 import { importFingerprint } from "./import-fingerprint.js";
 
+/** Rows of digests per staging round trip; a digest row is about 100 bytes. */
+const SNAPSHOT_CHUNK_ROWS = 256;
+
 const encoder = new TextEncoder();
 const hashBytes = new Uint8Array(64 * 1024);
 
@@ -50,21 +53,35 @@ export async function stageImportSnapshot(
     PRIMARY KEY (op, pk_hash)) WITHOUT ROWID`,
     },
   ]);
+  // One worker round trip per chunk, not per row: each driver call clones its
+  // message across the SQLite worker's thread boundary.
+  let chunk = new Map<string, string>();
+  const flush = async () => {
+    if (chunk.size === 0) return;
+    const prior = await db.query<{ pk_hash: string; body_sha256: string }>(
+      "SELECT pk_hash, body_sha256 FROM import_snapshot WHERE op = ? AND pk_hash IN (SELECT value FROM json_each(?))",
+      [op, JSON.stringify([...chunk.keys()])],
+    );
+    for (const row of prior)
+      if (row.body_sha256 !== chunk.get(row.pk_hash))
+        throw new Error("invalid_record");
+    await db.batch(
+      [...chunk].map(([pkHash, sha]) => ({
+        sql: "INSERT OR IGNORE INTO import_snapshot (op, pk_hash, body_sha256) VALUES (?, ?, ?)",
+        params: [op, pkHash, sha],
+      })),
+    );
+    chunk = new Map();
+  };
   for await (const record of source.records()) {
     const row = await canonicalImportRow(record, source.target.primaryKey);
-    const [prior] = await db.query<{ body_sha256: string }>(
-      "SELECT body_sha256 FROM import_snapshot WHERE op = ? AND pk_hash = ?",
-      [op, row.pk_hash],
-    );
-    if (prior && prior.body_sha256 !== row.body_sha256)
+    const inChunk = chunk.get(row.pk_hash);
+    if (inChunk !== undefined && inChunk !== row.body_sha256)
       throw new Error("invalid_record");
-    await db.batch([
-      {
-        sql: "INSERT OR IGNORE INTO import_snapshot (op, pk_hash, body_sha256) VALUES (?, ?, ?)",
-        params: [op, row.pk_hash, row.body_sha256],
-      },
-    ]);
+    chunk.set(row.pk_hash, row.body_sha256);
+    if (chunk.size >= SNAPSHOT_CHUNK_ROWS) await flush();
   }
+  await flush();
   return importFingerprint(snapshotDigests(db, op));
 }
 

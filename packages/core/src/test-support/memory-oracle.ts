@@ -43,6 +43,8 @@ export interface Workload {
   readonly args?: unknown;
   /** Heap ceiling for the child, in MiB. Default 2048. */
   readonly heapLimitMiB?: number;
+  /** Extra environment for the child, for example allocator tunables. */
+  readonly env?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -106,6 +108,7 @@ function spawnChild(workload: Workload, gc: GcMode): Promise<ChildReport> {
         NODE_NO_WARNINGS: "1",
         MALLOC_TRIM_THRESHOLD_: "0",
         MALLOC_TOP_PAD_: "0",
+        ...workload.env,
       },
     });
     let stdout = "";

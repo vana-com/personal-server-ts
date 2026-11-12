@@ -15,6 +15,10 @@ import type { LocalSyncDeps } from "./deps.js";
 import type { ImportLedger } from "./import-ledger.js";
 import type { ImportReceipt, ImportSource } from "./legacy-import-types.js";
 
+/** A merge batch ends at this many rows or body characters, whichever is first. */
+export const IMPORT_CHUNK_ROWS = 64;
+const IMPORT_CHUNK_BYTES = 256 * 1024;
+
 /** Import refusals are diagnostics; copy removal has its own exact-byte fence. */
 export type LegacyImportResult =
   | {
@@ -120,46 +124,87 @@ export async function importLegacySource(
       let lastRow: ImportRow | null = null;
       const guard = guardImport(source, op);
       const merge = mergeIncoming(op, connectionId);
+      const incomingInsert = (row: ImportRow): SqlStatement => ({
+        sql: `INSERT INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o) VALUES (?, ?, ?, ?, 0, 'seed', ?, ?, NULL)`,
+        params: [
+          op,
+          stream,
+          row.pk_hash,
+          row.record_key,
+          row.body,
+          row.body_sha256,
+        ],
+      });
       const mergeBatch = (row: ImportRow): SqlStatement[] =>
         withOrigin("import", [
           ...guard,
-          {
-            sql: `INSERT INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o) VALUES (?, ?, ?, ?, 0, 'seed', ?, ?, NULL)`,
-            params: [
-              op,
-              stream,
-              row.pk_hash,
-              row.record_key,
-              row.body,
-              row.body_sha256,
-            ],
-          },
+          incomingInsert(row),
           ...merge,
           { sql: "UPDATE write_ctx SET origin = 'local' WHERE id = 1" },
         ]);
-      for await (const record of source.records()) {
-        const row = await canonicalImportRow(record, source.target.primaryKey);
-        const [expected] = await deps.db.query<{
+      // One round trip per chunk of rows, not per row: each driver call clones
+      // its message across the SQLite worker's thread boundary, and a large
+      // import grew the server's memory with the number of calls.
+      let chunk: ImportRow[] = [];
+      let chunkBytes = 0;
+      const flush = async (): Promise<
+        Extract<LegacyImportResult, { kind: "refused" }>["reason"] | null
+      > => {
+        if (chunk.length === 0) return null;
+        const rows = chunk;
+        chunk = [];
+        chunkBytes = 0;
+        const snapshot = await deps.db.query<{
+          pk_hash: string;
           body_sha256: string;
           seen: number;
         }>(
-          "SELECT body_sha256, seen FROM import_snapshot WHERE op = ? AND pk_hash = ?",
-          [op, row.pk_hash],
+          "SELECT pk_hash, body_sha256, seen FROM import_snapshot WHERE op = ? AND pk_hash IN (SELECT value FROM json_each(?))",
+          [op, JSON.stringify(rows.map((r) => r.pk_hash))],
         );
-        if (!expected || expected.body_sha256 !== row.body_sha256)
-          return { kind: "refused", reason: "source_changed" };
-        if (expected.seen) continue;
+        const expected = new Map(snapshot.map((r) => [r.pk_hash, r]));
+        const todo: ImportRow[] = [];
+        const taken = new Set<string>();
+        for (const row of rows) {
+          const known = expected.get(row.pk_hash);
+          if (!known || known.body_sha256 !== row.body_sha256)
+            return "source_changed";
+          if (known.seen || taken.has(row.pk_hash)) continue;
+          taken.add(row.pk_hash);
+          todo.push(row);
+        }
+        if (todo.length === 0) return null;
         const fence = await importFence(deps, source);
-        if (fence) return { kind: "refused", reason: fence };
-        await deps.db.batch([
-          ...mergeBatch(row),
-          {
-            sql: "UPDATE import_snapshot SET seen = 1 WHERE op = ? AND pk_hash = ?",
-            params: [op, row.pk_hash],
-          },
-        ]);
-        lastRow = row;
+        if (fence) return fence;
+        await deps.db.batch(
+          withOrigin("import", [
+            ...guard,
+            ...todo.map(incomingInsert),
+            ...merge,
+            { sql: "UPDATE write_ctx SET origin = 'local' WHERE id = 1" },
+            ...todo.map((row) => ({
+              sql: "UPDATE import_snapshot SET seen = 1 WHERE op = ? AND pk_hash = ?",
+              params: [op, row.pk_hash],
+            })),
+          ]),
+        );
+        lastRow = todo[todo.length - 1]!;
+        return null;
+      };
+      for await (const record of source.records()) {
+        const row = await canonicalImportRow(record, source.target.primaryKey);
+        chunk.push(row);
+        chunkBytes += row.body.length;
+        if (
+          chunk.length >= IMPORT_CHUNK_ROWS ||
+          chunkBytes >= IMPORT_CHUNK_BYTES
+        ) {
+          const refused = await flush();
+          if (refused) return { kind: "refused", reason: refused };
+        }
       }
+      const refused = await flush();
+      if (refused) return { kind: "refused", reason: refused };
       const [remaining] = await deps.db.query<{ n: number }>(
         "SELECT count(*) AS n FROM import_snapshot WHERE op = ? AND seen = 0",
         [op],

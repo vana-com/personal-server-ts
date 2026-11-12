@@ -3,7 +3,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { afterEach, expect, it, vi } from "vitest";
-import { importLegacySource } from "../../../core/src/localdb/legacy-import.js";
+import {
+  IMPORT_CHUNK_ROWS,
+  importLegacySource,
+} from "../../../core/src/localdb/legacy-import.js";
 import { createImportLedger } from "../../../core/src/localdb/import-ledger.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
@@ -171,8 +174,32 @@ it("import-newer-row-wins", async () => {
   );
 });
 
+// Rows merge in chunks, so a second batch needs more rows than one chunk holds.
+const twoChunks = Array.from({ length: IMPORT_CHUNK_ROWS + 1 }, (_, i) => ({
+  id: String(i).padStart(4, "0"),
+  text: `row ${i}`,
+}));
+it("import-makes-fewer-driver-calls-than-rows", async () => {
+  // Each driver call clones its message to the SQLite worker; a large import
+  // once made about six calls per row and its memory grew with that count.
+  const f = await fixture();
+  const rows = IMPORT_CHUNK_ROWS * 3;
+  f.setValues(
+    Array.from({ length: rows }, (_, i) => ({ id: `r${i}`, text: "x" })),
+  );
+  let calls = 0;
+  const { query, batch } = f.db;
+  f.db.query = (...args: Parameters<typeof query>) => (calls++, query(...args));
+  f.db.batch = (...args: Parameters<typeof batch>) => (calls++, batch(...args));
+  expect((await f.run()).kind).toBe("imported");
+  expect(calls).toBeLessThan(rows / 2);
+  expect(await f.db.query("SELECT count(*) AS n FROM records")).toEqual([
+    { n: rows },
+  ]);
+});
 it("import-crash-resume-idempotent", async () => {
   const f = await fixture();
+  f.setValues(twoChunks);
   const batch = f.db.batch.bind(f.db);
   let merges = 0;
   f.db.batch = async (statements) => {
@@ -185,20 +212,21 @@ it("import-crash-resume-idempotent", async () => {
   };
   await expect(f.run()).rejects.toThrow("crash");
   expect(await f.db.query("SELECT count(*) AS n FROM records")).toEqual([
-    { n: 1 },
+    { n: IMPORT_CHUNK_ROWS },
   ]);
   expect(await f.db.query("SELECT * FROM import_ledger")).toEqual([]);
   f.db.batch = batch;
   expect((await f.run()).kind).toBe("imported");
   expect(await f.db.query("SELECT count(*) AS n FROM record_changes")).toEqual([
-    { n: 2 },
+    { n: IMPORT_CHUNK_ROWS + 1 },
   ]);
   expect(await f.db.query("SELECT highest_seq FROM import_ledger")).toEqual([
-    { highest_seq: 2 },
+    { highest_seq: IMPORT_CHUNK_ROWS + 1 },
   ]);
 });
 it("import-delete-between-batches-refuses", async () => {
   const f = await fixture();
+  f.setValues(twoChunks);
   const batch = f.db.batch.bind(f.db);
   let deleted = false;
   f.db.batch = async (statements) => {
@@ -219,7 +247,7 @@ it("import-delete-between-batches-refuses", async () => {
     reason: "connection_deleted",
   });
   expect(await f.db.query("SELECT count(*) AS n FROM record_changes")).toEqual([
-    { n: 1 },
+    { n: IMPORT_CHUNK_ROWS },
   ]);
   expect(await f.db.query("SELECT * FROM import_ledger")).toEqual([]);
 });
