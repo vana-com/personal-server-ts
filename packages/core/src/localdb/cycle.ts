@@ -2,6 +2,7 @@ import { applyConnection, type ApplyResult } from "./apply.js";
 import { bootstrapConnections } from "./bootstrap.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { publishConnection, type PublishResult } from "./publish.js";
+import { mark, timed } from "./timing.js";
 
 export interface CycleReport {
   readonly connections: readonly {
@@ -21,12 +22,18 @@ export interface CycleReport {
  * connection, then read).
  */
 export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
-  const connections = await bootstrapConnections(deps);
-  return {
-    connections: await Promise.all(
-      connections.map(({ connectionId }) => syncConnection(deps, connectionId)),
-    ),
-  };
+  return timed("cycle.run", {}, async () => {
+    const connections = await timed("cycle.bootstrap", {}, () =>
+      bootstrapConnections(deps),
+    );
+    return {
+      connections: await Promise.all(
+        connections.map(({ connectionId }) =>
+          syncConnection(deps, connectionId),
+        ),
+      ),
+    };
+  });
 }
 
 /** One connection: apply, then publish. */
@@ -52,11 +59,19 @@ export async function syncConnection(
           },
         },
       };
-      applied = await applyConnection(queuedDeps, connectionId);
-      published = await publishConnection(queuedDeps, connectionId);
+      applied = await timed("cycle.apply", { connectionId }, () =>
+        applyConnection(queuedDeps, connectionId),
+      );
+      published = await timed("cycle.publish", { connectionId }, () =>
+        publishConnection(queuedDeps, connectionId),
+      );
     });
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause);
+    mark("cycle.connection_failed", {
+      connectionId,
+      error: error.slice(0, 160),
+    });
     // The timer and `/sync/trigger` drop the report. A connection whose
     // publish keeps failing would otherwise stay unpublished with no trace:
     // its run ended as accepted, but nothing it holds becomes readable.

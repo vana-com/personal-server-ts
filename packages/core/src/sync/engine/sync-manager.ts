@@ -1,4 +1,5 @@
 import type { OwnedAccountStorageMode } from "../../api/account-storage-mode.js";
+import { timed } from "../../localdb/timing.js";
 import type { UploadWorkerDeps } from "../workers/upload.js";
 import type { DownloadWorkerDeps } from "../workers/download.js";
 import type { SyncStatus, SyncError, SyncBlockedReason } from "../types.js";
@@ -232,7 +233,11 @@ export function createSyncManager(
     cycleInFlight = exclusive(async () => {
       do {
         rerunRequested = false;
-        const canRun = await (options?.canSync?.() ?? { ok: true });
+        const canRun = await timed(
+          "syncmanager.canSync",
+          {},
+          async () => (await options?.canSync?.()) ?? ({ ok: true } as const),
+        );
         if (!canRun.ok) {
           blocked = { reason: canRun.reason, message: canRun.message };
           uploadDeps.logger.warn(blocked, "Sync cycle blocked");
@@ -244,7 +249,9 @@ export function createSyncManager(
           const mode = options.accountStorageMode.read();
           if (mode !== "unswitched") {
             if (mode === "switched" && options.localSync) {
-              await options.localSync.cycle();
+              await timed("syncmanager.localSync.cycle", {}, () =>
+                options.localSync!.cycle(),
+              );
               lastSync = new Date().toISOString();
             } else {
               blocked = {

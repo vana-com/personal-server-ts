@@ -16,6 +16,7 @@ import {
   type StorageAdapter,
 } from "../storage/adapters/interface.js";
 import { isDefinitiveNotFound } from "../storage/adapters/sdk.js";
+import { mark } from "../localdb/timing.js";
 import type { StreamSyncBlobs } from "./ports.js";
 import {
   DEFAULT_STORAGE_ACCESS_POLICY,
@@ -43,9 +44,25 @@ export function createStorageStreamSyncBlobs(
     get: (key) =>
       guarded(async () => {
         const url = storage.urlForKey(key);
+        const startedAt = Date.now();
+        const kind = /\/h-[^/]*$/.test(key)
+          ? "head"
+          : /\/g\d+-p-[^/]*$/.test(key)
+            ? "part"
+            : "other";
         try {
-          return await storage.download(url);
+          const bytes = await storage.download(url);
+          mark("storage.get.ok", { kind, ms: Date.now() - startedAt });
+          return bytes;
         } catch (error) {
+          mark("storage.get.failed", {
+            kind,
+            ms: Date.now() - startedAt,
+            error: (error instanceof Error
+              ? error.message
+              : String(error)
+            ).slice(0, 80),
+          });
           // A transient failure is retried, never read as "absent".
           if (isTransientStorageError(error)) throw error;
           if (isDefinitiveNotFound(error)) return null;

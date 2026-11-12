@@ -15,6 +15,7 @@ export {
   openLocalDb,
   type LocalDbIdentity,
 } from "./open.js";
+export { mark, setTimingSink, timed, timingEnabled } from "./timing.js";
 export { connectionQueue, type OperationKind } from "./queue.js";
 export type { ConnectionQueue, ConnectionRow, LocalSyncDeps } from "./deps.js";
 export { bootstrapConnections, syncBeforeBegin } from "./bootstrap.js";

@@ -16,6 +16,7 @@
  */
 
 import type { BlobStore } from "@opendatalabs/personal-server-ts-core/localdb";
+import { timed } from "@opendatalabs/personal-server-ts-core/localdb";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import {
@@ -77,7 +78,9 @@ export function streamSyncRunsRoutes(deps: StreamSyncRunsRouteDeps): Hono {
   const { intake } = deps;
 
   const answer = async (c: Context, work: () => Promise<unknown>) => {
-    await auth.authorizeOwner(c.req.raw);
+    await timed("route.authorizeOwner", {}, () =>
+      auth.authorizeOwner(c.req.raw),
+    );
     try {
       return c.json((await work()) ?? {}, 200);
     } catch (error) {
@@ -138,12 +141,17 @@ export function streamSyncRunsRoutes(deps: StreamSyncRunsRouteDeps): Hono {
   });
 
   app.put("/:runId", (c) =>
-    answer(c, async () =>
-      intake.begin(
-        c.req.param("runId"),
-        (await body(c, 1024 * 1024)) as Parameters<typeof intake.begin>[1],
-      ),
-    ),
+    answer(c, async () => {
+      const parsed = await timed("route.begin.body", {}, () =>
+        body(c, 1024 * 1024),
+      );
+      return timed("route.begin.intake", {}, () =>
+        intake.begin(
+          c.req.param("runId"),
+          parsed as Parameters<typeof intake.begin>[1],
+        ),
+      );
+    }),
   );
   app.post("/:runId/batches", createBodyLimit(MAX_BATCH_REQUEST_BYTES), (c) =>
     answer(c, async () =>

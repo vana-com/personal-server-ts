@@ -5,6 +5,7 @@ import type {
   RecordQuery,
   ConnectionLink,
 } from "@opendatalabs/personal-server-ts-core/localdb";
+import { mark } from "@opendatalabs/personal-server-ts-core/localdb";
 import { ouraRoutes } from "./routes/oura.js";
 import {
   streamSyncSeedRoutes,
@@ -491,6 +492,21 @@ export function createApp(deps: AppDeps): Hono {
   // fetch (unaffected by CORS) and the approval page calls its own origin,
   // so a cross-origin preflight for them must fail.
   const cors = corsMiddleware();
+  app.use("/v1/stream-sync/*", async (c, next) => {
+    const shape = c.req.path.replace(/\/runs\/[^/]+/, "/runs/:id");
+    mark("http.stream_sync.arrived", { method: c.req.method, path: shape });
+    const startedAt = Date.now();
+    try {
+      await next();
+    } finally {
+      mark("http.stream_sync.done", {
+        method: c.req.method,
+        path: shape,
+        status: c.res.status,
+        ms: Date.now() - startedAt,
+      });
+    }
+  });
   app.use("*", (c, next) =>
     c.req.path === "/auth/device" ||
     c.req.path.startsWith("/auth/device/") ||

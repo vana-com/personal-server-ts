@@ -27,6 +27,7 @@ import {
 } from "./resolve.js";
 import { createRunEndStore } from "./run-end.js";
 import { createRunIntakeStore } from "./run-intake.js";
+import { mark, timed } from "./timing.js";
 
 /**
  * The one facade a host holds for a switched owner's stream sync on the
@@ -105,22 +106,33 @@ export function createLocalSync(
       if (req.owner.address.toLowerCase() !== deps.ownerAddress.toLowerCase()) {
         throw new RunIntakeError("owner_mismatch");
       }
-      const receipt = await readBeginReceipt(deps.db, runId, req);
+      mark("sync.begin.enter", { connector: String(req.connector) });
+      const receipt = await timed("sync.begin.receipt", {}, () =>
+        readBeginReceipt(deps.db, runId, req),
+      );
       if (receipt) return receipt;
       const binding = {
         connector: req.connector,
         leaseId: req.owner.leaseId,
       };
-      await checkBinding(binding);
-      const declarations = await options.resolveArtifact(req.artifactDigest);
+      await timed("sync.begin.checkBinding1", {}, () => checkBinding(binding));
+      const declarations = await timed(
+        "sync.begin.resolveArtifact",
+        {},
+        async () => options.resolveArtifact(req.artifactDigest),
+      );
       if (!declarations) throw new RunIntakeError("unknown_artifact");
       // Artifact resolution can yield while the owner changes the write lease.
-      await checkBinding(binding);
+      await timed("sync.begin.checkBinding2", {}, () => checkBinding(binding));
       if (req.connect === true) {
-        await deletes().resumeDeletes();
+        await timed("sync.begin.resumeDeletes", {}, () =>
+          deletes().resumeDeletes(),
+        );
         await checkBinding(binding);
       }
-      const response = await intake().begin(runId, req, declarations);
+      const response = await timed("sync.begin.intake", {}, () =>
+        intake().begin(runId, req, declarations),
+      );
       if (response.status === "collecting") bindings.set(runId, binding);
       return response;
     },

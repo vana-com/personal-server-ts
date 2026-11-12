@@ -11,6 +11,8 @@
  * backoff and full jitter, and a small fixed number of attempts.
  */
 
+import { mark } from "../localdb/timing.js";
+
 export interface StorageAccessPolicy {
   /** Operations in flight at once, across every caller sharing the limiter. */
   readonly maxConcurrent: number;
@@ -103,16 +105,29 @@ export function createStorageAccess(
 ): <T>(operation: () => Promise<T>) => Promise<T> {
   const limit = createConcurrencyLimit(policy.maxConcurrent);
   let resumeAt = 0;
-  return (operation) =>
-    limit(async () => {
+  return (operation) => {
+    const enqueuedAt = Date.now();
+    return limit(async () => {
+      const limitWaitMs = Date.now() - enqueuedAt;
+      if (limitWaitMs > 200)
+        mark("storage.limit_wait", { waitedMs: limitWaitMs });
       for (let attempt = 1; ; attempt++) {
         const wait = resumeAt - policy.now();
-        if (wait > 0) await policy.sleep(wait);
+        if (wait > 0) {
+          mark("storage.shared_backoff", { attempt, waitMs: wait });
+          await policy.sleep(wait);
+        }
         try {
           return await operation();
         } catch (error) {
-          if (attempt >= policy.maxAttempts || !isTransientStorageError(error))
-            throw error;
+          const transient = isTransientStorageError(error);
+          mark("storage.attempt_failed", {
+            attempt,
+            transient,
+            status: statusOf(error) ?? null,
+            final: attempt >= policy.maxAttempts || !transient,
+          });
+          if (attempt >= policy.maxAttempts || !transient) throw error;
           resumeAt = Math.max(
             resumeAt,
             policy.now() + backoffDelayMs(attempt, policy),
@@ -120,6 +135,7 @@ export function createStorageAccess(
         }
       }
     });
+  };
 }
 
 /** A counting semaphore: at most `limit` operations run, the rest queue. */

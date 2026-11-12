@@ -27,6 +27,7 @@ import {
   type IntakeDeclarations,
 } from "../stream-sync/intake.js";
 import { syncBeforeBegin } from "./bootstrap.js";
+import { mark, timed } from "./timing.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { checkRunFence } from "./fence.js";
@@ -153,8 +154,13 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
     return run;
   }
   return {
-    begin: (runId, req, declarations) =>
-      serial(runId, async () => {
+    begin: (runId, req, declarations) => {
+      const queuedAt = Date.now();
+      return serial(runId, async () => {
+        mark("intake.begin.serial_started", {
+          connector: String(req.connector),
+          waitedMs: Date.now() - queuedAt,
+        });
         if (
           !/^[A-Za-z0-9._-]{1,128}$/.test(runId) ||
           !isPlainObject(req as unknown)
@@ -191,6 +197,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
         )
           throw invalid("invalid expectedControlVersion");
         const receipt = await readBeginReceipt(db, runId, req);
+        mark("intake.begin.receipt_read", { hit: receipt !== null });
         if (receipt) return receipt;
         if (declarations.connector !== req.connector)
           throw invalid("connector does not match artifact");
@@ -254,7 +261,11 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           ).length
         )
           throw new RunIntakeError("connection_stopped");
-        let synced = await syncBeforeBegin(deps, req.connector);
+        let synced = await timed(
+          "intake.begin.syncBeforeBegin",
+          { connector: req.connector },
+          () => syncBeforeBegin(deps, req.connector),
+        );
         if (req.expectedControlVersion !== undefined) {
           if (synced.unreachable)
             throw new RunIntakeError("control_basis_unavailable");
@@ -361,6 +372,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             mode: modes.get(d.name)!,
           })),
         };
+        mark("intake.begin.before_insert", { connector: req.connector });
         const statements: SqlStatement[] = [
           {
             sql: "INSERT OR IGNORE INTO connections(connection_id,connector,ns) VALUES (?,?,'')",
@@ -426,7 +438,9 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
         }
         statements.push({ sql: "DROP TRIGGER temp.intake_begin_check" });
         try {
-          await db.batch(statements);
+          await timed("intake.begin.insert", { connector: req.connector }, () =>
+            db.batch(statements),
+          );
         } catch (error) {
           if (String(error).includes("control_basis_mismatch"))
             throw new RunIntakeError("control_basis_mismatch");
@@ -436,7 +450,8 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
         }
         active.set(runId, { request: text, response });
         return response;
-      }),
+      });
+    },
     batch: (runId, req) =>
       serial(runId, async () => {
         const run = await live(runId);

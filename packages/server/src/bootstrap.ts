@@ -2,6 +2,8 @@ import {
   localDatabaseName,
   openLocalDb,
   connectionQueue,
+  mark,
+  setTimingSink,
   type LocalSync,
   type LocalSyncDeps,
   type SqlDriver,
@@ -33,6 +35,7 @@ import {
 import { createRequire } from "node:module";
 import { createHash, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
 import { privateKeyToAccount } from "viem/accounts";
 
@@ -379,6 +382,21 @@ async function bootstrapServer(
   const storageRoot = resolveRootPath(
     options?.rootPath ?? options?.serverDir ?? DEFAULT_ROOT_PATH,
   );
+  // Diagnostic: timing marks for stream-sync calls, written under logs/ only
+  // when PS_TIMING_MARKS=1 is set in the server's environment.
+  if (process.env.PS_TIMING_MARKS === "1") {
+    const timingDir = join(storageRoot, "logs");
+    mkdirSync(timingDir, { recursive: true });
+    const timingPath = join(timingDir, "timing-marks.jsonl");
+    setTimingSink((line) => appendFileSync(timingPath, `${line}\n`));
+    let last = Date.now();
+    setInterval(() => {
+      const now = Date.now();
+      if (now - last > 750) mark("eventloop.lag", { ms: now - last - 250 });
+      last = now;
+    }, 250).unref();
+    mark("timing.enabled", {});
+  }
   const dataDir = options?.dataDir ?? join(storageRoot, "data");
   const indexPath = join(storageRoot, "index.db");
   const configPath = join(storageRoot, "config.json");

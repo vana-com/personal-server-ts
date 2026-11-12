@@ -12,6 +12,7 @@ import { streamSyncHashes } from "../stream-sync/crypto.js";
 import { applyConnection } from "./apply.js";
 import type { ConnectionRow, LocalSyncDeps } from "./deps.js";
 import { purgeConnection } from "./purge.js";
+import { timed } from "./timing.js";
 
 // A connection id is its canonical control scope: pdpp.<connector>~<ns>.
 function connectionId(connector: string, ns: string): string {
@@ -163,7 +164,9 @@ export async function syncBeforeBegin(
     const control = await hashes(locked);
     let read: ControlRead;
     try {
-      read = await deps.registry.read(controlScope(connector, ns));
+      read = await timed("syncBeforeBegin.registry_read", { connector }, () =>
+        deps.registry.read(controlScope(connector, ns)),
+      );
     } catch {
       return {
         connection: await cachedConnection(locked, id),
@@ -176,7 +179,11 @@ export async function syncBeforeBegin(
       ReturnType<LocalSyncDeps["registry"]["listStreamRows"]>
     >;
     try {
-      streams = await deps.registry.listStreamRows(connector);
+      streams = await timed(
+        "syncBeforeBegin.registry_list",
+        { connector },
+        () => deps.registry.listStreamRows(connector),
+      );
     } catch {
       return {
         connection: await cachedConnection(locked, id),
@@ -186,20 +193,22 @@ export async function syncBeforeBegin(
     if (connection.controlState === "active") {
       // applyConnection owns version/empty-head-parts selection. Reuse this
       // listing, so its registry availability matches the snapshot above.
-      await applyConnection(
-        {
-          ...locked,
-          registry: {
-            read: (scope) => deps.registry.read(scope),
-            post: (request) => deps.registry.post(request),
-            listControlRows: () => deps.registry.listControlRows(),
-            listStreamRows: (key) =>
-              key === connector
-                ? Promise.resolve(streams)
-                : deps.registry.listStreamRows(key),
+      await timed("syncBeforeBegin.apply", { connector }, () =>
+        applyConnection(
+          {
+            ...locked,
+            registry: {
+              read: (scope) => deps.registry.read(scope),
+              post: (request) => deps.registry.post(request),
+              listControlRows: () => deps.registry.listControlRows(),
+              listStreamRows: (key) =>
+                key === connector
+                  ? Promise.resolve(streams)
+                  : deps.registry.listStreamRows(key),
+            },
           },
-        },
-        id,
+          id,
+        ),
       );
     }
     return {
