@@ -41,34 +41,35 @@ export type FrozenRow = {
 };
 
 /**
- * What the snapshot froze of one changed prefix: how many rows it held and a
- * digest of their identities, in key order. No row body is kept.
- *
- * A row's identity is (key, stamp, first checkpoint, body hash). The stamp and
- * the body hash change together, but `first_o` can change under an unchanged
- * stamp (an import or an older checkpoint lowers it, and logs nothing), and the
- * frame carries it, so it is part of the identity. Two reads of a prefix that
- * give the same digest therefore encode to the same bytes.
+ * What the snapshot spooled of one changed prefix: how many rows it copied
+ * into `publish_spool`. The rows themselves stay on disk; this is all the
+ * candidate keeps in memory.
  */
 export interface FrozenPrefix {
   readonly prefix: string;
   readonly rows: number;
-  readonly digest: string;
 }
 
 /**
- * The rows a transfer read are not the rows the snapshot froze. The candidate
- * is stale: the caller discards it and snapshots again.
+ * The spool no longer holds the rows the snapshot copied (a purge, or another
+ * process, removed them). The candidate is stale: the caller discards it and
+ * snapshots again. Later writes to `records` never cause this; the commit's
+ * revalidation is what rejects a snapshot that real changes made wrong.
  */
 export class FrozenRowsChanged extends Error {
   constructor(readonly prefix: string) {
-    super(`rows of prefix "${prefix}" changed after the snapshot`);
+    super(`spooled rows of prefix "${prefix}" are gone`);
     this.name = "FrozenRowsChanged";
   }
 }
 
-/** Rows read per query. Memory is a page of bodies plus the part in progress. */
+/**
+ * A transfer page holds at most this many rows and, when two or more rows
+ * fit, at most `PAGE_BYTES` of bodies. A row larger than that is a page of
+ * its own: one body is the floor, because a body is encoded whole.
+ */
 const PAGE_ROWS = 64;
+const PAGE_BYTES = 2 * 1024 * 1024;
 
 function partTarget(deps: LocalSyncDeps, generation: number): number {
   const target = deps.partTargetBytes ?? 4 * 1024 * 1024;
@@ -103,122 +104,157 @@ function checkedPrefixes(changedPrefixes: readonly string[]): string[] {
   return prefixes;
 }
 
-/**
- * Read one prefix from `records` in key order, `PAGE_ROWS` rows per query. Each
- * query is its own read (no transaction spans pages, so none spans a network
- * await). Under replace (H), rows below `replaceBelow` are left out.
- */
-async function* readPrefix(
-  deps: LocalSyncDeps,
-  input: PrefixQuery,
-  prefix: string,
-  columns: string,
-): AsyncGenerator<readonly FrozenRow[]> {
-  const params: SqlValue[] = [input.connectionId, input.stream];
-  let where = "connection_id = ? AND stream = ?";
-  if (prefix !== "") {
-    const lo = parseInt(prefix.padEnd(16, "0"), 2);
-    const hi = lo + 2 ** (16 - prefix.length);
-    where += " AND pk_hash >= ? AND pk_hash < ?";
-    params.push(
+/** The `pk_hash` range a part prefix covers, as SQL and parameters. */
+function keyRange(prefix: string): { sql: string; params: SqlValue[] } {
+  if (prefix === "") return { sql: "", params: [] };
+  const lo = parseInt(prefix.padEnd(16, "0"), 2);
+  const hi = lo + 2 ** (16 - prefix.length);
+  return {
+    sql: " AND pk_hash >= ? AND pk_hash < ?",
+    params: [
       lo.toString(16).padStart(4, "0").padEnd(64, "0"),
       hi === 65536 ? "g" : hi.toString(16).padStart(4, "0").padEnd(64, "0"),
-    );
-  }
-  if (input.replaceBelow) {
-    where += " AND (stamp_o > ? OR (stamp_o = ? AND stamp_r >= ?))";
-    params.push(
-      input.replaceBelow.o,
-      input.replaceBelow.o,
-      input.replaceBelow.r,
-    );
-  }
-  let after: string | null = null;
-  for (;;) {
-    const page: FrozenRow[] = await deps.db.query<FrozenRow>(
-      `SELECT ${columns} FROM records
-        WHERE ${where}${after === null ? "" : " AND pk_hash > ?"}
-        ORDER BY pk_hash LIMIT ${PAGE_ROWS}`,
-      after === null ? params : [...params, after],
-    );
-    if (page.length === 0) return;
-    yield page;
-    if (page.length < PAGE_ROWS) return;
-    after = page[page.length - 1]!.pk_hash;
-  }
-}
-
-/** Running digest of row identities, in key order. */
-function identityDigest() {
-  const state = sha256.create();
-  let rows = 0;
-  return {
-    add(row: Omit<FrozenRow, "body">) {
-      state.update(
-        new TextEncoder().encode(
-          JSON.stringify([
-            row.pk_hash,
-            row.stamp_o,
-            row.stamp_r,
-            row.first_o ?? null,
-            row.body_sha256,
-          ]) + "\n",
-        ),
-      );
-      rows += 1;
-    },
-    finish: () => ({
-      rows,
-      digest: Array.from(state.digest(), (b) =>
-        b.toString(16).padStart(2, "0"),
-      ).join(""),
-    }),
+    ],
   };
 }
 
-/**
- * Freeze the changed prefixes: read the identity columns of their rows (never
- * the bodies) and keep a count and a digest per prefix. Run under the queue
- * slot, so the digest is of one consistent state. Memory is one page, however
- * large the prefixes are; what is kept grows with the number of prefixes (at
- * most 65,536), not with the rows.
- */
-export async function freezePrefixRows(
+/** A fresh id for one publish attempt's spool rows. */
+export function newSpoolAttempt(): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+/** Delete an attempt's spool rows: on commit, on discard, on failure. */
+export async function dropSpool(
   deps: LocalSyncDeps,
-  input: PrefixQuery & { readonly changedPrefixes: readonly string[] },
-): Promise<readonly FrozenPrefix[]> {
-  const frozen: FrozenPrefix[] = [];
-  for (const prefix of checkedPrefixes(input.changedPrefixes)) {
-    const digest = identityDigest();
-    for await (const page of readPrefix(
-      deps,
-      input,
-      prefix,
-      "pk_hash, stamp_o, stamp_r, body_sha256, first_o",
-    )) {
-      for (const row of page) digest.add(row);
-    }
-    frozen.push({ prefix, ...digest.finish() });
-  }
-  return frozen;
+  attempt: string,
+): Promise<void> {
+  await deps.db.batch([
+    { sql: "DELETE FROM publish_spool WHERE attempt = ?", params: [attempt] },
+  ]);
 }
 
 /**
- * C.2 step 4, after the freeze: read the frozen prefixes page by page, encode
+ * Copy the changed prefixes' rows into `publish_spool` under `attempt`, all in
+ * one batch (one transaction, so one consistent state) and one `INSERT ...
+ * SELECT` per prefix, so no row passes through memory. Run under the queue
+ * slot. Under replace (H), rows below `replaceBelow` are left out. What
+ * is kept in memory grows with the number of prefixes (at most 65,536), not
+ * with the rows.
+ *
+ * The transfer reads only this copy, so a write to `records` after this call
+ * cannot change what is sent. A write that makes the snapshot wrong is the
+ * commit's to catch.
+ */
+export async function freezePrefixRows(
+  deps: LocalSyncDeps,
+  input: PrefixQuery & {
+    readonly attempt: string;
+    readonly changedPrefixes: readonly string[];
+  },
+): Promise<readonly FrozenPrefix[]> {
+  const prefixes = checkedPrefixes(input.changedPrefixes);
+  if (prefixes.length === 0) return [];
+  const statements = prefixes.map((prefix) => {
+    const range = keyRange(prefix);
+    let where = "connection_id = ? AND stream = ?" + range.sql;
+    const params: SqlValue[] = [
+      input.attempt,
+      input.connectionId,
+      input.stream,
+      ...range.params,
+    ];
+    if (input.replaceBelow) {
+      where += " AND (stamp_o > ? OR (stamp_o = ? AND stamp_r >= ?))";
+      params.push(
+        input.replaceBelow.o,
+        input.replaceBelow.o,
+        input.replaceBelow.r,
+      );
+    }
+    return {
+      sql: `INSERT INTO publish_spool
+        (attempt, connection_id, pk_hash, stamp_o, stamp_r, first_o,
+         body_sha256, body_bytes, body)
+      SELECT ?, connection_id, pk_hash, stamp_o, stamp_r, first_o,
+             body_sha256, length(CAST(body AS BLOB)), body
+        FROM records WHERE ${where}`,
+      params,
+    };
+  });
+  const { changes } = await deps.db.batch(statements);
+  return prefixes.map((prefix, i) => ({ prefix, rows: changes[i]! }));
+}
+
+type SpoolRow = Omit<FrozenRow, "body"> & { readonly body: string };
+
+/**
+ * Read one prefix of an attempt's spool in key order. A page is found by
+ * metadata first (key and body size, no body), cut at `PAGE_ROWS` rows or
+ * `PAGE_BYTES` of bodies (at least one row), and only then are its bodies
+ * read. The spool does not change while the attempt runs, so a range read
+ * returns exactly the rows the metadata named; fewer means the spool was
+ * emptied under the transfer.
+ */
+async function* readSpool(
+  deps: LocalSyncDeps,
+  attempt: string,
+  prefix: string,
+): AsyncGenerator<readonly SpoolRow[]> {
+  const range = keyRange(prefix);
+  let after: string | null = null;
+  for (;;) {
+    const meta: { pk_hash: string; body_bytes: number }[] = await deps.db.query(
+      `SELECT pk_hash, body_bytes FROM publish_spool
+          WHERE attempt = ?${range.sql}${after === null ? "" : " AND pk_hash > ?"}
+          ORDER BY pk_hash LIMIT ${PAGE_ROWS}`,
+      [attempt, ...range.params, ...(after === null ? [] : [after])],
+    );
+    if (meta.length === 0) return;
+    let take = 0;
+    let bytes = 0;
+    while (
+      take < meta.length &&
+      (take === 0 || bytes + Number(meta[take]!.body_bytes) <= PAGE_BYTES)
+    ) {
+      bytes += Number(meta[take]!.body_bytes);
+      take += 1;
+    }
+    const first = meta[0]!.pk_hash;
+    const last = meta[take - 1]!.pk_hash;
+    const page: SpoolRow[] = await deps.db.query(
+      `SELECT pk_hash, stamp_o, stamp_r, first_o, body_sha256, body
+         FROM publish_spool
+        WHERE attempt = ? AND pk_hash >= ? AND pk_hash <= ?
+        ORDER BY pk_hash`,
+      [attempt, first, last],
+    );
+    if (page.length !== take) throw new FrozenRowsChanged(prefix);
+    yield page;
+    if (take === meta.length && meta.length < PAGE_ROWS) return;
+    after = last;
+  }
+}
+
+/**
+ * C.2 step 4, after the freeze: read the attempt's spool page by page, encode
  * the rows as v3 frames (format 4 head) in parts of at most `partTargetBytes`,
  * STREAM-encrypted, and upload each part that does not exist. Identical rows
  * give an identical part, so a repeat run makes zero PUTs.
  *
- * It needs no queue slot and holds no transaction: each page is its own read.
- * The rows are not the snapshot's copy, so each prefix's rows are checked
- * against the frozen count and digest before its last part is uploaded; a
- * difference (a row changed, was added or removed) throws `FrozenRowsChanged`
- * and the head is never built. Memory is a page of rows and the part in
- * progress, however large the stream.
+ * It needs no queue slot and holds no transaction: each page is its own read
+ * of the spool, which no write to `records` reaches. Each prefix's row count
+ * is checked against the spooled count before its last part is uploaded; a
+ * difference means the spool was emptied under the transfer and throws
+ * `FrozenRowsChanged`, and the head is never built. Memory is one page (at most
+ * `PAGE_BYTES` of bodies, or one row) and the part in progress, however large
+ * the stream.
  */
 export async function uploadFrozenParts(
   deps: LocalSyncDeps,
-  input: PrefixQuery & {
+  input: {
+    readonly attempt: string;
     readonly scope: string;
     readonly generation: number;
     readonly frozen: readonly FrozenPrefix[];
@@ -250,15 +286,10 @@ export async function uploadFrozenParts(
       frames = [];
       bytes = 0;
     };
-    const seen = identityDigest();
-    for await (const page of readPrefix(
-      deps,
-      input,
-      prefix,
-      "pk_hash, stamp_o, stamp_r, body, body_sha256, first_o",
-    )) {
+    let seen = 0;
+    for await (const page of readSpool(deps, input.attempt, prefix)) {
       for (const row of page) {
-        seen.add(row);
+        seen += 1;
         const body = new TextEncoder().encode(row.body);
         const frame = frameOfBody(
           {
@@ -296,19 +327,17 @@ export async function uploadFrozenParts(
         }
       }
     }
-    const read = seen.finish();
-    if (read.rows !== frozen.rows || read.digest !== frozen.digest) {
-      throw new FrozenRowsChanged(prefix);
-    }
+    if (seen !== frozen.rows) throw new FrozenRowsChanged(prefix);
     await flush();
   }
   return result;
 }
 
 /**
- * C.2 step 4: freeze the changed prefixes, then encode and upload them. The
- * publisher calls the two halves apart (freeze under the queue slot, upload
+ * C.2 step 4: spool the changed prefixes, then encode and upload them. The
+ * publisher calls the two halves apart (spool under the queue slot, upload
  * outside it); this composition is for a caller that holds the slot itself.
+ * It drops its spool rows before returning, whether the upload succeeded or not.
  */
 export async function encodePrefixes(
   deps: LocalSyncDeps,
@@ -326,12 +355,15 @@ export async function encodePrefixes(
   partTarget(deps, input.generation);
   // upToSeq fences the publish watermark, not this snapshot of records.
   // HeadExtras belongs to the caller's head and is deliberately left opaque.
-  return uploadFrozenParts(deps, {
-    connectionId: input.connectionId,
-    stream: input.stream,
-    replaceBelow: input.replaceBelow,
-    scope: input.scope,
-    generation: input.generation,
-    frozen: await freezePrefixRows(deps, input),
-  });
+  const attempt = newSpoolAttempt();
+  try {
+    return await uploadFrozenParts(deps, {
+      attempt,
+      scope: input.scope,
+      generation: input.generation,
+      frozen: await freezePrefixRows(deps, { ...input, attempt }),
+    });
+  } finally {
+    await dropSpool(deps, attempt);
+  }
 }

@@ -158,4 +158,16 @@ END;`,
     `ALTER TABLE run_streams ADD COLUMN published_watermark INTEGER`,
     `ALTER TABLE run_streams ADD COLUMN publication_reason TEXT`,
   ],
+  [
+    // The rows one publish attempt sends, copied under the connection's slot
+    // so the upload reads a copy that later writes cannot move. Local only,
+    // never published or applied: an attempt deletes its rows when it ends,
+    // and `openLocalDb` deletes any left by a crash.
+    `CREATE TABLE publish_spool (
+  attempt TEXT NOT NULL, connection_id TEXT NOT NULL, pk_hash TEXT NOT NULL,
+  stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL, first_o INTEGER,
+  body_sha256 TEXT NOT NULL, body_bytes INTEGER NOT NULL, body TEXT NOT NULL,
+  PRIMARY KEY (attempt, pk_hash)) WITHOUT ROWID;`,
+    `CREATE INDEX publish_spool_by_connection ON publish_spool(connection_id)`,
+  ],
 ];

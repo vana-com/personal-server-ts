@@ -93,23 +93,29 @@ describe("a publish upload does not hold the queue slot", () => {
     expect(await readerKeys(stores)).toEqual(["one", "seed-row", "two"]);
   });
 
-  it("restarts the transfer when a late run rewrites a row of a prefix being sent", async () => {
+  it("sends the candidate's rows when a late run rewrites a row of a prefix being sent", async () => {
     const { stores, a } = await started();
     await a.run("r1", ["seed-row", "one"]);
+    const w1 = await a.newestChange();
     const hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
     await hold.reached;
-    // r2 re-stamps "one", which the frozen candidate re-encodes.
+    // r2 re-stamps "one", which the candidate re-encodes. The transfer reads
+    // its own copy, so this cannot stale it.
     await a.run("r2", ["seed-row", "one", "two"]);
     hold.release();
     const first = await cycle;
     expect(first.connections[0]?.error).toBeNull();
-    // The stale candidate was never posted: one new head, holding both runs.
+    // One new head, built from r1's rows; r2 is pending above W.
     expect(await streamRows(stores)).toEqual([{ version: 2, state: "head" }]);
-    expect(receiptRunIds(first)).toEqual(expect.arrayContaining(["r1", "r2"]));
-    // Nothing is left pending above the head.
+    expect(receiptRunIds(first)).toContain("r1");
+    expect(receiptRunIds(first)).not.toContain("r2");
+    expect(await a.watermark()).toBe(w1);
+    expect(await readerKeys(stores)).toEqual(["one", "seed-row"]);
+    // The next cycle publishes r2 and leaves nothing pending.
+    expect(receiptRunIds(await settle(a))).toContain("r2");
+    expect(await a.head()).toMatchObject({ version: 3 });
     expect(receiptRunIds(await settle(a))).toEqual([]);
-    expect(await a.head()).toMatchObject({ version: 2 });
     expect(await readerKeys(stores)).toEqual(["one", "seed-row", "two"]);
   });
 
@@ -143,6 +149,123 @@ describe("a publish upload does not hold the queue slot", () => {
     expect(receiptRunIds(last)).toContain("r2");
     expect(await a.watermark()).toBe(w2);
     expect(await readerKeys(stores)).toEqual(["one", "seed-row", "two"]);
+  });
+});
+
+describe("a publish sends from a spool", () => {
+  const spoolRows = async (a: Device) =>
+    (
+      await a.query<{ n: number }>("SELECT count(*) AS n FROM publish_spool")
+    )[0]!.n;
+  const attempts = async (a: Device) =>
+    (
+      await a.query<{ n: number }>(
+        "SELECT count(DISTINCT attempt) AS n FROM publish_spool",
+      )
+    )[0]!.n;
+
+  it("publishes in the cycle that began when unread rows are restamped during its transfers", async () => {
+    const { stores, a } = await started();
+    await a.run("r1", ["seed-row", "one"]);
+    const w1 = await a.newestChange();
+    let hold = stores.storage.holdNext(putting);
+    const cycle = a.cycle();
+    // A collector re-emits unchanged rows (new stamps) during every transfer
+    // the cycle starts. Up to five: more than the invalidation budget.
+    const restamped: string[] = [];
+    for (let n = 1; n <= 5; n++) {
+      const reached = await Promise.race([
+        hold.reached.then(() => true),
+        cycle.then(() => false),
+      ]);
+      if (!reached) break;
+      await a.run(`late-${n}`, ["seed-row", "one"]);
+      restamped.push(`late-${n}`);
+      const next = stores.storage.holdNext(putting);
+      hold.release();
+      hold = next;
+    }
+    const first = await cycle;
+    expect(first.connections[0]?.error).toBeNull();
+    // The first candidate published: the cycle was not starved.
+    expect(await a.head()).toMatchObject({ version: 2 });
+    expect(await a.watermark()).toBe(w1);
+    expect(receiptRunIds(first)).toContain("r1");
+    expect(await readerKeys(stores)).toEqual(["one", "seed-row"]);
+    // The restamps are pending above W and publish in the next cycle.
+    hold.release();
+    const second = await settle(a);
+    expect(restamped.length).toBeGreaterThanOrEqual(1);
+    expect(receiptRunIds(second)).toEqual(expect.arrayContaining(restamped));
+    expect(await readerKeys(stores)).toEqual(["one", "seed-row"]);
+  });
+
+  it("holds the candidate's rows in the spool during the transfer and none after the commit", async () => {
+    const { stores, a } = await started();
+    await a.run("r1", ["seed-row", "one"]);
+    expect(await spoolRows(a)).toBe(0);
+    const hold = stores.storage.holdNext(putting);
+    const cycle = a.cycle();
+    await hold.reached;
+    expect(await spoolRows(a)).toBe(2);
+    expect(await attempts(a)).toBe(1);
+    hold.release();
+    await cycle;
+    expect(await a.head()).toMatchObject({ version: 2 });
+    expect(await spoolRows(a)).toBe(0);
+  });
+
+  it("drops the spool of a candidate the commit discards, and of its replacement", async () => {
+    const { stores, a } = await started();
+    await a.run("r1", ["seed-row", "one", "x"]);
+    const first = stores.storage.holdNext(putting);
+    const cycle = a.cycle();
+    await first.reached;
+    // A rewrite the transfer ignores and a delete the commit must catch.
+    await a.run("r2", ["seed-row", "one"]);
+    await a.remove("r3", ["x"]);
+    const second = stores.storage.holdNext(putting);
+    first.release();
+    await second.reached;
+    // The discarded candidate's rows are gone; only the new attempt's remain.
+    expect(await attempts(a)).toBe(1);
+    second.release();
+    const report = await cycle;
+    expect(report.connections[0]?.error).toBeNull();
+    expect(await readerKeys(stores)).not.toContain("x");
+    expect(await spoolRows(a)).toBe(0);
+    await settle(a);
+    expect(await readerKeys(stores)).toEqual(["one", "seed-row"]);
+    expect(await spoolRows(a)).toBe(0);
+  });
+
+  it("drops the spool of a transfer that failed", async () => {
+    const { stores, a } = await started();
+    await a.run("r1", ["seed-row", "one"]);
+    stores.storage.failNextPut();
+    const failed = await a.cycle();
+    expect(failed.connections[0]?.error).toMatch(/put failed/);
+    expect(await spoolRows(a)).toBe(0);
+    await settle(a);
+    expect(await readerKeys(stores)).toEqual(["one", "seed-row"]);
+    expect(await spoolRows(a)).toBe(0);
+  });
+
+  it("keeps no copy of a connection's rows once the connection is deleted", async () => {
+    const { stores, a } = await started();
+    await a.run("r1", ["seed-row", "one"]);
+    const hold = stores.storage.holdNext(putting);
+    const cycle = a.cycle();
+    await hold.reached;
+    expect(await spoolRows(a)).toBe(2);
+    await a.sync.deleter.requestConnectionDelete("fixture");
+    // The purge took the copy with the records.
+    expect(await spoolRows(a)).toBe(0);
+    hold.release();
+    const report = await cycle;
+    expect(receiptRunIds(report)).toEqual([]);
+    expect(await spoolRows(a)).toBe(0);
+    expect(await readerKeys(stores)).toEqual([]);
   });
 });
 

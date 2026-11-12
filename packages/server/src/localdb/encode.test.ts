@@ -12,6 +12,7 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   FrozenRowsChanged,
+  dropSpool,
   encodePrefixes,
   freezePrefixRows,
   uploadFrozenParts,
@@ -49,13 +50,11 @@ afterEach(async () => {
 async function fresh(partTargetBytes?: number) {
   const dir = mkdtempSync(join(process.cwd(), ".encode-test-"));
   dirs.push(dir);
-  const driver = openBetterSqlite3(join(dir, "db.sqlite"));
+  const path = join(dir, "db.sqlite");
+  const identity = { owner: "0xabc", network: "test", deviceId: "encode-test" };
+  const driver = openBetterSqlite3(path);
   drivers.push(driver);
-  const db = await openLocalDb(driver, {
-    owner: "0xabc",
-    network: "test",
-    deviceId: "encode-test",
-  });
+  const db = await openLocalDb(driver, identity);
   const blobs = new Map<string, Uint8Array>();
   const testKey = new Uint8Array(32).fill(17);
   const encryptPart = vi.fn(async (_scope: string, clear: Uint8Array) =>
@@ -141,7 +140,18 @@ async function fresh(partTargetBytes?: number) {
     }
     return summaries;
   };
-  return { db, deps, blobs, get, put, encryptPart, insert, read };
+  return {
+    db,
+    deps,
+    blobs,
+    get,
+    put,
+    encryptPart,
+    insert,
+    read,
+    path,
+    identity,
+  };
 }
 
 describe("encodePrefixes", () => {
@@ -179,14 +189,15 @@ describe("encodePrefixes", () => {
     expect(second).toEqual(first);
     expect(f.put).not.toHaveBeenCalled();
     expect(f.encryptPart).not.toHaveBeenCalled();
-    // Per call and prefix: one page to freeze the identities, one to encode.
+    // Per call and prefix: one query for a page's keys and sizes, one for its
+    // bodies (the copy into the spool is a batch, not a query).
     expect(query).toHaveBeenCalledTimes(8);
     expect(
       query.mock.calls.every(([sql]) => sql.includes("ORDER BY pk_hash")),
     ).toBe(true);
-    // The freeze never reads a body.
+    // The first of the two never reads a body.
     expect(
-      query.mock.calls.filter(([sql]) => !sql.includes("body,")),
+      query.mock.calls.filter(([sql]) => sql.includes("body_bytes")),
     ).toHaveLength(4);
     expect(request.headExtras).toBe(headExtras);
   });
@@ -296,14 +307,18 @@ describe("encodePrefixes", () => {
   });
 });
 
-describe("a transfer reads the rows the snapshot froze", () => {
-  const prefixes = { ...input, changedPrefixes: [""] };
+describe("a transfer reads the spool the snapshot made", () => {
+  const prefixes = { ...input, changedPrefixes: [""], attempt: "attempt-1" };
   const upload = (f: Awaited<ReturnType<typeof fresh>>, frozen: never) =>
     uploadFrozenParts(f.deps, { ...prefixes, frozen });
 
   async function frozen(f: Awaited<ReturnType<typeof fresh>>) {
     return (await freezePrefixRows(f.deps, prefixes)) as never;
   }
+  const spooled = async (f: Awaited<ReturnType<typeof fresh>>) =>
+    (
+      await f.db.query<{ n: number }>("SELECT count(*) AS n FROM publish_spool")
+    )[0]!.n;
 
   it("encodes the same parts whether the stream fits one page or spans many", async () => {
     const f = await fresh();
@@ -321,32 +336,53 @@ describe("a transfer reads the rows the snapshot froze", () => {
     );
   });
 
-  it("keeps a count and a digest per prefix, not the rows", async () => {
+  it("keeps a count per prefix in memory and the rows in the spool", async () => {
     const f = await fresh();
-    await f.insert([{ k: keyHash("1") }, { k: keyHash("2") }]);
+    await f.insert([
+      { k: keyHash("1") },
+      { k: keyHash("2") },
+      { k: keyHash("1"), connectionId: "another-connection" },
+    ]);
     const [only, ...rest] = await freezePrefixRows(f.deps, prefixes);
     expect(rest).toEqual([]);
-    expect(Object.keys(only!).sort()).toEqual(["digest", "prefix", "rows"]);
-    expect(only).toMatchObject({ prefix: "", rows: 2 });
+    expect(only).toEqual({ prefix: "", rows: 2 });
+    expect(await spooled(f)).toBe(2);
   });
 
-  it.each([
-    [
-      "a row got a newer stamp",
-      "UPDATE records SET stamp_o = 11, body_sha256 = '" +
-        "f".repeat(64) +
-        "' WHERE pk_hash = ?",
-    ],
-    [
-      "a row's first checkpoint moved under the same stamp",
-      "UPDATE records SET first_o = 3 WHERE pk_hash = ?",
-    ],
-    ["a row was removed", "DELETE FROM records WHERE pk_hash = ?"],
-  ])("throws when %s after the freeze", async (_name, sql) => {
+  it("sends the snapshot's rows whatever later writes do to records", async () => {
     const f = await fresh();
-    await f.insert([{ k: keyHash("1") }, { k: keyHash("2"), f: 9 }]);
+    await f.insert([
+      { k: keyHash("1") },
+      { k: keyHash("2"), f: 9 },
+      { k: keyHash("3") },
+    ]);
     const froze = await frozen(f);
-    await f.db.batch([{ sql, params: [keyHash("2")] }]);
+    await f.db.batch([
+      {
+        sql: "UPDATE records SET stamp_o = 11, stamp_r = 'late', body_sha256 = ? WHERE pk_hash = ?",
+        params: ["f".repeat(64), keyHash("2")],
+      },
+      { sql: "DELETE FROM records WHERE pk_hash = ?", params: [keyHash("3")] },
+    ]);
+    await f.insert([{ k: keyHash("4") }]);
+    const parts = await upload(f, froze);
+    expect(await f.read(parts)).toEqual([
+      { k: keyHash("1"), o: 10, r: "run", f: null },
+      { k: keyHash("2"), o: 10, r: "run", f: 9 },
+      { k: keyHash("3"), o: 10, r: "run", f: null },
+    ]);
+  });
+
+  it("throws when the spool lost rows after the snapshot", async () => {
+    const f = await fresh();
+    await f.insert([{ k: keyHash("1") }, { k: keyHash("2") }]);
+    const froze = await frozen(f);
+    await f.db.batch([
+      {
+        sql: "DELETE FROM publish_spool WHERE pk_hash = ?",
+        params: [keyHash("2")],
+      },
+    ]);
     await expect(upload(f, froze)).rejects.toBeInstanceOf(FrozenRowsChanged);
     expect(f.put).not.toHaveBeenCalledWith(
       expect.stringContaining("-p-"),
@@ -354,11 +390,121 @@ describe("a transfer reads the rows the snapshot froze", () => {
     );
   });
 
-  it("throws when a row was added after the freeze", async () => {
+  it("drops one attempt's rows and no other's", async () => {
     const f = await fresh();
-    await f.insert([{ k: keyHash("1") }]);
-    const froze = await frozen(f);
-    await f.insert([{ k: keyHash("2") }]);
-    await expect(upload(f, froze)).rejects.toBeInstanceOf(FrozenRowsChanged);
+    await f.insert([{ k: keyHash("1") }, { k: keyHash("2") }]);
+    await freezePrefixRows(f.deps, prefixes);
+    await freezePrefixRows(f.deps, { ...prefixes, attempt: "attempt-2" });
+    expect(await spooled(f)).toBe(4);
+    await dropSpool(f.deps, "attempt-1");
+    expect(
+      await f.db.query("SELECT DISTINCT attempt FROM publish_spool"),
+    ).toEqual([{ attempt: "attempt-2" }]);
+  });
+
+  it("is empty after a simulated crash and restart", async () => {
+    const f = await fresh();
+    await f.insert([{ k: keyHash("1") }, { k: keyHash("2") }]);
+    await freezePrefixRows(f.deps, prefixes);
+    expect(await spooled(f)).toBe(2);
+    // The process stopped mid-publish: no drop. A new process opens the file.
+    await f.db.close();
+    drivers.splice(drivers.indexOf(f.db), 1);
+    const driver = openBetterSqlite3(f.path);
+    drivers.push(driver);
+    const reopened = await openLocalDb(driver, f.identity);
+    expect(
+      await reopened.query("SELECT count(*) AS n FROM publish_spool"),
+    ).toEqual([{ n: 0 }]);
+    // The records are untouched: only the copy went.
+    expect(await reopened.query("SELECT count(*) AS n FROM records")).toEqual([
+      { n: 2 },
+    ]);
+  });
+});
+
+describe("encodePrefixes under writes and large bodies", () => {
+  /** Spy on db.query: total body characters per result, and a hook per result. */
+  function watch(
+    f: Awaited<ReturnType<typeof fresh>>,
+    onBodies?: (calls: number) => Promise<void>,
+  ) {
+    const real = f.db.query.bind(f.db);
+    const seen = { maxBodyChars: 0, bodyPages: 0 };
+    vi.spyOn(f.db, "query").mockImplementation((async (
+      sql: string,
+      params?: never,
+    ) => {
+      const rows = (await real(sql, params)) as { body?: string }[];
+      const chars = rows.reduce(
+        (n, row) => n + (typeof row.body === "string" ? row.body.length : 0),
+        0,
+      );
+      if (chars > 0) {
+        seen.bodyPages += 1;
+        seen.maxBodyChars = Math.max(seen.maxBodyChars, chars);
+        await onBodies?.(seen.bodyPages);
+      }
+      return rows;
+    }) as never);
+    return seen;
+  }
+
+  it("encodes the snapshot when a row of a later page is rewritten between pages", async () => {
+    const f = await fresh();
+    const keys = Array.from({ length: 150 }, (_, i) =>
+      String(i).padStart(3, "0").padEnd(64, "0"),
+    );
+    await f.insert(keys.map((k) => ({ k })));
+    watch(f, async (page) => {
+      // After the first page is read, a collector re-emits a row not yet read.
+      if (page === 1) {
+        await f.db.batch([
+          {
+            sql: "UPDATE records SET stamp_o = 99, stamp_r = 'later' WHERE pk_hash = ?",
+            params: [keys[140]!],
+          },
+        ]);
+      }
+    });
+    const parts = await encodePrefixes(f.deps, input);
+    const rows = await f.read(parts);
+    expect(rows).toHaveLength(150);
+    expect(rows.every((row) => row.o === 10 && row.r === "run")).toBe(true);
+  });
+
+  it("keeps a page of bodies under the byte cap", async () => {
+    const f = await fresh();
+    const big = "x".repeat(600 * 1024);
+    await f.insert(
+      Array.from({ length: 12 }, (_, i) => ({
+        k: String(i).padStart(2, "0").padEnd(64, "0"),
+        value: big,
+      })),
+    );
+    const seen = watch(f);
+    const parts = await encodePrefixes(f.deps, input);
+    expect(parts.reduce((n, part) => n + part.count, 0)).toBeGreaterThan(0);
+    expect((await f.read(parts)).map((row) => row.k)).toHaveLength(12);
+    // Twelve rows are 7 MiB; a page holds what fits in 2 MiB (three rows).
+    expect(seen.maxBodyChars).toBeLessThanOrEqual(2 * 1024 * 1024);
+    expect(seen.bodyPages).toBeGreaterThanOrEqual(4);
+  });
+
+  it("reads a body larger than the cap as a page of its own", async () => {
+    const f = await fresh();
+    await f.insert([
+      { k: keyHash("1"), value: "y".repeat(3 * 1024 * 1024) },
+      { k: keyHash("2"), value: "z" },
+    ]);
+    const seen = watch(f);
+    const parts = await encodePrefixes(f.deps, input);
+    expect((await f.read(parts)).map((row) => row.k)).toEqual([
+      keyHash("1"),
+      keyHash("2"),
+    ]);
+    expect(seen.maxBodyChars).toBeGreaterThan(3 * 1024 * 1024);
+    expect(seen.maxBodyChars).toBeLessThan(3 * 1024 * 1024 + 1024);
+    expect(seen.bodyPages).toBe(2);
   });
 });
