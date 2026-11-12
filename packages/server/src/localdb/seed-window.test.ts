@@ -470,3 +470,52 @@ it("a staged seed that arrives after a real write is excluded for good, even acr
     ),
   ).toEqual(before);
 });
+
+it("a fresh device that only applied a remote head refuses a seed for that stream", async () => {
+  const w = await world();
+  const b = await w.device("b");
+  await b.run("refresh", ["B"], { observedAt: 5000 });
+  await b.publish();
+  // No local run on "a": its only head comes from applying b's publication.
+  const a = await w.device("a");
+  await a.sync.cycle();
+  expect(
+    await a.db.query(
+      "SELECT head_version, floor_o FROM stream_state WHERE stream = 'items'",
+    ),
+  ).toEqual([{ head_version: 1, floor_o: null }]);
+  expect(await a.seed("install-1", ["A"])).toEqual(refused);
+  expect(await a.keys()).toEqual(["B"]);
+});
+
+it("an accepted run that declared a stream but wrote nothing to it closes the window until a real write", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  // Accepted with no rows and no coverage for "items".
+  await a.sync.intake.begin("empty", {
+    connector: "fixture",
+    artifactDigest: "fixture",
+    streams: [{ name: "items" }],
+    wantFull: true,
+    owner: { address: owner, leaseId: null },
+  });
+  await a.sync.intake.batch("empty", { batch: 0, records: [] });
+  await a.sync.intake.end("empty", {
+    outcome: "succeeded",
+    coveredStreams: [],
+    lastBatch: 0,
+  });
+  await a.publish();
+  expect(await a.keys()).toEqual([]);
+  expect(await a.seed("install-1", ["A"])).toEqual(refused);
+  expect(await a.keys()).toEqual([]);
+  // A later real run writes a record and it is saved normally.
+  await a.run("real", ["R"]);
+  await a.publish();
+  expect(await a.keys()).toEqual(["R"]);
+  expect(
+    await a.db.query(
+      "SELECT stamp_r FROM records WHERE record_key = 'R' AND stream = 'items'",
+    ),
+  ).toEqual([{ stamp_r: "real" }]);
+});

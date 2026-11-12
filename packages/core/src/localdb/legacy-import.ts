@@ -281,6 +281,9 @@ async function importFence(
  * enforce this: it inserts an absent key whatever its stamp, so a seed would
  * bring back a record that a real full refresh or delete already removed.
  * `guardImport` repeats this exact predicate in SQL.
+ * The window also closes on purpose for a seed-only published head and for an
+ * accepted run decision on a stream with no rows; a later seed must not reopen
+ * either one. Do not treat them as bugs and reopen the window.
  */
 function seedWindowClosed(state: {
   floor_o: number | null;
