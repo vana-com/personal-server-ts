@@ -146,6 +146,57 @@ describe("a publish upload does not hold the queue slot", () => {
   });
 });
 
+describe("run publication evidence follows the candidate's runs", () => {
+  /** A run's publication state, as the intake answers it. */
+  const stateOf = async (device: Device, runId: string) =>
+    (await device.sync.intake.publicationStatus(runId)).state;
+
+  it("keeps a run that ended during the upload pending until a later cycle publishes it", async () => {
+    const { stores, a } = await started();
+    await a.run("r1", ["seed-row", "one"]);
+    const hold = stores.storage.holdNext(putting);
+    const cycle = a.cycle();
+    await hold.reached;
+    // "two" lies in no prefix the candidate re-encodes, so the candidate stands.
+    await a.run("r2", ["two"]);
+    hold.release();
+    const first = await cycle;
+    expect(first.connections[0]?.error).toBeNull();
+    expect(receiptRunIds(first)).toContain("r1");
+    expect(receiptRunIds(first)).not.toContain("r2");
+    // The head the commit wrote covers r1, not r2.
+    expect(await stateOf(a, "r1")).toBe("published");
+    expect(await stateOf(a, "r2")).toBe("pending");
+
+    await settle(a);
+    expect(await stateOf(a, "r2")).toBe("published");
+  });
+
+  it("writes no evidence for a candidate a record delete invalidated, until the re-snapshot commits", async () => {
+    const { stores, a } = await started();
+    await a.run("r1", ["seed-row", "one", "x"]);
+    const first = stores.storage.holdNext(putting);
+    const cycle = a.cycle();
+    await first.reached;
+    // The delete invalidates the candidate that r1 was captured in. Hold the
+    // re-snapshot's first upload so the state between the two can be read.
+    await a.remove("r2", ["x"]);
+    const second = stores.storage.holdNext(putting);
+    first.release();
+    await second.reached;
+    expect(await a.head()).toMatchObject({ version: 1 });
+    expect(await stateOf(a, "r1")).toBe("pending");
+    expect(await stateOf(a, "r2")).toBe("pending");
+    second.release();
+    const report = await cycle;
+    expect(report.connections[0]?.error).toBeNull();
+    expect(receiptRunIds(report)).toEqual(expect.arrayContaining(["r1", "r2"]));
+    expect(await stateOf(a, "r1")).toBe("published");
+    expect(await stateOf(a, "r2")).toBe("published");
+    expect(await readerKeys(stores)).toEqual(["one", "seed-row"]);
+  });
+});
+
 describe("another device publishing during an upload", () => {
   it("discards the stale candidate and converges on the newer head", async () => {
     const { stores, a } = await started();
