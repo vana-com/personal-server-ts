@@ -927,6 +927,49 @@ describe("startPersonalServer publication receipts", () => {
     }
   });
 
+  it("tells a client whose publish reply was lost that the run is saved", async () => {
+    const { options } = await setup();
+    const server = await startPersonalServer(options);
+    try {
+      await write(server, "acme", "run-a");
+      await expect(server.publicationStatus("run-a")).resolves.toMatchObject({
+        state: "pending",
+        streams: [{ name: "items", state: "pending" }],
+      });
+      const post = vi
+        .spyOn(options.streamSyncRegistry, "post")
+        .mockRejectedValueOnce(new Error("registry unavailable"));
+      await expect(server.publish()).rejects.toThrow("registry unavailable");
+      post.mockRestore();
+      expect((await server.publicationStatus("run-a")).state).toBe("pending");
+
+      await server.publish(); // the reply is dropped
+      const saved = await server.publicationStatus("run-a");
+      expect(saved).toMatchObject({
+        state: "published",
+        streams: [
+          {
+            name: "items",
+            state: "published",
+            publication: { generation: 1, version: 1 },
+          },
+        ],
+      });
+      // The same read through the intake door, and an unknown run.
+      await expect(
+        server.streamSyncIntake!.publicationStatus("run-a"),
+      ).resolves.toEqual(saved);
+      await expect(server.publicationStatus("nope")).rejects.toMatchObject({
+        code: "gone",
+      });
+    } finally {
+      await server.stop();
+    }
+    await expect(server.publicationStatus("run-a")).rejects.toThrow(
+      "unavailable",
+    );
+  });
+
   it("waits for an active publication before releasing the database", async () => {
     const { options, close } = await setup();
     const server = await startPersonalServer(options);

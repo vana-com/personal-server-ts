@@ -48,9 +48,10 @@ export async function unwriteRefusedRun(
         params: [input.connectionId, input.stream],
       },
       {
-        sql: `UPDATE run_streams SET decision = 'refused', reason = ?
+        sql: `UPDATE run_streams SET decision = 'refused', reason = ?,
+   publication_state = 'superseded', publication_reason = ?
  WHERE run_id = ? AND stream = ?`,
-        params: [input.reason, input.runId, input.stream],
+        params: [input.reason, input.reason, input.runId, input.stream],
       },
     ]),
   );

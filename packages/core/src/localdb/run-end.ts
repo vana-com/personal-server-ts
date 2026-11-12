@@ -100,8 +100,8 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         if (req.outcome === "failed" || req.outcome === "cancelled") {
           await db.batch([
             {
-              sql: "UPDATE run_streams SET decision = 'discarded', reason = ?, replace = 0 WHERE run_id = ?",
-              params: [req.outcome, runId],
+              sql: "UPDATE run_streams SET decision = 'discarded', reason = ?, replace = 0, publication_state = 'superseded', publication_reason = ? WHERE run_id = ?",
+              params: [req.outcome, req.outcome, runId],
             },
             ...cleanup({ result: "aborted", updateRequired: false }),
           ]);
@@ -122,12 +122,12 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               params: [run.connection_id],
             },
             {
-              sql: "UPDATE run_streams SET decision = 'discarded', reason = 'fence', replace = 0 WHERE run_id = ?",
+              sql: "UPDATE run_streams SET decision = 'discarded', reason = 'fence', replace = 0, publication_state = 'superseded', publication_reason = 'fence' WHERE run_id = ?",
               params: [runId],
             },
             ...trips.map(({ stream, trip }) => ({
-              sql: "UPDATE run_streams SET reason = ? WHERE run_id = ? AND stream = ?",
-              params: [trip, runId, stream],
+              sql: "UPDATE run_streams SET reason = ?, publication_reason = ? WHERE run_id = ? AND stream = ?",
+              params: [trip, trip, runId, stream],
             })),
             {
               sql: `UPDATE stream_state SET needs_full = 1, complete = 0
@@ -244,12 +244,15 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               provenFullStreams: req.provenFullStreams ?? [],
             });
           statements.push({
-            sql: "UPDATE run_streams SET decision = ?, reason = ?, replace = ?, full_read = ? WHERE run_id = ? AND stream = ?",
+            sql: "UPDATE run_streams SET decision = ?, reason = ?, replace = ?, full_read = ?, publication_state = ?, publication_reason = ? WHERE run_id = ? AND stream = ?",
             params: [
               decision.kind,
               "reason" in decision ? decision.reason : null,
               replace ? 1 : 0,
               full ? 1 : 0,
+              // Accepted work waits for a publication; refused work never gets one.
+              accepted ? "pending" : "superseded",
+              "reason" in decision ? decision.reason : null,
               runId,
               stream.stream,
             ],

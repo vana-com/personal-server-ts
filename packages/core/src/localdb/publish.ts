@@ -440,6 +440,24 @@ async function publishStream(
       plan.replaceBelow !== undefined ||
       plan.steps.some((step) => step.decision.kind === "publish");
     if (!hasWork) {
+      // No change to publish: the registry head already holds what the plan
+      // produces, so a pending run it covers is saved by that head.
+      if (registryHead && registryDataHash !== null) {
+        const evidence = await runPublicationStatements(
+          deps,
+          connectionId,
+          stream,
+          {
+            version: registryVersion,
+            generation: registryHead.generation,
+            dataHash: registryDataHash as `0x${string}`,
+            watermark: local.publish_watermark,
+            replaceBelow: undefined,
+            runIds: plan.steps.map((step) => step.runId),
+          },
+        );
+        if (evidence.length > 0) await deps.db.batch(evidence);
+      }
       return { stream, outcome: sawRefusal ? "refused" : "noop", watermark };
     }
 
@@ -547,6 +565,7 @@ async function publishStream(
         primaryKey: head.primaryKey,
         profile: head.profile,
         isNewVersion: false,
+        runIds: plan.steps.map((step) => step.runId),
       });
       return {
         stream,
@@ -635,6 +654,7 @@ async function publishStream(
       primaryKey: head.primaryKey,
       profile: head.profile,
       isNewVersion: true,
+      runIds: plan.steps.map((step) => step.runId),
     });
     return {
       stream,
@@ -704,8 +724,8 @@ async function discardFencedRuns(
         params: [id, stream, run.o, run.run_id],
       },
       {
-        sql: "UPDATE run_streams SET decision='discarded',reason=?,replace=0 WHERE run_id=? AND stream=?",
-        params: [trip.trip, run.run_id, stream],
+        sql: "UPDATE run_streams SET decision='discarded',reason=?,replace=0,publication_state='superseded',publication_reason=? WHERE run_id=? AND stream=?",
+        params: [trip.trip, trip.trip, run.run_id, stream],
       },
       {
         sql: "DELETE FROM run_rows WHERE run_id=? AND stream=?",
@@ -1028,7 +1048,79 @@ type CommitInput = {
   primaryKey: readonly string[];
   profile: Head["profile"];
   isNewVersion: boolean;
+  /** The plan's accepted runs for this stream: the runs this publication covers. */
+  runIds: readonly string[];
 };
+
+/** What a publication confirmed, and the runs it covered. */
+type RunEvidence = Pick<
+  CommitInput,
+  | "version"
+  | "generation"
+  | "dataHash"
+  | "watermark"
+  | "replaceBelow"
+  | "runIds"
+>;
+
+const RUN_ID_CHUNK = 400;
+
+/**
+ * Durable run-to-publication evidence, written in the same batch as the head.
+ * Only runs still `pending` move to `published`, so a later publication never
+ * rewrites older evidence and runs from before this column stay `unknown`.
+ * The ids are the plan's: a run that ended after planning is not covered.
+ * The watermark is stored as evidence only; it is a local change sequence and
+ * is never compared with a run's `o`.
+ */
+async function runPublicationStatements(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  stream: string,
+  input: RunEvidence,
+): Promise<SqlStatement[]> {
+  const planned = new Set(input.runIds);
+  const pending = (
+    await deps.db.query<{ run_id: string }>(
+      `SELECT rs.run_id FROM run_streams rs JOIN runs r ON r.run_id = rs.run_id
+        WHERE r.connection_id = ? AND rs.stream = ? AND rs.publication_state = 'pending'`,
+      [connectionId, stream],
+    )
+  )
+    .map((row) => row.run_id)
+    .filter((runId) => planned.has(runId));
+  const statements: SqlStatement[] = [];
+  for (let i = 0; i < pending.length; i += RUN_ID_CHUNK) {
+    const chunk = pending.slice(i, i + RUN_ID_CHUNK);
+    statements.push({
+      sql: `UPDATE run_streams SET publication_state = 'published',
+              published_generation = ?, published_version = ?, published_data_hash = ?,
+              published_watermark = ?, publication_reason = NULL
+            WHERE stream = ? AND publication_state = 'pending'
+              AND run_id IN (${chunk.map(() => "?").join(",")})`,
+      params: [
+        input.generation,
+        input.version,
+        input.dataHash,
+        input.watermark ?? 0,
+        stream,
+        ...chunk,
+      ],
+    });
+  }
+  if (input.replaceBelow) {
+    // The replacement dropped older rows: older runs were saved, then replaced.
+    const { o, r } = input.replaceBelow;
+    statements.push({
+      sql: `UPDATE run_streams SET publication_state = 'superseded', publication_reason = ?
+            WHERE stream = ? AND publication_state = 'published'
+              AND run_id IN (SELECT run_id FROM runs
+                              WHERE connection_id = ? AND (o < ? OR (o = ? AND run_id < ?)))`,
+      params: [`replaced_by:${r}`, stream, connectionId, o, o, r],
+    });
+  }
+  return statements;
+}
 
 /**
  * The one batch after a successful CAS (or a skipped CAS): replace deletes
@@ -1078,6 +1170,9 @@ async function commitBatch(
       stream,
     ],
   });
+  statements.push(
+    ...(await runPublicationStatements(deps, connectionId, stream, input)),
+  );
   statements.push({
     sql: `DELETE FROM head_parts WHERE connection_id = ? AND stream = ?`,
     params: [connectionId, stream],

@@ -10,6 +10,41 @@ export type FenceTrip =
   | "generation_moved_by_delete";
 
 /**
+ * The per-stream part of the fence, as a pure function of the facts it reads:
+ * the run's admitted generation and pinned delete snapshot against the
+ * connection's current generation and the stream's last delete version.
+ * `undefined` = the run's work is still publishable. A run with no admitted
+ * generation yet (`null`) is never tripped by generation. The control-deleted
+ * check stays with the callers: it reads the control row, not these facts.
+ */
+export function streamFenceTrip(facts: {
+  readonly runGeneration: number | null;
+  readonly deleteSnapshot: number;
+  readonly connectionGeneration: number | undefined;
+  readonly lastDeleteVersion: number | undefined;
+}): Exclude<FenceTrip, "control_deleted"> | undefined {
+  if (
+    facts.connectionGeneration !== undefined &&
+    facts.runGeneration !== null &&
+    facts.connectionGeneration > facts.runGeneration
+  )
+    // A generation can only rise through a delete (control.ts
+    // `deletedSinceStart`): a delete followed by a reconnect moved the
+    // connection past the generation the run started under. A run that
+    // started after the reconnect carries the new generation and is kept.
+    return "generation_moved_by_delete";
+  if (
+    facts.lastDeleteVersion !== undefined &&
+    facts.lastDeleteVersion > facts.deleteSnapshot
+  )
+    // The stream was deleted after the run pinned its snapshot. A row
+    // already tombstoned at collection is inside the snapshot, so it does
+    // not trip.
+    return "stream_deleted_after_start";
+  return undefined;
+}
+
+/**
  * C.1 per-stream fence. Tripped when `stream_state.last_delete_version >
  * run_streams.delete_snapshot`, or the control row is `deleted`, or its
  * generation moved past the run's generation through a delete. Returns the
@@ -63,25 +98,13 @@ export async function checkRunFence(
       // F.5 step 1 set the control row to `deleted`: the connection's data
       // is gone, so every stream of the run is fenced.
       trip = "control_deleted";
-    } else if (
-      connection !== undefined &&
-      run.generation !== null &&
-      connection.generation > run.generation
-    ) {
-      // A generation can only rise through a delete (control.ts
-      // `deletedSinceStart`): a delete followed by a reconnect moved the
-      // connection past the generation the run started under. A run that
-      // started after the reconnect carries the new generation and is kept.
-      trip = "generation_moved_by_delete";
     } else {
-      const lastDelete = lastDeleteByStream.get(stream);
-      if (lastDelete !== undefined && lastDelete > delete_snapshot) {
-        // The stream was deleted after the run pinned its snapshot: a run
-        // that started before the delete never publishes after it. A row
-        // already tombstoned at collection is inside the snapshot, so it
-        // does not trip.
-        trip = "stream_deleted_after_start";
-      }
+      trip = streamFenceTrip({
+        runGeneration: run.generation,
+        deleteSnapshot: delete_snapshot,
+        connectionGeneration: connection?.generation,
+        lastDeleteVersion: lastDeleteByStream.get(stream),
+      });
     }
     if (trip !== undefined) tripped.push({ stream, trip });
   }
