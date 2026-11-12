@@ -93,6 +93,20 @@ it("uses the caller alias ports through the real database resolver", async () =>
   ]);
   expect(f.project).toHaveBeenCalledTimes(1);
 });
+it("marks each alias with the logical scope it repeats, and no logical scope", async () => {
+  const f = await fixture();
+  const listing = createLocalListing({ ...f.deps, ...f.aliases }, () => ({
+    served: 0,
+    gone: 0,
+    off: 0,
+  }));
+  const listed = await listing.listScopes({ canRead: () => true });
+  expect(listed.map((s) => [s.scope, s.aliasOf])).toEqual([
+    ["fixture.summary", "pdpp.fixture-source.items"],
+    ["pdpp.fixture-source.items", undefined],
+  ]);
+  expect("aliasOf" in listed[1]!).toBe(false);
+});
 it("does not resolve aliases without a caller and checks grants before projection", async () => {
   const f = await fixture();
   const plain = createLocalListing(f.deps, () => ({
