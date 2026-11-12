@@ -1700,6 +1700,8 @@ export function createPsLiteRuntime(
             olderVersionReads: local.olderVersions.counts(),
           });
         }
+        // Whether a run is saved: `GET /v1/stream-sync/runs/:runId/publication`.
+        // `superseded` alone does not mean saved; a consumer must check `reason`.
         const runPublication =
           /^\/v1\/stream-sync\/runs\/([A-Za-z0-9._-]{1,128})\/publication$/.exec(
             url.pathname,
@@ -1712,14 +1714,22 @@ export function createPsLiteRuntime(
               "METHOD_NOT_ALLOWED",
               "Method not allowed",
             );
+          // Bind to the runtime's owner: a run written under another owner
+          // answers 404, the same as an unknown run, so it is not revealed.
+          const owner = ownerAddress();
+          if (!owner)
+            return errorResponse(404, "RUN_NOT_FOUND", "Run not found");
           try {
             return jsonResponse(
               await (
                 await options.localSync()
-              ).intake.publicationStatus(runPublication[1]),
+              ).intake.publicationStatus(runPublication[1], { owner }),
             );
           } catch (err) {
-            if (err instanceof RunIntakeError && err.code === "gone")
+            if (
+              err instanceof RunIntakeError &&
+              (err.code === "gone" || err.code === "owner_mismatch")
+            )
               return errorResponse(404, "RUN_NOT_FOUND", "Run not found");
             throw err;
           }

@@ -95,6 +95,15 @@ async function world() {
         ? legacy
         : (target as never)[key],
   });
+  // Tripwire: any legacy data-point call fails loudly and is recorded.
+  const dataPointFeed = {
+    getDataPoint: vi.fn(async () => {
+      throw new Error("legacy dataPointFeed.getDataPoint called");
+    }),
+    listDataPointsByOwner: vi.fn(async () => {
+      throw new Error("legacy dataPointFeed.listDataPointsByOwner called");
+    }),
+  };
   const dbPath = join(mkdtempSync(join(tmpdir(), "lite-cycle-")), "lite.db");
   const open = async () => {
     const lite = await createPsLiteSyncManager({
@@ -117,10 +126,7 @@ async function world() {
         signLineageAttestation: async () => "0x00",
       },
       gateway: gateway as never,
-      dataPointFeed: {
-        getDataPoint: async () => null,
-        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
-      },
+      dataPointFeed: dataPointFeed as never,
     });
     lites.push(lite);
     return lite;
@@ -159,12 +165,12 @@ async function world() {
       .map((r) => r.recordKey)
       .sort();
   };
-  return { open, legacy, readerKeys };
+  return { open, legacy, dataPointFeed, readerKeys };
 }
 
 describe("Lite save and delete cycle", () => {
   it("saves, survives a reload, reads from another reader, deletes by tombstone, never touches legacy", async () => {
-    const { open, legacy, readerKeys } = await world();
+    const { open, legacy, dataPointFeed, readerKeys } = await world();
     let lite = await open();
 
     // 1. Begin, one batch with one record, end, publish.
@@ -218,6 +224,8 @@ describe("Lite save and delete cycle", () => {
 
     // 5. The legacy data plane was never called.
     expect(legacy).not.toHaveBeenCalled();
+    expect(dataPointFeed.getDataPoint).not.toHaveBeenCalled();
+    expect(dataPointFeed.listDataPointsByOwner).not.toHaveBeenCalled();
   });
 
   it("answers the publication of a saved run over HTTP, across a reload, and 404s an unknown run", async () => {
@@ -235,14 +243,24 @@ describe("Lite save and delete cycle", () => {
       provenFullStreams: ["items"],
       lastBatch: 0,
     });
-    const owner = `0x${"1".repeat(40)}` as const;
+    const owner = account.address;
+    const other = `0x${"2".repeat(40)}` as const;
     const authority = createModeAuthority({
       store: createMemoryModeRecordStore(),
     });
     await authority.ready;
     await authority.submitEvidence({ owner, state: "on" });
+    const otherAuthority = createModeAuthority({
+      store: createMemoryModeRecordStore(),
+    });
+    await otherAuthority.ready;
+    await otherAuthority.submitEvidence({ owner: other, state: "on" });
     const accessLog = createMemoryPsLiteAccessLogStore();
-    const call = async (path: string, token = "owner-fixture") =>
+    const call = async (
+      path: string,
+      token = "owner-fixture",
+      runtimeOwner: `0x${string}` = owner,
+    ) =>
       createPsLiteRuntime({
         accessLogReader: accessLog,
         accessLogWriter: accessLog,
@@ -251,12 +269,13 @@ describe("Lite save and delete cycle", () => {
         stateCapabilities: { config: "memory" },
         mcpConnectionStore: createInMemoryMcpConnectionStore(),
         storage: createMemoryPsLiteStorage(),
-        serverOwner: owner,
+        serverOwner: runtimeOwner,
         auth: createBearerTokenPsLiteAuth({
           ownerToken: "owner-fixture",
           builderToken: "builder-fixture",
         }),
-        accountModeAuthority: authority,
+        accountModeAuthority:
+          runtimeOwner === owner ? authority : otherAuthority,
         active: true,
         localSync: lite.getLocalSync,
       }).fetch(
@@ -289,9 +308,15 @@ describe("Lite save and delete cycle", () => {
     const unknown = await call("/v1/stream-sync/runs/nope/publication");
     expect(unknown.status).toBe(404);
     expect((await unknown.json()).error.errorCode).toBe("RUN_NOT_FOUND");
+    // The run was written under `owner`; another owner's valid token answers
+    // 404 RUN_NOT_FOUND, not 403, so the run's existence is not revealed.
+    const crossOwner = await call(url, "owner-fixture", other);
+    expect(crossOwner.status).toBe(404);
+    expect((await crossOwner.json()).error.errorCode).toBe("RUN_NOT_FOUND");
     expect((await call(url, "builder-fixture")).status).toBeGreaterThanOrEqual(
       401,
     );
     await authority.close();
+    await otherAuthority.close();
   });
 });
