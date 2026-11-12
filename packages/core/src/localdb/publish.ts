@@ -86,6 +86,10 @@ import {
   type HeadExtras,
 } from "./encode.js";
 import { replaceDelete, withOrigin } from "./merge.js";
+import {
+  hydrateLifetimeBoundary,
+  olderLifetimeFence,
+} from "./lifetime-boundary.js";
 import { purgeConnection } from "./purge.js";
 import { checkRunFence } from "./fence.js";
 import { replaceMayApply } from "./replace.js";
@@ -448,7 +452,7 @@ async function snapshotStream(
     done({ stream, outcome: "deferred", watermark: run.watermark });
 
   // Step 1: snapshot W and the changes since the last publish.
-  const [local] = await deps.db.query<LocalStream>(
+  let [local] = await deps.db.query<LocalStream>(
     `SELECT primary_key, profile_key, profile_version, complete,
             floor_version, floor_o, floor_r, last_delete_version,
             head_version, head_generation, head_data_hash, publish_watermark
@@ -547,6 +551,9 @@ async function snapshotStream(
 
   const streamRead = await deps.registry.read(scope);
   const streamRow = classifyStreamRow(streamRead, hashes);
+  // `registryHead` is the content base: the verified head of THIS lifetime.
+  // `registryVersion` and `registryDataHash` are the compare-and-set basis and
+  // describe the registry row whatever lifetime its head is from.
   let registryHead: Head | null = null;
   let registryVersion = 0;
   let registryDataHash: string | null = null;
@@ -555,7 +562,7 @@ async function snapshotStream(
     registryDataHash = streamRead.dataHash;
   }
   if (streamRow === "present" && streamRead.found) {
-    registryHead = await readRegistryHead(
+    const verified = await readRegistryHead(
       deps,
       scope,
       streamRead.dataHash,
@@ -563,10 +570,28 @@ async function snapshotStream(
       stream,
       keyCheck,
     );
+    // A head of a later lifetime than this connection knows: it is not ours
+    // to replace. Wait for this connection to catch up.
+    if (verified.generation > connection.generation) return deferred();
+    if (verified.generation === connection.generation) {
+      registryHead = verified;
+    } else {
+      // No content base. Keep the delete fence of that lifetime: record it
+      // locally (see lifetime-boundary.ts) and carry it into the new head.
+      const fence = olderLifetimeFence(scope, streamRead, verified);
+      await hydrateLifetimeBoundary(deps, {
+        connectionId,
+        stream,
+        generation: connection.generation,
+        fence,
+        primaryKey: verified.primaryKey,
+      });
+      local = {
+        ...local,
+        last_delete_version: Math.max(local.last_delete_version, fence),
+      };
+    }
   }
-
-  if (registryHead && registryHead.generation !== connection.generation)
-    return deferred();
 
   // A registry row newer than the local head is applied (same slot turn)
   // and the stream restarts at step 1. Apply once per version: if the head
@@ -595,7 +620,8 @@ async function snapshotStream(
     local,
     registryHead,
     registryVersion,
-    registryDataHash,
+    // No content base: a replacing run replaces nothing, as with an absent row.
+    registryHead ? registryDataHash : null,
   );
   if (plan.deferred) return deferred();
   if (plan.refused) {
@@ -690,6 +716,7 @@ async function snapshotStream(
     generation: headGeneration,
     keyCheck,
     lastDeleteVersion: Math.max(
+      // Includes an earlier lifetime's fence, hydrated above.
       local.last_delete_version,
       streamRow === "tombstoned" ? registryVersion : 0,
     ),

@@ -26,6 +26,10 @@ import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js"
 import type { ConnectionQueue, LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { applyDelete, mergeIncoming, withOrigin } from "./merge.js";
+import {
+  hydrateLifetimeBoundary,
+  olderLifetimeFence,
+} from "./lifetime-boundary.js";
 import { purgeConnection } from "./purge.js";
 
 /** What one apply did, for the caller's status line. */
@@ -331,6 +335,18 @@ async function applyOne(
   if (verified.kind !== "ok")
     throw new Error(`apply: invalid head (${verified.kind})`);
   const { head } = verified;
+  if (head.generation < active.generation) {
+    // A head of an earlier lifetime (a delete marker). It is no content base:
+    // keep only its delete fence, so a run that begins now pins it.
+    await hydrateLifetimeBoundary(deps, {
+      connectionId: id,
+      stream,
+      generation: active.generation,
+      fence: olderLifetimeFence(scope, read, head),
+      primaryKey: head.primaryKey,
+    });
+    return result(stream, "gone");
+  }
   if (head.generation !== active.generation) return result(stream, "gone");
   const op = deps.newOp();
   let downloaded = 0;
