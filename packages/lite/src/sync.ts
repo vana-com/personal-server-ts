@@ -669,6 +669,8 @@ export async function createPsLiteSyncManager(
       batch: async (...args) => (await getLocalSync()).intake.batch(...args),
       end: async (...args) => (await getLocalSync()).intake.end(...args),
       abort: async (...args) => (await getLocalSync()).intake.abort(...args),
+      publicationStatus: async (...args) =>
+        (await getLocalSync()).intake.publicationStatus(...args),
     };
     syncManager = createSyncManager(
       {

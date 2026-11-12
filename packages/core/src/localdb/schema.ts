@@ -146,4 +146,16 @@ END;`,
     // rows, so a batch costs more than the one before it.
     `CREATE INDEX run_rows_by_key ON run_rows(stream, record_key)`,
   ],
+  [
+    // Durable link from a run's stream to the publication that covered it.
+    // Existing rows stay 'unknown': no publication is inferred from a
+    // watermark, which counts local changes, not time. `published_watermark`
+    // is evidence only; never compare it with `runs.o`.
+    `ALTER TABLE run_streams ADD COLUMN publication_state TEXT NOT NULL DEFAULT 'unknown' CHECK (publication_state IN ('unknown','pending','published','superseded'))`,
+    `ALTER TABLE run_streams ADD COLUMN published_generation INTEGER`,
+    `ALTER TABLE run_streams ADD COLUMN published_version INTEGER`,
+    `ALTER TABLE run_streams ADD COLUMN published_data_hash TEXT`,
+    `ALTER TABLE run_streams ADD COLUMN published_watermark INTEGER`,
+    `ALTER TABLE run_streams ADD COLUMN publication_reason TEXT`,
+  ],
 ];

@@ -42,7 +42,10 @@ import {
   type PersonalServerSyncTriggerResult,
 } from "@opendatalabs/personal-server-ts-core/client";
 import type { SyncStatus } from "@opendatalabs/personal-server-ts-core/sync";
-import type { RunIntake } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import type {
+  RunIntake,
+  RunPublicationStatus,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
   prepareScopeUploadBatches,
   type PreparedScopeUploadBatch,
@@ -117,6 +120,11 @@ export type PersonalServerLiteHandle = PersonalServerHandle & {
    * A noop contains no new coverage. Unavailable or stopped runtimes reject.
    */
   publish(): Promise<PersonalServerLitePublicationResult>;
+  /** Whether an ended run is saved, from durable local state. Use it when a
+   * `publish()` reply was lost; it does not collect or publish anything.
+   * Errors as `streamSyncIntake.publicationStatus` does.
+   */
+  publicationStatus(runId: string): Promise<RunPublicationStatus>;
 };
 
 export async function startPersonalServer(
@@ -747,6 +755,15 @@ export async function startPersonalServer(
     };
   }
 
+  async function publicationStatus(
+    runId: string,
+  ): Promise<RunPublicationStatus> {
+    const intake = runtimeBundle?.streamSyncIntake;
+    if (stopping || status === "stopped" || !intake)
+      throw new Error("Stream publication is unavailable");
+    return intake.publicationStatus(runId);
+  }
+
   async function stop(): Promise<void> {
     if (status === "stopped") return;
     stopping = true;
@@ -788,6 +805,7 @@ export async function startPersonalServer(
     streamSyncIntake: runtimeBundle?.streamSyncIntake ?? null,
     streamSyncSeed,
     publish,
+    publicationStatus,
     stop,
   };
 }

@@ -1,4 +1,8 @@
-import { readBeginReceipt, readEndReceipt } from "./run-receipts.js";
+import {
+  readBeginReceipt,
+  readEndReceipt,
+  readPublicationStatus,
+} from "./run-receipts.js";
 import { createGrantHistory } from "./query.js";
 import {
   createLinkedRecordQuery,
@@ -141,6 +145,17 @@ export function createLocalSync(
       await checkRun(runId);
       await endStore.abort(runId, reason);
       bindings.delete(runId);
+    },
+    async publicationStatus(runId, binding) {
+      if (
+        binding?.owner !== undefined &&
+        binding.owner.toLowerCase() !== deps.ownerAddress.toLowerCase()
+      ) {
+        throw new RunIntakeError("owner_mismatch");
+      }
+      return readPublicationStatus(deps.db, runId, {
+        connector: binding?.connector,
+      });
     },
   };
   const query = createRecordQuery(deps.db);

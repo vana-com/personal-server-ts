@@ -1486,6 +1486,8 @@ async function bootstrapServer(
         end: async (...args) => (await localSyncSource()).intake.end(...args),
         abort: async (...args) =>
           (await localSyncSource()).intake.abort(...args),
+        publicationStatus: async (...args) =>
+          (await localSyncSource()).intake.publicationStatus(...args),
       }
     : undefined;
 

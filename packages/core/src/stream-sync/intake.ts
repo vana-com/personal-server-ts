@@ -171,11 +171,56 @@ export interface EndResponse {
   readonly updateRequired: boolean;
 }
 
+/**
+ * Whether a run's work is saved. `published`: a publication this database
+ * confirmed covered the work. `pending`: accepted, not yet confirmed.
+ * `superseded`: refused, discarded, replaced, or its connection was deleted
+ * or restarted since. `unknown`: nothing durable says (runs from before this
+ * record existed, runs still collecting, runs with no accepted stream).
+ */
+export type RunPublicationState =
+  "published" | "pending" | "superseded" | "unknown";
+
+export interface RunStreamPublication {
+  readonly name: string;
+  readonly state: RunPublicationState;
+  readonly reason?: string;
+  /** The publication that covered this stream. Kept after supersession. */
+  readonly publication?: {
+    readonly generation: number;
+    readonly version: number;
+    readonly dataHash: string;
+    /** Local change sequence of this database. Not a time. */
+    readonly watermark: number;
+  };
+}
+
+/**
+ * The last locally confirmed publication state of an ended run; it is not a
+ * fresh read of remote storage. `published` means every accepted stream has a
+ * confirmed publication, not that every original record is still in the head.
+ */
+export interface RunPublicationStatus {
+  readonly runId: string;
+  readonly state: RunPublicationState;
+  readonly reason?: string;
+  readonly streams: readonly RunStreamPublication[];
+}
+
 export interface RunIntake {
   begin(runId: string, req: BeginRequest): Promise<BeginResponse>;
   batch(runId: string, req: BatchRequest): Promise<BatchResponse>;
   end(runId: string, req: EndRequest): Promise<EndResponse>;
   abort(runId: string, reason: "failed" | "cancelled"): Promise<void>;
+  /**
+   * Whether an ended run is saved, from durable local state. An unknown run
+   * answers `gone`. With `binding`, another owner answers `owner_mismatch` and
+   * another connector `run_conflict`, as `begin` does.
+   */
+  publicationStatus(
+    runId: string,
+    binding?: { readonly owner?: string; readonly connector?: string },
+  ): Promise<RunPublicationStatus>;
 }
 
 /** Adapt an already-composed database intake without constructing another writer. */
