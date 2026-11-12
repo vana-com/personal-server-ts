@@ -576,6 +576,7 @@ describe("TEE MCP ingress", () => {
       const engine = await handleMcpStreamableHttpRequest(post(message), {
         connection: {} as never,
         readClient: {} as never,
+        verifyGrantsLive: async () => [],
       });
       expect(ingress.status).toBe(engine.status);
       expect(ingress.headers.get("content-type")).toBe(

@@ -243,6 +243,28 @@ export interface CreateServerOptions {
    * builds the Vana Web link (`/mcp/requests/<id>?ps_origin=<origin>`).
    */
   mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /** Host sentence naming where to review a scope request (at most 200 characters). */
+  mcpScopeRequestReviewHint?: string;
+  /**
+   * Default off. When on, `list_granted_scopes` also returns `notShared`:
+   * the owner's scopes that have local data and no grant on the connection.
+   * This tells an already-approved MCP client which sources the owner has,
+   * which is why it is opt-in.
+   */
+  mcpExposeUnsharedScopes?: boolean;
+  /**
+   * Default off. When on, every read-side `scope_not_granted` carries a
+   * `nextAction` telling the agent to call `request_scope_access`.
+   */
+  mcpScopeRequestGuidance?: boolean;
+  /** Allow the owner to narrow connection scopes; default off. */
+  mcpOwnerAccessEdit?: boolean;
+  /**
+   * Static scope ids Vana supports, listed in the `request_scope_access`
+   * description when `mcpScopeRequestGuidance` is on. Not a list of what the
+   * owner has.
+   */
+  mcpRequestableScopes?: string[];
   /**
    * Lifetime in seconds of grants the server signs itself for MCP
    * connections: the OAuth approve path and a scope-request approve with no
@@ -1359,6 +1381,11 @@ export async function createServer(
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
     mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,
     mcpScopeRequestApprovalUrl: options?.mcpScopeRequestApprovalUrl,
+    mcpScopeRequestReviewHint: options?.mcpScopeRequestReviewHint,
+    mcpExposeUnsharedScopes: options?.mcpExposeUnsharedScopes,
+    mcpOwnerAccessEdit: options?.mcpOwnerAccessEdit,
+    mcpScopeRequestGuidance: options?.mcpScopeRequestGuidance,
+    mcpRequestableScopes: options?.mcpRequestableScopes,
     mcpGrantTtlSeconds: options?.mcpGrantTtlSeconds,
     mcpConnectionStore: mcpState?.connections,
     mcpOAuthAuthorizationStore: mcpState?.authorizations,

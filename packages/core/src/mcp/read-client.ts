@@ -37,6 +37,7 @@ import {
   assertScopeNotDeleted,
   handlePersonalServerDataRequest,
   isOwnerView,
+  listOwnerVisibleScopes,
   reportPersonalServerReadFulfillment,
   resolveReadDeletion,
   type PersonalServerDataApiDeps,
@@ -334,6 +335,15 @@ export interface McpDataReadClient {
   }): Promise<McpDataListResult>;
 
   /**
+   * Every scope this server holds data for, owner-wide and in process (no
+   * grantee signature, no grant filter): tombstoned and system scopes are
+   * left out, as in the data listing. Only `list_granted_scopes` calls it,
+   * and only when the host turned on `mcpExposeUnsharedScopes`. Optional:
+   * a client without it yields an empty `notShared`.
+   */
+  listOwnerScopes?(): Promise<ScopeSummary[]>;
+
+  /**
    * Return lightweight planning metadata for a scope using the storage index
    * only — no network call, no block read, no auth. Used by list_granted_scopes
    * to populate sizeBytes/sizeClass/recommendedAccess without reading data.
@@ -415,6 +425,10 @@ export interface McpDataReadClient {
   >;
 }
 
+const OWNER_SCOPE_PAGE_SIZE = 200;
+/** Safety bound on one owner-wide enumeration. */
+const OWNER_SCOPE_LISTING_CAP = 5000;
+
 export interface McpDataListResult {
   status: number;
   scopes: ScopeSummary[];
@@ -468,6 +482,21 @@ export interface CreateMcpDataReadClientOptions {
    * the exact same handler + ports so policy and access-logging are identical.
    */
   dataApiDeps: PersonalServerDataApiDeps;
+  /**
+   * Deps for the owner-wide listing (`listOwnerScopes`) only: the deletion
+   * tracker and owner the ordinary `GET /v1/data` listing receives, so a
+   * deleted scope is never listed. Kept apart from `dataApiDeps` so MCP reads
+   * keep serving exactly what they serve today.
+   *
+   * Deliberately no `legacyScopeView`: MCP reads serve the legacy file, and
+   * `notShared` lists only scopes `read_scope` can serve after approval.
+   * Canonical-only scopes join `notShared` together with moving MCP reads to
+   * the canonical view (follow-up after the demo).
+   */
+  ownerListingDeps?: Pick<
+    PersonalServerDataApiDeps,
+    "scopeDeletions" | "serverOwner"
+  >;
   /**
    * Base path the data API was mounted under externally — required so the
    * Web3Signed signature URI matches what `handlePersonalServerDataRequest`
@@ -642,6 +671,29 @@ export function createMcpDataReadClient(
       }
 
       return { status: response.status, ...normalizeListScopesPayload(body) };
+    },
+
+    async listOwnerScopes() {
+      const all: ScopeSummary[] = [];
+      for (let offset = 0; all.length < OWNER_SCOPE_LISTING_CAP;) {
+        const page = await listOwnerVisibleScopes(
+          {
+            ...options.dataApiDeps,
+            ...(options.ownerListingDeps && {
+              scopeDeletions: options.ownerListingDeps.scopeDeletions,
+              serverOwner: options.ownerListingDeps.serverOwner,
+            }),
+          },
+          {
+            limit: OWNER_SCOPE_PAGE_SIZE,
+            offset,
+          },
+        );
+        all.push(...page.scopes);
+        offset += OWNER_SCOPE_PAGE_SIZE;
+        if (offset >= page.total || page.scopes.length === 0) break;
+      }
+      return all;
     },
 
     async getScopeMetadata(scope: string): Promise<McpScopeMetadata | null> {

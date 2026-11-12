@@ -1,3 +1,4 @@
+import { withStrictMcpGrantRegistration } from "@opendatalabs/personal-server-ts-core/mcp";
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
 import { resolveLiteReplication } from "./replication-door.js";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
@@ -236,7 +237,10 @@ export async function createIndexedDbPsLiteRuntime(
   const gateway =
     options.gateway ??
     withCancellableRegistration(
-      createGatewayClient(config.gateway.url),
+      withStrictMcpGrantRegistration(
+        createGatewayClient(config.gateway.url),
+        config.gateway.url,
+      ),
       config.gateway.url,
     );
   const serverOwner = await resolvePsLiteOwner({

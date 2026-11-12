@@ -178,7 +178,11 @@ export function createNodeDataStorage(
     },
     findEntry(lookup: DataStorageEntryLookup) {
       if (lookup.fileId) {
-        return deps.indexManager.findByFileId(lookup.fileId);
+        // A file id selects a version of the requested scope only. Another
+        // scope's file id answers as a missing one, so a grant for this scope
+        // never reaches that scope's bytes or reveals that the id exists.
+        const entry = deps.indexManager.findByFileId(lookup.fileId);
+        return entry?.scope === lookup.scope ? entry : undefined;
       }
       if (lookup.at) {
         return deps.indexManager.findClosestByScope(lookup.scope, lookup.at);

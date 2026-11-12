@@ -1,5 +1,9 @@
 import { isSystemScope } from "../policy/reserved-scopes.js";
-import type { ReadResourceResult } from "@modelcontextprotocol/sdk/types.js";
+import {
+  ErrorCode,
+  McpError,
+  type ReadResourceResult,
+} from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { McpDataReadError, type McpDataReadClient } from "./read-client.js";
 import type { McpConnectionRecord } from "./types.js";
@@ -19,6 +23,8 @@ export interface RawScopeResourceParams {
 export interface RawScopeResourceContext {
   connection: McpConnectionRecord;
   readClient: McpDataReadClient;
+  /** Host option `mcpScopeRequestGuidance`: add `nextAction` to the refusal. */
+  scopeRequestGuidance?: boolean;
 }
 
 export function rawScopeResourceUri(params: RawScopeResourceParams): string {
@@ -88,10 +94,22 @@ export async function readRawScopeResource(
   const params = parseRawScopeResourceUri(uri);
   const grant = resolveGrantForRawScopeResource(ctx.connection, params.scope);
   if (!grant) {
-    throw new McpDataReadError(403, {
+    const body = {
       error: "scope_not_granted",
       message: `Scope '${params.scope}' is not covered by this MCP connection.`,
-    });
+    };
+    if (ctx.scopeRequestGuidance) {
+      // The SDK sends a client only an error's message and `data`, and only
+      // when the error carries a numeric `code`; a McpDataReadError's body
+      // never reaches the wire. Raise a protocol error that carries both.
+      const nextAction = `Call request_scope_access with scopes ${JSON.stringify([params.scope])}, then ask the user to approve it in Vana. This does not indicate whether the data exists.`;
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `${body.message} ${nextAction}`,
+        { ...body, scope: params.scope, nextAction },
+      );
+    }
+    throw new McpDataReadError(403, body);
   }
 
   const raw = await ctx.readClient.readRawScopeFile({

@@ -3,6 +3,7 @@ import { loadConfig } from "./config/index.js";
 import { createServer } from "./bootstrap.js";
 import { verifyTunnelUrl } from "./tunnel/index.js";
 import { runEnclaveMain } from "./enclave-main.js";
+import { mcpOptionsFromEnv } from "./mcp/env-options.js";
 import { listenHttpServer, type NodeServer } from "./listen.js";
 
 const require = createRequire(import.meta.url);
@@ -17,7 +18,10 @@ async function main(): Promise<void> {
 
   const rootPath = process.env.PERSONAL_SERVER_ROOT_PATH;
   const config = await loadConfig({ rootPath });
-  const context = await createServer(config, { rootPath });
+  const context = await createServer(config, {
+    rootPath,
+    ...mcpOptionsFromEnv(process.env),
+  });
   const { app, logger, devToken } = context;
 
   const server = await listenHttpServer({

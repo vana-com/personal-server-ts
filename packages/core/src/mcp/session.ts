@@ -14,7 +14,13 @@
  */
 
 import { generateMcpGrantee } from "./grantee.js";
-import { hashConnectionToken } from "./connection-api.js";
+import { GRANT_LIVENESS_TIMEOUT_MS, withTimeout } from "./tools.js";
+import {
+  assertStorableScopes,
+  hashConnectionToken,
+  isGrantExpired,
+  McpInvalidScopeError,
+} from "./connection-api.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { ServerAccount } from "../keys/server-account.js";
 import {
@@ -164,6 +170,8 @@ export interface CreateMcpSessionOptions {
   now?: () => number;
   /** Optional replay guard for the handshake proof (see `input.proof`). */
   replayStore?: McpProofReplayStore;
+  /** Bound on each gateway lookup; defaults to the live-grant check's 3 s. */
+  lookupTimeoutMs?: number;
 }
 
 export interface CreateMcpSessionResult {
@@ -183,12 +191,21 @@ export async function createMcpSession(
   input: CreateMcpSessionInput,
   options: CreateMcpSessionOptions,
 ): Promise<CreateMcpSessionResult> {
-  const builder = await options.authSessionVerifier.getBuilder(
-    input.builderAddress,
+  // A slow gateway fails the mint (nothing stored, proof untouched), as a
+  // throwing one does.
+  const lookupMs = options.lookupTimeoutMs ?? GRANT_LIVENESS_TIMEOUT_MS;
+  const builder = await withTimeout(
+    options.authSessionVerifier.getBuilder(input.builderAddress),
+    lookupMs,
+    "session builder lookup",
   );
   if (!builder) throw new UnregisteredBuilderError();
 
-  const grant = await options.grantVerifier.getGrant(input.grantId);
+  const grant = await withTimeout(
+    options.grantVerifier.getGrant(input.grantId),
+    lookupMs,
+    "session grant lookup",
+  );
   if (!grant) {
     throw new GrantRequiredError({
       reason: "Grant not found",
@@ -196,6 +213,12 @@ export async function createMcpSession(
     });
   }
   if (grant.revokedAt !== null) {
+    throw new GrantRevokedError({ grantId: grant.id });
+  }
+  // An expired grant counts as never granted: no session, no scopes back.
+  if (
+    isGrantExpired(grant, Math.floor((options.now?.() ?? Date.now()) / 1000))
+  ) {
     throw new GrantRevokedError({ grantId: grant.id });
   }
   if (builder.id.toLowerCase() !== grant.granteeId.toLowerCase()) {
@@ -222,6 +245,18 @@ export async function createMcpSession(
     });
   }
 
+  // The owner may have signed a grant carrying a scope no session may store
+  // (a bare "*", a blank entry, a non-memory write:). Refuse before the proof
+  // is reserved, so the rejection never burns a valid proof.
+  try {
+    assertStorableScopes(grant.scopes ?? []);
+  } catch (err) {
+    if (err instanceof McpInvalidScopeError) {
+      throw new ProtocolError(400, "invalid_scope", err.message);
+    }
+    throw err;
+  }
+
   // Prepare the token first (deterministic, can't meaningfully fail) so the
   // only fallible step after consuming the proof is persistence.
   const token = options.randomToken();
@@ -234,6 +269,13 @@ export async function createMcpSession(
   // persistence fails — so a transient failure never burns a valid proof.
   // consume() is an atomic check-and-set, so concurrent duplicates still
   // resolve to exactly one winner.
+  // The grant may have expired while the token was prepared: check once more
+  // with a fresh clock, before the proof is reserved.
+  if (
+    isGrantExpired(grant, Math.floor((options.now?.() ?? Date.now()) / 1000))
+  ) {
+    throw new GrantRevokedError({ grantId: grant.id });
+  }
   const usingReplayGuard = Boolean(input.proof && options.replayStore);
   if (input.proof && options.replayStore) {
     const replayed = await options.replayStore.consume(
