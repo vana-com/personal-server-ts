@@ -43,7 +43,7 @@ import { publishConnection } from "../../../core/src/localdb/publish.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
 import { createRunIntakeStore } from "../../../core/src/localdb/run-intake.js";
 import { syncConnection } from "../../../core/src/localdb/cycle.js";
-import { deleteMetadataHash } from "../../../core/src/stream-sync/delete-metadata.js";
+import { endedGenerationDeleteMetadataHash } from "../../../core/src/stream-sync/delete-metadata.js";
 import { remoteFixture } from "./apply-fixture.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
@@ -216,9 +216,12 @@ async function observeHead(w: World) {
     found: true as const,
     version: row.version,
     classification: classifyStreamRow(row, w.fixture.hashes),
-    isDeleteMarker:
-      row.metadataHash.toLowerCase() ===
-      deleteMetadataHash(w.scope, row.version),
+    // The delete writer marks its row, with the generation it ended.
+    isDeleteMarker: [1, 3, 5, 7].some(
+      (g) =>
+        row.metadataHash.toLowerCase() ===
+        endedGenerationDeleteMetadataHash(w.scope, row.version, g),
+    ),
     generation: head?.generation ?? null,
     recordCount: head?.recordCount ?? null,
     lastDeleteVersion: head?.lastDeleteVersion ?? null,
@@ -575,7 +578,27 @@ it("two devices publish the first new-lifetime head together: one wins, the othe
   await collect(w.a, ["from-a"], { connect: true });
   await applyConnection(w.b.deps, w.fixture.control);
   await collect(w.b, ["from-b"]);
+  // Hold both publishers at their first stream post until both have read the
+  // same registry row, so both plan over the same basis and one must lose.
+  const posts: number[] = [];
+  const conflicts: number[] = [];
+  let arrived = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const real = w.registry.post.bind(w.registry);
+  const spy = vi.spyOn(w.registry, "post").mockImplementation(async (req) => {
+    if (req.scope !== w.scope) return real(req);
+    posts.push(Number(req.expectedVersion));
+    if (++arrived === 2) release();
+    await gate;
+    const result = await real(req);
+    if (result.kind === "conflict") conflicts.push(Number(req.expectedVersion));
+    return result;
+  });
   await Promise.all([cycle(w.a, w), cycle(w.b, w)]);
+  spy.mockRestore();
+  expect(posts.slice(0, 2)).toEqual([3, 3]);
+  expect(conflicts).toEqual([3]);
   await cycle(w.a, w);
   await cycle(w.b, w);
   const head = await observeHead(w);
@@ -643,10 +666,16 @@ it("a head whose blob is missing never turns into an empty base", async () => {
 it("a deleted connection never heals: its publish purges", async () => {
   const w = await world();
   await published(w);
+  // B still holds the data and an unpublished run when A deletes.
+  await applyConnection(w.b.deps, w.fixture.control);
+  await collect(w.b, ["residue"]);
+  expect(await held(w.b)).toEqual(["old", "residue"].sort());
+  expect((await w.b.db.query("SELECT 1 FROM runs")).length).toBeGreaterThan(0);
   await deleteConnection(w.a);
-  const r = await publishConnection(w.a.deps, w.fixture.control);
+  const r = await publishConnection(w.b.deps, w.fixture.control);
   expect(r.map((p) => p.outcome)).not.toContain("published");
   expect(await observeHead(w)).toMatchObject({ version: 2, generation: 1 });
+  expect(await held(w.b)).toEqual([]);
 });
 
 // 12. An empty collection.
@@ -672,5 +701,48 @@ it("an empty collection after a reconnect posts nothing; the next real work carr
     lastDeleteVersion: 2,
     complete: true,
   });
+  posts.mockRestore();
+});
+
+// 13. A delete that is still in flight in the active lifetime.
+it("a stream delete whose control tombstone has not landed keeps an older pre-delete run fenced", async () => {
+  const w = await world();
+  await published(w);
+  await lifetime(w, w.a, w.a, "one"); // generation 3, head v3
+  await applyConnection(w.b.deps, w.fixture.control);
+  expect(await generationOf(w.b)).toBe(3);
+  // B collected rows under generation 3, before the delete, and has not published.
+  const pre = await collect(w.b, ["pre-delete"]);
+  // A deletes the generation-3 connection and stops after the stream delete
+  // post, before the control tombstone lands.
+  const real = w.registry.post.bind(w.registry);
+  const paused = vi
+    .spyOn(w.registry, "post")
+    .mockImplementation(async (req) => {
+      if (
+        req.scope === w.fixture.control &&
+        req.dataHash === w.fixture.hashes.tombstoneData
+      )
+        throw new Error("device A stopped before the control tombstone");
+      return real(req);
+    });
+  await w.a.deleter.requestConnectionDelete(declaration.connector);
+  // The delete stays pending: the tombstone post failed.
+  expect(await w.a.deleter.resumeDeletes()).toMatchObject([
+    { connector: declaration.connector },
+  ]);
+  paused.mockRestore();
+  const delRow = await observeHead(w);
+  expect(delRow).toMatchObject({ version: 4, generation: 1, recordCount: 0 });
+  const posts = vi.spyOn(w.registry, "post");
+  const r = await cycle(w.b, w);
+  expect(r.published.map((p) => p.outcome)).not.toContain("published");
+  expect(posts.mock.calls.filter(([req]) => req.scope === w.scope)).toEqual([]);
+  expect(await w.registry.read(w.scope)).toMatchObject({ version: 4 });
+  expect(await streamState(w.b)).toMatchObject({ last_delete_version: 4 });
+  expect(await snapshotOf(w.b, pre.runId)).toMatchObject({
+    delete_snapshot: expect.any(Number),
+  });
+  expect((await snapshotOf(w.b, pre.runId))!.delete_snapshot).toBeLessThan(4);
   posts.mockRestore();
 });

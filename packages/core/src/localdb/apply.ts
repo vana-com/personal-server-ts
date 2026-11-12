@@ -27,6 +27,7 @@ import type { ConnectionQueue, LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { applyDelete, mergeIncoming, withOrigin } from "./merge.js";
 import {
+  endsEarlierLifetime,
   hydrateLifetimeBoundary,
   olderLifetimeFence,
 } from "./lifetime-boundary.js";
@@ -342,7 +343,8 @@ async function applyOne(
       connectionId: id,
       stream,
       generation: active.generation,
-      fence: olderLifetimeFence(scope, read, head),
+      fence: olderLifetimeFence(scope, read, head, active.generation),
+      provenEarlier: endsEarlierLifetime(scope, read, active.generation),
       primaryKey: head.primaryKey,
     });
     return result(stream, "gone");

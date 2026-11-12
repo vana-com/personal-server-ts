@@ -16,7 +16,10 @@ import {
   type ControlState,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { manifestStreamLister } from "../stream-sync/artifacts.js";
-import { deleteMetadataHash } from "../stream-sync/delete-metadata.js";
+import {
+  deleteMetadataHash,
+  endedGenerationDeleteMetadataHash,
+} from "../stream-sync/delete-metadata.js";
 import { RegistryRefusedError } from "../stream-sync/ports.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { purgeConnection } from "./purge.js";
@@ -280,11 +283,18 @@ export function createConnectionDeleter(
                       : -1) === pin.version
                 : now.kind === "absent";
             if (!holds) throw new ConnectionDeleteSuperseded(connector);
+            // The generation this delete ends: the active control row it holds
+            // against. Any other control state keeps the unmarked delete.
+            const ended = now.kind === "active" ? now.generation : undefined;
+            const marked = (version: number, hash: string) =>
+              hash.toLowerCase() === deleteMetadataHash(scope, version) ||
+              (ended !== undefined &&
+                hash.toLowerCase() ===
+                  endedGenerationDeleteMetadataHash(scope, version, ended));
             let lastDelete =
               row.found &&
               (classifyStreamRow(row, hashes) === "tombstoned" ||
-                row.metadataHash.toLowerCase() ===
-                  deleteMetadataHash(scope, row.version))
+                marked(row.version, row.metadataHash))
                 ? row.version
                 : 0;
             if (row.found && lastDelete === 0 && signedPin !== undefined) {
@@ -354,7 +364,13 @@ export function createConnectionDeleter(
                   await signPost(
                     scope,
                     digest.dataHash,
-                    deleteMetadataHash(scope, version),
+                    ended === undefined
+                      ? deleteMetadataHash(scope, version)
+                      : endedGenerationDeleteMetadataHash(
+                          scope,
+                          version,
+                          ended,
+                        ),
                     version,
                   )
                 ).kind === "conflict";

@@ -1,5 +1,9 @@
 import type { Head } from "@opendatalabs/personal-server-ts-stream-sync";
-import { deleteMetadataHash } from "../stream-sync/delete-metadata.js";
+import {
+  deleteEndedEarlierLifetime,
+  deleteMetadataHash,
+  endedGenerationDeleteMetadataHash,
+} from "../stream-sync/delete-metadata.js";
 import type { LocalSyncDeps } from "./deps.js";
 
 /**
@@ -22,22 +26,40 @@ export function olderLifetimeFence(
   scope: string,
   row: { readonly version: number; readonly metadataHash: string },
   head: Pick<Head, "lastDeleteVersion">,
+  generation: number,
 ): number {
   // The delete writer marks its row twice: in the head and in the metadata
-  // hash. Either one is evidence; take both.
+  // hash. Either one is evidence of a delete at this version; take both.
+  const hash = row.metadataHash.toLowerCase();
   const marked =
-    row.metadataHash.toLowerCase() === deleteMetadataHash(scope, row.version);
+    hash === deleteMetadataHash(scope, row.version) ||
+    hash ===
+      endedGenerationDeleteMetadataHash(scope, row.version, generation) ||
+    deleteEndedEarlierLifetime(scope, row, generation);
   return Math.max(head.lastDeleteVersion ?? 0, marked ? row.version : 0);
 }
 
 /**
- * Record the old lifetime's delete fence locally, before a run begins, so
- * the run pins it as its delete snapshot. Idempotent and monotonic.
+ * Whether the stream row is the delete of a lifetime EARLIER than the
+ * connection's. Only a delete that recorded the generation it ended proves it.
+ * Without that proof the delete may belong to the active lifetime (its stream
+ * delete landed, its control tombstone has not), and nothing may write over it.
+ */
+export function endsEarlierLifetime(
+  scope: string,
+  row: { readonly version: number; readonly metadataHash: string },
+  generation: number,
+): boolean {
+  return deleteEndedEarlierLifetime(scope, row, generation);
+}
+
+/**
+ * Record the delete fence locally. Idempotent and monotonic.
  *
- * A run that began in this generation, under a control row of this
- * generation, began after the deletion that ended the old lifetime, so its
- * snapshot is raised to the fence. A run of any other generation keeps its
- * snapshot and the fence discards it.
+ * With `provenEarlier`, a run that began in this generation, under a control
+ * row of this generation, began after the deletion that ended the old
+ * lifetime, so its snapshot is raised to the fence. Without proof no run
+ * snapshot moves: the fence then discards every run collected before it.
  */
 export async function hydrateLifetimeBoundary(
   deps: LocalSyncDeps,
@@ -46,11 +68,24 @@ export async function hydrateLifetimeBoundary(
     readonly stream: string;
     readonly generation: number;
     readonly fence: number;
+    readonly provenEarlier: boolean;
     readonly primaryKey: readonly string[];
   },
 ): Promise<void> {
   const { connectionId, stream, generation, fence } = input;
   if (fence <= 0) return;
+  const raise = input.provenEarlier
+    ? [
+        {
+          sql: `UPDATE run_streams SET delete_snapshot = ?
+             WHERE stream = ? AND delete_snapshot < ?
+               AND run_id IN (SELECT run_id FROM runs
+                               WHERE connection_id = ? AND generation = ?
+                                 AND begin_control_version = ?)`,
+          params: [fence, stream, fence, connectionId, generation, generation],
+        },
+      ]
+    : [];
   await deps.db.batch([
     {
       sql: `INSERT OR IGNORE INTO stream_state (connection_id,stream,primary_key,semantics,incremental) VALUES (?,?,?,'mutable_state',1)`,
@@ -61,13 +96,6 @@ export async function hydrateLifetimeBoundary(
              WHERE connection_id = ? AND stream = ?`,
       params: [fence, connectionId, stream],
     },
-    {
-      sql: `UPDATE run_streams SET delete_snapshot = ?
-             WHERE stream = ? AND delete_snapshot < ?
-               AND run_id IN (SELECT run_id FROM runs
-                               WHERE connection_id = ? AND generation = ?
-                                 AND begin_control_version = ?)`,
-      params: [fence, stream, fence, connectionId, generation, generation],
-    },
+    ...raise,
   ]);
 }

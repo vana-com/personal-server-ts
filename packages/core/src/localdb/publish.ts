@@ -87,6 +87,7 @@ import {
 } from "./encode.js";
 import { replaceDelete, withOrigin } from "./merge.js";
 import {
+  endsEarlierLifetime,
   hydrateLifetimeBoundary,
   olderLifetimeFence,
 } from "./lifetime-boundary.js";
@@ -578,14 +579,28 @@ async function snapshotStream(
     } else {
       // No content base. Keep the delete fence of that lifetime: record it
       // locally (see lifetime-boundary.ts) and carry it into the new head.
-      const fence = olderLifetimeFence(scope, streamRead, verified);
+      const fence = olderLifetimeFence(
+        scope,
+        streamRead,
+        verified,
+        connection.generation,
+      );
+      const provenEarlier = endsEarlierLifetime(
+        scope,
+        streamRead,
+        connection.generation,
+      );
       await hydrateLifetimeBoundary(deps, {
         connectionId,
         stream,
         generation: connection.generation,
         fence,
+        provenEarlier,
         primaryKey: verified.primaryKey,
       });
+      // No proof this delete ended an earlier lifetime: it may be the delete
+      // of this one, awaiting its control tombstone. Do not write over it.
+      if (!provenEarlier) return deferred();
       local = {
         ...local,
         last_delete_version: Math.max(local.last_delete_version, fence),
