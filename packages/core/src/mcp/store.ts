@@ -18,6 +18,32 @@ import type {
 } from "./types.js";
 import { isMcpTokenExpired, matchesMcpRefreshHash } from "./token-expiry.js";
 
+/**
+ * The connection record without fields that record client activity. Two
+ * records with the same view hold the same grants, requests, status and
+ * tokens.
+ */
+export function mcpConnectionStateView(record: McpConnectionRecord): string {
+  const { revision: _revision, lastUsedAt: _lastUsedAt, ...rest } = record;
+  return JSON.stringify(rest);
+}
+
+/**
+ * Revision for a replacement record. A write that changes nothing but
+ * `lastUsedAt` (every MCP request stamps it) keeps the revision, so client
+ * activity never fails an owner's compare-and-set write. Any other change,
+ * including one that a later write reverts, still advances it.
+ */
+export function nextMcpConnectionRevision(
+  previous: McpConnectionRecord,
+  next: McpConnectionRecord,
+): number {
+  const revision = previous.revision ?? 0;
+  return mcpConnectionStateView(next) === mcpConnectionStateView(previous)
+    ? revision
+    : revision + 1;
+}
+
 export function createInMemoryMcpConnectionStore(): McpConnectionStore {
   const byId = new Map<string, McpConnectionRecord>();
   const byTokenHash = new Map<string, string>(); // tokenHash → id
@@ -91,9 +117,10 @@ export function createInMemoryMcpConnectionStore(): McpConnectionStore {
     async mutate(id, update) {
       const record = byId.get(id);
       if (!record) return null;
+      const next = update(structuredClone(record));
       const updated = {
-        ...update(structuredClone(record)),
-        revision: (record.revision ?? 0) + 1,
+        ...next,
+        revision: nextMcpConnectionRevision(record, next),
       };
       if (updated.tokenHash !== record.tokenHash) {
         byTokenHash.delete(record.tokenHash);
@@ -110,10 +137,10 @@ export function createInMemoryMcpConnectionStore(): McpConnectionStore {
         byTokenHash.delete(record.tokenHash);
         byTokenHash.set(patch.tokenHash, id);
       }
+      const next = { ...record, ...patch };
       const updated = {
-        ...record,
-        ...patch,
-        revision: (record.revision ?? 0) + 1,
+        ...next,
+        revision: nextMcpConnectionRevision(record, next),
       };
       byId.set(id, updated);
       return { ...updated };

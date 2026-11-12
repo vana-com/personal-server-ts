@@ -708,9 +708,11 @@ describe("mcp/connection-api scope request answers", () => {
     };
   }
 
-  it("re-signs the union of existing and approved scopes, never dropping one", async () => {
+  it("re-signs the stored scopes the gateway still holds plus the approved ones, never a gateway-only scope", async () => {
     const { store, id, grantee } = await connectionWithRequest();
-    // The gateway grant holds a scope this record never saw; it must survive.
+    // The gateway grant holds a scope this record never saw (a write whose
+    // local commit was lost, possibly denied since). It must not be re-signed:
+    // reads already never serve it, and approval must not bring it back.
     const gateway = gatewayMock(
       liveGrant({ scopes: ["instagram.profile", "github.profile"] }),
     );
@@ -725,14 +727,13 @@ describe("mcp/connection-api scope request answers", () => {
       expect.objectContaining({
         grantorAddress: OWNER,
         granteeId: "0xbuilder",
-        scopes: ["github.profile", "instagram.profile", "spotify.profile"],
+        scopes: ["instagram.profile", "spotify.profile"],
         grantVersion: "4",
         expiresAt: "0",
       }),
     );
     expect(gateway.getBuilder).toHaveBeenCalledWith(grantee);
     expect(result.grantedScopes).toEqual([
-      "github.profile",
       "instagram.profile",
       "spotify.profile",
     ]);
@@ -743,7 +744,7 @@ describe("mcp/connection-api scope request answers", () => {
     expect(view?.grants).toEqual([
       {
         grantId: "0xgrant2",
-        scopes: ["github.profile", "instagram.profile", "spotify.profile"],
+        scopes: ["instagram.profile", "spotify.profile"],
       },
     ]);
     expect(view?.grantedScopes).toEqual(result.grantedScopes);
@@ -1115,22 +1116,26 @@ describe("mcp/connection-api scope request answers", () => {
     expect(gateway.createGrant).not.toHaveBeenCalled();
   });
 
-  it("refuses a scope-request approval whose merged scopes include a gateway wildcard, and stores nothing", async () => {
+  it("never re-signs a gateway wildcard the record does not hold, and keeps the scope reads serve under it", async () => {
     const { store, id } = await connectionWithRequest(
       [{ grantId: "0xgrant1", scopes: ["chatgpt.conversations"] }],
       ["write:memory.app"],
     );
-    const before = await store.getById(id);
     // The live gateway grant holds "*", whatever the record says.
     const gateway = gatewayMock(liveGrant({ scopes: ["*"] }));
-    await expect(
-      approveMcpScopeAccessRequest(
-        { connectionId: id, scopes: ["write:memory.app"] },
-        approveOptions(store, gateway),
-      ),
-    ).rejects.toMatchObject({ code: "INVALID_SCOPE", status: 400 });
-    expect(gateway.createGrant).not.toHaveBeenCalled();
-    expect(await store.getById(id)).toEqual(before);
+    const result = await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["write:memory.app"] },
+      approveOptions(store, gateway),
+    );
+    expect(gateway.createGrant).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        scopes: ["chatgpt.conversations", "write:memory.app"],
+      }),
+    );
+    expect(result.grantedScopes).not.toContain("*");
+    expect(
+      (await store.getById(id))!.grants.flatMap((grant) => grant.scopes),
+    ).not.toContain("*");
   });
 
   it("leaves the request pending when the gateway refuses the grant", async () => {
