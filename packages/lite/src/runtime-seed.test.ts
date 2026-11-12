@@ -173,7 +173,7 @@ it("imports a phone snapshot through the real Lite runtime and reopens its recei
   });
 });
 
-it("imports seed rows without overwriting a real collection", async () => {
+it("skips a late seed once a real collection owns the stream", async () => {
   const f = await fixture();
   const context = await f.boot();
   const intake = context.streamSyncIntake!;
@@ -201,21 +201,31 @@ it("imports seed rows without overwriting a real collection", async () => {
       { id: "b", value: "seed-only" },
     ]),
   );
+  // Old data is a one-time seed: the real full refresh won, so neither the
+  // stale "a" nor the seed-only "b" comes back, and the skip is a final receipt.
   expect(await read(context)).toMatchObject({
-    data: {
-      records: expect.arrayContaining([
-        { id: "a", value: "new" },
-        { id: "b", value: "seed-only" },
-      ]),
-    },
+    data: { records: [{ id: "a", value: "new" }] },
   });
   expect(
     await f
       .driver()
-      .query(
-        "SELECT stamp_o, stamp_r, first_o FROM records WHERE record_key = 'b'",
-      ),
-  ).toEqual([{ stamp_o: 0, stamp_r: "seed", first_o: null }]);
+      .query("SELECT record_key FROM records WHERE stamp_r = 'seed'"),
+  ).toEqual([]);
+  expect(
+    await f
+      .driver()
+      .query("SELECT stream, state, reason, rows FROM import_ledger"),
+  ).toEqual([
+    {
+      stream: "items",
+      state: "excluded",
+      reason: "seed_window_closed",
+      rows: 0,
+    },
+  ]);
+  expect(
+    await context.runtime.streamSyncSeed!.status("fixture-source"),
+  ).toEqual({ targetKnown: true, streams: { items: { state: "merged" } } });
 });
 it("resumes a staged phone snapshot after a merge crash without duplicate changes", async () => {
   const f = await fixture();

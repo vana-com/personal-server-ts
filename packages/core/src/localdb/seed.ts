@@ -5,6 +5,7 @@ import {
 import { withScopeLock } from "../additions/scope-lock.js";
 import { createImportLedger } from "./import-ledger.js";
 import { importLegacySource } from "./legacy-import.js";
+import { importFingerprint } from "./import-fingerprint.js";
 import { syncBeforeBegin } from "./bootstrap.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { ImportSource } from "./legacy-import-types.js";
@@ -231,6 +232,29 @@ export function createLocalSeed(options: {
           records: () => source.records(connector, stream),
         };
         const result = await importLegacySource(locked, ledger, imported);
+        if (
+          result.kind === "refused" &&
+          result.reason === "seed_window_closed"
+        ) {
+          // A real write already owns this stream. The old data is skipped
+          // for good: an excluded receipt is final and is never re-imported.
+          await deps.db.batch([
+            ...ledger.statements({
+              ...(await importFingerprint((async function* () {})())),
+              source: imported.source,
+              revision: imported.revision,
+              connectionId,
+              stream,
+              generation: 1,
+              highestSeq: 0,
+              state: "excluded",
+              reason: "seed_window_closed",
+              at: deps.now(),
+            }),
+          ]);
+          receipts[stream] = "merged";
+          continue;
+        }
         if (result.kind === "refused") {
           if (result.reason === "connection_deleted")
             throw new ProtocolError(
