@@ -116,11 +116,14 @@ describe("local database cycle", () => {
     applyReady.resolve();
     const report = await cycle;
     await Promise.all([prior, next]);
+    // Apply keeps its slot. Publish takes its own slots afterwards, so an
+    // operation queued during apply (a run's begin) runs before it rather
+    // than behind the whole publish.
     expect(events.slice(-4)).toEqual([
       "apply:first:start",
       "apply:first:end",
-      "publish:first",
       "next:first",
+      "publish:first",
     ]);
     expect(report.connections).toEqual(
       ["first", "second"].map((id) => ({

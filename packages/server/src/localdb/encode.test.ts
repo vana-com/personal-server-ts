@@ -11,7 +11,10 @@ import {
   framesOfParts,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
+  FrozenRowsChanged,
   encodePrefixes,
+  freezePrefixRows,
+  uploadFrozenParts,
   type EncodedPart,
 } from "../../../core/src/localdb/encode.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
@@ -176,10 +179,15 @@ describe("encodePrefixes", () => {
     expect(second).toEqual(first);
     expect(f.put).not.toHaveBeenCalled();
     expect(f.encryptPart).not.toHaveBeenCalled();
-    expect(query).toHaveBeenCalledTimes(4);
+    // Per call and prefix: one page to freeze the identities, one to encode.
+    expect(query).toHaveBeenCalledTimes(8);
     expect(
       query.mock.calls.every(([sql]) => sql.includes("ORDER BY pk_hash")),
     ).toBe(true);
+    // The freeze never reads a body.
+    expect(
+      query.mock.calls.filter(([sql]) => !sql.includes("body,")),
+    ).toHaveLength(4);
     expect(request.headExtras).toBe(headExtras);
   });
 
@@ -281,9 +289,76 @@ describe("encodePrefixes", () => {
       { k: keyHash("ae"), o: 10, r: "z", f: null },
       { k: keyHash("bf"), o: 11, r: "a", f: null },
     ]);
-    expect(query).toHaveBeenCalledTimes(1);
+    expect(query).toHaveBeenCalledTimes(2);
     expect(
       await f.db.query<{ n: number }>("SELECT count(*) AS n FROM records"),
     ).toEqual([{ n: 8 }]);
+  });
+});
+
+describe("a transfer reads the rows the snapshot froze", () => {
+  const prefixes = { ...input, changedPrefixes: [""] };
+  const upload = (f: Awaited<ReturnType<typeof fresh>>, frozen: never) =>
+    uploadFrozenParts(f.deps, { ...prefixes, frozen });
+
+  async function frozen(f: Awaited<ReturnType<typeof fresh>>) {
+    return (await freezePrefixRows(f.deps, prefixes)) as never;
+  }
+
+  it("encodes the same parts whether the stream fits one page or spans many", async () => {
+    const f = await fresh();
+    await f.insert(
+      Array.from({ length: 150 }, (_, i) => ({
+        k: String(i).padStart(3, "0").padEnd(64, "0"),
+      })),
+    );
+    const parts = await upload(f, await frozen(f));
+    expect(parts.reduce((n, part) => n + part.count, 0)).toBe(150);
+    expect((await f.read(parts)).map((row) => row.k)).toEqual(
+      Array.from({ length: 150 }, (_, i) =>
+        String(i).padStart(3, "0").padEnd(64, "0"),
+      ),
+    );
+  });
+
+  it("keeps a count and a digest per prefix, not the rows", async () => {
+    const f = await fresh();
+    await f.insert([{ k: keyHash("1") }, { k: keyHash("2") }]);
+    const [only, ...rest] = await freezePrefixRows(f.deps, prefixes);
+    expect(rest).toEqual([]);
+    expect(Object.keys(only!).sort()).toEqual(["digest", "prefix", "rows"]);
+    expect(only).toMatchObject({ prefix: "", rows: 2 });
+  });
+
+  it.each([
+    [
+      "a row got a newer stamp",
+      "UPDATE records SET stamp_o = 11, body_sha256 = '" +
+        "f".repeat(64) +
+        "' WHERE pk_hash = ?",
+    ],
+    [
+      "a row's first checkpoint moved under the same stamp",
+      "UPDATE records SET first_o = 3 WHERE pk_hash = ?",
+    ],
+    ["a row was removed", "DELETE FROM records WHERE pk_hash = ?"],
+  ])("throws when %s after the freeze", async (_name, sql) => {
+    const f = await fresh();
+    await f.insert([{ k: keyHash("1") }, { k: keyHash("2"), f: 9 }]);
+    const froze = await frozen(f);
+    await f.db.batch([{ sql, params: [keyHash("2")] }]);
+    await expect(upload(f, froze)).rejects.toBeInstanceOf(FrozenRowsChanged);
+    expect(f.put).not.toHaveBeenCalledWith(
+      expect.stringContaining("-p-"),
+      expect.anything(),
+    );
+  });
+
+  it("throws when a row was added after the freeze", async () => {
+    const f = await fresh();
+    await f.insert([{ k: keyHash("1") }]);
+    const froze = await frozen(f);
+    await f.insert([{ k: keyHash("2") }]);
+    await expect(upload(f, froze)).rejects.toBeInstanceOf(FrozenRowsChanged);
   });
 });

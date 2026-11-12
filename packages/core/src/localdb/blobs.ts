@@ -230,11 +230,28 @@ export function createBlobStore(deps: LocalSyncDeps): BlobStore {
 // idle cycle just to test existence; restart safely probes the durable cache.
 const uploadedBlobs = new WeakMap<SqlDriver, Set<string>>();
 
-/** Publish cached run bytes before the head that references them (E.1).
- * Page metadata, then hold one blob at a time; a set of 32 MiB attachments
- * never becomes one SQL result containing all their payloads.
+/** One attachment a stream's records name, and where it is published. */
+export interface BlobDescriptor {
+  readonly blobId: string;
+  /** `<scope>/g<generation>-b-<sha256>`. */
+  readonly key: string;
+  readonly scope: string;
+}
+
+/** The attachment bytes a descriptor names are gone from the local store. */
+export class MissingAttachmentError extends Error {
+  constructor(readonly blobId: string) {
+    super(`attachment ${blobId} has no local bytes to publish`);
+    this.name = "MissingAttachmentError";
+  }
+}
+
+/**
+ * List the cached run bytes a stream's records name and that are not yet
+ * known to be published (E.1). Local reads only, paged by metadata: no blob
+ * payload is read. The result is the whole input of `uploadBlobs`.
  */
-export async function uploadStreamBlobs(
+export async function listStreamBlobs(
   deps: LocalSyncDeps,
   input: {
     readonly connectionId: string;
@@ -242,10 +259,9 @@ export async function uploadStreamBlobs(
     readonly scope: string;
     readonly generation: number;
   },
-): Promise<void> {
-  const store = createBlobStore(deps);
-  let uploaded = uploadedBlobs.get(deps.db);
-  if (!uploaded) uploadedBlobs.set(deps.db, (uploaded = new Set()));
+): Promise<readonly BlobDescriptor[]> {
+  const uploaded = uploadedBlobs.get(deps.db);
+  const found: BlobDescriptor[] = [];
   let after = "";
   for (;;) {
     const rows = await deps.db.query<{ blob_id: string }>(
@@ -258,7 +274,7 @@ export async function uploadStreamBlobs(
     );
     for (const row of rows) {
       const key = `${input.scope}/g${input.generation}-b-${row.blob_id}`;
-      if (uploaded.has(key)) continue;
+      if (uploaded?.has(key)) continue;
       const records = await deps.db.query<{ body: string }>(
         `SELECT r.body FROM records r JOIN blob_refs f
         ON f.connection_id=r.connection_id AND f.stream=r.stream AND f.pk_hash=r.pk_hash
@@ -267,20 +283,41 @@ export async function uploadStreamBlobs(
       );
       if (!records.some((record) => namesBlob(record.body, row.blob_id)))
         continue;
-      if ((await deps.blobs.get(key)) !== null) {
-        uploaded.add(key);
-        continue;
-      }
-      const value = await store.get(row.blob_id);
-      if (value) {
-        await deps.blobs.put(
-          key,
-          await deps.keys.encrypt(input.scope, value.bytes),
-        );
-        uploaded.add(key);
-      }
+      found.push({ blobId: row.blob_id, key, scope: input.scope });
     }
-    if (rows.length < 100) return;
+    if (rows.length < 100) return found;
     after = rows.at(-1)!.blob_id;
+  }
+}
+
+/**
+ * Publish the listed attachments before the head that references them (E.1),
+ * one blob in memory at a time. It reads `blobs` by exact id and checks the
+ * bytes against the id: it never takes the lazy-fetch path of
+ * `BlobStore.get`, which rebuilds references from live records. An attachment
+ * with no bytes fails the upload; it is never skipped. Needs no queue slot.
+ */
+export async function uploadBlobs(
+  deps: LocalSyncDeps,
+  blobs: readonly BlobDescriptor[],
+): Promise<void> {
+  let uploaded = uploadedBlobs.get(deps.db);
+  if (!uploaded) uploadedBlobs.set(deps.db, (uploaded = new Set()));
+  for (const { blobId, key, scope } of blobs) {
+    if (uploaded.has(key)) continue;
+    if ((await deps.blobs.get(key)) !== null) {
+      uploaded.add(key);
+      continue;
+    }
+    const [local] = await deps.db.query<{ bytes: Uint8Array | null }>(
+      "SELECT bytes FROM blobs WHERE blob_id = ?",
+      [blobId],
+    );
+    if (local?.bytes === null || local?.bytes === undefined) {
+      throw new MissingAttachmentError(blobId);
+    }
+    checkBytes(blobId, local.bytes);
+    await deps.blobs.put(key, await deps.keys.encrypt(scope, local.bytes));
+    uploaded.add(key);
   }
 }

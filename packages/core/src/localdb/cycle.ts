@@ -2,6 +2,7 @@ import { applyConnection, type ApplyResult } from "./apply.js";
 import { bootstrapConnections } from "./bootstrap.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { publishConnection, type PublishResult } from "./publish.js";
+import { insideQueue } from "./slot.js";
 
 export interface CycleReport {
   readonly connections: readonly {
@@ -14,10 +15,10 @@ export interface CycleReport {
 }
 
 /**
- * C.4: one sync cycle. Bootstrap listing (C.0), then per connection in the
- * queue: apply newer heads, then publish. Connections run concurrently, one
- * operation at a time each. Used by the sync-manager timer, `/sync/trigger`
- * and `/sync/file/:id` (trigger = this; file = `syncConnection` for the one
+ * C.4: one sync cycle. Bootstrap listing (C.0), then per connection: apply
+ * newer heads, then publish. Connections run concurrently, one operation at a
+ * time each. Used by the sync-manager timer, `/sync/trigger` and
+ * `/sync/file/:id` (trigger = this; file = `syncConnection` for the one
  * connection, then read).
  */
 export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
@@ -29,7 +30,16 @@ export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
   };
 }
 
-/** One connection: apply, then publish. */
+/**
+ * One connection: apply, then publish.
+ *
+ * Queue boundaries. Apply holds one "publish" slot, with nested queue calls
+ * inline: it merges downloaded rows while it downloads, so its slot cannot
+ * be shortened until apply is split the way publish is. Publish does not
+ * hold a slot here: `publishConnection` takes the slot for its snapshot and
+ * its commit and releases it while it uploads, so a run's begin waits for at
+ * most one of those short turns, never for an upload.
+ */
 export async function syncConnection(
   deps: LocalSyncDeps,
   connectionId: string,
@@ -39,22 +49,10 @@ export async function syncConnection(
   let error: string | null = null;
   try {
     // A pass includes publish, so it must not join an apply-only operation.
-    await deps.queue.run(connectionId, "publish", async () => {
-      // The queue is not reentrant. Siblings may acquire it themselves; this
-      // pass already owns this connection until both operations have settled.
-      const queuedDeps: LocalSyncDeps = {
-        ...deps,
-        queue: {
-          run(id, kind, operation) {
-            return id === connectionId
-              ? Promise.resolve().then(operation)
-              : deps.queue.run(id, kind, operation);
-          },
-        },
-      };
-      applied = await applyConnection(queuedDeps, connectionId);
-      published = await publishConnection(queuedDeps, connectionId);
-    });
+    applied = await deps.queue.run(connectionId, "publish", () =>
+      applyConnection(insideQueue(deps, connectionId), connectionId),
+    );
+    published = await publishConnection(deps, connectionId);
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause);
     // The timer and `/sync/trigger` drop the report. A connection whose
