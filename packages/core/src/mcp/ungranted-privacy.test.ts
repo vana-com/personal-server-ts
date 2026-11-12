@@ -336,6 +336,7 @@ describe("a grant the gateway no longer honours reveals nothing new", () => {
     });
     expect(client.getScopeMetadata).toHaveBeenCalledWith(
       "chatgpt.conversations",
+      "grant-1",
     );
   });
 });
@@ -443,6 +444,7 @@ describe("only the dead grants are dropped", () => {
     expect(owner.getScopeMetadata).toHaveBeenCalledTimes(1);
     expect(owner.getScopeMetadata).toHaveBeenCalledWith(
       "chatgpt.conversations",
+      "g-live",
     );
 
     const probe = ownerA();

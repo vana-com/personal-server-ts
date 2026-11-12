@@ -157,7 +157,7 @@ describe("startPersonalServer node handle", () => {
   ])(
     "carries the normalized review hint from startup to MCP: %j",
     async (hint) => {
-      const { ps, port } = await startTestServer(createGateway(), {
+      const { ps, port } = await startTestServer(createGateway(), true, {
         mcpScopeRequestReviewHint: hint,
         mcpScopeRequestApprovalUrl: () => "vana://approve",
       });

@@ -37,6 +37,7 @@ describe("data API: a wrong-scope file id is a missing file id", () => {
           authorizeBuilderRead,
         },
         accessLogWriter: { write: vi.fn() },
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
       } as never,
       { basePath: "/v1/data" },
     );

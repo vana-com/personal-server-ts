@@ -3339,6 +3339,7 @@ describe("MCP notShared owner listing deps (route level)", () => {
         indexManager,
         hierarchyOptions,
         mcpExposeUnsharedScopes: true,
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         mcpOwnerListingDeps: opts.listingDeps as never,
         localApprovalPort: LOOPBACK_PORT,
         serverPort: MAIN_PORT,

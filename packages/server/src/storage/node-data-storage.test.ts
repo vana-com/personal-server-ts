@@ -922,6 +922,7 @@ describe("findEntry binds a file id to its scope", () => {
     const db = initializeDatabase(join(root, "index.db"));
     try {
       const storage = createNodeDataStorage({
+        legacyWriteSeal: openLegacyWriteSealForTests(),
         indexManager: createIndexManager(db),
         hierarchyOptions: { dataDir: join(root, "data") },
       });

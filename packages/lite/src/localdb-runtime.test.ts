@@ -51,6 +51,13 @@ it("Lite HTTP history and status use the same database facade and its counters",
       ownerToken: "owner-fixture",
       builderToken: "builder-fixture",
     }),
+    // The MCP tools honour a grant only while the gateway still holds it.
+    gateway: {
+      getGrant: async (grantId: string) => ({
+        grantId,
+        scopes: ["memory.fixture", "write:memory.fixture"],
+      }),
+    } as never,
     accountModeAuthority: authority,
     active: true,
     localSync: getLocalSync,
@@ -75,7 +82,12 @@ it("Lite HTTP history and status use the same database facade and its counters",
   await approveMcpConnection(
     {
       connectionId: connection.connectionId,
-      grants: [{ grantId: "fixture-grant", scopes: ["write:memory.fixture"] }],
+      grants: [
+        {
+          grantId: "fixture-grant",
+          scopes: ["memory.fixture", "write:memory.fixture"],
+        },
+      ],
     },
     { store: connections },
   );
