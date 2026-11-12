@@ -66,6 +66,41 @@ import { checkRunFence } from "./fence.js";
 import { replaceMayApply } from "./replace.js";
 import { unwriteRefusedRun } from "./unwrite.js";
 
+/**
+ * Verified registry heads by (scope, data hash). A head blob is named by its
+ * data hash and never changes, so a head verified once need not be downloaded
+ * again. Without this every cycle downloaded one head blob per stream of every
+ * connection, quiet or not; the storage service rejects a burst of reads, and
+ * a cycle that has real work to publish then fails before it posts anything.
+ */
+const verifiedHeads = new WeakMap<object, Map<string, Head>>();
+const MAX_VERIFIED_HEADS = 512;
+
+function headCache(deps: LocalSyncDeps): Map<string, Head> {
+  let cache = verifiedHeads.get(deps.blobs);
+  if (!cache) {
+    cache = new Map();
+    verifiedHeads.set(deps.blobs, cache);
+  }
+  return cache;
+}
+
+function rememberHead(
+  deps: LocalSyncDeps,
+  scope: string,
+  dataHash: string,
+  keyCheck: string,
+  head: Head,
+): void {
+  const cache = headCache(deps);
+  const key = `${scope}|${dataHash.toLowerCase()}|${keyCheck}`;
+  cache.delete(key);
+  cache.set(key, head);
+  if (cache.size > MAX_VERIFIED_HEADS) {
+    cache.delete(cache.keys().next().value!);
+  }
+}
+
 /** Confirmed publication of one stream in a connector namespace. */
 export interface PublicationReceipt {
   readonly connectionId: string;
@@ -695,6 +730,10 @@ async function readRegistryHead(
   stream: string,
   keyCheck: string,
 ): Promise<Head> {
+  const remembered = headCache(deps).get(
+    `${scope}|${dataHash.toLowerCase()}|${keyCheck}`,
+  );
+  if (remembered) return remembered;
   const blobName = headBlobName(dataHash);
   const cipher = await deps.blobs.get(`${scope}/${blobName}`);
   if (cipher === null) {
@@ -715,6 +754,7 @@ async function readRegistryHead(
       `publish: registry head for ${stream} failed verification: ${verified.kind}`,
     );
   }
+  rememberHead(deps, scope, dataHash, keyCheck, verified.head);
   return verified.head;
 }
 
