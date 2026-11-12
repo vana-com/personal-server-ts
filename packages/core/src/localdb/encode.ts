@@ -30,26 +30,23 @@ export interface EncodedPart {
   readonly blobName: string;
 }
 
-/**
- * C.2 step 4: encode the changed prefixes of one stream from `records`
- * `ORDER BY pk_hash` (one prefix per query), as v3 frames (format 4 head) in parts of
- * at most `partTargetBytes`, STREAM-encrypted, and upload each part that does
- * not exist. Under replace (H), leave out rows below `replaceBelow`. Identical
- * rows give an identical part, so a repeat run makes zero PUTs.
- */
-export async function encodePrefixes(
-  deps: LocalSyncDeps,
-  input: {
-    readonly connectionId: string;
-    readonly stream: string;
-    readonly scope: string;
-    readonly generation: number;
-    readonly changedPrefixes: readonly string[];
-    readonly upToSeq: number;
-    readonly replaceBelow?: { readonly o: number; readonly r: string };
-    readonly headExtras?: HeadExtras;
-  },
-): Promise<readonly EncodedPart[]> {
+/** One `records` row as the encoder reads it. */
+export type FrozenRow = {
+  readonly pk_hash: string;
+  readonly stamp_o: number;
+  readonly stamp_r: string;
+  readonly body: string;
+  readonly body_sha256: string;
+  readonly first_o: number | null;
+};
+
+/** The rows of one changed prefix, read once and never read again. */
+export interface FrozenPrefix {
+  readonly prefix: string;
+  readonly rows: readonly FrozenRow[];
+}
+
+function partTarget(deps: LocalSyncDeps, generation: number): number {
   const target = deps.partTargetBytes ?? 4 * 1024 * 1024;
   if (
     !Number.isSafeInteger(target) ||
@@ -58,9 +55,27 @@ export async function encodePrefixes(
   ) {
     throw new Error("partTargetBytes must be between 1 and 16 MiB");
   }
-  if (!Number.isSafeInteger(input.generation) || input.generation < 1) {
+  if (!Number.isSafeInteger(generation) || generation < 1) {
     throw new Error("generation must be a positive safe integer");
   }
+  return target;
+}
+
+/**
+ * Read the rows of the changed prefixes from `records` `ORDER BY pk_hash`
+ * (one query per prefix). Under replace (H), leave out rows below
+ * `replaceBelow`. Local reads only: the result is the whole input of
+ * `uploadFrozenParts`, so the upload step reads nothing live.
+ */
+export async function freezePrefixRows(
+  deps: LocalSyncDeps,
+  input: {
+    readonly connectionId: string;
+    readonly stream: string;
+    readonly changedPrefixes: readonly string[];
+    readonly replaceBelow?: { readonly o: number; readonly r: string };
+  },
+): Promise<readonly FrozenPrefix[]> {
   const prefixes = [...new Set(input.changedPrefixes)].sort();
   for (let i = 0; i < prefixes.length; i += 1) {
     const prefix = prefixes[i]!;
@@ -69,10 +84,7 @@ export async function encodePrefixes(
       throw new Error("part prefixes must not overlap");
     }
   }
-
-  const result: EncodedPart[] = [];
-  // upToSeq fences the publish watermark, not this snapshot of records.
-  // HeadExtras belongs to the caller's head and is deliberately left opaque.
+  const frozen: FrozenPrefix[] = [];
   for (const prefix of prefixes) {
     const params: SqlValue[] = [input.connectionId, input.stream];
     let where = "connection_id = ? AND stream = ?";
@@ -93,18 +105,35 @@ export async function encodePrefixes(
         input.replaceBelow.r,
       );
     }
-    const rows = await deps.db.query<{
-      pk_hash: string;
-      stamp_o: number;
-      stamp_r: string;
-      body: string;
-      body_sha256: string;
-      first_o: number | null;
-    }>(
-      `SELECT pk_hash, stamp_o, stamp_r, body, body_sha256, first_o FROM records
+    frozen.push({
+      prefix,
+      rows: await deps.db.query<FrozenRow>(
+        `SELECT pk_hash, stamp_o, stamp_r, body, body_sha256, first_o FROM records
        WHERE ${where} ORDER BY pk_hash`,
-      params,
-    );
+        params,
+      ),
+    });
+  }
+  return frozen;
+}
+
+/**
+ * C.2 step 4, after the read: encode frozen rows as v3 frames (format 4 head)
+ * in parts of at most `partTargetBytes`, STREAM-encrypted, and upload each
+ * part that does not exist. Identical rows give an identical part, so a
+ * repeat run makes zero PUTs. Reads no local state; it needs no queue slot.
+ */
+export async function uploadFrozenParts(
+  deps: LocalSyncDeps,
+  input: {
+    readonly scope: string;
+    readonly generation: number;
+    readonly frozen: readonly FrozenPrefix[];
+  },
+): Promise<readonly EncodedPart[]> {
+  const target = partTarget(deps, input.generation);
+  const result: EncodedPart[] = [];
+  for (const { prefix, rows } of input.frozen) {
     let seq = 0;
     const upload = async (part: Awaited<ReturnType<typeof encodePiece>>) => {
       const { hash: partHash, bytes, count } = part.entry;
@@ -165,4 +194,32 @@ export async function encodePrefixes(
     await flush();
   }
   return result;
+}
+
+/**
+ * C.2 step 4: freeze the changed prefixes, then encode and upload them. The
+ * publisher calls the two halves apart (read under the queue slot, upload
+ * outside it); this composition is for a caller that holds the slot itself.
+ */
+export async function encodePrefixes(
+  deps: LocalSyncDeps,
+  input: {
+    readonly connectionId: string;
+    readonly stream: string;
+    readonly scope: string;
+    readonly generation: number;
+    readonly changedPrefixes: readonly string[];
+    readonly upToSeq: number;
+    readonly replaceBelow?: { readonly o: number; readonly r: string };
+    readonly headExtras?: HeadExtras;
+  },
+): Promise<readonly EncodedPart[]> {
+  partTarget(deps, input.generation);
+  // upToSeq fences the publish watermark, not this snapshot of records.
+  // HeadExtras belongs to the caller's head and is deliberately left opaque.
+  return uploadFrozenParts(deps, {
+    scope: input.scope,
+    generation: input.generation,
+    frozen: await freezePrefixRows(deps, input),
+  });
 }

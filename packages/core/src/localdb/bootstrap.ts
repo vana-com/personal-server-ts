@@ -12,6 +12,7 @@ import { streamSyncHashes } from "../stream-sync/crypto.js";
 import { applyConnection } from "./apply.js";
 import type { ConnectionRow, LocalSyncDeps } from "./deps.js";
 import { purgeConnection } from "./purge.js";
+import { insideQueue } from "./slot.js";
 
 // A connection id is its canonical control scope: pdpp.<connector>~<ns>.
 function connectionId(connector: string, ns: string): string {
@@ -36,17 +37,6 @@ async function hashes(deps: LocalSyncDeps): Promise<ControlHashes> {
     deps.keys.namespaceHmac(message),
   );
   return controlHashes(streamSyncHashes.keccak256, keyCheck);
-}
-
-/** Nested helpers already hold this connection's queue slot. */
-function insideQueue(deps: LocalSyncDeps, id: string): LocalSyncDeps {
-  return {
-    ...deps,
-    queue: {
-      run: (other, kind, work) =>
-        other === id ? work() : deps.queue.run(other, kind, work),
-    },
-  };
 }
 
 async function saveControl(

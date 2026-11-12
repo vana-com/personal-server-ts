@@ -1,24 +1,35 @@
-import { uploadStreamBlobs } from "./blobs.js";
+import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 // PS-2 P09 publish: the publish side of local sync.
 //
-// Per connection, in the connection queue (held by the caller, cycle.ts),
-// after apply. Per stream with work:
-//   1. Snapshot W = max(seq) in record_changes and the changes with
-//      seq > publish_watermark and seq <= W.
-//   2. Registry: a newer registry head is applied (same queue turn) and
+// Per connection, after apply. Per stream with work, in three phases. Only
+// the first and the last hold the connection's queue slot; the middle one
+// holds none, so a run's begin never waits for an upload:
+//
+//   SNAPSHOT (slot)  1. Snapshot W = max(seq) in record_changes and the
+//      changes with seq > publish_watermark and seq <= W.
+//      2. Registry: a newer registry head is applied (same slot turn) and
 //      the stream restarts at step 1; a deleted control row purges the
 //      connection and stops.
-//   3. Re-plan the retained ended runs against the registry head. A run
+//      3. Re-plan the retained ended runs against the registry head. A run
 //      accepted at end but now refused is un-written in one batch and
 //      apply runs at once; a deferred run defers the stream.
-//   4. Encode the changed prefixes (the head's partition is respected:
-//      a changed record re-encodes the base prefix that holds it, or its
-//      own 16-bit prefix when no base prefix covers it), under replace
-//      leaving out rows below the run's stamp.
-//   5. Head, then registry CAS from head_version: the same data hash
-//      skips the CAS; a conflict applies the winner and re-plans, at most
-//      5 tries, then back off. On success one batch: replace deletes
-//      (origin refresh), head identity, publish_watermark = W, head_parts,
+//      Freeze everything the next phase needs: the rows of the changed
+//      prefixes (under replace, leaving out rows below the run's stamp), the
+//      attachments to upload, and the basis the snapshot rests on (control,
+//      stream state, head parts, delete intents, retained runs, W).
+//   TRANSFER (no slot)  4. Encode the frozen rows, upload every new part and
+//      attachment, build the head and upload it. Objects are content
+//      addressed and authorize nothing until the registry CAS, so they need
+//      no mutual exclusion. Nothing local is read but the attachment bytes,
+//      by exact id and checked against it.
+//   COMMIT (slot)  5. Re-read the basis and the registry rows. Any change
+//      discards the candidate and re-snapshots (a few tries, then the work
+//      stays pending for the next cycle); nothing merges. Otherwise head,
+//      then registry CAS from head_version: the same data hash skips the CAS;
+//      a conflict applies the winner and re-plans, at most 5 tries, then back
+//      off. On success one batch: replace deletes (origin refresh), head
+//      identity, publish_watermark = the SNAPSHOT's W (never a fresh max, so a
+//      run that ended during the transfer stays pending), head_parts,
 //      stream_versions, compaction of record_changes at or below the
 //      connection's lowest watermark (kept while an import read-back is
 //      pending).
@@ -26,9 +37,9 @@ import { uploadStreamBlobs } from "./blobs.js";
 // Seeds (import rows with stamp (0, "seed")) publish only into generation
 // 1; otherwise they are purged and the ledger records excluded(seed_skipped).
 //
-// This module does not take the connection queue: the caller holds one
-// "publish" queue turn for the connection. applyConnection and
-// purgeConnection take the queue with the deps they receive.
+// Queue: this module takes the connection's "publish" slot itself, for the
+// snapshot and the commit. The caller must not hold it. applyConnection and
+// purgeConnection, called inside a turn, run inline in that turn.
 
 import { keccak_256 } from "@noble/hashes/sha3";
 import {
@@ -59,11 +70,18 @@ import {
 import { applyConnection } from "./apply.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
-import { encodePrefixes, type EncodedPart, type HeadExtras } from "./encode.js";
+import {
+  freezePrefixRows,
+  uploadFrozenParts,
+  type EncodedPart,
+  type FrozenPrefix,
+  type HeadExtras,
+} from "./encode.js";
 import { replaceDelete, withOrigin } from "./merge.js";
 import { purgeConnection } from "./purge.js";
 import { checkRunFence } from "./fence.js";
 import { replaceMayApply } from "./replace.js";
+import { insideQueue } from "./slot.js";
 import { unwriteRefusedRun } from "./unwrite.js";
 
 /**
@@ -132,54 +150,60 @@ export interface PublishResult {
   readonly watermark: number | null; // max(seq) read in step 1; new publish_watermark on success
 }
 
+export interface PublishOptions {
+  readonly headExtras?: (stream: string) => Promise<HeadExtras | undefined>;
+}
+
 export async function publishConnection(
   deps: LocalSyncDeps,
   connectionId: string,
-  options?: {
-    readonly headExtras?: (stream: string) => Promise<HeadExtras | undefined>;
-  },
+  options?: PublishOptions,
 ): Promise<readonly PublishResult[]> {
-  const [connection] = await deps.db.query<{
-    connector: string;
-    ns: string;
-    generation: number;
-  }>(
-    `SELECT connector, ns, generation FROM connections WHERE connection_id = ?`,
-    [connectionId],
-  );
-  if (!connection) {
-    throw new Error(`publish: unknown connection ${connectionId}`);
-  }
-  const keyCheck = await deriveKeyCheck(deps.keys.namespaceHmac);
-  const hashes = await controlHashes(keccak, keyCheck);
-  const streams = await deps.db.query<{ stream: string }>(
-    `SELECT stream FROM stream_state WHERE connection_id = ? ORDER BY stream`,
-    [connectionId],
-  );
-  if (
-    (
-      await deps.db.query("SELECT 1 FROM delete_intents WHERE connector=?", [
-        connection.connector,
-      ])
-    ).length
-  )
-    return streams.map(({ stream }) => ({
-      stream,
-      outcome: "deferred",
-      watermark: null,
-    }));
-  if (streams.length === 0) {
-    const state = classifyControl(
-      await deps.registry.read(
-        controlScope(connection.connector, connection.ns),
-      ),
-      hashes,
+  const opened = await deps.queue.run(connectionId, "publish", async () => {
+    const held = insideQueue(deps, connectionId);
+    const [connection] = await held.db.query<ConnectionRow>(
+      `SELECT connector, ns, generation FROM connections WHERE connection_id = ?`,
+      [connectionId],
     );
-    if (state.kind === "deleted")
-      await purgeConnection(deps, connectionId, {
-        controlVersion: state.version,
-      });
-  }
+    if (!connection) {
+      throw new Error(`publish: unknown connection ${connectionId}`);
+    }
+    const keyCheck = await deriveKeyCheck(held.keys.namespaceHmac);
+    const hashes = await controlHashes(keccak, keyCheck);
+    const streams = await held.db.query<{ stream: string }>(
+      `SELECT stream FROM stream_state WHERE connection_id = ? ORDER BY stream`,
+      [connectionId],
+    );
+    if (
+      (
+        await held.db.query("SELECT 1 FROM delete_intents WHERE connector=?", [
+          connection.connector,
+        ])
+      ).length
+    )
+      return {
+        results: streams.map(({ stream }): PublishResult => ({
+          stream,
+          outcome: "deferred",
+          watermark: null,
+        })),
+      };
+    if (streams.length === 0) {
+      const state = classifyControl(
+        await held.registry.read(
+          controlScope(connection.connector, connection.ns),
+        ),
+        hashes,
+      );
+      if (state.kind === "deleted")
+        await purgeConnection(held, connectionId, {
+          controlVersion: state.version,
+        });
+    }
+    return { connection, keyCheck, hashes, streams };
+  });
+  if (opened.results) return opened.results;
+  const { connection, keyCheck, hashes, streams } = opened;
   const results: PublishResult[] = [];
   for (const { stream } of streams) {
     const result = await publishStream(
@@ -252,6 +276,77 @@ type RetainedRun = {
 type ChangeRow = { pk_hash: string };
 
 const MAX_ATTEMPTS = 5;
+/** Candidates discarded for a changed basis before the work waits a cycle. */
+const MAX_INVALIDATIONS = 3;
+
+/** What one stream's publish carries from one loop pass to the next. */
+type StreamRun = {
+  sawRefusal: boolean;
+  appliedVersion: number | null;
+  attempts: number;
+  invalidations: number;
+  watermark: number | null;
+};
+
+type StreamContext = {
+  readonly connectionId: string;
+  readonly connection: ConnectionRow;
+  readonly stream: string;
+  readonly scope: string;
+  readonly keyCheck: string;
+  readonly hashes: ControlHashes;
+  readonly options: PublishOptions | undefined;
+};
+
+/**
+ * Everything a transfer and a commit need, frozen under the slot. Nothing
+ * here is read again from local state; `basis` is how the commit learns the
+ * local state it rests on has moved.
+ */
+type Candidate = {
+  readonly basis: string;
+  /** The change watermark W of the snapshot; the commit acknowledges this. */
+  readonly watermark: number;
+  readonly localWatermark: number;
+  readonly registryVersion: number;
+  readonly registryDataHash: string | null;
+  readonly baseParts: readonly HeadPart[];
+  readonly changedPrefixes: readonly string[];
+  readonly frozen: readonly FrozenPrefix[];
+  readonly blobs: readonly BlobDescriptor[];
+  readonly headGeneration: number;
+  /** The head but for its parts, which the transfer produces. */
+  readonly head: Omit<Head, "parts" | "recordCount">;
+  readonly replaceBelow: { o: number; r: string } | undefined;
+  readonly runIds: readonly string[];
+  readonly sawRefusal: boolean;
+};
+
+type Prepared = {
+  readonly parts: readonly HeadPart[];
+  readonly recordCount: number;
+  readonly dataHash: `0x${string}`;
+  readonly blobName: string;
+  /** `null` when the head equals the registry head: nothing to publish. */
+  readonly encryptedLength: number | null;
+};
+
+type Snapshot =
+  | { readonly kind: "done"; readonly result: PublishResult }
+  | { readonly kind: "retry" }
+  | {
+      readonly kind: "blobs";
+      readonly blobs: readonly BlobDescriptor[];
+      readonly result: PublishResult;
+      /** Held until the attachments are up; see `confirmNoWork`. */
+      readonly evidence: RunEvidence | null;
+    }
+  | { readonly kind: "candidate"; readonly candidate: Candidate };
+
+type Committed =
+  | { readonly kind: "done"; readonly result: PublishResult }
+  | { readonly kind: "retry" }
+  | { readonly kind: "invalidated" };
 
 async function publishStream(
   deps: LocalSyncDeps,
@@ -260,419 +355,657 @@ async function publishStream(
   stream: string,
   keyCheck: string,
   hashes: ControlHashes,
-  options:
-    | {
-        readonly headExtras?: (
-          stream: string,
-        ) => Promise<HeadExtras | undefined>;
-      }
-    | undefined,
+  options: PublishOptions | undefined,
 ): Promise<PublishResult> {
-  const scope = streamScope(connection.connector, connection.ns, stream);
-  const control = controlScope(connection.connector, connection.ns);
-  let sawRefusal = false;
-  let appliedVersion: number | null = null;
-  let watermark: number | null = null;
-
-  let attempts = 0;
-  while (attempts < MAX_ATTEMPTS) {
-    // Step 1: snapshot W and the changes since the last publish.
-    const [local] = await deps.db.query<LocalStream>(
-      `SELECT primary_key, profile_key, profile_version, complete,
-              floor_version, floor_o, floor_r, last_delete_version,
-              head_version, head_generation, head_data_hash, publish_watermark
-         FROM stream_state WHERE connection_id = ? AND stream = ?`,
-      [connectionId, stream],
+  const context: StreamContext = {
+    connectionId,
+    connection,
+    stream,
+    scope: streamScope(connection.connector, connection.ns, stream),
+    keyCheck,
+    hashes,
+    options,
+  };
+  const run: StreamRun = {
+    sawRefusal: false,
+    appliedVersion: null,
+    attempts: 0,
+    invalidations: 0,
+    watermark: null,
+  };
+  const slot = <T>(work: (held: LocalSyncDeps) => Promise<T>) =>
+    deps.queue.run(connectionId, "publish", () =>
+      work(insideQueue(deps, connectionId)),
     );
-    if (!local) {
-      throw new Error(`publish: missing local stream state for ${stream}`);
+  while (run.attempts < MAX_ATTEMPTS) {
+    if (run.invalidations > MAX_INVALIDATIONS) {
+      // Local state kept moving under every candidate. Nothing was published
+      // and nothing was acknowledged: the work is still pending next cycle.
+      return { stream, outcome: "backoff", watermark: run.watermark };
     }
-    const [wRow] = await deps.db.query<{ w: number | null }>(
-      `SELECT MAX(seq) AS w FROM record_changes WHERE connection_id = ? AND stream = ?`,
-      [connectionId, stream],
-    );
-    watermark = wRow?.w ?? local.publish_watermark;
-    const changes: ChangeRow[] =
-      watermark === null
-        ? []
-        : await deps.db.query<ChangeRow>(
-            `SELECT pk_hash FROM record_changes
-              WHERE connection_id = ? AND stream = ?
-                AND seq > ? AND seq <= ?
-                AND origin IN ('local', 'import', 'refresh')
-                AND NOT EXISTS (SELECT 1 FROM runs r JOIN run_streams rs ON rs.run_id=r.run_id
-                  WHERE r.connection_id=record_changes.connection_id AND rs.stream=record_changes.stream
-                    AND r.run_id=record_changes.stamp_r AND r.o=record_changes.stamp_o
-                    AND rs.decision IN ('refused','discarded'))`,
-            [connectionId, stream, local.publish_watermark, watermark],
-          );
-
-    // Step 2: registry. A deleted control row purges and stops; a foreign
-    // control row, or one whose generation moved, defers the stream.
-    let controlRead = await deps.registry.read(control);
-    let controlState = classifyControl(controlRead, hashes);
-    if (controlState.kind === "absent") {
-      if (connection.generation !== 1)
-        return { stream, outcome: "deferred", watermark };
-      const signature = await deps.signer.signAddData({
-        ownerAddress: deps.ownerAddress,
-        scope: control,
-        dataHash: hashes.activeData,
-        metadataHash: hashes.activeMetadata,
-        expectedVersion: 1n,
-      });
-      await deps.registry.post({
-        ownerAddress: deps.ownerAddress,
-        scope: control,
-        dataHash: hashes.activeData,
-        metadataHash: hashes.activeMetadata,
-        expectedVersion: "1",
-        signature,
-      });
-      controlRead = await deps.registry.read(control);
-      controlState = classifyControl(controlRead, hashes);
-    }
-    if (controlState.kind === "deleted") {
-      await purgeConnection(deps, connectionId, {
-        controlVersion: controlState.version,
-      });
-      return { stream, outcome: "purged", watermark };
-    }
-    if (controlState.kind === "foreign" || controlState.kind === "absent") {
-      deps.logger.warn(
-        {},
-        "publish: control unavailable for publishing; deferring stream",
-      );
-      return { stream, outcome: "deferred", watermark };
-    }
-    if (controlState.generation !== connection.generation) {
-      await applyConnection(deps, connectionId);
-      return { stream, outcome: "deferred", watermark };
-    }
-    await deps.db.batch([
-      {
-        sql: "UPDATE connections SET control_state='active',control_version=? WHERE connection_id=?",
-        params: [controlState.generation, connectionId],
-      },
-      // C.0: an offline fresh run binds when the registry first answers.
-      {
-        sql: "UPDATE runs SET generation=? WHERE connection_id=? AND generation IS NULL",
-        params: [controlState.generation, connectionId],
-      },
-    ]);
-
-    const streamRead = await deps.registry.read(scope);
-    const streamRow = classifyStreamRow(streamRead, hashes);
-    let registryHead: Head | null = null;
-    let registryVersion = 0;
-    let registryDataHash: string | null = null;
-    if (streamRead.found) {
-      registryVersion = streamRead.version;
-      registryDataHash = streamRead.dataHash;
-    }
-    if (streamRow === "present" && streamRead.found) {
-      registryHead = await readRegistryHead(
-        deps,
-        scope,
-        streamRead.dataHash,
-        connection,
-        stream,
-        keyCheck,
-      );
-    }
-
-    if (registryHead && registryHead.generation !== connection.generation)
-      return { stream, outcome: "deferred", watermark };
-
-    // A registry row newer than the local head is applied (same queue
-    // turn) and the stream restarts at step 1. Apply once per version:
-    // if the head still lags after apply, proceed with the registry head.
-    if (streamRead.found && registryVersion > local.head_version) {
-      if (appliedVersion !== registryVersion) {
-        await applyConnection(deps, connectionId);
-        appliedVersion = registryVersion;
-        continue;
+    const snapshot = await slot((held) => snapshotStream(held, context, run));
+    if (snapshot.kind === "done") return snapshot.result;
+    if (snapshot.kind === "retry") continue;
+    if (snapshot.kind === "blobs") {
+      await uploadBlobs(deps, snapshot.blobs);
+      const { evidence } = snapshot;
+      if (evidence) {
+        await slot((held) => confirmNoWork(held, context, evidence));
       }
+      return snapshot.result;
     }
-
-    if (await discardFencedRuns(deps, connectionId, stream)) {
-      await applyConnection(deps, connectionId);
+    const { candidate } = snapshot;
+    let prepared: Prepared;
+    try {
+      prepared = await transferCandidate(deps, context, candidate);
+    } catch (error) {
+      // A transfer that lost its input because local state moved (a delete
+      // purged an attachment) is a stale candidate, not a failure.
+      if ((await readBasis(deps, context, candidate)) === candidate.basis)
+        throw error;
+      run.invalidations++;
       continue;
     }
-    if (connection.generation !== 1)
-      await excludeSeedsIfAny(deps, connectionId, stream);
+    const committed = await slot((held) =>
+      commitCandidate(held, context, candidate, prepared, run),
+    );
+    if (committed.kind === "done") return committed.result;
+    if (committed.kind === "invalidated") run.invalidations++;
+  }
+  return { stream, outcome: "backoff", watermark: run.watermark };
+}
 
-    // Step 3: re-plan the retained ended runs against the registry head.
-    const plan = await planStream(
+/**
+ * SNAPSHOT, in the slot. Steps 1-3 of the file comment, then everything the
+ * transfer needs, read once. Returns a result when the stream ends here.
+ */
+async function snapshotStream(
+  deps: LocalSyncDeps,
+  context: StreamContext,
+  run: StreamRun,
+): Promise<Snapshot> {
+  const { connectionId, connection, stream, scope, keyCheck, hashes } = context;
+  const control = controlScope(connection.connector, connection.ns);
+  const done = (result: PublishResult): Snapshot => ({ kind: "done", result });
+  const deferred = (): Snapshot =>
+    done({ stream, outcome: "deferred", watermark: run.watermark });
+
+  // Step 1: snapshot W and the changes since the last publish.
+  const [local] = await deps.db.query<LocalStream>(
+    `SELECT primary_key, profile_key, profile_version, complete,
+            floor_version, floor_o, floor_r, last_delete_version,
+            head_version, head_generation, head_data_hash, publish_watermark
+       FROM stream_state WHERE connection_id = ? AND stream = ?`,
+    [connectionId, stream],
+  );
+  if (!local) {
+    throw new Error(`publish: missing local stream state for ${stream}`);
+  }
+  const [wRow] = await deps.db.query<{ w: number | null }>(
+    `SELECT MAX(seq) AS w FROM record_changes WHERE connection_id = ? AND stream = ?`,
+    [connectionId, stream],
+  );
+  const watermark = wRow?.w ?? local.publish_watermark;
+  run.watermark = watermark;
+  const changes: ChangeRow[] = await deps.db.query<ChangeRow>(
+    `SELECT pk_hash FROM record_changes
+      WHERE connection_id = ? AND stream = ?
+        AND seq > ? AND seq <= ?
+        AND origin IN ('local', 'import', 'refresh')
+        AND NOT EXISTS (SELECT 1 FROM runs r JOIN run_streams rs ON rs.run_id=r.run_id
+          WHERE r.connection_id=record_changes.connection_id AND rs.stream=record_changes.stream
+            AND r.run_id=record_changes.stamp_r AND r.o=record_changes.stamp_o
+            AND rs.decision IN ('refused','discarded'))`,
+    [connectionId, stream, local.publish_watermark, watermark],
+  );
+
+  // Step 2: registry. A deleted control row purges and stops; a foreign
+  // control row, or one whose generation moved, defers the stream.
+  let controlRead = await deps.registry.read(control);
+  let controlState = classifyControl(controlRead, hashes);
+  if (controlState.kind === "absent") {
+    if (connection.generation !== 1) return deferred();
+    const signature = await deps.signer.signAddData({
+      ownerAddress: deps.ownerAddress,
+      scope: control,
+      dataHash: hashes.activeData,
+      metadataHash: hashes.activeMetadata,
+      expectedVersion: 1n,
+    });
+    await deps.registry.post({
+      ownerAddress: deps.ownerAddress,
+      scope: control,
+      dataHash: hashes.activeData,
+      metadataHash: hashes.activeMetadata,
+      expectedVersion: "1",
+      signature,
+    });
+    controlRead = await deps.registry.read(control);
+    controlState = classifyControl(controlRead, hashes);
+  }
+  if (controlState.kind === "deleted") {
+    await purgeConnection(deps, connectionId, {
+      controlVersion: controlState.version,
+    });
+    return done({ stream, outcome: "purged", watermark });
+  }
+  if (controlState.kind === "foreign" || controlState.kind === "absent") {
+    deps.logger.warn(
+      {},
+      "publish: control unavailable for publishing; deferring stream",
+    );
+    return deferred();
+  }
+  if (controlState.generation !== connection.generation) {
+    await applyConnection(deps, connectionId);
+    return deferred();
+  }
+  // A run that began before this control generation never joins it: it is
+  // discarded here, before the binding below could give it the generation.
+  if (
+    await discardForeignLifetimeRuns(
       deps,
       connectionId,
+      controlState.generation,
+    )
+  ) {
+    await applyConnection(deps, connectionId);
+    return { kind: "retry" };
+  }
+  await deps.db.batch([
+    {
+      sql: "UPDATE connections SET control_state='active',control_version=? WHERE connection_id=?",
+      params: [controlState.generation, connectionId],
+    },
+    // C.0: an offline fresh run binds when the registry first answers.
+    {
+      sql: "UPDATE runs SET generation=? WHERE connection_id=? AND generation IS NULL",
+      params: [controlState.generation, connectionId],
+    },
+  ]);
+
+  const streamRead = await deps.registry.read(scope);
+  const streamRow = classifyStreamRow(streamRead, hashes);
+  let registryHead: Head | null = null;
+  let registryVersion = 0;
+  let registryDataHash: string | null = null;
+  if (streamRead.found) {
+    registryVersion = streamRead.version;
+    registryDataHash = streamRead.dataHash;
+  }
+  if (streamRow === "present" && streamRead.found) {
+    registryHead = await readRegistryHead(
+      deps,
+      scope,
+      streamRead.dataHash,
       connection,
       stream,
-      local,
-      registryHead,
-      registryVersion,
-      registryDataHash,
+      keyCheck,
     );
-    if (plan.deferred) {
-      return { stream, outcome: "deferred", watermark };
-    }
-    if (plan.refused) {
-      sawRefusal = true;
-      await unwriteRefusedRun(deps, {
-        connectionId,
-        stream,
-        runId: plan.refused.runId,
-        reason: plan.refused.reason,
-      });
-      await applyConnection(deps, connectionId);
-      continue;
-    }
+  }
 
-    const headGeneration = plan.finalHead?.generation ?? connection.generation;
-    await uploadStreamBlobs(deps, {
+  if (registryHead && registryHead.generation !== connection.generation)
+    return deferred();
+
+  // A registry row newer than the local head is applied (same slot turn)
+  // and the stream restarts at step 1. Apply once per version: if the head
+  // still lags after apply, proceed with the registry head.
+  if (streamRead.found && registryVersion > local.head_version) {
+    if (run.appliedVersion !== registryVersion) {
+      await applyConnection(deps, connectionId);
+      run.appliedVersion = registryVersion;
+      return { kind: "retry" };
+    }
+  }
+
+  if (await discardFencedRuns(deps, connectionId, stream)) {
+    await applyConnection(deps, connectionId);
+    return { kind: "retry" };
+  }
+  if (connection.generation !== 1)
+    await excludeSeedsIfAny(deps, connectionId, stream);
+
+  // Step 3: re-plan the retained ended runs against the registry head.
+  const plan = await planStream(
+    deps,
+    connectionId,
+    connection,
+    stream,
+    local,
+    registryHead,
+    registryVersion,
+    registryDataHash,
+  );
+  if (plan.deferred) return deferred();
+  if (plan.refused) {
+    run.sawRefusal = true;
+    await unwriteRefusedRun(deps, {
       connectionId,
       stream,
-      scope,
-      generation: headGeneration,
+      runId: plan.refused.runId,
+      reason: plan.refused.reason,
     });
-    const hasWork =
-      changes.length > 0 ||
-      plan.replaceBelow !== undefined ||
-      plan.steps.some((step) => step.decision.kind === "publish");
-    if (!hasWork) {
-      // No change to publish: the registry head already holds what the plan
-      // produces, so a pending run it covers is saved by that head.
-      if (registryHead && registryDataHash !== null) {
-        const evidence = await runPublicationStatements(
-          deps,
-          connectionId,
-          stream,
-          {
+    await applyConnection(deps, connectionId);
+    return { kind: "retry" };
+  }
+
+  const headGeneration = plan.finalHead?.generation ?? connection.generation;
+  const blobs = await listStreamBlobs(deps, {
+    connectionId,
+    stream,
+    scope,
+    generation: headGeneration,
+  });
+  const hasWork =
+    changes.length > 0 ||
+    plan.replaceBelow !== undefined ||
+    plan.steps.some((step) => step.decision.kind === "publish");
+  if (!hasWork) {
+    const result: PublishResult = {
+      stream,
+      outcome: run.sawRefusal ? "refused" : "noop",
+      watermark,
+    };
+    // No change to publish: the registry head, read in this slot turn, already
+    // holds what the plan produces, so a pending run it covers is saved by it.
+    const evidence: RunEvidence | null =
+      registryHead && registryDataHash !== null
+        ? {
             version: registryVersion,
             generation: registryHead.generation,
             dataHash: registryDataHash as `0x${string}`,
             watermark: local.publish_watermark,
             replaceBelow: undefined,
             runIds: plan.steps.map((step) => step.runId),
-          },
-        );
-        if (evidence.length > 0) await deps.db.batch(evidence);
-      }
-      return { stream, outcome: sawRefusal ? "refused" : "noop", watermark };
-    }
-
-    // Seeds publish only into generation 1; otherwise they are purged
-    // and the ledger records excluded(seed_skipped).
-    if (headGeneration !== 1) {
-      await excludeSeedsIfAny(deps, connectionId, stream);
-    }
-
-    // Step 4: encode the changed prefixes. The head's partition is
-    // respected: a changed record re-encodes the base prefix holding it,
-    // or its own 16-bit prefix when no base prefix covers it.
-    let changedPrefixes = changedPrefixesFor(
-      changes,
-      registryHead?.parts ?? null,
-    );
-    if (
-      registryHead &&
-      (registryHead.format !== HEAD_FORMAT || plan.replaceBelow)
-    ) {
-      changedPrefixes = [
-        ...new Set([
-          ...changedPrefixes,
-          ...registryHead.parts.map((p) => p.prefix),
-        ]),
-      ].sort();
-    }
-    const headExtras = await options?.headExtras?.(stream);
-    const encoded =
-      changedPrefixes.length === 0
-        ? []
-        : await encodePrefixes(deps, {
-            connectionId,
-            stream,
-            scope,
-            generation: headGeneration,
-            changedPrefixes,
-            upToSeq: watermark ?? 0,
-            replaceBelow: plan.replaceBelow,
-            headExtras,
-          });
-
-    const parts = mergedParts(
-      registryHead?.parts ?? [],
-      encoded,
-      changedPrefixes,
-    );
-    const recordCount = parts.reduce((sum, part) => sum + part.count, 0);
-    const observedAt =
-      plan.newestRunObservedAt ?? registryHead?.observedAt ?? deps.now();
-    const head: Head = {
-      complete: plan.finalHead?.complete ?? registryHead?.complete ?? false,
-      connector: connection.connector,
-      format: HEAD_FORMAT,
-      generation: headGeneration,
-      keyCheck,
-      lastDeleteVersion: Math.max(
-        local.last_delete_version,
-        streamRow === "tombstoned" ? registryVersion : 0,
-      ),
-      ns: connection.ns,
-      observedAt,
-      parts,
-      primaryKey:
-        plan.finalHead?.primaryKey ??
-        registryHead?.primaryKey ??
-        JSON.parse(local.primary_key),
-      profile: plan.finalHead?.profile ??
-        registryHead?.profile ?? {
-          key: local.profile_key ?? connection.connector,
-          version: local.profile_version ?? local.floor_version ?? "0",
-        },
-      recordCount,
-      stream,
-    };
-    const headBytes = encodeHead(head);
-    const { dataHash, blobName } = await digestHead(keccak, headBytes);
-
-    // Step 5: if the new head's data hash equals the registry head's,
-    // skip the CAS and record the local state (watermark advances, the
-    // head is already published).
-    if (
-      registryDataHash !== null &&
-      dataHash.toLowerCase() === registryDataHash.toLowerCase()
-    ) {
-      const checked = await checkControl(
-        deps,
-        connectionId,
-        connection,
-        hashes,
-      );
-      if (checked) return { stream, outcome: checked, watermark };
-      await commitBatch(deps, connectionId, stream, {
-        version: registryVersion,
-        generation: headGeneration,
-        dataHash,
-        blobName,
-        recordCount,
-        observedAt,
-        complete: head.complete,
-        parts,
-        watermark,
-        lastDeleteVersion: head.lastDeleteVersion ?? 0,
-        replaceBelow: plan.replaceBelow,
-        primaryKey: head.primaryKey,
-        profile: head.profile,
-        isNewVersion: false,
-        runIds: plan.steps.map((step) => step.runId),
-      });
-      return {
-        stream,
-        outcome: sawRefusal ? "refused" : "noop",
-        watermark,
-        ...(watermark > local.publish_watermark && {
-          publication: {
-            connectionId,
-            connector: connection.connector,
-            ns: connection.ns,
-            stream,
-            head: {
-              version: registryVersion,
-              generation: headGeneration,
-              dataHash,
-            },
-            watermark,
-            runIds: plan.steps.map((step) => step.runId),
-          },
-        }),
-      };
-    }
-
-    const encrypted = await deps.keys.encrypt(scope, headBytes);
-    if ((await deps.blobs.get(`${scope}/${blobName}`)) === null) {
-      await deps.blobs.put(`${scope}/${blobName}`, encrypted);
-    }
-    const newVersion = registryVersion + 1;
-    const metadataHash = metadataHashFor(
-      scope,
-      new Date(observedAt).toISOString(),
-      encrypted.length,
-    );
-    const signature = await deps.signer.signAddData({
-      ownerAddress: deps.ownerAddress,
-      scope,
-      dataHash,
-      metadataHash,
-      expectedVersion: BigInt(newVersion),
-    });
-    const beforePost = await checkControl(
-      deps,
-      connectionId,
-      connection,
-      hashes,
-    );
-    if (beforePost) return { stream, outcome: beforePost, watermark };
-    attempts++;
-    const posted = await deps.registry.post({
-      ownerAddress: deps.ownerAddress,
-      scope,
-      dataHash,
-      metadataHash,
-      expectedVersion: String(newVersion),
-      signature,
-    });
-    if (posted.kind === "conflict") {
-      // Apply the winner and re-plan. On the last try, back off without
-      // applying again: the winner will be applied on the next cycle.
-      if (attempts === MAX_ATTEMPTS) {
-        return { stream, outcome: "backoff", watermark };
-      }
-      await applyConnection(deps, connectionId);
-      continue;
-    }
-
-    const afterPost = await checkControl(
-      deps,
-      connectionId,
-      connection,
-      hashes,
-    );
-    if (afterPost) return { stream, outcome: afterPost, watermark };
-    await commitBatch(deps, connectionId, stream, {
-      version: newVersion,
-      generation: headGeneration,
-      dataHash,
-      blobName,
-      recordCount,
-      observedAt,
-      complete: head.complete,
-      parts,
-      watermark,
-      lastDeleteVersion: head.lastDeleteVersion ?? 0,
-      replaceBelow: plan.replaceBelow,
-      primaryKey: head.primaryKey,
-      profile: head.profile,
-      isNewVersion: true,
-      runIds: plan.steps.map((step) => step.runId),
-    });
-    return {
-      stream,
-      outcome: "published",
-      watermark,
-      publication: {
-        connectionId,
-        connector: connection.connector,
-        ns: connection.ns,
-        stream,
-        head: { version: newVersion, generation: headGeneration, dataHash },
-        watermark: watermark ?? 0,
-        runIds: plan.steps.map((step) => step.runId),
-      },
-    };
+          }
+        : null;
+    if (blobs.length > 0) return { kind: "blobs", blobs, result, evidence };
+    if (evidence) await saveRunEvidence(deps, connectionId, stream, evidence);
+    return done(result);
   }
 
-  return { stream, outcome: "backoff", watermark };
+  // Seeds publish only into generation 1; otherwise they are purged
+  // and the ledger records excluded(seed_skipped).
+  if (headGeneration !== 1) {
+    await excludeSeedsIfAny(deps, connectionId, stream);
+  }
+
+  // Step 4 input: the changed prefixes. The head's partition is respected:
+  // a changed record re-encodes the base prefix holding it, or its own
+  // 16-bit prefix when no base prefix covers it.
+  let changedPrefixes = changedPrefixesFor(
+    changes,
+    registryHead?.parts ?? null,
+  );
+  if (
+    registryHead &&
+    (registryHead.format !== HEAD_FORMAT || plan.replaceBelow)
+  ) {
+    changedPrefixes = [
+      ...new Set([
+        ...changedPrefixes,
+        ...registryHead.parts.map((p) => p.prefix),
+      ]),
+    ].sort();
+  }
+  // Read the caller's head extras, the rows to encode and the clock now: the
+  // transfer reads none of them again.
+  await context.options?.headExtras?.(stream);
+  const frozen =
+    changedPrefixes.length === 0
+      ? []
+      : await freezePrefixRows(deps, {
+          connectionId,
+          stream,
+          changedPrefixes,
+          replaceBelow: plan.replaceBelow,
+        });
+  const observedAt =
+    plan.newestRunObservedAt ?? registryHead?.observedAt ?? deps.now();
+  const head: Omit<Head, "parts" | "recordCount"> = {
+    complete: plan.finalHead?.complete ?? registryHead?.complete ?? false,
+    connector: connection.connector,
+    format: HEAD_FORMAT,
+    generation: headGeneration,
+    keyCheck,
+    lastDeleteVersion: Math.max(
+      local.last_delete_version,
+      streamRow === "tombstoned" ? registryVersion : 0,
+    ),
+    ns: connection.ns,
+    observedAt,
+    primaryKey:
+      plan.finalHead?.primaryKey ??
+      registryHead?.primaryKey ??
+      JSON.parse(local.primary_key),
+    profile: plan.finalHead?.profile ??
+      registryHead?.profile ?? {
+        key: local.profile_key ?? connection.connector,
+        version: local.profile_version ?? local.floor_version ?? "0",
+      },
+    stream,
+  };
+  const runIds = plan.steps.map((step) => step.runId);
+  const basis = await readBasis(deps, context, {
+    watermark,
+    localWatermark: local.publish_watermark,
+    runIds,
+  });
+  return {
+    kind: "candidate",
+    candidate: {
+      basis,
+      watermark,
+      localWatermark: local.publish_watermark,
+      registryVersion,
+      registryDataHash,
+      baseParts: registryHead?.parts ?? [],
+      changedPrefixes,
+      frozen,
+      blobs,
+      headGeneration,
+      head,
+      replaceBelow: plan.replaceBelow,
+      runIds,
+      sawRefusal: run.sawRefusal,
+    },
+  };
+}
+
+/**
+ * TRANSFER, outside the slot. Attachments, parts, then the head, each a
+ * content-addressed object. It reads only the frozen candidate (and
+ * attachment bytes by exact id), so it cannot disagree with the commit about
+ * what is being published.
+ */
+async function transferCandidate(
+  deps: LocalSyncDeps,
+  context: StreamContext,
+  candidate: Candidate,
+): Promise<Prepared> {
+  const { scope } = context;
+  await uploadBlobs(deps, candidate.blobs);
+  const encoded = await uploadFrozenParts(deps, {
+    scope,
+    generation: candidate.headGeneration,
+    frozen: candidate.frozen,
+  });
+  const parts = mergedParts(
+    candidate.baseParts,
+    encoded,
+    candidate.changedPrefixes,
+  );
+  const recordCount = parts.reduce((sum, part) => sum + part.count, 0);
+  const headBytes = encodeHead({ ...candidate.head, parts, recordCount });
+  const { dataHash, blobName } = await digestHead(keccak, headBytes);
+  // The same data hash as the registry head: nothing to upload or post.
+  if (
+    candidate.registryDataHash !== null &&
+    dataHash.toLowerCase() === candidate.registryDataHash.toLowerCase()
+  ) {
+    return { parts, recordCount, dataHash, blobName, encryptedLength: null };
+  }
+  const encrypted = await deps.keys.encrypt(scope, headBytes);
+  if ((await deps.blobs.get(`${scope}/${blobName}`)) === null) {
+    await deps.blobs.put(`${scope}/${blobName}`, encrypted);
+  }
+  return {
+    parts,
+    recordCount,
+    dataHash,
+    blobName,
+    encryptedLength: encrypted.length,
+  };
+}
+
+/** Write run evidence on its own: the no-work path has no head to commit. */
+async function saveRunEvidence(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  stream: string,
+  evidence: RunEvidence,
+): Promise<void> {
+  const statements = await runPublicationStatements(
+    deps,
+    connectionId,
+    stream,
+    evidence,
+  );
+  if (statements.length > 0) await deps.db.batch(statements);
+}
+
+/**
+ * The no-work path with attachments to upload: the snapshot's slot turn is
+ * over by the time they are up, so the registry row is read again, in a slot
+ * turn. Evidence is written only if it is still the row the plan matched; a
+ * head that moved leaves the runs pending for the next cycle.
+ */
+async function confirmNoWork(
+  deps: LocalSyncDeps,
+  context: StreamContext,
+  evidence: RunEvidence,
+): Promise<void> {
+  const read = await deps.registry.read(context.scope);
+  if (
+    !read.found ||
+    read.version !== evidence.version ||
+    read.dataHash.toLowerCase() !== evidence.dataHash.toLowerCase()
+  ) {
+    return;
+  }
+  await saveRunEvidence(deps, context.connectionId, context.stream, evidence);
+}
+
+/**
+ * COMMIT, in the slot. The candidate stands only if every input of its
+ * snapshot is unchanged; the registry CAS stays the remote fence.
+ */
+async function commitCandidate(
+  deps: LocalSyncDeps,
+  context: StreamContext,
+  candidate: Candidate,
+  prepared: Prepared,
+  run: StreamRun,
+): Promise<Committed> {
+  const { connectionId, connection, stream, scope, hashes } = context;
+  const { watermark } = candidate;
+  const done = (result: PublishResult): Committed => ({ kind: "done", result });
+  // Local state: control, stream state, head parts, delete intents, retained
+  // runs and the change log are the snapshot's. Later begins change none.
+  if ((await readBasis(deps, context, candidate)) !== candidate.basis) {
+    return { kind: "invalidated" };
+  }
+  // Registry: the stream row is the one the candidate was built over.
+  const read = await deps.registry.read(scope);
+  const version = read.found ? read.version : 0;
+  const dataHash = read.found ? read.dataHash.toLowerCase() : null;
+  if (
+    version !== candidate.registryVersion ||
+    dataHash !== (candidate.registryDataHash?.toLowerCase() ?? null)
+  ) {
+    return { kind: "invalidated" };
+  }
+  const { dataHash: headHash, blobName } = prepared;
+  const commit = (version: number, isNewVersion: boolean) =>
+    commitBatch(deps, connectionId, stream, {
+      version,
+      generation: candidate.headGeneration,
+      dataHash: headHash,
+      blobName,
+      recordCount: prepared.recordCount,
+      observedAt: candidate.head.observedAt,
+      complete: candidate.head.complete,
+      parts: prepared.parts,
+      watermark,
+      lastDeleteVersion: candidate.head.lastDeleteVersion ?? 0,
+      replaceBelow: candidate.replaceBelow,
+      primaryKey: candidate.head.primaryKey,
+      profile: candidate.head.profile,
+      isNewVersion,
+      runIds: candidate.runIds,
+    });
+
+  // Step 5: if the new head's data hash equals the registry head's, skip the
+  // CAS and record the local state (watermark advances, the head is already
+  // published).
+  if (prepared.encryptedLength === null) {
+    const checked = await checkControl(deps, connectionId, connection, hashes);
+    if (checked) return done({ stream, outcome: checked, watermark });
+    await commit(candidate.registryVersion, false);
+    return done({
+      stream,
+      outcome: candidate.sawRefusal ? "refused" : "noop",
+      watermark,
+      ...(watermark > candidate.localWatermark && {
+        publication: {
+          connectionId,
+          connector: connection.connector,
+          ns: connection.ns,
+          stream,
+          head: {
+            version: candidate.registryVersion,
+            generation: candidate.headGeneration,
+            dataHash: headHash,
+          },
+          watermark,
+          runIds: candidate.runIds,
+        },
+      }),
+    });
+  }
+
+  const newVersion = candidate.registryVersion + 1;
+  const metadataHash = metadataHashFor(
+    scope,
+    new Date(candidate.head.observedAt).toISOString(),
+    prepared.encryptedLength,
+  );
+  const signature = await deps.signer.signAddData({
+    ownerAddress: deps.ownerAddress,
+    scope,
+    dataHash: headHash,
+    metadataHash,
+    expectedVersion: BigInt(newVersion),
+  });
+  const beforePost = await checkControl(deps, connectionId, connection, hashes);
+  if (beforePost) return done({ stream, outcome: beforePost, watermark });
+  run.attempts++;
+  const posted = await deps.registry.post({
+    ownerAddress: deps.ownerAddress,
+    scope,
+    dataHash: headHash,
+    metadataHash,
+    expectedVersion: String(newVersion),
+    signature,
+  });
+  if (posted.kind === "conflict") {
+    // Apply the winner and re-plan. On the last try, back off without
+    // applying again: the winner will be applied on the next cycle.
+    if (run.attempts === MAX_ATTEMPTS) {
+      return done({ stream, outcome: "backoff", watermark });
+    }
+    await applyConnection(deps, connectionId);
+    return { kind: "retry" };
+  }
+
+  const afterPost = await checkControl(deps, connectionId, connection, hashes);
+  if (afterPost) return done({ stream, outcome: afterPost, watermark });
+  await commit(newVersion, true);
+  return done({
+    stream,
+    outcome: "published",
+    watermark,
+    publication: {
+      connectionId,
+      connector: connection.connector,
+      ns: connection.ns,
+      stream,
+      head: {
+        version: newVersion,
+        generation: candidate.headGeneration,
+        dataHash: headHash,
+      },
+      watermark,
+      runIds: candidate.runIds,
+    },
+  });
+}
+
+/**
+ * The local state a candidate rests on, as one comparable key. A candidate is
+ * valid while every input of its snapshot is unchanged: the connection's
+ * control, the stream's head fields and parts, the connection's delete
+ * intents, the selected runs and the rows at or below W. Record changes alone
+ * would miss control, run and head metadata, so the key spans all of them.
+ *
+ * What it leaves out is what a candidate survives: a run that begins or ends
+ * after the snapshot, and the rows it merges (origin `local`, sequence above
+ * W). Those stay queued above W and publish in a later pass. A write of any
+ * other origin above W (a purge) is in the key: it may have removed a frozen
+ * row. Reads only; no transaction is held.
+ */
+async function readBasis(
+  deps: LocalSyncDeps,
+  context: StreamContext,
+  snapshot: {
+    readonly watermark: number;
+    readonly localWatermark: number;
+    readonly runIds: readonly string[];
+  },
+): Promise<string> {
+  const { connectionId, connection, stream } = context;
+  const [connectionRow] = await deps.db.query(
+    `SELECT generation, control_state, control_version FROM connections WHERE connection_id = ?`,
+    [connectionId],
+  );
+  const [streamRow] = await deps.db.query(
+    `SELECT head_version, head_generation, head_data_hash, head_blob,
+            last_delete_version, publish_watermark
+       FROM stream_state WHERE connection_id = ? AND stream = ?`,
+    [connectionId, stream],
+  );
+  const headParts = await deps.db.query(
+    `SELECT prefix, seq, part_hash, bytes, count FROM head_parts
+      WHERE connection_id = ? AND stream = ? ORDER BY prefix, seq`,
+    [connectionId, stream],
+  );
+  const intents = await deps.db.query(
+    `SELECT delete_id, intent FROM delete_intents WHERE connector = ?`,
+    [connection.connector],
+  );
+  const runs: unknown[] = [];
+  for (const runId of snapshot.runIds) {
+    runs.push(
+      await deps.db.query(
+        `SELECT r.run_id, r.state, r.generation, rs.decision, rs.replace,
+                (SELECT COUNT(*) FROM run_rows rr
+                  WHERE rr.run_id = r.run_id AND rr.stream = rs.stream) AS row_count
+           FROM runs r JOIN run_streams rs ON rs.run_id = r.run_id
+          WHERE r.run_id = ? AND rs.stream = ?`,
+        [runId, stream],
+      ),
+    );
+  }
+  const covered = await deps.db.query(
+    `SELECT COUNT(*) AS n, MAX(seq) AS newest FROM record_changes
+      WHERE connection_id = ? AND stream = ? AND seq > ? AND seq <= ?`,
+    [connectionId, stream, snapshot.localWatermark, snapshot.watermark],
+  );
+  const foreign = await deps.db.query(
+    `SELECT COUNT(*) AS n FROM record_changes
+      WHERE connection_id = ? AND stream = ? AND seq > ?
+        AND origin NOT IN ('local', 'import')`,
+    [connectionId, stream, snapshot.watermark],
+  );
+  return JSON.stringify([
+    connectionRow ?? null,
+    streamRow ?? null,
+    headParts,
+    intents,
+    runs,
+    covered,
+    foreign,
+  ]);
 }
 
 async function checkControl(
@@ -700,6 +1033,97 @@ async function checkControl(
   if (state.kind !== "active" || state.generation !== connection.generation)
     return "deferred";
   return null;
+}
+
+/** The ended runs whose decision still awaits publication, oldest first. */
+async function retainedRuns(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  stream: string,
+): Promise<RetainedRun[]> {
+  return deps.db.query<RetainedRun>(
+    `SELECT r.run_id, r.o, r.generation, r.artifact_version,
+            rs.primary_key, rs.profile_key, rs.profile_version,
+            rs.full_read, rs.foreign_checkpoint, rs.seed, rs.decision,
+            rs.replace, rs.basis_version, rs.basis_generation, rs.basis_data_hash,
+            (SELECT COUNT(*) FROM run_rows rr
+              WHERE rr.run_id = r.run_id AND rr.stream = rs.stream) AS row_count
+       FROM runs r JOIN run_streams rs ON rs.run_id = r.run_id
+      WHERE r.connection_id = ? AND rs.stream = ? AND r.state = 'ended'
+        AND rs.decision IN ('publish', 'noop', 'deferred')
+      ORDER BY r.o, r.run_id`,
+    [connectionId, stream],
+  );
+}
+
+/**
+ * A run belongs to the connection lifetime it began in. A run that began
+ * before the current control generation (it has no generation of its own, or
+ * its begin basis is another control version) must never publish into the
+ * current one: its rows may be rows another writer deleted. Such runs are
+ * discarded with `lifetime_changed` and the connection recollects.
+ *
+ * Without this the "bind unbound runs" step of the snapshot hands a run that
+ * ended before a delete+reconnect the NEW generation, and the next cycle
+ * publishes the deleted rows back.
+ */
+export async function discardForeignLifetimeRuns(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  currentGeneration: number,
+): Promise<boolean> {
+  const runs = await deps.db.query<{
+    run_id: string;
+    o: number;
+    stream: string;
+    generation: number | null;
+    begin_control_version: number | null;
+  }>(
+    `SELECT r.run_id, r.o, rs.stream, r.generation, r.begin_control_version
+       FROM runs r JOIN run_streams rs ON rs.run_id = r.run_id
+      WHERE r.connection_id = ? AND r.state = 'ended'
+        AND rs.decision IN ('publish', 'noop', 'deferred')`,
+    [connectionId],
+  );
+  const foreign = runs.filter(
+    (run) =>
+      (run.generation === null && currentGeneration > 1) ||
+      (run.begin_control_version !== null &&
+        run.begin_control_version > 0 &&
+        run.begin_control_version !== currentGeneration),
+  );
+  if (foreign.length === 0) return false;
+  const statements: SqlStatement[] = [];
+  for (const run of foreign) {
+    statements.push(
+      {
+        sql: "DELETE FROM records WHERE connection_id=? AND stream=? AND stamp_o=? AND stamp_r=?",
+        params: [connectionId, run.stream, run.o, run.run_id],
+      },
+      {
+        sql: "UPDATE run_streams SET decision='discarded',reason='lifetime_changed',replace=0,publication_state='superseded',publication_reason='lifetime_changed' WHERE run_id=? AND stream=?",
+        params: [run.run_id, run.stream],
+      },
+      {
+        sql: "DELETE FROM run_rows WHERE run_id=? AND stream=?",
+        params: [run.run_id, run.stream],
+      },
+    );
+  }
+  for (const stream of new Set(foreign.map((run) => run.stream))) {
+    statements.push({
+      sql: "DELETE FROM head_parts WHERE connection_id=? AND stream=?",
+      params: [connectionId, stream],
+    });
+  }
+  // The discarded rows were collected against a lifetime that ended: the next
+  // run collects in full instead of resuming from their checkpoint.
+  statements.push({
+    sql: "UPDATE connections SET checkpoint = NULL WHERE connection_id = ?",
+    params: [connectionId],
+  });
+  await deps.db.batch(withOrigin("purge", statements));
+  return true;
 }
 
 async function discardFencedRuns(
@@ -800,19 +1224,7 @@ async function planStream(
   registryVersion: number,
   registryDataHash: string | null,
 ): Promise<StreamPlan> {
-  const runs = await deps.db.query<RetainedRun>(
-    `SELECT r.run_id, r.o, r.generation, r.artifact_version,
-            rs.primary_key, rs.profile_key, rs.profile_version,
-            rs.full_read, rs.foreign_checkpoint, rs.seed, rs.decision,
-            rs.replace, rs.basis_version, rs.basis_generation, rs.basis_data_hash,
-            (SELECT COUNT(*) FROM run_rows rr
-              WHERE rr.run_id = r.run_id AND rr.stream = rs.stream) AS row_count
-       FROM runs r JOIN run_streams rs ON rs.run_id = r.run_id
-      WHERE r.connection_id = ? AND rs.stream = ? AND r.state = 'ended'
-        AND rs.decision IN ('publish', 'noop', 'deferred')
-      ORDER BY r.o, r.run_id`,
-    [connectionId, stream],
-  );
+  const runs = await retainedRuns(deps, connectionId, stream);
 
   const newest = runs.length > 0 ? runs[runs.length - 1] : undefined;
   const baseHead: PlanHead | null = registryHead
