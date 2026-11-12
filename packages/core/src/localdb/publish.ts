@@ -15,19 +15,24 @@ import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 //      3. Re-plan the retained ended runs against the registry head. A run
 //      accepted at end but now refused is un-written in one batch and
 //      apply runs at once; a deferred run defers the stream.
-//      Freeze what the next phase needs: for each changed prefix a count and
-//      a digest of its rows' identities (never the bodies; under replace,
-//      leaving out rows below the run's stamp), the attachments to upload,
-//      and the basis the snapshot rests on (control, stream state, head
-//      parts, delete intents, retained runs, W, and what readBasis lists).
-//   TRANSFER (no slot)  4. Read the changed prefixes page by page, encode,
+//      Freeze what the next phase needs: the rows of each changed prefix,
+//      copied by SQL into the attempt's rows of `publish_spool` (on disk, in
+//      the same database; under replace, leaving out rows below the run's
+//      stamp), the attachments to upload, and the basis the snapshot rests
+//      on (control, stream state, head parts, delete intents, retained runs,
+//      W, and what readBasis lists).
+//   TRANSFER (no slot)  4. Read the spooled rows page by page, encode,
 //      upload every new part and attachment, build the head and upload it.
 //      Objects are content addressed and authorize nothing until the registry
-//      CAS, so they need no mutual exclusion. Each page is a plain read (no
-//      slot, no transaction across a network await), so memory is a page and
-//      the part in progress. A prefix whose rows no longer match the frozen
-//      digest discards the candidate before its head exists. Attachment
-//      bytes are read by exact id and checked against it.
+//      CAS, so they need no mutual exclusion. The spool is a copy no write to
+//      `records` reaches, so continuous collection cannot invalidate a
+//      transfer; only the commit's revalidation can. Each page is a plain read
+//      (no slot, no transaction across a network await) of at most a few
+//      MiB of bodies, so memory is a page and the part in progress. A spool
+//      that lost rows discards the candidate before its head exists.
+//      Attachment bytes are read by exact id and checked against it. The
+//      attempt's spool rows are deleted when the attempt ends, however it
+//      ends; `openLocalDb` deletes any a crash left.
 //   COMMIT (slot)  5. Re-read the basis and the registry rows. A change in
 //      what readBasis compares discards the candidate and re-snapshots (up
 //      to MAX_INVALIDATIONS re-snapshots, then the work stays pending for the
@@ -79,7 +84,9 @@ import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import {
   FrozenRowsChanged,
+  dropSpool,
   freezePrefixRows,
+  newSpoolAttempt,
   uploadFrozenParts,
   type EncodedPart,
   type FrozenPrefix,
@@ -290,9 +297,10 @@ type ChangeRow = { pk_hash: string };
 
 const MAX_ATTEMPTS = 5;
 /**
- * Re-snapshots allowed after a candidate was discarded (changed basis or
- * changed rows) before the work waits for the next cycle. A cycle builds at
- * most MAX_INVALIDATIONS + 1 candidates for a stream.
+ * Re-snapshots allowed after a candidate was discarded (a changed basis, or a
+ * spool that lost rows) before the work waits for the next cycle. A cycle
+ * builds at most MAX_INVALIDATIONS + 1 candidates for a stream. A write that
+ * only re-stamps rows is not a reason to discard: the transfer sends its copy.
  */
 const MAX_INVALIDATIONS = 3;
 
@@ -303,6 +311,8 @@ type StreamRun = {
   attempts: number;
   invalidations: number;
   watermark: number | null;
+  /** The attempt whose rows are in `publish_spool`; see `endSpool`. */
+  spool: string | null;
 };
 
 type StreamContext = {
@@ -330,6 +340,8 @@ type Candidate = {
   readonly baseParts: readonly HeadPart[];
   readonly changedPrefixes: readonly string[];
   readonly frozen: readonly FrozenPrefix[];
+  /** The spool rows of `frozen`; the transfer reads them, nothing else does. */
+  readonly attempt: string;
   readonly blobs: readonly BlobDescriptor[];
   readonly headGeneration: number;
   /** The head but for its parts, which the transfer produces. */
@@ -374,6 +386,58 @@ async function publishStream(
   hashes: ControlHashes,
   options: PublishOptions | undefined,
 ): Promise<PublishResult> {
+  const run: StreamRun = {
+    sawRefusal: false,
+    appliedVersion: null,
+    attempts: 0,
+    invalidations: 0,
+    watermark: null,
+    spool: null,
+  };
+  try {
+    return await publishAttempts(
+      deps,
+      run,
+      connectionId,
+      connection,
+      stream,
+      keyCheck,
+      hashes,
+      options,
+    );
+  } finally {
+    // Commit, discard and failure all end here.
+    await endSpool(deps, run);
+  }
+}
+
+/**
+ * Drop the spool rows of the attempt in `run`, if it spooled any. A failed
+ * drop leaves rows that the next start deletes; it must not hide the
+ * attempt's result.
+ */
+async function endSpool(deps: LocalSyncDeps, run: StreamRun): Promise<void> {
+  const { spool } = run;
+  if (spool === null) return;
+  run.spool = null;
+  await dropSpool(deps, spool).catch((error: unknown) =>
+    deps.logger.warn(
+      { error: String(error) },
+      "publish: spool rows not dropped",
+    ),
+  );
+}
+
+async function publishAttempts(
+  deps: LocalSyncDeps,
+  run: StreamRun,
+  connectionId: string,
+  connection: ConnectionRow,
+  stream: string,
+  keyCheck: string,
+  hashes: ControlHashes,
+  options: PublishOptions | undefined,
+): Promise<PublishResult> {
   const context: StreamContext = {
     connectionId,
     connection,
@@ -382,13 +446,6 @@ async function publishStream(
     keyCheck,
     hashes,
     options,
-  };
-  const run: StreamRun = {
-    sawRefusal: false,
-    appliedVersion: null,
-    attempts: 0,
-    invalidations: 0,
-    watermark: null,
   };
   const slot = <T>(work: (held: LocalSyncDeps) => Promise<T>) =>
     deps.queue.run(connectionId, "publish", () =>
@@ -400,6 +457,8 @@ async function publishStream(
       // and nothing was acknowledged: the work is still pending next cycle.
       return { stream, outcome: "backoff", watermark: run.watermark };
     }
+    // The last attempt's copy is of no use now: it was discarded or ended.
+    await endSpool(deps, run);
     const snapshot = await slot((held) => snapshotStream(held, context, run));
     if (snapshot.kind === "done") return snapshot.result;
     if (snapshot.kind === "retry") continue;
@@ -416,9 +475,9 @@ async function publishStream(
     try {
       prepared = await transferCandidate(deps, context, candidate);
     } catch (error) {
-      // A transfer that lost its input because local state moved (rows that
-      // changed, a delete that purged an attachment) is a stale candidate,
-      // not a failure.
+      // A transfer that lost its input because local state moved (a purge
+      // took the spooled rows or an attachment) is a stale candidate, not a
+      // failure.
       if (error instanceof FrozenRowsChanged) {
         run.invalidations++;
         continue;
@@ -713,12 +772,15 @@ async function snapshotStream(
   // Read the caller's head extras, the rows to encode and the clock now: the
   // transfer reads none of them again.
   await context.options?.headExtras?.(stream);
+  const attempt = newSpoolAttempt();
+  if (changedPrefixes.length > 0) run.spool = attempt;
   const frozen =
     changedPrefixes.length === 0
       ? []
       : await freezePrefixRows(deps, {
           connectionId,
           stream,
+          attempt,
           changedPrefixes,
           replaceBelow: plan.replaceBelow,
         });
@@ -765,6 +827,7 @@ async function snapshotStream(
       baseParts: registryHead?.parts ?? [],
       changedPrefixes,
       frozen,
+      attempt,
       blobs,
       headGeneration,
       head,
@@ -777,10 +840,10 @@ async function snapshotStream(
 
 /**
  * TRANSFER, outside the slot. Attachments, parts, then the head, each a
- * content-addressed object. It reads the changed prefixes' rows (page by page,
- * checked against the frozen digest) and attachment bytes by exact id, so it
- * cannot encode rows the snapshot did not freeze: a difference throws
- * FrozenRowsChanged.
+ * content-addressed object. It reads the attempt's spooled rows (page by page)
+ * and attachment bytes by exact id, so it cannot encode rows the snapshot did
+ * not freeze, and no write to `records` can invalidate it. A spool that lost
+ * rows throws FrozenRowsChanged.
  */
 async function transferCandidate(
   deps: LocalSyncDeps,
@@ -790,9 +853,7 @@ async function transferCandidate(
   const { scope } = context;
   await uploadBlobs(deps, candidate.blobs);
   const encoded = await uploadFrozenParts(deps, {
-    connectionId: context.connectionId,
-    stream: context.stream,
-    replaceBelow: candidate.replaceBelow,
+    attempt: candidate.attempt,
     scope,
     generation: candidate.headGeneration,
     frozen: candidate.frozen,

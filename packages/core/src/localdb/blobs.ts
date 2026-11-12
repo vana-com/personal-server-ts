@@ -246,6 +246,37 @@ export class MissingAttachmentError extends Error {
   }
 }
 
+/** Rows of one blob's referring records read at a time. */
+const REFERRER_PAGE_ROWS = 8;
+
+/**
+ * Whether a record of the stream names the blob. A blob can be referred to by
+ * every record of a stream, so the records are read a page at a time, in key
+ * order, and the search stops at the first that names it. The `instr` test is
+ * a necessary condition of `namesBlob` (the id is a JSON string in the body),
+ * so a record that cannot name the blob is never read into memory.
+ */
+async function someRecordNamesBlob(
+  deps: LocalSyncDeps,
+  input: { readonly connectionId: string; readonly stream: string },
+  blobId: string,
+): Promise<boolean> {
+  let after = "";
+  for (;;) {
+    const records = await deps.db.query<{ pk_hash: string; body: string }>(
+      `SELECT r.pk_hash, r.body FROM blob_refs f JOIN records r
+        ON r.connection_id=f.connection_id AND r.stream=f.stream AND r.pk_hash=f.pk_hash
+       WHERE f.blob_id=? AND f.connection_id=? AND f.stream=? AND f.pk_hash>?
+         AND instr(r.body, ?)>0
+       ORDER BY f.pk_hash LIMIT ${REFERRER_PAGE_ROWS}`,
+      [blobId, input.connectionId, input.stream, after, blobId],
+    );
+    if (records.some((record) => namesBlob(record.body, blobId))) return true;
+    if (records.length < REFERRER_PAGE_ROWS) return false;
+    after = records[records.length - 1]!.pk_hash;
+  }
+}
+
 /**
  * List the cached run bytes a stream's records name and that are not yet
  * known to be published (E.1). Local reads only, paged by metadata: no blob
@@ -275,14 +306,7 @@ export async function listStreamBlobs(
     for (const row of rows) {
       const key = `${input.scope}/g${input.generation}-b-${row.blob_id}`;
       if (uploaded?.has(key)) continue;
-      const records = await deps.db.query<{ body: string }>(
-        `SELECT r.body FROM records r JOIN blob_refs f
-        ON f.connection_id=r.connection_id AND f.stream=r.stream AND f.pk_hash=r.pk_hash
-        WHERE f.blob_id=? AND f.connection_id=? AND f.stream=?`,
-        [row.blob_id, input.connectionId, input.stream],
-      );
-      if (!records.some((record) => namesBlob(record.body, row.blob_id)))
-        continue;
+      if (!(await someRecordNamesBlob(deps, input, row.blob_id))) continue;
       found.push({ blobId: row.blob_id, key, scope: input.scope });
     }
     if (rows.length < 100) return found;

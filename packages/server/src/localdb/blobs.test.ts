@@ -9,6 +9,7 @@ import {
   type SqlDriver,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import { IDENTITYLESS_NS } from "@opendatalabs/personal-server-ts-stream-sync";
+import { listStreamBlobs } from "../../../core/src/localdb/blobs.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const digest = (bytes: Uint8Array) =>
@@ -218,5 +219,107 @@ describe("local database blobs", () => {
     ]);
     expect(await db.query("SELECT * FROM blob_refs")).toEqual([]);
     expect(await db.query("SELECT blob_id FROM blobs")).toEqual([]);
+  });
+});
+
+describe("listing the attachments a stream names", () => {
+  const list = (f: Awaited<ReturnType<typeof fresh>>) =>
+    listStreamBlobs({ db: f.db } as LocalSyncDeps, {
+      connectionId: "c",
+      stream: "files",
+      scope: "scope",
+      generation: 4,
+    });
+
+  /** A blob with bytes, and a ref from each record in `records` (by key). */
+  async function refer(
+    f: Awaited<ReturnType<typeof fresh>>,
+    hash: string,
+    records: { key: string; body: unknown }[],
+  ) {
+    await f.db.batch([
+      {
+        sql: "INSERT INTO blobs(blob_id, mime_type, size_bytes, generation, bytes) VALUES (?, 'x/y', 1, 4, ?)",
+        params: [hash, new Uint8Array([1])],
+      },
+      ...records.flatMap(({ key, body }) => [
+        {
+          sql: "INSERT INTO records(connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256) VALUES ('c', 'files', ?, ?, 100, 'run', ?, 'fixture')",
+          params: [key, key, JSON.stringify(body)],
+        },
+        {
+          sql: "INSERT INTO blob_refs(blob_id, connection_id, stream, pk_hash) VALUES (?, 'c', 'files', ?)",
+          params: [hash, key],
+        },
+      ]),
+    ]);
+  }
+
+  /** Referring bodies each referrer-lookup result carried, per query. */
+  function referrerPages(f: Awaited<ReturnType<typeof fresh>>) {
+    const real = f.db.query.bind(f.db);
+    const pages: number[] = [];
+    vi.spyOn(f.db, "query").mockImplementation((async (
+      sql: string,
+      params?: never,
+    ) => {
+      const rows = (await real(sql, params)) as unknown[];
+      if (sql.includes("r.body")) pages.push(rows.length);
+      return rows;
+    }) as never);
+    return pages;
+  }
+
+  const keyOf = (i: number) => String(i).padStart(4, "0");
+
+  it("lists a blob that many records name, reading the referrers a page at a time", async () => {
+    const f = await fresh();
+    const hash = digest(new Uint8Array([9]));
+    await refer(
+      f,
+      hash,
+      Array.from({ length: 40 }, (_, i) => ({
+        key: keyOf(i),
+        body: { attachment: { sha256: hash } },
+      })),
+    );
+    const pages = referrerPages(f);
+    expect(await list(f)).toEqual([
+      { blobId: hash, key: `scope/g4-b-${hash}`, scope: "scope" },
+    ]);
+    // The first page names it, so the search stops: 8 rows read, not 40.
+    expect(pages).toEqual([8]);
+  });
+
+  it("looks past a page of records that only contain the hash as text", async () => {
+    const f = await fresh();
+    const hash = digest(new Uint8Array([8]));
+    await refer(f, hash, [
+      // Twenty referrers hold the hash inside a longer string: no match.
+      ...Array.from({ length: 20 }, (_, i) => ({
+        key: keyOf(i),
+        body: { note: `see ${hash} here` },
+      })),
+      { key: keyOf(20), body: { attachment: `sha256:${hash}` } },
+    ]);
+    const pages = referrerPages(f);
+    expect(await list(f)).toEqual([
+      { blobId: hash, key: `scope/g4-b-${hash}`, scope: "scope" },
+    ]);
+    expect(pages).toEqual([8, 8, 5]);
+  });
+
+  it("omits a blob no referring record names", async () => {
+    const f = await fresh();
+    const hash = digest(new Uint8Array([7]));
+    await refer(
+      f,
+      hash,
+      Array.from({ length: 12 }, (_, i) => ({
+        key: keyOf(i),
+        body: { note: `see ${hash} here` },
+      })),
+    );
+    expect(await list(f)).toEqual([]);
   });
 });

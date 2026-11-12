@@ -18,7 +18,8 @@ export class LocalDbIdentityMismatch extends Error {
 }
 
 /**
- * Sets the connection pragmas, migrates, creates the TEMP tables and checks
+ * Sets the connection pragmas, migrates, creates the TEMP tables, drops stale
+ * publish spool rows and checks
  * (or, on a new file, records) the owner and network. Web uses TRUNCATE
  * journaling; the other hosts use WAL.
  */
@@ -33,6 +34,9 @@ export async function openLocalDb(
   await migrate(driver);
   await driver.batch([
     ...TEMP_TABLES.map((sql) => ({ sql })),
+    // One process holds the database, so no publish attempt is running yet:
+    // every spool row is left from a process that stopped mid-publish.
+    { sql: "DELETE FROM publish_spool" },
     {
       sql: "INSERT OR IGNORE INTO db_meta (id, owner, network, device_id, created_at) VALUES (1, ?, ?, ?, ?)",
       params: [

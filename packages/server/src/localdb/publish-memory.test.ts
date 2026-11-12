@@ -17,6 +17,7 @@ import { afterAll, beforeAll, expect, it } from "vitest";
 import { run } from "../../../core/src/test-support/memory-oracle.js";
 import {
   buildPublishMemoryDb,
+  buildRowsDb,
   type PublishMemoryResult,
 } from "./publish-memory.workload.js";
 
@@ -114,4 +115,124 @@ it("publish-memory-does-not-grow-with-the-stream", async () => {
       "\n",
   );
   expect(median(large)).toBeLessThanOrEqual(median(small) + MARGIN);
+}, 1_800_000);
+
+/**
+ * Peak of one child over a database built by `build`. Fresh copy per run: the
+ * workloads write (the spool) and the next run must start from the same file.
+ */
+async function measure<T>(
+  name: string,
+  exportName: string,
+  build: () => Promise<string>,
+): Promise<{ peakBytes: number; result: T }> {
+  const source = await build();
+  const path = `${source}.run-${Math.random().toString(36).slice(2)}`;
+  copyFileSync(source, path);
+  try {
+    const measured = await run<T>({
+      module: childModule,
+      exportName,
+      args: { path },
+    });
+    process.stdout.write(
+      `${name} ` +
+        JSON.stringify({
+          peakBytes: measured.peakBytes,
+          result: measured.result,
+        }) +
+        "\n",
+    );
+    return measured;
+  } finally {
+    rmSync(path, { force: true });
+  }
+}
+
+const extra = new Set<string>();
+const median3 = (values: number[]) => [...values].sort((a, b) => a - b)[1]!;
+const BLOB = "ab".repeat(32);
+
+// One attachment named by every record of a stream. Finding it must not read
+// every referring body at once: 6,000 rows of 16 KiB are 98 MiB. A lookup that
+// pages the referrers and stops at the first that names the blob keeps a few
+// rows, however many refer to it.
+it("listing-a-shared-attachment-does-not-grow-with-its-referrers", async () => {
+  const build = (rows: number) => async () => {
+    const path = join(root, `fanout-${rows}.sqlite`);
+    if (!extra.has(path)) {
+      await buildRowsDb(path, rows, ROW_BYTES, BLOB);
+      extra.add(path);
+    }
+    return path;
+  };
+  const small: number[] = [];
+  const large: number[] = [];
+  for (let repetition = 0; repetition < 3; repetition++) {
+    for (const [rows, into] of [
+      [SMALL_ROWS, small],
+      [LARGE_ROWS, large],
+    ] as const) {
+      const { peakBytes, result } = await measure<{ blobs: number }>(
+        `LIST_BLOBS_MEMORY rows=${rows}`,
+        "listBlobsWorkload",
+        build(rows),
+      );
+      expect(result.blobs).toBe(1);
+      into.push(peakBytes);
+    }
+  }
+  process.stdout.write(
+    "LIST_BLOBS_MEMORY_COMPARISON " +
+      JSON.stringify({
+        small,
+        large,
+        median: { small: median3(small), large: median3(large) },
+      }) +
+      "\n",
+  );
+  // Four times the referrers add 73 MiB of bodies. A bounded lookup adds none.
+  expect(median3(large)).toBeLessThanOrEqual(median3(small) + MARGIN);
+}, 1_800_000);
+
+// One prefix of very large bodies. A page is cut by bytes as well as rows, so
+// a prefix five times larger must not grow the peak by the extra bodies. With
+// a page of 64 rows, 40 bodies of 2 MiB were one 80 MiB page.
+const HUGE_BODY = 2 * 1024 * 1024;
+it("encoding-large-bodies-does-not-grow-with-the-prefix", async () => {
+  const build = (rows: number) => async () => {
+    const path = join(root, `huge-${rows}.sqlite`);
+    if (!extra.has(path)) {
+      await buildRowsDb(path, rows, HUGE_BODY);
+      extra.add(path);
+    }
+    return path;
+  };
+  const small: number[] = [];
+  const large: number[] = [];
+  for (let repetition = 0; repetition < 3; repetition++) {
+    for (const [rows, into] of [
+      [8, small],
+      [40, large],
+    ] as const) {
+      const { peakBytes, result } = await measure<{ puts: number }>(
+        `HUGE_BODIES_MEMORY rows=${rows}`,
+        "encodeOnePrefixWorkload",
+        build(rows),
+      );
+      expect(result.puts).toBeGreaterThan(0);
+      into.push(peakBytes);
+    }
+  }
+  process.stdout.write(
+    "HUGE_BODIES_MEMORY_COMPARISON " +
+      JSON.stringify({
+        small,
+        large,
+        median: { small: median3(small), large: median3(large) },
+      }) +
+      "\n",
+  );
+  // 32 more bodies are 64 MiB of text, and a copy of each as bytes.
+  expect(median3(large)).toBeLessThanOrEqual(median3(small) + 24 * 1024 * 1024);
 }, 1_800_000);
