@@ -10,6 +10,7 @@ import {
   evictableMcpClient,
   isMcpTokenExpired,
   matchesMcpRefreshHash,
+  nextMcpConnectionRevision,
   type McpConnectionRecord,
   type McpConnectionStore,
   type McpOAuthAuthorizationRecord,
@@ -497,19 +498,20 @@ export async function openMcpDurableState(options: {
         mutate((draft) => {
           const record = draft.connections[id];
           if (!record) return null;
+          const next = update(structuredClone(record));
           return (draft.connections[id] = {
-            ...update(structuredClone(record)),
-            revision: (record.revision ?? 0) + 1,
+            ...next,
+            revision: nextMcpConnectionRevision(record, next),
           });
         }),
       update: (id, patch) =>
         mutate((draft) => {
           const record = draft.connections[id];
           if (!record) return null;
+          const next = { ...record, ...patch };
           return (draft.connections[id] = {
-            ...record,
-            ...patch,
-            revision: (record.revision ?? 0) + 1,
+            ...next,
+            revision: nextMcpConnectionRevision(record, next),
           });
         }),
     },

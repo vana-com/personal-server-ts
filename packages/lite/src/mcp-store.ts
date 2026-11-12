@@ -26,6 +26,7 @@ import {
   isMcpTokenExpired,
   isPreExpiryMcpRecord,
   matchesMcpRefreshHash,
+  nextMcpConnectionRevision,
   type McpConnectionRecord,
   type McpConnectionStore,
   type McpOAuthAuthorizationRecord,
@@ -231,9 +232,10 @@ function mutateConnectionRecord(
         request.onsuccess = () => {
           if (!request.result) return;
           try {
+            const next = update(structuredClone(request.result));
             result = {
-              ...update(structuredClone(request.result)),
-              revision: (request.result.revision ?? 0) + 1,
+              ...next,
+              revision: nextMcpConnectionRevision(request.result, next),
             };
             store.put(result);
           } catch (error) {

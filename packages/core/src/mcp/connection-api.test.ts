@@ -11,6 +11,7 @@ import {
 } from "./store.js";
 import {
   approveMcpConnection,
+  editMcpConnectionAccess,
   approveMcpOAuthAuthorization,
   approveMcpOAuthAuthorizationWithScopes,
   approveMcpScopeAccessRequest,
@@ -708,9 +709,11 @@ describe("mcp/connection-api scope request answers", () => {
     };
   }
 
-  it("re-signs the union of existing and approved scopes, never dropping one", async () => {
+  it("re-signs the stored scopes the gateway still holds plus the approved ones, never a gateway-only scope", async () => {
     const { store, id, grantee } = await connectionWithRequest();
-    // The gateway grant holds a scope this record never saw; it must survive.
+    // The gateway grant holds a scope this record never saw (a write whose
+    // local commit was lost, possibly denied since). It must not be re-signed:
+    // reads already never serve it, and approval must not bring it back.
     const gateway = gatewayMock(
       liveGrant({ scopes: ["instagram.profile", "github.profile"] }),
     );
@@ -725,14 +728,13 @@ describe("mcp/connection-api scope request answers", () => {
       expect.objectContaining({
         grantorAddress: OWNER,
         granteeId: "0xbuilder",
-        scopes: ["github.profile", "instagram.profile", "spotify.profile"],
+        scopes: ["instagram.profile", "spotify.profile"],
         grantVersion: "4",
         expiresAt: "0",
       }),
     );
     expect(gateway.getBuilder).toHaveBeenCalledWith(grantee);
     expect(result.grantedScopes).toEqual([
-      "github.profile",
       "instagram.profile",
       "spotify.profile",
     ]);
@@ -743,7 +745,7 @@ describe("mcp/connection-api scope request answers", () => {
     expect(view?.grants).toEqual([
       {
         grantId: "0xgrant2",
-        scopes: ["github.profile", "instagram.profile", "spotify.profile"],
+        scopes: ["instagram.profile", "spotify.profile"],
       },
     ]);
     expect(view?.grantedScopes).toEqual(result.grantedScopes);
@@ -1115,22 +1117,26 @@ describe("mcp/connection-api scope request answers", () => {
     expect(gateway.createGrant).not.toHaveBeenCalled();
   });
 
-  it("refuses a scope-request approval whose merged scopes include a gateway wildcard, and stores nothing", async () => {
+  it("never re-signs a gateway wildcard the record does not hold, and keeps the scope reads serve under it", async () => {
     const { store, id } = await connectionWithRequest(
       [{ grantId: "0xgrant1", scopes: ["chatgpt.conversations"] }],
       ["write:memory.app"],
     );
-    const before = await store.getById(id);
     // The live gateway grant holds "*", whatever the record says.
     const gateway = gatewayMock(liveGrant({ scopes: ["*"] }));
-    await expect(
-      approveMcpScopeAccessRequest(
-        { connectionId: id, scopes: ["write:memory.app"] },
-        approveOptions(store, gateway),
-      ),
-    ).rejects.toMatchObject({ code: "INVALID_SCOPE", status: 400 });
-    expect(gateway.createGrant).not.toHaveBeenCalled();
-    expect(await store.getById(id)).toEqual(before);
+    const result = await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["write:memory.app"] },
+      approveOptions(store, gateway),
+    );
+    expect(gateway.createGrant).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        scopes: ["chatgpt.conversations", "write:memory.app"],
+      }),
+    );
+    expect(result.grantedScopes).not.toContain("*");
+    expect(
+      (await store.getById(id))!.grants.flatMap((grant) => grant.scopes),
+    ).not.toContain("*");
   });
 
   it("leaves the request pending when the gateway refuses the grant", async () => {
@@ -1222,6 +1228,121 @@ describe("mcp/connection-api scope request answers", () => {
     await expect(
       denyMcpScopeAccessRequest({ connectionId: "nope" }, { store }),
     ).rejects.toBeInstanceOf(McpConnectionNotFoundError);
+  });
+
+  it("does not re-sign a stored scope the gateway no longer holds", async () => {
+    const { store, id } = await connectionWithRequest([
+      {
+        grantId: "0xgrant1",
+        scopes: ["instagram.profile", "youtube.history"],
+      },
+    ]);
+    const gateway = gatewayMock(liveGrant({ scopes: ["instagram.profile"] }));
+    await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["spotify.profile"] },
+      approveOptions(store, gateway),
+    );
+    expect(gateway.createGrant).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        scopes: ["instagram.profile", "spotify.profile"],
+      }),
+    );
+  });
+
+  it.each([
+    {
+      stored: ["chatgpt.*"],
+      live: ["chatgpt.conversations"],
+      kept: ["chatgpt.conversations"],
+    },
+    {
+      stored: ["chatgpt.conversations"],
+      live: ["chatgpt.*"],
+      kept: ["chatgpt.conversations"],
+    },
+    { stored: ["chatgpt.*"], live: ["chatgpt.*"], kept: ["chatgpt.*"] },
+  ])(
+    "approve keeps what reads serve: stored $stored, gateway $live keeps $kept",
+    async ({ stored, live, kept }) => {
+      const { store, id } = await connectionWithRequest([
+        { grantId: "0xgrant1", scopes: stored },
+      ]);
+      const gateway = gatewayMock(liveGrant({ scopes: live }));
+      await approveMcpScopeAccessRequest(
+        { connectionId: id, scopes: ["spotify.profile"] },
+        approveOptions(store, gateway),
+      );
+      expect(gateway.createGrant).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ scopes: [...kept, "spotify.profile"] }),
+      );
+    },
+  );
+
+  describe("client traffic during an owner write", () => {
+    const USED_AT = "2030-01-01T00:00:00.000Z";
+    const heldScopes = ["instagram.profile", "youtube.history"];
+
+    it("approve commits locally when only lastUsedAt changed during the gateway write", async () => {
+      const { store, id } = await connectionWithRequest([
+        { grantId: "0xgrant1", scopes: heldScopes },
+      ]);
+      const gateway = gatewayMock(liveGrant({ scopes: heldScopes }));
+      // Every MCP request stamps lastUsedAt.
+      gateway.createGrant.mockImplementation(async () => {
+        await store.update(id, { lastUsedAt: USED_AT });
+        return { grantId: "0xgrant2" };
+      });
+      const result = await approveMcpScopeAccessRequest(
+        { connectionId: id, scopes: ["spotify.profile"] },
+        approveOptions(store, gateway),
+      );
+      const stored = (await store.getById(id))!;
+      expect(stored.grants).toEqual([
+        {
+          grantId: "0xgrant2",
+          scopes: ["instagram.profile", "spotify.profile", "youtube.history"],
+        },
+      ]);
+      expect(stored.scopeAccessRequest).toBeUndefined();
+      expect(stored.lastUsedAt).toBe(USED_AT);
+      expect(result.approvedScopes).toEqual(["spotify.profile"]);
+    });
+
+    it("edit commits locally when only lastUsedAt changed during the gateway write", async () => {
+      const { store, id } = await connectionWithRequest([
+        { grantId: "0xgrant1", scopes: heldScopes },
+      ]);
+      const gateway = gatewayMock(liveGrant({ scopes: heldScopes }));
+      gateway.createGrant.mockImplementation(async () => {
+        await store.update(id, { lastUsedAt: USED_AT });
+        return { grantId: "0xgrant2" };
+      });
+      const result = await editMcpConnectionAccess(
+        { connectionId: id, scopes: ["instagram.profile"] },
+        approveOptions(store, gateway),
+      );
+      const grants = [{ grantId: "0xgrant2", scopes: ["instagram.profile"] }];
+      expect(result.grants).toEqual(grants);
+      expect((await store.getById(id))!.grants).toEqual(grants);
+    });
+
+    it("still refuses the local commit when the record really changed", async () => {
+      const { store, id } = await connectionWithRequest();
+      const gateway = gatewayMock();
+      gateway.createGrant.mockImplementation(async () => {
+        await requestMcpScopeAccess(
+          { connectionId: id, scopes: ["linkedin.profile"] },
+          { store },
+        );
+        return { grantId: "0xgrant2" };
+      });
+      await expect(
+        approveMcpScopeAccessRequest(
+          { connectionId: id, scopes: ["spotify.profile"] },
+          approveOptions(store, gateway),
+        ),
+      ).rejects.toMatchObject({ code: "CONCURRENT_UPDATE", status: 409 });
+    });
   });
 });
 
