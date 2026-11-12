@@ -20,6 +20,16 @@ interface WorkerReply {
   };
 }
 
+/** Statement texts the worker may hold by id; later texts travel inline. */
+const MAX_STATEMENT_IDS = 256;
+
+/** A statement on the wire: its text only on first use, then its id. */
+interface WireStatement {
+  readonly sid?: number;
+  readonly sql?: string;
+  readonly params?: readonly SqlValue[];
+}
+
 /** Structured clone turns a Buffer into a plain Uint8Array; callers read
  * blobs as Buffers from the native driver, so restore that type. */
 const asBuffers = <R extends Record<string, SqlValue>>(rows: R[]): R[] => {
@@ -89,6 +99,21 @@ export function openBetterSqlite3(path: string): SqlDriver {
     if (!closed) fail(new Error(`sqlite_worker_exited_${code}`));
   });
   let closed = false;
+  // A statement's text crosses the thread boundary once; later calls send its
+  // id. Messages are handled in order, so the first one has registered the id.
+  const statementIds = new Map<string, number>();
+  const wire = (statement: SqlStatement): WireStatement => {
+    const sid = statementIds.get(statement.sql);
+    if (sid !== undefined) return { sid, params: statement.params };
+    if (statementIds.size >= MAX_STATEMENT_IDS)
+      return { sql: statement.sql, params: statement.params };
+    statementIds.set(statement.sql, statementIds.size);
+    return {
+      sid: statementIds.size - 1,
+      sql: statement.sql,
+      params: statement.params,
+    };
+  };
   const call = <T>(message: Record<string, unknown>): Promise<T> => {
     if (failure) return Promise.reject(failure);
     if (closed) return Promise.reject(new Error("sqlite_driver_closed"));
@@ -110,12 +135,14 @@ export function openBetterSqlite3(path: string): SqlDriver {
       sql: string,
       params?: readonly SqlValue[],
     ) {
-      return asBuffers(await call<R[]>({ op: "query", sql, params }));
+      return asBuffers(
+        await call<R[]>({ op: "query", ...wire({ sql, params }) }),
+      );
     },
     batch(statements: readonly SqlStatement[]) {
       return call<{ changes: readonly number[] }>({
         op: "batch",
-        statements,
+        statements: statements.map(wire),
       });
     },
     async close() {

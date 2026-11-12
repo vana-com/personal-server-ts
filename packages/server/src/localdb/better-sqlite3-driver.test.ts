@@ -1,3 +1,4 @@
+import { Worker } from "node:worker_threads";
 import Database from "better-sqlite3";
 import { afterEach, expect, it, vi } from "vitest";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
@@ -152,4 +153,46 @@ it("rejects calls after close and reports a database that cannot open", async ()
   await expect(db.query("SELECT 1")).rejects.toThrow("sqlite_driver_closed");
   const broken = openBetterSqlite3("/nonexistent-directory/x.sqlite");
   await expect(broken.query("SELECT 1")).rejects.toThrow();
+});
+
+it("sends each statement's text to the worker once, then only its id", async () => {
+  const post = vi.spyOn(Worker.prototype, "postMessage");
+  const db = fixture();
+  await db.batch([{ sql: "CREATE TABLE items (id INTEGER, body TEXT)" }]);
+  const insert = "INSERT INTO items VALUES (?, ?)";
+  const select = "SELECT body FROM items WHERE id = ?";
+  for (let i = 0; i < 50; i++) {
+    await db.batch([{ sql: insert, params: [i, `body-${i}`] }]);
+    expect(await db.query(select, [i])).toEqual([{ body: `body-${i}` }]);
+  }
+  const sent = post.mock.calls.map(([message]) => JSON.stringify(message));
+  const copies = (sql: string) =>
+    sent.filter((message) => message.includes(JSON.stringify(sql))).length;
+  expect(copies(insert)).toBe(1);
+  expect(copies(select)).toBe(1);
+});
+
+it("keeps later statement ids valid when an earlier batch statement fails", async () => {
+  const db = fixture();
+  await db.batch([{ sql: "CREATE TABLE items (id INTEGER)" }]);
+  const insert = "INSERT INTO items VALUES (?)";
+  await expect(
+    db.batch([
+      { sql: "INSERT INTO missing VALUES (1)" },
+      { sql: insert, params: [1] },
+    ]),
+  ).rejects.toThrow();
+  await db.batch([{ sql: insert, params: [2] }]);
+  expect(await db.query("SELECT id FROM items")).toEqual([{ id: 2 }]);
+});
+
+it("falls back to inline text past the id limit", async () => {
+  const db = fixture();
+  for (let i = 0; i < 300; i++)
+    expect(await db.query(`SELECT ? AS value /* ${i} */`, [i])).toEqual([
+      { value: i },
+    ]);
+  expect(await db.query("SELECT ? AS value /* 299 */", [7])).toEqual([
+    { value: 7 },
+  ]);
 });

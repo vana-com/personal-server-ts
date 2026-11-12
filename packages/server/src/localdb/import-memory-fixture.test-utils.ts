@@ -69,6 +69,7 @@ export const MEMORY_TARGET = {
 export function createImportMemoryFixture(
   root: string,
   rows = MEMORY_ROWS,
+  rowBytes = MEMORY_ROW_BYTES,
 ): ImportMemoryFixture {
   const nativeRoot = join(root, "native");
   mkdirSync(join(nativeRoot, "data"), { recursive: true });
@@ -93,11 +94,11 @@ export function createImportMemoryFixture(
         const empty = JSON.stringify({ id, text: "" }) + "\n";
         const prefix = `payload-${id}-`;
         const text = prefix
-          .repeat(Math.ceil(MEMORY_ROW_BYTES / prefix.length))
-          .slice(0, MEMORY_ROW_BYTES - Buffer.byteLength(empty));
+          .repeat(Math.ceil(rowBytes / prefix.length))
+          .slice(0, rowBytes - Buffer.byteLength(empty));
         const data = { id, text };
         const line = Buffer.from(JSON.stringify(data) + "\n");
-        if (line.length !== MEMORY_ROW_BYTES)
+        if (line.length !== rowBytes)
           throw new Error("memory_fixture_row_size");
         let offset = 0;
         while (offset < line.length) {

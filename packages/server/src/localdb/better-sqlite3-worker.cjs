@@ -6,8 +6,10 @@
  * here, so a long merge never holds the main thread's event loop and writes
  * stay serialized on one connection.
  *
- * Messages in:  { id, op: "query", sql, params }
- *               { id, op: "batch", statements }
+ * A statement is { sid?, sql?, params }. The first use of an id carries the
+ * text; later uses carry only the id. Messages in:
+ *               { id, op: "query", ...statement }
+ *               { id, op: "batch", statements: [statement] }
  *               { id, op: "close" }
  * Messages out: { id, ok: true, result } or { id, ok: false, error }.
  * Plain CommonJS: the worker loads it directly, with no build step of its own.
@@ -36,18 +38,29 @@ try {
   openError = error;
 }
 
+const texts = new Map();
+const textOf = ({ sid, sql }) => {
+  if (sql === undefined) return texts.get(sid);
+  if (sid !== undefined) texts.set(sid, sql);
+  return sql;
+};
+
 const run = {
-  query({ sql, params }) {
-    const stmt = cache.prepare(sql);
+  query(statement) {
+    const { params } = statement;
+    const stmt = cache.prepare(textOf(statement));
     if (stmt.reader) return stmt.all(...bind(params));
     stmt.run(...bind(params));
     return [];
   },
   batch({ statements }) {
+    // Register every text first: a failure part way must not leave a later
+    // id unknown to the worker while the other side believes it is sent.
+    const sqls = statements.map(textOf);
     db.exec("BEGIN IMMEDIATE");
     try {
-      const changes = statements.map((s) => {
-        const stmt = cache.prepare(s.sql);
+      const changes = statements.map((s, i) => {
+        const stmt = cache.prepare(sqls[i]);
         return stmt.reader
           ? (stmt.all(...bind(s.params)), 0)
           : stmt.run(...bind(s.params)).changes;

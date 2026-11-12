@@ -49,6 +49,11 @@ async function measure(
       module: childModule,
       exportName: "importMemoryWorkload",
       args: { fixture, path, loadWhole, workRoot },
+      // glibc gives the SQLite worker thread its own malloc arena and keeps
+      // memory it has freed there. That adds 15-20 MiB between 4x and 16x
+      // (arena cap 1: 6 MiB; in-thread driver: 8 MiB) and reads as growth
+      // with row count at the margin below. One arena measures the workload.
+      env: { MALLOC_ARENA_MAX: "1" },
     });
   } finally {
     rmSync(workRoot, { recursive: true, force: true });
