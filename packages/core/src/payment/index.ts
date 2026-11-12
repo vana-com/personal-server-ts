@@ -1,4 +1,6 @@
 export {
+  DATA_ACCESS_OP_TYPE,
+  GRANT_OP_TYPE,
   buildChallenge,
   encodePaymentHeader,
   generateRecordId,
