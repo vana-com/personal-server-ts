@@ -23,6 +23,8 @@ import type { SqlDriver } from "../../../core/src/localdb/driver.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import { MIGRATIONS } from "../../../core/src/localdb/schema.js";
+import { withOrigin } from "../../../core/src/localdb/merge.js";
+import { applyStream } from "../../../core/src/localdb/apply.js";
 import { publishConnection } from "../../../core/src/localdb/publish.js";
 import { purgeConnection } from "../../../core/src/localdb/purge.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
@@ -327,6 +329,39 @@ describe("run publication state", () => {
     expect((await status(world, "r1")).state).toBe("published");
   });
 
+  it("does not promote a noop run while a local change is still unacknowledged", async () => {
+    const world = await makeWorld();
+    await collect(world, "r1", 1000, { [A]: ["x"] }, { full: false });
+    await endRun(world, "r1");
+    await publishConnection(world.deps, CONNECTION_ID);
+
+    // A local change the registry head does not hold yet, then a run that
+    // found nothing: its plan is a noop, but "saved" would be false.
+    const localBody = canonicalJson({ id: "local-only" });
+    const localKey = await pkHash(
+      async (b) => new Uint8Array(createHash("sha256").update(b).digest()),
+      JSON.parse(localBody),
+      ["id"],
+    );
+    await world.deps.db.batch(
+      withOrigin("local", [
+        {
+          sql: `INSERT INTO records (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256)
+                VALUES (?, ?, ?, 'local-only', 1500, 'local', ?, ?)`,
+          params: [CONNECTION_ID, A, localKey, localBody, sha256(localBody)],
+        },
+      ]),
+    );
+    await collect(world, "r2", 2000, { [A]: [] }, { full: false });
+    await endRun(world, "r2");
+    failStream(world, A, () => true);
+
+    await expect(publishConnection(world.deps, CONNECTION_ID)).rejects.toThrow(
+      "storage unavailable",
+    );
+    expect((await status(world, "r2")).state).toBe("pending");
+  });
+
   it("recovers a lost local commit of an empty full run without a new post", async () => {
     const world = await makeWorld();
     await collect(world, "r1", 1000, { [A]: ["x"] }, { full: false });
@@ -373,6 +408,122 @@ describe("run publication state", () => {
     expect(streamPosts(world, A)).toHaveLength(1); // matched the head, no second post
     expect(stateOf(await status(world, "r1"), A)?.publication?.version).toBe(1);
     expect((await status(world, "r1")).state).toBe("published");
+  });
+
+  describe("pending work already overtaken locally", () => {
+    // The real apply sees the registry; the test only changes what it reads.
+    async function hashesOf(world: World) {
+      return controlHashes(
+        keccak,
+        await deriveKeyCheck(world.deps.keys.namespaceHmac),
+      );
+    }
+    async function pendingRun() {
+      const world = await makeWorld();
+      await collect(world, "r1", 1000);
+      await endRun(world, "r1");
+      expect((await status(world, "r1")).state).toBe("pending");
+      return world;
+    }
+    const readsAs =
+      (
+        world: World,
+        scope: string,
+        row: { version: number; data: string; metadata: string },
+        deleted: boolean,
+      ) =>
+      (deps: LocalSyncDeps): LocalSyncDeps => ({
+        ...deps,
+        registry: {
+          ...world.registry,
+          read: async (s: string) =>
+            s === scope
+              ? {
+                  found: true as const,
+                  version: row.version,
+                  dataHash: row.data,
+                  metadataHash: row.metadata,
+                  deleted,
+                }
+              : world.registry.read(s),
+          listStreamRows: async () => [],
+          listControlRows: async () => [],
+          post: world.registry.post.bind(world.registry),
+        } as LocalSyncDeps["registry"],
+      });
+
+    it("reads superseded right after an applied generation reset, with no publish between", async () => {
+      const world = await pendingRun();
+      const hashes = await hashesOf(world);
+      await applyStream(
+        readsAs(
+          world,
+          CONTROL,
+          {
+            version: 2,
+            data: hashes.activeData,
+            metadata: hashes.activeMetadata,
+          },
+          false,
+        )(world.deps),
+        CONNECTION_ID,
+        A,
+      );
+      const [connection] = await world.deps.db.query(
+        "SELECT generation, control_state FROM connections",
+      );
+      expect(connection).toMatchObject({
+        generation: 2,
+        control_state: "active",
+      });
+      expect(await status(world, "r1")).toMatchObject({
+        state: "superseded",
+        streams: [
+          { name: A, state: "superseded", reason: "generation_changed" },
+        ],
+      });
+    });
+
+    it("reads superseded right after an applied stream tombstone, with no publish between", async () => {
+      const world = await pendingRun();
+      const hashes = await hashesOf(world);
+      await applyStream(
+        readsAs(
+          world,
+          streamScope(CONNECTOR, NS, A),
+          {
+            version: 2,
+            data: hashes.tombstoneData,
+            metadata: hashes.tombstoneMetadata,
+          },
+          true,
+        )(world.deps),
+        CONNECTION_ID,
+        A,
+      );
+      const [row] = await world.deps.db.query(
+        "SELECT last_delete_version FROM stream_state",
+      );
+      expect(row!.last_delete_version).toBe(2);
+      expect(await status(world, "r1")).toMatchObject({
+        state: "superseded",
+        streams: [{ name: A, state: "superseded", reason: "stream_deleted" }],
+      });
+    });
+
+    it("keeps a run with no admitted generation pending", async () => {
+      const world = await pendingRun();
+      await world.deps.db.batch([
+        { sql: "UPDATE runs SET generation = NULL" },
+        { sql: "UPDATE connections SET generation = 2" },
+      ]);
+      expect((await status(world, "r1")).state).toBe("pending");
+    });
+
+    it("keeps a run admitted at the current generation pending", async () => {
+      const world = await pendingRun();
+      expect((await status(world, "r1")).streams[0]?.state).toBe("pending");
+    });
   });
 
   describe("after publication", () => {

@@ -9,6 +9,7 @@ import {
   type RunStreamPublication,
 } from "../stream-sync/intake.js";
 import type { SqlDriver } from "./driver.js";
+import { streamFenceTrip } from "./fence.js";
 
 export type LocalEndReceipt = Pick<EndResponse, "result" | "updateRequired">;
 
@@ -88,6 +89,8 @@ type PublicationRow = {
   connection_generation: number | null;
   last_delete_version: number | null;
   delete_requested: number;
+  run_generation: number | null;
+  delete_snapshot: number | null;
 };
 
 /**
@@ -108,7 +111,7 @@ export async function readPublicationStatus(
             rs.publication_state, rs.publication_reason, rs.published_generation, rs.published_version,
             rs.published_data_hash, rs.published_watermark,
             c.control_state, c.generation AS connection_generation,
-            s.last_delete_version,
+            s.last_delete_version, r.generation AS run_generation, rs.delete_snapshot,
             EXISTS (SELECT 1 FROM delete_intents d WHERE d.connector = c.connector) AS delete_requested
        FROM runs r
        LEFT JOIN run_streams rs ON rs.run_id = r.run_id
@@ -190,7 +193,25 @@ function streamPublication(row: PublicationRow): RunStreamPublication {
     return result("superseded", "connection_deleted");
   if (row.delete_requested === 1)
     return result("superseded", "connection_delete_requested");
-  if (stored === "pending") return result("pending", row.publication_reason);
+  if (stored === "pending") {
+    // Pending work whose generation or delete snapshot was overtaken by an
+    // applied reset or tombstone can never publish; say so now, with the
+    // same facts the publish fence uses, rather than after the next pass.
+    const trip = streamFenceTrip({
+      runGeneration: row.run_generation,
+      deleteSnapshot: row.delete_snapshot ?? 0,
+      connectionGeneration: row.connection_generation ?? undefined,
+      lastDeleteVersion: row.last_delete_version ?? undefined,
+    });
+    if (trip !== undefined)
+      return result(
+        "superseded",
+        trip === "generation_moved_by_delete"
+          ? "generation_changed"
+          : "stream_deleted",
+      );
+    return result("pending", row.publication_reason);
+  }
   if (row.published_generation !== row.connection_generation)
     return result("superseded", "generation_changed");
   if ((row.last_delete_version ?? 0) > (row.published_version ?? 0))
