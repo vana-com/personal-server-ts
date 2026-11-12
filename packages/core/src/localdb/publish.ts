@@ -3,7 +3,9 @@ import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 //
 // Per connection, after apply. Per stream with work, in three phases. Only
 // the first and the last hold the connection's queue slot; the middle one
-// holds none, so a run's begin never waits for an upload:
+// holds none, so a run's begin never waits for the upload. The slot is not
+// network-free: the snapshot still reads the registry and prior head blobs,
+// and the commit still reads, signs and posts the CAS under it.
 //
 //   SNAPSHOT (slot)  1. Snapshot W = max(seq) in record_changes and the
 //      changes with seq > publish_watermark and seq <= W.
@@ -13,18 +15,23 @@ import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 //      3. Re-plan the retained ended runs against the registry head. A run
 //      accepted at end but now refused is un-written in one batch and
 //      apply runs at once; a deferred run defers the stream.
-//      Freeze everything the next phase needs: the rows of the changed
-//      prefixes (under replace, leaving out rows below the run's stamp), the
-//      attachments to upload, and the basis the snapshot rests on (control,
-//      stream state, head parts, delete intents, retained runs, W).
-//   TRANSFER (no slot)  4. Encode the frozen rows, upload every new part and
-//      attachment, build the head and upload it. Objects are content
-//      addressed and authorize nothing until the registry CAS, so they need
-//      no mutual exclusion. Nothing local is read but the attachment bytes,
-//      by exact id and checked against it.
-//   COMMIT (slot)  5. Re-read the basis and the registry rows. Any change
-//      discards the candidate and re-snapshots (a few tries, then the work
-//      stays pending for the next cycle); nothing merges. Otherwise head,
+//      Freeze what the next phase needs: for each changed prefix a count and
+//      a digest of its rows' identities (never the bodies; under replace,
+//      leaving out rows below the run's stamp), the attachments to upload,
+//      and the basis the snapshot rests on (control, stream state, head
+//      parts, delete intents, retained runs, W, and what readBasis lists).
+//   TRANSFER (no slot)  4. Read the changed prefixes page by page, encode,
+//      upload every new part and attachment, build the head and upload it.
+//      Objects are content addressed and authorize nothing until the registry
+//      CAS, so they need no mutual exclusion. Each page is a plain read (no
+//      slot, no transaction across a network await), so memory is a page and
+//      the part in progress. A prefix whose rows no longer match the frozen
+//      digest discards the candidate before its head exists. Attachment
+//      bytes are read by exact id and checked against it.
+//   COMMIT (slot)  5. Re-read the basis and the registry rows. A change in
+//      what readBasis compares discards the candidate and re-snapshots (up
+//      to MAX_INVALIDATIONS re-snapshots, then the work stays pending for the
+//      next cycle); nothing merges. Otherwise head,
 //      then registry CAS from head_version: the same data hash skips the CAS;
 //      a conflict applies the winner and re-plans, at most 5 tries, then back
 //      off. On success one batch: replace deletes (origin refresh), head
@@ -71,6 +78,7 @@ import { applyConnection } from "./apply.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import {
+  FrozenRowsChanged,
   freezePrefixRows,
   uploadFrozenParts,
   type EncodedPart,
@@ -276,7 +284,11 @@ type RetainedRun = {
 type ChangeRow = { pk_hash: string };
 
 const MAX_ATTEMPTS = 5;
-/** Candidates discarded for a changed basis before the work waits a cycle. */
+/**
+ * Re-snapshots allowed after a candidate was discarded (changed basis or
+ * changed rows) before the work waits for the next cycle. A cycle builds at
+ * most MAX_INVALIDATIONS + 1 candidates for a stream.
+ */
 const MAX_INVALIDATIONS = 3;
 
 /** What one stream's publish carries from one loop pass to the next. */
@@ -399,8 +411,13 @@ async function publishStream(
     try {
       prepared = await transferCandidate(deps, context, candidate);
     } catch (error) {
-      // A transfer that lost its input because local state moved (a delete
-      // purged an attachment) is a stale candidate, not a failure.
+      // A transfer that lost its input because local state moved (rows that
+      // changed, a delete that purged an attachment) is a stale candidate,
+      // not a failure.
+      if (error instanceof FrozenRowsChanged) {
+        run.invalidations++;
+        continue;
+      }
       if ((await readBasis(deps, context, candidate)) === candidate.basis)
         throw error;
       run.invalidations++;
@@ -517,9 +534,13 @@ async function snapshotStream(
       sql: "UPDATE connections SET control_state='active',control_version=? WHERE connection_id=?",
       params: [controlState.generation, connectionId],
     },
-    // C.0: an offline fresh run binds when the registry first answers.
+    // C.0: an offline fresh run binds when the registry first answers. Only a
+    // run that has ended and passed the lifetime check above: a run still
+    // collecting keeps its lifetime (none) until it ends, so a collector that
+    // began before another writer moved the lifetime is never handed the new
+    // one. End then discards it if the lifetime moved past 1.
     {
-      sql: "UPDATE runs SET generation=? WHERE connection_id=? AND generation IS NULL",
+      sql: "UPDATE runs SET generation=? WHERE connection_id=? AND generation IS NULL AND state='ended'",
       params: [controlState.generation, connectionId],
     },
   ]);
@@ -714,9 +735,10 @@ async function snapshotStream(
 
 /**
  * TRANSFER, outside the slot. Attachments, parts, then the head, each a
- * content-addressed object. It reads only the frozen candidate (and
- * attachment bytes by exact id), so it cannot disagree with the commit about
- * what is being published.
+ * content-addressed object. It reads the changed prefixes' rows (page by page,
+ * checked against the frozen digest) and attachment bytes by exact id, so it
+ * cannot encode rows the snapshot did not freeze: a difference throws
+ * FrozenRowsChanged.
  */
 async function transferCandidate(
   deps: LocalSyncDeps,
@@ -726,6 +748,9 @@ async function transferCandidate(
   const { scope } = context;
   await uploadBlobs(deps, candidate.blobs);
   const encoded = await uploadFrozenParts(deps, {
+    connectionId: context.connectionId,
+    stream: context.stream,
+    replaceBelow: candidate.replaceBelow,
     scope,
     generation: candidate.headGeneration,
     frozen: candidate.frozen,
@@ -797,8 +822,9 @@ async function confirmNoWork(
 }
 
 /**
- * COMMIT, in the slot. The candidate stands only if every input of its
- * snapshot is unchanged; the registry CAS stays the remote fence.
+ * COMMIT, in the slot. The candidate stands only if what readBasis compares
+ * is unchanged and the registry row is the one it was built over; the
+ * registry CAS stays the remote fence.
  */
 async function commitCandidate(
   deps: LocalSyncDeps,
@@ -810,8 +836,9 @@ async function commitCandidate(
   const { connectionId, connection, stream, scope, hashes } = context;
   const { watermark } = candidate;
   const done = (result: PublishResult): Committed => ({ kind: "done", result });
-  // Local state: control, stream state, head parts, delete intents, retained
-  // runs and the change log are the snapshot's. Later begins change none.
+  // Local state: what readBasis compares (control, stream state, head parts,
+  // delete intents, selected runs, the covered change log, removals and
+  // foreign writes above W) is the snapshot's. Later begins change none.
   if ((await readBasis(deps, context, candidate)) !== candidate.basis) {
     return { kind: "invalidated" };
   }
@@ -932,17 +959,21 @@ async function commitCandidate(
 }
 
 /**
- * The local state a candidate rests on, as one comparable key. A candidate is
- * valid while every input of its snapshot is unchanged: the connection's
- * control, the stream's head fields and parts, the connection's delete
- * intents, the selected runs and the rows at or below W. Record changes alone
- * would miss control, run and head metadata, so the key spans all of them.
+ * The local state a candidate rests on, as one comparable key. It compares the
+ * connection's control, the stream's head fields and parts, the connection's
+ * delete intents, the selected runs, the changes at or below W, and what
+ * happened above W that could make the frozen rows wrong (below). It is not
+ * every input: stream floor and profile fields, and runs that ended after the
+ * snapshot, are left out on purpose.
  *
- * What it leaves out is what a candidate survives: a run that begins or ends
- * after the snapshot, and the rows it merges (origin `local`, sequence above
- * W). Those stay queued above W and publish in a later pass. A write of any
- * other origin above W (a purge) is in the key: it may have removed a frozen
- * row. Reads only; no transaction is held.
+ * A candidate survives a run that begins or ends after the snapshot and the
+ * rows it upserts (origin `local` or `import`, sequence above W): they stay
+ * queued above W, compaction never passes W, and a later publish carries them.
+ * A removal above W is different: a remote head that still shows the row
+ * would outlive the local delete. So every removal above W (a PDPP record
+ * delete is origin `local`, `explicit_delete`) and every write of another
+ * origin (a purge, a refresh) is in the key. Reads only; no transaction is
+ * held.
  */
 async function readBasis(
   deps: LocalSyncDeps,
@@ -994,7 +1025,8 @@ async function readBasis(
   const foreign = await deps.db.query(
     `SELECT COUNT(*) AS n FROM record_changes
       WHERE connection_id = ? AND stream = ? AND seq > ?
-        AND origin NOT IN ('local', 'import')`,
+        AND (origin NOT IN ('local', 'import')
+             OR op = 'remove' OR explicit_delete = 1)`,
     [connectionId, stream, snapshot.watermark],
   );
   return JSON.stringify([

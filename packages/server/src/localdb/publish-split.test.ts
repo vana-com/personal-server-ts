@@ -72,7 +72,8 @@ describe("a publish upload does not hold the queue slot", () => {
     const hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
     await hold.reached;
-    await a.run("r2", ["seed-row", "one", "two"]);
+    // "two" lies in no prefix the candidate re-encodes.
+    await a.run("r2", ["two"]);
     const w2 = await a.newestChange();
     expect(w2).toBeGreaterThan(w1);
     hold.release();
@@ -92,6 +93,26 @@ describe("a publish upload does not hold the queue slot", () => {
     expect(await readerKeys(stores)).toEqual(["one", "seed-row", "two"]);
   });
 
+  it("restarts the transfer when a late run rewrites a row of a prefix being sent", async () => {
+    const { stores, a } = await started();
+    await a.run("r1", ["seed-row", "one"]);
+    const hold = stores.storage.holdNext(putting);
+    const cycle = a.cycle();
+    await hold.reached;
+    // r2 re-stamps "one", which the frozen candidate re-encodes.
+    await a.run("r2", ["seed-row", "one", "two"]);
+    hold.release();
+    const first = await cycle;
+    expect(first.connections[0]?.error).toBeNull();
+    // The stale candidate was never posted: one new head, holding both runs.
+    expect(await streamRows(stores)).toEqual([{ version: 2, state: "head" }]);
+    expect(receiptRunIds(first)).toEqual(expect.arrayContaining(["r1", "r2"]));
+    // Nothing is left pending above the head.
+    expect(receiptRunIds(await settle(a))).toEqual([]);
+    expect(await a.head()).toMatchObject({ version: 2 });
+    expect(await readerKeys(stores)).toEqual(["one", "seed-row", "two"]);
+  });
+
   it("keeps the same bound when the head equals the registry head (no CAS)", async () => {
     const { stores, a } = await started();
     await a.run("r1", ["seed-row", "one"]);
@@ -108,7 +129,7 @@ describe("a publish upload does not hold the queue slot", () => {
     const hold = stores.storage.holdNext(() => !a.inSlot());
     const cycle = a.cycle();
     await hold.reached;
-    await a.run("r2", ["seed-row", "one", "two"]);
+    await a.run("r2", ["two"]);
     const w2 = await a.newestChange();
     hold.release();
     const retry = await cycle;
@@ -190,6 +211,40 @@ describe("a delete during an upload wins", () => {
     await settle(a);
     expect(await a.keys()).not.toContain("one");
     expect(await readerKeys(stores)).not.toContain("one");
+  });
+});
+
+describe("an explicit record delete during an upload", () => {
+  it("does not publish the frozen head that still holds the deleted record", async () => {
+    const { stores, a } = await started();
+    await a.run("r1", ["seed-row", "one", "x"]);
+    const hold = stores.storage.holdNext(putting);
+    const cycle = a.cycle();
+    await hold.reached;
+    // A real intake delete of x, begun and ended while the part PUT is held.
+    await a.remove("r2", ["x"]);
+    expect(await a.keys()).not.toContain("x");
+    hold.release();
+    const report = await cycle;
+    expect(report.connections[0]?.error).toBeNull();
+    // No head the registry holds shows x, as a fresh reader sees it.
+    expect(await readerKeys(stores)).not.toContain("x");
+    await settle(a);
+    expect(await a.keys()).not.toContain("x");
+    expect(await readerKeys(stores)).toEqual(["one", "seed-row"]);
+  });
+
+  it("publishes the delete in the next cycle when a later upsert did not stop it", async () => {
+    const { stores, a } = await started();
+    await a.run("r1", ["seed-row", "one", "x"]);
+    const hold = stores.storage.holdNext(putting);
+    const cycle = a.cycle();
+    await hold.reached;
+    await a.remove("r2", ["x"]);
+    hold.release();
+    await cycle;
+    await settle(a);
+    expect(await readerKeys(stores)).not.toContain("x");
   });
 });
 
@@ -308,6 +363,30 @@ describe("a run never publishes into a later connection lifetime", () => {
     expect(reports.flatMap(receiptRunIds)).not.toContain("R");
     expect(await a.keys()).not.toContain("deleted-row");
     expect(await readerKeys(stores)).not.toContain("deleted-row");
+  });
+});
+
+describe("a collecting run keeps the lifetime it began in", () => {
+  it("is discarded at its end when another writer moved the lifetime while it collected", async () => {
+    const stores = sharedStores();
+    const a = await makeDevice(stores, "a");
+    // Control is absent at begin: the run has no generation and stays collecting.
+    await a.begin("R");
+    expect(
+      await a.query("SELECT generation FROM runs WHERE run_id = 'R'"),
+    ).toEqual([{ generation: null }]);
+    await webDeleteAndReconnect(stores);
+    // A cycle learns the new lifetime while R is still collecting.
+    await settle(a);
+    await a.sync.intake.batch("R", {
+      batch: 0,
+      records: [{ stream: "items", data: { id: "old-lifetime-row" } }],
+    });
+    await a.end("R");
+    const reports = [await settle(a), await settle(a)];
+    expect(reports.flatMap(receiptRunIds)).not.toContain("R");
+    expect(await a.keys()).not.toContain("old-lifetime-row");
+    expect(await readerKeys(stores)).not.toContain("old-lifetime-row");
   });
 });
 

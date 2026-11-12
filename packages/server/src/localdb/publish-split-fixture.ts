@@ -257,6 +257,19 @@ export async function makeDevice(
         });
         return end(id);
       },
+      /** A run that deletes records by key (PDPP `op: "delete"`). */
+      async remove(id: string, keys: string[]) {
+        await begin(id);
+        await sync.intake.batch(id, {
+          batch: 0,
+          records: keys.map((key) => ({
+            stream: "items",
+            op: "delete" as const,
+            data: { id: key },
+          })),
+        });
+        return end(id);
+      },
       /** Local record keys, ordered. */
       async keys(): Promise<string[]> {
         return (
