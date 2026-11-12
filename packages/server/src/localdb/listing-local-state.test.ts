@@ -155,9 +155,9 @@ async function seedBusyHost(db: SqlDriver) {
 }
 
 const everything = () => true;
-/** The old list predates `latestCollectedAt`; compare everything else. */
+/** The old list predates `latestCollectedAt` and `aliasOf`; compare the rest. */
 const withoutIso = (listed: readonly ListedScope[]) =>
-  listed.map(({ latestCollectedAt: _iso, ...rest }) => rest);
+  listed.map(({ latestCollectedAt: _iso, aliasOf: _alias, ...rest }) => rest);
 const scopesOf = (listed: readonly ListedScope[]) => listed.map((s) => s.scope);
 
 describe("bounded local scope list", () => {

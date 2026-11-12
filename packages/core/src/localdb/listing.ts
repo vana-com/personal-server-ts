@@ -9,6 +9,7 @@ import {
   loadStreams,
   projectAlias,
   selectForTarget,
+  servedStreamOf,
   targetsForScope,
   type Candidate,
   type Connection as SelectionConnection,
@@ -30,6 +31,12 @@ export interface ListedScope {
    * legacy summaries carry and clients read. Absent when `updatedAt` is null.
    */
   readonly latestCollectedAt?: string;
+  /**
+   * Set only on a legacy alias scope: the logical `pdpp.<connector>.<stream>`
+   * scope it repeats. Readers that want one entry per stream skip entries
+   * that carry it; the alias stays listed because grants and reads use it.
+   */
+  readonly aliasOf?: string;
 }
 
 function collectedAt(updatedAt: number | null): { latestCollectedAt?: string } {
@@ -242,6 +249,11 @@ export function createLocalListing(
           records: logicalStreamScopeParts(scope) ? records : null,
           updatedAt,
           ...collectedAt(updatedAt),
+          ...(target.alias
+            ? {
+                aliasOf: `pdpp.${owner.connector}.${servedStreamOf(target)}`,
+              }
+            : {}),
         },
         bodyBuilds: () => (projection ??= aliasBodyBuilds(target, chosen)),
       });
