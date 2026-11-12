@@ -41,6 +41,7 @@ import {
   handlePersonalServerDataRequest,
   isOwnerView,
   listOwnerVisibleScopes,
+  type OwnerScopeSummary,
   reportPersonalServerReadFulfillment,
   resolveReadDeletion,
   type PersonalServerDataApiDeps,
@@ -346,7 +347,7 @@ export interface McpDataReadClient {
    * and only when the host turned on `mcpExposeUnsharedScopes`. Optional:
    * a client without it yields an empty `notShared`.
    */
-  listOwnerScopes?(): Promise<ScopeSummary[]>;
+  listOwnerScopes?(): Promise<OwnerScopeSummary[]>;
 
   /**
    * Return lightweight planning metadata for a scope using the storage index
@@ -835,7 +836,7 @@ export function createMcpDataReadClient(
     },
 
     async listOwnerScopes() {
-      const all: ScopeSummary[] = [];
+      const all: OwnerScopeSummary[] = [];
       for (let offset = 0; all.length < OWNER_SCOPE_LISTING_CAP;) {
         const page = await listOwnerVisibleScopes(
           {

@@ -2596,15 +2596,66 @@ function historyInteger(
 }
 
 /**
+ * One owner-listed scope. A `ScopeSummary` satisfies it; a stream listing row
+ * is mapped to it. `dataStatus: "ready"` means bounded read can serve it.
+ */
+export interface OwnerScopeSummary {
+  scope: string;
+  latestCollectedAt?: string;
+  dataStatus?: "ready" | "indexing";
+}
+
+/** The account's storage mode as one request freezes it before any read. */
+function readAccountStorageMode(deps: PersonalServerDataApiDeps) {
+  return (
+    deps.accountStorageMode?.read() ??
+    deps.accountMode?.read(deps.serverOwner) ??
+    "unknown"
+  );
+}
+
+/**
  * One page of every scope this server holds data for, under the filters the
  * `GET /v1/data` listing applies (tombstones, canonical-only scopes, system
  * scopes) but with no grant filter. In-process only: the caller must itself
  * decide who may see the result (MCP exposes it only through `notShared`).
+ *
+ * It takes the same account-mode decision as that listing: a switched account
+ * lists from the stream port and never touches legacy storage; an unknown
+ * account, or a switched one with no stream listing, throws rather than
+ * answering with an empty page.
  */
 export async function listOwnerVisibleScopes(
   deps: PersonalServerDataApiDeps,
   page: { limit: number; offset: number },
-): Promise<{ scopes: ScopeSummary[]; total: number }> {
+): Promise<{ scopes: OwnerScopeSummary[]; total: number }> {
+  const mode = readAccountStorageMode(deps);
+  if (mode === "unknown") {
+    throw new Error("Owner scope listing unavailable: account mode unknown");
+  }
+  if (mode === "switched") {
+    const listScopes = deps.streamSyncRead?.listScopes;
+    if (!listScopes) {
+      throw new Error("Owner scope listing unavailable: no stream listing");
+    }
+    const listed = await listScopes({
+      canRead: (scope) => !isSystemScope(scope),
+    });
+    return {
+      // The stream listing applies the resolver's own selection rule, so a
+      // listed scope is one a read can serve: that is its readiness.
+      scopes: listed
+        .slice(page.offset, page.offset + page.limit)
+        .map((row) => ({
+          scope: row.scope,
+          ...(row.latestCollectedAt && {
+            latestCollectedAt: row.latestCollectedAt,
+          }),
+          dataStatus: "ready" as const,
+        })),
+      total: listed.length,
+    };
+  }
   const deletionDeadlineAtMs = Date.now() + 250;
   const result = await listDataScopesContract({
     storage: deps.storage,
@@ -2638,10 +2689,7 @@ export async function handlePersonalServerDataRequest(
   };
   return withApiErrors(async () => {
     // Freeze the routing decision before consulting any data source.
-    const mode =
-      deps.accountStorageMode?.read() ??
-      deps.accountMode?.read(deps.serverOwner) ??
-      "unknown";
+    const mode = readAccountStorageMode(deps);
     const url = new URL(request.url);
     const pathname = stripBasePath(url.pathname, options.basePath);
 
