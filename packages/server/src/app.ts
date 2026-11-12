@@ -1,3 +1,4 @@
+import { withStrictMcpGrantRegistration } from "@opendatalabs/personal-server-ts-core/mcp";
 import { grantBlobStore } from "./localdb/grant-blobs.js";
 import type {
   LocalSync,
@@ -295,6 +296,15 @@ export interface AppDeps {
   };
   /** See `CreateServerOptions.mcpScopeRequestApprovalUrl`. */
   mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  mcpScopeRequestReviewHint?: string;
+  /** See `CreateServerOptions.mcpExposeUnsharedScopes`. */
+  mcpExposeUnsharedScopes?: boolean;
+  /** See `CreateServerOptions.mcpScopeRequestGuidance`. */
+  mcpScopeRequestGuidance?: boolean;
+  /** Allow the owner to narrow connection scopes; default off. */
+  mcpOwnerAccessEdit?: boolean;
+  /** See `CreateServerOptions.mcpRequestableScopes`. */
+  mcpRequestableScopes?: string[];
   mcpActivityRecorder?: McpActivityRecorder;
   mcpHydrateScopes?: (scopes: string[]) => Promise<void>;
   /**
@@ -938,7 +948,9 @@ export function createApp(deps: AppDeps): Hono {
     serverOwner: deps.serverOwner,
     serverAddress: deps.identity?.address,
     serverSigner: deps.serverSigner,
-    gateway: deps.gateway,
+    gateway: deps.gatewayConfig?.url
+      ? withStrictMcpGrantRegistration(deps.gateway, deps.gatewayConfig.url)
+      : deps.gateway,
     gatewayConfig: deps.gatewayConfig,
     paymentEnabled: deps.paymentEnabled,
     ownAppAccountUrl: deps.ownAppAccountUrl,
@@ -961,6 +973,15 @@ export function createApp(deps: AppDeps): Hono {
     oauthClientStore: deps.mcpOAuthClientStore,
     oauthApprovalUrl: deps.mcpOAuthApprovalUrl,
     scopeRequestApprovalUrl: deps.mcpScopeRequestApprovalUrl,
+    scopeRequestReviewHint: deps.mcpScopeRequestReviewHint,
+    mcpExposeUnsharedScopes: deps.mcpExposeUnsharedScopes,
+    mcpOwnerListingDeps: {
+      scopeDeletions: deps.scopeDeletions,
+      serverOwner: deps.serverOwner,
+    },
+    mcpOwnerAccessEdit: deps.mcpOwnerAccessEdit,
+    mcpScopeRequestGuidance: deps.mcpScopeRequestGuidance,
+    mcpRequestableScopes: deps.mcpRequestableScopes,
     activityRecorder: mcpActivityRecorder,
     localApprovalPort: deps.localApprovalPort,
     serverPort: deps.serverPort,

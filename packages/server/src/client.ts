@@ -58,6 +58,11 @@ export interface StartPersonalServerNodeOptions
       | "readFulfillmentReporter"
       | "mcpOAuthApprovalUrl"
       | "mcpScopeRequestApprovalUrl"
+      | "mcpScopeRequestReviewHint"
+      | "mcpExposeUnsharedScopes"
+      | "mcpOwnerAccessEdit"
+      | "mcpScopeRequestGuidance"
+      | "mcpRequestableScopes"
       | "mcpGrantTtlSeconds"
       | "rotateReplicaWriterIdentity"
       | "legacyImporter"
@@ -79,6 +84,20 @@ export async function startPersonalServer(
   if (options.port === 0) {
     throw new Error("port: 0 is not supported by the public Node handle");
   }
+  const reviewHint = options.mcpScopeRequestReviewHint;
+  if (reviewHint !== undefined) {
+    if (/[\u0000-\u001f\u007f-\u009f]/u.test(reviewHint)) {
+      throw new Error(
+        "mcpScopeRequestReviewHint must not contain control characters",
+      );
+    }
+    if (reviewHint.trim().length > 200) {
+      throw new Error(
+        "mcpScopeRequestReviewHint must be at most 200 characters",
+      );
+    }
+  }
+  const scopeRequestReviewHint = reviewHint?.trim() || undefined;
   let status: PersonalServerStatus = "starting";
   let stopped = false;
   let lastInfo: PersonalServerInfo | null = null;
@@ -100,6 +119,11 @@ export async function startPersonalServer(
     readFulfillmentReporter: options.readFulfillmentReporter,
     mcpOAuthApprovalUrl: options.mcpOAuthApprovalUrl,
     mcpScopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
+    mcpScopeRequestReviewHint: scopeRequestReviewHint,
+    mcpExposeUnsharedScopes: options.mcpExposeUnsharedScopes,
+    mcpOwnerAccessEdit: options.mcpOwnerAccessEdit,
+    mcpScopeRequestGuidance: options.mcpScopeRequestGuidance,
+    mcpRequestableScopes: options.mcpRequestableScopes,
     mcpGrantTtlSeconds: options.mcpGrantTtlSeconds,
     rotateReplicaWriterIdentity: options.rotateReplicaWriterIdentity,
     legacyImporter: options.legacyImporter,

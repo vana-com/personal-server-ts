@@ -1,3 +1,4 @@
+import { withStrictMcpGrantRegistration } from "@opendatalabs/personal-server-ts-core/mcp";
 import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
 import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import type {
@@ -326,7 +327,10 @@ export async function createIndexedDbPsLiteRuntime(
   const gateway =
     options.gateway ??
     withCancellableRegistration(
-      createGatewayClient(config.gateway.url),
+      withStrictMcpGrantRegistration(
+        createGatewayClient(config.gateway.url),
+        config.gateway.url,
+      ),
       config.gateway.url,
     );
   const serverSigner =

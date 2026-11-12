@@ -98,6 +98,8 @@ export type McpEncryptedPrivateKey =
     };
 
 export interface McpConnectionRecord {
+  /** Local CAS revision. Older records start at zero. */
+  revision?: number;
   id: string;
   displayName: string;
   granteeAddress: `0x${string}`;
@@ -166,7 +168,7 @@ export interface McpConnectionStore {
   getByRefreshTokenHash(
     refreshTokenHash: string,
   ): Promise<McpConnectionRecord | null>;
-  /** Atomically replace one connection from its latest stored value. */
+  /** Atomically replace one connection and increment its revision, starting from zero. */
   mutate(
     id: string,
     update: (record: McpConnectionRecord) => McpConnectionRecord,

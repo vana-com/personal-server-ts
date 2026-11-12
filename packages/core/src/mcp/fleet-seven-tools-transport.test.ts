@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { alwaysLive } from "../test-utils/live-grants.js";
 import { handleMcpStreamableHttpRequest } from "./server.js";
 import type { McpDataReadClient } from "./read-client.js";
 import type { McpConnectionRecord } from "./types.js";
@@ -116,7 +117,7 @@ function fixture() {
         },
         body: JSON.stringify({ jsonrpc: "2.0", id: sequence, method, params }),
       }),
-      { connection, readClient },
+      { connection, readClient, verifyGrantsLive: alwaysLive(connection) },
     );
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("application/json");

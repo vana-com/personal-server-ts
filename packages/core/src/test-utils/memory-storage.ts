@@ -165,7 +165,10 @@ export function createMemoryDataStorage(
       return forScope(scope).length;
     },
     findEntry({ scope, fileId, at }) {
-      if (fileId) return entries.find((entry) => entry.fileId === fileId);
+      if (fileId)
+        return entries.find(
+          (entry) => entry.fileId === fileId && entry.scope === scope,
+        );
       const scoped = forScope(scope);
       if (at) return scoped.find((entry) => entry.collectedAt === at);
       return scoped[0];

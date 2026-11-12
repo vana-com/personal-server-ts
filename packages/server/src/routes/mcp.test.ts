@@ -154,9 +154,14 @@ function makeGatewayForGrantee(opts: {
     getSchema: vi.fn().mockResolvedValue(null),
     registerServer: vi.fn().mockResolvedValue({ alreadyRegistered: false }),
     registerDataPoint: vi.fn().mockResolvedValue({ dataPointId: "0xdp" }),
-    createGrant: vi.fn().mockResolvedValue({
-      grantId: opts.grantId ?? "grant-mcp-1",
-    }),
+    // A re-registration replaces the scopes under the same grant id, as the
+    // real gateway does.
+    createGrant: vi
+      .fn()
+      .mockImplementation(async (request: { scopes: string[] }) => {
+        (grant as { scopes: string[] }).scopes = request.scopes;
+        return { grantId: opts.grantId ?? "grant-mcp-1" };
+      }),
     revokeGrant: vi.fn().mockResolvedValue(undefined),
   };
   return { gateway, grant };
@@ -359,6 +364,18 @@ describe("MCP owner connection routes", () => {
     expect(res.status).toBe(400);
     expect((await res.json()).error.errorCode).toBe("GRANTS_REQUIRED");
   });
+
+  it("rejects approve with a bare wildcard or an empty scope (400 invalid_scope)", async () => {
+    const create = await postOwner("/v1/mcp/connections", {});
+    const created = await create.json();
+    const res = await postOwner(
+      `/v1/mcp/connections/${created.connectionId}/approve`,
+      { grants: [{ grantId: "g", scopes: ["*", ""] }] },
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error.errorCode).toBe("invalid_scope");
+    expect((await store.getById(created.connectionId))?.grants).toEqual([]);
+  });
 });
 
 describe("MCP owner scope-request answers", () => {
@@ -468,6 +485,63 @@ describe("MCP owner scope-request answers", () => {
     );
     return { ...created, requested };
   }
+
+  it("serves a live grant id only for the scopes the gateway still holds for it", async () => {
+    // The gateway keeps one id per grantee; a re-registration under the same
+    // id narrows what it covers. The real verifier (the gateway mock) reports
+    // that, with no verifyGrantsLive stub.
+    const connect = async (scopes: string[]) => {
+      const created = await createMcpConnection(
+        { displayName: "Claude" },
+        { store, publicOrigin: SERVER_ORIGIN },
+      );
+      await approveMcpConnection(
+        {
+          connectionId: created.connectionId,
+          grants: [{ grantId: "grant-1", scopes }],
+        },
+        { store },
+      );
+      return created.connectionToken;
+    };
+    const gatewayGrant = (await gateway.getGrant("grant-1")) as unknown as {
+      scopes: string[];
+    };
+    const read = async (token: string) => {
+      const res = await app.request(`/mcp/${encodeURIComponent(token)}`, {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: {
+            name: "read_scope",
+            arguments: { scope: "youtube.history" },
+          },
+        }),
+      });
+      return res.text();
+    };
+    const approved = ["chatgpt.conversations", "youtube.history"];
+    const token = await connect(approved);
+    gatewayGrant.scopes = approved;
+    const neverGranted = await read(await connect(["chatgpt.conversations"]));
+    const before = await callTool(token, "list_granted_scopes", {});
+    expect(before.scopes.map((e: { scope: string }) => e.scope)).toContain(
+      "youtube.history",
+    );
+
+    gatewayGrant.scopes = ["chatgpt.conversations"];
+    const after = await callTool(token, "list_granted_scopes", {});
+    expect(after.scopes.map((e: { scope: string }) => e.scope)).toEqual([
+      "chatgpt.conversations",
+    ]);
+    expect(await read(token)).toBe(neverGranted);
+  });
 
   it("gives the agent the host approval link, then grants the union on approve", async () => {
     const { connectionId, connectionToken, requested } =
@@ -719,6 +793,20 @@ describe("MCP owner scope-request answers", () => {
       "requestedAt",
       "scopes",
     ]);
+  });
+
+  it("GET /:id/scope-request names no granted scope once the grant is revoked", async () => {
+    const { connectionId } = await connectionWithRequest();
+    vi.mocked(gateway.getGrant).mockResolvedValue({
+      id: "grant-1",
+      scopes: ["instagram.profile"],
+      grantVersion: "1",
+      expiresAt: null,
+      revokedAt: "2026-11-01T00:00:00.000Z",
+    } as never);
+    const res = await tokenRead(connectionId, lastReadToken());
+    expect(res.status).toBe(200);
+    expect((await res.json()).grantedScopes).toEqual([]);
   });
 
   it("GET /:id/scope-request answers one 404 for a wrong, missing or misplaced token", async () => {
@@ -974,6 +1062,58 @@ describe("MCP /mcp/:token route", () => {
 
     expect(response.status).toBe(200);
     expect(await response.text()).toContain('"requestRecorded":true');
+  });
+
+  it("serves no scope on the enclave dispatch path once the grant is revoked", async () => {
+    const created = await createMcpConnection(
+      { displayName: "TEE Claude" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-1", scopes: ["instagram.profile"] }],
+      },
+      { store },
+    );
+    const connection = (await store.getById(created.connectionId))!;
+    const { gateway: revoked, grant } = makeGatewayForGrantee({
+      granteeAddress: connection.granteeAddress,
+      grantId: "grant-1",
+      scopes: ["instagram.profile"],
+    });
+    (grant as { revokedAt: string | null }).revokedAt =
+      "2026-11-01T00:00:00.000Z";
+    const response = await executeMcpConnectionRequest(
+      new Request("https://worker.local/mcp", {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "list_granted_scopes", arguments: {} },
+        }),
+      }),
+      connection,
+      {
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway: revoked,
+        accessLogWriter: createMockAccessLogWriter(),
+        connectionStore: createInMemoryMcpConnectionStore(),
+        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        hierarchyOptions: { dataDir: "/tmp" },
+      },
+    );
+    const body = (await response.json()) as {
+      result: { content: Array<{ text: string }> };
+    };
+    expect(JSON.parse(body.result.content[0]!.text).scopes).toEqual([]);
   });
 
   it("returns OAuth discovery challenge on stable /mcp without bearer token", async () => {
@@ -2991,6 +3131,61 @@ describe("MCP /mcp/session (self-signing handshake)", () => {
     expect((await res.json()).error.errorCode).toBe("GRANT_OWNER_MISMATCH");
   });
 
+  it("refuses a session call when the grant lookup fails or the grant is past its expiry", async () => {
+    const { gateway, grant } = makeGatewayForGrantee({
+      granteeAddress: appWallet.address,
+      grantId: GRANT_ID,
+      scopes: ["instagram.profile"],
+    });
+    const app = new Hono();
+    app.route(
+      "/mcp",
+      mcpStreamableHttpRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        gatewayConfig,
+        accessLogWriter: createMockAccessLogWriter(),
+        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        hierarchyOptions: { dataDir: "/tmp" },
+      }),
+    );
+    const minted = (await (
+      await app.request("/mcp/session", {
+        method: "POST",
+        headers: { Authorization: await sessionProof() },
+      })
+    ).json()) as { access_token: string };
+    const call = () =>
+      app.request("/mcp", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${minted.access_token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "list_granted_scopes", arguments: {} },
+        }),
+      });
+    expect((await call()).status).toBe(200);
+
+    const original = gateway.getGrant as ReturnType<typeof vi.fn>;
+    const lookup = original.getMockImplementation();
+    original.mockRejectedValue(new Error("gateway down"));
+    const failed = await call();
+    expect(failed.status).toBe(403);
+    expect((await failed.json()).error.errorCode).toBe("GRANT_REVOKED");
+
+    original.mockImplementation(lookup!);
+    (grant as { expiresAt: string | null }).expiresAt = "1000";
+    expect((await call()).status).toBe(403);
+  });
+
   it("stops an open session on any tool call once the grant is revoked", async () => {
     const { gateway, grant } = makeGatewayForGrantee({
       granteeAddress: appWallet.address,
@@ -3059,5 +3254,291 @@ describe("MCP /mcp/session (self-signing handshake)", () => {
     });
     expect(read.status).toBe(500);
     expect((await read.json()).error.errorCode).toBe("SERVER_NOT_CONFIGURED");
+  });
+});
+
+describe("MCP notShared owner listing deps (route level)", () => {
+  let dataDir: string;
+  let hierarchyOptions: HierarchyManagerOptions;
+  let indexManager: IndexManager;
+
+  beforeEach(async () => {
+    dataDir = await mkdtemp(join(tmpdir(), "mcp-owner-listing-"));
+    hierarchyOptions = { dataDir };
+    indexManager = createIndexManager(initializeDatabase(":memory:"));
+  });
+
+  afterEach(async () => {
+    indexManager.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  /** A canonical view that serves `canonical` scopes; everything else is a file. */
+  const canonicalView = (canonical: string[]) =>
+    ({
+      listingFor: (scope: string) =>
+        canonical.includes(scope)
+          ? { kind: "canonical", collectedAt: "2026-11-02T00:00:00Z" }
+          : { kind: "file", deletion: "file" },
+      listCanonicalScopes: () =>
+        canonical.map((scope) => ({
+          scope,
+          collectedAt: "2026-11-02T00:00:00Z",
+        })),
+    }) as never;
+
+  async function setup(opts: {
+    legacyScopes: string[];
+    listingDeps?: Record<string, unknown>;
+  }) {
+    const store = createInMemoryMcpConnectionStore();
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    const record = (await store.getById(created.connectionId))!;
+    const { gateway } = makeGatewayForGrantee({
+      granteeAddress: record.granteeAddress,
+      grantId: "grant-mcp-1",
+      scopes: ["instagram.*"],
+    });
+    const accessLogWriter = createMockAccessLogWriter();
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-mcp-1", scopes: ["instagram.*"] }],
+      },
+      { store },
+    );
+    for (const scope of opts.legacyScopes) {
+      await ingestScope({
+        scope,
+        data: { username: "mcp_user" },
+        indexManager,
+        hierarchyOptions,
+        gateway,
+        accessLogWriter,
+      });
+    }
+    const root = new Hono();
+    root.route(
+      "/mcp",
+      mcpStreamableHttpRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        gatewayConfig,
+        serverSigner: {
+          signGrantRegistration: vi
+            .fn()
+            .mockResolvedValue("0xgrantsig" as `0x${string}`),
+        },
+        accessLogWriter,
+        connectionStore: store,
+        indexManager,
+        hierarchyOptions,
+        mcpExposeUnsharedScopes: true,
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+        mcpOwnerListingDeps: opts.listingDeps as never,
+        localApprovalPort: LOOPBACK_PORT,
+        serverPort: MAIN_PORT,
+      }),
+    );
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const res = await root.request(
+        `/mcp/${encodeURIComponent(created.connectionToken)}`,
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json, text/event-stream",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: "1",
+            method: "tools/call",
+            params: { name, arguments: args },
+          }),
+        },
+      );
+      return JSON.parse((await res.json()).result.content[0].text);
+    };
+    return { call };
+  }
+
+  it("does not list a canonical-only scope: notShared lists only what read_scope can serve", async () => {
+    // Canonical-only scopes join notShared together with moving MCP reads to
+    // the canonical view (follow-up after the demo). Even a view handed to
+    // the listing deps must not add them.
+    const { call } = await setup({
+      legacyScopes: ["instagram.profile"],
+      listingDeps: {
+        serverOwner: ownerWallet.address,
+        legacyScopeView: canonicalView(["youtube.history"]),
+      },
+    });
+    const body = await call("list_granted_scopes", {});
+    expect(body.notShared ?? []).toEqual([]);
+  });
+
+  it("does not list a legacy scope with no block sidecars (indexing): read_scope would answer 503", async () => {
+    const { call } = await setup({
+      legacyScopes: ["instagram.profile", "youtube.history", "spotify.library"],
+      listingDeps: { serverOwner: ownerWallet.address },
+    });
+    // A streamed upload commits the file without sidecars.
+    await rm(join(dataDir, "blocks", "spotify"), {
+      recursive: true,
+      force: true,
+    });
+    const body = await call("list_granted_scopes", {});
+    expect(body.notShared.map((s: { scope: string }) => s.scope)).toEqual([
+      "youtube.history",
+    ]);
+  });
+
+  it("lists a scope with a ready legacy file as ready", async () => {
+    const { call } = await setup({
+      legacyScopes: ["instagram.profile", "youtube.history"],
+      listingDeps: { serverOwner: ownerWallet.address },
+    });
+    const body = await call("list_granted_scopes", {});
+    expect(body.notShared).toEqual([
+      expect.objectContaining({
+        scope: "youtube.history",
+        source: "youtube",
+        dataStatus: "ready",
+      }),
+    ]);
+  });
+
+  it("does not list a tombstoned scope in notShared", async () => {
+    const scopeDeletions = {
+      resolve: async (scope: string) =>
+        scope === "spotify.library"
+          ? { deleted: true, deletedAt: "2099-01-01T00:00:00Z" }
+          : { deleted: false },
+    };
+    const { call } = await setup({
+      legacyScopes: ["instagram.profile", "spotify.library", "youtube.history"],
+      listingDeps: {
+        serverOwner: ownerWallet.address,
+        scopeDeletions,
+      },
+    });
+    const body = await call("list_granted_scopes", {});
+    expect(body.notShared.map((s: { scope: string }) => s.scope)).toEqual([
+      "youtube.history",
+    ]);
+  });
+
+  it("read_scope output for a legacy+canonical scope is unchanged by the listing deps", async () => {
+    const read = async (listingDeps?: Record<string, unknown>) => {
+      const { call } = await setup({
+        legacyScopes: ["instagram.profile"],
+        listingDeps,
+      });
+      return call("read_scope", { scope: "instagram.profile" });
+    };
+    const without = await read(undefined);
+    const withView = await read({
+      serverOwner: ownerWallet.address,
+      scopeDeletions: { resolve: async () => ({ deleted: false }) },
+    });
+    // Reads still serve the legacy file, as before this change.
+    expect(withView.blocks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "$.data",
+          value: { username: "mcp_user" },
+        }),
+      ]),
+    );
+    // Ingest time differs per run; everything else must be identical.
+    const normalize = (value: unknown) =>
+      JSON.parse(
+        JSON.stringify(value).replace(/\d{4}-\d\d-\d\dT[\d:.]+Z/gu, "<ts>"),
+      );
+    expect(normalize(withView)).toEqual(normalize(without));
+  });
+});
+
+describe("MCP scope-request opener route", () => {
+  const ID = "0b9f3c1e-6d2a-4a52-9a53-1f7e2c3d4e5f";
+  const buildApp = (hook?: (id: string) => string | undefined) => {
+    const root = new Hono();
+    root.route(
+      "/mcp",
+      mcpStreamableHttpRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway: makeGatewayForGrantee({
+          granteeAddress: "0x0000000000000000000000000000000000000002",
+        }).gateway,
+        gatewayConfig,
+        serverSigner: {
+          signGrantRegistration: vi
+            .fn()
+            .mockResolvedValue("0xgrantsig" as `0x${string}`),
+        },
+        accessLogWriter: createMockAccessLogWriter(),
+        connectionStore: createInMemoryMcpConnectionStore(),
+        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        hierarchyOptions: { dataDir: "/tmp" },
+        scopeRequestApprovalUrl: hook,
+        localApprovalPort: LOOPBACK_PORT,
+        serverPort: MAIN_PORT,
+      }),
+    );
+    return root;
+  };
+  const open = (app: Hono, query: string, localPort: number = LOOPBACK_PORT) =>
+    app.request(
+      `/mcp/scope-request/open${query}`,
+      {},
+      { incoming: { socket: { localPort, localAddress: "127.0.0.1" } } },
+    );
+  const hook = (id: string) => `vana://mcp-scope-request?connection=${id}`;
+
+  it("redirects a valid id to the host's URL without caching or referrer", async () => {
+    const res = await open(buildApp(hook), `?connection=${ID}`);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(hook(ID));
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(res.headers.get("referrer-policy")).toBe("no-referrer");
+  });
+
+  it.each([
+    "",
+    "?connection=",
+    "?connection=../x",
+    "?connection=a%0d%0ab",
+    `?connection=${ID}x`,
+  ])("rejects %j with 400 and no redirect", async (query) => {
+    const res = await open(buildApp(hook), query);
+    expect(res.status).toBe(400);
+    expect(res.headers.get("location")).toBeNull();
+  });
+
+  it("answers 404 when the host has no approval URL hook", async () => {
+    const res = await open(buildApp(), `?connection=${ID}`);
+    expect(res.status).toBe(404);
+    expect(res.headers.get("location")).toBeNull();
+  });
+
+  it("answers 404 when the hook gives no URL", async () => {
+    const res = await open(
+      buildApp(() => undefined),
+      `?connection=${ID}`,
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("is invisible on the public (tunnel) ingress", async () => {
+    const res = await open(buildApp(hook), `?connection=${ID}`, MAIN_PORT);
+    expect(res.status).toBe(404);
+    expect(res.headers.get("location")).toBeNull();
   });
 });

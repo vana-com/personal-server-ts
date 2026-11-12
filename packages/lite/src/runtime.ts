@@ -102,6 +102,7 @@ import {
   approveMcpOAuthAuthorizationWithScopes,
   approveMcpConnection,
   approveMcpScopeAccessRequest,
+  liveMcpGrants,
   buildMcpProtectedResourceMetadataUrl,
   buildStableMcpUrl,
   createInMemoryMcpOAuthAuthorizationStore,
@@ -117,6 +118,7 @@ import {
   MCP_CONNECTION_NOT_FOUND,
   MCP_SCOPE_REQUEST_NOT_FOUND,
   MCP_SCOPE_REQUEST_TOKEN_HEADER,
+  McpInvalidScopeError,
   readMcpScopeRequestWithToken,
   getMcpConnectionView,
   McpConnectionNotFoundError,
@@ -285,6 +287,10 @@ export interface PsLiteRuntimeOptions {
    * pointing the owner at Vana.
    */
   mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /** Default off. `list_granted_scopes` adds `notShared`; see the server option. */
+  mcpExposeUnsharedScopes?: boolean;
+  /** Default off. Read-side `scope_not_granted` adds `nextAction`. */
+  mcpScopeRequestGuidance?: boolean;
   /**
    * Lifetime in seconds of grants this runtime signs itself for MCP
    * connections (OAuth approve, scope-request approve with no live grant to
@@ -1766,6 +1772,8 @@ export function createPsLiteRuntime(
             authorizationStore: mcpOAuthAuthorizationStore,
             approvalUrl: options.mcpOAuthApprovalUrl,
             scopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
+            exposeUnsharedScopes: options.mcpExposeUnsharedScopes,
+            scopeRequestGuidance: options.mcpScopeRequestGuidance,
             auth,
             dataStorage,
             streamSyncRead: options.streamSyncRead,
@@ -1810,6 +1818,8 @@ async function handleMcpRoute(input: {
   authorizationStore: McpOAuthAuthorizationStore;
   approvalUrl?: string | (() => string);
   scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  exposeUnsharedScopes?: boolean;
+  scopeRequestGuidance?: boolean;
   auth: PsLiteAuthAdapter;
   dataStorage: DataStoragePort;
   streamSyncRead?: StreamSyncReadPort;
@@ -2151,7 +2161,7 @@ async function handleMcpRoute(input: {
         connectionId,
         token: input.request.headers.get(MCP_SCOPE_REQUEST_TOKEN_HEADER),
       },
-      { store: input.store, now: input.now },
+      { store: input.store, gateway: input.gateway, now: input.now },
     );
     if (!view) {
       const notFound = errorResponse(
@@ -2250,6 +2260,9 @@ async function handleMcpRoute(input: {
         }
         if (err instanceof McpConnectionStateError) {
           return errorResponse(409, "INVALID_STATE", err.message);
+        }
+        if (err instanceof McpInvalidScopeError) {
+          return errorResponse(400, err.code, err.message);
         }
         throw err;
       }
@@ -2461,6 +2474,9 @@ async function handleMcpRoute(input: {
         );
       },
       scopeRequestApprovalUrl: input.scopeRequestApprovalUrl,
+      exposeUnsharedScopes: input.exposeUnsharedScopes,
+      verifyGrantsLive: () => liveMcpGrants(record, input.gateway, input.now),
+      scopeRequestGuidance: input.scopeRequestGuidance,
       serverOrigin: input.serverOrigin,
     });
     void input.store

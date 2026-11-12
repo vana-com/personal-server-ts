@@ -1013,7 +1013,9 @@ describe("#599 MCP account-mode adapters", () => {
         await import("../../../server/src/routes/mcp.js");
       const connection = {
         id: "mode-test",
-        grants: [{ grantId: GRANT_ID, scopes: ["write:memory.test"] }],
+        grants: [
+          { grantId: GRANT_ID, scopes: ["memory.test", "write:memory.test"] },
+        ],
         granteeAddress: OWNER,
       } as ToolContext["connection"];
       await executeMcpConnectionRequest(

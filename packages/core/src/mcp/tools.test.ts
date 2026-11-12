@@ -1,4 +1,5 @@
 import { resolveGrantForRawScopeResource } from "./resources.js";
+import { alwaysLive } from "../test-utils/live-grants.js";
 import { describe, expect, it, vi } from "vitest";
 import { McpActivityRecorder } from "./activity.js";
 import {
@@ -10,6 +11,7 @@ import {
 import {
   handleMcpHandshake,
   handleMcpStreamableHttpRequest,
+  type HandleMcpRequestOptions,
   MCP_SERVER_INSTRUCTIONS,
 } from "./server.js";
 import type { McpConnectionRecord } from "./types.js";
@@ -63,6 +65,18 @@ function createMinimalReadClient(
   };
 }
 
+/** The server requires a verifier; these tests are not about liveness. */
+function handle(
+  request: Request,
+  options: Omit<HandleMcpRequestOptions, "verifyGrantsLive"> &
+    Partial<Pick<HandleMcpRequestOptions, "verifyGrantsLive">>,
+) {
+  return handleMcpStreamableHttpRequest(request, {
+    verifyGrantsLive: alwaysLive(options.connection),
+    ...options,
+  });
+}
+
 describe("mcp/tools", () => {
   it("names the data scope behind each write grant, so hydration fetches what remember rewrites", () => {
     const connection = {
@@ -81,7 +95,7 @@ describe("mcp/tools", () => {
   });
 
   it("keeps the MCP tools/list response parseable and under the tunnel budget", async () => {
-    const response = await handleMcpStreamableHttpRequest(
+    const response = await handle(
       new Request("http://localhost/mcp/test-token", {
         method: "POST",
         headers: {
@@ -131,9 +145,10 @@ describe("mcp/tools", () => {
         }),
       });
 
-    const full = await handleMcpStreamableHttpRequest(initialize(), {
+    const full = await handle(initialize(), {
       connection: createConnection(),
       readClient: createMinimalReadClient(),
+      verifyGrantsLive: async () => [],
     });
     const handshake = await handleMcpHandshake(initialize());
 
@@ -162,7 +177,7 @@ describe("mcp/tools", () => {
   });
 
   it("advertises no timeoutMs larger than the dispatcher will allow", async () => {
-    const response = await handleMcpStreamableHttpRequest(
+    const response = await handle(
       new Request("http://localhost/mcp/test-token", {
         method: "POST",
         headers: {
@@ -206,7 +221,7 @@ describe("mcp/tools", () => {
 
   it("records activity for MCP HTTP tool calls", async () => {
     const activityRecorder = new McpActivityRecorder();
-    const response = await handleMcpStreamableHttpRequest(
+    const response = await handle(
       new Request("http://localhost/mcp/test-token", {
         method: "POST",
         headers: {
@@ -245,7 +260,7 @@ describe("mcp/tools", () => {
   });
 
   it("serves raw scope files through MCP resources/read", async () => {
-    const response = await handleMcpStreamableHttpRequest(
+    const response = await handle(
       new Request("http://localhost/mcp/test-token", {
         method: "POST",
         headers: {
@@ -302,7 +317,7 @@ describe("mcp/tools", () => {
     });
 
     const started = Date.now();
-    const response = await handleMcpStreamableHttpRequest(
+    const response = await handle(
       new Request("http://localhost/mcp/test-token", {
         method: "POST",
         headers: {
@@ -400,16 +415,18 @@ describe("mcp/tools", () => {
       grantedRequestedScopes: ["instagram.profile", "chatgpt.history"],
       missingScopes: ["chatgpt.conversations"],
       requestRecorded: true,
-      nextAction: expect.stringContaining("owner approval"),
+      nextAction: expect.stringContaining("approve or decline it"),
     });
     expect(result.structuredContent).toMatchObject({
       approvalRequired: true,
       missingScopes: ["chatgpt.conversations"],
     });
-    expect(requestScopeAccess).toHaveBeenCalledWith({
-      scopes: ["chatgpt.conversations"],
-      reason: "Use ChatGPT history for the requested analysis.",
-    });
+    expect(requestScopeAccess).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopes: ["chatgpt.conversations"],
+        reason: "Use ChatGPT history for the requested analysis.",
+      }),
+    );
   });
 
   it("request_scope_access reports when requested scopes are already granted", async () => {
@@ -479,6 +496,126 @@ describe("mcp/tools", () => {
       expect(body.nextAction).toContain("tell you when they are done");
     });
 
+    describe("http opener link on the loopback ingress", () => {
+      const LOOPBACK = "http://127.0.0.1:47321";
+      const call = async (
+        hook: (id: string, ctx: { readToken?: string }) => string | undefined,
+        loopbackOrigin: string | null = LOOPBACK,
+      ) => {
+        const connection = createConnection();
+        const result = await getTool("request_scope_access").handler(
+          { scopes: ["chatgpt.conversations"] },
+          {
+            connection,
+            readClient: createMinimalReadClient(),
+            requestScopeAccess: vi.fn().mockResolvedValue({
+              connection: {
+                ...connection,
+                scopeAccessRequest: {
+                  scopes: ["chatgpt.conversations"],
+                  requestedAt: "2026-10-07T10:00:00.000Z",
+                },
+              },
+              requestRecorded: true,
+              readToken: "tok",
+            }),
+            scopeRequestApprovalUrl: hook,
+            serverOrigin: "https://ps.example.com",
+            ...(loopbackOrigin ? { loopbackOrigin } : {}),
+          },
+        );
+        return JSON.parse(result.content[0].text);
+      };
+
+      it("replaces a custom-scheme URL with the loopback opener as a markdown link", async () => {
+        const body = await call(
+          (id) => `vana://mcp-scope-request?connection=${id}`,
+        );
+        const url = `${LOOPBACK}/mcp/scope-request/open?connection=conn-1`;
+        expect(body.approvalUrl).toBe(url);
+        expect(body.nextAction).toContain(
+          `Show the user this link as a markdown link, [Review the request in Vana](${url})`,
+        );
+        expect(body.nextAction).toContain("tell you when they are done");
+        expect(body.nextAction).not.toContain("vana://");
+      });
+
+      it("keeps today's URL when the host URL depends on the read token", async () => {
+        const body = await call((id, ctx) =>
+          ctx.readToken
+            ? `vana://mcp-scope-request?connection=${id}#t=${ctx.readToken}`
+            : `vana://mcp-scope-request?connection=${id}`,
+        );
+        expect(body.approvalUrl).toBe(
+          "vana://mcp-scope-request?connection=conn-1#t=tok",
+        );
+        expect(body.nextAction).toContain(
+          "Show the user this link to review the request: vana://",
+        );
+      });
+
+      it("keeps today's URL without a loopback origin", async () => {
+        const body = await call(
+          (id) => `vana://mcp-scope-request?connection=${id}`,
+          null,
+        );
+        expect(body.approvalUrl).toBe(
+          "vana://mcp-scope-request?connection=conn-1",
+        );
+      });
+
+      it("keeps an http(s) host URL as is", async () => {
+        const body = await call((id) => `https://app.vana.org/x/${id}`);
+        expect(body.approvalUrl).toBe("https://app.vana.org/x/conn-1");
+      });
+    });
+
+    it.each([undefined, "vana://approve/conn-1"])(
+      "appends the review hint once when approvalUrl is %s",
+      async (approvalUrl) => {
+        const connection = createConnection();
+        const hint =
+          "In Vana, open Settings → Server and choose Review next to this client.";
+        const result = await getTool("request_scope_access").handler(
+          { scopes: ["chatgpt.conversations"] },
+          {
+            connection,
+            readClient: createMinimalReadClient(),
+            requestScopeAccess: recordedRequest(connection),
+            scopeRequestApprovalUrl: () => approvalUrl,
+            scopeRequestReviewHint: hint,
+          },
+        );
+        const { nextAction } = JSON.parse(result.content[0].text);
+        const original = approvalUrl
+          ? `Show the user this link to review the request: ${approvalUrl} . Ask them to approve or decline it there and to tell you when they are done, then call list_granted_scopes to see what was granted. Access remains unchanged until the owner approves.`
+          : "Ask the user to review this request in Vana and approve or decline it. Access remains unchanged until the owner approves it.";
+        expect(nextAction).toBe(`${original} ${hint}`);
+        expect(nextAction.split(hint)).toHaveLength(2);
+      },
+    );
+
+    it.each([
+      ["instagram.profile", "No new grant is needed for the requested scopes."],
+      [
+        "chatgpt.conversations",
+        "Ask the user to open Vana's Personal Server page and add the missing scopes to this MCP client. This tool cannot grant access by itself.",
+      ],
+    ])(
+      "does not append the hint without a recorded request for %s",
+      async (scope, expected) => {
+        const result = await getTool("request_scope_access").handler(
+          { scopes: [scope] },
+          {
+            connection: createConnection(),
+            readClient: createMinimalReadClient(),
+            scopeRequestReviewHint: "In Vana, open Settings → Server.",
+          },
+        );
+        expect(JSON.parse(result.content[0].text).nextAction).toBe(expected);
+      },
+    );
+
     it("puts the request's read token in the Vana Web link fragment", async () => {
       const connection = createConnection();
       const requestScopeAccess = vi.fn().mockResolvedValue({
@@ -534,7 +671,7 @@ describe("mcp/tools", () => {
       const body = JSON.parse(result.content[0].text);
       expect(body).not.toHaveProperty("approvalUrl");
       expect(body.nextAction).toBe(
-        "The request is waiting for owner approval in Vana. Access remains unchanged until the owner approves it.",
+        "Ask the user to review this request in Vana and approve or decline it. Access remains unchanged until the owner approves it.",
       );
     });
 
