@@ -276,6 +276,55 @@ describe("mcp/connection-api", () => {
     ).rejects.toBeInstanceOf(McpConnectionStateError);
   });
 
+  it("asks to read a memory scope together with the write, so the agent can recall what it saves", async () => {
+    const store = createInMemoryMcpConnectionStore();
+    const created = await createMcpConnection(
+      { displayName: "Helper" },
+      { store, publicOrigin: PUBLIC_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "g1", scopes: ["memory.claude"] }],
+      },
+      { store },
+    );
+
+    const result = await requestMcpScopeAccess(
+      { connectionId: created.connectionId, scopes: ["write:memory.helper"] },
+      { store, now: () => new Date("2026-10-29T21:57:00.000Z") },
+    );
+
+    expect(result.requestRecorded).toBe(true);
+    expect(
+      (await listMcpConnectionViews(store))[0]?.scopeAccessRequest?.scopes,
+    ).toEqual(["memory.helper", "write:memory.helper"]);
+  });
+
+  it("does not re-ask for a memory read the connection already holds", async () => {
+    const store = createInMemoryMcpConnectionStore();
+    const created = await createMcpConnection(
+      { displayName: "Helper" },
+      { store, publicOrigin: PUBLIC_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "g1", scopes: ["memory.helper"] }],
+      },
+      { store },
+    );
+
+    await requestMcpScopeAccess(
+      { connectionId: created.connectionId, scopes: ["write:memory.helper"] },
+      { store },
+    );
+
+    expect(
+      (await listMcpConnectionViews(store))[0]?.scopeAccessRequest?.scopes,
+    ).toEqual(["write:memory.helper"]);
+  });
+
   it("keeps the existing request unchanged when the aggregate scope limit would be exceeded", async () => {
     const store = createInMemoryMcpConnectionStore();
     const created = await createMcpConnection(
@@ -953,12 +1002,14 @@ describe("mcp/connection-api scope request answers", () => {
 
   it("records an exact write: request when only a write wildcard is held", async () => {
     // remember ignores write wildcards, so the exact grant must stay requestable.
+    // With no read grant held, the request also asks to read the scope back.
     const { store, id } = await connectionWithRequest(
       [{ grantId: "0xgrant1", scopes: ["write:memory.*"] }],
       ["write:memory.claude"],
     );
 
     expect((await store.getById(id))?.scopeAccessRequest?.scopes).toEqual([
+      "memory.claude",
       "write:memory.claude",
     ]);
   });
