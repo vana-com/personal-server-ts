@@ -606,9 +606,9 @@ export interface ApproveMcpScopeAccessRequestOutput {
  * path does.
  *
  * The gateway keeps ONE grant per (owner, grantee) and a new registration
- * replaces its scopes, so the grant is re-signed over the union of every
- * scope the connection already holds plus the approved ones. Signing only
- * the new scopes would silently revoke the old ones.
+ * replaces its scopes, so the grant is re-signed over the scopes the
+ * connection still holds (see `retainedScopes`) plus the approved ones.
+ * Signing only the new scopes would silently revoke the old ones.
  */
 export async function approveMcpScopeAccessRequest(
   input: ApproveMcpScopeAccessRequestInput,
@@ -690,13 +690,13 @@ async function writeConnectionGrantScopes(
   finish: (record: McpConnectionRecord) => McpConnectionRecord = (record) =>
     record,
 ): Promise<{ connection: McpConnectionRecord; grantId: string }> {
-  // Approve supplies the snapshot used for its union: never re-read a newer
-  // version and sign it with scopes computed from an older gateway state.
+  // Approve and edit pass the snapshot their scopes came from, so the version
+  // and expiry signed match it (never a newer re-read).
   const live =
     liveState ??
     (await readLiveGrantState(connection, options.gateway, options.now));
-  // The gateway's scopes are inherited, not trusted: the whole array that
-  // will be stored must pass, before any gateway call or store write.
+  // Approve and edit sign record ∩ live gateway plus the approved scopes; the
+  // whole array must still be storable, before any gateway call or store write.
   try {
     assertStorableScopes(exactScopes);
   } catch (err) {
@@ -926,8 +926,6 @@ function parseApprovedScopes(
 }
 
 interface LiveGrantState {
-  /** Scopes the connection holds now: its record plus the live gateway grant. */
-  scopes: string[];
   /** Each grant the gateway holds live now, with its own scopes. */
   grants: LiveGrant[];
   nextGrantVersion: string;
@@ -954,7 +952,6 @@ async function readLiveGrantState(
   const grantIds = sortedUnique(
     connection.grants.map((grant) => grant.grantId),
   );
-  const scopes = new Set<string>();
   let maxVersion = 0n;
   let anyLive = false;
   let anyPerpetual = false;
@@ -987,7 +984,6 @@ async function readLiveGrantState(
   for (const { grantId, live } of looked) {
     if (live.revokedAt || isGrantExpired(live, nowSeconds)) continue;
     const liveExpiry = parseExpirySeconds(live.expiresAt);
-    for (const scope of live.scopes) scopes.add(scope);
     liveGrants.push({ grantId, scopes: [...live.scopes] });
     anyLive = true;
     if (liveExpiry === undefined) {
@@ -998,7 +994,6 @@ async function readLiveGrantState(
     }
   }
   return {
-    scopes: sortedUnique(scopes),
     grants: liveGrants,
     nextGrantVersion: (maxVersion + 1n).toString(),
     expiry: !anyLive
