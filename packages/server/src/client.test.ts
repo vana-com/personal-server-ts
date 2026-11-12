@@ -11,7 +11,10 @@ import {
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createTestReplicaRoster } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
 import Database from "better-sqlite3";
-import { startPersonalServer } from "./client.js";
+import {
+  startPersonalServer,
+  type StartPersonalServerNodeOptions,
+} from "./client.js";
 import type { PersonalServerHandle } from "@opendatalabs/personal-server-ts-core/client";
 import {
   enableReplicaTestIdentity,
@@ -84,6 +87,7 @@ async function getFreePort(): Promise<number> {
 async function startTestServer(
   gateway = createGateway(),
   declareUnswitched = true,
+  options: Partial<StartPersonalServerNodeOptions> = {},
 ) {
   const rootPath = await mkdtemp(join(tmpdir(), "ps-client-"));
   const port = await getFreePort();
@@ -101,6 +105,7 @@ async function startTestServer(
     gatewayClient: gateway,
     localApproval: false,
     startBackgroundServices: false,
+    ...options,
   });
   cleanupFns.push(async () => {
     await ps.stop();
@@ -126,6 +131,90 @@ describe("startPersonalServer node handle", () => {
       "port: 0 is not supported",
     );
   });
+
+  it.each([
+    "x".repeat(201),
+    "review\nthere",
+    "review\u0000there",
+    "\treview",
+    "review\u0085there",
+  ])(
+    "rejects an invalid review hint at startup: %j",
+    async (mcpScopeRequestReviewHint) => {
+      await expect(
+        startPersonalServer({ mcpScopeRequestReviewHint }),
+      ).rejects.toThrow(
+        /mcpScopeRequestReviewHint must (?:be at most 200 characters|not contain control characters)/,
+      );
+    },
+  );
+
+  it.each([
+    undefined,
+    "   ",
+    "  In Vana, open Settings → Server and choose Review next to this client.  ",
+    "x".repeat(200),
+  ])(
+    "carries the normalized review hint from startup to MCP: %j",
+    async (hint) => {
+      const { ps, port } = await startTestServer(createGateway(), {
+        mcpScopeRequestReviewHint: hint,
+        mcpScopeRequestApprovalUrl: () => "vana://approve",
+      });
+      const ownerPost = async (path: string, body: unknown) => {
+        const bytes = new TextEncoder().encode(JSON.stringify(body));
+        const auth = await buildWeb3SignedHeader({
+          wallet: ownerWallet,
+          aud: `http://localhost:${port}`,
+          method: "POST",
+          uri: path,
+          body: bytes,
+        });
+        return ps.fetch(path, {
+          method: "POST",
+          headers: { Authorization: auth, "Content-Type": "application/json" },
+          body: bytes,
+        });
+      };
+      const created = await ownerPost("/v1/mcp/connections", {
+        displayName: "Test client",
+      });
+      expect(created.status).toBe(201);
+      const { connectionId, connectionToken } = await created.json();
+      const approved = await ownerPost(
+        `/v1/mcp/connections/${connectionId}/approve`,
+        {
+          grants: [{ grantId: "grant-1", scopes: ["instagram.profile"] }],
+        },
+      );
+      expect(approved.status).toBe(200);
+      const response = await ps.fetch(`/mcp/${connectionToken}`, {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: {
+            name: "request_scope_access",
+            arguments: { scopes: ["chatgpt.conversations"] },
+          },
+        }),
+      });
+      expect(response.status).toBe(200);
+      const { result } = await response.json();
+      const body = JSON.parse(result.content[0].text);
+      const original =
+        "Show the user this link to review the request: vana://approve . Ask them to approve or decline it there and to tell you when they are done, then call list_granted_scopes to see what was granted. Access remains unchanged until the owner approves.";
+      expect(body.requestRecorded).toBe(true);
+      expect(body.nextAction).toBe(
+        original + (hint?.trim() ? ` ${hint.trim()}` : ""),
+      );
+    },
+  );
 
   it("passes mcpGrantTtlSeconds to the server and rejects a bad one at startup", async () => {
     const rootPath = await mkdtemp(join(tmpdir(), "ps-client-"));

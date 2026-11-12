@@ -76,6 +76,7 @@ export interface DataStorageScopeListOptions extends DataStorageListOptions {
   scopePrefix?: string;
 }
 
+/** See `DataStoragePort.findEntry`: a file id selects only within `scope`. */
 export interface DataStorageEntryLookup {
   scope: string;
   fileId?: string;
@@ -176,6 +177,10 @@ export interface DataStoragePort extends RuntimeStoragePort {
   };
   listVersions(scope: string, options: DataStorageListOptions): IndexEntry[];
   countVersions(scope: string): number;
+  /**
+   * Return an entry only if entry.scope === lookup.scope, including fileId
+   * lookups; otherwise return undefined exactly as for a nonexistent fileId.
+   */
   findEntry(lookup: DataStorageEntryLookup): IndexEntry | undefined;
   findByFileId(fileId: string): IndexEntry | undefined;
   /**

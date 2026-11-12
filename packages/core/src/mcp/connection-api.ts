@@ -11,6 +11,7 @@
  *
  *   POST   /v1/mcp/connections/:id/scope-request/approve
  *   POST   /v1/mcp/connections/:id/scope-request/deny
+ *   PUT    /v1/mcp/connections/:id/access (opt-in owner narrowing)
  *
  * and one read that is NOT owner-signed, because the owner's page needs it
  * before it asks for any signature:
@@ -23,7 +24,9 @@
  * approves them, and mark connections revoked.
  */
 
+import { McpGrantRegistrationError } from "./grant-registration.js";
 import { generateMcpGrantee } from "./grantee.js";
+import { mcpConnectionStateView } from "./store.js";
 import { createGrantContract } from "../contracts/index.js";
 import { isWriteScopeEntry, WRITE_SCOPE_PREFIX } from "../policy/data-write.js";
 import { isMemoryScope, isSystemScope } from "../policy/reserved-scopes.js";
@@ -306,6 +309,7 @@ export async function approveMcpConnection(
       "approveMcpConnection requires at least one grant; the consent flow must mint grants first",
     );
   }
+  assertStorableScopes(input.grants.flatMap((grant) => grant.scopes ?? []));
   const approvedAt = nowIso(options.now);
   const updated = await options.store.mutate(input.connectionId, (existing) => {
     if (existing.status === "revoked") {
@@ -354,6 +358,41 @@ function grantCoversScope(grant: McpConnectionGrant, scope: string): boolean {
   );
 }
 
+/** A grant the gateway holds live now, with the scopes it holds for it. */
+export interface LiveGrant {
+  grantId: string;
+  scopes: string[];
+}
+
+/**
+ * The stored grants, cut down to what the gateway says is live now. The
+ * gateway keeps one grant id per (owner, grantee) and a re-registration
+ * replaces its scopes under the same id, so a live id says nothing about
+ * which scopes still stand. A scope survives only when both the record and
+ * the gateway name it (a wildcard on one side covers a narrower scope on the
+ * other); a scope only the gateway names is never added; a grant left with no
+ * scope, or not live, is dropped.
+ */
+export function narrowGrants(
+  stored: readonly McpConnectionGrant[],
+  live: readonly LiveGrant[],
+): McpConnectionGrant[] {
+  const current = new Map(live.map((grant) => [grant.grantId, grant.scopes]));
+  return stored.flatMap((grant) => {
+    const gateway = current.get(grant.grantId);
+    if (!gateway) return [];
+    const scopes = Array.from(
+      new Set([
+        ...grant.scopes.filter((scope) =>
+          grantCoversScope({ ...grant, scopes: gateway }, scope),
+        ),
+        ...gateway.filter((scope) => grantCoversScope(grant, scope)),
+      ]),
+    );
+    return scopes.length > 0 ? [{ ...grant, scopes }] : [];
+  });
+}
+
 export interface RequestMcpScopeAccessOutput {
   connection: McpConnectionRecord;
   requestRecorded: boolean;
@@ -367,7 +406,13 @@ export interface RequestMcpScopeAccessOutput {
 }
 
 export async function requestMcpScopeAccess(
-  input: { connectionId: string; scopes: string[]; reason?: string },
+  input: {
+    connectionId: string;
+    scopes: string[];
+    reason?: string;
+    /** Grants live now; filters the request instead of the stored grants. */
+    liveGrants?: McpConnectionRecord["grants"];
+  },
   options: { store: McpConnectionStore; now?: () => Date },
 ): Promise<RequestMcpScopeAccessOutput> {
   const requestedAt = nowIso(options.now);
@@ -379,7 +424,9 @@ export async function requestMcpScopeAccess(
   const inputScopes = Array.from(
     new Set(input.scopes.map((scope) => scope.trim()).filter(Boolean)),
   ).sort();
+  let storedGrantIds = new Set<string>();
   const updated = await options.store.mutate(input.connectionId, (existing) => {
+    storedGrantIds = new Set(existing.grants.map((grant) => grant.grantId));
     if (existing.status !== "approved") {
       throw new McpConnectionStateError(
         input.connectionId,
@@ -394,7 +441,9 @@ export async function requestMcpScopeAccess(
           .filter(
             (scope) =>
               scope.length > 0 &&
-              !existing.grants.some((grant) => grantCoversScope(grant, scope)),
+              !(input.liveGrants ?? existing.grants).some((grant) =>
+                grantCoversScope(grant, scope),
+              ),
           ),
       ),
     ).sort();
@@ -412,10 +461,27 @@ export async function requestMcpScopeAccess(
   });
   if (!updated) throw new McpConnectionNotFoundError(input.connectionId);
   const missingInputScopes = inputScopes.filter(
-    (scope) => !updated.grants.some((grant) => grantCoversScope(grant, scope)),
+    (scope) =>
+      !(input.liveGrants ?? updated.grants).some((grant) =>
+        grantCoversScope(grant, scope),
+      ),
   );
+  // Grants the caller found dead stay out of the answer, so it does not call
+  // them granted; a grant added while the request was written still counts.
+  const liveById = input.liveGrants
+    ? new Map(input.liveGrants.map((grant) => [grant.grantId, grant]))
+    : undefined;
   return {
-    connection: updated,
+    connection: liveById
+      ? {
+          ...updated,
+          grants: updated.grants.flatMap((grant) => {
+            if (!storedGrantIds.has(grant.grantId)) return [grant];
+            const live = liveById.get(grant.grantId);
+            return live ? [live] : [];
+          }),
+        }
+      : updated,
     requestRecorded:
       missingInputScopes.length > 0 &&
       missingInputScopes.every((scope) =>
@@ -457,7 +523,12 @@ function digestsEqual(a: string, b: string): boolean {
  */
 export async function readMcpScopeRequestWithToken(
   input: { connectionId: string; token: string | null | undefined },
-  options: { store: McpConnectionStore; now?: () => Date },
+  options: {
+    store: McpConnectionStore;
+    /** Required: dead grants must not show, and no gateway shows none. */
+    gateway: Pick<GatewayClient, "getGrant"> | undefined;
+    now?: () => Date;
+  },
 ): Promise<McpScopeRequestReadView | null> {
   const token = input.token?.trim() ?? "";
   if (!token || token.length > MAX_READ_TOKEN_CHARS || !input.connectionId) {
@@ -474,11 +545,15 @@ export async function readMcpScopeRequestWithToken(
     return null;
   }
   if (request.scopes.length === 0) return null;
+  const liveGrants = narrowGrants(
+    record.grants,
+    await liveMcpGrants(record, options.gateway, options.now),
+  );
   return {
     id: record.id,
     displayName: record.displayName,
     scopeAccessRequest: toMcpScopeAccessRequestView(request),
-    grantedScopes: sortedUnique(record.grants.flatMap((grant) => grant.scopes)),
+    grantedScopes: sortedUnique(liveGrants.flatMap((grant) => grant.scopes)),
   };
 }
 
@@ -503,6 +578,7 @@ export interface ApproveMcpScopeAccessRequestInput {
 
 export interface ApproveMcpScopeAccessRequestOptions {
   store: McpConnectionStore;
+  /** Registration must reject failed writes; wrap SDK clients with withStrictMcpGrantRegistration. */
   gateway: Pick<GatewayClient, "getBuilder" | "getGrant" | "createGrant">;
   serverOwner?: `0x${string}`;
   serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
@@ -530,9 +606,9 @@ export interface ApproveMcpScopeAccessRequestOutput {
  * path does.
  *
  * The gateway keeps ONE grant per (owner, grantee) and a new registration
- * replaces its scopes, so the grant is re-signed over the union of every
- * scope the connection already holds plus the approved ones. Signing only
- * the new scopes would silently revoke the old ones.
+ * replaces its scopes, so the grant is re-signed over the scopes the
+ * connection still holds (see `retainedScopes`) plus the approved ones.
+ * Signing only the new scopes would silently revoke the old ones.
  */
 export async function approveMcpScopeAccessRequest(
   input: ApproveMcpScopeAccessRequestInput,
@@ -543,8 +619,92 @@ export async function approveMcpScopeAccessRequest(
   const pending = requirePendingScopeRequest(connection);
   const approvedScopes = parseApprovedScopes(input.scopes, pending);
 
-  const live = await readLiveGrantState(connection, options.gateway);
-  const grantedScopes = sortedUnique([...live.scopes, ...approvedScopes]);
+  const live = await readLiveGrantState(
+    connection,
+    options.gateway,
+    options.now,
+  );
+  // Keep only what reads serve (record AND gateway), as edit does. A scope on
+  // the gateway but not in the record is a write whose local commit was lost;
+  // the owner may have denied it since (deny is local and does not touch the
+  // gateway), so it is never re-signed. Reads never serve it meanwhile.
+  const grantedScopes = sortedUnique([
+    ...retainedScopes(connection, live),
+    ...approvedScopes,
+  ]);
+
+  const decidedAt = nowIso(options.now);
+  const deniedScopes = pending.scopes.filter(
+    (scope) => !approvedScopes.includes(scope),
+  );
+  const { connection: updated, grantId } = await writeConnectionGrantScopes(
+    connection,
+    grantedScopes,
+    options,
+    live,
+    (latest) => ({
+      ...latest,
+      scopeAccessRequest: undefined,
+      scopeAccessDecision: {
+        decision: "approved",
+        approvedScopes,
+        deniedScopes,
+        requestedAt: pending.requestedAt,
+        decidedAt,
+      },
+    }),
+  );
+  return {
+    connection: updated,
+    grantId,
+    grantedScopes,
+    approvedScopes,
+    deniedScopes,
+  };
+}
+
+/**
+ * Scopes a replacement grant may keep: exactly what reads serve now
+ * (`narrowGrants`: the record and the live gateway grant must both cover a
+ * scope, wildcards included). Neither side alone is enough: the record can lag
+ * a lost commit, and the gateway can hold a scope the owner has since denied.
+ */
+function retainedScopes(
+  connection: McpConnectionRecord,
+  live: LiveGrantState,
+): string[] {
+  if (live.expiry.kind === "none") return [];
+  return sortedUnique(
+    narrowGrants(connection.grants, live.grants).flatMap(
+      (grant) => grant.scopes,
+    ),
+  );
+}
+
+/** Register exact scopes, then commit only over the record version read before signing. */
+async function writeConnectionGrantScopes(
+  connection: McpConnectionRecord,
+  exactScopes: string[],
+  options: ApproveMcpScopeAccessRequestOptions,
+  liveState?: LiveGrantState,
+  finish: (record: McpConnectionRecord) => McpConnectionRecord = (record) =>
+    record,
+): Promise<{ connection: McpConnectionRecord; grantId: string }> {
+  // Approve and edit pass the snapshot their scopes came from, so the version
+  // and expiry signed match it (never a newer re-read).
+  const live =
+    liveState ??
+    (await readLiveGrantState(connection, options.gateway, options.now));
+  // Approve and edit sign record ∩ live gateway plus the approved scopes; the
+  // whole array must still be storable, before any gateway call or store write.
+  try {
+    assertStorableScopes(exactScopes);
+  } catch (err) {
+    if (err instanceof McpInvalidScopeError) {
+      throw new McpScopeRequestError("INVALID_SCOPE", err.message, 400);
+    }
+    throw err;
+  }
   // Keep the live grant's expiry so approval never extends it (a perpetual
   // live grant stays perpetual). Only a connection with no live grant gets
   // the default lifetime from now.
@@ -561,21 +721,23 @@ export async function approveMcpScopeAccessRequest(
       serverSigner: options.serverSigner,
       body: {
         granteeAddress: connection.granteeAddress,
-        scopes: grantedScopes,
+        scopes: exactScopes,
         grantVersion: live.nextGrantVersion,
         ...(expiresAt !== undefined ? { expiresAt } : {}),
       },
     });
   } catch (err) {
     throw new McpScopeRequestError(
-      "GRANT_CREATION_FAILED",
+      err instanceof McpGrantRegistrationError && err.retryable
+        ? "RETRY"
+        : "GRANT_CREATION_FAILED",
       err instanceof Error ? err.message : String(err),
-      502,
+      err instanceof McpGrantRegistrationError && err.retryable ? 409 : 502,
     );
   }
   if (!grantResult.ok) {
     throw new McpScopeRequestError(
-      "GRANT_CREATION_FAILED",
+      grantResult.status === 409 ? "RETRY" : "GRANT_CREATION_FAILED",
       extractGrantErrorMessage(grantResult.body),
       grantResult.status >= 500 ? 502 : grantResult.status === 409 ? 409 : 400,
       grantResult.body,
@@ -591,43 +753,79 @@ export async function approveMcpScopeAccessRequest(
     );
   }
 
-  const decidedAt = nowIso(options.now);
-  const deniedScopes = pending.scopes.filter(
-    (scope) => !approvedScopes.includes(scope),
-  );
-  const updated = await options.store.mutate(input.connectionId, (latest) => {
-    // The grant above was signed from the state read before the gateway
-    // round trip; refuse to store it over a change made in between.
-    requirePendingScopeRequest(latest);
-    if (JSON.stringify(latest.grants) !== JSON.stringify(connection.grants)) {
+  const updated = await options.store.mutate(connection.id, (latest) => {
+    if (
+      (latest.revision ?? 0) !== (connection.revision ?? 0) ||
+      mcpConnectionStateView(latest) !== mcpConnectionStateView(connection)
+    ) {
       throw new McpScopeRequestError(
         "CONCURRENT_UPDATE",
-        "The connection's grants changed during approval; retry.",
+        "The connection changed during the grant write; retry.",
         409,
       );
     }
-    const decision: McpScopeAccessDecision = {
-      decision: "approved",
-      approvedScopes,
-      deniedScopes,
-      requestedAt: pending.requestedAt,
-      decidedAt,
-    };
-    return {
-      ...latest,
-      grants: [{ grantId, scopes: grantedScopes }],
-      scopeAccessRequest: undefined,
-      scopeAccessDecision: decision,
-    };
+    return finish({ ...latest, grants: [{ grantId, scopes: exactScopes }] });
   });
-  if (!updated) throw new McpConnectionNotFoundError(input.connectionId);
-  return {
-    connection: updated,
-    grantId,
-    grantedScopes,
-    approvedScopes,
-    deniedScopes,
-  };
+  if (!updated) throw new McpConnectionNotFoundError(connection.id);
+  return { connection: updated, grantId };
+}
+
+/** Owner replaces an approved connection's access with a non-empty subset. */
+export async function editMcpConnectionAccess(
+  input: { connectionId: string; scopes: unknown },
+  options: ApproveMcpScopeAccessRequestOptions,
+): Promise<McpConnectionRecord> {
+  const connection = await options.store.getById(input.connectionId);
+  if (!connection) throw new McpConnectionNotFoundError(input.connectionId);
+  if (connection.status !== "approved") {
+    throw new McpConnectionStateError(
+      connection.id,
+      connection.status,
+      "approved",
+    );
+  }
+  if (
+    !Array.isArray(input.scopes) ||
+    input.scopes.length === 0 ||
+    !input.scopes.every(
+      (scope) => typeof scope === "string" && scope.length > 0,
+    )
+  ) {
+    throw new McpScopeRequestError(
+      "INVALID_SCOPE",
+      "Provide a non-empty scopes array. Use Disconnect to remove all access.",
+    );
+  }
+  const scopes = sortedUnique(input.scopes as string[]);
+  const stored = sortedUnique(
+    connection.grants.flatMap((grant) => grant.scopes),
+  );
+  if (scopes.some((scope) => !stored.includes(scope))) {
+    throw new McpScopeRequestError(
+      "INVALID_SCOPE",
+      "Edits may only remove stored scopes. Request access to add a scope.",
+    );
+  }
+  if (JSON.stringify(scopes) === JSON.stringify(stored)) return connection;
+  // The stored grant can lag the gateway (a gateway write accepted, the local
+  // commit lost). Judge the edit against the gateway's scopes at the version
+  // the write will advance past: the gateway's version check then guarantees
+  // nothing lands in between, so an edit can never re-sign a removed scope.
+  const live = await readLiveGrantState(
+    connection,
+    options.gateway,
+    options.now,
+  );
+  const effective = retainedScopes(connection, live);
+  if (scopes.some((scope) => !effective.includes(scope))) {
+    throw new McpScopeRequestError(
+      "RETRY",
+      "The connection's access changed on the gateway. Refresh and try again.",
+      409,
+    );
+  }
+  return (await writeConnectionGrantScopes(connection, scopes, options, live))
+    .connection;
 }
 
 /** Owner declines the pending request; the decision stays for the client. */
@@ -728,8 +926,8 @@ function parseApprovedScopes(
 }
 
 interface LiveGrantState {
-  /** Scopes the connection holds now: its record plus the live gateway grant. */
-  scopes: string[];
+  /** Each grant the gateway holds live now, with its own scopes. */
+  grants: LiveGrant[];
   nextGrantVersion: string;
   /**
    * The expiry approval must carry over so it never extends access:
@@ -749,16 +947,19 @@ interface LiveGrantState {
 async function readLiveGrantState(
   connection: McpConnectionRecord,
   gateway: Pick<GatewayClient, "getGrant">,
+  now?: () => Date,
 ): Promise<LiveGrantState> {
   const grantIds = sortedUnique(
     connection.grants.map((grant) => grant.grantId),
   );
-  const revoked = new Set<string>();
-  const scopes = new Set<string>();
   let maxVersion = 0n;
   let anyLive = false;
   let anyPerpetual = false;
   let expiresAt: number | undefined;
+  const looked: {
+    grantId: string;
+    live: NonNullable<Awaited<ReturnType<typeof gateway.getGrant>>>;
+  }[] = [];
   for (const grantId of grantIds) {
     let live: Awaited<ReturnType<typeof gateway.getGrant>>;
     try {
@@ -773,13 +974,18 @@ async function readLiveGrantState(
     if (!live) continue;
     const version = parseUint(live.grantVersion);
     if (version !== null && version > maxVersion) maxVersion = version;
-    if (live.revokedAt) {
-      revoked.add(grantId);
-      continue;
-    }
-    for (const scope of live.scopes) scopes.add(scope);
-    anyLive = true;
+    looked.push({ grantId, live });
+  }
+  // One clock reading after ALL the lookups: a grant that expired while a
+  // later lookup ran must not pass its scopes on. Only a grant that is live
+  // now does; a revoked, expired or missing one counts as never granted.
+  const nowSeconds = Math.floor(nowMs(now) / 1000);
+  const liveGrants: LiveGrant[] = [];
+  for (const { grantId, live } of looked) {
+    if (live.revokedAt || isGrantExpired(live, nowSeconds)) continue;
     const liveExpiry = parseExpirySeconds(live.expiresAt);
+    liveGrants.push({ grantId, scopes: [...live.scopes] });
+    anyLive = true;
     if (liveExpiry === undefined) {
       anyPerpetual = true;
     } else {
@@ -787,12 +993,8 @@ async function readLiveGrantState(
         expiresAt === undefined ? liveExpiry : Math.max(expiresAt, liveExpiry);
     }
   }
-  for (const grant of connection.grants) {
-    if (revoked.has(grant.grantId)) continue;
-    for (const scope of grant.scopes) scopes.add(scope);
-  }
   return {
-    scopes: sortedUnique(scopes),
+    grants: liveGrants,
     nextGrantVersion: (maxVersion + 1n).toString(),
     expiry: !anyLive
       ? { kind: "none" }
@@ -807,15 +1009,95 @@ function parseUint(value: unknown): bigint | null {
   return BigInt(value);
 }
 
-/** Gateway expiry may be unix seconds or an ISO date; 0/null means perpetual. */
-function parseExpirySeconds(value: string | null): number | undefined {
-  if (!value) return undefined;
+/** Parsed as already expired: anything we cannot read is never "perpetual". */
+const EXPIRED_AT_SECONDS = 0;
+/** Unix seconds above this (year 5138) are really milliseconds. */
+const MAX_UNIX_SECONDS = 1e11;
+const ISO_DATE_TIME =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/u;
+
+/**
+ * The gateway's expiry (data-gateway lib/grants.ts: `expiresAt` is an ISO 8601
+ * string or null; the uint256 form is unix seconds, "0" meaning no expiry), as
+ * unix seconds. `undefined` is perpetual and only null, undefined or "0" give
+ * it. Anything unreadable fails closed as already expired.
+ */
+function parseExpirySeconds(value: unknown): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value !== "string") return EXPIRED_AT_SECONDS;
   if (/^\d+$/u.test(value)) {
     const seconds = Number(value);
-    return seconds > 0 ? seconds : undefined;
+    if (seconds === 0) return undefined;
+    return Number.isFinite(seconds) && seconds <= MAX_UNIX_SECONDS
+      ? seconds
+      : EXPIRED_AT_SECONDS;
   }
-  const ms = Date.parse(value);
-  return Number.isFinite(ms) ? Math.floor(ms / 1000) : undefined;
+  const ms = ISO_DATE_TIME.test(value) ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : EXPIRED_AT_SECONDS;
+}
+
+/** The one expiry rule: the gateway's `expired` flag, or `expiresAt` reached. */
+export function isGrantExpired(
+  grant: { expired?: boolean; expiresAt?: unknown },
+  nowSeconds: number,
+): boolean {
+  const expiresAt = parseExpirySeconds(grant.expiresAt);
+  return (
+    Boolean(grant.expired) ||
+    (expiresAt !== undefined && expiresAt <= nowSeconds)
+  );
+}
+
+/**
+ * The connection's grants that are still live at the gateway (present, not
+ * revoked, not expired), each with the scopes the gateway holds for it now.
+ * Looked up in parallel, one `getGrant` per grant. Not approved, no grants, or
+ * any failed lookup gives none, so callers fail closed. A connection token
+ * outlives its grants, so a feature that reveals data must check this first
+ * and cut the stored scopes down with `narrowGrants`.
+ */
+export async function liveMcpGrants(
+  connection: McpConnectionRecord,
+  gateway: Pick<GatewayClient, "getGrant"> | undefined,
+  now: () => Date = () => new Date(),
+): Promise<LiveGrant[]> {
+  const grantIds = sortedUnique(
+    connection.grants.map((grant) => grant.grantId),
+  );
+  if (connection.status !== "approved") return [];
+  // No gateway means no authority to say a grant still stands: no grants.
+  if (!gateway) return [];
+  try {
+    const looked = await Promise.all(
+      grantIds.map(async (grantId) => ({
+        grantId,
+        live: await gateway.getGrant(grantId),
+      })),
+    );
+    // One clock reading after ALL the lookups: a grant that expired while a
+    // later lookup ran is not live.
+    const nowSeconds = Math.floor(now().getTime() / 1000);
+    return looked.flatMap(({ grantId, live }) =>
+      !live || live.revokedAt || isGrantExpired(live, nowSeconds)
+        ? []
+        : [{ grantId, scopes: [...live.scopes] }],
+    );
+  } catch {
+    return [];
+  }
+}
+
+/** True when the connection has grants and every one is live. */
+export async function areMcpConnectionGrantsLive(
+  connection: McpConnectionRecord,
+  gateway: Pick<GatewayClient, "getGrant">,
+  now: () => Date = () => new Date(),
+): Promise<boolean> {
+  const live = await liveMcpGrants(connection, gateway, now);
+  return (
+    live.length > 0 &&
+    live.length === sortedUnique(connection.grants.map((g) => g.grantId)).length
+  );
 }
 
 function sortedUnique(values: Iterable<string>): string[] {
@@ -957,6 +1239,29 @@ export class McpOAuthAuthorizationError extends Error {
   ) {
     super(message);
     this.name = "McpOAuthAuthorizationError";
+  }
+}
+
+/** A scope no grant may store. A 400 on every route that stores scopes. */
+export class McpInvalidScopeError extends McpOAuthAuthorizationError {
+  constructor(scope: unknown) {
+    super("invalid_scope", `Invalid scope: ${JSON.stringify(scope)}`);
+  }
+}
+
+/**
+ * The one check for scopes about to be stored on a connection, whichever
+ * route they arrive by. A read entry must name something (never blank or a
+ * bare "*"); a `write:` entry must be one concrete memory scope.
+ */
+export function assertStorableScopes(scopes: readonly unknown[]): void {
+  for (const scope of scopes) {
+    const bad =
+      typeof scope !== "string" ||
+      scope.trim() === "" ||
+      scope === "*" ||
+      (isWriteScopeEntry(scope) && !isApprovableScope(scope));
+    if (bad) throw new McpInvalidScopeError(scope);
   }
 }
 
@@ -1255,18 +1560,8 @@ export async function approveMcpOAuthAuthorizationWithScopes(
   // Read entries are signed as before. A `write:` entry follows the same rule
   // as a scope-request approval: one concrete scope, never a wildcard, since
   // `remember` makes a write grant on this connection usable.
-  const badWrite = input.scopes.find(
-    (scope) =>
-      typeof scope === "string" &&
-      isWriteScopeEntry(scope) &&
-      !isApprovableScope(scope),
-  );
-  if (badWrite !== undefined) {
-    throw new McpOAuthAuthorizationError(
-      "invalid_scope",
-      `Invalid write scope: ${JSON.stringify(badWrite)}`,
-    );
-  }
+  // A bare "*" or an empty entry names no source; it must never be stored.
+  assertStorableScopes(input.scopes);
 
   const connection = await options.connectionStore.getById(record.connectionId);
   if (!connection) {
@@ -1335,7 +1630,12 @@ export async function approveMcpOAuthAuthorizationWithScopes(
   return approveMcpOAuthAuthorization(
     {
       authorizationId: input.authorizationId,
-      grants: [{ grantId, scopes: input.scopes }],
+      grants: [
+        {
+          grantId,
+          scopes: input.scopes,
+        },
+      ],
     },
     options,
   );
