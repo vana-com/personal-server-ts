@@ -26,6 +26,8 @@ export type LegacyImportResult =
       readonly reason:
         | "connection_deleted"
         | "generation_not_one"
+        /** A real write already owns the stream; see `seedWindowClosed`. */
+        | "seed_window_closed"
         | "unknown_control"
         | "owner_mismatch"
         | "source_changed"
@@ -45,6 +47,7 @@ export type LegacyImportResult =
  * per-stream deletion history too. Stage sorted digests only, then replay source
  * rows and check each digest before merging. Missing/extra/changed rows cannot
  * earn a receipt. Replays/crash retries add no rows or changes.
+ * A stream's seed window closes at its first real write (`seedWindowClosed`).
  * Receipt and last merge commit atomically; highestSeq includes earlier crash
  * batches (conservatively use the stream change high-water mark). Empty
  * snapshots receive a zero-row receipt; invalid, changed or excluded sources
@@ -66,8 +69,23 @@ export async function importLegacySource(
   )
     return { kind: "refused", reason: "owner_mismatch" };
   return deps.queue.run(connectionId, "end", async () => {
+    // A closed seed window refuses a new import. A completed receipt for this
+    // exact revision is reported as such, and nothing is merged again.
+    const refuse = async (
+      reason: Extract<LegacyImportResult, { kind: "refused" }>["reason"],
+    ): Promise<LegacyImportResult> => {
+      if (reason === "seed_window_closed") {
+        const prior = await ledger.get(source.source, connectionId, stream);
+        if (
+          prior?.revision === source.revision &&
+          ["imported", "verified", "retired"].includes(prior.state)
+        )
+          return { kind: "already-imported", receipt: prior };
+      }
+      return { kind: "refused", reason };
+    };
     const refused = await importFence(deps, source);
-    if (refused) return { kind: "refused", reason: refused };
+    if (refused) return refuse(refused);
     if (connectionId === controlScope(connector, IDENTITYLESS_NS)) {
       await syncBeforeBegin(
         {
@@ -81,7 +99,7 @@ export async function importLegacySource(
       );
     }
     const refreshed = await importFence(deps, source);
-    if (refreshed) return { kind: "refused", reason: refreshed };
+    if (refreshed) return refuse(refreshed);
     if (source.exclusions.length > 0)
       return { kind: "refused", reason: "invalid_record" };
     const op = deps.newOp();
@@ -238,12 +256,12 @@ async function importFence(
     semantics: string;
     incremental: number;
     last_delete_version: number;
+    floor_o: number | null;
+    head_version: number;
   }>(
-    "SELECT primary_key, semantics, incremental, last_delete_version FROM stream_state WHERE connection_id = ? AND stream = ?",
+    "SELECT primary_key, semantics, incremental, last_delete_version, floor_o, head_version FROM stream_state WHERE connection_id = ? AND stream = ?",
     [source.target.connectionId, source.target.stream],
   );
-  // A collection floor describes newer data, not a deletion. Seed stamps
-  // lose to real writes at the merge owner; actual delete history still fences.
   if (state && state.last_delete_version !== 0) return "connection_deleted";
   if (
     state &&
@@ -252,7 +270,23 @@ async function importFence(
       state.incremental !== (source.target.incremental ? 1 : 0))
   )
     return "invalid_record";
+  if (state && seedWindowClosed(state)) return "seed_window_closed";
   return null;
+}
+
+/**
+ * Old data is a one-time seed and any real write wins over it. A stream's
+ * window closes at its first accepted real write (`floor_o`, set by run end) or
+ * its first published or applied head (`head_version`). The merge cannot
+ * enforce this: it inserts an absent key whatever its stamp, so a seed would
+ * bring back a record that a real full refresh or delete already removed.
+ * `guardImport` repeats this exact predicate in SQL.
+ */
+function seedWindowClosed(state: {
+  floor_o: number | null;
+  head_version: number;
+}): boolean {
+  return state.floor_o !== null || state.head_version > 0;
 }
 /** Enforce the fence in the merge transaction too, closing the read/commit gap.
  * This TEMP assertion is operation-scoped and never authorizes deletion. */
@@ -270,7 +304,7 @@ function guardImport(source: ImportSource, op: string): SqlStatement[] {
       sql: "CREATE TEMP TABLE IF NOT EXISTS import_guard (op TEXT PRIMARY KEY, ok INTEGER NOT NULL CHECK(ok = 1))",
     },
     {
-      sql: `INSERT INTO import_guard SELECT ?, CASE WHEN EXISTS(SELECT 1 FROM connections c WHERE c.connection_id = ? AND c.connector = ? AND c.generation = 1 AND c.control_state IN ('active','absent') AND c.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector = c.connector)) AND NOT EXISTS(SELECT 1 FROM stream_state s WHERE s.connection_id = ? AND s.stream = ? AND (s.last_delete_version <> 0 OR s.primary_key <> ? OR s.semantics <> ? OR s.incremental <> ?)) THEN 1 ELSE 0 END`,
+      sql: `INSERT INTO import_guard SELECT ?, CASE WHEN EXISTS(SELECT 1 FROM connections c WHERE c.connection_id = ? AND c.connector = ? AND c.generation = 1 AND c.control_state IN ('active','absent') AND c.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector = c.connector)) AND NOT EXISTS(SELECT 1 FROM stream_state s WHERE s.connection_id = ? AND s.stream = ? AND (s.last_delete_version <> 0 OR s.floor_o IS NOT NULL OR s.head_version > 0 OR s.primary_key <> ? OR s.semantics <> ? OR s.incremental <> ?)) THEN 1 ELSE 0 END`,
       params: [
         op,
         connectionId,
