@@ -275,7 +275,16 @@ async function applyOne(
   const read = await deps.registry.read(scope);
   const classification = classifyStreamRow(read, hashes);
   if (!read.found || classification === "absent") return result(stream, "gone");
+  const [state] = await deps.db.query<State>(
+    `SELECT s.primary_key,s.last_delete_version,s.head_version,s.head_generation,s.head_data_hash,v.head_format FROM stream_state s LEFT JOIN stream_versions v ON v.connection_id=s.connection_id AND v.stream=s.stream AND v.version=s.head_version AND v.generation=s.head_generation WHERE s.connection_id=? AND s.stream=?`,
+    [id, stream],
+  );
   if (classification === "tombstoned") {
+    // A tombstone this device already consumed deleted nothing new. Rows a
+    // collection staged or committed after that fence are newer than the
+    // delete and stay; only a later delete version purges them.
+    if (state && read.version <= state.last_delete_version)
+      return result(stream, "noop");
     await deps.db.batch(
       withOrigin("purge", [
         {
@@ -302,10 +311,6 @@ async function applyOne(
     );
     return result(stream, "purged");
   }
-  const [state] = await deps.db.query<State>(
-    `SELECT s.primary_key,s.last_delete_version,s.head_version,s.head_generation,s.head_data_hash,v.head_format FROM stream_state s LEFT JOIN stream_versions v ON v.connection_id=s.connection_id AND v.stream=s.stream AND v.version=s.head_version AND v.generation=s.head_generation WHERE s.connection_id=? AND s.stream=?`,
-    [id, stream],
-  );
   if (state && read.version <= state.last_delete_version)
     return result(stream, "gone");
   const saved = await deps.db.query<SavedPart>(
