@@ -1118,4 +1118,139 @@ describe("part layout of records with no covering part", () => {
     for (const p of grown.head.parts)
       expect(p.bytes).toBeLessThanOrEqual(16 * 1024);
   });
+
+  // A 16-bit prefix group heavier than the target: the planner must split
+  // below 8 bits there, which needs that shard's 16-bit counts.
+  describe("a base group heavier than the target", () => {
+    const TARGET = 1024;
+
+    /** Two ids whose pk hashes share their first 16 bits. */
+    async function sharedPrefixPair() {
+      const seen = new Map<string, string>();
+      for (let i = 0; ; i += 1) {
+        const id = `p${i}`;
+        const hash = await pkHash(sha256Bytes, { id }, ["id"]);
+        const shard = hash.slice(0, 4);
+        const first = seen.get(shard);
+        if (first !== undefined) return { ids: [first, id], shard, hash };
+        seen.set(shard, id);
+      }
+    }
+
+    /** An id whose pk hash starts in a different shard than `shard`. */
+    async function idOutsideShard(shard: string) {
+      for (let i = 0; ; i += 1) {
+        const id = `o${i}`;
+        const hash = await pkHash(sha256Bytes, { id }, ["id"]);
+        if (hash.slice(0, 2) !== shard.slice(0, 2)) return id;
+      }
+    }
+
+    async function seedIds(deps: LocalSyncDeps, ids: readonly string[]) {
+      const statements: { sql: string; params: never[] | unknown[] }[] = [
+        {
+          sql: `UPDATE write_ctx SET origin = 'local' WHERE id = 1`,
+          params: [],
+        },
+      ];
+      for (const id of ids) {
+        const body = canonicalJson({ id, pad: "x".repeat(600) });
+        statements.push({
+          sql: `INSERT INTO records (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
+                VALUES (?, ?, ?, ?, 1000, 'r1', ?, ?, NULL)`,
+          params: [
+            CONNECTION_ID,
+            STREAM,
+            await pkHash(sha256Bytes, { id }, ["id"]),
+            id,
+            body,
+            sha256Hex(body),
+          ],
+        });
+      }
+      await deps.db.batch(statements as never);
+    }
+
+    /** A published stream whose two ids share one 16-bit group above target. */
+    async function heavyGroup() {
+      const { ids, shard, hash } = await sharedPrefixPair();
+      const world = await makeWorld();
+      world.deps.partTargetBytes = TARGET;
+      await seedConnection(world.deps);
+      await seedStream(world.deps);
+      await localRun(world);
+      await seedIds(world.deps, ids);
+      expect(
+        (await publishConnection(world.deps, CONNECTION_ID))[0]?.outcome,
+      ).toBe("published");
+      const bits = pkHashBits(hash, 16);
+      const before = await published(world);
+      expect(before.values.map((v) => v.id).sort()).toEqual([...ids].sort());
+      expect(before.head.parts.some((p) => p.prefix === bits)).toBe(true);
+      return { world, ids, bits, shard, before };
+    }
+
+    it("a delete of a row in that group publishes without counts and drops the row", async () => {
+      const { world, ids } = await heavyGroup();
+      await seedRun(world.deps, "r2", 2000);
+      await world.deps.db.batch([
+        {
+          sql: `UPDATE write_ctx SET origin = 'local' WHERE id = 1`,
+          params: [],
+        },
+        {
+          sql: `DELETE FROM records WHERE connection_id = ? AND stream = ? AND record_key = ?`,
+          params: [CONNECTION_ID, STREAM, ids[1]!],
+        },
+      ]);
+      expect(
+        (await publishConnection(world.deps, CONNECTION_ID))[0]?.outcome,
+      ).toBe("published");
+      const after = await published(world);
+      expect(after.values.map((v) => v.id)).toEqual([ids[0]]);
+      // No part prefix is a prefix of another part's prefix.
+      const prefixes = after.head.parts.map((p) => p.prefix);
+      for (const a of prefixes)
+        for (const b of prefixes)
+          if (a !== b) expect(b.startsWith(a)).toBe(false);
+    });
+
+    it("a replace run over that group publishes without counts", async () => {
+      const { world } = await heavyGroup();
+      const read = await world.registry.read(SCOPE);
+      if (!read.found) throw new Error("no head");
+      await localRun(world, "r2", {
+        replace: true,
+        basisVersion: read.version,
+        basisHash: read.dataHash,
+      });
+      // Stamped by the replace run r2, so it is at or above the replace bound.
+      await seedRecord(world.deps, "c", canonicalJson({ id: "c" }), {
+        stampO: 2000,
+        stampR: "r2",
+      });
+      expect(
+        (await publishConnection(world.deps, CONNECTION_ID))[0]?.outcome,
+      ).toBe("published");
+      expect((await published(world)).values.map((v) => v.id)).toEqual(["c"]);
+    });
+
+    it("an unchanged heavy group is retained while a row in another shard publishes", async () => {
+      const { world, ids, bits, shard, before } = await heavyGroup();
+      const other = await idOutsideShard(shard);
+      await seedRun(world.deps, "r2", 2000);
+      await seedIds(world.deps, [other]);
+      expect(
+        (await publishConnection(world.deps, CONNECTION_ID))[0]?.outcome,
+      ).toBe("published");
+      const after = await published(world);
+      expect(after.values.map((v) => v.id).sort()).toEqual(
+        [...ids, other].sort(),
+      );
+      const heavy = (head: Head) =>
+        head.parts.filter((p) => p.prefix.startsWith(bits)).map((p) => p.hash);
+      expect(heavy(before.head).length).toBeGreaterThan(1);
+      expect(heavy(after.head)).toEqual(heavy(before.head));
+    });
+  });
 });
