@@ -10,6 +10,7 @@ import {
 import type { SqlValue } from "./driver.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { meteredBlobs, type PublishMeter } from "./publish-meter.js";
+import { newUploadWave, type UploadWave } from "./upload-wave.js";
 
 const hash = async (bytes: Uint8Array): Promise<Uint8Array> => sha256(bytes);
 
@@ -262,18 +263,21 @@ async function* readSpool(
 }
 
 /**
+/**
+ * Parts one stream's transfer holds at once while they wait for the storage
+ * client's turn (encoded bytes and ciphertext each). The storage client's own
+ * limits decide how many go on the wire; this only bounds memory.
+ */
+export const PARTS_IN_FLIGHT = 2;
+
+/**
  * C.2 step 4, after the freeze: read the attempt's spool page by page, encode
  * the rows as v3 frames (format 4 head) in parts of at most `partTargetBytes`,
  * STREAM-encrypted, and upload each part that does not exist. Identical rows
  * give an identical part, so a repeat run makes zero PUTs.
  *
- * It needs no queue slot and holds no transaction: each page is its own read
- * of the spool, which no write to `records` reaches. Each prefix's row count
- * is checked against the spooled count before its last part is uploaded; a
- * difference means the spool was emptied under the transfer and throws
- * `FrozenRowsChanged`, and the head is never built. Memory is one page (at most
- * `PAGE_BYTES` of bodies, or one row) and the part in progress, however large
- * the stream.
+ * Returns when every part is stored. `startFrozenParts` is the same work for a
+ * caller that overlaps the uploads with its next step.
  */
 export async function uploadFrozenParts(
   deps: LocalSyncDeps,
@@ -282,6 +286,57 @@ export async function uploadFrozenParts(
     readonly scope: string;
     readonly generation: number;
     readonly frozen: readonly FrozenPrefix[];
+    /** Counts the blob calls and parts written; the bytes stay the same. */
+    readonly meter?: PublishMeter;
+    /** Called before each part is probed and again before it is uploaded; a throw stops the transfer. */
+    readonly beforeUpload?: () => void;
+  },
+): Promise<readonly EncodedPart[]> {
+  const wave = newUploadWave(PARTS_IN_FLIGHT);
+  try {
+    const parts = await startFrozenParts(deps, { ...input, wave, probe: true });
+    await wave.drain();
+    return parts;
+  } catch (error) {
+    await wave.settle();
+    throw error;
+  }
+}
+
+/**
+ * The encoding half of `uploadFrozenParts`: it starts each part's upload on
+ * `wave` and returns the parts as soon as the last one is encoded, while the
+ * uploads may still be running. The caller owns the wave: it must `drain` it
+ * before anything that points at the parts, and `settle` it if it exits early.
+ * A part's hash, size and count are known when it is encoded, so a head can be
+ * built and uploaded without waiting for the parts it names.
+ *
+ * `probe` is whether to ask storage if a part exists before uploading it. A
+ * stream with no registry row has nothing in storage worth finding, so its
+ * transfer passes `false` and always uploads. A name is the hash of the clear
+ * bytes, so an upload of a stored name keeps or replaces the object with
+ * another encryption of the same clear bytes (storage does not promise which);
+ * a probe skipped can cost a repeated upload and never a missing part. Never
+ * skip a probe because this device uploaded the part before: storage can
+ * delete or overwrite objects, and a remembered upload proves nothing.
+ *
+ * It needs no queue slot and holds no transaction: each page is its own read
+ * of the spool, which no write to `records` reaches. Each prefix's row count
+ * is checked against the spooled count before its last part is encoded; a
+ * difference means the spool was emptied under the transfer and throws
+ * `FrozenRowsChanged`, and the head is never built. Memory is one page (at most
+ * `PAGE_BYTES` of bodies, or one row) and the `PARTS_IN_FLIGHT` parts of the
+ * wave, however large the stream.
+ */
+export async function startFrozenParts(
+  deps: LocalSyncDeps,
+  input: {
+    readonly attempt: string;
+    readonly scope: string;
+    readonly generation: number;
+    readonly frozen: readonly FrozenPrefix[];
+    readonly wave: UploadWave;
+    readonly probe: boolean;
     /** Counts the blob calls and parts written; the bytes stay the same. */
     readonly meter?: PublishMeter;
     /** Called before each part is probed and again before it is uploaded; a throw stops the transfer. */
@@ -298,13 +353,15 @@ export async function uploadFrozenParts(
       const { hash: partHash, bytes, count } = part.entry;
       const blobName = `g${input.generation}-p-${partHash}`;
       const key = `${input.scope}/${blobName}`;
-      input.beforeUpload?.();
-      if (!(await blobs.exists(key))) {
-        const cipher = await deps.keys.encryptPart(input.scope, part.data);
+      await input.wave.start(async () => {
         input.beforeUpload?.();
-        await blobs.put(key, cipher, input.beforeUpload);
-        if (input.meter) input.meter.partsUploaded += 1;
-      }
+        if (!input.probe || !(await blobs.exists(key))) {
+          const cipher = await deps.keys.encryptPart(input.scope, part.data);
+          input.beforeUpload?.();
+          await blobs.put(key, cipher, input.beforeUpload);
+          if (input.meter) input.meter.partsUploaded += 1;
+        }
+      });
       result.push({ prefix, seq, partHash, bytes, count, blobName });
       seq += 1;
     };

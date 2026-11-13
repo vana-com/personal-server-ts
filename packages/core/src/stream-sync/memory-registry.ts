@@ -92,6 +92,17 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
     }
     return out;
   }
+
+  async listConnectionRows(connector: string, ns: string) {
+    const out: { scope: string; read: ControlRead }[] = [];
+    for (const scope of this.versions.keys()) {
+      const parsed = parseScope(scope);
+      if (parsed?.connector === connector && parsed.ns === ns) {
+        out.push({ scope, read: await this.read(scope) });
+      }
+    }
+    return out;
+  }
 }
 
 /** A fresh in-memory registry (see `MemoryStreamSyncRegistry`). */

@@ -95,6 +95,8 @@ async function world(options: Options) {
     },
     listControlRows: () => innerRegistry.listControlRows(),
     listStreamRows: (connector) => innerRegistry.listStreamRows(connector),
+    listConnectionRows: (connector, ns) =>
+      innerRegistry.listConnectionRows(connector, ns),
   };
   const innerBlobs = createMemoryStreamSyncBlobs();
   const guards: { key: string; guard: (() => void) | undefined }[] = [];
@@ -256,29 +258,29 @@ describe("streams of one connection publish together", () => {
 
   it("never runs more streams at once than the option says", async () => {
     const { deps } = await world({ streams: 6, blobMs: 25 });
-    const active = new Set<string>();
+    // A stream is active while one of its blob calls is out.
+    const out = new Map<string, number>();
     let peak = 0;
     const original = deps.blobs;
+    const during = async <T>(key: string, call: () => Promise<T>) => {
+      const stream = streamOfKey(key)!;
+      out.set(stream, (out.get(stream) ?? 0) + 1);
+      peak = Math.max(peak, out.size);
+      try {
+        return await call();
+      } finally {
+        const left = out.get(stream)! - 1;
+        if (left === 0) out.delete(stream);
+        else out.set(stream, left);
+      }
+    };
     const watched: LocalSyncDeps = {
       ...deps,
       blobs: {
-        async get(key) {
-          const stream = streamOfKey(key)!;
-          active.add(stream);
-          peak = Math.max(peak, active.size);
-          return original.get(key);
-        },
-        async exists(key) {
-          const stream = streamOfKey(key)!;
-          active.add(stream);
-          peak = Math.max(peak, active.size);
-          return original.exists(key);
-        },
-        async put(key, bytes) {
-          await original.put(key, bytes);
-          // A stream's last blob call is its head: it leaves the set.
-          if (/\/h-/.test(key)) active.delete(streamOfKey(key)!);
-        },
+        get: (key) => during(key, () => original.get(key)),
+        exists: (key) => during(key, () => original.exists(key)),
+        put: (key, bytes, beforeAttempt) =>
+          during(key, () => original.put(key, bytes, beforeAttempt)),
       },
     };
     await publishConnection(watched, CONNECTION_ID, { streamConcurrency: 2 });
@@ -478,23 +480,22 @@ describe("streams of one connection publish together", () => {
   });
 
   /**
-   * Every stream parks past its last purge check: at its head probe, or with its attachment read and encrypted. One is let go
+   * Every stream parks past its last purge check: with its head, or its attachment, read and encrypted (a first publish
+   * has no probe to park at). One is let go
    * and purges the connection (the control row was deleted while all were
    * parked). The rest are then released with the read answering "absent", the
    * answer that sends a stream on to upload.
    */
-  async function purgeWhileSiblingsProbe(
+  async function purgeWhileSiblingsEncrypt(
     options: Pick<Options, "attachments">,
-    hold: "headProbe" | "attachmentEncrypt",
   ) {
     const parked: (() => void)[] = [];
     const park = () => new Promise<void>((release) => parked.push(release));
     const w = await world({
       streams: 4,
       ...options,
-      holdGet: (key) =>
-        hold === "headProbe" && /\/h-/.test(key) ? park() : Promise.resolve(),
-      holdAttachmentEncrypt: hold === "attachmentEncrypt" ? park : undefined,
+      // A stream's first encrypt call is its attachment's, else its head's.
+      holdAttachmentEncrypt: park,
     });
     const publishing = publishConnection(w.deps, CONNECTION_ID);
     await vi.waitFor(() => expect(parked).toHaveLength(4));
@@ -508,21 +509,17 @@ describe("streams of one connection publish together", () => {
     return { ...w, purgedAt, results };
   }
 
-  it("starts no head upload after a sibling purged while its head probe was out", async () => {
-    const { calls, purgedAt, results } = await purgeWhileSiblingsProbe(
-      {},
-      "headProbe",
-    );
+  it("starts no head upload after a sibling purged while its head was being encrypted", async () => {
+    const { calls, purgedAt, results } = await purgeWhileSiblingsEncrypt({});
     expect(results.at(-1)).toMatchObject({ outcome: "purged" });
     expect(calls.slice(purgedAt).filter((c) => c.kind === "put")).toEqual([]);
     expect(calls.slice(purgedAt).filter((c) => c.kind === "post")).toEqual([]);
   });
 
   it("starts no attachment upload after a sibling purged while its attachment was being encrypted", async () => {
-    const { calls, purgedAt, results } = await purgeWhileSiblingsProbe(
-      { attachments: true },
-      "attachmentEncrypt",
-    );
+    const { calls, purgedAt, results } = await purgeWhileSiblingsEncrypt({
+      attachments: true,
+    });
     expect(results.at(-1)).toMatchObject({ outcome: "purged" });
     expect(calls.slice(purgedAt).filter((c) => c.kind === "put")).toEqual([]);
     expect(calls.slice(purgedAt).filter((c) => c.kind === "post")).toEqual([]);

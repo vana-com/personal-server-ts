@@ -1,0 +1,550 @@
+// What one publish asks of the registry and of storage.
+//
+// One listing of the connection's rows replaces the snapshot reads of every
+// stream after the first. A first publish makes no existence probe. A stream's
+// part and head uploads overlap, and only the registry write waits for all.
+// Real SQLite driver and connection queue; the registry and storage are fakes
+// that count and can hold a call.
+import { afterEach, describe, expect, it } from "vitest";
+import { keccak_256 } from "@noble/hashes/sha3";
+import {
+  HEAD_FORMAT,
+  controlHashes,
+  controlScope,
+  deriveKeyCheck,
+  digestHead,
+  encodeHead,
+  streamScope,
+  type Head,
+} from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  connectionQueue,
+  createLocalSync,
+  openLocalDb,
+  publishConnection,
+  type LocalSyncDeps,
+  type SqlDriver,
+} from "@opendatalabs/personal-server-ts-core/localdb";
+import {
+  createMemoryStreamSyncBlobs,
+  createMemoryStreamSyncRegistry,
+  type MemoryStreamSyncRegistry,
+  type StreamSyncRegistry,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { openRegistryView } from "../../../core/src/localdb/registry-view.js";
+import { newUploadWave } from "../../../core/src/localdb/upload-wave.js";
+import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+
+const OWNER = `0x${"11".repeat(20)}` as const;
+const CONNECTOR = "fixture";
+const CONNECTION_ID = `pdpp.${CONNECTOR}~`;
+const CONTROL = controlScope(CONNECTOR, "");
+const keccak = async (b: Uint8Array) => keccak_256(b);
+
+type Call = {
+  readonly kind: "read" | "post" | "list" | "probe" | "put";
+  readonly scope: string;
+  /** The blob key, for probes and puts. */
+  readonly key?: string;
+};
+
+type Options = {
+  readonly streams: number;
+  /** A registry that cannot list a connection in one pass. */
+  readonly noListing?: boolean;
+  /** Runs when a put starts, after it is logged; the put waits for it. */
+  readonly holdPut?: (key: string) => Promise<void>;
+};
+
+const drivers: SqlDriver[] = [];
+afterEach(async () => {
+  for (const db of drivers.splice(0)) await db.close();
+});
+
+const streamName = (i: number) => `s${i}`;
+const scopeOfKey = (key: string) => key.slice(0, key.lastIndexOf("/"));
+
+async function world(options: Options) {
+  const db = await openLocalDb(openBetterSqlite3(":memory:"), {
+    owner: OWNER,
+    network: "test",
+    deviceId: "d",
+  });
+  drivers.push(db);
+  const names = Array.from({ length: options.streams }, (_, i) =>
+    streamName(i),
+  );
+  const calls: Call[] = [];
+  const inner = createMemoryStreamSyncRegistry() as MemoryStreamSyncRegistry;
+  const registry: StreamSyncRegistry = {
+    async read(scope) {
+      calls.push({ kind: "read", scope });
+      return inner.read(scope);
+    },
+    async post(request) {
+      calls.push({ kind: "post", scope: request.scope });
+      return inner.post(request);
+    },
+    listControlRows: () => inner.listControlRows(),
+    listStreamRows: (connector) => inner.listStreamRows(connector),
+    ...(options.noListing
+      ? {}
+      : {
+          async listConnectionRows(connector: string, ns: string) {
+            calls.push({ kind: "list", scope: connector });
+            return inner.listConnectionRows(connector, ns);
+          },
+        }),
+  };
+  const innerBlobs = createMemoryStreamSyncBlobs();
+  const blobs = {
+    get: (key: string) => innerBlobs.get(key),
+    async exists(key: string) {
+      calls.push({ kind: "probe", scope: scopeOfKey(key), key });
+      return innerBlobs.exists(key);
+    },
+    async put(key: string, bytes: Uint8Array) {
+      calls.push({ kind: "put", scope: scopeOfKey(key), key });
+      await options.holdPut?.(key);
+      await innerBlobs.put(key, bytes);
+    },
+  };
+  let op = 0;
+  const deps: LocalSyncDeps = {
+    db,
+    queue: connectionQueue(),
+    registry,
+    blobs,
+    ownerAddress: OWNER,
+    keys: {
+      namespaceHmac: async () => new Uint8Array(32),
+      encrypt: async (_s, b) => b,
+      encryptPart: async (_s, b) => b,
+      decrypt: async (_s, b) => b,
+    },
+    signer: { signAddData: async () => "0x00" },
+    logger: { info: () => {}, warn: () => {} },
+    now: () => 1000,
+    newOp: () => `op-${++op}`,
+  };
+  const sync = createLocalSync(deps, {
+    resolveArtifact: (digest) => ({
+      connector: digest,
+      version: "1",
+      streams: names.map((name) => ({
+        name,
+        semantics: "mutable_state" as const,
+        primaryKey: ["id"],
+      })),
+    }),
+    declaredStreams: () => names,
+    olderVersionReads: () => true,
+  });
+  let runs = 0;
+  /** A run that writes `rows` rows of every stream, with `version` in each. */
+  const collect = async (version: number, rows = 2) => {
+    const runId = `run-${++runs}`;
+    await sync.intake.begin(runId, {
+      connector: CONNECTOR,
+      artifactDigest: CONNECTOR,
+      wantFull: true,
+      owner: { address: OWNER, leaseId: null },
+    });
+    await sync.intake.batch(runId, {
+      batch: 0,
+      records: names.flatMap((stream) =>
+        Array.from({ length: rows }, (_, n) => ({
+          stream,
+          data: { id: `${stream}-${n}`, version },
+        })),
+      ),
+    });
+    await sync.intake.end(runId, {
+      outcome: "succeeded",
+      coveredStreams: names,
+      lastBatch: 0,
+    });
+  };
+  await collect(1);
+  // The run's own registry traffic is not the publish's.
+  calls.length = 0;
+  return { deps, db, calls, names, inner, collect, blobs, innerBlobs };
+}
+
+const count = (calls: readonly Call[], kind: Call["kind"], scope?: string) =>
+  calls.filter(
+    (c) => c.kind === kind && (scope === undefined || c.scope === scope),
+  ).length;
+
+/** A head another device wrote, with no rows, so that it wins a CAS. */
+async function foreignHead(
+  w: Awaited<ReturnType<typeof world>>,
+  stream: string,
+  version: number,
+): Promise<void> {
+  const scope = streamScope(CONNECTOR, "", stream);
+  const keyCheck = await deriveKeyCheck(w.deps.keys.namespaceHmac);
+  const head: Head = {
+    complete: false,
+    connector: CONNECTOR,
+    format: HEAD_FORMAT,
+    generation: 1,
+    keyCheck,
+    lastDeleteVersion: 0,
+    ns: "",
+    observedAt: 1000,
+    parts: [],
+    primaryKey: ["id"],
+    profile: { key: CONNECTOR, version: "1" },
+    recordCount: 0,
+    stream,
+  };
+  const bytes = encodeHead(head);
+  const { dataHash, blobName } = await digestHead(keccak, bytes);
+  await w.innerBlobs.put(`${scope}/${blobName}`, bytes);
+  await w.inner.post({
+    ownerAddress: OWNER,
+    scope,
+    dataHash,
+    metadataHash: `0x${"22".repeat(32)}`,
+    expectedVersion: String(version),
+    signature: "0x00",
+  });
+}
+
+describe("one listing of the connection's registry rows", () => {
+  it("is taken once for six streams, and only the first stream reads its own rows", async () => {
+    const w = await world({ streams: 6 });
+    const results = await publishConnection(w.deps, CONNECTION_ID);
+    expect(results.map((r) => r.outcome)).toEqual(Array(6).fill("published"));
+    expect(count(w.calls, "list")).toBe(1);
+    // Stream rows: the first stream's snapshot read. The others come from the
+    // listing, and a CAS follows each commit, so none is read again.
+    const streamReads = w.names.map((n) =>
+      count(w.calls, "read", streamScope(CONNECTOR, "", n)),
+    );
+    expect(streamReads).toEqual([1, 0, 0, 0, 0, 0]);
+    // Control: the first snapshot's read and its read-back after creating the
+    // row, then the commit's live check before and after each of six posts.
+    expect(count(w.calls, "read", CONTROL)).toBe(2 + 6 * 2);
+  });
+
+  it("is not taken for a registry that cannot list a connection: every stream reads its rows", async () => {
+    const w = await world({ streams: 6, noListing: true });
+    const results = await publishConnection(w.deps, CONNECTION_ID);
+    expect(results.map((r) => r.outcome)).toEqual(Array(6).fill("published"));
+    expect(count(w.calls, "list")).toBe(0);
+    for (const n of w.names)
+      expect(count(w.calls, "read", streamScope(CONNECTOR, "", n))).toBe(1);
+    // Each snapshot reads it (6), one read-back after creating it, and the
+    // commit's two live checks per stream (12).
+    expect(count(w.calls, "read", CONTROL)).toBe(6 + 1 + 12);
+  });
+
+  it("is not taken for two streams: it would not save a request", async () => {
+    const w = await world({ streams: 2 });
+    await publishConnection(w.deps, CONNECTION_ID);
+    expect(count(w.calls, "list")).toBe(0);
+  });
+
+  it("falls back to reading each row when the listing fails", async () => {
+    const w = await world({ streams: 4 });
+    (
+      w.deps.registry as { listConnectionRows: () => Promise<never> }
+    ).listConnectionRows = async () => {
+      throw new Error("offline");
+    };
+    const results = await publishConnection(w.deps, CONNECTION_ID);
+    expect(results.map((r) => r.outcome)).toEqual(Array(4).fill("published"));
+    for (const n of w.names)
+      expect(count(w.calls, "read", streamScope(CONNECTOR, "", n))).toBe(1);
+  });
+
+  it("is taken again after a lost CAS, never reused across the retry", async () => {
+    const w = await world({ streams: 4 });
+    // s1's first upload is held until s0 has lost its CAS, retried and
+    // finished, so s2 takes its first snapshot after the conflict.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const s0 = streamScope(CONNECTOR, "", "s0");
+    const s1 = streamScope(CONNECTOR, "", "s1");
+    const held = w.deps.blobs.put;
+    w.deps.blobs.put = async (key, bytes, before) => {
+      if (scopeOfKey(key) === s1) await gate;
+      return held(key, bytes, before);
+    };
+    let beaten = false;
+    w.inner.beforePost = async (post) => {
+      if (post.scope !== s0 || beaten) return;
+      beaten = true;
+      await foreignHead(w, "s0", 1);
+    };
+    const published = publishConnection(w.deps, CONNECTION_ID, {
+      streamConcurrency: 2,
+    });
+    // s0 finishes (conflict, apply, retry, publish); then release s1.
+    const settled = new Promise<void>((resolve) => {
+      const timer = setInterval(() => {
+        if (count(w.calls, "post", s0) >= 2) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, 5);
+    });
+    await settled;
+    // Give s2 its first snapshot while s1 is still held.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    release();
+    const results = await published;
+    expect(results.map((r) => r.outcome)).toEqual(Array(4).fill("published"));
+    // The conflict on s0 dropped the first listing: s2 listed again, and s3
+    // (which started later still) used that second one.
+    expect(count(w.calls, "list")).toBe(2);
+    const secondList = w.calls
+      .map((c, i) => (c.kind === "list" ? i : -1))
+      .filter((i) => i >= 0)[1]!;
+    const conflict = w.calls.findIndex(
+      (c) => c.kind === "post" && c.scope === s0,
+    );
+    expect(secondList).toBeGreaterThan(conflict);
+    // s0's retry read its row live.
+    expect(count(w.calls, "read", s0)).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("a listing taken before an apply", () => {
+  it("is not handed to a stream that starts after the apply", async () => {
+    const w = await world({ streams: 4 });
+    // Another device already wrote s1's head. s1 learns it from the listing the
+    // second stream took, and applies it: the listing predates that apply.
+    await foreignHead(w, "s1", 1);
+    const results = await publishConnection(w.deps, CONNECTION_ID, {
+      streamConcurrency: 1,
+    });
+    expect(results).toHaveLength(4);
+    // s2 took a new listing after s1's apply; s3 used that one.
+    expect(count(w.calls, "list")).toBe(2);
+    const lists = w.calls
+      .map((c, i) => (c.kind === "list" ? i : -1))
+      .filter((i) => i >= 0);
+    const apply = w.calls.findIndex(
+      (c, i) => i > lists[0]! && c.kind === "read" && c.scope.endsWith(".s1"),
+    );
+    expect(apply).toBeGreaterThan(lists[0]!);
+    expect(lists[1]).toBeGreaterThan(apply);
+  });
+});
+
+describe("the registry view", () => {
+  const deps = (rows: () => Promise<unknown[]>) =>
+    ({
+      registry: { listConnectionRows: rows },
+      logger: { warn: () => {}, info: () => {} },
+    }) as unknown as LocalSyncDeps;
+
+  it("hands out no listing that was in flight when the publish applied registry state", async () => {
+    let finish!: () => void;
+    const slow = new Promise<void>((resolve) => (finish = resolve));
+    let lists = 0;
+    const view = openRegistryView(
+      deps(async () => {
+        lists += 1;
+        await slow;
+        return [];
+      }),
+      { connector: CONNECTOR, ns: "" },
+      3,
+    );
+    await view.firstSnapshot("a"); // the first stream gets none
+    const second = view.firstSnapshot("b");
+    view.invalidate();
+    finish();
+    expect(await second).toEqual({});
+    // The next stream takes a fresh listing.
+    expect(await view.firstSnapshot("c")).toMatchObject({
+      stream: { found: false },
+    });
+    expect(lists).toBe(2);
+  });
+
+  it("serves a stream's first snapshot only", async () => {
+    const view = openRegistryView(
+      deps(async () => []),
+      { connector: CONNECTOR, ns: "" },
+      3,
+    );
+    await view.firstSnapshot("a");
+    expect(await view.firstSnapshot("b")).toMatchObject({
+      stream: { found: false },
+    });
+    expect(await view.firstSnapshot("b")).toEqual({});
+  });
+});
+
+describe("existence probes", () => {
+  it("a first publish makes none and uploads every part and head", async () => {
+    const w = await world({ streams: 6 });
+    const results = await publishConnection(w.deps, CONNECTION_ID);
+    expect(results.map((r) => r.outcome)).toEqual(Array(6).fill("published"));
+    expect(count(w.calls, "probe")).toBe(0);
+    // One part and one head per stream.
+    expect(count(w.calls, "put")).toBe(12);
+  });
+
+  it("a first publish that crashed before its registry write publishes on the retry, uploading the same objects again", async () => {
+    const w = await world({ streams: 3 });
+    let crash = true;
+    w.inner.beforePost = async (post) => {
+      if (crash && post.scope !== CONTROL) throw new Error("connection lost");
+    };
+    await expect(publishConnection(w.deps, CONNECTION_ID)).rejects.toThrow();
+    const stored = count(w.calls, "put");
+    expect(stored).toBeGreaterThan(0);
+    crash = false;
+    w.calls.length = 0;
+    const results = await publishConnection(w.deps, CONNECTION_ID);
+    expect(results.map((r) => r.outcome)).toEqual(Array(3).fill("published"));
+    // No registry row yet, so still no probe; the stored names are uploaded again.
+    expect(count(w.calls, "probe")).toBe(0);
+    expect(count(w.calls, "put")).toBeGreaterThan(0);
+  });
+
+  it("a refresh probes where a registry row exists", async () => {
+    const w = await world({ streams: 3 });
+    await publishConnection(w.deps, CONNECTION_ID);
+    w.calls.length = 0;
+    await w.collect(2);
+    const results = await publishConnection(w.deps, CONNECTION_ID);
+    expect(results.map((r) => r.outcome)).toEqual(Array(3).fill("published"));
+    // Every stream probed its part and its head.
+    expect(count(w.calls, "probe")).toBe(6);
+  });
+});
+
+describe("a stream's uploads overlap and the registry write waits for all", () => {
+  it("starts the head before the part is stored, and posts only after both", async () => {
+    let releasePart!: () => void;
+    const partGate = new Promise<void>((resolve) => (releasePart = resolve));
+    let headStarted!: () => void;
+    const headSeen = new Promise<void>((resolve) => (headStarted = resolve));
+    const w = await world({
+      streams: 1,
+      holdPut: async (key) => {
+        if (key.includes("-p-")) await partGate;
+        else headStarted();
+      },
+    });
+    const published = publishConnection(w.deps, CONNECTION_ID);
+    // The part's upload is held; the head's upload starts all the same.
+    await headSeen;
+    expect(
+      w.calls.some((c) => c.kind === "put" && c.key!.includes("-p-")),
+    ).toBe(true);
+    // Nothing is posted while the part is not stored.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(count(w.calls, "post", streamScope(CONNECTOR, "", "s0"))).toBe(0);
+    releasePart();
+    const results = await published;
+    expect(results[0]?.outcome).toBe("published");
+    expect(count(w.calls, "post", streamScope(CONNECTOR, "", "s0"))).toBe(1);
+  });
+
+  it("does not post when a part fails to upload, and leaves no upload running", async () => {
+    const w = await world({
+      streams: 1,
+      holdPut: async (key) => {
+        if (key.includes("-p-")) throw new Error("storage refused the part");
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      },
+    });
+    await expect(publishConnection(w.deps, CONNECTION_ID)).rejects.toThrow(
+      "storage refused the part",
+    );
+    expect(count(w.calls, "post", streamScope(CONNECTOR, "", "s0"))).toBe(0);
+    // The head's upload was settled before the failure was reported.
+    expect(w.innerBlobs.exists).toBeDefined();
+    const putsAtReturn = count(w.calls, "put");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(count(w.calls, "put")).toBe(putsAtReturn);
+  });
+
+  it("a delete that purges the connection during the uploads stops every stream and posts no stream row", async () => {
+    let first = true;
+    const w: Awaited<ReturnType<typeof world>> = await world({
+      streams: 3,
+      holdPut: async () => {
+        if (!first) return;
+        first = false;
+        const hashes = await controlHashes(
+          keccak,
+          await deriveKeyCheck(w.deps.keys.namespaceHmac),
+        );
+        await w.inner.post({
+          ownerAddress: OWNER,
+          scope: CONTROL,
+          dataHash: hashes.tombstoneData,
+          metadataHash: hashes.tombstoneMetadata,
+          expectedVersion: "2",
+          signature: "0x00",
+        });
+      },
+    });
+    const results = await publishConnection(w.deps, CONNECTION_ID);
+    expect(results.every((r) => r.outcome === "purged")).toBe(true);
+    for (const n of w.names)
+      expect(count(w.calls, "post", streamScope(CONNECTOR, "", n))).toBe(0);
+    const putsAtReturn = count(w.calls, "put");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(count(w.calls, "put")).toBe(putsAtReturn);
+  });
+});
+
+describe("the upload wave", () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it("holds at most `limit` unfinished uploads, and startAlongside is not held", async () => {
+    const wave = newUploadWave(2);
+    let running = 0;
+    let peak = 0;
+    const work = async () => {
+      running += 1;
+      peak = Math.max(peak, running);
+      await sleep(10);
+      running -= 1;
+    };
+    for (let i = 0; i < 6; i++) await wave.start(work);
+    wave.startAlongside(work);
+    await wave.drain();
+    expect(peak).toBe(3);
+  });
+
+  it("throws the first failure, starts nothing after it, and settles the rest", async () => {
+    const wave = newUploadWave(2);
+    let started = 0;
+    let finished = 0;
+    await wave.start(async () => {
+      started += 1;
+      await sleep(5);
+      throw new Error("first");
+    });
+    await wave.start(async () => {
+      started += 1;
+      await sleep(30);
+      finished += 1;
+    });
+    await expect(
+      wave.start(async () => {
+        started += 1;
+      }),
+    ).rejects.toThrow("first");
+    expect(started).toBe(2);
+    await wave.settle();
+    expect(finished).toBe(1);
+    await expect(wave.drain()).rejects.toThrow("first");
+  });
+
+  it("refuses a limit that is not a positive whole number", () => {
+    expect(() => newUploadWave(0)).toThrow(RangeError);
+    expect(() => newUploadWave(1.5)).toThrow(RangeError);
+  });
+});

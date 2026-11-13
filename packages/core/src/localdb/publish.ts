@@ -96,8 +96,9 @@ import {
   dropSpool,
   freezePrefixRows,
   newSpoolAttempt,
+  PARTS_IN_FLIGHT,
   partTargetOf,
-  uploadFrozenParts,
+  startFrozenParts,
   type EncodedPart,
   type FrozenPrefix,
   type HeadExtras,
@@ -119,8 +120,10 @@ import {
 import { purgeConnection } from "./purge.js";
 import { checkRunFence } from "./fence.js";
 import { replaceMayApply } from "./replace.js";
+import { openRegistryView, type RegistryView } from "./registry-view.js";
 import { insideQueue } from "./slot.js";
 import { recallHead, rememberHead, rememberOwnHead } from "./verified-heads.js";
+import { newUploadWave, type UploadWave } from "./upload-wave.js";
 import { unwriteRefusedRun } from "./unwrite.js";
 
 /** Confirmed publication of one stream in a connector namespace. */
@@ -220,6 +223,7 @@ export async function publishConnection(
   if (opened.results) return opened.results;
   const { connection, keyCheck, hashes, streams } = opened;
   const latch: PurgeLatch = { purged: false };
+  const view = openRegistryView(deps, connection, streams.length);
   const published = await publishEach(
     streams.map(({ stream }) => stream),
     options?.streamConcurrency ?? DEFAULT_STREAM_CONCURRENCY,
@@ -233,6 +237,7 @@ export async function publishConnection(
         keyCheck,
         hashes,
         latch,
+        view,
         options,
       ),
   );
@@ -388,6 +393,8 @@ type StreamContext = {
   readonly keyCheck: string;
   readonly hashes: ControlHashes;
   readonly latch: PurgeLatch;
+  /** What the publish already read from the registry; see registry-view.ts. */
+  readonly view: RegistryView;
   readonly options: PublishOptions | undefined;
 };
 
@@ -440,7 +447,7 @@ type Snapshot =
       readonly kind: "blobs";
       readonly blobs: readonly BlobDescriptor[];
       readonly result: PublishResult;
-      /** Held until the attachments are up; see `confirmNoWork`. */
+      /** Held until the attachments are up and the row is read again; see `confirmNoWork`. */
       readonly evidence: RunEvidence | null;
     }
   | { readonly kind: "candidate"; readonly candidate: Candidate };
@@ -458,6 +465,7 @@ async function publishStream(
   keyCheck: string,
   hashes: ControlHashes,
   latch: PurgeLatch,
+  view: RegistryView,
   options: PublishOptions | undefined,
 ): Promise<PublishResult> {
   const run: StreamRun = {
@@ -481,6 +489,7 @@ async function publishStream(
       keyCheck,
       hashes,
       latch,
+      view,
       options,
     ).catch((error: unknown): PublishResult => {
       if (error instanceof ConnectionPurged)
@@ -558,6 +567,7 @@ async function publishAttempts(
   keyCheck: string,
   hashes: ControlHashes,
   latch: PurgeLatch,
+  view: RegistryView,
   options: PublishOptions | undefined,
 ): Promise<PublishResult> {
   const context: StreamContext = {
@@ -568,6 +578,7 @@ async function publishAttempts(
     keyCheck,
     hashes,
     latch,
+    view,
     options,
   };
   // Another stream may have purged the connection while this one waited for
@@ -631,6 +642,9 @@ async function publishAttempts(
     );
     if (committed.kind === "done") return committed.result;
     if (committed.kind === "invalidated") run.invalidations++;
+    // A lost CAS applied the winner: the next snapshot of this stream reads
+    // the registry, and so does any stream not yet started.
+    if (committed.kind === "retry") view.invalidate();
   }
   return { stream, outcome: "backoff", watermark: run.watermark };
 }
@@ -647,6 +661,12 @@ async function snapshotStream(
   const { connectionId, connection, stream, scope, keyCheck, hashes } = context;
   const control = controlScope(connection.connector, connection.ns);
   const done = (result: PublishResult): Snapshot => ({ kind: "done", result });
+  // An apply changes local state from the registry: a listing taken before it
+  // is not a starting point for any stream's first snapshot after it.
+  const applyRegistry = async () => {
+    context.view.invalidate();
+    await applyConnection(deps, connectionId);
+  };
   const deferred = (): Snapshot =>
     done({ stream, outcome: "deferred", watermark: run.watermark });
 
@@ -681,7 +701,17 @@ async function snapshotStream(
 
   // Step 2: registry. A deleted control row purges and stops; a foreign
   // control row, or one whose generation moved, defers the stream.
-  let controlRead = await deps.registry.read(control);
+  // The hints of this stream's first snapshot; a snapshot that repeats reads
+  // the registry. A control hint is only an active row of this generation:
+  // absent would create the row and deleted would purge, so those are read.
+  const hints = await context.view.firstSnapshot(scope);
+  const hintedState = hints.control && classifyControl(hints.control, hashes);
+  const hintedControl =
+    hintedState?.kind === "active" &&
+    hintedState.generation === connection.generation;
+  let controlRead = hintedControl
+    ? hints.control!
+    : await deps.registry.read(control);
   let controlState = classifyControl(controlRead, hashes);
   if (controlState.kind === "absent") {
     if (connection.generation !== 1) return deferred();
@@ -718,7 +748,7 @@ async function snapshotStream(
     return deferred();
   }
   if (controlState.generation !== connection.generation) {
-    await applyConnection(deps, connectionId);
+    await applyRegistry();
     return deferred();
   }
   // A run that began before this control generation never joins it: it is
@@ -730,7 +760,7 @@ async function snapshotStream(
       controlState.generation,
     )
   ) {
-    await applyConnection(deps, connectionId);
+    await applyRegistry();
     return { kind: "retry" };
   }
   await deps.db.batch([
@@ -749,7 +779,10 @@ async function snapshotStream(
     },
   ]);
 
-  const streamRead = await deps.registry.read(scope);
+  // A stream row from the listing is a hint (see `hintedRow` below); a repeat
+  // snapshot reads it.
+  const hintedRow = hints.stream !== undefined;
+  const streamRead = hints.stream ?? (await deps.registry.read(scope));
   const streamRow = classifyStreamRow(streamRead, hashes);
   // `registryHead` is the content base: the verified head of THIS lifetime.
   // `registryVersion` and `registryDataHash` are the compare-and-set basis and
@@ -812,14 +845,14 @@ async function snapshotStream(
   // still lags after apply, proceed with the registry head.
   if (streamRead.found && registryVersion > local.head_version) {
     if (run.appliedVersion !== registryVersion) {
-      await applyConnection(deps, connectionId);
+      await applyRegistry();
       run.appliedVersion = registryVersion;
       return { kind: "retry" };
     }
   }
 
   if (await discardFencedRuns(deps, connectionId, stream)) {
-    await applyConnection(deps, connectionId);
+    await applyRegistry();
     return { kind: "retry" };
   }
   if (connection.generation !== 1)
@@ -846,7 +879,7 @@ async function snapshotStream(
       runId: plan.refused.runId,
       reason: plan.refused.reason,
     });
-    await applyConnection(deps, connectionId);
+    await applyRegistry();
     return { kind: "retry" };
   }
 
@@ -880,7 +913,14 @@ async function snapshotStream(
             runIds: plan.steps.map((step) => step.runId),
           }
         : null;
-    if (blobs.length > 0) return { kind: "blobs", blobs, result, evidence };
+    // Evidence says the registry row, as of now, holds these runs. A row
+    // that came from the listing is older than this turn, so it is read again
+    // before it is believed, as with attachments (see `confirmNoWork`). A
+    // stream with no pending run writes nothing and needs no read.
+    const needsConfirm =
+      hintedRow && evidence !== null && evidence.runIds.length > 0;
+    if (blobs.length > 0 || needsConfirm)
+      return { kind: "blobs", blobs, result, evidence };
     if (evidence) await saveRunEvidence(deps, connectionId, stream, evidence);
     return done(result);
   }
@@ -976,11 +1016,18 @@ async function snapshotStream(
 }
 
 /**
- * TRANSFER, outside the slot. Attachments, parts, then the head, each a
+ * TRANSFER, outside the slot. Attachments, parts and the head, each a
  * content-addressed object. It reads the attempt's spooled rows (page by page)
  * and attachment bytes by exact id, so it cannot encode rows the snapshot did
  * not freeze, and no write to `records` can invalidate it. A spool that lost
  * rows throws FrozenRowsChanged.
+ *
+ * The uploads are not ordered among themselves: nothing points at any of them
+ * until the registry CAS, and the head names its parts by hash, which are
+ * known once they are encoded. Each upload starts when it is ready and the
+ * transfer returns once all of them are stored, so the commit (the registry
+ * write) never runs before the stream's last file is in storage. The storage
+ * client's limits decide how many go on the wire at once.
  */
 async function transferCandidate(
   deps: LocalSyncDeps,
@@ -988,13 +1035,58 @@ async function transferCandidate(
   candidate: Candidate,
   meter: PublishMeter,
 ): Promise<Prepared> {
+  const wave = newUploadWave(PARTS_IN_FLIGHT);
+  try {
+    const prepared = await transferOnWave(
+      deps,
+      context,
+      candidate,
+      meter,
+      wave,
+    );
+    await wave.drain();
+    return prepared;
+  } catch (error) {
+    // Nothing of this transfer runs on after it returns, nor reports unseen.
+    await wave.settle();
+    throw error;
+  }
+}
+
+async function transferOnWave(
+  deps: LocalSyncDeps,
+  context: StreamContext,
+  candidate: Candidate,
+  meter: PublishMeter,
+  wave: UploadWave,
+): Promise<Prepared> {
   const { scope, latch } = context;
-  await uploadBlobs(deps, candidate.blobs, meter, () => stopIfPurged(latch));
-  const encoded = await uploadFrozenParts(deps, {
+  // A stream with no registry row has nothing in storage to find: a probe
+  // could only answer "no". An upload of a stored name keeps or replaces the
+  // object with another encryption of the same clear bytes, so skipping a
+  // probe can repeat an upload and never drop one. Where a row exists (a
+  // resume, a refresh) files may well be stored, and a probe saves the upload.
+  // The rule is "no registry row", never "this device uploaded it before":
+  // storage can delete or overwrite objects.
+  const probe = candidate.registryVersion > 0;
+  if (candidate.blobs.length > 0) {
+    await wave.start(() =>
+      uploadBlobs(
+        deps,
+        candidate.blobs,
+        meter,
+        () => stopIfPurged(latch),
+        probe,
+      ),
+    );
+  }
+  const encoded = await startFrozenParts(deps, {
     attempt: candidate.attempt,
     scope,
     generation: candidate.headGeneration,
     frozen: candidate.frozen,
+    wave,
+    probe,
     meter,
     // A purge by another stream ends this transfer before its next upload.
     beforeUpload: () => stopIfPurged(latch),
@@ -1038,13 +1130,16 @@ async function transferCandidate(
   const encrypted = await deps.keys.encrypt(scope, headBytes);
   stopIfPurged(latch);
   const blobs = meteredBlobs(deps, meter);
-  if (!(await blobs.exists(`${scope}/${blobName}`))) {
-    // A sibling may have purged the connection while the probe was out.
-    stopIfPurged(latch);
-    await blobs.put(`${scope}/${blobName}`, encrypted, () =>
-      stopIfPurged(latch),
-    );
-  }
+  // Started with the parts still going: the head names them by hash.
+  wave.startAlongside(async () => {
+    if (!probe || !(await blobs.exists(`${scope}/${blobName}`))) {
+      // A sibling may have purged the connection while the probe was out.
+      stopIfPurged(latch);
+      await blobs.put(`${scope}/${blobName}`, encrypted, () =>
+        stopIfPurged(latch),
+      );
+    }
+  });
   return {
     parts,
     recordCount,
