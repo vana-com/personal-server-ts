@@ -57,17 +57,32 @@ interface Connection {
     statements: readonly SqlStatement[],
   ): Promise<{ changes: readonly number[] }>;
   close(): Promise<void>;
+  /** The writer's real path and file identity (`dev:ino`). Writer only. */
+  identify(): Promise<{ path: string; identity: string }>;
+  /** Fails every pending call with `error` and ends the worker. */
+  abort(error: Error): Promise<void>;
 }
 
 function connect(
   path: string,
   role: "writer" | "reader",
-  lockTimeoutMs: number | undefined,
+  options: {
+    readonly lockTimeoutMs?: number;
+    /** The file the reader may serve: the writer's `dev:ino`. */
+    readonly identity?: string;
+    /** The worker died or errored without `close()`, once. */
+    readonly onFailure?: (error: Error) => void;
+  } = {},
 ): Connection {
   const worker = new Worker(
     new URL("./better-sqlite3-worker.cjs", import.meta.url),
     {
-      workerData: { path, role, lockTimeoutMs },
+      workerData: {
+        path,
+        role,
+        lockTimeoutMs: options.lockTimeoutMs,
+        identity: options.identity,
+      },
       // A small young generation makes V8 reclaim received messages early.
       resourceLimits: { maxYoungGenerationSizeMb: 2 },
     },
@@ -91,11 +106,13 @@ function connect(
   };
   worker.on("message", (reply: WorkerReply) => settle(reply.id, reply));
   const fail = (error: Error) => {
+    const first = failure === undefined;
     failure ??= error;
     for (const [id, call] of pending) {
       pending.delete(id);
       call.reject(error);
     }
+    if (first) options.onFailure?.(error);
   };
   worker.on("error", fail);
   worker.on("exit", (code) => {
@@ -142,6 +159,14 @@ function connect(
         statements: statements.map(wire),
       });
     },
+    identify() {
+      return call<{ path: string; identity: string }>({ op: "identity" });
+    },
+    async abort(error) {
+      closed = true;
+      fail(error);
+      await worker.terminate();
+    },
     async close() {
       try {
         await call({ op: "close" });
@@ -159,8 +184,10 @@ function connect(
  * thread's event loop, and every statement runs in order on one connection.
  *
  * A file database also has `reads`: a second worker thread with a read-only
- * connection to the same WAL file, started on its first read. A read on it
- * waits for no write. `close()` closes both connections.
+ * connection to the same WAL file, started on its first read and bound to the
+ * file the writer holds. A read on it waits for no write. `close()` closes
+ * both connections. If the writer worker dies or errors without `close()`,
+ * the read connection is closed and reads fail with `sqlite_writer_failed`.
  *
  * The process holds the file exclusively: a lock file next to the database
  * (see the worker) refuses a second process, as the old
@@ -180,18 +207,46 @@ export function openBetterSqlite3(
   probe.close();
 
   const persistent = path !== ":memory:";
-  const writer = connect(path, "writer", options.lockTimeoutMs);
-  let reader: Connection | undefined;
   let closed = false;
+  let writerFailure: Error | undefined;
+  let readerReady: Promise<Connection> | undefined;
+  // A reader must not outlive its writer: if the writer worker dies or errors
+  // without `close()`, nobody owns the file, so the reader stops answering.
+  const onWriterFailure = (cause: Error) => {
+    if (closed) return;
+    writerFailure = new Error(`sqlite_writer_failed: ${cause.message}`, {
+      cause,
+    });
+    void readerReady
+      ?.then((r) => r.abort(writerFailure!))
+      .catch(() => undefined);
+  };
+  const writer = connect(path, "writer", {
+    lockTimeoutMs: options.lockTimeoutMs,
+    onFailure: onWriterFailure,
+  });
+  // The reader starts on its first read, bound to the file the writer holds:
+  // it gets the writer's real path and `dev:ino`. The writer is asked at open
+  // (first in its queue), so a first read never waits behind a long write. A
+  // writer that failed to open (a second process, say) gives no reader.
+  const identified = persistent ? writer.identify() : undefined;
+  identified?.catch(() => undefined);
+  const startReader = () =>
+    identified!.then(({ path: real, identity }) => {
+      if (writerFailure) throw writerFailure;
+      if (closed) throw new Error("sqlite_driver_closed");
+      return connect(real, "reader", { identity });
+    });
   const reads: SqlReader | undefined = persistent
     ? {
-        query<R extends Record<string, SqlValue>>(
+        async query<R extends Record<string, SqlValue>>(
           sql: string,
           params?: readonly SqlValue[],
         ) {
-          if (closed) return Promise.reject(new Error("sqlite_driver_closed"));
-          reader ??= connect(path, "reader", undefined);
-          return reader.query<R>(sql, params);
+          if (closed) throw new Error("sqlite_driver_closed");
+          if (writerFailure) throw writerFailure;
+          readerReady ??= startReader();
+          return (await readerReady).query<R>(sql, params);
         },
       }
     : undefined;
@@ -204,6 +259,7 @@ export function openBetterSqlite3(
     async close() {
       closed = true;
       try {
+        const reader = await readerReady?.catch(() => undefined);
         await reader?.close();
       } finally {
         await writer.close();

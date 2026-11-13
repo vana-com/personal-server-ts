@@ -1,12 +1,14 @@
 import {
+  linkSync,
   mkdtempSync,
   readdirSync,
   readlinkSync,
   renameSync,
   rmSync,
+  symlinkSync,
 } from "node:fs";
 import { join } from "node:path";
-import { setTimeout as sleep } from "node:timers/promises";
+import { setImmediate as yieldToLoop } from "node:timers/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   connectionQueue,
@@ -28,24 +30,25 @@ import Database from "better-sqlite3";
 // system temp directory.
 const ID = { owner: "0xAbC", network: "moksha", deviceId: "dev-1" };
 
-/** A write transaction that holds the writer for a few seconds: one insert,
- * then a CPU-bound statement that runs before COMMIT. */
-const SLOW_WRITE: readonly SqlStatement[] = [
+/** A write transaction held open by the test: one insert, then an insert into
+ * an attached database whose write lock the test holds. The writer waits in
+ * its busy handler, inside BEGIN IMMEDIATE, until the test releases the gate.
+ * No sleep or CPU-bound statement sets how long it stays there. */
+const HELD_WRITE: readonly SqlStatement[] = [
   {
     sql: `INSERT INTO connections (connection_id, connector, ns, control_state)
           VALUES ('pdpp.slow~', 'slow', '', 'active')`,
   },
-  {
-    sql: `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 25000000)
-          SELECT count(*) FROM c`,
-  },
+  { sql: "INSERT INTO gate.g (x) VALUES (1)" },
 ];
 
 describe("read connection", () => {
   const dirs: string[] = [];
   const open: SqlDriver[] = [];
+  const gates: Database.Database[] = [];
 
   afterEach(async () => {
+    for (const g of gates.splice(0)) if (g.open) g.close();
     for (const d of open.splice(0)) await d.close().catch(() => undefined);
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
   });
@@ -76,65 +79,99 @@ describe("read connection", () => {
       olderVersionReads: () => true,
     });
 
-  /** Starts the slow write and waits until the writer is inside it. */
-  async function startSlowWrite(db: SqlDriver) {
+  /**
+   * Holds the writer inside a write transaction, then returns. The test owns
+   * a gate database and its write lock; the writer's batch enters BEGIN
+   * IMMEDIATE and blocks on the gate. Entry is observed, not timed: a probe
+   * connection (zero busy timeout) fails BEGIN IMMEDIATE only while the
+   * writer holds the main database's write lock.
+   */
+  async function holdWriter(db: SqlDriver, dir: string, file: string) {
+    const gatePath = join(dir, "gate.sqlite");
+    const gate = new Database(gatePath);
+    gates.push(gate);
+    gate.exec("CREATE TABLE g (x)");
+    await db.query("ATTACH DATABASE ? AS gate", [gatePath]);
+    gate.exec("BEGIN IMMEDIATE");
+
     const state = { settled: false };
-    const write = db.batch(SLOW_WRITE).finally(() => (state.settled = true));
-    await sleep(100);
-    return { state, write };
+    const write = db.batch(HELD_WRITE).finally(() => (state.settled = true));
+    const probe = new Database(file, { timeout: 0 });
+    gates.push(probe);
+    for (;;) {
+      try {
+        probe.exec("BEGIN IMMEDIATE");
+        probe.exec("ROLLBACK");
+      } catch (error) {
+        if ((error as { code?: string }).code === "SQLITE_BUSY") break;
+        throw error;
+      }
+      if (state.settled) throw new Error("write ended before it was held");
+      await yieldToLoop();
+    }
+    probe.close();
+    return { state, write, release: () => gate.exec("COMMIT") };
   }
 
-  async function timed<T>(read: () => Promise<T>) {
-    const started = performance.now();
-    const value = await read();
-    return { value, ms: performance.now() - started };
+  /** The read finished while the held write had not: the read did not wait. */
+  async function readsWhileHeld<T>(
+    held: { write: Promise<unknown> },
+    read: () => Promise<T>,
+  ): Promise<T> {
+    const outcome = await Promise.race([
+      read().then((value) => ({ value })),
+      held.write.then(
+        () => "write ended first" as const,
+        () => "write ended first" as const,
+      ),
+    ]);
+    if (outcome === "write ended first")
+      throw new Error("the read waited for the write");
+    return outcome.value;
   }
 
-  it("answers a status read within 100 ms while a long write transaction is running", async () => {
-    const { db } = await fresh();
+  it("answers a status read while a write transaction is held open", async () => {
+    const { db, dir, file } = await fresh();
     const local = localFor(db);
-    await local.listing.status(); // warm: the read connection is up
-    const { state, write } = await startSlowWrite(db);
+    const held = await holdWriter(db, dir, file);
 
-    const { value, ms } = await timed(() => local.listing.status());
+    const value = await readsWhileHeld(held, () => local.listing.status());
 
-    expect(state.settled).toBe(false);
-    expect(ms).toBeLessThan(100);
+    expect(held.state.settled).toBe(false);
     expect(value.connections).toEqual([]); // the write is not committed yet
-    await write;
-  });
+    held.release();
+    await held.write;
+  }, 20_000);
 
-  it("answers a record query within 100 ms while a long write transaction is running", async () => {
-    const { db } = await fresh();
+  it("answers a record query while a write transaction is held open", async () => {
+    const { db, dir, file } = await fresh();
     const local = localFor(db);
     const records = local.recordsFor(() => ({
       connector: "slow",
       namespace: "",
     }));
-    await records.listRecords({
-      connectionId: "i",
-      stream: "s",
-      limit: 10,
-    });
-    const { state, write } = await startSlowWrite(db);
+    const held = await holdWriter(db, dir, file);
 
-    const { value, ms } = await timed(() =>
+    const value = await readsWhileHeld(held, () =>
       records.listRecords({ connectionId: "i", stream: "s", limit: 10 }),
     );
 
-    expect(state.settled).toBe(false);
-    expect(ms).toBeLessThan(100);
+    expect(held.state.settled).toBe(false);
     expect(value.records).toEqual([]);
-    await write;
-  });
+    held.release();
+    await held.write;
+  }, 20_000);
 
   it("shows the committed write to the next read", async () => {
-    const { db } = await fresh();
+    const { db, dir, file } = await fresh();
     const local = localFor(db);
-    const { write } = await startSlowWrite(db);
-    expect((await local.listing.status()).connections).toEqual([]);
+    const held = await holdWriter(db, dir, file);
+    expect(
+      (await readsWhileHeld(held, () => local.listing.status())).connections,
+    ).toEqual([]);
 
-    await write;
+    held.release();
+    await held.write;
 
     expect(
       (await local.listing.status()).connections.map((c) => c.connector),
@@ -267,5 +304,48 @@ describe("read connection", () => {
     const third = openBetterSqlite3(file);
     open.push(third);
     await expect(third.query("SELECT 1 AS one")).resolves.toEqual([{ one: 1 }]);
+  });
+
+  it("does not serve a file that replaced the writer's file before the read connection first opened", async () => {
+    // The reader is bound to the file the writer holds, not to whatever the
+    // path names when the reader happens to open.
+    const { db, dir, file } = await fresh();
+    const other = new Database(join(dir, "other.sqlite"));
+    other.exec("CREATE TABLE connections (connection_id TEXT)");
+    other.close();
+    renameSync(join(dir, "other.sqlite"), file);
+
+    await expect(db.reads!.query("SELECT * FROM connections")).rejects.toThrow(
+      /sqlite_database_replaced/,
+    );
+  });
+
+  it("refuses a second owner that opens the same database through a symlink", async () => {
+    const { dir, file, db } = await fresh();
+    const alias = join(dir, "alias.sqlite");
+    symlinkSync(file, alias);
+    const second = openBetterSqlite3(alias, { lockTimeoutMs: 100 });
+    open.push(second);
+
+    await expect(second.query("SELECT 1")).rejects.toMatchObject({
+      code: "SQLITE_BUSY",
+    });
+    await expect(second.reads!.query("SELECT 1")).rejects.toMatchObject({
+      code: "SQLITE_BUSY",
+    });
+    await expect(db.query("SELECT 1 AS one")).resolves.toEqual([{ one: 1 }]);
+  });
+
+  it("refuses to own a database file that has a second hard link", async () => {
+    const { dir, file } = await fresh();
+    linkSync(file, join(dir, "hard.sqlite"));
+    const second = openBetterSqlite3(join(dir, "hard.sqlite"), {
+      lockTimeoutMs: 100,
+    });
+    open.push(second);
+
+    await expect(second.query("SELECT 1")).rejects.toMatchObject({
+      code: "SQLITE_DATABASE_HARD_LINKED",
+    });
   });
 });
