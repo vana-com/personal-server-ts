@@ -266,7 +266,12 @@ export function createConnectionDeleter(
           const scope = streamScope(connector, target.ns, target.stream);
           let finished = false;
           let signedPin = target.pin;
-          for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+          // A rejected CAS spends one of ATTEMPTS, and so does a landed CAS that
+          // the next read no longer shows. A landed CAS the next read confirms
+          // is free: confirming it must not consume the attempt that won.
+          let spent = 0;
+          let landed = false;
+          for (;;) {
             const row = await deps.registry.read(scope);
             const now = classifyControl(
               await deps.registry.read(controlScope(connector, target.ns)),
@@ -327,6 +332,8 @@ export function createConnectionDeleter(
               finished = true;
               break;
             }
+            if (landed) spent++;
+            if (spent >= ATTEMPTS) break;
             const version = row.found ? row.version + 1 : 1;
             const head = encodeHead({
               format: HEAD_FORMAT,
@@ -381,10 +388,13 @@ export function createConnectionDeleter(
                 throw error;
               conflict = true;
             }
-            if (conflict)
+            if (conflict) {
               await new Promise<void>((resolve) =>
-                setTimeout(resolve, Math.min(10 * 2 ** attempt, 1000)),
+                setTimeout(resolve, Math.min(10 * 2 ** spent, 1000)),
               );
+              spent++;
+            }
+            landed = !conflict;
             // The next authoritative read proves whether this pin landed.
             signedPin = version;
           }

@@ -486,8 +486,10 @@ type Snapshot =
       readonly kind: "blobs";
       readonly blobs: readonly BlobDescriptor[];
       readonly result: PublishResult;
-      /** Held until the attachments are up; see `confirmNoWork`. */
+      /** Held until the attachments are up; see `confirmIdle`. */
       readonly evidence: RunEvidence | null;
+      /** The stream row the plan matched: absent, or this version and hash. */
+      readonly planned: ControlRead;
       readonly controlDataHash: `0x${string}`;
     }
   /** Nothing to publish, but the hints it rests on are not yet confirmed. */
@@ -505,16 +507,16 @@ type Idle = {
   readonly result: PublishResult;
   /** Written once the hints are confirmed. */
   readonly evidence: RunEvidence | null;
-  /** The listing's stream row, when the snapshot rests on it; `null` if it read live. */
+  /**
+   * The stream row the confirmation must still find: the listing's row when
+   * the snapshot rests on it, or, after an attachment upload, the row the plan
+   * matched (absent included, whether it was a hint or a live read). `null` if
+   * the snapshot read the row live and nothing has run since. A found row is
+   * a condition of the batch request; an absent one cannot be, so it is
+   * confirmed by the live read.
+   */
   readonly hint: ControlRead | null;
-  /** The stream row to hold fixed, if there is one to hold. */
-  readonly fence: {
-    readonly version: number;
-    readonly dataHash: `0x${string}`;
-  } | null;
   readonly controlDataHash: `0x${string}`;
-  /** The attachments were uploaded after the snapshot: see `confirmNoWork`. */
-  readonly uploaded: boolean;
 };
 
 type Committed =
@@ -681,23 +683,24 @@ async function publishAttempts(
         await uploadBlobs(deps, snapshot.blobs, run.meter, () =>
           stopIfPurged(latch),
         );
-        // The attachments took time outside the slot: the control row and the
-        // stream row are confirmed again before the stream is called done.
-        const { evidence, result } = snapshot;
+        // The attachments took time outside the slot: the stream row (the
+        // planned one, absent included) and the control row are confirmed
+        // again before the stream is called done.
+        const { evidence, planned, result } = snapshot;
         idle = {
           result,
           evidence,
-          hint: null,
-          fence: evidence
-            ? { version: evidence.version, dataHash: evidence.dataHash }
-            : null,
+          hint: planned,
           controlDataHash: snapshot.controlDataHash,
-          uploaded: true,
         };
       }
       const ended = await finishIdle(slot, context, run, idle);
       if (ended.kind === "retry") {
+        // The stream row moved after the plan read it (while the attachments
+        // went up, or after the listing the hint came from): the plan that
+        // found nothing to publish is not the registry's any more.
         view.invalidate();
+        run.invalidations++;
         continue;
       }
       if (ended.kind === "done") return ended.result;
@@ -735,9 +738,6 @@ async function publishAttempts(
     );
     if (committed.kind === "done") return committed.result;
     if (committed.kind === "invalidated") run.invalidations++;
-    // A lost CAS applied the winner: the next snapshot of this stream reads
-    // the registry, and so does any stream not yet started.
-    if (committed.kind === "retry") view.invalidate();
   }
   return { stream, outcome: "backoff", watermark: run.watermark };
 }
@@ -877,17 +877,21 @@ async function snapshotStream(
   const hintedRow = hints.stream !== undefined;
   const streamRead = hints.stream ?? (await deps.registry.read(scope));
   const streamRow = classifyStreamRow(streamRead, hashes);
-  // Hints are older than this turn. Anything a snapshot does besides building
-  // a candidate (the commit has its own live checks and a CAS) acts on the
-  // registry as it is now, so it reads again first: the stream row, THEN the
-  // control row. That order matters: a stream row outlives the deletion of its
-  // connection until cleanup, so a row read alone proves nothing, and a
-  // control read made before the row read can predate a deletion the row
-  // read then misses. A deleted control row purges; one that moved defers; a
-  // stream row that is no longer the hinted one repeats the snapshot, which
-  // reads live (a hint serves a first snapshot only).
-  const confirmHints = async (): Promise<Snapshot | null> => {
-    if (!hintedRow && !hintedControl) return null;
+  // Anything a snapshot does besides building a candidate (the commit has its
+  // own live checks and a CAS) acts on the registry as it is now, whether or
+  // not this turn's reads were hints: the stream row, THEN the control row.
+  // That order matters: a stream row outlives the deletion of its connection
+  // until cleanup, so a row read alone proves nothing, and the control read
+  // made at the top of this turn can predate a deletion the row read then
+  // misses (the first stream, a publish of fewer than MIN_STREAMS_FOR_LISTING
+  // streams, no listing adapter and a failed listing all read the row live
+  // and unhinted). So the control row is always read here, after the row. A
+  // row that was a hint is read again and must still be the hinted one;
+  // otherwise this turn's own row read already came before the control read.
+  // A deleted control row purges; one that moved defers; a hinted row that
+  // moved repeats the snapshot, which reads live (a hint serves a first
+  // snapshot only).
+  const confirmLive = async (): Promise<Snapshot | null> => {
     if (hintedRow && !sameRow(await deps.registry.read(scope), streamRead))
       return { kind: "retry" };
     const checked = await checkControl(deps, context);
@@ -981,7 +985,7 @@ async function snapshotStream(
   );
   if (plan.deferred) return deferred();
   if (plan.refused) {
-    const stale = await confirmHints();
+    const stale = await confirmLive();
     if (stale) return stale;
     run.sawRefusal = true;
     await unwriteRefusedRun(deps, {
@@ -1017,7 +1021,7 @@ async function snapshotStream(
       !context.commits.unsupported &&
       (!hintedRow || streamRead.found);
     if (!asCondition) {
-      const stale = await confirmHints();
+      const stale = await confirmLive();
       if (stale) return stale;
     }
     const controlDataHash = (
@@ -1042,7 +1046,14 @@ async function snapshotStream(
           }
         : null;
     if (blobs.length > 0) {
-      return { kind: "blobs", blobs, result, evidence, controlDataHash };
+      return {
+        kind: "blobs",
+        blobs,
+        result,
+        evidence,
+        planned: streamRead,
+        controlDataHash,
+      };
     }
     if (asCondition) {
       return {
@@ -1051,15 +1062,7 @@ async function snapshotStream(
           result,
           evidence,
           hint: hintedRow ? streamRead : null,
-          fence:
-            hintedRow && streamRead.found
-              ? {
-                  version: streamRead.version,
-                  dataHash: streamRead.dataHash as `0x${string}`,
-                }
-              : null,
           controlDataHash,
-          uploaded: false,
         },
       };
     }
@@ -1311,37 +1314,6 @@ async function saveRunEvidence(
   if (statements.length > 0) await deps.db.batch(statements);
 }
 
-/**
- * The no-work path with attachments to upload: the snapshot's slot turn is
- * over by the time they are up, so the stream row is read again, then the
- * control row, in a slot turn. A connection deleted meanwhile purges and one
- * that moved defers, never "noop". Evidence is written only if the stream row
- * is still the one the plan matched; a head that moved leaves the runs pending
- * for the next cycle.
- */
-async function confirmNoWork(
-  deps: LocalSyncDeps,
-  context: StreamContext,
-  evidence: RunEvidence | null,
-): Promise<"purged" | "deferred" | null> {
-  // The row first, the control row second: see `confirmHints`.
-  const read =
-    evidence === null ? null : await deps.registry.read(context.scope);
-  const checked = await checkControl(deps, context);
-  if (checked) return checked;
-  if (
-    evidence === null ||
-    read === null ||
-    !read.found ||
-    read.version !== evidence.version ||
-    read.dataHash.toLowerCase() !== evidence.dataHash.toLowerCase()
-  ) {
-    return null;
-  }
-  await saveRunEvidence(deps, context.connectionId, context.stream, evidence);
-  return null;
-}
-
 /** Whether two reads of a stream's row are the same row version and content. */
 function sameRow(a: ControlRead, b: ControlRead): boolean {
   if (!a.found || !b.found) return a.found === b.found;
@@ -1419,6 +1391,10 @@ async function commitCandidate(
     }),
   );
   if (posted.kind === "conflict") {
+    // Another writer moved this row, so a listing read before that is no
+    // starting point for any stream not yet started, including after the
+    // last try, which ends this stream without a retry.
+    context.view.invalidate();
     // Apply the winner and re-plan. On the last try, back off without
     // applying again: the winner will be applied on the next cycle.
     if (run.attempts === MAX_ATTEMPTS) {
@@ -1607,7 +1583,12 @@ const fenceOf = (
   entry: CommitEntry,
 ): { readonly version: number; readonly dataHash: `0x${string}` } | null =>
   entry.kind === "idle"
-    ? entry.idle.fence
+    ? entry.idle.hint?.found
+      ? {
+          version: entry.idle.hint.version,
+          dataHash: entry.idle.hint.dataHash as `0x${string}`,
+        }
+      : null
     : {
         version: entry.candidate.registryVersion,
         dataHash: entry.candidate.registryDataHash as `0x${string}`,
@@ -1694,8 +1675,9 @@ async function commitStream(
 /**
  * The end of a stream that has no candidate. On the batch path its hints are
  * confirmed by the conditions of a commit request. Without the batch route,
- * or when the request finds the route absent, they are confirmed by live
- * reads in its own slot turn.
+ * when the request finds the route absent, or when the stream row to confirm
+ * is absent (a request cannot hold an absent row fixed), they are confirmed by
+ * live reads in its own slot turn.
  */
 async function finishIdle(
   slot: <T>(work: (held: LocalSyncDeps) => Promise<T>) => Promise<T>,
@@ -1703,7 +1685,9 @@ async function finishIdle(
   run: StreamRun,
   idle: Idle,
 ): Promise<Committed> {
-  if (!context.commits.unsupported) {
+  const conditional =
+    !context.commits.unsupported && idle.hint?.found !== false;
+  if (conditional) {
     const turn = await context.commits.group.submit({
       kind: "idle",
       context,
@@ -1716,11 +1700,14 @@ async function finishIdle(
 }
 
 /**
- * Confirm an idle stream's hints with live reads, in the slot: the stream row
- * first, then the control row (see `confirmHints`). A row that is no longer
- * the hinted one repeats the snapshot, which reads live. A connection deleted
- * meanwhile purges and one that moved defers, never "noop". Evidence is
- * written only after both reads agree.
+ * Confirm an idle stream with live reads, in the slot: the stream row first,
+ * then the control row (see `confirmLive`). The row is read whenever the
+ * stream holds one to compare (`hint`: a listing's row, or the planned row
+ * after an attachment upload, absent included); a row that is no longer that
+ * one means the plan is stale: "retry", which re-snapshots live. A connection
+ * deleted meanwhile purges and one that moved defers, never "noop". Evidence is
+ * written only after both reads agree with the plan; with none to save the
+ * reads still run, because a "noop" is a claim about the registry too.
  */
 async function confirmIdle(
   held: LocalSyncDeps,
@@ -1734,8 +1721,6 @@ async function confirmIdle(
       ? { stream, outcome, watermark: idle.result.watermark }
       : idle.result,
   });
-  if (idle.uploaded)
-    return end(await confirmNoWork(held, context, idle.evidence));
   if (idle.hint && !sameRow(await held.registry.read(context.scope), idle.hint))
     return { kind: "retry" };
   const checked = await checkControl(held, context);
@@ -1773,7 +1758,7 @@ async function postBatchOnce(
  * (version and data hash) instead, and the stream is recorded when the
  * request succeeds. So is a stream with no candidate whose snapshot rests on a
  * listing hint (`idle`): its stream-row condition replaces the live reads of
- * `confirmHints`, and its run evidence is saved on the request's success. The
+ * `confirmLive`, and its run evidence is saved on the request's success. The
  * control row is a condition too: this connection's
  * generation, its hash, not deleted. The gateway checks every condition in the
  * transaction of the writes, so no client read brackets the request. The local
@@ -1964,7 +1949,13 @@ async function commitBatchTurn(
       );
       if (moved !== undefined) {
         // One stream's row is not the one it was planned over. It re-plans.
-        // The rest decided nothing: loop and send them now, without it.
+        // The rest decided nothing: loop and send them now, without it. The
+        // listing it came from is older than the row that moved. A stream
+        // with no candidate (`idle`) is counted as an invalidation by its
+        // caller; one with a candidate is counted here.
+        entries[moved]!.context.view.invalidate();
+        if (entries[moved]!.kind === "head")
+          entries[moved]!.run.invalidations++;
         entries[moved]!.run.attempts++;
         if (entries[moved]!.run.attempts >= MAX_ATTEMPTS)
           done(moved, "backoff");
@@ -2059,6 +2050,10 @@ async function commitBatchTurn(
     }
   }
   if (conflicted.length > 0) {
+    // Another writer moved those rows, so a listing read before that is no
+    // starting point for any stream not yet started, including after the last
+    // try, which ends a stream without a retry (as in `commitCandidate`).
+    entries[conflicted[0]!]!.context.view.invalidate();
     try {
       // Apply the winners once, after the rows that committed are recorded.
       if (conflicted.some((at) => entries[at]!.run.attempts < MAX_ATTEMPTS)) {

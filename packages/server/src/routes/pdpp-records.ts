@@ -3,9 +3,10 @@ import {
   refuseLegacyWrite,
   type OwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/api";
-import type {
-  RecordQuery,
-  StoredRecord,
+import {
+  listCursor,
+  type RecordQuery,
+  type StoredRecord,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import { Buffer } from "node:buffer";
 import { parseRecordQuery } from "./pdpp-record-query.js";
@@ -2386,7 +2387,11 @@ async function localRecordPage(
   );
   const page = records.slice(0, input.limit);
   const hasMore = more || records.length > input.limit;
-  for (const entry of page) after[entry.index] = entry.record.recordKey;
+  for (const entry of page)
+    after[entry.index] = listCursor(
+      entry.record.recordKey,
+      entry.record.pkHash,
+    );
   const nextCursor = !hasMore
     ? null
     : instances.length === 1

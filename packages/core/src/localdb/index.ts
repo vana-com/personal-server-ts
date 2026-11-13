@@ -50,6 +50,7 @@ export { createBlobStore, type BlobStore } from "./blobs.js";
 export {
   createRecordQuery,
   createGrantHistory,
+  listCursor,
   type ChangePage,
   type RecordPage,
   type RecordQuery,
