@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { selectChangedBuckets } from "../../../core/src/localdb/part-layout.js";
+import {
+  prefixBits,
+  selectChangedBuckets,
+} from "../../../core/src/localdb/part-layout.js";
 
 const key = (i: number) => createHash("sha256").update(`k${i}`).digest("hex");
 const bits = (hex: string, n: number) =>
@@ -70,5 +73,114 @@ describe("selectChangedBuckets", () => {
       false,
     );
     expect(prefixFree(out)).toBe(true);
+  });
+});
+
+/** The pre-table implementation, kept as the oracle: one `find` per key. */
+function legacySelectChangedBuckets(
+  buckets: readonly string[],
+  changedKeys: readonly string[],
+  baseParts: readonly { readonly prefix: string }[],
+  rewriteAll: boolean,
+): string[] {
+  const changed = new Set<string>();
+  for (const key of changedKeys) {
+    const bucket = buckets.find(
+      (prefix) => prefixBits(key, prefix.length) === prefix,
+    );
+    if (bucket !== undefined) changed.add(bucket);
+  }
+  const dropped = new Set<string>(
+    rewriteAll ? baseParts.map((p) => p.prefix) : [],
+  );
+  for (;;) {
+    const before = changed.size + dropped.size;
+    for (const part of baseParts) {
+      if ([...changed].some((bucket) => overlaps(bucket, part.prefix))) {
+        dropped.add(part.prefix);
+      }
+    }
+    for (const bucket of buckets) {
+      if ([...dropped].some((prefix) => overlaps(bucket, prefix))) {
+        changed.add(bucket);
+      }
+    }
+    if (changed.size + dropped.size === before) break;
+  }
+  return [...changed].sort();
+}
+
+const overlaps = (a: string, b: string) => a.startsWith(b) || b.startsWith(a);
+
+/** A seeded generator, so a failing case can be replayed. */
+function random(seed: number) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+describe("selectChangedBuckets matches the per-key implementation", () => {
+  it("agrees on random partitions, overlapping bucket lists, base parts and rewriteAll", () => {
+    const next = random(20261113);
+    const pick = (n: number) => Math.floor(next() * n);
+    const bitString = (length: number) =>
+      Array.from({ length }, () => (next() < 0.5 ? "0" : "1")).join("");
+    // Recursively split the bit space: a partition with mixed depths.
+    const split = (prefix: string, depth: number): string[] =>
+      depth === 0 || (prefix.length >= 3 && next() < 0.3)
+        ? [prefix]
+        : [
+            ...split(`${prefix}0`, depth - 1),
+            ...split(`${prefix}1`, depth - 1),
+          ];
+
+    let checked = 0;
+    for (let trial = 0; trial < 300; trial += 1) {
+      const shape = trial % 3;
+      // shape 0: a partition; 1: arbitrary prefixes that may overlap or repeat;
+      // 2: a partition with some buckets longer than the 16-bit table.
+      const buckets =
+        shape === 1
+          ? Array.from({ length: 1 + pick(12) }, () => bitString(pick(17)))
+          : split("", 1 + pick(8)).sort();
+      if (shape === 2) buckets.push(bitString(17 + pick(4)));
+      const keys = Array.from({ length: pick(300) }, () =>
+        key(pick(1_000_000)),
+      );
+      const baseParts =
+        next() < 0.5
+          ? []
+          : Array.from({ length: pick(6) }, () => ({
+              prefix: bitString(pick(10)),
+            }));
+      const rewriteAll = next() < 0.3;
+      expect(
+        selectChangedBuckets(buckets, keys, baseParts, rewriteAll),
+        `trial ${trial}`,
+      ).toEqual(
+        legacySelectChangedBuckets(buckets, keys, baseParts, rewriteAll),
+      );
+      checked += 1;
+    }
+    expect(checked).toBe(300);
+  });
+
+  it("agrees when keys repeat their first 16 bits and when no bucket matches", () => {
+    const k = key(7);
+    const sibling = k.slice(0, 4) + k.slice(4).split("").reverse().join("");
+    const buckets = ["0000", "0001", "0010", "1", "1111"];
+    for (const keys of [[k, sibling], [k], []]) {
+      expect(selectChangedBuckets(buckets, keys, [], false)).toEqual(
+        legacySelectChangedBuckets(buckets, keys, [], false),
+      );
+    }
+    expect(selectChangedBuckets(["0000"], [k], [], false)).toEqual(
+      legacySelectChangedBuckets(["0000"], [k], [], false),
+    );
   });
 });

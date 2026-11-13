@@ -27,6 +27,53 @@ export function prefixBits(hex: string, bits: number): string {
 
 const overlaps = (a: string, b: string) => a.startsWith(b) || b.startsWith(a);
 
+/** Key bits in the lookup table: a bucket of at most this many bits depends only on them. */
+const KEY_TABLE_BITS = 16;
+
+/**
+ * The bucket of each changed key: the first bucket, in `buckets` order, whose
+ * bits are a prefix of the key's bits (the same answer as `find` over each
+ * key). Keys are grouped by their first 16 bits, so each distinct value is
+ * resolved once instead of once per key. Buckets longer than 16 bits, or keys
+ * without four leading hex digits, take the per-key path.
+ */
+function bucketsOfKeys(
+  buckets: readonly string[],
+  changedKeys: readonly string[],
+): Set<string> {
+  const found = new Set<string>();
+  const tableable =
+    buckets.every((prefix) => prefix.length <= KEY_TABLE_BITS) &&
+    changedKeys.every((key) => /^[0-9a-fA-F]{4}/.test(key));
+  if (!tableable) {
+    for (const key of changedKeys) {
+      const bucket = buckets.find(
+        (prefix) => prefixBits(key, prefix.length) === prefix,
+      );
+      if (bucket !== undefined) found.add(bucket);
+    }
+    return found;
+  }
+  const marked = new Uint8Array(1 << KEY_TABLE_BITS);
+  for (const key of changedKeys) marked[parseInt(key.slice(0, 4), 16)] = 1;
+  const firstIndex = new Map<string, number>();
+  buckets.forEach((prefix, index) => {
+    if (!firstIndex.has(prefix)) firstIndex.set(prefix, index);
+  });
+  const lengths = [...new Set(buckets.map((prefix) => prefix.length))];
+  for (let value = 0; value < marked.length; value += 1) {
+    if (marked[value] === 0) continue;
+    const bits = value.toString(2).padStart(KEY_TABLE_BITS, "0");
+    let best = -1;
+    for (const length of lengths) {
+      const index = firstIndex.get(bits.slice(0, length));
+      if (index !== undefined && (best === -1 || index < best)) best = index;
+    }
+    if (best !== -1) found.add(buckets[best]!);
+  }
+  return found;
+}
+
 /**
  * Which planned buckets to encode. A bucket holding a changed key is encoded.
  * A base part that overlaps an encoded bucket is dropped, so every other
@@ -41,13 +88,7 @@ export function selectChangedBuckets(
   baseParts: readonly { readonly prefix: string }[],
   rewriteAll: boolean,
 ): string[] {
-  const changed = new Set<string>();
-  for (const key of changedKeys) {
-    const bucket = buckets.find(
-      (prefix) => prefixBits(key, prefix.length) === prefix,
-    );
-    if (bucket !== undefined) changed.add(bucket);
-  }
+  const changed = bucketsOfKeys(buckets, changedKeys);
   const dropped = new Set<string>(
     rewriteAll ? baseParts.map((p) => p.prefix) : [],
   );
