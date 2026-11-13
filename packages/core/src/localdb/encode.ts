@@ -11,6 +11,7 @@ import type { SqlValue } from "./driver.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { meteredBlobs, type PublishMeter } from "./publish-meter.js";
 import { newUploadWave, type UploadWave } from "./upload-wave.js";
+import { holdMemory } from "./transfer-memory.js";
 
 const hash = async (bytes: Uint8Array): Promise<Uint8Array> => sha256(bytes);
 
@@ -263,10 +264,13 @@ async function* readSpool(
 }
 
 /**
-/**
  * Parts one stream's transfer holds at once while they wait for the storage
  * client's turn (encoded bytes and ciphertext each). The storage client's own
- * limits decide how many go on the wire; this only bounds memory.
+ * limits decide how many go on the wire; this only bounds memory per stream.
+ * Memory across streams is bounded by the store's byte budget (`holdMemory`).
+ *
+ * At least 2: a wave also carries the attachment upload, which can wait for
+ * bytes, and a part upload must be able to run beside it.
  */
 export const PARTS_IN_FLIGHT = 2;
 
@@ -345,6 +349,44 @@ export async function startFrozenParts(
 ): Promise<readonly EncodedPart[]> {
   const target = partTarget(deps, input.generation);
   const blobs = input.meter ? meteredBlobs(deps, input.meter) : deps.blobs;
+  // Memory budget (see `holdMemory`): one part's worth, `target` bytes, is
+  // reserved before a page of rows is read for a part. When the part is
+  // encoded its upload takes the reservation and releases it once the part is
+  // stored (or skipped), so the bytes of a part waiting for the send gate stay
+  // counted. The builder asks for the next reservation only while it holds
+  // none, and an upload never asks for bytes, so a held reservation always
+  // ends and reservations cannot wait on each other.
+  let held: (() => void) | undefined;
+  const memory = {
+    hold: async () => {
+      held ??= await holdMemory(blobs, target);
+    },
+    /** Passes the reservation to the caller, who must release it. */
+    take: (): (() => void) => {
+      const release = held ?? (() => {});
+      held = undefined;
+      return release;
+    },
+    drop: () => memory.take()(),
+  };
+  try {
+    return await encodeFrozenParts(deps, input, target, blobs, memory);
+  } finally {
+    memory.drop();
+  }
+}
+
+async function encodeFrozenParts(
+  deps: LocalSyncDeps,
+  input: Parameters<typeof startFrozenParts>[1],
+  target: number,
+  blobs: ReturnType<typeof meteredBlobs>,
+  memory: {
+    readonly hold: () => Promise<void>;
+    readonly take: () => () => void;
+    readonly drop: () => void;
+  },
+): Promise<readonly EncodedPart[]> {
   const result: EncodedPart[] = [];
   for (const frozen of input.frozen) {
     const { prefix } = frozen;
@@ -353,29 +395,51 @@ export async function startFrozenParts(
       const { hash: partHash, bytes, count } = part.entry;
       const blobName = `g${input.generation}-p-${partHash}`;
       const key = `${input.scope}/${blobName}`;
-      await input.wave.start(async () => {
-        input.beforeUpload?.();
-        if (!input.probe || !(await blobs.exists(key))) {
-          const cipher = await deps.keys.encryptPart(input.scope, part.data);
-          input.beforeUpload?.();
-          await blobs.put(key, cipher, input.beforeUpload);
-          if (input.meter) input.meter.partsUploaded += 1;
-        }
-      });
+      const release = memory.take();
+      try {
+        await input.wave.start(async () => {
+          try {
+            input.beforeUpload?.();
+            if (!input.probe || !(await blobs.exists(key))) {
+              const cipher = await deps.keys.encryptPart(
+                input.scope,
+                part.data,
+              );
+              input.beforeUpload?.();
+              await blobs.put(key, cipher, input.beforeUpload);
+              if (input.meter) input.meter.partsUploaded += 1;
+            }
+          } finally {
+            release();
+          }
+        });
+      } catch (error) {
+        // The wave refused it: no upload took the reservation.
+        release();
+        throw error;
+      }
       result.push({ prefix, seq, partHash, bytes, count, blobName });
       seq += 1;
     };
     let frames: FrameBytes[] = [];
     let bytes = 0;
     const flush = async () => {
-      const part = await encodeFramePart(hash, prefix, frames);
-      if (part) await upload(part);
-      frames = [];
-      bytes = 0;
+      try {
+        const part = await encodeFramePart(hash, prefix, frames);
+        if (part) await upload(part);
+        frames = [];
+        bytes = 0;
+      } finally {
+        memory.drop();
+      }
     };
     let seen = 0;
-    for await (const page of readSpool(deps, input.attempt, prefix)) {
-      for (const row of page) {
+    const pages = readSpool(deps, input.attempt, prefix);
+    for (;;) {
+      await memory.hold();
+      const next = await pages.next();
+      if (next.done) break;
+      for (const row of next.value) {
         seen += 1;
         const body = new TextEncoder().encode(row.body);
         const frame = frameOfBody(
@@ -398,6 +462,7 @@ export async function startFrozenParts(
             );
           }
           for (let at = 0; at < frame.length; at += target) {
+            await memory.hold();
             await upload(
               await encodePiece(
                 hash,
@@ -409,6 +474,7 @@ export async function startFrozenParts(
           }
         } else {
           if (bytes + frame.length > target) await flush();
+          await memory.hold();
           frames.push({ k: row.pk_hash, bytes: frame });
           bytes += frame.length;
         }

@@ -285,55 +285,23 @@ describe("one listing of the connection's registry rows", () => {
       expect(count(w.calls, "read", streamScope(CONNECTOR, "", n))).toBe(1);
   });
 
-  it("is taken again after a lost CAS, never reused across the retry", async () => {
+  it("publishes every stream after a lost CAS, the loser reading its row again", async () => {
+    // All streams start at once and queue their first snapshot turn before any
+    // commit turn, so no first snapshot follows the conflict: the listing is
+    // taken once. The loser applies the winner and retries from a live read.
     const w = await world({ streams: 4 });
-    // s1's first upload is held until s0 has lost its CAS, retried and
-    // finished, so s2 takes its first snapshot after the conflict.
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => (release = resolve));
     const s0 = streamScope(CONNECTOR, "", "s0");
-    const s1 = streamScope(CONNECTOR, "", "s1");
-    const held = w.deps.blobs.put;
-    w.deps.blobs.put = async (key, bytes, before) => {
-      if (scopeOfKey(key) === s1) await gate;
-      return held(key, bytes, before);
-    };
     let beaten = false;
     w.inner.beforePost = async (post) => {
       if (post.scope !== s0 || beaten) return;
       beaten = true;
       await foreignHead(w, "s0", 1);
     };
-    const published = publishConnection(w.deps, CONNECTION_ID, {
-      streamConcurrency: 2,
-    });
-    // s0 finishes (conflict, apply, retry, publish); then release s1.
-    const settled = new Promise<void>((resolve) => {
-      const timer = setInterval(() => {
-        if (count(w.calls, "post", s0) >= 2) {
-          clearInterval(timer);
-          resolve();
-        }
-      }, 5);
-    });
-    await settled;
-    // Give s2 its first snapshot while s1 is still held.
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    release();
-    const results = await published;
+    const results = await publishConnection(w.deps, CONNECTION_ID);
     expect(results.map((r) => r.outcome)).toEqual(Array(4).fill("published"));
-    // The conflict on s0 dropped the first listing: s2 listed again, and s3
-    // (which started later still) used that second one.
-    expect(count(w.calls, "list")).toBe(2);
-    const secondList = w.calls
-      .map((c, i) => (c.kind === "list" ? i : -1))
-      .filter((i) => i >= 0)[1]!;
-    const conflict = w.calls.findIndex(
-      (c) => c.kind === "post" && c.scope === s0,
-    );
-    expect(secondList).toBeGreaterThan(conflict);
-    // s0's retry read its row live.
+    expect(count(w.calls, "list")).toBe(1);
     expect(count(w.calls, "read", s0)).toBeGreaterThanOrEqual(2);
+    expect(count(w.calls, "post", s0)).toBeGreaterThanOrEqual(2);
   });
 });
 
@@ -343,9 +311,7 @@ describe("a listing taken before an apply", () => {
     // Another device already wrote s1's head. s1 learns it from the listing the
     // second stream took, and applies it: the listing predates that apply.
     await foreignHead(w, "s1", 1);
-    const results = await publishConnection(w.deps, CONNECTION_ID, {
-      streamConcurrency: 1,
-    });
+    const results = await publishConnection(w.deps, CONNECTION_ID);
     expect(results).toHaveLength(4);
     // s2 took a new listing after s1's apply; s3 used that one.
     expect(count(w.calls, "list")).toBe(2);
@@ -423,9 +389,7 @@ describe("a stream with no work, served by a listing older than its turn", () =>
 
   it("purges when the control row was deleted after the listing, and does not say noop", async () => {
     const { w, runId } = await refreshWorld(tombstoneControl);
-    const results = await publishConnection(w.deps, CONNECTION_ID, {
-      streamConcurrency: 1,
-    });
+    const results = await publishConnection(w.deps, CONNECTION_ID);
     expect(count(w.calls, "list")).toBe(1);
     // Only the stream that read its own rows has evidence for the run.
     const evidence = await evidenceOf(w, runId);
@@ -451,9 +415,7 @@ describe("a stream with no work, served by a listing older than its turn", () =>
         await tombstoneControl(world);
       },
     );
-    const results = await publishConnection(w.deps, CONNECTION_ID, {
-      streamConcurrency: 1,
-    });
+    const results = await publishConnection(w.deps, CONNECTION_ID);
     expect(deleted).toBe(true);
     expect(results[1]!.outcome).toBe("purged");
     expect((await evidenceOf(w, runId)).s1).toBeNull();
@@ -463,7 +425,7 @@ describe("a stream with no work, served by a listing older than its turn", () =>
     const { w, runId } = await refreshWorld((world) =>
       foreignHead(world, "s1", 2),
     );
-    await publishConnection(w.deps, CONNECTION_ID, { streamConcurrency: 1 });
+    await publishConnection(w.deps, CONNECTION_ID);
     const evidence = await evidenceOf(w, runId);
     // s0 read the row itself: its evidence names version 1. s1's listed row
     // (version 1) was not current by its turn: no evidence for that version.

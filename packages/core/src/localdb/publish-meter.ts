@@ -63,6 +63,7 @@ export function meteredBlobs(
     meter.uploadMs += ms;
   };
   return {
+    ...(deps.blobs.governor ? { governor: deps.blobs.governor } : {}),
     get: (key) => {
       meter.blobGets += 1;
       return timed(deps, add, () => deps.blobs.get(key));

@@ -1,3 +1,4 @@
+import { holdMemory } from "./transfer-memory.js";
 import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 // PS-2 P09 publish: the publish side of local sync.
 //
@@ -49,7 +50,7 @@ import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 // Seeds (import rows with stamp (0, "seed")) publish only into generation
 // 1; otherwise they are purged and the ledger records excluded(seed_skipped).
 //
-// Streams of one connection run together, up to `streamConcurrency`. Each
+// Every stream of one connection runs together. Each
 // stream's turns take the slot one at a time, so the control row is settled
 // by whichever snapshot runs first and every other stream sees it active; the
 // transfers overlap. Each stream's own state (stream_state row, spool attempt,
@@ -106,6 +107,10 @@ import {
 } from "./encode.js";
 import { planChangedPrefixes } from "./part-layout.js";
 import {
+  StorageDeferredError,
+  type SendWindowStats,
+} from "../stream-sync/storage-retry.js";
+import {
   meteredBlobs,
   newPublishMeter,
   publishTimings,
@@ -159,18 +164,13 @@ export interface PublishResult {
 }
 
 /**
- * Streams of one connection published at once. Their transfers (the uploads)
+ * All streams of one connection start at once. Their transfers (the uploads)
  * overlap; their snapshot and commit turns still take the connection's slot one
- * at a time. One line to change: the storage client's own limits
- * (`maxConcurrent`, `maxConcurrentPuts`) bound the requests no matter how many
- * streams run.
+ * at a time. No stream count bounds the work: the blob store's send governor
+ * paces every request and bounds the encoded bytes held in memory.
  */
-export const DEFAULT_STREAM_CONCURRENCY = 4;
-
 export interface PublishOptions {
   readonly headExtras?: (stream: string) => Promise<HeadExtras | undefined>;
-  /** Streams published at once; a positive whole number. Default 4. */
-  readonly streamConcurrency?: number;
 }
 
 export async function publishConnection(
@@ -225,9 +225,9 @@ export async function publishConnection(
   const { connection, keyCheck, hashes, streams } = opened;
   const latch: PurgeLatch = { purged: false };
   const view = openRegistryView(deps, connection, streams.length);
+  const sendWindow = deps.blobs.governor?.window();
   const published = await publishEach(
     streams.map(({ stream }) => stream),
-    options?.streamConcurrency ?? DEFAULT_STREAM_CONCURRENCY,
     latch,
     (stream) =>
       publishStream(
@@ -241,7 +241,7 @@ export async function publishConnection(
         view,
         options,
       ),
-  );
+  ).finally(() => logSendGate(deps, connectionId, sendWindow));
   // A deleted control row purges the whole connection. Every stream that
   // started has a result, "purged" included: with streams running together,
   // a stream after the purged one may already have published, and leaving it
@@ -268,41 +268,54 @@ function stopIfPurged(latch: PurgeLatch): void {
 }
 
 /**
- * Run `publish` for every stream, at most `limit` at a time, starting them in
- * order. Returns the results of the streams that ran, in stream order whatever
- * order they finished in. Once the connection is purged or a stream fails, no
- * further stream starts; streams already running are waited for, so nothing
- * runs on after this returns. The failure of the earliest stream is thrown.
+ * Run `publish` for every stream at once. Returns the results of the streams
+ * that ran, in stream order whatever order they finished in. Every stream is
+ * waited for, so nothing runs on after this returns; a stream that starts
+ * after the connection was purged or another stream failed stops at its next
+ * turn or upload. The failure of the earliest stream is thrown.
  */
 async function publishEach(
   streams: readonly string[],
-  limit: number,
   latch: PurgeLatch,
   publish: (stream: string) => Promise<PublishResult>,
 ): Promise<PublishResult[]> {
-  if (!Number.isInteger(limit) || limit < 1) {
-    throw new RangeError(
-      `publish: streamConcurrency must be a positive whole number, got ${limit}`,
-    );
-  }
   const results: (PublishResult | undefined)[] = streams.map(() => undefined);
   const failures = new Map<number, unknown>();
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    while (failures.size === 0 && !latch.purged && next < streams.length) {
-      const at = next++;
+  await Promise.all(
+    streams.map(async (stream, at) => {
       try {
-        results[at] = await publish(streams[at]!);
+        results[at] = await publish(stream);
       } catch (error) {
         failures.set(at, error);
       }
-    }
-  };
-  await Promise.all(
-    Array.from({ length: Math.min(limit, streams.length) }, worker),
+    }),
   );
   if (failures.size > 0) throw failures.get(Math.min(...failures.keys()));
   return results.filter((r): r is PublishResult => r !== undefined);
+}
+
+/** One line per publish that sent requests: what the send governor did. */
+function logSendGate(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  window: { end(): SendWindowStats } | undefined,
+): void {
+  const stats = window?.end();
+  if (!stats || stats.requests === 0) return;
+  deps.logger.info(
+    {
+      connectionId,
+      gateWindow: stats.window,
+      ...(stats.quotaPerSec === undefined
+        ? {}
+        : { quotaPerSec: Math.round(stats.quotaPerSec * 100) / 100 }),
+      requests: stats.requests,
+      throttles: stats.throttles,
+      retryAfterWaitMs: Math.round(stats.retryAfterWaitMs),
+      peakBytesInFlight: stats.peakBytesInFlight,
+    },
+    "stream sync: publish send gate",
+  );
 }
 
 const keccak: Keccak256 = async (data) => keccak_256(data);
@@ -495,6 +508,16 @@ async function publishStream(
     ).catch((error: unknown): PublishResult => {
       if (error instanceof ConnectionPurged)
         return { stream, outcome: "purged", watermark: run.watermark };
+      // Storage kept refusing past the retry budget. Nothing is wrong with
+      // the data: the stream stays in the durable queue (its watermark is not
+      // advanced) and the next cycle sends it again.
+      if (error instanceof StorageDeferredError) {
+        deps.logger.info(
+          { connectionId, stream, error: error.message },
+          "stream sync: storage unavailable, publish left in the queue",
+        );
+        return { stream, outcome: "backoff", watermark: run.watermark };
+      }
       throw error;
     });
     outcome = result.outcome;
@@ -648,7 +671,8 @@ async function publishAttempts(
     if (committed.kind === "done") return committed.result;
     if (committed.kind === "invalidated") run.invalidations++;
     // A lost CAS applied the winner: the next snapshot of this stream reads
-    // the registry, and so does any stream not yet started.
+    // the registry. Streams start together, so none takes a first snapshot
+    // after this; the call keeps a listing from outliving the conflict.
     if (committed.kind === "retry") view.invalidate();
   }
   return { stream, outcome: "backoff", watermark: run.watermark };
@@ -1115,57 +1139,72 @@ async function transferOnWave(
     candidate.changedPrefixes,
   );
   const recordCount = parts.reduce((sum, part) => sum + part.count, 0);
-  const headBytes = encodeHead({ ...candidate.head, parts, recordCount });
-  const { dataHash, blobName } = await digestHead(keccak, headBytes);
-  // The same data hash as the registry head: nothing to upload or post.
-  if (
-    candidate.registryDataHash !== null &&
-    dataHash.toLowerCase() === candidate.registryDataHash.toLowerCase()
-  ) {
+  const blobs = meteredBlobs(deps, meter);
+  // The head is built, verified and encrypted in memory and stays there until
+  // its upload settles. It is held as one part's worth, like a part, from
+  // before it is built, so heads of many streams cannot pile up under a slow
+  // store. The upload task owns the reservation once it starts.
+  const release = await holdMemory(blobs, partTargetOf(deps));
+  let handedOver = false;
+  try {
+    const headBytes = encodeHead({ ...candidate.head, parts, recordCount });
+    const { dataHash, blobName } = await digestHead(keccak, headBytes);
+    // The same data hash as the registry head: nothing to upload or post.
+    if (
+      candidate.registryDataHash !== null &&
+      dataHash.toLowerCase() === candidate.registryDataHash.toLowerCase()
+    ) {
+      return {
+        parts,
+        recordCount,
+        dataHash,
+        blobName,
+        encryptedLength: null,
+        verifiedHead: null,
+      };
+    }
+    // The reader's own check, on the bytes about to be uploaded: a head that
+    // would not verify is never uploaded, posted or remembered.
+    const verified = await verifyHead(keccak, headBytes, {
+      dataHash,
+      connector: context.connection.connector,
+      ns: context.connection.ns,
+      stream: context.stream,
+      keyCheck: context.keyCheck,
+    });
+    if (verified.kind !== "ok") {
+      throw new Error(
+        `publish: the head built for ${context.stream} failed verification: ${verified.kind}`,
+      );
+    }
+    const encrypted = await deps.keys.encrypt(scope, headBytes);
+    stopIfPurged(latch);
+    // Started with the parts still going: the head names them by hash.
+    wave.startAlongside(async () => {
+      try {
+        if (!probe || !(await blobs.exists(`${scope}/${blobName}`))) {
+          // A sibling may have purged the connection while the probe was out.
+          stopIfPurged(latch);
+          await blobs.put(`${scope}/${blobName}`, encrypted, () =>
+            stopIfPurged(latch),
+          );
+        }
+      } finally {
+        release();
+      }
+    });
+    handedOver = true;
     return {
       parts,
       recordCount,
       dataHash,
       blobName,
-      encryptedLength: null,
-      verifiedHead: null,
+      encryptedLength: encrypted.length,
+      verifiedHead: verified.head,
     };
+  } finally {
+    if (!handedOver) release();
   }
-  // The reader's own check, on the bytes about to be uploaded: a head that
-  // would not verify is never uploaded, posted or remembered.
-  const verified = await verifyHead(keccak, headBytes, {
-    dataHash,
-    connector: context.connection.connector,
-    ns: context.connection.ns,
-    stream: context.stream,
-    keyCheck: context.keyCheck,
-  });
-  if (verified.kind !== "ok") {
-    throw new Error(
-      `publish: the head built for ${context.stream} failed verification: ${verified.kind}`,
-    );
-  }
-  const encrypted = await deps.keys.encrypt(scope, headBytes);
-  stopIfPurged(latch);
-  const blobs = meteredBlobs(deps, meter);
-  // Started with the parts still going: the head names them by hash.
-  wave.startAlongside(async () => {
-    if (!probe || !(await blobs.exists(`${scope}/${blobName}`))) {
-      // A sibling may have purged the connection while the probe was out.
-      stopIfPurged(latch);
-      await blobs.put(`${scope}/${blobName}`, encrypted, () =>
-        stopIfPurged(latch),
-      );
-    }
-  });
-  return {
-    parts,
-    recordCount,
-    dataHash,
-    blobName,
-    encryptedLength: encrypted.length,
-    verifiedHead: verified.head,
-  };
 }
 
 /** Write run evidence on its own: the no-work path has no head to commit. */

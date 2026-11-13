@@ -90,6 +90,72 @@ describe("createVanaSyncStorageAdapter — chain-scoped storage", () => {
     },
   );
 
+  describe("what the send governor needs from storage's answers", () => {
+    const url = `https://storage.vana.org/v1/chains/14800/blobs/${OWNER_LOWER}/scope.name/v1`;
+    const policyHeader = { "ratelimit-policy": '"put";q=240;w=60' };
+
+    it("reports a published RateLimit-Policy from a HEAD probe", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(null, { status: 200, headers: policyHeader }),
+        ),
+      );
+      const adapter = buildAdapter({ gateway: { chainId: 14800 } }, "public");
+      const seen: unknown[] = [];
+      adapter.onRateLimitPolicy!((policy) => seen.push(policy));
+      await expect(adapter.exists(url)).resolves.toBe(true);
+      expect(seen).toEqual([{ limit: 240, windowMs: 60_000 }]);
+    });
+
+    it("throws a 429 HEAD with its status and Retry-After", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(null, {
+              status: 429,
+              headers: { "retry-after": "60" },
+            }),
+        ),
+      );
+      const adapter = buildAdapter({ gateway: { chainId: 14800 } }, "public");
+      await expect(adapter.exists(url)).rejects.toMatchObject({
+        status: 429,
+        retryAfterMs: 60_000,
+      });
+    });
+
+    it("hands the SDK a fetch that reports the policy and throws a 429 instead of retrying it", async () => {
+      const fetchMock = vi.fn(
+        async () =>
+          new Response('{"error":"RATE_LIMITED","retryAfter":60}', {
+            status: 429,
+            headers: { ...policyHeader, "retry-after": "60" },
+          }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const adapter = buildAdapter({ gateway: { chainId: 14800 } });
+      const seen: unknown[] = [];
+      adapter.onRateLimitPolicy!((policy) => seen.push(policy));
+      const options = (
+        createVanaStorageProvider.mock.calls as unknown as [
+          { fetchImpl: typeof fetch },
+        ][]
+      ).at(-1)![0];
+      await expect(
+        options.fetchImpl(url, { method: "PUT" }),
+      ).rejects.toMatchObject({
+        status: 429,
+        retryAfterMs: 60_000,
+      });
+      // One request: the SDK's own retry loop never gets a response to retry.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(seen).toEqual([{ limit: 240, windowMs: 60_000 }]);
+    });
+  });
+
   it("scopes blob paths by the gateway chainId (moksha, 14800)", () => {
     const adapter = buildAdapter({ gateway: { chainId: 14800 } });
 

@@ -8,3 +8,4 @@ export * from "./artifacts.js";
 export * from "./memory-registry.js";
 export * from "./seed-staging.js";
 export * from "./storage-retry.js";
+export * from "./send-gate.js";

@@ -1,3 +1,4 @@
+import { holdMemory } from "./transfer-memory.js";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
 import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -346,17 +347,31 @@ export async function uploadBlobs(
       uploaded.add(key);
       continue;
     }
-    const [local] = await deps.db.query<{ bytes: Uint8Array | null }>(
-      "SELECT bytes FROM blobs WHERE blob_id = ?",
+    const [stored] = await deps.db.query<{ size: number | null }>(
+      "SELECT length(bytes) AS size FROM blobs WHERE blob_id = ?",
       [blobId],
     );
-    if (local?.bytes === null || local?.bytes === undefined) {
+    if (stored?.size === null || stored?.size === undefined) {
       throw new MissingAttachmentError(blobId);
     }
-    checkBytes(blobId, local.bytes);
-    const cipher = await deps.keys.encrypt(scope, local.bytes);
-    beforeUpload?.();
-    await store.put(key, cipher, beforeUpload);
+    // The attachment is in memory as plain bytes and again as ciphertext, so
+    // twice its size is held from before the read until its upload settles.
+    const release = await holdMemory(store, 2 * stored.size, stored.size);
+    try {
+      const [local] = await deps.db.query<{ bytes: Uint8Array | null }>(
+        "SELECT bytes FROM blobs WHERE blob_id = ?",
+        [blobId],
+      );
+      if (local?.bytes === null || local?.bytes === undefined) {
+        throw new MissingAttachmentError(blobId);
+      }
+      checkBytes(blobId, local.bytes);
+      const cipher = await deps.keys.encrypt(scope, local.bytes);
+      beforeUpload?.();
+      await store.put(key, cipher, beforeUpload);
+    } finally {
+      release();
+    }
     uploaded.add(key);
   }
 }
