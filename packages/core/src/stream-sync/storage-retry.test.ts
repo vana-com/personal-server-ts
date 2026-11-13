@@ -319,6 +319,110 @@ describe("createStorageStreamSyncBlobs", () => {
     expect(refused).toBe(0);
   });
 
+  describe("uploads in flight", () => {
+    /** Storage that counts uploads in flight, and reads, while each takes a moment. */
+    const counting = () => {
+      const seen = { puts: 0, putPeak: 0, reads: 0, readPeak: 0 };
+      return {
+        seen,
+        storage: adapter({
+          upload: vi.fn(async () => {
+            seen.puts++;
+            seen.putPeak = Math.max(seen.putPeak, seen.puts);
+            await new Promise((resolve) => setTimeout(resolve, 3));
+            seen.puts--;
+            return "url";
+          }),
+          download: vi.fn(async () => {
+            seen.reads++;
+            seen.readPeak = Math.max(seen.readPeak, seen.reads);
+            await new Promise((resolve) => setTimeout(resolve, 3));
+            seen.reads--;
+            return new Uint8Array([1]);
+          }),
+        }),
+      };
+    };
+    const putAll = (blobs: ReturnType<typeof createStorageStreamSyncBlobs>) =>
+      Promise.all(
+        Array.from({ length: 12 }, (_, i) =>
+          blobs.put(`scope/part-${i}`, new Uint8Array([i])),
+        ),
+      );
+
+    it("keeps one upload in flight by default, however many callers", () => {
+      expect(DEFAULT_STORAGE_ACCESS_POLICY.maxConcurrentPuts).toBe(1);
+      const { seen, storage } = counting();
+      return putAll(
+        createStorageStreamSyncBlobs(storage, policy({ maxConcurrent: 4 })),
+      ).then(() => expect(seen.putPeak).toBe(1));
+    });
+
+    it("lets maxConcurrentPuts raise it, never above maxConcurrent", async () => {
+      const wide = counting();
+      await putAll(
+        createStorageStreamSyncBlobs(
+          wide.storage,
+          policy({ maxConcurrent: 4, maxConcurrentPuts: 3 }),
+        ),
+      );
+      expect(wide.seen.putPeak).toBe(3);
+      const narrow = counting();
+      await putAll(
+        createStorageStreamSyncBlobs(
+          narrow.storage,
+          policy({ maxConcurrent: 2, maxConcurrentPuts: 5 }),
+        ),
+      );
+      expect(narrow.seen.putPeak).toBe(2);
+    });
+
+    it("does not queue reads behind uploads that wait for their turn", async () => {
+      const { seen, storage } = counting();
+      const blobs = createStorageStreamSyncBlobs(
+        storage,
+        policy({ maxConcurrent: 2, maxConcurrentPuts: 1 }),
+      );
+      let putsDone = 0;
+      const puts = putAll(blobs).then(() => (putsDone = 12));
+      const settledPuts = () => seen.puts === 0 && putsDone === 12;
+      await Promise.all(
+        Array.from({ length: 4 }, (_, i) => blobs.get(`scope/read-${i}`)),
+      );
+      // Eleven uploads still wait for their turn; they hold no slot of the
+      // shared limit, so the reads finish while uploads remain.
+      expect(settledPuts()).toBe(false);
+      await puts;
+      expect(seen.putPeak).toBe(1);
+    });
+
+    it("keeps an upload's retries inside its turn", async () => {
+      let puts = 0;
+      let peak = 0;
+      let calls = 0;
+      const upload = vi.fn(async () => {
+        calls++;
+        puts++;
+        peak = Math.max(peak, puts);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        puts--;
+        if (calls % 2 === 1)
+          throw new Error("vana-storage upload failed: 500 Fast");
+        return "url";
+      });
+      const blobs = createStorageStreamSyncBlobs(
+        adapter({ upload }),
+        policy({ maxConcurrent: 4 }),
+      );
+      await Promise.all(
+        Array.from({ length: 6 }, (_, i) =>
+          blobs.put(`scope/part-${i}`, new Uint8Array([i])),
+        ),
+      );
+      expect(peak).toBe(1);
+    });
+  });
+
   it("retries a failed upload and still ignores a conflict", async () => {
     const upload = vi
       .fn()

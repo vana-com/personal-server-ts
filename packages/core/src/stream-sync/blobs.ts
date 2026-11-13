@@ -19,6 +19,7 @@ import { isDefinitiveNotFound } from "../storage/adapters/sdk.js";
 import type { StreamSyncBlobs } from "./ports.js";
 import {
   DEFAULT_STORAGE_ACCESS_POLICY,
+  createConcurrencyLimit,
   createStorageAccess,
   isTransientStorageError,
   type StorageAccessPolicy,
@@ -30,16 +31,22 @@ export function createStorageStreamSyncBlobs(
 ): StreamSyncBlobs {
   const resolved = { ...DEFAULT_STORAGE_ACCESS_POLICY, ...policy };
   const guarded = createStorageAccess(resolved);
+  // Outside `guarded`: an upload waiting for its turn holds no `maxConcurrent`
+  // slot, so reads are not queued behind uploads, and its retries stay inside
+  // its turn.
+  const onePut = createConcurrencyLimit(resolved.maxConcurrentPuts);
   return {
     put: (key, bytes) =>
-      guarded(async () => {
-        try {
-          await storage.upload(key, bytes);
-        } catch (error) {
-          if (error instanceof StoredBlobConflictError) return;
-          throw error;
-        }
-      }),
+      onePut(() =>
+        guarded(async () => {
+          try {
+            await storage.upload(key, bytes);
+          } catch (error) {
+            if (error instanceof StoredBlobConflictError) return;
+            throw error;
+          }
+        }),
+      ),
     get: (key) =>
       guarded(async () => {
         const url = storage.urlForKey(key);

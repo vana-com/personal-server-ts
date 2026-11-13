@@ -14,6 +14,13 @@
 export interface StorageAccessPolicy {
   /** Operations in flight at once, across every caller sharing the limiter. */
   readonly maxConcurrent: number;
+  /**
+   * Uploads in flight at once, a limit under `maxConcurrent` that only uploads
+   * pass through. vana-storage answers fast HTTP 500s while one owner has two
+   * or more uploads in flight; keep this at 1 until that is fixed there. Reads,
+   * the gateway and the other uploads' share of `maxConcurrent` are unaffected.
+   */
+  readonly maxConcurrentPuts: number;
   /** Total tries per operation, the first one included. */
   readonly maxAttempts: number;
   /** Upper bound of the wait before the second try; it doubles each time. */
@@ -29,6 +36,7 @@ export interface StorageAccessPolicy {
 
 export const DEFAULT_STORAGE_ACCESS_POLICY: StorageAccessPolicy = {
   maxConcurrent: 2,
+  maxConcurrentPuts: 1,
   maxAttempts: 6,
   baseDelayMs: 250,
   maxDelayMs: 4_000,
