@@ -319,7 +319,8 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
           generation: number;
           control_state: string;
         }>(
-          "SELECT generation,control_state FROM connections WHERE connection_id=?",
+          `SELECT generation,control_state FROM connections WHERE connection_id=?
+          AND NOT EXISTS (SELECT 1 FROM delete_intents WHERE connector=connections.connector)`,
           [target.id],
         );
         if (
