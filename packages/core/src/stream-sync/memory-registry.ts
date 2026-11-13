@@ -109,5 +109,8 @@ export function createMemoryStreamSyncBlobs(): StreamSyncBlobs {
     async get(key) {
       return blobs.get(key) ?? null;
     },
+    async exists(key) {
+      return blobs.has(key);
+    },
   };
 }

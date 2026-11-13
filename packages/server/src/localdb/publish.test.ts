@@ -36,6 +36,7 @@ import {
   type StreamSyncBlobs,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import { encodePrefixes } from "../../../core/src/localdb/encode.js";
 
 import { deleteMetadataHash } from "../../../core/src/stream-sync/delete-metadata.js";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
@@ -387,6 +388,10 @@ describe("publishConnection", () => {
           clock += 2;
           return blobs.get(key);
         },
+        exists: async (key: string) => {
+          clock += 2;
+          return blobs.exists(key);
+        },
         put: async (key: string, bytes: Uint8Array) => {
           clock += 5;
           sizes.push(bytes.length);
@@ -438,7 +443,7 @@ describe("publishConnection", () => {
       encodeEncryptMs: 10,
       partsUploaded: 1,
       bytesUploaded: sizes.reduce((sum, size) => sum + size, 0),
-      // Part and head, each probed with a GET (2 ms) and written (5 ms).
+      // Part probed with a HEAD and head with a GET (2 ms each), then both written (5 ms each).
       blobGets: 2,
       blobPuts: 2,
       uploadMs: 14,
@@ -1128,6 +1133,11 @@ describe("part layout of records with no covering part", () => {
           gets.push(key);
           return world.blobs.get(key);
         },
+        // A probe is an object request too: the simulated cost counts it.
+        exists: (key) => {
+          gets.push(key);
+          return world.blobs.exists(key);
+        },
         put: async (key, bytes) => {
           puts.push(key);
           await world.blobs.put(key, bytes);
@@ -1251,6 +1261,74 @@ describe("part layout of records with no covering part", () => {
 
   // A 16-bit prefix group heavier than the target: the planner must split
   // below 8 bits there, which needs that shard's 16-bit counts.
+  describe("a publish that re-encodes parts already in storage", () => {
+    /**
+     * Blob port that counts the body bytes it serves through `get`. `exists`
+     * answers from storage without serving a body, as a HEAD does; keys in
+     * `hidden` are reported missing.
+     */
+    function probeStore(world: World, hidden = new Set<string>()) {
+      let bytesServed = 0;
+      const puts: string[] = [];
+      const deps: LocalSyncDeps = {
+        ...world.deps,
+        blobs: {
+          get: async (key) => {
+            const body = await world.blobs.get(key);
+            bytesServed += body?.length ?? 0;
+            return body;
+          },
+          exists: async (key) =>
+            !hidden.has(key) && (await world.blobs.get(key)) !== null,
+          put: async (key, bytes) => {
+            puts.push(key);
+            await world.blobs.put(key, bytes);
+          },
+        },
+      };
+      return { deps, puts, bytesServed: () => bytesServed };
+    }
+
+    async function publishedWithParts(records: number) {
+      const world = await freshWorld(records, 4 * 1024 * 1024);
+      const first = probeStore(world);
+      expect(
+        (await publishConnection(first.deps, CONNECTION_ID))[0]?.outcome,
+      ).toBe("published");
+      const { head } = await published(world);
+      const encodeAgain = (deps: LocalSyncDeps) =>
+        encodePrefixes(deps, {
+          connectionId: CONNECTION_ID,
+          stream: STREAM,
+          scope: SCOPE,
+          generation: 1,
+          changedPrefixes: head.parts.map((part) => part.prefix),
+          upToSeq: 0,
+        });
+      return { world, first, head, encodeAgain };
+    }
+
+    it("downloads no part body when every part is already stored", async () => {
+      const { world, head, encodeAgain } = await publishedWithParts(350);
+      const again = probeStore(world);
+      // The re-encode is what a resumed publish runs: same rows, same parts.
+      await encodeAgain(again.deps);
+      expect(again.bytesServed()).toBe(0);
+      expect(again.puts).toEqual([]);
+      expect(head.parts.length).toBeGreaterThan(0);
+    });
+
+    it("uploads a part that storage does not have", async () => {
+      const { world, first, encodeAgain } = await publishedWithParts(350);
+      const missing = first.puts.find((key) => key.includes("-p-"));
+      expect(missing).toBeDefined();
+      const again = probeStore(world, new Set([missing!]));
+      await encodeAgain(again.deps);
+      expect(again.puts).toEqual([missing]);
+      expect(again.bytesServed()).toBe(0);
+    });
+  });
+
   describe("a base group heavier than the target", () => {
     const TARGET = 1024;
 
