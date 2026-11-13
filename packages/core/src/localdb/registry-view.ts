@@ -12,7 +12,7 @@ import type { LocalSyncDeps } from "./deps.js";
  * the connection's slot. A publish of N streams made 2N of those requests.
  * The view answers them from two things the publish already has:
  *
- *  - the stream rows, from ONE listing taken when the publish opens;
+ *  - the stream rows, from ONE listing started when the publish opens;
  *  - the control row, from the newest read of it any stream made in this
  *    publish (the first snapshot's, or a commit's check around its post).
  *
@@ -32,9 +32,13 @@ import type { LocalSyncDeps } from "./deps.js";
 export interface RegistryView {
   /**
    * The hints for `scope`'s first snapshot. Later calls for the same scope
-   * return none.
+   * return none. The first stream to ask gets none and does not wait: its own
+   * reads run while the listing is in flight, so the listing never delays the
+   * first upload. Every other stream waits for the listing, which is long done
+   * by the time that stream's turn comes (the first snapshot, with its control
+   * read, comes first in the slot).
    */
-  firstSnapshot(scope: string): RegistryHints;
+  firstSnapshot(scope: string): Promise<RegistryHints>;
   /** Remember a control row this publish read from the registry itself. */
   sawControl(read: ControlRead): void;
 }
@@ -46,7 +50,7 @@ export interface RegistryHints {
 
 /** A view that hints nothing: every read goes to the registry. */
 export const NO_VIEW: RegistryView = {
-  firstSnapshot: () => ({}),
+  firstSnapshot: async () => ({}),
   sawControl: () => {},
 };
 
@@ -59,41 +63,26 @@ export const NO_VIEW: RegistryView = {
 const MIN_STREAMS_FOR_LISTING = 2;
 
 /**
- * List the stream rows of `connector` once and hand them out as hints. A
+ * Start listing the stream rows of `connector` and hand them out as hints. A
  * listing that fails is not a failed publish: the snapshots read their rows.
  */
-export async function openRegistryView(
+export function openRegistryView(
   deps: LocalSyncDeps,
   connection: { readonly connector: string; readonly ns: string },
   streamCount: number,
-): Promise<RegistryView> {
+): RegistryView {
   if (streamCount < MIN_STREAMS_FOR_LISTING) return NO_VIEW;
-  let listed: readonly { scope: string; read: ControlRead }[];
-  try {
-    listed = await deps.registry.listStreamRows(connection.connector);
-  } catch (error) {
-    deps.logger.warn(
-      { error: String(error) },
-      "publish: registry listing failed; reading each stream's row",
-    );
-    return NO_VIEW;
-  }
-  const rows = new Map<string, ControlRead>();
-  for (const row of listed) {
-    const scope = parseScope(row.scope);
-    if (
-      scope?.kind === "stream" &&
-      scope.connector === connection.connector &&
-      scope.ns === connection.ns
-    )
-      rows.set(row.scope, row.read);
-  }
+  const listing = listRows(deps, connection);
   const started = new Set<string>();
   let control: ControlRead | undefined;
   return {
-    firstSnapshot(scope) {
+    async firstSnapshot(scope) {
       if (started.has(scope)) return {};
+      const first = started.size === 0;
       started.add(scope);
+      if (first) return {};
+      const rows = await listing;
+      if (rows === null) return {};
       // The listing is complete (a missing page marker throws), so a scope it
       // does not hold has no row.
       return {
@@ -105,4 +94,32 @@ export async function openRegistryView(
       control = read;
     },
   };
+}
+
+/** The connection's stream rows by scope, or null when the listing failed. */
+async function listRows(
+  deps: LocalSyncDeps,
+  connection: { readonly connector: string; readonly ns: string },
+): Promise<Map<string, ControlRead> | null> {
+  try {
+    const rows = new Map<string, ControlRead>();
+    for (const row of await deps.registry.listStreamRows(
+      connection.connector,
+    )) {
+      const scope = parseScope(row.scope);
+      if (
+        scope?.kind === "stream" &&
+        scope.connector === connection.connector &&
+        scope.ns === connection.ns
+      )
+        rows.set(row.scope, row.read);
+    }
+    return rows;
+  } catch (error) {
+    deps.logger.warn(
+      { error: String(error) },
+      "publish: registry listing failed; reading each stream's row",
+    );
+    return null;
+  }
 }

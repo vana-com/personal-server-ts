@@ -255,7 +255,7 @@ export async function publishConnection(
   if (opened.results) return opened.results;
   const { connection, keyCheck, hashes, streams } = opened;
   const latch: PurgeLatch = { purged: false };
-  const view = await openRegistryView(deps, connection, streams.length);
+  const view = openRegistryView(deps, connection, streams.length);
   const published = await publishEach(
     streams.map(({ stream }) => stream),
     options?.streamConcurrency ?? DEFAULT_STREAM_CONCURRENCY,
@@ -720,7 +720,7 @@ async function snapshotStream(
   // The hints of this stream's first snapshot; a snapshot that repeats reads
   // the registry. A control hint is only an active row of this generation:
   // absent would create the row and deleted would purge, so those are read.
-  const hints = context.view.firstSnapshot(scope);
+  const hints = await context.view.firstSnapshot(scope);
   const hintedState = hints.control && classifyControl(hints.control, hashes);
   const hinted =
     hints.control &&

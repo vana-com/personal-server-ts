@@ -170,23 +170,56 @@ const reads = (calls: readonly Call[], scope: (s: string) => boolean) =>
   calls.filter((c) => c.kind === "read" && scope(c.scope));
 
 describe("what a publish reads before it posts", () => {
+  it("does not make the first stream wait for the listing", async () => {
+    // From the publish on, the listing is held until the first stream has
+    // read its own row and uploaded. If the first snapshot waited for the
+    // listing this would never finish.
+    let holding = false;
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const stores = sharedStores();
+    const { deps, calls } = await device({
+      streams: 3,
+      stores,
+      listing: async (connector) => {
+        if (holding) await held;
+        return stores.registry.listStreamRows(connector);
+      },
+    });
+    holding = true;
+    const done = publishConnection(deps, CONNECTION_ID);
+    await vi.waitFor(() => {
+      expect(calls.some((c) => c.kind === "put")).toBe(true);
+    });
+    expect(
+      calls.some((c) => c.kind === "read" && streamOfScope(c.scope) === "s0"),
+    ).toBe(true);
+    release();
+    const results = await done;
+    expect(results.map((r) => r.outcome)).toEqual(Array(3).fill("published"));
+  });
+
   it("lists the stream rows once, and reads each stream's row only right before its post", async () => {
     const { deps, calls, names } = await device({ streams: 6 });
     const results = await publishConnection(deps, CONNECTION_ID);
     expect(results.map((r) => r.outcome)).toEqual(Array(6).fill("published"));
 
     expect(calls.filter((c) => c.kind === "list")).toHaveLength(1);
-    // One strict read per stream, none in a snapshot: the snapshots used the
-    // listing.
+    // One strict read per stream before its post, plus the first stream's
+    // snapshot read (it does not wait for the listing). The other five
+    // snapshots used the listing.
     const streamReads = reads(calls, (s) => s !== CONTROL);
-    expect(streamReads).toHaveLength(6);
+    expect(streamReads).toHaveLength(6 + 1);
     for (const stream of names) {
       const at = (pred: (c: Call) => boolean) => calls.findIndex(pred);
       const post = at(
         (c) => c.kind === "post" && streamOfScope(c.scope) === stream,
       );
-      const read = at(
-        (c) => c.kind === "read" && streamOfScope(c.scope) === stream,
+      // The read the post rests on is the LAST read of the stream's row.
+      const read = calls.reduce(
+        (last, c, i) =>
+          c.kind === "read" && streamOfScope(c.scope) === stream ? i : last,
+        -1,
       );
       const lastPut = calls.reduce(
         (last, c, i) =>
