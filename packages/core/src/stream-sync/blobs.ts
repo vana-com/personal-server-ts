@@ -39,7 +39,7 @@ export function createStorageStreamSyncBlobs(
     "maxConcurrentPuts",
   );
   return {
-    put: (key, bytes) =>
+    put: (key, bytes, beforeAttempt) =>
       onePut(() =>
         guarded(async () => {
           try {
@@ -48,7 +48,7 @@ export function createStorageStreamSyncBlobs(
             if (error instanceof StoredBlobConflictError) return;
             throw error;
           }
-        }),
+        }, beforeAttempt),
       ),
     get: (key) =>
       guarded(async () => {

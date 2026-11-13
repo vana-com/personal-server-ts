@@ -326,7 +326,7 @@ export async function uploadBlobs(
   deps: LocalSyncDeps,
   blobs: readonly BlobDescriptor[],
   meter?: PublishMeter,
-  /** Called before each probe and again before each upload; a throw stops it. */
+  /** Called before each probe and before each upload request, after the storage layer's waits; a throw stops it. */
   beforeUpload?: () => void,
 ): Promise<void> {
   const store = meter ? meteredBlobs(deps, meter) : deps.blobs;
@@ -349,7 +349,7 @@ export async function uploadBlobs(
     checkBytes(blobId, local.bytes);
     const cipher = await deps.keys.encrypt(scope, local.bytes);
     beforeUpload?.();
-    await store.put(key, cipher);
+    await store.put(key, cipher, beforeUpload);
     uploaded.add(key);
   }
 }

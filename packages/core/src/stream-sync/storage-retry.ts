@@ -108,14 +108,17 @@ export function backoffDelayMs(
  */
 export function createStorageAccess(
   policy: StorageAccessPolicy,
-): <T>(operation: () => Promise<T>) => Promise<T> {
+): <T>(operation: () => Promise<T>, beforeAttempt?: () => void) => Promise<T> {
   const limit = createConcurrencyLimit(policy.maxConcurrent, "maxConcurrent");
   let resumeAt = 0;
-  return (operation) =>
+  return (operation, beforeAttempt) =>
     limit(async () => {
       for (let attempt = 1; ; attempt++) {
         const wait = resumeAt - policy.now();
         if (wait > 0) await policy.sleep(wait);
+        // After every wait, so a call that queued or slept while the caller
+        // went stale does not start. Its throw is final: it is not retried.
+        beforeAttempt?.();
         try {
           return await operation();
         } catch (error) {

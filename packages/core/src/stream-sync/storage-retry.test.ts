@@ -236,7 +236,7 @@ describe("createConcurrencyLimit", () => {
   });
 });
 
-function adapter(over: Partial<StorageAdapter>): StorageAdapter {
+function adapter(over: Partial<StorageAdapter> = {}): StorageAdapter {
   return {
     upload: vi.fn(async (key: string) => key),
     urlForKey: (key: string) => `https://storage.test/${key}`,
@@ -347,6 +347,99 @@ describe("createStorageStreamSyncBlobs", () => {
           maxConcurrentPuts: undefined,
         }),
       ).toThrow(/maxConcurrentPuts/);
+    });
+  });
+
+  describe("an upload that is no longer wanted", () => {
+    /** The caller's guard: throws once the caller has gone stale. */
+    const staleness = () => {
+      const state = { stale: false };
+      return {
+        state,
+        guard: () => {
+          if (state.stale) throw new Error("connection purged");
+        },
+      };
+    };
+    const deferred = () => {
+      let release!: () => void;
+      const promise = new Promise<void>((r) => (release = r));
+      return { promise, release };
+    };
+
+    it("does not start an upload that queued for the single PUT slot while the caller was current", async () => {
+      // A holds the one slot; B queues for it; C (the purge) makes the caller
+      // stale; A finishes. B's request must not start.
+      const a = deferred();
+      const upload = vi.fn(async (key: string) => {
+        if (key === "scope/a") await a.promise;
+        return key;
+      });
+      const blobs = createStorageStreamSyncBlobs(
+        adapter({ upload }),
+        policy({ maxConcurrentPuts: 1 }),
+      );
+      const { state, guard } = staleness();
+      const putA = blobs.put("scope/a", new Uint8Array([1]), guard);
+      await vi.waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
+      const putB = blobs.put("scope/b", new Uint8Array([2]), guard);
+      const rejection = expect(putB).rejects.toThrow("connection purged");
+      state.stale = true;
+      a.release();
+      await putA;
+      await rejection;
+      expect(upload.mock.calls.map(([key]) => key)).toEqual(["scope/a"]);
+    });
+
+    it("does not start an upload that waits for the shared storage limit", async () => {
+      // Same, through `maxConcurrent`: the upload waits there, not at the PUT limit.
+      const a = deferred();
+      const upload = vi.fn(async (key: string) => {
+        if (key === "scope/a") await a.promise;
+        return key;
+      });
+      const blobs = createStorageStreamSyncBlobs(
+        adapter({ upload }),
+        policy({ maxConcurrentPuts: 2, maxConcurrent: 1 }),
+      );
+      const { state, guard } = staleness();
+      const putA = blobs.put("scope/a", new Uint8Array([1]), guard);
+      await vi.waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
+      const putB = blobs.put("scope/b", new Uint8Array([2]), guard);
+      const rejection = expect(putB).rejects.toThrow("connection purged");
+      state.stale = true;
+      a.release();
+      await putA;
+      await rejection;
+      expect(upload.mock.calls.map(([key]) => key)).toEqual(["scope/a"]);
+    });
+
+    it("makes no second attempt when the caller went stale during the retry delay", async () => {
+      const sleeping = deferred();
+      const slept = vi.fn(() => sleeping.promise);
+      const upload = vi.fn().mockRejectedValueOnce(failed(500));
+      const blobs = createStorageStreamSyncBlobs(
+        adapter({ upload }),
+        policy({ sleep: slept, now: () => 0, baseDelayMs: 100 }),
+      );
+      const { state, guard } = staleness();
+      const put = blobs.put("scope/a", new Uint8Array([1]), guard);
+      const rejection = expect(put).rejects.toThrow("connection purged");
+      await vi.waitFor(() => expect(slept).toHaveBeenCalledTimes(1));
+      state.stale = true;
+      sleeping.release();
+      await rejection;
+      expect(upload).toHaveBeenCalledTimes(1);
+    });
+
+    it("still retries when the caller is current after the retry delay", async () => {
+      const upload = vi.fn().mockRejectedValueOnce(failed(500));
+      const blobs = createStorageStreamSyncBlobs(
+        adapter({ upload }),
+        policy({ now: () => 0, baseDelayMs: 100 }),
+      );
+      await blobs.put("scope/a", new Uint8Array([1]), staleness().guard);
+      expect(upload).toHaveBeenCalledTimes(2);
     });
   });
 

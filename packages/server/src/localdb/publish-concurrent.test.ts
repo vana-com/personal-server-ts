@@ -97,6 +97,7 @@ async function world(options: Options) {
     listStreamRows: (connector) => innerRegistry.listStreamRows(connector),
   };
   const innerBlobs = createMemoryStreamSyncBlobs();
+  const guards: { key: string; guard: (() => void) | undefined }[] = [];
   const timedBlobs: StreamSyncBlobs = {
     async get(key) {
       record("get", key);
@@ -106,8 +107,9 @@ async function world(options: Options) {
       );
       return innerBlobs.get(key);
     },
-    async put(key, bytes) {
+    async put(key, bytes, beforeAttempt) {
       record("put", key);
+      guards.push({ key, guard: beforeAttempt });
       await options.holdPut?.(key);
       await sleep(
         (options.blobMs ?? 0) + (options.blobMsFor?.(streamOfKey(key)!) ?? 0),
@@ -198,7 +200,7 @@ async function world(options: Options) {
     coveredStreams: names,
     lastBatch: 0,
   });
-  return { deps, db, calls, purges, names, innerRegistry, sync };
+  return { deps, db, calls, guards, purges, names, innerRegistry, sync };
 }
 
 async function tombstoneControl(
@@ -334,10 +336,12 @@ describe("streams of one connection publish together", () => {
     for (const part of parked.slice(1)) part.release();
     const results = await publishing;
 
-    // Today's shape: the results end at the purged stream.
-    expect(results.at(-1)).toMatchObject({ outcome: "purged" });
-    expect(results.filter((r) => r.outcome === "purged")).toHaveLength(1);
-    expect(results.some((r) => r.outcome === "published")).toBe(false);
+    // Every stream that started reports it, in stream order; none published.
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.map((r) => r.stream)).toEqual(
+      results.map((_, i) => streamName(i)),
+    );
+    expect(results.every((r) => r.outcome === "purged")).toBe(true);
     // Nothing started after the purge: no upload, no read of a blob, no post.
     const after = calls.slice(purgedAt);
     expect(after.filter((c) => c.kind === "put" || c.kind === "get")).toEqual(
@@ -352,7 +356,54 @@ describe("streams of one connection publish together", () => {
     expect(purges).toHaveLength(1);
   });
 
-  it("results end at the first purged stream and nothing is written", async () => {
+  it("hands every upload's purge guard down to the storage layer", async () => {
+    // The storage wrapper runs the guard right before each request, after its
+    // queue and retry waits (see storage-retry.test.ts). Parts, attachments and
+    // heads all pass one.
+    const { deps, guards } = await world({ streams: 2, attachments: true });
+    await publishConnection(deps, CONNECTION_ID);
+    const kind = (key: string) =>
+      /-p-/.test(key) ? "part" : /-b-/.test(key) ? "attachment" : "head";
+    expect(new Set(guards.map(({ key }) => kind(key)))).toEqual(
+      new Set(["part", "attachment", "head"]),
+    );
+    expect(guards.filter(({ guard }) => typeof guard !== "function")).toEqual(
+      [],
+    );
+  });
+
+  it("keeps the result of a stream that published while a slower one found the purge", async () => {
+    // s0 parks in its part upload; s1 publishes completely; then the control
+    // row is deleted and s0 is let go, so it finds the tombstone at its commit.
+    let release!: () => void;
+    const parked = new Promise<void>((r) => (release = r));
+    const { deps, db, innerRegistry } = await world({
+      streams: 2,
+      holdPut: (key) => (/\.s0\/.*-p-/.test(key) ? parked : Promise.resolve()),
+    });
+    const publishing = publishConnection(deps, CONNECTION_ID, {
+      streamConcurrency: 2,
+    });
+    await vi.waitFor(async () =>
+      expect(
+        await db.query(
+          "SELECT 1 FROM run_streams WHERE stream='s1' AND publication_state='published'",
+        ),
+      ).toHaveLength(1),
+    );
+    await tombstoneControl(innerRegistry, 2);
+    release();
+    const results = await publishing;
+
+    // Every stream that started has a result, in stream order. Purged is an
+    // explicit status, and it does not hide the stream that published.
+    expect(results.map((r) => [r.stream, r.outcome])).toEqual([
+      ["s0", "purged"],
+      ["s1", "published"],
+    ]);
+  });
+
+  it("every stream that started reports the purge and nothing is written", async () => {
     const { deps, calls, innerRegistry } = await world({ streams: 4 });
     const first = await publishConnection(deps, CONNECTION_ID, {
       streamConcurrency: 1,
@@ -399,9 +450,12 @@ describe("streams of one connection publish together", () => {
       CONNECTION_ID,
       { streamConcurrency: 4 },
     );
-    // What the serial loop returned: the stream that found the purge, last.
+    // All four started together; each found the purge.
     expect(results.map((r) => [r.stream, r.outcome])).toEqual([
       ["s0", "purged"],
+      ["s1", "purged"],
+      ["s2", "purged"],
+      ["s3", "purged"],
     ]);
     expect(
       calls.slice(before).filter((c) => c.kind === "put" || c.kind === "post"),
@@ -460,36 +514,71 @@ describe("streams of one connection publish together", () => {
   });
 
   it("on a failure starts no new stream, drains the running ones and throws the earliest stream's error", async () => {
-    // s0 finishes slowly and well. s1 fails late, s2 fails early: the failures
-    // arrive in the reverse of stream order. s3 to s5 wait for a free worker.
+    // Three of six streams run at once. Each parks at its first part upload
+    // on a gate the test controls: s0 will succeed, s1 and s2 will fail, in the
+    // reverse of stream order. s3 to s5 wait for a free worker.
+    type Gate = { settle: (error?: Error) => void; promise: Promise<void> };
+    const gates = new Map<string, Gate>();
+    const gateFor = (stream: string): Gate => {
+      let gate = gates.get(stream);
+      if (!gate) {
+        let settle!: Gate["settle"];
+        const promise = new Promise<void>((resolve, reject) => {
+          settle = (error) => (error ? reject(error) : resolve());
+        });
+        // A rejection is observed by the upload that awaits the gate.
+        promise.catch(() => {});
+        gates.set(stream, (gate = { settle, promise }));
+      }
+      return gate;
+    };
     const { deps, calls, db } = await world({
       streams: 6,
-      holdPut: async (key) => {
-        const stream = streamOfKey(key);
-        if (stream === "s0") await sleep(150);
-        if (stream === "s1") {
-          await sleep(80);
-          throw new Error("s1 upload failed");
-        }
-        if (stream === "s2") {
-          await sleep(20);
-          throw new Error("s2 upload failed");
-        }
-      },
+      holdPut: (key) =>
+        /-p-/.test(key)
+          ? gateFor(streamOfKey(key)!).promise
+          : Promise.resolve(),
     });
-    await expect(
-      publishConnection(deps, CONNECTION_ID, { streamConcurrency: 3 }),
-    ).rejects.toThrow("s1 upload failed");
-    const seen = calls.length;
+    let settled = false;
+    const publishing = publishConnection(deps, CONNECTION_ID, {
+      streamConcurrency: 3,
+    });
+    const outcome = publishing.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    // A few macrotask turns: whatever a failure would set going has run.
+    const quiet = async () => {
+      for (let turn = 0; turn < 10; turn++)
+        await new Promise<void>((r) => setImmediate(r));
+    };
+    const started = (pattern: RegExp) =>
+      calls.some((c) => pattern.test(c.scope));
+    await vi.waitFor(() =>
+      expect([...gates.keys()].sort()).toEqual(["s0", "s1", "s2"]),
+    );
+
+    // The later stream fails first: nothing new starts, nothing is rejected yet.
+    gates.get("s2")!.settle(new Error("s2 upload failed"));
+    await quiet();
+    expect(settled).toBe(false);
+    expect(started(/\.s[345]\b/)).toBe(false);
+
+    // The earlier stream fails second: still waiting for s0.
+    gates.get("s1")!.settle(new Error("s1 upload failed"));
+    await quiet();
+    expect(settled).toBe(false);
+    expect(started(/\.s[345]\b/)).toBe(false);
+
+    // s0 finishes; only then does the publish end, with the earliest error.
+    gates.get("s0")!.settle();
+    await expect(publishing).rejects.toThrow("s1 upload failed");
+    await outcome;
     // The running stream was waited for: its head is posted before the rejection.
     expect(
       calls.some((c) => c.kind === "post" && c.scope.endsWith(".s0")),
     ).toBe(true);
-    // No stream after the failure ever started.
-    expect(calls.some((c) => /\.s[345]\b/.test(c.scope))).toBe(false);
-    // And nothing runs on after the rejection.
-    await sleep(100);
-    expect(calls).toHaveLength(seen);
+    expect(started(/\.s[345]\b/)).toBe(false);
     // Every stream dropped its spool rows, the failed ones too.
     expect(await db.query("SELECT 1 FROM publish_spool")).toEqual([]);
   });

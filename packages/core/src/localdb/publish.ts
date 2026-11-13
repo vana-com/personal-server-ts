@@ -270,10 +270,12 @@ export async function publishConnection(
         options,
       ),
   );
-  // A deleted control row purges the whole connection and stops: the results
-  // end at the first purged stream, as the one-at-a-time loop's did.
-  const purgedAt = published.findIndex((r) => r.outcome === "purged");
-  return purgedAt < 0 ? published : published.slice(0, purgedAt + 1);
+  // A deleted control row purges the whole connection. Every stream that
+  // started has a result, "purged" included: with streams running together,
+  // a stream after the purged one may already have published, and leaving it
+  // out would hide a real publication. A stream missing from the results never
+  // started.
+  return published;
 }
 
 /**
@@ -1045,7 +1047,9 @@ async function transferCandidate(
   if ((await blobs.get(`${scope}/${blobName}`)) === null) {
     // A sibling may have purged the connection while the probe was out.
     stopIfPurged(latch);
-    await blobs.put(`${scope}/${blobName}`, encrypted);
+    await blobs.put(`${scope}/${blobName}`, encrypted, () =>
+      stopIfPurged(latch),
+    );
   }
   return {
     parts,

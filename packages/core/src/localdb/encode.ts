@@ -302,7 +302,7 @@ export async function uploadFrozenParts(
       if ((await blobs.get(key)) === null) {
         const cipher = await deps.keys.encryptPart(input.scope, part.data);
         input.beforeUpload?.();
-        await blobs.put(key, cipher);
+        await blobs.put(key, cipher, input.beforeUpload);
         if (input.meter) input.meter.partsUploaded += 1;
       }
       result.push({ prefix, seq, partHash, bytes, count, blobName });
