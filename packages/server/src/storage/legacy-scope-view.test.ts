@@ -3347,3 +3347,148 @@ describe("Oura completed wholesale snapshots with retained tombstones", () => {
     );
   }
 });
+
+describe("an unkeyed Desktop projection of its own snapshot (spotify.savedTracks)", () => {
+  const SPOTIFY = "https://registry.pdpp.dev/sources/spotify";
+  const SCOPE = "spotify.savedTracks";
+  const STORED = "2026-10-01T00:00:00.000Z";
+  let db: InstanceType<typeof Database>;
+  let store: Store;
+  let view: ReturnType<typeof createLegacyScopeView>;
+
+  const track = (id: string, name: string | null = `Track ${id}`) => ({
+    id,
+    name,
+    artist_names: ["Artist"],
+    album_name: "Album",
+    duration_ms: 1000,
+    added_at: "2026-09-01T00:00:00Z",
+    uri: `spotify:track:${id}`,
+    explicit: false,
+  });
+  const legacyTrack = (id: string) => ({
+    added_at: "2026-09-01T00:00:00Z",
+    name: `Track ${id}`,
+    artists: [{ name: "Artist" }],
+    album: { name: "Album", artists: [] },
+    duration_ms: 1000,
+    uri: `spotify:track:${id}`,
+    explicit: false,
+  });
+
+  /** The body the stored head holds: an older snapshot with tracks a and b. */
+  const storedBody = {
+    savedTracks: [legacyTrack("a"), legacyTrack("b")],
+    total: 2,
+  };
+
+  function storeHead(producer: string | null) {
+    db.prepare(
+      `INSERT INTO data_files (scope, version, cas_revision, collected_at, path, producer)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(SCOPE, 1, 1, STORED, "spotify/savedTracks/stored.json", producer);
+  }
+
+  /**
+   * A fresh full refresh from Desktop's runtime: it replaces the stream but
+   * carries no reviewed completion receipt (none ship in production).
+   */
+  function refresh(rows: ReturnType<typeof track>[]) {
+    store.registerConnection({
+      instance: "conn_spotify",
+      sourceId: SPOTIFY,
+      method: "spotify",
+      label: "",
+    });
+    store.replaceStream({
+      instance: "conn_spotify",
+      stream: "saved_tracks",
+      method: "spotify",
+      generation: 1,
+      primaryKey: ["id"],
+      emittedAt: "2026-11-13T00:00:00.000Z",
+      envelopes: rows.map((data) => ({
+        instance: "conn_spotify",
+        stream: "saved_tracks",
+        key: data.id,
+        data,
+        emitted_at: "2026-11-13T00:00:00.000Z",
+      })),
+    });
+  }
+
+  beforeEach(() => {
+    db = initializeDatabase(":memory:");
+    store = createSqliteRecordStore(db);
+    view = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) =>
+        sourceId === SPOTIFY ? ["spotify"] : [],
+      readLegacyHead: async () => ({
+        version: "1.0",
+        scope: SCOPE,
+        collectedAt: STORED,
+        data: storedBody,
+      }),
+    });
+  });
+  afterEach(() => store.close());
+
+  it.each(["pdpp-projector", "pdpp-import-projection"])(
+    "serves a fresh complete projection over an older snapshot stamped %s, removed tracks included",
+    async (producer) => {
+      storeHead(producer);
+      // Track b was unsaved upstream; c is new. Unkeyed coverage could never
+      // prove this, so only the producer stamp lets the fresh view win.
+      refresh([track("a"), track("c")]);
+
+      const read = await view.readLatest(SCOPE);
+      expect(read.kind).toBe("canonical");
+      if (read.kind !== "canonical") throw new Error("stale snapshot served");
+      expect(read.envelope.data).toEqual({
+        savedTracks: [legacyTrack("a"), legacyTrack("c")],
+        total: 2,
+      });
+      expect(view.listingFor(SCOPE)).toMatchObject({ kind: "canonical" });
+      // The older version stays indexed; nothing is deleted.
+      expect(
+        db
+          .prepare("SELECT producer FROM data_files WHERE scope = ?")
+          .all(SCOPE),
+      ).toEqual([{ producer }]);
+    },
+  );
+
+  it("keeps an unattributed stored file (another producer) when unkeyed coverage cannot prove it", async () => {
+    storeHead(null);
+    refresh([track("a"), track("c")]);
+
+    expect(await view.readLatest(SCOPE)).toMatchObject({ kind: "file" });
+    expect(view.listingFor(SCOPE)).toMatchObject({ kind: "file" });
+    expect(view.verdictFor(SCOPE)).toMatchObject([
+      { verdict: "not_covered", reason: { reason: "no_stable_key" } },
+    ]);
+  });
+
+  it("keeps an unattributed stored file even when the fresh view retains every stored track", async () => {
+    storeHead(null);
+    refresh([track("a"), track("b"), track("c")]);
+
+    expect(await view.readLatest(SCOPE)).toMatchObject({ kind: "file" });
+  });
+
+  it("does not serve a partial run over its own older snapshot", async () => {
+    storeHead("pdpp-projector");
+    // A row short of its required name is dropped: the projection is lossy.
+    refresh([track("a"), track("c", null)]);
+
+    const read = await view.readLatest(SCOPE);
+    expect(read).toMatchObject({
+      kind: "refused",
+      refusal: { status: "incomplete", reason: "canonical_view_incomplete" },
+    });
+    // Desktop publishes only a body the read serves as canonical, so a
+    // refused read leaves the stored snapshot as the latest version.
+  });
+});
