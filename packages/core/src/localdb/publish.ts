@@ -119,6 +119,7 @@ import {
 import { purgeConnection } from "./purge.js";
 import { checkRunFence } from "./fence.js";
 import { replaceMayApply } from "./replace.js";
+import { openRegistryView, type RegistryView } from "./registry-view.js";
 import { insideQueue } from "./slot.js";
 import { unwriteRefusedRun } from "./unwrite.js";
 
@@ -254,6 +255,7 @@ export async function publishConnection(
   if (opened.results) return opened.results;
   const { connection, keyCheck, hashes, streams } = opened;
   const latch: PurgeLatch = { purged: false };
+  const view = await openRegistryView(deps, connection, streams.length);
   const published = await publishEach(
     streams.map(({ stream }) => stream),
     options?.streamConcurrency ?? DEFAULT_STREAM_CONCURRENCY,
@@ -267,6 +269,7 @@ export async function publishConnection(
         keyCheck,
         hashes,
         latch,
+        view,
         options,
       ),
   );
@@ -422,6 +425,8 @@ type StreamContext = {
   readonly keyCheck: string;
   readonly hashes: ControlHashes;
   readonly latch: PurgeLatch;
+  /** What the publish already read from the registry; see registry-view.ts. */
+  readonly view: RegistryView;
   readonly options: PublishOptions | undefined;
 };
 
@@ -485,6 +490,7 @@ async function publishStream(
   keyCheck: string,
   hashes: ControlHashes,
   latch: PurgeLatch,
+  view: RegistryView,
   options: PublishOptions | undefined,
 ): Promise<PublishResult> {
   const run: StreamRun = {
@@ -508,6 +514,7 @@ async function publishStream(
       keyCheck,
       hashes,
       latch,
+      view,
       options,
     ).catch((error: unknown): PublishResult => {
       if (error instanceof ConnectionPurged)
@@ -585,6 +592,7 @@ async function publishAttempts(
   keyCheck: string,
   hashes: ControlHashes,
   latch: PurgeLatch,
+  view: RegistryView,
   options: PublishOptions | undefined,
 ): Promise<PublishResult> {
   const context: StreamContext = {
@@ -595,6 +603,7 @@ async function publishAttempts(
     keyCheck,
     hashes,
     latch,
+    view,
     options,
   };
   // Another stream may have purged the connection while this one waited for
@@ -708,7 +717,16 @@ async function snapshotStream(
 
   // Step 2: registry. A deleted control row purges and stops; a foreign
   // control row, or one whose generation moved, defers the stream.
-  let controlRead = await deps.registry.read(control);
+  // The hints of this stream's first snapshot; a snapshot that repeats reads
+  // the registry. A control hint is only an active row of this generation:
+  // absent would create the row and deleted would purge, so those are read.
+  const hints = context.view.firstSnapshot(scope);
+  const hintedState = hints.control && classifyControl(hints.control, hashes);
+  const hinted =
+    hints.control &&
+    hintedState?.kind === "active" &&
+    hintedState.generation === connection.generation;
+  let controlRead = hinted ? hints.control! : await deps.registry.read(control);
   let controlState = classifyControl(controlRead, hashes);
   if (controlState.kind === "absent") {
     if (connection.generation !== 1) return deferred();
@@ -730,6 +748,7 @@ async function snapshotStream(
     controlRead = await deps.registry.read(control);
     controlState = classifyControl(controlRead, hashes);
   }
+  if (!hinted) context.view.sawControl(controlRead);
   if (controlState.kind === "deleted") {
     await purgeConnection(deps, connectionId, {
       controlVersion: controlState.version,
@@ -776,7 +795,7 @@ async function snapshotStream(
     },
   ]);
 
-  const streamRead = await deps.registry.read(scope);
+  const streamRead = hints.stream ?? (await deps.registry.read(scope));
   const streamRow = classifyStreamRow(streamRead, hashes);
   // `registryHead` is the content base: the verified head of THIS lifetime.
   // `registryVersion` and `registryDataHash` are the compare-and-set basis and
@@ -1335,10 +1354,11 @@ async function checkControl(
     ).length
   )
     return "deferred";
-  const state = classifyControl(
-    await deps.registry.read(controlScope(connection.connector, connection.ns)),
-    hashes,
+  const read = await deps.registry.read(
+    controlScope(connection.connector, connection.ns),
   );
+  context.view.sawControl(read);
+  const state = classifyControl(read, hashes);
   if (state.kind === "deleted") {
     await purgeConnection(deps, id, { controlVersion: state.version });
     context.latch.purged = true;
