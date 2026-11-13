@@ -37,6 +37,99 @@ export type RegistryPostResult =
   /** 409: another row holds this version or a higher one. */
   | { readonly kind: "conflict"; readonly latestVersion: string | null };
 
+/**
+ * A condition on another row of the owner, checked by the gateway in the same
+ * transaction as the write: the row's head version is `expectedVersion` and,
+ * with `notDeleted`, it is not a tombstone. The gateway checks it, so a delete
+ * cannot land between the client's check and the write.
+ */
+export interface RegistryRequirement {
+  readonly scope: string;
+  readonly expectedVersion: string;
+  readonly notDeleted: boolean;
+  /**
+   * The row's head data hash. A version alone does not tell a refresh of the
+   * same version from the row the caller saw; the hash does.
+   */
+  readonly expectedDataHash?: `0x${string}`;
+}
+
+/** The first condition that failed. Nothing was written. */
+export interface RegistryRequirementFailure {
+  readonly scope: string;
+  /** Why it failed, when the gateway says. */
+  readonly reason?:
+    "absent" | "deleted" | "version-mismatch" | "data-hash-mismatch";
+  /** Head version the gateway holds for the row; `null` when it has none. */
+  readonly latestVersion: string | null;
+  readonly deleted: boolean;
+}
+
+/** A single write that carries conditions on other rows. */
+export interface ConditionalRegistryPost extends SignedRegistryPost {
+  readonly requires: readonly RegistryRequirement[];
+}
+
+export type ConditionalPostResult =
+  | RegistryPostResult
+  | {
+      readonly kind: "precondition_failed";
+      readonly failure: RegistryRequirementFailure;
+    };
+
+/** One signed row of a batch; the owner and the conditions are the batch's. */
+export type SignedBatchRow = Omit<SignedRegistryPost, "ownerAddress"> & {
+  /**
+   * The data hash of the row this one replaces, as the snapshot saw it. The
+   * gateway refuses the row when the head's hash differs. Absent for a first
+   * version.
+   */
+  readonly expectedHeadDataHash?: `0x${string}`;
+};
+
+/**
+ * Several writes of one owner in one request, with conditions on other rows.
+ * The conditions are the batch's: if one fails nothing is written. Each row
+ * then lands or loses on its own, and a row that lost does not affect its
+ * siblings. The conditions are judged on every request, a replay included.
+ * `rows` may be empty when `requires` is not: nothing is written and the
+ * answer says whether every condition holds.
+ */
+export interface SignedRegistryBatch {
+  readonly ownerAddress: string;
+  readonly rows: readonly SignedBatchRow[];
+  readonly requires: readonly RegistryRequirement[];
+}
+
+export type RegistryBatchRow =
+  /** 201: written. */
+  | { readonly kind: "committed" }
+  /**
+   * 409: the gateway holds this version or a later one. The winner's version
+   * and data hash come with it; a row whose hash is the winner's is already
+   * published (a resend).
+   */
+  | {
+      readonly kind: "conflict";
+      readonly latestVersion: string | null;
+      readonly latestDataHash: string | null;
+    };
+
+export type RegistryBatchResult =
+  /** The gateway has no batch route (404 or 405). Nothing was written. */
+  | { readonly kind: "unsupported" }
+  /**
+   * A condition failed. Nothing was written, for any row. `failure` is `null`
+   * when the gateway did not say which condition or why: the caller reads the
+   * row to find out.
+   */
+  | {
+      readonly kind: "precondition_failed";
+      readonly failure: RegistryRequirementFailure | null;
+    }
+  /** 2xx: one result per request row, in request order. */
+  | { readonly kind: "rows"; readonly rows: readonly RegistryBatchRow[] };
+
 /** Neither committed nor refused: resend the persisted request unchanged. */
 export class AmbiguousRegistryReplyError extends Error {
   constructor(message: string) {
@@ -61,6 +154,23 @@ export interface StreamSyncRegistry {
   read(scope: string): Promise<ControlRead>;
   /** `POST /v1/data` with `exclusive: true`. Throws `AmbiguousRegistryReplyError`. */
   post(request: SignedRegistryPost): Promise<RegistryPostResult>;
+  /**
+   * `POST /v1/data` with `requires`. A gateway that does not know `requires`
+   * ignores it and writes anyway, and the answer does not say so, so a caller
+   * may use this only against a gateway known to enforce it.
+   */
+  postConditional?(
+    request: ConditionalRegistryPost,
+  ): Promise<ConditionalPostResult>;
+  /**
+   * `POST /v1/data/batch`: every row and every condition in one request.
+   * Absent on a registry without a batch route. `unsupported` when the
+   * gateway answers 404 or 405; the adapter remembers that, so later calls
+   * send nothing. Throws `AmbiguousRegistryReplyError`: resend the same
+   * request; a row that already landed answers as a conflict with its own hash
+   * (or as committed).
+   */
+  postBatch?(request: SignedRegistryBatch): Promise<RegistryBatchResult>;
   /**
    * Every control scope row of the owner (`pdpp.<c>~<ns>`), deleted or not.
    * Used for the per-session control listing (§2.4 `controls`).

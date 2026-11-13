@@ -45,6 +45,22 @@ import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 //      stream_versions, compaction of record_changes at or below the
 //      connection's lowest watermark (kept while an import read-back is
 //      pending).
+//      With a gateway that has a batch route, the streams of one connection
+//      that are ready commit in ONE request per slot turn (see commitBatchTurn
+//      and batch-commit.ts): group commit, no timer. Each stream that writes
+//      sends its row with the registry head's data hash it was planned over;
+//      each stream with nothing to write sends a condition on its stream row.
+//      The request also names the connection's control row (generation, hash,
+//      not deleted). The gateway checks the conditions in the transaction of
+//      the writes, so no client read of the control row brackets the write. A
+//      failed condition writes nothing: purge (control deleted), defer
+//      (another lifetime) or re-plan one stream (its row moved). Otherwise each
+//      row answers for itself: 201 publishes that stream (only the frozen
+//      watermark is acknowledged); a 409 applies the winner and re-plans that
+//      stream, and the others are not affected. A lost reply is answered by
+//      sending the same request again. A gateway without the route (404 or
+//      405) is remembered, and every stream commits alone as before
+//      (commitCandidate).
 //
 // Seeds (import rows with stamp (0, "seed")) publish only into generation
 // 1; otherwise they are purged and the ledger records excluded(seed_skipped).
@@ -89,7 +105,21 @@ import {
   type PlanRun,
   type StepDecision,
 } from "../stream-sync/publish-plan.js";
+import {
+  AmbiguousRegistryReplyError,
+  type RegistryBatchResult,
+  type SignedRegistryBatch,
+  type StreamSyncRegistry,
+} from "../stream-sync/ports.js";
 import { applyConnection } from "./apply.js";
+import {
+  createCommitGroup,
+  GATEWAY_MAX_BATCH_REQUIRES,
+  GATEWAY_MAX_BATCH_ROWS,
+  settleRequirementFailure,
+  settleRow,
+  type CommitGroup,
+} from "./batch-commit.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import {
@@ -225,6 +255,7 @@ export async function publishConnection(
   const { connection, keyCheck, hashes, streams } = opened;
   const latch: PurgeLatch = { purged: false };
   const view = openRegistryView(deps, connection, streams.length);
+  const commits = connectionCommits(deps, connectionId, latch);
   const published = await publishEach(
     streams.map(({ stream }) => stream),
     options?.streamConcurrency ?? DEFAULT_STREAM_CONCURRENCY,
@@ -240,6 +271,7 @@ export async function publishConnection(
         latch,
         view,
         options,
+        commits,
       ),
   );
   // A deleted control row purges the whole connection. Every stream that
@@ -397,6 +429,7 @@ type StreamContext = {
   /** What the publish already read from the registry; see registry-view.ts. */
   readonly view: RegistryView;
   readonly options: PublishOptions | undefined;
+  readonly commits: ConnectionCommits;
 };
 
 /**
@@ -411,6 +444,11 @@ type Candidate = {
   readonly localWatermark: number;
   readonly registryVersion: number;
   readonly registryDataHash: string | null;
+  /**
+   * The control row's data hash at the snapshot (its active hash), which the
+   * commit's `requires` names with the generation.
+   */
+  readonly controlDataHash: `0x${string}`;
   readonly baseParts: readonly HeadPart[];
   readonly changedPrefixes: readonly string[];
   readonly frozen: readonly FrozenPrefix[];
@@ -448,12 +486,38 @@ type Snapshot =
       readonly kind: "blobs";
       readonly blobs: readonly BlobDescriptor[];
       readonly result: PublishResult;
-      /** Held until the attachments are up; see `confirmNoWork`. */
+      /** Held until the attachments are up; see `confirmIdle`. */
       readonly evidence: RunEvidence | null;
       /** The stream row the plan matched: absent, or this version and hash. */
       readonly planned: ControlRead;
+      readonly controlDataHash: `0x${string}`;
     }
+  /** Nothing to publish, but the hints it rests on are not yet confirmed. */
+  | { readonly kind: "idle"; readonly idle: Idle }
   | { readonly kind: "candidate"; readonly candidate: Candidate };
+
+/**
+ * A stream that ends without a candidate, waiting for its hints to be
+ * confirmed. On the batch path the confirmation is a condition of the commit
+ * request (its stream row and the control row, judged by the gateway in the
+ * request's transaction); without the batch route it is `confirmIdle`: the
+ * live reads, stream row then control row.
+ */
+type Idle = {
+  readonly result: PublishResult;
+  /** Written once the hints are confirmed. */
+  readonly evidence: RunEvidence | null;
+  /**
+   * The stream row the confirmation must still find: the listing's row when
+   * the snapshot rests on it, or, after an attachment upload, the row the plan
+   * matched (absent included, whether it was a hint or a live read). `null` if
+   * the snapshot read the row live and nothing has run since. A found row is
+   * a condition of the batch request; an absent one cannot be, so it is
+   * confirmed by the live read.
+   */
+  readonly hint: ControlRead | null;
+  readonly controlDataHash: `0x${string}`;
+};
 
 type Committed =
   | { readonly kind: "done"; readonly result: PublishResult }
@@ -470,6 +534,7 @@ async function publishStream(
   latch: PurgeLatch,
   view: RegistryView,
   options: PublishOptions | undefined,
+  commits: ConnectionCommits,
 ): Promise<PublishResult> {
   const run: StreamRun = {
     sawRefusal: false,
@@ -494,6 +559,7 @@ async function publishStream(
       latch,
       view,
       options,
+      commits,
     ).catch((error: unknown): PublishResult => {
       if (error instanceof ConnectionPurged)
         return { stream, outcome: "purged", watermark: run.watermark };
@@ -572,6 +638,7 @@ async function publishAttempts(
   latch: PurgeLatch,
   view: RegistryView,
   options: PublishOptions | undefined,
+  commits: ConnectionCommits,
 ): Promise<PublishResult> {
   const context: StreamContext = {
     connectionId,
@@ -583,6 +650,7 @@ async function publishAttempts(
     latch,
     view,
     options,
+    commits,
   };
   // Another stream may have purged the connection while this one waited for
   // the turn or was transferring: the turn does nothing then.
@@ -607,26 +675,36 @@ async function publishAttempts(
     );
     if (snapshot.kind === "done") return snapshot.result;
     if (snapshot.kind === "retry") continue;
-    if (snapshot.kind === "blobs") {
-      await uploadBlobs(deps, snapshot.blobs, run.meter, () =>
-        stopIfPurged(latch),
-      );
-      // The attachments took time outside the slot: the control row and the
-      // stream row are read again before the stream is called done.
-      const { evidence, planned, result } = snapshot;
-      const ended = await slot((held) =>
-        confirmNoWork(held, context, planned, evidence),
-      );
-      if (ended === "retry") {
-        // The stream row moved while the attachments went up: the plan that
+    if (snapshot.kind === "idle" || snapshot.kind === "blobs") {
+      let idle: Idle;
+      if (snapshot.kind === "idle") {
+        idle = snapshot.idle;
+      } else {
+        await uploadBlobs(deps, snapshot.blobs, run.meter, () =>
+          stopIfPurged(latch),
+        );
+        // The attachments took time outside the slot: the stream row (the
+        // planned one, absent included) and the control row are confirmed
+        // again before the stream is called done.
+        const { evidence, planned, result } = snapshot;
+        idle = {
+          result,
+          evidence,
+          hint: planned,
+          controlDataHash: snapshot.controlDataHash,
+        };
+      }
+      const ended = await finishIdle(slot, context, run, idle);
+      if (ended.kind === "retry") {
+        // The stream row moved after the plan read it (while the attachments
+        // went up, or after the listing the hint came from): the plan that
         // found nothing to publish is not the registry's any more.
         view.invalidate();
         run.invalidations++;
         continue;
       }
-      return ended
-        ? { stream, outcome: ended, watermark: result.watermark }
-        : result;
+      if (ended.kind === "done") return ended.result;
+      continue;
     }
     const { candidate } = snapshot;
     stopIfPurged(latch);
@@ -651,8 +729,12 @@ async function publishAttempts(
       run.invalidations++;
       continue;
     }
-    const committed = await slot((held) =>
-      commitCandidate(held, context, candidate, prepared, run),
+    const committed = await commitStream(
+      slot,
+      context,
+      candidate,
+      prepared,
+      run,
     );
     if (committed.kind === "done") return committed.result;
     if (committed.kind === "invalidated") run.invalidations++;
@@ -928,8 +1010,23 @@ async function snapshotStream(
     plan.replaceBelow !== undefined ||
     plan.steps.some((step) => step.decision.kind === "publish");
   if (!hasWork) {
-    const stale = await confirmLive();
-    if (stale) return stale;
+    // On the batch path a snapshot that rests on hints and has nothing to
+    // upload confirms them as conditions of its commit request (the gateway
+    // judges its stream row and the control row in the request's
+    // transaction), not as two live reads. A stream row that was not found
+    // cannot be a condition: it reads live.
+    const asCondition =
+      (hintedRow || hintedControl) &&
+      blobs.length === 0 &&
+      !context.commits.unsupported &&
+      (!hintedRow || streamRead.found);
+    if (!asCondition) {
+      const stale = await confirmLive();
+      if (stale) return stale;
+    }
+    const controlDataHash = (
+      controlRead.found ? controlRead.dataHash : hashes.activeData
+    ) as `0x${string}`;
     const result: PublishResult = {
       stream,
       outcome: run.sawRefusal ? "refused" : "noop",
@@ -949,7 +1046,25 @@ async function snapshotStream(
           }
         : null;
     if (blobs.length > 0) {
-      return { kind: "blobs", blobs, result, evidence, planned: streamRead };
+      return {
+        kind: "blobs",
+        blobs,
+        result,
+        evidence,
+        planned: streamRead,
+        controlDataHash,
+      };
+    }
+    if (asCondition) {
+      return {
+        kind: "idle",
+        idle: {
+          result,
+          evidence,
+          hint: hintedRow ? streamRead : null,
+          controlDataHash,
+        },
+      };
     }
     if (evidence) await saveRunEvidence(deps, connectionId, stream, evidence);
     return done(result);
@@ -1031,6 +1146,9 @@ async function snapshotStream(
       localWatermark: local.publish_watermark,
       registryVersion,
       registryDataHash,
+      controlDataHash: (controlRead.found
+        ? controlRead.dataHash
+        : hashes.activeData) as `0x${string}`,
       baseParts: registryHead?.parts ?? [],
       changedPrefixes,
       frozen,
@@ -1196,34 +1314,6 @@ async function saveRunEvidence(
   if (statements.length > 0) await deps.db.batch(statements);
 }
 
-/**
- * The no-work path with attachments to upload: the snapshot's slot turn is
- * over by the time they are up, so the stream row is read again, then the
- * control row, in a slot turn. A row that is no longer the planned one
- * (changed, or gone) means the plan is stale: "retry". A connection deleted
- * meanwhile purges and one that moved defers, never "noop". Evidence is
- * written only after both reads agree with the plan; it is also read when
- * there is no evidence to save, because a "noop" is a claim about the
- * registry too.
- */
-async function confirmNoWork(
-  deps: LocalSyncDeps,
-  context: StreamContext,
-  planned: ControlRead,
-  evidence: RunEvidence | null,
-): Promise<"purged" | "deferred" | "retry" | null> {
-  // The row first, the control row second: see `confirmLive`.
-  if (!sameRow(await deps.registry.read(context.scope), planned)) {
-    return "retry";
-  }
-  const checked = await checkControl(deps, context);
-  if (checked) return checked;
-  if (evidence) {
-    await saveRunEvidence(deps, context.connectionId, context.stream, evidence);
-  }
-  return null;
-}
-
 /** Whether two reads of a stream's row are the same row version and content. */
 function sameRow(a: ControlRead, b: ControlRead): boolean {
   if (!a.found || !b.found) return a.found === b.found;
@@ -1245,7 +1335,7 @@ async function commitCandidate(
   prepared: Prepared,
   run: StreamRun,
 ): Promise<Committed> {
-  const { connectionId, connection, stream, scope } = context;
+  const { connectionId, stream, scope } = context;
   const { watermark } = candidate;
   const done = (result: PublishResult): Committed => ({ kind: "done", result });
   // Local state: what readBasis compares (control, stream state, head parts,
@@ -1258,25 +1348,7 @@ async function commitCandidate(
   // fence: a stale expectedVersion answers 409, the winner is applied, the
   // stream re-plans and is never marked published. The no-op path sends no
   // CAS and re-reads the row itself.
-  const { dataHash: headHash, blobName } = prepared;
-  const commit = (version: number, isNewVersion: boolean) =>
-    commitBatch(deps, connectionId, stream, {
-      version,
-      generation: candidate.headGeneration,
-      dataHash: headHash,
-      blobName,
-      recordCount: prepared.recordCount,
-      observedAt: candidate.head.observedAt,
-      complete: candidate.head.complete,
-      parts: prepared.parts,
-      watermark,
-      lastDeleteVersion: candidate.head.lastDeleteVersion ?? 0,
-      replaceBelow: candidate.replaceBelow,
-      primaryKey: candidate.head.primaryKey,
-      profile: candidate.head.profile,
-      isNewVersion,
-      runIds: candidate.runIds,
-    });
+  const { dataHash: headHash } = prepared;
 
   // Step 5: if the new head's data hash equals the registry head's, skip the
   // CAS and record the local state (watermark advances, the head is already
@@ -1295,44 +1367,15 @@ async function commitCandidate(
     }
     const checked = await checkControl(deps, context);
     if (checked) return done({ stream, outcome: checked, watermark });
-    await commit(candidate.registryVersion, false);
-    return done({
-      stream,
-      outcome: candidate.sawRefusal ? "refused" : "noop",
-      watermark,
-      ...(watermark > candidate.localWatermark && {
-        publication: {
-          connectionId,
-          connector: connection.connector,
-          ns: connection.ns,
-          stream,
-          head: {
-            version: candidate.registryVersion,
-            generation: candidate.headGeneration,
-            dataHash: headHash,
-          },
-          watermark,
-          runIds: candidate.runIds,
-        },
-      }),
-    });
+    return finishNoop(deps, context, candidate, prepared);
   }
 
-  const newVersion = candidate.registryVersion + 1;
-  const metadataHash = metadataHashFor(
-    scope,
-    new Date(candidate.head.observedAt).toISOString(),
-    prepared.encryptedLength,
-  );
   const addRegisterMs = (ms: number) => (run.meter.headRegisterMs += ms);
-  const signature = await timed(deps, addRegisterMs, () =>
-    deps.signer.signAddData({
-      ownerAddress: deps.ownerAddress,
-      scope,
-      dataHash: headHash,
-      metadataHash,
-      expectedVersion: BigInt(newVersion),
-    }),
+  const { newVersion, metadataHash, signature } = await timed(
+    deps,
+    addRegisterMs,
+    () =>
+      signHead(deps, context, candidate, prepared.encryptedLength!, prepared),
   );
   const beforePost = await checkControl(deps, context);
   if (beforePost) return done({ stream, outcome: beforePost, watermark });
@@ -1363,36 +1406,681 @@ async function commitCandidate(
 
   const afterPost = await checkControl(deps, context);
   if (afterPost) return done({ stream, outcome: afterPost, watermark });
-  await commit(newVersion, true);
+  return finishPosted(deps, context, candidate, prepared, newVersion);
+}
+
+/**
+ * The head equals the registry's: nothing was posted. Record the local state
+ * (the watermark advances; the head is already published) and report it.
+ */
+async function finishNoop(
+  deps: LocalSyncDeps,
+  context: StreamContext,
+  candidate: Candidate,
+  prepared: Prepared,
+): Promise<Committed> {
+  const { connectionId, connection, stream } = context;
+  const { watermark } = candidate;
+  await commitLocal(
+    deps,
+    context,
+    candidate,
+    prepared,
+    candidate.registryVersion,
+    false,
+  );
+  return {
+    kind: "done",
+    result: {
+      stream,
+      outcome: candidate.sawRefusal ? "refused" : "noop",
+      watermark,
+      ...(watermark > candidate.localWatermark && {
+        publication: {
+          connectionId,
+          connector: connection.connector,
+          ns: connection.ns,
+          stream,
+          head: {
+            version: candidate.registryVersion,
+            generation: candidate.headGeneration,
+            dataHash: prepared.dataHash,
+          },
+          watermark,
+          runIds: candidate.runIds,
+        },
+      }),
+    },
+  };
+}
+
+/** Sign the head's registry row: version `registryVersion + 1`. */
+async function signHead(
+  deps: LocalSyncDeps,
+  context: StreamContext,
+  candidate: Candidate,
+  encryptedLength: number,
+  prepared: Prepared,
+) {
+  const newVersion = candidate.registryVersion + 1;
+  const metadataHash = metadataHashFor(
+    context.scope,
+    new Date(candidate.head.observedAt).toISOString(),
+    encryptedLength,
+  );
+  const signature = await deps.signer.signAddData({
+    ownerAddress: deps.ownerAddress,
+    scope: context.scope,
+    dataHash: prepared.dataHash,
+    metadataHash,
+    expectedVersion: BigInt(newVersion),
+  });
+  return { newVersion, metadataHash, signature };
+}
+
+/** The local write of a stream's head: stream state, parts, evidence, compaction. */
+function commitLocal(
+  deps: LocalSyncDeps,
+  context: StreamContext,
+  candidate: Candidate,
+  prepared: Prepared,
+  version: number,
+  isNewVersion: boolean,
+): Promise<void> {
+  return commitBatch(deps, context.connectionId, context.stream, {
+    version,
+    generation: candidate.headGeneration,
+    dataHash: prepared.dataHash,
+    blobName: prepared.blobName,
+    recordCount: prepared.recordCount,
+    observedAt: candidate.head.observedAt,
+    complete: candidate.head.complete,
+    parts: prepared.parts,
+    watermark: candidate.watermark,
+    lastDeleteVersion: candidate.head.lastDeleteVersion ?? 0,
+    replaceBelow: candidate.replaceBelow,
+    primaryKey: candidate.head.primaryKey,
+    profile: candidate.head.profile,
+    isNewVersion,
+    runIds: candidate.runIds,
+  });
+}
+
+/** The registry took the row: record it locally and report the publication. */
+async function finishPosted(
+  deps: LocalSyncDeps,
+  context: StreamContext,
+  candidate: Candidate,
+  prepared: Prepared,
+  newVersion: number,
+): Promise<Committed> {
+  const { connectionId, connection, stream, scope } = context;
+  await commitLocal(deps, context, candidate, prepared, newVersion, true);
   // The next snapshot of this stream meets this head at the registry. This
   // device built, verified and committed it, so it need not download it.
   if (prepared.verifiedHead) {
     rememberOwnHead(
       deps,
       scope,
-      headHash,
+      prepared.dataHash,
       context.keyCheck,
       prepared.verifiedHead,
     );
   }
-  return done({
-    stream,
-    outcome: "published",
-    watermark,
-    publication: {
-      connectionId,
-      connector: connection.connector,
-      ns: connection.ns,
+  return {
+    kind: "done",
+    result: {
       stream,
-      head: {
-        version: newVersion,
-        generation: candidate.headGeneration,
-        dataHash: headHash,
+      outcome: "published",
+      watermark: candidate.watermark,
+      publication: {
+        connectionId,
+        connector: connection.connector,
+        ns: connection.ns,
+        stream,
+        head: {
+          version: newVersion,
+          generation: candidate.headGeneration,
+          dataHash: prepared.dataHash,
+        },
+        watermark: candidate.watermark,
+        runIds: candidate.runIds,
       },
-      watermark,
-      runIds: candidate.runIds,
     },
+  };
+}
+
+/**
+ * A stream waiting for its commit: one with a finished transfer (`head`), or
+ * one with no candidate whose hints wait to be confirmed (`idle`).
+ */
+type CommitEntry =
+  | {
+      readonly kind: "head";
+      readonly context: StreamContext;
+      readonly candidate: Candidate;
+      readonly prepared: Prepared;
+      readonly run: StreamRun;
+    }
+  | {
+      readonly kind: "idle";
+      readonly context: StreamContext;
+      readonly idle: Idle;
+      readonly run: StreamRun;
+    };
+
+type HeadEntry = Extract<CommitEntry, { kind: "head" }>;
+
+/** A stream whose head differs from the registry's writes a row. */
+const writesHead = (entry: CommitEntry): entry is HeadEntry =>
+  entry.kind === "head" && entry.prepared.encryptedLength !== null;
+
+/**
+ * The stream row a stream that writes nothing holds fixed: the row it planned
+ * over. `null` if it has none to hold.
+ */
+const fenceOf = (
+  entry: CommitEntry,
+): { readonly version: number; readonly dataHash: `0x${string}` } | null =>
+  entry.kind === "idle"
+    ? entry.idle.hint?.found
+      ? {
+          version: entry.idle.hint.version,
+          dataHash: entry.idle.hint.dataHash as `0x${string}`,
+        }
+      : null
+    : {
+        version: entry.candidate.registryVersion,
+        dataHash: entry.candidate.registryDataHash as `0x${string}`,
+      };
+
+const controlHashOf = (entry: CommitEntry): `0x${string}` =>
+  entry.kind === "idle"
+    ? entry.idle.controlDataHash
+    : entry.candidate.controlDataHash;
+
+const watermarkOf = (entry: CommitEntry): number | null =>
+  entry.kind === "idle"
+    ? entry.idle.result.watermark
+    : entry.candidate.watermark;
+
+/** What a commit turn gives a stream. `unbatched`: commit alone, as before. */
+type CommitTurn = Committed | { readonly kind: "unbatched" };
+
+/**
+ * The commit coalescer of one publish of one connection. `unsupported` is set
+ * when the registry has no batch route; from then on every stream commits
+ * alone. It never waits for a stream: see batch-commit.ts.
+ */
+type ConnectionCommits = {
+  unsupported: boolean;
+  readonly group: CommitGroup<CommitEntry, CommitTurn>;
+};
+
+function connectionCommits(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  latch: PurgeLatch,
+): ConnectionCommits {
+  const commits: ConnectionCommits = {
+    unsupported: deps.registry.postBatch === undefined,
+    group: createCommitGroup<CommitEntry, CommitTurn>({
+      runInSlot: (work) =>
+        deps.queue.run(connectionId, "publish", () => {
+          stopIfPurged(latch);
+          return work(insideQueue(deps, connectionId));
+        }),
+      flush: (held, entries) => commitBatchTurn(held, entries, commits),
+      // A turn is bounded by what the gateway accepts: rows are the streams
+      // that write, and each stream that does not write is one more condition
+      // beside the control row's.
+      canJoin: (taken, next) => {
+        const writes = (list: readonly CommitEntry[]) =>
+          list.filter(writesHead).length;
+        return writesHead(next)
+          ? writes(taken) < GATEWAY_MAX_BATCH_ROWS
+          : taken.length - writes(taken) < GATEWAY_MAX_BATCH_REQUIRES - 1;
+      },
+    }),
+  };
+  return commits;
+}
+
+/**
+ * COMMIT of one stream. It joins the connection's commit group. A head that
+ * equals the registry's writes no row; it joins as a condition on its stream
+ * row instead. A stream commits alone, in its own slot turn with fresh reads
+ * of its stream row and the control row, when the registry has no batch route.
+ */
+async function commitStream(
+  slot: <T>(work: (held: LocalSyncDeps) => Promise<T>) => Promise<T>,
+  context: StreamContext,
+  candidate: Candidate,
+  prepared: Prepared,
+  run: StreamRun,
+): Promise<Committed> {
+  const alone = () =>
+    slot((held) => commitCandidate(held, context, candidate, prepared, run));
+  if (context.commits.unsupported) return alone();
+  const turn = await context.commits.group.submit({
+    kind: "head",
+    context,
+    candidate,
+    prepared,
+    run,
   });
+  return turn.kind === "unbatched" ? alone() : turn;
+}
+
+/**
+ * The end of a stream that has no candidate. On the batch path its hints are
+ * confirmed by the conditions of a commit request. Without the batch route,
+ * when the request finds the route absent, or when the stream row to confirm
+ * is absent (a request cannot hold an absent row fixed), they are confirmed by
+ * live reads in its own slot turn.
+ */
+async function finishIdle(
+  slot: <T>(work: (held: LocalSyncDeps) => Promise<T>) => Promise<T>,
+  context: StreamContext,
+  run: StreamRun,
+  idle: Idle,
+): Promise<Committed> {
+  const conditional =
+    !context.commits.unsupported && idle.hint?.found !== false;
+  if (conditional) {
+    const turn = await context.commits.group.submit({
+      kind: "idle",
+      context,
+      idle,
+      run,
+    });
+    if (turn.kind !== "unbatched") return turn;
+  }
+  return slot((held) => confirmIdle(held, context, idle));
+}
+
+/**
+ * Confirm an idle stream with live reads, in the slot: the stream row first,
+ * then the control row (see `confirmLive`). The row is read whenever the
+ * stream holds one to compare (`hint`: a listing's row, or the planned row
+ * after an attachment upload, absent included); a row that is no longer that
+ * one means the plan is stale: "retry", which re-snapshots live. A connection
+ * deleted meanwhile purges and one that moved defers, never "noop". Evidence is
+ * written only after both reads agree with the plan; with none to save the
+ * reads still run, because a "noop" is a claim about the registry too.
+ */
+async function confirmIdle(
+  held: LocalSyncDeps,
+  context: StreamContext,
+  idle: Idle,
+): Promise<Committed> {
+  const { stream } = context;
+  const end = (outcome: "purged" | "deferred" | null): Committed => ({
+    kind: "done",
+    result: outcome
+      ? { stream, outcome, watermark: idle.result.watermark }
+      : idle.result,
+  });
+  if (idle.hint && !sameRow(await held.registry.read(context.scope), idle.hint))
+    return { kind: "retry" };
+  const checked = await checkControl(held, context);
+  if (checked) return end(checked);
+  if (idle.evidence) {
+    await saveRunEvidence(held, context.connectionId, stream, idle.evidence);
+  }
+  return end(null);
+}
+
+/** The identical request twice at most: a lost reply is resent once. */
+async function postBatchOnce(
+  registry: StreamSyncRegistry,
+  request: SignedRegistryBatch,
+): Promise<RegistryBatchResult> {
+  try {
+    return await registry.postBatch!(request);
+  } catch (error) {
+    if (!(error instanceof AmbiguousRegistryReplyError)) throw error;
+  }
+  // The first send may have landed. The gateway answers a row it already holds
+  // with its own hash, which settleRow reads as published. A second lost
+  // reply is an unknown outcome and throws, as a lost single write does.
+  return registry.postBatch!(request);
+}
+
+/**
+ * COMMIT of the streams that wait at one slot turn, in the slot: one request.
+ *
+ * Each stream's local basis is still the snapshot's. A stream whose head
+ * differs from the registry's gets a signed row; its `expectedHeadDataHash` is
+ * the registry head the snapshot saw, so a same-version refresh by another
+ * writer is refused, not overwritten. A stream whose head equals the
+ * registry's writes nothing; the request carries a condition on its stream row
+ * (version and data hash) instead, and the stream is recorded when the
+ * request succeeds. So is a stream with no candidate whose snapshot rests on a
+ * listing hint (`idle`): its stream-row condition replaces the live reads of
+ * `confirmLive`, and its run evidence is saved on the request's success. The
+ * control row is a condition too: this connection's
+ * generation, its hash, not deleted. The gateway checks every condition in the
+ * transaction of the writes, so no client read brackets the request. The local
+ * delete-intent check below stops a send that is already wrong; it is not what
+ * keeps a write from landing after a delete. The conditions are.
+ *
+ * Conditions are the batch's: one that fails writes nothing for anyone.
+ *   control row deleted      -> purge the connection
+ *   control row otherwise    -> defer every stream (another lifetime)
+ *   a stream row moved       -> that stream re-plans. The others go again in
+ *                               the next request, sent at once from this same
+ *                               slot turn, without it. They do not return to
+ *                               the pool: the stream that re-plans would
+ *                               rejoin before the flush, and if it kept moving
+ *                               its siblings would never commit.
+ * Otherwise each row answers for itself, and its siblings are not affected:
+ *   201, or a 409 whose winner is this row's own content (a copy of it landed)
+ *                            -> local commit, published; the watermark
+ *                               acknowledged is the snapshot's
+ *   any other 409            -> apply the winner once and re-plan that stream
+ *                               (the attempt count bounds it)
+ * A reply is settled only if the local lifetime is still the one the request
+ * carried (the control row's generation); otherwise it is discarded and every
+ * stream is deferred. A request with no row to write (every stream unchanged)
+ * is sent as conditions only. No batch route: every stream commits alone. A
+ * lost reply is answered by the same request sent once more: the gateway
+ * returns the original 201 for a row it already holds and judges the
+ * conditions again, so a resend after a delete purges.
+ *
+ * A delete that lands after the request commits is not seen here (the old
+ * check after the write could see it); the next snapshot reads the tombstone
+ * and purges.
+ */
+async function commitBatchTurn(
+  held: LocalSyncDeps,
+  entries: readonly CommitEntry[],
+  commits: ConnectionCommits,
+): Promise<PromiseSettledResult<CommitTurn>[]> {
+  const { connectionId, connection } = entries[0]!.context;
+  const control = controlScope(connection.connector, connection.ns);
+  const outcomes = new Map<number, PromiseSettledResult<CommitTurn>>();
+  const ok = (at: number, value: CommitTurn) =>
+    outcomes.set(at, { status: "fulfilled", value });
+  const fail = (at: number, reason: unknown) =>
+    outcomes.set(at, { status: "rejected", reason });
+  const done = (at: number, outcome: PublishResult["outcome"]) =>
+    ok(at, {
+      kind: "done",
+      result: {
+        stream: entries[at]!.context.stream,
+        outcome,
+        watermark: watermarkOf(entries[at]!),
+      },
+    });
+  const headAt = (at: number): HeadEntry => {
+    const entry = entries[at]!;
+    if (entry.kind !== "head")
+      throw new Error("publish: an idle stream has no head to write");
+    return entry;
+  };
+  const settle = () =>
+    entries.map(
+      (_, at): PromiseSettledResult<CommitTurn> =>
+        outcomes.get(at) ?? {
+          status: "rejected",
+          reason: new Error("publish: a commit turn left a stream unsettled"),
+        },
+    );
+
+  const signed: {
+    readonly at: number;
+    readonly newVersion: number;
+    readonly row: SignedRegistryBatch["rows"][number];
+  }[] = [];
+  /** Streams with nothing to write: a condition on their row, recorded on success. */
+  const fenced: number[] = [];
+  for (const [at, entry] of entries.entries()) {
+    try {
+      if (entry.kind === "idle") {
+        // No local basis to compare: it holds its hints, and the request
+        // confirms them.
+        fenced.push(at);
+        continue;
+      }
+      const { context, candidate, prepared, run } = entry;
+      if ((await readBasis(held, context, candidate)) !== candidate.basis) {
+        ok(at, { kind: "invalidated" });
+        continue;
+      }
+      if (!writesHead(entry)) {
+        fenced.push(at);
+        continue;
+      }
+      const head = await timed(
+        held,
+        (ms) => (run.meter.headRegisterMs += ms),
+        () =>
+          signHead(
+            held,
+            context,
+            candidate,
+            prepared.encryptedLength!,
+            prepared,
+          ),
+      );
+      signed.push({
+        at,
+        newVersion: head.newVersion,
+        row: {
+          scope: context.scope,
+          dataHash: prepared.dataHash,
+          metadataHash: head.metadataHash,
+          expectedVersion: String(head.newVersion),
+          signature: head.signature,
+          ...(candidate.registryDataHash !== null && {
+            expectedHeadDataHash: candidate.registryDataHash as `0x${string}`,
+          }),
+        },
+      });
+    } catch (error) {
+      fail(at, error);
+    }
+  }
+  /** The streams still in the request: one that moved leaves it. */
+  let live = fenced;
+  let rows: Extract<RegistryBatchResult, { kind: "rows" }>["rows"];
+  for (;;) {
+    if (signed.length === 0 && live.length === 0) return settle();
+    // The local veto, under the slot, right before the request: a delete
+    // intent can appear after the snapshot recorded it in its basis, which
+    // then still compares equal.
+    if (await hasDeleteIntent(held, connection.connector)) {
+      for (const { at } of signed) done(at, "deferred");
+      for (const at of live) done(at, "deferred");
+      return settle();
+    }
+    const first = entries[signed[0]?.at ?? live[0]!]!;
+    const request: SignedRegistryBatch = {
+      ownerAddress: held.ownerAddress,
+      rows: signed.map(({ row }) => row),
+      requires: [
+        {
+          scope: control,
+          expectedVersion: String(connection.generation),
+          notDeleted: true,
+          expectedDataHash: controlHashOf(first),
+        },
+        ...live.flatMap((at) => {
+          const fence = fenceOf(entries[at]!);
+          return fence
+            ? [
+                {
+                  scope: entries[at]!.context.scope,
+                  expectedVersion: String(fence.version),
+                  notDeleted: true,
+                  expectedDataHash: fence.dataHash,
+                },
+              ]
+            : [];
+        }),
+      ],
+    };
+    const answer = await timed(
+      held,
+      (ms) => {
+        for (const { at } of signed) headAt(at).run.meter.headRegisterMs += ms;
+      },
+      () => postBatchOnce(held.registry, request),
+    );
+    if (answer.kind === "unsupported") {
+      commits.unsupported = true;
+      for (const { at } of signed) ok(at, { kind: "unbatched" });
+      for (const at of live) ok(at, { kind: "unbatched" });
+      return settle();
+    }
+    if (answer.kind === "rows") {
+      rows = answer.rows;
+      break;
+    }
+
+    // Nothing was written. Without the gateway's detail, read the control row.
+    const verdict = answer.failure
+      ? settleRequirementFailure(answer.failure, control)
+      : null;
+    if (verdict?.kind === "stream_moved") {
+      const moved = live.find(
+        (at) => entries[at]!.context.scope === verdict.scope,
+      );
+      if (moved !== undefined) {
+        // One stream's row is not the one it was planned over. It re-plans.
+        // The rest decided nothing: loop and send them now, without it. The
+        // listing it came from is older than the row that moved. A stream
+        // with no candidate (`idle`) is counted as an invalidation by its
+        // caller; one with a candidate is counted here.
+        entries[moved]!.context.view.invalidate();
+        if (entries[moved]!.kind === "head")
+          entries[moved]!.run.invalidations++;
+        entries[moved]!.run.attempts++;
+        if (entries[moved]!.run.attempts >= MAX_ATTEMPTS)
+          done(moved, "backoff");
+        else ok(moved, { kind: "retry" });
+        live = live.filter((at) => at !== moved);
+        continue;
+      }
+    }
+    let outcome: "purged" | "deferred";
+    if (verdict?.kind === "purge") {
+      await purgeConnection(held, connectionId, {
+        controlVersion: verdict.controlVersion,
+      });
+      for (const { context } of entries) context.latch.purged = true;
+      outcome = "purged";
+    } else if (verdict === null) {
+      outcome = (await checkControl(held, first.context)) ?? "deferred";
+    } else {
+      outcome = "deferred";
+    }
+    for (const { at } of signed) done(at, outcome);
+    for (const at of live) done(at, outcome);
+    return settle();
+  }
+
+  // A reply, stored or fresh, is for the lifetime the request carried. If the
+  // local one moved meanwhile (a purge and a reconnect), settling would record
+  // this lifetime's rows under another: discard the reply.
+  if (!(await lifetimeHolds(held, connectionId, connection.generation))) {
+    for (const { at } of signed) done(at, "deferred");
+    for (const at of live) done(at, "deferred");
+    return settle();
+  }
+  for (const { at } of signed) headAt(at).run.attempts++;
+  const answerRows = rows;
+
+  const conflicted: number[] = [];
+  for (const [i, { at, newVersion, row }] of signed.entries()) {
+    const settlement = settleRow(answerRows[i]!, {
+      expectedVersion: row.expectedVersion,
+      dataHash: row.dataHash,
+    });
+    if (settlement === "conflict") {
+      conflicted.push(at);
+      continue;
+    }
+    const { context, candidate, prepared } = headAt(at);
+    try {
+      if (await hasDeleteIntent(held, connection.connector)) {
+        done(at, "deferred");
+      } else {
+        ok(
+          at,
+          await finishPosted(held, context, candidate, prepared, newVersion),
+        );
+      }
+    } catch (error) {
+      fail(at, error);
+    }
+  }
+  // The conditions held, in the transaction of the writes: the streams with
+  // nothing to write hold the registry's row as they planned it.
+  for (const at of live) {
+    const entry = entries[at]!;
+    try {
+      if (await hasDeleteIntent(held, connection.connector)) {
+        done(at, "deferred");
+      } else if (entry.kind === "idle") {
+        // The hints held: the evidence the plan matched is recorded.
+        if (entry.idle.evidence) {
+          await saveRunEvidence(
+            held,
+            entry.context.connectionId,
+            entry.context.stream,
+            entry.idle.evidence,
+          );
+        }
+        ok(at, { kind: "done", result: entry.idle.result });
+      } else {
+        ok(
+          at,
+          await finishNoop(
+            held,
+            entry.context,
+            entry.candidate,
+            entry.prepared,
+          ),
+        );
+      }
+    } catch (error) {
+      fail(at, error);
+    }
+  }
+  if (conflicted.length > 0) {
+    // Another writer moved those rows, so a listing read before that is no
+    // starting point for any stream not yet started, including after the last
+    // try, which ends a stream without a retry (as in `commitCandidate`).
+    entries[conflicted[0]!]!.context.view.invalidate();
+    try {
+      // Apply the winners once, after the rows that committed are recorded.
+      if (conflicted.some((at) => entries[at]!.run.attempts < MAX_ATTEMPTS)) {
+        await applyConnection(held, connectionId);
+      }
+      for (const at of conflicted) {
+        if (entries[at]!.run.attempts === MAX_ATTEMPTS) done(at, "backoff");
+        else ok(at, { kind: "retry" });
+      }
+    } catch (error) {
+      for (const at of conflicted) fail(at, error);
+    }
+  }
+  return settle();
+}
+
+/** Whether the connection's local lifetime is still generation `generation`. */
+async function lifetimeHolds(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  generation: number,
+): Promise<boolean> {
+  const [row] = await deps.db.query(
+    `SELECT generation FROM connections WHERE connection_id = ?`,
+    [connectionId],
+  );
+  return row !== undefined && Number(row.generation) === generation;
 }
 
 /**
@@ -1477,19 +2165,24 @@ async function readBasis(
   ]);
 }
 
+/** A local delete of the connector is under way: nothing is published. */
+async function hasDeleteIntent(
+  deps: LocalSyncDeps,
+  connector: string,
+): Promise<boolean> {
+  const rows = await deps.db.query(
+    "SELECT 1 FROM delete_intents WHERE connector=?",
+    [connector],
+  );
+  return rows.length > 0;
+}
+
 async function checkControl(
   deps: LocalSyncDeps,
   context: StreamContext,
 ): Promise<"purged" | "deferred" | null> {
   const { connectionId: id, connection, hashes } = context;
-  if (
-    (
-      await deps.db.query("SELECT 1 FROM delete_intents WHERE connector=?", [
-        connection.connector,
-      ])
-    ).length
-  )
-    return "deferred";
+  if (await hasDeleteIntent(deps, connection.connector)) return "deferred";
   const state = classifyControl(
     await deps.registry.read(controlScope(connection.connector, connection.ns)),
     hashes,
