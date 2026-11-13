@@ -34,7 +34,10 @@ export function createStorageStreamSyncBlobs(
   // Outside `guarded`: an upload waiting for its turn holds no `maxConcurrent`
   // slot, so reads are not queued behind uploads, and its retries stay inside
   // its turn.
-  const onePut = createConcurrencyLimit(resolved.maxConcurrentPuts);
+  const onePut = createConcurrencyLimit(
+    resolved.maxConcurrentPuts,
+    "maxConcurrentPuts",
+  );
   return {
     put: (key, bytes) =>
       onePut(() =>

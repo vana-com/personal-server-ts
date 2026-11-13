@@ -109,7 +109,7 @@ export function backoffDelayMs(
 export function createStorageAccess(
   policy: StorageAccessPolicy,
 ): <T>(operation: () => Promise<T>) => Promise<T> {
-  const limit = createConcurrencyLimit(policy.maxConcurrent);
+  const limit = createConcurrencyLimit(policy.maxConcurrent, "maxConcurrent");
   let resumeAt = 0;
   return (operation) =>
     limit(async () => {
@@ -130,10 +130,24 @@ export function createStorageAccess(
     });
 }
 
+/**
+ * A limit of 0, a negative or fractional number, NaN or undefined would make
+ * every operation wait for ever or let in more than asked; refuse it.
+ */
+export function requirePositiveWhole(name: string, value: unknown): void {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new RangeError(
+      `storage access: ${name} must be a positive whole number, got ${String(value)}`,
+    );
+  }
+}
+
 /** A counting semaphore: at most `limit` operations run, the rest queue. */
 export function createConcurrencyLimit(
   limit: number,
+  name = "limit",
 ): <T>(operation: () => Promise<T>) => Promise<T> {
+  requirePositiveWhole(name, limit);
   let active = 0;
   const waiting: (() => void)[] = [];
   const release = () => {

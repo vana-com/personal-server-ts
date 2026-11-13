@@ -619,7 +619,9 @@ async function publishAttempts(
     if (snapshot.kind === "done") return snapshot.result;
     if (snapshot.kind === "retry") continue;
     if (snapshot.kind === "blobs") {
-      await uploadBlobs(deps, snapshot.blobs, run.meter);
+      await uploadBlobs(deps, snapshot.blobs, run.meter, () =>
+        stopIfPurged(latch),
+      );
       const { evidence } = snapshot;
       if (evidence) {
         await slot((held) => confirmNoWork(held, context, evidence));
@@ -1012,7 +1014,7 @@ async function transferCandidate(
   meter: PublishMeter,
 ): Promise<Prepared> {
   const { scope, latch } = context;
-  await uploadBlobs(deps, candidate.blobs, meter);
+  await uploadBlobs(deps, candidate.blobs, meter, () => stopIfPurged(latch));
   const encoded = await uploadFrozenParts(deps, {
     attempt: candidate.attempt,
     scope,
@@ -1041,6 +1043,8 @@ async function transferCandidate(
   stopIfPurged(latch);
   const blobs = meteredBlobs(deps, meter);
   if ((await blobs.get(`${scope}/${blobName}`)) === null) {
+    // A sibling may have purged the connection while the probe was out.
+    stopIfPurged(latch);
     await blobs.put(`${scope}/${blobName}`, encrypted);
   }
   return {

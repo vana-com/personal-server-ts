@@ -4,6 +4,7 @@
 // driver and the real connection queue: only the wire is simulated. A stream's
 // snapshot and commit still take the queue slot one at a time; what overlaps is
 // every stream's transfer and the waits between slot turns.
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { keccak_256 } from "@noble/hashes/sha3";
 import {
@@ -51,6 +52,12 @@ type Options = {
   readonly blobMsFor?: (stream: string) => number;
   /** Called when an upload starts, after it is logged; the upload waits for it. */
   readonly holdPut?: (key: string) => Promise<void>;
+  /** Called when a blob read starts, after it is logged; the read waits for it. */
+  readonly holdGet?: (key: string) => Promise<void>;
+  /** Called when a stream's first encrypt call (its attachment's) starts. */
+  readonly holdAttachmentEncrypt?: () => Promise<void>;
+  /** Give every stream's record an attachment of its own. */
+  readonly attachments?: boolean;
 };
 
 const drivers: SqlDriver[] = [];
@@ -93,6 +100,7 @@ async function world(options: Options) {
   const timedBlobs: StreamSyncBlobs = {
     async get(key) {
       record("get", key);
+      await options.holdGet?.(key);
       await sleep(
         (options.blobMs ?? 0) + (options.blobMsFor?.(streamOfKey(key)!) ?? 0),
       );
@@ -108,6 +116,7 @@ async function world(options: Options) {
     },
   };
   const purges: number[] = [];
+  const encrypting = new Set<string>();
   let op = 0;
   const deps: LocalSyncDeps = {
     db,
@@ -117,7 +126,13 @@ async function world(options: Options) {
     ownerAddress: OWNER,
     keys: {
       namespaceHmac: async () => new Uint8Array(32),
-      encrypt: async (_s, b) => b,
+      encrypt: async (scope, b) => {
+        if (options.holdAttachmentEncrypt && !encrypting.has(scope)) {
+          encrypting.add(scope);
+          await options.holdAttachmentEncrypt();
+        }
+        return b;
+      },
       encryptPart: async (_s, b) => b,
       decrypt: async (_s, b) => b,
     },
@@ -150,18 +165,40 @@ async function world(options: Options) {
     wantFull: true,
     owner: { address: OWNER, leaseId: null },
   });
+  const attachment = (stream: string) => {
+    const bytes = new TextEncoder().encode(`attachment of ${stream}`);
+    return { bytes, sha256: createHash("sha256").update(bytes).digest("hex") };
+  };
   await sync.intake.batch("run-1", {
     batch: 0,
     records: names.flatMap((stream) =>
-      [1, 2].map((n) => ({ stream, data: { id: `${stream}-${n}` } })),
+      [1, 2].map((n) => ({
+        stream,
+        data: {
+          id: `${stream}-${n}`,
+          ...(options.attachments && n === 1
+            ? { blob_ref: { blob_id: `sha256:${attachment(stream).sha256}` } }
+            : {}),
+        },
+      })),
     ),
   });
+  if (options.attachments)
+    for (const stream of names) {
+      const { bytes, sha256 } = attachment(stream);
+      await sync.blobs.put({
+        runId: "run-1",
+        sha256,
+        mimeType: "application/octet-stream",
+        bytes,
+      });
+    }
   await sync.intake.end("run-1", {
     outcome: "succeeded",
     coveredStreams: names,
     lastBatch: 0,
   });
-  return { deps, db, calls, purges, names, innerRegistry };
+  return { deps, db, calls, purges, names, innerRegistry, sync };
 }
 
 async function tombstoneControl(
@@ -369,6 +406,92 @@ describe("streams of one connection publish together", () => {
     expect(
       calls.slice(before).filter((c) => c.kind === "put" || c.kind === "post"),
     ).toEqual([]);
+  });
+
+  /**
+   * Every stream parks past its last purge check: at its head probe, or with its attachment read and encrypted. One is let go
+   * and purges the connection (the control row was deleted while all were
+   * parked). The rest are then released with the read answering "absent", the
+   * answer that sends a stream on to upload.
+   */
+  async function purgeWhileSiblingsProbe(
+    options: Pick<Options, "attachments">,
+    hold: "headProbe" | "attachmentEncrypt",
+  ) {
+    const parked: (() => void)[] = [];
+    const park = () => new Promise<void>((release) => parked.push(release));
+    const w = await world({
+      streams: 4,
+      ...options,
+      holdGet: (key) =>
+        hold === "headProbe" && /\/h-/.test(key) ? park() : Promise.resolve(),
+      holdAttachmentEncrypt: hold === "attachmentEncrypt" ? park : undefined,
+    });
+    const publishing = publishConnection(w.deps, CONNECTION_ID);
+    await vi.waitFor(() => expect(parked).toHaveLength(4));
+    await tombstoneControl(w.innerRegistry, 2);
+    // The first stream goes on, uploads, commits and finds the deleted control row.
+    parked[0]!();
+    await vi.waitFor(() => expect(w.purges.length).toBeGreaterThan(0));
+    const purgedAt = w.purges[0]!;
+    for (const release of parked.slice(1)) release();
+    const results = await publishing;
+    return { ...w, purgedAt, results };
+  }
+
+  it("starts no head upload after a sibling purged while its head probe was out", async () => {
+    const { calls, purgedAt, results } = await purgeWhileSiblingsProbe(
+      {},
+      "headProbe",
+    );
+    expect(results.at(-1)).toMatchObject({ outcome: "purged" });
+    expect(calls.slice(purgedAt).filter((c) => c.kind === "put")).toEqual([]);
+    expect(calls.slice(purgedAt).filter((c) => c.kind === "post")).toEqual([]);
+  });
+
+  it("starts no attachment upload after a sibling purged while its attachment was being encrypted", async () => {
+    const { calls, purgedAt, results } = await purgeWhileSiblingsProbe(
+      { attachments: true },
+      "attachmentEncrypt",
+    );
+    expect(results.at(-1)).toMatchObject({ outcome: "purged" });
+    expect(calls.slice(purgedAt).filter((c) => c.kind === "put")).toEqual([]);
+    expect(calls.slice(purgedAt).filter((c) => c.kind === "post")).toEqual([]);
+  });
+
+  it("on a failure starts no new stream, drains the running ones and throws the earliest stream's error", async () => {
+    // s0 finishes slowly and well. s1 fails late, s2 fails early: the failures
+    // arrive in the reverse of stream order. s3 to s5 wait for a free worker.
+    const { deps, calls, db } = await world({
+      streams: 6,
+      holdPut: async (key) => {
+        const stream = streamOfKey(key);
+        if (stream === "s0") await sleep(150);
+        if (stream === "s1") {
+          await sleep(80);
+          throw new Error("s1 upload failed");
+        }
+        if (stream === "s2") {
+          await sleep(20);
+          throw new Error("s2 upload failed");
+        }
+      },
+    });
+    await expect(
+      publishConnection(deps, CONNECTION_ID, { streamConcurrency: 3 }),
+    ).rejects.toThrow("s1 upload failed");
+    const seen = calls.length;
+    // The running stream was waited for: its head is posted before the rejection.
+    expect(
+      calls.some((c) => c.kind === "post" && c.scope.endsWith(".s0")),
+    ).toBe(true);
+    // No stream after the failure ever started.
+    expect(calls.some((c) => /\.s[345]\b/.test(c.scope))).toBe(false);
+    // And nothing runs on after the rejection.
+    await sleep(100);
+    expect(calls).toHaveLength(seen);
+    // Every stream dropped its spool rows, the failed ones too.
+    expect(await db.query("SELECT 1 FROM publish_spool")).toEqual([]);
   });
 
   it("refuses a stream concurrency that is not a positive whole number", async () => {

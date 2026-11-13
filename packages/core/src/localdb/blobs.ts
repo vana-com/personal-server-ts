@@ -326,12 +326,15 @@ export async function uploadBlobs(
   deps: LocalSyncDeps,
   blobs: readonly BlobDescriptor[],
   meter?: PublishMeter,
+  /** Called before each probe and again before each upload; a throw stops it. */
+  beforeUpload?: () => void,
 ): Promise<void> {
   const store = meter ? meteredBlobs(deps, meter) : deps.blobs;
   let uploaded = uploadedBlobs.get(deps.db);
   if (!uploaded) uploadedBlobs.set(deps.db, (uploaded = new Set()));
   for (const { blobId, key, scope } of blobs) {
     if (uploaded.has(key)) continue;
+    beforeUpload?.();
     if ((await store.get(key)) !== null) {
       uploaded.add(key);
       continue;
@@ -344,7 +347,9 @@ export async function uploadBlobs(
       throw new MissingAttachmentError(blobId);
     }
     checkBytes(blobId, local.bytes);
-    await store.put(key, await deps.keys.encrypt(scope, local.bytes));
+    const cipher = await deps.keys.encrypt(scope, local.bytes);
+    beforeUpload?.();
+    await store.put(key, cipher);
     uploaded.add(key);
   }
 }

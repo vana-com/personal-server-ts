@@ -319,6 +319,37 @@ describe("createStorageStreamSyncBlobs", () => {
     expect(refused).toBe(0);
   });
 
+  describe("limits that are not a positive whole number", () => {
+    it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, undefined])(
+      "refuses %s for maxConcurrentPuts and maxConcurrent",
+      (bad) => {
+        expect(() =>
+          createStorageStreamSyncBlobs(
+            adapter(),
+            policy({ maxConcurrentPuts: bad as number }),
+          ),
+        ).toThrow(/maxConcurrentPuts must be a positive whole number/);
+        expect(() =>
+          createStorageStreamSyncBlobs(
+            adapter(),
+            policy({ maxConcurrent: bad as number }),
+          ),
+        ).toThrow(/maxConcurrent must be a positive whole number/);
+        expect(() =>
+          createStorageAccess(policy({ maxConcurrent: bad as number })),
+        ).toThrow(/maxConcurrent must be a positive whole number/);
+      },
+    );
+
+    it("refuses an explicit undefined that the policy spread would let through", () => {
+      expect(() =>
+        createStorageStreamSyncBlobs(adapter(), {
+          maxConcurrentPuts: undefined,
+        }),
+      ).toThrow(/maxConcurrentPuts/);
+    });
+  });
+
   describe("uploads in flight", () => {
     /** Storage that counts uploads in flight, and reads, while each takes a moment. */
     const counting = () => {
