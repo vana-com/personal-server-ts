@@ -949,3 +949,173 @@ it("a fresh offline run binds its generation when the registry answers", async (
     { generation: 1 },
   ]);
 });
+
+// The part layout of a stream with no covering parts. A fresh stream goes into
+// a few parts sized by `partTargetBytes`, not one part per record: each part is
+// one object upload now and one object read for every reader later.
+describe("part layout of records with no covering part", () => {
+  const sha256Bytes = async (b: Uint8Array) =>
+    new Uint8Array(createHash("sha256").update(b).digest());
+
+  async function seedMany(
+    deps: LocalSyncDeps,
+    count: number,
+    pad = 400,
+    from = 0,
+  ) {
+    const statements = [
+      {
+        sql: `UPDATE write_ctx SET origin = 'local' WHERE id = 1`,
+        params: [],
+      },
+    ];
+    for (let i = from; i < from + count; i += 1) {
+      const body = canonicalJson({ id: `k${i}`, pad: "x".repeat(pad) });
+      statements.push({
+        sql: `INSERT INTO records (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
+              VALUES (?, ?, ?, ?, 1000, 'r1', ?, ?, NULL)`,
+        params: [
+          CONNECTION_ID,
+          STREAM,
+          await pkHash(sha256Bytes, JSON.parse(body), ["id"]),
+          `k${i}`,
+          body,
+          sha256Hex(body),
+        ] as never,
+      });
+    }
+    await deps.db.batch(statements);
+  }
+
+  /** Deps whose blob store counts the uploads the publisher makes. */
+  function counting(world: World) {
+    const puts: string[] = [];
+    const gets: string[] = [];
+    const deps: LocalSyncDeps = {
+      ...world.deps,
+      blobs: {
+        get: (key) => {
+          gets.push(key);
+          return world.blobs.get(key);
+        },
+        put: async (key, bytes) => {
+          puts.push(key);
+          await world.blobs.put(key, bytes);
+        },
+      },
+    };
+    return {
+      deps,
+      puts,
+      gets,
+      partPuts: () => puts.filter((k) => k.includes("-p-")),
+    };
+  }
+
+  async function freshWorld(records: number, target?: number) {
+    const world = await makeWorld();
+    if (target !== undefined) world.deps.partTargetBytes = target;
+    await seedConnection(world.deps);
+    await seedStream(world.deps);
+    await localRun(world);
+    await seedMany(world.deps, records);
+    return world;
+  }
+
+  it("puts a 350-record stream in a few parts, not one part per record", async () => {
+    const world = await freshWorld(350, 4 * 1024 * 1024);
+    const counted = counting(world);
+    expect(
+      (await publishConnection(counted.deps, CONNECTION_ID))[0]?.outcome,
+    ).toBe("published");
+    const { head, values } = await published(world);
+    expect(values).toHaveLength(350);
+    expect(head.parts.length).toBeLessThanOrEqual(2);
+    expect(counted.partPuts().length).toBe(head.parts.length);
+  });
+
+  it("publishes a 350-record stream in seconds at 1 s per object upload", async () => {
+    const world = await freshWorld(350, 4 * 1024 * 1024);
+    const counted = counting(world);
+    await publishConnection(counted.deps, CONNECTION_ID);
+    // Every object request (the existence GET before a put, and the put) costs
+    // one second. Before the layout fix this was 350 parts: over 700 s.
+    const simulatedSeconds = counted.puts.length + counted.gets.length;
+    process.stdout.write(
+      `PART_LAYOUT ${JSON.stringify({ puts: counted.puts.length, gets: counted.gets.length, simulatedSeconds })}\n`,
+    );
+    expect(simulatedSeconds).toBeLessThanOrEqual(10);
+  });
+
+  it("sizes parts by the byte target and reads back every record", async () => {
+    // About 150 KB of rows against a 16 KB target: several parts, far fewer
+    // than 350.
+    const world = await freshWorld(350, 16 * 1024);
+    await publishConnection(world.deps, CONNECTION_ID);
+    const { head, values } = await published(world);
+    expect(values).toHaveLength(350);
+    expect(head.parts.length).toBeGreaterThan(4);
+    expect(head.parts.length).toBeLessThan(64);
+    for (const part of head.parts)
+      expect(part.bytes).toBeLessThanOrEqual(16 * 1024);
+  });
+
+  it("rewrites only the part that holds a changed record", async () => {
+    const world = await freshWorld(350, 16 * 1024);
+    await publishConnection(world.deps, CONNECTION_ID);
+    const before = (await published(world)).head.parts;
+    await seedRun(world.deps, "r2", 2000);
+    const body = canonicalJson({ id: "k7", pad: "y".repeat(400) });
+    await world.deps.db.batch([
+      { sql: `UPDATE write_ctx SET origin = 'local' WHERE id = 1`, params: [] },
+      {
+        sql: `UPDATE records SET body = ?, body_sha256 = ?, stamp_o = 2000, stamp_r = 'r2'
+               WHERE connection_id = ? AND stream = ? AND record_key = 'k7'`,
+        params: [body, sha256Hex(body), CONNECTION_ID, STREAM],
+      },
+    ]);
+    const counted = counting(world);
+    await publishConnection(counted.deps, CONNECTION_ID);
+    const after = (await published(world)).head.parts;
+    // The bucket that holds the record, and no other part.
+    expect(counted.partPuts().length).toBeLessThanOrEqual(2);
+    expect(counted.partPuts().length).toBeLessThan(before.length / 3);
+    expect(after.length).toBeLessThanOrEqual(before.length + 1);
+  });
+
+  it("puts a record that no part covers into the same layout", async () => {
+    const world = await freshWorld(3, 16 * 1024);
+    await publishConnection(world.deps, CONNECTION_ID);
+    await seedRun(world.deps, "r2", 2000);
+    await seedMany(world.deps, 200, 400, 3);
+    await world.deps.db.batch([
+      {
+        sql: `UPDATE records SET stamp_o = 2000, stamp_r = 'r2' WHERE record_key != 'k0' AND stamp_r = 'r1'`,
+        params: [],
+      },
+    ]);
+    await publishConnection(world.deps, CONNECTION_ID);
+    const { head, values } = await published(world);
+    expect(values).toHaveLength(203);
+    expect(head.parts.length).toBeLessThan(40);
+  });
+
+  it("splits a grown stream by the byte target, then rewrites a bucket per change", async () => {
+    const world = await freshWorld(3, 16 * 1024);
+    await publishConnection(world.deps, CONNECTION_ID);
+    expect((await published(world)).head.parts.map((p) => p.prefix)).toEqual([
+      "",
+    ]);
+    // The stream grows far past one part: the planner cuts it by the target.
+    await seedRun(world.deps, "r2", 2000);
+    await seedMany(world.deps, 347, 400, 3);
+    await publishConnection(world.deps, CONNECTION_ID);
+    const grown = await published(world);
+    expect(grown.values).toHaveLength(350);
+    expect(grown.head.parts.length).toBeGreaterThan(4);
+    expect(grown.head.parts.length).toBeLessThan(64);
+    expect(grown.head.parts.every((p) => p.prefix.length > 0)).toBe(true);
+    for (const p of grown.head.parts)
+      expect(p.bytes).toBeLessThanOrEqual(16 * 1024);
+  });
+});
