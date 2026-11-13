@@ -1,4 +1,4 @@
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   controlScope,
   streamScope,
@@ -114,4 +114,307 @@ it.each([
 it("a listing that says it is complete ends", async () => {
   const registry = registryWithMarker({ hasMore: false, nextCursor: null });
   expect(await registry.listStreamRows("acme")).toHaveLength(1);
+});
+
+// --- batch commit and `requires` ---
+
+import { AmbiguousRegistryReplyError, RegistryRefusedError } from "./ports.js";
+
+const OWNER = "0x" + "11".repeat(20);
+const batchRequest = {
+  ownerAddress: OWNER,
+  rows: ["a", "b"].map((name) => ({
+    scope: `pdpp.x~.${name}`,
+    dataHash: hash("aa") as `0x${string}`,
+    metadataHash: hash("bb") as `0x${string}`,
+    expectedVersion: "2",
+    signature: `0x${"cc".repeat(65)}` as `0x${string}`,
+  })),
+  requires: [
+    { scope: "pdpp.x~", expectedVersion: "1", notDeleted: true as const },
+  ],
+};
+
+function gatewayAnswering(answer: () => Response | Promise<Response>) {
+  const sent: { url: string; body: unknown }[] = [];
+  const registry = createGatewayStreamSyncRegistry({
+    gatewayUrl: "https://gateway.test/",
+    ownerAddress: OWNER,
+    fetch: (async (url: string, init?: RequestInit) => {
+      sent.push({ url, body: JSON.parse(String(init?.body)) });
+      return answer();
+    }) as typeof fetch,
+  });
+  return { registry, sent };
+}
+
+const results200 = (statuses: Record<string, object>) =>
+  new Response(
+    JSON.stringify({
+      success: true,
+      results: Object.entries(statuses).map(([scope, rest]) => ({
+        scope,
+        ...rest,
+      })),
+      requires: { ok: true },
+    }),
+  );
+
+it("sends every row and every condition in one request and reads one result per row", async () => {
+  const { registry, sent } = gatewayAnswering(() =>
+    results200({
+      "pdpp.x~.b": {
+        status: 409,
+        reason: "stale",
+        latestVersion: "2",
+        latestDataHash: hash("aa"),
+      },
+      "pdpp.x~.a": { status: 201, version: "2" },
+    }),
+  );
+  const result = await registry.postBatch!(batchRequest);
+  expect(sent).toHaveLength(1);
+  expect(sent[0]!.url).toBe("https://gateway.test/v1/data/batch");
+  expect(sent[0]!.body).toEqual({
+    ownerAddress: OWNER,
+    rows: batchRequest.rows,
+    requires: batchRequest.requires,
+  });
+  // Results come back in request order, whatever order the gateway lists them.
+  expect(result).toEqual({
+    kind: "rows",
+    rows: [
+      { kind: "committed" },
+      { kind: "conflict", latestVersion: "2", latestDataHash: hash("aa") },
+    ],
+  });
+});
+
+it("sends each row's head fence and each condition's data hash as given, and omits them when absent", async () => {
+  const { registry, sent } = gatewayAnswering(() =>
+    results200({
+      "pdpp.x~.a": { status: 201, version: "2" },
+      "pdpp.x~.b": { status: 201, version: "2" },
+    }),
+  );
+  await registry.postBatch!({
+    ownerAddress: OWNER,
+    rows: [
+      {
+        ...batchRequest.rows[0]!,
+        expectedHeadDataHash: hash("dd") as `0x${string}`,
+      },
+      batchRequest.rows[1]!,
+    ],
+    requires: [
+      {
+        scope: "pdpp.x~",
+        expectedVersion: "1",
+        notDeleted: true as const,
+        expectedDataHash: hash("ee") as `0x${string}`,
+      },
+      { scope: "pdpp.x~.c", expectedVersion: "1", notDeleted: true as const },
+    ],
+  });
+  const body = sent[0]!.body as {
+    rows: Record<string, unknown>[];
+    requires: Record<string, unknown>[];
+  };
+  expect(body.rows[0]!.expectedHeadDataHash).toBe(hash("dd"));
+  expect("expectedHeadDataHash" in body.rows[1]!).toBe(false);
+  expect(body.requires[0]!.expectedDataHash).toBe(hash("ee"));
+  expect("expectedDataHash" in body.requires[1]!).toBe(false);
+});
+
+it.each([
+  ["deleted", true],
+  ["absent", false],
+  ["version-mismatch", false],
+  ["data-hash-mismatch", false],
+] as const)(
+  "the final failure body's reason %s is read (a reason of 'deleted' is a delete)",
+  async (reason, deleted) => {
+    const { registry } = gatewayAnswering(
+      () =>
+        new Response(
+          JSON.stringify({
+            error: "precondition_failed",
+            requires: {
+              reason,
+              scope: "pdpp.x~.a",
+              expectedVersion: "1",
+              expectedDataHash: hash("ee"),
+              latestVersion: "2",
+              latestDataHash: hash("ff"),
+              deleted: false,
+            },
+          }),
+          { status: 409 },
+        ),
+    );
+    expect(await registry.postBatch!(batchRequest)).toEqual({
+      kind: "precondition_failed",
+      failure: expect.objectContaining({
+        scope: "pdpp.x~.a",
+        reason,
+        deleted,
+      }),
+    });
+  },
+);
+
+it.each([404, 405])(
+  "a %s on the batch route is remembered: later calls send nothing",
+  async (status) => {
+    const { registry, sent } = gatewayAnswering(
+      () => new Response("{}", { status }),
+    );
+    expect(await registry.postBatch!(batchRequest)).toEqual({
+      kind: "unsupported",
+    });
+    expect(await registry.postBatch!(batchRequest)).toEqual({
+      kind: "unsupported",
+    });
+    expect(sent).toHaveLength(1);
+  },
+);
+
+it.each([
+  [
+    "the batch route's body",
+    {
+      success: false,
+      requires: { ok: false, scope: "c", version: "3", deleted: true },
+    },
+    { scope: "c", latestVersion: "3", deleted: true },
+  ],
+  [
+    "the single write's body",
+    {
+      error: "precondition_failed",
+      requires: {
+        scope: "c",
+        expectedVersion: "1",
+        latestVersion: "3",
+        deleted: false,
+      },
+    },
+    { scope: "c", latestVersion: "3", deleted: false },
+  ],
+  [
+    "a missing row",
+    {
+      success: false,
+      requires: { ok: false, scope: "c", version: null, deleted: false },
+    },
+    { scope: "c", latestVersion: null, deleted: false },
+  ],
+  ["no detail", { success: false }, null],
+])(
+  "a 409 from the batch route is a failed condition: %s",
+  async (_n, body, failure) => {
+    const { registry } = gatewayAnswering(
+      () => new Response(JSON.stringify(body), { status: 409 }),
+    );
+    expect(await registry.postBatch!(batchRequest)).toEqual({
+      kind: "precondition_failed",
+      failure,
+    });
+  },
+);
+
+it("a reply that did not say whether the rows landed is ambiguous, a refusal is not", async () => {
+  for (const status of [500, 503, 429]) {
+    const { registry } = gatewayAnswering(() => new Response("{}", { status }));
+    await expect(registry.postBatch!(batchRequest)).rejects.toBeInstanceOf(
+      AmbiguousRegistryReplyError,
+    );
+  }
+  const refused = gatewayAnswering(
+    () => new Response('{"error":"bad"}', { status: 400 }),
+  );
+  await expect(
+    refused.registry.postBatch!(batchRequest),
+  ).rejects.toBeInstanceOf(RegistryRefusedError);
+  const dropped = createGatewayStreamSyncRegistry({
+    gatewayUrl: "https://gateway.test",
+    ownerAddress: OWNER,
+    fetch: (async () => {
+      throw new TypeError("fetch failed");
+    }) as typeof fetch,
+  });
+  await expect(dropped.postBatch!(batchRequest)).rejects.toBeInstanceOf(
+    AmbiguousRegistryReplyError,
+  );
+  // A 200 that does not answer every row cannot be read as published.
+  const partial = gatewayAnswering(() =>
+    results200({ "pdpp.x~.a": { status: 201 } }),
+  );
+  await expect(
+    partial.registry.postBatch!(batchRequest),
+  ).rejects.toBeInstanceOf(AmbiguousRegistryReplyError);
+  const notJson = gatewayAnswering(() => new Response("<html>"));
+  await expect(
+    notJson.registry.postBatch!(batchRequest),
+  ).rejects.toBeInstanceOf(AmbiguousRegistryReplyError);
+});
+
+describe("requires on the single write", () => {
+  const post = {
+    ownerAddress: OWNER,
+    scope: "pdpp.x~.a",
+    dataHash: hash("aa") as `0x${string}`,
+    metadataHash: hash("bb") as `0x${string}`,
+    expectedVersion: "2",
+    signature: `0x${"cc".repeat(65)}` as `0x${string}`,
+  };
+
+  it("sends requires and maps a failed condition apart from a stale version", async () => {
+    const failed = gatewayAnswering(
+      () =>
+        new Response(
+          JSON.stringify({
+            error: "precondition_failed",
+            requires: { scope: "pdpp.x~", latestVersion: "2", deleted: true },
+          }),
+          { status: 409 },
+        ),
+    );
+    expect(
+      await failed.registry.postConditional!({
+        ...post,
+        requires: batchRequest.requires,
+      }),
+    ).toEqual({
+      kind: "precondition_failed",
+      failure: { scope: "pdpp.x~", latestVersion: "2", deleted: true },
+    });
+    expect(failed.sent[0]!.body).toMatchObject({
+      requires: batchRequest.requires,
+      exclusive: true,
+    });
+    const stale = gatewayAnswering(
+      () =>
+        new Response(JSON.stringify({ success: false, latestVersion: "5" }), {
+          status: 409,
+        }),
+    );
+    expect(
+      await stale.registry.postConditional!({
+        ...post,
+        requires: batchRequest.requires,
+      }),
+    ).toEqual({ kind: "conflict", latestVersion: "5" });
+  });
+
+  it("a write without requires sends none, and its 409 stays a conflict", async () => {
+    const { registry, sent } = gatewayAnswering(
+      () => new Response(JSON.stringify({ latestVersion: 4 }), { status: 409 }),
+    );
+    expect(await registry.post(post)).toEqual({
+      kind: "conflict",
+      latestVersion: "4",
+    });
+    expect("requires" in (sent[0]!.body as object)).toBe(false);
+  });
 });
