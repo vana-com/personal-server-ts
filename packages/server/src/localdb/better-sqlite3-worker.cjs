@@ -25,7 +25,13 @@
  * Plain CommonJS: the worker loads it directly, with no build step of its own.
  */
 const { parentPort, workerData } = require("node:worker_threads");
-const { realpathSync, statSync } = require("node:fs");
+const {
+  closeSync,
+  fstatSync,
+  openSync,
+  realpathSync,
+  statSync,
+} = require("node:fs");
 const { basename, dirname, join } = require("node:path");
 const Database = require("better-sqlite3");
 const { createStatementCache } = require("./statement-cache.cjs");
@@ -40,6 +46,12 @@ const bind = (params = []) =>
   );
 
 const { role, lockTimeoutMs } = workerData;
+// Test only: a module that runs code at fixed points in the open sequence
+// (`afterCreate`, `beforeOpen`, `beforeRun`), so a test can place an event at
+// an exact step instead of timing it. Nothing in production sets it.
+const seam = workerData.testSeam
+  ? { ...require(workerData.testSeam.module), data: workerData.testSeam.data }
+  : {};
 const isFile = workerData.path !== ":memory:";
 
 /**
@@ -105,12 +117,33 @@ const replaced = () =>
     code: "SQLITE_DATABASE_REPLACED",
   });
 /**
+ * A file that does not exist yet has no identity to expect, so the writer
+ * creates it first, exclusively, and reads the identity from the descriptor
+ * it created. SQLite then opens an empty file (a zero-length file is a valid
+ * new database). Returns undefined if the file already exists.
+ */
+const createExclusively = () => {
+  let fd;
+  try {
+    fd = openSync(path, "wx", 0o644);
+  } catch (error) {
+    if (error.code === "EEXIST") return undefined;
+    throw error;
+  }
+  try {
+    const { dev, ino } = fstatSync(fd);
+    return `${dev}:${ino}`;
+  } finally {
+    closeSync(fd);
+  }
+};
+/**
  * The platform gives no way to ask an open SQLite handle which file it holds,
- * so identity is proved around the open: the path names the expected file
- * before the open and again after it. The opened file is whatever the path
- * named in between, so two equal answers around the open mean the handle
- * holds that file (the expected file stays open in the writer, so its inode
- * cannot be reused by another file). Any difference refuses.
+ * so identity is checked around the open: the path must name the expected
+ * file before the open and again after it. This narrows the race; it does not
+ * prove the handle's identity. A swap that puts another file at the path for
+ * the open and the original back before the second check (swap and swap
+ * back) is not caught. Any other difference refuses.
  */
 const openChecked = (open, expected) => {
   if (expected !== undefined && identityOf() !== expected) throw replaced();
@@ -134,7 +167,13 @@ if (role === "writer") {
         throw Object.assign(new Error("sqlite_database_hard_linked"), {
           code: "SQLITE_DATABASE_HARD_LINKED",
         });
-      const first = identityOf();
+      // A new file gets its expected identity from our own exclusive create.
+      let first = createExclusively();
+      if (first !== undefined) seam.afterCreate?.(path, seam.data);
+      else {
+        first = identityOf();
+        if (first === undefined) throw replaced(); // removed since EEXIST
+      }
       const { opened, after } = openChecked(() => new Database(path), first);
       db = opened;
       identity = after;
@@ -161,6 +200,7 @@ if (role === "writer") {
 /** The reader opens on first use: the writer has made the file and set WAL by then. */
 const openReader = () => {
   if (db) return;
+  seam.beforeOpen?.(seam.data);
   const { opened } = openChecked(
     () => new Database(path, { readonly: true, fileMustExist: true }),
     identity,
@@ -187,7 +227,10 @@ const run = {
     return { path, identity };
   },
   query(statement) {
-    if (role === "reader") checkReader();
+    if (role === "reader") {
+      checkReader();
+      seam.beforeRun?.(seam.data);
+    }
     const { params } = statement;
     const stmt = cache.prepare(textOf(statement));
     if (stmt.reader) return stmt.all(...bind(params));

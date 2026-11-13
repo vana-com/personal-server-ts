@@ -946,6 +946,13 @@ async function bootstrapServer(
         return facade;
       } catch (error) {
         await driver.close();
+        if ((error as { code?: string }).code === "SQLITE_DATABASE_HARD_LINKED")
+          throw Object.assign(
+            new Error(
+              "The database file has a second hard link, so another process could open it. Stop every app that uses it and replace the extra link with a separate copy.",
+            ),
+            { code: "SQLITE_DATABASE_HARD_LINKED", cause: error },
+          );
         throw error;
       }
     })().finally(() => {

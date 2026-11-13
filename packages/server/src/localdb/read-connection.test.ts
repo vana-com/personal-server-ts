@@ -8,6 +8,7 @@ import {
   symlinkSync,
 } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { setImmediate as yieldToLoop } from "node:timers/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -346,6 +347,29 @@ describe("read connection", () => {
 
     await expect(second.query("SELECT 1")).rejects.toMatchObject({
       code: "SQLITE_DATABASE_HARD_LINKED",
+    });
+  });
+
+  it("refuses a database file that another file replaces while it is being created", async () => {
+    const dir = mkdtempSync(join(process.cwd(), ".read-connection-test-"));
+    dirs.push(dir);
+    // Between the writer's exclusive create and SQLite's open, the test puts
+    // another file at the path. The writer must not bind to either file.
+    const driver = openBetterSqlite3(join(dir, "db.sqlite"), {
+      testSeam: {
+        module: fileURLToPath(
+          new URL("./open-seam.test-utils.cjs", import.meta.url),
+        ),
+        data: { replaceAfterCreate: true },
+      },
+    });
+    open.push(driver);
+
+    await expect(driver.query("SELECT 1")).rejects.toMatchObject({
+      code: "SQLITE_DATABASE_REPLACED",
+    });
+    await expect(driver.reads!.query("SELECT 1")).rejects.toMatchObject({
+      code: "SQLITE_DATABASE_REPLACED",
     });
   });
 });
