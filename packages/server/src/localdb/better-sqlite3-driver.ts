@@ -63,12 +63,6 @@ interface Connection {
   abort(error: Error): Promise<void>;
 }
 
-/** Test only: a CommonJS module the workers call at fixed points of the open sequence. */
-export interface TestSeam {
-  readonly module: string;
-  readonly data?: unknown;
-}
-
 function connect(
   path: string,
   role: "writer" | "reader",
@@ -76,7 +70,6 @@ function connect(
     readonly lockTimeoutMs?: number;
     /** The file the reader may serve: the writer's `dev:ino`. */
     readonly identity?: string;
-    readonly testSeam?: TestSeam;
     /** The worker died or errored without `close()`, once. */
     readonly onFailure?: (error: Error) => void;
   } = {},
@@ -89,7 +82,6 @@ function connect(
         role,
         lockTimeoutMs: options.lockTimeoutMs,
         identity: options.identity,
-        testSeam: options.testSeam,
       },
       // A small young generation makes V8 reclaim received messages early.
       resourceLimits: { maxYoungGenerationSizeMb: 2 },
@@ -205,11 +197,7 @@ function connect(
  */
 export function openBetterSqlite3(
   path: string,
-  options: {
-    readonly lockTimeoutMs?: number;
-    /** Test only; see `TestSeam`. */
-    readonly testSeam?: TestSeam;
-  } = {},
+  options: { readonly lockTimeoutMs?: number } = {},
 ): SqlDriver {
   // Read the version here: `info` is synchronous and the worker is not up yet.
   const probe = new Database(":memory:");
@@ -235,7 +223,6 @@ export function openBetterSqlite3(
   };
   const writer = connect(path, "writer", {
     lockTimeoutMs: options.lockTimeoutMs,
-    testSeam: options.testSeam,
     onFailure: onWriterFailure,
   });
   // The reader starts on its first read, bound to the file the writer holds:
@@ -248,7 +235,7 @@ export function openBetterSqlite3(
     identified!.then(({ path: real, identity }) => {
       if (writerFailure) throw writerFailure;
       if (closed) throw new Error("sqlite_driver_closed");
-      return connect(real, "reader", { identity, testSeam: options.testSeam });
+      return connect(real, "reader", { identity });
     });
   const reads: SqlReader | undefined = persistent
     ? {

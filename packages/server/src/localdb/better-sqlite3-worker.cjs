@@ -46,12 +46,6 @@ const bind = (params = []) =>
   );
 
 const { role, lockTimeoutMs } = workerData;
-// Test only: a module that runs code at fixed points in the open sequence
-// (`afterCreate`, `beforeOpen`, `beforeRun`), so a test can place an event at
-// an exact step instead of timing it. Nothing in production sets it.
-const seam = workerData.testSeam
-  ? { ...require(workerData.testSeam.module), data: workerData.testSeam.data }
-  : {};
 const isFile = workerData.path !== ":memory:";
 
 /**
@@ -169,8 +163,7 @@ if (role === "writer") {
         });
       // A new file gets its expected identity from our own exclusive create.
       let first = createExclusively();
-      if (first !== undefined) seam.afterCreate?.(path, seam.data);
-      else {
+      if (first === undefined) {
         first = identityOf();
         if (first === undefined) throw replaced(); // removed since EEXIST
       }
@@ -200,7 +193,6 @@ if (role === "writer") {
 /** The reader opens on first use: the writer has made the file and set WAL by then. */
 const openReader = () => {
   if (db) return;
-  seam.beforeOpen?.(seam.data);
   const { opened } = openChecked(
     () => new Database(path, { readonly: true, fileMustExist: true }),
     identity,
@@ -227,10 +219,7 @@ const run = {
     return { path, identity };
   },
   query(statement) {
-    if (role === "reader") {
-      checkReader();
-      seam.beforeRun?.(seam.data);
-    }
+    if (role === "reader") checkReader();
     const { params } = statement;
     const stmt = cache.prepare(textOf(statement));
     if (stmt.reader) return stmt.all(...bind(params));

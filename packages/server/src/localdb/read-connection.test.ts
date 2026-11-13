@@ -8,9 +8,9 @@ import {
   symlinkSync,
 } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { setImmediate as yieldToLoop } from "node:timers/promises";
-import { afterEach, describe, expect, it } from "vitest";
+import type * as WorkerThreads from "node:worker_threads";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   connectionQueue,
   openLocalDb,
@@ -22,6 +22,15 @@ import {
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { createServerLocalSync } from "./sync.js";
 import Database from "better-sqlite3";
+import { harness } from "./worker-harness.test-utils.js";
+
+// The driver starts its workers through the harness's Worker class, which puts
+// a test hook in front of the worker only when a test sets `harness.hooks`.
+vi.mock("node:worker_threads", async (importOriginal) => {
+  const { hookedWorkerClass } = await import("./worker-harness.test-utils.js");
+  const original = await importOriginal<typeof WorkerThreads>();
+  return { ...original, Worker: hookedWorkerClass(original.Worker) };
+});
 
 // HTTP reads must not queue behind the writer. The writer owns one connection
 // and runs a long import or publish batch in one transaction; the read
@@ -49,6 +58,8 @@ describe("read connection", () => {
   const gates: Database.Database[] = [];
 
   afterEach(async () => {
+    harness.hooks = {};
+    harness.workers.length = 0;
     for (const g of gates.splice(0)) if (g.open) g.close();
     for (const d of open.splice(0)) await d.close().catch(() => undefined);
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
@@ -355,14 +366,8 @@ describe("read connection", () => {
     dirs.push(dir);
     // Between the writer's exclusive create and SQLite's open, the test puts
     // another file at the path. The writer must not bind to either file.
-    const driver = openBetterSqlite3(join(dir, "db.sqlite"), {
-      testSeam: {
-        module: fileURLToPath(
-          new URL("./open-seam.test-utils.cjs", import.meta.url),
-        ),
-        data: { replaceAfterCreate: true },
-      },
-    });
+    harness.hooks = { replaceAfterCreate: true };
+    const driver = openBetterSqlite3(join(dir, "db.sqlite"));
     open.push(driver);
 
     await expect(driver.query("SELECT 1")).rejects.toMatchObject({

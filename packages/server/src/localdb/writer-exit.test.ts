@@ -1,34 +1,21 @@
 import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type * as WorkerThreads from "node:worker_threads";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { harness } from "./worker-harness.test-utils.js";
 
 // The test ends the writer worker the way a crash would, from outside the
-// driver: it keeps a handle on every worker the driver starts.
-const workers = vi.hoisted(
-  () => [] as { role: string; worker: WorkerThreads.Worker }[],
-);
+// driver: the harness keeps a handle on every worker the driver starts, and
+// puts a reader at an exact step of its open sequence (see the harness).
 vi.mock("node:worker_threads", async (importOriginal) => {
+  const { hookedWorkerClass } = await import("./worker-harness.test-utils.js");
   const original = await importOriginal<typeof WorkerThreads>();
-  class RecordingWorker extends original.Worker {
-    constructor(
-      file: URL | string,
-      options?: { workerData?: { role: string } },
-    ) {
-      super(file, options as never);
-      workers.push({ role: options?.workerData?.role ?? "", worker: this });
-    }
-  }
-  return { ...original, Worker: RecordingWorker };
+  return { ...original, Worker: hookedWorkerClass(original.Worker) };
 });
 
 const { openBetterSqlite3 } = await import("./better-sqlite3-driver.js");
-
-const SEAM = fileURLToPath(
-  new URL("./open-seam.test-utils.cjs", import.meta.url),
-);
+const { workers } = harness;
 
 describe("writer worker exit", () => {
   const dirs: string[] = [];
@@ -37,6 +24,7 @@ describe("writer worker exit", () => {
   // every parked worker, end every worker, then delete the directories.
   afterEach(async () => {
     for (const release of gates.splice(0)) release();
+    harness.hooks = {};
     const started = workers.splice(0);
     await Promise.all(started.map(({ worker }) => worker.terminate()));
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
@@ -89,10 +77,8 @@ describe("writer worker exit", () => {
       Atomics.notify(gate, 1);
     };
     gates.push(release);
-    return {
-      testSeam: { module: SEAM, data: { park: step, gate: gate.buffer } },
-      parked: Atomics.waitAsync(gate, 0, 0).value as Promise<unknown>,
-    };
+    harness.hooks = { park: { step, gate: gate.buffer as SharedArrayBuffer } };
+    return Atomics.waitAsync(gate, 0, 0).value as Promise<unknown>;
   };
 
   for (const [step, what] of [
@@ -102,17 +88,15 @@ describe("writer worker exit", () => {
     it(`rejects ${what} when the writer dies, and ends the reader`, async () => {
       const dir = mkdtempSync(join(process.cwd(), ".writer-exit-test-"));
       dirs.push(dir);
-      const seam = parkedReader(step);
-      const db = openBetterSqlite3(join(dir, "db.sqlite"), {
-        testSeam: seam.testSeam,
-      });
+      const parked = parkedReader(step);
+      const db = openBetterSqlite3(join(dir, "db.sqlite"));
       await db.query("CREATE TABLE t (x)");
       const read = db.reads!.query("SELECT 1");
       const outcome = read.then(
         () => "resolved",
         (error: Error) => error.message,
       );
-      await seam.parked; // the reader holds this read: it is in flight
+      await parked; // the reader holds this read: it is in flight
       const readerExit = once(workerOf("reader"), "exit");
 
       await workerOf("writer").terminate();
