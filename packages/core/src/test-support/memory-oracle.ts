@@ -45,6 +45,17 @@ export interface Workload {
   readonly heapLimitMiB?: number;
   /** Extra environment for the child, for example allocator tunables. */
   readonly env?: Readonly<Record<string, string>>;
+  /**
+   * Cap each V8 young-generation semi-space at this many MiB
+   * (`--max-semi-space-size`). V8 starts the new space small and doubles it, up
+   * to 128 MiB of capacity on 64-bit Node 24, once enough bytes survive
+   * scavenges, so how many bytes the workload moves decides when the doubling
+   * happens. Pages that the new space touches stay resident after their garbage
+   * is collected. A comparison of two input sizes can then read the doubling as
+   * workload growth. A cap makes the capacity the same at both sizes. Unset
+   * keeps V8's default, which is what a phone or server runs.
+   */
+  readonly maxSemiSpaceMiB?: number;
 }
 
 /**
@@ -90,6 +101,9 @@ function spawnChild(workload: Workload, gc: GcMode): Promise<ChildReport> {
     ...(/\.(?:[cm]?ts|tsx)$/.test(workload.module) ? ["--import", "tsx"] : []),
     "--expose-gc",
     `--max-old-space-size=${heap}`,
+    ...(workload.maxSemiSpaceMiB === undefined
+      ? []
+      : [`--max-semi-space-size=${workload.maxSemiSpaceMiB}`]),
     CHILD,
     workload.module,
     workload.exportName,

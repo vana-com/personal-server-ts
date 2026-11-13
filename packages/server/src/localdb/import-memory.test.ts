@@ -54,6 +54,13 @@ async function measure(
       // (arena cap 1: 6 MiB; in-thread driver: 8 MiB) and reads as growth
       // with row count at the margin below. One arena measures the workload.
       env: { MALLOC_ARENA_MAX: "1" },
+      // V8 doubles its young-generation capacity (64 to 128 MiB) once enough
+      // bytes survive scavenges. The upload path crosses that point between 1x
+      // and 4x and the node path before 1x, so the pages it touches read as
+      // about 20-30 MB of upload growth with no retained row. A 4 MiB
+      // semi-space cap gives both sizes the same capacity; 4x minus 1x is then
+      // 2 to 4 MB on upload and 5 to 6 MB on node.
+      maxSemiSpaceMiB: 4,
     });
   } finally {
     rmSync(workRoot, { recursive: true, force: true });
