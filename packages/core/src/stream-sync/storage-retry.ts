@@ -7,6 +7,8 @@ import {
   createSendGate,
   realAfter,
   type GateTicket,
+  type RequestKind,
+  type SendGateStats,
 } from "./send-gate.js";
 
 /**
@@ -34,7 +36,7 @@ import {
 export interface StorageAccessPolicy {
   /**
    * A quota known before any response (for tests, or a configured store).
-   * The service's own `RateLimit-Policy` replaces it.
+   * The service's own `RateLimit-Policy` replaces it. It paces every kind.
    */
   readonly quota?: QuotaPolicy;
   /**
@@ -205,7 +207,7 @@ export interface SendWindowStats {
   /** The in-flight window when the publish ended. */
   readonly window: number;
   /** The published quota in requests per second, when the service published one. */
-  readonly quotaPerSec?: number;
+  readonly quotaPerSec?: SendGateStats["quotaPerSec"];
   readonly requests: number;
   readonly throttles: number;
   /** Time the shared resume time was pushed out by Retry-After answers. */
@@ -215,6 +217,8 @@ export interface SendWindowStats {
 }
 
 export interface SendRequest {
+  /** The kind of request: the quota a service names for it is the one that paces it. */
+  readonly kind: RequestKind;
   /** Runs after every wait at the gate, so a stale caller does not send. Its throw is final. */
   readonly beforeAttempt?: () => void;
 }
@@ -317,7 +321,7 @@ export function createStorageAccess(policy: StorageAccessPolicy): SendGovernor {
     now: policy.now,
     after: policy.after,
   });
-  if (policy.quota) gate.setQuota(policy.quota);
+  if (policy.quota) gate.setQuota({ named: {}, unnamed: policy.quota });
   const windows = new Set<{ peak: number }>();
   const budget = createByteBudget(policy.maxBytesInFlight, (inUse) => {
     for (const open of windows) open.peak = Math.max(open.peak, inUse);
@@ -368,7 +372,7 @@ export function createStorageAccess(policy: StorageAccessPolicy): SendGovernor {
         for (let attempt = 1; ; attempt++) {
           let ticket: GateTicket;
           try {
-            ticket = await gate.admit(signal);
+            ticket = await gate.admit(request.kind, signal);
           } catch (error) {
             throw signal.aborted ? deferred() : error;
           }

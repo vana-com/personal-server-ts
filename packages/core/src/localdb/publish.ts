@@ -308,7 +308,14 @@ function logSendGate(
       gateWindow: stats.window,
       ...(stats.quotaPerSec === undefined
         ? {}
-        : { quotaPerSec: Math.round(stats.quotaPerSec * 100) / 100 }),
+        : {
+            quotaPerSec: Object.fromEntries(
+              Object.entries(stats.quotaPerSec).map(([kind, rate]) => [
+                kind,
+                Math.round(rate * 100) / 100,
+              ]),
+            ),
+          }),
       requests: stats.requests,
       throttles: stats.throttles,
       retryAfterWaitMs: Math.round(stats.retryAfterWaitMs),

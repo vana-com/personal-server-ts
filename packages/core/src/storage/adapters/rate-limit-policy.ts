@@ -1,5 +1,5 @@
 /**
- * The request quota a storage service publishes in a `RateLimit-Policy`
+ * The request quotas a storage service publishes in a `RateLimit-Policy`
  * response header (IETF draft-ietf-httpapi-ratelimit-headers), and the feed
  * that carries it from an adapter's responses to the send governor.
  *
@@ -18,21 +18,65 @@ export interface QuotaPolicy {
 }
 
 /**
+ * What a `RateLimit-Policy` value says, by the request kind each policy names.
+ * A service limits its kinds separately (vana-storage: `"put";q=240;w=60,
+ * "delete";q=30;w=60`), so one number for all requests would pace a PUT to the
+ * DELETE limit.
+ */
+export interface QuotaPolicies {
+  /** Policies that name a kind, by lower-case name (`put`, `delete`, ...). */
+  readonly named: Readonly<Record<string, QuotaPolicy>>;
+  /**
+   * The unnamed form (`240;w=60`): it applies to every request, and only when
+   * the value names no readable policy.
+   */
+  readonly unnamed?: QuotaPolicy;
+}
+
+/** The quota that paces a kind, and the bucket whose tokens it spends. */
+export interface QuotaForKind {
+  /**
+   * Kinds with the same bucket share one allowance: the kind's own name for a
+   * named policy, `"*"` for the unnamed form, which limits all requests together.
+   */
+  readonly bucket: string;
+  readonly quota: QuotaPolicy;
+}
+
+/**
+ * The quota that paces requests of `kind`, or `undefined` when none does: a
+ * kind no policy names is not paced by quota (a 429 or 503 still backs it
+ * off). The unnamed form applies to every kind only when no policy is named.
+ */
+export function quotaFor(
+  policies: QuotaPolicies,
+  kind: string,
+): QuotaForKind | undefined {
+  if (Object.keys(policies.named).length > 0) {
+    const quota = policies.named[kind];
+    return quota && { bucket: kind, quota };
+  }
+  return policies.unnamed && { bucket: "*", quota: policies.unnamed };
+}
+
+/**
  * Reads a `RateLimit-Policy` value: a list of policies, each `q` requests per
- * `w` seconds, as `"name";q=240;w=60` or in the older `240;w=60` form. When it
- * lists several, the slowest one binds, so it is the one returned.
- * `undefined` when no policy in it is readable.
+ * `w` seconds, as `"name";q=240;w=60` or in the older `240;w=60` form. A name
+ * is the request kind the policy limits. Several policies for one name: the
+ * slowest binds. `undefined` when no policy in it is readable.
  */
 export function parseRateLimitPolicy(
   value: string | null | undefined,
-): QuotaPolicy | undefined {
+): QuotaPolicies | undefined {
   if (!value) return undefined;
-  let slowest: QuotaPolicy | undefined;
+  const named: Record<string, QuotaPolicy> = {};
+  let unnamed: QuotaPolicy | undefined;
   for (const item of value.split(",")) {
     const parts = item.split(";").map((part) => part.trim());
+    const first = parts[0] ?? "";
+    const legacy = /^\d+$/.test(first);
     const quota =
-      numberParam(parts, "q") ??
-      (/^\d+$/.test(parts[0] ?? "") ? Number(parts[0]) : undefined);
+      numberParam(parts, "q") ?? (legacy ? Number(first) : undefined);
     const seconds = numberParam(parts, "w");
     if (
       !quota ||
@@ -46,14 +90,20 @@ export function parseRateLimitPolicy(
     )
       continue;
     const policy = { limit: quota, windowMs: seconds * 1000 };
-    if (
-      !slowest ||
-      policy.limit / policy.windowMs < slowest.limit / slowest.windowMs
-    ) {
-      slowest = policy;
+    // No name: `240;w=60`, or a first parameter such as `q=240`.
+    if (legacy || first === "" || first.includes("=")) {
+      unnamed = slower(unnamed, policy);
+      continue;
     }
+    const name = first.replace(/^"(.*)"$/, "$1").toLowerCase();
+    named[name] = slower(named[name], policy);
   }
-  return slowest;
+  if (Object.keys(named).length === 0 && !unnamed) return undefined;
+  return { named, ...(unnamed ? { unnamed } : {}) };
+}
+
+function slower(a: QuotaPolicy | undefined, b: QuotaPolicy): QuotaPolicy {
+  return !a || b.limit / b.windowMs < a.limit / a.windowMs ? b : a;
 }
 
 function numberParam(
@@ -67,7 +117,7 @@ function numberParam(
   return undefined;
 }
 
-export type QuotaListener = (policy: QuotaPolicy) => void;
+export type QuotaListener = (policies: QuotaPolicies) => void;
 
 /** Fans the policy an adapter's responses publish out to its subscribers. */
 export interface RateLimitPolicyFeed {
@@ -83,7 +133,7 @@ export interface RateLimitPolicyFeed {
 export function createRateLimitPolicyFeed(): RateLimitPolicyFeed {
   const listeners = new Set<QuotaListener>();
   let latest: string | undefined;
-  let current: QuotaPolicy | undefined;
+  let current: QuotaPolicies | undefined;
   return {
     // `globalThis.fetch` is read per call, so a replaced global is honoured.
     async fetch(input, init) {

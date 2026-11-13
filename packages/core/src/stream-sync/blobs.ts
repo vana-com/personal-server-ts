@@ -57,13 +57,13 @@ export function createStorageStreamSyncBlobs(
     ...policy,
   });
   const probe = (key: string) =>
-    governor.run({}, (signal) =>
+    governor.run({ kind: "head" }, (signal) =>
       storage.exists(storage.urlForKey(key), signal),
     );
   return {
     governor,
     put: (key, bytes, beforeAttempt) =>
-      governor.run({ beforeAttempt }, async (signal) => {
+      governor.run({ kind: "put", beforeAttempt }, async (signal) => {
         try {
           await storage.upload(key, bytes, signal);
         } catch (error) {
@@ -76,7 +76,7 @@ export function createStorageStreamSyncBlobs(
     exists: probe,
     get: async (key) => {
       const url = storage.urlForKey(key);
-      const read = await governor.run({}, async (signal) => {
+      const read = await governor.run({ kind: "get" }, async (signal) => {
         try {
           return {
             kind: "bytes" as const,

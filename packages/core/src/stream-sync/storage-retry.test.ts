@@ -1,8 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   StoredBlobConflictError,
   type StorageAdapter,
 } from "../storage/adapters/interface.js";
+import {
+  createRateLimitPolicyFeed,
+  type QuotaListener,
+} from "../storage/adapters/rate-limit-policy.js";
 import { createStorageStreamSyncBlobs } from "./blobs.js";
 import { fakeClock, type FakeClock } from "./fake-clock.test-helper.js";
 import {
@@ -18,7 +22,7 @@ import {
   type StorageAccessPolicy,
 } from "./storage-retry.js";
 
-const NO_REQUEST = {} as const;
+const NO_REQUEST = { kind: "put" } as const;
 const failed = (status: number) =>
   new Error(`vana-storage download failed: ${status} Whatever`);
 const ONE_MINUTE = 60_000;
@@ -831,7 +835,7 @@ describe("createStorageStreamSyncBlobs and a published quota", () => {
   it("paces its requests to the quota the adapter reports, and to nothing before", async () => {
     const clock = fakeClock();
     const sentAt: number[] = [];
-    let report: ((q: { limit: number; windowMs: number }) => void) | undefined;
+    let report: QuotaListener | undefined;
     const blobs = createStorageStreamSyncBlobs(
       adapter({
         upload: vi.fn(async () => (sentAt.push(clock.now()), "url")),
@@ -845,7 +849,7 @@ describe("createStorageStreamSyncBlobs and a published quota", () => {
     // No quota yet: nothing to pace to, the window alone decides.
     await blobs.put("s/a", new Uint8Array([1]));
     expect(sentAt).toEqual([0]);
-    report!({ limit: 1, windowMs: 2_000 });
+    report!({ named: {}, unnamed: { limit: 1, windowMs: 2_000 } });
     const rest = Promise.all([
       blobs.put("s/b", new Uint8Array([1])),
       blobs.put("s/c", new Uint8Array([1])),
@@ -854,6 +858,75 @@ describe("createStorageStreamSyncBlobs and a published quota", () => {
     await clock.advance(10_000);
     await rest;
     expect(sentAt).toEqual([0, 0, 2_000, 4_000]);
+  });
+});
+
+describe("createStorageStreamSyncBlobs and the header storage sends", () => {
+  /** A blob store whose adapter learns its quotas from a real response header. */
+  async function storeAnnouncing(header: string) {
+    const clock = fakeClock();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response("", { headers: { "ratelimit-policy": header } }),
+      ),
+    );
+    const feed = createRateLimitPolicyFeed();
+    await feed.fetch("https://storage.test/");
+    const sent: { kind: string; at: number }[] = [];
+    const blobs = createStorageStreamSyncBlobs(
+      adapter({
+        upload: vi.fn(
+          async () => (sent.push({ kind: "put", at: clock.now() }), "url"),
+        ),
+        download: vi.fn(
+          async () => (
+            sent.push({ kind: "get", at: clock.now() }),
+            new Uint8Array([1])
+          ),
+        ),
+        exists: vi.fn(
+          async () => (sent.push({ kind: "head", at: clock.now() }), true),
+        ),
+        onRateLimitPolicy: feed.subscribe,
+      }),
+      policyOn(clock),
+    );
+    const times = (kind: string) =>
+      sent.filter((s) => s.kind === kind).map((s) => s.at);
+    return { clock, blobs, times };
+  }
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("sends a first import's 105 parts at the put policy, not the delete policy, with reads unpaced", async () => {
+    const { clock, blobs, times } = await storeAnnouncing(
+      '"put";q=240;w=60, "delete";q=30;w=60',
+    );
+    const parts = Array.from({ length: 105 }, (_, i) =>
+      blobs.put(`s/p${i}`, new Uint8Array([1])),
+    );
+    const reads = [blobs.get("s/a"), blobs.exists("s/b")];
+    await clock.advance(300_000);
+    await Promise.all([...parts, ...reads]);
+    // One PUT every 250 ms: the last of 105 leaves at 26 s. The delete
+    // policy would put it at 208 s.
+    expect(times("put")).toHaveLength(105);
+    expect(Math.max(...times("put"))).toBe(26_000);
+    // Storage limits neither: they leave at once, ahead of the queued PUTs.
+    expect(times("get")).toEqual([0]);
+    expect(times("head")).toEqual([0]);
+  });
+
+  it("follows the 600 a minute put policy", async () => {
+    const { clock, blobs, times } = await storeAnnouncing('"put";q=600;w=60');
+    const parts = Array.from({ length: 105 }, (_, i) =>
+      blobs.put(`s/p${i}`, new Uint8Array([1])),
+    );
+    await clock.advance(300_000);
+    await Promise.all(parts);
+    expect(Math.max(...times("put"))).toBe(10_400);
   });
 });
 

@@ -4,6 +4,7 @@ import {
   QUOTA_WINDOW_MAX_SECONDS,
   createRateLimitPolicyFeed,
   parseRateLimitPolicy,
+  quotaFor,
 } from "./rate-limit-policy.js";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -25,8 +26,8 @@ describe("createRateLimitPolicyFeed", () => {
     const stop = feed.subscribe((policy) => seen.push(policy));
     for (let i = 0; i < 3; i++) await feed.fetch("https://storage.test/");
     expect(seen).toEqual([
-      { limit: 240, windowMs: 60_000 },
-      { limit: 120, windowMs: 60_000 },
+      { named: { put: { limit: 240, windowMs: 60_000 } } },
+      { named: { put: { limit: 120, windowMs: 60_000 } } },
     ]);
     stop();
     answers.push(
@@ -63,11 +64,13 @@ describe("a subscriber that attaches after the first response", () => {
     await feed.fetch("https://storage.test/");
     const seen: unknown[] = [];
     feed.subscribe((policy) => seen.push(policy));
-    expect(seen).toEqual([{ limit: 240, windowMs: 60_000 }]);
+    expect(seen).toEqual([
+      { named: { put: { limit: 240, windowMs: 60_000 } } },
+    ]);
     await feed.fetch("https://storage.test/");
     expect(seen).toEqual([
-      { limit: 240, windowMs: 60_000 },
-      { limit: 120, windowMs: 60_000 },
+      { named: { put: { limit: 240, windowMs: 60_000 } } },
+      { named: { put: { limit: 120, windowMs: 60_000 } } },
     ]);
   });
 
@@ -78,14 +81,83 @@ describe("a subscriber that attaches after the first response", () => {
   });
 });
 
+/** What a request of each kind is paced to, by the quota that names it. */
+const pacing = (header: string) => {
+  const policies = parseRateLimitPolicy(header)!;
+  const of = (kind: string) => {
+    const found = quotaFor(policies, kind);
+    return found && found.quota.limit / (found.quota.windowMs / 1000);
+  };
+  return {
+    put: of("put"),
+    get: of("get"),
+    head: of("head"),
+    delete: of("delete"),
+  };
+};
+
 describe("parseRateLimitPolicy", () => {
-  it("returns the slowest of several policies", () => {
-    expect(parseRateLimitPolicy('"burst";q=100;w=1, "sust";q=60;w=60')).toEqual(
-      {
-        limit: 60,
-        windowMs: 60_000,
+  // The header vana-storage dev sends on every response (policy-headers.ts).
+  const DEV = '"put";q=240;w=60, "delete";q=30;w=60';
+
+  it("paces each kind by the policy that names it: storage dev's header", () => {
+    expect(parseRateLimitPolicy(DEV)).toEqual({
+      named: {
+        put: { limit: 240, windowMs: 60_000 },
+        delete: { limit: 30, windowMs: 60_000 },
       },
-    );
+    });
+    // PUTs run at 240 a minute, whatever the DELETE limit is. GET and HEAD are
+    // named by no policy, so no quota paces them.
+    expect(pacing(DEV)).toEqual({
+      put: 4,
+      delete: 0.5,
+      get: undefined,
+      head: undefined,
+    });
+  });
+
+  it("follows the 600 a minute PUT policy storage is about to send", () => {
+    expect(pacing('"put";q=600;w=60')).toEqual({
+      put: 10,
+      get: undefined,
+      head: undefined,
+      delete: undefined,
+    });
+    expect(pacing('"put";q=600;w=60, "delete";q=30;w=60').put).toBe(10);
+  });
+
+  it("applies the unnamed form to every kind, as one allowance", () => {
+    const policies = parseRateLimitPolicy("240;w=60")!;
+    expect(quotaFor(policies, "put")).toEqual({
+      bucket: "*",
+      quota: { limit: 240, windowMs: 60_000 },
+    });
+    expect(quotaFor(policies, "get")?.bucket).toBe("*");
+    expect(quotaFor(policies, "head")?.bucket).toBe("*");
+    expect(parseRateLimitPolicy("q=240;w=60")?.unnamed).toEqual({
+      limit: 240,
+      windowMs: 60_000,
+    });
+  });
+
+  it("ignores the unnamed form when a named policy is present", () => {
+    expect(pacing('5;w=60, "put";q=240;w=60')).toEqual({
+      put: 4,
+      get: undefined,
+      head: undefined,
+      delete: undefined,
+    });
+  });
+
+  it("keeps the slowest of several policies that name one kind, and of several unnamed ones", () => {
+    expect(pacing('"put";q=100;w=1, "put";q=60;w=60').put).toBe(1);
+    expect(pacing("100;w=1, 60;w=60").get).toBe(1);
+  });
+
+  it("reads a kind's name in any case, quoted or not", () => {
+    expect(pacing('"PUT";q=240;w=60').put).toBe(4);
+    expect(pacing("put;q=240;w=60").put).toBe(4);
   });
 
   it("takes no quota that is zero, not finite or outside the bounds", () => {
@@ -97,21 +169,34 @@ describe("parseRateLimitPolicy", () => {
       `10;w=${huge}`,
       `${QUOTA_LIMIT_MAX + 1};w=60`,
       `10;w=${QUOTA_WINDOW_MAX_SECONDS + 1}`,
+      '"put";q=0;w=60',
+      `"put";q=${huge};w=60`,
     ]) {
       expect(parseRateLimitPolicy(bad)).toBeUndefined();
     }
     expect(
-      parseRateLimitPolicy(`${QUOTA_LIMIT_MAX};w=${QUOTA_WINDOW_MAX_SECONDS}`),
+      parseRateLimitPolicy(
+        `"put";q=${QUOTA_LIMIT_MAX};w=${QUOTA_WINDOW_MAX_SECONDS}`,
+      ),
     ).toEqual({
-      limit: QUOTA_LIMIT_MAX,
-      windowMs: QUOTA_WINDOW_MAX_SECONDS * 1000,
+      named: {
+        put: {
+          limit: QUOTA_LIMIT_MAX,
+          windowMs: QUOTA_WINDOW_MAX_SECONDS * 1000,
+        },
+      },
     });
   });
 
   it("skips an unreadable policy and keeps a readable one beside it", () => {
     expect(parseRateLimitPolicy("junk, 5;w=10")).toEqual({
-      limit: 5,
-      windowMs: 10_000,
+      named: {},
+      unnamed: { limit: 5, windowMs: 10_000 },
+    });
+    // An unreadable named policy does not count as present.
+    expect(parseRateLimitPolicy('"put";q=0;w=60, 5;w=10')).toEqual({
+      named: {},
+      unnamed: { limit: 5, windowMs: 10_000 },
     });
   });
 });

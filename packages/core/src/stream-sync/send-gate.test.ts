@@ -6,7 +6,17 @@ import {
   type GateTicket,
   type SendGate,
 } from "./send-gate.js";
+import type {
+  QuotaPolicies,
+  QuotaPolicy,
+} from "../storage/adapters/rate-limit-policy.js";
 import { fakeClock, type FakeClock } from "./fake-clock.test-helper.js";
+
+/** A quota that paces every kind, as the unnamed header form does. */
+const allKinds = (quota: QuotaPolicy): QuotaPolicies => ({
+  named: {},
+  unnamed: quota,
+});
 
 function gateOn(clock: FakeClock, overrides = {}): SendGate {
   return createSendGate({ now: clock.now, after: clock.after, ...overrides });
@@ -14,7 +24,7 @@ function gateOn(clock: FakeClock, overrides = {}): SendGate {
 
 /** The next request out of the gate, however long the gate makes it wait. */
 async function next(gate: SendGate, clock: FakeClock): Promise<GateTicket> {
-  return clock.drive(gate.admit());
+  return clock.drive(gate.admit("put"));
 }
 
 /** Admit `n` requests one after another and report each as a success. */
@@ -33,7 +43,7 @@ describe("the in-flight window", () => {
     const gate = gateOn(clock, { maxWindow: 8 });
     const first = await next(gate, clock);
     let secondOut = false;
-    void gate.admit().then(() => (secondOut = true));
+    void gate.admit("put").then(() => (secondOut = true));
     await clock.advance(5_000);
     expect(secondOut).toBe(false);
     first.abandon();
@@ -73,7 +83,7 @@ describe("the in-flight window", () => {
     const gate = gateOn(clock, { maxWindow: 8 });
     await openTo(gate, clock, 8);
     const sent = await Promise.all(
-      Array.from({ length: 8 }, () => gate.admit()),
+      Array.from({ length: 8 }, () => gate.admit("put")),
     );
     for (const ticket of sent) ticket.congested();
     expect(gate.stats().window).toBe(4);
@@ -114,7 +124,7 @@ describe("the in-flight window", () => {
     const gate = gateOn(clock, { maxHoldMs: 10_000 });
     (await next(gate, clock)).quotaExceeded(7 * 24 * 60 * 60 * 1000);
     const left: number[] = [];
-    void gate.admit().then(() => left.push(clock.now()));
+    void gate.admit("put").then(() => left.push(clock.now()));
     await clock.advance(9_999);
     expect(left).toEqual([]);
     await clock.advance(2);
@@ -128,7 +138,7 @@ describe("the in-flight window", () => {
     (await next(gate, clock)).quotaExceeded(Number.POSITIVE_INFINITY);
     (await next(gate, clock)).congested(Number.NaN);
     const left: number[] = [];
-    void gate.admit().then(() => left.push(clock.now()));
+    void gate.admit("put").then(() => left.push(clock.now()));
     await clock.advance(0);
     expect(left).toEqual([0]);
   });
@@ -140,13 +150,13 @@ describe("a caller that stops waiting", () => {
     const gate = gateOn(clock, { maxWindow: 4 });
     const first = await next(gate, clock);
     const stop = new AbortController();
-    const abandoned = gate.admit(stop.signal);
+    const abandoned = gate.admit("put", stop.signal);
     const abandonedResult = abandoned.then(
       () => "admitted",
       (reason: unknown) => reason,
     );
     let thirdOut = false;
-    void gate.admit().then(() => (thirdOut = true));
+    void gate.admit("put").then(() => (thirdOut = true));
     await clock.advance(1_000);
     stop.abort("gave up");
     expect(await abandonedResult).toBe("gave up");
@@ -161,17 +171,17 @@ describe("a caller that stops waiting", () => {
     const gate = createSendGate();
     const stop = new AbortController();
     stop.abort("already");
-    await expect(gate.admit(stop.signal)).rejects.toBe("already");
+    await expect(gate.admit("put", stop.signal)).rejects.toBe("already");
     expect(gate.stats().requests).toBe(0);
   });
 
   it("leaves a wait for a spent quota too, with no timer left behind", async () => {
     const clock = fakeClock();
     const gate = gateOn(clock);
-    gate.setQuota({ limit: 1, windowMs: 3_600_000 });
+    gate.setQuota(allKinds({ limit: 1, windowMs: 3_600_000 }));
     (await next(gate, clock)).success();
     const stop = new AbortController();
-    const waiting = gate.admit(stop.signal).catch((e: unknown) => e);
+    const waiting = gate.admit("put", stop.signal).catch((e: unknown) => e);
     await clock.advance(1_000);
     stop.abort("deadline");
     expect(await waiting).toBe("deadline");
@@ -188,11 +198,11 @@ describe("the quota tokens", () => {
     const clock = fakeClock();
     // 10 requests per 10 s; a wide window, so only the tokens limit it.
     const gate = gateOn(clock, { maxWindow: 16 });
-    gate.setQuota({ limit: 10, windowMs: 10_000 });
+    gate.setQuota(allKinds({ limit: 10, windowMs: 10_000 }));
     await openTo(gate, clock, 16);
     const left: number[] = [];
     for (let i = 0; i < 40; i++) {
-      void gate.admit().then((t) => {
+      void gate.admit("put").then((t) => {
         left.push(clock.now());
         t.success();
       });
@@ -211,7 +221,7 @@ describe("the quota tokens", () => {
     await openTo(gate, clock, 4);
     const left: number[] = [];
     for (let i = 0; i < 4; i++) {
-      void gate.admit().then(() => left.push(clock.now()));
+      void gate.admit("put").then(() => left.push(clock.now()));
     }
     await clock.advance(0);
     expect(left).toEqual([0, 0, 0, 0]);
@@ -221,14 +231,14 @@ describe("the quota tokens", () => {
   it("spends a token when a request leaves, and a reply gives none back", async () => {
     const clock = fakeClock();
     const gate = gateOn(clock, { maxWindow: 4 });
-    gate.setQuota(perSecond);
+    gate.setQuota(allKinds(perSecond));
     const first = await next(gate, clock);
     expect(clock.now()).toBe(0);
     // The reply comes back early; the next token is still a second after the send.
     await clock.advance(100);
     first.success();
     const second: number[] = [];
-    void gate.admit().then(() => second.push(clock.now()));
+    void gate.admit("put").then(() => second.push(clock.now()));
     await clock.advance(2_000);
     expect(second).toEqual([1_000]);
   });
@@ -236,11 +246,11 @@ describe("the quota tokens", () => {
   it("holds every caller for a 429's Retry-After, then paces them again", async () => {
     const clock = fakeClock();
     const gate = gateOn(clock, { maxWindow: 4 });
-    gate.setQuota({ limit: 4, windowMs: 1_000 });
+    gate.setQuota(allKinds({ limit: 4, windowMs: 1_000 }));
     (await next(gate, clock)).quotaExceeded(60_000);
     const left: number[] = [];
     for (let i = 0; i < 3; i++) {
-      void gate.admit().then((t) => {
+      void gate.admit("put").then((t) => {
         left.push(clock.now());
         t.success();
       });
@@ -255,15 +265,15 @@ describe("the quota tokens", () => {
   it("follows a quota that changes, and a waiter sleeping on the old one wakes", async () => {
     const clock = fakeClock();
     const gate = gateOn(clock, { maxWindow: 4 });
-    gate.setQuota({ limit: 1, windowMs: 86_400_000 });
-    expect(gate.stats().quotaPerSec).toBeCloseTo(1 / 86_400);
+    gate.setQuota(allKinds({ limit: 1, windowMs: 86_400_000 }));
+    expect(gate.stats().quotaPerSec?.put).toBeCloseTo(1 / 86_400);
     (await next(gate, clock)).success();
     const left: number[] = [];
-    void gate.admit().then(() => left.push(clock.now()));
+    void gate.admit("put").then(() => left.push(clock.now()));
     await clock.advance(1_000);
     expect(left).toEqual([]); // a day away
-    gate.setQuota({ limit: 1, windowMs: 1_000 });
-    expect(gate.stats().quotaPerSec).toBe(1);
+    gate.setQuota(allKinds({ limit: 1, windowMs: 1_000 }));
+    expect(gate.stats().quotaPerSec?.put).toBe(1);
     await clock.advance(1_000);
     expect(left.length).toBe(1);
     gate.setQuota(undefined);
@@ -271,15 +281,124 @@ describe("the quota tokens", () => {
   });
 });
 
+describe("the quota of each kind", () => {
+  // storage dev's header: `"put";q=240;w=60, "delete";q=30;w=60`
+  const dev: QuotaPolicies = {
+    named: {
+      put: { limit: 240, windowMs: 60_000 },
+      delete: { limit: 30, windowMs: 60_000 },
+    },
+  };
+
+  /** A gate with its window open, and the quotas set after, so the first token of each kind is free at `start`. */
+  async function opened(quotas: QuotaPolicies) {
+    const clock = fakeClock();
+    const gate = gateOn(clock, { maxWindow: 16 });
+    await openTo(gate, clock, 16);
+    gate.setQuota(quotas);
+    return { clock, gate, start: clock.now() };
+  }
+
+  it("paces a PUT to the put policy, whatever slower policy the header also names", async () => {
+    const { clock, gate, start } = await opened(dev);
+    const left: number[] = [];
+    for (let i = 0; i < 5; i++)
+      void gate.admit("put").then((t) => {
+        left.push(clock.now() - start);
+        t.success();
+      });
+    await clock.advance(10_000);
+    // 240 a minute is one every 250 ms; the delete policy (one every 2 s)
+    // does not bind a PUT.
+    expect(left).toEqual([0, 250, 500, 750, 1_000]);
+    expect(gate.stats().quotaPerSec).toEqual({ put: 4 });
+  });
+
+  it("does not pace a kind no policy names, and does not hold it behind a paced PUT", async () => {
+    const { clock, gate, start } = await opened(dev);
+    (await clock.drive(gate.admit("put"))).success(); // spends the put token
+    const left: string[] = [];
+    const at = () => clock.now() - start;
+    void gate.admit("put").then(() => left.push(`put@${at()}`));
+    for (const kind of ["get", "head", "get"] as const)
+      void gate.admit(kind).then(() => left.push(`${kind}@${at()}`));
+    await clock.advance(0);
+    // The PUT waits for its token; the reads behind it do not.
+    expect(left).toEqual(["get@0", "head@0", "get@0"]);
+    await clock.advance(300);
+    expect(left).toContain("put@250");
+  });
+
+  it("gives the unnamed form one allowance for all kinds", async () => {
+    const { clock, gate, start } = await opened({
+      named: {},
+      unnamed: { limit: 2, windowMs: 1_000 },
+    });
+    const left: number[] = [];
+    for (const kind of ["put", "get", "head"] as const)
+      void gate.admit(kind).then((t) => {
+        left.push(clock.now() - start);
+        t.success();
+      });
+    await clock.advance(2_000);
+    expect(left).toEqual([0, 500, 1_000]);
+  });
+
+  it("zeroes only the tokens of the kind that was answered 429", async () => {
+    const { clock, gate, start } = await opened({
+      named: {
+        put: { limit: 60, windowMs: 60_000 },
+        get: { limit: 60, windowMs: 60_000 },
+      },
+    });
+    // Both kinds have spent their free token and earned one again.
+    (await clock.drive(gate.admit("get"))).success();
+    (await clock.drive(gate.admit("put"))).success();
+    await clock.advance(1_000);
+    const put = await clock.drive(gate.admit("put"));
+    put.quotaExceeded(); // no Retry-After: only the put tokens are gone
+    const left: string[] = [];
+    const at = () => clock.now() - start;
+    void gate.admit("put").then(() => left.push(`put@${at()}`));
+    void gate.admit("get").then(() => left.push(`get@${at()}`));
+    await clock.advance(0);
+    expect(left).toEqual(["get@1000"]);
+    await clock.advance(1_000);
+    expect(left).toEqual(["get@1000", "put@2000"]);
+  });
+
+  it("drops the pacing of a kind the new quotas no longer name", async () => {
+    const { clock, gate, start } = await opened({
+      named: { put: { limit: 1, windowMs: 3_600_000 } },
+    });
+    (await clock.drive(gate.admit("put"))).success();
+    const left: number[] = [];
+    void gate.admit("put").then(() => left.push(clock.now() - start));
+    await clock.advance(1_000);
+    expect(left).toEqual([]);
+    gate.setQuota({ named: { delete: { limit: 1, windowMs: 1_000 } } });
+    await clock.advance(0);
+    expect(left).toEqual([1_000]);
+    expect(gate.stats().quotaPerSec).toBeUndefined();
+    // A quota that names put again starts it afresh: no allowance spent under
+    // the old quota is carried over.
+    gate.setQuota({ named: { put: { limit: 1, windowMs: 3_600_000 } } });
+    const again: number[] = [];
+    void gate.admit("put").then(() => again.push(clock.now() - start));
+    await clock.advance(0);
+    expect(again).toEqual([1_000]);
+  });
+});
+
 describe("one place to wait", () => {
   it("a request leaves only when the window, the resume time and a token all allow it", async () => {
     const clock = fakeClock();
     const gate = gateOn(clock, { maxWindow: 4 });
-    gate.setQuota({ limit: 1, windowMs: 1_000 });
+    gate.setQuota(allKinds({ limit: 1, windowMs: 1_000 }));
     const first = await next(gate, clock); // takes the window's one slot and the token
     gate.holdFor(5_000);
     const left: number[] = [];
-    void gate.admit().then(() => left.push(clock.now()));
+    void gate.admit("put").then(() => left.push(clock.now()));
     await clock.advance(1_500); // token back, resume time not passed, slot taken
     expect(left).toEqual([]);
     first.success(); // slot free (and the window is now 2)

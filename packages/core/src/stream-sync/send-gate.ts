@@ -7,7 +7,9 @@
  *
  *  - Quota (HTTP 429, and the `RateLimit-Policy` header when the service
  *    publishes one). Quota is a rate the server will accept: when a policy is
- *    known, requests are paced to it with tokens, never above it. A 429 only
+ *    known, requests are paced to it with tokens, never above it. The policy
+ *    names the kind of request it limits, so each kind has its own tokens and
+ *    a kind no policy names is not paced. A 429 only
  *    delays every caller until its Retry-After: it says the quota is spent,
  *    not that the path is congested, so it does not shrink the window.
  *    Tokens are spent when a request is sent, so a reply that arrives out of
@@ -29,7 +31,20 @@
  * after a failure and then re-enters this gate.
  */
 
-import type { QuotaPolicy } from "../storage/adapters/rate-limit-policy.js";
+import {
+  quotaFor,
+  type QuotaPolicies,
+  type QuotaPolicy,
+} from "../storage/adapters/rate-limit-policy.js";
+
+/**
+ * The kinds of request the gate paces. A service's quota names the kind it
+ * limits (vana-storage: `put` and `delete`), so a request waits only for the
+ * quota of its own kind. There is no `delete` here: nothing deletes through
+ * the gate.
+ */
+export type RequestKind = "put" | "get" | "head";
+const REQUEST_KINDS: readonly RequestKind[] = ["put", "get", "head"];
 
 export interface SendGatePolicy {
   /**
@@ -93,8 +108,8 @@ export interface SendGateStats {
   readonly throttles: number;
   /** Time the shared resume time was pushed out by Retry-After answers. */
   readonly retryAfterWaitMs: number;
-  /** The published quota, in requests per second, when one is known. */
-  readonly quotaPerSec?: number;
+  /** The quota that paces each kind, in requests per second; a kind no quota paces is absent. */
+  readonly quotaPerSec?: Readonly<Partial<Record<RequestKind, number>>>;
 }
 
 export interface SendGate {
@@ -103,9 +118,9 @@ export interface SendGate {
    * asked. Rejects with the signal's reason, and leaves the queue, if the
    * signal aborts first.
    */
-  admit(signal?: AbortSignal): Promise<GateTicket>;
-  /** The quota the service published, or `undefined` for none. */
-  setQuota(quota: QuotaPolicy | undefined): void;
+  admit(kind: RequestKind, signal?: AbortSignal): Promise<GateTicket>;
+  /** The quotas the service published, or `undefined` for none. */
+  setQuota(quotas: QuotaPolicies | undefined): void;
   /** No request leaves before `now + ms`, whoever asks. Never moves it earlier. Not counted as a server ask. */
   holdFor(ms: number): void;
   stats(): SendGateStats;
@@ -126,10 +141,10 @@ export function createSendGate(
   let epoch = 0;
   let streak = 0;
   let inFlight = 0;
-  // Quota state: tokens are spent when a request leaves and never given back.
-  let quota: QuotaPolicy | undefined;
-  let tokens = 0;
-  let refilledAt = 0;
+  // Quota state, one bucket per kind a quota paces: tokens are spent when a
+  // request leaves and never given back.
+  let quotas: QuotaPolicies | undefined;
+  const buckets = new Map<string, Bucket>();
   // Shared wait.
   let resumeAt = 0;
   // Counters.
@@ -137,7 +152,13 @@ export function createSendGate(
   let throttles = 0;
   let retryAfterWaitMs = 0;
 
+  interface Bucket {
+    quota: QuotaPolicy;
+    tokens: number;
+    refilledAt: number;
+  }
   interface Waiter {
+    readonly kind: RequestKind;
     resolve: (ticket: GateTicket) => void;
     reject: (reason: unknown) => void;
     leave?: () => void;
@@ -146,15 +167,29 @@ export function createSendGate(
   let pumping = false;
   let wake: (() => void) | undefined;
 
-  const refill = () => {
+  const refill = (bucket: Bucket) => {
     const now = policy.now();
-    if (quota) {
-      tokens = Math.min(
-        1,
-        tokens + ((now - refilledAt) * quota.limit) / quota.windowMs,
-      );
+    bucket.tokens = Math.min(
+      1,
+      bucket.tokens +
+        ((now - bucket.refilledAt) * bucket.quota.limit) /
+          bucket.quota.windowMs,
+    );
+    bucket.refilledAt = now;
+  };
+
+  // The bucket that paces `kind`, or none when no quota names it. A bucket
+  // seen for the first time starts with its one token free.
+  const bucketFor = (kind: RequestKind): Bucket | undefined => {
+    const found = quotas && quotaFor(quotas, kind);
+    if (!found) return undefined;
+    let bucket = buckets.get(found.bucket);
+    if (!bucket) {
+      bucket = { quota: found.quota, tokens: 1, refilledAt: policy.now() };
+      buckets.set(found.bucket, bucket);
     }
-    refilledAt = now;
+    refill(bucket);
+    return bucket;
   };
 
   // Waits until `wakeLoop` is called, or `ms` have passed.
@@ -186,23 +221,39 @@ export function createSendGate(
           await idle();
           continue;
         }
-        refill();
-        const tokenWait = quota
-          ? ((1 - tokens) * quota.windowMs) / quota.limit
-          : 0;
-        const wait = Math.max(resumeAt - policy.now(), tokenWait);
-        if (wait > 0) {
-          // Whole milliseconds, so a fractional wait cannot leave the loop
-          // asleep for less than it needs and spinning.
-          await idle(wait);
+        const resumeWait = resumeAt - policy.now();
+        if (resumeWait > 0) {
+          await idle(resumeWait);
           continue;
         }
-        if (quota) tokens -= 1;
+        // The first waiter, in order, that no quota holds back: a request of
+        // a kind with no quota does not wait behind one that is paced.
+        let at = -1;
+        let tokenWait = Infinity;
+        for (let i = 0; i < queue.length; i++) {
+          const bucket = bucketFor(queue[i]!.kind);
+          if (!bucket || bucket.tokens >= 1) {
+            at = i;
+            break;
+          }
+          tokenWait = Math.min(
+            tokenWait,
+            ((1 - bucket.tokens) * bucket.quota.windowMs) / bucket.quota.limit,
+          );
+        }
+        if (at < 0) {
+          // Whole milliseconds, so a fractional wait cannot leave the loop
+          // asleep for less than it needs and spinning.
+          await idle(tokenWait);
+          continue;
+        }
+        const [next] = queue.splice(at, 1) as [Waiter];
+        const bucket = bucketFor(next.kind);
+        if (bucket) bucket.tokens -= 1;
         inFlight += 1;
         requests += 1;
-        const next = queue.shift()!;
         next.leave?.();
-        next.resolve(ticketFor());
+        next.resolve(ticketFor(next.kind));
       }
     } finally {
       pumping = false;
@@ -230,7 +281,7 @@ export function createSendGate(
     window = Math.max(1, Math.floor(window / 2));
   }
 
-  function ticketFor(): GateTicket {
+  function ticketFor(kind: RequestKind): GateTicket {
     const ticketEpoch = epoch;
     let settled = false;
     const settle = (): boolean => {
@@ -254,8 +305,8 @@ export function createSendGate(
         throttles += 1;
         // The tokens spent are not given back, and none is free until the
         // wait is over.
-        tokens = 0;
-        refilledAt = policy.now();
+        const bucket = bucketFor(kind);
+        if (bucket) bucket.tokens = 0;
         if (retryAfterMs !== undefined) hold(retryAfterMs, true);
         wakeLoop();
       },
@@ -274,16 +325,26 @@ export function createSendGate(
     };
   }
 
+  // Requests per second of each kind a quota paces.
+  const quotaRates = (): Pick<SendGateStats, "quotaPerSec"> => {
+    const rates: Partial<Record<RequestKind, number>> = {};
+    for (const kind of REQUEST_KINDS) {
+      const found = quotas && quotaFor(quotas, kind);
+      if (found)
+        rates[kind] = (found.quota.limit * 1000) / found.quota.windowMs;
+    }
+    return Object.keys(rates).length > 0 ? { quotaPerSec: rates } : {};
+  };
+
   return {
-    admit: (signal) => {
+    admit: (kind, signal) => {
       if (signal?.aborted) return Promise.reject(signal.reason);
       return new Promise((resolve, reject) => {
-        const waiter: Waiter = { resolve, reject };
+        const waiter: Waiter = { kind, resolve, reject };
         if (signal) {
           const onAbort = () => {
             const at = queue.indexOf(waiter);
             if (at < 0) return;
-            queue.splice(at, 1);
             reject(signal.reason);
             // The loop may be asleep on this waiter's wait: let it look again.
             wakeLoop();
@@ -292,16 +353,24 @@ export function createSendGate(
           waiter.leave = () => signal.removeEventListener("abort", onAbort);
         }
         queue.push(waiter);
+        // A loop asleep on another kind's token must look at this waiter too.
+        wakeLoop();
         void pump();
       });
     },
     setQuota(next) {
-      refill();
-      const first = quota === undefined;
-      quota = next;
-      // A quota seen for the first time starts with its one token free.
-      if (next && first) tokens = 1;
-      if (!next) tokens = 0;
+      // Tokens earned at the old rate are kept; a kind the new quotas do not
+      // pace loses its bucket, and one they pace for the first time gets a
+      // new bucket with its one token free.
+      for (const [name, bucket] of buckets) {
+        refill(bucket);
+        const quota = REQUEST_KINDS.map(
+          (kind) => next && quotaFor(next, kind),
+        ).find((found) => found?.bucket === name)?.quota;
+        if (quota) bucket.quota = quota;
+        else buckets.delete(name);
+      }
+      quotas = next;
       wakeLoop();
     },
     holdFor: (ms) => hold(ms, false),
@@ -310,7 +379,7 @@ export function createSendGate(
       requests,
       throttles,
       retryAfterWaitMs,
-      ...(quota ? { quotaPerSec: (quota.limit * 1000) / quota.windowMs } : {}),
+      ...quotaRates(),
     }),
   };
 }

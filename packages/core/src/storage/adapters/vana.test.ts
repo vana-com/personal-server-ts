@@ -106,7 +106,9 @@ describe("createVanaSyncStorageAdapter — chain-scoped storage", () => {
       const seen: unknown[] = [];
       adapter.onRateLimitPolicy!((policy) => seen.push(policy));
       await expect(adapter.exists(url)).resolves.toBe(true);
-      expect(seen).toEqual([{ limit: 240, windowMs: 60_000 }]);
+      expect(seen).toEqual([
+        { named: { put: { limit: 240, windowMs: 60_000 } } },
+      ]);
     });
 
     it("throws a 429 HEAD with its status and Retry-After", async () => {
@@ -152,7 +154,9 @@ describe("createVanaSyncStorageAdapter — chain-scoped storage", () => {
       });
       // One request: the SDK's own retry loop never gets a response to retry.
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(seen).toEqual([{ limit: 240, windowMs: 60_000 }]);
+      expect(seen).toEqual([
+        { named: { put: { limit: 240, windowMs: 60_000 } } },
+      ]);
     });
   });
 
