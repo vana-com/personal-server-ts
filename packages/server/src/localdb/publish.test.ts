@@ -1488,6 +1488,8 @@ describe("the head this device committed", () => {
         if (hidden.has(key)) return null;
         return replaced.get(key) ?? inner.get(key);
       },
+      exists: async (key: string) =>
+        !hidden.has(key) && (replaced.has(key) || inner.exists(key)),
       put: async (key: string, bytes: Uint8Array) => {
         puts.push(key);
         return inner.put(key, bytes);
