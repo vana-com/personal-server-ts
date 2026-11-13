@@ -517,3 +517,145 @@ it("an absent registry answer never clears a local-only delete, but explicit con
     ).status,
   ).toBe("collecting");
 });
+
+// Makes the first `losses` posts to the stream head lose their CAS: a rival row
+// takes the version the delete signed for, so the delete must re-read and re-sign.
+function loseHeadRaces(f: Awaited<ReturnType<typeof world>>, losses: number) {
+  let lost = 0;
+  f.registry.beforePost = async (post) => {
+    if (post.scope !== f.head.scope || lost === losses) return;
+    lost++;
+    const hook = f.registry.beforePost;
+    f.registry.beforePost = undefined;
+    const current = (await f.registry.read(post.scope)).version ?? 0;
+    await f.registry.post({
+      ownerAddress: owner,
+      scope: post.scope,
+      dataHash: `0x${"ab".repeat(32)}`,
+      metadataHash: `0x${"cd".repeat(32)}`,
+      expectedVersion: String(current + 1),
+      signature: "0x00",
+    });
+    f.registry.beforePost = hook;
+  };
+  return () => lost;
+}
+
+it("a stream delete that wins its eighth CAS attempt still confirms and reports success", async () => {
+  const f = await world();
+  const lost = loseHeadRaces(f, 7);
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(lost()).toBe(7);
+  // Fixture version 1, seven rival rows, then the delete's own winning row.
+  expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 9 });
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+it("eight lost stream CAS races still end pending without a ninth post", async () => {
+  const f = await world();
+  const lost = loseHeadRaces(f, 8);
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  const pending = await f.a.deleter.resumeDeletes();
+  expect(lost()).toBe(8);
+  expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 9 });
+  expect(pending).toEqual([{ connector: "fixture-source", why: "Error" }]);
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toHaveLength(1);
+});
+
+type World = Awaited<ReturnType<typeof world>>;
+const EIGHT_ATTEMPTS = 8;
+/** A row no delete signed: its head blob does not exist, so no read verifies it. */
+const UNSHOWN = {
+  dataHash: `0x${"ef".repeat(32)}` as `0x${string}`,
+  metadataHash: `0x${"fe".repeat(32)}` as `0x${string}`,
+};
+
+/** Another writer's acknowledged post, made without re-entering the test hooks. */
+async function rivalWrite(registry: MemoryStreamSyncRegistry, scope: string) {
+  const { beforePost, afterPost } = registry;
+  registry.beforePost = undefined;
+  registry.afterPost = undefined;
+  try {
+    const current = (await registry.read(scope)).version ?? 0;
+    await registry.post({
+      ownerAddress: owner,
+      scope,
+      dataHash: UNSHOWN.dataHash,
+      metadataHash: UNSHOWN.metadataHash,
+      expectedVersion: String(current + 1),
+      signature: "0x00",
+    });
+  } finally {
+    registry.beforePost = beforePost;
+    registry.afterPost = afterPost;
+  }
+}
+
+/**
+ * Scripts the registry's answer to each head post, 1-based: "lose" (a rival
+ * takes the version first, so the CAS is rejected), "ack" (committed and
+ * acknowledged, reads unchanged), or "overwrite" (committed, then a rival
+ * overwrites it before the delete's next read). `hideHead` makes every head
+ * read show an unsigned row. Returns the count of the delete's head posts; a
+ * ninth post throws, so a broken budget fails fast with a count, not a hang.
+ */
+function scriptHeadPosts(
+  f: World,
+  outcome: (post: number) => "lose" | "ack" | "overwrite",
+  hideHead = false,
+) {
+  const registry = f.registry;
+  let posts = 0;
+  let current: "lose" | "ack" | "overwrite" = "ack";
+  if (hideHead) {
+    const read = registry.read.bind(registry);
+    registry.read = async (scope) => {
+      const row = await read(scope);
+      return scope === f.head.scope && row.found ? { ...row, ...UNSHOWN } : row;
+    };
+  }
+  registry.beforePost = async (post) => {
+    if (post.scope !== f.head.scope) return;
+    posts++;
+    if (posts > EIGHT_ATTEMPTS)
+      throw new Error("runaway: more than eight stream posts");
+    current = outcome(posts);
+    if (current === "lose") await rivalWrite(registry, post.scope);
+  };
+  registry.afterPost = async (post) => {
+    if (post.scope === f.head.scope && current === "overwrite")
+      await rivalWrite(registry, post.scope);
+  };
+  return () => posts;
+}
+
+it("an acknowledged stream post that the next read never shows ends pending after eight posts", async () => {
+  const f = await world();
+  const posts = scriptHeadPosts(f, () => "ack", true);
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  const pending = await f.a.deleter.resumeDeletes();
+  expect(posts()).toBe(EIGHT_ATTEMPTS);
+  expect(pending).toEqual([{ connector: "fixture-source", why: "Error" }]);
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toHaveLength(1);
+});
+
+it("an acknowledged stream post overwritten before the next read ends pending after eight posts", async () => {
+  const f = await world();
+  const posts = scriptHeadPosts(f, () => "overwrite");
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  const pending = await f.a.deleter.resumeDeletes();
+  expect(posts()).toBe(EIGHT_ATTEMPTS);
+  expect(pending).toEqual([{ connector: "fixture-source", why: "Error" }]);
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toHaveLength(1);
+});
+
+it("rejected and overwritten stream posts share one budget of eight", async () => {
+  const f = await world();
+  const posts = scriptHeadPosts(f, (n) => (n % 2 === 1 ? "lose" : "overwrite"));
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  const pending = await f.a.deleter.resumeDeletes();
+  expect(posts()).toBe(EIGHT_ATTEMPTS);
+  expect(pending).toEqual([{ connector: "fixture-source", why: "Error" }]);
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toHaveLength(1);
+});
