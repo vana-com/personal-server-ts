@@ -71,7 +71,8 @@ export class FrozenRowsChanged extends Error {
 const PAGE_ROWS = 64;
 const PAGE_BYTES = 2 * 1024 * 1024;
 
-function partTarget(deps: LocalSyncDeps, generation: number): number {
+/** The byte target a part is cut at: `deps.partTargetBytes`, default 4 MiB. */
+export function partTargetOf(deps: LocalSyncDeps): number {
   const target = deps.partTargetBytes ?? 4 * 1024 * 1024;
   if (
     !Number.isSafeInteger(target) ||
@@ -80,6 +81,11 @@ function partTarget(deps: LocalSyncDeps, generation: number): number {
   ) {
     throw new Error("partTargetBytes must be between 1 and 16 MiB");
   }
+  return target;
+}
+
+function partTarget(deps: LocalSyncDeps, generation: number): number {
+  const target = partTargetOf(deps);
   if (!Number.isSafeInteger(generation) || generation < 1) {
     throw new Error("generation must be a positive safe integer");
   }

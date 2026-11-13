@@ -87,11 +87,13 @@ import {
   dropSpool,
   freezePrefixRows,
   newSpoolAttempt,
+  partTargetOf,
   uploadFrozenParts,
   type EncodedPart,
   type FrozenPrefix,
   type HeadExtras,
 } from "./encode.js";
+import { planChangedPrefixes } from "./part-layout.js";
 import { replaceDelete, withOrigin } from "./merge.js";
 import {
   endsEarlierLifetime,
@@ -751,24 +753,19 @@ async function snapshotStream(
     await excludeSeedsIfAny(deps, connectionId, stream);
   }
 
-  // Step 4 input: the changed prefixes. The head's partition is respected:
-  // a changed record re-encodes the base prefix holding it, or its own
-  // 16-bit prefix when no base prefix covers it.
-  let changedPrefixes = changedPrefixesFor(
-    changes,
-    registryHead?.parts ?? null,
+  // Step 4 input: the changed prefixes, planned by the spec's bucket planner
+  // so parts are sized by the byte target (see part-layout.ts).
+  const rewriteAll = Boolean(
+    registryHead && (registryHead.format !== HEAD_FORMAT || plan.replaceBelow),
   );
-  if (
-    registryHead &&
-    (registryHead.format !== HEAD_FORMAT || plan.replaceBelow)
-  ) {
-    changedPrefixes = [
-      ...new Set([
-        ...changedPrefixes,
-        ...registryHead.parts.map((p) => p.prefix),
-      ]),
-    ].sort();
-  }
+  const changedPrefixes = await planChangedPrefixes(deps, {
+    connectionId,
+    stream,
+    changedKeys: changes.map((change) => change.pk_hash),
+    baseParts: registryHead?.parts ?? [],
+    targetBytes: partTargetOf(deps),
+    rewriteAll,
+  });
   // Read the caller's head extras, the rows to encode and the clock now: the
   // transfer reads none of them again.
   await context.options?.headExtras?.(stream);
@@ -1515,40 +1512,6 @@ async function excludeSeedsIfAny(
   );
 }
 
-/** The first `bits` bits of a hex string, as a bit string. */
-function prefixBits(hex: string, bits: number): string {
-  if (bits === 0) return "";
-  const needed = Math.ceil(bits / 4);
-  const value = BigInt(`0x${hex.slice(0, needed)}`);
-  return value
-    .toString(2)
-    .padStart(needed * 4, "0")
-    .slice(0, bits);
-}
-
-function covers(prefix: string, pkHash: string): boolean {
-  return prefixBits(pkHash, prefix.length) === prefix;
-}
-
-/**
- * The prefixes to encode for the changed records, aligned to the base
- * head's partition: a changed record re-encodes the base prefix holding
- * it, or its own 16-bit prefix when no base prefix covers it. With no
- * base head, every changed record's own 16-bit prefix.
- */
-function changedPrefixesFor(
-  changes: readonly ChangeRow[],
-  baseParts: readonly HeadPart[] | null,
-): string[] {
-  const prefixes = new Set<string>();
-  const basePrefixes = baseParts?.map((part) => part.prefix) ?? [];
-  for (const { pk_hash } of changes) {
-    const holding = basePrefixes.find((prefix) => covers(prefix, pk_hash));
-    prefixes.add(holding ?? prefixBits(pk_hash, 16));
-  }
-  return [...prefixes].sort();
-}
-
 /**
  * The new head's parts: the base head's parts for prefixes not re-encoded,
  * the freshly encoded parts for the changed prefixes, grouped by prefix
@@ -1559,7 +1522,7 @@ function mergedParts(
   encoded: readonly EncodedPart[],
   changedPrefixes: readonly string[],
 ): HeadPart[] {
-  const changed = new Set(changedPrefixes);
+  const changed = [...changedPrefixes];
   const groups = new Map<string, HeadPart[]>();
   const push = (prefix: string, part: HeadPart) => {
     const group = groups.get(prefix);
@@ -1567,7 +1530,16 @@ function mergedParts(
     else groups.set(prefix, [part]);
   };
   for (const part of baseParts) {
-    if (!changed.has(part.prefix)) push(part.prefix, part);
+    // A base part goes when it overlaps a changed prefix (see
+    // `selectChangedBuckets`: then every prefix it overlaps is changed).
+    if (
+      !changed.some(
+        (prefix) =>
+          prefix.startsWith(part.prefix) || part.prefix.startsWith(prefix),
+      )
+    ) {
+      push(part.prefix, part);
+    }
   }
   for (const part of encoded) {
     push(part.prefix, {

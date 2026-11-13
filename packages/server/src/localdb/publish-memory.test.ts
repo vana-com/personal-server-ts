@@ -82,8 +82,10 @@ async function peak(rows: number): Promise<number> {
       "PUBLISH_MEMORY " + JSON.stringify({ rows, ...measured }) + "\n",
     );
     expect(measured.result.outcome).toBe("published");
-    // One part per 16-bit prefix, and a few prefixes hold two rows.
-    expect(measured.result.puts).toBeGreaterThanOrEqual(rows * 0.9);
+    // Parts of about half the 4 MiB target hold hundreds of rows each: a few
+    // dozen parts and the head, far fewer objects than rows.
+    expect(measured.result.puts).toBeGreaterThan(1);
+    expect(measured.result.puts).toBeLessThan(rows / 10);
     return measured.peakBytes;
   } finally {
     rmSync(path, { force: true });
@@ -91,8 +93,9 @@ async function peak(rows: number): Promise<number> {
 }
 
 // Four times the rows adds 73.2 MiB of row bodies. What a publish keeps per
-// part (the head's part list, the change list, the commit statements) is about
-// 4 KiB per row here, where every row is its own part: +18 MiB measured. A
+// part (the head's part list, the change list, the commit statements) is small
+// now that a part holds hundreds of rows; with one part per row it was about
+// 4 KiB per row (+18 MiB measured). A
 // publisher that held the stream's rows added 108 MiB before this test's fix.
 // The margin sits between the two.
 const MARGIN = 32 * 1024 * 1024;

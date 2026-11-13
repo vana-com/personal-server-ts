@@ -413,9 +413,9 @@ function burstLimitedStorage(raw: {
 
 describe("a stream of many parts publishes while storage refuses read bursts", () => {
   const ROWS = 24;
-  // A part holds one row at this size, so the following stream is a head of
+  // A part holds one or two rows at this size, so the following stream is a head of
   // about 25 parts, as in the live case.
-  const PART_BYTES = 1_100;
+  const PART_BYTES = 400;
   const whole = {
     outcome: "succeeded",
     coveredStreams: ALL,
