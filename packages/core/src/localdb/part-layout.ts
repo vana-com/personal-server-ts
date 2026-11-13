@@ -109,6 +109,12 @@ export async function planChangedPrefixes(
       ]! += bytes;
     }
   }
+  // A shard with no surviving changed row has zero delta bytes. Its counts are
+  // known, so they are zeros, not missing: the planner splits a base group that
+  // is heavier than the target there without a counting pass.
+  for (let shard = 0; shard < SHARD_COUNT; shard += 1) {
+    prefix16Bytes[shard] ??= new Array<number>(SHARD_COUNT).fill(0);
+  }
   const plan = planBuckets({
     targetBytes: input.targetBytes,
     baseParts: input.baseParts.map(({ prefix, bytes }) => ({ prefix, bytes })),
