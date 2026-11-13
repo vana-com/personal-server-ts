@@ -16,9 +16,10 @@ export interface StorageAccessPolicy {
   readonly maxConcurrent: number;
   /**
    * Uploads in flight at once, a limit under `maxConcurrent` that only uploads
-   * pass through. vana-storage answers fast HTTP 500s while one owner has two
-   * or more uploads in flight; keep this at 1 until that is fixed there. Reads,
-   * the gateway and the other uploads' share of `maxConcurrent` are unaffected.
+   * pass through. Reads, the gateway and the other uploads' share of
+   * `maxConcurrent` are unaffected. The default of 1 is a conservative choice;
+   * the storage 500s seen with concurrent uploads were fixed server-side
+   * (vana-storage #39).
    */
   readonly maxConcurrentPuts: number;
   /** Total tries per operation, the first one included. */

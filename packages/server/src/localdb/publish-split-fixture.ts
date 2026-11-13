@@ -89,6 +89,11 @@ function fakeStorage(inner: StreamSyncBlobs): FakeStorage {
       await pause("get", key);
       return inner.get(key);
     },
+    async exists(key) {
+      // A probe was a GET before it became a HEAD; a hold on gets still holds it.
+      await pause("get", key);
+      return inner.exists(key);
+    },
     async put(key, bytes) {
       if (failing) {
         failing = false;

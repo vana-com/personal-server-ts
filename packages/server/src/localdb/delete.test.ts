@@ -186,6 +186,7 @@ it("resumes a pinned delete even when the old head cannot be read", async () => 
       ...f.a.deps,
       blobs: {
         put: (...args) => f.blobs.put(...args),
+        exists: (...args) => f.blobs.exists(...args),
         get: async () => {
           throw new Error("unreadable old head fixture");
         },

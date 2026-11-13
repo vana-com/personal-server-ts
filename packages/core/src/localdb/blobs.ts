@@ -335,7 +335,7 @@ export async function uploadBlobs(
   for (const { blobId, key, scope } of blobs) {
     if (uploaded.has(key)) continue;
     beforeUpload?.();
-    if ((await store.get(key)) !== null) {
+    if (await store.exists(key)) {
       uploaded.add(key);
       continue;
     }

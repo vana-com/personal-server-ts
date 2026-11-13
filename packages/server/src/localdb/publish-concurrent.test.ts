@@ -107,6 +107,15 @@ async function world(options: Options) {
       );
       return innerBlobs.get(key);
     },
+    // The existence probe is the same request class as a read here.
+    async exists(key) {
+      record("get", key);
+      await options.holdGet?.(key);
+      await sleep(
+        (options.blobMs ?? 0) + (options.blobMsFor?.(streamOfKey(key)!) ?? 0),
+      );
+      return innerBlobs.exists(key);
+    },
     async put(key, bytes, beforeAttempt) {
       record("put", key);
       guards.push({ key, guard: beforeAttempt });
@@ -258,6 +267,12 @@ describe("streams of one connection publish together", () => {
           active.add(stream);
           peak = Math.max(peak, active.size);
           return original.get(key);
+        },
+        async exists(key) {
+          const stream = streamOfKey(key)!;
+          active.add(stream);
+          peak = Math.max(peak, active.size);
+          return original.exists(key);
         },
         async put(key, bytes) {
           await original.put(key, bytes);

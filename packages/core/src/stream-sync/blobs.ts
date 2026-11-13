@@ -50,6 +50,9 @@ export function createStorageStreamSyncBlobs(
           }
         }, beforeAttempt),
       ),
+    // A HEAD probe through the same retry and limiter as `get`. The adapter
+    // answers "absent" only for a definitive not-found.
+    exists: (key) => guarded(() => storage.exists(storage.urlForKey(key))),
     get: (key) =>
       guarded(async () => {
         const url = storage.urlForKey(key);
