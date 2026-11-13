@@ -10,6 +10,10 @@ import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
 import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { createServerLocalSync } from "./localdb/sync.js";
+import {
+  retireAfterImport,
+  type LegacyRetirePort,
+} from "./localdb/retire-after-import.js";
 import { createLocalSeed } from "./localdb/seed.js";
 import { createSeedStaging } from "./stream-sync/seed-staging.js";
 import { createFsStreamSyncFiles } from "./stream-sync/fs-files.js";
@@ -237,6 +241,13 @@ export interface CreateServerOptions {
    * it is done is the importer's own record. Without one no import starts.
    */
   legacyImporter?: ImportRunner;
+  /**
+   * The host's switched-owner view of the old legacy files. With it, a
+   * successful `legacyImporter` run is followed by `retireLegacyCopies`, which
+   * removes the files only when `streamSync.retireLegacy` is on and otherwise
+   * reports read-back only. Without it, nothing is retired.
+   */
+  legacyRetire?: LegacyRetirePort;
   /** Owner-authorized HTTP signing capability supplied by the trusted host. */
   ownerRequestSigner?: RequestSigner;
   /** Inventory-route-only signer; never used by the owner-only scope feed. */
@@ -511,7 +522,21 @@ async function bootstrapServer(
     importWaker = createImportWaker({
       authority: accountModeAuthority,
       owner: serverOwner,
-      importer: options.legacyImporter,
+      importer: options.legacyRetire
+        ? retireAfterImport({
+            importer: options.legacyImporter,
+            port: options.legacyRetire,
+            // The server's one shared handle; the import has just written
+            // through it, so this opens nothing new for a switched owner.
+            getDeps: async () => {
+              await getLocalSync();
+              return localSyncDeps!;
+            },
+            isSwitched: () => legacyWriteSeal.verdict() === "switched",
+            streamSync: () => config.streamSync,
+            logger,
+          })
+        : options.legacyImporter,
       onWarning: (message, detail) => logger.warn({ detail }, message),
     });
   }

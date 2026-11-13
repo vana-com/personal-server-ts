@@ -63,8 +63,9 @@ export const DEFAULTS = {
     // declare a stream-sync client is refused with `update_required`. Turn it
     // on only after the clients that send `Vana-Stream-Sync-Client` ship.
     refuseLegacyWrites: false,
-    // Off by default. Legacy copies may be retired only after an explicit
-    // opt-in and the import, read-back, and publication safety checks.
+    // Off by default. When true, the old legacy files, a one-time seed, are
+    // removed after the host's import returns for a switched owner. When
+    // false the same step only reads them back and reports.
     retireLegacy: false,
   },
   olderVersionReads: true,
