@@ -36,6 +36,29 @@ describe("memory-oracle calibration", () => {
     }
   });
 
+  it("caps the young-generation semi-space only when asked", async () => {
+    const temporary = join(homedir(), ".tmp");
+    mkdirSync(temporary, { recursive: true });
+    const root = mkdtempSync(join(temporary, "memory-oracle-semi-"));
+    try {
+      const module = join(root, "workload.mjs");
+      writeFileSync(
+        module,
+        "export function args() { return process.execArgv; }",
+      );
+      const capped = await run<string[]>({
+        module,
+        exportName: "args",
+        maxSemiSpaceMiB: 4,
+      });
+      expect(capped.result).toContain("--max-semi-space-size=4");
+      const unset = await run<string[]>({ module, exportName: "args" });
+      expect(unset.result.join(" ")).not.toContain("semi-space");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   // The bounded case churns the same total through short-lived buffers, paced.
   // Its peak must stay well below a retained accumulation of that size.
   it("reads a bounded churn well below a retained accumulation", async () => {
