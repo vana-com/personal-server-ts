@@ -517,3 +517,48 @@ it("an absent registry answer never clears a local-only delete, but explicit con
     ).status,
   ).toBe("collecting");
 });
+
+// Makes the first `losses` posts to the stream head lose their CAS: a rival row
+// takes the version the delete signed for, so the delete must re-read and re-sign.
+function loseHeadRaces(f: Awaited<ReturnType<typeof world>>, losses: number) {
+  let lost = 0;
+  f.registry.beforePost = async (post) => {
+    if (post.scope !== f.head.scope || lost === losses) return;
+    lost++;
+    const hook = f.registry.beforePost;
+    f.registry.beforePost = undefined;
+    const current = (await f.registry.read(post.scope)).version ?? 0;
+    await f.registry.post({
+      ownerAddress: owner,
+      scope: post.scope,
+      dataHash: `0x${"ab".repeat(32)}`,
+      metadataHash: `0x${"cd".repeat(32)}`,
+      expectedVersion: String(current + 1),
+      signature: "0x00",
+    });
+    f.registry.beforePost = hook;
+  };
+  return () => lost;
+}
+
+it("a stream delete that wins its eighth CAS attempt still confirms and reports success", async () => {
+  const f = await world();
+  const lost = loseHeadRaces(f, 7);
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(lost()).toBe(7);
+  // Fixture version 1, seven rival rows, then the delete's own winning row.
+  expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 9 });
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+it("eight lost stream CAS races still end pending without a ninth post", async () => {
+  const f = await world();
+  const lost = loseHeadRaces(f, 8);
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  const pending = await f.a.deleter.resumeDeletes();
+  expect(lost()).toBe(8);
+  expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 9 });
+  expect(pending).toEqual([{ connector: "fixture-source", why: "Error" }]);
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toHaveLength(1);
+});
