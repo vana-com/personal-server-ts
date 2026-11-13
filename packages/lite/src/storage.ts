@@ -467,6 +467,12 @@ function openIndexedDb(
   });
 }
 
+/**
+ * Run one request in its own transaction. Resolves with the request's result
+ * only when the transaction has committed: a request's `success` event comes
+ * before the commit, and the transaction can still abort after it (quota, a
+ * closed tab, an explicit `abort()`). Rejects on a request error and on abort.
+ */
 function runIndexedDbTransaction<T>(
   options: Required<IndexedDbPsLitePersistenceOptions>,
   mode: IDBTransactionMode,
@@ -475,16 +481,31 @@ function runIndexedDbTransaction<T>(
   return openIndexedDb(options.dbName, options.storeName).then(
     (db) =>
       new Promise<T>((resolve, reject) => {
-        const transaction = db.transaction(options.storeName, mode);
-        const store = transaction.objectStore(options.storeName);
-        const request = callback(store);
+        let transaction: IDBTransaction;
+        let request: IDBRequest<T>;
+        try {
+          transaction = db.transaction(options.storeName, mode);
+          request = callback(transaction.objectStore(options.storeName));
+        } catch (err) {
+          db.close();
+          reject(err);
+          return;
+        }
 
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-        transaction.oncomplete = () => db.close();
+        transaction.oncomplete = () => {
+          db.close();
+          resolve(request.result);
+        };
         transaction.onerror = () => {
           db.close();
-          reject(transaction.error);
+          reject(transaction.error ?? request.error);
+        };
+        transaction.onabort = () => {
+          db.close();
+          reject(
+            transaction.error ??
+              new DOMException("The transaction was aborted", "AbortError"),
+          );
         };
       }),
   );
@@ -701,9 +722,12 @@ export async function createPersistentPsLiteStorage(
   function updateEntryField(
     path: string,
     patch: Partial<Pick<IndexEntry, "fileId" | "dataPointId" | "version">>,
+    expectedId?: number,
   ): Promise<boolean> {
     return updateIndex((current) => {
-      if (!current.entries.some((entry) => entry.path === path)) return null;
+      const row = current.entries.find((entry) => entry.path === path);
+      if (!row || (expectedId !== undefined && row.id !== expectedId))
+        return null;
       return {
         ...current,
         entries: current.entries.map((entry) =>
@@ -1208,12 +1232,12 @@ export async function createPersistentPsLiteStorage(
       );
     },
 
-    updateDataPointId(path, dataPointId) {
-      return updateEntryField(path, { dataPointId });
+    updateDataPointId(path, dataPointId, expectedId) {
+      return updateEntryField(path, { dataPointId }, expectedId);
     },
 
-    updateEntryVersion(path, version) {
-      return updateEntryField(path, { version });
+    updateEntryVersion(path, version, expectedId) {
+      return updateEntryField(path, { version }, expectedId);
     },
 
     async readFirstSeenLedger(scope) {

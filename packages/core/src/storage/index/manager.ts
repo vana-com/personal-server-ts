@@ -82,7 +82,11 @@ export interface IndexManager {
    * registerDataPoint). Sync-worker step that runs alongside fileId update.
    * @returns true if row was updated, false if path not found
    */
-  updateDataPointId(path: string, dataPointId: string | null): boolean;
+  updateDataPointId(
+    path: string,
+    dataPointId: string | null,
+    expectedId?: number,
+  ): boolean;
   /**
    * Update the DPv2 `version` for an index entry. Used by the upload worker
    * when a registration is rebased onto the registry's live version after a
@@ -90,7 +94,7 @@ export interface IndexManager {
    * local row must follow).
    * @returns true if row was updated, false if path not found
    */
-  updateVersion(path: string, version: number): boolean;
+  updateVersion(path: string, version: number, expectedId?: number): boolean;
   /** Deletes all index entries for a scope. Returns count of deleted rows. */
   deleteByScope(scope: string): number;
   close(): void;

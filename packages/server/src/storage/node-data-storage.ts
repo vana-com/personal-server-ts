@@ -443,11 +443,15 @@ export function createNodeDataStorage(
     findLatestVersionByScope(scope: string) {
       return deps.indexManager.findLatestVersionByScope(scope);
     },
-    updateDataPointId(path: string, dataPointId: string | null) {
-      return deps.indexManager.updateDataPointId(path, dataPointId);
+    updateDataPointId(
+      path: string,
+      dataPointId: string | null,
+      expectedId?: number,
+    ) {
+      return deps.indexManager.updateDataPointId(path, dataPointId, expectedId);
     },
-    updateEntryVersion(path: string, version: number) {
-      return deps.indexManager.updateVersion(path, version);
+    updateEntryVersion(path: string, version: number, expectedId?: number) {
+      return deps.indexManager.updateVersion(path, version, expectedId);
     },
     readFirstSeenLedger(scope: string) {
       return readFirstSeenLedger(deps.hierarchyOptions, scope);

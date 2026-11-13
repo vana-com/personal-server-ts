@@ -82,13 +82,17 @@ export interface IndexManager {
    * Update the dataPointId for an index entry (after DPv2 registerDataPoint).
    * @returns true if row was updated, false if path not found
    */
-  updateDataPointId(path: string, dataPointId: string | null): boolean;
+  updateDataPointId(
+    path: string,
+    dataPointId: string | null,
+    expectedId?: number,
+  ): boolean;
   /**
    * Update the DPv2 `version` for an index entry (upload-worker rebase after
    * a stale-expectedVersion conflict).
    * @returns true if row was updated, false if path not found
    */
-  updateVersion(path: string, version: number): boolean;
+  updateVersion(path: string, version: number, expectedId?: number): boolean;
   /** Deletes all index entries for a scope. Returns count of deleted rows. */
   deleteByScope(scope: string): number;
   close(): void;
@@ -378,10 +382,17 @@ export function createIndexManager(
   const updateDataPointIdStmt = db.prepare<{
     data_point_id: string | null;
     path: string;
-  }>("UPDATE data_files SET data_point_id = @data_point_id WHERE path = @path");
+    expected_id: number | null;
+  }>(
+    "UPDATE data_files SET data_point_id = @data_point_id WHERE path = @path AND (@expected_id IS NULL OR id = @expected_id)",
+  );
 
-  const updateVersionStmt = db.prepare<{ version: number; path: string }>(
-    "UPDATE data_files SET version = @version WHERE path = @path",
+  const updateVersionStmt = db.prepare<{
+    version: number;
+    path: string;
+    expected_id: number | null;
+  }>(
+    "UPDATE data_files SET version = @version WHERE path = @path AND (@expected_id IS NULL OR id = @expected_id)",
   );
 
   const ensureScopeRevisionStmt = db.prepare<{ scope: string }>(
@@ -686,16 +697,21 @@ export function createIndexManager(
       return row?.max_version ?? 0;
     },
 
-    updateDataPointId(path, dataPointId) {
+    updateDataPointId(path, dataPointId, expectedId) {
       const result = updateDataPointIdStmt.run({
         data_point_id: dataPointId,
         path,
+        expected_id: expectedId ?? null,
       });
       return result.changes > 0;
     },
 
-    updateVersion(path, version) {
-      const result = updateVersionStmt.run({ version, path });
+    updateVersion(path, version, expectedId) {
+      const result = updateVersionStmt.run({
+        version,
+        path,
+        expected_id: expectedId ?? null,
+      });
       return result.changes > 0;
     },
 

@@ -285,6 +285,7 @@ describe("upload worker", () => {
       expect(deps.storage.updateDataPointId).toHaveBeenCalledWith(
         entry.path,
         DATA_POINT_ID,
+        entry.id,
       );
       expect(result).toEqual({
         path: entry.path,
@@ -345,6 +346,52 @@ describe("upload worker", () => {
       await expect(uploadOne(deps, makeEntry())).rejects.toThrow(
         /registerDataPoint did not return a dataPointId/,
       );
+    });
+  });
+
+  describe("uploadOne — the row is replaced while it uploads", () => {
+    it("does not stamp upload A's dataPointId onto the row that replaced it", async () => {
+      const deps = makeMockDeps();
+      const entryA = makeEntry({ id: 1 });
+      // A path-keyed index whose rows are replaced by an insert at the same
+      // path (new row id), with the rows' guarded update contract.
+      const rows = new Map<string, IndexEntry>([[entryA.path, entryA]]);
+      const guarded =
+        (field: "dataPointId" | "version") =>
+        (path: string, value: unknown, expectedId?: number) => {
+          const row = rows.get(path);
+          if (!row || (expectedId !== undefined && row.id !== expectedId))
+            return false;
+          rows.set(path, { ...row, [field]: value });
+          return true;
+        };
+      deps.storage.updateDataPointId = guarded("dataPointId") as never;
+      deps.storage.updateEntryVersion = guarded("version") as never;
+
+      let reachPublication!: () => void;
+      const reached = new Promise<void>((r) => (reachPublication = r));
+      let releasePublication!: () => void;
+      const gate = new Promise<void>((r) => (releasePublication = r));
+      (
+        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+      ).mockImplementationOnce(async () => {
+        reachPublication();
+        await gate;
+        return { dataPointId: DATA_POINT_ID, expectedVersion: "1" };
+      });
+
+      const upload = uploadOne(deps, entryA);
+      await reached;
+      // B takes the path while A's publication is in flight.
+      const entryB = makeEntry({ id: 2, sizeBytes: 999 });
+      rows.set(entryB.path, entryB);
+      releasePublication();
+      await upload;
+
+      expect(rows.get(entryB.path)).toMatchObject({
+        id: 2,
+        dataPointId: null,
+      });
     });
   });
 
@@ -689,11 +736,13 @@ describe("upload worker", () => {
       expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
         entry.path,
         8,
+        entry.id,
       );
       expect(result.dataPointId).toBe(DATA_POINT_ID);
       expect(deps.storage.updateDataPointId).toHaveBeenCalledWith(
         entry.path,
         DATA_POINT_ID,
+        entry.id,
       );
     });
 
@@ -794,6 +843,7 @@ describe("upload worker", () => {
       expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
         entry.path,
         1,
+        entry.id,
       );
       expect(result.dataPointId).toBe(DATA_POINT_ID);
     });
@@ -831,6 +881,7 @@ describe("upload worker", () => {
       expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
         entry.path,
         2,
+        entry.id,
       );
     });
   });
@@ -911,6 +962,7 @@ describe("upload worker", () => {
       expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
         entry.path,
         5,
+        entry.id,
       );
     });
 

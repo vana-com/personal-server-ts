@@ -372,10 +372,21 @@ export async function uploadOne(
   // left alone: the retry finds the registered head and adopts it.
   signal?.throwIfAborted();
   if (!entry.dataPointId) {
-    if (proof.version !== BigInt(entry.version))
-      await storage.updateEntryVersion(entry.path, Number(proof.version));
-    await storage.updateDataPointId(entry.path, dataPointId);
-    deps.scopeDeletions?.markLive(entry.scope);
+    // The path may have been replaced by a new row while this one uploaded;
+    // the acknowledgement names the row it uploaded (`entry.id`) and changes
+    // nothing on a different one, which stays unsynced for its own upload.
+    const acknowledged =
+      proof.version === BigInt(entry.version) ||
+      (await storage.updateEntryVersion(
+        entry.path,
+        Number(proof.version),
+        entry.id,
+      ));
+    if (
+      acknowledged &&
+      (await storage.updateDataPointId(entry.path, dataPointId, entry.id))
+    )
+      deps.scopeDeletions?.markLive(entry.scope);
   }
 
   if (deps.additions) {

@@ -325,19 +325,29 @@ export interface DataStoragePort extends RuntimeStoragePort {
   findLatestVersionByScope(scope: string): number | Promise<number>;
   /**
    * Stamps the DPv2 dataPointId on an entry after registerDataPoint; `null`
-   * marks it unsynced again (the gateway lost the registration).
+   * marks it unsynced again (the gateway lost the registration). With
+   * `expectedId` the stamp applies only to the row with that `IndexEntry.id`:
+   * a path can be replaced by a new row (new id) while an upload of the old
+   * row is in flight, and its acknowledgement must not reach the new row.
+   * Returns false when the path has no row, or its row is not `expectedId`.
    */
   updateDataPointId(
     path: string,
     dataPointId: string | null,
+    expectedId?: number,
   ): boolean | Promise<boolean>;
   /**
    * Rewrites the DPv2 `version` on an entry. Used when the upload worker
    * rebases a registration onto the registry's live version after a
    * stale-expectedVersion conflict — the blob key embeds the version, so
-   * the local row must follow the registered one.
+   * the local row must follow the registered one. `expectedId` guards as in
+   * `updateDataPointId`.
    */
-  updateEntryVersion(path: string, version: number): boolean | Promise<boolean>;
+  updateEntryVersion(
+    path: string,
+    version: number,
+    expectedId?: number,
+  ): boolean | Promise<boolean>;
   /**
    * Every removal below runs under the seal's lock in every mode
    * (`LegacyWriteSeal.remove`). A caller that is already inside
