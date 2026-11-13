@@ -132,23 +132,38 @@ export function newSpoolAttempt(): string {
   ).join("");
 }
 
-/** Delete an attempt's spool rows: on commit, on discard, on failure. */
+/**
+ * Delete an attempt's spool rows: on commit, on discard, on failure. `prefixes`
+ * are the ones the attempt froze (`freezePrefixRows`), so each delete is one
+ * key range on the spool's primary key. One batch per prefix, so no batch holds
+ * the worker for the whole spool. Rows outside those prefixes are not possible:
+ * only `freezePrefixRows` writes an attempt's rows, and only for these prefixes.
+ */
 export async function dropSpool(
   deps: LocalSyncDeps,
   attempt: string,
+  prefixes: readonly string[],
 ): Promise<void> {
-  await deps.db.batch([
-    { sql: "DELETE FROM publish_spool WHERE attempt = ?", params: [attempt] },
-  ]);
+  for (const prefix of new Set(prefixes)) {
+    const range = keyRange(prefix);
+    await deps.db.batch([
+      {
+        sql: `DELETE FROM publish_spool WHERE attempt = ?${range.sql}`,
+        params: [attempt, ...range.params],
+      },
+    ]);
+  }
 }
 
 /**
- * Copy the changed prefixes' rows into `publish_spool` under `attempt`, all in
- * one batch (one transaction, so one consistent state) and one `INSERT ...
- * SELECT` per prefix, so no row passes through memory. Run under the queue
- * slot. Under replace (H), rows below `replaceBelow` are left out. What
- * is kept in memory grows with the number of prefixes (at most 65,536), not
- * with the rows.
+ * Copy the changed prefixes' rows into `publish_spool` under `attempt`, one
+ * batch per prefix and one `INSERT ... SELECT` per batch, so no row passes
+ * through memory and no batch holds the worker for the whole spool. Run under
+ * the connection's queue slot: no other writer of `records` for this
+ * connection runs between the batches, so together they copy one consistent
+ * state. Under replace (H), rows below `replaceBelow` are left out. What is
+ * kept in memory grows with the number of prefixes (at most 65,536), not with
+ * the rows.
  *
  * The transfer reads only this copy, so a write to `records` after this call
  * cannot change what is sent. A write that makes the snapshot wrong is the
@@ -162,8 +177,8 @@ export async function freezePrefixRows(
   },
 ): Promise<readonly FrozenPrefix[]> {
   const prefixes = checkedPrefixes(input.changedPrefixes);
-  if (prefixes.length === 0) return [];
-  const statements = prefixes.map((prefix) => {
+  const frozen: FrozenPrefix[] = [];
+  for (const prefix of prefixes) {
     const range = keyRange(prefix);
     let where = "connection_id = ? AND stream = ?" + range.sql;
     const params: SqlValue[] = [
@@ -180,18 +195,20 @@ export async function freezePrefixRows(
         input.replaceBelow.r,
       );
     }
-    return {
-      sql: `INSERT INTO publish_spool
+    const { changes } = await deps.db.batch([
+      {
+        sql: `INSERT INTO publish_spool
         (attempt, connection_id, pk_hash, stamp_o, stamp_r, first_o,
          body_sha256, body_bytes, body)
       SELECT ?, connection_id, pk_hash, stamp_o, stamp_r, first_o,
              body_sha256, length(CAST(body AS BLOB)), body
         FROM records WHERE ${where}`,
-      params,
-    };
-  });
-  const { changes } = await deps.db.batch(statements);
-  return prefixes.map((prefix, i) => ({ prefix, rows: changes[i]! }));
+        params,
+      },
+    ]);
+    frozen.push({ prefix, rows: changes[0]! });
+  }
+  return frozen;
 }
 
 type SpoolRow = Omit<FrozenRow, "body"> & { readonly body: string };
@@ -375,6 +392,6 @@ export async function encodePrefixes(
       frozen: await freezePrefixRows(deps, { ...input, attempt }),
     });
   } finally {
-    await dropSpool(deps, attempt);
+    await dropSpool(deps, attempt, input.changedPrefixes);
   }
 }

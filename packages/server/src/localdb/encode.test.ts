@@ -396,7 +396,7 @@ describe("a transfer reads the spool the snapshot made", () => {
     await freezePrefixRows(f.deps, prefixes);
     await freezePrefixRows(f.deps, { ...prefixes, attempt: "attempt-2" });
     expect(await spooled(f)).toBe(4);
-    await dropSpool(f.deps, "attempt-1");
+    await dropSpool(f.deps, "attempt-1", prefixes.changedPrefixes);
     expect(
       await f.db.query("SELECT DISTINCT attempt FROM publish_spool"),
     ).toEqual([{ attempt: "attempt-2" }]);
@@ -506,5 +506,78 @@ describe("encodePrefixes under writes and large bodies", () => {
     expect(seen.maxBodyChars).toBeGreaterThan(3 * 1024 * 1024);
     expect(seen.maxBodyChars).toBeLessThan(3 * 1024 * 1024 + 1024);
     expect(seen.bodyPages).toBe(2);
+  });
+});
+
+describe("a freeze over many prefixes, one batch each, copies the same spool", () => {
+  // Prefix-free; together they cover every key nibble. Two keys per nibble.
+  const prefixes = ["0000", "0001", "001", "01", "1"];
+  const nibbles = "0123456789abcdef";
+  const expectedKeys = [...nibbles].flatMap((d) => [
+    keyHash(`${d}1`),
+    keyHash(`${d}f`),
+  ]);
+  const spoolRows = (f: Awaited<ReturnType<typeof fresh>>, attempt: string) =>
+    f.db.query<{ pk_hash: string; body: string; stamp_o: number }>(
+      `SELECT pk_hash, body, stamp_o FROM publish_spool
+        WHERE attempt = ? ORDER BY pk_hash`,
+      [attempt],
+    );
+
+  it("spools exactly the prefixes' rows, with the per-prefix counts, and publishes the same rows", async () => {
+    const f = await fresh();
+    await f.insert([
+      ...expectedKeys.map((k) => ({ k })),
+      { k: keyHash("1"), connectionId: "another-connection" },
+      { k: keyHash("2"), stream: "another-stream" },
+    ]);
+    const frozen = await freezePrefixRows(f.deps, {
+      ...input,
+      changedPrefixes: prefixes,
+      attempt: "attempt-1",
+    });
+    expect(frozen).toEqual([
+      { prefix: "0000", rows: 2 },
+      { prefix: "0001", rows: 2 },
+      { prefix: "001", rows: 4 },
+      { prefix: "01", rows: 8 },
+      { prefix: "1", rows: 16 },
+    ]);
+    const spooled = await spoolRows(f, "attempt-1");
+    expect(spooled.map((row) => row.pk_hash)).toEqual([...expectedKeys].sort());
+    const records = await f.db.query<{ pk_hash: string; body: string }>(
+      `SELECT pk_hash, body FROM records
+        WHERE connection_id = ? AND stream = ? ORDER BY pk_hash`,
+      [input.connectionId, input.stream],
+    );
+    expect(spooled.map(({ pk_hash, body }) => ({ pk_hash, body }))).toEqual(
+      records.filter((row) => expectedKeys.includes(row.pk_hash)),
+    );
+    const parts = await uploadFrozenParts(f.deps, {
+      attempt: "attempt-1",
+      scope: input.scope,
+      generation: input.generation,
+      frozen,
+    });
+    expect(parts.map((part) => part.prefix)).toEqual(prefixes);
+    expect((await f.read(parts)).map((row) => row.k)).toEqual(
+      [...expectedKeys].sort(),
+    );
+  });
+
+  it("drops exactly one attempt's rows across its prefixes", async () => {
+    const f = await fresh();
+    await f.insert(expectedKeys.map((k) => ({ k })));
+    const request = { ...input, changedPrefixes: prefixes };
+    await freezePrefixRows(f.deps, { ...request, attempt: "attempt-1" });
+    await freezePrefixRows(f.deps, { ...request, attempt: "attempt-2" });
+    expect(await spoolRows(f, "attempt-1")).toHaveLength(32);
+    await dropSpool(f.deps, "attempt-1", prefixes);
+    expect(await spoolRows(f, "attempt-1")).toEqual([]);
+    expect(await spoolRows(f, "attempt-2")).toHaveLength(32);
+    // The records themselves are untouched.
+    expect(await f.db.query("SELECT count(*) AS n FROM records")).toEqual([
+      { n: 32 },
+    ]);
   });
 });

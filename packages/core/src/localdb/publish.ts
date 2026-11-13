@@ -320,8 +320,14 @@ type StreamRun = {
   attempts: number;
   invalidations: number;
   watermark: number | null;
-  /** The attempt whose rows are in `publish_spool`; see `endSpool`. */
-  spool: string | null;
+  /**
+   * The attempt whose rows are in `publish_spool`, and the prefixes it froze;
+   * see `endSpool`.
+   */
+  spool: {
+    readonly attempt: string;
+    readonly prefixes: readonly string[];
+  } | null;
   /** Counts for the one log line the stream's publish ends with. */
   readonly meter: PublishMeter;
 };
@@ -473,7 +479,7 @@ async function endSpool(deps: LocalSyncDeps, run: StreamRun): Promise<void> {
   const { spool } = run;
   if (spool === null) return;
   run.spool = null;
-  await dropSpool(deps, spool).catch((error: unknown) =>
+  await dropSpool(deps, spool.attempt, spool.prefixes).catch((error: unknown) =>
     deps.logger.warn(
       { error: String(error) },
       "publish: spool rows not dropped",
@@ -829,7 +835,9 @@ async function snapshotStream(
   // transfer reads none of them again.
   await context.options?.headExtras?.(stream);
   const attempt = newSpoolAttempt();
-  if (changedPrefixes.length > 0) run.spool = attempt;
+  // Recorded before the freeze, so a freeze that fails part-way is still dropped.
+  if (changedPrefixes.length > 0)
+    run.spool = { attempt, prefixes: changedPrefixes };
   const frozen =
     changedPrefixes.length === 0
       ? []
