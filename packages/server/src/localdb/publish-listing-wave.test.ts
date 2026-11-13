@@ -337,6 +337,70 @@ describe("one listing of the connection's registry rows", () => {
   });
 });
 
+describe("a listing taken before the last lost CAS", () => {
+  it("is taken again by a stream that starts after a stream gave up", async () => {
+    // Four streams, two at a time. s0 loses all five of its CASes (a foreign
+    // head wins each) and backs off: its last loss is not followed by a
+    // retry. s1's upload is held until s0 has lost four, so that s2, the next
+    // to start, takes its listing after the fourth loss and before the fifth.
+    // That listing predates the last winner: s3, which starts after s0 gave
+    // up, must list again.
+    const w = await world({ streams: 4 });
+    const s0 = streamScope(CONNECTOR, "", "s0");
+    const s1 = streamScope(CONNECTOR, "", "s1");
+    const s2 = streamScope(CONNECTOR, "", "s2");
+    const waitFor = async (until: () => boolean) => {
+      while (!until()) await new Promise((r) => setTimeout(r, 5));
+    };
+    const held = w.deps.blobs.put;
+    w.deps.blobs.put = async (key, bytes, before) => {
+      // s1 finishes only once s0 is in its fourth post.
+      if (scopeOfKey(key) === s1)
+        await waitFor(() => count(w.calls, "post", s0) >= 4);
+      // s2 finishes only after s0 has given up.
+      if (scopeOfKey(key) === s2) {
+        await waitFor(() => count(w.calls, "post", s0) >= 5);
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return held(key, bytes, before);
+    };
+    // The fifth attempt's transfer (outside the connection's turn) waits for
+    // s2's listing, which the fourth loss left to take.
+    const probed = w.deps.blobs.exists;
+    w.deps.blobs.exists = async (key) => {
+      if (scopeOfKey(key) === s0 && count(w.calls, "post", s0) === 4) {
+        await waitFor(() => count(w.calls, "list") >= 2);
+      }
+      return probed(key);
+    };
+    let posts = 0;
+    let winning = false;
+    w.inner.beforePost = async (post) => {
+      // The winner is itself a post to this scope.
+      if (post.scope !== s0 || winning) return;
+      posts++;
+      winning = true;
+      try {
+        await foreignHead(w, "s0", posts);
+      } finally {
+        winning = false;
+      }
+    };
+    const results = await publishConnection(w.deps, CONNECTION_ID, {
+      streamConcurrency: 2,
+    });
+    expect(results.map((r) => r.outcome)).toEqual([
+      "backoff",
+      "published",
+      "published",
+      "published",
+    ]);
+    expect(count(w.calls, "post", s0)).toBe(5);
+    // s1's listing, s2's (after the fourth loss), and s3's (after the fifth).
+    expect(count(w.calls, "list")).toBe(3);
+  });
+});
+
 describe("a listing taken before an apply", () => {
   it("is not handed to a stream that starts after the apply", async () => {
     const w = await world({ streams: 4 });
@@ -473,6 +537,80 @@ describe("a stream with no work, served by a listing older than its turn", () =>
     expect(evidence.s2).toBe(1);
     expect(evidence.s3).toBe(1);
   });
+});
+
+describe("a stream with no work whose rows were all read live", () => {
+  // No listing hint serves these publishes' first reads (the first stream, a
+  // connection of fewer than three streams, a registry that cannot list, a
+  // listing that fails), so nothing in the snapshot is a hint to confirm. The
+  // control row was still read before the stream row. A delete that lands
+  // between the two leaves the stream row as it was (it outlives the
+  // deletion), so only a control read after the row read can see it.
+  const cases: readonly {
+    readonly name: string;
+    readonly streams: number;
+    /** The stream whose row read is followed by the deletion. */
+    readonly stream: number;
+    readonly noListing?: boolean;
+    readonly listingFails?: boolean;
+  }[] = [
+    { name: "the first stream of four", streams: 4, stream: 0 },
+    { name: "the only stream", streams: 1, stream: 0 },
+    { name: "the first of two streams", streams: 2, stream: 0 },
+    { name: "the second of two streams", streams: 2, stream: 1 },
+    {
+      name: "a registry with no listing",
+      streams: 4,
+      stream: 1,
+      noListing: true,
+    },
+    { name: "a listing that fails", streams: 4, stream: 1, listingFails: true },
+  ];
+  it.each(cases)(
+    "purges and keeps no evidence when the connection is deleted after the row read: $name",
+    async ({ streams, stream, noListing, listingFails }) => {
+      const target = streamScope(CONNECTOR, "", streamName(stream));
+      let armed = false;
+      let deleted = false;
+      const holder: { w?: Awaited<ReturnType<typeof world>> } = {};
+      const w: Awaited<ReturnType<typeof world>> = await world({
+        streams,
+        ...(noListing && { noListing }),
+        afterRead: async (scope) => {
+          if (!armed || deleted || scope !== target) return;
+          deleted = true;
+          await tombstoneControl(holder.w!);
+        },
+      });
+      holder.w = w;
+      if (listingFails) {
+        (
+          w.deps.registry as { listConnectionRows: () => Promise<never> }
+        ).listConnectionRows = async () => {
+          throw new Error("offline");
+        };
+      }
+      await publishConnection(w.deps, CONNECTION_ID);
+      const runId = await w.idle();
+      w.calls.length = 0;
+      armed = true;
+      const results = await publishConnection(w.deps, CONNECTION_ID, {
+        streamConcurrency: 1,
+      });
+      expect(deleted).toBe(true);
+      expect(results[stream]!.outcome).toBe("purged");
+      expect(
+        results.some(
+          (r) => r.stream === streamName(stream) && r.outcome === "noop",
+        ),
+      ).toBe(false);
+      const [row] = await w.db.query<{ published_version: number | null }>(
+        "SELECT published_version FROM run_streams WHERE run_id = ? AND stream = ?",
+        [runId, streamName(stream)],
+      );
+      expect(row?.published_version).toBeNull();
+    },
+  );
 });
 
 describe("the registry view", () => {

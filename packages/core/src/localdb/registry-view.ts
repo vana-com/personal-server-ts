@@ -29,7 +29,7 @@ import type { LocalSyncDeps } from "./deps.js";
  *  - a snapshot that would do anything but build a candidate (no work to
  *    publish, so no evidence is written and no result is "noop"; a refused
  *    run) reads the control row and the stream row live first: see
- *    `confirmHints` in publish.ts. A candidate is guarded by the commit's live
+ *    `confirmLive` in publish.ts. A candidate is guarded by the commit's live
  *    control checks and its CAS;
  *  - a listing is never reused after the publish changed local state from the
  *    registry (an apply, a CAS conflict): `invalidate` drops it, a listing

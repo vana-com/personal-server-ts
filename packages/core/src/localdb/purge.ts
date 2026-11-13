@@ -1,3 +1,4 @@
+import { forgetUploadedBlobs } from "./blobs.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { withOrigin } from "./merge.js";
 
@@ -66,6 +67,8 @@ export async function purgeConnection(
         },
       ]),
     );
+    // The lifetime is over: nothing uploaded for it is known to be there.
+    forgetUploadedBlobs(deps.db);
     deps.logger.info(
       {
         connectionId,
