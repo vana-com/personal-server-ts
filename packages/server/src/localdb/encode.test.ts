@@ -19,6 +19,7 @@ import {
   type EncodedPart,
 } from "../../../core/src/localdb/encode.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
+import { newPublishMeter } from "../../../core/src/localdb/publish-meter.js";
 import {
   openBytes,
   sealBytes,
@@ -567,6 +568,48 @@ describe("a freeze over many prefixes, one batch each, copies the same spool", (
     expect((await f.read(parts)).map((row) => row.k)).toEqual(
       [...expectedKeys].sort(),
     );
+  });
+
+  it("a part already in storage is probed through the metered port and downloads no body", async () => {
+    const f = await fresh();
+    await f.insert(expectedKeys.map((k) => ({ k })));
+    const request = { ...input, changedPrefixes: prefixes };
+    const attempt = { ...request, attempt: "attempt-1" };
+    const frozenPrefixes = (await freezePrefixRows(f.deps, attempt)) as never;
+    const first = await uploadFrozenParts(f.deps, {
+      attempt: "attempt-1",
+      scope: input.scope,
+      generation: input.generation,
+      frozen: frozenPrefixes,
+    });
+    // Every part is now stored. Count the body bytes a second transfer reads.
+    let bytesServed = 0;
+    const served = f.get.getMockImplementation()!;
+    f.get.mockImplementation(async (key: string) => {
+      const body = await served(key);
+      bytesServed += body?.length ?? 0;
+      return body;
+    });
+    f.put.mockClear();
+    f.exists.mockClear();
+    const meter = newPublishMeter();
+    const again = await uploadFrozenParts(
+      { ...f.deps, now: Date.now },
+      {
+        attempt: "attempt-1",
+        scope: input.scope,
+        generation: input.generation,
+        frozen: frozenPrefixes,
+        meter,
+      },
+    );
+    expect(again).toEqual(first);
+    expect(f.exists).toHaveBeenCalledTimes(first.length);
+    expect(f.get).not.toHaveBeenCalled();
+    expect(bytesServed).toBe(0);
+    expect(f.put).not.toHaveBeenCalled();
+    expect(meter.blobGets).toBe(first.length);
+    expect(meter.partsUploaded).toBe(0);
   });
 
   it("drops exactly one attempt's rows across its prefixes", async () => {

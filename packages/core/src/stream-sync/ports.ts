@@ -84,7 +84,8 @@ export interface StreamSyncBlobs {
   /** `null` when the blob does not exist. */
   get(key: string): Promise<Uint8Array | null>;
   /**
-   * Whether the blob exists, without reading its body. Only a definitive
+   * Whether the blob exists. The Vana adapter uses HEAD and reads no body; the
+   * SDK fallback downloads the blob. Only a definitive
    * "not found" answers `false`; any other failure throws, never reads as
    * present or absent.
    */

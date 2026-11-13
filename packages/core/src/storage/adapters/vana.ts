@@ -110,7 +110,8 @@ export function createVanaSyncStorageAdapter(params: {
 /**
  * Existence by an HTTP HEAD on the blob URL: the body is never read. Storage
  * serves blob HEAD publicly, like GET, so the probe carries no authorization.
- * Only a 404 answers "absent"; every other status throws, so the caller's
+ * Only a 200 answers "present" and only a 404 "absent"; every other status
+ * (204, 202, redirects included) throws, so the caller's
  * retry policy applies and a refusal is never read as a missing blob.
  */
 function headProbe(prefix: string): StorageAdapter["exists"] {
@@ -128,12 +129,11 @@ function headProbe(prefix: string): StorageAdapter["exists"] {
       ...(signal ? { signal } : {}),
     });
     await response.body?.cancel();
+    if (response.status === 200) return true;
     if (response.status === 404) return false;
-    if (!response.ok)
-      throw Object.assign(new Error(`Blob probe failed (${response.status})`), {
-        status: response.status,
-      });
-    return true;
+    throw Object.assign(new Error(`Blob probe failed (${response.status})`), {
+      status: response.status,
+    });
   };
 }
 
