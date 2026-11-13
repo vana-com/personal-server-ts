@@ -33,11 +33,26 @@ afterAll(() => {
   if (root) rmSync(root, { recursive: true, force: true });
 });
 
+/** What the child keeps reachable through the final HWM read. Default: nothing. */
+interface Retention {
+  /** Every source record. */
+  loadWhole?: boolean;
+  /** Every Nth source record (indexes 0, N, 2N, ...). */
+  retainEvery?: number;
+}
+const retainedRowsFor = (fixture: ImportMemoryFixture, r: Retention) =>
+  r.loadWhole
+    ? fixture.rows
+    : r.retainEvery
+      ? Math.ceil(fixture.rows / r.retainEvery)
+      : 0;
+
 async function measure(
   fixture: ImportMemoryFixture,
   path: "node" | "upload",
-  loadWhole = false,
+  retention: Retention = {},
 ) {
+  const loadWhole = retention.loadWhole ?? false;
   expect(fixture.bytes).toBe(fixture.rows * MEMORY_ROW_BYTES);
   // Share only immutable input; every fresh child gets a new database and
   // staging area, removed as soon as its peak has been reported.
@@ -48,18 +63,31 @@ async function measure(
     measured = await run<ImportMemoryResult>({
       module: childModule,
       exportName: "importMemoryWorkload",
-      args: { fixture, path, loadWhole, workRoot },
+      args: {
+        fixture,
+        path,
+        loadWhole,
+        retainEvery: retention.retainEvery,
+        workRoot,
+      },
       // glibc gives the SQLite worker thread its own malloc arena and keeps
       // memory it has freed there. That adds 15-20 MiB between 4x and 16x
       // (arena cap 1: 6 MiB; in-thread driver: 8 MiB) and reads as growth
       // with row count at the margin below. One arena measures the workload.
       env: { MALLOC_ARENA_MAX: "1" },
-      // V8 doubles its young-generation capacity (64 to 128 MiB) once enough
-      // bytes survive scavenges. The upload path crosses that point between 1x
-      // and 4x and the node path before 1x, so the pages it touches read as
-      // about 20-30 MB of upload growth with no retained row. A 4 MiB
-      // semi-space cap gives both sizes the same capacity; 4x minus 1x is then
-      // 2 to 4 MB on upload and 5 to 6 MB on node.
+      // A fixed small nursery (4 MiB semi-space, 8 MiB reported capacity). With
+      // V8's default nursery the upload path read 18-30 MB more peak RSS at 4x
+      // than at 1x (node: -4 to 14 MB); with this setting 4x minus 1x is 2-4 MB
+      // on upload and 5-6 MB on node. So this setting measurably removes the
+      // size-dependent RSS difference. Diagnostic that points at capacity, not
+      // live data: after a full GC the live old and large-object space was the
+      // same at 1x and 4x in both the main and the SQLite worker isolate, and
+      // RSS did not fall after the GC. It is not a full attribution: the first
+      // RSS step happens while V8 still reports its initial 64 MB capacity, so
+      // it is consistent with touching that capacity, not proof of it. It does
+      // NOT measure default-runtime memory: a phone or server with V8's default
+      // nursery holds more young-generation pages than this test charges. The
+      // retention controls below must fail this same comparison.
       maxSemiSpaceMiB: 4,
     });
   } finally {
@@ -70,6 +98,7 @@ async function measure(
       JSON.stringify({
         path,
         loadWhole,
+        retainEvery: retention.retainEvery,
         fixtureBytes: fixture.bytes,
         node: process.version,
         abi: process.versions.modules,
@@ -81,9 +110,12 @@ async function measure(
   expect(measured.result.rows).toBe(fixture.rows);
   expect(measured.result.receiptRows).toBe(fixture.rows);
   expect(measured.result.payloadBytes).toBe(fixture.payloadBytes);
-  expect(measured.result.retainedRows).toBe(loadWhole ? fixture.rows : 0);
+  const retainedRows = retainedRowsFor(fixture, retention);
+  expect(measured.result.retainedRows).toBe(retainedRows);
+  // Every fixture row carries the same payload size.
+  expect(fixture.payloadBytes % fixture.rows).toBe(0);
   expect(measured.result.retainedPayloadBytes).toBe(
-    loadWhole ? fixture.payloadBytes : 0,
+    retainedRows * (fixture.payloadBytes / fixture.rows),
   );
   return measured;
 }
@@ -96,15 +128,15 @@ const PAGE_MARGIN = 2 * 4 * 1024 * 1024;
 function expectBoundedGrowth(small: number, large: number) {
   expect(large).toBeLessThanOrEqual(small + PAGE_MARGIN);
 }
-async function compare(path: "node" | "upload", loadWhole = false) {
+async function compare(path: "node" | "upload", retention: Retention = {}) {
   const small: number[] = [];
   const large: number[] = [];
   // RSS includes allocator/collector and startup scatter. Compare the median
   // of three independent children at each size; keep every raw peak above.
-  // The whole-source mutant uses the identical sampling and growth assertion.
+  // Every retention mutant uses the identical sampling and growth assertion.
   for (let repetition = 0; repetition < 3; repetition++) {
-    small.push((await measure(fixtures[0]!, path, loadWhole)).peakBytes);
-    large.push((await measure(fixtures[1]!, path, loadWhole)).peakBytes);
+    small.push((await measure(fixtures[0]!, path, retention)).peakBytes);
+    large.push((await measure(fixtures[1]!, path, retention)).peakBytes);
   }
   const median = (values: number[]) => [...values].sort((a, b) => a - b)[1]!;
   const result = { small: median(small), large: median(large) };
@@ -112,7 +144,7 @@ async function compare(path: "node" | "upload", loadWhole = false) {
     "IMPORT_MEMORY_COMPARISON " +
       JSON.stringify({
         path,
-        loadWhole,
+        ...retention,
         small,
         large,
         median: result,
@@ -130,6 +162,23 @@ it.each(["node", "upload"] as const)(
   1_800_000,
 );
 it("import-load-whole-mutant-fails", async () => {
-  const { small, large } = await compare("upload", true);
+  const { small, large } = await compare("upload", { loadWhole: true });
   expect(() => expectBoundedGrowth(small, large)).toThrow();
 }, 1_800_000);
+// Partial retention. At equal resident bytes per payload byte, keeping one row
+// in N adds (9,000 - 2,250) / N rows of 16 KiB between 1x and 4x: 10.55 MiB for
+// N = 10 (2.55 MiB above the 8 MiB margin) and 26.37 MiB for N = 4. RSS is not
+// an exact byte counter, so the repetition count in the PR body, not this
+// arithmetic, is the claim about how reliably each is caught.
+it.each(
+  (["node", "upload"] as const).flatMap((path) =>
+    [10, 4].map((retainEvery) => [path, retainEvery] as const),
+  ),
+)(
+  "import-%s-retaining-every-%ith-record-fails",
+  async (path, retainEvery) => {
+    const { small, large } = await compare(path, { retainEvery });
+    expect(() => expectBoundedGrowth(small, large)).toThrow();
+  },
+  1_800_000,
+);

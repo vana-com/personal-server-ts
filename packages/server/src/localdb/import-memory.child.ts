@@ -65,8 +65,10 @@ export interface DriverTraffic {
   maxLoopStallMs?: number;
 }
 
-// LOAD_WHOLE negative control: actual source objects stay reachable through
-// receipt verification and the oracle's final HWM read, including forced GCs.
+// Negative controls: actual source objects stay reachable through receipt
+// verification and the oracle's final HWM read, including forced GCs. Either
+// every record (`loadWhole`) or every `retainEvery`-th record of the first
+// source pass (indexes 0, N, 2N, ...) is kept here.
 const retained: Record<string, unknown>[] = [];
 
 /** Called only by the existing fresh-child oracle, after module warm-up. */
@@ -74,12 +76,16 @@ export async function importMemoryWorkload(input: {
   fixture: ImportMemoryFixture;
   path: "node" | "upload";
   loadWhole: boolean;
+  /** Partial-retention control: keep every Nth source record. Off when unset. */
+  retainEvery?: number;
   /** Fresh mutable workspace; immutable source fixtures are shared. */
   workRoot?: string;
   /** Optional attribution run; acceptance runs leave sampling off. */
   diagnostics?: boolean;
 }): Promise<ImportMemoryResult> {
   const { identity, target } = input.fixture;
+  if (input.loadWhole && input.retainEvery !== undefined)
+    throw new Error("memory_retention_modes_are_exclusive");
   const workRoot = input.workRoot ?? input.fixture.root;
   const memory: Record<string, NodeJS.MemoryUsage> = {
     start: process.memoryUsage(),
@@ -306,6 +312,12 @@ export async function importMemoryWorkload(input: {
         memory[`sourcePass${current}Start`] = process.memoryUsage();
         let rows = 0;
         for await (const record of reader.records()) {
+          if (
+            current === 1 &&
+            input.retainEvery !== undefined &&
+            rows % input.retainEvery === 0
+          )
+            retained.push(record);
           if (++rows % 64 === 0) observe(phase);
           yield record;
         }
