@@ -37,6 +37,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
+import { deleteMetadataHash } from "../../../core/src/stream-sync/delete-metadata.js";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { remoteFixture } from "./apply-fixture.js";
 
@@ -1447,13 +1448,14 @@ describe("the head this device committed", () => {
    * Does a snapshot of a stream whose registry head is `hash` download that
    * head? Another database on the same blob port, whose blob store has lost
    * the head: the snapshot reads it from the cache, or fails because storage
-   * has no such blob. Returns the error message, or null when it did not fail
-   * on the missing head.
+   * has no such blob. Returns the error message (null when it did not fail on
+   * the missing head) and the number of GETs of the head blob. Any other
+   * failure is rethrown.
    */
   async function missingHeadError(
     blobs: ReturnType<typeof countingBlobs>,
     hash: string,
-  ): Promise<string | null> {
+  ): Promise<{ error: string | null; headGets: number }> {
     const probe = await makeWorld();
     Object.assign(probe.deps, { blobs });
     await seedConnection(probe.deps);
@@ -1466,19 +1468,38 @@ describe("the head this device committed", () => {
       expectedVersion: "1",
       signature: "0x00",
     });
+    // The registry version is already applied here, so apply never reads the
+    // head: the only possible GET is the snapshot's own.
+    await probe.deps.db.batch([
+      {
+        sql: "UPDATE stream_state SET head_version = 1 WHERE connection_id = ? AND stream = ?",
+        params: [CONNECTION_ID, STREAM],
+      },
+    ]);
     const key = headKey(hash);
+    const before = blobs.gets.get(key) ?? 0;
     blobs.hidden.add(key);
     try {
       await publishConnection(probe.deps, CONNECTION_ID);
-      return null;
+      return { error: null, headGets: (blobs.gets.get(key) ?? 0) - before };
     } catch (error) {
       const message = String((error as Error).message);
-      return message.includes("registry head blob") ? message : null;
+      // Any other failure is not a cache hit: let the test see it.
+      if (!message.includes("registry head blob")) throw error;
+      return {
+        error: message,
+        headGets: (blobs.gets.get(key) ?? 0) - before,
+      };
     } finally {
       blobs.hidden.delete(key);
     }
   }
-  const downloads = (message: string | null) => message !== null;
+  /** The head was fetched from storage, and storage had lost it. */
+  const downloads = (probe: { error: string | null; headGets: number }) =>
+    probe.error !== null && probe.headGets > 0;
+  /** The head came from the cache: no GET of its blob, and no failure. */
+  const servedFromCache = (probe: { error: string | null; headGets: number }) =>
+    probe.error === null && probe.headGets === 0;
 
   it("is not downloaded by the next snapshot of that stream", async () => {
     const { world, blobs } = await countedWorld();
@@ -1512,8 +1533,8 @@ describe("the head this device committed", () => {
     // The probe sees the difference: the head just committed is remembered,
     // an unknown head is not.
     expect(
-      downloads(await missingHeadError(blobs, await registryHash(world))),
-    ).toBe(false);
+      servedFromCache(await missingHeadError(blobs, await registryHash(world))),
+    ).toBe(true);
     expect(
       downloads(await missingHeadError(blobs, `0x${"cd".repeat(32)}`)),
     ).toBe(true);
@@ -1551,9 +1572,9 @@ describe("the head this device committed", () => {
     const results = await publishConnection(world.deps, CONNECTION_ID);
     expect(results[0]?.outcome).toBe("published");
     expect(blobs.gets.get(headKey(foreign.dataHash))).toBe(1);
-    expect(downloads(await missingHeadError(blobs, foreign.dataHash))).toBe(
-      false,
-    );
+    expect(
+      servedFromCache(await missingHeadError(blobs, foreign.dataHash)),
+    ).toBe(true);
   });
 
   it("is not remembered after a CAS conflict", async () => {
@@ -1577,7 +1598,7 @@ describe("the head this device committed", () => {
     const retried = uploaded[uploaded.length - 1]!;
     expect(retried).toBe(await registryHash(world));
     expect(downloads(await missingHeadError(blobs, loser))).toBe(true);
-    expect(downloads(await missingHeadError(blobs, retried))).toBe(false);
+    expect(servedFromCache(await missingHeadError(blobs, retried))).toBe(true);
   });
 
   it("is not remembered when a delete purges the connection before the CAS", async () => {
@@ -1688,7 +1709,7 @@ describe("the head this device committed", () => {
     const { world, blobs } = await countedWorld();
     expect((await publishRun(world, "r1", 1000)).outcome).toBe("published");
     const head = await registryHash(world);
-    expect(downloads(await missingHeadError(blobs, head))).toBe(false);
+    expect(servedFromCache(await missingHeadError(blobs, head))).toBe(true);
     // A namespace key that derives another key check cannot use the entry:
     // the head is downloaded and refused as another key's.
     const probe = await makeWorld();
@@ -1754,6 +1775,47 @@ describe("the head this device committed", () => {
         (entry) => entry.scope === SCOPE,
       ),
     ).toHaveLength(1);
+  });
+
+  it("does not record a newer lifetime's delete fence as this lifetime's", async () => {
+    const { world: first, blobs } = await countedWorld();
+    await first.deps.db.batch([
+      { sql: "DELETE FROM stream_state" },
+      { sql: "DELETE FROM connections" },
+    ]);
+    await seedConnection(first.deps, 2);
+    await seedStream(first.deps);
+    await seedRun(first.deps, "r1", 1000, { generation: 2 });
+    await seedRecord(first.deps, "a", canonicalJson({ id: "a" }));
+    expect(
+      (await publishConnection(first.deps, CONNECTION_ID))[0]?.outcome,
+    ).toBe("published");
+    const head = await registryHash(first);
+
+    // The registry row of that generation-2 head also carries a delete mark.
+    // Taken as an older lifetime's head it would raise this database's delete
+    // fence; a newer lifetime's head must leave the fence alone.
+    const behind = await makeWorld();
+    Object.assign(behind.deps, { blobs });
+    await seedConnection(behind.deps, 1);
+    await seedStream(behind.deps);
+    await behind.registry.post({
+      ownerAddress: OWNER,
+      scope: SCOPE,
+      dataHash: head as `0x${string}`,
+      metadataHash: deleteMetadataHash(SCOPE, 1),
+      expectedVersion: "1",
+      signature: "0x00",
+    });
+    await seedRun(behind.deps, "r9", 3000, { generation: 1 });
+    await seedRecord(behind.deps, "b", canonicalJson({ id: "b" }));
+    const results = await publishConnection(behind.deps, CONNECTION_ID);
+    expect(results[0]?.outcome).toBe("deferred");
+    const rows = await behind.deps.db.query<{ last_delete_version: number }>(
+      "SELECT last_delete_version FROM stream_state WHERE connection_id = ? AND stream = ?",
+      [CONNECTION_ID, STREAM],
+    );
+    expect(rows[0]?.last_delete_version).toBe(0);
   });
 });
 
