@@ -525,6 +525,40 @@ describe("streams of one connection publish together", () => {
     expect(calls.slice(purgedAt).filter((c) => c.kind === "post")).toEqual([]);
   });
 
+  it("an attachment-only stream whose connection was deleted while its attachment was out purges and does not say noop", async () => {
+    // The stream's row is unchanged; only its attachment is not known to be
+    // in storage (a driver the process has not uploaded through), so its turn
+    // ends with an attachment to upload and nothing to publish. One stream, so
+    // that no sibling's purge can stop it: only the check after the upload can.
+    let tombstoned: Promise<void> | undefined;
+    const probe: { run?: () => Promise<void> } = {};
+    const w = await world({
+      streams: 1,
+      attachments: true,
+      holdGet: async (key) => {
+        if (/-b-/.test(key)) await probe.run?.();
+      },
+    });
+    const first = await publishConnection(w.deps, CONNECTION_ID);
+    expect(first.map((r) => r.outcome)).toEqual(["published"]);
+    const db = w.db;
+    const fresh: LocalSyncDeps = {
+      ...w.deps,
+      db: {
+        info: db.info,
+        query: (sql, params) => db.query(sql, params),
+        batch: (statements) => db.batch(statements),
+        close: () => db.close(),
+      },
+    };
+    // The control row is at version 1; another device deletes the connection
+    // while the attachment is being probed, after the snapshot.
+    probe.run = () => (tombstoned ??= tombstoneControl(w.innerRegistry, 2));
+    const results = await publishConnection(fresh, CONNECTION_ID);
+    expect(results.map((r) => r.outcome)).toEqual(["purged"]);
+    expect(w.purges.length).toBeGreaterThan(0);
+  });
+
   it("on a failure starts no new stream, drains the running ones and throws the earliest stream's error", async () => {
     // Three of six streams run at once. Each parks at its first part upload
     // on a gate the test controls: s0 will succeed, s1 and s2 will fail, in the

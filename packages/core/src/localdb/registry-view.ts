@@ -26,8 +26,11 @@ import type { LocalSyncDeps } from "./deps.js";
  *    the connection has. Anything else (absent, deleted, foreign, moved) is
  *    read again before the snapshot acts on it, because absent creates the
  *    row and deleted purges local data;
- *  - a stream hint never writes run evidence by itself: see `hintedRow` in
- *    publish.ts;
+ *  - a snapshot that would do anything but build a candidate (no work to
+ *    publish, so no evidence is written and no result is "noop"; a refused
+ *    run) reads the control row and the stream row live first: see
+ *    `confirmHints` in publish.ts. A candidate is guarded by the commit's live
+ *    control checks and its CAS;
  *  - a listing is never reused after the publish changed local state from the
  *    registry (an apply, a CAS conflict): `invalidate` drops it, a listing
  *    still in flight is not handed out, and the next stream takes a new one.

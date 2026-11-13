@@ -78,6 +78,7 @@ import {
   utf8,
   verifyHead,
   type ControlHashes,
+  type ControlRead,
   type Head,
   type HeadPart,
   type Keccak256,
@@ -447,7 +448,7 @@ type Snapshot =
       readonly kind: "blobs";
       readonly blobs: readonly BlobDescriptor[];
       readonly result: PublishResult;
-      /** Held until the attachments are up and the row is read again; see `confirmNoWork`. */
+      /** Held until the attachments are up; see `confirmNoWork`. */
       readonly evidence: RunEvidence | null;
     }
   | { readonly kind: "candidate"; readonly candidate: Candidate };
@@ -608,11 +609,15 @@ async function publishAttempts(
       await uploadBlobs(deps, snapshot.blobs, run.meter, () =>
         stopIfPurged(latch),
       );
-      const { evidence } = snapshot;
-      if (evidence) {
-        await slot((held) => confirmNoWork(held, context, evidence));
-      }
-      return snapshot.result;
+      // The attachments took time outside the slot: the control row and the
+      // stream row are read again before the stream is called done.
+      const { evidence, result } = snapshot;
+      const ended = await slot((held) =>
+        confirmNoWork(held, context, evidence),
+      );
+      return ended
+        ? { stream, outcome: ended, watermark: result.watermark }
+        : result;
     }
     const { candidate } = snapshot;
     stopIfPurged(latch);
@@ -784,6 +789,22 @@ async function snapshotStream(
   const hintedRow = hints.stream !== undefined;
   const streamRead = hints.stream ?? (await deps.registry.read(scope));
   const streamRow = classifyStreamRow(streamRead, hashes);
+  // Hints are older than this turn. Anything a snapshot does besides building
+  // a candidate (the commit has its own live checks and a CAS) acts on the
+  // registry as it is now, so it reads again first: the stream row, THEN the
+  // control row. That order matters: a stream row outlives the deletion of its
+  // connection until cleanup, so a row read alone proves nothing, and a
+  // control read made before the row read can predate a deletion the row
+  // read then misses. A deleted control row purges; one that moved defers; a
+  // stream row that is no longer the hinted one repeats the snapshot, which
+  // reads live (a hint serves a first snapshot only).
+  const confirmHints = async (): Promise<Snapshot | null> => {
+    if (!hintedRow && !hintedControl) return null;
+    if (hintedRow && !sameRow(await deps.registry.read(scope), streamRead))
+      return { kind: "retry" };
+    const checked = await checkControl(deps, context);
+    return checked ? done({ stream, outcome: checked, watermark }) : null;
+  };
   // `registryHead` is the content base: the verified head of THIS lifetime.
   // `registryVersion` and `registryDataHash` are the compare-and-set basis and
   // describe the registry row whatever lifetime its head is from.
@@ -872,6 +893,8 @@ async function snapshotStream(
   );
   if (plan.deferred) return deferred();
   if (plan.refused) {
+    const stale = await confirmHints();
+    if (stale) return stale;
     run.sawRefusal = true;
     await unwriteRefusedRun(deps, {
       connectionId,
@@ -895,6 +918,8 @@ async function snapshotStream(
     plan.replaceBelow !== undefined ||
     plan.steps.some((step) => step.decision.kind === "publish");
   if (!hasWork) {
+    const stale = await confirmHints();
+    if (stale) return stale;
     const result: PublishResult = {
       stream,
       outcome: run.sawRefusal ? "refused" : "noop",
@@ -913,14 +938,7 @@ async function snapshotStream(
             runIds: plan.steps.map((step) => step.runId),
           }
         : null;
-    // Evidence says the registry row, as of now, holds these runs. A row
-    // that came from the listing is older than this turn, so it is read again
-    // before it is believed, as with attachments (see `confirmNoWork`). A
-    // stream with no pending run writes nothing and needs no read.
-    const needsConfirm =
-      hintedRow && evidence !== null && evidence.runIds.length > 0;
-    if (blobs.length > 0 || needsConfirm)
-      return { kind: "blobs", blobs, result, evidence };
+    if (blobs.length > 0) return { kind: "blobs", blobs, result, evidence };
     if (evidence) await saveRunEvidence(deps, connectionId, stream, evidence);
     return done(result);
   }
@@ -1168,24 +1186,42 @@ async function saveRunEvidence(
 
 /**
  * The no-work path with attachments to upload: the snapshot's slot turn is
- * over by the time they are up, so the registry row is read again, in a slot
- * turn. Evidence is written only if it is still the row the plan matched; a
- * head that moved leaves the runs pending for the next cycle.
+ * over by the time they are up, so the stream row is read again, then the
+ * control row, in a slot turn. A connection deleted meanwhile purges and one
+ * that moved defers, never "noop". Evidence is written only if the stream row
+ * is still the one the plan matched; a head that moved leaves the runs pending
+ * for the next cycle.
  */
 async function confirmNoWork(
   deps: LocalSyncDeps,
   context: StreamContext,
-  evidence: RunEvidence,
-): Promise<void> {
-  const read = await deps.registry.read(context.scope);
+  evidence: RunEvidence | null,
+): Promise<"purged" | "deferred" | null> {
+  // The row first, the control row second: see `confirmHints`.
+  const read =
+    evidence === null ? null : await deps.registry.read(context.scope);
+  const checked = await checkControl(deps, context);
+  if (checked) return checked;
   if (
+    evidence === null ||
+    read === null ||
     !read.found ||
     read.version !== evidence.version ||
     read.dataHash.toLowerCase() !== evidence.dataHash.toLowerCase()
   ) {
-    return;
+    return null;
   }
   await saveRunEvidence(deps, context.connectionId, context.stream, evidence);
+  return null;
+}
+
+/** Whether two reads of a stream's row are the same row version and content. */
+function sameRow(a: ControlRead, b: ControlRead): boolean {
+  if (!a.found || !b.found) return a.found === b.found;
+  return (
+    a.version === b.version &&
+    a.dataHash.toLowerCase() === b.dataHash.toLowerCase()
+  );
 }
 
 /**

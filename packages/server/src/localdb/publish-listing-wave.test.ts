@@ -54,6 +54,10 @@ type Options = {
   readonly noListing?: boolean;
   /** Runs when a put starts, after it is logged; the put waits for it. */
   readonly holdPut?: (key: string) => Promise<void>;
+  /** Runs after the registry took a listing and before the publish sees it. */
+  readonly afterList?: () => Promise<void>;
+  /** Runs after the registry answered a read, before the publish sees the answer. */
+  readonly afterRead?: (scope: string) => Promise<void>;
 };
 
 const drivers: SqlDriver[] = [];
@@ -79,7 +83,9 @@ async function world(options: Options) {
   const registry: StreamSyncRegistry = {
     async read(scope) {
       calls.push({ kind: "read", scope });
-      return inner.read(scope);
+      const read = await inner.read(scope);
+      await options.afterRead?.(scope);
+      return read;
     },
     async post(request) {
       calls.push({ kind: "post", scope: request.scope });
@@ -92,7 +98,9 @@ async function world(options: Options) {
       : {
           async listConnectionRows(connector: string, ns: string) {
             calls.push({ kind: "list", scope: connector });
-            return inner.listConnectionRows(connector, ns);
+            const rows = await inner.listConnectionRows(connector, ns);
+            await options.afterList?.();
+            return rows;
           },
         }),
   };
@@ -165,10 +173,27 @@ async function world(options: Options) {
       lastBatch: 0,
     });
   };
+  /** A later partial run that found nothing new in any stream. */
+  const idle = async () => {
+    const runId = `run-${++runs}`;
+    await sync.intake.begin(runId, {
+      connector: CONNECTOR,
+      artifactDigest: CONNECTOR,
+      wantFull: false,
+      owner: { address: OWNER, leaseId: null },
+    });
+    await sync.intake.batch(runId, { batch: 0, records: [] });
+    await sync.intake.end(runId, {
+      outcome: "succeeded",
+      coveredStreams: names,
+      lastBatch: 0,
+    });
+    return runId;
+  };
   await collect(1);
   // The run's own registry traffic is not the publish's.
   calls.length = 0;
-  return { deps, db, calls, names, inner, collect, blobs, innerBlobs };
+  return { deps, db, calls, names, inner, collect, idle, blobs, innerBlobs };
 }
 
 const count = (calls: readonly Call[], kind: Call["kind"], scope?: string) =>
@@ -332,6 +357,121 @@ describe("a listing taken before an apply", () => {
     );
     expect(apply).toBeGreaterThan(lists[0]!);
     expect(lists[1]).toBeGreaterThan(apply);
+  });
+});
+
+/** Another device deletes the connection: the control row, at version 1, is tombstoned. */
+async function tombstoneControl(
+  w: Awaited<ReturnType<typeof world>>,
+): Promise<void> {
+  const hashes = await controlHashes(
+    keccak,
+    await deriveKeyCheck(w.deps.keys.namespaceHmac),
+  );
+  await w.inner.post({
+    ownerAddress: OWNER,
+    scope: CONTROL,
+    dataHash: hashes.tombstoneData,
+    metadataHash: hashes.tombstoneMetadata,
+    expectedVersion: "2",
+    signature: "0x00",
+  });
+}
+
+describe("a stream with no work, served by a listing older than its turn", () => {
+  // Every stream is published once; a later partial run finds nothing new, so
+  // each stream's plan has nothing to publish but a run to take evidence of.
+  // `afterList` runs once the second stream's listing is taken: its rows are
+  // then older than the turn of every stream after the first.
+  const refreshWorld = async (
+    afterList: (w: Awaited<ReturnType<typeof world>>) => Promise<void>,
+    afterRead?: (
+      w: Awaited<ReturnType<typeof world>>,
+      scope: string,
+    ) => Promise<void>,
+  ) => {
+    let armed = false;
+    const holder: { w?: Awaited<ReturnType<typeof world>> } = {};
+    const w = await world({
+      streams: 4,
+      afterList: async () => {
+        if (armed) await afterList(holder.w!);
+      },
+      afterRead: async (scope) => {
+        if (armed) await afterRead?.(holder.w!, scope);
+      },
+    });
+    holder.w = w;
+    await publishConnection(w.deps, CONNECTION_ID);
+    const runId = await w.idle();
+    w.calls.length = 0;
+    armed = true;
+    return { w, runId };
+  };
+  const evidenceOf = async (
+    w: Awaited<ReturnType<typeof world>>,
+    runId: string,
+  ) =>
+    Object.fromEntries(
+      (
+        await w.db.query<{ stream: string; published_version: number | null }>(
+          "SELECT stream, published_version FROM run_streams WHERE run_id = ?",
+          [runId],
+        )
+      ).map((row) => [row.stream, row.published_version]),
+    );
+
+  it("purges when the control row was deleted after the listing, and does not say noop", async () => {
+    const { w, runId } = await refreshWorld(tombstoneControl);
+    const results = await publishConnection(w.deps, CONNECTION_ID, {
+      streamConcurrency: 1,
+    });
+    expect(count(w.calls, "list")).toBe(1);
+    // Only the stream that read its own rows has evidence for the run.
+    const evidence = await evidenceOf(w, runId);
+    expect(evidence.s1).toBeNull();
+    // s0 read its own rows and found the connection live; s1 held a listing
+    // that still showed it active.
+    expect(results[0]!.outcome).toBe("noop");
+    expect(results[1]!.outcome).toBe("purged");
+    expect(results.slice(1).some((r) => r.outcome === "noop")).toBe(false);
+  });
+
+  it("reads the stream row first and the control row second: a deletion between them is caught", async () => {
+    // The connection is deleted just after s1's stream row is read, and its
+    // row is unchanged (it survives the deletion). Only a control read made
+    // after the row read can see it.
+    const s1 = streamScope(CONNECTOR, "", "s1");
+    let deleted = false;
+    const { w, runId } = await refreshWorld(
+      async () => {},
+      async (world, scope) => {
+        if (scope !== s1 || deleted) return;
+        deleted = true;
+        await tombstoneControl(world);
+      },
+    );
+    const results = await publishConnection(w.deps, CONNECTION_ID, {
+      streamConcurrency: 1,
+    });
+    expect(deleted).toBe(true);
+    expect(results[1]!.outcome).toBe("purged");
+    expect((await evidenceOf(w, runId)).s1).toBeNull();
+  });
+
+  it("saves no evidence for a row another publisher advanced after the listing", async () => {
+    const { w, runId } = await refreshWorld((world) =>
+      foreignHead(world, "s1", 2),
+    );
+    await publishConnection(w.deps, CONNECTION_ID, { streamConcurrency: 1 });
+    const evidence = await evidenceOf(w, runId);
+    // s0 read the row itself: its evidence names version 1. s1's listed row
+    // (version 1) was not current by its turn: no evidence for that version.
+    expect(evidence.s0).toBe(1);
+    expect(evidence.s1).not.toBe(1);
+    // s2 and s3 came from the same listing but their rows did not move.
+    expect(evidence.s2).toBe(1);
+    expect(evidence.s3).toBe(1);
   });
 });
 
