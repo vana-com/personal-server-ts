@@ -172,8 +172,8 @@ const reads = (calls: readonly Call[], scope: (s: string) => boolean) =>
 describe("what a publish reads before it posts", () => {
   it("does not make the first stream wait for the listing", async () => {
     // From the publish on, the listing is held until the first stream has
-    // read its own row and uploaded. If the first snapshot waited for the
-    // listing this would never finish.
+    // read its own row and uploaded. If the first stream's snapshot waited
+    // for the listing this would never finish.
     let holding = false;
     let release: () => void = () => {};
     const held = new Promise<void>((resolve) => (release = resolve));
@@ -191,9 +191,14 @@ describe("what a publish reads before it posts", () => {
     await vi.waitFor(() => {
       expect(calls.some((c) => c.kind === "put")).toBe(true);
     });
-    expect(
-      calls.some((c) => c.kind === "read" && streamOfScope(c.scope) === "s0"),
-    ).toBe(true);
+    // The listing is not taken until the first stream's own reads are done:
+    // before its first upload nothing else is in flight.
+    const firstRead = calls.findIndex(
+      (c) => c.kind === "read" && streamOfScope(c.scope) === "s0",
+    );
+    const listed = calls.findIndex((c) => c.kind === "list");
+    expect(firstRead).toBeGreaterThanOrEqual(0);
+    expect(listed).toBeGreaterThan(firstRead);
     release();
     const results = await done;
     expect(results.map((r) => r.outcome)).toEqual(Array(3).fill("published"));
@@ -277,8 +282,11 @@ describe("what a publish reads before it posts", () => {
     });
     const results = await publishConnection(second.deps, CONNECTION_ID);
 
-    // The publish starts from the (stale) listing. A later apply lists again.
-    expect(second.calls[0]).toEqual({ kind: "list", scope: CONNECTOR });
+    // The second stream starts from the (stale) listing, taken after the
+    // first stream's own reads.
+    const firstList = second.calls.findIndex((c) => c.kind === "list");
+    expect(firstList).toBeGreaterThan(0);
+    expect(second.calls[0]).toMatchObject({ kind: "read" });
     // The candidate built on "absent" would post version 1. The row is at 1
     // already; the live read before the post found that and the post never
     // went out.

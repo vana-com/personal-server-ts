@@ -12,7 +12,8 @@ import type { LocalSyncDeps } from "./deps.js";
  * the connection's slot. A publish of N streams made 2N of those requests.
  * The view answers them from two things the publish already has:
  *
- *  - the stream rows, from ONE listing started when the publish opens;
+ *  - the stream rows, from ONE listing taken by the second stream's first
+ *    snapshot;
  *  - the control row, from the newest read of it any stream made in this
  *    publish (the first snapshot's, or a commit's check around its post).
  *
@@ -32,11 +33,10 @@ import type { LocalSyncDeps } from "./deps.js";
 export interface RegistryView {
   /**
    * The hints for `scope`'s first snapshot. Later calls for the same scope
-   * return none. The first stream to ask gets none and does not wait: its own
-   * reads run while the listing is in flight, so the listing never delays the
-   * first upload. Every other stream waits for the listing, which is long done
-   * by the time that stream's turn comes (the first snapshot, with its control
-   * read, comes first in the slot).
+   * return none. The first stream to ask gets none: it reads its own rows, and
+   * the listing is taken only when the second stream asks, so that nothing but
+   * the first stream's reads is in flight before its first upload. The other
+   * streams then answer from the one listing.
    */
   firstSnapshot(scope: string): Promise<RegistryHints>;
   /** Remember a control row this publish read from the registry itself. */
@@ -63,8 +63,9 @@ export const NO_VIEW: RegistryView = {
 const MIN_STREAMS_FOR_LISTING = 2;
 
 /**
- * Start listing the stream rows of `connector` and hand them out as hints. A
- * listing that fails is not a failed publish: the snapshots read their rows.
+ * Hand out hints from one listing of the stream rows of `connector`, taken
+ * when the second stream first needs it. A listing that fails is not a failed
+ * publish: the snapshots read their rows.
  */
 export function openRegistryView(
   deps: LocalSyncDeps,
@@ -72,7 +73,7 @@ export function openRegistryView(
   streamCount: number,
 ): RegistryView {
   if (streamCount < MIN_STREAMS_FOR_LISTING) return NO_VIEW;
-  const listing = listRows(deps, connection);
+  let listing: Promise<Map<string, ControlRead> | null> | undefined;
   const started = new Set<string>();
   let control: ControlRead | undefined;
   return {
@@ -81,6 +82,10 @@ export function openRegistryView(
       const first = started.size === 0;
       started.add(scope);
       if (first) return {};
+      // Taken by the second stream's turn, so that the first stream's own
+      // reads (the control row, then its row) are the only requests in flight
+      // before its first upload.
+      listing ??= listRows(deps, connection);
       const rows = await listing;
       if (rows === null) return {};
       // The listing is complete (a missing page marker throws), so a scope it
