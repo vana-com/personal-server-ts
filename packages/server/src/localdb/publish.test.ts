@@ -12,6 +12,7 @@ import {
   deriveKeyCheck,
   digestHead,
   encodeHead,
+  headBlobName,
   streamScope,
   type Head,
   canonicalJson,
@@ -32,11 +33,38 @@ import {
   type StreamSyncRegistry,
   createMemoryStreamSyncBlobs,
   createMemoryStreamSyncRegistry,
+  type StreamSyncBlobs,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { remoteFixture } from "./apply-fixture.js";
+
+// Lets one test make the publisher build a head the reader would refuse.
+const heads = vi.hoisted(() => ({ corrupt: false }));
+vi.mock(
+  "@opendatalabs/personal-server-ts-stream-sync",
+  async (importOriginal) => {
+    const real = (await importOriginal()) as {
+      encodeHead: (head: Head) => Uint8Array;
+    };
+    return {
+      ...real,
+      encodeHead: (head: Head) => {
+        const bytes = real.encodeHead(head);
+        return heads.corrupt
+          ? new TextEncoder().encode(
+              JSON.stringify(
+                JSON.parse(new TextDecoder().decode(bytes)),
+                null,
+                1,
+              ),
+            )
+          : bytes;
+      },
+    };
+  },
+);
 
 const CONNECTOR = "test-conn";
 const NS = "0123456789abcdef";
@@ -69,6 +97,7 @@ afterEach(async () => {
     rmSync(world.dir, { recursive: true, force: true });
   }
   worlds.length = 0;
+  heads.corrupt = false;
   vi.resetAllMocks();
 });
 
@@ -1352,5 +1381,378 @@ describe("part layout of records with no covering part", () => {
       expect(heavy(before.head).length).toBeGreaterThan(1);
       expect(heavy(after.head)).toEqual(heavy(before.head));
     });
+  });
+});
+
+describe("the head this device committed", () => {
+  const OTHER_HMAC = async (message: Uint8Array) =>
+    new Uint8Array(
+      createHmac("sha256", Buffer.from("another-namespace-key"))
+        .update(message)
+        .digest(),
+    );
+  const headKey = (hash: string) => `${SCOPE}/${headBlobName(hash)}`;
+
+  /** A blob port that counts reads, and can hide or replace a key. */
+  function countingBlobs(inner: StreamSyncBlobs) {
+    const gets = new Map<string, number>();
+    const puts: string[] = [];
+    const hidden = new Set<string>();
+    const replaced = new Map<string, Uint8Array>();
+    const port = {
+      gets,
+      puts,
+      hidden,
+      replaced,
+      get: async (key: string) => {
+        gets.set(key, (gets.get(key) ?? 0) + 1);
+        if (hidden.has(key)) return null;
+        return replaced.get(key) ?? inner.get(key);
+      },
+      put: async (key: string, bytes: Uint8Array) => {
+        puts.push(key);
+        return inner.put(key, bytes);
+      },
+    };
+    return port;
+  }
+
+  /** A world whose blob port is one counting object, kept for the whole test. */
+  async function countedWorld(registry?: StreamSyncRegistry) {
+    const world = await makeWorld(registry);
+    const blobs = countingBlobs(world.blobs);
+    Object.assign(world.deps, { blobs });
+    await seedConnection(world.deps);
+    await seedStream(world.deps);
+    return { world, blobs };
+  }
+
+  async function publishRun(world: World, runId: string, o: number) {
+    await seedRun(world.deps, runId, o);
+    await seedRecord(world.deps, `rec-${runId}`, canonicalJson({ id: runId }), {
+      stampO: o,
+      stampR: runId,
+    });
+    const results = await publishConnection(world.deps, CONNECTION_ID);
+    return results[0]!;
+  }
+
+  async function registryHash(world: World): Promise<string> {
+    const read = await world.registry.read(SCOPE);
+    if (!read.found) throw new Error("no registry head");
+    return read.dataHash;
+  }
+
+  /**
+   * Does a snapshot of a stream whose registry head is `hash` download that
+   * head? Another database on the same blob port, whose blob store has lost
+   * the head: the snapshot reads it from the cache, or fails because storage
+   * has no such blob. Returns the error message, or null when it did not fail
+   * on the missing head.
+   */
+  async function missingHeadError(
+    blobs: ReturnType<typeof countingBlobs>,
+    hash: string,
+  ): Promise<string | null> {
+    const probe = await makeWorld();
+    Object.assign(probe.deps, { blobs });
+    await seedConnection(probe.deps);
+    await seedStream(probe.deps);
+    await probe.registry.post({
+      ownerAddress: OWNER,
+      scope: SCOPE,
+      dataHash: hash as `0x${string}`,
+      metadataHash: `0x${"22".repeat(32)}`,
+      expectedVersion: "1",
+      signature: "0x00",
+    });
+    const key = headKey(hash);
+    blobs.hidden.add(key);
+    try {
+      await publishConnection(probe.deps, CONNECTION_ID);
+      return null;
+    } catch (error) {
+      const message = String((error as Error).message);
+      return message.includes("registry head blob") ? message : null;
+    } finally {
+      blobs.hidden.delete(key);
+    }
+  }
+  const downloads = (message: string | null) => message !== null;
+
+  it("is not downloaded by the next snapshot of that stream", async () => {
+    const { world, blobs } = await countedWorld();
+    const registry = world.registry;
+    const reads = new Map<string, number>();
+    Object.assign(world.deps, {
+      registry: {
+        read: async (scope: string) => {
+          reads.set(scope, (reads.get(scope) ?? 0) + 1);
+          return registry.read(scope);
+        },
+        post: registry.post.bind(registry),
+        listControlRows: registry.listControlRows.bind(registry),
+        listStreamRows: registry.listStreamRows.bind(registry),
+      },
+    });
+
+    expect((await publishRun(world, "r1", 1000)).outcome).toBe("published");
+    const first = await registryHash(world);
+    blobs.gets.clear();
+    reads.clear();
+
+    expect((await publishRun(world, "r2", 2000)).outcome).toBe("published");
+    expect(await registryHash(world)).not.toBe(first);
+    // No GET for the head this device wrote; the control and stream rows are
+    // still read from the registry.
+    expect(blobs.gets.get(headKey(first)) ?? 0).toBe(0);
+    expect(reads.get(CONTROL)).toBeGreaterThan(0);
+    expect(reads.get(SCOPE)).toBeGreaterThan(0);
+
+    // The probe sees the difference: the head just committed is remembered,
+    // an unknown head is not.
+    expect(
+      downloads(await missingHeadError(blobs, await registryHash(world))),
+    ).toBe(false);
+    expect(
+      downloads(await missingHeadError(blobs, `0x${"cd".repeat(32)}`)),
+    ).toBe(true);
+  });
+
+  it("a foreign head costs one verified GET and a tampered one is neither accepted nor remembered", async () => {
+    const { world, blobs } = await countedWorld();
+    const foreign = await registryHead(world, [{ id: "theirs" }]);
+    await applyConnection(world.deps, CONNECTION_ID);
+    blobs.gets.clear();
+    // Tampered: the bytes no longer hash to the registry's data hash.
+    const good = (await world.blobs.get(headKey(foreign.dataHash)))!;
+    blobs.replaced.set(
+      headKey(foreign.dataHash),
+      new TextEncoder().encode(
+        new TextDecoder()
+          .decode(good)
+          .replace('"stream":"s1"', '"stream":"s2"'),
+      ),
+    );
+    await seedRun(world.deps, "r1", 2000);
+    await seedRecord(world.deps, "mine", canonicalJson({ id: "mine" }), {
+      stampO: 2000,
+      stampR: "r1",
+    });
+    await expect(publishConnection(world.deps, CONNECTION_ID)).rejects.toThrow(
+      /failed verification: hash_mismatch/,
+    );
+    expect(blobs.gets.get(headKey(foreign.dataHash))).toBe(1);
+
+    // Honest bytes again: the rejected head was not remembered, so it is read
+    // (once) and verified now, and the publish goes through.
+    blobs.replaced.clear();
+    blobs.gets.clear();
+    const results = await publishConnection(world.deps, CONNECTION_ID);
+    expect(results[0]?.outcome).toBe("published");
+    expect(blobs.gets.get(headKey(foreign.dataHash))).toBe(1);
+    expect(downloads(await missingHeadError(blobs, foreign.dataHash))).toBe(
+      false,
+    );
+  });
+
+  it("is not remembered after a CAS conflict", async () => {
+    const { world, blobs } = await countedWorld();
+    const registry = world.registry as MemoryStreamSyncRegistry;
+    // Another device's head lands between this device's upload and its post.
+    let beaten = false;
+    registry.beforePost = async (post) => {
+      if (post.scope !== SCOPE || beaten) return;
+      beaten = true;
+      await registryHead(world, [{ id: "theirs" }]);
+    };
+    expect((await publishRun(world, "r1", 1000)).outcome).toBe("published");
+    const uploaded = blobs.puts
+      .filter((key) => key.includes("/h-"))
+      .map((key) => `0x${key.split("/h-")[1]}`);
+    // This device's first head (the loser), the other device's (the fixture
+    // writes two blobs), then the re-planned head that won on the retry.
+    expect(uploaded.length).toBeGreaterThan(2);
+    const loser = uploaded[0]!;
+    const retried = uploaded[uploaded.length - 1]!;
+    expect(retried).toBe(await registryHash(world));
+    expect(downloads(await missingHeadError(blobs, loser))).toBe(true);
+    expect(downloads(await missingHeadError(blobs, retried))).toBe(false);
+  });
+
+  it("is not remembered when a delete purges the connection before the CAS", async () => {
+    const { world, blobs } = await countedWorld();
+    const hashes = await controlHashes(
+      keccak,
+      await deriveKeyCheck(world.deps.keys.namespaceHmac),
+    );
+    const put = blobs.put;
+    blobs.put = async (key, value) => {
+      if (key.includes("/h-")) {
+        await world.registry.post({
+          ownerAddress: OWNER,
+          scope: CONTROL,
+          dataHash: hashes.tombstoneData,
+          metadataHash: hashes.tombstoneMetadata,
+          expectedVersion: "2",
+          signature: "0x00",
+        });
+      }
+      return put(key, value);
+    };
+    expect((await publishRun(world, "r1", 1000)).outcome).toBe("purged");
+    expect(await world.registry.read(SCOPE)).toEqual({ found: false });
+    const uploaded = blobs.puts.filter((key) => key.includes("/h-"));
+    expect(uploaded).toHaveLength(1);
+    expect(
+      downloads(
+        await missingHeadError(blobs, `0x${uploaded[0]!.split("/h-")[1]}`),
+      ),
+    ).toBe(true);
+  });
+
+  it("is not remembered when a delete purges the connection after the CAS", async () => {
+    const { world, blobs } = await countedWorld();
+    const hashes = await controlHashes(
+      keccak,
+      await deriveKeyCheck(world.deps.keys.namespaceHmac),
+    );
+    const registry = world.registry;
+    Object.assign(world.deps, {
+      registry: {
+        read: registry.read.bind(registry),
+        listControlRows: registry.listControlRows.bind(registry),
+        listStreamRows: registry.listStreamRows.bind(registry),
+        post: async (post: Parameters<typeof registry.post>[0]) => {
+          const result = await registry.post(post);
+          if (post.scope === SCOPE)
+            await registry.post({
+              ownerAddress: OWNER,
+              scope: CONTROL,
+              dataHash: hashes.tombstoneData,
+              metadataHash: hashes.tombstoneMetadata,
+              expectedVersion: "2",
+              signature: "0x00",
+            });
+          return result;
+        },
+      },
+    });
+    expect((await publishRun(world, "r1", 1000)).outcome).toBe("purged");
+    const head = await registryHash(world);
+    // The CAS landed; the local commit never ran; this device did not vouch
+    // for the head.
+    expect(downloads(await missingHeadError(blobs, head))).toBe(true);
+  });
+
+  it("is not remembered when the local commit fails", async () => {
+    const { world, blobs } = await countedWorld();
+    const db = world.deps.db;
+    Object.assign(world.deps, {
+      db: {
+        ...db,
+        query: db.query.bind(db),
+        batch: async (statements: Parameters<typeof db.batch>[0]) => {
+          if (statements.some((s) => s.sql.includes("INTO stream_versions")))
+            throw new Error("disk full");
+          return db.batch(statements);
+        },
+      },
+    });
+    await seedRun(world.deps, "r1", 1000);
+    await seedRecord(world.deps, "a", canonicalJson({ id: "a" }));
+    await expect(publishConnection(world.deps, CONNECTION_ID)).rejects.toThrow(
+      /disk full/,
+    );
+    const head = await registryHash(world);
+    expect(downloads(await missingHeadError(blobs, head))).toBe(true);
+  });
+
+  it("is verified before it is uploaded, posted or remembered", async () => {
+    const { world, blobs } = await countedWorld();
+    heads.corrupt = true;
+    await seedRun(world.deps, "r1", 1000);
+    await seedRecord(world.deps, "a", canonicalJson({ id: "a" }));
+    await expect(publishConnection(world.deps, CONNECTION_ID)).rejects.toThrow(
+      /the head built for s1 failed verification: malformed/,
+    );
+    expect(blobs.puts.filter((key) => key.includes("/h-"))).toEqual([]);
+    expect(
+      (world.registry as MemoryStreamSyncRegistry).log.filter(
+        (entry) => entry.scope === SCOPE,
+      ),
+    ).toEqual([]);
+  });
+
+  it("misses when the key check changed", async () => {
+    const { world, blobs } = await countedWorld();
+    expect((await publishRun(world, "r1", 1000)).outcome).toBe("published");
+    const head = await registryHash(world);
+    expect(downloads(await missingHeadError(blobs, head))).toBe(false);
+    // A namespace key that derives another key check cannot use the entry:
+    // the head is downloaded and refused as another key's.
+    const probe = await makeWorld();
+    Object.assign(probe.deps, {
+      blobs,
+      keys: { ...probe.deps.keys, namespaceHmac: OTHER_HMAC },
+    });
+    await seedConnection(probe.deps);
+    await seedStream(probe.deps);
+    await probe.registry.post({
+      ownerAddress: OWNER,
+      scope: SCOPE,
+      dataHash: head as `0x${string}`,
+      metadataHash: `0x${"22".repeat(32)}`,
+      expectedVersion: "1",
+      signature: "0x00",
+    });
+    blobs.gets.clear();
+    await expect(publishConnection(probe.deps, CONNECTION_ID)).rejects.toThrow(
+      /failed verification: key_mismatch/,
+    );
+    expect(blobs.gets.get(headKey(head))).toBe(1);
+  });
+
+  it("does not stop a newer lifetime from deferring the publish", async () => {
+    const { world: first, blobs } = await countedWorld();
+    // Generation 2: the head this device remembers is a newer lifetime's.
+    await first.deps.db.batch([
+      { sql: "DELETE FROM stream_state" },
+      { sql: "DELETE FROM connections" },
+    ]);
+    await seedConnection(first.deps, 2);
+    await seedStream(first.deps);
+    await seedRun(first.deps, "r1", 1000, { generation: 2 });
+    await seedRecord(first.deps, "a", canonicalJson({ id: "a" }));
+    expect(
+      (await publishConnection(first.deps, CONNECTION_ID))[0]?.outcome,
+    ).toBe("published");
+    const head = await registryHash(first);
+
+    // A database still at generation 1 meets that head at the registry.
+    const behind = await makeWorld();
+    Object.assign(behind.deps, { blobs });
+    await seedConnection(behind.deps, 1);
+    await seedStream(behind.deps);
+    await behind.registry.post({
+      ownerAddress: OWNER,
+      scope: SCOPE,
+      dataHash: head as `0x${string}`,
+      metadataHash: `0x${"22".repeat(32)}`,
+      expectedVersion: "1",
+      signature: "0x00",
+    });
+    await seedRun(behind.deps, "r9", 3000, { generation: 1 });
+    await seedRecord(behind.deps, "b", canonicalJson({ id: "b" }));
+    blobs.gets.clear();
+    const results = await publishConnection(behind.deps, CONNECTION_ID);
+    expect(results[0]?.outcome).toBe("deferred");
+    // Served from the cache, and still not published over.
+    expect(blobs.gets.get(headKey(head)) ?? 0).toBe(0);
+    expect(
+      (behind.registry as MemoryStreamSyncRegistry).log.filter(
+        (entry) => entry.scope === SCOPE,
+      ),
+    ).toHaveLength(1);
   });
 });
