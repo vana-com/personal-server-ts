@@ -945,7 +945,9 @@ async function bootstrapServer(
         localSync = facade;
         return facade;
       } catch (error) {
-        await driver.close();
+        // A worker whose open failed answers every op, close included, with
+        // that open error. The cleanup must not replace the error we report.
+        await driver.close().catch(() => undefined);
         if ((error as { code?: string }).code === "SQLITE_DATABASE_HARD_LINKED")
           throw Object.assign(
             new Error(

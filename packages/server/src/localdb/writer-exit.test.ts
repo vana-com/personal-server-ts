@@ -32,8 +32,13 @@ const SEAM = fileURLToPath(
 
 describe("writer worker exit", () => {
   const dirs: string[] = [];
-  afterEach(() => {
-    workers.length = 0;
+  const gates: (() => void)[] = [];
+  // Teardown cannot depend on the test body reaching its last line: release
+  // every parked worker, end every worker, then delete the directories.
+  afterEach(async () => {
+    for (const release of gates.splice(0)) release();
+    const started = workers.splice(0);
+    await Promise.all(started.map(({ worker }) => worker.terminate()));
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
   });
 
@@ -79,13 +84,14 @@ describe("writer worker exit", () => {
   /** The reader worker parks at `step`; resolves once it is parked there. */
   const parkedReader = (step: "open" | "run") => {
     const gate = new Int32Array(new SharedArrayBuffer(8));
+    const release = () => {
+      Atomics.store(gate, 1, 1);
+      Atomics.notify(gate, 1);
+    };
+    gates.push(release);
     return {
       testSeam: { module: SEAM, data: { park: step, gate: gate.buffer } },
       parked: Atomics.waitAsync(gate, 0, 0).value as Promise<unknown>,
-      release: () => {
-        Atomics.store(gate, 1, 1);
-        Atomics.notify(gate, 1);
-      },
     };
   };
 
@@ -113,7 +119,6 @@ describe("writer worker exit", () => {
 
       expect(await outcome).toMatch(/sqlite_writer_failed/);
       await readerExit;
-      seam.release();
     });
   }
 });
