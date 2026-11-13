@@ -1756,3 +1756,114 @@ describe("the head this device committed", () => {
     ).toHaveLength(1);
   });
 });
+
+describe("the commit step's stream-row fence", () => {
+  /** A registry that counts reads and the results of posts, per scope. */
+  function countingRegistry(inner: StreamSyncRegistry) {
+    const reads = new Map<string, number>();
+    const posts: Array<{ scope: string; kind: string }> = [];
+    return {
+      reads,
+      posts,
+      read: async (scope: string) => {
+        reads.set(scope, (reads.get(scope) ?? 0) + 1);
+        return inner.read(scope);
+      },
+      post: async (request: Parameters<StreamSyncRegistry["post"]>[0]) => {
+        const result = await inner.post(request);
+        posts.push({ scope: request.scope, kind: result.kind });
+        return result;
+      },
+      listControlRows: inner.listControlRows.bind(inner),
+      listStreamRows: inner.listStreamRows.bind(inner),
+    };
+  }
+
+  async function setup() {
+    const world = await makeWorld();
+    await seedConnection(world.deps);
+    await seedStream(world.deps);
+    const counted = countingRegistry(world.registry);
+    Object.assign(world.deps, { registry: counted });
+    return { world, counted };
+  }
+
+  it("reads the stream row once per published stream: the snapshot's read, not a second one before the CAS", async () => {
+    const { world, counted } = await setup();
+    await seedRun(world.deps, "r1", 1000);
+    await seedRecord(world.deps, "a", canonicalJson({ id: "a" }));
+    expect(
+      (await publishConnection(world.deps, CONNECTION_ID))[0]?.outcome,
+    ).toBe("published");
+    expect(counted.reads.get(SCOPE)).toBe(1);
+    expect(counted.posts.filter((p) => p.scope === SCOPE)).toEqual([
+      { scope: SCOPE, kind: "committed" },
+    ]);
+  });
+
+  it("a row that moved between the snapshot and the commit is a 409: the stream re-plans on top of it and is never published over it", async () => {
+    const { world, counted } = await setup();
+    await seedRun(world.deps, "r1", 1000);
+    await seedRecord(world.deps, "mine", canonicalJson({ id: "mine" }));
+    // Another device's head lands while this device uploads.
+    const put = world.deps.blobs.put.bind(world.deps.blobs);
+    let moved = false;
+    world.deps.blobs.put = async (key, bytes) => {
+      if (!moved) {
+        moved = true;
+        await registryHead(world, [{ id: "theirs" }]);
+      }
+      return put(key, bytes);
+    };
+    expect(
+      (await publishConnection(world.deps, CONNECTION_ID))[0]?.outcome,
+    ).toBe("published");
+    // The CAS lost (the other device's own post is not counted here), then
+    // the re-planned head won on top of it.
+    expect(
+      counted.posts.filter((p) => p.scope === SCOPE).map((p) => p.kind),
+    ).toEqual(["conflict", "committed"]);
+    const read = await world.registry.read(SCOPE);
+    expect(read.found && read.version).toBe(2);
+    expect((await published(world)).values.map((v) => v.id).sort()).toEqual([
+      "mine",
+      "theirs",
+    ]);
+  });
+
+  it("the no-op path sends no CAS, so it still re-reads the row and catches a move", async () => {
+    const { world, counted } = await setup();
+    await localRun(world);
+    await seedRecord(world.deps, "a", canonicalJson({ id: "a" }));
+    await seedRunRow(world.deps, "r1", "a", canonicalJson({ id: "a" }));
+    await publishConnection(world.deps, CONNECTION_ID);
+    counted.reads.clear();
+    counted.posts.length = 0;
+
+    // An identical head is a no-op: two reads (snapshot, then the fence).
+    expect(
+      (await publishConnection(world.deps, CONNECTION_ID))[0]?.outcome,
+    ).toBe("noop");
+    expect(counted.reads.get(SCOPE)).toBe(2);
+    expect(counted.posts).toEqual([]);
+
+    // Another device's head lands just after that snapshot's read of the row.
+    const read = counted.read;
+    let moved = false;
+    counted.read = async (scope) => {
+      const row = await read(scope);
+      if (scope === SCOPE && !moved) {
+        moved = true;
+        await registryHead(world, [{ id: "theirs" }]);
+      }
+      return row;
+    };
+    const [result] = await publishConnection(world.deps, CONNECTION_ID);
+    // Not committed as a no-op over the moved row (version 2, the other
+    // device's): re-planned onto it and published as version 3 by one CAS.
+    expect(result?.outcome).toBe("published");
+    expect(counted.posts).toEqual([{ scope: SCOPE, kind: "committed" }]);
+    const row = await world.registry.read(SCOPE);
+    expect(row.found && row.version).toBe(3);
+  });
+});

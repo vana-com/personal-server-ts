@@ -1007,16 +1007,10 @@ async function commitCandidate(
   if ((await readBasis(deps, context, candidate)) !== candidate.basis) {
     return { kind: "invalidated" };
   }
-  // Registry: the stream row is the one the candidate was built over.
-  const read = await deps.registry.read(scope);
-  const version = read.found ? read.version : 0;
-  const dataHash = read.found ? read.dataHash.toLowerCase() : null;
-  if (
-    version !== candidate.registryVersion ||
-    dataHash !== (candidate.registryDataHash?.toLowerCase() ?? null)
-  ) {
-    return { kind: "invalidated" };
-  }
+  // The registry row is not re-read here. A CAS follows (below) and is the
+  // fence: a stale expectedVersion answers 409, the winner is applied, the
+  // stream re-plans and is never marked published. The no-op path sends no
+  // CAS and re-reads the row itself.
   const { dataHash: headHash, blobName } = prepared;
   const commit = (version: number, isNewVersion: boolean) =>
     commitBatch(deps, connectionId, stream, {
@@ -1041,6 +1035,17 @@ async function commitCandidate(
   // CAS and record the local state (watermark advances, the head is already
   // published).
   if (prepared.encryptedLength === null) {
+    // No CAS follows, so this read is the only fence: the registry row is
+    // still the one the candidate was built over.
+    const read = await deps.registry.read(scope);
+    const version = read.found ? read.version : 0;
+    const dataHash = read.found ? read.dataHash.toLowerCase() : null;
+    if (
+      version !== candidate.registryVersion ||
+      dataHash !== (candidate.registryDataHash?.toLowerCase() ?? null)
+    ) {
+      return { kind: "invalidated" };
+    }
     const checked = await checkControl(deps, connectionId, connection, hashes);
     if (checked) return done({ stream, outcome: checked, watermark });
     await commit(candidate.registryVersion, false);
