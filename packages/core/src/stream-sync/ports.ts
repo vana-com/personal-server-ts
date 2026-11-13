@@ -76,6 +76,18 @@ export interface StreamSyncRegistry {
   listStreamRows(
     connector: string,
   ): Promise<readonly { readonly scope: string; readonly read: ControlRead }[]>;
+  /**
+   * The control row of one connection and every stream row in its namespace,
+   * deleted or not, in one pass over the owner's rows. A publish takes its
+   * snapshot's starting point from it instead of reading each row. The rows
+   * are a hint: the commit still re-checks the control row and posts with
+   * compare-and-set. A registry that cannot list in one pass leaves this out,
+   * and publish reads each row itself.
+   */
+  listConnectionRows?(
+    connector: string,
+    ns: string,
+  ): Promise<readonly { readonly scope: string; readonly read: ControlRead }[]>;
 }
 
 /** Encrypted blob storage, keyed `<physical scope>/<blob name>`. */

@@ -321,6 +321,12 @@ export async function listStreamBlobs(
  * bytes against the id: it never takes the lazy-fetch path of
  * `BlobStore.get`, which rebuilds references from live records. An attachment
  * with no bytes fails the upload; it is never skipped. Needs no queue slot.
+ *
+ * With `probe` false a blob is uploaded without asking storage whether it is
+ * there. A name is the hash of the clear bytes, so an upload of a stored name
+ * keeps or replaces the object with another encryption of the same clear
+ * bytes: skipping the probe can repeat an upload and never leave a blob
+ * missing. For a stream with no registry row only.
  */
 export async function uploadBlobs(
   deps: LocalSyncDeps,
@@ -328,6 +334,7 @@ export async function uploadBlobs(
   meter?: PublishMeter,
   /** Called before each probe and before each upload request, after the storage layer's waits; a throw stops it. */
   beforeUpload?: () => void,
+  probe = true,
 ): Promise<void> {
   const store = meter ? meteredBlobs(deps, meter) : deps.blobs;
   let uploaded = uploadedBlobs.get(deps.db);
@@ -335,7 +342,7 @@ export async function uploadBlobs(
   for (const { blobId, key, scope } of blobs) {
     if (uploaded.has(key)) continue;
     beforeUpload?.();
-    if (await store.exists(key)) {
+    if (probe && (await store.exists(key))) {
       uploaded.add(key);
       continue;
     }

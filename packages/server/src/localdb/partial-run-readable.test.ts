@@ -461,8 +461,11 @@ describe("a stream of many parts publishes while storage refuses read bursts", (
   it("stalls the same publish when a refused read is not retried", async () => {
     const { w, storage, first, second } = await twoPublishes(1);
     expect(storage.stats.refused).toBeGreaterThan(0);
-    // The failure is reported, and the stream stays at its first version.
-    expect([...first, ...second].some((error) => error !== null)).toBe(true);
-    expect(await w.read("following")).toBe(404);
+    // A first publish probes nothing, so it reads nothing and publishes. The
+    // second downloads each base part: a refused read there is reported, and
+    // the stream stays at its first version.
+    expect(first).toEqual([null]);
+    expect(second.some((error) => error !== null)).toBe(true);
+    expect(await w.read("following")).toBe(200);
   });
 });

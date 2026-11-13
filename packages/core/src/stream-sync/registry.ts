@@ -185,5 +185,13 @@ export function createGatewayStreamSyncRegistry(
         const parsed = parseScope(scope);
         return parsed?.kind === "stream" && parsed.connector === connector;
       }),
+
+    listConnectionRows: (connector, ns) =>
+      listRows((scope) => {
+        const parsed = parseScope(scope);
+        return (
+          parsed !== null && parsed.connector === connector && parsed.ns === ns
+        );
+      }),
   };
 }

@@ -443,10 +443,10 @@ describe("publishConnection", () => {
       encodeEncryptMs: 10,
       partsUploaded: 1,
       bytesUploaded: sizes.reduce((sum, size) => sum + size, 0),
-      // Part probed with a HEAD and head with a GET (2 ms each), then both written (5 ms each).
-      blobGets: 2,
+      // A first publish has no registry row, so nothing is probed: both files are written (5 ms each).
+      blobGets: 0,
       blobPuts: 2,
-      uploadMs: 14,
+      uploadMs: 10,
       // Signing 3 and posting 11.
       headRegisterMs: 14,
       totalMs: clock,
