@@ -340,3 +340,53 @@ describe("createStorageStreamSyncBlobs", () => {
     expect(conflict).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("createStorageStreamSyncBlobs.exists", () => {
+  it("answers from the storage probe and never reads the body", async () => {
+    const download = vi.fn(async () => new Uint8Array([1, 2, 3]));
+    const exists = vi.fn(async () => true);
+    const blobs = createStorageStreamSyncBlobs(
+      adapter({ download, exists }),
+      policy(),
+    );
+    await expect(blobs.exists("scope/blob")).resolves.toBe(true);
+    expect(exists).toHaveBeenCalledTimes(1);
+    expect(download).not.toHaveBeenCalled();
+  });
+
+  it("reads a probe answering not found as missing", async () => {
+    const exists = vi.fn(async () => false);
+    const blobs = createStorageStreamSyncBlobs(adapter({ exists }), policy());
+    await expect(blobs.exists("scope/blob")).resolves.toBe(false);
+  });
+
+  it("retries a probe that failed with a 500, then answers", async () => {
+    const exists = vi
+      .fn()
+      .mockRejectedValueOnce(failed(500))
+      .mockResolvedValue(true);
+    const blobs = createStorageStreamSyncBlobs(adapter({ exists }), policy());
+    await expect(blobs.exists("scope/blob")).resolves.toBe(true);
+    expect(exists).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([401, 403])(
+    "fails at once on a probe refused with %i, never as missing",
+    async (status) => {
+      const exists = vi.fn().mockRejectedValue(failed(status));
+      const blobs = createStorageStreamSyncBlobs(adapter({ exists }), policy());
+      await expect(blobs.exists("scope/blob")).rejects.toThrow(String(status));
+      expect(exists).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("throws a persistent 5xx probe after its attempts, never as missing", async () => {
+    const exists = vi.fn().mockRejectedValue(failed(500));
+    const blobs = createStorageStreamSyncBlobs(
+      adapter({ exists }),
+      policy({ maxAttempts: 3 }),
+    );
+    await expect(blobs.exists("scope/blob")).rejects.toThrow("500");
+    expect(exists).toHaveBeenCalledTimes(3);
+  });
+});

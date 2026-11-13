@@ -192,7 +192,7 @@ export async function runLegacyRetireDryRun(
         listControlRows: unavailable,
         listStreamRows: unavailable,
       },
-      blobs: { get: unavailable, put: unavailable },
+      blobs: { get: unavailable, put: unavailable, exists: unavailable },
       keys: {
         namespaceHmac: unavailable,
         encrypt: unavailable,

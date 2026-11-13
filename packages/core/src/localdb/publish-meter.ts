@@ -15,6 +15,7 @@ export interface PublishMeter {
   uploadMs: number;
   /** Signing and posting the head to the registry. */
   headRegisterMs: number;
+  /** Blob reads: a GET of a body, or an existence probe (a HEAD, no body). */
   blobGets: number;
   blobPuts: number;
   /** Part blobs written (a part already in storage is a GET and no PUT). */
@@ -65,6 +66,10 @@ export function meteredBlobs(
     get: (key) => {
       meter.blobGets += 1;
       return timed(deps, add, () => deps.blobs.get(key));
+    },
+    exists: (key) => {
+      meter.blobGets += 1;
+      return timed(deps, add, () => deps.blobs.exists(key));
     },
     put: async (key, bytes) => {
       meter.blobPuts += 1;

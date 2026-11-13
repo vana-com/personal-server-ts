@@ -61,13 +61,14 @@ async function fresh(partTargetBytes?: number) {
     sealBytes(testKey, clear, (n) => randomBytes(n)),
   );
   const get = vi.fn(async (key: string) => blobs.get(key) ?? null);
+  const exists = vi.fn(async (key: string) => blobs.has(key));
   const put = vi.fn(async (key: string, bytes: Uint8Array) => {
     blobs.set(key, bytes.slice());
   });
   // Encoding must not call registry, queue, signer, or another PS-2 body.
   const deps = {
     db,
-    blobs: { get, put },
+    blobs: { get, exists, put },
     keys: { encryptPart },
     ...(partTargetBytes === undefined ? {} : { partTargetBytes }),
   } as LocalSyncDeps;
@@ -145,6 +146,7 @@ async function fresh(partTargetBytes?: number) {
     deps,
     blobs,
     get,
+    exists,
     put,
     encryptPart,
     insert,
@@ -257,9 +259,11 @@ describe("encodePrefixes", () => {
       expect(f.blobs.get(input.scope + "/" + existingName)).toBe(
         existingCipher,
       );
-      expect(f.get.mock.calls.map(([key]) => key)).toEqual(
+      // The existence probe is a HEAD: it asks about each part and reads none.
+      expect(f.exists.mock.calls.map(([key]) => key)).toEqual(
         parts.map((part) => input.scope + "/" + part.blobName),
       );
+      expect(f.get).not.toHaveBeenCalled();
       expect(f.put).toHaveBeenCalledTimes(3);
       expect(f.encryptPart).toHaveBeenCalledTimes(3);
       expect(f.put.mock.calls.some(([key]) => key.endsWith(existingName))).toBe(

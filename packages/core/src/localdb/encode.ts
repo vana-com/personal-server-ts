@@ -296,7 +296,7 @@ export async function uploadFrozenParts(
       const { hash: partHash, bytes, count } = part.entry;
       const blobName = `g${input.generation}-p-${partHash}`;
       const key = `${input.scope}/${blobName}`;
-      if ((await blobs.get(key)) === null) {
+      if (!(await blobs.exists(key))) {
         await blobs.put(
           key,
           await deps.keys.encryptPart(input.scope, part.data),

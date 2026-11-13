@@ -83,6 +83,12 @@ export interface StreamSyncBlobs {
   put(key: string, bytes: Uint8Array): Promise<void>;
   /** `null` when the blob does not exist. */
   get(key: string): Promise<Uint8Array | null>;
+  /**
+   * Whether the blob exists, without reading its body. Only a definitive
+   * "not found" answers `false`; any other failure throws, never reads as
+   * present or absent.
+   */
+  exists(key: string): Promise<boolean>;
 }
 
 /**
