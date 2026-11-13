@@ -32,7 +32,7 @@ vi.mock("../../../core/src/localdb/blobs.js", () => ({
 vi.mock("../../../core/src/localdb/delete.js", () => ({
   createConnectionDeleter: () => ({
     requestConnectionDelete: vi.fn(),
-    resumeDeletes: vi.fn(),
+    resumeDeletes: vi.fn(async () => []),
   }),
 }));
 vi.mock("../../../core/src/localdb/older-versions.js", () => ({
