@@ -516,3 +516,36 @@ it("import accepts a collection floor without treating it as a delete", async ()
   ]);
   expect((await f.run()).kind).toBe("already-imported");
 });
+
+it("an import wakes publish once when it imports, and not on a replay or a refusal", async () => {
+  const f = await fixture();
+  const wake = vi.fn();
+  Object.assign(f.deps, { recordsCommitted: wake });
+  // More rows than one chunk: a wake per chunk would be more than one.
+  f.setValues(
+    Array.from({ length: IMPORT_CHUNK_ROWS * 2 + 1 }, (_, i) => ({
+      id: `row-${i}`,
+    })),
+  );
+  expect((await f.run()).kind).toBe("imported");
+  expect(wake).toHaveBeenCalledTimes(1);
+  expect((await f.run()).kind).toBe("already-imported");
+  expect(wake).toHaveBeenCalledTimes(1);
+  Object.assign(f.source, { owner: "0xdef" });
+  expect((await f.run()).kind).toBe("refused");
+  expect(wake).toHaveBeenCalledTimes(1);
+});
+
+it("a publish wake that throws does not fail the import", async () => {
+  const f = await fixture();
+  const warn = vi.fn();
+  Object.assign(f.deps, {
+    logger: { info() {}, warn },
+    recordsCommitted: () => {
+      throw new Error("no manager");
+    },
+  });
+  expect((await f.run()).kind).toBe("imported");
+  expect(await f.db.query("SELECT record_key FROM records")).toHaveLength(2);
+  expect(warn).toHaveBeenCalledTimes(1);
+});

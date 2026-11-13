@@ -923,6 +923,7 @@ async function bootstrapServer(
           logger,
           now: Date.now,
           newOp: randomUUID,
+          recordsCommitted: () => syncManager?.notifyNewData(),
           ...(options?.streamSyncPartTargetBytes === undefined
             ? {}
             : { partTargetBytes: options.streamSyncPartTargetBytes }),
