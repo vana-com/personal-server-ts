@@ -51,13 +51,13 @@ export function createVanaSyncStorageAdapter(params: {
 
   // enclave sandbox --> public blob GET ----------> vana-storage
   // desktop/cloud ---> signed PUT / GET / DELETE -> vana-storage
-  const downloadBounded = boundedBlobDownload(
-    `${endpoint}/v1/chains/${chainId}/blobs/${owner}/`,
-  );
+  const blobPrefix = `${endpoint}/v1/chains/${chainId}/blobs/${owner}/`;
+  const downloadBounded = boundedBlobDownload(blobPrefix);
   if (params.reads === PUBLIC_READS) {
     // TODO(decision): blob reads stay public (architecture, resolved 2026-09-02); revisit if storage adds read auth.
     return {
       ...createPublicReadAdapter({ endpoint, chainId, owner }),
+      exists: headProbe(blobPrefix),
       downloadBounded,
     };
   }
@@ -104,7 +104,37 @@ export function createVanaSyncStorageAdapter(params: {
             return `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${subpath}`;
           },
         });
-  return { ...adapter, downloadBounded };
+  return { ...adapter, exists: headProbe(blobPrefix), downloadBounded };
+}
+
+/**
+ * Existence by an HTTP HEAD on the blob URL: the body is never read. Storage
+ * serves blob HEAD publicly, like GET, so the probe carries no authorization.
+ * Only a 200 answers "present" and only a 404 "absent"; every other status
+ * (204, 202, redirects included) throws, so the caller's
+ * retry policy applies and a refusal is never read as a missing blob.
+ */
+function headProbe(prefix: string): StorageAdapter["exists"] {
+  return async (url, signal) => {
+    const parsed = new URL(url);
+    if (
+      !parsed.href.startsWith(prefix) ||
+      ENCODED_PATH_SEPARATOR_PATTERN.test(parsed.pathname)
+    )
+      throw new Error("Blob URL does not match configured namespace");
+    const response = await fetch(parsed.href, {
+      method: "HEAD",
+      cache: "no-store",
+      redirect: "error",
+      ...(signal ? { signal } : {}),
+    });
+    await response.body?.cancel();
+    if (response.status === 200) return true;
+    if (response.status === 404) return false;
+    throw Object.assign(new Error(`Blob probe failed (${response.status})`), {
+      status: response.status,
+    });
+  };
 }
 
 /**

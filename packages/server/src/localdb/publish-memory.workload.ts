@@ -49,6 +49,7 @@ async function makeDeps(
     // would itself grow with the stream and hide what the publisher holds.
     blobs: {
       get: async () => null,
+      exists: async () => false,
       put: async (_key, bytes) => {
         sink.puts += 1;
         sink.bytes += bytes.length;
