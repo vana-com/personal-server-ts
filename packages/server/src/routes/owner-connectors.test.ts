@@ -94,7 +94,6 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
       config: ServerConfigSchema.parse({
         streamSync: {
           write: opts.switched || opts.unwired === true,
-          refuseLegacyWrites: opts.switched,
         },
       }),
       streamSyncAdmitting: () => opts.closing !== true,

@@ -54,7 +54,7 @@ describe("createApp legacy-write refusal", () => {
 
   function makeApp(
     accountModeAuthority?: ModeAuthority,
-    streamSync: { write?: boolean; refuseLegacyWrites?: boolean } = {},
+    streamSync: { write?: boolean } = {},
   ) {
     return createApp({
       logger: pino({ level: "silent" }),
@@ -144,7 +144,7 @@ describe("createApp legacy-write refusal", () => {
       store: createMemoryModeRecordStore(),
     });
     await flagOnly.ready;
-    const app = makeApp(flagOnly, { write: true, refuseLegacyWrites: false });
+    const app = makeApp(flagOnly, { write: true });
     expect((await post(app)).status).toBe(503);
   });
 
