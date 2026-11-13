@@ -239,15 +239,17 @@ export function createMemoryDataStorage(
         0,
       );
     },
-    updateDataPointId(path, dataPointId) {
+    updateDataPointId(path, dataPointId, expectedId) {
       const entry = byPath(path);
-      if (!entry) return false;
+      if (!entry || (expectedId !== undefined && entry.id !== expectedId))
+        return false;
       entry.dataPointId = dataPointId;
       return true;
     },
-    updateEntryVersion(path, version) {
+    updateEntryVersion(path, version, expectedId) {
       const entry = byPath(path);
-      if (!entry) return false;
+      if (!entry || (expectedId !== undefined && entry.id !== expectedId))
+        return false;
       entry.version = version;
       return true;
     },

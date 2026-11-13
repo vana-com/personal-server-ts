@@ -722,9 +722,12 @@ export async function createPersistentPsLiteStorage(
   function updateEntryField(
     path: string,
     patch: Partial<Pick<IndexEntry, "fileId" | "dataPointId" | "version">>,
+    expectedId?: number,
   ): Promise<boolean> {
     return updateIndex((current) => {
-      if (!current.entries.some((entry) => entry.path === path)) return null;
+      const row = current.entries.find((entry) => entry.path === path);
+      if (!row || (expectedId !== undefined && row.id !== expectedId))
+        return null;
       return {
         ...current,
         entries: current.entries.map((entry) =>
@@ -1229,12 +1232,12 @@ export async function createPersistentPsLiteStorage(
       );
     },
 
-    updateDataPointId(path, dataPointId) {
-      return updateEntryField(path, { dataPointId });
+    updateDataPointId(path, dataPointId, expectedId) {
+      return updateEntryField(path, { dataPointId }, expectedId);
     },
 
-    updateEntryVersion(path, version) {
-      return updateEntryField(path, { version });
+    updateEntryVersion(path, version, expectedId) {
+      return updateEntryField(path, { version }, expectedId);
     },
 
     async readFirstSeenLedger(scope) {

@@ -825,6 +825,32 @@ describe("IndexManager", () => {
     expect(manager.findLatestVersionByScope("instagram.profile")).toBe(2);
   });
 
+  it("updateDataPointId and updateVersion apply only to the row named by expectedId", () => {
+    const entry = manager.insert(HOLD_FOR_TESTS, {
+      fileId: null,
+      path: "ig/profile/2026-01-01T00-00-00Z.json",
+      scope: "instagram.profile",
+      collectedAt: "2026-01-01T00:00:00Z",
+      sizeBytes: 100,
+    });
+
+    expect(manager.updateVersion(entry.path, 4, entry.id + 1)).toBe(false);
+    expect(manager.updateDataPointId(entry.path, "0xa", entry.id + 1)).toBe(
+      false,
+    );
+    expect(manager.findByPath(entry.path)).toMatchObject({
+      version: entry.version,
+      dataPointId: null,
+    });
+
+    expect(manager.updateVersion(entry.path, 4, entry.id)).toBe(true);
+    expect(manager.updateDataPointId(entry.path, "0xa", entry.id)).toBe(true);
+    expect(manager.findByPath(entry.path)).toMatchObject({
+      version: 4,
+      dataPointId: "0xa",
+    });
+  });
+
   it("updateDataPointId persists the id and returns true", () => {
     const entry = manager.insert(HOLD_FOR_TESTS, {
       fileId: null,

@@ -389,16 +389,18 @@ export function createMemoryPsLiteStorage(
       );
     },
 
-    updateDataPointId(path, dataPointId) {
+    updateDataPointId(path, dataPointId, expectedId) {
       const entry = entries.get(path);
-      if (!entry) return false;
+      if (!entry || (expectedId !== undefined && entry.id !== expectedId))
+        return false;
       entries.set(path, { ...entry, dataPointId });
       return true;
     },
 
-    updateEntryVersion(path, version) {
+    updateEntryVersion(path, version, expectedId) {
       const entry = entries.get(path);
-      if (!entry) return false;
+      if (!entry || (expectedId !== undefined && entry.id !== expectedId))
+        return false;
       entries.set(path, { ...entry, version });
       return true;
     },
