@@ -132,14 +132,27 @@ export function newSpoolAttempt(): string {
   ).join("");
 }
 
-/** Delete an attempt's spool rows: on commit, on discard, on failure. */
+/**
+ * Delete an attempt's spool rows: on commit, on discard, on failure. `prefixes`
+ * are the ones the attempt froze (`freezePrefixRows`), so each delete is one
+ * key range on the spool's primary key. One batch per prefix, so no batch holds
+ * the worker for the whole spool. Rows outside those prefixes are not possible:
+ * only `freezePrefixRows` writes an attempt's rows, and only for these prefixes.
+ */
 export async function dropSpool(
   deps: LocalSyncDeps,
   attempt: string,
+  prefixes: readonly string[],
 ): Promise<void> {
-  await deps.db.batch([
-    { sql: "DELETE FROM publish_spool WHERE attempt = ?", params: [attempt] },
-  ]);
+  for (const prefix of new Set(prefixes)) {
+    const range = keyRange(prefix);
+    await deps.db.batch([
+      {
+        sql: `DELETE FROM publish_spool WHERE attempt = ?${range.sql}`,
+        params: [attempt, ...range.params],
+      },
+    ]);
+  }
 }
 
 /**
@@ -379,6 +392,6 @@ export async function encodePrefixes(
       frozen: await freezePrefixRows(deps, { ...input, attempt }),
     });
   } finally {
-    await dropSpool(deps, attempt);
+    await dropSpool(deps, attempt, input.changedPrefixes);
   }
 }

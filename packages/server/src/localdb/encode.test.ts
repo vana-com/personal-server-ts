@@ -396,7 +396,7 @@ describe("a transfer reads the spool the snapshot made", () => {
     await freezePrefixRows(f.deps, prefixes);
     await freezePrefixRows(f.deps, { ...prefixes, attempt: "attempt-2" });
     expect(await spooled(f)).toBe(4);
-    await dropSpool(f.deps, "attempt-1");
+    await dropSpool(f.deps, "attempt-1", prefixes.changedPrefixes);
     expect(
       await f.db.query("SELECT DISTINCT attempt FROM publish_spool"),
     ).toEqual([{ attempt: "attempt-2" }]);
@@ -563,5 +563,21 @@ describe("a freeze over many prefixes, one batch each, copies the same spool", (
     expect((await f.read(parts)).map((row) => row.k)).toEqual(
       [...expectedKeys].sort(),
     );
+  });
+
+  it("drops exactly one attempt's rows across its prefixes", async () => {
+    const f = await fresh();
+    await f.insert(expectedKeys.map((k) => ({ k })));
+    const request = { ...input, changedPrefixes: prefixes };
+    await freezePrefixRows(f.deps, { ...request, attempt: "attempt-1" });
+    await freezePrefixRows(f.deps, { ...request, attempt: "attempt-2" });
+    expect(await spoolRows(f, "attempt-1")).toHaveLength(32);
+    await dropSpool(f.deps, "attempt-1", prefixes);
+    expect(await spoolRows(f, "attempt-1")).toEqual([]);
+    expect(await spoolRows(f, "attempt-2")).toHaveLength(32);
+    // The records themselves are untouched.
+    expect(await f.db.query("SELECT count(*) AS n FROM records")).toEqual([
+      { n: 32 },
+    ]);
   });
 });
