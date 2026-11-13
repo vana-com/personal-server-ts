@@ -49,6 +49,15 @@ import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 // Seeds (import rows with stamp (0, "seed")) publish only into generation
 // 1; otherwise they are purged and the ledger records excluded(seed_skipped).
 //
+// Streams of one connection run together, up to `streamConcurrency`. Each
+// stream's turns take the slot one at a time, so the control row is settled
+// by whichever snapshot runs first and every other stream sees it active; the
+// transfers overlap. Each stream's own state (stream_state row, spool attempt,
+// watermark) is its own; the connection's state (control, apply) is only
+// touched in a slot turn, and a change to it shows in the other streams'
+// readBasis. A purge sets a latch in its turn: streams still running stop at
+// their next turn or upload and report "purged"; no stream starts after it.
+//
 // Queue: this module takes the connection's "publish" slot itself, for the
 // snapshot and the commit. The caller must not hold it. applyConnection and
 // purgeConnection, called inside a turn, run inline in that turn.
