@@ -547,7 +547,8 @@ describe("streams of one connection publish together", () => {
       () => (settled = true),
       () => (settled = true),
     );
-    // A few macrotask turns: whatever a failure would set going has run.
+    // Deferred gates control upload order. A few setImmediate turns, not
+    // timers: whatever a failure would set going has run.
     const quiet = async () => {
       for (let turn = 0; turn < 10; turn++)
         await new Promise<void>((r) => setImmediate(r));

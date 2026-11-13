@@ -366,6 +366,18 @@ describe("createStorageStreamSyncBlobs", () => {
       const promise = new Promise<void>((r) => (release = r));
       return { promise, release };
     };
+    /** Records how `promise` settled, so a test can wait on it with `vi.waitFor`. */
+    const outcomeOf = (promise: Promise<unknown>) => {
+      const outcome: { done: boolean; error?: unknown } = { done: false };
+      promise.then(
+        () => (outcome.done = true),
+        (error: unknown) => {
+          outcome.error = error;
+          outcome.done = true;
+        },
+      );
+      return outcome;
+    };
 
     it("does not start an upload that queued for the single PUT slot while the caller was current", async () => {
       // A holds the one slot; B queues for it; C (the purge) makes the caller
@@ -412,6 +424,76 @@ describe("createStorageStreamSyncBlobs", () => {
       await putA;
       await rejection;
       expect(upload.mock.calls.map(([key]) => key)).toEqual(["scope/a"]);
+    });
+
+    it("frees the single PUT slot when a queued upload's guard throws", async () => {
+      // A holds the one PUT slot; B queues for it and its guard throws when
+      // the slot reaches it. The slot must come back: a fresh upload C runs.
+      const a = deferred();
+      const upload = vi.fn(async (key: string) => {
+        if (key === "scope/a") await a.promise;
+        return key;
+      });
+      const blobs = createStorageStreamSyncBlobs(
+        adapter({ upload }),
+        policy({ maxConcurrentPuts: 1 }),
+      );
+      const { state, guard } = staleness();
+      const putA = blobs.put("scope/a", new Uint8Array([1]), guard);
+      await vi.waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
+      const putB = outcomeOf(blobs.put("scope/b", new Uint8Array([2]), guard));
+      state.stale = true;
+      a.release();
+      await putA;
+      // Bounded: if B never settles, this wait fails the test instead of hanging it.
+      await vi.waitFor(() => expect(putB.done).toBe(true));
+      expect(putB.error).toEqual(new Error("connection purged"));
+      expect(upload.mock.calls.map(([key]) => key)).toEqual(["scope/a"]);
+      // Bounded: a slot left taken fails this wait instead of hanging the test.
+      const putC = blobs.put("scope/c", new Uint8Array([3]), staleness().guard);
+      await vi.waitFor(() =>
+        expect(upload.mock.calls.map(([key]) => key)).toContain("scope/c"),
+      );
+      await expect(putC).resolves.toBeUndefined();
+      expect(upload.mock.calls.map(([key]) => key)).toEqual([
+        "scope/a",
+        "scope/c",
+      ]);
+    });
+
+    it("frees the shared storage limit when a queued upload's guard throws", async () => {
+      // Same, through `maxConcurrent`: B takes the shared slot, its guard
+      // throws, and the slot must come back for a fresh upload C.
+      const a = deferred();
+      const upload = vi.fn(async (key: string) => {
+        if (key === "scope/a") await a.promise;
+        return key;
+      });
+      const blobs = createStorageStreamSyncBlobs(
+        adapter({ upload }),
+        policy({ maxConcurrentPuts: 2, maxConcurrent: 1 }),
+      );
+      const { state, guard } = staleness();
+      const putA = blobs.put("scope/a", new Uint8Array([1]), guard);
+      await vi.waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
+      const putB = outcomeOf(blobs.put("scope/b", new Uint8Array([2]), guard));
+      state.stale = true;
+      a.release();
+      await putA;
+      // Bounded: if B never settles, this wait fails the test instead of hanging it.
+      await vi.waitFor(() => expect(putB.done).toBe(true));
+      expect(putB.error).toEqual(new Error("connection purged"));
+      expect(upload.mock.calls.map(([key]) => key)).toEqual(["scope/a"]);
+      // Bounded: a slot left taken fails this wait instead of hanging the test.
+      const putC = blobs.put("scope/c", new Uint8Array([3]), staleness().guard);
+      await vi.waitFor(() =>
+        expect(upload.mock.calls.map(([key]) => key)).toContain("scope/c"),
+      );
+      await expect(putC).resolves.toBeUndefined();
+      expect(upload.mock.calls.map(([key]) => key)).toEqual([
+        "scope/a",
+        "scope/c",
+      ]);
     });
 
     it("makes no second attempt when the caller went stale during the retry delay", async () => {
