@@ -80,9 +80,25 @@ export interface StreamSyncRegistry {
 
 /** Encrypted blob storage, keyed `<physical scope>/<blob name>`. */
 export interface StreamSyncBlobs {
-  put(key: string, bytes: Uint8Array): Promise<void>;
+  /**
+   * `beforeAttempt` runs immediately before each request that sends the bytes,
+   * after every wait for a turn or a retry delay; a throw stops the upload and
+   * reaches the caller. A request already sent cannot be recalled.
+   */
+  put(
+    key: string,
+    bytes: Uint8Array,
+    beforeAttempt?: () => void,
+  ): Promise<void>;
   /** `null` when the blob does not exist. */
   get(key: string): Promise<Uint8Array | null>;
+  /**
+   * Whether the blob exists. The Vana adapter uses HEAD and reads no body; the
+   * SDK fallback downloads the blob. Only a definitive
+   * "not found" answers `false`; any other failure throws, never reads as
+   * present or absent.
+   */
+  exists(key: string): Promise<boolean>;
 }
 
 /**

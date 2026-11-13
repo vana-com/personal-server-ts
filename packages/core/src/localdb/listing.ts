@@ -2,6 +2,7 @@ import { sha256 } from "@noble/hashes/sha2";
 import type { StreamSyncReadStatus } from "../stream-sync-read/service.js";
 import { logicalStreamScopeParts } from "../stream-sync-read/routing.js";
 import type { LocalSyncDeps } from "./deps.js";
+import { readerOf } from "./driver.js";
 import type { OlderVersionCounts } from "./older-versions.js";
 import { createRecordQuery } from "./query.js";
 import {
@@ -108,8 +109,11 @@ export function createLocalListing(
   },
   counts: () => OlderVersionCounts,
 ): LocalListing {
+  // Listing and status only read: they take the read connection, so they do
+  // not wait for a long import or publish batch on the writer.
+  const reads = { db: readerOf(deps.db) };
   const connections = () =>
-    deps.db.query<Connection>(
+    reads.db.query<Connection>(
       "SELECT connection_id, connector, ns, generation, control_state FROM connections ORDER BY connector, ns, connection_id",
     );
 
@@ -119,11 +123,11 @@ export function createLocalListing(
    * caller's authority, so overlapping callers share one.
    */
   async function readSnapshot(): Promise<readonly Entry[]> {
-    const rows = await deps.db.query<SelectionConnection>(
+    const rows = await reads.db.query<SelectionConnection>(
       "SELECT connection_id, connector, ns, generation, control_state, deleted_at FROM connections ORDER BY connector, ns, connection_id",
     );
-    const streams = await loadStreams(deps);
-    const stamps = await deps.db.query<{
+    const streams = await loadStreams(reads);
+    const stamps = await reads.db.query<{
       connection_id: string;
       stream: string;
       records: number;
@@ -131,7 +135,7 @@ export function createLocalListing(
     }>(
       "SELECT connection_id, stream, COUNT(*) AS records, MAX(stamp_o) AS stamped_at FROM records GROUP BY connection_id, stream",
     );
-    const heads = await deps.db.query<{
+    const heads = await reads.db.query<{
       connection_id: string;
       stream: string;
       observed_at: number;
@@ -278,7 +282,7 @@ export function createLocalListing(
     const projected = await projectAlias(
       target.alias,
       chosen,
-      createRecordQuery(deps.db),
+      createRecordQuery(reads.db),
       new Date(deps.now()).toISOString(),
     );
     return projected.kind === "ok";
@@ -315,7 +319,7 @@ export function createLocalListing(
 
     async status() {
       const rows = await connections();
-      const states = await deps.db.query<StreamState>(
+      const states = await reads.db.query<StreamState>(
         "SELECT s.*, (SELECT COUNT(*) FROM records r WHERE r.connection_id = s.connection_id AND r.stream = s.stream) AS records FROM stream_state s ORDER BY s.connection_id, s.stream",
       );
       const result: StreamSyncReadStatus["connections"][number][] = [];
@@ -362,10 +366,10 @@ export function createLocalListing(
     async cacheKey() {
       // Include every column, not only a control version or the newest head:
       // local edits, deletions and changes to unselected connections count too.
-      const controls = await deps.db.query(
+      const controls = await reads.db.query(
         "SELECT * FROM connections ORDER BY connection_id",
       );
-      const heads = await deps.db.query(
+      const heads = await reads.db.query(
         "SELECT * FROM stream_state ORDER BY connection_id, stream",
       );
       const digest = sha256(

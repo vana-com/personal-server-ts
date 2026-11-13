@@ -59,6 +59,7 @@ export async function remoteFixture(
   };
   const storage = {
     get: async (key: string) => blobs.get(key) ?? null,
+    exists: async (key: string) => blobs.has(key),
     put: async (key: string, bytes: Uint8Array) => {
       blobs.set(key, bytes);
     },

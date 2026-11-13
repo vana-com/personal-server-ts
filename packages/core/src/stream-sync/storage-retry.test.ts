@@ -236,7 +236,7 @@ describe("createConcurrencyLimit", () => {
   });
 });
 
-function adapter(over: Partial<StorageAdapter>): StorageAdapter {
+function adapter(over: Partial<StorageAdapter> = {}): StorageAdapter {
   return {
     upload: vi.fn(async (key: string) => key),
     urlForKey: (key: string) => `https://storage.test/${key}`,
@@ -319,6 +319,316 @@ describe("createStorageStreamSyncBlobs", () => {
     expect(refused).toBe(0);
   });
 
+  describe("limits that are not a positive whole number", () => {
+    it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, undefined])(
+      "refuses %s for maxConcurrentPuts and maxConcurrent",
+      (bad) => {
+        expect(() =>
+          createStorageStreamSyncBlobs(
+            adapter(),
+            policy({ maxConcurrentPuts: bad as number }),
+          ),
+        ).toThrow(/maxConcurrentPuts must be a positive whole number/);
+        expect(() =>
+          createStorageStreamSyncBlobs(
+            adapter(),
+            policy({ maxConcurrent: bad as number }),
+          ),
+        ).toThrow(/maxConcurrent must be a positive whole number/);
+        expect(() =>
+          createStorageAccess(policy({ maxConcurrent: bad as number })),
+        ).toThrow(/maxConcurrent must be a positive whole number/);
+      },
+    );
+
+    it("refuses an explicit undefined that the policy spread would let through", () => {
+      expect(() =>
+        createStorageStreamSyncBlobs(adapter(), {
+          maxConcurrentPuts: undefined,
+        }),
+      ).toThrow(/maxConcurrentPuts/);
+    });
+  });
+
+  describe("an upload that is no longer wanted", () => {
+    /** The caller's guard: throws once the caller has gone stale. */
+    const staleness = () => {
+      const state = { stale: false };
+      return {
+        state,
+        guard: () => {
+          if (state.stale) throw new Error("connection purged");
+        },
+      };
+    };
+    const deferred = () => {
+      let release!: () => void;
+      const promise = new Promise<void>((r) => (release = r));
+      return { promise, release };
+    };
+    /** Records how `promise` settled, so a test can wait on it with `vi.waitFor`. */
+    const outcomeOf = (promise: Promise<unknown>) => {
+      const outcome: { done: boolean; error?: unknown } = { done: false };
+      promise.then(
+        () => (outcome.done = true),
+        (error: unknown) => {
+          outcome.error = error;
+          outcome.done = true;
+        },
+      );
+      return outcome;
+    };
+
+    it("does not start an upload that queued for the single PUT slot while the caller was current", async () => {
+      // A holds the one slot; B queues for it; C (the purge) makes the caller
+      // stale; A finishes. B's request must not start.
+      const a = deferred();
+      const upload = vi.fn(async (key: string) => {
+        if (key === "scope/a") await a.promise;
+        return key;
+      });
+      const blobs = createStorageStreamSyncBlobs(
+        adapter({ upload }),
+        policy({ maxConcurrentPuts: 1 }),
+      );
+      const { state, guard } = staleness();
+      const putA = blobs.put("scope/a", new Uint8Array([1]), guard);
+      await vi.waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
+      const putB = blobs.put("scope/b", new Uint8Array([2]), guard);
+      const rejection = expect(putB).rejects.toThrow("connection purged");
+      state.stale = true;
+      a.release();
+      await putA;
+      await rejection;
+      expect(upload.mock.calls.map(([key]) => key)).toEqual(["scope/a"]);
+    });
+
+    it("does not start an upload that waits for the shared storage limit", async () => {
+      // Same, through `maxConcurrent`: the upload waits there, not at the PUT limit.
+      const a = deferred();
+      const upload = vi.fn(async (key: string) => {
+        if (key === "scope/a") await a.promise;
+        return key;
+      });
+      const blobs = createStorageStreamSyncBlobs(
+        adapter({ upload }),
+        policy({ maxConcurrentPuts: 2, maxConcurrent: 1 }),
+      );
+      const { state, guard } = staleness();
+      const putA = blobs.put("scope/a", new Uint8Array([1]), guard);
+      await vi.waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
+      const putB = blobs.put("scope/b", new Uint8Array([2]), guard);
+      const rejection = expect(putB).rejects.toThrow("connection purged");
+      state.stale = true;
+      a.release();
+      await putA;
+      await rejection;
+      expect(upload.mock.calls.map(([key]) => key)).toEqual(["scope/a"]);
+    });
+
+    it("frees the single PUT slot when a queued upload's guard throws", async () => {
+      // A holds the one PUT slot; B queues for it and its guard throws when
+      // the slot reaches it. The slot must come back: a fresh upload C runs.
+      const a = deferred();
+      const upload = vi.fn(async (key: string) => {
+        if (key === "scope/a") await a.promise;
+        return key;
+      });
+      const blobs = createStorageStreamSyncBlobs(
+        adapter({ upload }),
+        policy({ maxConcurrentPuts: 1 }),
+      );
+      const { state, guard } = staleness();
+      const putA = blobs.put("scope/a", new Uint8Array([1]), guard);
+      await vi.waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
+      const putB = outcomeOf(blobs.put("scope/b", new Uint8Array([2]), guard));
+      state.stale = true;
+      a.release();
+      await putA;
+      // Bounded: if B never settles, this wait fails the test instead of hanging it.
+      await vi.waitFor(() => expect(putB.done).toBe(true));
+      expect(putB.error).toEqual(new Error("connection purged"));
+      expect(upload.mock.calls.map(([key]) => key)).toEqual(["scope/a"]);
+      // Bounded: a slot left taken fails this wait instead of hanging the test.
+      const putC = blobs.put("scope/c", new Uint8Array([3]), staleness().guard);
+      await vi.waitFor(() =>
+        expect(upload.mock.calls.map(([key]) => key)).toContain("scope/c"),
+      );
+      await expect(putC).resolves.toBeUndefined();
+      expect(upload.mock.calls.map(([key]) => key)).toEqual([
+        "scope/a",
+        "scope/c",
+      ]);
+    });
+
+    it("frees the shared storage limit when a queued upload's guard throws", async () => {
+      // Same, through `maxConcurrent`: B takes the shared slot, its guard
+      // throws, and the slot must come back for a fresh upload C.
+      const a = deferred();
+      const upload = vi.fn(async (key: string) => {
+        if (key === "scope/a") await a.promise;
+        return key;
+      });
+      const blobs = createStorageStreamSyncBlobs(
+        adapter({ upload }),
+        policy({ maxConcurrentPuts: 2, maxConcurrent: 1 }),
+      );
+      const { state, guard } = staleness();
+      const putA = blobs.put("scope/a", new Uint8Array([1]), guard);
+      await vi.waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
+      const putB = outcomeOf(blobs.put("scope/b", new Uint8Array([2]), guard));
+      state.stale = true;
+      a.release();
+      await putA;
+      // Bounded: if B never settles, this wait fails the test instead of hanging it.
+      await vi.waitFor(() => expect(putB.done).toBe(true));
+      expect(putB.error).toEqual(new Error("connection purged"));
+      expect(upload.mock.calls.map(([key]) => key)).toEqual(["scope/a"]);
+      // Bounded: a slot left taken fails this wait instead of hanging the test.
+      const putC = blobs.put("scope/c", new Uint8Array([3]), staleness().guard);
+      await vi.waitFor(() =>
+        expect(upload.mock.calls.map(([key]) => key)).toContain("scope/c"),
+      );
+      await expect(putC).resolves.toBeUndefined();
+      expect(upload.mock.calls.map(([key]) => key)).toEqual([
+        "scope/a",
+        "scope/c",
+      ]);
+    });
+
+    it("makes no second attempt when the caller went stale during the retry delay", async () => {
+      const sleeping = deferred();
+      const slept = vi.fn(() => sleeping.promise);
+      const upload = vi.fn().mockRejectedValueOnce(failed(500));
+      const blobs = createStorageStreamSyncBlobs(
+        adapter({ upload }),
+        policy({ sleep: slept, now: () => 0, baseDelayMs: 100 }),
+      );
+      const { state, guard } = staleness();
+      const put = blobs.put("scope/a", new Uint8Array([1]), guard);
+      const rejection = expect(put).rejects.toThrow("connection purged");
+      await vi.waitFor(() => expect(slept).toHaveBeenCalledTimes(1));
+      state.stale = true;
+      sleeping.release();
+      await rejection;
+      expect(upload).toHaveBeenCalledTimes(1);
+    });
+
+    it("still retries when the caller is current after the retry delay", async () => {
+      const upload = vi.fn().mockRejectedValueOnce(failed(500));
+      const blobs = createStorageStreamSyncBlobs(
+        adapter({ upload }),
+        policy({ now: () => 0, baseDelayMs: 100 }),
+      );
+      await blobs.put("scope/a", new Uint8Array([1]), staleness().guard);
+      expect(upload).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("uploads in flight", () => {
+    /** Storage that counts uploads in flight, and reads, while each takes a moment. */
+    const counting = () => {
+      const seen = { puts: 0, putPeak: 0, reads: 0, readPeak: 0 };
+      return {
+        seen,
+        storage: adapter({
+          upload: vi.fn(async () => {
+            seen.puts++;
+            seen.putPeak = Math.max(seen.putPeak, seen.puts);
+            await new Promise((resolve) => setTimeout(resolve, 3));
+            seen.puts--;
+            return "url";
+          }),
+          download: vi.fn(async () => {
+            seen.reads++;
+            seen.readPeak = Math.max(seen.readPeak, seen.reads);
+            await new Promise((resolve) => setTimeout(resolve, 3));
+            seen.reads--;
+            return new Uint8Array([1]);
+          }),
+        }),
+      };
+    };
+    const putAll = (blobs: ReturnType<typeof createStorageStreamSyncBlobs>) =>
+      Promise.all(
+        Array.from({ length: 12 }, (_, i) =>
+          blobs.put(`scope/part-${i}`, new Uint8Array([i])),
+        ),
+      );
+
+    it("keeps one upload in flight by default, however many callers", () => {
+      expect(DEFAULT_STORAGE_ACCESS_POLICY.maxConcurrentPuts).toBe(1);
+      const { seen, storage } = counting();
+      return putAll(
+        createStorageStreamSyncBlobs(storage, policy({ maxConcurrent: 4 })),
+      ).then(() => expect(seen.putPeak).toBe(1));
+    });
+
+    it("lets maxConcurrentPuts raise it, never above maxConcurrent", async () => {
+      const wide = counting();
+      await putAll(
+        createStorageStreamSyncBlobs(
+          wide.storage,
+          policy({ maxConcurrent: 4, maxConcurrentPuts: 3 }),
+        ),
+      );
+      expect(wide.seen.putPeak).toBe(3);
+      const narrow = counting();
+      await putAll(
+        createStorageStreamSyncBlobs(
+          narrow.storage,
+          policy({ maxConcurrent: 2, maxConcurrentPuts: 5 }),
+        ),
+      );
+      expect(narrow.seen.putPeak).toBe(2);
+    });
+
+    it("does not queue reads behind uploads that wait for their turn", async () => {
+      const { seen, storage } = counting();
+      const blobs = createStorageStreamSyncBlobs(
+        storage,
+        policy({ maxConcurrent: 2, maxConcurrentPuts: 1 }),
+      );
+      let putsDone = 0;
+      const puts = putAll(blobs).then(() => (putsDone = 12));
+      const settledPuts = () => seen.puts === 0 && putsDone === 12;
+      await Promise.all(
+        Array.from({ length: 4 }, (_, i) => blobs.get(`scope/read-${i}`)),
+      );
+      // Eleven uploads still wait for their turn; they hold no slot of the
+      // shared limit, so the reads finish while uploads remain.
+      expect(settledPuts()).toBe(false);
+      await puts;
+      expect(seen.putPeak).toBe(1);
+    });
+
+    it("keeps an upload's retries inside its turn", async () => {
+      let puts = 0;
+      let peak = 0;
+      let calls = 0;
+      const upload = vi.fn(async () => {
+        calls++;
+        puts++;
+        peak = Math.max(peak, puts);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        puts--;
+        if (calls % 2 === 1)
+          throw new Error("vana-storage upload failed: 500 Fast");
+        return "url";
+      });
+      const blobs = createStorageStreamSyncBlobs(
+        adapter({ upload }),
+        policy({ maxConcurrent: 4 }),
+      );
+      await Promise.all(
+        Array.from({ length: 6 }, (_, i) =>
+          blobs.put(`scope/part-${i}`, new Uint8Array([i])),
+        ),
+      );
+      expect(peak).toBe(1);
+    });
+  });
+
   it("retries a failed upload and still ignores a conflict", async () => {
     const upload = vi
       .fn()
@@ -338,5 +648,55 @@ describe("createStorageStreamSyncBlobs", () => {
       policy(),
     ).put("scope/blob", new Uint8Array([2]));
     expect(conflict).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("createStorageStreamSyncBlobs.exists", () => {
+  it("answers from the storage probe and never reads the body", async () => {
+    const download = vi.fn(async () => new Uint8Array([1, 2, 3]));
+    const exists = vi.fn(async () => true);
+    const blobs = createStorageStreamSyncBlobs(
+      adapter({ download, exists }),
+      policy(),
+    );
+    await expect(blobs.exists("scope/blob")).resolves.toBe(true);
+    expect(exists).toHaveBeenCalledTimes(1);
+    expect(download).not.toHaveBeenCalled();
+  });
+
+  it("reads a probe answering not found as missing", async () => {
+    const exists = vi.fn(async () => false);
+    const blobs = createStorageStreamSyncBlobs(adapter({ exists }), policy());
+    await expect(blobs.exists("scope/blob")).resolves.toBe(false);
+  });
+
+  it("retries a probe that failed with a 500, then answers", async () => {
+    const exists = vi
+      .fn()
+      .mockRejectedValueOnce(failed(500))
+      .mockResolvedValue(true);
+    const blobs = createStorageStreamSyncBlobs(adapter({ exists }), policy());
+    await expect(blobs.exists("scope/blob")).resolves.toBe(true);
+    expect(exists).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([401, 403])(
+    "fails at once on a probe refused with %i, never as missing",
+    async (status) => {
+      const exists = vi.fn().mockRejectedValue(failed(status));
+      const blobs = createStorageStreamSyncBlobs(adapter({ exists }), policy());
+      await expect(blobs.exists("scope/blob")).rejects.toThrow(String(status));
+      expect(exists).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("throws a persistent 5xx probe after its attempts, never as missing", async () => {
+    const exists = vi.fn().mockRejectedValue(failed(500));
+    const blobs = createStorageStreamSyncBlobs(
+      adapter({ exists }),
+      policy({ maxAttempts: 3 }),
+    );
+    await expect(blobs.exists("scope/blob")).rejects.toThrow("500");
+    expect(exists).toHaveBeenCalledTimes(3);
   });
 });

@@ -8,7 +8,7 @@ import {
   type RunPublicationStatus,
   type RunStreamPublication,
 } from "../stream-sync/intake.js";
-import type { SqlDriver } from "./driver.js";
+import type { SqlDriver, SqlReader } from "./driver.js";
 import { streamFenceTrip } from "./fence.js";
 
 export type LocalEndReceipt = Pick<EndResponse, "result" | "updateRequired">;
@@ -102,7 +102,7 @@ type PublicationRow = {
  * changes, the other is a time.
  */
 export async function readPublicationStatus(
-  db: SqlDriver,
+  db: SqlReader,
   runId: string,
   expect?: { readonly connector?: string },
 ): Promise<RunPublicationStatus> {

@@ -1,5 +1,12 @@
 import { createHash } from "node:crypto";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  link,
+  readdir,
+  access,
+  mkdtemp,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { privateKeyToAccount } from "viem/accounts";
@@ -313,5 +320,33 @@ describe("Node database composition", () => {
         })
       ).status,
     ).toBe(410);
+  });
+
+  it("tells the caller a database file with a second hard link cannot be opened", async () => {
+    const root = await directory();
+    const store = createMemoryModeRecordStore();
+    let context = await boot(root, store);
+    await context.accountModeAuthority.submitEvidence({
+      owner: context.serverOwner!,
+      state: "on",
+    });
+    await context.getLocalSync!(); // creates the database file
+    await context.cleanup();
+    contexts.splice(contexts.indexOf(context), 1);
+
+    const files = (await readdir(join(root, "localdb"))).filter((name) =>
+      name.endsWith(".sqlite"),
+    );
+    expect(files).toHaveLength(1);
+    await link(
+      join(root, "localdb", files[0]!),
+      join(root, "localdb", "second-name.sqlite"),
+    );
+
+    context = await boot(root, store);
+    await expect(context.getLocalSync!()).rejects.toMatchObject({
+      code: "SQLITE_DATABASE_HARD_LINKED",
+      message: expect.stringContaining("second hard link"),
+    });
   });
 });
