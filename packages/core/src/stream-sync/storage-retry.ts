@@ -14,6 +14,14 @@
 export interface StorageAccessPolicy {
   /** Operations in flight at once, across every caller sharing the limiter. */
   readonly maxConcurrent: number;
+  /**
+   * Uploads in flight at once, a limit under `maxConcurrent` that only uploads
+   * pass through. Reads, the gateway and the other uploads' share of
+   * `maxConcurrent` are unaffected. The default of 1 is a conservative choice;
+   * the storage 500s seen with concurrent uploads were fixed server-side
+   * (vana-storage #39).
+   */
+  readonly maxConcurrentPuts: number;
   /** Total tries per operation, the first one included. */
   readonly maxAttempts: number;
   /** Upper bound of the wait before the second try; it doubles each time. */
@@ -29,6 +37,7 @@ export interface StorageAccessPolicy {
 
 export const DEFAULT_STORAGE_ACCESS_POLICY: StorageAccessPolicy = {
   maxConcurrent: 2,
+  maxConcurrentPuts: 1,
   maxAttempts: 6,
   baseDelayMs: 250,
   maxDelayMs: 4_000,
@@ -100,14 +109,17 @@ export function backoffDelayMs(
  */
 export function createStorageAccess(
   policy: StorageAccessPolicy,
-): <T>(operation: () => Promise<T>) => Promise<T> {
-  const limit = createConcurrencyLimit(policy.maxConcurrent);
+): <T>(operation: () => Promise<T>, beforeAttempt?: () => void) => Promise<T> {
+  const limit = createConcurrencyLimit(policy.maxConcurrent, "maxConcurrent");
   let resumeAt = 0;
-  return (operation) =>
+  return (operation, beforeAttempt) =>
     limit(async () => {
       for (let attempt = 1; ; attempt++) {
         const wait = resumeAt - policy.now();
         if (wait > 0) await policy.sleep(wait);
+        // After every wait, so a call that queued or slept while the caller
+        // went stale does not start. Its throw is final: it is not retried.
+        beforeAttempt?.();
         try {
           return await operation();
         } catch (error) {
@@ -122,10 +134,24 @@ export function createStorageAccess(
     });
 }
 
+/**
+ * A limit of 0, a negative or fractional number, NaN or undefined would make
+ * every operation wait for ever or let in more than asked; refuse it.
+ */
+export function requirePositiveWhole(name: string, value: unknown): void {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new RangeError(
+      `storage access: ${name} must be a positive whole number, got ${String(value)}`,
+    );
+  }
+}
+
 /** A counting semaphore: at most `limit` operations run, the rest queue. */
 export function createConcurrencyLimit(
   limit: number,
+  name = "limit",
 ): <T>(operation: () => Promise<T>) => Promise<T> {
+  requirePositiveWhole(name, limit);
   let active = 0;
   const waiting: (() => void)[] = [];
   const release = () => {

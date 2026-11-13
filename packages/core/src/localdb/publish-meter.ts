@@ -71,9 +71,9 @@ export function meteredBlobs(
       meter.blobGets += 1;
       return timed(deps, add, () => deps.blobs.exists(key));
     },
-    put: async (key, bytes) => {
+    put: async (key, bytes, beforeAttempt) => {
       meter.blobPuts += 1;
-      await timed(deps, add, () => deps.blobs.put(key, bytes));
+      await timed(deps, add, () => deps.blobs.put(key, bytes, beforeAttempt));
       meter.bytesUploaded += bytes.length;
     },
   };
