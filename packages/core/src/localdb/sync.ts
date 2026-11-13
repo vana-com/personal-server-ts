@@ -19,6 +19,7 @@ import { createBlobStore, type BlobStore } from "./blobs.js";
 import { runCycle, syncConnection, type CycleReport } from "./cycle.js";
 import { createConnectionDeleter, type ConnectionDeleter } from "./delete.js";
 import type { LocalSyncDeps } from "./deps.js";
+import { readerOf } from "./driver.js";
 import { createLocalHistory, type LocalHistory } from "./history.js";
 import { createLocalListing, type LocalListing } from "./listing.js";
 import { createOlderVersions, type OlderVersions } from "./older-versions.js";
@@ -153,7 +154,7 @@ export function createLocalSync(
       ) {
         throw new RunIntakeError("owner_mismatch");
       }
-      return readPublicationStatus(deps.db, runId, {
+      return readPublicationStatus(readerOf(deps.db), runId, {
         connector: binding?.connector,
       });
     },
@@ -194,8 +195,8 @@ export function createLocalSync(
     }),
     listing: createLocalListing(listingDeps, () => olderVersions.counts()),
     query,
-    recordsFor: (link) => createLinkedRecordQuery(deps.db, link),
-    changesFor: (link) => createGrantHistory(deps.db, link),
+    recordsFor: (link) => createLinkedRecordQuery(readerOf(deps.db), link),
+    changesFor: (link) => createGrantHistory(readerOf(deps.db), link),
     history: createLocalHistory(deps, {
       olderVersionReads: options.olderVersionReads,
       aliasScopes: options.aliasScopes,

@@ -315,22 +315,25 @@ describe("local history versions", () => {
       const { db, deps } = await fresh();
       await seed(db);
       let reads = 0;
+      const racingQuery = async (...args: Parameters<SqlDriver["query"]>) => {
+        const rows = await db.query(...args);
+        if (++reads === 1) {
+          await db.batch([
+            {
+              sql: "UPDATE connections SET control_state = 'deleted', generation = 3",
+            },
+            { sql: "DELETE FROM stream_state" },
+            { sql: "DELETE FROM stream_versions" },
+          ]);
+        }
+        return rows;
+      };
+      // History reads take the read connection when the driver has one.
       const racingDb = new Proxy(db, {
         get(target, key) {
-          if (key !== "query") return Reflect.get(target, key);
-          return async (...args: Parameters<SqlDriver["query"]>) => {
-            const rows = await db.query(...args);
-            if (++reads === 1) {
-              await db.batch([
-                {
-                  sql: "UPDATE connections SET control_state = 'deleted', generation = 3",
-                },
-                { sql: "DELETE FROM stream_state" },
-                { sql: "DELETE FROM stream_versions" },
-              ]);
-            }
-            return rows;
-          };
+          if (key === "query") return racingQuery;
+          if (key === "reads") return { query: racingQuery };
+          return Reflect.get(target, key);
         },
       });
       const history = createLocalHistory(

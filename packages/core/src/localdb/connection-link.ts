@@ -1,5 +1,5 @@
 import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
-import type { SqlDriver } from "./driver.js";
+import type { SqlReader } from "./driver.js";
 import { createRecordQuery, type RecordQuery } from "./query.js";
 
 /** Host authority for one registered PDPP connection and declared stream.
@@ -15,7 +15,7 @@ export type ConnectionLink = (
 
 /** Apply the host's consent identity before querying the owner's current generation. */
 export function createLinkedRecordQuery(
-  db: SqlDriver,
+  db: SqlReader,
   link: ConnectionLink,
 ): RecordQuery {
   const query = createRecordQuery(db);
