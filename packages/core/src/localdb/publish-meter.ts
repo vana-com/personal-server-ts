@@ -11,14 +11,14 @@ export interface PublishMeter {
   planMs: number;
   /** The whole transfer: spool reads, framing, hashing, encryption, upload. */
   transferMs: number;
-  /** Blob GET and PUT calls only: the part of the transfer spent on the wire. */
+  /** Blob reads and probes, and PUT calls only: the part of the transfer spent on the wire. */
   uploadMs: number;
   /** Signing and posting the head to the registry. */
   headRegisterMs: number;
   /** Blob reads: a GET of a body, or an existence probe (a HEAD, no body). */
   blobGets: number;
   blobPuts: number;
-  /** Part blobs written (a part already in storage is a GET and no PUT). */
+  /** Part blobs written (a part already in storage is a HEAD and no PUT). */
   partsUploaded: number;
   /** Bytes of every blob written: parts, attachments and the head. */
   bytesUploaded: number;

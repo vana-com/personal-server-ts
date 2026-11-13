@@ -413,7 +413,7 @@ describe("publishConnection", () => {
       encodeEncryptMs: 10,
       partsUploaded: 1,
       bytesUploaded: sizes.reduce((sum, size) => sum + size, 0),
-      // Part and head, each probed with a HEAD (2 ms) and written (5 ms).
+      // Part probed with a HEAD and head with a GET (2 ms each), then both written (5 ms each).
       blobGets: 2,
       blobPuts: 2,
       uploadMs: 14,
