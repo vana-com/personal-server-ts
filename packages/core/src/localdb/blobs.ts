@@ -232,6 +232,18 @@ export function createBlobStore(deps: LocalSyncDeps): BlobStore {
 // idle cycle just to test existence; restart safely probes the durable cache.
 const uploadedBlobs = new WeakMap<SqlDriver, Set<string>>();
 
+/**
+ * Forget what this process uploaded. A name carries its lifetime
+ * (`g<generation>`), so a later lifetime never meets an earlier one's entries;
+ * this also removes them when a lifetime ends (a purge), so the cache never
+ * vouches for objects a connection delete may have removed. Not called on a
+ * routine apply: a foreign head says nothing about the remote store, and
+ * probing again after each one would cost a request per attachment.
+ */
+export function forgetUploadedBlobs(db: SqlDriver): void {
+  uploadedBlobs.delete(db);
+}
+
 /** One attachment a stream's records name, and where it is published. */
 export interface BlobDescriptor {
   readonly blobId: string;

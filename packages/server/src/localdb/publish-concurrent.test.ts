@@ -8,15 +8,21 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { keccak_256 } from "@noble/hashes/sha3";
 import {
+  HEAD_FORMAT,
   controlHashes,
   controlScope,
   deriveKeyCheck,
+  digestHead,
+  encodeHead,
+  streamScope,
+  type Head,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   connectionQueue,
   createLocalSync,
   openLocalDb,
   publishConnection,
+  purgeConnection,
   type LocalSyncDeps,
   type PublishResult,
   type SqlDriver,
@@ -31,6 +37,12 @@ import {
   type StreamSyncBlobs,
   type StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
+// The built module, the one `purgeConnection` above runs: the memory of
+// uploads is per module instance.
+import {
+  MissingAttachmentError,
+  uploadBlobs,
+} from "../../../core/dist/localdb/blobs.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const OWNER = `0x${"11".repeat(20)}` as const;
@@ -109,6 +121,8 @@ async function world(options: Options) {
       innerRegistry.listConnectionRows(connector, ns),
   };
   const innerBlobs = createMemoryStreamSyncBlobs();
+  /** Keys storage answers "absent" for, as if removed from outside. */
+  const hidden = new Set<string>();
   const guards: { key: string; guard: (() => void) | undefined }[] = [];
   const timedBlobs: StreamSyncBlobs = {
     governor: options.governor,
@@ -127,7 +141,7 @@ async function world(options: Options) {
       await sleep(
         (options.blobMs ?? 0) + (options.blobMsFor?.(streamOfKey(key)!) ?? 0),
       );
-      return innerBlobs.exists(key);
+      return !hidden.has(key) && (await innerBlobs.exists(key));
     },
     async put(key, bytes, beforeAttempt) {
       record("put", key);
@@ -226,7 +240,57 @@ async function world(options: Options) {
     coveredStreams: names,
     lastBatch: 0,
   });
-  return { deps, db, calls, guards, purges, names, innerRegistry, sync };
+  return {
+    deps,
+    db,
+    calls,
+    guards,
+    purges,
+    names,
+    innerRegistry,
+    innerBlobs,
+    hidden,
+    sync,
+  };
+}
+
+/** A head another device wrote, with no rows, as the stream's row at `version`. */
+async function foreignHead(
+  w: Awaited<ReturnType<typeof world>>,
+  stream: string,
+  version: number,
+): Promise<void> {
+  const scope = streamScope(CONNECTOR, "", stream);
+  const keyCheck = await deriveKeyCheck(w.deps.keys.namespaceHmac);
+  const head: Head = {
+    complete: false,
+    connector: CONNECTOR,
+    format: HEAD_FORMAT,
+    generation: 1,
+    keyCheck,
+    lastDeleteVersion: 0,
+    ns: "",
+    observedAt: 1000,
+    parts: [],
+    primaryKey: ["id"],
+    profile: { key: CONNECTOR, version: "1" },
+    recordCount: 0,
+    stream,
+  };
+  const bytes = encodeHead(head);
+  const { dataHash, blobName } = await digestHead(
+    async (b) => keccak_256(b),
+    bytes,
+  );
+  await w.innerBlobs.put(`${scope}/${blobName}`, bytes);
+  await w.innerRegistry.post({
+    ownerAddress: OWNER,
+    scope,
+    dataHash,
+    metadataHash: `0x${"22".repeat(32)}`,
+    expectedVersion: String(version),
+    signature: "0x00",
+  });
 }
 
 async function tombstoneControl(
@@ -558,6 +622,76 @@ describe("streams of one connection publish together", () => {
     const results = await publishConnection(fresh, CONNECTION_ID);
     expect(results.map((r) => r.outcome)).toEqual(["purged"]);
     expect(w.purges.length).toBeGreaterThan(0);
+  });
+
+  it("an attachment-only stream whose row another device advanced while its attachment was out plans again, and does not say noop", async () => {
+    // Same shape as above, but the stream row moves instead of the connection
+    // going away. The plan that found nothing to publish was over the old row.
+    let advanced: Promise<void> | undefined;
+    const probe: { run?: () => Promise<void> } = {};
+    const w = await world({
+      streams: 1,
+      attachments: true,
+      holdGet: async (key) => {
+        if (/-b-/.test(key)) await probe.run?.();
+      },
+    });
+    const first = await publishConnection(w.deps, CONNECTION_ID);
+    expect(first.map((r) => r.outcome)).toEqual(["published"]);
+    const db = w.db;
+    const fresh: LocalSyncDeps = {
+      ...w.deps,
+      db: {
+        info: db.info,
+        query: (sql, params) => db.query(sql, params),
+        batch: (statements) => db.batch(statements),
+        close: () => db.close(),
+      },
+    };
+    const headVersion = async () =>
+      (
+        await db.query<{ v: number }>(
+          "SELECT head_version AS v FROM stream_state WHERE connection_id = ? AND stream = 's0'",
+          [CONNECTION_ID],
+        )
+      )[0]!.v;
+    expect(await headVersion()).toBe(1);
+    probe.run = () => (advanced ??= foreignHead(w, "s0", 2));
+    const results = await publishConnection(fresh, CONNECTION_ID);
+    // The winner's head holds none of this device's rows: the stream applied
+    // it (version 2), planned again over it and published its own (version 3).
+    expect(results.map((r) => r.outcome)).toEqual(["published"]);
+    expect(await headVersion()).toBe(3);
+  });
+
+  it("remembers an uploaded attachment until the connection is purged, and not after", async () => {
+    // What this process uploaded is not probed again while the lifetime lives
+    // (an idle cycle would otherwise ask for every attachment every time). A
+    // purge ends the lifetime: storage may have dropped the objects, and the
+    // memory must not vouch for them.
+    const w = await world({ streams: 1, attachments: true });
+    expect(
+      (await publishConnection(w.deps, CONNECTION_ID)).map((r) => r.outcome),
+    ).toEqual(["published"]);
+    const key = w.calls.find(
+      (c) => c.kind === "put" && /-b-/.test(c.scope),
+    )!.scope;
+    const [{ blob_id: blobId }] = (await w.db.query<{ blob_id: string }>(
+      "SELECT blob_id FROM blobs",
+    )) as [{ blob_id: string }];
+    const descriptor = {
+      blobId,
+      key,
+      scope: streamScope(CONNECTOR, "", "s0"),
+    };
+    w.hidden.add(key);
+    // Remembered: no probe, so the missing object goes unnoticed.
+    await uploadBlobs(w.deps, [descriptor]);
+    await purgeConnection(w.deps, CONNECTION_ID, { controlVersion: 2 });
+    // Forgotten: probed, found absent, and the bytes are gone with the purge.
+    await expect(uploadBlobs(w.deps, [descriptor])).rejects.toBeInstanceOf(
+      MissingAttachmentError,
+    );
   });
 
   it("on a failure waits for every running stream and throws the earliest stream's error", async () => {

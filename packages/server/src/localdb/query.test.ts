@@ -7,6 +7,7 @@ import type {
 } from "../../../core/src/localdb/driver.js";
 import {
   createRecordQuery,
+  listCursor,
   type StoredRecord,
 } from "../../../core/src/localdb/query.js";
 import { run } from "../../../core/src/test-support/memory-oracle.js";
@@ -113,7 +114,7 @@ if (!process.argv[1]?.endsWith("/memory-oracle-child.mjs")) {
       expect(first.records.map((r) => r.recordKey)).toEqual(
         Array.from({ length: 25 }, (_, i) => key(i)),
       );
-      expect(first.nextCursor).toBe(key(24));
+      expect(first.nextCursor).toBe(listCursor(key(24), key(80)));
       expect(first.records.every((r) => r.emittedAt === 123)).toBe(true);
       const second = await query.listRecords({
         connectionId: "c",
@@ -123,13 +124,22 @@ if (!process.argv[1]?.endsWith("/memory-oracle-child.mjs")) {
       expect(second.records.map((r) => r.recordKey)).toEqual(
         Array.from({ length: 25 }, (_, i) => key(i + 25)),
       );
+      // A plain record_key cursor, issued before the pk_hash tiebreak, still resumes.
+      const legacy = await query.listRecords({
+        connectionId: "c",
+        stream: "s",
+        cursor: key(24),
+      });
+      expect(legacy.records.map((r) => r.recordKey)).toEqual(
+        second.records.map((r) => r.recordKey),
+      );
       const capped = await query.listRecords({
         connectionId: "c",
         stream: "s",
         limit: 1000,
       });
       expect(capped.records).toHaveLength(100);
-      expect(capped.nextCursor).toBe(key(99));
+      expect(capped.nextCursor).toBe(listCursor(key(99), key(5)));
       const last = await query.listRecords({
         connectionId: "c",
         stream: "s",

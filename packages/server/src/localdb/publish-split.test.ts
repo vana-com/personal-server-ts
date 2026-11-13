@@ -12,7 +12,7 @@ import {
   streamRows,
   webDeleteAndReconnect,
   type Device,
-} from "./publish-split-fixture.js";
+} from "./publish-split.test-utils.js";
 
 afterEach(closeDrivers);
 

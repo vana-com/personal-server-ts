@@ -557,3 +557,30 @@ it("rechecks binding authority after the database query resolves", async () => {
     }),
   ).toBeNull();
 });
+
+it("a delete intent that lands while rows are read expires the grant read", async () => {
+  const { db } = await fixture();
+  let inserted = false;
+  const guarded: SqlDriver = {
+    ...db,
+    query: async <R extends Record<string, SqlValue>>(
+      sql: string,
+      params?: readonly SqlValue[],
+    ) => {
+      const rows = await db.query<R>(sql, params);
+      if (!inserted && sql.includes("FROM records r JOIN targets")) {
+        inserted = true;
+        await run(db, "INSERT INTO delete_intents VALUES ('fixture','d','{}')");
+      }
+      return rows;
+    },
+  };
+  const read = createGrantHistory(guarded, () => ({
+    connector: "fixture",
+    namespace: "",
+  }));
+  await expect(
+    read("selected", { instanceIds: ["handle-a"], limit: 10 }),
+  ).rejects.toThrow();
+  expect(inserted).toBe(true);
+});

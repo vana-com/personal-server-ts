@@ -345,6 +345,7 @@ export function createSendGate(
           const onAbort = () => {
             const at = queue.indexOf(waiter);
             if (at < 0) return;
+            queue.splice(at, 1);
             reject(signal.reason);
             // The loop may be asleep on this waiter's wait: let it look again.
             wakeLoop();

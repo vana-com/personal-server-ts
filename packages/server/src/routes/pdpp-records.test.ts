@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import {
   createRecordQuery,
+  listCursor,
   openLocalDb,
   type SqlDriver,
   type SqlValue,
@@ -149,7 +150,7 @@ describe("PS-2 D.8 local record routes", () => {
         new Date(stamp + 1000).toISOString(),
         new Date(stamp).toISOString(),
       ]);
-      expect(firstBody.next_cursor).toBe("b");
+      expect(firstBody.next_cursor).toBe(listCursor("b", "b"));
       expect(firstBody.has_more).toBe(true);
       expect(listRecords).toHaveBeenCalledWith({
         connectionId: "inst_1",
@@ -158,7 +159,17 @@ describe("PS-2 D.8 local record routes", () => {
         limit: 2,
       });
       expect(readMode).toHaveBeenCalledTimes(1);
-      const second = await app.request(path + "?limit=2&cursor=b", { headers });
+      // A plain record_key cursor from before the pk_hash tiebreak still works.
+      const plainKey = await app.request(path + "?limit=2&cursor=b", {
+        headers,
+      });
+      expect(
+        (await plainKey.json()).data.map((row: { id: string }) => row.id),
+      ).toEqual(["c"]);
+      const second = await app.request(
+        path + "?limit=2&cursor=" + firstBody.next_cursor,
+        { headers },
+      );
       expect(
         (await second.json()).data.map((row: { id: string }) => row.id),
       ).toEqual(["c"]);
@@ -324,6 +335,88 @@ describe("PS-2 D.8 local record routes", () => {
       }).app;
       const missing = await missingQuery.request(path, { headers });
       expect(missing.status).toBe(503);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("PS-2 local owner listing order", () => {
+  it("pages records that share a record_key, in pk_hash order, without skipping one", async () => {
+    const db = new Database(":memory:");
+    try {
+      const driver: SqlDriver = {
+        info: { sqliteVersion: "3.22.0", host: "node", persistent: false },
+        async query<R extends Record<string, SqlValue>>(
+          sql: string,
+          params: readonly SqlValue[] = [],
+        ) {
+          const stmt = db.prepare(sql);
+          if (stmt.reader) return stmt.all(...params) as R[];
+          stmt.run(...params);
+          return [];
+        },
+        async batch(statements) {
+          return db.transaction(() => ({
+            changes: statements.map(({ sql, params = [] }) => {
+              const stmt = db.prepare(sql);
+              return stmt.reader
+                ? (stmt.all(...params), 0)
+                : stmt.run(...params).changes;
+            }),
+          }))();
+        },
+        async close() {
+          db.close();
+        },
+      };
+      await openLocalDb(driver, {
+        owner: "0xowner",
+        network: "test",
+        deviceId: "record-route-order",
+      });
+      // A numeric 1 and a string "1" share record_key "1"; pk_hash tells them apart.
+      const insert = db.prepare(
+        "INSERT INTO records(connection_id,stream,record_key,pk_hash,body,stamp_o,stamp_r,body_sha256) VALUES ('inst_1','playlists',?,?,?,1,'fixture','fixture')",
+      );
+      // Remote rows may carry both key types; local writes refuse the conflict.
+      db.prepare("UPDATE write_ctx SET origin = 'remote' WHERE id = 1").run();
+      insert.run("1", "hash-a", JSON.stringify({ id: 1, name: "number" }));
+      insert.run("1", "hash-b", JSON.stringify({ id: "1", name: "string" }));
+      insert.run("2", "hash-c", JSON.stringify({ id: "2", name: "two" }));
+      const { app } = buildApp(
+        {
+          owner: {
+            active: true,
+            tokenKind: "owner",
+            subjectId: "sub_1",
+            instanceIds: ["inst_1"],
+          },
+        },
+        {
+          recordQuery: createRecordQuery(driver),
+          accountStorageMode: { owner: "sub_1", read: () => "switched" },
+        },
+      );
+      const headers = { Authorization: "Bearer owner" };
+      const names: string[] = [];
+      let cursor: string | null = null;
+      for (let page = 0; page < 5; page++) {
+        const res = await app.request(
+          "/streams/playlists/records?limit=1" +
+            (cursor === null ? "" : "&cursor=" + encodeURIComponent(cursor)),
+          { headers },
+        );
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        names.push(
+          ...body.data.map((row: { id: unknown }) => JSON.stringify(row.id)),
+        );
+        cursor = body.next_cursor;
+        if (!body.has_more) break;
+      }
+      // Both rows of record_key "1" are listed, then "2".
+      expect(names).toEqual(['"1"', '"1"', '"2"']);
     } finally {
       db.close();
     }

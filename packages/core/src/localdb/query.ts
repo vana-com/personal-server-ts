@@ -21,7 +21,7 @@ export interface StoredRecord {
 
 export interface RecordPage {
   readonly records: readonly StoredRecord[];
-  /** The last `record_key` of the page; `null` when there is no more. */
+  /** Resumes after the page's last row (see `listCursor`); `null` when there is no more. */
   readonly nextCursor: string | null;
 }
 
@@ -37,7 +37,7 @@ export interface ChangePage {
 
 /**
  * D: paged reads over `records` and `record_changes`. `listRecords`: cursor
- * `record_key`, default 25, max 100. `getRecord`: string key; on a `1` vs
+ * `(record_key, pk_hash)`, default 25, max 100. `getRecord`: string key; on a `1` vs
  * `"1"` collision, the first match in `pk_hash` order. `changesSince`: cursor
  * `seq`; a cursor below the compaction floor answers `"gone"` (route = 410).
  * `streamRecords` yields every record of a stream in `pk_hash` order, one page
@@ -78,6 +78,47 @@ type RecordRow = {
 const RECORD_COLUMNS = "stream, record_key, pk_hash, body, stamp_o";
 const STREAM_PAGE_SIZE = 100;
 
+const LIST_CURSOR_PREFIX = "v2.";
+
+/**
+ * The cursor that resumes `listRecords` after one row. Listing orders by
+ * `(record_key, pk_hash)` and a `1` and a `"1"` share a record_key, so the
+ * key alone would skip the second of them. A cursor without this prefix is a
+ * plain record_key from before; it still resumes after that key.
+ */
+export function listCursor(recordKey: string, pkHash: string): string {
+  return (
+    LIST_CURSOR_PREFIX +
+    Buffer.from(JSON.stringify([recordKey, pkHash])).toString("base64url")
+  );
+}
+
+function parseListCursor(cursor: string): {
+  recordKey: string;
+  pkHash: string | null;
+} {
+  if (cursor.startsWith(LIST_CURSOR_PREFIX)) {
+    try {
+      const value: unknown = JSON.parse(
+        Buffer.from(
+          cursor.slice(LIST_CURSOR_PREFIX.length),
+          "base64url",
+        ).toString("utf8"),
+      );
+      if (
+        Array.isArray(value) &&
+        value.length === 2 &&
+        typeof value[0] === "string" &&
+        typeof value[1] === "string"
+      )
+        return { recordKey: value[0], pkHash: value[1] };
+    } catch {
+      // Not ours: a record_key that happens to start with the prefix.
+    }
+  }
+  return { recordKey: cursor, pkHash: null };
+}
+
 function pageLimit(limit: number | undefined): number {
   return limit === undefined || !Number.isFinite(limit)
     ? 25
@@ -98,20 +139,35 @@ export function createRecordQuery(db: SqlReader): RecordQuery {
   return {
     async listRecords({ connectionId, stream, cursor, limit }) {
       const size = pageLimit(limit);
+      const after = cursor === undefined ? null : parseListCursor(cursor);
       const rows = await db.query<RecordRow>(
         `SELECT ${RECORD_COLUMNS} FROM records
          WHERE connection_id = ? AND stream = ?
-           ${cursor === undefined ? "" : "AND record_key > ?"}
+           ${
+             after === null
+               ? ""
+               : after.pkHash === null
+                 ? "AND record_key > ?"
+                 : "AND (record_key, pk_hash) > (?, ?)"
+           }
          ORDER BY record_key, pk_hash LIMIT ?`,
-        cursor === undefined
-          ? [connectionId, stream, size + 1]
-          : [connectionId, stream, cursor, size + 1],
+        [
+          connectionId,
+          stream,
+          ...(after === null
+            ? []
+            : after.pkHash === null
+              ? [after.recordKey]
+              : [after.recordKey, after.pkHash]),
+          size + 1,
+        ],
       );
       const more = rows.length > size;
       const page = rows.slice(0, size);
+      const last = page[page.length - 1];
       return {
         records: page.map(stored),
-        nextCursor: more ? page[page.length - 1]!.record_key : null,
+        nextCursor: more ? listCursor(last!.record_key, last!.pk_hash) : null,
       };
     },
 
@@ -319,7 +375,8 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
           generation: number;
           control_state: string;
         }>(
-          "SELECT generation,control_state FROM connections WHERE connection_id=?",
+          `SELECT generation,control_state FROM connections WHERE connection_id=?
+          AND NOT EXISTS (SELECT 1 FROM delete_intents WHERE connector=connections.connector)`,
           [target.id],
         );
         if (
