@@ -8,7 +8,7 @@ import {
 } from "../storage/pdpp-records/types.js";
 import type { ConnectionLink } from "./connection-link.js";
 
-import type { SqlDriver } from "./driver.js";
+import type { SqlReader } from "./driver.js";
 
 /** One stored record as reads see it. `emittedAt` is `stamp_o`. */
 export interface StoredRecord {
@@ -94,7 +94,7 @@ function stored(row: RecordRow): StoredRecord {
   };
 }
 
-export function createRecordQuery(db: SqlDriver): RecordQuery {
+export function createRecordQuery(db: SqlReader): RecordQuery {
   return {
     async listRecords({ connectionId, stream, cursor, limit }) {
       const size = pageLimit(limit);
@@ -206,7 +206,7 @@ export function createRecordQuery(db: SqlDriver): RecordQuery {
 /** Frozen grant projections over the current table. Lost bodies expire the cursor;
  * published older bodies remain owned by older-versions, never a local archive.
  */
-export function createGrantHistory(db: SqlDriver, link: ConnectionLink) {
+export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
   return async (
     stream: string,
     options: ChangesSinceOptions,

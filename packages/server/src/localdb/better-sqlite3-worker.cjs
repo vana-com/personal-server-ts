@@ -1,20 +1,30 @@
 "use strict";
 
 /**
- * The one owner of a local database connection. `better-sqlite3-driver.ts`
+ * The owner of one local database connection. `better-sqlite3-driver.ts`
  * starts this file as a worker thread and sends every statement and batch
- * here, so a long merge never holds the main thread's event loop and writes
- * stay serialized on one connection.
+ * here, so a long merge never holds the main thread's event loop.
+ *
+ * Two roles, set by `workerData.role`:
+ * - "writer": the one connection that writes. Statements and batches run in
+ *   order on it, so writes stay serialized. For a file database it also takes
+ *   the process lock (see `acquireProcessLock`).
+ * - "reader": a read-only connection to the same WAL file, opened on its first
+ *   message. It sees the last committed state and never waits for the
+ *   writer's transaction. It refuses a file that was deleted or replaced
+ *   after it opened (`sqlite_database_replaced`), rather than serving the
+ *   old file.
  *
  * A statement is { sid?, sql?, params }. The first use of an id carries the
  * text; later uses carry only the id. Messages in:
  *               { id, op: "query", ...statement }
- *               { id, op: "batch", statements: [statement] }
+ *               { id, op: "batch", statements: [statement] }   (writer only)
  *               { id, op: "close" }
  * Messages out: { id, ok: true, result } or { id, ok: false, error }.
  * Plain CommonJS: the worker loads it directly, with no build step of its own.
  */
 const { parentPort, workerData } = require("node:worker_threads");
+const { statSync } = require("node:fs");
 const Database = require("better-sqlite3");
 const { createStatementCache } = require("./statement-cache.cjs");
 
@@ -27,16 +37,74 @@ const bind = (params = []) =>
       : v,
   );
 
+const { path, role, lockTimeoutMs } = workerData;
+const isFile = path !== ":memory:";
+
+/**
+ * One process holds one database file. With separate read and write
+ * connections the file itself cannot stay in `locking_mode=EXCLUSIVE` (that
+ * mode refuses every other connection, this process's reader included), so a
+ * lock file next to it carries the rule: an EXCLUSIVE SQLite lock taken by one
+ * write and kept until `close`. The kernel drops it when the process dies. A
+ * second process waits `lockTimeoutMs`, then gets SQLITE_BUSY, as it did when
+ * the database file itself was exclusive.
+ */
+const acquireProcessLock = () => {
+  const lock = new Database(`${path}.lock`, {
+    ...(lockTimeoutMs === undefined ? {} : { timeout: lockTimeoutMs }),
+  });
+  try {
+    lock.pragma("locking_mode = EXCLUSIVE");
+    lock.pragma("user_version = 1");
+  } catch (error) {
+    lock.close();
+    throw error;
+  }
+  return lock;
+};
+
 let db;
 let cache;
+let processLock;
 let openError;
-try {
-  db = new Database(workerData.path);
-  cache = createStatementCache(db);
-  db.pragma("locking_mode = EXCLUSIVE");
-} catch (error) {
-  openError = error;
+let identity;
+const identityOf = () => {
+  const { dev, ino } = statSync(path);
+  return `${dev}:${ino}`;
+};
+if (role === "writer") {
+  try {
+    if (isFile) processLock = acquireProcessLock();
+    db = new Database(path);
+    cache = createStatementCache(db);
+    if (!isFile) db.pragma("locking_mode = EXCLUSIVE");
+  } catch (error) {
+    openError = error;
+  }
 }
+
+/** The reader opens on first use: the writer has made the file and set WAL by then. */
+const openReader = () => {
+  if (db) return;
+  db = new Database(path, { readonly: true, fileMustExist: true });
+  db.pragma("query_only = ON");
+  cache = createStatementCache(db);
+  identity = identityOf();
+};
+const checkReader = () => {
+  openReader();
+  let now;
+  try {
+    now = identityOf();
+  } catch {
+    now = undefined;
+  }
+  if (now !== identity) {
+    throw Object.assign(new Error("sqlite_database_replaced"), {
+      code: "SQLITE_DATABASE_REPLACED",
+    });
+  }
+};
 
 const texts = new Map();
 const textOf = ({ sid, sql }) => {
@@ -47,6 +115,7 @@ const textOf = ({ sid, sql }) => {
 
 const run = {
   query(statement) {
+    if (role === "reader") checkReader();
     const { params } = statement;
     const stmt = cache.prepare(textOf(statement));
     if (stmt.reader) return stmt.all(...bind(params));
@@ -54,6 +123,7 @@ const run = {
     return [];
   },
   batch({ statements }) {
+    if (role === "reader") throw new Error("sqlite_reader_cannot_write");
     // Register every text first: a failure part way must not leave a later
     // id unknown to the worker while the other side believes it is sent.
     const sqls = statements.map(textOf);
@@ -73,8 +143,12 @@ const run = {
     }
   },
   close() {
-    cache.clear();
-    db.close();
+    try {
+      cache?.clear();
+      db?.close();
+    } finally {
+      processLock?.close();
+    }
     return null;
   },
 };

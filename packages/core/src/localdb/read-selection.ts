@@ -2,7 +2,7 @@ import {
   logicalStreamScopeParts,
   streamReadScope,
 } from "../stream-sync-read/routing.js";
-import type { LocalSyncDeps } from "./deps.js";
+import type { SqlReader } from "./driver.js";
 import type { RecordQuery } from "./query.js";
 import type {
   AliasTargets,
@@ -86,7 +86,7 @@ export const servedStreamOf = (target: Target): string =>
 
 /** Every connection of one connector, by namespace. */
 export function connectionsOf(
-  deps: Pick<LocalSyncDeps, "db">,
+  deps: { readonly db: SqlReader },
   connector: string,
 ): Promise<Connection[]> {
   return deps.db.query<Connection>(
@@ -117,7 +117,7 @@ export const complete = (s: Stream, c: Connection) =>
  * complete head above the deletion floor.
  */
 export function loadStreams(
-  deps: Pick<LocalSyncDeps, "db">,
+  deps: { readonly db: SqlReader },
   connectionId?: string,
 ): Promise<Stream[]> {
   return deps.db.query<Stream>(

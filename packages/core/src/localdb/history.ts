@@ -6,6 +6,7 @@ import {
 } from "../additions/summary.js";
 import { ProtocolError } from "../errors/catalog.js";
 import type { LocalSyncDeps } from "./deps.js";
+import { readerOf } from "./driver.js";
 import {
   chooseCandidate,
   connectionsOf,
@@ -124,6 +125,8 @@ export function createLocalHistory(
     readonly aliasTargets?: AliasTargets;
   },
 ): LocalHistory {
+  // Every history read is a query: it takes the read connection.
+  const reads = { db: readerOf(deps.db) };
   type Located =
     | {
         readonly connector: string;
@@ -154,7 +157,7 @@ export function createLocalHistory(
     const picks: Candidate[] = [];
     let sawDeleted = false;
     for (const target of targets) {
-      const rows = await connectionsOf(deps, target.connector);
+      const rows = await connectionsOf(reads, target.connector);
       sawDeleted ||= rows.some(
         (c) => c.control_state === "deleted" || c.deleted_at !== null,
       );
@@ -163,7 +166,7 @@ export function createLocalHistory(
         await Promise.all(
           rows.map(async (connection) => ({
             connection,
-            streams: await loadStreams(deps, connection.connection_id),
+            streams: await loadStreams(reads, connection.connection_id),
           })),
         ),
       );
@@ -197,7 +200,7 @@ export function createLocalHistory(
 
       // One statement keeps rows, control visibility and frontiers in one
       // committed snapshot, including a connection deleted in a single batch.
-      const rows = await deps.db.query<{
+      const rows = await reads.db.query<{
         connection_id: string;
         connector: string;
         stream: string | null;
@@ -311,7 +314,7 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
       if ("gone" in located) return { ok: false, reason: located.gone };
       const { connector, ns, stream } = located;
       // One statement gives control, frontier, total and page one snapshot.
-      const rows = await deps.db.query<{
+      const rows = await reads.db.query<{
         control_state: string;
         head_version: number | null;
         total: number;
@@ -390,7 +393,7 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
       const located = await locate(scope);
       if ("gone" in located) return { ok: false, reason: located.gone };
       const { connector, ns, stream } = located;
-      const [row] = await deps.db.query<{
+      const [row] = await reads.db.query<{
         control_state: string;
         version: number | null;
       }>(

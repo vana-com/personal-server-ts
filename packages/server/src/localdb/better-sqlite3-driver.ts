@@ -2,6 +2,7 @@ import { Worker } from "node:worker_threads";
 import Database from "better-sqlite3";
 import type {
   SqlDriver,
+  SqlReader,
   SqlStatement,
   SqlValue,
 } from "@opendatalabs/personal-server-ts-core/localdb";
@@ -46,25 +47,27 @@ const asBuffers = <R extends Record<string, SqlValue>>(rows: R[]): R[] => {
   return rows;
 };
 
-/**
- * Node and Desktop driver. A worker thread owns the one connection, so a
- * long `batch` (a synchronous BEGIN IMMEDIATE ... COMMIT) never holds this
- * thread's event loop, and every statement runs in order on one connection.
- * The process holds the file exclusively (`locking_mode=EXCLUSIVE`).
- * `path` is a file path, or `:memory:`.
- */
-export function openBetterSqlite3(path: string): SqlDriver {
-  // Read the version here: `info` is synchronous and the worker is not up yet.
-  const probe = new Database(":memory:");
-  const { v } = probe.prepare("SELECT sqlite_version() AS v").get() as {
-    v: string;
-  };
-  probe.close();
+/** One worker thread that owns one connection, and the calls into it. */
+interface Connection {
+  query<R extends Record<string, SqlValue>>(
+    sql: string,
+    params?: readonly SqlValue[],
+  ): Promise<R[]>;
+  batch(
+    statements: readonly SqlStatement[],
+  ): Promise<{ changes: readonly number[] }>;
+  close(): Promise<void>;
+}
 
+function connect(
+  path: string,
+  role: "writer" | "reader",
+  lockTimeoutMs: number | undefined,
+): Connection {
   const worker = new Worker(
     new URL("./better-sqlite3-worker.cjs", import.meta.url),
     {
-      workerData: { path },
+      workerData: { path, role, lockTimeoutMs },
       // A small young generation makes V8 reclaim received messages early.
       resourceLimits: { maxYoungGenerationSizeMb: 2 },
     },
@@ -124,13 +127,7 @@ export function openBetterSqlite3(path: string): SqlDriver {
       worker.postMessage({ id, ...message });
     });
   };
-
   return {
-    info: {
-      sqliteVersion: v,
-      host: "node",
-      persistent: path !== ":memory:",
-    },
     async query<R extends Record<string, SqlValue>>(
       sql: string,
       params?: readonly SqlValue[],
@@ -139,16 +136,78 @@ export function openBetterSqlite3(path: string): SqlDriver {
         await call<R[]>({ op: "query", ...wire({ sql, params }) }),
       );
     },
-    batch(statements: readonly SqlStatement[]) {
+    batch(statements) {
       return call<{ changes: readonly number[] }>({
         op: "batch",
         statements: statements.map(wire),
       });
     },
     async close() {
-      await call({ op: "close" });
+      try {
+        await call({ op: "close" });
+      } finally {
+        closed = true;
+        await worker.terminate();
+      }
+    },
+  };
+}
+
+/**
+ * Node and Desktop driver. A worker thread owns the writing connection, so a
+ * long `batch` (a synchronous BEGIN IMMEDIATE ... COMMIT) never holds this
+ * thread's event loop, and every statement runs in order on one connection.
+ *
+ * A file database also has `reads`: a second worker thread with a read-only
+ * connection to the same WAL file, started on its first read. A read on it
+ * waits for no write. `close()` closes both connections.
+ *
+ * The process holds the file exclusively: a lock file next to the database
+ * (see the worker) refuses a second process, as the old
+ * `locking_mode=EXCLUSIVE` on the database did. `lockTimeoutMs` is how long a
+ * second opener waits for it (default: SQLite's 5 s).
+ * `path` is a file path, or `:memory:`, which has no separate read connection.
+ */
+export function openBetterSqlite3(
+  path: string,
+  options: { readonly lockTimeoutMs?: number } = {},
+): SqlDriver {
+  // Read the version here: `info` is synchronous and the worker is not up yet.
+  const probe = new Database(":memory:");
+  const { v } = probe.prepare("SELECT sqlite_version() AS v").get() as {
+    v: string;
+  };
+  probe.close();
+
+  const persistent = path !== ":memory:";
+  const writer = connect(path, "writer", options.lockTimeoutMs);
+  let reader: Connection | undefined;
+  let closed = false;
+  const reads: SqlReader | undefined = persistent
+    ? {
+        query<R extends Record<string, SqlValue>>(
+          sql: string,
+          params?: readonly SqlValue[],
+        ) {
+          if (closed) return Promise.reject(new Error("sqlite_driver_closed"));
+          reader ??= connect(path, "reader", undefined);
+          return reader.query<R>(sql, params);
+        },
+      }
+    : undefined;
+
+  return {
+    info: { sqliteVersion: v, host: "node", persistent },
+    query: writer.query,
+    batch: writer.batch,
+    ...(reads ? { reads } : {}),
+    async close() {
       closed = true;
-      await worker.terminate();
+      try {
+        await reader?.close();
+      } finally {
+        await writer.close();
+      }
     },
   };
 }
