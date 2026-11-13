@@ -2145,7 +2145,7 @@ describe("Oura collection requirements", () => {
         method: "oura-browser",
         generation: 1,
         artifactDigest:
-          "sha256:45d044af6e263a5121033df51f7ad5eaed1e19f1263cffe95ae63737259888c5",
+          "sha256:cb546f620242313cd43a2f4be7bb5f1082f73706f56806502cf83c0e3a3896ea",
       },
       collectedAt: T_PDPP,
       records: SCOPES.flatMap((scope) =>
@@ -2167,6 +2167,11 @@ describe("Oura collection requirements", () => {
       { generation: 2 },
       { method: "oura" },
       { artifactDigest: "sha256:changed" },
+      // The previously accepted 0.1.41 build is no longer the reviewed one.
+      {
+        artifactDigest:
+          "sha256:45d044af6e263a5121033df51f7ad5eaed1e19f1263cffe95ae63737259888c5",
+      },
       { sourceId: "https://example.invalid/sources/oura" },
     ]) {
       const refused = await ctx!.app.request("/v1/import/oura-browser", {
@@ -2323,7 +2328,7 @@ describe("Oura collection requirements", () => {
       method: "oura-browser",
       generation: 1,
       artifactDigest:
-        "sha256:45d044af6e263a5121033df51f7ad5eaed1e19f1263cffe95ae63737259888c5",
+        "sha256:cb546f620242313cd43a2f4be7bb5f1082f73706f56806502cf83c0e3a3896ea",
     };
     const startAt = (since: string) => ({
       streams: SCOPES.map((scope) => ({

@@ -37,6 +37,14 @@ type OuraRouteDeps = Pick<
 >;
 const SCOPES = ["oura.sleep", "oura.readiness", "oura.activity"];
 
+/**
+ * The one oura-browser build whose native batches this route accepts. Desktop's
+ * importer (`pdpp_oura_import::ARTIFACT`) and its admitted pin name the same build;
+ * moving to another build is a reviewed change to all three together.
+ */
+export const OURA_BROWSER_ARTIFACT_DIGEST =
+  "sha256:cb546f620242313cd43a2f4be7bb5f1082f73706f56806502cf83c0e3a3896ea";
+
 export function ouraRoutes(deps: OuraRouteDeps): Hono {
   const app = new Hono();
   app.use("*", createBodyLimit(DATA_INGEST_MAX_SIZE));
@@ -245,8 +253,7 @@ function validNativePublication(
     typeof native !== "object" ||
     native.sourceId !== "https://registry.pdpp.dev/sources/oura" ||
     native.method !== "oura-browser" ||
-    native.artifactDigest !==
-      "sha256:45d044af6e263a5121033df51f7ad5eaed1e19f1263cffe95ae63737259888c5" ||
+    native.artifactDigest !== OURA_BROWSER_ARTIFACT_DIGEST ||
     typeof native.instance !== "string" ||
     !Number.isSafeInteger(native.generation)
   )
