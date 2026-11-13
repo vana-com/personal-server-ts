@@ -10,10 +10,7 @@ import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
 import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { createServerLocalSync } from "./localdb/sync.js";
-import {
-  retireAfterImport,
-  type LegacyRetirePort,
-} from "./localdb/retire-after-import.js";
+import { createLegacyStoreRunner } from "./localdb/legacy-store-import.js";
 import { createLocalSeed } from "./localdb/seed.js";
 import { createSeedStaging } from "./stream-sync/seed-staging.js";
 import { createFsStreamSyncFiles } from "./stream-sync/fs-files.js";
@@ -235,19 +232,6 @@ export interface CreateServerOptions {
    * under the storage root, outside the data database. Tests inject a store.
    */
   accountModeStore?: ModeRecordStore;
-  /**
-   * The host's legacy importer. The server runs it when the Account says On
-   * and once at boot when the owner is already switched; what is owed and when
-   * it is done is the importer's own record. Without one no import starts.
-   */
-  legacyImporter?: ImportRunner;
-  /**
-   * The host's switched-owner view of the old legacy files. With it, a
-   * successful `legacyImporter` run is followed by `retireLegacyCopies`, which
-   * removes the files only when `streamSync.retireLegacy` is on and otherwise
-   * reports read-back only. Without it, nothing is retired.
-   */
-  legacyRetire?: LegacyRetirePort;
   /** Owner-authorized HTTP signing capability supplied by the trusted host. */
   ownerRequestSigner?: RequestSigner;
   /** Inventory-route-only signer; never used by the owner-only scope feed. */
@@ -518,29 +502,6 @@ async function bootstrapServer(
     authority: accountModeAuthority,
     owner: serverOwner,
   });
-  if (options?.legacyImporter && serverOwner) {
-    importWaker = createImportWaker({
-      authority: accountModeAuthority,
-      owner: serverOwner,
-      importer: options.legacyRetire
-        ? retireAfterImport({
-            importer: options.legacyImporter,
-            port: options.legacyRetire,
-            // The server's one shared handle; the import has just written
-            // through it, so this opens nothing new for a switched owner.
-            getDeps: async () => {
-              await getLocalSync();
-              return localSyncDeps!;
-            },
-            isSwitched: () => legacyWriteSeal.verdict() === "switched",
-            streamSync: () => config.streamSync,
-            logger,
-          })
-        : options.legacyImporter,
-      onWarning: (message, detail) => logger.warn({ detail }, message),
-    });
-  }
-
   const reindexInProgressPath = join(storageRoot, "reindex-in-progress");
   const hasReindexInProgress = async (): Promise<boolean> => {
     return pathExists(reindexInProgressPath);
@@ -1547,6 +1508,39 @@ async function bootstrapServer(
           (await localSyncSource()).intake.publicationStatus(...args),
       }
     : undefined;
+
+  // The server's own legacy store is a one-time seed for a switched owner.
+  // The waker runs the import, then the retirement, when the Account answers
+  // On and once at boot for an owner already switched. No host supplies a port.
+  if (localSyncSource && serverOwner) {
+    if (dataDir === join(storageRoot, "data")) {
+      importWaker = createImportWaker({
+        authority: accountModeAuthority,
+        owner: serverOwner,
+        importer: createLegacyStoreRunner({
+          db,
+          root: storageRoot,
+          owner: serverOwner,
+          network: streamSyncNetwork(config.gateway),
+          legacyWriteSeal,
+          getDeps: async () => {
+            await localSyncSource();
+            return localSyncDeps!;
+          },
+          declarations: () => pdppAuth?.retainedDeclarations ?? [],
+          methods: () => pdppAuth?.configuredMethods ?? [],
+          manifests: () => pdppAuth?.retainedManifests ?? [],
+          streamSync: () => config.streamSync,
+          logger,
+        }),
+        onWarning: (message, detail) => logger.warn({ detail }, message),
+      });
+    } else {
+      logger.warn(
+        "the data directory is not <root>/data; the legacy store import is off",
+      );
+    }
+  }
 
   const streamSyncSeed = localSyncSource
     ? createLocalSeed({

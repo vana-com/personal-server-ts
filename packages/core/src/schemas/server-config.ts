@@ -60,8 +60,8 @@ export const DEFAULTS = {
     // reads are exactly as before.
     read: false,
     // Off by default. When true, the old legacy files, a one-time seed, are
-    // removed after the host's import returns for a switched owner. When
-    // false the same step only reads them back and reports.
+    // removed after this server's own import of them finishes, for a switched
+    // owner. When false the same step only reads them back and reports.
     retireLegacy: false,
   },
   olderVersionReads: true,
