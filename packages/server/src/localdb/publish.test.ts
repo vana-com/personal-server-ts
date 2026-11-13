@@ -331,6 +331,106 @@ describe("publishConnection", () => {
     expect(pending.n).toBeGreaterThan(0);
   });
 
+  it("logs one line per stream publish with where the time went", async () => {
+    const world = await makeWorld();
+    await seedConnection(world.deps, 1);
+    await seedStream(world.deps);
+    await seedRun(world.deps, "r1", 1000);
+    await seedRecord(world.deps, "rec-1", JSON.stringify({ id: 1 }));
+    await seedRunRow(world.deps, "r1", "rec-1", JSON.stringify({ id: 1 }));
+
+    // A clock the ports advance, so each phase has a known duration.
+    let clock = 0;
+    const lines: Array<Record<string, unknown>> = [];
+    const { deps } = world;
+    const blobs = deps.blobs;
+    const registry = deps.registry;
+    const sizes: number[] = [];
+    Object.assign(deps, {
+      now: () => clock,
+      logger: {
+        info: (line: Record<string, unknown>) => lines.push(line),
+        warn: () => {},
+      },
+      blobs: {
+        get: async (key: string) => {
+          clock += 2;
+          return blobs.get(key);
+        },
+        put: async (key: string, bytes: Uint8Array) => {
+          clock += 5;
+          sizes.push(bytes.length);
+          return blobs.put(key, bytes);
+        },
+      },
+      keys: {
+        ...deps.keys,
+        encryptPart: async (_scope: string, clear: Uint8Array) => {
+          clock += 4;
+          return clear;
+        },
+        encrypt: async (_scope: string, clear: Uint8Array) => {
+          clock += 6;
+          return clear;
+        },
+      },
+      registry: {
+        read: async (scope: string) => {
+          clock += 1;
+          return registry.read(scope);
+        },
+        listControlRows: registry.listControlRows.bind(registry),
+        listStreamRows: registry.listStreamRows.bind(registry),
+        post: async (post: Parameters<typeof registry.post>[0]) => {
+          clock += 11;
+          return registry.post(post);
+        },
+      },
+      signer: {
+        signAddData: async () => {
+          clock += 3;
+          return ("0x" + "0".repeat(128)) as `0x${string}`;
+        },
+      },
+    });
+
+    const results = await publishConnection(deps, CONNECTION_ID);
+    expect(results[0]).toMatchObject({ outcome: "published" });
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toEqual({
+      connectionId: CONNECTION_ID,
+      stream: STREAM,
+      outcome: "published",
+      // The snapshot reads the control row and the stream row.
+      planMs: 2,
+      // Part encrypt 4 and head encrypt 6; the wire time is the upload.
+      encodeEncryptMs: 10,
+      partsUploaded: 1,
+      bytesUploaded: sizes.reduce((sum, size) => sum + size, 0),
+      // Part and head, each probed with a GET (2 ms) and written (5 ms).
+      blobGets: 2,
+      blobPuts: 2,
+      uploadMs: 14,
+      // Signing 3 and posting 11.
+      headRegisterMs: 14,
+      totalMs: clock,
+    });
+    expect(sizes).toHaveLength(2);
+  });
+
+  it("logs nothing for a stream that has nothing to publish", async () => {
+    const world = await makeWorld();
+    await seedConnection(world.deps, 1);
+    await seedStream(world.deps);
+    const lines: unknown[] = [];
+    Object.assign(world.deps, {
+      logger: { info: (line: unknown) => lines.push(line), warn: () => {} },
+    });
+    await publishConnection(world.deps, CONNECTION_ID);
+    expect(lines).toEqual([]);
+  });
+
   it("applies the winner and re-plans, at most 5 tries, then backs off", async () => {
     const world = await makeWorld();
     await seedConnection(world.deps, 1);

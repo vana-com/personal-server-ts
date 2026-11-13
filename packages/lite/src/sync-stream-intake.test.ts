@@ -181,6 +181,12 @@ describe("Lite database intake", () => {
       ).records.map((r) => JSON.parse(r.body)),
     ).toEqual([{ id: "from-node", value: 2000 }]);
   });
+  it("a run that ends wakes the sync manager so publish does not wait for the poll", async () => {
+    const { lite } = await fixture();
+    const wake = vi.spyOn(lite.syncManager, "notifyNewData");
+    await collect(lite.streamSyncIntake!, "lite-wake", "item", 1000);
+    expect(wake).toHaveBeenCalledTimes(1);
+  });
   it("unknown and explicit Off never open a database or fall back to writer files", async () => {
     let mode: "unknown" | "unswitched" | "switched" = "unknown";
     const { lite, openDriver } = await fixture(() => mode);

@@ -11,7 +11,7 @@ import {
   type ImportRow,
 } from "./import-snapshot.js";
 import type { SqlStatement } from "./driver.js";
-import type { LocalSyncDeps } from "./deps.js";
+import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
 import type { ImportLedger } from "./import-ledger.js";
 import type { ImportReceipt, ImportSource } from "./legacy-import-types.js";
 
@@ -58,6 +58,18 @@ export type LegacyImportResult =
  * never prove delivery. No frame codec.
  */
 export async function importLegacySource(
+  deps: LocalSyncDeps,
+  ledger: ImportLedger,
+  source: ImportSource,
+): Promise<LegacyImportResult> {
+  const result = await importSource(deps, ledger, source);
+  // One wake per import, not per chunk: a wake per chunk would start a publish
+  // cycle every debounce while the import is still merging.
+  if (result.kind === "imported") announceRecordsCommitted(deps);
+  return result;
+}
+
+async function importSource(
   deps: LocalSyncDeps,
   ledger: ImportLedger,
   source: ImportSource,

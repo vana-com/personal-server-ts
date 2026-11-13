@@ -32,6 +32,25 @@ export interface LocalSyncDeps {
   readonly newOp: () => string;
   /** Part target in bytes; default 4 MiB (C.2). */
   readonly partTargetBytes?: number;
+  /**
+   * The host's wake for publish. Called after rows of a run or an import
+   * commit, so a publish starts soon after them and not at the next poll.
+   * Fire and forget: the poll is the recovery sweep, so a missed call only
+   * costs latency, and a throw here never fails the commit.
+   */
+  readonly recordsCommitted?: () => void;
+}
+
+/** The one call every commit of local rows makes (run end, import). */
+export function announceRecordsCommitted(deps: LocalSyncDeps): void {
+  try {
+    deps.recordsCommitted?.();
+  } catch (error) {
+    deps.logger.warn(
+      { error: String(error) },
+      "stream sync: the publish wake threw; the poll will publish",
+    );
+  }
 }
 
 /** One `connections` row, as the modules pass it around. */

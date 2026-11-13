@@ -595,6 +595,7 @@ export async function createPsLiteSyncManager(
           logger,
           now: Date.now,
           newOp: () => globalThis.crypto.randomUUID(),
+          recordsCommitted: () => syncManager?.notifyNewData(),
           partTargetBytes: LITE_PART_TARGET_BYTES,
         };
         localSync = createLocalSync(localSyncDeps, {

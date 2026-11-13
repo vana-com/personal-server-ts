@@ -94,6 +94,13 @@ import {
   type HeadExtras,
 } from "./encode.js";
 import { planChangedPrefixes } from "./part-layout.js";
+import {
+  meteredBlobs,
+  newPublishMeter,
+  publishTimings,
+  timed,
+  type PublishMeter,
+} from "./publish-meter.js";
 import { replaceDelete, withOrigin } from "./merge.js";
 import {
   endsEarlierLifetime,
@@ -315,6 +322,8 @@ type StreamRun = {
   watermark: number | null;
   /** The attempt whose rows are in `publish_spool`; see `endSpool`. */
   spool: string | null;
+  /** Counts for the one log line the stream's publish ends with. */
+  readonly meter: PublishMeter;
 };
 
 type StreamContext = {
@@ -395,9 +404,12 @@ async function publishStream(
     invalidations: 0,
     watermark: null,
     spool: null,
+    meter: newPublishMeter(),
   };
+  const startedAt = deps.now();
+  let outcome: PublishResult["outcome"] | "failed" = "failed";
   try {
-    return await publishAttempts(
+    const result = await publishAttempts(
       deps,
       run,
       connectionId,
@@ -407,10 +419,49 @@ async function publishStream(
       hashes,
       options,
     );
+    outcome = result.outcome;
+    return result;
   } finally {
     // Commit, discard and failure all end here.
     await endSpool(deps, run);
+    logPublishTimings(
+      deps,
+      connectionId,
+      stream,
+      outcome,
+      run.meter,
+      startedAt,
+    );
   }
+}
+
+/**
+ * One info line per stream publish that did work, so a journey reads where the
+ * time went. A stream with nothing to do (a quiet poll) logs nothing: it would
+ * add a line per stream every cycle.
+ */
+function logPublishTimings(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  stream: string,
+  outcome: PublishResult["outcome"] | "failed",
+  meter: PublishMeter,
+  startedAt: number,
+): void {
+  const idle =
+    (outcome === "noop" || outcome === "deferred") &&
+    meter.blobGets === 0 &&
+    meter.blobPuts === 0;
+  if (idle) return;
+  deps.logger.info(
+    {
+      connectionId,
+      stream,
+      outcome,
+      ...publishTimings(meter, deps.now() - startedAt),
+    },
+    "stream sync: stream publish timings",
+  );
 }
 
 /**
@@ -461,11 +512,15 @@ async function publishAttempts(
     }
     // The last attempt's copy is of no use now: it was discarded or ended.
     await endSpool(deps, run);
-    const snapshot = await slot((held) => snapshotStream(held, context, run));
+    const snapshot = await timed(
+      deps,
+      (ms) => (run.meter.planMs += ms),
+      () => slot((held) => snapshotStream(held, context, run)),
+    );
     if (snapshot.kind === "done") return snapshot.result;
     if (snapshot.kind === "retry") continue;
     if (snapshot.kind === "blobs") {
-      await uploadBlobs(deps, snapshot.blobs);
+      await uploadBlobs(deps, snapshot.blobs, run.meter);
       const { evidence } = snapshot;
       if (evidence) {
         await slot((held) => confirmNoWork(held, context, evidence));
@@ -475,7 +530,11 @@ async function publishAttempts(
     const { candidate } = snapshot;
     let prepared: Prepared;
     try {
-      prepared = await transferCandidate(deps, context, candidate);
+      prepared = await timed(
+        deps,
+        (ms) => (run.meter.transferMs += ms),
+        () => transferCandidate(deps, context, candidate, run.meter),
+      );
     } catch (error) {
       // A transfer that lost its input because local state moved (a purge
       // took the spooled rows or an attachment) is a stale candidate, not a
@@ -846,14 +905,16 @@ async function transferCandidate(
   deps: LocalSyncDeps,
   context: StreamContext,
   candidate: Candidate,
+  meter: PublishMeter,
 ): Promise<Prepared> {
   const { scope } = context;
-  await uploadBlobs(deps, candidate.blobs);
+  await uploadBlobs(deps, candidate.blobs, meter);
   const encoded = await uploadFrozenParts(deps, {
     attempt: candidate.attempt,
     scope,
     generation: candidate.headGeneration,
     frozen: candidate.frozen,
+    meter,
   });
   const parts = mergedParts(
     candidate.baseParts,
@@ -871,8 +932,9 @@ async function transferCandidate(
     return { parts, recordCount, dataHash, blobName, encryptedLength: null };
   }
   const encrypted = await deps.keys.encrypt(scope, headBytes);
-  if ((await deps.blobs.get(`${scope}/${blobName}`)) === null) {
-    await deps.blobs.put(`${scope}/${blobName}`, encrypted);
+  const blobs = meteredBlobs(deps, meter);
+  if ((await blobs.get(`${scope}/${blobName}`)) === null) {
+    await blobs.put(`${scope}/${blobName}`, encrypted);
   }
   return {
     parts,
@@ -1007,24 +1069,29 @@ async function commitCandidate(
     new Date(candidate.head.observedAt).toISOString(),
     prepared.encryptedLength,
   );
-  const signature = await deps.signer.signAddData({
-    ownerAddress: deps.ownerAddress,
-    scope,
-    dataHash: headHash,
-    metadataHash,
-    expectedVersion: BigInt(newVersion),
-  });
+  const addRegisterMs = (ms: number) => (run.meter.headRegisterMs += ms);
+  const signature = await timed(deps, addRegisterMs, () =>
+    deps.signer.signAddData({
+      ownerAddress: deps.ownerAddress,
+      scope,
+      dataHash: headHash,
+      metadataHash,
+      expectedVersion: BigInt(newVersion),
+    }),
+  );
   const beforePost = await checkControl(deps, connectionId, connection, hashes);
   if (beforePost) return done({ stream, outcome: beforePost, watermark });
   run.attempts++;
-  const posted = await deps.registry.post({
-    ownerAddress: deps.ownerAddress,
-    scope,
-    dataHash: headHash,
-    metadataHash,
-    expectedVersion: String(newVersion),
-    signature,
-  });
+  const posted = await timed(deps, addRegisterMs, () =>
+    deps.registry.post({
+      ownerAddress: deps.ownerAddress,
+      scope,
+      dataHash: headHash,
+      metadataHash,
+      expectedVersion: String(newVersion),
+      signature,
+    }),
+  );
   if (posted.kind === "conflict") {
     // Apply the winner and re-plan. On the last try, back off without
     // applying again: the winner will be applied on the next cycle.

@@ -9,6 +9,7 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { SqlValue } from "./driver.js";
 import type { LocalSyncDeps } from "./deps.js";
+import { meteredBlobs, type PublishMeter } from "./publish-meter.js";
 
 const hash = async (bytes: Uint8Array): Promise<Uint8Array> => sha256(bytes);
 
@@ -264,9 +265,12 @@ export async function uploadFrozenParts(
     readonly scope: string;
     readonly generation: number;
     readonly frozen: readonly FrozenPrefix[];
+    /** Counts the blob calls and parts written; the bytes stay the same. */
+    readonly meter?: PublishMeter;
   },
 ): Promise<readonly EncodedPart[]> {
   const target = partTarget(deps, input.generation);
+  const blobs = input.meter ? meteredBlobs(deps, input.meter) : deps.blobs;
   const result: EncodedPart[] = [];
   for (const frozen of input.frozen) {
     const { prefix } = frozen;
@@ -275,11 +279,12 @@ export async function uploadFrozenParts(
       const { hash: partHash, bytes, count } = part.entry;
       const blobName = `g${input.generation}-p-${partHash}`;
       const key = `${input.scope}/${blobName}`;
-      if ((await deps.blobs.get(key)) === null) {
-        await deps.blobs.put(
+      if ((await blobs.get(key)) === null) {
+        await blobs.put(
           key,
           await deps.keys.encryptPart(input.scope, part.data),
         );
+        if (input.meter) input.meter.partsUploaded += 1;
       }
       result.push({ prefix, seq, partHash, bytes, count, blobName });
       seq += 1;

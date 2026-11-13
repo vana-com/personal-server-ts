@@ -3,6 +3,7 @@ import { bytesToHex } from "@noble/hashes/utils";
 import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlDriver, SqlStatement } from "./driver.js";
+import { meteredBlobs, type PublishMeter } from "./publish-meter.js";
 
 /**
  * E.1: run blobs (at most 32 MiB). `PUT /v1/stream-sync/runs/:runId/blobs/:sha256`
@@ -324,12 +325,14 @@ export async function listStreamBlobs(
 export async function uploadBlobs(
   deps: LocalSyncDeps,
   blobs: readonly BlobDescriptor[],
+  meter?: PublishMeter,
 ): Promise<void> {
+  const store = meter ? meteredBlobs(deps, meter) : deps.blobs;
   let uploaded = uploadedBlobs.get(deps.db);
   if (!uploaded) uploadedBlobs.set(deps.db, (uploaded = new Set()));
   for (const { blobId, key, scope } of blobs) {
     if (uploaded.has(key)) continue;
-    if ((await deps.blobs.get(key)) !== null) {
+    if ((await store.get(key)) !== null) {
       uploaded.add(key);
       continue;
     }
@@ -341,7 +344,7 @@ export async function uploadBlobs(
       throw new MissingAttachmentError(blobId);
     }
     checkBytes(blobId, local.bytes);
-    await deps.blobs.put(key, await deps.keys.encrypt(scope, local.bytes));
+    await store.put(key, await deps.keys.encrypt(scope, local.bytes));
     uploaded.add(key);
   }
 }

@@ -13,7 +13,7 @@ import {
   planStreamStep,
   type PlanHead,
 } from "../stream-sync/publish-plan.js";
-import type { LocalSyncDeps } from "./deps.js";
+import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { checkRunFence } from "./fence.js";
 import { deleteRunRecords, mergeIncoming, withOrigin } from "./merge.js";
@@ -381,6 +381,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         };
         statements.push(...cleanup(response));
         await db.batch(withOrigin("local", statements));
+        announceRecordsCommitted(deps);
         return response;
       },
     );
