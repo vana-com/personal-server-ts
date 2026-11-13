@@ -284,6 +284,8 @@ export async function uploadFrozenParts(
     readonly frozen: readonly FrozenPrefix[];
     /** Counts the blob calls and parts written; the bytes stay the same. */
     readonly meter?: PublishMeter;
+    /** Called before each part is probed and again before it is uploaded; a throw stops the transfer. */
+    readonly beforeUpload?: () => void;
   },
 ): Promise<readonly EncodedPart[]> {
   const target = partTarget(deps, input.generation);
@@ -296,11 +298,11 @@ export async function uploadFrozenParts(
       const { hash: partHash, bytes, count } = part.entry;
       const blobName = `g${input.generation}-p-${partHash}`;
       const key = `${input.scope}/${blobName}`;
-      if ((await blobs.get(key)) === null) {
-        await blobs.put(
-          key,
-          await deps.keys.encryptPart(input.scope, part.data),
-        );
+      input.beforeUpload?.();
+      if (!(await blobs.exists(key))) {
+        const cipher = await deps.keys.encryptPart(input.scope, part.data);
+        input.beforeUpload?.();
+        await blobs.put(key, cipher, input.beforeUpload);
         if (input.meter) input.meter.partsUploaded += 1;
       }
       result.push({ prefix, seq, partHash, bytes, count, blobName });

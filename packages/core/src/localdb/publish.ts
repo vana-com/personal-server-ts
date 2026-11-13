@@ -49,6 +49,15 @@ import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 // Seeds (import rows with stamp (0, "seed")) publish only into generation
 // 1; otherwise they are purged and the ledger records excluded(seed_skipped).
 //
+// Streams of one connection run together, up to `streamConcurrency`. Each
+// stream's turns take the slot one at a time, so the control row is settled
+// by whichever snapshot runs first and every other stream sees it active; the
+// transfers overlap. Each stream's own state (stream_state row, spool attempt,
+// watermark) is its own; the connection's state (control, apply) is only
+// touched in a slot turn, and a change to it shows in the other streams'
+// readBasis. A purge sets a latch in its turn: streams still running stop at
+// their next turn or upload and report "purged"; no stream starts after it.
+//
 // Queue: this module takes the connection's "publish" slot itself, for the
 // snapshot and the commit. The caller must not hold it. applyConnection and
 // purgeConnection, called inside a turn, run inline in that turn.
@@ -111,42 +120,8 @@ import { purgeConnection } from "./purge.js";
 import { checkRunFence } from "./fence.js";
 import { replaceMayApply } from "./replace.js";
 import { insideQueue } from "./slot.js";
+import { recallHead, rememberHead, rememberOwnHead } from "./verified-heads.js";
 import { unwriteRefusedRun } from "./unwrite.js";
-
-/**
- * Verified registry heads by (scope, data hash). A head blob is named by its
- * data hash and never changes, so a head verified once need not be downloaded
- * again. Without this every cycle downloaded one head blob per stream of every
- * connection, quiet or not; the storage service rejects a burst of reads, and
- * a cycle that has real work to publish then fails before it posts anything.
- */
-const verifiedHeads = new WeakMap<object, Map<string, Head>>();
-const MAX_VERIFIED_HEADS = 512;
-
-function headCache(deps: LocalSyncDeps): Map<string, Head> {
-  let cache = verifiedHeads.get(deps.blobs);
-  if (!cache) {
-    cache = new Map();
-    verifiedHeads.set(deps.blobs, cache);
-  }
-  return cache;
-}
-
-function rememberHead(
-  deps: LocalSyncDeps,
-  scope: string,
-  dataHash: string,
-  keyCheck: string,
-  head: Head,
-): void {
-  const cache = headCache(deps);
-  const key = `${scope}|${dataHash.toLowerCase()}|${keyCheck}`;
-  cache.delete(key);
-  cache.set(key, head);
-  if (cache.size > MAX_VERIFIED_HEADS) {
-    cache.delete(cache.keys().next().value!);
-  }
-}
 
 /** Confirmed publication of one stream in a connector namespace. */
 export interface PublicationReceipt {
@@ -179,8 +154,19 @@ export interface PublishResult {
   readonly watermark: number | null; // max(seq) read in step 1; new publish_watermark on success
 }
 
+/**
+ * Streams of one connection published at once. Their transfers (the uploads)
+ * overlap; their snapshot and commit turns still take the connection's slot one
+ * at a time. One line to change: the storage client's own limits
+ * (`maxConcurrent`, `maxConcurrentPuts`) bound the requests no matter how many
+ * streams run.
+ */
+export const DEFAULT_STREAM_CONCURRENCY = 4;
+
 export interface PublishOptions {
   readonly headExtras?: (stream: string) => Promise<HeadExtras | undefined>;
+  /** Streams published at once; a positive whole number. Default 4. */
+  readonly streamConcurrency?: number;
 }
 
 export async function publishConnection(
@@ -233,22 +219,84 @@ export async function publishConnection(
   });
   if (opened.results) return opened.results;
   const { connection, keyCheck, hashes, streams } = opened;
-  const results: PublishResult[] = [];
-  for (const { stream } of streams) {
-    const result = await publishStream(
-      deps,
-      connectionId,
-      connection,
-      stream,
-      keyCheck,
-      hashes,
-      options,
-    );
-    results.push(result);
-    // A deleted control row purges the whole connection and stops.
-    if (result.outcome === "purged") break;
+  const latch: PurgeLatch = { purged: false };
+  const published = await publishEach(
+    streams.map(({ stream }) => stream),
+    options?.streamConcurrency ?? DEFAULT_STREAM_CONCURRENCY,
+    latch,
+    (stream) =>
+      publishStream(
+        deps,
+        connectionId,
+        connection,
+        stream,
+        keyCheck,
+        hashes,
+        latch,
+        options,
+      ),
+  );
+  // A deleted control row purges the whole connection. Every stream that
+  // started has a result, "purged" included: with streams running together,
+  // a stream after the purged one may already have published, and leaving it
+  // out would hide a real publication. A stream missing from the results never
+  // started.
+  return published;
+}
+
+/**
+ * Set, in the slot turn that purged the connection, so that the next turn of
+ * any stream of the connection sees it. Streams of one publish share one.
+ */
+type PurgeLatch = { purged: boolean };
+
+/** A stream stopped because another stream's turn purged the connection. */
+class ConnectionPurged extends Error {
+  constructor() {
+    super("publish: the connection was purged");
   }
-  return results;
+}
+
+function stopIfPurged(latch: PurgeLatch): void {
+  if (latch.purged) throw new ConnectionPurged();
+}
+
+/**
+ * Run `publish` for every stream, at most `limit` at a time, starting them in
+ * order. Returns the results of the streams that ran, in stream order whatever
+ * order they finished in. Once the connection is purged or a stream fails, no
+ * further stream starts; streams already running are waited for, so nothing
+ * runs on after this returns. The failure of the earliest stream is thrown.
+ */
+async function publishEach(
+  streams: readonly string[],
+  limit: number,
+  latch: PurgeLatch,
+  publish: (stream: string) => Promise<PublishResult>,
+): Promise<PublishResult[]> {
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new RangeError(
+      `publish: streamConcurrency must be a positive whole number, got ${limit}`,
+    );
+  }
+  const results: (PublishResult | undefined)[] = streams.map(() => undefined);
+  const failures = new Map<number, unknown>();
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (failures.size === 0 && !latch.purged && next < streams.length) {
+      const at = next++;
+      try {
+        results[at] = await publish(streams[at]!);
+      } catch (error) {
+        failures.set(at, error);
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, streams.length) }, worker),
+  );
+  if (failures.size > 0) throw failures.get(Math.min(...failures.keys()));
+  return results.filter((r): r is PublishResult => r !== undefined);
 }
 
 const keccak: Keccak256 = async (data) => keccak_256(data);
@@ -339,6 +387,7 @@ type StreamContext = {
   readonly scope: string;
   readonly keyCheck: string;
   readonly hashes: ControlHashes;
+  readonly latch: PurgeLatch;
   readonly options: PublishOptions | undefined;
 };
 
@@ -375,6 +424,13 @@ type Prepared = {
   readonly blobName: string;
   /** `null` when the head equals the registry head: nothing to publish. */
   readonly encryptedLength: number | null;
+  /**
+   * The head this device encoded, as the reader would parse it: the result of
+   * `verifyHead` on the exact bytes that were hashed and uploaded. `null` when
+   * `encryptedLength` is `null`: that head is the registry's own, and the
+   * snapshot that planned over it already verified and remembered it.
+   */
+  readonly verifiedHead: Head | null;
 };
 
 type Snapshot =
@@ -401,6 +457,7 @@ async function publishStream(
   stream: string,
   keyCheck: string,
   hashes: ControlHashes,
+  latch: PurgeLatch,
   options: PublishOptions | undefined,
 ): Promise<PublishResult> {
   const run: StreamRun = {
@@ -423,8 +480,13 @@ async function publishStream(
       stream,
       keyCheck,
       hashes,
+      latch,
       options,
-    );
+    ).catch((error: unknown): PublishResult => {
+      if (error instanceof ConnectionPurged)
+        return { stream, outcome: "purged", watermark: run.watermark };
+      throw error;
+    });
     outcome = result.outcome;
     return result;
   } finally {
@@ -495,6 +557,7 @@ async function publishAttempts(
   stream: string,
   keyCheck: string,
   hashes: ControlHashes,
+  latch: PurgeLatch,
   options: PublishOptions | undefined,
 ): Promise<PublishResult> {
   const context: StreamContext = {
@@ -504,13 +567,18 @@ async function publishAttempts(
     scope: streamScope(connection.connector, connection.ns, stream),
     keyCheck,
     hashes,
+    latch,
     options,
   };
+  // Another stream may have purged the connection while this one waited for
+  // the turn or was transferring: the turn does nothing then.
   const slot = <T>(work: (held: LocalSyncDeps) => Promise<T>) =>
-    deps.queue.run(connectionId, "publish", () =>
-      work(insideQueue(deps, connectionId)),
-    );
+    deps.queue.run(connectionId, "publish", () => {
+      stopIfPurged(latch);
+      return work(insideQueue(deps, connectionId));
+    });
   while (run.attempts < MAX_ATTEMPTS) {
+    stopIfPurged(latch);
     if (run.invalidations > MAX_INVALIDATIONS) {
       // Local state kept moving under every candidate. Nothing was published
       // and nothing was acknowledged: the work is still pending next cycle.
@@ -526,7 +594,9 @@ async function publishAttempts(
     if (snapshot.kind === "done") return snapshot.result;
     if (snapshot.kind === "retry") continue;
     if (snapshot.kind === "blobs") {
-      await uploadBlobs(deps, snapshot.blobs, run.meter);
+      await uploadBlobs(deps, snapshot.blobs, run.meter, () =>
+        stopIfPurged(latch),
+      );
       const { evidence } = snapshot;
       if (evidence) {
         await slot((held) => confirmNoWork(held, context, evidence));
@@ -534,6 +604,7 @@ async function publishAttempts(
       return snapshot.result;
     }
     const { candidate } = snapshot;
+    stopIfPurged(latch);
     let prepared: Prepared;
     try {
       prepared = await timed(
@@ -542,6 +613,7 @@ async function publishAttempts(
         () => transferCandidate(deps, context, candidate, run.meter),
       );
     } catch (error) {
+      if (error instanceof ConnectionPurged) throw error;
       // A transfer that lost its input because local state moved (a purge
       // took the spooled rows or an attachment) is a stale candidate, not a
       // failure.
@@ -635,6 +707,7 @@ async function snapshotStream(
     await purgeConnection(deps, connectionId, {
       controlVersion: controlState.version,
     });
+    context.latch.purged = true;
     return done({ stream, outcome: "purged", watermark });
   }
   if (controlState.kind === "foreign" || controlState.kind === "absent") {
@@ -915,14 +988,16 @@ async function transferCandidate(
   candidate: Candidate,
   meter: PublishMeter,
 ): Promise<Prepared> {
-  const { scope } = context;
-  await uploadBlobs(deps, candidate.blobs, meter);
+  const { scope, latch } = context;
+  await uploadBlobs(deps, candidate.blobs, meter, () => stopIfPurged(latch));
   const encoded = await uploadFrozenParts(deps, {
     attempt: candidate.attempt,
     scope,
     generation: candidate.headGeneration,
     frozen: candidate.frozen,
     meter,
+    // A purge by another stream ends this transfer before its next upload.
+    beforeUpload: () => stopIfPurged(latch),
   });
   const parts = mergedParts(
     candidate.baseParts,
@@ -937,12 +1012,38 @@ async function transferCandidate(
     candidate.registryDataHash !== null &&
     dataHash.toLowerCase() === candidate.registryDataHash.toLowerCase()
   ) {
-    return { parts, recordCount, dataHash, blobName, encryptedLength: null };
+    return {
+      parts,
+      recordCount,
+      dataHash,
+      blobName,
+      encryptedLength: null,
+      verifiedHead: null,
+    };
+  }
+  // The reader's own check, on the bytes about to be uploaded: a head that
+  // would not verify is never uploaded, posted or remembered.
+  const verified = await verifyHead(keccak, headBytes, {
+    dataHash,
+    connector: context.connection.connector,
+    ns: context.connection.ns,
+    stream: context.stream,
+    keyCheck: context.keyCheck,
+  });
+  if (verified.kind !== "ok") {
+    throw new Error(
+      `publish: the head built for ${context.stream} failed verification: ${verified.kind}`,
+    );
   }
   const encrypted = await deps.keys.encrypt(scope, headBytes);
+  stopIfPurged(latch);
   const blobs = meteredBlobs(deps, meter);
-  if ((await blobs.get(`${scope}/${blobName}`)) === null) {
-    await blobs.put(`${scope}/${blobName}`, encrypted);
+  if (!(await blobs.exists(`${scope}/${blobName}`))) {
+    // A sibling may have purged the connection while the probe was out.
+    stopIfPurged(latch);
+    await blobs.put(`${scope}/${blobName}`, encrypted, () =>
+      stopIfPurged(latch),
+    );
   }
   return {
     parts,
@@ -950,6 +1051,7 @@ async function transferCandidate(
     dataHash,
     blobName,
     encryptedLength: encrypted.length,
+    verifiedHead: verified.head,
   };
 }
 
@@ -1003,7 +1105,7 @@ async function commitCandidate(
   prepared: Prepared,
   run: StreamRun,
 ): Promise<Committed> {
-  const { connectionId, connection, stream, scope, hashes } = context;
+  const { connectionId, connection, stream, scope } = context;
   const { watermark } = candidate;
   const done = (result: PublishResult): Committed => ({ kind: "done", result });
   // Local state: what readBasis compares (control, stream state, head parts,
@@ -1012,16 +1114,10 @@ async function commitCandidate(
   if ((await readBasis(deps, context, candidate)) !== candidate.basis) {
     return { kind: "invalidated" };
   }
-  // Registry: the stream row is the one the candidate was built over.
-  const read = await deps.registry.read(scope);
-  const version = read.found ? read.version : 0;
-  const dataHash = read.found ? read.dataHash.toLowerCase() : null;
-  if (
-    version !== candidate.registryVersion ||
-    dataHash !== (candidate.registryDataHash?.toLowerCase() ?? null)
-  ) {
-    return { kind: "invalidated" };
-  }
+  // The registry row is not re-read here. A CAS follows (below) and is the
+  // fence: a stale expectedVersion answers 409, the winner is applied, the
+  // stream re-plans and is never marked published. The no-op path sends no
+  // CAS and re-reads the row itself.
   const { dataHash: headHash, blobName } = prepared;
   const commit = (version: number, isNewVersion: boolean) =>
     commitBatch(deps, connectionId, stream, {
@@ -1046,7 +1142,18 @@ async function commitCandidate(
   // CAS and record the local state (watermark advances, the head is already
   // published).
   if (prepared.encryptedLength === null) {
-    const checked = await checkControl(deps, connectionId, connection, hashes);
+    // No CAS follows, so this read is the only fence: the registry row is
+    // still the one the candidate was built over.
+    const read = await deps.registry.read(scope);
+    const version = read.found ? read.version : 0;
+    const dataHash = read.found ? read.dataHash.toLowerCase() : null;
+    if (
+      version !== candidate.registryVersion ||
+      dataHash !== (candidate.registryDataHash?.toLowerCase() ?? null)
+    ) {
+      return { kind: "invalidated" };
+    }
+    const checked = await checkControl(deps, context);
     if (checked) return done({ stream, outcome: checked, watermark });
     await commit(candidate.registryVersion, false);
     return done({
@@ -1087,7 +1194,7 @@ async function commitCandidate(
       expectedVersion: BigInt(newVersion),
     }),
   );
-  const beforePost = await checkControl(deps, connectionId, connection, hashes);
+  const beforePost = await checkControl(deps, context);
   if (beforePost) return done({ stream, outcome: beforePost, watermark });
   run.attempts++;
   const posted = await timed(deps, addRegisterMs, () =>
@@ -1110,9 +1217,20 @@ async function commitCandidate(
     return { kind: "retry" };
   }
 
-  const afterPost = await checkControl(deps, connectionId, connection, hashes);
+  const afterPost = await checkControl(deps, context);
   if (afterPost) return done({ stream, outcome: afterPost, watermark });
   await commit(newVersion, true);
+  // The next snapshot of this stream meets this head at the registry. This
+  // device built, verified and committed it, so it need not download it.
+  if (prepared.verifiedHead) {
+    rememberOwnHead(
+      deps,
+      scope,
+      headHash,
+      context.keyCheck,
+      prepared.verifiedHead,
+    );
+  }
   return done({
     stream,
     outcome: "published",
@@ -1217,10 +1335,9 @@ async function readBasis(
 
 async function checkControl(
   deps: LocalSyncDeps,
-  id: string,
-  connection: ConnectionRow,
-  hashes: ControlHashes,
+  context: StreamContext,
 ): Promise<"purged" | "deferred" | null> {
+  const { connectionId: id, connection, hashes } = context;
   if (
     (
       await deps.db.query("SELECT 1 FROM delete_intents WHERE connector=?", [
@@ -1235,6 +1352,7 @@ async function checkControl(
   );
   if (state.kind === "deleted") {
     await purgeConnection(deps, id, { controlVersion: state.version });
+    context.latch.purged = true;
     return "purged";
   }
   if (state.kind !== "active" || state.generation !== connection.generation)
@@ -1381,9 +1499,7 @@ async function readRegistryHead(
   stream: string,
   keyCheck: string,
 ): Promise<Head> {
-  const remembered = headCache(deps).get(
-    `${scope}|${dataHash.toLowerCase()}|${keyCheck}`,
-  );
+  const remembered = recallHead(deps, scope, dataHash, keyCheck);
   if (remembered) return remembered;
   const blobName = headBlobName(dataHash);
   const cipher = await deps.blobs.get(`${scope}/${blobName}`);
