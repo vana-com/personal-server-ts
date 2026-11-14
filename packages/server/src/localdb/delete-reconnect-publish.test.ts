@@ -746,3 +746,40 @@ it("a stream delete whose control tombstone has not landed keeps an older pre-de
   expect((await snapshotOf(w.b, pre.runId))!.delete_snapshot).toBeLessThan(4);
   posts.mockRestore();
 });
+
+// 14. A deferral is never silent.
+it("a stream that waits on an unproven delete says why in the log, naming the stream and the reason", async () => {
+  const w = await world();
+  await published(w);
+  await lifetime(w, w.a, w.a, "one"); // generation 3, head v3
+  await applyConnection(w.b.deps, w.fixture.control);
+  await collect(w.b, ["pre-delete"]);
+  // A deletes the generation-3 connection and stops after the stream delete
+  // post, before the control tombstone lands: the stream row is a delete the
+  // reader cannot place in an earlier lifetime.
+  const real = w.registry.post.bind(w.registry);
+  const paused = vi
+    .spyOn(w.registry, "post")
+    .mockImplementation(async (req) => {
+      if (
+        req.scope === w.fixture.control &&
+        req.dataHash === w.fixture.hashes.tombstoneData
+      )
+        throw new Error("device A stopped before the control tombstone");
+      return real(req);
+    });
+  await w.a.deleter.requestConnectionDelete(declaration.connector);
+  await w.a.deleter.resumeDeletes();
+  paused.mockRestore();
+  const warn = w.b.deps.logger.warn as ReturnType<typeof vi.fn>;
+  warn.mockClear();
+  const r = await cycle(w.b, w);
+  expect(r.published.map((p) => p.outcome)).toEqual(["deferred"]);
+  expect(warn).toHaveBeenCalledWith(
+    expect.objectContaining({
+      stream: "items",
+      reason: "stream_delete_not_proven_earlier",
+    }),
+    "stream sync: publish deferred",
+  );
+});
