@@ -21,13 +21,15 @@ export function withOrigin(
  * run that observed the body, local only; it orders conflicts and decides what
  * a full refresh keeps. `seen_o`/`seen_r` are NULL, or older than the stamp,
  * until a run sees an unchanged body, so always read them through these.
+ * The pair is NULL, or at least the stamp: whatever moves the stamp keeps or
+ * clears it. That makes the effective stamp a plain COALESCE, which the index
+ * `records_by_observation` holds, so "rows last seen before run R" is a seek.
  */
 export function seenStamp(alias = ""): { o: string; r: string } {
   const c = (name: string) => `${alias}${name}`;
-  const newer = `(${c("seen_o")}, ${c("seen_r")}) > (${c("stamp_o")}, ${c("stamp_r")})`;
   return {
-    o: `(CASE WHEN ${newer} THEN ${c("seen_o")} ELSE ${c("stamp_o")} END)`,
-    r: `(CASE WHEN ${newer} THEN ${c("seen_r")} ELSE ${c("stamp_r")} END)`,
+    o: `COALESCE(${c("seen_o")}, ${c("stamp_o")})`,
+    r: `COALESCE(${c("seen_r")}, ${c("stamp_r")})`,
   };
 }
 
@@ -39,6 +41,16 @@ export function seenPair(alias = ""): string {
 
 const SEEN = seenStamp();
 export const SEEN_PAIR = seenPair();
+/**
+ * "Last observed before run (o, r)", written so the index seeks. SQLite
+ * ranges an index on a lone leading term, not on a row value, so the first term
+ * is the seek and the row value is the exact test. Bind `seenBeforeParams`.
+ */
+export const SEEN_BEFORE = `${SEEN.o} <= ? AND ${SEEN_PAIR} < (?, ?)`;
+export const seenBeforeParams = (
+  o: number,
+  r: string,
+): [number, number, string] => [o, o, r];
 /** `SEEN.o` as a column name for reads that show when a record was last collected. */
 export const SEEN_O = SEEN.o;
 
@@ -131,14 +143,18 @@ export function mergeIncoming(
       params: [op, op, connectionId, op, op],
     },
     {
-      sql: `UPDATE records SET ${FIELDS.map((f) => `${f} = ${pick(f)}`).join(", ")}
+      // A seen stamp newer than the incoming one survives; an older one is
+      // the incoming row's own observation.
+      sql: `UPDATE records SET ${FIELDS.map((f) => `${f} = ${pick(f)}`).join(", ")},
+   seen_o = CASE WHEN (seen_o, seen_r) > (${pick("stamp_o")}, ${pick("stamp_r")}) THEN seen_o END,
+   seen_r = CASE WHEN (seen_o, seen_r) > (${pick("stamp_o")}, ${pick("stamp_r")}) THEN seen_r END
  WHERE ${incomingKeys}
    AND EXISTS (SELECT 1 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash
                AND CASE WHEN ${SAME_BODY}
                         THEN (SELECT origin FROM write_ctx WHERE id = 1) <> 'local'
                              AND (i.stamp_o, i.stamp_r) > (records.stamp_o, records.stamp_r)
                         ELSE (i.stamp_o, i.stamp_r) > ${seenPair("records.")} END)`,
-      params: [...FIELDS.map(() => op), connectionId, op, op],
+      params: [...FIELDS.map(() => op), op, op, op, op, connectionId, op, op],
     },
   ];
   if (options.promoteSeen) {
@@ -182,19 +198,41 @@ SELECT ?, i.stream, i.pk_hash, ${FIELDS.map((f) => `i.${f}`).join(", ")},
  * Apply's one delete per stream (origin `remote`): drops rows the applied head
  * does not hold, except rows in an unchanged part (`keep_ranges`) and rows a
  * local write changed after the publish watermark. Clears the operation's TEMP rows.
+ *
+ * A head that omits a row says the source did not list it when the head was
+ * observed (`observedAt`). A run on this device that saw the row's body later
+ * than that, and only moved `seen`, logged no change. Before the delete, that
+ * sighting becomes the row's published stamp, as a local change, so the delete
+ * spares it and publish sends the row back.
  */
 export function applyDelete(
   op: string,
   connectionId: string,
   stream: string,
+  observedAt: number = Number.MAX_SAFE_INTEGER,
 ): SqlStatement[] {
   const keys: SqlValue[] = [connectionId, stream];
+  const omitted = `connection_id = ? AND stream = ?
+   AND pk_hash NOT IN (SELECT pk_hash FROM temp.apply_keys WHERE op = ?)
+   AND NOT EXISTS (SELECT 1 FROM temp.keep_ranges k WHERE k.op = ? AND records.pk_hash >= k.lo AND records.pk_hash < k.hi)`;
   return [
     {
+      sql: "UPDATE write_ctx SET origin = 'local' WHERE id = 1 AND origin = 'remote'",
+      params: [],
+    },
+    {
+      sql: `UPDATE records SET stamp_o = seen_o, stamp_r = seen_r
+ WHERE ${omitted}
+   AND seen_o > ?`,
+      params: [...keys, op, op, observedAt],
+    },
+    {
+      sql: "UPDATE write_ctx SET origin = 'remote' WHERE id = 1 AND origin = 'local'",
+      params: [],
+    },
+    {
       sql: `DELETE FROM records
- WHERE connection_id = ? AND stream = ?
-   AND pk_hash NOT IN (SELECT pk_hash FROM temp.apply_keys WHERE op = ?)
-   AND NOT EXISTS (SELECT 1 FROM temp.keep_ranges k WHERE k.op = ? AND records.pk_hash >= k.lo AND records.pk_hash < k.hi)
+ WHERE ${omitted}
    AND NOT EXISTS (SELECT 1 FROM record_changes ch
                     WHERE ch.connection_id = records.connection_id AND ch.stream = records.stream
                       AND ch.pk_hash = records.pk_hash AND ch.origin IN ('local','import','refresh')
@@ -219,8 +257,8 @@ export function replaceDelete(
 ): SqlStatement {
   return {
     sql: `DELETE FROM records WHERE connection_id = ? AND stream = ?
-   AND ${SEEN_PAIR} < (?, ?)`,
-    params: [connectionId, stream, stampO, stampR],
+   AND ${SEEN_BEFORE}`,
+    params: [connectionId, stream, ...seenBeforeParams(stampO, stampR)],
   };
 }
 

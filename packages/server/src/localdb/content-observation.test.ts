@@ -94,7 +94,11 @@ async function world() {
       id: string,
       at: number,
       rows: readonly Row[],
-      options: { cycle?: boolean } = {},
+      options: {
+        cycle?: boolean;
+        /** Runs while this run is collecting: after its begin, before its rows. */
+        during?: () => Promise<void>;
+      } = {},
     ) => {
       now = at;
       await sync.intake.begin(id, {
@@ -104,6 +108,7 @@ async function world() {
         wantFull: true,
         observedAt: at,
       });
+      await options.during?.();
       if (rows.length)
         await sync.intake.batch(id, {
           batch: 0,
@@ -276,5 +281,43 @@ describe("the newest observation wins a conflict whether or not the other surfac
     await w.web.sync.apply();
     expect(await w.desktop.values()).toEqual({ k: "Y" });
     expect(await w.web.values()).toEqual({ k: "Y" });
+  });
+});
+
+describe("a refresh that omits a record is an observation of its absence", () => {
+  const both: Row[] = [
+    { id: "k", v: "X" },
+    { id: "z", v: "1" },
+  ];
+  const without: Row[] = [{ id: "z", v: "1" }];
+
+  it("a newer unchanged observation, made while the omission landed, keeps the record", async () => {
+    const w = await world();
+    await w.desktop.refresh("r1", 1000, both); // both devices hold k@t1
+    await w.web.sync.apply();
+    // Desktop's run begins (it has pulled everything so far). While it collects,
+    // Web's full refresh omits k at t2. The source still lists k at t3.
+    await w.desktop.refresh("r3", 3000, both, {
+      during: async () => {
+        await w.web.refresh("w2", 2000, without);
+      },
+    });
+    await w.web.sync.apply();
+    expect(Object.keys(await w.desktop.values()).sort()).toEqual(["k", "z"]);
+    expect(Object.keys(await w.web.values()).sort()).toEqual(["k", "z"]);
+  });
+
+  it("an omission newer than the unchanged observation deletes the record", async () => {
+    const w = await world();
+    await w.desktop.refresh("r1", 1000, both);
+    await w.web.sync.apply();
+    await w.desktop.refresh("r2", 2000, both, {
+      during: async () => {
+        await w.web.refresh("w3", 3000, without);
+      },
+    });
+    await w.web.sync.apply();
+    expect(Object.keys(await w.desktop.values())).toEqual(["z"]);
+    expect(Object.keys(await w.web.values())).toEqual(["z"]);
   });
 });

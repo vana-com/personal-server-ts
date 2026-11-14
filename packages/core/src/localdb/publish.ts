@@ -136,7 +136,7 @@ import {
   type FrozenPrefix,
   type HeadExtras,
 } from "./encode.js";
-import { planChangedPrefixes } from "./part-layout.js";
+import { planChangedPrefixes, replacedPrefixGroups } from "./part-layout.js";
 import {
   StorageDeferredError,
   type SendWindowStats,
@@ -148,7 +148,7 @@ import {
   timed,
   type PublishMeter,
 } from "./publish-meter.js";
-import { SEEN_PAIR, dropRunRows, replaceDelete, withOrigin } from "./merge.js";
+import { dropRunRows, replaceDelete, withOrigin } from "./merge.js";
 import {
   endsEarlierLifetime,
   hydrateLifetimeBoundary,
@@ -1051,17 +1051,19 @@ async function snapshotStream(
     generation: headGeneration,
   });
   // A full refresh drops what the source no longer lists. The replace is
-  // work only where some local row is older than the replacing run: a row a
-  // run saw again, even unchanged, stays as it is and costs no upload.
-  const replaced: string[] =
+  // work only where some local row was last observed before the replacing
+  // run: a row a run saw again, even unchanged, stays as it is and costs no
+  // upload. Read as one entry per 16-bit key prefix, so memory does not grow
+  // with the number of rows dropped, and as a seek on the observation index,
+  // so a refresh that dropped nothing does not read the stream.
+  const replaced =
     registryHead && plan.replaceBelow
-      ? (
-          await deps.db.query<{ pk_hash: string }>(
-            `SELECT pk_hash FROM records WHERE connection_id = ? AND stream = ?
-              AND ${SEEN_PAIR} < (?, ?)`,
-            [connectionId, stream, plan.replaceBelow.o, plan.replaceBelow.r],
-          )
-        ).map((row) => row.pk_hash)
+      ? await replacedPrefixGroups(
+          deps.db,
+          connectionId,
+          stream,
+          plan.replaceBelow,
+        )
       : [];
   const hasWork = registryHead
     ? changes.length > 0 ||
@@ -1155,7 +1157,8 @@ async function snapshotStream(
   const changedPrefixes = await planChangedPrefixes(deps, {
     connectionId,
     stream,
-    changedKeys: [...changes.map((change) => change.pk_hash), ...replaced],
+    changedKeys: changes.map((change) => change.pk_hash),
+    replaced,
     baseParts: registryHead?.parts ?? [],
     targetBytes: partTargetOf(deps),
     rewriteAll,

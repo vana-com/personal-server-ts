@@ -179,4 +179,10 @@ END;`,
     `ALTER TABLE records ADD COLUMN seen_o INTEGER`,
     `ALTER TABLE records ADD COLUMN seen_r TEXT`,
   ],
+  [
+    // "Rows last observed before run R" (a full refresh's replace) is a range
+    // on the effective observation. This holds it, in the same terms as
+    // `seenStamp` in merge.ts, so that read seeks and does not scan the stream.
+    `CREATE INDEX records_by_observation ON records(connection_id, stream, COALESCE(seen_o, stamp_o), COALESCE(seen_r, stamp_r))`,
+  ],
 ];
