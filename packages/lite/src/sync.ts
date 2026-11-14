@@ -579,6 +579,10 @@ export async function createPsLiteSyncManager(
   const changeProbe = options.localDb
     ? createRegistryChangeProbe(streamSyncRegistry, {
         intervalMs: options.config.streamSync.changeProbeMs,
+        push: {
+          enabled: options.config.streamSync.changePush,
+          healthyProbeMs: options.config.streamSync.changeProbeHealthyMs,
+        },
         active: () =>
           (globalThis as { document?: { visibilityState?: string } }).document
             ?.visibilityState !== "hidden",

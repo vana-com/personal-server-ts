@@ -1,4 +1,8 @@
 import type { StreamSyncRegistry } from "../../stream-sync/ports.js";
+import {
+  createRegistryChangePush,
+  type RegistryChangePushOptions,
+} from "./change-push.js";
 import type { ChangeProbe } from "./sync-manager.js";
 
 /**
@@ -25,19 +29,30 @@ export interface RegistryChangeProbeOptions {
   /** Default {@link DEFAULT_CHANGE_PROBE_MS}; 0 or less: no probe. */
   intervalMs?: number;
   active?: () => boolean;
+  /**
+   * The server push that relieves the probe, when the registry can hold a
+   * change request. `{ enabled: false }` keeps the probe alone. The host's
+   * `active` gate applies to it too: a hidden tab holds no request.
+   */
+  push?: Omit<RegistryChangePushOptions, "active">;
 }
 
 /** The manager's probe over a registry that can answer one; none otherwise. */
 export function createRegistryChangeProbe(
-  registry: Pick<StreamSyncRegistry, "probeChange">,
+  registry: Pick<StreamSyncRegistry, "probeChange" | "waitForChange">,
   options: RegistryChangeProbeOptions = {},
 ): ChangeProbe | undefined {
   const intervalMs = options.intervalMs ?? DEFAULT_CHANGE_PROBE_MS;
   const probeChange = registry.probeChange?.bind(registry);
   if (!probeChange || !(intervalMs > 0)) return undefined;
+  const push = createRegistryChangePush(registry, {
+    ...options.push,
+    ...(options.active && { active: options.active }),
+  });
   return {
     read: probeChange,
     intervalMs,
+    ...(push && { push }),
     ...(options.active && { active: options.active }),
   };
 }

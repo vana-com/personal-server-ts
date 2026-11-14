@@ -14,6 +14,7 @@ export {
 export {
   createSyncManager,
   type ChangeProbe,
+  type ChangePush,
   type SyncManager,
   type SyncManagerOptions,
 } from "./engine/sync-manager.js";
@@ -22,6 +23,12 @@ export {
   createRegistryChangeProbe,
   type RegistryChangeProbeOptions,
 } from "./engine/change-probe.js";
+export {
+  CHANGE_PUSH_WAIT_MS,
+  DEFAULT_CHANGE_PUSH_HEALTHY_PROBE_MS,
+  createRegistryChangePush,
+  type RegistryChangePushOptions,
+} from "./engine/change-push.js";
 export type {
   DownloadDiagnosticsHook,
   DownloadWorkerDeps,

@@ -48,10 +48,41 @@ export interface ChangeProbe {
    */
   intervalMs: number;
   /**
+   * A server push that tells the manager when to pull. While it is healthy the
+   * timed probe stretches to `push.healthyProbeMs`; otherwise nothing differs.
+   */
+  push?: ChangePush;
+  /**
    * Whether the timed probe is worth sending now. A hidden Web tab has no one
    * to show a change to and re-probes when it is shown (a signal). Absent: always.
    */
   active?: () => boolean;
+}
+
+/**
+ * A server-pushed hint that the registry changed. It is lossy by design: a
+ * poke can be lost, doubled or late, and nothing here depends on one arriving.
+ * The manager turns a poke into `requestPull`, the same path a focus or a
+ * probe tick takes, so the pull still compares the registry's marker and the
+ * timer cycle stays the completeness guarantee. The push only shortens the
+ * wait, and it says when it cannot be trusted so the short probe returns.
+ */
+export interface ChangePush {
+  /**
+   * The timed probe's period while the push is healthy. Longer than the
+   * probe's own `intervalMs`; the unconditional timer cycle bounds it.
+   */
+  healthyProbeMs: number;
+  /**
+   * Start a subscription; the returned function ends it. `onChange` means the
+   * registry may have changed since the last poke: pull. `onHealth(true)`:
+   * the channel answered lately, so pokes can be expected; `onHealth(false)`:
+   * it failed or went quiet, so do not rely on one.
+   */
+  subscribe(handlers: {
+    onChange(): void;
+    onHealth(healthy: boolean): void;
+  }): () => void;
 }
 
 export interface SyncManagerOptions {
@@ -204,6 +235,12 @@ export function createSyncManager(
   // Failed probes in a row, and the earliest time the timed probe tries again.
   let probeFailures = 0;
   let nextTimedProbeAt = 0;
+  // The change push (`ChangeProbe.push`): whether it can be trusted now, when
+  // the registry was last probed (a tick within the healthy period of one is
+  // skipped), and how to end the subscription of this run.
+  let pushHealthy = false;
+  let lastProbeAt = 0;
+  let stopPush: (() => void) | null = null;
   // The registry marker as of the last cycle a pull ran and finished cleanly.
   // Only a pull moves it, and only to a marker read BEFORE its cycle started,
   // so every change up to it was in the registry when that cycle read.
@@ -557,6 +594,7 @@ export function createSyncManager(
     fromSignal: boolean,
   ): Promise<void> {
     let marker: string | null | undefined;
+    lastProbeAt = Date.now();
     try {
       marker = await probe.read();
     } catch (err) {
@@ -670,10 +708,43 @@ export function createSyncManager(
     probeIntervalId = setInterval(() => {
       if (probe.active && !probe.active()) return;
       if (Date.now() < nextTimedProbeAt) return; // backing off after failures
+      // A healthy push pokes on a change; the timer cycle still runs every
+      // poll interval, so this probe only has to back it up now and then.
+      if (
+        pushHealthy &&
+        probe.push &&
+        Date.now() - lastProbeAt < probe.push.healthyProbeMs
+      ) {
+        return;
+      }
       pull(false).catch(() => {
         // Errors already captured in ring buffer
       });
     }, probe.intervalMs);
+  }
+
+  function startChangePush(): void {
+    const push = options?.changeProbe?.push;
+    if (!push || stopPush !== null) return;
+    const run = lifecycle;
+    stopPush = push.subscribe({
+      onChange() {
+        if (run !== lifecycle || !isRunning) return;
+        pull(true).catch(() => {
+          // Errors already captured in ring buffer
+        });
+      },
+      onHealth(healthy) {
+        if (run !== lifecycle) return;
+        pushHealthy = healthy;
+      },
+    });
+  }
+
+  function stopChangePush(): void {
+    stopPush?.();
+    stopPush = null;
+    pushHealthy = false;
   }
 
   function clearProbeInterval(): void {
@@ -702,6 +773,7 @@ export function createSyncManager(
       pulledMarker = undefined;
       probeFailures = 0;
       nextTimedProbeAt = 0;
+      lastProbeAt = Date.now();
 
       // Crash recovery: run one cycle immediately on start
       runCycle().catch(() => {
@@ -710,6 +782,7 @@ export function createSyncManager(
 
       startInterval();
       startProbeInterval();
+      startChangePush();
     },
 
     async stop() {
@@ -720,6 +793,7 @@ export function createSyncManager(
         .catch((err: unknown) => err);
       clearIntervalTimer();
       clearProbeInterval();
+      stopChangePush();
       clearNotifyTimer();
       isRunning = false;
       // Cancel pulls: a probe that answers later finds a new lifecycle value.

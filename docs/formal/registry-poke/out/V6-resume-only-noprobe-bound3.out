@@ -1,0 +1,146 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 110 and seed 8921742203374676 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 1651284] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/tnunamak/.tmp/stream-sync-plan/formal/registry-poke/RegistryPoke.tla
+Parsing file /tmp/Naturals.tla
+Semantic processing of module Naturals
+Semantic processing of module RegistryPoke
+Starting... (2026-11-14 16:51:18)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-14 16:51:18.
+Error: Invariant StaleBound is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ age = (d1 :> 0)
+/\ applied = (d1 :> 0)
+/\ healthy = (d1 :> FALSE)
+/\ needPull = (d1 :> FALSE)
+/\ reply = (d1 :> -1)
+/\ req = (d1 :> [on |-> FALSE, base |-> 0, since |-> 0, held |-> FALSE])
+/\ seq = 0
+/\ nextProbe = (d1 :> 13)
+/\ writes = 0
+/\ lastSeen = (d1 :> 0)
+/\ clock = 0
+
+State 2: <Subscribe line 77, col 3 to line 88, col 67 of module RegistryPoke>
+/\ age = (d1 :> 0)
+/\ applied = (d1 :> 0)
+/\ healthy = (d1 :> FALSE)
+/\ needPull = (d1 :> FALSE)
+/\ reply = (d1 :> -1)
+/\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 0, held |-> TRUE])
+/\ seq = 0
+/\ nextProbe = (d1 :> 13)
+/\ writes = 0
+/\ lastSeen = (d1 :> 0)
+/\ clock = 0
+
+State 3: <Commit line 69, col 3 to line 72, col 33 of module RegistryPoke>
+/\ age = (d1 :> 0)
+/\ applied = (d1 :> 0)
+/\ healthy = (d1 :> FALSE)
+/\ needPull = (d1 :> FALSE)
+/\ reply = (d1 :> -1)
+/\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 0, held |-> TRUE])
+/\ seq = 1
+/\ nextProbe = (d1 :> 13)
+/\ writes = 1
+/\ lastSeen = (d1 :> 0)
+/\ clock = 0
+
+State 4: <Tick line 165, col 3 to line 170, col 38 of module RegistryPoke>
+/\ age = (d1 :> 1)
+/\ applied = (d1 :> 0)
+/\ healthy = (d1 :> FALSE)
+/\ needPull = (d1 :> FALSE)
+/\ reply = (d1 :> -1)
+/\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 0, held |-> TRUE])
+/\ seq = 1
+/\ nextProbe = (d1 :> 13)
+/\ writes = 1
+/\ lastSeen = (d1 :> 0)
+/\ clock = 1
+
+State 5: <Tick line 165, col 3 to line 170, col 38 of module RegistryPoke>
+/\ age = (d1 :> 2)
+/\ applied = (d1 :> 0)
+/\ healthy = (d1 :> FALSE)
+/\ needPull = (d1 :> FALSE)
+/\ reply = (d1 :> -1)
+/\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 0, held |-> TRUE])
+/\ seq = 1
+/\ nextProbe = (d1 :> 13)
+/\ writes = 1
+/\ lastSeen = (d1 :> 0)
+/\ clock = 2
+
+State 6: <Drop line 133, col 3 to line 137, col 79 of module RegistryPoke>
+/\ age = (d1 :> 2)
+/\ applied = (d1 :> 0)
+/\ healthy = (d1 :> FALSE)
+/\ needPull = (d1 :> TRUE)
+/\ reply = (d1 :> -1)
+/\ req = (d1 :> [on |-> FALSE, base |-> 0, since |-> 0, held |-> FALSE])
+/\ seq = 1
+/\ nextProbe = (d1 :> 13)
+/\ writes = 1
+/\ lastSeen = (d1 :> 0)
+/\ clock = 2
+
+State 7: <Subscribe line 77, col 3 to line 88, col 67 of module RegistryPoke>
+/\ age = (d1 :> 2)
+/\ applied = (d1 :> 0)
+/\ healthy = (d1 :> FALSE)
+/\ needPull = (d1 :> FALSE)
+/\ reply = (d1 :> 1)
+/\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 2, held |-> FALSE])
+/\ seq = 1
+/\ nextProbe = (d1 :> 13)
+/\ writes = 1
+/\ lastSeen = (d1 :> 0)
+/\ clock = 2
+
+State 8: <Lose line 126, col 3 to line 129, col 43 of module RegistryPoke>
+/\ age = (d1 :> 2)
+/\ applied = (d1 :> 0)
+/\ healthy = (d1 :> FALSE)
+/\ needPull = (d1 :> FALSE)
+/\ reply = (d1 :> -1)
+/\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 2, held |-> FALSE])
+/\ seq = 1
+/\ nextProbe = (d1 :> 13)
+/\ writes = 1
+/\ lastSeen = (d1 :> 0)
+/\ clock = 2
+
+State 9: <Tick line 165, col 3 to line 170, col 38 of module RegistryPoke>
+/\ age = (d1 :> 3)
+/\ applied = (d1 :> 0)
+/\ healthy = (d1 :> FALSE)
+/\ needPull = (d1 :> FALSE)
+/\ reply = (d1 :> -1)
+/\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 2, held |-> FALSE])
+/\ seq = 1
+/\ nextProbe = (d1 :> 13)
+/\ writes = 1
+/\ lastSeen = (d1 :> 0)
+/\ clock = 3
+
+State 10: <Tick line 165, col 3 to line 170, col 38 of module RegistryPoke>
+/\ age = (d1 :> 4)
+/\ applied = (d1 :> 0)
+/\ healthy = (d1 :> FALSE)
+/\ needPull = (d1 :> FALSE)
+/\ reply = (d1 :> -1)
+/\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 2, held |-> FALSE])
+/\ seq = 1
+/\ nextProbe = (d1 :> 13)
+/\ writes = 1
+/\ lastSeen = (d1 :> 0)
+/\ clock = 4
+
+592 states generated, 348 distinct states found, 93 states left on queue.
+The depth of the complete state graph search is 12.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 4 and the 95th percentile is 3).
+Finished in 00s at (2026-11-14 16:51:18)
+exit 12

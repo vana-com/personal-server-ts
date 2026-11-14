@@ -140,6 +140,29 @@ export class AmbiguousRegistryReplyError extends Error {
 }
 
 /** The registry refused the request for good (4xx other than 409). */
+/**
+ * The gateway has no change route (404 or 405): it predates the change push.
+ * The caller stops asking and keeps its timed probe; asking again cannot help.
+ */
+export class ChangeFeedAbsentError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChangeFeedAbsentError";
+  }
+}
+
+/** The answer to one held change request. */
+export interface RegistryChangeAnswer {
+  /**
+   * The owner's registry sequence now: a decimal string, compared for
+   * inequality only (it is not a count of what changed, and a restored
+   * database may lower it).
+   */
+  readonly seq: string;
+  /** `seq` differs from the cursor the request carried (or it carried none). */
+  readonly changed: boolean;
+}
+
 export class RegistryRefusedError extends Error {
   constructor(
     message: string,
@@ -212,6 +235,21 @@ export interface StreamSyncRegistry {
    * and a pull still reads the rows it applies.
    */
   probeChange?(): Promise<string | null | undefined>;
+  /**
+   * One held request: answers when the owner's registry sequence differs from
+   * `after` (a cursor from an earlier answer; none asks for the current one),
+   * or after about `waitMs` with `changed: false`. It carries no registry data
+   * and is never an authority: a caller that gets `changed` pulls with its
+   * ordinary reads, and one that gets nothing (a lost answer, a dropped
+   * connection) is repaired by the next pull. Throws `ChangeFeedAbsentError`
+   * when the gateway has no such route, and any other error on a failed read.
+   * `signal` ends the request.
+   */
+  waitForChange?(
+    after: string | undefined,
+    waitMs: number,
+    signal: AbortSignal,
+  ): Promise<RegistryChangeAnswer>;
 }
 
 /** Encrypted blob storage, keyed `<physical scope>/<blob name>`. */

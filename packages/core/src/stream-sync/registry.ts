@@ -20,6 +20,7 @@ import {
 import { computeDataPointId } from "../sync/data-point-id.js";
 import {
   AmbiguousRegistryReplyError,
+  ChangeFeedAbsentError,
   RegistryRefusedError,
   type ConditionalPostResult,
   type ConditionalRegistryPost,
@@ -410,6 +411,35 @@ export function createGatewayStreamSyncRegistry(
         return undefined;
       }
       return `${newest.changedAt}|${String(newest.id)}|${String(newest.expectedVersion)}`;
+    },
+
+    async waitForChange(after, waitMs, signal) {
+      const params = new URLSearchParams({ user: options.ownerAddress });
+      if (after !== undefined) {
+        params.set("after", after);
+        params.set("wait", String(Math.max(0, Math.round(waitMs / 1000))));
+      }
+      const res = await fetchImpl(
+        `${base}/v1/data/changes?${params.toString()}`,
+        { signal },
+      );
+      if (res.status === 404 || res.status === 405) {
+        throw new ChangeFeedAbsentError(
+          `registry has no change route: ${res.status}`,
+        );
+      }
+      if (!res.ok) {
+        throw new Error(`registry change wait failed: ${res.status}`);
+      }
+      const body = (await res.json()) as { seq?: unknown; changed?: unknown };
+      if (
+        typeof body.seq !== "string" ||
+        !/^(0|[1-9]\d*)$/.test(body.seq) ||
+        typeof body.changed !== "boolean"
+      ) {
+        throw new Error("registry change answer is not {seq, changed}");
+      }
+      return { seq: body.seq, changed: body.changed };
     },
 
     listConnectionRows: (connector, ns) =>
