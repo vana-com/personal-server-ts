@@ -96,6 +96,8 @@ async function world() {
       rows: readonly Row[],
       options: {
         cycle?: boolean;
+        /** FALSE: a partial run that proves nothing about records it does not list. */
+        full?: boolean;
         /** Runs while this run is collecting: after its begin, before its rows. */
         during?: () => Promise<void>;
       } = {},
@@ -105,7 +107,7 @@ async function world() {
         connector: "fixture-source",
         artifactDigest: "fixture",
         owner: { address: owner, leaseId: null },
-        wantFull: true,
+        wantFull: options.full !== false,
         observedAt: at,
       });
       await options.during?.();
@@ -117,7 +119,7 @@ async function world() {
       await sync.intake.end(id, {
         outcome: "succeeded",
         coveredStreams: ["A"],
-        provenFullStreams: ["A"],
+        provenFullStreams: options.full === false ? [] : ["A"],
         lastBatch: rows.length ? 0 : -1,
       });
       if (options.cycle !== false) await cycle();
@@ -319,5 +321,38 @@ describe("a refresh that omits a record is an observation of its absence", () =>
     await w.web.sync.apply();
     expect(Object.keys(await w.desktop.values())).toEqual(["z"]);
     expect(Object.keys(await w.web.values())).toEqual(["z"]);
+  });
+
+  it("a partial run published with the omitting refresh does not widen the omission", async () => {
+    const w = await world();
+    await w.desktop.refresh("r1", 1000, both);
+    await w.web.sync.apply();
+    // Desktop's run has begun. While it collects, Web holds a full refresh that
+    // omits k at t2 and a later partial run at t4, and publishes them as ONE
+    // head whose observedAt is t4. The source still lists k at t3, newer than
+    // the omission and older than the head's observedAt.
+    await w.desktop.refresh("r3", 3000, both, {
+      during: async () => {
+        await w.web.refresh("w2", 2000, without, { cycle: false });
+        await w.web.refresh("w4", 4000, [{ id: "p", v: "1" }], { full: false });
+      },
+    });
+    await w.web.sync.apply();
+    expect(Object.keys(await w.desktop.values()).sort()).toEqual([
+      "k",
+      "p",
+      "z",
+    ]);
+    expect(Object.keys(await w.web.values()).sort()).toEqual(["k", "p", "z"]);
+  });
+
+  it("the omission still deletes a record last observed before it, beside a later partial run", async () => {
+    const w = await world();
+    await w.desktop.refresh("r1", 1000, both);
+    await w.web.sync.apply();
+    await w.web.refresh("w2", 2000, without, { cycle: false });
+    await w.web.refresh("w4", 4000, [{ id: "p", v: "1" }], { full: false });
+    await w.desktop.sync.apply();
+    expect(Object.keys(await w.desktop.values()).sort()).toEqual(["p", "z"]);
   });
 });
