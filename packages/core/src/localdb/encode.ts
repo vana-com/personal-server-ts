@@ -264,17 +264,6 @@ async function* readSpool(
 }
 
 /**
- * Parts one stream's transfer holds at once while they wait for the storage
- * client's turn (encoded bytes and ciphertext each). The storage client's own
- * limits decide how many go on the wire; this only bounds memory per stream.
- * Memory across streams is bounded by the store's byte budget (`holdMemory`).
- *
- * At least 2: a wave also carries the attachment upload, which can wait for
- * bytes, and a part upload must be able to run beside it.
- */
-export const PARTS_IN_FLIGHT = 2;
-
-/**
  * C.2 step 4, after the freeze: read the attempt's spool page by page, encode
  * the rows as v3 frames (format 4 head) in parts of at most `partTargetBytes`,
  * STREAM-encrypted, and upload each part that does not exist. Identical rows
@@ -296,7 +285,7 @@ export async function uploadFrozenParts(
     readonly beforeUpload?: () => void;
   },
 ): Promise<readonly EncodedPart[]> {
-  const wave = newUploadWave(PARTS_IN_FLIGHT);
+  const wave = newUploadWave();
   try {
     const parts = await startFrozenParts(deps, { ...input, wave, probe: true });
     await wave.drain();
@@ -329,8 +318,10 @@ export async function uploadFrozenParts(
  * is checked against the spooled count before its last part is encoded; a
  * difference means the spool was emptied under the transfer and throws
  * `FrozenRowsChanged`, and the head is never built. Memory is one page (at most
- * `PAGE_BYTES` of bodies, or one row) and the `PARTS_IN_FLIGHT` parts of the
- * wave, however large the stream.
+ * `PAGE_BYTES` of bodies, or one row) and the parts the store's byte budget
+ * allows (`holdMemory`), however large the stream. A stream has no upload
+ * width of its own: the store's send gate decides how many parts are on the
+ * wire.
  */
 export async function startFrozenParts(
   deps: LocalSyncDeps,
@@ -397,7 +388,7 @@ async function encodeFrozenParts(
       const key = `${input.scope}/${blobName}`;
       const release = memory.take();
       try {
-        await input.wave.start(async () => {
+        input.wave.start(async () => {
           try {
             input.beforeUpload?.();
             if (!input.probe || !(await blobs.exists(key))) {

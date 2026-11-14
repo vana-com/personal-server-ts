@@ -80,6 +80,14 @@ type Options = {
   readonly store?: (inner: StreamSyncBlobs) => StreamSyncBlobs;
   /** Called at every encrypt (a head, an attachment) and encryptPart call. */
   readonly onEncrypt?: (kind: "encrypt" | "encryptPart") => void;
+  /** Records per stream; default 2. */
+  readonly recordsPerStream?: number;
+  /** Pads every record by this many bytes, so a small part target cuts many parts. */
+  readonly padBytes?: number;
+  /** The part target, in bytes; the default is 4 MiB. */
+  readonly partTargetBytes?: number;
+  /** Called when the registry is asked to post, before it answers. */
+  readonly onPost?: (scope: string) => void;
 };
 
 const drivers: SqlDriver[] = [];
@@ -112,6 +120,7 @@ async function world(options: Options) {
     },
     async post(request) {
       record("post", request.scope);
+      options.onPost?.(request.scope);
       await sleep(options.registryMs ?? 0);
       return innerRegistry.post(request);
     },
@@ -187,6 +196,9 @@ async function world(options: Options) {
     },
     now: () => 1000,
     newOp: () => `op-${++op}`,
+    ...(options.partTargetBytes === undefined
+      ? {}
+      : { partTargetBytes: options.partTargetBytes }),
   };
   const sync = createLocalSync(deps, {
     resolveArtifact: (digest) => ({
@@ -214,10 +226,14 @@ async function world(options: Options) {
   await sync.intake.batch("run-1", {
     batch: 0,
     records: names.flatMap((stream) =>
-      [1, 2].map((n) => ({
+      Array.from(
+        { length: options.recordsPerStream ?? 2 },
+        (_, i) => i + 1,
+      ).map((n) => ({
         stream,
         data: {
           id: `${stream}-${n}`,
+          ...(options.padBytes ? { pad: "x".repeat(options.padBytes) } : {}),
           ...(options.attachments && n === 1
             ? { blob_ref: { blob_id: `sha256:${attachment(stream).sha256}` } }
             : {}),
@@ -982,5 +998,70 @@ describe("the uploads of every stream's wave go through one send gate", () => {
     // uploads want to leave. The gate lets two out at most.
     expect(peak).toBeGreaterThanOrEqual(1);
     expect(peak).toBeLessThanOrEqual(2);
+  });
+
+  it("writes the stream's registry row only after every part and the head are stored, with many parts on the wire", async () => {
+    const partBytes = 2048;
+    let onWire = 0;
+    let peak = 0;
+    let started = 0;
+    let stored = 0;
+    let storedAtPost: number | undefined;
+    let startedAtPost: number | undefined;
+    const wire = async <T>(work: () => Promise<T>): Promise<T> => {
+      onWire += 1;
+      peak = Math.max(peak, onWire);
+      try {
+        await sleep(40);
+        return await work();
+      } finally {
+        onWire -= 1;
+      }
+    };
+    const { deps, names } = await world({
+      streams: 1,
+      recordsPerStream: 24,
+      padBytes: 1500,
+      partTargetBytes: partBytes,
+      onPost: (scope) => {
+        if (scope === CONTROL) return;
+        storedAtPost = stored;
+        startedAtPost = started;
+      },
+      store: (inner) =>
+        createStorageStreamSyncBlobs(
+          {
+            urlForKey: (key: string) => key,
+            upload: (key: string, bytes: Uint8Array) =>
+              wire(async () => {
+                started += 1;
+                await inner.put(key, bytes);
+                stored += 1;
+                return key;
+              }),
+            download: (url: string) =>
+              wire(async () => (await inner.get(url)) ?? new Uint8Array()),
+            exists: (url: string) => wire(() => inner.exists(url)),
+            delete: async () => true,
+          } as never,
+          {
+            ...DEFAULT_STORAGE_ACCESS_POLICY,
+            // The window may grow to eight parts.
+            maxBytesInFlight: 8 * partBytes,
+            partBytes,
+          },
+        ),
+    });
+    const results = await publishConnection(deps, CONNECTION_ID);
+    expect(results.map((r) => r.outcome)).toEqual(["published"]);
+    expect(names).toHaveLength(1);
+    // About one part per record, and the head.
+    expect(stored).toBeGreaterThan(20);
+    // Two parts and the head were the most a stream could have out at once.
+    expect(peak).toBeGreaterThan(3);
+    expect(peak).toBeLessThanOrEqual(8);
+    // At the stream's registry write, every upload that ever started was stored.
+    expect(startedAtPost).toBe(stored);
+    expect(storedAtPost).toBe(stored);
   });
 });
