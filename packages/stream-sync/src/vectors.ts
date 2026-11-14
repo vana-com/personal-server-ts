@@ -274,7 +274,7 @@ export async function runVectors(
     await throws(`decodeEnvelope ${c.why}`, () => decodeEnvelope(utf8(c.text)));
   }
 
-  // v3 frames (head format 4)
+  // v3 frames (head format 4 and later)
   for (const c of vectors.framesV3?.cases ?? []) {
     const body = utf8(canonicalJson(c.record));
     const envelope = {

@@ -199,9 +199,12 @@ SELECT ?, i.stream, i.pk_hash, ${FIELDS.map((f) => `i.${f}`).join(", ")},
  * does not hold, except rows in an unchanged part (`keep_ranges`) and rows a
  * local write changed after the publish watermark. Clears the operation's TEMP rows.
  *
- * A head that omits a row says the source did not list it when the head was
- * observed (`observedAt`). A run on this device that saw the row's body later
- * than that, and only moved `seen`, logged no change. Before the delete, that
+ * A head that omits a row says the source did not list it when the run that
+ * dropped it observed (`droppedAt`, the head's `omissionCutoff`: not the
+ * head's `observedAt`, which a later partial run in the same head can move
+ * past a sighting that is newer than the omission). A run on this device that
+ * saw the row's body later than `droppedAt`, and only moved `seen`, logged no
+ * change. Before the delete, that
  * sighting becomes the row's published stamp, as a local change, so the delete
  * spares it and publish sends the row back.
  */
@@ -209,7 +212,7 @@ export function applyDelete(
   op: string,
   connectionId: string,
   stream: string,
-  observedAt: number = Number.MAX_SAFE_INTEGER,
+  droppedAt: number = Number.MAX_SAFE_INTEGER,
 ): SqlStatement[] {
   const keys: SqlValue[] = [connectionId, stream];
   const omitted = `connection_id = ? AND stream = ?
@@ -224,7 +227,7 @@ export function applyDelete(
       sql: `UPDATE records SET stamp_o = seen_o, stamp_r = seen_r
  WHERE ${omitted}
    AND seen_o > ?`,
-      params: [...keys, op, op, observedAt],
+      params: [...keys, op, op, droppedAt],
     },
     {
       sql: "UPDATE write_ctx SET origin = 'remote' WHERE id = 1 AND origin = 'local'",

@@ -9,6 +9,7 @@ import {
   framesCarryFirstSeen,
   HEAD_FORMAT,
   isHeadLive,
+  omissionCutoff,
   verifyHead,
   writerCompatibility,
   type Head,
@@ -28,10 +29,12 @@ const head: Head = {
   primaryKey: ["id"],
   profile: { key: null, version: "1.0.0" },
   recordCount: 1,
+  replacedAt: 1,
   stream: "s",
 };
 
 function randomHead(random: () => number): Head {
+  const observedAt = int(random, 2 ** 45);
   const parts = [];
   const depth = int(random, 5);
   let total = 0;
@@ -53,7 +56,8 @@ function randomHead(random: () => number): Head {
     complete: random() < 0.5,
     generation: 1 + int(random, 1e9),
     ns: random() < 0.3 ? "" : head.ns,
-    observedAt: int(random, 2 ** 45),
+    observedAt,
+    replacedAt: int(random, observedAt + 1),
     parts,
     primaryKey: random() < 0.5 ? ["id"] : ["a", "é"],
     profile: { key: random() < 0.5 ? null : "pk ✓", version: "2.0.0-beta.1" },
@@ -63,19 +67,21 @@ function randomHead(random: () => number): Head {
 }
 
 describe("head", () => {
-  it("head-format-4-emitted-and-1-to-4-accepted", () => {
-    expect(HEAD_FORMAT).toBe(4);
+  it("head-format-5-emitted-and-1-to-5-accepted", () => {
+    expect(HEAD_FORMAT).toBe(5);
     const encoded = encodeHead(head);
-    expect(JSON.parse(new TextDecoder().decode(encoded)).format).toBe(4);
+    expect(JSON.parse(new TextDecoder().decode(encoded)).format).toBe(5);
 
-    // Build legacy wire fixtures without the writer, which emits format 4.
+    // Build legacy wire fixtures without the writer, which emits format 5.
     const legacy = { ...head };
     delete legacy.lastDeleteVersion;
-    for (const format of [1, 2, 3, 4] as const) {
+    delete legacy.replacedAt;
+    for (const format of [1, 2, 3, 4, 5] as const) {
       const expected: Head = {
         ...legacy,
         format,
         ...(format >= 3 ? { lastDeleteVersion: 7 } : {}),
+        ...(format >= 5 ? { replacedAt: 1 } : {}),
       };
       const wire = JSON.stringify({
         complete: expected.complete,
@@ -90,19 +96,59 @@ describe("head", () => {
         primaryKey: expected.primaryKey,
         profile: expected.profile,
         recordCount: expected.recordCount,
+        ...(format >= 5 ? { replacedAt: 1 } : {}),
         stream: expected.stream,
       });
       expect(decodeHead(utf8(wire))).toEqual({ kind: "ok", head: expected });
       // Each format round-trips byte for byte; format 3 is the frozen v1 form.
       expect(encodeHead(expected)).toEqual(utf8(wire));
     }
-    expect(() => encodeHead({ ...head, format: 5 as never })).toThrow(
+    expect(() => encodeHead({ ...head, format: 6 as never })).toThrow(
       InvalidArgumentError,
     );
-    expect(decodeHead(utf8('{"format":5}'))).toEqual({
+    expect(decodeHead(utf8('{"format":6}'))).toEqual({
       kind: "unsupported_format",
-      format: 5,
+      format: 6,
     });
+  });
+
+  it("replacedAt is a format 5 field: required there, refused earlier, never after observedAt", () => {
+    const { replacedAt: _drop, ...without } = head;
+    expect(() => encodeHead(without)).toThrow(InvalidArgumentError);
+    expect(() => encodeHead({ ...head, observedAt: 5, replacedAt: 6 })).toThrow(
+      InvalidArgumentError,
+    );
+    const four = decodeHead(
+      utf8(
+        JSON.stringify({
+          complete: true,
+          connector: "c",
+          format: 4,
+          generation: "2",
+          keyCheck: head.keyCheck,
+          lastDeleteVersion: 0,
+          ns: head.ns,
+          observedAt: 9,
+          parts: head.parts,
+          primaryKey: ["id"],
+          profile: head.profile,
+          recordCount: 1,
+          replacedAt: 9,
+          stream: "s",
+        }),
+      ),
+    );
+    expect(four.kind).toBe("malformed");
+  });
+
+  it("omissionCutoff is the replacing run's time, or observedAt on an older head", () => {
+    expect(
+      omissionCutoff({ ...head, observedAt: 4000, replacedAt: 2000 }),
+    ).toBe(2000);
+    const { replacedAt: _drop, ...older } = head;
+    expect(omissionCutoff({ ...older, format: 4, observedAt: 4000 })).toBe(
+      4000,
+    );
   });
 
   it("framesCarryFirstSeen(format) is true only for format 4 and more", () => {
@@ -168,7 +214,7 @@ describe("head", () => {
     expect(() => encodeHead({ ...head, recordCount: 2 })).toThrow(
       InvalidArgumentError,
     );
-    expect(() => encodeHead({ ...head, format: 5 as 4 })).toThrow(
+    expect(() => encodeHead({ ...head, format: 6 as 5 })).toThrow(
       InvalidArgumentError,
     );
   });

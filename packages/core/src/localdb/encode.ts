@@ -274,7 +274,7 @@ export const PARTS_IN_FLIGHT = 2;
 
 /**
  * C.2 step 4, after the freeze: read the attempt's spool page by page, encode
- * the rows as v3 frames (format 4 head) in parts of at most `partTargetBytes`,
+ * the rows as v3 frames (format 4 or later head) in parts of at most `partTargetBytes`,
  * STREAM-encrypted, and upload each part that does not exist. Identical rows
  * give an identical part, so a repeat run makes zero PUTs.
  *

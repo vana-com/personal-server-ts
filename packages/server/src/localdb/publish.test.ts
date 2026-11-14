@@ -512,6 +512,7 @@ describe("publishConnection", () => {
           primaryKey: ["id"],
           profile: { key: CONNECTOR, version: "1.0.0" },
           recordCount: 0,
+          replacedAt: NOW,
           stream: STREAM,
         };
         const winnerBytes = encodeHead(winner);
@@ -756,7 +757,7 @@ async function localRun(
 }
 
 describe("publish with real apply", () => {
-  it("publishes format 4 with f and installs it on another database", async () => {
+  it("publishes format 5 with f and installs it on another database", async () => {
     const world = await makeWorld();
     await seedConnection(world.deps);
     await seedStream(world.deps);
@@ -766,7 +767,7 @@ describe("publish with real apply", () => {
     expect(
       (await publishConnection(world.deps, CONNECTION_ID))[0]?.outcome,
     ).toBe("published");
-    expect((await published(world)).head.format).toBe(4);
+    expect((await published(world)).head.format).toBe(5);
     const reader = await makeWorld(world.registry);
     await seedConnection(reader.deps);
     await applyConnection(
@@ -781,7 +782,54 @@ describe("publish with real apply", () => {
     ).toEqual([{ complete: 1 }]);
   });
 
-  it("upgrades every retained old-format part before publishing format 4", async () => {
+  it("leaves a format 4 head alone when nothing changed", async () => {
+    const world = await makeWorld();
+    await seedConnection(world.deps);
+    await seedStream(world.deps);
+    const basis = await registryHead(world, [{ id: "old" }], { format: 4 });
+    await applyConnection(world.deps, CONNECTION_ID);
+    await localRun(world);
+    expect(
+      (await publishConnection(world.deps, CONNECTION_ID))[0]?.outcome,
+    ).toBe("noop");
+    const read = await world.registry.read(SCOPE);
+    expect(read.found && read.version).toBe(basis.version);
+    expect((await published(world)).head.format).toBe(4);
+  });
+
+  it("the next publish over a format 4 head writes format 5, with the old head's observedAt as its cutoff", async () => {
+    const world = await makeWorld();
+    await seedConnection(world.deps);
+    await seedStream(world.deps);
+    await registryHead(world, [{ id: "old" }], { format: 4 });
+    await applyConnection(world.deps, CONNECTION_ID);
+    await localRun(world); // a partial run at 1000: it replaces nothing
+    await seedRecord(world.deps, "new", canonicalJson({ id: "new" }));
+    await publishConnection(world.deps, CONNECTION_ID);
+    const { head } = await published(world);
+    expect(head.format).toBe(5);
+    expect(head.observedAt).toBe(1000);
+    expect(head.replacedAt).toBe(100);
+  });
+
+  it("a replacing run's time is the cutoff of the head it publishes", async () => {
+    const world = await makeWorld();
+    await seedConnection(world.deps);
+    await seedStream(world.deps);
+    const basis = await registryHead(world, [{ id: "old" }]);
+    await applyConnection(world.deps, CONNECTION_ID);
+    await localRun(world, "r1", {
+      replace: true,
+      basisVersion: basis.version,
+      basisHash: basis.dataHash,
+    });
+    await seedRecord(world.deps, "new", canonicalJson({ id: "new" }));
+    await publishConnection(world.deps, CONNECTION_ID);
+    const { head } = await published(world);
+    expect(head.replacedAt).toBe(1000);
+  });
+
+  it("upgrades every retained old-format part before publishing format 5", async () => {
     const world = await makeWorld();
     await seedConnection(world.deps);
     await seedStream(world.deps);
@@ -806,7 +854,7 @@ describe("publish with real apply", () => {
     await seedRecord(world.deps, "new", canonicalJson({ id: "new" }));
     await publishConnection(world.deps, CONNECTION_ID);
     const image = await published(world);
-    expect(image.head.format).toBe(4);
+    expect(image.head.format).toBe(5);
     expect(image.values.map((v) => v.id).sort()).toEqual(
       ["new", ...oldValues.map((v) => v.id)].sort(),
     );

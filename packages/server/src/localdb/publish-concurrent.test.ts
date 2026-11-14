@@ -275,6 +275,7 @@ async function foreignHead(
     primaryKey: ["id"],
     profile: { key: CONNECTOR, version: "1" },
     recordCount: 0,
+    replacedAt: 1000,
     stream,
   };
   const bytes = encodeHead(head);

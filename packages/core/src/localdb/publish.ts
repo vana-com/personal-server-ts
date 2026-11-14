@@ -89,7 +89,9 @@ import {
   deriveKeyCheck,
   digestHead,
   encodeHead,
+  framesCarryFirstSeen,
   headBlobName,
+  omissionCutoff,
   streamScope,
   toHex,
   utf8,
@@ -1065,10 +1067,17 @@ async function snapshotStream(
           plan.replaceBelow,
         )
       : [];
+  // Heads of an older frame generation are rewritten whole. A head that only
+  // lacks a newer field keeps its parts: its next publish writes the field.
+  const framesStale = Boolean(
+    registryHead &&
+    framesCarryFirstSeen(registryHead.format) !==
+      framesCarryFirstSeen(HEAD_FORMAT),
+  );
   const hasWork = registryHead
     ? changes.length > 0 ||
       replaced.length > 0 ||
-      registryHead.format !== HEAD_FORMAT ||
+      framesStale ||
       (plan.steps.some((step) => step.decision.kind === "publish") &&
         !(
           plan.finalHead &&
@@ -1151,9 +1160,7 @@ async function snapshotStream(
 
   // Step 4 input: the changed prefixes, planned by the spec's bucket planner
   // so parts are sized by the byte target (see part-layout.ts).
-  const rewriteAll = Boolean(
-    registryHead && registryHead.format !== HEAD_FORMAT,
-  );
+  const rewriteAll = framesStale;
   const changedPrefixes = await planChangedPrefixes(deps, {
     connectionId,
     stream,
@@ -1204,6 +1211,18 @@ async function snapshotStream(
         key: local.profile_key ?? connection.connector,
         version: local.profile_version ?? local.floor_version ?? "0",
       },
+    // When the source last dropped what it no longer lists: the replacing
+    // run's time, else the registry head's, so a later partial run in this
+    // head does not widen it (see omissionCutoff). Never after observedAt: a
+    // device whose clock is behind the registry head's may publish an
+    // earlier observedAt, and the earlier cutoff then keeps more, not less.
+    replacedAt: Math.min(
+      observedAt,
+      Math.max(
+        plan.replaceBelow?.o ?? 0,
+        registryHead ? omissionCutoff(registryHead) : 0,
+      ),
+    ),
     stream,
   };
   const runIds = plan.steps.map((step) => step.runId);

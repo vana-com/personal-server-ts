@@ -11,6 +11,7 @@ import {
   framesOfParts,
   headBlobName,
   isPlainObject,
+  omissionCutoff,
   parseScope,
   partBlobName,
   pkHash,
@@ -516,7 +517,7 @@ async function applyOne(
         sql: `INSERT OR IGNORE INTO stream_state (connection_id,stream,primary_key,semantics,incremental) VALUES (?,?,?,'mutable_state',1)`,
         params: [id, stream, JSON.stringify(head.primaryKey)],
       },
-      ...applyDelete(op, id, stream, head.observedAt),
+      ...applyDelete(op, id, stream, omissionCutoff(head)),
       {
         sql: `UPDATE stream_state SET primary_key=?,profile_key=?,profile_version=?,complete=?,head_version=?,head_generation=?,head_data_hash=?,head_blob=?,last_delete_version=? WHERE connection_id=? AND stream=?`,
         params: [

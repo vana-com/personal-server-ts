@@ -1,14 +1,14 @@
 /**
- * §2.5 head format 4, and the head rules of §2.4, §2.5, §2.6 and §2.7:
+ * §2.5 head format 5, and the head rules of §2.4, §2.5, §2.6 and §2.7:
  * liveness, base choice, the compatible-writer rule, `complete` and no-op.
  *
  * Clear head bytes are canonical JSON:
  *
- *   {"complete":bool,"connector":c,"format":4,"generation":"<dec>",
+ *   {"complete":bool,"connector":c,"format":5,"generation":"<dec>",
  *    "keyCheck":"<16 hex>","lastDeleteVersion":n,"ns":ns,"observedAt":<ms>,
  *    "parts":[{"bytes":n,"count":n,"hash":"<sha256>","prefix":"<bits>"}],
  *    "primaryKey":[...],"profile":{"key":<string|null>,"version":"<v>"},
- *    "recordCount":n,"stream":s}
+ *    "recordCount":n,"replacedAt":<ms>,"stream":s}
  *
  * The registry `dataHash` of a head is Keccak-256 of these bytes; its blob
  * name is `h-<that hash in hex>`.
@@ -30,12 +30,15 @@ import { headBlobName } from "./names.js";
 import type { HeadPart } from "./parts.js";
 import type { ControlState } from "./control.js";
 
-/** The format writers build new heads with: first-seen (v3) frames. Readers also accept formats 1, 2 and 3. */
-export const HEAD_FORMAT = 4;
+/**
+ * The format writers build new heads with: first-seen (v3) frames and the
+ * `replacedAt` field. Readers also accept formats 1 to 4.
+ */
+export const HEAD_FORMAT = 5;
 /** Parts are NDJSON lines (§2.2). Readers still accept it; writers no longer write it. */
 export const HEAD_FORMAT_PREVIOUS = 1;
 
-export type HeadFormat = 1 | 2 | 3 | 4;
+export type HeadFormat = 1 | 2 | 3 | 4 | 5;
 
 /** Format 4 and later carry the first-seen checkpoint in each record frame. */
 export function framesCarryFirstSeen(format: number): boolean {
@@ -64,7 +67,24 @@ export interface Head {
   readonly primaryKey: readonly string[];
   readonly profile: HeadProfile;
   readonly recordCount: number;
+  /**
+   * Format 5 and later. The `observedAt` of the newest full run that dropped
+   * what the source no longer listed, carried unchanged through the partial
+   * runs and publishes after it. A record this head omits was dropped at this
+   * time; `observedAt` may be later, because a partial run can follow the
+   * replacing one in the same head. At most `observedAt`.
+   */
+  readonly replacedAt?: number;
   readonly stream: string;
+}
+
+/**
+ * The time at which a record absent from `head` was dropped: the replacing
+ * run's, where the head carries it; otherwise the head's own `observedAt`,
+ * which is the best an older head says.
+ */
+export function omissionCutoff(head: Head): number {
+  return head.replacedAt ?? head.observedAt;
 }
 
 const HEAD_FIELDS = [
@@ -103,8 +123,12 @@ function headProblem(
   value: Record<string, unknown>,
   format: HeadFormat,
 ): string | null {
+  const extra = [
+    ...(format >= 3 ? ["lastDeleteVersion"] : []),
+    ...(format >= 5 ? ["replacedAt"] : []),
+  ];
   const fields =
-    format >= 3 ? [...HEAD_FIELDS, "lastDeleteVersion"].sort() : HEAD_FIELDS;
+    extra.length > 0 ? [...HEAD_FIELDS, ...extra].sort() : HEAD_FIELDS;
   if (!exactKeys(value, fields)) {
     return `fields must be exactly: ${fields.join(", ")}`;
   }
@@ -137,6 +161,13 @@ function headProblem(
   }
   if (!isCount(v["observedAt"], 0))
     return "observedAt must be a non-negative integer";
+  if (format >= 5) {
+    const replacedAt = v["replacedAt"];
+    if (!isCount(replacedAt, 0))
+      return "replacedAt must be a non-negative integer";
+    if (replacedAt > v["observedAt"])
+      return "replacedAt must be at most observedAt";
+  }
   if (typeof v["stream"] !== "string" || v["stream"] === "") {
     return "stream must be a non-empty string";
   }
@@ -227,17 +258,18 @@ function toWire(head: Head): Record<string, unknown> {
     primaryKey: [...head.primaryKey],
     profile: { key: head.profile.key, version: head.profile.version },
     recordCount: head.recordCount,
+    ...(head.format >= 5 ? { replacedAt: head.replacedAt } : {}),
     stream: head.stream,
   };
 }
 
 /**
- * Canonical head bytes in the format the head carries (1–4), so frozen
+ * Canonical head bytes in the format the head carries (1–5), so frozen
  * older-format vectors re-encode byte for byte. Writers build new heads with
  * `HEAD_FORMAT`.
  */
 export function encodeHead(head: Head): Uint8Array {
-  if (![1, 2, 3, 4].includes(head.format)) {
+  if (![1, 2, 3, 4, 5].includes(head.format)) {
     throw new InvalidArgumentError(`unsupported head format: ${head.format}`);
   }
   if (!Number.isSafeInteger(head.generation) || head.generation < 1) {
@@ -278,7 +310,7 @@ export type DecodedHead =
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 /**
- * Parse clear head bytes. Formats outside 1–4 are `unsupported_format`.
+ * Parse clear head bytes. Formats outside 1–5 are `unsupported_format`.
  * A head must be canonical, so every host derives the same hash.
  */
 export function decodeHead(bytes: Uint8Array): DecodedHead {
@@ -299,7 +331,13 @@ export function decodeHead(bytes: Uint8Array): DecodedHead {
   if (!isPlainObject(parsed))
     return { kind: "malformed", reason: "head is not an object" };
   const format = hasOwn(parsed, "format") ? parsed["format"] : undefined;
-  if (format !== 1 && format !== 2 && format !== 3 && format !== 4) {
+  if (
+    format !== 1 &&
+    format !== 2 &&
+    format !== 3 &&
+    format !== 4 &&
+    format !== 5
+  ) {
     return { kind: "unsupported_format", format };
   }
   const problem = headProblem(parsed, format);
@@ -328,6 +366,7 @@ export function decodeHead(bytes: Uint8Array): DecodedHead {
       primaryKey: p["primaryKey"] as string[],
       profile: p.profile,
       recordCount: p["recordCount"] as number,
+      ...(format >= 5 ? { replacedAt: p["replacedAt"] as number } : {}),
       stream: p["stream"] as string,
     },
   };

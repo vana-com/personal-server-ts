@@ -71,6 +71,8 @@ export async function remoteFixture(
       version?: number;
       generation?: number;
       o?: number;
+      /** Format 5: when the replacing run dropped what the source no longer lists. */
+      replacedAt?: number;
       f?: number | null;
       format?: Head["format"];
       pieceBytes?: number;
@@ -130,6 +132,9 @@ export async function remoteFixture(
       profile: options.profile ?? { key: null, version: "1" },
       complete: options.complete ?? true,
       observedAt: options.o ?? 100,
+      ...(format >= 5
+        ? { replacedAt: options.replacedAt ?? options.o ?? 100 }
+        : {}),
       recordCount: values.length,
       parts,
     });

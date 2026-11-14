@@ -368,6 +368,7 @@ export function createConnectionDeleter(
             if (landed) spent++;
             if (spent >= ATTEMPTS) break;
             const version = row.found ? row.version + 1 : 1;
+            const observedAt = deps.now();
             const head = encodeHead({
               format: HEAD_FORMAT,
               connector,
@@ -377,7 +378,8 @@ export function createConnectionDeleter(
               keyCheck,
               lastDeleteVersion: version,
               complete: false,
-              observedAt: deps.now(),
+              observedAt,
+              replacedAt: observedAt,
               parts: [],
               primaryKey: ["id"],
               profile: { key: null, version: "0.0.0" },

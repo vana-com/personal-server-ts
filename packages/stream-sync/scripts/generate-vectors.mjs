@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Writes vectors/v1.json (frozen: format 4 heads are unsupported) and
- * vectors/v2.json (current: head format 4 is supported, format 5 is not). Byte outputs (HMAC, SHA-256, Keccak-256, canonical
+ * vectors/v2.json (current: head format 5 is supported, format 6 is not). Byte outputs (HMAC, SHA-256, Keccak-256, canonical
  * text) are computed here with node:crypto and @noble/hashes, independently of
  * the package code. Logic expectations (decide, checkpoint, needsFull,
  * eligible, ...) are written by hand from the design tables, not computed
@@ -2027,12 +2027,21 @@ const vectors = {
   eligible: eligibleCases,
 };
 
-// ---------- v2: head format 4 ----------
-// Every v1 case is kept. Only the two format-4 head cases change (format 5 is
-// now the unsupported one), and one format-4 head is added to encode and verify.
+// ---------- v2: head formats 4 and 5 ----------
+// Every v1 case is kept. Only the two format-4 head cases change (format 6 is
+// now the unsupported one), and format-4 and format-5 heads are added to encode
+// and verify. Format 5 adds `replacedAt`: the time the newest full run dropped
+// what the source no longer listed, at most `observedAt`.
 const f4 = { ...baseHead, format: 4, lastDeleteVersion: 2 };
 const f4Text = cj(f4);
-const f5Text = mutate({ format: 5, lastDeleteVersion: 2 });
+const f5 = {
+  ...baseHead,
+  format: 5,
+  lastDeleteVersion: 2,
+  replacedAt: baseHead.observedAt - 1000,
+};
+const f5Text = cj(f5);
+const f6Text = mutate({ format: 6, lastDeleteVersion: 2 });
 // v3 frames (head format 4): the envelope adds `f`, the record's first-seen
 // checkpoint (an integer, or null when unknown).
 const frameCaseV3 = (name, primaryKey, record, o, r, f) => {
@@ -2202,6 +2211,13 @@ const vectorsV2 = {
         dataHash: keccak(v3HeadText),
         blobName: `h-${keccak(v3HeadText).slice(2)}`,
       },
+      {
+        name: "format 5 head with replacedAt before observedAt",
+        head: f5,
+        text: f5Text,
+        dataHash: keccak(f5Text),
+        blobName: `h-${keccak(f5Text).slice(2)}`,
+      },
     ],
     decode: [
       ...vectors.heads.decode.map((c) =>
@@ -2209,10 +2225,31 @@ const vectorsV2 = {
           ? { name: "format 4", text: f4Text, expected: "ok" }
           : c,
       ),
-      { name: "format 5", text: f5Text, expected: "unsupported_format" },
+      { name: "format 5", text: f5Text, expected: "ok" },
+      { name: "format 6", text: f6Text, expected: "unsupported_format" },
       {
         name: "format 4 missing delete version",
         text: mutate({ format: 4 }),
+        expected: "malformed",
+      },
+      {
+        name: "format 5 missing replacedAt",
+        text: mutate({ format: 5, lastDeleteVersion: 2 }),
+        expected: "malformed",
+      },
+      {
+        name: "format 5 replacedAt after observedAt",
+        text: cj({ ...f5, replacedAt: f5.observedAt + 1 }),
+        expected: "malformed",
+      },
+      {
+        name: "format 5 negative replacedAt",
+        text: cj({ ...f5, replacedAt: -1 }),
+        expected: "malformed",
+      },
+      {
+        name: "format 4 refuses replacedAt",
+        text: cj({ ...f4, replacedAt: f4.observedAt }),
         expected: "malformed",
       },
     ],
@@ -2221,8 +2258,8 @@ const vectorsV2 = {
         c.name === "unsupported format is reported before name and key"
           ? {
               ...c,
-              text: f5Text,
-              expect: { ...c.expect, dataHash: keccak(f5Text) },
+              text: f6Text,
+              expect: { ...c.expect, dataHash: keccak(f6Text) },
             }
           : c,
       ),
@@ -2230,6 +2267,12 @@ const vectorsV2 = {
         name: "format 4 head verifies",
         text: f4Text,
         expect: { ...verifyExpect, dataHash: keccak(f4Text) },
+        result: "ok",
+      },
+      {
+        name: "format 5 head verifies",
+        text: f5Text,
+        expect: { ...verifyExpect, dataHash: keccak(f5Text) },
         result: "ok",
       },
     ],
