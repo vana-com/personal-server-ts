@@ -12,7 +12,13 @@ export type RunIntakeErrorName =
   | "owner_mismatch"
   | "lease_lost"
   | "connection_busy"
+  /** The connection is stopped: deleted, and an explicit connect is required. */
   | "connection_stopped"
+  /**
+   * A delete of this connection is not finished on this device and the last
+   * resume failed. The device keeps retrying; no run may write until it lands.
+   */
+  | "delete_pending"
   | "gone"
   | "run_conflict"
   | "unknown_artifact"
@@ -27,6 +33,7 @@ const STATUS: Record<RunIntakeErrorName, number> = {
   lease_lost: 409,
   connection_busy: 409,
   connection_stopped: 409,
+  delete_pending: 409,
   gone: 410,
   run_conflict: 409,
   unknown_artifact: 422,
@@ -42,6 +49,8 @@ export class RunIntakeError extends Error {
     readonly code: RunIntakeErrorName,
     message: string = code,
     readonly nextBatch?: number,
+    /** `delete_pending` only: the error name of the last failed resume. */
+    readonly lastError?: string,
   ) {
     super(message);
     this.name = "RunIntakeError";

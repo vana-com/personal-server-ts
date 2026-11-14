@@ -60,6 +60,10 @@ export interface LocalSync {
   close(): Promise<void>;
 }
 
+/** Default waits before a failed delete is resumed again; the wait doubles. */
+const RESUME_RETRY_FIRST_MS = 5_000;
+const RESUME_RETRY_MAX_MS = 5 * 60_000;
+
 export function createLocalSync(
   deps: LocalSyncDeps,
   options: {
@@ -72,8 +76,12 @@ export function createLocalSync(
     readonly olderVersionReads: () => boolean;
     readonly deleting?: (connector: string) => boolean | Promise<boolean>;
     readonly currentLease?: () => string | null;
+    /** Waits between resumes of a delete that keeps failing (tests shorten). */
+    readonly deleteRetryMs?: { readonly first: number; readonly max: number };
   },
 ): LocalSync {
+  const retryFirst = options.deleteRetryMs?.first ?? RESUME_RETRY_FIRST_MS;
+  const retryMax = options.deleteRetryMs?.max ?? RESUME_RETRY_MAX_MS;
   let intakeStore: ReturnType<typeof createRunIntakeStore> | undefined;
   const intake = () => (intakeStore ??= createRunIntakeStore(deps));
   const endStore = createRunEndStore(deps);
@@ -121,9 +129,23 @@ export function createLocalSync(
       if (!declarations) throw new RunIntakeError("unknown_artifact");
       // Artifact resolution can yield while the owner changes the write lease.
       await checkBinding(binding);
-      if (req.connect === true) {
-        await deletes().resumeDeletes();
+      // An unfinished delete fences every run. Try to finish it first; if it
+      // cannot finish, say so, so the host can show why the connection waits.
+      const unfinished = await deps.db.query(
+        "SELECT 1 FROM delete_intents WHERE connector=?",
+        [req.connector],
+      );
+      if (req.connect === true || unfinished.length > 0) {
+        const pending = await resume();
         await checkBinding(binding);
+        const stuck = pending.find((p) => p.connector === req.connector);
+        if (stuck)
+          throw new RunIntakeError(
+            "delete_pending",
+            "delete_pending",
+            undefined,
+            stuck.why,
+          );
       }
       const response = await intake().begin(runId, req, declarations);
       if (response.status === "collecting") bindings.set(runId, binding);
@@ -173,10 +195,39 @@ export function createLocalSync(
     });
   let deleteStore: ConnectionDeleter | undefined;
   const deletes = () => (deleteStore ??= makeDeleter());
+  // A delete that cannot land is retried here, with backoff, until it lands:
+  // finishing it must not wait for a begin or a sync cycle to ask.
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let retryDelay = retryFirst;
+  let closed = false;
+  const armRetry = () => {
+    if (closed || retryTimer) return;
+    const delay = retryDelay;
+    retryDelay = Math.min(retryDelay * 2, retryMax);
+    retryTimer = setTimeout(() => {
+      retryTimer = undefined;
+      void resume().catch(armRetry);
+    }, delay);
+    retryTimer.unref?.();
+  };
+  const resume = async () => {
+    const pending = await deletes().resumeDeletes();
+    if (pending.length > 0) armRetry();
+    else {
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = undefined;
+      retryDelay = retryFirst;
+    }
+    return pending;
+  };
   const deleter: ConnectionDeleter = {
-    requestConnectionDelete: (connector) =>
-      deletes().requestConnectionDelete(connector),
-    resumeDeletes: () => deletes().resumeDeletes(),
+    async requestConnectionDelete(connector) {
+      const result = await deletes().requestConnectionDelete(connector);
+      // Its landing runs in the background; check back whether it landed.
+      armRetry();
+      return result;
+    },
+    resumeDeletes: resume,
   };
   const listingDeps = {
     ...deps,
@@ -205,19 +256,24 @@ export function createLocalSync(
     olderVersions,
     blobs: createBlobStore(deps),
     async cycle() {
-      await deletes().resumeDeletes();
+      await resume();
       return runCycle(deps);
     },
     async apply() {
-      await deletes().resumeDeletes();
+      await resume();
       for (const connection of await bootstrapConnections(deps)) {
         await applyConnection(deps, connection.connectionId);
       }
     },
     async syncConnection(connectionId) {
-      await deletes().resumeDeletes();
+      await resume();
       return syncConnection(deps, connectionId);
     },
-    close: () => (closing ??= deps.db.close()),
+    close: () => {
+      closed = true;
+      clearTimeout(retryTimer);
+      retryTimer = undefined;
+      return (closing ??= deps.db.close());
+    },
   };
 }
