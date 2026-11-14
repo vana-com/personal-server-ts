@@ -29,8 +29,10 @@ import { importProjection } from "./sync.js";
 export interface LegacyStoreImportOptions {
   /** The server's own `index.db` handle. Borrowed: never closed here. */
   readonly db: Database;
-  /** The storage root that holds `index.db` and `data/`. */
+  /** The storage root that holds `index.db`. */
   readonly root: string;
+  /** Canonical directory used by the server for legacy data files. */
+  readonly dataDir?: string;
   readonly owner: string;
   readonly network: string;
   readonly legacyWriteSeal: LegacyWriteSeal;
@@ -53,7 +55,7 @@ export interface LegacyStoreImportOptions {
  * `retireLegacyCopies`, which removes the old files only when
  * `streamSync.retireLegacy` is on; with it off the same call reads back and
  * reports. No host supplies a port: the server builds the access from its own
- * root, handle and seal.
+ * root, data directory, handle and seal.
  *
  * Retirement follows the import in this one run, never before it. It would
  * otherwise remove a file that the import has not read yet. The import waker
@@ -89,6 +91,7 @@ export function createLegacyStoreRunner(
         owner: options.owner,
         network: options.network,
         root,
+        dataDir: options.dataDir,
         declarations: options.declarations(),
         eraseLedger: createLegacyEraseLedger(deps.db, () => deps.now()),
         legacyWriteSeal: options.legacyWriteSeal,
@@ -234,6 +237,7 @@ async function retire(
     retireAccess(deps, access, imported, signal),
     {
       streamSync: options.streamSync(),
+      signal,
       reportFile: (file) =>
         options.logger.info({ ...file }, "legacy file retirement"),
     },
@@ -260,7 +264,7 @@ function retireAccess(
   }
   return {
     copies,
-    erase: (copy) => access.erase(copy),
+    erase: (copy) => access.erase(copy, signal),
     erasedWithIntent: (copy) => access.erasedWithIntent(copy),
     finishErase: (copy) => access.finishErase(copy),
     async readBack(copy) {

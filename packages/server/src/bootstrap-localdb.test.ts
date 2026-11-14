@@ -16,6 +16,7 @@ import { createMemoryModeRecordStore } from "@opendatalabs/personal-server-ts-co
 import { createStreamSyncKeyPorts } from "../../core/src/stream-sync/crypto.js";
 import { remoteFixture } from "./localdb/apply-fixture.js";
 import { createServer, type ServerContext } from "./bootstrap.js";
+import * as legacyImport from "./localdb/legacy-store-import.js";
 
 const contexts: ServerContext[] = [];
 const directories: string[] = [];
@@ -62,6 +63,31 @@ async function directory() {
 }
 
 describe("Node database composition", () => {
+  it("creates an importer for Desktop and equivalent and external data paths", async () => {
+    const root = await directory();
+    const external = await directory();
+    const runner = vi.spyOn(legacyImport, "createLegacyStoreRunner");
+    vi.stubEnv("PS_ACCESS_TOKEN", "node-database-fixture");
+    vi.stubEnv("VANA_OWNER_PRIVATE_KEY", "");
+    for (const dataDir of [undefined, `${root}/data/../data`, external]) {
+      const context = await createServer(config, {
+        rootPath: root,
+        dataDir,
+        ownerSignature: await signature(),
+        accountModeStore: createMemoryModeRecordStore(),
+      });
+      contexts.push(context);
+      expect(runner).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          root,
+          dataDir: dataDir === external ? external : join(root, "data"),
+        }),
+      );
+      await context.cleanup();
+      contexts.pop();
+    }
+    expect(runner).toHaveBeenCalledTimes(3);
+  });
   it("boots with sync disabled and opens no database before Account says On", async () => {
     const root = await directory();
     const context = await boot(root);

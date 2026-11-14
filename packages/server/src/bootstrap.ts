@@ -28,6 +28,7 @@ import {
   open,
   readFile,
   readdir,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -395,7 +396,7 @@ async function bootstrapServer(
   const storageRoot = resolveRootPath(
     options?.rootPath ?? options?.serverDir ?? DEFAULT_ROOT_PATH,
   );
-  const dataDir = options?.dataDir ?? join(storageRoot, "data");
+  let dataDir = options?.dataDir ?? join(storageRoot, "data");
   const indexPath = join(storageRoot, "index.db");
   const configPath = join(storageRoot, "config.json");
   const syncCursorPath = join(storageRoot, "sync-cursor.json");
@@ -446,6 +447,7 @@ async function bootstrapServer(
   }
   await mkdir(storageRoot, { recursive: true });
   await mkdir(dataDir, { recursive: true });
+  dataDir = await realpath(dataDir);
   for (const parent of [...newDirectoryParents].sort(
     (a, b) => a.length - b.length,
   )) {
@@ -1512,33 +1514,28 @@ async function bootstrapServer(
   // The waker runs the import, then the retirement, when the Account answers
   // On and once at boot for an owner already switched. No host supplies a port.
   if (localSyncSource && serverOwner) {
-    if (dataDir === join(storageRoot, "data")) {
-      importWaker = createImportWaker({
-        authority: accountModeAuthority,
+    importWaker = createImportWaker({
+      authority: accountModeAuthority,
+      owner: serverOwner,
+      importer: createLegacyStoreRunner({
+        db,
+        root: storageRoot,
+        dataDir,
         owner: serverOwner,
-        importer: createLegacyStoreRunner({
-          db,
-          root: storageRoot,
-          owner: serverOwner,
-          network: streamSyncNetwork(config.gateway),
-          legacyWriteSeal,
-          getDeps: async () => {
-            await localSyncSource();
-            return localSyncDeps!;
-          },
-          declarations: () => pdppAuth?.retainedDeclarations ?? [],
-          methods: () => pdppAuth?.configuredMethods ?? [],
-          manifests: () => pdppAuth?.retainedManifests ?? [],
-          streamSync: () => config.streamSync,
-          logger,
-        }),
-        onWarning: (message, detail) => logger.warn({ detail }, message),
-      });
-    } else {
-      logger.warn(
-        "the data directory is not <root>/data; the legacy store import is off",
-      );
-    }
+        network: streamSyncNetwork(config.gateway),
+        legacyWriteSeal,
+        getDeps: async () => {
+          await localSyncSource();
+          return localSyncDeps!;
+        },
+        declarations: () => pdppAuth?.retainedDeclarations ?? [],
+        methods: () => pdppAuth?.configuredMethods ?? [],
+        manifests: () => pdppAuth?.retainedManifests ?? [],
+        streamSync: () => config.streamSync,
+        logger,
+      }),
+      onWarning: (message, detail) => logger.warn({ detail }, message),
+    });
   }
 
   const streamSyncSeed = localSyncSource

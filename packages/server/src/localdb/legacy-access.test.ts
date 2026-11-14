@@ -9,6 +9,7 @@ import {
   existsSync,
   readFileSync,
   symlinkSync,
+  renameSync,
 } from "node:fs";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
@@ -162,6 +163,67 @@ async function collect<T>(source: AsyncIterable<T>) {
   for await (const item of source) items.push(item);
   return items;
 }
+it("imports and erases copies from the bound external data directory", async () => {
+  const f = await fixture();
+  const external = mkdtempSync(join(process.cwd(), ".legacy-data-test-"));
+  dirs.push(external);
+  renameSync(f.file, join(external, "copy.json"));
+  const access = await openLegacyAccess({ ...f.options, dataDir: external });
+  const [copy] = await collect(access.copies());
+  expect(copy?.path).toBe(join(external, "copy.json"));
+  expect(await access.erase(copy!)).toBe(true);
+  expect(existsSync(join(external, "copy.json"))).toBe(false);
+  await access.close();
+});
+it("does not erase when shutdown occurs while waiting for the write seal", async () => {
+  const f = await fixture();
+  let release!: () => void;
+  let entered!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  f.seal.remove = async (work) => {
+    entered();
+    await gate;
+    return work();
+  };
+  const access = await openLegacyAccess(f.options);
+  const [copy] = await collect(access.copies());
+  const controller = new AbortController();
+  const result = access.erase(copy!, controller.signal);
+  await waiting;
+  controller.abort();
+  release();
+  await expect(result).rejects.toMatchObject({ name: "AbortError" });
+  expect(existsSync(f.file)).toBe(true);
+  expect(await f.eraseLedger.has(copy!)).toBe(false);
+  await access.close();
+});
+it("retains a journaled copy after shutdown for a later retry", async () => {
+  const f = await fixture();
+  const access = await openLegacyAccess(f.options);
+  const [copy] = await collect(access.copies());
+  const controller = new AbortController();
+  const record = f.eraseLedger.record;
+  f.eraseLedger.record = async (value) => {
+    await record(value);
+    controller.abort();
+  };
+  await expect(access.erase(copy!, controller.signal)).rejects.toMatchObject({
+    name: "AbortError",
+  });
+  expect(existsSync(f.file)).toBe(true);
+  expect(await f.eraseLedger.has(copy!)).toBe(true);
+  f.eraseLedger.record = record;
+  await access.close();
+  const reopened = await openLegacyAccess(f.options);
+  expect(await reopened.erase(copy!)).toBe(true);
+  expect(await reopened.erasedWithIntent(copy!)).toBe(true);
+  await reopened.close();
+});
 it("legacy-access-unswitched-and-unknown-refuse", async () => {
   const f = await fixture();
   const before = f.db.prepare("SELECT total_changes() AS n").get();
