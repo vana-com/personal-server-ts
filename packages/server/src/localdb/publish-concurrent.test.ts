@@ -872,10 +872,15 @@ describe("the memory budget is taken before data is built", () => {
     // An attachment is held twice (plain and encrypted) and named by its own size.
     const attachment = new TextEncoder().encode("attachment of s0").length;
     expect(state.reserves).toContain(`${2 * attachment}/${attachment}`);
-    // One reservation per part and one per head (each a part-target unit
-    // that names no object), and one per attachment: nothing is built
-    // unreserved, and a sibling's reservation cannot stand in for it.
-    expect(state.reserves.filter((r) => r.endsWith("/-"))).toHaveLength(6);
+    // One reservation per part, one per head and one per attachment: nothing
+    // is built unreserved, and a sibling's reservation cannot stand in for it.
+    // A part is held twice (plain and encrypted) and named by its own size,
+    // like an attachment; a head is one part-target unit that names no object.
+    const partUnit = 4 * 1024 * 1024;
+    expect(state.reserves.filter((r) => r === `${partUnit}/-`)).toHaveLength(3);
+    expect(
+      state.reserves.filter((r) => r === `${2 * partUnit}/${partUnit}`),
+    ).toHaveLength(3);
     expect(state.reserves).toHaveLength(9);
     expect(state.held).toBe(0);
   });
@@ -895,7 +900,8 @@ describe("the memory budget is taken before data is built", () => {
     expect(results.map((r) => r.outcome)).toEqual(["published"]);
     const part = heldAtPut.find((p) => !p.head);
     const head = heldAtPut.find((p) => p.head);
-    expect(part?.held).toBe(4 * 1024 * 1024);
+    // A part is held twice: plain encoded bytes and ciphertext.
+    expect(part?.held).toBe(2 * 4 * 1024 * 1024);
     expect(head?.held).toBeGreaterThanOrEqual(4 * 1024 * 1024);
     expect(state.held).toBe(0);
   });

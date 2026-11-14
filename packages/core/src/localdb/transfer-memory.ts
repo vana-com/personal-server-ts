@@ -10,7 +10,7 @@ import type { StreamSyncBlobs } from "../stream-sync/ports.js";
  * each other. A store without a governor holds nothing.
  *
  * `objectBytes` is the size of the stored object when the memory held is
- * larger (an attachment is in memory as plain and as encrypted bytes). The
+ * larger (an attachment or a part is in memory as plain and as encrypted bytes). The
  * governor refuses an object larger than the store accepts.
  */
 export async function holdMemory(

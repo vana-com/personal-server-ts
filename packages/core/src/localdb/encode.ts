@@ -340,17 +340,19 @@ export async function startFrozenParts(
 ): Promise<readonly EncodedPart[]> {
   const target = partTarget(deps, input.generation);
   const blobs = input.meter ? meteredBlobs(deps, input.meter) : deps.blobs;
-  // Memory budget (see `holdMemory`): one part's worth, `target` bytes, is
-  // reserved before a page of rows is read for a part. When the part is
-  // encoded its upload takes the reservation and releases it once the part is
-  // stored (or skipped), so the bytes of a part waiting for the send gate stay
-  // counted. The builder asks for the next reservation only while it holds
+  // Memory budget (see `holdMemory`): two parts' worth, `2 * target` bytes, is
+  // reserved before a page of rows is read for a part: the plain encoded part
+  // and its ciphertext are both in memory while the PUT runs, as for an
+  // attachment. The budget is then the real peak, not half of it. When the
+  // part is encoded its upload takes the reservation and releases it once the
+  // part is stored (or skipped), so the bytes of a part waiting for the send
+  // gate stay counted. The builder asks for the next reservation only while it holds
   // none, and an upload never asks for bytes, so a held reservation always
   // ends and reservations cannot wait on each other.
   let held: (() => void) | undefined;
   const memory = {
     hold: async () => {
-      held ??= await holdMemory(blobs, target);
+      held ??= await holdMemory(blobs, 2 * target, target);
     },
     /** Passes the reservation to the caller, who must release it. */
     take: (): (() => void) => {

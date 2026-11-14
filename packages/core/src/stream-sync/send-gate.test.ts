@@ -32,9 +32,9 @@ async function succeed(gate: SendGate, clock: FakeClock, n: number) {
   for (let i = 0; i < n; i++) (await next(gate, clock)).success();
 }
 
-/** Opens the window to `to` by successes alone. */
+/** Opens the window to `to` (a power of two) by successes alone: slow start. */
 async function openTo(gate: SendGate, clock: FakeClock, to: number) {
-  for (let size = 1; size < to; size++) await succeed(gate, clock, size);
+  while (gate.stats().window < to) await succeed(gate, clock, 1);
 }
 
 describe("the in-flight window", () => {
@@ -51,18 +51,105 @@ describe("the in-flight window", () => {
     expect(secondOut).toBe(true);
   });
 
-  it("grows by one after a window's worth of successes, up to its cap", async () => {
+  it("after the ramp it grows by one after a window's worth of successes, up to its cap", async () => {
     const clock = fakeClock();
-    const gate = gateOn(clock, { maxWindow: 3 });
+    const gate = gateOn(clock, { maxWindow: 4 });
     expect(gate.stats().window).toBe(1);
-    await succeed(gate, clock, 1); // 1 success fills a window of 1
+    await succeed(gate, clock, 1); // slow start: 1 success fills a window of 1
     expect(gate.stats().window).toBe(2);
+    (await next(gate, clock)).quotaExceeded(); // the ramp ends at 2
     await succeed(gate, clock, 1);
     expect(gate.stats().window).toBe(2); // 1 of 2
     await succeed(gate, clock, 1);
     expect(gate.stats().window).toBe(3);
+    await succeed(gate, clock, 2); // 2 of 3: not a doubling to 4 yet
+    expect(gate.stats().window).toBe(3);
+    await succeed(gate, clock, 1);
+    expect(gate.stats().window).toBe(4);
     await succeed(gate, clock, 9);
-    expect(gate.stats().window).toBe(3); // the cap
+    expect(gate.stats().window).toBe(4); // the cap
+  });
+
+  describe("slow start", () => {
+    /** Successes one after another, reporting the window after each one that changed it. */
+    async function windowsAfter(
+      gate: SendGate,
+      clock: FakeClock,
+      successes: number,
+    ): Promise<number[]> {
+      const seen = [gate.stats().window];
+      for (let i = 0; i < successes; i++) {
+        (await next(gate, clock)).success();
+        const now = gate.stats().window;
+        if (now !== seen[seen.length - 1]) seen.push(now);
+      }
+      return seen;
+    }
+
+    it("doubles the window after a window's worth of successes, up to the cap", async () => {
+      const clock = fakeClock();
+      const gate = gateOn(clock, { maxWindow: 16 });
+      // 1 + 2 + 4 + 8 successes fill the windows of 1, 2, 4 and 8.
+      expect(await windowsAfter(gate, clock, 15)).toEqual([1, 2, 4, 8, 16]);
+      expect(await windowsAfter(gate, clock, 40)).toEqual([16]);
+    });
+
+    it("stops doubling at the cap when the cap is not a power of two", async () => {
+      const clock = fakeClock();
+      const gate = gateOn(clock, { maxWindow: 6 });
+      expect(await windowsAfter(gate, clock, 20)).toEqual([1, 2, 4, 6]);
+    });
+
+    it("a 503 during the ramp halves the window, sets the threshold there, and growth goes on by one", async () => {
+      const clock = fakeClock();
+      const gate = gateOn(clock, { maxWindow: 32 });
+      expect(await windowsAfter(gate, clock, 7)).toEqual([1, 2, 4, 8]);
+      (await next(gate, clock)).congested();
+      expect(gate.stats().window).toBe(4);
+      // A window of 4 successes would double a ramping window to 8. At the
+      // threshold it adds one.
+      expect(await windowsAfter(gate, clock, 4)).toEqual([4, 5]);
+      expect(await windowsAfter(gate, clock, 5)).toEqual([5, 6]);
+      expect(await windowsAfter(gate, clock, 6)).toEqual([6, 7]);
+    });
+
+    it("a 429 during the ramp leaves the window as it is, and growth goes on by one", async () => {
+      const clock = fakeClock();
+      const gate = gateOn(clock, { maxWindow: 32 });
+      expect(await windowsAfter(gate, clock, 3)).toEqual([1, 2, 4]);
+      (await next(gate, clock)).quotaExceeded(1_000);
+      expect(gate.stats().window).toBe(4);
+      await clock.advance(1_000);
+      expect(await windowsAfter(gate, clock, 4)).toEqual([4, 5]);
+    });
+
+    it("a 429 with no Retry-After ends the ramp too", async () => {
+      const clock = fakeClock();
+      const gate = gateOn(clock, { maxWindow: 32 });
+      expect(await windowsAfter(gate, clock, 1)).toEqual([1, 2]);
+      (await next(gate, clock)).quotaExceeded();
+      expect(gate.stats().window).toBe(2);
+      expect(await windowsAfter(gate, clock, 2)).toEqual([2, 3]);
+    });
+
+    it("a 503 at window 1 keeps it at 1, and growth after it is by one", async () => {
+      const clock = fakeClock();
+      const gate = gateOn(clock, { maxWindow: 32 });
+      (await next(gate, clock)).congested();
+      expect(gate.stats().window).toBe(1);
+      // A ramping window would be 4 after three successes.
+      expect(await windowsAfter(gate, clock, 3)).toEqual([1, 2, 3]);
+    });
+
+    it("a 503 stays in force: a later halving sets a lower threshold", async () => {
+      const clock = fakeClock();
+      const gate = gateOn(clock, { maxWindow: 32 });
+      expect(await windowsAfter(gate, clock, 7)).toEqual([1, 2, 4, 8]);
+      (await next(gate, clock)).congested(); // 4
+      (await next(gate, clock)).congested(); // 2
+      expect(gate.stats().window).toBe(2);
+      expect(await windowsAfter(gate, clock, 2)).toEqual([2, 3]);
+    });
   });
 
   it("halves on a 503, never below 1", async () => {

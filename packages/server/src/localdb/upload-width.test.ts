@@ -69,7 +69,10 @@ interface Rig {
     stored: number;
     onWire: number;
     peakOnWire: number;
-    /** Bytes of parts encrypted and not yet stored. */
+    /**
+     * Bytes in memory for parts encrypted and not yet stored: the plain
+     * encoded part and its ciphertext, both held while the PUT runs.
+     */
     heldBytes: number;
     peakHeldBytes: number;
     readonly startTimes: number[];
@@ -160,7 +163,7 @@ async function rig(options: {
       if (failure) options.onFailureAnswer?.({ ...context(), n: started.n });
       if (failure) throw failure;
       stats.stored += 1;
-      stats.heldBytes -= bytes.length;
+      stats.heldBytes -= 2 * bytes.length;
       return "";
     },
   };
@@ -177,7 +180,8 @@ async function rig(options: {
     blobs,
     keys: {
       encryptPart: async (_scope: string, clear: Uint8Array) => {
-        stats.heldBytes += clear.length;
+        // The encoder still holds `clear` while the ciphertext is uploaded.
+        stats.heldBytes += 2 * clear.length;
         stats.peakHeldBytes = Math.max(stats.peakHeldBytes, stats.heldBytes);
         return clear.slice();
       },
@@ -216,11 +220,15 @@ async function rig(options: {
   };
 }
 
-/** The window may grow to `cap` parts; the budget holds `budgetParts` of them. */
+/**
+ * The window may grow to `cap` parts; the budget holds `budgetParts` of them.
+ * A part counts twice (plain and ciphertext), so the budget is two parts' bytes
+ * for each.
+ */
 const policyFor = (cap: number, budgetParts: number) => ({
   // The gate's cap is maxBytesInFlight / partBytes.
-  maxBytesInFlight: budgetParts * PART,
-  partBytes: Math.floor((budgetParts * PART) / cap),
+  maxBytesInFlight: budgetParts * 2 * PART,
+  partBytes: Math.floor((budgetParts * 2 * PART) / cap),
 });
 
 describe("a stream's part uploads are limited by the send gate and the byte budget, not by a width of their own", () => {
@@ -232,7 +240,7 @@ describe("a stream's part uploads are limited by the send gate and the byte budg
     expect(r.stats.peakOnWire).toBeLessThanOrEqual(8);
   });
 
-  it("never holds more encoded bytes than the byte budget, however wide the gate allows", async () => {
+  it("never holds more bytes in memory (plain and ciphertext) than the byte budget, however wide the gate allows", async () => {
     const budgetParts = 5;
     const r = await rig({
       parts: 48,
@@ -243,11 +251,11 @@ describe("a stream's part uploads are limited by the send gate and the byte budg
     await r.drive(r.publish());
     expect(r.stats.stored).toBe(48);
     expect(r.stats.peakOnWire).toBeGreaterThan(2);
-    expect(r.stats.peakHeldBytes).toBeLessThanOrEqual(budgetParts * PART);
+    expect(r.stats.peakHeldBytes).toBeLessThanOrEqual(budgetParts * 2 * PART);
     expect(r.stats.peakOnWire).toBeLessThanOrEqual(budgetParts);
     // The governor's own count of reserved bytes agrees.
     expect(window.end().peakBytesInFlight).toBeLessThanOrEqual(
-      budgetParts * PART,
+      budgetParts * 2 * PART,
     );
   });
 
@@ -340,6 +348,9 @@ describe("a stream's part uploads are limited by the send gate and the byte budg
     expect(peak).toBeGreaterThan(2);
     expect(peak).toBeLessThanOrEqual(16);
     expect(spentMs).toBeLessThan(((parts / 2) * PUT_MS) / 2);
+    // Slow start reaches the guard's rate in 1+2+4+8 PUTs over four round
+    // trips. Growing by one per window of successes took 19 s on this model.
+    expect(spentMs).toBeLessThan(19_000);
     // The guard's 10 PUT/s is the floor.
     expect(spentMs).toBeGreaterThanOrEqual((parts / 10) * 1_000);
   });
