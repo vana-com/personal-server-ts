@@ -38,6 +38,7 @@ import {
   encodeHead,
   headBlobName,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { RegistryRefusedError } from "../../../core/src/stream-sync/ports.js";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import { createConnectionDeleter } from "../../../core/src/localdb/delete.js";
@@ -936,4 +937,226 @@ it("foreign control deletion recovers after restoring the matching key", async (
   } finally {
     key.mockRestore();
   }
+});
+
+it.each([false, true])(
+  "active generation 11 replaces legacy markers for every stream before reconnect publishes (tombstoned: %s)",
+  async (tombstoned) => {
+    const w = await world(1);
+    for (let v = 2; v <= 11; v++)
+      await w.registry.post({
+        ownerAddress: owner,
+        scope: w.fixture.control,
+        dataHash: w.fixture.hashes.activeData,
+        metadataHash: w.fixture.hashes.activeMetadata,
+        expectedVersion: String(v),
+        signature: "0x00",
+      });
+    await applyConnection(w.a.deps, w.fixture.control);
+    const names = [
+      "profile",
+      "repositories",
+      "history",
+      "events",
+      "contributions",
+      "starred",
+    ];
+    const decl = {
+      ...declaration,
+      streams: names.map((name) => ({
+        name,
+        semantics: "mutable_state" as const,
+        primaryKey: ["id"],
+      })),
+    };
+    for (const name of names) {
+      const scope = `${w.fixture.control}.${name}`;
+      await w.fixture.head(name, [], { version: 15, generation: 1 });
+      for (const [key, bytes] of w.fixture.blobs) await w.blobs.put(key, bytes);
+      const row = w.fixture.reads.get(scope)!;
+      if (!row.found) throw new Error("fixture missing");
+      for (let v = 1; v <= 15; v++)
+        await w.registry.post({
+          ownerAddress: owner,
+          scope,
+          dataHash: row.dataHash as `0x${string}`,
+          metadataHash: deleteMetadataHash(scope, v),
+          expectedVersion: String(v),
+          signature: "0x00",
+        });
+    }
+    if (tombstoned) {
+      const read = w.registry.read.bind(w.registry);
+      vi.spyOn(w.registry, "read").mockImplementation(async (scope) => {
+        const row = await read(scope);
+        return row.found && row.version === 15 && scope !== w.fixture.control
+          ? { ...row, deleted: true }
+          : row;
+      });
+    }
+    const intake = createRunIntakeStore(w.a.deps);
+    const begin = async (runId: string, connect = false) => {
+      await intake.begin(
+        runId,
+        {
+          connector: declaration.connector,
+          artifactDigest: "fixture",
+          owner: { address: owner, leaseId: null },
+          observedAt: connect ? 4000 : 3000,
+          connect,
+        },
+        decl,
+      );
+      await intake.batch(runId, {
+        batch: 0,
+        records: names.map((stream) => ({ stream, data: { id: runId } })),
+      });
+      await createRunEndStore(w.a.deps).end(runId, {
+        outcome: "succeeded",
+        coveredStreams: names,
+        lastBatch: 0,
+        provenFullStreams: names,
+      });
+    };
+    await begin("before-delete");
+    const deleter = createConnectionDeleter(w.a.deps, {
+      declaredStreams: () => names,
+    });
+    await deleter.requestConnectionDelete(declaration.connector);
+    expect(await deleter.resumeDeletes()).toEqual([]);
+    for (const name of names) {
+      const scope = `${w.fixture.control}.${name}`;
+      expect(await w.registry.read(scope)).toMatchObject({
+        version: 16,
+        metadataHash: endedGenerationDeleteMetadataHash(scope, 16, 11),
+      });
+    }
+    // Pre-delete rows cannot publish over the replacement markers.
+    expect(
+      (await publishConnection(w.a.deps, w.fixture.control)).map(
+        (p) => p.outcome,
+      ),
+    ).not.toContain("published");
+    await begin("after-reconnect", true);
+    expect(await generationOf(w.a)).toBe(13);
+    const result = await cycle(w.a, w);
+    expect(result.published.map((p) => p.outcome)).toEqual(
+      names.map(() => "published"),
+    );
+    for (const name of names)
+      expect(
+        await w.registry.read(`${w.fixture.control}.${name}`),
+      ).toMatchObject({ version: 17 });
+    expect(await w.a.db.query("SELECT DISTINCT body FROM records")).toEqual([
+      { body: '{"id":"after-reconnect"}' },
+    ]);
+  },
+);
+
+it.each(["conflict", "refused", "unconfirmed"])(
+  "unchanged active control keeps delete pending after %s CAS",
+  async (reply) => {
+    const w = await world(1);
+    await published(w);
+    const real = w.registry.post.bind(w.registry);
+    const blocked = vi
+      .spyOn(w.registry, "post")
+      .mockImplementation(async (req) => {
+        if (req.scope !== w.fixture.control) return real(req);
+        if (reply === "refused") throw new RegistryRefusedError("refused", 409);
+        return reply === "conflict"
+          ? { kind: "conflict", latestVersion: "1" }
+          : { kind: "committed" };
+      });
+    await w.a.deleter.requestConnectionDelete(declaration.connector);
+    expect(await w.a.deleter.resumeDeletes()).toHaveLength(1);
+    expect(await w.a.db.query("SELECT * FROM delete_intents")).toHaveLength(1);
+    await expect(
+      collect(w.a, ["blocked"], { connect: true }),
+    ).rejects.toMatchObject({ code: "connection_stopped", status: 409 });
+    blocked.mockRestore();
+    expect(await w.a.deleter.resumeDeletes()).toEqual([]);
+    await collect(w.a, ["reconnected"], { connect: true });
+    expect((await cycle(w.a, w)).published.map((p) => p.outcome)).toEqual([
+      "published",
+    ]);
+  },
+);
+
+it.each([10, 11, 12])(
+  "remote active v%s cannot restore local deleted v12",
+  async (version) => {
+    const w = await world(1);
+    await published(w);
+    for (let v = 2; v <= version; v++)
+      await w.registry.post({
+        ownerAddress: owner,
+        scope: w.fixture.control,
+        dataHash: w.fixture.hashes.activeData,
+        metadataHash: w.fixture.hashes.activeMetadata,
+        expectedVersion: String(v),
+        signature: "0x00",
+      });
+    await w.a.db.batch([
+      {
+        sql: "UPDATE connections SET control_state='deleted',control_version=12,generation=11",
+      },
+    ]);
+    await applyConnection(w.a.deps, w.fixture.control);
+    expect(
+      await w.a.db.query(
+        "SELECT control_state,control_version,generation FROM connections",
+      ),
+    ).toEqual([
+      { control_state: "deleted", control_version: 12, generation: 11 },
+    ]);
+  },
+);
+
+it("a resumed signed pin and head fence cannot replace ended-generation proof", async () => {
+  const w = await world(1);
+  await published(w);
+  await lifetime(w, w.a, w.a, "first");
+  const real = w.registry.post.bind(w.registry);
+  const blocked = vi
+    .spyOn(w.registry, "post")
+    .mockImplementation(async (req) => {
+      if (req.scope === w.scope)
+        throw new Error("stopped after saving signed pin");
+      return real(req);
+    });
+  await w.a.deleter.requestConnectionDelete(declaration.connector);
+  expect(await w.a.deleter.resumeDeletes()).toHaveLength(1);
+  blocked.mockRestore();
+  const row = await w.registry.read(w.scope);
+  if (!row.found) throw new Error("missing head");
+  const bytes = await w.blobs.get(`${w.scope}/${headBlobName(row.dataHash)}`);
+  const decoded = decodeHead(bytes!);
+  if (decoded.kind !== "ok") throw new Error("invalid head");
+  const head = encodeHead({
+    ...decoded.head,
+    parts: [],
+    recordCount: 0,
+    lastDeleteVersion: 4,
+  });
+  const digest = await digestHead(async (b) => keccak_256(b), head);
+  await w.blobs.put(`${w.scope}/${digest.blobName}`, head);
+  await real({
+    ownerAddress: owner,
+    scope: w.scope,
+    dataHash: digest.dataHash,
+    metadataHash: w.fixture.hashes.activeMetadata,
+    expectedVersion: "4",
+    signature: "0x00",
+  });
+  expect(await w.a.deleter.resumeDeletes()).toEqual([]);
+  expect(await w.registry.read(w.scope)).toMatchObject({
+    version: 5,
+    metadataHash: endedGenerationDeleteMetadataHash(w.scope, 5, 3),
+  });
+  await collect(w.a, ["second"], { connect: true });
+  expect((await cycle(w.a, w)).published.map((p) => p.outcome)).toEqual([
+    "published",
+  ]);
+  expect(await held(w.a)).toEqual(["second"]);
 });

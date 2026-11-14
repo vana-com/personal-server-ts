@@ -225,6 +225,21 @@ async function control(
     controlScope(connection.connector, connection.ns),
   );
   const state = classifyControl(read, hashes);
+  // A stale active read cannot undo a deletion this device already observed.
+  // Check before purging/resetting stream state as well as before the row update.
+  const [local] = await deps.db.query<{
+    control_state: string;
+    control_version: number;
+  }>(
+    "SELECT control_state,control_version FROM connections WHERE connection_id=?",
+    [id],
+  );
+  if (
+    state.kind === "active" &&
+    local?.control_state === "deleted" &&
+    state.generation <= local.control_version
+  )
+    return { kind: "deleted" as const, version: local.control_version };
   if (state.kind === "deleted")
     await purgeConnection(deps, id, { controlVersion: state.version });
   if (state.kind === "active") {

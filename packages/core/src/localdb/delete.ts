@@ -315,19 +315,27 @@ export function createConnectionDeleter(
                 : now.kind === "deleted"
                   ? now.version
                   : undefined;
+            // With a known lifetime, only its v2 metadata proves the boundary.
+            // A tombstoned row or a head fence cannot substitute for that proof.
             const marked = (version: number, hash: string) =>
-              (now.kind !== "deleted" &&
+              (now.kind === "absent" &&
                 hash.toLowerCase() === deleteMetadataHash(scope, version)) ||
               (ended !== undefined &&
                 hash.toLowerCase() ===
                   endedGenerationDeleteMetadataHash(scope, version, ended));
             let lastDelete =
               row.found &&
-              (classifyStreamRow(row, hashes) === "tombstoned" ||
+              ((now.kind === "absent" &&
+                classifyStreamRow(row, hashes) === "tombstoned") ||
                 marked(row.version, row.metadataHash))
                 ? row.version
                 : 0;
-            if (row.found && lastDelete === 0 && signedPin !== undefined) {
+            if (
+              now.kind === "absent" &&
+              row.found &&
+              lastDelete === 0 &&
+              signedPin !== undefined
+            ) {
               try {
                 const cipher = await deps.blobs.get(
                   `${scope}/${headBlobName(row.dataHash)}`,
@@ -443,8 +451,16 @@ export function createConnectionDeleter(
             throw error;
         }
         const after = classifyControl(await deps.registry.read(scope), hashes);
-        if (after.kind !== "deleted")
+        if (after.kind !== "deleted") {
+          if (
+            after.kind === "absent" ||
+            (after.kind === "active" && after.generation <= pin.version)
+          )
+            throw new Error(
+              "control delete pending without confirmed tombstone",
+            );
           throw new ConnectionDeleteSuperseded(connector);
+        }
       }
       await purgeLocal(connector, intent);
       await options.eraseLegacy?.(connector);
