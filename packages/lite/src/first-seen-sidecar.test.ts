@@ -4,6 +4,8 @@
  * removed with the scope.
  */
 
+import { createOpenPersistentPsLiteStorage } from "./test-support/open-storage.js";
+import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { describe, expect, it } from "vitest";
 import { ingestDataContract } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
@@ -20,7 +22,6 @@ import {
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
 import { createMockPsLiteGateway } from "./test-support/gateway.js";
-import { createPersistentPsLiteStorage } from "./storage.js";
 
 const SCOPE = "notes.entries";
 const items = (...ids: string[]) => ({ items: ids.map((id) => ({ id })) });
@@ -29,6 +30,7 @@ function createRuntime() {
   const storage = createMemoryPsLiteStorage();
   const accessLogStore = createMemoryPsLiteAccessLogStore();
   const runtime = createPsLiteRuntime({
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     storage,
     gateway: createMockPsLiteGateway(),
     accessLogReader: accessLogStore,
@@ -106,7 +108,7 @@ describe("PS-Lite first-seen sidecar", () => {
 
   it("persists the sidecar with the storage state and removes it with the scope", async () => {
     const persistence = createMemoryPsLitePersistence();
-    const first = await createPersistentPsLiteStorage(
+    const first = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -119,7 +121,7 @@ describe("PS-Lite first-seen sidecar", () => {
     });
     expect(await first.readFirstSeenLedger!(SCOPE)).not.toBeNull();
 
-    const reloaded = await createPersistentPsLiteStorage(
+    const reloaded = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -136,7 +138,7 @@ describe("PS-Lite first-seen sidecar", () => {
 
     await reloaded.deleteScope(SCOPE);
     expect(await reloaded.readFirstSeenLedger!(SCOPE)).toBeNull();
-    const afterDelete = await createPersistentPsLiteStorage(
+    const afterDelete = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -144,7 +146,7 @@ describe("PS-Lite first-seen sidecar", () => {
   });
 
   it("drops the sidecar with the scope's last version, keeps it while others remain", async () => {
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       createMemoryPsLitePersistence(),
     );
@@ -188,7 +190,7 @@ describe("PS-Lite first-seen sidecar", () => {
         writes.push(name);
         return writeAux(name, value);
       };
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         persistence,
       );
@@ -213,7 +215,7 @@ describe("PS-Lite first-seen sidecar", () => {
 
     it("keeps ledgers out of the main state, whatever their size", async () => {
       const persistence = createMemoryPsLitePersistence();
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         persistence,
       );
@@ -246,7 +248,7 @@ describe("PS-Lite first-seen sidecar", () => {
 
     it("survives a reload", async () => {
       const persistence = createMemoryPsLitePersistence();
-      const first = await createPersistentPsLiteStorage(
+      const first = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         persistence,
       );
@@ -254,7 +256,7 @@ describe("PS-Lite first-seen sidecar", () => {
         "notes.big",
         bigLedger("notes.big", 50),
       );
-      const reloaded = await createPersistentPsLiteStorage(
+      const reloaded = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         persistence,
       );
@@ -274,7 +276,7 @@ describe("PS-Lite first-seen sidecar", () => {
         ],
       };
       const persistence = createMemoryPsLitePersistence(seed);
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         persistence,
       );
@@ -307,7 +309,7 @@ describe("PS-Lite first-seen sidecar", () => {
         read: full.read.bind(full),
         write: full.write.bind(full),
       };
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         persistence,
       );
@@ -331,7 +333,7 @@ describe("PS-Lite first-seen sidecar", () => {
         if (failing) throw new Error("aux store unavailable");
         return deleteAux(name);
       };
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         persistence,
       );
@@ -351,7 +353,7 @@ describe("PS-Lite first-seen sidecar", () => {
       ).toEqual(["notes.a"]);
 
       failing = false;
-      const reloaded = await createPersistentPsLiteStorage(
+      const reloaded = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         persistence,
       );
@@ -368,7 +370,7 @@ describe("PS-Lite first-seen sidecar", () => {
       [null, true],
       [4, undefined],
     ] as const) {
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         createMemoryPsLitePersistence(),
       );

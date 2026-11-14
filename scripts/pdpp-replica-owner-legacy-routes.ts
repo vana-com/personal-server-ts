@@ -20,14 +20,25 @@ import {
 import { initializeDatabase } from "../packages/server/src/storage/index-schema.js";
 import { createIndexManager } from "../packages/server/src/storage/index-manager.js";
 import { createNodeDataStorage } from "../packages/server/src/storage/node-data-storage.js";
+import { unwiredLegacyWriteSeal } from "../packages/server/src/storage/unwired-legacy-write-seal.js";
+import type { LegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 
 /**
  * Normal file storage at A's existing root. A separate normal index avoids
  * migrating the receiver's runtime.db; no authority database is opened.
  * Empty storage stays empty until a normal ingest writes actual envelopes.
+ * This tool has no account-mode authority, so unless the caller passes a seal
+ * every legacy write is refused as "mode unknown". Routes likewise require
+ * an explicit account-mode answer before serving retained legacy reads.
  * The caller owns close(), including when route composition fails.
  */
-export function openReplicaOwnerLegacyStorage({ root }: { root: string }) {
+export function openReplicaOwnerLegacyStorage({
+  root,
+  legacyWriteSeal = unwiredLegacyWriteSeal(),
+}: {
+  root: string;
+  legacyWriteSeal?: LegacyWriteSeal;
+}) {
   assert(statSync(root).isDirectory(), "Existing A root directory required");
   const db = initializeDatabase(join(root, "legacy-index.db"));
   try {
@@ -36,6 +47,7 @@ export function openReplicaOwnerLegacyStorage({ root }: { root: string }) {
     const rawDataStorage = createNodeDataStorage({
       indexManager,
       hierarchyOptions,
+      legacyWriteSeal,
     });
     let closed = false;
     return {
@@ -56,6 +68,7 @@ export function openReplicaOwnerLegacyStorage({ root }: { root: string }) {
 
 export type ReplicaOwnerLegacyRouteDeps = Pick<
   DataRouteDeps,
+  | "accountStorageMode"
   | "indexManager"
   | "hierarchyOptions"
   | "logger"

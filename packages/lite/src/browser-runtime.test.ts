@@ -1,3 +1,11 @@
+import type { LegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
+import { createPersistentPsLiteStorage } from "./storage.js";
+import {
+  createMemoryPsLitePersistence,
+  createMemoryPsLiteStagedFileStore,
+} from "./test-support/memory.js";
+import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
+import { openBetterSqlite3 } from "../../server/src/localdb/better-sqlite3-driver.js";
 /**
  * Proves `createIndexedDbPsLiteRuntime` composes its identity/config/sync/auth
  * over INJECTED persistence ports (the Mobile native path) instead of the
@@ -5,13 +13,26 @@
  * environment. Browser defaults remain exercised by the existing suite.
  */
 
+import {
+  createSwitchedIndexedDbPsLiteRuntime,
+  createUnswitchedIndexedDbPsLiteRuntime,
+} from "./test-support/unswitched-runtime.js";
 import { IDBFactory } from "fake-indexeddb";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
-import { buildPersonalServerLiteOwnerBindingMessage } from "@opendatalabs/vana-sdk/protocol/personal-server-lite-owner-binding";
+import { signOwnerMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
+import {
+  createMemoryStreamSyncRegistry,
+  createMemoryStreamSyncBlobs,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { startPersonalServer } from "./client.js";
 import { createBearerTokenPsLiteAuth } from "./runtime.js";
+import {
+  createMemoryModeRecordStore,
+  type ImportRunner,
+  type ModeRecordStore,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import type { PsLitePersistenceBundle } from "./persistence.js";
 import {
   createMemoryPsLiteAccessLogStore,
@@ -40,9 +61,7 @@ afterEach(() => {
 beforeAll(async () => {
   const account = privateKeyToAccount(`0x${"11".repeat(32)}`);
   ownerAddress = account.address;
-  ownerSignature = await account.signMessage({
-    message: buildPersonalServerLiteOwnerBindingMessage(account.address),
-  });
+  ownerSignature = await signOwnerMasterKey(account);
 });
 
 function memoryBundle(): PsLitePersistenceBundle {
@@ -62,7 +81,8 @@ function memoryBundle(): PsLitePersistenceBundle {
 }
 
 function build(bundle: PsLitePersistenceBundle) {
-  return createIndexedDbPsLiteRuntime({
+  return createUnswitchedIndexedDbPsLiteRuntime({
+    streamSyncDeclaredStreams: () => [],
     ownerAddress,
     ownerSignature,
     persistence: bundle,
@@ -80,9 +100,57 @@ function build(bundle: PsLitePersistenceBundle) {
 }
 
 describe("createIndexedDbPsLiteRuntime persistence injection", () => {
+  it("seals host storage with the runtime account mode", async () => {
+    const bundle = memoryBundle();
+    const { storage: _storage, ...hostBundle } = bundle;
+    const factory = vi.fn(async (seal: LegacyWriteSeal) =>
+      createPersistentPsLiteStorage(
+        { kind: "custom" },
+        createMemoryPsLitePersistence(),
+        createMemoryPsLiteStagedFileStore(),
+        seal,
+      ),
+    );
+    const built = await createIndexedDbPsLiteRuntime({
+      ownerAddress,
+      ownerSignature,
+      persistence: hostBundle,
+      storageFactory: factory,
+      streamSyncDeclaredStreams: () => [],
+      gateway: createMockPsLiteGateway(),
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    });
+    expect(factory).toHaveBeenCalledOnce();
+    await built.accountModeAuthority.submitEvidence({
+      owner: ownerAddress,
+      state: "off",
+    });
+    await built.storage.writeEnvelope(
+      createDataFileEnvelope("notes.entries", "2026-01-01T00:00:00.000Z", {
+        entry: 1,
+      }),
+    );
+    await built.accountModeAuthority.submitEvidence({
+      owner: ownerAddress,
+      state: "on",
+    });
+    await expect(
+      built.storage.writeEnvelope(
+        createDataFileEnvelope("notes.entries", "2026-01-02T00:00:00.000Z", {
+          entry: 2,
+        }),
+      ),
+    ).rejects.toThrow();
+    await built.accountModeAuthority.close();
+  });
+
   it("rejects a partial bundle instead of mixing native and IndexedDB stores", async () => {
     await expect(
       createIndexedDbPsLiteRuntime({
+        streamSyncDeclaredStreams: () => [],
         ownerAddress,
         ownerSignature,
         persistence: {} as PsLitePersistenceBundle,
@@ -200,7 +268,7 @@ describe("createIndexedDbPsLiteRuntime browser defaults", () => {
       },
     };
 
-    const first = await createIndexedDbPsLiteRuntime(options);
+    const first = await createUnswitchedIndexedDbPsLiteRuntime(options);
     const write = await first.runtime.fetch(
       new Request("https://ps.local/v1/data/instagram.profile", {
         method: "POST",
@@ -213,7 +281,7 @@ describe("createIndexedDbPsLiteRuntime browser defaults", () => {
     );
     expect(write.status).toBe(201);
 
-    const restarted = await createIndexedDbPsLiteRuntime(options);
+    const restarted = await createUnswitchedIndexedDbPsLiteRuntime(options);
     const list = await restarted.runtime.fetch(
       new Request("https://ps.local/v1/data", {
         headers: { Authorization: "Bearer owner-token" },
@@ -224,6 +292,164 @@ describe("createIndexedDbPsLiteRuntime browser defaults", () => {
       scopes: [{ scope: "instagram.profile" }],
       total: 1,
     });
+  });
+});
+
+describe("createIndexedDbPsLiteRuntime run intake", () => {
+  const options = (extra: Record<string, unknown>) => ({
+    ownerAddress,
+    ownerSignature,
+    dbName: `ps-lite-intake-${Math.random()}`,
+    storageDbName: `ps-lite-intake-storage-${Math.random()}`,
+    gateway: createMockPsLiteGateway(),
+    auth: createBearerTokenPsLiteAuth({
+      ownerToken: "owner-token",
+      builderToken: "builder-token",
+    }),
+    active: true,
+    streamSyncDeclaredStreams: () => [],
+    ...extra,
+  });
+  const digest = `sha256:${"ab".repeat(32)}`;
+  const begin = (
+    owner: string,
+    intake: NonNullable<
+      Awaited<
+        ReturnType<typeof createIndexedDbPsLiteRuntime>
+      >["streamSyncIntake"]
+    >,
+    artifactDigest: string,
+  ) =>
+    intake.begin("r1", {
+      connector: "c",
+      artifactDigest,
+      owner: { address: owner, leaseId: null },
+      observedAt: Date.now(),
+    });
+
+  it("exposes the sync manager's intake and resolves digests from the host table", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const resolve = vi.fn((d: string) =>
+      d === digest ? { connector: "c", version: "1", streams: [] } : null,
+    );
+    const context = await createSwitchedIndexedDbPsLiteRuntime(
+      options({
+        streamSyncDeclarations: resolve,
+        localDb: { openDriver: async () => openBetterSqlite3(":memory:") },
+        configDefaults: {
+          gateway: { url: "https://gateway.local" },
+          sync: { enabled: true },
+          streamSync: { write: true },
+        },
+      }),
+    );
+    const { streamSyncIntake } = context;
+    expect(streamSyncIntake).not.toBeNull();
+    const unknown = `sha256:${"cd".repeat(32)}`;
+    await expect(
+      begin(ownerAddress, streamSyncIntake!, unknown),
+    ).rejects.toMatchObject({ code: "unknown_artifact" });
+    expect(resolve).toHaveBeenCalledWith(unknown);
+    await context.syncManager?.stop();
+    await context.closeStreamSync?.();
+  });
+
+  it("refuses intake while Account is Off regardless of the old write flag", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const { streamSyncIntake } = await createUnswitchedIndexedDbPsLiteRuntime(
+      options({
+        configDefaults: {
+          gateway: { url: "https://gateway.local" },
+          sync: { enabled: true },
+        },
+      }),
+    );
+    expect(streamSyncIntake).not.toBeNull();
+    await expect(
+      begin(ownerAddress, streamSyncIntake!, digest),
+    ).rejects.toMatchObject({
+      code: 409,
+      errorCode: "STREAM_SYNC_NOT_ENABLED",
+    });
+  });
+});
+
+describe("createIndexedDbPsLiteRuntime own-write reads", () => {
+  it("reads back a run this device collected, through the runtime's data route", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    // An empty registry: listings are empty, single reads are 404, and every
+    // POST commits. The run is then this device's own unpublished rows.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if ((init?.method ?? "GET") === "POST")
+          return new Response(null, { status: 201 });
+        if (String(input).includes("/v1/data?"))
+          return Response.json({
+            data: { dataPoints: [] },
+            pagination: { hasMore: false, nextCursor: null },
+          });
+        return new Response(null, { status: 404 });
+      }),
+    );
+    const dbName = `ps-lite-own-reads-${Math.random()}`;
+    const context = await createSwitchedIndexedDbPsLiteRuntime({
+      streamSyncDeclaredStreams: () => [],
+      ownerAddress,
+      ownerSignature,
+      dbName,
+      storageDbName: `${dbName}-storage`,
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      localDb: { openDriver: async () => openBetterSqlite3(":memory:") },
+      streamSyncRegistry: createMemoryStreamSyncRegistry(),
+      streamSyncBlobs: createMemoryStreamSyncBlobs(),
+      streamSyncDeclarations: () => ({
+        connector: "acme",
+        version: "1.0.0",
+        streams: [
+          { name: "items", semantics: "mutable_state", primaryKey: ["id"] },
+        ],
+      }),
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: true },
+        streamSync: { write: true, read: true },
+      },
+    });
+    await context.streamSyncIntake!.begin("run-1", {
+      connector: "acme",
+      artifactDigest: "fixture",
+      owner: { address: ownerAddress, leaseId: null },
+      observedAt: Date.now(),
+    });
+    await context.streamSyncIntake!.batch("run-1", {
+      batch: 0,
+      records: [{ stream: "items", data: { id: "a", v: 1 } }],
+    });
+    await context.streamSyncIntake!.end("run-1", {
+      outcome: "succeeded",
+      coveredStreams: ["items"],
+      provenFullStreams: ["items"],
+      lastBatch: 0,
+    });
+    await context.localSync!.cycle();
+
+    const read = await context.runtime.fetch(
+      new Request("https://ps.local/v1/data/pdpp.acme.items", {
+        headers: { Authorization: "Bearer owner-token" },
+      }),
+    );
+    expect(read.status).toBe(200);
+    await expect(read.json()).resolves.toMatchObject({
+      data: { records: [{ id: "a", v: 1 }] },
+    });
+    await context.syncManager?.stop();
+    await context.closeStreamSync?.();
   });
 });
 
@@ -249,7 +475,8 @@ describe("createIndexedDbPsLiteRuntime write sessions", () => {
 
     // Default wiring: the route exists, and refuses an unauthenticated
     // handshake rather than 404ing as if delegated writes were unsupported.
-    const withDefaults = await createIndexedDbPsLiteRuntime({
+    const withDefaults = await createUnswitchedIndexedDbPsLiteRuntime({
+      streamSyncDeclaredStreams: () => [],
       ...base,
       dbName: "ps-lite-write-default",
       storageDbName: "ps-lite-write-default-storage",
@@ -258,7 +485,8 @@ describe("createIndexedDbPsLiteRuntime write sessions", () => {
 
     // A caller that brings its own auth adapter owns the wiring: we must not
     // mint tokens that adapter has never heard of.
-    const withOwnAuth = await createIndexedDbPsLiteRuntime({
+    const withOwnAuth = await createUnswitchedIndexedDbPsLiteRuntime({
+      streamSyncDeclaredStreams: () => [],
       ...base,
       dbName: "ps-lite-write-own-auth",
       storageDbName: "ps-lite-write-own-auth-storage",
@@ -307,7 +535,8 @@ describe("createIndexedDbPsLiteRuntime data listings", () => {
       grant({ id: "grant-other", granteeId: "builder-2", scopes: ["*"] }),
     ]);
     const getGrant = vi.fn(async () => null);
-    const { runtime } = await createIndexedDbPsLiteRuntime({
+    const { runtime } = await createUnswitchedIndexedDbPsLiteRuntime({
+      streamSyncDeclaredStreams: () => [],
       ownerAddress,
       ownerSignature,
       persistence: memoryBundle(),
@@ -385,5 +614,410 @@ describe("createIndexedDbPsLiteRuntime data listings", () => {
       total: 2,
     });
     expect(listGrantsByUser).not.toHaveBeenCalled();
+  });
+});
+
+describe("the account-mode records of a runtime over injected persistence", () => {
+  const plain = (
+    bundle: PsLitePersistenceBundle,
+    accountModeStore?: ModeRecordStore,
+  ) =>
+    createIndexedDbPsLiteRuntime({
+      ownerAddress,
+      ownerSignature,
+      persistence: bundle,
+      accountModeStore,
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    });
+  const answer = (
+    runtime: Awaited<ReturnType<typeof plain>>,
+    state: "on" | "off",
+  ) =>
+    runtime.accountModeAuthority.submitEvidence({
+      owner: ownerAddress,
+      state,
+    });
+
+  it("keeps the answer in memory when the host injects persistence but no mode store: the next launch's answer restores it", async () => {
+    const bundle = memoryBundle();
+    const first = await plain(bundle);
+    expect((await answer(first, "on")).kind).toBe("streams");
+    expect(first.accountModeAuthority.read(ownerAddress).kind).toBe("streams");
+    const second = await plain(bundle);
+    expect(second.accountModeAuthority.read(ownerAddress).kind).toBe("refuse");
+  });
+
+  it("keeps an On through a restart when the host injects a durable store, and a later Off is refused", async () => {
+    const store = createMemoryModeRecordStore();
+    const bundle = memoryBundle();
+    const first = await plain(bundle, store);
+    expect((await answer(first, "on")).kind).toBe("streams");
+    await first.accountModeAuthority.close();
+    const second = await plain(bundle, store);
+    expect((await answer(second, "off")).kind).toBe("streams");
+    expect(
+      (await second.accountModeAuthority.commitLegacy(ownerAddress, () => 1))
+        .ok,
+    ).toBe(false);
+  });
+});
+
+describe("the legacy import wake of a runtime", () => {
+  const withImporter = async (store: ModeRecordStore, importer: ImportRunner) =>
+    createIndexedDbPsLiteRuntime({
+      ownerAddress,
+      ownerSignature,
+      persistence: memoryBundle(),
+      accountModeStore: store,
+      legacyImporter: importer,
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    });
+  const runningImporter = () => {
+    const runs: AbortSignal[] = [];
+    const importer: ImportRunner = {
+      run: (signal) =>
+        new Promise<void>((resolve) => {
+          runs.push(signal);
+          signal.addEventListener("abort", () => resolve());
+        }),
+    };
+    return { importer, runs };
+  };
+  const until = async (check: () => boolean) => {
+    for (let i = 0; i < 200 && !check(); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+
+  it("runs the importer when the Account says On, and stop aborts it", async () => {
+    const store = createMemoryModeRecordStore();
+    const { importer, runs } = runningImporter();
+    const runtime = await withImporter(store, importer);
+    await runtime.accountModeAuthority.submitEvidence({
+      owner: ownerAddress,
+      state: "off",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(runs).toHaveLength(0);
+
+    await runtime.accountModeAuthority.submitEvidence({
+      owner: ownerAddress,
+      state: "on",
+    });
+    await until(() => runs.length > 0);
+    expect(runs).toHaveLength(1);
+
+    await runtime.importWaker?.stop();
+    expect(runs[0]?.aborted).toBe(true);
+  });
+
+  it("runs it at boot when the saved answer is already On", async () => {
+    const store = createMemoryModeRecordStore();
+    await store.save(ownerAddress.toLowerCase(), {
+      answer: "on",
+      generation: 0,
+      receivedAt: 1,
+    });
+    const { importer, runs } = runningImporter();
+    const runtime = await withImporter(store, importer);
+    await until(() => runs.length > 0);
+    expect(runs).toHaveLength(1);
+    await runtime.importWaker?.stop();
+  });
+
+  it("startPersonalServer forwards the importer, and its stop aborts the run", async () => {
+    const store = createMemoryModeRecordStore();
+    await store.save(ownerAddress.toLowerCase(), {
+      answer: "on",
+      generation: 0,
+      receivedAt: 1,
+    });
+    const { importer, runs } = runningImporter();
+    const server = await startPersonalServer({
+      ownerAddress,
+      ownerSignature,
+      persistence: memoryBundle(),
+      accountModeStore: store,
+      legacyImporter: importer,
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+      relay: false,
+    });
+    await until(() => runs.length > 0);
+    expect(runs).toHaveLength(1);
+    // Would hang if stop did not abort the run and wait for it.
+    await server.stop();
+    expect(runs[0]?.aborted).toBe(true);
+  });
+
+  it("starts nothing when the host passes no importer", async () => {
+    const runtime = await createIndexedDbPsLiteRuntime({
+      streamSyncDeclaredStreams: () => [],
+      ownerAddress,
+      ownerSignature,
+      persistence: memoryBundle(),
+      accountModeStore: createMemoryModeRecordStore(),
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    });
+    expect(runtime.importWaker).toBeUndefined();
+  });
+});
+
+describe("startPersonalServer publication receipts", () => {
+  async function setup() {
+    const store = createMemoryModeRecordStore();
+    await store.save(ownerAddress.toLowerCase(), {
+      answer: "on",
+      generation: 0,
+      receivedAt: 1,
+    });
+    const held = new Set<string>();
+    const close = vi.fn();
+    const options = {
+      ownerAddress,
+      ownerSignature,
+      persistence: memoryBundle(),
+      accountModeStore: store,
+      gateway: createMockPsLiteGateway(),
+      relay: false as const,
+      localDb: {
+        openDriver: async ({ name }: { name: string }) => {
+          if (held.has(name)) throw new Error("database lock held");
+          held.add(name);
+          const db = openBetterSqlite3(":memory:");
+          return {
+            ...db,
+            close: async () => {
+              await db.close();
+              held.delete(name);
+              close();
+            },
+          };
+        },
+      },
+      streamSyncRegistry: createMemoryStreamSyncRegistry(),
+      streamSyncBlobs: createMemoryStreamSyncBlobs(),
+      streamSyncDeclaredStreams: () => ["items"],
+      streamSyncDeclarations: (connector: string) => ({
+        connector,
+        version: "1",
+        streams: [
+          {
+            name: "items",
+            semantics: "mutable_state" as const,
+            primaryKey: ["id"],
+          },
+        ],
+      }),
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    };
+    return { options, held, close };
+  }
+  async function write(
+    server: Awaited<ReturnType<typeof startPersonalServer>>,
+    connector: string,
+    runId: string,
+  ) {
+    await server.streamSyncIntake!.begin(runId, {
+      connector,
+      artifactDigest: connector,
+      owner: { address: ownerAddress, leaseId: null },
+      observedAt: Date.now(),
+    });
+    await server.streamSyncIntake!.batch(runId, {
+      batch: 0,
+      records: [{ stream: "items", data: { id: "a" } }],
+    });
+    await server.streamSyncIntake!.end(runId, {
+      outcome: "succeeded",
+      coveredStreams: ["items"],
+      provenFullStreams: ["items"],
+      lastBatch: 0,
+    });
+  }
+  it("returns both connections' confirmed heads and run coverage, then nothing new", async () => {
+    const { options } = await setup();
+    const server = await startPersonalServer(options);
+    try {
+      await write(server, "acme", "run-a");
+      await write(server, "other", "run-b");
+      const receipt = await server.publish();
+      expect(receipt.outcome).toBe("published");
+      expect(receipt.publications).toHaveLength(2);
+      expect(receipt.publications).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            connector: "acme",
+            stream: "items",
+            runIds: ["run-a"],
+          }),
+          expect.objectContaining({
+            connector: "other",
+            stream: "items",
+            runIds: ["run-b"],
+          }),
+        ]),
+      );
+      for (const publication of receipt.publications) {
+        expect(publication.ns).toEqual(expect.any(String));
+        expect(publication.head).toMatchObject({
+          version: 1,
+          dataHash: expect.any(String),
+          generation: 1,
+        });
+        expect(publication.watermark).toBeGreaterThan(0);
+      }
+      await expect(server.publish()).resolves.toEqual({
+        outcome: "noop",
+        publications: [],
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+  it("rejects a failed publication instead of returning a receipt", async () => {
+    const { options } = await setup();
+    const server = await startPersonalServer(options);
+    try {
+      await write(server, "acme", "run-a");
+      vi.spyOn(options.streamSyncRegistry, "post").mockRejectedValue(
+        new Error("registry unavailable"),
+      );
+      await expect(server.publish()).rejects.toThrow("registry unavailable");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("tells a client whose publish reply was lost that the run is saved", async () => {
+    const { options } = await setup();
+    const server = await startPersonalServer(options);
+    try {
+      await write(server, "acme", "run-a");
+      await expect(server.publicationStatus("run-a")).resolves.toMatchObject({
+        state: "pending",
+        streams: [{ name: "items", state: "pending" }],
+      });
+      const post = vi
+        .spyOn(options.streamSyncRegistry, "post")
+        .mockRejectedValueOnce(new Error("registry unavailable"));
+      await expect(server.publish()).rejects.toThrow("registry unavailable");
+      post.mockRestore();
+      expect((await server.publicationStatus("run-a")).state).toBe("pending");
+
+      await server.publish(); // the reply is dropped
+      const saved = await server.publicationStatus("run-a");
+      expect(saved).toMatchObject({
+        state: "published",
+        streams: [
+          {
+            name: "items",
+            state: "published",
+            publication: { generation: 1, version: 1 },
+          },
+        ],
+      });
+      // The same read through the intake door, and an unknown run.
+      await expect(
+        server.streamSyncIntake!.publicationStatus("run-a"),
+      ).resolves.toEqual(saved);
+      await expect(server.publicationStatus("nope")).rejects.toMatchObject({
+        code: "gone",
+      });
+    } finally {
+      await server.stop();
+    }
+    await expect(server.publicationStatus("run-a")).rejects.toThrow(
+      "unavailable",
+    );
+  });
+
+  it("waits for an active publication before releasing the database", async () => {
+    const { options, close } = await setup();
+    const server = await startPersonalServer(options);
+    await write(server, "acme", "run-a");
+    let release!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const post = options.streamSyncRegistry.post.bind(
+      options.streamSyncRegistry,
+    );
+    vi.spyOn(options.streamSyncRegistry, "post").mockImplementation(
+      async (request) => {
+        entered();
+        await blocked;
+        return post(request);
+      },
+    );
+    const publication = server.publish();
+    await started;
+    const stopped = server.stop();
+    await expect(server.publish()).rejects.toThrow("unavailable");
+    expect(close).not.toHaveBeenCalled();
+    release();
+    await expect(publication).resolves.toMatchObject({ outcome: "published" });
+    await stopped;
+    expect(close).toHaveBeenCalledTimes(1);
+    await expect(server.publish()).rejects.toThrow("unavailable");
+  });
+
+  it("closes the database and releases the host lock before another start", async () => {
+    const { options, held, close } = await setup();
+    const first = await startPersonalServer(options);
+    await write(first, "acme", "run-a");
+    expect(held.size).toBe(1);
+    await first.stop();
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(held.size).toBe(0);
+    const second = await startPersonalServer(options);
+    try {
+      await write(second, "acme", "run-b");
+    } finally {
+      await second.stop();
+    }
+    expect(close).toHaveBeenCalledTimes(2);
   });
 });

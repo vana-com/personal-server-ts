@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { mkdtempSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -121,6 +122,7 @@ describe("single issuer harness through real HTTP AS/RS and SQLite", () => {
     const f = fixture(join(root, "records.sqlite"));
     const issuer = await openConsentIssuer(root, "ephemeral-test-owner", 2);
     let rs = await openReplicaResourceServer(f.store, {
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       owner: "ephemeral-test-owner",
       issuerOrigin: issuer.origin,
       credential: issuer.credential,
@@ -129,6 +131,7 @@ describe("single issuer harness through real HTTP AS/RS and SQLite", () => {
     const reopen = async () => {
       await rs.close();
       rs = await openReplicaResourceServer(f.store, {
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         owner: "ephemeral-test-owner",
         issuerOrigin: issuer.origin,
         credential: issuer.credential,
@@ -400,6 +403,7 @@ async function scenario(
   const f = fixture(join(root, "records.sqlite"));
   const issuer = await openConsentIssuer(root, "ephemeral-contract-owner", 60);
   const rs = await openReplicaResourceServer(f.store, {
+    accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
     owner: "ephemeral-contract-owner",
     issuerOrigin: issuer.origin,
     credential: issuer.credential,
@@ -720,6 +724,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
         declarations: () => [{ sourceId, binding, validateData: () => true }],
       });
       const rs = await openReplicaResourceServer(f.store, {
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         owner,
         issuerOrigin: issuer.origin,
         credential: issuer.credential,
@@ -856,6 +861,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
     const f = fixture(join(root, "records.sqlite"));
     const issuer = await openConsentIssuer(root, "ephemeral-contract-owner", 2);
     const rs = await openReplicaResourceServer(f.store, {
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       owner: "ephemeral-contract-owner",
       issuerOrigin: issuer.origin,
       credential: issuer.credential,
@@ -1040,54 +1046,6 @@ describe("P0 adversarial public AS and app-read contracts", () => {
       expect(metadata.pdpp_core_query_base).toBe("/pdpp/v1");
     }));
 
-  it("#12 reset removes live rows and old blob authorization without claiming generation-bound grants", async () =>
-    scenario(async ({ issuer, rs, f }) => {
-      const consent = await approveNarrowConsent(issuer);
-      await assertAppRead(rs.origin, consent.token, f.expected, f.blob);
-      f.store.resetInstanceBinding({
-        instance: "conn",
-        expectedMethod: "export",
-        expectedGeneration: 1,
-        nextMethod: "export",
-      });
-      for (const path of [
-        "/streams/messages/records/visible",
-        `/blobs/${encodeURIComponent(f.blob.blobId)}`,
-      ])
-        await noDisclosure(await request(rs.origin, path, consent.token), 404, [
-          "public text",
-          "replicated blob fixture",
-        ]);
-      const list = await payload(
-        await request(rs.origin, "/streams/messages/records", consent.token),
-        200,
-      );
-      expect(list.data).toEqual([]);
-      seed(f.store, "conn", "visible", {
-        text: "new generation",
-        blob_ref: undefined,
-      });
-      const fresh = await mint(issuer, { fields: ["text"] });
-      const record = await payload(
-        await request(
-          rs.origin,
-          "/streams/messages/records/visible",
-          fresh.token,
-        ),
-        200,
-      );
-      expect(record.data).toEqual({ text: "new generation" });
-      await noDisclosure(
-        await request(
-          rs.origin,
-          `/blobs/${encodeURIComponent(f.blob.blobId)}`,
-          fresh.token,
-        ),
-        404,
-        ["replicated blob fixture"],
-      );
-    }));
-
   it("#15 a read paused before issuer permission decision denies after revocation commits", async () =>
     scenario(async ({ issuer, f }) => {
       const consent = await approveNarrowConsent(issuer);
@@ -1112,6 +1070,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
         return normalFetch(input, init);
       };
       const rs = await openReplicaResourceServer(f.store, {
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         owner: "ephemeral-contract-owner",
         issuerOrigin: issuer.origin,
         credential: issuer.credential,

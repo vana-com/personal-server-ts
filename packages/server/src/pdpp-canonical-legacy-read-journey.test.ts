@@ -11,6 +11,7 @@
  * checked again and may explicitly return to the file.
  */
 
+import { createUnswitchedServer } from "./account-mode/unswitched-server.test-utils.js";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -35,11 +36,7 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
-import {
-  createServer,
-  type CreateServerOptions,
-  type ServerContext,
-} from "./bootstrap.js";
+import { type CreateServerOptions, type ServerContext } from "./bootstrap.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
 
 const KNOWN_SIG =
@@ -161,7 +158,7 @@ async function boot(
     } satisfies Builder),
     getGrant: vi.fn().mockResolvedValue(grant()),
   } as unknown as GatewayClient;
-  return createServer(
+  return createUnswitchedServer(
     ServerConfigSchema.parse({
       tunnel: { enabled: false },
       payment: { enabled: payment },
@@ -1695,7 +1692,7 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     await collectActivity();
     expect((await ownerGet("/v1/data/oura.activity")).status).toBe(200);
     await ctx!.cleanup();
-    ctx = await createServer(
+    ctx = await createUnswitchedServer(
       ServerConfigSchema.parse({
         tunnel: { enabled: false },
         pdpp: { enabled: false },

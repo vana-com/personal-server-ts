@@ -4,6 +4,10 @@ import { keccak256 } from "viem";
 
 import type { UploadWorkerDeps } from "./upload.js";
 import { uploadOne, uploadAll, computeDataPointId } from "./upload.js";
+import {
+  createUploadStateTracker,
+  type UploadStateTracker,
+} from "../upload-state.js";
 import type { IndexEntry } from "../../storage/index/types.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import type {
@@ -281,6 +285,7 @@ describe("upload worker", () => {
       expect(deps.storage.updateDataPointId).toHaveBeenCalledWith(
         entry.path,
         DATA_POINT_ID,
+        entry.id,
       );
       expect(result).toEqual({
         path: entry.path,
@@ -344,6 +349,52 @@ describe("upload worker", () => {
     });
   });
 
+  describe("uploadOne — the row is replaced while it uploads", () => {
+    it("does not stamp upload A's dataPointId onto the row that replaced it", async () => {
+      const deps = makeMockDeps();
+      const entryA = makeEntry({ id: 1 });
+      // A path-keyed index whose rows are replaced by an insert at the same
+      // path (new row id), with the rows' guarded update contract.
+      const rows = new Map<string, IndexEntry>([[entryA.path, entryA]]);
+      const guarded =
+        (field: "dataPointId" | "version") =>
+        (path: string, value: unknown, expectedId?: number) => {
+          const row = rows.get(path);
+          if (!row || (expectedId !== undefined && row.id !== expectedId))
+            return false;
+          rows.set(path, { ...row, [field]: value });
+          return true;
+        };
+      deps.storage.updateDataPointId = guarded("dataPointId") as never;
+      deps.storage.updateEntryVersion = guarded("version") as never;
+
+      let reachPublication!: () => void;
+      const reached = new Promise<void>((r) => (reachPublication = r));
+      let releasePublication!: () => void;
+      const gate = new Promise<void>((r) => (releasePublication = r));
+      (
+        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+      ).mockImplementationOnce(async () => {
+        reachPublication();
+        await gate;
+        return { dataPointId: DATA_POINT_ID, expectedVersion: "1" };
+      });
+
+      const upload = uploadOne(deps, entryA);
+      await reached;
+      // B takes the path while A's publication is in flight.
+      const entryB = makeEntry({ id: 2, sizeBytes: 999 });
+      rows.set(entryB.path, entryB);
+      releasePublication();
+      await upload;
+
+      expect(rows.get(entryB.path)).toMatchObject({
+        id: 2,
+        dataPointId: null,
+      });
+    });
+  });
+
   describe("uploadAll", () => {
     it("processes all unsynced entries", async () => {
       const deps = makeMockDeps();
@@ -358,9 +409,6 @@ describe("upload worker", () => {
 
       const results = await uploadAll(deps);
 
-      expect(deps.storage.findUnsynced).toHaveBeenCalledWith({
-        limit: 50,
-      });
       expect(results).toHaveLength(3);
       expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(3);
     });
@@ -688,11 +736,13 @@ describe("upload worker", () => {
       expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
         entry.path,
         8,
+        entry.id,
       );
       expect(result.dataPointId).toBe(DATA_POINT_ID);
       expect(deps.storage.updateDataPointId).toHaveBeenCalledWith(
         entry.path,
         DATA_POINT_ID,
+        entry.id,
       );
     });
 
@@ -793,6 +843,7 @@ describe("upload worker", () => {
       expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
         entry.path,
         1,
+        entry.id,
       );
       expect(result.dataPointId).toBe(DATA_POINT_ID);
     });
@@ -830,6 +881,7 @@ describe("upload worker", () => {
       expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
         entry.path,
         2,
+        entry.id,
       );
     });
   });
@@ -910,6 +962,7 @@ describe("upload worker", () => {
       expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
         entry.path,
         5,
+        entry.id,
       );
     });
 
@@ -1257,5 +1310,835 @@ describe("uploadOne — derivative registration (lineage)", () => {
     await uploadOne(deps, makeEntry());
     expect(deps.gateway.registerDataPoint).toHaveBeenCalled();
     expect(deps.lineageGateway.registerDataPoint).not.toHaveBeenCalled();
+  });
+});
+
+describe("uploadAll — upload size cap and bounded retry", () => {
+  const SCOPE_KEY = new Uint8Array(32).fill(0xbb);
+  const MIB = 1024 * 1024;
+  const T0 = Date.parse("2026-11-07T12:00:00Z");
+  const MINUTE = 60_000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (deriveScopeKey as ReturnType<typeof vi.fn>).mockReturnValue(SCOPE_KEY);
+    (encryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+    );
+  });
+
+  function setup(entries: IndexEntry[]) {
+    const deps = makeMockDeps();
+    const uploadState = createUploadStateTracker();
+    deps.uploadState = uploadState;
+    (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue(
+      entries,
+    );
+    return { deps, uploadState };
+  }
+  const cycle = (deps: UploadWorkerDeps, offsetMs: number) =>
+    uploadAll(deps, { now: () => new Date(T0 + offsetMs) });
+
+  it("never reads, encrypts or sends a 337 MiB entry and reports it too large", async () => {
+    const huge = makeEntry({ sizeBytes: 337 * MIB });
+    const { deps, uploadState } = setup([huge]);
+
+    const results = await cycle(deps, 0);
+
+    expect(results).toEqual([]);
+    expect(deps.storage.readEnvelope).not.toHaveBeenCalled();
+    expect(encryptWithPassword).not.toHaveBeenCalled();
+    expect(deps.storageAdapter.upload).not.toHaveBeenCalled();
+    expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+    expect(uploadState.snapshot().tooLarge).toEqual([
+      expect.objectContaining({
+        scope: huge.scope,
+        path: huge.path,
+        sizeBytes: 337 * MIB,
+      }),
+    ]);
+  });
+
+  it("treats an entry whose encrypted body would pass the cap as too large, and one safely under it as uploadable", async () => {
+    const nearCap = makeEntry({
+      id: 1,
+      path: "a/1.json",
+      sizeBytes: 94_000_000,
+    });
+    const safe = makeEntry({ id: 2, path: "b/2.json", sizeBytes: 80_000_000 });
+    const { deps, uploadState } = setup([nearCap, safe]);
+
+    const results = await cycle(deps, 0);
+
+    expect(results.map((r) => r.path)).toEqual(["b/2.json"]);
+    expect(uploadState.snapshot().tooLarge.map((e) => e.path)).toEqual([
+      "a/1.json",
+    ]);
+  });
+
+  it("logs a too-large entry once across several cycles", async () => {
+    const { deps } = setup([makeEntry({ sizeBytes: 337 * MIB })]);
+
+    for (let i = 0; i < 5; i++) await cycle(deps, i * 4 * MINUTE);
+
+    const tooLargeLogs = [
+      ...(deps.logger.warn as ReturnType<typeof vi.fn>).mock.calls,
+      ...(deps.logger.info as ReturnType<typeof vi.fn>).mock.calls,
+      ...(deps.logger.error as ReturnType<typeof vi.fn>).mock.calls,
+    ].filter(([, message]) => /too large/i.test(String(message)));
+    expect(tooLargeLogs).toHaveLength(1);
+    expect(deps.storage.readEnvelope).not.toHaveBeenCalled();
+  });
+
+  it("does not erase older snapshots when the coalesced head is too large", async () => {
+    const deps = makeMockDeps();
+    deps.uploadState = createUploadStateTracker();
+    deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+    const older = makeEntry({
+      id: 11,
+      path: "memory.claude/1.json",
+      scope: "memory.claude",
+      collectedAt: "2026-10-27T10:00:00.000Z",
+      version: 1,
+    });
+    const head = makeEntry({
+      id: 12,
+      path: "memory.claude/2.json",
+      scope: "memory.claude",
+      collectedAt: "2026-10-27T10:00:05.000Z",
+      version: 2,
+      sizeBytes: 337 * MIB,
+    });
+    (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+      older,
+      head,
+    ]);
+    withVersions(deps, [older, head]);
+
+    await cycle(deps, 0);
+
+    expect(deps.storage.deleteVersion).not.toHaveBeenCalled();
+    expect(deps.storage.readEnvelope).not.toHaveBeenCalled();
+    expect(deps.uploadState?.snapshot().tooLarge).toHaveLength(1);
+  });
+
+  it("backs off a failing entry and stops after the failure cap", async () => {
+    const entry = makeEntry();
+    const { deps, uploadState } = setup([entry]);
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("Failed to fetch"),
+    );
+    const upload = deps.storageAdapter.upload as ReturnType<typeof vi.fn>;
+
+    await cycle(deps, 0);
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(uploadState.snapshot().retrying).toEqual([
+      expect.objectContaining({ path: entry.path, failures: 1 }),
+    ]);
+
+    // Inside the 1 minute backoff: no attempt.
+    await cycle(deps, 30_000);
+    expect(upload).toHaveBeenCalledTimes(1);
+
+    // After failure n the wait is 2^(n-1) minutes, capped at 60.
+    let last = 0;
+    for (const waitMinutes of [1, 2, 4, 8, 16, 32, 60]) {
+      const due = last + waitMinutes * MINUTE;
+      const before = upload.mock.calls.length;
+      await cycle(deps, due - 1_000);
+      expect(upload.mock.calls.length).toBe(before);
+      await cycle(deps, due);
+      expect(upload.mock.calls.length).toBe(before + 1);
+      last = due;
+    }
+    const now = last;
+
+    expect(upload).toHaveBeenCalledTimes(8);
+    expect(uploadState.snapshot().retrying).toEqual([]);
+    expect(uploadState.snapshot().stopped).toEqual([
+      expect.objectContaining({
+        path: entry.path,
+        failures: 8,
+        lastError: "Failed to fetch",
+      }),
+    ]);
+
+    // Stopped: a day of cycles makes no further attempt.
+    for (let i = 1; i <= 20; i++) await cycle(deps, now + i * 60 * MINUTE);
+    expect(upload).toHaveBeenCalledTimes(8);
+  });
+
+  it("clears the state after a later successful upload", async () => {
+    const entry = makeEntry();
+    const { deps, uploadState } = setup([entry]);
+    const upload = deps.storageAdapter.upload as ReturnType<typeof vi.fn>;
+    upload.mockRejectedValueOnce(new Error("boom"));
+
+    await cycle(deps, 0);
+    expect(uploadState.snapshot().retrying).toHaveLength(1);
+
+    await cycle(deps, 2 * MINUTE);
+    expect(uploadState.snapshot()).toEqual({
+      tooLarge: [],
+      unsizable: [],
+      retrying: [],
+      stopped: [],
+    });
+  });
+
+  it("clears a stopped scope when new data arrives for it", async () => {
+    const stale = makeEntry({ id: 1, path: "s/1.json", version: 1 });
+    const { deps, uploadState } = setup([stale]);
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("boom"),
+    );
+    for (let i = 0; i < 8; i++) await cycle(deps, i * 61 * MINUTE);
+    expect(uploadState.snapshot().stopped).toHaveLength(1);
+
+    const fresh = makeEntry({
+      id: 2,
+      path: "s/2.json",
+      version: 2,
+      collectedAt: "2026-01-22T10:00:00Z",
+    });
+    (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+      stale,
+      fresh,
+    ]);
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockResolvedValue(
+      STORAGE_URL,
+    );
+
+    const results = await cycle(deps, 10 * 61 * MINUTE);
+
+    expect(results.map((r) => r.path)).toEqual(["s/2.json"]);
+    expect(uploadState.snapshot().stopped).toEqual([]);
+  });
+});
+
+describe("uploadAll — terminal entries, failure clock and removals", () => {
+  const SCOPE_KEY = new Uint8Array(32).fill(0xbb);
+  const MIB = 1024 * 1024;
+  const T0 = Date.parse("2026-11-07T12:00:00Z");
+  const MINUTE = 60_000;
+  const oversized = (n: number, overrides?: Partial<IndexEntry>) =>
+    makeEntry({
+      id: n,
+      path: `big/${n}.json`,
+      scope: `big.${n}`,
+      sizeBytes: 337 * MIB,
+      ...overrides,
+    });
+  const healthy = (n: number, overrides?: Partial<IndexEntry>) =>
+    makeEntry({
+      id: n,
+      path: `ok/${n}.json`,
+      scope: `ok.${n}`,
+      sizeBytes: 1024,
+      ...overrides,
+    });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (deriveScopeKey as ReturnType<typeof vi.fn>).mockReturnValue(SCOPE_KEY);
+    (encryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+    );
+  });
+
+  /** A live index that honours `limit` the way the real hosts do. */
+  function setup(initial: IndexEntry[]) {
+    const deps = makeMockDeps();
+    const uploadState = createUploadStateTracker();
+    deps.uploadState = uploadState;
+    const index = { rows: [...initial] };
+    deps.storage.findUnsynced = vi.fn((options?: { limit?: number }) => {
+      const unsynced = index.rows.filter((row) => row.dataPointId === null);
+      return options?.limit === undefined
+        ? unsynced
+        : unsynced.slice(0, options.limit);
+    });
+    deps.storage.updateDataPointId = vi.fn(
+      (path: string, id: string | null) => {
+        const row = index.rows.find((r) => r.path === path);
+        if (row) row.dataPointId = id;
+        return true;
+      },
+    );
+    return { deps, uploadState, index };
+  }
+
+  it("reaches a healthy entry behind a page full of oversized ones", async () => {
+    const { deps } = setup([oversized(1), healthy(2)]);
+    const uploaded: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const results = await uploadAll(deps, {
+        batchSize: 1,
+        now: () => new Date(T0 + i * 60 * MINUTE),
+      });
+      uploaded.push(...results.map((r) => r.path));
+    }
+    expect(uploaded).toEqual(["ok/2.json"]);
+    expect(deps.storage.readEnvelope).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps terminal entries instead of deleting them to make room", async () => {
+    const { deps, index } = setup([oversized(1), oversized(2), healthy(3)]);
+    deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+    await uploadAll(deps, { batchSize: 2, now: () => new Date(T0) });
+    expect(deps.storage.deleteVersion).not.toHaveBeenCalled();
+    expect(index.rows.map((r) => r.path)).toContain("big/1.json");
+  });
+
+  it("lets a fresh entry release a stopped scope even when terminal entries fill the page", async () => {
+    const stale = makeEntry({
+      id: 3,
+      path: "s/1.json",
+      scope: "s",
+      version: 1,
+    });
+    const fresh = makeEntry({
+      id: 4,
+      path: "s/2.json",
+      scope: "s",
+      version: 2,
+      collectedAt: "2026-01-22T10:00:00Z",
+      sizeBytes: 1024,
+    });
+    const { deps, uploadState } = setup([
+      oversized(1),
+      oversized(2),
+      stale,
+      fresh,
+    ]);
+    for (let i = 0; i < 8; i++)
+      uploadState.recordFailure(
+        { scope: "s", path: stale.path },
+        "boom",
+        T0 + i,
+      );
+    expect(uploadState.snapshot().stopped).toHaveLength(1);
+
+    const results = await uploadAll(deps, {
+      batchSize: 2,
+      now: () => new Date(T0 + 10 * 60 * MINUTE),
+    });
+
+    expect(results.map((r) => r.path)).toEqual(["s/2.json"]);
+    expect(uploadState.snapshot().stopped).toEqual([]);
+  });
+
+  it("starts the backoff at the failure time when the upload itself takes minutes", async () => {
+    const entry = healthy(1);
+    const { deps, uploadState } = setup([entry]);
+    let clock = T0;
+    const upload = deps.storageAdapter.upload as ReturnType<typeof vi.fn>;
+    upload.mockImplementation(async () => {
+      clock += 120_000;
+      throw new Error("Failed to fetch");
+    });
+
+    await uploadAll(deps, { now: () => new Date(clock) });
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(uploadState.snapshot().retrying).toEqual([
+      expect.objectContaining({
+        path: entry.path,
+        nextAttemptAt: new Date(T0 + 120_000 + MINUTE).toISOString(),
+      }),
+    ]);
+
+    await uploadAll(deps, { now: () => new Date(clock) });
+    expect(upload).toHaveBeenCalledTimes(1);
+  });
+
+  it("forgets rows removed elsewhere while the backlog stays a full page, and keeps later-page backoff", async () => {
+    const failing = healthy(100);
+    const bigs = Array.from({ length: 10 }, (_, i) => oversized(i + 1));
+    const { deps, uploadState, index } = setup([failing, ...bigs]);
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("boom"),
+    );
+
+    for (let i = 0; i < 6; i++) {
+      // Another path (a download tombstone) removes the oldest oversized row.
+      index.rows.splice(1, 1);
+      await uploadAll(deps, {
+        batchSize: 3,
+        now: () => new Date(T0 + i * 1000),
+      });
+      const live = new Set(index.rows.map((r) => r.path));
+      const tracked = [
+        ...uploadState.snapshot().tooLarge,
+        ...uploadState.snapshot().retrying,
+        ...uploadState.snapshot().stopped,
+      ].map((e) => e.path);
+      expect(tracked.filter((p) => !live.has(p))).toEqual([]);
+    }
+    await uploadAll(deps, { batchSize: 3, now: () => new Date(T0 + 7000) });
+    const final = uploadState.snapshot();
+    expect(final.retrying).toEqual([
+      expect.objectContaining({ path: failing.path, failures: 1 }),
+    ]);
+    expect(
+      final.tooLarge.every((e) => index.rows.some((r) => r.path === e.path)),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["undefined", undefined],
+    ["NaN", Number.NaN],
+    ["zero", 0],
+    ["negative", -5],
+    ["infinite", Number.POSITIVE_INFINITY],
+  ])(
+    "never reads the body of an entry whose size is %s",
+    async (_name, size) => {
+      const entry = healthy(1, { sizeBytes: size as unknown as number });
+      const { deps, uploadState } = setup([entry]);
+
+      for (let i = 0; i < 3; i++)
+        await uploadAll(deps, { now: () => new Date(T0 + i * MINUTE) });
+
+      expect(deps.storage.readEnvelope).not.toHaveBeenCalled();
+      expect(deps.storageAdapter.upload).not.toHaveBeenCalled();
+      expect(uploadState.snapshot().unsizable).toEqual([
+        expect.objectContaining({ scope: entry.scope, path: entry.path }),
+      ]);
+      expect(uploadState.snapshot().tooLarge).toEqual([]);
+      const logs = (deps.logger.warn as ReturnType<typeof vi.fn>).mock.calls
+        .map(([, message]) => String(message))
+        .filter((message) => /size/i.test(message));
+      expect(logs).toHaveLength(1);
+    },
+  );
+});
+
+describe("uploadAll — planning cost over a large backlog", () => {
+  const T0 = Date.parse("2026-11-07T12:00:00Z");
+
+  /** Elements read through the array iterator (spread, for-of) while `fn` runs. */
+  async function countIteratedElements(fn: () => Promise<void>) {
+    const proto = Array.prototype as unknown as Record<symbol, unknown>;
+    const original = proto[Symbol.iterator] as () => IterableIterator<unknown>;
+    let count = 0;
+    proto[Symbol.iterator] = function (this: unknown[]) {
+      count += this.length;
+      return original.call(this);
+    };
+    try {
+      await fn();
+    } finally {
+      proto[Symbol.iterator] = original;
+    }
+    return count;
+  }
+
+  it("plans one coalesced scope in a single pass, without copying its growing version list", async () => {
+    const N = 2000;
+    const deps = makeMockDeps();
+    const rows = Array.from({ length: N }, (_, i) =>
+      makeEntry({
+        id: i + 1,
+        path: `memory.claude/${i}.json`,
+        scope: "memory.claude",
+        collectedAt: new Date(T0 + i * 10).toISOString(),
+        sizeBytes: 1024,
+      }),
+    );
+    (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue(
+      rows,
+    );
+
+    // The newest snapshot is inside the quiet window, so nothing uploads: the
+    // whole cost measured here is selection and planning.
+    const iterated = await countIteratedElements(async () => {
+      await uploadAll(deps, { now: () => new Date(T0 + N * 10 + 1000) });
+    });
+
+    expect(deps.storageAdapter.upload).not.toHaveBeenCalled();
+    // One pass is a few passes over N rows; the quadratic accumulator reads
+    // about N^2 / 2 (2,000,000 here).
+    expect(iterated).toBeLessThan(20 * N);
+  });
+});
+
+describe("uploadAll — terminal state follows the row, not the path", () => {
+  const SCOPE_KEY = new Uint8Array(32).fill(0xbb);
+  const MIB = 1024 * 1024;
+  const T0 = Date.parse("2026-11-07T12:00:00Z");
+  const MINUTE = 60_000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (deriveScopeKey as ReturnType<typeof vi.fn>).mockReturnValue(SCOPE_KEY);
+    (encryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+    );
+  });
+
+  function setup(initial: IndexEntry) {
+    const deps = makeMockDeps();
+    const uploadState = createUploadStateTracker();
+    deps.uploadState = uploadState;
+    const index = { row: initial };
+    deps.storage.findUnsynced = vi.fn(() =>
+      index.row.dataPointId === null ? [index.row] : [],
+    );
+    deps.storage.updateDataPointId = vi.fn(
+      (_path: string, id: string | null) => {
+        index.row = { ...index.row, dataPointId: id };
+        return true;
+      },
+    );
+    const cycle = (n: number) =>
+      uploadAll(deps, { now: () => new Date(T0 + n * 61 * MINUTE) });
+    return { deps, uploadState, index, cycle };
+  }
+
+  it("uploads a small row written at the path of a held too-large row", async () => {
+    const big = makeEntry({ id: 1, path: "s/1.json", sizeBytes: 337 * MIB });
+    const { deps, uploadState, index, cycle } = setup(big);
+    await cycle(0);
+    expect(uploadState.snapshot().tooLarge).toHaveLength(1);
+
+    // Same scope and collectedAt, so the same path; a fresh id and a 1 KiB body.
+    index.row = { ...big, id: 2, sizeBytes: 1024 };
+    const results = await cycle(1);
+
+    expect(results.map((r) => r.path)).toEqual(["s/1.json"]);
+    expect(deps.storage.readEnvelope).toHaveBeenCalledTimes(1);
+    expect(uploadState.snapshot().tooLarge).toEqual([]);
+  });
+
+  it("uploads a row whose missing size was repaired in place", async () => {
+    const bad = makeEntry({ id: 1, path: "s/1.json", sizeBytes: 0 });
+    const { uploadState, index, cycle } = setup(bad);
+    await cycle(0);
+    expect(uploadState.snapshot().unsizable).toHaveLength(1);
+
+    index.row = { ...bad, sizeBytes: 1024 };
+    const results = await cycle(1);
+
+    expect(results.map((r) => r.path)).toEqual(["s/1.json"]);
+    expect(uploadState.snapshot().unsizable).toEqual([]);
+  });
+
+  it("uploads a valid row written at the path of an unsizable one", async () => {
+    const bad = makeEntry({ id: 1, path: "s/1.json", sizeBytes: Number.NaN });
+    const { uploadState, index, cycle } = setup(bad);
+    await cycle(0);
+    expect(uploadState.snapshot().unsizable).toHaveLength(1);
+
+    index.row = { ...bad, id: 2, sizeBytes: 1024 };
+    const results = await cycle(1);
+
+    expect(results.map((r) => r.path)).toEqual(["s/1.json"]);
+  });
+
+  it("retries a stopped path at once when a new row replaces it", async () => {
+    const row = makeEntry({ id: 1, path: "s/1.json", sizeBytes: 1024 });
+    const { deps, uploadState, index, cycle } = setup(row);
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("boom"),
+    );
+    for (let i = 0; i < 8; i++) await cycle(i);
+    expect(uploadState.snapshot().stopped).toHaveLength(1);
+
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockResolvedValue(
+      `https://storage.vana.com/v1/blobs/${OWNER}/s/1`,
+    );
+    index.row = { ...row, id: 2 };
+    const results = await cycle(8);
+
+    expect(results.map((r) => r.path)).toEqual(["s/1.json"]);
+  });
+
+  it("keeps an unchanged held row held and an unchanged backoff in force", async () => {
+    const big = makeEntry({ id: 1, path: "s/1.json", sizeBytes: 337 * MIB });
+    const { deps, uploadState, cycle } = setup(big);
+    for (let i = 0; i < 4; i++) await cycle(i);
+    expect(uploadState.snapshot().tooLarge).toHaveLength(1);
+    expect(deps.storage.readEnvelope).not.toHaveBeenCalled();
+
+    const failing = makeEntry({ id: 2, path: "s/2.json", sizeBytes: 1024 });
+    const second = setup(failing);
+    (
+      second.deps.storageAdapter.upload as ReturnType<typeof vi.fn>
+    ).mockRejectedValue(new Error("boom"));
+    await uploadAll(second.deps, { now: () => new Date(T0) });
+    await uploadAll(second.deps, { now: () => new Date(T0 + 1000) });
+    expect(second.deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
+    expect(second.uploadState.snapshot().retrying).toHaveLength(1);
+  });
+});
+
+describe("uploadAll — paged scan of a large backlog", () => {
+  const SCOPE_KEY = new Uint8Array(32).fill(0xbb);
+  const MIB = 1024 * 1024;
+  const T0 = Date.parse("2026-11-07T12:00:00Z");
+  const MINUTE = 60_000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (deriveScopeKey as ReturnType<typeof vi.fn>).mockReturnValue(SCOPE_KEY);
+    (encryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+    );
+  });
+
+  const row = (id: number, overrides?: Partial<IndexEntry>) =>
+    makeEntry({
+      id,
+      path: `p/${id}.json`,
+      scope: `p.${id}`,
+      sizeBytes: 1024,
+      ...overrides,
+    });
+
+  /** A host with the keyset page method: rows after `afterId`, id order. */
+  function setup(rows: IndexEntry[]) {
+    const deps = makeMockDeps();
+    const uploadState = createUploadStateTracker();
+    deps.uploadState = uploadState;
+    const pageLimits: number[] = [];
+    deps.storage.findUnsynced = vi.fn(() => {
+      throw new Error("a paged host is never asked for the whole set");
+    });
+    deps.storage.findUnsyncedPage = vi.fn(
+      ({ afterId, limit }: { afterId: number; limit: number }) => {
+        pageLimits.push(limit);
+        return rows
+          .filter((r) => r.dataPointId === null && r.id > afterId)
+          .sort((a, b) => a.id - b.id)
+          .slice(0, limit);
+      },
+    );
+    deps.storage.maxUnsyncedId = vi.fn(() =>
+      rows
+        .filter((r) => r.dataPointId === null)
+        .reduce((max, r) => Math.max(max, r.id), 0),
+    );
+    deps.storage.updateDataPointId = vi.fn(
+      (path: string, id: string | null) => {
+        const found = rows.find((r) => r.path === path);
+        if (found) found.dataPointId = id;
+        return true;
+      },
+    );
+    return { deps, uploadState, rows, pageLimits };
+  }
+
+  it("reads at most the scan budget per cycle and still reaches rows behind a terminal prefix", async () => {
+    const rows = [
+      ...Array.from({ length: 25 }, (_, i) =>
+        row(i + 1, { sizeBytes: 337 * MIB }),
+      ),
+      row(26),
+    ];
+    const { deps, pageLimits } = setup(rows);
+    const uploaded: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      const results = await uploadAll(deps, {
+        batchSize: 2,
+        scanBudget: 10,
+        now: () => new Date(T0 + i * 60 * MINUTE),
+      });
+      uploaded.push(...results.map((r) => r.path));
+    }
+    expect(uploaded).toEqual(["p/26.json"]);
+    expect(Math.max(...pageLimits)).toBeLessThanOrEqual(10);
+  });
+
+  it("does not forget backoff of rows outside the window it scanned", async () => {
+    const rows = Array.from({ length: 30 }, (_, i) => row(i + 1));
+    const { deps, uploadState } = setup(rows);
+    // A row far beyond the first window has a failure on record.
+    uploadState.recordFailure(
+      {
+        scope: "p.30",
+        path: "p/30.json",
+        identity: { id: 30, sizeBytes: 1024 },
+      },
+      "boom",
+      T0,
+    );
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("boom"),
+    );
+
+    await uploadAll(deps, {
+      batchSize: 1,
+      scanBudget: 10,
+      now: () => new Date(T0 + 1000),
+    });
+
+    expect(uploadState.snapshot().retrying.map((e) => e.path)).toContain(
+      "p/30.json",
+    );
+  });
+
+  it("forgets a row that vanished from the range it scanned", async () => {
+    const rows = Array.from({ length: 5 }, (_, i) => row(i + 1));
+    const { deps, uploadState } = setup(rows);
+    uploadState.recordFailure(
+      {
+        scope: "p.9",
+        path: "p/9.json",
+        identity: { id: 3.5, sizeBytes: 1024 },
+      },
+      "boom",
+      T0,
+    );
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("boom"),
+    );
+
+    await uploadAll(deps, {
+      batchSize: 50,
+      scanBudget: 10,
+      now: () => new Date(T0 + 1000),
+    });
+
+    expect(uploadState.snapshot().retrying.map((e) => e.path)).not.toContain(
+      "p/9.json",
+    );
+  });
+  describe("tracked state above a new sweep's maximum", () => {
+    const track = (uploadState: UploadStateTracker, id: number) =>
+      uploadState.recordFailure(
+        {
+          scope: `p.${id}`,
+          path: `p/${id}.json`,
+          identity: { id, sizeBytes: 1024 },
+        },
+        "boom",
+        T0,
+      );
+
+    it("prunes the state of a deleted tracked maximum while lower rows remain", async () => {
+      const { deps, uploadState } = setup([row(1), row(2), row(3)]);
+      track(uploadState, 10);
+      await uploadAll(deps, { now: () => new Date(T0 + 1000) });
+      expect(uploadState.has("p/10.json")).toBe(false);
+    });
+
+    it("prunes the state of the last deleted row", async () => {
+      const { deps, uploadState } = setup([]);
+      track(uploadState, 10);
+      await uploadAll(deps, { now: () => new Date(T0 + 1000) });
+      expect(uploadState.has("p/10.json")).toBe(false);
+    });
+
+    it("keeps live backoff above an older active fence", async () => {
+      const { deps, uploadState } = setup([row(1), row(2), row(3), row(10)]);
+      track(uploadState, 10);
+      uploadState.setScanFence(3);
+      uploadState.setScanCursor(1);
+      await uploadAll(deps, {
+        batchSize: 1,
+        now: () => new Date(T0 + 1000),
+      });
+      expect(uploadState.has("p/10.json")).toBe(true);
+    });
+
+    it("does not bring the moving-tail starvation back on a host with a page method but no maximum", async () => {
+      const { rows } = await runWithArrivals({
+        initial: 100,
+        arrivals: 50,
+        cycles: 30,
+        failScope: "p.1",
+        failTimes: 1,
+        withoutMax: true,
+      });
+      expect(rows.find((r) => r.id === 1)?.dataPointId).not.toBeNull();
+    });
+  });
+
+  /** Rows arrive at the tail every cycle while the scan keeps working. */
+  async function runWithArrivals(options: {
+    initial: number;
+    arrivals: number;
+    batchSize?: number;
+    scanBudget?: number;
+    cycles: number;
+    failScope: string;
+    failTimes: number;
+    withoutMax?: boolean;
+    onCycle?: (cycle: number, rows: IndexEntry[]) => void;
+  }) {
+    const rows = Array.from({ length: options.initial }, (_, i) => row(i + 1));
+    const ctx = setup(rows);
+    if (options.withoutMax) {
+      // A host with the page method but no maximum is scanned whole.
+      ctx.deps.storage.maxUnsyncedId = undefined;
+      ctx.deps.storage.findUnsynced = vi.fn(() =>
+        rows.filter((r) => r.dataPointId === null),
+      );
+    }
+    let failuresLeft = options.failTimes;
+    (ctx.deps.storage.readEnvelope as ReturnType<typeof vi.fn>)
+      .mockReset()
+      .mockImplementation(async (scope: string) => {
+        if (scope === options.failScope && failuresLeft > 0) {
+          failuresLeft -= 1;
+          throw new Error("transient");
+        }
+        return makeEnvelope();
+      });
+    let nextId = options.initial + 1;
+    for (let cycle = 0; cycle < options.cycles; cycle++) {
+      if (cycle > 0) {
+        for (let i = 0; i < options.arrivals; i++) rows.push(row(nextId++));
+      }
+      options.onCycle?.(cycle, rows);
+      await uploadAll(ctx.deps, {
+        batchSize: options.batchSize,
+        scanBudget: options.scanBudget,
+        now: () => new Date(T0 + cycle * MINUTE),
+      });
+    }
+    return ctx;
+  }
+
+  it("retries an earlier failed row while arrivals keep extending the tail (default sizes)", async () => {
+    const { rows } = await runWithArrivals({
+      initial: 100,
+      arrivals: 50,
+      cycles: 30,
+      failScope: "p.1",
+      failTimes: 1,
+    });
+    expect(rows.find((r) => r.id === 1)?.dataPointId).not.toBeNull();
+  });
+
+  it("retries an earlier failed row while arrivals keep extending the tail (small sizes)", async () => {
+    const { rows } = await runWithArrivals({
+      initial: 6,
+      arrivals: 2,
+      batchSize: 2,
+      scanBudget: 5,
+      cycles: 30,
+      failScope: "p.1",
+      failTimes: 1,
+    });
+    expect(rows.find((r) => r.id === 1)?.dataPointId).not.toBeNull();
+  });
+
+  it("prunes a tracked row deleted behind the cursor while arrivals continue", async () => {
+    const ctx = await runWithArrivals({
+      initial: 100,
+      arrivals: 50,
+      cycles: 40,
+      failScope: "p.5",
+      failTimes: Number.POSITIVE_INFINITY,
+      onCycle: (cycle, rows) => {
+        if (cycle !== 5) return;
+        const at = rows.findIndex((r) => r.id === 5);
+        if (at >= 0) rows.splice(at, 1);
+      },
+    });
+    expect(
+      ctx.uploadState.snapshot().retrying.map((e) => e.path),
+    ).not.toContain("p/5.json");
   });
 });

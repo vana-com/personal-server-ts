@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 /**
  * The v0.2 query journey, end to end: real AS, real token, real RS read.
  *
@@ -324,6 +325,7 @@ function rs(): Hono {
   app.route(
     "/v1",
     pdppRecordsRoutes({
+      accountStorageMode: explicitLegacyStorageMode("unswitched"),
       store: records,
       auth,
       declarations,

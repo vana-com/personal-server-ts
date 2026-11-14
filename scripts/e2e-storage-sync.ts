@@ -42,6 +42,7 @@
  *     step 5 fails with a clear signer/owner error.
  */
 
+import { fixedLegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -246,6 +247,8 @@ async function makeServerSide(
   const storage = createNodeDataStorage({
     indexManager,
     hierarchyOptions: { dataDir },
+    // These runs model an account that has not switched.
+    legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
   });
   const serverAccount = loadOrCreateServerAccount(join(rootDir, "key.json"));
   const storageAdapter = createVanaSyncStorageAdapter({

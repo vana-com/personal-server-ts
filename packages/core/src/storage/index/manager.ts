@@ -4,11 +4,17 @@ import type {
   NewIndexEntry,
   ScopeSummary,
 } from "./types.js";
+import type { LegacyWriteHold } from "../legacy-write-seal.js";
 
 export interface IndexManager {
-  insert(entry: NewIndexEntry): IndexEntry;
+  /**
+   * Every call that adds a row takes a `LegacyWriteHold`: a row is a visible
+   * legacy version, and a hold exists only inside `LegacyWriteSeal.commit`.
+   */
+  insert(hold: LegacyWriteHold, entry: NewIndexEntry): IndexEntry;
   /** Check a legacy write and allocate its CAS revision in one SQLite transaction. */
   insertIfCurrent(
+    hold: LegacyWriteHold,
     entry: NewIndexEntry,
     precondition?: { kind: "none" } | { kind: "match"; version: number },
   ):
@@ -29,7 +35,7 @@ export interface IndexManager {
    * Internal recovery path for already persisted envelopes. Bypasses the
    * closed-for-writes guard while preserving CAS allocation and journals.
    */
-  insertRecovered(entry: NewIndexEntry): IndexEntry;
+  insertRecovered(hold: LegacyWriteHold, entry: NewIndexEntry): IndexEntry;
   findByPath(path: string): IndexEntry | undefined;
   findByScope(options: IndexListOptions): IndexEntry[];
   findLatestByScope(scope: string): IndexEntry | undefined;
@@ -57,6 +63,10 @@ export interface IndexManager {
    * first).
    */
   findUnsynced(options?: { limit?: number }): IndexEntry[];
+  /** Unsynced rows with `id > afterId`, `id` ascending, at most `limit`. */
+  findUnsyncedPage(options: { afterId: number; limit: number }): IndexEntry[];
+  /** Highest `id` among the unsynced rows; 0 when there are none. */
+  maxUnsyncedId(): number;
   /**
    * Update the fileId for an index entry (after successful upload + on-chain registration).
    * @returns true if row was updated, false if path not found
@@ -72,7 +82,11 @@ export interface IndexManager {
    * registerDataPoint). Sync-worker step that runs alongside fileId update.
    * @returns true if row was updated, false if path not found
    */
-  updateDataPointId(path: string, dataPointId: string | null): boolean;
+  updateDataPointId(
+    path: string,
+    dataPointId: string | null,
+    expectedId?: number,
+  ): boolean;
   /**
    * Update the DPv2 `version` for an index entry. Used by the upload worker
    * when a registration is rebased onto the registry's live version after a
@@ -80,7 +94,7 @@ export interface IndexManager {
    * local row must follow).
    * @returns true if row was updated, false if path not found
    */
-  updateVersion(path: string, version: number): boolean;
+  updateVersion(path: string, version: number, expectedId?: number): boolean;
   /** Deletes all index entries for a scope. Returns count of deleted rows. */
   deleteByScope(scope: string): number;
   close(): void;

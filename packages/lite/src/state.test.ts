@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { privateKeyToAccount } from "viem/accounts";
+import type { Hex } from "viem";
 import {
   createIndexedDbPsLiteAccessLogStore,
   createIndexedDbPsLiteTokenStore,
@@ -13,6 +15,14 @@ import {
   DEFAULTS,
   SUPERSEDED_INFERENCE_MODELS,
 } from "@opendatalabs/personal-server-ts-core/schemas";
+import {
+  deriveMasterKey,
+  deriveScopeKey,
+} from "@opendatalabs/vana-sdk/browser";
+
+/** High-s signature (v = 0x1c). Its legacy key is the raw bytes. */
+const HIGH_S_SIGNATURE =
+  "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7dbd555e6d21a3207991a060a0c6afd5992e4183bad14f5218f2fd6dc20cf515f6c1c" as const;
 
 const OWNER_SIGNATURE =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b" as const;
@@ -369,6 +379,43 @@ describe("PS Lite browser state", () => {
         ownerSignature: `0x${"11".repeat(65)}`,
       }),
     ).rejects.toThrow();
+  });
+
+  it("encrypts the identity under the raw signature bytes, not the normal form", async () => {
+    // High-s signature: its raw bytes and its normal form give different keys.
+    // The oracle is the SDK's key derivation, independent of the owner module.
+    const signature = HIGH_S_SIGNATURE;
+    const store = createMemoryPsLiteStateStore();
+    const created = await loadOrCreatePsLiteServerIdentity({
+      store,
+      ownerSignature: signature,
+    });
+
+    const oracleKey = await crypto.subtle.importKey(
+      "raw",
+      new Uint8Array(
+        deriveScopeKey(deriveMasterKey(signature), "ps-lite.server-identity"),
+      ),
+      "AES-GCM",
+      false,
+      ["decrypt"],
+    );
+    const { iv, ciphertext } = created.persisted.encryptedPrivateKey;
+    const plaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: Buffer.from(iv, "base64") },
+      oracleKey,
+      Buffer.from(ciphertext, "base64"),
+    );
+    const privateKey = new TextDecoder().decode(plaintext) as Hex;
+    expect(privateKeyToAccount(privateKey).address).toBe(
+      created.account.address,
+    );
+
+    const reloaded = await loadOrCreatePsLiteServerIdentity({
+      store,
+      ownerSignature: signature,
+    });
+    expect(reloaded.account.address).toBe(created.account.address);
   });
 
   it("persists PS Lite relay state", async () => {

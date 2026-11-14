@@ -1,8 +1,10 @@
+import { createOpenPersistentPsLiteStorage } from "./test-support/open-storage.js";
 import { describe, expect, it, vi } from "vitest";
 import type { Builder, GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
+  fixedModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
@@ -14,7 +16,6 @@ import {
   createMemoryPsLiteStorage,
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
-import { createPersistentPsLiteStorage } from "./storage.js";
 import { createPsLiteRuntime, createWeb3SignedPsLiteAuth } from "./runtime.js";
 import { startPersonalServer } from "./client.js";
 
@@ -56,6 +57,7 @@ function createRuntime(
 ) {
   const accessLogs = createMemoryPsLiteAccessLogStore();
   return createPsLiteRuntime({
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     active: true,
     storage,
     accessLogReader: accessLogs,
@@ -210,7 +212,7 @@ describe("startPersonalServer lite handle", () => {
 
   it("streams a scope version in batches with owner Web3Signed auth", async () => {
     const gateway = createGateway();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       createMemoryPsLitePersistence(),
       createMemoryPsLiteStagedFileStore(),
@@ -249,7 +251,7 @@ describe("startPersonalServer lite handle", () => {
 
   it("serializes each bulk item once, parses none, and reuses bytes after a lost reply", async () => {
     const gateway = createGateway();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       createMemoryPsLitePersistence(),
       createMemoryPsLiteStagedFileStore(),
@@ -329,7 +331,7 @@ describe("startPersonalServer lite handle", () => {
 
   it("never serializes more than one batch of a large append at once", async () => {
     const gateway = createGateway();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       createMemoryPsLitePersistence(),
       createMemoryPsLiteStagedFileStore(),
@@ -366,7 +368,7 @@ describe("startPersonalServer lite handle", () => {
   it("does not look the server up at the gateway once per batch", async () => {
     const getServer = vi.fn().mockResolvedValue(null);
     const gateway = createGateway({ getServer });
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       createMemoryPsLitePersistence(),
       createMemoryPsLiteStagedFileStore(),
@@ -404,7 +406,7 @@ describe("startPersonalServer lite handle", () => {
 
   it("does not resend a batch that landed before a later batch of the same append failed", async () => {
     const gateway = createGateway();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       createMemoryPsLitePersistence(),
       createMemoryPsLiteStagedFileStore(),
@@ -458,7 +460,7 @@ describe("startPersonalServer lite handle", () => {
   it("poisons a partially failed direct append until abort", async () => {
     const gateway = createGateway();
     const files = createMemoryPsLiteStagedFileStore();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       createMemoryPsLitePersistence(),
       files,

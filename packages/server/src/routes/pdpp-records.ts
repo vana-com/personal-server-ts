@@ -1,4 +1,14 @@
 import { grantIsCandidate } from "@opendatalabs/personal-server-ts-core/pdpp";
+import {
+  refuseLegacyWrite,
+  type OwnedAccountStorageMode,
+} from "@opendatalabs/personal-server-ts-core/api";
+import {
+  listCursor,
+  type RecordQuery,
+  type StoredRecord,
+} from "@opendatalabs/personal-server-ts-core/localdb";
+import { Buffer } from "node:buffer";
 import { parseRecordQuery } from "./pdpp-record-query.js";
 import type { ReplicaReader } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import { Hono, type Context } from "hono";
@@ -30,6 +40,8 @@ import {
   resolveReadScope,
   summarizeIngest,
   type IngestOutcome,
+  type ChangesSinceOptions,
+  type ChangesSincePage,
   type PdppRecordEnvelopeInput,
   type PdppRecordRow,
   type PdppRecordStore,
@@ -204,6 +216,18 @@ function parseIngestBody(bytes: Uint8Array): unknown {
 type RouteReadStore = Omit<PdppReplicaReadStore, "listStreamCompletions">;
 
 export interface PdppRecordsRouteDeps {
+  /** The same owner-bound mode used by the legacy-write seal. */
+  accountStorageMode?: OwnedAccountStorageMode;
+  /** Host-linked database query; callers pass logical PDPP instance ids. */
+  recordQuery?: RecordQuery;
+  /** Query-backed frozen snapshots for grant listing and changes. Filter the
+   * authorized projection at both horizons, return unprojected rows, and expire
+   * when current records cannot answer exactly. No legacy or current-only
+   * approximation may substitute for an unavailable historical body. */
+  recordHistory?: (
+    stream: string,
+    options: ChangesSinceOptions,
+  ) => Promise<ChangesSincePage>;
   /** Writes and write-side lookups. Reads go through `reads`. */
   store: PdppRecordStore;
   /**
@@ -463,6 +487,10 @@ function sendError(c: Context, err: PdppError, reqId: string) {
   if (err instanceof PdppAuthorizationUnavailableError) {
     headers["Retry-After"] = String(err.retryAfterSeconds);
   }
+  if (err.status === 503) {
+    headers["Retry-After"] ??= "5";
+    headers["Cache-Control"] = "no-store";
+  }
   if (err.status === 401) {
     headers["WWW-Authenticate"] =
       `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`;
@@ -534,11 +562,56 @@ function projectSchemaToFields(
 
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   const app = new Hono();
+  // Metadata handlers also use the guarded reader. Preserve its typed refusal
+  // when it throws outside a record handler's local try/catch.
+  app.onError((error, c) => {
+    const reqId = requestId();
+    return sendError(c, mapAndLog(deps, c.req.path, reqId, error), reqId);
+  });
   const validateData = createRecordDataValidator(deps.declarations);
   const readsFor = deps.reads ?? (() => deps.store);
   /** The token class selects the reader; request input never does. */
   function reads(context: PdppTokenContext): RouteReadStore {
+    const mode = deps.accountStorageMode?.read() ?? "unknown";
+    if (mode === "unknown")
+      throw new PdppError(
+        "ACCOUNT_MODE_UNKNOWN",
+        "The account mode is not known yet",
+      );
+    if (mode === "switched")
+      throw new PdppError(
+        "STREAM_READ_UNAVAILABLE",
+        "This legacy reader is unavailable for a switched account",
+      );
     return readsFor(context.tokenKind === "owner" ? "owner" : "grant");
+  }
+
+  /** Read the mode once per request. A switched read never uses legacy rows. */
+  function localRecords(): RecordQuery | undefined {
+    const mode = deps.accountStorageMode?.read() ?? "unknown";
+    if (mode === "unknown")
+      throw new PdppError(
+        "ACCOUNT_MODE_UNKNOWN",
+        "The account mode is not known yet",
+      );
+    if (mode === "unswitched") return undefined;
+    if (!deps.recordQuery) {
+      throw new PdppError(
+        "STREAM_READ_UNAVAILABLE",
+        "Local record query is unavailable for a switched account",
+      );
+    }
+    return deps.recordQuery;
+  }
+
+  /** Retain the standalone legacy behaviour when no mode port is supplied. */
+  function refuseRecordWrite(reqId: string): Response | null {
+    const refusal = refuseLegacyWrite(deps.accountStorageMode);
+    if (refusal) {
+      refusal.headers.set("Request-Id", reqId);
+      refusal.headers.set("PDPP-Version", PDPP_VERSION);
+    }
+    return refusal;
   }
 
   /**
@@ -796,6 +869,52 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       );
     }
 
+    const localQuery = localRecords();
+    if (localQuery) {
+      const names =
+        context.tokenKind === "owner"
+          ? deps.declarations.list().map((d) => d.name)
+          : (context.grant?.streams.map((s) => s.name) ?? []);
+      const data = [];
+      for (const stream of new Set(names)) {
+        const { declaration, ownerInstanceIds } = readDeclaration(
+          context,
+          stream,
+        );
+        const scope = resolveReadScope(context, stream, declaration);
+        let count = 0,
+          scanned = 0,
+          latest: number | null = null;
+        for (const instance of context.tokenKind === "owner"
+          ? ownerInstanceIds
+          : scope.instanceIds) {
+          for await (const row of localQuery.streamRecords(instance, stream)) {
+            if (++scanned > STREAM_COUNT_CAP) break;
+            const body = JSON.parse(row.body);
+            if (
+              !recordKeyWithinGrantResources(
+                row.recordKey,
+                scope.streamGrant,
+              ) ||
+              !recordWithinGrantTimeConstraint(body, scope.streamGrant)
+            )
+              continue;
+            count++;
+            latest = Math.max(latest ?? row.emittedAt, row.emittedAt);
+          }
+        }
+        data.push({
+          object: "stream",
+          name: stream,
+          record_count: scanned > STREAM_COUNT_CAP ? null : count,
+          last_updated: latest === null ? null : new Date(latest).toISOString(),
+        });
+      }
+      return c.json({ object: "list", data }, 200, {
+        "Request-Id": reqId,
+        "PDPP-Version": PDPP_VERSION,
+      });
+    }
     const streams = reads(context).listStreams(instanceIds);
 
     // A client token gets a closed projection: only the streams its grant
@@ -951,6 +1070,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     const reqId = requestId();
     const { context, error } = await authenticate(c, reqId);
     if (error) return error;
+    if (!context?.active)
+      return sendError(c, mapInactiveToError(context!), reqId);
 
     try {
       const query = parseRecordQuery(
@@ -958,6 +1079,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         "listRecords",
         context!.tokenKind,
       );
+      const localQuery = localRecords();
       const stream = c.req.param("stream");
 
       const { declaration, ownerInstanceIds } = readDeclaration(
@@ -984,6 +1106,51 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
       const { limit, clamped, order, cursor } = query;
       const fields = scope.fields;
+
+      if (localQuery) {
+        const page = await localRecordPage(
+          localQuery,
+          stream,
+          effectiveInstanceIds,
+          query,
+          scope.streamGrant,
+          context!.tokenKind === "owner",
+          deps.recordHistory,
+          grantIsCandidate(context!.grant),
+          grantIsCandidate(context!.grant)
+            ? scope.streamGrant?.fields
+            : scope.fields,
+        );
+        const response = c.json(
+          {
+            object: "list",
+            has_more: page.hasMore,
+            ...(page.nextCursor !== null && { next_cursor: page.nextCursor }),
+            ...(page.nextChangesSince !== undefined && {
+              next_changes_since: page.nextChangesSince,
+            }),
+            data: page.data.map((row) =>
+              localRecordJson(
+                stream,
+                row,
+                fields,
+                grantIsCandidate(context!.grant),
+              ),
+            ),
+            ...(clamped && {
+              meta: {
+                warnings: [
+                  { code: "limit_clamped", message: "limit clamped to 100" },
+                ],
+              },
+            }),
+          },
+          200,
+          { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+        );
+        await logClientRead(c, context, stream, "completed", reqId);
+        return response;
+      }
 
       if (query.changesSince !== undefined) {
         // Eligibility compares the frozen candidate grant projection; sparse
@@ -1123,6 +1290,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     const reqId = requestId();
     const { context, error } = await authenticate(c, reqId);
     if (error) return error;
+    if (!context?.active)
+      return sendError(c, mapInactiveToError(context!), reqId);
 
     try {
       const query = parseRecordQuery(
@@ -1130,6 +1299,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         "getRecord",
         context!.tokenKind,
       );
+      const localQuery = localRecords();
       // §8 requires client-token `expand[]` to be REJECTED before the
       // declaration is consulted, on single-record reads as well as lists.
       // Silently ignoring it told a client its request was honored when a
@@ -1155,6 +1325,37 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
       if (!recordKeyWithinGrantResources(recordKey, scope.streamGrant)) {
         throw new PdppError("not_found", "Record not found");
+      }
+
+      if (localQuery) {
+        let found: LocalRecord | undefined;
+        for (const instance of effectiveInstanceIds) {
+          const record = await localQuery.getRecord({
+            connectionId: instance,
+            stream,
+            recordKey,
+          });
+          if (record) {
+            const row = localRecord(instance, record);
+            if (recordWithinGrantTimeConstraint(row.data, scope.streamGrant)) {
+              found = row;
+              break;
+            }
+          }
+        }
+        if (!found) throw new PdppError("not_found", "Record not found");
+        const response = c.json(
+          localRecordJson(
+            stream,
+            found,
+            scope.fields,
+            grantIsCandidate(context!.grant),
+          ),
+          200,
+          { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+        );
+        await logClientRead(c, context, stream, "completed", reqId);
+        return response;
       }
 
       let found;
@@ -1288,6 +1489,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           "Ingest requires an owner token",
         );
       }
+      if (!context?.active) throw mapInactiveToError(context!);
+      const refusal = refuseRecordWrite(reqId);
+      if (refusal) return refusal;
       const stream = c.req.param("stream");
       if (!deps.declarations.declares(stream)) {
         throw new PdppError("not_found", "Stream not found");
@@ -1446,6 +1650,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             "Replace requires an owner token",
           );
         }
+        if (!context?.active) throw mapInactiveToError(context!);
+        const refusal = refuseRecordWrite(reqId);
+        if (refusal) return refusal;
         const stream = c.req.param("stream");
         if (!deps.declarations.declares(stream)) {
           throw new PdppError("not_found", "Stream not found");
@@ -1921,6 +2128,289 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   });
 
   return app;
+}
+
+interface LocalRecord {
+  readonly instance: string;
+  readonly recordKey: string;
+  readonly data: Record<string, unknown>;
+  readonly emittedAt: string | null;
+  readonly deleted?: boolean;
+}
+
+function localRecord(instance: string, record: StoredRecord): LocalRecord {
+  const data: unknown = JSON.parse(record.body);
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("Local record data is not an object");
+  }
+  return {
+    instance,
+    recordKey: record.recordKey,
+    data: data as Record<string, unknown>,
+    emittedAt: new Date(record.emittedAt).toISOString(),
+  };
+}
+
+function localRecordJson(
+  stream: string,
+  row: LocalRecord,
+  fields: string[] | undefined,
+  candidate: boolean,
+) {
+  const identity = {
+    object: "record",
+    id: row.recordKey,
+    ...(candidate && { instance_id: row.instance }),
+    stream,
+  };
+  if (row.deleted) {
+    // RecordQuery exposes the removal sequence, not a deletion timestamp.
+    return candidate
+      ? { ...identity, deleted: true }
+      : { ...identity, deleted: true, deleted_at: null, emitted_at: null };
+  }
+  return {
+    ...identity,
+    data: projectFields(row.data, fields),
+    emitted_at: row.emittedAt,
+  };
+}
+
+/** Multi-connection continuation keeps a key per connection, including ties. */
+function localListCursors(
+  cursor: string | undefined,
+  stream: string,
+  instances: string[],
+): (string | undefined)[] {
+  if (instances.length === 1) return [cursor];
+  if (cursor === undefined) return instances.map(() => undefined);
+  try {
+    const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (
+      value.kind !== "local-records" ||
+      value.stream !== stream ||
+      JSON.stringify(value.instances) !== JSON.stringify(instances) ||
+      !Array.isArray(value.after) ||
+      value.after.length !== instances.length ||
+      !value.after.every(
+        (key: unknown) => key === null || typeof key === "string",
+      )
+    ) {
+      throw new Error("invalid cursor");
+    }
+    return value.after.map((key: string | null) => key ?? undefined);
+  } catch {
+    throw new PdppError("invalid_cursor", "Cursor does not match this stream");
+  }
+}
+
+function localSequence(value: string): number {
+  const number = value === "beginning" ? 0 : Number(value);
+  if (
+    (value !== "beginning" && !/^(0|[1-9][0-9]*)$/.test(value)) ||
+    !Number.isSafeInteger(number)
+  ) {
+    throw new PdppError("invalid_cursor", "Change cursor must be a sequence");
+  }
+  return number;
+}
+
+/** Only authorized connection ids enter the query; projection follows filtering. */
+async function localRecordPage(
+  query: RecordQuery,
+  stream: string,
+  instanceIds: string[],
+  input: ReturnType<typeof parseRecordQuery>,
+  streamGrant: StreamGrant | undefined,
+  owner: boolean,
+  history: PdppRecordsRouteDeps["recordHistory"],
+  candidate: boolean,
+  eligibilityFields: string[] | undefined,
+): Promise<{
+  data: LocalRecord[];
+  hasMore: boolean;
+  nextCursor: string | null;
+  nextChangesSince?: string;
+}> {
+  const instances = [...new Set(instanceIds)].sort();
+  const visible = (row: LocalRecord) =>
+    recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
+    (row.deleted || recordWithinGrantTimeConstraint(row.data, streamGrant));
+  if (input.changesSince !== undefined) {
+    if (!owner) {
+      if (!history)
+        throw new PdppError(
+          "STREAM_HISTORY_UNAVAILABLE",
+          "Grant-safe stream change history is unavailable",
+        );
+      const page = await history(stream, {
+        instanceIds: instances,
+        changesSince:
+          candidate && input.changesSince === "beginning"
+            ? undefined
+            : input.changesSince,
+        cursor: input.cursor,
+        limit: input.limit,
+        fields: eligibilityFields,
+        expireOnErasure: candidate,
+        isVisible: (row) =>
+          recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
+          recordWithinGrantTimeConstraint(row.data, streamGrant),
+      });
+      return {
+        data: page.data.map((row) => ({
+          instance: row.instance,
+          recordKey: row.recordKey,
+          data: row.deleted ? {} : row.data,
+          emittedAt: row.emittedAt,
+          deleted: row.deleted,
+        })),
+        hasMore: page.hasMore,
+        nextCursor: page.nextCursor ?? null,
+        nextChangesSince: page.nextChangesSince,
+      };
+    }
+    const since = localSequence(input.changesSince);
+    const after =
+      input.cursor === undefined ? since : localSequence(input.cursor);
+    if (after < since) {
+      throw new PdppError(
+        "invalid_cursor",
+        "Change cursor precedes changes_since",
+      );
+    }
+    const changes: {
+      seq: number;
+      row: LocalRecord | null;
+    }[] = [];
+    let more = false;
+    for (const instance of instances) {
+      const page = await query.changesSince({
+        connectionId: instance,
+        stream,
+        cursor: after,
+        limit: input.limit,
+      });
+      if (page === "gone") {
+        throw new PdppError(
+          "cursor_expired",
+          "changes_since cursor has expired",
+        );
+      }
+      more ||= page.nextCursor !== null;
+      for (const change of page.changes) {
+        changes.push({
+          seq: change.seq,
+          row:
+            change.op === "remove"
+              ? {
+                  instance,
+                  recordKey: change.recordKey,
+                  data: {},
+                  emittedAt: null,
+                  deleted: true,
+                }
+              : change.record === null
+                ? null
+                : localRecord(instance, change.record),
+        });
+      }
+    }
+    changes.sort((a, b) => a.seq - b.seq);
+    const page = changes.slice(0, input.limit);
+    const hasMore = more || changes.length > input.limit;
+    const last = page.at(-1)?.seq ?? after;
+    return {
+      data: page.flatMap(({ row }) => (row && visible(row) ? [row] : [])),
+      hasMore,
+      nextCursor: hasMore ? String(last) : null,
+      nextChangesSince: String(last),
+    };
+  }
+
+  if (!owner) {
+    if (!history)
+      throw new PdppError(
+        "STREAM_HISTORY_UNAVAILABLE",
+        "Grant-safe stream snapshots are unavailable",
+      );
+    // Reuse the query module's frozen, visibility-filtered initial snapshot.
+    // Hidden identities never consume a page or escape in a list cursor.
+    const page = await history(stream, {
+      purpose: "listing",
+      instanceIds: instances,
+      cursor: input.cursor,
+      limit: input.limit,
+      fields: eligibilityFields,
+      isVisible: (row) =>
+        visible({
+          instance: row.instance,
+          recordKey: row.recordKey,
+          data: row.data,
+          emittedAt: row.emittedAt,
+          deleted: false,
+        }),
+    });
+    return {
+      data: page.data.map((row) => ({
+        instance: row.instance,
+        recordKey: row.recordKey,
+        data: row.deleted ? {} : row.data,
+        emittedAt: row.emittedAt,
+        deleted: row.deleted,
+      })),
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor ?? null,
+    };
+  }
+
+  const after = localListCursors(input.cursor, stream, instances);
+  const records: { index: number; record: StoredRecord }[] = [];
+  let more = false;
+  for (const [index, instance] of instances.entries()) {
+    const page = await query.listRecords({
+      connectionId: instance,
+      stream,
+      cursor: after[index],
+      limit: input.limit,
+    });
+    more ||= page.nextCursor !== null;
+    for (const record of page.records) records.push({ index, record });
+  }
+  // SQLite record_key order is binary UTF-8, independent of locale or stamp_o.
+  records.sort(
+    (a, b) =>
+      Buffer.compare(
+        Buffer.from(a.record.recordKey),
+        Buffer.from(b.record.recordKey),
+      ) || a.index - b.index,
+  );
+  const page = records.slice(0, input.limit);
+  const hasMore = more || records.length > input.limit;
+  for (const entry of page)
+    after[entry.index] = listCursor(
+      entry.record.recordKey,
+      entry.record.pkHash,
+    );
+  const nextCursor = !hasMore
+    ? null
+    : instances.length === 1
+      ? after[0]!
+      : Buffer.from(
+          JSON.stringify({
+            kind: "local-records",
+            stream,
+            instances,
+            after: after.map((key) => key ?? null),
+          }),
+        ).toString("base64url");
+  return {
+    data: page
+      .map(({ index, record }) => localRecord(instances[index]!, record))
+      .filter(visible),
+    hasMore,
+    nextCursor,
+  };
 }
 
 /**

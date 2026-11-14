@@ -116,17 +116,8 @@ describe("pre-v4 historical blob retention", () => {
       store = createSqliteRecordStore(db);
       try {
         expect(Buffer.from(store.getBlobBytes(blobId)!)).toEqual(bytes);
-        // Both owner erase routes delete history first, then release its bytes.
-        if (current === "tombstone") {
-          store.deleteConnection("legacy");
-        } else {
-          store.resetInstanceBinding({
-            instance: "legacy",
-            expectedMethod: null,
-            expectedGeneration: 1,
-            nextMethod: null,
-          });
-        }
+        // Connection deletion releases historical claims before collecting bytes.
+        store.deleteConnection("legacy");
         expect(
           db.prepare("SELECT COUNT(*) AS n FROM pdpp_record_changes").get(),
         ).toEqual({ n: 0 });

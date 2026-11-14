@@ -13,16 +13,26 @@ export {
 } from "./issues.js";
 export {
   createSyncManager,
+  type ChangeProbe,
   type SyncManager,
   type SyncManagerOptions,
 } from "./engine/sync-manager.js";
+export {
+  DEFAULT_CHANGE_PROBE_MS,
+  createRegistryChangeProbe,
+  type RegistryChangeProbeOptions,
+} from "./engine/change-probe.js";
 export type {
   DownloadDiagnosticsHook,
   DownloadWorkerDeps,
 } from "./workers/download.js";
 // The single-data-point download path, exported so an integration test can
 // drive the REAL decrypt-and-index worker end to end rather than restate it.
-export { downloadOne, type DownloadResult } from "./workers/download.js";
+export {
+  downloadAll,
+  downloadOne,
+  type DownloadResult,
+} from "./workers/download.js";
 export {
   createPdppImporter,
   isPermanentRejection,
@@ -68,6 +78,24 @@ export {
   type PendingBlobDeletionPlanned,
   type PendingBlobDeletionState,
 } from "./pending-blob-deletions.js";
+export {
+  CRASHED_UPLOAD_REASON,
+  MAX_INTERRUPTED_UPLOAD_ATTEMPTS,
+  createMemoryUploadAttemptStore,
+  UPLOAD_ATTEMPTS_ENVELOPE_VERSION,
+  UploadAttemptStoreInvalidError,
+  UploadAttemptWriteUncertainError,
+  UPLOAD_ATTEMPTS_RESET_NOTICE,
+  createUploadAttemptLedger,
+  parseUploadAttemptsEnvelope,
+  uploadAttemptKey,
+  type UploadAttemptLease,
+  type UploadAttemptLedger,
+  type UploadAttemptRecord,
+  type UploadAttemptToken,
+  type UploadAttemptStore,
+  type UploadAttemptsEnvelope,
+} from "./upload-attempts.js";
 export { computeDataPointId } from "./data-point-id.js";
 export {
   createScopeDeletionTracker,
@@ -96,3 +124,8 @@ export {
   type PublicationFence,
   type PublicationRecord,
 } from "../publication/publish.js";
+
+export {
+  withCancellableRegistration,
+  type CancellableRegistration,
+} from "./cancellable-gateway.js";

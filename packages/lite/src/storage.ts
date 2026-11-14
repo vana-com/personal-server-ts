@@ -21,6 +21,11 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/storage/index";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 import {
+  LegacyWriteRefusedError,
+  type LegacyWriteHold,
+  type LegacyWriteSeal,
+} from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
+import {
   IngestPersistedError,
   VersionSupersededError,
 } from "@opendatalabs/personal-server-ts-core/contracts";
@@ -98,6 +103,12 @@ export interface PsLiteStorageCapabilities {
 /** Persistent Lite storage with its public backend capability report. */
 export interface PsLiteStoragePort extends DataStoragePort {
   readonly capabilities: PsLiteStorageCapabilities;
+  /**
+   * The seal every legacy write of this storage runs inside, and every
+   * removal under its shared lock. Given at construction; see
+   * `core/storage/legacy-write-seal.ts`.
+   */
+  readonly legacyWriteSeal: LegacyWriteSeal;
 }
 
 export interface PsLitePersistenceAdapter {
@@ -456,6 +467,12 @@ function openIndexedDb(
   });
 }
 
+/**
+ * Run one request in its own transaction. Resolves with the request's result
+ * only when the transaction has committed: a request's `success` event comes
+ * before the commit, and the transaction can still abort after it (quota, a
+ * closed tab, an explicit `abort()`). Rejects on a request error and on abort.
+ */
 function runIndexedDbTransaction<T>(
   options: Required<IndexedDbPsLitePersistenceOptions>,
   mode: IDBTransactionMode,
@@ -464,16 +481,31 @@ function runIndexedDbTransaction<T>(
   return openIndexedDb(options.dbName, options.storeName).then(
     (db) =>
       new Promise<T>((resolve, reject) => {
-        const transaction = db.transaction(options.storeName, mode);
-        const store = transaction.objectStore(options.storeName);
-        const request = callback(store);
+        let transaction: IDBTransaction;
+        let request: IDBRequest<T>;
+        try {
+          transaction = db.transaction(options.storeName, mode);
+          request = callback(transaction.objectStore(options.storeName));
+        } catch (err) {
+          db.close();
+          reject(err);
+          return;
+        }
 
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-        transaction.oncomplete = () => db.close();
+        transaction.oncomplete = () => {
+          db.close();
+          resolve(request.result);
+        };
         transaction.onerror = () => {
           db.close();
-          reject(transaction.error);
+          reject(transaction.error ?? request.error);
+        };
+        transaction.onabort = () => {
+          db.close();
+          reject(
+            transaction.error ??
+              new DOMException("The transaction was aborted", "AbortError"),
+          );
         };
       }),
   );
@@ -527,11 +559,31 @@ export function createIndexedDbPsLitePersistence(
   };
 }
 
+/**
+ * Persistent Lite storage. `legacyWriteSeal` is required: the storage makes a
+ * legacy version durable only inside `legacyWriteSeal.commit`, and removes
+ * data only inside `legacyWriteSeal.remove` (or under the `hold` of a caller
+ * that is already inside `commit`).
+ *
+ * Lock order, for every sealed method: the seal first, then the path lock,
+ * then the scope lock, then the index queue. A method takes the seal once, at
+ * its outermost call, and hands the hold to the helpers it calls; the seal is
+ * never taken from inside a path lock, the queue or a scope lock, so a write
+ * that waits behind a queued On cannot be waited on by a call that holds the
+ * lock the On is waiting for.
+ *
+ * Not sealed, because they add no visible version: `updateFileId`,
+ * `updateDataPointId`, `updateEntryVersion` (they rewrite a row that is
+ * already visible), and the sidecars (block manifests and payloads, first-seen
+ * ledgers).
+ */
 export async function createPersistentPsLiteStorage(
   adapter: PsLiteStorageAdapter,
-  persistence: PsLitePersistenceAdapter = createIndexedDbPsLitePersistence(),
-  dataFileStore?: PsLiteDataFileStore,
+  persistenceAdapter: PsLitePersistenceAdapter | undefined,
+  dataFileStore: PsLiteDataFileStore | undefined,
+  legacyWriteSeal: LegacyWriteSeal,
 ): Promise<PsLiteStoragePort> {
+  const persistence = persistenceAdapter ?? createIndexedDbPsLitePersistence();
   let state = normalizeState(await persistence.read());
   const fallbackEnvelopes = new Map(
     state.envelopes.map((envelope) => [
@@ -585,6 +637,34 @@ export async function createPersistentPsLiteStorage(
       () => undefined,
     );
     return run;
+  }
+
+  /**
+   * Write a version's blob. Caller holds the path lock and is inside
+   * `legacyWriteSeal.commit`. Returns the size in bytes.
+   */
+  async function storeEnvelopeBlob(
+    _hold: LegacyWriteHold,
+    path: string,
+    envelope: DataFileEnvelope,
+  ): Promise<number> {
+    const size = await fileStore.writeEnvelope(path, envelope);
+    if (fileStore.kind !== "indexeddb") {
+      await fallbackStore.deleteEnvelope(path);
+    }
+    return size;
+  }
+
+  /**
+   * Run a pure removal. Inside a `commit` (the caller passes its `hold`) it
+   * runs as is, because the lock is already held and is not re-entrant;
+   * otherwise it takes the seal's shared lock, which is open in every mode.
+   */
+  function removal<T>(
+    hold: LegacyWriteHold | undefined,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    return hold ? work() : legacyWriteSeal.remove(work);
   }
 
   function snapshotOf(source: PsLitePersistedStorageState) {
@@ -642,9 +722,12 @@ export async function createPersistentPsLiteStorage(
   function updateEntryField(
     path: string,
     patch: Partial<Pick<IndexEntry, "fileId" | "dataPointId" | "version">>,
+    expectedId?: number,
   ): Promise<boolean> {
     return updateIndex((current) => {
-      if (!current.entries.some((entry) => entry.path === path)) return null;
+      const row = current.entries.find((entry) => entry.path === path);
+      if (!row || (expectedId !== undefined && row.id !== expectedId))
+        return null;
       return {
         ...current,
         entries: current.entries.map((entry) =>
@@ -670,12 +753,14 @@ export async function createPersistentPsLiteStorage(
   }
 
   /**
-   * Install a row at its path, replacing any row there. Caller holds the path
-   * lock. With `onlyIfNewest`, the row is refused when the scope already has a
-   * later `collectedAt`; that check runs in the index queue, so it is atomic
-   * with the publication.
+   * Install a row at its path, replacing any row there. A row is a visible
+   * legacy version, so the caller must be inside `legacyWriteSeal.commit` (it
+   * holds the proof) and holds the path lock. With `onlyIfNewest`, the row is
+   * refused when the scope already has a later `collectedAt`; that check runs
+   * in the index queue, so it is atomic with the publication.
    */
   async function installEntry(
+    _hold: LegacyWriteHold,
     entry: NewIndexEntry,
     options: { onlyIfNewest?: boolean } = {},
   ): Promise<IndexEntry> {
@@ -719,13 +804,27 @@ export async function createPersistentPsLiteStorage(
     return indexed!;
   }
 
+  // Rows grouped by scope, rebuilt once per index state (state is replaced,
+  // never edited in place), so a lookup is O(scope rows) instead of O(all
+  // rows): the upload worker looks up every coalesced scope it plans.
+  let scopeGroups: { source: IndexEntry[]; groups: Map<string, IndexEntry[]> };
   function entriesForScope(scope: string): IndexEntry[] {
-    return sortEntries(state.entries.filter((entry) => entry.scope === scope));
+    if (scopeGroups?.source !== state.entries) {
+      const groups = new Map<string, IndexEntry[]>();
+      for (const entry of state.entries) {
+        const group = groups.get(entry.scope);
+        if (group) group.push(entry);
+        else groups.set(entry.scope, [entry]);
+      }
+      scopeGroups = { source: state.entries, groups };
+    }
+    return sortEntries(scopeGroups.groups.get(scope) ?? []);
   }
 
   const storagePort: PsLiteStoragePort = {
     kind: adapter.kind === "custom" ? "custom" : "browser-indexeddb-opfs",
     capabilities,
+    legacyWriteSeal,
     ...createStorageReadMethods(() => state.entries, entriesForScope),
 
     findByFileId(fileId) {
@@ -750,6 +849,22 @@ export async function createPersistentPsLiteStorage(
         : entries.slice(0, options.limit);
     },
 
+    findUnsyncedPage({ afterId, limit }) {
+      const page: IndexEntry[] = [];
+      for (const entry of state.entries) {
+        if (entry.dataPointId === null && entry.id > afterId) page.push(entry);
+      }
+      return page.sort((a, b) => a.id - b.id).slice(0, limit);
+    },
+
+    maxUnsyncedId() {
+      let max = 0;
+      for (const entry of state.entries) {
+        if (entry.dataPointId === null && entry.id > max) max = entry.id;
+      }
+      return max;
+    },
+
     async readEnvelope(scope, collectedAt) {
       const path = envelopePath(scope, collectedAt);
       const envelope =
@@ -761,45 +876,48 @@ export async function createPersistentPsLiteStorage(
       return envelope;
     },
 
-    async writeEnvelope(envelope): Promise<WriteResult> {
+    // A blob with no row is invisible, but it is the bytes of a legacy
+    // version: a refused write must not write them. The whole write is sealed,
+    // so a refusal happens before any file is touched and there is nothing to
+    // clean up.
+    writeEnvelope(envelope): Promise<WriteResult> {
       const path = envelopePath(envelope.scope, envelope.collectedAt);
-      const sizeBytes = await withPathLock(path, async () => {
-        const size = await fileStore.writeEnvelope(path, envelope);
-        if (fileStore.kind !== "indexeddb") {
-          await fallbackStore.deleteEnvelope(path);
-        }
-        return size;
+      return legacyWriteSeal.commit(async (blobHold) => {
+        const sizeBytes = await withPathLock(path, () =>
+          storeEnvelopeBlob(blobHold, path, envelope),
+        );
+        await persist();
+        return {
+          path,
+          relativePath: path,
+          sizeBytes,
+        };
       });
-      await persist();
-      return {
-        path,
-        relativePath: path,
-        sizeBytes,
-      };
     },
 
-    async writeEnvelopeAndIndex(envelope, entry): Promise<IndexEntry> {
+    writeEnvelopeAndIndex(envelope, entry): Promise<IndexEntry> {
       const path = envelopePath(envelope.scope, envelope.collectedAt);
-      // The blob and its row are one step under the path lock, so no erase or
+      // Sealed as one step, blob and row: a refusal comes before the blob is
+      // written, so a refused write leaves neither. Under the seal, the blob
+      // and its row are one step under the path lock, so no erase or
       // replacement of this path runs between them.
-      return withPathLock(path, async () => {
-        const size = await fileStore.writeEnvelope(path, envelope);
-        if (fileStore.kind !== "indexeddb") {
-          await fallbackStore.deleteEnvelope(path);
-        }
-        try {
-          return await installEntry({
-            ...entry,
-            scope: envelope.scope,
-            collectedAt: envelope.collectedAt,
-            path,
-            sizeBytes: entry.sizeBytes ?? size,
-          });
-        } catch (error) {
-          // The bytes are durable here; the caller's recovery depends on that.
-          throw new IngestPersistedError(path, error);
-        }
-      });
+      return legacyWriteSeal.commit((blobAndRowHold) =>
+        withPathLock(path, async () => {
+          const size = await storeEnvelopeBlob(blobAndRowHold, path, envelope);
+          try {
+            return await installEntry(blobAndRowHold, {
+              ...entry,
+              scope: envelope.scope,
+              collectedAt: envelope.collectedAt,
+              path,
+              sizeBytes: entry.sizeBytes ?? size,
+            });
+          } catch (error) {
+            // The bytes are durable here; the caller's recovery depends on that.
+            throw new IngestPersistedError(path, error);
+          }
+        }),
+      );
     },
 
     ...(fileStore.openEnvelopeWriter
@@ -814,31 +932,44 @@ export async function createPersistentPsLiteStorage(
               write: (text) => file.write(text),
               abort: () => file.abort(),
               async commit(entry, options): Promise<WriteResult> {
-                // The rename and the index install are one step under the path
-                // lock, so no erase of this path runs between them.
-                return withPathLock(path, async () => {
-                  const sizeBytes = await file.commit();
-                  try {
-                    // The index entry is what makes the version visible.
-                    await installEntry(
-                      {
-                        ...entry,
-                        scope,
-                        collectedAt,
-                        path,
-                        sizeBytes,
-                      },
-                      options,
-                    );
-                  } catch (error) {
-                    await dropUnindexedEnvelope(path);
-                    throw error;
+                // The bytes were streamed to a staged file before this call
+                // and are invisible there. The seal covers the rename and the
+                // index install, which are one step under the path lock, so
+                // no erase of this path runs between them. A refused commit
+                // discards the staged file.
+                try {
+                  return await legacyWriteSeal.commit((renameHold) =>
+                    withPathLock(path, async () => {
+                      const sizeBytes = await file.commit();
+                      try {
+                        // The index entry is what makes the version visible.
+                        await installEntry(
+                          renameHold,
+                          {
+                            ...entry,
+                            scope,
+                            collectedAt,
+                            path,
+                            sizeBytes,
+                          },
+                          options,
+                        );
+                      } catch (error) {
+                        await dropUnindexedEnvelope(path);
+                        throw error;
+                      }
+                      if (fileStore.kind !== "indexeddb") {
+                        await fallbackStore.deleteEnvelope(path);
+                      }
+                      return { path, relativePath: path, sizeBytes };
+                    }),
+                  );
+                } catch (error) {
+                  if (error instanceof LegacyWriteRefusedError) {
+                    await file.abort();
                   }
-                  if (fileStore.kind !== "indexeddb") {
-                    await fallbackStore.deleteEnvelope(path);
-                  }
-                  return { path, relativePath: path, sizeBytes };
-                });
+                  throw error;
+                }
               },
             };
           },
@@ -1085,7 +1216,9 @@ export async function createPersistentPsLiteStorage(
     },
 
     insertEntry(entry) {
-      return withPathLock(entry.path, () => installEntry(entry));
+      return legacyWriteSeal.commit((rowHold) =>
+        withPathLock(entry.path, () => installEntry(rowHold, entry)),
+      );
     },
 
     updateFileId(path, fileId) {
@@ -1099,12 +1232,12 @@ export async function createPersistentPsLiteStorage(
       );
     },
 
-    updateDataPointId(path, dataPointId) {
-      return updateEntryField(path, { dataPointId });
+    updateDataPointId(path, dataPointId, expectedId) {
+      return updateEntryField(path, { dataPointId }, expectedId);
     },
 
-    updateEntryVersion(path, version) {
-      return updateEntryField(path, { version });
+    updateEntryVersion(path, version, expectedId) {
+      return updateEntryField(path, { version }, expectedId);
     },
 
     async readFirstSeenLedger(scope) {
@@ -1125,67 +1258,72 @@ export async function createPersistentPsLiteStorage(
       await persistence.deleteAux?.(ledgerAux(scope));
     },
 
-    // The ledger barrier runs under the scope lock (a rebuild in flight cannot
-    // write it back). Each row is then erased under its own path lock, the
-    // same owner an ordinary write takes, so no write to a path interleaves
-    // with the erase of that path. The scope lock is never held across those
-    // path locks: lock order is path, scope, queue.
-    async deleteScope(scope) {
-      await withScopeLock(scope, async () => {
-        await dropLedger(scope);
-        for (const entry of entriesForScope(scope)) {
-          readyBlockManifests.delete(
-            blockManifestPath(scope, entry.collectedAt),
-          );
-        }
-        // Repeat the barrier on retry, even if a failed write cleared the set.
-        await persist();
-      });
-      // A row a later write adds is not in this snapshot; it is not deleted.
-      const paths = await enqueue(async () =>
-        Array.from(
-          new Set(
-            state.entries
-              .filter((entry) => entry.scope === scope)
-              .map((entry) => entry.path),
-          ),
-        ),
-      );
-      // Each path settles on its own, so one failed blob delete does not stop
-      // the others. Rows whose delete failed stay, for the next retry.
-      const outcomes = await Promise.allSettled(
-        paths.map((path) =>
-          withPathLock(path, () =>
-            eraseUnderPathLock(
-              path,
-              (e) => e.scope === scope && e.path === path,
+    // The whole removal runs under the seal's shared lock (or the caller's
+    // hold). The ledger barrier runs under the scope lock (a rebuild in flight
+    // cannot write it back). Each row is then erased under its own path lock,
+    // the same owner an ordinary write takes, so no write to a path
+    // interleaves with the erase of that path. The scope lock is never held
+    // across those path locks: lock order is seal, path, scope, queue.
+    deleteScope(scope, hold) {
+      return removal(hold, async () => {
+        await withScopeLock(scope, async () => {
+          await dropLedger(scope);
+          for (const entry of entriesForScope(scope)) {
+            readyBlockManifests.delete(
+              blockManifestPath(scope, entry.collectedAt),
+            );
+          }
+          // Repeat the barrier on retry, even if a failed write cleared the set.
+          await persist();
+        });
+        // A row a later write adds is not in this snapshot; it is not deleted.
+        const paths = await enqueue(async () =>
+          Array.from(
+            new Set(
+              state.entries
+                .filter((entry) => entry.scope === scope)
+                .map((entry) => entry.path),
             ),
           ),
-        ),
-      );
-      const failed = outcomes.find(
-        (outcome): outcome is PromiseRejectedResult =>
-          outcome.status === "rejected",
-      );
-      if (failed) throw failed.reason;
-      return outcomes.filter(
-        (outcome) => outcome.status === "fulfilled" && outcome.value === true,
-      ).length;
+        );
+        // Each path settles on its own, so one failed blob delete does not stop
+        // the others. Rows whose delete failed stay, for the next retry.
+        const outcomes = await Promise.allSettled(
+          paths.map((path) =>
+            withPathLock(path, () =>
+              eraseUnderPathLock(
+                path,
+                (e) => e.scope === scope && e.path === path,
+              ),
+            ),
+          ),
+        );
+        const failed = outcomes.find(
+          (outcome): outcome is PromiseRejectedResult =>
+            outcome.status === "rejected",
+        );
+        if (failed) throw failed.reason;
+        return outcomes.filter(
+          (outcome) => outcome.status === "fulfilled" && outcome.value === true,
+        ).length;
+      });
     },
 
     // Unfenced: by (scope, collectedAt) alone. Fenced: only the row the caller
     // decided on, by its id and path.
-    deleteVersion(scope, collectedAt, fence) {
+    deleteVersion(scope, collectedAt, fence, hold) {
       // The path is fixed by (scope, collectedAt), so the lock is known now.
       const path = envelopePath(scope, collectedAt);
-      return withPathLock(path, () =>
-        eraseUnderPathLock(
-          path,
-          (e) =>
-            e.scope === scope &&
-            e.collectedAt === collectedAt &&
-            e.path === path &&
-            (fence === undefined || e.id === fence.id),
+      return removal(hold, () =>
+        withPathLock(path, () =>
+          eraseUnderPathLock(
+            path,
+            (e) =>
+              e.scope === scope &&
+              e.collectedAt === collectedAt &&
+              e.path === path &&
+              (fence === undefined || e.id === fence.id),
+          ),
         ),
       ).then((outcome) => outcome === true);
     },
@@ -1193,40 +1331,44 @@ export async function createPersistentPsLiteStorage(
     // Only while the envelope is absent: the check and the erase both run
     // under the path lock that every write of this path takes. A store that
     // throws on read is a fault, not absence, and the row stays.
-    deleteVersionIfEnvelopeMissing(scope, collectedAt, fence) {
+    deleteVersionIfEnvelopeMissing(scope, collectedAt, fence, hold) {
       const path = envelopePath(scope, collectedAt);
       if (fence.path !== path) return Promise.resolve(false);
-      return withPathLock(path, async () => {
-        const present =
-          (await fileStore.readEnvelope(path)) ??
-          (await fallbackStore.readEnvelope(path));
-        if (present) return false;
-        const outcome = await eraseUnderPathLock(
-          path,
-          (e) =>
-            e.scope === scope &&
-            e.collectedAt === collectedAt &&
-            e.path === path &&
-            e.id === fence.id,
-        );
-        return outcome === true;
-      });
+      return removal(hold, () =>
+        withPathLock(path, async () => {
+          const present =
+            (await fileStore.readEnvelope(path)) ??
+            (await fallbackStore.readEnvelope(path));
+          if (present) return false;
+          const outcome = await eraseUnderPathLock(
+            path,
+            (e) =>
+              e.scope === scope &&
+              e.collectedAt === collectedAt &&
+              e.path === path &&
+              e.id === fence.id,
+          );
+          return outcome === true;
+        }),
+      );
     },
 
-    async deleteByFileId(fileId) {
-      // The fileId only names the path whose lock to take. The row is
-      // re-resolved under that lock, and looked again if it moved.
-      for (;;) {
-        const path = await enqueue(
-          async () =>
-            state.entries.find((e) => e.fileId === fileId)?.path ?? null,
-        );
-        if (path === null) return false;
-        const outcome = await withPathLock(path, () =>
-          eraseUnderPathLock(path, (e) => e.fileId === fileId),
-        );
-        if (outcome !== "moved") return outcome;
-      }
+    deleteByFileId(fileId, hold) {
+      return removal(hold, async () => {
+        // The fileId only names the path whose lock to take. The row is
+        // re-resolved under that lock, and looked again if it moved.
+        for (;;) {
+          const path = await enqueue(
+            async () =>
+              state.entries.find((e) => e.fileId === fileId)?.path ?? null,
+          );
+          if (path === null) return false;
+          const outcome = await withPathLock(path, () =>
+            eraseUnderPathLock(path, (e) => e.fileId === fileId),
+          );
+          if (outcome !== "moved") return outcome;
+        }
+      });
     },
   };
 
@@ -1264,9 +1406,10 @@ export async function createPersistentPsLiteStorage(
    * interleave. The slot is taken synchronously at call time, so calls run in
    * call order.
    *
-   * Lock order, never reversed: path lock, then scope lock, then the index
-   * queue. Never take a path lock while holding the scope lock or inside the
-   * queue (`enqueue`), or two operations can wait on each other.
+   * Lock order, never reversed: the legacy-write seal, then the path lock,
+   * then the scope lock, then the index queue. Never take a path lock while
+   * holding the scope lock or inside the queue (`enqueue`), and never take the
+   * seal inside any of them, or two operations can wait on each other.
    */
   const pathTails = new Map<string, Promise<void>>();
   function withPathLock<T>(path: string, fn: () => Promise<T>): Promise<T> {

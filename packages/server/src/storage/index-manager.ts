@@ -17,10 +17,16 @@ import type {
   NewIndexEntry,
   ScopeSummary,
 } from "@opendatalabs/personal-server-ts-core/storage/index";
+import type { LegacyWriteHold } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 
 export interface IndexManager {
-  insert(entry: NewIndexEntry): IndexEntry;
+  /**
+   * Every call that adds a row takes a `LegacyWriteHold`: a row is a visible
+   * legacy version, and a hold exists only inside `LegacyWriteSeal.commit`.
+   */
+  insert(hold: LegacyWriteHold, entry: NewIndexEntry): IndexEntry;
   insertIfCurrent(
+    hold: LegacyWriteHold,
     entry: NewIndexEntry,
     precondition?: { kind: "none" } | { kind: "match"; version: number },
   ):
@@ -32,7 +38,7 @@ export interface IndexManager {
       };
   closeScopeForWrites(scope: string): void;
   hasTrustedRevisionJournal(scope: string): boolean;
-  insertRecovered(entry: NewIndexEntry): IndexEntry;
+  insertRecovered(hold: LegacyWriteHold, entry: NewIndexEntry): IndexEntry;
   findByPath(path: string): IndexEntry | undefined;
   findByScope(options: IndexListOptions): IndexEntry[];
   findLatestByScope(scope: string): IndexEntry | undefined;
@@ -61,6 +67,10 @@ export interface IndexManager {
    * first).
    */
   findUnsynced(options?: { limit?: number }): IndexEntry[];
+  /** Unsynced rows with `id > afterId`, `id` ascending, at most `limit`. */
+  findUnsyncedPage(options: { afterId: number; limit: number }): IndexEntry[];
+  /** Highest `id` among the unsynced rows; 0 when there are none. */
+  maxUnsyncedId(): number;
   /**
    * Update the fileId for an index entry (after successful upload + on-chain registration).
    * @returns true if row was updated, false if path not found
@@ -72,13 +82,17 @@ export interface IndexManager {
    * Update the dataPointId for an index entry (after DPv2 registerDataPoint).
    * @returns true if row was updated, false if path not found
    */
-  updateDataPointId(path: string, dataPointId: string | null): boolean;
+  updateDataPointId(
+    path: string,
+    dataPointId: string | null,
+    expectedId?: number,
+  ): boolean;
   /**
    * Update the DPv2 `version` for an index entry (upload-worker rebase after
    * a stale-expectedVersion conflict).
    * @returns true if row was updated, false if path not found
    */
-  updateVersion(path: string, version: number): boolean;
+  updateVersion(path: string, version: number, expectedId?: number): boolean;
   /** Deletes all index entries for a scope. Returns count of deleted rows. */
   deleteByScope(scope: string): number;
   close(): void;
@@ -352,6 +366,15 @@ export function createIndexManager(
     "SELECT * FROM data_files WHERE data_point_id IS NULL ORDER BY created_at ASC LIMIT @limit",
   );
 
+  // Keyset on the primary key: each page starts where the last ended.
+  const findUnsyncedPageStmt = db.prepare<{ afterId: number; limit: number }>(
+    "SELECT * FROM data_files WHERE data_point_id IS NULL AND id > @afterId ORDER BY id ASC LIMIT @limit",
+  );
+
+  const maxUnsyncedIdStmt = db.prepare(
+    "SELECT MAX(id) AS maxId FROM data_files WHERE data_point_id IS NULL",
+  );
+
   const updateFileIdStmt = db.prepare<{ file_id: string; path: string }>(
     "UPDATE data_files SET file_id = @file_id WHERE path = @path",
   );
@@ -359,10 +382,17 @@ export function createIndexManager(
   const updateDataPointIdStmt = db.prepare<{
     data_point_id: string | null;
     path: string;
-  }>("UPDATE data_files SET data_point_id = @data_point_id WHERE path = @path");
+    expected_id: number | null;
+  }>(
+    "UPDATE data_files SET data_point_id = @data_point_id WHERE path = @path AND (@expected_id IS NULL OR id = @expected_id)",
+  );
 
-  const updateVersionStmt = db.prepare<{ version: number; path: string }>(
-    "UPDATE data_files SET version = @version WHERE path = @path",
+  const updateVersionStmt = db.prepare<{
+    version: number;
+    path: string;
+    expected_id: number | null;
+  }>(
+    "UPDATE data_files SET version = @version WHERE path = @path AND (@expected_id IS NULL OR id = @expected_id)",
   );
 
   const ensureScopeRevisionStmt = db.prepare<{ scope: string }>(
@@ -432,7 +462,7 @@ export function createIndexManager(
       .get(result.lastInsertRowid) as RawRow;
     return rowToEntry(row);
   };
-  const insertIfCurrent = db.transaction(
+  const insertIfCurrentTransaction = db.transaction(
     (
       entry: NewIndexEntry,
       precondition?: { kind: "none" } | { kind: "match"; version: number },
@@ -480,13 +510,16 @@ export function createIndexManager(
     },
   );
 
+  // The `hold` parameters are compile-time proof that the caller is inside the
+  // legacy-write seal; the row insert itself needs nothing from them.
   const manager: IndexManager = {
-    insert(entry) {
-      const result = insertIfCurrent(entry);
+    insert(_hold, entry) {
+      const result = insertIfCurrentTransaction(entry);
       if (!result.ok) throw new Error("Unconditional insert was rejected");
       return result.entry;
     },
-    insertIfCurrent,
+    insertIfCurrent: (_hold, entry, precondition) =>
+      insertIfCurrentTransaction(entry, precondition),
     closeScopeForWrites(scope) {
       ensureScopeRevisionStmt.run({ scope });
       // Durable fail-closed marker. There is no HTTP reset path; clearing this
@@ -498,7 +531,7 @@ export function createIndexManager(
       closeScopeForWritesStmt.run({ scope });
     },
     hasTrustedRevisionJournal,
-    insertRecovered(entry) {
+    insertRecovered(_hold, entry) {
       return insertRow(entry);
     },
 
@@ -628,6 +661,17 @@ export function createIndexManager(
       return row ? rowToEntry(row) : undefined;
     },
 
+    findUnsyncedPage({ afterId, limit }) {
+      return (findUnsyncedPageStmt.all({ afterId, limit }) as RawRow[]).map(
+        rowToEntry,
+      );
+    },
+
+    maxUnsyncedId() {
+      const row = maxUnsyncedIdStmt.get() as { maxId: number | null };
+      return row.maxId ?? 0;
+    },
+
     findUnsynced(options) {
       if (options?.limit !== undefined) {
         const rows = findUnsyncedLimitStmt.all({
@@ -653,16 +697,21 @@ export function createIndexManager(
       return row?.max_version ?? 0;
     },
 
-    updateDataPointId(path, dataPointId) {
+    updateDataPointId(path, dataPointId, expectedId) {
       const result = updateDataPointIdStmt.run({
         data_point_id: dataPointId,
         path,
+        expected_id: expectedId ?? null,
       });
       return result.changes > 0;
     },
 
-    updateVersion(path, version) {
-      const result = updateVersionStmt.run({ version, path });
+    updateVersion(path, version, expectedId) {
+      const result = updateVersionStmt.run({
+        version,
+        path,
+        expected_id: expectedId ?? null,
+      });
       return result.changes > 0;
     },
 

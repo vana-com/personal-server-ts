@@ -1,3 +1,4 @@
+import type { ConnectionLink } from "@opendatalabs/personal-server-ts-core/localdb";
 /**
  * Boot the PDPP Resource Server for a real Personal Server.
  *
@@ -32,6 +33,7 @@ import { createHash } from "node:crypto";
 import type { Database } from "better-sqlite3";
 import type { Logger } from "pino";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
+import type { LegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 import {
   createSourceStreamDeclarationRegistry,
   type PdppRecordStore,
@@ -113,6 +115,7 @@ export function resolveReplication(
 }
 
 export interface PdppRecordsDeps {
+  connectionLink?: ConnectionLink;
   store: PdppRecordStore;
   /** See `AppDeps.pdpp.reads`. */
   reads: PdppReplicaReads;
@@ -393,6 +396,19 @@ export function createPdppRecordsDeps(
   );
 
   return {
+    // Existing installations have one account per verified source. All registered
+    // handles of that source share its identity-less namespace on every device.
+    // Future multi-account registration must supply an explicit namespace here.
+    connectionLink: (instance, stream) => {
+      const binding = store.getInstanceBinding(instance);
+      if (binding.deletedAt !== null || binding.sourceId === null) return null;
+      const source = sources.find(
+        (candidate) => candidate.sourceId === binding.sourceId,
+      );
+      if (!source || !sourceRegistry.get(stream, source.sourceId)) return null;
+      const connector = source.sourceId.split("/").filter(Boolean).at(-1);
+      return connector ? { connector, namespace: "" } : null;
+    },
     store,
     // Without a replica receiver every reader reads the canonical store.
     reads: options.replica?.reads ?? (() => store),
@@ -496,6 +512,8 @@ export function createPdppSyncImporter(options: {
   /** Exact retained bytes per source id, from the AS boot. */
   documents: Map<string, string>;
   serverOwner: `0x${string}` | undefined;
+  /** The one seal every canonical publish runs inside; only an Off record lets it through. */
+  legacyWriteSeal?: LegacyWriteSeal;
   logger: Logger;
 }): PdppImporter | undefined {
   const { records, serverOwner, logger } = options;
@@ -549,6 +567,7 @@ export function createPdppSyncImporter(options: {
       if (connections.length > 1) return undefined;
       return undefined;
     },
+    legacyWriteSeal: options.legacyWriteSeal,
     logger,
   });
 }

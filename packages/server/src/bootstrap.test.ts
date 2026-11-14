@@ -6,18 +6,28 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import {
+  createUnswitchedServer,
+  declareAccountMode,
+} from "./account-mode/unswitched-server.test-utils.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer as createHttpServer } from "node:http";
 import { privateKeyToAccount } from "viem/accounts";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createServer } from "./bootstrap.js";
+import { resolvePsLiteOwner } from "../../lite/src/owner-binding.js";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { initializeDatabase } from "./storage/index-schema.js";
 import { createSqliteQuestionStore } from "./storage/question-store.js";
 
 function makeDefaultConfig() {
   return ServerConfigSchema.parse({ tunnel: { enabled: false } });
+}
+
+async function testOwnerSignature() {
+  const owner = privateKeyToAccount(`0x${"11".repeat(32)}`);
+  return owner.signMessage({ message: "Disposably authorize Node" });
 }
 
 describe("createServer", () => {
@@ -80,6 +90,7 @@ describe("createServer", () => {
     let ctx;
     try {
       ctx = await createServer(config, { rootPath: tempDir, ownerSignature });
+      await declareAccountMode(ctx, "off");
       const response = await ctx.app.request(
         "/v1/data/additions?tz=UTC&days=7",
         {
@@ -211,7 +222,8 @@ describe("createServer", () => {
 
   it("POST /v1/data/test.scope returns 401 when owner auth is missing", async () => {
     const config = makeDefaultConfig();
-    const ctx = await createServer(config, {
+    const ctx = await createUnswitchedServer(config, {
+      ownerSignature: await testOwnerSignature(),
       serverDir: tempDir,
       dataDir: join(tempDir, "data"),
     });
@@ -225,6 +237,87 @@ describe("createServer", () => {
     const body = await res.json();
     expect(body.error.errorCode).toBe("MISSING_AUTH");
     await ctx.cleanup();
+  });
+
+  describe("the account storage mode", () => {
+    const write = (ctx: Awaited<ReturnType<typeof createServer>>) =>
+      ctx.app.request("/v1/data/test.scope", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ctx.devToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ hello: "world" }),
+      });
+
+    // FLAG_MINTS_OFF
+    it("is unknown at boot whatever the old streamSync flags say", async () => {
+      for (const streamSync of [
+        {},
+        { write: true },
+        { write: true, refuseLegacyWrites: true },
+      ]) {
+        const ctx = await createServer(
+          ServerConfigSchema.parse({
+            ...makeDefaultConfig(),
+            streamSync,
+          }),
+          {
+            serverDir: tempDir,
+            dataDir: join(tempDir, "data"),
+            ownerSignature: await testOwnerSignature(),
+          },
+        );
+        expect((await write(ctx)).status, JSON.stringify(streamSync)).toBe(503);
+        await ctx.cleanup();
+      }
+    });
+
+    // NEVER_SEEN_OWNER_ADMITS
+    it("lets an explicit Off from the Account open legacy work at once", async () => {
+      const ctx = await createUnswitchedServer(makeDefaultConfig(), {
+        serverDir: tempDir,
+        dataDir: join(tempDir, "data"),
+        ownerSignature: await testOwnerSignature(),
+      });
+      expect((await write(ctx)).status).toBe(201);
+      await ctx.cleanup();
+    });
+
+    // LATCH_NOT_DURABLE
+    it("keeps an On across a restart, with the Off forgotten", async () => {
+      const options = {
+        serverDir: tempDir,
+        dataDir: join(tempDir, "data"),
+        ownerSignature: await testOwnerSignature(),
+      };
+      const first = await createUnswitchedServer(makeDefaultConfig(), options);
+      await declareAccountMode(first, "on");
+      expect((await write(first)).status).toBe(426);
+      await first.cleanup();
+
+      const second = await createServer(makeDefaultConfig(), options);
+      expect((await write(second)).status).toBe(426);
+      // A stale Off after the restart does not lower it.
+      await declareAccountMode(second, "off");
+      expect((await write(second)).status).toBe(426);
+      await second.cleanup();
+    });
+
+    it("keeps an Off across a restart, with no new answer", async () => {
+      const options = {
+        serverDir: tempDir,
+        dataDir: join(tempDir, "data"),
+        ownerSignature: await testOwnerSignature(),
+      };
+      const first = await createUnswitchedServer(makeDefaultConfig(), options);
+      expect((await write(first)).status).toBe(201);
+      await first.cleanup();
+
+      const second = await createServer(makeDefaultConfig(), options);
+      expect((await write(second)).status).toBe(201);
+      await second.cleanup();
+    });
   });
 
   it("cleanup() can be called without error", async () => {
@@ -297,7 +390,8 @@ describe("createServer", () => {
 
   it("POST /v1/data/:scope requires owner auth", async () => {
     const config = makeDefaultConfig();
-    const ctx = await createServer(config, {
+    const ctx = await createUnswitchedServer(config, {
+      ownerSignature: await testOwnerSignature(),
       serverDir: tempDir,
       dataDir: join(tempDir, "data"),
     });
@@ -477,6 +571,32 @@ describe("createServer", () => {
 
     await ctx.cleanup();
     vi.unstubAllEnvs();
+  });
+
+  it("the Node server and the PS-Lite ownerAddress check agree on one owner for one master-key signature", async () => {
+    const knownSig =
+      "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
+    const config = makeDefaultConfig();
+    const ctx = await createServer(config, {
+      serverDir: tempDir,
+      dataDir: join(tempDir, "data"),
+      ownerSignature: knownSig,
+    });
+
+    const body = await (await ctx.app.request("/health")).json();
+    const nodeOwner = body.owner as `0x${string}`;
+
+    // PS-Lite started with ownerAddress verifies the same signature.
+    const liteOwner = await resolvePsLiteOwner({
+      ownerAddress: nodeOwner,
+      ownerSignature: knownSig,
+    });
+    expect(liteOwner).toBe(nodeOwner);
+    expect(nodeOwner.toLowerCase()).toBe(
+      "0x2ac93684679a5bda03c6160def908cdb8d46792f",
+    );
+
+    await ctx.cleanup();
   });
 
   describe("sync manager wiring", () => {

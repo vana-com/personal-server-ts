@@ -1,4 +1,5 @@
 import type { ByteBudget } from "../../additions/budget.js";
+import type { QuotaPolicies } from "./rate-limit-policy.js";
 /**
  * Abstract storage backend adapter.
  * All methods operate on encrypted binary blobs.
@@ -33,10 +34,19 @@ export interface StorageAdapter {
   /**
    * Download an encrypted blob from the storage backend.
    * @param url - storage URL returned by upload()
+   * @param signal - cancels the transfer; the call settles once it stops
    * @returns encrypted binary data
    * @throws if blob not found
    */
-  download(url: string): Promise<Uint8Array>;
+  download(url: string, signal?: AbortSignal): Promise<Uint8Array>;
+
+  /**
+   * Optional. Reports the request quotas the backend publishes in its
+   * `RateLimit-Policy` response header, whenever a response carries a new one.
+   * Absence means the backend publishes none, and callers pace nothing to it.
+   * @returns a function that ends the subscription
+   */
+  onRateLimitPolicy?(listener: (policies: QuotaPolicies) => void): () => void;
 
   /** Optional bounded transport. Absence means budgeted recovery is unavailable. */
   downloadBounded?(url: string, budget: ByteBudget): Promise<Uint8Array>;
@@ -51,9 +61,10 @@ export interface StorageAdapter {
   /**
    * Check if a blob exists in the storage backend.
    * @param url - storage URL
+   * @param signal - cancels the probe; the call settles once it stops
    * @returns true if blob exists
    */
-  exists(url: string): Promise<boolean>;
+  exists(url: string, signal?: AbortSignal): Promise<boolean>;
 
   /**
    * Bulk delete all blobs for a scope.

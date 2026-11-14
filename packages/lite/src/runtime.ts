@@ -1,3 +1,10 @@
+import type { SeedIntake } from "@opendatalabs/personal-server-ts-core/localdb";
+import type {
+  LocalSync,
+  LocalHistory,
+} from "@opendatalabs/personal-server-ts-core/localdb";
+import { liveStreamCounts } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
+import { RunIntakeError } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { importOuraBrowserRecords } from "./oura-import.js";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import {
@@ -27,10 +34,24 @@ import {
   type DeviceSessionStore,
 } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
+  accountStorageModeOf,
+  decisionBody,
+  normalizeOwner,
+  type ModeDecision,
+  parseEvidenceBody,
+  type ModeAuthority,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import {
+  handleOwnerConnectorDelete,
+  type ConnectionDeletePort,
   handlePersonalServerAccessLogsRequest,
   handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
   handlePersonalServerScopeUploadAppend,
+  refuseLegacyWrite,
+  LegacyWriteRefusedError,
+  type OwnedAccountStorageMode,
+  accountStorageModeFor,
   createScopeUploadRegistry,
   handleOuraCollectionRequirementsRequest,
   handlePersonalServerGrantsRequest,
@@ -42,6 +63,7 @@ import {
   type PersonalServerReadAuthResult,
   type PersonalServerReadFulfillmentReporter,
   type PreparedScopeUploadBatch,
+  type StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
   handlePersonalServerDerivativesRequest,
@@ -81,12 +103,14 @@ import {
   approveMcpOAuthAuthorizationWithScopes,
   approveMcpConnection,
   approveMcpScopeAccessRequest,
+  liveMcpGrants,
   buildMcpProtectedResourceMetadataUrl,
   buildStableMcpUrl,
   createInMemoryMcpOAuthAuthorizationStore,
   createMcpConnection,
   createMcpOAuthAuthorization,
   createMcpDataReadClient,
+  McpDataWriteError,
   denyMcpScopeAccessRequest,
   handleMcpStreamableHttpRequest,
   hashConnectionToken,
@@ -95,6 +119,7 @@ import {
   MCP_CONNECTION_NOT_FOUND,
   MCP_SCOPE_REQUEST_NOT_FOUND,
   MCP_SCOPE_REQUEST_TOKEN_HEADER,
+  McpInvalidScopeError,
   readMcpScopeRequestWithToken,
   getMcpConnectionView,
   McpConnectionNotFoundError,
@@ -114,6 +139,7 @@ import {
   type McpOAuthAuthorizationStore,
   type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
+import { startPullSignals } from "./pull-signals.js";
 import type { PsLiteStorageCapabilities } from "./storage.js";
 import type { LiteReplicationRuntime } from "./replication-runtime.js";
 import {
@@ -144,6 +170,15 @@ export interface PsLiteAuthAdapter extends PersonalServerApiAuthPort {
 }
 
 export interface PsLiteRuntimeOptions {
+  localSync?: () => Promise<LocalSync>;
+  streamSyncSeed?: SeedIntake | null;
+  history?: LocalHistory;
+
+  /**
+   * The stream-sync writer's connection delete. Absent = `DELETE
+   * /v1/owner/connectors/:id` answers 503, as the Node server does unwired.
+   */
+  streamSyncConnectionDelete?: ConnectionDeletePort | null;
   storage: PsLiteStorageAdapter | DataStoragePort;
   auth?: PsLiteAuthAdapter;
   active?: boolean;
@@ -155,6 +190,16 @@ export interface PsLiteRuntimeOptions {
     payment?: { enabled?: boolean };
   };
   saveConfig?: (config: unknown) => Promise<void>;
+  /**
+   * The account-mode module: the only source of the account's storage mode.
+   * The legacy write gate, the data routes and the MCP engines read the port
+   * derived from it, and no option supplies a mode separately. When wired, the
+   * owner-authenticated `POST /v1/account-mode/evidence`
+   * route answers and the host gives the module the Account's answers
+   * through it. Absent = unknown: every legacy
+   * write answers a retryable 503.
+   */
+  accountModeAuthority?: ModeAuthority;
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
   gateway?: GatewayClient;
   serverOwner?: `0x${string}`;
@@ -171,7 +216,9 @@ export interface PsLiteRuntimeOptions {
     >;
   syncManager?:
     | (Pick<SyncManager, "trigger" | "getStatus"> &
-        Partial<Pick<SyncManager, "start" | "stop" | "deleteScope">>)
+        Partial<
+          Pick<SyncManager, "start" | "stop" | "deleteScope" | "requestPull">
+        >)
     | null;
   /**
    * Read-side tombstone memory; reads of a scope the gateway reports deleted
@@ -179,6 +226,11 @@ export interface PsLiteRuntimeOptions {
    * alongside the sync manager, which keeps it current.
    */
   scopeDeletions?: ScopeDeletionTracker;
+  /**
+   * Stream-sync reads, from `createPsLiteSyncManager`'s `streamSyncRead`.
+   * Absent = reads as before.
+   */
+  streamSyncRead?: StreamSyncReadPort;
   /** Receives the cause of every 500 the runtime answers. */
   logger?: PersonalServerApiLogger;
   additions?: DurableAdditionsService;
@@ -239,6 +291,10 @@ export interface PsLiteRuntimeOptions {
    * pointing the owner at Vana.
    */
   mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /** Default off. `list_granted_scopes` adds `notShared`; see the server option. */
+  mcpExposeUnsharedScopes?: boolean;
+  /** Default off. Read-side `scope_not_granted` adds `nextAction`. */
+  mcpScopeRequestGuidance?: boolean;
   /**
    * Lifetime in seconds of grants this runtime signs itself for MCP
    * connections (OAuth approve, scope-request approve with no live grant to
@@ -286,6 +342,8 @@ interface PsLiteRuntimeStoreCapabilities {
 
 export interface PsLiteRuntime extends RuntimeAvailabilityPort {
   readonly kind: "ps-lite";
+  /** Descriptor-first streamed snapshot intake, admitted by Account mode. */
+  readonly streamSyncSeed?: SeedIntake | null;
   readonly storage: PsLiteStorageAdapter | DataStoragePort;
   activate(): void;
   deactivate(): void;
@@ -365,6 +423,82 @@ function jsonResponse(body: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
   return new Response(JSON.stringify(body), { ...init, headers });
+}
+
+/**
+ * A mode answer: the decision body, with a refusal's own HTTP status. A 503 is
+ * retryable and says when to ask again.
+ */
+function decisionResponse(decision: ModeDecision): Response {
+  const refused = decision.kind === "refuse";
+  return jsonResponse(decisionBody(decision), {
+    status: refused ? decision.status : 200,
+    ...(refused && decision.status === 503
+      ? { headers: { "Retry-After": MODE_RETRY_AFTER_SECONDS } }
+      : {}),
+  });
+}
+
+// The mode routes take small bodies, as on the Node server: at most 16 KiB
+// (413 above it, sized or chunked), a flat object of at most 8 plain values,
+// and an owner of at most 100 characters (400 otherwise).
+const MODE_BODY_MAX_BYTES = 16 * 1024;
+const MODE_BODY_MAX_KEYS = 8;
+const MODE_OWNER_MAX_LENGTH = 100;
+const MODE_RETRY_AFTER_SECONDS = "5";
+const BODY_TOO_LARGE = Symbol("body too large");
+
+/** The request's flat JSON object, null when it is not one, or too large. */
+async function readModeBody(
+  request: Request,
+): Promise<Record<string, unknown> | null | typeof BODY_TOO_LARGE> {
+  if (Number(request.headers.get("content-length")) > MODE_BODY_MAX_BYTES) {
+    return BODY_TOO_LARGE;
+  }
+  const reader = request.body?.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let size = 0;
+  while (reader) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MODE_BODY_MAX_BYTES) {
+      await reader.cancel().catch(() => undefined);
+      return BODY_TOO_LARGE;
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text + decoder.decode());
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return null;
+  }
+  const values = Object.values(parsed);
+  if (values.length > MODE_BODY_MAX_KEYS) return null;
+  if (values.some((v) => v !== null && typeof v === "object")) return null;
+  return parsed as Record<string, unknown>;
+}
+
+function modeBodyRefusal(
+  body: Record<string, unknown> | null | typeof BODY_TOO_LARGE,
+  code: string,
+  shape: string,
+): Response | null {
+  if (body === BODY_TOO_LARGE) {
+    return jsonResponse(
+      {
+        error: "CONTENT_TOO_LARGE",
+        message: `Request body exceeds maximum size of ${MODE_BODY_MAX_BYTES} bytes`,
+      },
+      { status: 413 },
+    );
+  }
+  return body ? null : errorResponse(400, code, shape);
 }
 
 function protocolErrorResponse(err: ProtocolError): Response {
@@ -800,6 +934,8 @@ export function createPsLiteRuntime(
   options: PsLiteRuntimeOptions,
 ): PsLiteRuntime {
   let active = options.active ?? false;
+  // Page signals start a pull while the runtime is active (D4-SYNC-TRIGGERS).
+  let stopPullSignals: (() => void) | undefined;
   const now = options.now ?? (() => new Date());
   const auth = options.auth ?? createMissingAuthAdapter();
   // Readers get legacy bodies projected from stored PDPP records; writes and
@@ -894,6 +1030,60 @@ export function createPsLiteRuntime(
   function ownerAddress(): `0x${string}` | undefined {
     return options.serverOwner ?? options.identity?.address;
   }
+
+  // The owner the account mode is bound to: the person's owner only, as on the
+  // Node server. The server identity is never a substitute.
+  function modeOwner(): `0x${string}` | undefined {
+    return options.serverOwner;
+  }
+
+  function modeMethodNotAllowed(): Response {
+    return jsonResponse(
+      {
+        error: {
+          code: 405,
+          errorCode: "METHOD_NOT_ALLOWED",
+          message: "Method not allowed",
+        },
+      },
+      { status: 405, headers: { Allow: "POST" } },
+    );
+  }
+
+  /** A refusal unless the body's owner is the runtime's mode owner. */
+  function modeOwnerRefusal(owner: unknown): Response | null {
+    if (typeof owner !== "string" || owner.length > MODE_OWNER_MAX_LENGTH) {
+      return errorResponse(
+        400,
+        "INVALID_ACCOUNT_MODE_OWNER",
+        "Body owner must be a string of at most 100 characters",
+      );
+    }
+    const bound = modeOwner();
+    if (
+      bound === undefined ||
+      normalizeOwner(owner) !== normalizeOwner(bound)
+    ) {
+      return errorResponse(
+        403,
+        "ACCOUNT_MODE_OWNER_MISMATCH",
+        "This server only takes account mode for its own owner",
+      );
+    }
+    return null;
+  }
+
+  // The host's mode, bound once to this runtime's owner. Every consumer below
+  // (scope-upload append, the data handler, Oura, every MCP engine) receives
+  // this bound view, which cannot be asked about another account. The mode
+  // answers `unknown` when it is bound to a different owner or this runtime
+  // has none.
+  const accountStorageMode: OwnedAccountStorageMode = accountStorageModeFor(
+    options.accountModeAuthority
+      ? accountStorageModeOf(options.accountModeAuthority)
+      : { read: () => "unknown" },
+    modeOwner(),
+  );
 
   async function handleAuthDevice(request: Request, url: URL) {
     if (url.pathname === "/auth/device") {
@@ -1034,15 +1224,25 @@ export function createPsLiteRuntime(
 
   return {
     kind: "ps-lite",
+    streamSyncSeed: options.streamSyncSeed ?? null,
     storage: options.storage,
     activate() {
       active = true;
       options.syncManager?.start?.();
+      stopPullSignals?.();
+      const manager = options.syncManager;
+      stopPullSignals = manager?.requestPull
+        ? startPullSignals(() => {
+            manager.requestPull?.().catch(() => undefined);
+          })
+        : undefined;
       options.derivatives?.scheduler.start();
       options.replication?.resume();
     },
     deactivate() {
       active = false;
+      stopPullSignals?.();
+      stopPullSignals = undefined;
       void options.syncManager?.stop?.();
       options.derivatives?.scheduler.stop();
       void options.replication?.pause();
@@ -1059,7 +1259,13 @@ export function createPsLiteRuntime(
             if (!active) return unavailableResponse();
             return handlePersonalServerScopeUploadAppend(
               request,
-              { storage: dataStorage, auth, accessLogWriter, scopeUploads },
+              {
+                storage: dataStorage,
+                auth,
+                accessLogWriter,
+                scopeUploads,
+                accountStorageMode,
+              },
               batch,
             );
           },
@@ -1181,8 +1387,69 @@ export function createPsLiteRuntime(
           );
         }
 
+        // Account-mode answers do not wait for activation: a host submits the
+        // first Off or On, and only then starts the workers that depend on it.
+        if (
+          url.pathname === "/v1/account-mode/evidence" &&
+          options.accountModeAuthority
+        ) {
+          if (request.method !== "POST") return modeMethodNotAllowed();
+          await auth.authorizeOwner(request);
+          const raw = await readModeBody(request);
+          const bad = modeBodyRefusal(
+            raw,
+            "INVALID_ACCOUNT_MODE_BODY",
+            "Body must be a flat JSON object",
+          );
+          if (bad) return bad;
+          const mismatch = modeOwnerRefusal(
+            (raw as Record<string, unknown>).owner,
+          );
+          if (mismatch) return mismatch;
+          const body = parseEvidenceBody(raw);
+          if (!body) {
+            return errorResponse(
+              400,
+              "INVALID_ACCOUNT_MODE_EVIDENCE",
+              "Body must be {owner, state, generation?}",
+            );
+          }
+          // authorizeOwner succeeded, so the caller is this runtime's owner,
+          // and so is the body's.
+          return decisionResponse(
+            await options.accountModeAuthority.submitEvidence(body),
+          );
+        }
+
         if (!active) {
           return unavailableResponse();
+        }
+
+        const connectorPath = /^\/v1\/owner\/connectors\/([^/]+)$/.exec(
+          url.pathname,
+        );
+        if (connectorPath) {
+          if (request.method !== "DELETE") {
+            // Owner first: a caller who is not the owner learns nothing of the route.
+            await auth.authorizeOwner(request);
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          }
+          let connectorId: string | null;
+          try {
+            connectorId = decodeURIComponent(connectorPath[1]!);
+          } catch {
+            // A malformed percent-escape is a bad id (400 after authorization).
+            connectorId = null;
+          }
+          return handleOwnerConnectorDelete(request, connectorId, {
+            authorizeOwner: (req) => auth.authorizeOwner(req),
+            mode: accountStorageMode,
+            connectionDelete: options.streamSyncConnectionDelete,
+          });
         }
 
         if (url.pathname === "/v1/replication/sync") {
@@ -1227,29 +1494,41 @@ export function createPsLiteRuntime(
               "METHOD_NOT_ALLOWED",
               "Method not allowed",
             );
+          // An Oura browser import is a legacy write: a switched account refuses
+          // it. This is the early refusal; each stream the import stores is a
+          // storage write that passes the storage's seal on its own, so an
+          // account that switches mid-batch stops at the next stream.
+          const refusal = refuseLegacyWrite(accountStorageMode);
+          if (refusal) return refusal;
           let body;
           try {
             body = await request.json();
           } catch {
             return errorResponse(400, "INVALID_BODY", "Body must be JSON");
           }
-          const result = await importOuraBrowserRecords(
-            toDataStoragePort(options.storage),
-            body,
-            {
-              additions: options.additions,
-              scopeDeletions: options.scopeDeletions,
-              syncManager: options.syncManager ?? null,
-              onDataWritten: options.derivatives
-                ? (event) =>
-                    options.derivatives?.scheduler.markSourceChanged(
-                      event.scope,
-                      { lineageSources: event.lineageSources },
-                    )
-                : undefined,
-            },
-          );
-          return jsonResponse(result, { status: result.ok ? 200 : 409 });
+          try {
+            const result = await importOuraBrowserRecords(
+              toDataStoragePort(options.storage),
+              body,
+              {
+                accountStorageMode,
+                additions: options.additions,
+                scopeDeletions: options.scopeDeletions,
+                syncManager: options.syncManager ?? null,
+                onDataWritten: options.derivatives
+                  ? (event) =>
+                      options.derivatives?.scheduler.markSourceChanged(
+                        event.scope,
+                        { lineageSources: event.lineageSources },
+                      )
+                  : undefined,
+              },
+            );
+            return jsonResponse(result, { status: result.ok ? 200 : 409 });
+          } catch (error) {
+            if (error instanceof LegacyWriteRefusedError) return error.response;
+            throw error;
+          }
         }
 
         const dataPrefix = "/v1/data";
@@ -1262,6 +1541,7 @@ export function createPsLiteRuntime(
             request,
             {
               storage: dataStorage,
+              accountStorageMode,
               auth,
               logger: options.logger,
               accessLogWriter,
@@ -1269,6 +1549,8 @@ export function createPsLiteRuntime(
               additions: options.additions,
               syncManager: options.syncManager ?? null,
               scopeDeletions: options.scopeDeletions,
+              streamSyncRead: options.streamSyncRead,
+              history: options.history,
               scopeUploads,
               now,
               createLogId,
@@ -1418,7 +1700,77 @@ export function createPsLiteRuntime(
           );
         }
 
+        if (
+          url.pathname === "/v1/stream-sync/read-status" &&
+          options.localSync
+        ) {
+          await auth.authorizeOwner(request);
+          if (request.method !== "GET")
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          const local = await options.localSync();
+          const status = await local.listing.status();
+          return jsonResponse({
+            listed: status.listed,
+            streams: liveStreamCounts(status),
+            issues: status.issues.length,
+            olderVersionReads: local.olderVersions.counts(),
+          });
+        }
+        // Whether a run is saved: `GET /v1/stream-sync/runs/:runId/publication`.
+        // `superseded` alone does not mean saved; a consumer must check `reason`.
+        const runPublication =
+          /^\/v1\/stream-sync\/runs\/([A-Za-z0-9._-]{1,128})\/publication$/.exec(
+            url.pathname,
+          );
+        if (runPublication && options.localSync) {
+          await auth.authorizeOwner(request);
+          if (request.method !== "GET")
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          // Bind to the runtime's owner: a run written under another owner
+          // answers 404, the same as an unknown run, so it is not revealed.
+          const owner = ownerAddress();
+          if (!owner)
+            return errorResponse(404, "RUN_NOT_FOUND", "Run not found");
+          try {
+            return jsonResponse(
+              await (
+                await options.localSync()
+              ).intake.publicationStatus(runPublication[1], { owner }),
+            );
+          } catch (err) {
+            if (
+              err instanceof RunIntakeError &&
+              (err.code === "gone" || err.code === "owner_mismatch")
+            )
+              return errorResponse(404, "RUN_NOT_FOUND", "Run not found");
+            throw err;
+          }
+        }
         const syncPrefix = "/v1/sync";
+        if (
+          url.pathname === `${syncPrefix}/status` &&
+          options.localSync &&
+          accountStorageMode.read() !== "unswitched"
+        ) {
+          await auth.authorizeOwner(request);
+          if (request.method !== "GET")
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          return jsonResponse(
+            await (await options.localSync()).listing.status(),
+          );
+        }
         if (
           url.pathname === `${syncPrefix}/trigger` ||
           url.pathname === `${syncPrefix}/status` ||
@@ -1469,8 +1821,12 @@ export function createPsLiteRuntime(
             authorizationStore: mcpOAuthAuthorizationStore,
             approvalUrl: options.mcpOAuthApprovalUrl,
             scopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
+            exposeUnsharedScopes: options.mcpExposeUnsharedScopes,
+            scopeRequestGuidance: options.mcpScopeRequestGuidance,
             auth,
             dataStorage,
+            streamSyncRead: options.streamSyncRead,
+            accountStorageMode,
             accessLogWriter,
             readFulfillmentReporter: options.readFulfillmentReporter,
             now,
@@ -1511,8 +1867,12 @@ async function handleMcpRoute(input: {
   authorizationStore: McpOAuthAuthorizationStore;
   approvalUrl?: string | (() => string);
   scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  exposeUnsharedScopes?: boolean;
+  scopeRequestGuidance?: boolean;
   auth: PsLiteAuthAdapter;
   dataStorage: DataStoragePort;
+  streamSyncRead?: StreamSyncReadPort;
+  accountStorageMode?: OwnedAccountStorageMode;
   accessLogWriter: AccessLogWriter;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   now: () => Date;
@@ -1850,7 +2210,7 @@ async function handleMcpRoute(input: {
         connectionId,
         token: input.request.headers.get(MCP_SCOPE_REQUEST_TOKEN_HEADER),
       },
-      { store: input.store, now: input.now },
+      { store: input.store, gateway: input.gateway, now: input.now },
     );
     if (!view) {
       const notFound = errorResponse(
@@ -1949,6 +2309,9 @@ async function handleMcpRoute(input: {
         }
         if (err instanceof McpConnectionStateError) {
           return errorResponse(409, "INVALID_STATE", err.message);
+        }
+        if (err instanceof McpInvalidScopeError) {
+          return errorResponse(400, err.code, err.message);
         }
         throw err;
       }
@@ -2101,11 +2464,31 @@ async function handleMcpRoute(input: {
       publicKey: record.granteePublicKey,
       encryptedPrivateKey: record.encryptedGranteePrivateKey,
     });
+    const mode = input.accountStorageMode?.read() ?? "unknown";
+    const storage =
+      mode === "unswitched"
+        ? input.dataStorage
+        : new Proxy({} as DataStoragePort, {
+            get() {
+              return () => {
+                throw new ProtocolError(
+                  503,
+                  "STREAM_SYNC_LEGACY_STORAGE",
+                  "Legacy storage is sealed for this account mode",
+                );
+              };
+            },
+          });
     const readClient = createMcpDataReadClient({
       serverOrigin: input.serverOrigin,
       granteeAccount,
       dataApiDeps: {
-        storage: input.dataStorage,
+        storage,
+        streamSyncRead: mode === "switched" ? input.streamSyncRead : undefined,
+        accountStorageMode: {
+          owner: input.accountStorageMode?.owner ?? input.serverOwner ?? "",
+          read: () => mode,
+        },
         auth: input.auth,
         accessLogWriter: input.accessLogWriter,
         readFulfillmentReporter: input.readFulfillmentReporter,
@@ -2117,6 +2500,21 @@ async function handleMcpRoute(input: {
     const response = await handleMcpStreamableHttpRequest(input.request, {
       connection: record,
       readClient,
+      writeClient:
+        mode === "switched"
+          ? {
+              async updateScope() {
+                throw new McpDataWriteError(409, {
+                  error: {
+                    code: 409,
+                    errorCode: "STREAM_SYNC_WRITE_UNAVAILABLE",
+                    message:
+                      "Memory writes are not available through stream sync",
+                  },
+                });
+              },
+            }
+          : undefined,
       activityRecorder: input.activityRecorder,
       requestScopeAccess: async (request) => {
         return requestMcpScopeAccess(
@@ -2125,6 +2523,9 @@ async function handleMcpRoute(input: {
         );
       },
       scopeRequestApprovalUrl: input.scopeRequestApprovalUrl,
+      exposeUnsharedScopes: input.exposeUnsharedScopes,
+      verifyGrantsLive: () => liveMcpGrants(record, input.gateway, input.now),
+      scopeRequestGuidance: input.scopeRequestGuidance,
       serverOrigin: input.serverOrigin,
     });
     void input.store

@@ -6,7 +6,17 @@ import type { ServerConfig } from "../../schemas/server-config.js";
 import type { ServerAccount } from "../../keys/server-account.js";
 import type { BoundedStorageAdapter, StorageAdapter } from "./interface.js";
 import { createAudienceVanaAdapter } from "./vana-audience.js";
-import { createSdkStorageAdapter } from "./sdk.js";
+import { createSdkStorageAdapter, type SdkStorageProvider } from "./sdk.js";
+import {
+  settleFailure,
+  throttleAwareFetch,
+  throttleError,
+} from "./throttle.js";
+import {
+  createRateLimitPolicyFeed,
+  type RateLimitPolicyFeed,
+} from "./rate-limit-policy.js";
+import { parseRetryAfterHeader } from "../../stream-sync/storage-retry.js";
 
 // Default endpoint baked into the SDK's vana-storage provider; mirrored here
 // so urlForKey resolves to the same host the provider uploads to when no
@@ -51,17 +61,35 @@ export function createVanaSyncStorageAdapter(params: {
 
   // enclave sandbox --> public blob GET ----------> vana-storage
   // desktop/cloud ---> signed PUT / GET / DELETE -> vana-storage
-  const downloadBounded = boundedBlobDownload(
-    `${endpoint}/v1/chains/${chainId}/blobs/${owner}/`,
-  );
+  const blobPrefix = `${endpoint}/v1/chains/${chainId}/blobs/${owner}/`;
+  const feed = createRateLimitPolicyFeed();
+  const downloadBounded = boundedBlobDownload(blobPrefix, feed.fetch);
   if (params.reads === PUBLIC_READS) {
     // TODO(decision): blob reads stay public (architecture, resolved 2026-09-02); revisit if storage adds read auth.
     return {
-      ...createPublicReadAdapter({ endpoint, chainId, owner }),
+      ...createPublicReadAdapter({ endpoint, chainId, owner, feed }),
+      exists: headProbe(blobPrefix, feed.fetch),
       downloadBounded,
+      onRateLimitPolicy: feed.subscribe,
     };
   }
 
+  const sdkProvider = (signal?: AbortSignal) =>
+    createVanaStorageProvider({
+      endpoint: params.config.storage.config.vana?.apiUrl,
+      chainId,
+      ownerAddress: owner,
+      signer: {
+        address: params.serverAccount.address,
+        signMessage: (message: string) =>
+          params.serverAccount.signMessage(message),
+      },
+      // Always set: a 429 or 503 must reach the send governor, not the SDK's
+      // own retry loop (see `throttleAwareFetch`).
+      fetchImpl: throttleAwareFetch((input, init) =>
+        feed.fetch(input, { ...init, ...(signal ? { signal } : {}) }),
+      ),
+    });
   const adapter =
     params.audience && params.audience !== endpoint
       ? createAudienceVanaAdapter({
@@ -70,33 +98,72 @@ export function createVanaSyncStorageAdapter(params: {
           chainId,
           owner,
           signer: params.serverAccount,
+          feed,
         })
-      : createSdkStorageAdapter(
-          createVanaStorageProvider({
-            endpoint: params.config.storage.config.vana?.apiUrl,
-            chainId,
-            ownerAddress: owner,
-            signer: {
-              address: params.serverAccount.address,
-              signMessage: (message: string) =>
-                params.serverAccount.signMessage(message),
-            },
-          }),
-          {
-            // Mirror the provider's keying: PUT/GET target
-            // `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${encodeURIComponent-per-segment(key)}`.
-            // The download worker hands us `{scope}/{version}` and we rebuild the
-            // exact URL the provider's pathFromUrl() validator accepts.
-            urlForKey: (key) => {
-              const subpath = key
-                .split("/")
-                .map((segment) => encodeURIComponent(segment))
-                .join("/");
-              return `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${subpath}`;
-            },
+      : createSdkStorageAdapter(sdkProvider(), {
+          // The provider's transport is its `fetchImpl`; a provider built
+          // per signal sends every request of one call under that signal.
+          providerFor: (signal) => sdkProvider(signal),
+          // Mirror the provider's keying: PUT/GET target
+          // `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${encodeURIComponent-per-segment(key)}`.
+          // The download worker hands us `{scope}/{version}` and we rebuild the
+          // exact URL the provider's pathFromUrl() validator accepts.
+          urlForKey: (key) => {
+            const subpath = key
+              .split("/")
+              .map((segment) => encodeURIComponent(segment))
+              .join("/");
+            return `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${subpath}`;
           },
-        );
-  return { ...adapter, downloadBounded };
+        });
+  return {
+    ...adapter,
+    exists: headProbe(blobPrefix, feed.fetch),
+    downloadBounded,
+    onRateLimitPolicy: feed.subscribe,
+  };
+}
+
+/**
+ * Existence by an HTTP HEAD on the blob URL: the body is never read. Storage
+ * serves blob HEAD publicly, like GET, so the probe carries no authorization.
+ * Only a 200 answers "present" and only a 404 "absent"; every other status
+ * (204, 202, redirects included) throws, so the caller's
+ * retry policy applies and a refusal is never read as a missing blob.
+ */
+function headProbe(
+  prefix: string,
+  fetchFn: typeof fetch,
+): StorageAdapter["exists"] {
+  return async (url, signal) => {
+    const parsed = new URL(url);
+    if (
+      !parsed.href.startsWith(prefix) ||
+      ENCODED_PATH_SEPARATOR_PATTERN.test(parsed.pathname)
+    )
+      throw new Error("Blob URL does not match configured namespace");
+    const response = await fetchFn(parsed.href, {
+      method: "HEAD",
+      cache: "no-store",
+      redirect: "error",
+      ...(signal ? { signal } : {}),
+    });
+    await response.body?.cancel();
+    if (response.status === 200) return true;
+    if (response.status === 404) return false;
+    if (response.status === 429 || response.status === 503) {
+      throw Object.assign(new Error(`Blob probe failed (${response.status})`), {
+        status: response.status,
+        retryAfterMs: parseRetryAfterHeader(
+          response.headers.get("retry-after"),
+          Date.now(),
+        ),
+      });
+    }
+    throw Object.assign(new Error(`Blob probe failed (${response.status})`), {
+      status: response.status,
+    });
+  };
 }
 
 /**
@@ -106,6 +173,7 @@ export function createVanaSyncStorageAdapter(params: {
  */
 function boundedBlobDownload(
   prefix: string,
+  fetchFn: typeof fetch,
 ): BoundedStorageAdapter["downloadBounded"] {
   return async (url, budget) => {
     const parsed = new URL(url);
@@ -115,17 +183,18 @@ function boundedBlobDownload(
     )
       throw new Error("Blob URL does not match configured namespace");
     budget.charge();
-    const response = await fetch(parsed.href, {
+    const response = await fetchFn(parsed.href, {
       signal: budget.signal,
       cache: "no-store",
       redirect: "error",
     });
     if (!response.ok) {
-      await response.body?.cancel();
+      const retryAfterMs = await settleFailure(response);
       throw Object.assign(
         new Error(`Blob download failed (${response.status})`),
         {
           status: response.status,
+          ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
         },
       );
     }
@@ -137,6 +206,7 @@ function createPublicReadAdapter(options: {
   endpoint: string;
   chainId: number;
   owner: `0x${string}`;
+  feed: RateLimitPolicyFeed;
 }): StorageAdapter {
   const blobPrefix = `${options.endpoint}/v1/chains/${options.chainId}/blobs/${options.owner}/`;
 
@@ -148,61 +218,67 @@ function createPublicReadAdapter(options: {
     );
   }
 
-  return createSdkStorageAdapter(
-    {
-      async upload() {
-        throw new ServerSigningUnavailableError();
-      },
+  const provider = (signal?: AbortSignal): SdkStorageProvider => ({
+    async upload() {
+      throw new ServerSigningUnavailableError();
+    },
 
-      async download(storageUrl) {
-        let requestUrl: string;
-        try {
-          const parsed = new URL(storageUrl);
-          if (ENCODED_PATH_SEPARATOR_PATTERN.test(parsed.pathname)) {
-            throw invalidBlobUrl();
-          }
-          requestUrl = parsed.href;
-        } catch {
+    async download(storageUrl) {
+      let requestUrl: string;
+      try {
+        const parsed = new URL(storageUrl);
+        if (ENCODED_PATH_SEPARATOR_PATTERN.test(parsed.pathname)) {
           throw invalidBlobUrl();
         }
-        if (!requestUrl.startsWith(blobPrefix)) {
-          throw invalidBlobUrl();
-        }
+        requestUrl = parsed.href;
+      } catch {
+        throw invalidBlobUrl();
+      }
+      if (!requestUrl.startsWith(blobPrefix)) {
+        throw invalidBlobUrl();
+      }
 
-        let response: Response;
-        try {
-          response = await fetch(requestUrl, { method: GET_METHOD });
-        } catch (cause) {
-          throw new StorageError(
-            "vana-storage public download network error",
-            DOWNLOAD_ERROR,
-            VANA_STORAGE,
-            { cause: cause instanceof Error ? cause : undefined },
-          );
-        }
-        if (!response.ok) {
-          throw new StorageError(
-            `vana-storage download failed: ${response.status} ${response.statusText}`,
-            DOWNLOAD_FAILED,
-            VANA_STORAGE,
-          );
-        }
+      let response: Response;
+      try {
+        response = await options.feed.fetch(requestUrl, {
+          method: GET_METHOD,
+          ...(signal ? { signal } : {}),
+        });
+      } catch (cause) {
+        throw new StorageError(
+          "vana-storage public download network error",
+          DOWNLOAD_ERROR,
+          VANA_STORAGE,
+          { cause: cause instanceof Error ? cause : undefined },
+        );
+      }
+      if (response.status === 429 || response.status === 503) {
+        throw await throttleError(response);
+      }
+      if (!response.ok) {
+        throw new StorageError(
+          `vana-storage download failed: ${response.status} ${response.statusText}`,
+          DOWNLOAD_FAILED,
+          VANA_STORAGE,
+        );
+      }
 
-        return response.blob();
-      },
-
-      async delete() {
-        throw new ServerSigningUnavailableError();
-      },
+      return response.blob();
     },
-    {
-      urlForKey(key) {
-        const subpath = key
-          .split("/")
-          .map((segment) => encodeURIComponent(segment))
-          .join("/");
-        return `${blobPrefix}${subpath}`;
-      },
+
+    async delete() {
+      throw new ServerSigningUnavailableError();
     },
-  );
+  });
+
+  return createSdkStorageAdapter(provider(), {
+    providerFor: (signal) => provider(signal),
+    urlForKey(key) {
+      const subpath = key
+        .split("/")
+        .map((segment) => encodeURIComponent(segment))
+        .join("/");
+      return `${blobPrefix}${subpath}`;
+    },
+  });
 }

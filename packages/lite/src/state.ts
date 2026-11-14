@@ -4,10 +4,8 @@ import {
   ServerConfigSchema,
   withCurrentInferenceModel,
 } from "@opendatalabs/personal-server-ts-core/schemas";
-import {
-  deriveMasterKey,
-  deriveScopeKey,
-} from "@opendatalabs/vana-sdk/browser";
+import { deriveScopeKey } from "@opendatalabs/vana-sdk/browser";
+import { legacyMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import type {
   ServerAccount,
   SignTypedDataParams,
@@ -25,10 +23,13 @@ export type PsLiteStateKey =
   | "relay-v1"
   | "sync-cursor-v1"
   | "pending-blob-deletions-v1"
+  | "upload-attempts-v1"
+  | `upload-attempts-v1.corrupt-${string}`
   | `additions-publication-v1:${string}`
   | `additions-deletion-v1:${string}`
   | "derivative-questions-v1"
-  | "replication-door-v1";
+  | "replication-door-v1"
+  | `seed-v1:${string}`;
 
 /** Implementations must settle on abort and prevent late mutations. */
 export interface PsLiteBoundedStateStore {
@@ -38,8 +39,16 @@ export interface PsLiteBoundedStateStore {
 }
 
 export interface PsLiteStateStore {
+  /**
+   * Stable name of the backing store (IndexedDB: database and object store).
+   * The same store has the same name whatever wrapper object holds it, and
+   * different stores differ. Upload crash protection is keyed by it; without
+   * one, it stays in memory.
+   */
+  readonly namespace?: string;
   bounded?: PsLiteBoundedStateStore;
   get<T>(key: PsLiteStateKey): Promise<T | null>;
+  /** A rejection after storing must be an UploadAttemptWriteUncertainError. */
   set<T>(key: PsLiteStateKey, value: T): Promise<void>;
   delete(key: PsLiteStateKey): Promise<void>;
 }
@@ -146,7 +155,7 @@ async function encryptPrivateKey(
   ownerSignature: `0x${string}`,
 ): Promise<PsLiteEncryptedPrivateKey> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await importAesKey(deriveMasterKey(ownerSignature));
+  const key = await importAesKey(legacyMasterKey(ownerSignature));
   const plaintext = new TextEncoder().encode(privateKey);
   const ciphertext = new Uint8Array(
     await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext),
@@ -162,7 +171,7 @@ async function decryptPrivateKey(
   encrypted: PsLiteEncryptedPrivateKey,
   ownerSignature: `0x${string}`,
 ): Promise<`0x${string}`> {
-  const key = await importAesKey(deriveMasterKey(ownerSignature));
+  const key = await importAesKey(legacyMasterKey(ownerSignature));
   const iv = base64ToBytes(encrypted.iv);
   const ciphertext = base64ToBytes(encrypted.ciphertext);
   const plaintext = await crypto.subtle.decrypt(
@@ -442,7 +451,12 @@ export function createIndexedDbPsLiteStateStore(
       );
     },
   };
-  return { ...bounded, bounded };
+  return {
+    ...bounded,
+    bounded,
+    // Injective: "a/b" + "c" and "a" + "b/c" must not name one store.
+    namespace: `indexeddb:${JSON.stringify([resolved.dbName, resolved.storeName])}`,
+  };
 }
 
 export function createIndexedDbPsLiteTokenStore(

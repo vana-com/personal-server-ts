@@ -17,6 +17,7 @@ import {
 import { initializeDatabase } from "./index-schema.js";
 import { createIndexManager, type IndexManager } from "./index-manager.js";
 import { createNodeDataStorage } from "./node-data-storage.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils";
 
 const syncTrace = vi.hoisted(() => ({
   beforePublish: undefined as (() => Promise<void>) | undefined,
@@ -119,6 +120,7 @@ describe("sync download durability", () => {
     async (matching) => {
       const dataDir = join(root, "data");
       const storage = createNodeDataStorage({
+        legacyWriteSeal: openLegacyWriteSealForTests(),
         indexManager,
         hierarchyOptions: { dataDir },
       });
@@ -271,12 +273,13 @@ describe("sync download durability", () => {
 
     const tracedIndexManager: IndexManager = {
       ...indexManager,
-      insert(entry) {
+      insert(hold, entry) {
         syncTrace.events.push({ kind: "index-insert", path: entry.path });
-        return indexManager.insert(entry);
+        return indexManager.insert(hold, entry);
       },
     };
     const storage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: tracedIndexManager,
       hierarchyOptions: { dataDir, blockTargetBytes: 450 },
     });

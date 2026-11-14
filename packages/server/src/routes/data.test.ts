@@ -20,8 +20,10 @@ import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import {
+  fixedLegacyWriteSeal,
   createTestWallet,
   buildWeb3SignedHeader,
+  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   createScopeDeletionTracker,
@@ -41,6 +43,11 @@ import {
   type DataPortabilityGatewayConfig,
 } from "@opendatalabs/vana-sdk/node";
 import { privateKeyToAccount } from "viem/accounts";
+import { encodeAbiParameters, keccak256 } from "viem";
+import type { StreamSyncReadPort } from "@opendatalabs/personal-server-ts-core/api";
+import { request as httpRequest } from "node:http";
+import type { AddressInfo } from "node:net";
+import { listenHttpServer } from "../listen.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const wallet = createTestWallet(0);
@@ -196,6 +203,8 @@ describe("POST /v1/data/:scope", () => {
     const indexManager = createIndexManager(db);
 
     app = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -250,6 +259,8 @@ describe("POST /v1/data/:scope", () => {
       initializeDatabase(":memory:"),
     );
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: localIndexManager,
       hierarchyOptions,
       logger,
@@ -278,6 +289,8 @@ describe("POST /v1/data/:scope", () => {
       initializeDatabase(":memory:"),
     );
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: localIndexManager,
       hierarchyOptions,
       logger,
@@ -342,6 +355,8 @@ describe("POST /v1/data/:scope", () => {
     const db = initializeDatabase(":memory:");
     const indexManager = createIndexManager(db);
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -427,6 +442,8 @@ describe("POST /v1/data/:scope", () => {
       getSchemaForScope: vi.fn().mockResolvedValue(null),
     });
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -467,6 +484,8 @@ describe("POST /v1/data/:scope", () => {
     } satisfies SyncManager;
 
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -493,6 +512,8 @@ describe("POST /v1/data/:scope", () => {
     const indexManager2 = createIndexManager(db2);
 
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -527,6 +548,8 @@ describe("POST /v1/data/:scope", () => {
     } satisfies SyncManager;
 
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -586,6 +609,8 @@ describe("GET /v1/data (list scopes)", () => {
 
   function createApp(overrides: Partial<DataRouteDeps> = {}) {
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -756,6 +781,8 @@ describe("GET /v1/data listings are scoped to the builder's grants", () => {
     depsOverrides: Partial<DataRouteDeps> = {},
   ) {
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -1082,6 +1109,8 @@ describe("GET /v1/data/additions", () => {
       getGrant: vi.fn().mockResolvedValue(makeGrant({ scopes: ["notes.*"] })),
     });
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -1285,6 +1314,8 @@ describe("GET /v1/data/:scope/versions", () => {
 
   function createApp(overrides: Partial<DataRouteDeps> = {}) {
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -1442,6 +1473,8 @@ describe("GET /v1/data/:scope", () => {
     });
 
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -2070,6 +2103,42 @@ describe("GET /v1/data/:scope", () => {
     expect(json.error.errorCode).toBe("PS_UNAVAILABLE");
   });
 
+  it("reads a stream-sync stream by a connector key the SDK scope rule rejects", async () => {
+    const app = createApp({
+      accountStorageMode: fixedOwnedAccountStorageMode("switched"),
+      streamSyncRead: { resolve: async () => ({ kind: "pass" }) },
+    });
+    // `pdpp.github-browser~.repositories` is the identity-less physical
+    // scope (R23); `pdpp.github-browser.repositories` is its logical name.
+    for (const name of [
+      "pdpp.github-browser.repositories",
+      "pdpp.github-browser~.repositories",
+    ]) {
+      const res = await getWithAuth(app, name);
+      const json = (await res.json()) as { error?: unknown };
+      expect(json.error, name).not.toBe("INVALID_SCOPE");
+      expect(res.status, name).not.toBe(400);
+    }
+    // With stream-sync reads off, every read answers as before.
+    const off = await getWithAuth(
+      createApp(),
+      "pdpp.github-browser.repositories",
+    );
+    expect(off.status).toBe(400);
+    // Physical names with a namespace, and control scopes, stay internal (Q7).
+    for (const name of [
+      "pdpp.github-browser~0123456789abcdef.repositories",
+      "pdpp.github-browser~",
+      "pdpp.github-browser~0123456789abcdef",
+    ]) {
+      const res = await getWithAuth(app, name);
+      expect(res.status, name).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe(
+        "INVALID_SCOPE",
+      );
+    }
+  });
+
   it("returns 404 for nonexistent scope", async () => {
     const app = createApp();
 
@@ -2124,6 +2193,124 @@ describe("GET /v1/data/:scope", () => {
     expect(json.data).toEqual({ version: 1 });
     expect(json.collectedAt).toBe(json1.collectedAt);
   });
+
+  describe("a stream view that fails after the 200 status", () => {
+    // The envelope prefix a projection writes before it fails. No proper
+    // prefix of the envelope is valid JSON; the client must also see the
+    // connection abort, never a complete response.
+    const prefix = JSON.stringify({
+      version: "1.0",
+      scope: "instagram.posts",
+      collectedAt: "2026-11-01T00:00:00.000Z",
+      data: { posts: [{ id: "a" }, { id: "b" }] },
+    }).slice(0, -3);
+
+    function failingView(failAfterMs: number | null): StreamSyncReadPort {
+      return {
+        async resolve() {
+          let pulls = 0;
+          return {
+            kind: "view",
+            connector: "meta",
+            ns: "0123456789abcdef",
+            cursor: "pinned",
+            served: { scope: "pdpp.meta~0123456789abcdef.posts", version: 1 },
+            body: new ReadableStream<Uint8Array>({
+              async pull(controller) {
+                if (pulls++ === 0) {
+                  controller.enqueue(new TextEncoder().encode(prefix));
+                  return;
+                }
+                if (failAfterMs !== null) {
+                  await new Promise((r) => setTimeout(r, failAfterMs));
+                }
+                controller.error(new Error("projection failed"));
+              },
+            }),
+          };
+        },
+      };
+    }
+
+    async function readOverHttp(
+      app: ReturnType<typeof dataRoutes>,
+      scope: string,
+    ): Promise<{
+      status: number;
+      headers: Record<string, unknown>;
+      complete: boolean;
+      body: string;
+    }> {
+      const server = await listenHttpServer({
+        fetch: app.fetch,
+        port: 0,
+        hostname: "127.0.0.1",
+      });
+      try {
+        const { port } = server.address() as AddressInfo;
+        const uri = `/${scope}`;
+        const authorization = await buildWeb3SignedHeader({
+          wallet,
+          aud: SERVER_ORIGIN,
+          method: "GET",
+          uri,
+          grantId: "grant-123",
+        });
+        return await new Promise((resolve, reject) => {
+          const req = httpRequest(
+            {
+              hostname: "127.0.0.1",
+              port,
+              method: "GET",
+              path: uri,
+              headers: { authorization },
+            },
+            (res) => {
+              const chunks: Buffer[] = [];
+              res.on("data", (chunk: Buffer) => chunks.push(chunk));
+              res.on("error", () => {});
+              res.on("close", () =>
+                resolve({
+                  status: res.statusCode ?? 0,
+                  headers: res.headers,
+                  complete: res.complete,
+                  body: Buffer.concat(chunks).toString("utf8"),
+                }),
+              );
+            },
+          );
+          req.on("error", reject);
+          req.end();
+        });
+      } finally {
+        await new Promise((r) => server.close(r));
+      }
+    }
+
+    for (const [label, failAfterMs] of [
+      ["at once", null],
+      ["after a delay", 20],
+    ] as const) {
+      it(`aborts the connection when the body fails ${label}`, async () => {
+        const app = createApp({
+          accountStorageMode: fixedOwnedAccountStorageMode("switched"),
+          streamSyncRead: failingView(failAfterMs),
+        });
+        const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          const res = await readOverHttp(app, "instagram.posts");
+          expect(res.status).toBe(200);
+          // Bytes written before the abort may or may not reach the client.
+          expect(prefix.startsWith(res.body)).toBe(true);
+          expect(res.headers["transfer-encoding"]).toBe("chunked");
+          expect(res.complete).toBe(false);
+          expect(() => JSON.parse(res.body)).toThrow();
+        } finally {
+          quiet.mockRestore();
+        }
+      });
+    }
+  });
 });
 
 describe("DELETE /v1/data/:scope", () => {
@@ -2136,6 +2323,8 @@ describe("DELETE /v1/data/:scope", () => {
 
   function createApp(overrides: Partial<DataRouteDeps> = {}) {
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -2260,7 +2449,12 @@ describe("DELETE /v1/data/:scope", () => {
     const res = await deleteWithAuth(app, "instagram.profile");
 
     expect(res.status).toBe(200);
-    expect(deleteScope).toHaveBeenCalledWith("instagram.profile");
+    // The route hands the sync manager the seal's commit, so the mode decision
+    // and the local delete happen under one lock.
+    expect(deleteScope).toHaveBeenCalledWith(
+      "instagram.profile",
+      expect.any(Function),
+    );
     expect(await res.json()).toMatchObject({
       durable: true,
       steps: { gateway: { status: "ok", version: "3" } },
@@ -2330,6 +2524,64 @@ describe("DELETE /v1/data/:scope", () => {
         },
       },
     });
+  });
+
+  it("refuses a DELETE of a stream-sync control scope with 409: connection delete goes through the stream-sync writer (review item 2)", async () => {
+    const app = createApp();
+    const res = await deleteWithAuth(app, "pdpp.acme~0123456789abcdef");
+    expect(res.status).toBe(409);
+  });
+
+  it("refuses a data-set DELETE with 409 USE_CONNECTOR_DELETE once the account is switched, and deletes nothing", async () => {
+    let switchedNow = false;
+    const app = createApp({
+      accountStorageMode: {
+        owner: "",
+        read: () => (switchedNow ? "switched" : "unswitched"),
+      },
+    });
+    await ingestData("instagram.profile", { version: 1 }, app);
+    switchedNow = true;
+    const res = await deleteWithAuth(app, "instagram.profile");
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      error: { code: 409, errorCode: "USE_CONNECTOR_DELETE" },
+    });
+    expect(indexManager.countByScope("instagram.profile")).toBe(1);
+  });
+
+  it("refuses a switched account's data-set DELETE with 409 even from a client that declares stream sync", async () => {
+    let switchedNow = false;
+    const app = createApp({
+      accountStorageMode: {
+        owner: "",
+        read: () => (switchedNow ? "switched" : "unswitched"),
+      },
+    });
+    await ingestData("instagram.profile", { version: 1 }, app);
+    switchedNow = true;
+    const auth = await buildWeb3SignedHeader({
+      wallet: deleteOwnerWallet,
+      aud: SERVER_ORIGIN,
+      method: "DELETE",
+      uri: "/instagram.profile",
+    });
+    const res = await app.request("/instagram.profile", {
+      method: "DELETE",
+      headers: { authorization: auth, "vana-stream-sync-client": "1" },
+    });
+    expect(res.status).toBe(409);
+    expect(indexManager.countByScope("instagram.profile")).toBe(1);
+  });
+
+  it("deletes a data set as before while the account is not switched", async () => {
+    const app = createApp({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+    });
+    await ingestData("instagram.profile", { version: 1 }, app);
+    const res = await deleteWithAuth(app, "instagram.profile");
+    expect(res.status).toBe(200);
+    expect(indexManager.countByScope("instagram.profile")).toBe(0);
   });
 
   it("returns 502 DELETE_TOMBSTONE_FAILED and keeps local data when the gateway tombstone fails", async () => {
@@ -2899,6 +3151,8 @@ describe("X402 payment on GET /v1/data/:scope", () => {
       getGrant: vi.fn().mockResolvedValue(grant),
     });
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -3053,6 +3307,120 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     vi.unstubAllGlobals();
   });
 
+  it("waives only the same-Account app fee without granting the owner view", async () => {
+    const app = createX402App({
+      ownAppAccountUrl: "https://account-dev.vana.org",
+    });
+    const fetch = vi.fn(async () =>
+      Response.json({
+        object: "own_app_read_eligibility",
+        appAddress: builderWallet.address.toLowerCase(),
+        dataOwner: ownerForX402.address.toLowerCase(),
+        network: "moksha",
+        eligibility: "eligible",
+      }),
+    );
+    vi.stubGlobal("fetch", fetch);
+    await ingest(app, "instagram.profile", { username: "own-data" });
+    const response = await getNoPayment(app, "instagram.profile");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Vana-Payment-Exemption")).toBe("own-app");
+    expect(response.headers.get("X-PAYMENT-RESPONSE")).toBeNull();
+    expect(await response.json()).toMatchObject({
+      data: { username: "own-data" },
+    });
+    const storedUri = "/instagram.profile?view=stored";
+    const storedAuth = await buildWeb3SignedHeader({
+      wallet: builderWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/instagram.profile",
+      grantId: GRANT_FOR_X402,
+    });
+    const stored = await app.request(storedUri, {
+      headers: { Authorization: storedAuth },
+    });
+    expect(stored.status).toBe(403);
+    expect(await stored.json()).toMatchObject({
+      error: { errorCode: "FORBIDDEN" },
+    });
+    expect(
+      fetch.mock.calls.every(([url]) =>
+        String(url).startsWith(
+          "https://account-dev.vana.org/api/v1/apps/own-data-read-eligibility?",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["not_eligible", 402],
+    ["unavailable", 503],
+    ["wrong-owner", 503],
+    ["wrong-network", 503],
+    ["redirect", 503],
+  ])(
+    "keeps payment enforcement or fails closed for Account evidence %s",
+    async (evidence, status) => {
+      const app = createX402App({
+        ownAppAccountUrl: "https://account-dev.vana.org",
+      });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          if (evidence === "redirect")
+            return new Response(null, { status: 302 });
+          return Response.json(
+            {
+              object: "own_app_read_eligibility",
+              appAddress: builderWallet.address.toLowerCase(),
+              dataOwner:
+                evidence === "wrong-owner"
+                  ? builderWallet.address.toLowerCase()
+                  : ownerForX402.address.toLowerCase(),
+              network: evidence === "wrong-network" ? "mainnet" : "moksha",
+              eligibility:
+                evidence === "not_eligible"
+                  ? evidence
+                  : evidence === "unavailable"
+                    ? evidence
+                    : "eligible",
+            },
+            { status: evidence === "unavailable" ? 503 : 200 },
+          );
+        }),
+      );
+      await ingest(app, "instagram.profile", { username: "protected" });
+      const response = await getNoPayment(app, "instagram.profile");
+      expect(response.status).toBe(status);
+      expect(response.headers.get("X-Vana-Payment-Exemption")).toBeNull();
+      const body = await response.json();
+      if (status === 402)
+        expect(body.accepts[0].amount).toBe("11000000000000000");
+      else expect(body.error.errorCode).toBe("OWN_APP_ELIGIBILITY_UNAVAILABLE");
+    },
+  );
+
+  it("still refuses a revoked grant before looking up an own-app exemption", async () => {
+    const app = createX402App({
+      ownAppAccountUrl: "https://account-dev.vana.org",
+      gateway: createMockGateway({
+        getGrant: vi.fn().mockResolvedValue({
+          ...paidGrant(),
+          revokedAt: "2026-10-29T00:00:00Z",
+        }),
+      }),
+    });
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    const response = await getNoPayment(app, "instagram.profile");
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({
+      error: { errorCode: "GRANT_REVOKED" },
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("answers 410 for a deleted scope before issuing any payment challenge", async () => {
     // Deletion is checked ahead of the x402 cycle so a builder is never
     // charged (or even challenged) for data the owner deleted.
@@ -3160,6 +3528,152 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     const body = await res.json();
     expect(body.x402Version).toBe(1);
     expect(body.error).toBe("PAYMENT_REQUIRED");
+  });
+
+  it("charges a paid read of a stream view exactly as a paid read of a legacy file", async () => {
+    // A legacy file and a stream view serve the same records under two names
+    // the grant covers. A builder pays for each the same way: one challenge,
+    // the same price, one gateway payment, the same records. The access
+    // record binds the registered data point each body comes from.
+    const records = [
+      { id: "p1", caption: "first" },
+      { id: "p2", caption: "second" },
+    ];
+    const physical = "pdpp.meta~0123456789abcdef.posts";
+    const dataPointId = (scope: string) =>
+      keccak256(
+        encodeAbiParameters(
+          [
+            { name: "ownerAddress", type: "address" },
+            { name: "scope", type: "string" },
+          ],
+          [ownerForX402.address.toLowerCase() as `0x${string}`, scope],
+        ),
+      );
+    const resolves: string[] = [];
+    const streamSyncRead: StreamSyncReadPort = {
+      async resolve(input) {
+        resolves.push(input.scope);
+        if (input.scope !== "instagram.posts") return { kind: "pass" };
+        return {
+          kind: "view",
+          connector: "meta",
+          ns: "0123456789abcdef",
+          cursor: "pinned",
+          served: { scope: physical, version: 7 },
+          body: new Response(
+            JSON.stringify({
+              version: "1.0",
+              scope: "instagram.posts",
+              collectedAt: "2026-11-01T00:00:00.000Z",
+              data: { records },
+            }),
+          ).body!,
+        };
+      },
+    };
+    const payResponse = {
+      success: true,
+      breakdown: {
+        registrationFee: "10000000000000000",
+        dataAccessFee: "1000000000000000",
+        registrationPaid: true,
+      },
+      paidAt: "2026-01-21T10:00:05Z",
+    };
+    const gatewayFetch = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        new Response(JSON.stringify(payResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", gatewayFetch);
+
+    let mode: "unswitched" | "switched" = "unswitched";
+    const app = createX402App({
+      streamSyncRead,
+      accountStorageMode: { owner: ownerForX402.address, read: () => mode },
+    });
+    expect(
+      (await ingest(app, "instagram.saved_items", { records })).status,
+    ).toBe(201);
+    const entry = indexManager.findLatestByScope("instagram.saved_items")!;
+    indexManager.updateDataPointId(
+      entry.path,
+      dataPointId("instagram.saved_items"),
+    );
+
+    const payFor = async (scope: string) => {
+      const challenge = await getNoPayment(app, scope);
+      expect(challenge.status, scope).toBe(402);
+      const accept = (await challenge.json()).accepts[0];
+      const message = {
+        ...accept.message,
+        amount: BigInt(accept.message.amount),
+        paymentNonce: BigInt(accept.message.paymentNonce),
+      };
+      const signature = await builderWallet.signTypedData({
+        domain: escrowPaymentDomain(gatewayConfig),
+        types: GENERIC_PAYMENT_TYPES,
+        primaryType: "GenericPayment",
+        message,
+      });
+      const paid = await getWithPayment(
+        app,
+        scope,
+        encodePaymentHeader({
+          x402Version: 1,
+          scheme: "vana-escrow-grant",
+          network: accept.network,
+          payload: {
+            message: accept.message,
+            signature,
+            accessRecord: accept.accessRecord,
+          },
+        }),
+      );
+      return {
+        accept,
+        status: paid.status,
+        paymentResponse: paid.headers.get("X-PAYMENT-RESPONSE"),
+        body: await paid.json(),
+      };
+    };
+    const legacy = await payFor("instagram.saved_items");
+    mode = "switched";
+    const view = await payFor("instagram.posts");
+
+    const comparable = (accept: Record<string, any>) => ({
+      ...accept,
+      expiresAt: typeof accept.expiresAt,
+      message: { ...accept.message, paymentNonce: "fresh" },
+      accessRecord: Object.keys(accept.accessRecord).sort(),
+    });
+    expect(comparable(view.accept)).toEqual(comparable(legacy.accept));
+    expect(view.accept.amount).toBe("11000000000000000");
+    expect(legacy.accept.accessRecord.dataPointId).toBe(
+      dataPointId("instagram.saved_items"),
+    );
+    expect(view.accept.accessRecord).toMatchObject({
+      dataPointId: dataPointId(physical),
+      version: "7",
+      accessor: builderWallet.address,
+    });
+
+    expect(view.status).toBe(200);
+    expect(legacy.status).toBe(200);
+    expect(view.body.data).toEqual(legacy.body.data);
+    expect(view.paymentResponse).toBe(legacy.paymentResponse);
+    expect(view.paymentResponse).not.toBeNull();
+    expect(gatewayFetch).toHaveBeenCalledTimes(2);
+    const forwarded = gatewayFetch.mock.calls.map(([, init]) =>
+      JSON.parse(String(init?.body)),
+    );
+    expect(Object.keys(forwarded[1]).sort()).toEqual(
+      Object.keys(forwarded[0]).sort(),
+    );
+    expect(forwarded[1].accessRecord.dataPointId).toBe(dataPointId(physical));
   });
 
   it("relays gateway 402 (insufficient balance) verbatim", async () => {

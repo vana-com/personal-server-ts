@@ -1,3 +1,4 @@
+import type { LocalHistory } from "@opendatalabs/personal-server-ts-core/localdb";
 /**
  * MCP routes — both the Claude-facing `/mcp/:token` Streamable HTTP endpoint
  * and the owner-only `/v1/mcp/connections` management surface.
@@ -30,6 +31,10 @@ import {
   approveMcpOAuthAuthorizationWithScopes,
   approveMcpConnection,
   approveMcpScopeAccessRequest,
+  editMcpConnectionAccess,
+  liveGrants,
+  liveMcpGrants,
+  narrowGrants,
   buildMcpProtectedResourceMetadataUrl,
   buildMcpUrl,
   buildStableMcpUrl,
@@ -47,6 +52,7 @@ import {
   type McpProofReplayStore,
   createMcpDataReadClient,
   createMcpDataWriteClient,
+  McpDataWriteError,
   type McpDataWriteClient,
   denyMcpScopeAccessRequest,
   getMcpConnectionView,
@@ -58,11 +64,15 @@ import {
   McpConnectionNotFoundError,
   McpConnectionStateError,
   McpIngress,
+  MCP_SCOPE_REQUEST_OPEN_CONNECTION_PARAM,
+  isMcpConnectionId,
+  resolveMcpScopeRequestApprovalUrl,
   McpOAuthAuthorizationError,
   isAllowedOAuthRedirectUri,
   McpScopeRequestError,
   MCP_SCOPE_REQUEST_NOT_FOUND,
   MCP_SCOPE_REQUEST_TOKEN_HEADER,
+  McpInvalidScopeError,
   readMcpScopeRequestWithToken,
   redeemMcpOAuthAuthorizationCode,
   refreshMcpOAuthToken,
@@ -81,9 +91,11 @@ import {
   type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type {
+  OwnedAccountStorageMode,
   PersonalServerDataApiDeps,
   PersonalServerApiAuthPort,
   PersonalServerReadFulfillmentReporter,
+  StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createServerApiAuth } from "../api-auth.js";
@@ -108,9 +120,13 @@ import type {
 import type { TokenStore } from "../token-store.js";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
+import { unwiredLegacyWriteSeal } from "../storage/unwired-legacy-write-seal.js";
+import type { LegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 
 export interface McpRouteDeps {
   logger: Logger;
+  /** The seal for the fallback storage built when no `dataStorage` is given. */
+  legacyWriteSeal?: LegacyWriteSeal;
   /**
    * `serverOrigin` used both as the Web3Signed `aud` for the per-connection
    * grantee's self-issued read requests AND as the base URL printed back to
@@ -132,6 +148,7 @@ export interface McpRouteDeps {
    * The owner/OAuth connection path is always free regardless of this flag.
    */
   paymentEnabled?: boolean;
+  ownAppAccountUrl?: string;
   /**
    * Lifetime in seconds of grants this server signs itself for MCP
    * connections when there is no live grant expiry to keep. Unset or 0
@@ -146,6 +163,10 @@ export interface McpRouteDeps {
   indexManager?: IndexManager;
   hierarchyOptions?: HierarchyManagerOptions;
   dataStorage?: DataStoragePort;
+  streamSyncRead?: StreamSyncReadPort;
+  history?: LocalHistory;
+  /** The account's storage mode; every MCP engine reads through this one. */
+  accountStorageMode?: OwnedAccountStorageMode;
   runtimeAvailability?: RuntimeAvailabilityPort;
   /** Per-process connection store. Defaults to in-memory. */
   connectionStore?: McpConnectionStore;
@@ -180,6 +201,25 @@ export interface McpRouteDeps {
    * user. Absent: the agent is told to wait for approval in Vana.
    */
   scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  scopeRequestReviewHint?: string;
+  /** Opt-in `notShared` on `list_granted_scopes`; see McpToolContext. */
+  mcpExposeUnsharedScopes?: boolean;
+  /**
+   * The deletion tracker and owner the ordinary data route gets; used only
+   * by the owner-wide `notShared` listing, never by reads. No canonical view:
+   * canonical-only scopes join `notShared` together with moving MCP reads to
+   * the canonical view (follow-up after the demo).
+   */
+  mcpOwnerListingDeps?: Pick<
+    PersonalServerDataApiDeps,
+    "scopeDeletions" | "serverOwner"
+  >;
+  /** Opt-in `nextAction` on read-side `scope_not_granted`. */
+  mcpScopeRequestGuidance?: boolean;
+  /** Allow the owner to narrow connection scopes; default off. */
+  mcpOwnerAccessEdit?: boolean;
+  /** Static scope ids listed in `request_scope_access` under guidance. */
+  mcpRequestableScopes?: string[];
   /**
    * MCP writes (`remember`): the store the data route redeems write sessions
    * from, and a dispatcher into the mounted data route. Absent: MCP stays
@@ -226,6 +266,16 @@ function requestOrigin(c: Context, deps: ListenerDeps): string {
     return resolveOrigin(deps.serverOrigin);
   }
   return new URL(c.req.url).origin;
+}
+
+/** The origin the caller used, only when the call arrived on the loopback listener. */
+function loopbackOriginOption(
+  c: Context,
+  deps: ListenerDeps,
+): { loopbackOrigin: string } | Record<string, never> {
+  return requestIngress(c, deps) === McpIngress.Loopback
+    ? { loopbackOrigin: requestOrigin(c, deps) }
+    : {};
 }
 
 function jsonError(status: number, errorCode: string, message: string) {
@@ -363,17 +413,59 @@ async function parseFormBody(request: Request): Promise<URLSearchParams> {
   return new URLSearchParams(text);
 }
 
+/**
+ * A switched request must never accidentally answer from the old store.
+ * Every operation fails loudly, including optional reads that callers might
+ * otherwise treat as a missing entry or an empty listing.
+ */
+function sealedMcpLegacyStorage(): DataStoragePort {
+  return new Proxy({} as DataStoragePort, {
+    get() {
+      return () => {
+        throw new ProtocolError(
+          503,
+          "STREAM_SYNC_LEGACY_STORAGE",
+          "Legacy storage is sealed for a switched account.",
+        );
+      };
+    },
+  });
+}
+
+function streamSyncMemoryWriteRefusal(): McpDataWriteClient {
+  return {
+    async updateScope() {
+      throw new McpDataWriteError(
+        409,
+        jsonError(
+          409,
+          "STREAM_SYNC_WRITE_UNAVAILABLE",
+          "Memory writes are not available through stream sync.",
+        ),
+      );
+    },
+  };
+}
+
 function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
+  // Pin the account's answer before constructing either path. A reader being
+  // wired is a runtime capability, not permission to use it.
+  const mode = deps.accountStorageMode?.read() ?? "unknown";
+  const switched = mode === "switched";
   const dataStorage =
-    deps.dataStorage ??
-    (deps.indexManager && deps.hierarchyOptions
-      ? withLegacyProjection(
-          createNodeDataStorage({
-            indexManager: deps.indexManager,
-            hierarchyOptions: deps.hierarchyOptions,
-          }),
-        )
-      : undefined);
+    mode !== "unswitched"
+      ? sealedMcpLegacyStorage()
+      : (deps.dataStorage ??
+        (deps.indexManager && deps.hierarchyOptions
+          ? withLegacyProjection(
+              createNodeDataStorage({
+                indexManager: deps.indexManager,
+                hierarchyOptions: deps.hierarchyOptions,
+                legacyWriteSeal:
+                  deps.legacyWriteSeal ?? unwiredLegacyWriteSeal(),
+              }),
+            )
+          : undefined));
   if (!dataStorage) {
     throw new Error(
       "mcpRoutes requires either `dataStorage` or `{ indexManager, hierarchyOptions }` to build the read path",
@@ -387,12 +479,18 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
     devToken: deps.devToken,
     accessToken: deps.accessToken,
     tokenStore: deps.tokenStore,
-    dataStorage,
+    dataStorage: mode === "unswitched" ? dataStorage : undefined,
     runtimeAvailability: deps.runtimeAvailability,
   });
 
   return {
     storage: dataStorage,
+    streamSyncRead: switched ? deps.streamSyncRead : undefined,
+    history: switched ? deps.history : undefined,
+    accountStorageMode: {
+      owner: deps.accountStorageMode?.owner ?? deps.serverOwner ?? "",
+      read: () => mode,
+    },
     auth,
     accessLogWriter: deps.accessLogWriter,
     readFulfillmentReporter: deps.readFulfillmentReporter,
@@ -405,14 +503,17 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
 function buildWriteClient(
   deps: McpRouteDeps,
   granteeAccount: ReturnType<typeof loadMcpGranteeAccount>,
-  storage: PersonalServerDataApiDeps["storage"],
+  dataApiDeps: PersonalServerDataApiDeps,
 ): McpDataWriteClient | undefined {
+  if (dataApiDeps.accountStorageMode?.read() === "switched") {
+    return streamSyncMemoryWriteRefusal();
+  }
   const serverOwner = deps.serverOwner;
   if (!deps.mcpWrites || !serverOwner) return undefined;
   return createMcpDataWriteClient({
     serverOrigin: resolveOrigin(deps.serverOrigin),
     granteeAccount,
-    storage,
+    storage: dataApiDeps.storage,
     sessionStore: deps.mcpWrites.sessionStore,
     dispatch: deps.mcpWrites.dispatch,
     authorize: async ({ scope, grantId }) => {
@@ -429,6 +530,18 @@ function buildWriteClient(
           runtimeAvailability: deps.runtimeAvailability,
         },
       );
+      // Recheck after policy's asynchronous work, before updateScope reads
+      // the legacy record. A switch must not race a read-modify-write.
+      const mode = deps.accountStorageMode?.read() ?? "unknown";
+      if (mode !== "unswitched") {
+        throw new ProtocolError(
+          mode === "switched" ? 409 : 503,
+          mode === "switched"
+            ? "STREAM_SYNC_WRITE_UNAVAILABLE"
+            : "ACCOUNT_MODE_UNKNOWN",
+          "Legacy memory writes are unavailable for this account mode.",
+        );
+      }
     },
   });
 }
@@ -452,8 +565,9 @@ export function executeMcpConnectionRequest(
       granteeAccount,
       dataApiDeps,
     }),
-    writeClient: buildWriteClient(deps, granteeAccount, dataApiDeps.storage),
+    writeClient: buildWriteClient(deps, granteeAccount, dataApiDeps),
     activityRecorder: deps.activityRecorder,
+    verifyGrantsLive: () => liveMcpGrants(connection, deps.gateway),
     // Denied tool calls are recorded by the wrapper, not the read path.
     reporterDeps: {
       readFulfillmentReporter: deps.readFulfillmentReporter,
@@ -564,7 +678,7 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
         connectionId: c.req.param("id"),
         token: c.req.header(MCP_SCOPE_REQUEST_TOKEN_HEADER),
       },
-      { store },
+      { store, gateway: deps.gateway },
     );
     c.header("Cache-Control", "no-store");
     if (!view) {
@@ -609,6 +723,38 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
       if (caught instanceof McpConnectionStateError) {
         return c.json(jsonError(409, "INVALID_STATE", caught.message), 409);
       }
+      if (caught instanceof McpInvalidScopeError) {
+        return c.json(jsonError(400, caught.code, caught.message), 400);
+      }
+      throw caught;
+    }
+  });
+
+  app.put("/:id/access", async (c) => {
+    if (!deps.mcpOwnerAccessEdit) return c.notFound();
+    const err = await requireOwner(c);
+    if (err) return err;
+    let body: { scopes?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json(jsonError(400, "INVALID_BODY", "Body must be JSON"), 400);
+    }
+    try {
+      const connection = await editMcpConnectionAccess(
+        { connectionId: c.req.param("id"), scopes: body?.scopes },
+        {
+          store,
+          gateway: deps.gateway,
+          serverOwner: deps.serverOwner,
+          serverSigner: deps.serverSigner,
+          grantTtlSeconds: deps.mcpGrantTtlSeconds,
+        },
+      );
+      return c.json({ connection: toMcpConnectionView(connection) });
+    } catch (caught) {
+      const response = scopeRequestErrorResponse(c, caught);
+      if (response) return response;
       throw caught;
     }
   });
@@ -1151,11 +1297,12 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       serverOrigin: resolveOrigin(deps.serverOrigin),
       granteeAccount,
       dataApiDeps,
+      ownerListingDeps: deps.mcpOwnerListingDeps,
     });
     const response = await handleMcpStreamableHttpRequest(c.req.raw, {
       connection: record,
       readClient,
-      writeClient: buildWriteClient(deps, granteeAccount, dataApiDeps.storage),
+      writeClient: buildWriteClient(deps, granteeAccount, dataApiDeps),
       activityRecorder: deps.activityRecorder,
       requestScopeAccess: async (input) => {
         return requestMcpScopeAccess(
@@ -1164,7 +1311,13 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
         );
       },
       scopeRequestApprovalUrl: deps.scopeRequestApprovalUrl,
+      scopeRequestReviewHint: deps.scopeRequestReviewHint,
       serverOrigin: resolveOrigin(deps.serverOrigin),
+      ...loopbackOriginOption(c, deps),
+      exposeUnsharedScopes: deps.mcpExposeUnsharedScopes,
+      verifyGrantsLive: () => liveMcpGrants(record, deps.gateway),
+      scopeRequestGuidance: deps.mcpScopeRequestGuidance,
+      requestableScopes: deps.mcpRequestableScopes,
     });
     void store
       .update(record.id, { lastUsedAt: new Date().toISOString() })
@@ -1207,21 +1360,6 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       );
     }
 
-    // Revocation is checked on every session request, not only on data reads:
-    // the listing tools (list_granted_scopes, list_granted_sources,
-    // request_scope_access) answer from the session record and would keep
-    // describing a revoked grant's scopes until the token expired. A failed
-    // lookup is left to the per-read checks, which fail closed on their own.
-    const liveGrant = await deps.gateway
-      .getGrant(session.grantId)
-      .catch(() => undefined);
-    if (liveGrant === null || liveGrant?.revokedAt || liveGrant?.expired) {
-      return c.json(
-        jsonError(403, "GRANT_REVOKED", "Grant has been revoked or expired"),
-        403,
-      );
-    }
-
     const baseDeps = dataApiDepsOrError(c);
     if (baseDeps instanceof Response) return baseDeps;
 
@@ -1240,6 +1378,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
           serverSigner: deps.serverSigner,
           serverAddress: deps.serverAddress,
           paymentEnabled: true,
+          ownAppAccountUrl: deps.ownAppAccountUrl,
         },
         gateway: deps.gateway,
         gatewayConfig: deps.gatewayConfig,
@@ -1257,6 +1396,19 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       payment,
     });
     const { connection, account } = buildMcpSessionConnection(session);
+    // Revocation is checked on every session request, not only on data reads:
+    // the listing tools answer from the session record and would keep
+    // describing a revoked grant's scopes until the token expired. A failed
+    // lookup counts as not live, never as "continue".
+    const live = await liveGrants(() =>
+      liveMcpGrants(connection, deps.gateway),
+    );
+    if (narrowGrants(connection.grants, live).length === 0) {
+      return c.json(
+        jsonError(403, "GRANT_REVOKED", "Grant has been revoked or expired"),
+        403,
+      );
+    }
     const readClient = createMcpDataReadClient({
       serverOrigin: resolveOrigin(deps.serverOrigin),
       granteeAccount: account,
@@ -1268,7 +1420,12 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
     return handleMcpStreamableHttpRequest(c.req.raw, {
       connection,
       readClient,
+      writeClient:
+        baseDeps.accountStorageMode?.read() === "switched"
+          ? streamSyncMemoryWriteRefusal()
+          : undefined,
       activityRecorder: deps.activityRecorder,
+      verifyGrantsLive: () => liveMcpGrants(connection, deps.gateway),
     });
   }
 
@@ -1412,6 +1569,26 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
         400,
       );
     }
+  });
+
+  // Chat clients open links in a browser, which ignores a bare `vana://` URL.
+  // This http link on the loopback listener redirects to the host's approval
+  // URL for one connection id, so the browser hands it to the OS. Only what the
+  // host hook returns is ever a redirect target. Same answer whether or not
+  // the connection exists. Not served through the tunnel.
+  app.get("/scope-request/open", (c) => {
+    if (requestIngress(c, deps) !== McpIngress.Loopback) return c.notFound();
+    c.header("Cache-Control", "no-store");
+    c.header("Referrer-Policy", "no-referrer");
+    const id = c.req.query(MCP_SCOPE_REQUEST_OPEN_CONNECTION_PARAM) ?? "";
+    if (!isMcpConnectionId(id)) return c.text("Invalid connection", 400);
+    const target = resolveMcpScopeRequestApprovalUrl(
+      deps.scopeRequestApprovalUrl,
+      id,
+      { serverOrigin: resolveOrigin(deps.serverOrigin) },
+    );
+    if (!target) return c.notFound();
+    return c.redirect(target, 302);
   });
 
   app.all("/", async (c) =>

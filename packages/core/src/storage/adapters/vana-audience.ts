@@ -1,6 +1,12 @@
 import { buildWeb3SignedHeader } from "@opendatalabs/vana-sdk/browser";
 import type { ServerAccount } from "../../keys/server-account.js";
 import { StoredBlobConflictError, type StorageAdapter } from "./interface.js";
+import { parseRetryAfterHeader } from "../../stream-sync/storage-retry.js";
+import { settleFailure } from "./throttle.js";
+import {
+  createRateLimitPolicyFeed,
+  type RateLimitPolicyFeed,
+} from "./rate-limit-policy.js";
 
 interface VanaBlobNamespace {
   endpoint: string;
@@ -45,17 +51,19 @@ export function vanaBlobRequests(input: VanaBlobNamespace) {
 /** SDK 3.x couples routing and authentication origins. This adapter supplies the
  * explicit audience needed by preview workers without rewriting a signed claim. */
 export function createAudienceVanaAdapter(
-  input: VanaBlobNamespace,
+  input: VanaBlobNamespace & { feed?: RateLimitPolicyFeed },
 ): StorageAdapter {
   const { urlForKey, validate, authorization: sign } = vanaBlobRequests(input);
+  const feed = input.feed ?? createRateLimitPolicyFeed();
   async function request(
     url: string,
     method: "PUT" | "GET" | "DELETE",
     body?: Uint8Array,
+    signal?: AbortSignal,
   ) {
     const parsed = validate(url);
     const authorization = await sign(method, url, body);
-    const response = await fetch(parsed.href, {
+    const response = await feed.fetch(parsed.href, {
       method,
       headers: {
         authorization,
@@ -63,26 +71,31 @@ export function createAudienceVanaAdapter(
       },
       body: body ? Uint8Array.from(body) : undefined,
       redirect: "error",
+      ...(signal ? { signal } : {}),
     });
     if (!response.ok && response.status !== 404) {
-      await response.body?.cancel();
+      const retryAfterMs = await settleFailure(response);
       if (method === "PUT" && response.status === 409)
         throw new StoredBlobConflictError(new URL(url).pathname);
-      throw new Error(`Storage ${method} failed (${response.status})`);
+      throw Object.assign(
+        new Error(`Storage ${method} failed (${response.status})`),
+        retryAfterMs === undefined ? {} : { retryAfterMs },
+      );
     }
     return response;
   }
   return {
     urlForKey,
-    async upload(key, bytes) {
+    onRateLimitPolicy: feed.subscribe,
+    async upload(key, bytes, signal) {
       const url = urlForKey(key);
-      const response = await request(url, "PUT", bytes);
+      const response = await request(url, "PUT", bytes, signal);
       await response.body?.cancel();
       if (!response.ok) throw new Error("Storage upload not found");
       return url;
     },
-    async download(url) {
-      const response = await request(url, "GET");
+    async download(url, signal) {
+      const response = await request(url, "GET", undefined, signal);
       if (!response.ok) {
         await response.body?.cancel();
         throw new Error("Storage blob not found");
@@ -94,13 +107,25 @@ export function createAudienceVanaAdapter(
       await response.body?.cancel();
       return response.ok;
     },
-    async exists(url) {
+    async exists(url, signal) {
       validate(url);
-      const response = await fetch(url, { method: "HEAD", redirect: "error" });
+      const response = await feed.fetch(url, {
+        method: "HEAD",
+        redirect: "error",
+        ...(signal ? { signal } : {}),
+      });
       await response.body?.cancel();
       if (response.status === 404) return false;
       if (!response.ok)
-        throw new Error(`Storage probe failed (${response.status})`);
+        throw Object.assign(
+          new Error(`Storage probe failed (${response.status})`),
+          {
+            retryAfterMs: parseRetryAfterHeader(
+              response.headers.get("retry-after"),
+              Date.now(),
+            ),
+          },
+        );
       return true;
     },
   };

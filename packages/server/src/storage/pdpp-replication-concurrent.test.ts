@@ -450,13 +450,6 @@ describe("replication on: derived state follows other connections", () => {
       primaryKey: ["id"],
     });
     agree("a stream replaced");
-    plain.resetInstanceBinding({
-      instance: "conn_a",
-      expectedMethod: "collector",
-      expectedGeneration: 1,
-      nextMethod: "collector",
-    });
-    agree("the connection reset");
     plain.deleteConnection("conn_a");
     agree("the connection deleted");
   });

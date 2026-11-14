@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { join } from "node:path";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import {
   DEFAULTS,
   ServerConfigSchema,
@@ -15,13 +14,107 @@ import {
 import { loadConfig, saveConfig } from "../../../server/src/config/loader.js";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
-  const dir = await mkdtemp(join(tmpdir(), "server-config-test-"));
+  const dir = await mkdtemp(join(process.cwd(), ".server-config-test-"));
   try {
     await fn(dir);
   } finally {
     await rm(dir, { recursive: true });
   }
 }
+
+describe("ServerConfigSchema — streamSync.retireLegacy", () => {
+  it("retire-legacy-default-off", () => {
+    expect(DEFAULTS.streamSync.retireLegacy).toBe(false);
+    expect(ServerConfigSchema.parse({ streamSync: {} }).streamSync).toEqual({
+      write: false,
+      read: false,
+      retireLegacy: false,
+      changeProbeMs: 5_000,
+    });
+  });
+
+  it("retire-legacy-explicit-true-only", () => {
+    expect(
+      ServerConfigSchema.parse({ streamSync: { retireLegacy: true } })
+        .streamSync.retireLegacy,
+    ).toBe(true);
+    expect(
+      ServerConfigSchema.parse({ streamSync: { retireLegacy: false } })
+        .streamSync.retireLegacy,
+    ).toBe(false);
+
+    for (const retireLegacy of ["true", "false", "", 1, 0, null, {}, []]) {
+      expect(
+        ServerConfigSchema.safeParse({ streamSync: { retireLegacy } }).success,
+      ).toBe(false);
+    }
+  });
+
+  it("retire-legacy-absent-host-option-off", () => {
+    for (const hostOptions of [
+      {},
+      { streamSync: undefined },
+      { streamSync: { retireLegacy: undefined } },
+      {
+        streamSync: { write: true, read: true, refuseLegacyWrites: true },
+      },
+    ]) {
+      expect(
+        ServerConfigSchema.parse(hostOptions).streamSync.retireLegacy,
+      ).toBe(false);
+    }
+  });
+});
+
+describe("ServerConfigSchema — streamSync.refuseLegacyWrites (removed)", () => {
+  it("a saved config that still names it parses, and the key is dropped", () => {
+    const parsed = ServerConfigSchema.parse({
+      streamSync: { write: true, refuseLegacyWrites: true },
+    });
+    expect(parsed.streamSync).toEqual({
+      write: true,
+      read: false,
+      retireLegacy: false,
+      changeProbeMs: 5_000,
+    });
+    expect("refuseLegacyWrites" in DEFAULTS.streamSync).toBe(false);
+  });
+});
+
+describe("ServerConfigSchema — streamSync.changeProbeMs", () => {
+  it("is the registry change probe period: 5 s by default, 0 turns it off", () => {
+    expect(DEFAULTS.streamSync.changeProbeMs).toBe(5_000);
+    expect(
+      ServerConfigSchema.parse({ streamSync: { changeProbeMs: 0 } }).streamSync
+        .changeProbeMs,
+    ).toBe(0);
+    expect(
+      ServerConfigSchema.parse({ streamSync: { changeProbeMs: 15_000 } })
+        .streamSync.changeProbeMs,
+    ).toBe(15_000);
+  });
+
+  it("refuses a negative or fractional period", () => {
+    for (const changeProbeMs of [-1, 2.5, "5000"]) {
+      expect(
+        ServerConfigSchema.safeParse({ streamSync: { changeProbeMs } }).success,
+      ).toBe(false);
+    }
+  });
+});
+
+describe("ServerConfigSchema — olderVersionReads", () => {
+  it("olderVersionReads is a boolean that defaults to true and accepts false", () => {
+    expect(DEFAULTS.olderVersionReads).toBe(true);
+    expect(ServerConfigSchema.parse({}).olderVersionReads).toBe(true);
+    expect(
+      ServerConfigSchema.parse({ olderVersionReads: false }).olderVersionReads,
+    ).toBe(false);
+    expect(
+      ServerConfigSchema.safeParse({ olderVersionReads: "false" }).success,
+    ).toBe(false);
+  });
+});
 
 describe("ServerConfigSchema — sync fields", () => {
   it("default config has sync.enabled: false and sync.lastProcessedTimestamp: null", () => {

@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 /**
  * Three §8 wire-contract gaps found by an independent normative review.
  *
@@ -107,6 +108,7 @@ function app(kind: "client" | "owner") {
   a.route(
     "/v1",
     pdppRecordsRoutes({
+      accountStorageMode: explicitLegacyStorageMode("unswitched"),
       store,
       auth: auth(kind),
       declarations,

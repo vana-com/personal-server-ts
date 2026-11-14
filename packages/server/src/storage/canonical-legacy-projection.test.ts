@@ -1513,15 +1513,8 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       }).toEqual(before);
     });
 
-    it("erases receipts on reset and delete, and ignores a receipt from another generation or method", async () => {
+    it("ignores foreign receipts and erases receipts on connection delete", async () => {
       const a = connect("conn_a", "oura");
-      replace("conn_a", "activity", [], COLLECTED);
-      store.resetInstanceBinding({
-        instance: "conn_a",
-        expectedMethod: METHOD,
-        expectedGeneration: 1,
-        nextMethod: METHOD,
-      });
       expect(receipts()).toEqual([]);
       expect(await readOura(a)).toMatchObject({ reason: "no_synced_data" });
 
@@ -1529,14 +1522,14 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       const insert = db.prepare(
         "INSERT INTO pdpp_stream_completion (instance, stream, method, generation, source_collected_at, write_seq, live_count) VALUES (?, 'activity', ?, ?, ?, 0, 0)",
       );
-      insert.run("conn_a", METHOD, 1, COLLECTED);
+      insert.run("conn_a", METHOD, 2, COLLECTED);
       expect(await readOura(a)).toMatchObject({ reason: "no_synced_data" });
       db.prepare("DELETE FROM pdpp_stream_completion").run();
-      insert.run("conn_a", "other_method", 2, COLLECTED);
+      insert.run("conn_a", "other_method", 1, COLLECTED);
       expect(await readOura(a)).toMatchObject({ reason: "no_synced_data" });
       db.prepare("DELETE FROM pdpp_stream_completion").run();
 
-      replace("conn_a", "activity", [], COLLECTED, { generation: 2 });
+      replace("conn_a", "activity", [], COLLECTED, { generation: 1 });
       expect((await readOura(a)).ok).toBe(true);
       store.deleteConnection("conn_a");
       expect(receipts()).toEqual([]);

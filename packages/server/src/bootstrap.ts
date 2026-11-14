@@ -1,3 +1,20 @@
+import {
+  localDatabaseName,
+  openLocalDb,
+  connectionQueue,
+  type LocalSync,
+  type LocalSyncDeps,
+  type SqlDriver,
+} from "@opendatalabs/personal-server-ts-core/localdb";
+import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
+import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
+import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import { createServerLocalSync } from "./localdb/sync.js";
+import { createLegacyStoreRunner } from "./localdb/legacy-store-import.js";
+import { createLocalSeed } from "./localdb/seed.js";
+import { createSeedStaging } from "./stream-sync/seed-staging.js";
+import { createFsStreamSyncFiles } from "./stream-sync/fs-files.js";
+import { openBetterSqlite3 } from "./localdb/better-sqlite3-driver.js";
 import type { DurableAdditionsOptions } from "@opendatalabs/personal-server-ts-core/additions";
 import {
   createDurableAdditions,
@@ -11,6 +28,7 @@ import {
   open,
   readFile,
   readdir,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -33,7 +51,20 @@ function takeoverLimit(name: string, fallback: number): number {
   return value;
 }
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
-import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
+import { type PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  createImportWaker,
+  createModeAuthority,
+  type ImportWaker,
+  type ModeAuthority,
+  type ModeRecordStore,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import {
+  createLegacyWriteSeal,
+  LegacyWriteRefusedError,
+  type LegacyWriteSeal,
+} from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
+import { createFileModeRecordStore } from "./account-mode/file-record-store.js";
 import { DEFAULT_ROOT_PATH, resolveRootPath } from "./config/index.js";
 import { createLogger, type Logger } from "./logger/index.js";
 import { initializeDatabase } from "./storage/index-schema.js";
@@ -53,11 +84,11 @@ import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { createAccessLogWriter } from "./logging/access-log.js";
 import { createAccessLogReader } from "./logging/access-reader.js";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
+import { buildWeb3SignedHeader } from "@opendatalabs/vana-sdk/node";
 import {
-  buildWeb3SignedHeader,
-  deriveMasterKey,
-  recoverServerOwner,
-} from "@opendatalabs/vana-sdk/node";
+  legacyMasterKey,
+  recoverOwnerAddress,
+} from "@opendatalabs/personal-server-ts-core/keys";
 import { loadOrCreateServerAccount } from "./keys/server-account.js";
 import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
 import {
@@ -74,8 +105,10 @@ import {
   createGatewayDataPointFeed,
   createGatewayDeleteDataPort,
   createInventoryTombstoneFinality,
+  createRegistryChangeProbe,
   createScopeDeletionTracker,
   createSyncManager,
+  withCancellableRegistration,
   type PdppImporter,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
@@ -85,6 +118,7 @@ import {
   resolveVanaStorageEndpoint,
 } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js";
+import { createFileUploadAttemptStore } from "./upload-attempts.js";
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
@@ -118,8 +152,20 @@ import {
   createNodeDataStorage,
   recoverStagedDataFiles,
   reindexLegacyDataFiles,
+  recoverImportOperations,
 } from "./storage/node-data-storage.js";
 import { createSqliteQuestionStore } from "./storage/question-store.js";
+import {
+  type RunIntake,
+  type StreamSyncBlobs,
+  type StreamSyncRegistry,
+  createGatewayStreamSyncRegistry,
+  manifestArtifactResolver,
+  createStorageStreamSyncBlobs,
+  createStreamSyncKeyPorts,
+  streamSyncNetwork,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { eraseConnectorLeftovers } from "./stream-sync/erase-connector-leftovers.js";
 import {
   computeQuestion,
   createOpenAiCompatibleInferenceProvider,
@@ -144,6 +190,10 @@ export interface ServerContext {
   serverAccount?: ServerAccount;
   serverSigner?: ServerSigner;
   syncManager: SyncManager | null;
+  /** Retired writer capability; database callers use getLocalSync. */
+  streamSyncWriter: null;
+  /** Owner/network database composition; absent for enclaves and unconfigured owners. */
+  getLocalSync?: () => Promise<LocalSync>;
   tunnelManager?: TunnelManager;
   tunnelUrl?: string;
   isServerRegistered: () => boolean;
@@ -162,9 +212,27 @@ export interface ServerContext {
   replication?: NodeReplication;
   /** What this boot did with `rotateReplicaWriterIdentity`. */
   replicaWriterRotation: ReplicaWriterRotation;
+  /**
+   * The account-mode module: an in-process host gives it the Account's answer
+   * with `submitEvidence`. HTTP hosts use `POST /v1/account-mode/evidence`.
+   */
+  accountModeAuthority: ModeAuthority;
+  /**
+   * The seal over `accountModeAuthority` that every legacy file and row of
+   * this server is made durable through. A host that writes legacy data
+   * itself (outside the routes) must do it inside `legacyWriteSeal.commit`.
+   */
+  legacyWriteSeal: LegacyWriteSeal;
+  /** The owner this server acts for; the owner name in account-mode evidence. */
+  serverOwner?: string;
 }
 
 export interface CreateServerOptions {
+  /**
+   * Where the account-mode module keeps its per-owner records. Default: files
+   * under the storage root, outside the data database. Tests inject a store.
+   */
+  accountModeStore?: ModeRecordStore;
   /** Owner-authorized HTTP signing capability supplied by the trusted host. */
   ownerRequestSigner?: RequestSigner;
   /** Inventory-route-only signer; never used by the owner-only scope feed. */
@@ -217,6 +285,28 @@ export interface CreateServerOptions {
    * builds the Vana Web link (`/mcp/requests/<id>?ps_origin=<origin>`).
    */
   mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /** Host sentence naming where to review a scope request (at most 200 characters). */
+  mcpScopeRequestReviewHint?: string;
+  /**
+   * Default off. When on, `list_granted_scopes` also returns `notShared`:
+   * the owner's scopes that have local data and no grant on the connection.
+   * This tells an already-approved MCP client which sources the owner has,
+   * which is why it is opt-in.
+   */
+  mcpExposeUnsharedScopes?: boolean;
+  /**
+   * Default off. When on, every read-side `scope_not_granted` carries a
+   * `nextAction` telling the agent to call `request_scope_access`.
+   */
+  mcpScopeRequestGuidance?: boolean;
+  /** Allow the owner to narrow connection scopes; default off. */
+  mcpOwnerAccessEdit?: boolean;
+  /**
+   * Static scope ids Vana supports, listed in the `request_scope_access`
+   * description when `mcpScopeRequestGuidance` is on. Not a list of what the
+   * owner has.
+   */
+  mcpRequestableScopes?: string[];
   /**
    * Lifetime in seconds of grants the server signs itself for MCP
    * connections: the OAuth approve path and a scope-request approve with no
@@ -226,6 +316,31 @@ export interface CreateServerOptions {
   mcpGrantTtlSeconds?: number;
   profile?: "standard" | "enclave";
   serverAccount?: ServerAccount;
+  /**
+   * Stream names a connection delete fences for a connector, beside the
+   * streams of the manifests this server retained. A host that no longer
+   * verifies a connector (uninstalled, manifest not retained) names its
+   * streams here; without it such a connector's delete refuses
+   * (CONNECTOR_NOT_VERIFIED). Read at delete time.
+   */
+  declaredStreams?: (connector: string) => readonly string[];
+  /**
+   * The stream-sync registry. Default: the gateway client at `gateway.url`. A
+   * test with no gateway passes its own (for example
+   * `createMemoryStreamSyncRegistry()`).
+   */
+  streamSyncRegistry?: StreamSyncRegistry;
+  /**
+   * The stream-sync blob store. Default: the storage service at `gateway.url`.
+   * A test with no storage service passes its own (for example
+   * `createMemoryStreamSyncBlobs()`).
+   */
+  streamSyncBlobs?: StreamSyncBlobs;
+  /**
+   * Part size, in bytes, for published stream heads. Default: 4 MiB. A test
+   * lowers it to get a head of many parts from a small fixture.
+   */
+  streamSyncPartTargetBytes?: number;
   /**
    * Rotate the replica writer identity before this boot writes anything
    * (host contract §3.2). A host sets it when this database may be a copy:
@@ -263,6 +378,13 @@ export async function createServer(
   config: ServerConfig,
   options?: CreateServerOptions,
 ): Promise<ServerContext> {
+  return bootstrapServer(config, options);
+}
+
+async function bootstrapServer(
+  config: ServerConfig,
+  options: CreateServerOptions | undefined,
+): Promise<ServerContext> {
   const logger = createLogger(config.logging);
   const startedAt = new Date();
   const isEnclave = options?.profile === "enclave";
@@ -275,7 +397,7 @@ export async function createServer(
   const storageRoot = resolveRootPath(
     options?.rootPath ?? options?.serverDir ?? DEFAULT_ROOT_PATH,
   );
-  const dataDir = options?.dataDir ?? join(storageRoot, "data");
+  let dataDir = options?.dataDir ?? join(storageRoot, "data");
   const indexPath = join(storageRoot, "index.db");
   const configPath = join(storageRoot, "config.json");
   const syncCursorPath = join(storageRoot, "sync-cursor.json");
@@ -283,6 +405,7 @@ export async function createServer(
     storageRoot,
     "pending-blob-deletions.json",
   );
+  const uploadAttemptsPath = join(storageRoot, "upload-attempts.json");
   const tokensPath = join(storageRoot, "tokens.json");
   const revisionJournalDir = join(storageRoot, "cas-revisions");
   const metadataSentinelPath = join(storageRoot, "cas-metadata-initialized");
@@ -325,12 +448,62 @@ export async function createServer(
   }
   await mkdir(storageRoot, { recursive: true });
   await mkdir(dataDir, { recursive: true });
+  dataDir = await realpath(dataDir);
   for (const parent of [...newDirectoryParents].sort(
     (a, b) => a.length - b.length,
   )) {
     await fsyncDirectory(parent);
   }
 
+  const masterKeySignature =
+    options?.ownerSignature ??
+    (process.env.VANA_MASTER_KEY_SIGNATURE as `0x${string}` | undefined);
+  const serverOwner: `0x${string}` | undefined = masterKeySignature
+    ? await recoverOwnerAddress(masterKeySignature)
+    : undefined;
+  // One mode per runtime, from one place: the shared account-mode module. The
+  // write gate, the read selector, the PDPP importer and every MCP engine
+  // consume the bound view of this one authority. Hosts feed it the Account's
+  // answers through `POST /v1/account-mode/evidence` (or
+  // `context.accountModeAuthority`). Boot reads the saved records from disk and
+  // never waits for the Account.
+  let importWaker: ImportWaker | undefined;
+  const rawModeAuthority = createModeAuthority({
+    store:
+      options?.accountModeStore ??
+      createFileModeRecordStore(join(storageRoot, "account-mode"), {
+        onCorrupt: (file) =>
+          logger.warn({ file }, "account mode record could not be read"),
+      }),
+    // An answer that leaves the owner On wakes the import.
+    onOn: () => void importWaker?.wake(),
+    onWarning: (message, detail) => logger.warn({ detail }, message),
+  });
+  await rawModeAuthority.ready;
+  // Boot recovery of legacy work needs a known mode, and at boot the mode is
+  // usually still unknown. The module is wrapped so that the first answer that
+  // makes it known re-runs that recovery (see `recoverLegacyFiles`). Every
+  // consumer still sees one authority.
+  let modeHeard: () => Promise<void> = async () => {};
+  const accountModeAuthority: ModeAuthority = {
+    ...rawModeAuthority,
+    submitEvidence: async (input) => {
+      const decision = await rawModeAuthority.submitEvidence(input);
+      await modeHeard().catch((err: unknown) => {
+        logger.warn(
+          { err },
+          "legacy file recovery after the mode was heard failed",
+        );
+      });
+      return decision;
+    },
+  };
+  // The one seal every legacy file and row is made durable through. It asks
+  // the authority above under the module's lock; nothing else decides.
+  const legacyWriteSeal = createLegacyWriteSeal({
+    authority: accountModeAuthority,
+    owner: serverOwner,
+  });
   const reindexInProgressPath = join(storageRoot, "reindex-in-progress");
   const hasReindexInProgress = async (): Promise<boolean> => {
     return pathExists(reindexInProgressPath);
@@ -421,46 +594,87 @@ export async function createServer(
     "CREATE TABLE IF NOT EXISTS cas_open_marker_protocol (id INTEGER PRIMARY KEY)",
   );
   const hierarchyOptions: HierarchyManagerOptions = { dataDir };
+
   await cleanupExpiredScopeImports(
-    { hierarchyOptions, indexManager },
+    { hierarchyOptions, indexManager, legacyWriteSeal },
     Date.now(),
     true,
   );
-  await recoverStagedDataFiles({ indexManager, hierarchyOptions });
   const resumeReindex = await hasReindexInProgress();
-  let needsRecoveryScan = false;
-  for (const scope of indexManager.listIndexedScopes()) {
-    const closed = await hasScopeClosedMarker(scope);
-    if (resumeReindex || closed) {
-      indexManager.closeScopeForWrites(scope);
-    }
-    if (!closed && !indexManager.hasTrustedRevisionJournal(scope)) {
-      needsRecoveryScan = true;
-      indexManager.closeScopeForWrites(scope);
-    }
-  }
-  const indexedCount = db
-    .prepare("SELECT COUNT(*) AS count FROM data_files")
-    .get() as { count: number };
-  if (indexedCount.count === 0 || resumeReindex || needsRecoveryScan) {
-    await markReindexInProgress();
-    await reindexLegacyDataFiles({
+  // Finish what the last run acknowledged and did not publish, and rebuild a
+  // lost index. Every legacy file and row it makes durable goes through the
+  // seal: an unswitched account gets them back, a switched one has them
+  // dropped, and while the mode is unknown they are left in place, with the
+  // reindex marker kept, for the pass that runs once the mode is heard.
+  const recoverLegacyFiles = async (): Promise<void> => {
+    await recoverStagedDataFiles({
       indexManager,
       hierarchyOptions,
-      closeRecoveredScopeForWrites: async (scope) =>
-        resumeReindex ||
-        (await hasScopeClosedMarker(scope)) ||
-        !indexManager.hasTrustedRevisionJournal(scope),
+      legacyWriteSeal,
     });
-    await clearReindexInProgress();
-  }
+    let needsRecoveryScan = false;
+    for (const scope of indexManager.listIndexedScopes()) {
+      const closed = await hasScopeClosedMarker(scope);
+      if (resumeReindex || closed) {
+        indexManager.closeScopeForWrites(scope);
+      }
+      if (!closed && !indexManager.hasTrustedRevisionJournal(scope)) {
+        needsRecoveryScan = true;
+        indexManager.closeScopeForWrites(scope);
+      }
+    }
+    const indexedCount = db
+      .prepare("SELECT COUNT(*) AS count FROM data_files")
+      .get() as { count: number };
+    if (indexedCount.count === 0 || resumeReindex || needsRecoveryScan) {
+      // The marker is a legacy file like any other: only an unswitched account
+      // gets a new one. An existing marker is left as it is, and a refused
+      // account (switched, or mode unknown) has nothing marked on its behalf.
+      if (!resumeReindex) {
+        await legacyWriteSeal
+          .commit(() => markReindexInProgress())
+          .catch((err: unknown) => {
+            if (!(err instanceof LegacyWriteRefusedError)) throw err;
+          });
+      }
+      await reindexLegacyDataFiles({
+        indexManager,
+        hierarchyOptions,
+        legacyWriteSeal,
+        closeRecoveredScopeForWrites: async (scope) =>
+          resumeReindex ||
+          (await hasScopeClosedMarker(scope)) ||
+          !indexManager.hasTrustedRevisionJournal(scope),
+      });
+      // Files left unindexed because the mode was unknown are still owed.
+      if (legacyWriteSeal.verdict() !== "unknown") {
+        await legacyWriteSeal.remove(() => clearReindexInProgress());
+      }
+    }
+    // Operations acknowledged before the last stop and not yet published
+    // finish (or, on a switched account, are dropped) before they are read.
+    await recoverImportOperations({
+      indexManager,
+      hierarchyOptions,
+      legacyWriteSeal,
+    });
+  };
+  let rerunWhenModeHeard = true;
+  let recoveryPass: Promise<void> = recoverLegacyFiles();
+  modeHeard = async () => {
+    if (!rerunWhenModeHeard || legacyWriteSeal.verdict() === "unknown") return;
+    rerunWhenModeHeard = false;
+    await recoveryPass.catch(() => undefined);
+    recoveryPass = recoverLegacyFiles();
+    await recoveryPass;
+  };
+  await recoveryPass;
+  if (legacyWriteSeal.verdict() !== "unknown") rerunWhenModeHeard = false;
   // Sync moves stored bytes and must see them unchanged (the upload hashes
   // them). Every reader gets the served port, which projects legacy scope
   // bodies from stored PDPP records.
-  const rawDataStorage = createNodeDataStorage({
-    indexManager,
-    hierarchyOptions,
-  });
+  const storageDeps = { indexManager, hierarchyOptions, legacyWriteSeal };
+  const rawDataStorage = createNodeDataStorage(storageDeps);
   const dataStorage = withLegacyProjection(rawDataStorage, {
     onIssue: (issue) =>
       issue.kind === "projection_failed"
@@ -480,10 +694,6 @@ export async function createServer(
     logger.info("X402 payment enforcement enabled on data reads");
   }
 
-  // Derive server owner from VANA_MASTER_KEY_SIGNATURE env var
-  const masterKeySignature =
-    options?.ownerSignature ??
-    (process.env.VANA_MASTER_KEY_SIGNATURE as `0x${string}` | undefined);
   const ownerPrivateKey = process.env.VANA_OWNER_PRIVATE_KEY as
     `0x${string}` | undefined;
   const ownerTunnelSigner = ownerPrivateKey
@@ -493,16 +703,14 @@ export async function createServer(
           : (`0x${ownerPrivateKey}` as `0x${string}`),
       )
     : null;
-  let serverOwner: `0x${string}` | undefined;
 
   let serverAccount: ServerAccount | undefined;
   let serverSigner: ServerSigner | undefined;
   let identity: IdentityInfo | undefined;
 
-  if (masterKeySignature) {
-    const recoveredServerOwner = await recoverServerOwner(masterKeySignature);
-    serverOwner = recoveredServerOwner;
-    deriveMasterKey(masterKeySignature); // validate signature format
+  if (masterKeySignature && serverOwner) {
+    const recoveredServerOwner = serverOwner;
+    legacyMasterKey(masterKeySignature); // validate signature format
     logger.info({ owner: serverOwner }, "Server owner derived from master key");
     if (
       ownerTunnelSigner &&
@@ -617,6 +825,140 @@ export async function createServer(
 
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
+  const streamSyncWriter = null;
+  let localSyncDeps: LocalSyncDeps | undefined;
+  let backgroundClosed = false;
+  let localSync: LocalSync | undefined;
+  let localDb: SqlDriver | undefined;
+  let openingLocalSync: Promise<LocalSync> | undefined;
+  const accountStorageMode = accountStorageModeFor(
+    accountStorageModeOf(accountModeAuthority),
+    serverOwner,
+  );
+  function requireStreamMode() {
+    if (backgroundClosed)
+      throw new ProtocolError(
+        503,
+        "STREAM_READ_UNAVAILABLE",
+        "Stream sync is unavailable",
+      );
+    const mode = accountStorageMode.read();
+    if (mode === "unknown")
+      throw new ProtocolError(
+        503,
+        "ACCOUNT_MODE_UNKNOWN",
+        "Waiting for the account storage mode",
+      );
+    if (mode !== "switched")
+      throw new ProtocolError(
+        409,
+        "STREAM_SYNC_NOT_ENABLED",
+        "Stream sync is not enabled for this account",
+      );
+    if (
+      isEnclave ||
+      !masterKeySignature ||
+      !serverOwner ||
+      !serverAccount ||
+      !serverSigner
+    )
+      throw new ProtocolError(
+        503,
+        "STREAM_READ_UNAVAILABLE",
+        "Stream sync is unavailable on this server",
+      );
+  }
+  // One registry client for the cycle's reads and the change probe.
+  let streamSyncRegistryClient: StreamSyncRegistry | undefined;
+  function streamSyncRegistry(): StreamSyncRegistry {
+    return (streamSyncRegistryClient ??=
+      options?.streamSyncRegistry ??
+      createGatewayStreamSyncRegistry({
+        gatewayUrl: config.gateway.url,
+        ownerAddress: serverOwner!,
+      }));
+  }
+  async function getLocalSync(): Promise<LocalSync> {
+    requireStreamMode();
+    if (localSync) return localSync;
+    openingLocalSync ??= (async () => {
+      const directory = join(storageRoot, "localdb");
+      await mkdir(directory, { recursive: true });
+      const network = streamSyncNetwork(config.gateway);
+      const driver = openBetterSqlite3(
+        join(
+          directory,
+          encodeURIComponent(localDatabaseName(serverOwner!, network)) +
+            ".sqlite",
+        ),
+      );
+      try {
+        await openLocalDb(driver, {
+          owner: serverOwner!,
+          network,
+          deviceId: serverAccount!.address,
+        });
+        const storage = createVanaSyncStorageAdapter({
+          config,
+          serverOwner: serverOwner!,
+          serverAccount: serverAccount!,
+          reads: "signed",
+        });
+        const deps: LocalSyncDeps = {
+          db: driver,
+          ownerAddress: serverOwner!,
+          queue: connectionQueue(),
+          registry: streamSyncRegistry(),
+          blobs:
+            options?.streamSyncBlobs ?? createStorageStreamSyncBlobs(storage),
+          keys: createStreamSyncKeyPorts(masterKeySignature!),
+          signer: serverSigner!,
+          logger,
+          now: Date.now,
+          newOp: randomUUID,
+          recordsCommitted: () => syncManager?.notifyNewData(),
+          ...(options?.streamSyncPartTargetBytes === undefined
+            ? {}
+            : { partTargetBytes: options.streamSyncPartTargetBytes }),
+        };
+        const facade = createServerLocalSync(deps, {
+          resolveArtifact: (digest) =>
+            manifestArtifactResolver(pdppAuth?.retainedManifests ?? [])(digest),
+          declaredStreams: options?.declaredStreams ?? (() => []),
+          retainedManifests: () => pdppAuth?.retainedManifests ?? [],
+          eraseLegacy: (connector) =>
+            eraseConnectorLeftovers(connector, {
+              storage: rawDataStorage,
+              pdpp: pdppConnections,
+            }),
+          olderVersionReads: () => config.olderVersionReads,
+        });
+        localSyncDeps = deps;
+        localDb = driver;
+        localSync = facade;
+        return facade;
+      } catch (error) {
+        // A worker whose open failed answers every op, close included, with
+        // that open error. The cleanup must not replace the error we report.
+        await driver.close().catch(() => undefined);
+        if ((error as { code?: string }).code === "SQLITE_DATABASE_HARD_LINKED")
+          throw Object.assign(
+            new Error(
+              "The database file has a second hard link, so another process could open it. Stop every app that uses it and replace the extra link with a separate copy.",
+            ),
+            { code: "SQLITE_DATABASE_HARD_LINKED", cause: error },
+          );
+        throw error;
+      }
+    })().finally(() => {
+      openingLocalSync = undefined;
+    });
+    const result = await openingLocalSync;
+    requireStreamMode();
+    return result;
+  }
+  const localSyncSource =
+    !isEnclave && serverOwner && masterKeySignature ? getLocalSync : undefined;
   /**
    * Late-bound PDPP importer.
    *
@@ -629,10 +971,15 @@ export async function createServer(
    * delegate reports every envelope as skipped — sync behaves exactly as it
    * did before this existed.
    */
+  // The account-mode authority and the legacy-write seal were built before
+  // storage (see `accountModeAuthority` above): the same instances serve the
+  // write gate, the read selector, the PDPP importer and every MCP engine.
   let pdppImporterImpl: PdppImporter | null = null;
   const pdppImporter: PdppImporter = {
-    importEnvelope: (envelope) =>
-      pdppImporterImpl?.importEnvelope(envelope) ?? { status: "skipped" },
+    importEnvelope: async (envelope) =>
+      (await pdppImporterImpl?.importEnvelope(envelope)) ?? {
+        status: "skipped",
+      },
     // Before PDPP mounts, nothing is settled: an entry indexed during that
     // window must still be retried once the real importer attaches, which is
     // the "enable PDPP after an earlier sync" case.
@@ -771,7 +1118,7 @@ export async function createServer(
           serverAccount,
           reads: isEnclave ? "public" : "signed",
         }),
-      masterKey: deriveMasterKey(masterKeySignature),
+      masterKey: legacyMasterKey(masterKeySignature),
       signer: options?.additionsWriter?.signer ?? serverSigner,
       gateway: options?.additionsWriter?.gateway ?? gatewayClient,
     });
@@ -784,7 +1131,7 @@ export async function createServer(
     serverAccount &&
     serverSigner
   ) {
-    const masterKey = deriveMasterKey(masterKeySignature);
+    const masterKey = legacyMasterKey(masterKeySignature);
 
     const storageAdapter = createVanaSyncStorageAdapter({
       config,
@@ -801,7 +1148,11 @@ export async function createServer(
       additions,
       storage: rawDataStorage,
       storageAdapter,
-      gateway: gatewayClient,
+      // An injected client is a test double or a host's own; only the default
+      // SDK client needs wrapping to take the attempt signal.
+      gateway: options?.gatewayClient
+        ? gatewayClient
+        : withCancellableRegistration(gatewayClient, config.gateway.url),
       signer: serverSigner,
       masterKey,
       serverOwner,
@@ -809,26 +1160,6 @@ export async function createServer(
       lineageGateway,
       dataPointFeed,
       scopeDeletions,
-    };
-
-    const downloadDeps = {
-      storage: rawDataStorage,
-      storageAdapter,
-      gateway: gatewayClient,
-      cursor,
-      masterKey,
-      serverOwner,
-      logger,
-      dataPointFeed,
-      scopeDeletions,
-      onDataPointIndexed: (event: {
-        scope: string;
-        lineageSources?: string[];
-      }) =>
-        derivativeScheduler.markSourceChanged(event.scope, {
-          lineageSources: event.lineageSources,
-        }),
-      pdppImporter,
     };
 
     // Durable deletion: gateway tombstone signed with the same server
@@ -879,10 +1210,47 @@ export async function createServer(
       );
     }
 
+    const downloadDeps = {
+      ...(localSyncSource && {
+        localSync: { apply: async () => (await localSyncSource()).apply() },
+      }),
+      storage: rawDataStorage,
+      storageAdapter,
+      gateway: gatewayClient,
+      cursor,
+      masterKey,
+      serverOwner,
+      logger,
+      dataPointFeed,
+      scopeDeletions,
+      onDataPointIndexed: (event: {
+        scope: string;
+        lineageSources?: string[];
+      }) =>
+        derivativeScheduler.markSourceChanged(event.scope, {
+          lineageSources: event.lineageSources,
+        }),
+      pdppImporter,
+    };
+
+    // The Desktop PS runs in the tray with no window of its own: the timed
+    // probe is what reaches a change made while the app is in the background.
+    const changeProbe =
+      localSyncSource &&
+      createRegistryChangeProbe(streamSyncRegistry(), {
+        intervalMs: config.streamSync.changeProbeMs,
+      });
+
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
+      accountStorageMode,
+      ...(changeProbe && { changeProbe }),
+      ...(localSyncSource && {
+        localSync: { cycle: async () => (await localSyncSource()).cycle() },
+      }),
       deleteData,
       hydrateScopes: options?.hydrateScopes,
       pendingBlobDeletions,
+      uploadAttemptStore: createFileUploadAttemptStore(uploadAttemptsPath),
       tombstoneFinality,
       transferMode: isEnclave ? "download-only" : "upload-download",
       async canSync() {
@@ -949,7 +1317,6 @@ export async function createServer(
   // holds no timer handle, so clearing the timer alone cannot stop it — and
   // a reserved-but-never-connected TunnelManager would happily spawn frpc
   // from an orphaned poll after shutdown. Every deferred path checks this.
-  let backgroundClosed = false;
   const clearRegistrationPoll = () => {
     if (registrationPollTimer) {
       clearTimeout(registrationPollTimer);
@@ -1039,7 +1406,7 @@ export async function createServer(
               createReplicationNetworkPorts({
                 config,
                 owner,
-                masterKey: deriveMasterKey(masterKeySignature),
+                masterKey: legacyMasterKey(masterKeySignature),
                 storage: createVanaSyncStorageAdapter({
                   config,
                   serverOwner,
@@ -1126,6 +1493,7 @@ export async function createServer(
       declarations: pdppAuth?.retainedDeclarations ?? [],
       documents: pdppAuth?.retainedDocuments ?? new Map(),
       serverOwner,
+      legacyWriteSeal,
       logger,
     }) ?? null;
 
@@ -1135,12 +1503,72 @@ export async function createServer(
     !isEnclave && masterKeySignature
       ? await openLocalMcpState({
           path: join(storageRoot, "mcp-state.json"),
-          masterKey: deriveMasterKey(masterKeySignature),
+          masterKey: legacyMasterKey(masterKeySignature),
           logger,
         })
       : undefined;
 
+  // Database intake is available for an Account that answered On. An artifact
+  // digest resolves only to a pinned connector manifest whose bytes this boot
+  // verified (§6); an unknown digest answers `unknown_artifact`.
+  const streamSyncIntake: RunIntake | undefined = localSyncSource
+    ? {
+        begin: async (...args) =>
+          (await localSyncSource()).intake.begin(...args),
+        batch: async (...args) =>
+          (await localSyncSource()).intake.batch(...args),
+        end: async (...args) => (await localSyncSource()).intake.end(...args),
+        abort: async (...args) =>
+          (await localSyncSource()).intake.abort(...args),
+        publicationStatus: async (...args) =>
+          (await localSyncSource()).intake.publicationStatus(...args),
+      }
+    : undefined;
+
+  // The server's own legacy store is a one-time seed for a switched owner.
+  // The waker runs the import, then the retirement, when the Account answers
+  // On and once at boot for an owner already switched. No host supplies a port.
+  if (localSyncSource && serverOwner) {
+    importWaker = createImportWaker({
+      authority: accountModeAuthority,
+      owner: serverOwner,
+      importer: createLegacyStoreRunner({
+        db,
+        root: storageRoot,
+        dataDir,
+        owner: serverOwner,
+        network: streamSyncNetwork(config.gateway),
+        legacyWriteSeal,
+        getDeps: async () => {
+          await localSyncSource();
+          return localSyncDeps!;
+        },
+        declarations: () => pdppAuth?.retainedDeclarations ?? [],
+        methods: () => pdppAuth?.configuredMethods ?? [],
+        manifests: () => pdppAuth?.retainedManifests ?? [],
+        streamSync: () => config.streamSync,
+        logger,
+      }),
+      onWarning: (message, detail) => logger.warn({ detail }, message),
+    });
+  }
+
+  const streamSyncSeed = localSyncSource
+    ? createLocalSeed({
+        getDeps: async () => {
+          await localSyncSource();
+          return localSyncDeps!;
+        },
+        manifests: () => pdppAuth?.retainedManifests ?? [],
+        staging: createSeedStaging(
+          createFsStreamSyncFiles(join(storageRoot, "stream-sync", "seed")),
+        ),
+      })
+    : null;
+
   const app = createApp({
+    accountModeAuthority,
+    legacyWriteSeal,
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
     // deployment already uses for operator surfaces (`PS_ACCESS_TOKEN`).
@@ -1180,6 +1608,7 @@ export async function createServer(
     gateway: gatewayClient,
     gatewayConfig: config.gateway,
     paymentEnabled: config.payment.enabled,
+    ownAppAccountUrl: config.payment.ownAppAccountUrl,
     gatewayUrl: config.gateway.url,
     lineageGateway,
     derivativeCompute,
@@ -1189,6 +1618,47 @@ export async function createServer(
     readFulfillmentReporter: options?.readFulfillmentReporter,
     dataStorage,
     additions,
+    localSync: localSyncSource,
+    localFile: localSyncSource
+      ? async (id) => {
+          const local = await localSyncSource();
+          const [row] = await localDb!.query<{
+            connection_id: string;
+            connector: string;
+            ns: string;
+            stream: string;
+          }>(
+            `SELECT s.connection_id, c.connector, c.ns, s.stream FROM stream_state s
+         JOIN connections c ON c.connection_id = s.connection_id
+         WHERE s.head_blob = ? AND c.control_state = 'active'
+           AND c.deleted_at IS NULL AND s.head_generation = c.generation
+           AND s.head_version > s.last_delete_version`,
+            [id],
+          );
+          if (!row) return null;
+          return {
+            connectionId: row.connection_id,
+            read: async () => {
+              const decision = await local.resolver.resolve({
+                scope: `pdpp.${row.connector}.${row.stream}`,
+                connection: row.ns,
+                cursor: null,
+                legacyFile: false,
+                isOwnerView: true,
+              });
+              if ("body" in decision)
+                return new Response(decision.body, {
+                  headers: { "Content-Type": "application/json" },
+                });
+              throw new ProtocolError(
+                404,
+                "STREAM_DATA_NOT_FOUND",
+                "Stream data is unavailable",
+              );
+            },
+          };
+        }
+      : undefined,
     // Latest legacy reads of connector scopes the owner collects into the
     // record store come from its rows: the same store and the same
     // configured methods the RS enforces. Composed with or without the RS,
@@ -1233,10 +1703,27 @@ export async function createServer(
     tokenStore,
     configPath,
     syncManager,
+    streamSyncSeed,
+    streamSyncIntake,
+    streamSyncConnectionDelete: localSyncSource
+      ? {
+          requestConnectionDelete: async (connector) =>
+            (await localSyncSource()).deleter.requestConnectionDelete(
+              connector,
+            ),
+        }
+      : null,
+    // Shutdown stops admission before the database closes.
+    streamSyncAdmitting: () => !backgroundClosed,
     serverSigner,
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
     mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,
     mcpScopeRequestApprovalUrl: options?.mcpScopeRequestApprovalUrl,
+    mcpScopeRequestReviewHint: options?.mcpScopeRequestReviewHint,
+    mcpExposeUnsharedScopes: options?.mcpExposeUnsharedScopes,
+    mcpOwnerAccessEdit: options?.mcpOwnerAccessEdit,
+    mcpScopeRequestGuidance: options?.mcpScopeRequestGuidance,
+    mcpRequestableScopes: options?.mcpRequestableScopes,
     mcpGrantTtlSeconds: options?.mcpGrantTtlSeconds,
     mcpConnectionStore: mcpState?.connections,
     mcpOAuthAuthorizationStore: mcpState?.authorizations,
@@ -1248,21 +1735,36 @@ export async function createServer(
 
   const cleanup = async () => {
     backgroundClosed = true;
-    clearRegistrationPoll();
-    // Before the database closes: abort the running step and let it settle.
-    if (
-      replicaHost &&
-      !(await replicaHost.driver.stop(NODE_REPLICATION_STOP_GRACE_MS))
-    )
-      logger.warn("Replication step did not settle before shutdown");
-    derivativeScheduler.stop();
-    if (tunnelManager) {
-      await tunnelManager.stop();
+    try {
+      // The importer writes through the stores that close below.
+      await importWaker?.stop();
+      clearRegistrationPoll();
+      // Before the database closes: abort the running step and let it settle.
+      if (
+        replicaHost &&
+        !(await replicaHost.driver.stop(NODE_REPLICATION_STOP_GRACE_MS))
+      )
+        logger.warn("Replication step did not settle before shutdown");
+      derivativeScheduler.stop();
+      if (tunnelManager) {
+        await tunnelManager.stop();
+      }
+      if (syncManager) {
+        await syncManager.stop();
+      }
+      // Finish an outstanding open before releasing the database lock.
+      await openingLocalSync?.catch(() => undefined);
+      await localSync?.close();
+    } finally {
+      // However the steps above ended, the authority drains the legacy writes
+      // it already admitted (they still need the index, which stays open until
+      // they are done).
+      try {
+        await accountModeAuthority.close();
+      } finally {
+        indexManager.close();
+      }
     }
-    if (syncManager) {
-      await syncManager.stop();
-    }
-    indexManager.close();
   };
 
   const context: ServerContext = {
@@ -1276,6 +1778,8 @@ export async function createServer(
     serverAccount,
     serverSigner,
     syncManager,
+    streamSyncWriter,
+    getLocalSync: localSyncSource,
     tunnelManager,
     tunnelUrl: undefined,
     isServerRegistered: () => Boolean(identity?.serverId),
@@ -1288,7 +1792,12 @@ export async function createServer(
     replicationStatus: replication.status,
     replication: nodeReplication,
     replicaWriterRotation,
+    accountModeAuthority,
+    legacyWriteSeal,
+    serverOwner,
     startBackgroundServices: async () => {
+      // An import owed from a saved On needs no new answer from the Account.
+      if (!backgroundClosed) void importWaker?.wake();
       // Steps once now, then follows the coordinator's next wake.
       if (!backgroundClosed) replicaHost?.driver.start();
       // Replay questions a previous run left pending or stale: nothing

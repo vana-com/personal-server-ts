@@ -17,7 +17,8 @@
     "access": "public"
   },
   "files": [
-    "dist"
+    "dist",
+    "dist-test"
   ],
   "exports": {
     "./config": {
@@ -39,6 +40,14 @@
     "./api": {
       "types": "./dist/api/index.d.ts",
       "import": "./dist/api/index.js"
+    },
+    "./localdb": {
+      "types": "./dist/localdb/index.d.ts",
+      "import": "./dist/localdb/index.js"
+    },
+    "./localdb/conformance": {
+      "types": "./dist-test/localdb/conformance.d.ts",
+      "import": "./dist-test/localdb/conformance.js"
     },
     "./logger": {
       "types": "./dist/logger/index.d.ts",
@@ -79,6 +88,10 @@
     "./storage/canonical-legacy-projection": {
       "types": "./dist/storage/canonical-legacy-projection.d.ts",
       "import": "./dist/storage/canonical-legacy-projection.js"
+    },
+    "./storage/legacy-write-seal": {
+      "types": "./dist/storage/legacy-write-seal.d.ts",
+      "import": "./dist/storage/legacy-write-seal.js"
     },
     "./storage/legacy-scope-view": {
       "types": "./dist/storage/legacy-scope-view.d.ts",
@@ -164,9 +177,21 @@
       "types": "./dist/publication/publish.d.ts",
       "import": "./dist/publication/publish.js"
     },
+    "./sync/account-mode": {
+      "types": "./dist/sync/account-mode/index.d.ts",
+      "import": "./dist/sync/account-mode/index.js"
+    },
     "./sync": {
       "types": "./dist/sync/index.d.ts",
       "import": "./dist/sync/index.js"
+    },
+    "./stream-sync": {
+      "types": "./dist/stream-sync/index.d.ts",
+      "import": "./dist/stream-sync/index.js"
+    },
+    "./stream-sync-read": {
+      "types": "./dist/stream-sync-read/index.d.ts",
+      "import": "./dist/stream-sync-read/index.js"
     },
     "./sync/manager": {
       "types": "./dist/sync/engine/sync-manager.d.ts",
@@ -175,6 +200,10 @@
     "./storage/adapters": {
       "types": "./dist/storage/adapters/index.d.ts",
       "import": "./dist/storage/adapters/index.js"
+    },
+    "./test-utils/legacy-write-seal": {
+      "types": "./dist/test-utils/legacy-write-seal.d.ts",
+      "import": "./dist/test-utils/legacy-write-seal.js"
     },
     "./test-utils": {
       "types": "./dist/test-utils/index.d.ts",
@@ -222,7 +251,7 @@
     }
   },
   "scripts": {
-    "build": "tsc --build"
+    "build": "tsc --build && tsc --build tsconfig.test-support.json"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -233,6 +262,16 @@
     "unpdf": "^1.6.2",
     "viem": "^2.54.2",
     "zod": "^4.4.3",
-    "@noble/hashes": "1.8.0"
+    "@noble/ciphers": "1.3.0",
+    "@noble/hashes": "1.8.0",
+    "@opendatalabs/personal-server-ts-stream-sync": "*"
+  },
+  "peerDependencies": {
+    "vitest": ">=4"
+  },
+  "peerDependenciesMeta": {
+    "vitest": {
+      "optional": true
+    }
   }
 }

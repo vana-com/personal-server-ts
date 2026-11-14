@@ -1,4 +1,5 @@
 import { isReplicaScope } from "../replication/namespace.js";
+import { isPhysicalScope } from "../stream-sync-read/routing.js";
 import type {
   CreateGrantParams,
   DataPortabilityGatewayConfig,
@@ -178,6 +179,17 @@ export async function createGrantContract(
       400,
       "RESERVED_SCOPE",
       "Replica transport scopes are private",
+    );
+  // Grants carry logical names only.
+  if (
+    scopes.some((scope) =>
+      isPhysicalScope(scope.startsWith("write:") ? scope.slice(6) : scope),
+    )
+  )
+    return contractError(
+      400,
+      "RESERVED_SCOPE",
+      "Stream-sync names are not grantable; grant the logical name",
     );
   const builder = await input.gateway.getBuilder(granteeAddress);
   if (!builder) {

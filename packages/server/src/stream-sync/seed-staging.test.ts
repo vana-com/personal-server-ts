@@ -1,0 +1,161 @@
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createFsStreamSyncFiles } from "./fs-files.js";
+import { createSeedStaging, type SeedStaging } from "./seed-staging.js";
+
+const encoder = new TextEncoder();
+const DESCRIPTOR = JSON.stringify({
+  primaryKey: ["id"],
+  profile: { key: "p", version: "2.0.0" },
+  records: 3,
+});
+
+/** Yield `text` in pieces of `size` bytes, so lines cross chunk borders. */
+async function* pieces(text: string, size: number): AsyncGenerator<Uint8Array> {
+  const bytes = encoder.encode(text);
+  for (let at = 0; at < bytes.length; at += size) {
+    yield bytes.subarray(at, at + size);
+  }
+}
+
+const NONE = { receipts: {}, skipped: [] };
+
+describe("seed staging", () => {
+  let root: string;
+  let staging: SeedStaging;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "seed-staging-"));
+    staging = createSeedStaging(createFsStreamSyncFiles(root));
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("keeps the install id across instances", async () => {
+    const id = await staging.installId();
+    expect(id).toMatch(/^[0-9a-f]{32}$/);
+    expect(
+      await createSeedStaging(createFsStreamSyncFiles(root)).installId(),
+    ).toBe(id);
+  });
+
+  it("stages a 9 MiB record like any other, across chunk borders", async () => {
+    const big = JSON.stringify({
+      id: "big",
+      pad: "x".repeat(9 * 1024 * 1024),
+    });
+    const text = [DESCRIPTOR, '{"id":"a"}', big, '{"id":"b"}'].join("\n");
+    const seed = await staging.stage("c", "s", pieces(text, 64 * 1024 + 7));
+    expect(seed).toMatchObject({ records: 3, invalid: 0 });
+    const source = staging.source("install", async () => NONE);
+    const rows = [];
+    for await (const row of source.records("c", "s")) rows.push(row);
+    expect(rows.map((r) => (r as { id: string }).id)).toEqual([
+      "a",
+      "big",
+      "b",
+    ]);
+    expect((rows[1] as { pad: string }).pad.length).toBe(9 * 1024 * 1024);
+    expect(await source.streams("c")).toEqual([
+      {
+        stream: "s",
+        upload: expect.any(String),
+        primaryKey: ["id"],
+        profile: { key: "p", version: "2.0.0" },
+      },
+    ]);
+  });
+
+  it("drops the rows of a stream once the writer holds its receipt", async () => {
+    const text = [DESCRIPTOR, '{"id":"a"}', '{"id":"b"}', '{"id":"c"}'].join(
+      "\n",
+    );
+    await staging.stage("c", "s", pieces(text, 5));
+    await staging.stage("c", "t", pieces(text, 5));
+    const source = staging.source("install", async () => ({
+      receipts: { s: "merged" },
+      skipped: [],
+    }));
+    expect((await source.streams("c")).map((s) => s.stream)).toEqual(["t"]);
+    expect(Object.keys(await staging.staged("c"))).toEqual(["t"]);
+    expect(await readdir(join(root, "uploads"))).toHaveLength(1);
+  });
+
+  it("drops a retired upload, and offers a later upload of the same stream", async () => {
+    const text = [DESCRIPTOR, '{"id":"a"}', '{"id":"b"}', '{"id":"c"}'].join(
+      "\n",
+    );
+    await staging.stage("c", "s", pieces(text, 5));
+    const retired = (await staging.staged("c")).s!.upload;
+    const retiredSource = staging.source("install", async () => ({
+      receipts: {},
+      skipped: [{ stream: "s", upload: retired }],
+    }));
+    expect(await retiredSource.streams("c")).toEqual([]);
+    expect(Object.keys(await staging.staged("c"))).toEqual([]);
+
+    await staging.stage("c", "s", pieces(text, 5));
+    const source = staging.source("install", async () => ({
+      receipts: {},
+      skipped: [{ stream: "s", upload: retired }],
+    }));
+    expect((await source.streams("c")).map((s) => s.stream)).toEqual(["s"]);
+  });
+
+  it("removes an upload that failed", async () => {
+    const text = [DESCRIPTOR, '{"id":"a"}'].join("\n");
+    await expect(
+      staging.stage("c", "s", pieces(text, 3)),
+    ).rejects.toMatchObject({
+      errorCode: "SEED_COUNT_MISMATCH",
+    });
+    expect(await readdir(join(root, "uploads")).catch(() => [])).toEqual([]);
+  });
+  it.each([false, true])(
+    "reconciles a committed pointer after a lost write acknowledgement (readback unavailable: %s)",
+    async (unavailable) => {
+      const files = createFsStreamSyncFiles(root);
+      let failReadback = false;
+      const uncertain = createSeedStaging({
+        ...files,
+        async write(path, bytes) {
+          await files.write(path, bytes);
+          if (path.startsWith("staged/")) {
+            failReadback = unavailable;
+            throw new Error("pointer_ack_lost");
+          }
+        },
+        async read(path) {
+          if (failReadback && path.startsWith("staged/")) {
+            failReadback = false;
+            throw new Error("pointer_read_unavailable");
+          }
+          return files.read(path);
+        },
+      });
+      const descriptor = JSON.stringify({
+        primaryKey: ["id"],
+        profile: { key: null, version: "1" },
+        records: 1,
+      });
+      const staged = uncertain.stage(
+        "c",
+        "s",
+        pieces(descriptor + '\n{"id":"a"}\n', 5),
+      );
+      if (unavailable) await expect(staged).rejects.toThrow("pointer_ack_lost");
+      else expect(await staged).toMatchObject({ records: 1, invalid: 0 });
+      const source = createSeedStaging(files).source(
+        "install",
+        async () => NONE,
+      );
+      const rows = [];
+      for await (const row of source.records("c", "s")) rows.push(row);
+      expect(rows).toEqual([{ id: "a" }]);
+    },
+  );
+});

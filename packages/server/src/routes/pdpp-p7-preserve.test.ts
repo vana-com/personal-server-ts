@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createSourceStreamDeclarationRegistry } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
@@ -67,6 +68,7 @@ describe("POST /streams/:stream/records/replace completion_policy", () => {
       label: "Test",
     });
     app = pdppRecordsRoutes({
+      accountStorageMode: explicitLegacyStorageMode("unswitched"),
       store,
       bindingStore: store,
       configuredMethods: new Map([["inst_1", ["m1"]]]),

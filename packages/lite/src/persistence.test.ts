@@ -12,10 +12,11 @@
  * record shape + plaintext-at-rest behavior are preserved.
  */
 
+import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import forge from "node-forge";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
-import { buildPersonalServerLiteOwnerBindingMessage } from "@opendatalabs/vana-sdk/protocol/personal-server-lite-owner-binding";
+import { signOwnerMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
 import {
   assertCompletePsLitePersistenceBundle,
@@ -50,9 +51,7 @@ const SERVER_OWNER = ownerAccount.address;
 let OWNER_SIGNATURE: `0x${string}`;
 
 beforeAll(async () => {
-  OWNER_SIGNATURE = await ownerAccount.signMessage({
-    message: buildPersonalServerLiteOwnerBindingMessage(SERVER_OWNER),
-  });
+  OWNER_SIGNATURE = await signOwnerMasterKey(ownerAccount);
 });
 
 function ownerAuth() {
@@ -99,6 +98,7 @@ async function runtimeOverBundle(
 ) {
   const { config: configDefaults, ...runtimeOverrides } = options;
   return createPsLiteRuntime({
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     ...(await psLitePersistenceRuntimeOptions(bundle, configDefaults)),
     auth: ownerAuth(),
     gateway: createMockPsLiteGateway(),

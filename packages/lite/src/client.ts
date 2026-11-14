@@ -1,3 +1,7 @@
+import type {
+  PublicationReceipt,
+  SeedIntake,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   accessLogsListPath,
   createOwnerSignedPersonalServerRequest,
@@ -38,6 +42,10 @@ import {
   type PersonalServerSyncTriggerResult,
 } from "@opendatalabs/personal-server-ts-core/client";
 import type { SyncStatus } from "@opendatalabs/personal-server-ts-core/sync";
+import type {
+  RunIntake,
+  RunPublicationStatus,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
   prepareScopeUploadBatches,
   type PreparedScopeUploadBatch,
@@ -96,9 +104,32 @@ export interface StartPersonalServerLiteOptions extends Omit<
   onStatus?: (status: PersonalServerStatus) => void;
 }
 
+export type PersonalServerLitePublicationResult = {
+  readonly outcome: "published" | "noop";
+  readonly publications: readonly PublicationReceipt[];
+};
+
+/** The Lite handle: the shared handle plus the host's run-intake door. */
+export type PersonalServerLiteHandle = PersonalServerHandle & {
+  /** In-process run intake; `null` unless `config.streamSync.write` is on. */
+  readonly streamSyncIntake: RunIntake | null;
+  /** One-time retained-snapshot intake, with the runtime's Account admission. */
+  readonly streamSyncSeed: SeedIntake | null;
+  /** Await a database publication cycle. Rejects if any stream cannot confirm publication.
+   * Receipts cover individual streams, not every stream of a connection.
+   * A noop contains no new coverage. Unavailable or stopped runtimes reject.
+   */
+  publish(): Promise<PersonalServerLitePublicationResult>;
+  /** Whether an ended run is saved, from durable local state. Use it when a
+   * `publish()` reply was lost; it does not collect or publish anything.
+   * Errors as `streamSyncIntake.publicationStatus` does.
+   */
+  publicationStatus(runId: string): Promise<RunPublicationStatus>;
+};
+
 export async function startPersonalServer(
   options: StartPersonalServerLiteOptions,
-): Promise<PersonalServerHandle> {
+): Promise<PersonalServerLiteHandle> {
   if (options.persistence && options.runtime) {
     throw new Error(
       "runtime cannot be supplied with a complete persistence bundle",
@@ -677,12 +708,73 @@ export async function startPersonalServer(
     });
   }
 
+  const publishing = new Set<Promise<PersonalServerLitePublicationResult>>();
+  let stopping = false;
+  const seedPort = runtime.streamSyncSeed;
+  const streamSyncSeed: SeedIntake | null = seedPort
+    ? {
+        async status(connector) {
+          if (stopping || status === "stopped")
+            throw new Error("Stream seed intake is unavailable");
+          return seedPort.status(connector);
+        },
+        async put(connector, stream, body) {
+          if (stopping || status === "stopped")
+            throw new Error("Stream seed intake is unavailable");
+          return seedPort.put(connector, stream, body);
+        },
+      }
+    : null;
+  function publish(): Promise<PersonalServerLitePublicationResult> {
+    if (stopping)
+      return Promise.reject(new Error("Stream publication is unavailable"));
+    const operation = publishCycle();
+    publishing.add(operation);
+    void operation.finally(() => publishing.delete(operation)).catch(() => {});
+    return operation;
+  }
+
+  async function publishCycle(): Promise<PersonalServerLitePublicationResult> {
+    if (status === "stopped" || !runtimeBundle?.getLocalSync)
+      throw new Error("Stream publication is unavailable");
+    const report = await (await runtimeBundle.getLocalSync()).cycle();
+    const publications: PublicationReceipt[] = [];
+    for (const connection of report.connections) {
+      if (connection.error) throw new Error(connection.error);
+      for (const result of connection.published) {
+        if (result.outcome !== "published" && result.outcome !== "noop")
+          throw new Error(
+            `Stream publication ${result.outcome}: ${connection.connectionId}/${result.stream}`,
+          );
+        if (result.publication) publications.push(result.publication);
+      }
+    }
+    return {
+      outcome: publications.length ? "published" : "noop",
+      publications,
+    };
+  }
+
+  async function publicationStatus(
+    runId: string,
+  ): Promise<RunPublicationStatus> {
+    const intake = runtimeBundle?.streamSyncIntake;
+    if (stopping || status === "stopped" || !intake)
+      throw new Error("Stream publication is unavailable");
+    return intake.publicationStatus(runId);
+  }
+
   async function stop(): Promise<void> {
     if (status === "stopped") return;
+    stopping = true;
     relayClient?.close("personal-server-stop");
     relayClient = undefined;
     runtime.deactivate();
+    // The importer writes through the stores; stop it before they wind down.
+    await runtimeBundle?.importWaker?.stop();
     await runtimeBundle?.syncManager?.stop?.();
+    await Promise.allSettled([...publishing]);
+    await runtimeBundle?.closeStreamSync?.();
     setStatus("stopped");
   }
 
@@ -710,6 +802,10 @@ export async function startPersonalServer(
     revokeGrant,
     syncStatus,
     syncNow,
+    streamSyncIntake: runtimeBundle?.streamSyncIntake ?? null,
+    streamSyncSeed,
+    publish,
+    publicationStatus,
     stop,
   };
 }

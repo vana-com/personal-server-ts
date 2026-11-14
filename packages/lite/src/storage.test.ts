@@ -1,3 +1,4 @@
+import { createOpenPersistentPsLiteStorage } from "./test-support/open-storage.js";
 import { describe, expect, it, vi } from "vitest";
 import type {
   DataBlockManifest,
@@ -9,14 +10,11 @@ import {
   createMemoryPsLiteDataFileStore,
   createMemoryPsLitePersistence,
 } from "./test-support/memory.js";
-import {
-  createPersistentPsLiteStorage,
-  type PsLiteDataFileStore,
-} from "./storage.js";
+import { type PsLiteDataFileStore } from "./storage.js";
 import { previewEnvelopeValue } from "./storage-utils.js";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 
-describe("createPersistentPsLiteStorage", () => {
+describe("createOpenPersistentPsLiteStorage", () => {
   it("bounds in-memory previews by traversal work for container-heavy envelopes", () => {
     const envelope = createDataFileEnvelope(
       "chatgpt.conversations",
@@ -45,7 +43,7 @@ describe("createPersistentPsLiteStorage", () => {
         files.delete(path);
       },
     };
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       persistence,
       dataFileStore,
@@ -75,7 +73,7 @@ describe("createPersistentPsLiteStorage", () => {
   });
 
   it("keeps the browser IndexedDB fallback capability unchanged", async () => {
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       createMemoryPsLitePersistence(),
     );
@@ -89,7 +87,7 @@ describe("createPersistentPsLiteStorage", () => {
 
   it("persists envelopes and index entries across storage reloads", async () => {
     const persistence = createMemoryPsLitePersistence();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -108,7 +106,7 @@ describe("createPersistentPsLiteStorage", () => {
       sizeBytes: write.sizeBytes,
     });
 
-    const reloaded = await createPersistentPsLiteStorage(
+    const reloaded = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -127,7 +125,7 @@ describe("createPersistentPsLiteStorage", () => {
 
   it("persists scope deletion", async () => {
     const persistence = createMemoryPsLitePersistence();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -147,7 +145,7 @@ describe("createPersistentPsLiteStorage", () => {
     });
     await storage.deleteScope("instagram.profile");
 
-    const reloaded = await createPersistentPsLiteStorage(
+    const reloaded = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -158,7 +156,7 @@ describe("createPersistentPsLiteStorage", () => {
 
   it("deletes a single version by fileId (entry + blob) and no-ops on unknown id", async () => {
     const persistence = createMemoryPsLitePersistence();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -188,7 +186,7 @@ describe("createPersistentPsLiteStorage", () => {
     // Unknown fileId is a no-op.
     expect(await storage.deleteByFileId("file-unknown")).toBe(false);
 
-    const reloaded = await createPersistentPsLiteStorage(
+    const reloaded = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -207,7 +205,7 @@ describe("createPersistentPsLiteStorage", () => {
 
   it("summarizes persisted scopes with latest collection time and version count", async () => {
     const persistence = createMemoryPsLitePersistence();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -234,7 +232,7 @@ describe("createPersistentPsLiteStorage", () => {
       });
     }
 
-    const reloaded = await createPersistentPsLiteStorage(
+    const reloaded = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -254,7 +252,7 @@ describe("createPersistentPsLiteStorage", () => {
   it("stores envelope JSON in the file store and metadata in persistence", async () => {
     const persistence = createMemoryPsLitePersistence();
     const fileStore = createMemoryPsLiteDataFileStore("opfs");
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
       fileStore,
@@ -291,7 +289,7 @@ describe("createPersistentPsLiteStorage", () => {
 
   it("persists sync index updates", async () => {
     const persistence = createMemoryPsLitePersistence();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -314,7 +312,7 @@ describe("createPersistentPsLiteStorage", () => {
       await storage.updateDataPointId(write.relativePath, "0xdp-synced-1"),
     ).toBe(true);
 
-    const reloaded = await createPersistentPsLiteStorage(
+    const reloaded = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -328,7 +326,7 @@ describe("createPersistentPsLiteStorage", () => {
 
   it("serializes overlapping index persistence so data-point id updates win", async () => {
     const persistence = createMemoryPsLitePersistence();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -353,7 +351,7 @@ describe("createPersistentPsLiteStorage", () => {
     await inserted;
     await updated;
 
-    const reloaded = await createPersistentPsLiteStorage(
+    const reloaded = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -370,7 +368,7 @@ describe("createPersistentPsLiteStorage", () => {
     const collectedAt = "2026-05-08T00:00:00.000Z";
 
     async function writeIndexed(
-      storage: Awaited<ReturnType<typeof createPersistentPsLiteStorage>>,
+      storage: Awaited<ReturnType<typeof createOpenPersistentPsLiteStorage>>,
       value: string,
     ) {
       const envelope = createDataFileEnvelope(scope, collectedAt, {
@@ -391,21 +389,27 @@ describe("createPersistentPsLiteStorage", () => {
       [
         "updateFileId",
         (
-          storage: Awaited<ReturnType<typeof createPersistentPsLiteStorage>>,
+          storage: Awaited<
+            ReturnType<typeof createOpenPersistentPsLiteStorage>
+          >,
           path: string,
         ) => storage.updateFileId(path, "synced-id"),
       ],
       [
         "updateDataPointId",
         (
-          storage: Awaited<ReturnType<typeof createPersistentPsLiteStorage>>,
+          storage: Awaited<
+            ReturnType<typeof createOpenPersistentPsLiteStorage>
+          >,
           path: string,
         ) => storage.updateDataPointId(path, "0xdp-synced-1"),
       ],
       [
         "updateEntryVersion",
         (
-          storage: Awaited<ReturnType<typeof createPersistentPsLiteStorage>>,
+          storage: Awaited<
+            ReturnType<typeof createOpenPersistentPsLiteStorage>
+          >,
           path: string,
         ) => storage.updateEntryVersion(path, 7),
       ],
@@ -413,7 +417,7 @@ describe("createPersistentPsLiteStorage", () => {
       "erases the row and its blob when %s is queued first",
       async (_name, update) => {
         const persistence = createMemoryPsLitePersistence();
-        const storage = await createPersistentPsLiteStorage(
+        const storage = await createOpenPersistentPsLiteStorage(
           { kind: "indexeddb" },
           persistence,
         );
@@ -425,7 +429,7 @@ describe("createPersistentPsLiteStorage", () => {
         await expect(erased).resolves.toBe(true);
 
         expect(storage.countVersions(scope)).toBe(0);
-        const reloaded = await createPersistentPsLiteStorage(
+        const reloaded = await createOpenPersistentPsLiteStorage(
           { kind: "indexeddb" },
           persistence,
         );
@@ -438,7 +442,7 @@ describe("createPersistentPsLiteStorage", () => {
 
     it("erases by a fileId that a queued update sets just before the delete", async () => {
       const persistence = createMemoryPsLitePersistence();
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         persistence,
       );
@@ -449,7 +453,7 @@ describe("createPersistentPsLiteStorage", () => {
       await updated;
       await expect(erased).resolves.toBe(true);
 
-      const reloaded = await createPersistentPsLiteStorage(
+      const reloaded = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         persistence,
       );
@@ -461,7 +465,7 @@ describe("createPersistentPsLiteStorage", () => {
 
     it("keeps a same-path replacement, with its blob, written while an erase of the old version is queued", async () => {
       const persistence = createMemoryPsLitePersistence();
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         persistence,
       );
@@ -475,7 +479,7 @@ describe("createPersistentPsLiteStorage", () => {
       // The old row was still the decided one when the erase was queued.
       await expect(erased).resolves.toBe(true);
 
-      const reloaded = await createPersistentPsLiteStorage(
+      const reloaded = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         persistence,
       );
@@ -521,7 +525,7 @@ describe("createPersistentPsLiteStorage", () => {
     }
 
     async function writeRow(
-      storage: Awaited<ReturnType<typeof createPersistentPsLiteStorage>>,
+      storage: Awaited<ReturnType<typeof createOpenPersistentPsLiteStorage>>,
       collectedAt: string,
       value: string,
     ) {
@@ -553,7 +557,7 @@ describe("createPersistentPsLiteStorage", () => {
       const persistence = createMemoryPsLitePersistence();
       const xPath = `data/${scope}/${X}.json`;
       const gate = gatedFiles(() => xPath);
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         gate.files,
@@ -567,7 +571,7 @@ describe("createPersistentPsLiteStorage", () => {
 
       gate.release();
       await expect(erase).resolves.toBe(true);
-      const reloaded = await createPersistentPsLiteStorage(
+      const reloaded = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         gate.files,
@@ -581,7 +585,7 @@ describe("createPersistentPsLiteStorage", () => {
       const persistence = createMemoryPsLitePersistence();
       const xPath = `data/${scope}/${X}.json`;
       const gate = gatedFiles(() => xPath);
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         gate.files,
@@ -596,7 +600,7 @@ describe("createPersistentPsLiteStorage", () => {
       gate.release();
       await expect(erase).resolves.toBe(true);
       await replacement;
-      const reloaded = await createPersistentPsLiteStorage(
+      const reloaded = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         gate.files,
@@ -695,7 +699,7 @@ describe("createPersistentPsLiteStorage", () => {
     }
 
     async function writeRowAt(
-      storage: Awaited<ReturnType<typeof createPersistentPsLiteStorage>>,
+      storage: Awaited<ReturnType<typeof createOpenPersistentPsLiteStorage>>,
       value: string,
     ) {
       const envelope = createDataFileEnvelope(scope, X, { username: value });
@@ -716,7 +720,7 @@ describe("createPersistentPsLiteStorage", () => {
       const persistence = createMemoryPsLitePersistence();
       const rename = deferredStep();
       const files = scriptedFiles({ pauseRename: rename });
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         files,
@@ -747,7 +751,7 @@ describe("createPersistentPsLiteStorage", () => {
 
       // The old row was replaced by the commit before the erase ran.
       await expect(erase).resolves.toBe(false);
-      const reloaded = await createPersistentPsLiteStorage(
+      const reloaded = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         files,
@@ -768,7 +772,7 @@ describe("createPersistentPsLiteStorage", () => {
           [2, second],
         ]),
       });
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         files,
@@ -792,7 +796,7 @@ describe("createPersistentPsLiteStorage", () => {
 
       await expect(firstErase).resolves.toBe(true);
       await expect(secondErase).resolves.toBe(false);
-      const reloaded = await createPersistentPsLiteStorage(
+      const reloaded = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         files,
@@ -809,7 +813,7 @@ describe("createPersistentPsLiteStorage", () => {
         pauseDelete: new Map([[1, envelopeDelete]]),
         failTreeDelete: true,
       });
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         files,
@@ -839,7 +843,7 @@ describe("createPersistentPsLiteStorage", () => {
       });
       await write;
 
-      const reloaded = await createPersistentPsLiteStorage(
+      const reloaded = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         files,
@@ -853,7 +857,7 @@ describe("createPersistentPsLiteStorage", () => {
       const persistence = createMemoryPsLitePersistence();
       const secondWrite = deferredStep();
       const files = scriptedFiles({ pauseWrite: new Map([[2, secondWrite]]) });
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         files,
@@ -873,7 +877,7 @@ describe("createPersistentPsLiteStorage", () => {
       await write;
       await expect(deleting).resolves.toBe(1);
 
-      const reloaded = await createPersistentPsLiteStorage(
+      const reloaded = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         files,
@@ -888,7 +892,7 @@ describe("createPersistentPsLiteStorage", () => {
       const persistence = createMemoryPsLitePersistence();
       const afterRename = deferredStep();
       const files = scriptedFiles({ pauseAfterRename: afterRename });
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         files,
@@ -908,7 +912,7 @@ describe("createPersistentPsLiteStorage", () => {
       await committed;
       await expect(deleting).resolves.toBe(1);
 
-      const reloaded = await createPersistentPsLiteStorage(
+      const reloaded = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         files,
@@ -923,7 +927,7 @@ describe("createPersistentPsLiteStorage", () => {
       const persistence = createMemoryPsLitePersistence();
       const repairWrite = deferredStep();
       const files = scriptedFiles({ pauseWrite: new Map([[2, repairWrite]]) });
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         files,
@@ -947,7 +951,7 @@ describe("createPersistentPsLiteStorage", () => {
       await repair;
       await expect(erase).resolves.toBe(false);
 
-      const reloaded = await createPersistentPsLiteStorage(
+      const reloaded = await createOpenPersistentPsLiteStorage(
         { kind: "custom" },
         persistence,
         files,
@@ -960,7 +964,7 @@ describe("createPersistentPsLiteStorage", () => {
 
   it("persists IndexedDB fallback block sidecars across storage reloads", async () => {
     const persistence = createMemoryPsLitePersistence();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -977,7 +981,7 @@ describe("createPersistentPsLiteStorage", () => {
       blocks,
     );
 
-    const reloaded = await createPersistentPsLiteStorage(
+    const reloaded = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -1034,7 +1038,7 @@ describe("createPersistentPsLiteStorage", () => {
         }
       },
     };
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       createMemoryPsLitePersistence(),
       dataFileStore,
@@ -1090,7 +1094,7 @@ describe("createPersistentPsLiteStorage", () => {
       },
       async deleteBlockTree() {},
     };
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       persistence,
       dataFileStore,
@@ -1121,7 +1125,7 @@ describe("createPersistentPsLiteStorage", () => {
       blocks: [{ value: { index: 0 } }, { value: { index: 1 } }],
     });
 
-    const reloaded = await createPersistentPsLiteStorage(
+    const reloaded = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       persistence,
       dataFileStore,
@@ -1132,7 +1136,7 @@ describe("createPersistentPsLiteStorage", () => {
   });
 
   it("pages block sidecar reads by cursor until all blocks are reachable", async () => {
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       createMemoryPsLitePersistence(),
     );
@@ -1164,7 +1168,7 @@ describe("createPersistentPsLiteStorage", () => {
   });
 
   it("reads only the named blocks and exposes the manifest as a table of contents", async () => {
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       createMemoryPsLitePersistence(),
     );
@@ -1198,7 +1202,7 @@ describe("createPersistentPsLiteStorage", () => {
   });
 
   it("returns no manifest for a scope that was never indexed", async () => {
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       createMemoryPsLitePersistence(),
     );
@@ -1212,7 +1216,7 @@ describe("createPersistentPsLiteStorage", () => {
   });
 
   it("pages through a single oversized persistent block", async () => {
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       createMemoryPsLitePersistence(),
     );
@@ -1285,7 +1289,7 @@ describe("createPersistentPsLiteStorage", () => {
         throw new Error("payload should not be read without a manifest");
       },
     };
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       createMemoryPsLitePersistence(),
       dataFileStore,
@@ -1446,7 +1450,7 @@ describe("deleteVersionIfEnvelopeMissing", () => {
         return files.readEnvelope(path);
       },
     };
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       createMemoryPsLitePersistence(),
       store,
@@ -1522,5 +1526,141 @@ describe("deleteVersionIfEnvelopeMissing", () => {
     await expect(storage.readEnvelope(scope, collectedAt)).resolves.toEqual(
       envelope,
     );
+  });
+});
+
+describe("same-path replacement of an unsynced row", () => {
+  const scope = "notes.entries";
+  const collectedAt = "2026-11-07T12:00:00.000Z";
+
+  // The upload worker keys its held and backoff state by path and tells a
+  // replaced row apart by its id and size. This pins what a replacement at an
+  // existing scope and collectedAt looks like to `findUnsynced`.
+  it("lists one unsynced row, with a fresh id and the new size", async () => {
+    const storage = await createOpenPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteDataFileStore("custom"),
+    );
+    const large = await storage.writeEnvelopeAndIndex!(
+      createDataFileEnvelope(scope, collectedAt, { value: 1 }),
+      {
+        fileId: null,
+        scope,
+        collectedAt,
+        dataPointId: null,
+        sizeBytes: 337 * 1024 * 1024,
+      },
+    );
+
+    const small = await storage.writeEnvelopeAndIndex!(
+      createDataFileEnvelope(scope, collectedAt, { value: 2 }),
+      { fileId: null, scope, collectedAt, dataPointId: null },
+    );
+
+    expect(small.path).toBe(large.path);
+    expect(small.id).not.toBe(large.id);
+    expect(small.sizeBytes).toBeLessThan(1024);
+    const unsynced = storage.findUnsynced();
+    expect(unsynced).toHaveLength(1);
+    expect(unsynced[0]).toMatchObject({
+      id: small.id,
+      path: large.path,
+      sizeBytes: small.sizeBytes,
+    });
+  });
+});
+
+describe("findUnsyncedPage", () => {
+  it("pages unsynced rows by id and skips synced ones", async () => {
+    const storage = await createOpenPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteDataFileStore("custom"),
+    );
+    const rows = [];
+    for (let i = 0; i < 5; i++) {
+      const collectedAt = `2026-11-07T12:00:0${i}.000Z`;
+      rows.push(
+        await storage.writeEnvelopeAndIndex!(
+          createDataFileEnvelope(`notes.s${i}`, collectedAt, { value: i }),
+          {
+            fileId: null,
+            scope: `notes.s${i}`,
+            collectedAt,
+            dataPointId: i === 2 ? "0xdp" : null,
+          },
+        ),
+      );
+    }
+
+    const first = storage.findUnsyncedPage!({ afterId: 0, limit: 2 });
+    const second = storage.findUnsyncedPage!({
+      afterId: first[first.length - 1].id,
+      limit: 2,
+    });
+    const done = storage.findUnsyncedPage!({
+      afterId: second[second.length - 1].id,
+      limit: 2,
+    });
+
+    expect(first.map((e) => e.id)).toEqual([rows[0].id, rows[1].id]);
+    expect(second.map((e) => e.id)).toEqual([rows[3].id, rows[4].id]);
+    expect(done).toEqual([]);
+  });
+
+  it("maxUnsyncedId is the highest unsynced id, 0 when none", async () => {
+    const storage = await createOpenPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteDataFileStore("custom"),
+    );
+    expect(storage.maxUnsyncedId!()).toBe(0);
+    const rows = [];
+    for (let i = 0; i < 3; i++) {
+      const collectedAt = `2026-11-07T12:00:0${i}.000Z`;
+      rows.push(
+        await storage.writeEnvelopeAndIndex!(
+          createDataFileEnvelope(`notes.m${i}`, collectedAt, { value: i }),
+          {
+            fileId: null,
+            scope: `notes.m${i}`,
+            collectedAt,
+            dataPointId: i === 2 ? "0xdp" : null,
+          },
+        ),
+      );
+    }
+    expect(storage.maxUnsyncedId!()).toBe(rows[1].id);
+  });
+});
+
+describe("PS-Lite findEntry binds a file id to its scope", () => {
+  it("answers another scope's file id as a missing one", async () => {
+    const storage = createMemoryPsLiteStorage();
+    for (const [scope, fileId] of [
+      ["chatgpt.conversations", "file-chatgpt"],
+      ["youtube.history", "file-youtube"],
+    ] as const) {
+      await storage.insertEntry({
+        fileId,
+        path: `${scope}/2026-11-01.json`,
+        scope,
+        collectedAt: "2026-11-01T00:00:00Z",
+        sizeBytes: 10,
+      });
+    }
+    expect(
+      storage.findEntry({
+        scope: "chatgpt.conversations",
+        fileId: "file-chatgpt",
+      })?.scope,
+    ).toBe("chatgpt.conversations");
+    expect(
+      storage.findEntry({
+        scope: "chatgpt.conversations",
+        fileId: "file-youtube",
+      }),
+    ).toBeUndefined();
   });
 });

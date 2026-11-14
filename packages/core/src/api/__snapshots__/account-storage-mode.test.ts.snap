@@ -1,0 +1,26 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`a read of an unswitched account > answers write, list, read and versions with today's responses 1`] = `
+[
+  {
+    "body": "",
+    "path": "POST",
+    "status": 201,
+  },
+  {
+    "body": "{"scopes":[{"scope":"notes.entries","latestCollectedAt":"2026-11-01T00:00:00.000Z","versionCount":1,"dataStatus":"indexing","sizeBytes":112}],"total":1,"limit":20,"offset":0}",
+    "path": "/",
+    "status": 200,
+  },
+  {
+    "body": "{"version":"1.0","scope":"notes.entries","collectedAt":"2026-11-01T00:00:00.000Z","data":{"records":[{"id":1}]}}",
+    "path": "/notes.entries",
+    "status": 200,
+  },
+  {
+    "body": "{"scope":"notes.entries","versions":[{"fileId":null,"schemaId":null,"collectedAt":"2026-11-01T00:00:00.000Z","version":1,"producer":null,"producer_provenance":null}],"total":1,"limit":20,"offset":0}",
+    "path": "/notes.entries/versions",
+    "status": 200,
+  },
+]
+`;

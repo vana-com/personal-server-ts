@@ -1,4 +1,8 @@
 import type {
+  LegacyWriteHold,
+  LegacyWriteSeal,
+} from "../storage/legacy-write-seal.js";
+import type {
   Builder,
   DataFileEnvelope,
   DataPointListResult,
@@ -72,6 +76,7 @@ export interface DataStorageScopeListOptions extends DataStorageListOptions {
   scopePrefix?: string;
 }
 
+/** See `DataStoragePort.findEntry`: a file id selects only within `scope`. */
 export interface DataStorageEntryLookup {
   scope: string;
   fileId?: string;
@@ -157,12 +162,25 @@ export interface DataVersionWriter {
 }
 
 export interface DataStoragePort extends RuntimeStoragePort {
+  /**
+   * The seal this storage asks before it makes any legacy version durable
+   * (see `storage/legacy-write-seal.ts`). Node and Lite storage always have
+   * one, and every sealed write below runs inside its `commit`. A caller that
+   * writes through other means reads it to refuse early (`admit`) or stop a
+   * worker (`verdict`). Absent on test doubles; an absent seal answers
+   * nothing and a route treats that as unknown.
+   */
+  readonly legacyWriteSeal?: LegacyWriteSeal;
   listScopes(options: DataStorageScopeListOptions): {
     scopes: ScopeSummary[];
     total: number;
   };
   listVersions(scope: string, options: DataStorageListOptions): IndexEntry[];
   countVersions(scope: string): number;
+  /**
+   * Return an entry only if entry.scope === lookup.scope, including fileId
+   * lookups; otherwise return undefined exactly as for a nonexistent fileId.
+   */
   findEntry(lookup: DataStorageEntryLookup): IndexEntry | undefined;
   findByFileId(fileId: string): IndexEntry | undefined;
   /**
@@ -172,6 +190,22 @@ export interface DataStoragePort extends RuntimeStoragePort {
    */
   findByDataPointId(dataPointId: string): IndexEntry | undefined;
   findUnsynced(options?: { limit?: number }): IndexEntry[];
+  /**
+   * Keyset page of the unsynced rows: those with `id > afterId`, ordered by
+   * `id` ascending, at most `limit`. Index rows only; no envelope is read. Lets
+   * the upload worker scan a large backlog a bounded window per cycle. Used
+   * only together with `maxUnsyncedId`; a host without both is scanned whole
+   * through `findUnsynced`.
+   */
+  findUnsyncedPage?(options: { afterId: number; limit: number }): IndexEntry[];
+  /**
+   * Highest row id among the unsynced rows (0 when there are none). With
+   * `findUnsyncedPage` it fences a scan sweep: rows that arrive above the
+   * fence wait for the next sweep, so a moving tail cannot keep the sweep
+   * from ever wrapping back to earlier rows. Without it the page method is
+   * not used.
+   */
+  maxUnsyncedId?(): number;
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
   /**
    * The envelope exactly as stored, bypassing any read-time view. Only a
@@ -291,26 +325,42 @@ export interface DataStoragePort extends RuntimeStoragePort {
   findLatestVersionByScope(scope: string): number | Promise<number>;
   /**
    * Stamps the DPv2 dataPointId on an entry after registerDataPoint; `null`
-   * marks it unsynced again (the gateway lost the registration).
+   * marks it unsynced again (the gateway lost the registration). With
+   * `expectedId` the stamp applies only to the row with that `IndexEntry.id`:
+   * a path can be replaced by a new row (new id) while an upload of the old
+   * row is in flight, and its acknowledgement must not reach the new row.
+   * Returns false when the path has no row, or its row is not `expectedId`.
    */
   updateDataPointId(
     path: string,
     dataPointId: string | null,
+    expectedId?: number,
   ): boolean | Promise<boolean>;
   /**
    * Rewrites the DPv2 `version` on an entry. Used when the upload worker
    * rebases a registration onto the registry's live version after a
    * stale-expectedVersion conflict — the blob key embeds the version, so
-   * the local row must follow the registered one.
+   * the local row must follow the registered one. `expectedId` guards as in
+   * `updateDataPointId`.
    */
-  updateEntryVersion(path: string, version: number): boolean | Promise<boolean>;
-  deleteScope(scope: string): Promise<number>;
+  updateEntryVersion(
+    path: string,
+    version: number,
+    expectedId?: number,
+  ): boolean | Promise<boolean>;
+  /**
+   * Every removal below runs under the seal's lock in every mode
+   * (`LegacyWriteSeal.remove`). A caller that is already inside
+   * `LegacyWriteSeal.commit` passes its `hold`: the removal then runs inside
+   * that lock and does not take it again (the lock is not re-entrant).
+   */
+  deleteScope(scope: string, hold?: LegacyWriteHold): Promise<number>;
   /**
    * Delete a single version (index entry + its local blob) by its gateway fileId.
    * Returns true if a local copy existed and was removed, false if none was present (no-op).
    * Used by sync delete-reconciliation to drop a copy the gateway reports as deleted.
    */
-  deleteByFileId(fileId: string): Promise<boolean>;
+  deleteByFileId(fileId: string, hold?: LegacyWriteHold): Promise<boolean>;
   /**
    * Delete a single version (index entry + its local blob + block sidecars)
    * by its DPv2 identity (scope, collectedAt). Returns true if a local copy
@@ -328,6 +378,7 @@ export interface DataStoragePort extends RuntimeStoragePort {
     scope: string,
     collectedAt: string,
     fence?: VersionFence,
+    hold?: LegacyWriteHold,
   ): Promise<boolean>;
   /**
    * Erases one version (index row + local blob) only while its envelope is
@@ -342,6 +393,7 @@ export interface DataStoragePort extends RuntimeStoragePort {
     scope: string,
     collectedAt: string,
     fence: VersionFence,
+    hold?: LegacyWriteHold,
   ): Promise<boolean>;
   /**
    * Drop a single unsynced index entry by path, WITHOUT touching any blob.
@@ -350,7 +402,10 @@ export interface DataStoragePort extends RuntimeStoragePort {
    * never upload, so retrying it head-blocks the scope forever. Returns true
    * if a row was removed. No-op-safe when the path is unknown.
    */
-  dropUnsyncedEntry?(path: string): boolean | Promise<boolean>;
+  dropUnsyncedEntry?(
+    path: string,
+    hold?: LegacyWriteHold,
+  ): boolean | Promise<boolean>;
 }
 
 export interface RuntimeAvailabilityPort {

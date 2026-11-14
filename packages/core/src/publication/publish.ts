@@ -11,6 +11,7 @@ import { isTombstoneRecord } from "../sync/tombstone.js";
 import { readStoredLineage } from "../lineage/lineage.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import type { ServerSigner } from "../signing/signer.js";
+import type { LegacyWriteSeal } from "../storage/legacy-write-seal.js";
 import {
   StoredBlobConflictError,
   type StorageAdapter,
@@ -37,11 +38,13 @@ export interface FencedPublicationPort {
   read(input: {
     ownerAddress: string;
     scope: string;
+    signal?: AbortSignal;
   }): Promise<PublicationFence>;
   commit(
     input: Registration & {
       mode: "register" | "adopt";
       fence: PublicationFence;
+      signal?: AbortSignal;
     },
   ): Promise<{ dataPointId: string; fence: PublicationFence }>;
 }
@@ -74,9 +77,28 @@ export interface PublishOptions {
   storageAdapter: StorageAdapter;
   signer: Pick<ServerSigner, "signAddData"> &
     Partial<Pick<ServerSigner, "signLineageAttestation">>;
-  gateway: Pick<GatewayClient, "registerDataPoint">;
+  /**
+   * `registerDataPoint` receives the attempt's signal as a second argument. A
+   * client that ignores it (the plain SDK client) keeps an in-flight request
+   * running past the deadline; wrap it with `withCancellableRegistration`.
+   */
+  gateway: {
+    registerDataPoint(
+      params: Parameters<GatewayClient["registerDataPoint"]>[0],
+      options?: { signal?: AbortSignal },
+    ): ReturnType<GatewayClient["registerDataPoint"]>;
+  };
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
   fencedPublication?: FencedPublicationPort;
+  /**
+   * The seal on legacy writes. Each remote write (a blob upload, a registry
+   * registration) runs as its own `legacyWriteSeal.commit`, so none starts
+   * after the account has moved to stream sync. The lock is held only across
+   * that one remote call; reads, signing and verification stay outside.
+   * Absent means the caller does not seal (a host with no stream-sync switch).
+   * A refused write throws `LegacyWriteRefusedError`.
+   */
+  legacyWriteSeal?: LegacyWriteSeal;
   /** Undefined means the caller has no initial registry observation. */
   head?: PublicationRecord | null;
   readHead(): Promise<PublicationRecord | null>;
@@ -94,10 +116,22 @@ export interface PublishOptions {
    * resume, or bytes to heal still need the fence.
    */
   deletionAcknowledgedAtIngest?: boolean;
+  /**
+   * Passed into every remote request (storage, registry, fenced port) and
+   * checked before each remote effect. Once aborted, the request in flight is
+   * cancelled and publication stops instead of continuing after the caller
+   * gave up on it.
+   */
+  signal?: AbortSignal;
 }
 
 const sameHash = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
-function metadata(scope: string, collectedAt: string, sizeBytes: number) {
+/** The registry `metadataHash` of a published version. */
+export function publicationMetadataHash(
+  scope: string,
+  collectedAt: string,
+  sizeBytes: number,
+): `0x${string}` {
   return keccak256(
     stringToHex(JSON.stringify({ scope, collectedAt, sizeBytes })),
   );
@@ -122,7 +156,11 @@ export async function publishVersion(
   ): PublicationCandidate {
     return {
       dataHash: hash,
-      metadataHash: metadata(scope, env.collectedAt, bytes.byteLength),
+      metadataHash: publicationMetadataHash(
+        scope,
+        env.collectedAt,
+        bytes.byteLength,
+      ),
       sizeBytes: bytes.byteLength,
       lineage: readStoredLineage(env.data as Record<string, unknown>),
     };
@@ -186,14 +224,26 @@ export async function publishPreparedVersion(
   options: PreparedPublishOptions,
 ): Promise<PublicationResult> {
   const { scope, storageAdapter, fencedPublication, signer } = options;
+  const signal = options.signal;
+  const checkpoint = () => signal?.throwIfAborted();
+  // Trailing arguments appear only under a signal, so ports written before
+  // the signal existed see the calls they always saw.
+  const sig: [AbortSignal] | [] = signal ? [signal] : [];
+  const opts: [{ signal: AbortSignal }] | [] = signal ? [{ signal }] : [];
+  checkpoint();
   const isDeleted = (row: PublicationRecord) =>
     Boolean(row.deletedAt) || isTombstoneRecord(row);
   let fence = await fencedPublication?.read({
     ownerAddress: options.ownerAddress,
     scope,
+    signal,
   });
   let head = fence ? fence.head : options.head;
   await options.checkHead?.(head ?? null);
+  // One remote legacy write, alone in the seal. A refusal throws
+  // `LegacyWriteRefusedError` before the remote call is made.
+  const sealed = <T>(write: () => Promise<T>): Promise<T> =>
+    options.legacyWriteSeal ? options.legacyWriteSeal.commit(write) : write();
   function requireFence(reason: string): PublicationFence {
     if (!fence) throw new NeedsFencedPublicationError(scope, reason);
     return fence;
@@ -210,11 +260,12 @@ export async function publishPreparedVersion(
   }
   checkDeletion();
   const { encrypted, wanted, verifyStored } = await options.prepare();
+  checkpoint();
   const wantedHash = wanted.dataHash;
   const keyUrl = (version: bigint) =>
     storageAdapter.urlForKey(`${scope}/${version}`);
   async function readCandidate(version: bigint): Promise<PublicationCandidate> {
-    const bytes = await storageAdapter.download(keyUrl(version));
+    const bytes = await storageAdapter.download(keyUrl(version), ...sig);
     return verifyStored(bytes);
   }
   async function commit(
@@ -222,6 +273,7 @@ export async function publishPreparedVersion(
     value: PublicationCandidate,
     mode: "register" | "adopt",
   ) {
+    checkpoint();
     const request = {
       ownerAddress: options.ownerAddress,
       scope,
@@ -258,15 +310,20 @@ export async function publishPreparedVersion(
         }),
       };
     }
+    // Signing awaited: the caller may have given up while it ran.
+    checkpoint();
     let id: string | undefined;
     if (fencedPublication) {
       const previous = requireFence("registration/adoption");
-      const result = await fencedPublication.commit({
-        ...request,
-        ...lineageFields,
-        mode,
-        fence: previous,
-      });
+      const result = await sealed(() =>
+        fencedPublication.commit({
+          ...request,
+          ...lineageFields,
+          mode,
+          fence: previous,
+          signal,
+        }),
+      );
       const registered = result.fence.head;
       if (
         result.fence.generation !== previous.generation ||
@@ -285,12 +342,14 @@ export async function publishPreparedVersion(
       // No remote effect: the caller verified the live row's stored bytes.
       id = head?.id;
     } else {
-      const result = lineageFields
-        ? await options.lineageGateway!.registerDataPoint({
-            ...request,
-            ...lineageFields,
-          })
-        : await options.gateway.registerDataPoint(request);
+      const result = await sealed(() =>
+        lineageFields
+          ? options.lineageGateway!.registerDataPoint(
+              { ...request, ...lineageFields },
+              ...opts,
+            )
+          : options.gateway.registerDataPoint(request, ...opts),
+      );
       id = result.dataPointId;
     }
     if (!id)
@@ -314,19 +373,23 @@ export async function publishPreparedVersion(
       : BigInt(head?.expectedVersion ?? "0") + 1n;
   let rebased = false;
   for (let step = 0; step < 4; step++) {
+    checkpoint();
     checkDeletion();
     if (head && !isDeleted(head) && sameHash(head.dataHash, wantedHash)) {
       version = BigInt(head.expectedVersion);
       const url = keyUrl(version);
-      if (!(await storageAdapter.exists(url))) {
+      if (!(await storageAdapter.exists(url, ...sig))) {
         // Recreating bytes can race a delete's cleanup; that needs the fence.
         requireFence("healing a committed version's missing bytes");
         if (!sameHash(wanted.metadataHash, head.metadataHash))
           throw new Error(
             "Missing committed blob cannot be healed: metadata commitment mismatch",
           );
+        checkpoint();
         try {
-          await storageAdapter.upload(`${scope}/${version}`, encrypted);
+          await sealed(() =>
+            storageAdapter.upload(`${scope}/${version}`, encrypted, ...sig),
+          );
         } catch (error) {
           if (!(error instanceof StoredBlobConflictError)) throw error;
         }
@@ -344,7 +407,9 @@ export async function publishPreparedVersion(
       version = BigInt(head.expectedVersion) + 1n;
     let value = wanted;
     try {
-      await storageAdapter.upload(`${scope}/${version}`, encrypted);
+      await sealed(() =>
+        storageAdapter.upload(`${scope}/${version}`, encrypted, ...sig),
+      );
     } catch (error) {
       if (!(error instanceof StoredBlobConflictError)) throw error;
       value = await readCandidate(version);

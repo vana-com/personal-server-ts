@@ -165,8 +165,8 @@ it("pins existing rows before admitting newer tail revisions and resumes the sam
     );
 });
 
-it("pages a large frozen baseline while another DB handle updates, deletes, replaces, resets and deletes connections", () => {
-  register("conn_reset");
+it("pages a large frozen baseline while another DB handle updates, deletes, replaces and deletes connections", () => {
+  register("conn_untouched");
   register("conn_delete");
   store.ingestBatch(
     Array.from({ length: 1205 }, (_, i) => envelope(String(i))),
@@ -174,7 +174,7 @@ it("pages a large frozen baseline while another DB handle updates, deletes, repl
     () => ["id"],
     { method: "collector", generation: 1 },
   );
-  ingest("a", "old", "conn_reset");
+  ingest("a", "old", "conn_untouched");
   ingest("a", "old", "conn_delete");
   const fence = store.replication.beginBaseline(config);
   const first = store.replication.readBaselinePage({ limit: 37 });
@@ -195,12 +195,6 @@ it("pages a large frozen baseline while another DB handle updates, deletes, repl
       emittedAt: at,
       envelopes: [envelope("0", "replacement"), envelope("fresh")],
       primaryKey: ["id"],
-    });
-    second.resetInstanceBinding({
-      instance: "conn_reset",
-      expectedMethod: "collector",
-      expectedGeneration: 1,
-      nextMethod: "collector",
     });
     second.deleteConnection("conn_delete");
   } finally {
@@ -241,15 +235,14 @@ it("pages a large frozen baseline while another DB handle updates, deletes, repl
       .filter((r) => r.winner?.kind === "upsert")
       .map((r) => r.identity.recordKey)
       .sort(),
-  ).toEqual(["0", "fresh"]);
+  ).toEqual(["0", "a", "fresh"]);
   expect(
     db
       .prepare(
-        "SELECT COUNT(*) AS n FROM pdpp_record_changes WHERE instance IN ('conn_reset', 'conn_delete')",
+        "SELECT COUNT(*) AS n FROM pdpp_record_changes WHERE instance IN ('conn_untouched', 'conn_delete')",
       )
       .get(),
-  ).toEqual({ n: 0 });
-  expect(tail.map((op) => op.kind)).toContain("connection-reset");
+  ).toEqual({ n: 1 });
   expect(tail.map((op) => op.kind)).toContain("connection-delete");
 }, 60000);
 
@@ -287,7 +280,7 @@ it("makes a later upsert win in every permutation, including after an explicit r
     ).toMatchObject({ kind: "upsert", data: { text: "new" } });
 });
 
-it("captures blob claims idempotently and retains verified bytes after reset and deletion", () => {
+it("captures blob claims idempotently and retains verified bytes after connection deletion", () => {
   const bytes = new Uint8Array([1, 2, 3]);
   const blob = store.storeBlobBytesForInstance({
     instance: "conn_a",
@@ -309,23 +302,8 @@ it("captures blob claims idempotently and retains verified bytes after reset and
     mimeType: "application/octet-stream",
   });
   expect(drain(store.replication.readTailPage)).toEqual([]);
-  store.resetInstanceBinding({
-    instance: "conn_a",
-    expectedMethod: "collector",
-    expectedGeneration: 1,
-    nextMethod: "collector",
-  });
-  store.storeBlobBytesForInstance({
-    instance: "conn_a",
-    method: "collector",
-    generation: 2,
-    bytes,
-    mimeType: "application/octet-stream",
-  });
   store.deleteConnection("conn_a");
   expect(drain(store.replication.readTailPage).map((op) => op.kind)).toEqual([
-    "connection-reset",
-    "blob-claim",
     "connection-delete",
   ]);
   expect(store.getBlobBytes(blob.blobId)).toBeUndefined();
@@ -337,26 +315,13 @@ it("captures connection registration once and makes lifecycle retries inert", ()
   store.replication.beginBaseline(config);
   register("conn_b");
   register("conn_b");
-  store.resetInstanceBinding({
-    instance: "conn_b",
-    expectedMethod: "collector",
-    expectedGeneration: 1,
-    nextMethod: "collector",
-  });
-  store.resetInstanceBinding({
-    instance: "conn_b",
-    expectedMethod: "collector",
-    expectedGeneration: 1,
-    nextMethod: "collector",
-  });
   store.deleteConnection("conn_b");
   store.deleteConnection("conn_b");
   expect(
     drain(store.replication.readTailPage).map((op) => [op.kind, op.generation]),
   ).toEqual([
     ["connection-register", 1],
-    ["connection-reset", 2],
-    ["connection-delete", 3],
+    ["connection-delete", 2],
   ]);
 });
 
@@ -461,7 +426,6 @@ it.each([
   "ingest",
   "record-delete",
   "replace",
-  "reset",
   "delete",
   "register",
   "blob",
@@ -507,13 +471,6 @@ it.each([
           envelopes: [],
           primaryKey: ["id"],
         }),
-      reset: () =>
-        store.resetInstanceBinding({
-          instance: "conn_a",
-          expectedMethod: "collector",
-          expectedGeneration: 1,
-          nextMethod: "collector",
-        }),
       delete: () => store.deleteConnection("conn_a"),
       register: () => register("conn_b"),
       blob: () =>
@@ -537,7 +494,6 @@ it.each(
     "baseline",
     "update",
     "replace",
-    "reset",
     "delete",
     "register",
     "blob",
@@ -573,7 +529,6 @@ it.each(
       baseline: `store.replication.beginBaseline(${JSON.stringify(config)})`,
       update: `store.ingestBatch([${JSON.stringify(envelope("a", "new"))}], () => 'mutable_state', () => ['id'], {method:'collector',generation:1})`,
       replace: `store.replaceStream({instance:'conn_a',stream:'messages',method:'collector',generation:1,emittedAt:'${at}',envelopes:[],primaryKey:['id']})`,
-      reset: `store.resetInstanceBinding({instance:'conn_a',expectedMethod:'collector',expectedGeneration:1,nextMethod:'collector'})`,
       delete: `store.deleteConnection('conn_a')`,
       register: `store.registerConnection({instance:'conn_b',sourceId:'${sourceId}',method:'collector',label:'B'})`,
       blob: `store.storeBlobBytesForInstance({instance:'conn_a',method:'collector',generation:1,bytes:new Uint8Array([4]),mimeType:'x/test'})`,
@@ -634,17 +589,15 @@ it("remains inert before enablement and rejects declaration mismatches atomicall
   expect(drain(store.replication.readTailPage)).toEqual([]);
 });
 
-it("exports existing tombstones, empty completions, resets and deleted connections without changing query state", () => {
+it("exports existing tombstones, empty completions, prior generations and deleted connections without changing query state", () => {
   ingest("a");
   store.deleteRecord("conn_a", "messages", "a", at, "mutable_state");
-  register("conn_reset");
-  store.resetInstanceBinding({
-    instance: "conn_reset",
-    expectedMethod: "collector",
-    expectedGeneration: 1,
-    nextMethod: "collector",
-  });
-  ingest("b", "old", "conn_reset", 2);
+  register("conn_prior_generation");
+  // This is an existing generation-2 database, restored from an older build.
+  db.prepare(
+    "UPDATE pdpp_instance_binding SET generation=2 WHERE instance='conn_prior_generation'",
+  ).run();
+  ingest("b", "old", "conn_prior_generation", 2);
   register("conn_deleted");
   store.deleteConnection("conn_deleted");
   store.completeStreams(
@@ -697,8 +650,9 @@ it("exports existing tombstones, empty completions, resets and deleted connectio
   });
   const plan = planReplicaMerge(mergeContext, operations.reverse());
   expect(
-    plan.records.find((row) => row.identity.connectionId === "conn_reset")
-      ?.winner,
+    plan.records.find(
+      (row) => row.identity.connectionId === "conn_prior_generation",
+    )?.winner,
   ).toMatchObject({ generation: 2, kind: "upsert" });
   expect(
     plan.suppressed.some((issue) => issue.reason === "connection_deleted"),

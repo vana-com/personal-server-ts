@@ -11,8 +11,14 @@ import {
   buildDataFilePath,
   type HierarchyManagerOptions,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
+import {
+  LegacyWriteRefusedError,
+  type LegacyWriteHold,
+  type LegacyWriteSeal,
+} from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
   deleteDataFileSync,
@@ -42,10 +48,29 @@ interface OperationRow {
 const keyWhere =
   "authority = @authority AND owner = @owner AND scope = @scope AND operation = @operation";
 
+/**
+ * Owner import operations: journaled legacy writes and their erasers.
+ *
+ * Seal map (see `LegacyWriteSeal`). A publication (`commitVersion`, and
+ * `recover` when it finishes a prepared operation) installs a legacy file and
+ * row, so it runs inside `seal.commit` and every primitive below it takes the
+ * `hold`. The whole sealed region is one synchronous SQLite transaction with
+ * no await in it, so the seal's lock is held only for that transaction.
+ * An eraser is a pure removal: it runs inside `seal.remove`, or directly when
+ * the caller is already inside `seal.commit` and passes its `hold`. The lock
+ * is not re-entrant, so no function here seals inside another sealed region.
+ * An eraser that must also finish other operations' publications does that as
+ * its own sealed commit first, then removes, in sequence.
+ *
+ * Lock order is seal, then scope lock: the seal is the outermost lock, and an
+ * eraser takes the scope's lock INSIDE its removal (or inside the caller's
+ * hold). Nothing here takes the scope lock and then asks for the seal.
+ */
 export function createImportOperations(
   db: Database.Database,
   index: IndexManager,
   options: HierarchyManagerOptions,
+  seal: LegacyWriteSeal,
 ) {
   const immediate = <T>(run: () => T): T => db.transaction(run).immediate();
   const lookup = db.prepare(
@@ -84,15 +109,26 @@ export function createImportOperations(
     }
   }
 
-  function recover(own?: ReturnType<typeof key>, replicaPath?: string): void {
+  /**
+   * Finish interrupted work. Cleaning up a retired operation is a removal and
+   * needs nothing; finishing a prepared one publishes a legacy file, so it
+   * happens only for a caller that holds the seal (`hold`). Without a hold
+   * prepared operations are left as they are.
+   */
+  function recover(
+    hold: LegacyWriteHold | undefined,
+    own?: ReturnType<typeof key>,
+    replicaPath?: string,
+  ): void {
     const rows = db
       .prepare(
         "SELECT * FROM owner_import_operations WHERE state = 'prepared' OR (state IN ('deleted', 'cancelled') AND metadata_json IS NOT NULL) ORDER BY rowid",
       )
       .all() as OperationRow[];
     for (const row of rows) {
+      if (row.state === "prepared" && !hold) continue;
       try {
-        recoverRow(row);
+        recoverRow(row, hold);
       } catch (error) {
         if (
           row.path === replicaPath ||
@@ -108,7 +144,10 @@ export function createImportOperations(
     }
   }
 
-  function recoverRow(row: OperationRow): void {
+  function recoverRow(
+    row: OperationRow,
+    hold: LegacyWriteHold | undefined,
+  ): void {
     if (row.state !== "prepared") {
       deleteDataFileSync(options, row.scope, row.collected_at, row.operation);
       index.deleteByPath(row.path);
@@ -117,6 +156,7 @@ export function createImportOperations(
       ).run(row);
       return;
     }
+    if (!hold) return;
     const bytes = row.envelope_bytes!;
     const envelope = JSON.parse(bytes.toString("utf8")) as DataFileEnvelope;
     const metadata = JSON.parse(
@@ -125,10 +165,16 @@ export function createImportOperations(
       sizeBytes?: number;
       afterTombstoneVersion?: number | null;
     };
-    const written = publishDataFile(options, envelope, bytes, row.operation);
+    const written = publishDataFile(
+      hold,
+      options,
+      envelope,
+      bytes,
+      row.operation,
+    );
     let entry = index.findByPath(row.path);
     if (!entry) {
-      const inserted = index.insertIfCurrent({
+      const inserted = index.insertIfCurrent(hold, {
         fileId: null,
         schemaId: null,
         path: row.path,
@@ -202,128 +248,133 @@ export function createImportOperations(
   ): Promise<VersionCommitResult> {
     const intent = command.kind === "append" ? command.import : undefined;
     if (intent) {
-      const admitted = immediate(() => {
-        const prior = find(command.envelope.scope, intent);
-        check(prior, intent);
-        recover(key(command.envelope.scope, intent));
-        if (prior) return false;
-        const envelope = reserve(command.envelope);
-        const path = relative(
-          options.dataDir,
-          buildDataFilePath(
+      return seal.commit((hold) => {
+        const admitted = immediate(() => {
+          const prior = find(command.envelope.scope, intent);
+          check(prior, intent);
+          recover(hold, key(command.envelope.scope, intent));
+          if (prior) return false;
+          const envelope = reserve(command.envelope);
+          const path = relative(
             options.dataDir,
-            envelope.scope,
-            envelope.collectedAt,
-          ),
-        );
-        db.prepare(
-          `INSERT INTO owner_import_operations (authority, owner, scope, operation, body_sha256, state, collected_at, path, envelope_bytes, metadata_json)
-          VALUES (@authority, @owner, @scope, @operation, @body_sha256, 'prepared', @collected_at, @path, @envelope_bytes, @metadata_json)`,
-        ).run({
-          ...key(envelope.scope, intent),
-          body_sha256: intent.bodySha256,
-          collected_at: envelope.collectedAt,
-          path,
-          envelope_bytes: Buffer.from(JSON.stringify(envelope, null, 2)),
-          metadata_json: JSON.stringify(command.metadata),
-        });
-        return true;
-      });
-      const published = immediate((): VersionCommitResult | undefined => {
-        recover(key(command.envelope.scope, intent));
-        const row = find(command.envelope.scope, intent);
-        // recover() dropped the operation: the scope is closed for writes.
-        // Report it after the drop commits; a throw here would roll it back.
-        if (!row) return undefined;
-        check(row, intent);
-        const receipt = JSON.parse(row.receipt_json!) as ImportReceipt;
-        if (!admitted) return { kind: "replay", receipt };
-        const entry = index.findByPath(row.path)!;
-        const envelope = {
-          ...command.envelope,
-          collectedAt: receipt.collectedAt,
-        };
-        return {
-          kind: "stored",
-          envelope,
-          entry,
-          receipt,
-          writeResult: {
-            path: buildDataFilePath(
+            buildDataFilePath(
               options.dataDir,
               envelope.scope,
               envelope.collectedAt,
             ),
-            relativePath: row.path,
-            sizeBytes: entry.sizeBytes,
-          },
-        };
+          );
+          db.prepare(
+            `INSERT INTO owner_import_operations (authority, owner, scope, operation, body_sha256, state, collected_at, path, envelope_bytes, metadata_json)
+          VALUES (@authority, @owner, @scope, @operation, @body_sha256, 'prepared', @collected_at, @path, @envelope_bytes, @metadata_json)`,
+          ).run({
+            ...key(envelope.scope, intent),
+            body_sha256: intent.bodySha256,
+            collected_at: envelope.collectedAt,
+            path,
+            envelope_bytes: Buffer.from(JSON.stringify(envelope, null, 2)),
+            metadata_json: JSON.stringify(command.metadata),
+          });
+          return true;
+        });
+        const published = immediate((): VersionCommitResult | undefined => {
+          recover(hold, key(command.envelope.scope, intent));
+          const row = find(command.envelope.scope, intent);
+          // recover() dropped the operation: the scope is closed for writes.
+          // Report it after the drop commits; a throw here would roll it back.
+          if (!row) return undefined;
+          check(row, intent);
+          const receipt = JSON.parse(row.receipt_json!) as ImportReceipt;
+          if (!admitted) return { kind: "replay", receipt };
+          const entry = index.findByPath(row.path)!;
+          const envelope = {
+            ...command.envelope,
+            collectedAt: receipt.collectedAt,
+          };
+          return {
+            kind: "stored",
+            envelope,
+            entry,
+            receipt,
+            writeResult: {
+              path: buildDataFilePath(
+                options.dataDir,
+                envelope.scope,
+                envelope.collectedAt,
+              ),
+              relativePath: row.path,
+              sizeBytes: entry.sizeBytes,
+            },
+          };
+        });
+        if (!published) {
+          throw new ProtocolError(
+            409,
+            "SCOPE_CLOSED_FOR_WRITES",
+            "This scope is closed for writes until its index history is repaired",
+          );
+        }
+        return published;
       });
-      if (!published) {
-        throw new ProtocolError(
-          409,
-          "SCOPE_CLOSED_FOR_WRITES",
-          "This scope is closed for writes until its index history is repaired",
-        );
-      }
-      return published;
     }
     let publishedPath: string | undefined;
     try {
-      return immediate(() => {
-        // A replica cannot reuse a path still owned by failed import cleanup.
-        recover(
-          undefined,
-          command.kind === "replica"
-            ? relative(
-                options.dataDir,
-                buildDataFilePath(
+      return await seal.commit((hold) =>
+        immediate(() => {
+          // A replica cannot reuse a path still owned by failed import cleanup.
+          recover(
+            hold,
+            undefined,
+            command.kind === "replica"
+              ? relative(
                   options.dataDir,
-                  command.envelope.scope,
-                  command.envelope.collectedAt,
-                ),
-              )
-            : undefined,
-        );
-        const envelope =
-          command.kind === "append"
-            ? reserve(command.envelope)
-            : command.envelope;
-        const bytes = Buffer.from(JSON.stringify(envelope, null, 2));
-        let writeResult;
-        try {
-          writeResult = publishDataFile(options, envelope, bytes);
-        } catch (err) {
-          if (err instanceof PublishedDataFileError)
-            publishedPath = err.relativePath;
-          throw err;
-        }
-        publishedPath = writeResult.relativePath;
-        let entry = index.findByPath(writeResult.relativePath);
-        if (entry && command.kind === "replica") {
-          index.updateDataPointId(entry.path, command.metadata.dataPointId);
-          index.updateVersion(entry.path, command.metadata.version);
-          entry = index.findByPath(entry.path)!;
-        } else {
-          entry = index.insert({
-            fileId: null,
-            path: writeResult.relativePath,
-            scope: envelope.scope,
-            collectedAt: envelope.collectedAt,
-            sizeBytes:
-              command.kind === "append"
-                ? (command.metadata.sizeBytes ?? writeResult.sizeBytes)
-                : writeResult.sizeBytes,
-            ...(command.kind === "replica"
-              ? command.metadata
-              : {
-                  afterTombstoneVersion:
-                    command.metadata.afterTombstoneVersion ?? null,
-                }),
-          });
-        }
-        return { kind: "stored", envelope, entry, writeResult };
-      });
+                  buildDataFilePath(
+                    options.dataDir,
+                    command.envelope.scope,
+                    command.envelope.collectedAt,
+                  ),
+                )
+              : undefined,
+          );
+          const envelope =
+            command.kind === "append"
+              ? reserve(command.envelope)
+              : command.envelope;
+          const bytes = Buffer.from(JSON.stringify(envelope, null, 2));
+          let writeResult;
+          try {
+            writeResult = publishDataFile(hold, options, envelope, bytes);
+          } catch (err) {
+            if (err instanceof PublishedDataFileError)
+              publishedPath = err.relativePath;
+            throw err;
+          }
+          publishedPath = writeResult.relativePath;
+          let entry = index.findByPath(writeResult.relativePath);
+          if (entry && command.kind === "replica") {
+            index.updateDataPointId(entry.path, command.metadata.dataPointId);
+            index.updateVersion(entry.path, command.metadata.version);
+            entry = index.findByPath(entry.path)!;
+          } else {
+            entry = index.insert(hold, {
+              fileId: null,
+              path: writeResult.relativePath,
+              scope: envelope.scope,
+              collectedAt: envelope.collectedAt,
+              sizeBytes:
+                command.kind === "append"
+                  ? (command.metadata.sizeBytes ?? writeResult.sizeBytes)
+                  : writeResult.sizeBytes,
+              ...(command.kind === "replica"
+                ? command.metadata
+                : {
+                    afterTombstoneVersion:
+                      command.metadata.afterTombstoneVersion ?? null,
+                  }),
+            });
+          }
+          return { kind: "stored" as const, envelope, entry, writeResult };
+        }),
+      );
     } catch (err) {
       if (command.kind === "append" && publishedPath) {
         throw new IngestPersistedError(publishedPath, err);
@@ -338,44 +389,144 @@ export function createImportOperations(
     ).run(params);
   }
 
-  immediate(recover);
+  /**
+   * Cancels the prepared operations an erase targets, before it finishes the
+   * publications other operations are owed. A cancelled operation is never
+   * published, so the erase's target is not made readable, not even for the
+   * moment before the removal. A removal: it publishes nothing.
+   */
+  function cancelTargets(
+    hold: LegacyWriteHold | undefined,
+    scope: string,
+    where: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    return removal(hold, scope, () =>
+      immediate(() => {
+        db.prepare(
+          `UPDATE owner_import_operations SET state = 'cancelled', metadata_json = COALESCE(metadata_json, '{}') WHERE ${where} AND state = 'prepared'`,
+        ).run(params);
+      }),
+    );
+  }
+
+  /**
+   * A pure removal of one scope's data: under the seal's lock, or inside the
+   * caller's own commit, and under that scope's lock taken inside the seal.
+   */
+  function removal<T>(
+    hold: LegacyWriteHold | undefined,
+    scope: string,
+    work: () => T,
+  ): Promise<T> {
+    const locked = () => withScopeLock(scope, async () => work());
+    return hold ? locked() : seal.remove(locked);
+  }
+
+  /**
+   * Before an erase, finish the publications other operations are owed, as an
+   * erase always did. That publishes legacy files, so it is a sealed commit of
+   * its own, run before and apart from the removal (the lock is not
+   * re-entrant): a removal never publishes. A caller that already holds the
+   * seal publishes under its own hold. A refusal leaves those operations
+   * prepared; the erase itself is never refused.
+   */
+  async function finishOwedPublications(
+    hold: LegacyWriteHold | undefined,
+  ): Promise<void> {
+    if (hold) {
+      immediate(() => recover(hold));
+      return;
+    }
+    const owed = db
+      .prepare(
+        "SELECT 1 FROM owner_import_operations WHERE state = 'prepared' LIMIT 1",
+      )
+      .get();
+    if (!owed) return;
+    try {
+      await seal.commit((sealed) => immediate(() => recover(sealed)));
+    } catch (error) {
+      if (!(error instanceof LegacyWriteRefusedError)) throw error;
+    }
+  }
+
+  /**
+   * Boot recovery of interrupted operations. A prepared operation was
+   * acknowledged to a legacy client but not yet published, so finishing it is
+   * a sealed publication. Unswitched: published. Switched: dropped, with any
+   * file it left, so it cannot outlive the switch. Unknown: left prepared for
+   * a later boot to decide. Cleaning up retired operations is a removal and
+   * always runs.
+   */
+  async function recoverAtBoot(): Promise<void> {
+    try {
+      await seal.commit((hold) => immediate(() => recover(hold)));
+    } catch (error) {
+      if (!(error instanceof LegacyWriteRefusedError)) throw error;
+      await seal.remove(() =>
+        immediate(() => {
+          if (error.verdict === "switched") dropPrepared();
+          recover(undefined);
+        }),
+      );
+    }
+  }
+
+  function dropPrepared(): void {
+    const rows = db
+      .prepare("SELECT * FROM owner_import_operations WHERE state = 'prepared'")
+      .all() as OperationRow[];
+    for (const row of rows) {
+      deleteDataFileSync(options, row.scope, row.collected_at, row.operation);
+      db.prepare(`DELETE FROM owner_import_operations WHERE ${keyWhere}`).run(
+        row,
+      );
+    }
+  }
+
   return {
     commitVersion,
-    deleteScope(scope: string): number {
-      const snapshot = immediate(() => {
-        deleteFirstSeenLedgerSync(options, scope);
-        const files = snapshotScopeFiles(options, scope);
-        const entries = db
-          .prepare("SELECT id, path FROM data_files WHERE scope = ?")
-          .all(scope) as { id: number; path: string }[];
-        retire("scope = @scope", { scope });
-        return { files, entries };
-      });
-      return immediate(() => {
-        recover();
-        // A replica can reuse a captured path between these transactions.
-        const captured = new Set(snapshot.entries.map(({ id }) => id));
-        const later = new Set(
-          (
-            db
-              .prepare("SELECT id, path FROM data_files WHERE scope = ?")
-              .all(scope) as { id: number; path: string }[]
-          )
-            .filter(({ id }) => !captured.has(id))
-            .map(({ path }) => resolve(options.dataDir, path)),
-        );
-        deleteScopeFilesSync({
-          ...snapshot.files,
-          files: snapshot.files.files.filter((file) => !later.has(file)),
-        });
-        const remove = db.prepare(
-          "DELETE FROM data_files WHERE id = @id AND path = @path",
-        );
-        for (const entry of snapshot.entries) remove.run(entry);
-        if (index.countByScope(scope) === 0) {
+    recoverAtBoot,
+    async deleteScope(scope: string, hold?: LegacyWriteHold): Promise<number> {
+      await cancelTargets(hold, scope, "scope = @scope", { scope });
+      await finishOwedPublications(hold);
+      return removal(hold, scope, () => {
+        const snapshot = immediate(() => {
           deleteFirstSeenLedgerSync(options, scope);
-        }
-        return snapshot.entries.length;
+          const files = snapshotScopeFiles(options, scope);
+          const entries = db
+            .prepare("SELECT id, path FROM data_files WHERE scope = ?")
+            .all(scope) as { id: number; path: string }[];
+          retire("scope = @scope", { scope });
+          return { files, entries };
+        });
+        return immediate(() => {
+          recover(undefined);
+          // A replica can reuse a captured path between these transactions.
+          const captured = new Set(snapshot.entries.map(({ id }) => id));
+          const later = new Set(
+            (
+              db
+                .prepare("SELECT id, path FROM data_files WHERE scope = ?")
+                .all(scope) as { id: number; path: string }[]
+            )
+              .filter(({ id }) => !captured.has(id))
+              .map(({ path }) => resolve(options.dataDir, path)),
+          );
+          deleteScopeFilesSync({
+            ...snapshot.files,
+            files: snapshot.files.files.filter((file) => !later.has(file)),
+          });
+          const remove = db.prepare(
+            "DELETE FROM data_files WHERE id = @id AND path = @path",
+          );
+          for (const entry of snapshot.entries) remove.run(entry);
+          if (index.countByScope(scope) === 0) {
+            deleteFirstSeenLedgerSync(options, scope);
+          }
+          return snapshot.entries.length;
+        });
       });
     },
     /**
@@ -385,27 +536,31 @@ export function createImportOperations(
      * the same kind every owner import commits in, so a replacement row cannot
      * land between them. A row erased or replaced since is left alone.
      */
-    deleteFencedVersion(
+    async deleteFencedVersion(
       scope: string,
       collectedAt: string,
       fence: VersionFence,
-    ): boolean {
-      return immediate(() => {
-        recover();
-        const row = index.findByPath(fence.path);
-        if (
-          !row ||
-          row.id !== fence.id ||
-          row.scope !== scope ||
-          row.collectedAt !== collectedAt
-        ) {
-          return false;
-        }
-        retire("path = @path", { path: fence.path });
-        deleteDataFileSync(options, scope, collectedAt);
-        index.deleteByPath(fence.path);
-        return true;
-      });
+      hold?: LegacyWriteHold,
+    ): Promise<boolean> {
+      await finishOwedPublications(hold);
+      return removal(hold, scope, () =>
+        immediate(() => {
+          recover(undefined);
+          const row = index.findByPath(fence.path);
+          if (
+            !row ||
+            row.id !== fence.id ||
+            row.scope !== scope ||
+            row.collectedAt !== collectedAt
+          ) {
+            return false;
+          }
+          retire("path = @path", { path: fence.path });
+          deleteDataFileSync(options, scope, collectedAt);
+          index.deleteByPath(fence.path);
+          return true;
+        }),
+      );
     },
     /**
      * Like `deleteFencedVersion`, and only while the envelope file is absent.
@@ -413,66 +568,84 @@ export function createImportOperations(
      * write publishes in, so a restored file cannot be erased. Only ENOENT is
      * absence; any other fault throws and the row stays.
      */
-    deleteFencedVersionIfMissing(
+    async deleteFencedVersionIfMissing(
       scope: string,
       collectedAt: string,
       fence: VersionFence,
-    ): boolean {
-      return immediate(() => {
-        recover();
-        const row = index.findByPath(fence.path);
-        if (
-          !row ||
-          row.id !== fence.id ||
-          row.scope !== scope ||
-          row.collectedAt !== collectedAt
-        ) {
-          return false;
-        }
-        try {
-          statSync(buildDataFilePath(options.dataDir, scope, collectedAt));
-          return false;
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-        }
-        retire("path = @path", { path: fence.path });
-        deleteDataFileSync(options, scope, collectedAt);
-        index.deleteByPath(fence.path);
-        return true;
-      });
+      hold?: LegacyWriteHold,
+    ): Promise<boolean> {
+      await finishOwedPublications(hold);
+      return removal(hold, scope, () =>
+        immediate(() => {
+          recover(undefined);
+          const row = index.findByPath(fence.path);
+          if (
+            !row ||
+            row.id !== fence.id ||
+            row.scope !== scope ||
+            row.collectedAt !== collectedAt
+          ) {
+            return false;
+          }
+          try {
+            statSync(buildDataFilePath(options.dataDir, scope, collectedAt));
+            return false;
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          }
+          retire("path = @path", { path: fence.path });
+          deleteDataFileSync(options, scope, collectedAt);
+          index.deleteByPath(fence.path);
+          return true;
+        }),
+      );
     },
-    deleteVersion(
+    async deleteVersion(
       scope: string,
       collectedAt: string,
       indexedPath?: string,
-    ): boolean {
-      immediate(() => {
-        retire("scope = @scope AND collected_at = @collectedAt", {
-          scope,
-          collectedAt,
+      hold?: LegacyWriteHold,
+    ): Promise<boolean> {
+      await cancelTargets(
+        hold,
+        scope,
+        "scope = @scope AND collected_at = @collectedAt",
+        { scope, collectedAt },
+      );
+      await finishOwedPublications(hold);
+      return removal(hold, scope, () => {
+        immediate(() => {
+          retire("scope = @scope AND collected_at = @collectedAt", {
+            scope,
+            collectedAt,
+          });
+        });
+        return immediate(() => {
+          const path =
+            indexedPath ??
+            relative(
+              options.dataDir,
+              buildDataFilePath(options.dataDir, scope, collectedAt),
+            );
+          const existed = index.findByPath(path) !== undefined;
+          recover(undefined);
+          deleteDataFileSync(options, scope, collectedAt);
+          index.deleteByPath(path);
+          return existed;
         });
       });
-      return immediate(() => {
-        const path =
-          indexedPath ??
-          relative(
-            options.dataDir,
-            buildDataFilePath(options.dataDir, scope, collectedAt),
-          );
-        const existed = index.findByPath(path) !== undefined;
-        recover();
-        deleteDataFileSync(options, scope, collectedAt);
-        index.deleteByPath(path);
-        return existed;
-      });
     },
-    dropUnsyncedEntry(path: string): boolean {
-      return immediate(() => {
-        if (index.findByPath(path)?.dataPointId !== null) return false;
-        if (!index.deleteUnsyncedByPath(path)) return false;
-        retire("path = @path", { path });
-        return true;
-      });
+    dropUnsyncedEntry(path: string, hold?: LegacyWriteHold): Promise<boolean> {
+      const scope = index.findByPath(path)?.scope;
+      if (scope === undefined) return Promise.resolve(false);
+      return removal(hold, scope, () =>
+        immediate(() => {
+          if (index.findByPath(path)?.dataPointId !== null) return false;
+          if (!index.deleteUnsyncedByPath(path)) return false;
+          retire("path = @path", { path });
+          return true;
+        }),
+      );
     },
   };
 }

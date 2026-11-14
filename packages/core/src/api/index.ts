@@ -1,4 +1,8 @@
+import type { LocalListing } from "../localdb/listing.js";
+import type { OlderVersions } from "../localdb/older-versions.js";
+import { isOwnAppRead } from "../payment/own-app.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
+import { HISTORY_PAGE_LIMIT, type LocalHistory } from "../localdb/history.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import {
   DataDeletedError,
@@ -43,6 +47,7 @@ import {
   listAccessLogsContract,
   listDataScopesContract,
   listDataVersionsContract,
+  parseDataReadScopeContract,
   parseDataScopeContract,
   parseJsonObjectBody,
   readDataContract,
@@ -94,7 +99,26 @@ import {
 } from "../lineage/lineage.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import { ScopeUploadError, type ScopeUploadRegistry } from "./scope-uploads.js";
+import type {
+  OwnerNotes,
+  ReadDecision,
+  ResolveInput,
+  StreamSyncReadStatus,
+  WithheldRun,
+} from "../stream-sync-read/service.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
+import {
+  accountModeUnknownResponse,
+  type OwnedAccountStorageMode,
+} from "./account-storage-mode.js";
+import {
+  LegacyWriteRefusedError,
+  refuseLegacyWrite,
+  updateRequiredResponse,
+} from "./legacy-write-gate.js";
+import type { StorageModeRead } from "./owner-connector-delete.js";
+import { switchedDeleteRefusalResponse } from "./switched-delete-refusal.js";
+import type { LegacyWriteSeal } from "../storage/legacy-write-seal.js";
 import {
   deletionHistoryOf,
   type LegacyScopeRefusal,
@@ -123,6 +147,14 @@ export interface PersonalServerReadAuthInput {
    * x402 challenge/settlement to the exact version served, not the latest.
    */
   at?: string;
+  /**
+   * The registered data point version the body comes from, when it is not
+   * the stored entry of `scope`: a stream view serves a stream head. Taken
+   * unchanged from the read decision, so settlement names the head that was
+   * validated and served. When present, `fileId` and `at` select no
+   * settlement entry.
+   */
+  servedEntry?: { scope: string; version: number };
   /**
    * The read serves no block values, only a scope's table of contents (block
    * ids, paths, sizes). Grant policy still applies; payment-enforcing auth
@@ -312,12 +344,43 @@ export interface PersonalServerIngestSyncManager {
    * Durable scope deletion (gateway tombstone -> storage blobs -> local).
    * When absent the DELETE route deletes the local copy only and reports
    * `durable: false`.
+   *
+   * `within` is the legacy-write seal's `commit`. The manager runs its delete
+   * inside it, AFTER it has taken its own mutation queue: the seal must be the
+   * innermost lock (a sync cycle holds the queue and asks for the seal, so
+   * asking for the seal first would wait on a cycle that waits on the seal).
+   * Pass it on every call that must refuse on a switched account.
    */
-  deleteScope?(scope: string): Promise<DeleteScopeResult>;
+  deleteScope?(
+    scope: string,
+    within?: LegacyWriteSeal["commit"],
+  ): Promise<DeleteScopeResult>;
+}
+
+/** The read side of stream sync, as the data API uses it. */
+export interface StreamSyncReadPort {
+  resolve(input: ResolveInput): Promise<ReadDecision>;
+  /** Per-stream counts and open import problems, for owner diagnostics. */
+  status?(): StreamSyncReadStatus;
+  listScopes?: LocalListing["listScopes"];
+  olderVersions?: OlderVersions;
 }
 
 export interface PersonalServerDataApiDeps {
+  /**
+   * The account's storage mode: the one answer the write gate and the read
+   * selector share (see `account-storage-mode.ts`). Absent = unknown: every
+   * legacy write is refused with a retryable 503.
+   */
+  accountStorageMode?: OwnedAccountStorageMode;
+  /**
+   * The account's storage mode, sampled once per data request. Switched
+   * accounts read stream data from the database. Absent preserves the legacy path.
+   */
+  accountMode?: StorageModeRead;
   additions?: DurableAdditionsService;
+  /** Database history, constructed by the host for this owner and network. */
+  history?: LocalHistory;
   storage: DataStoragePort;
   /**
    * Latest bodies of connector scopes the owner collects into the canonical
@@ -325,6 +388,13 @@ export interface PersonalServerDataApiDeps {
    * Explicit versions (`fileId`, `at`) always read from `storage`.
    */
   legacyScopeView?: LegacyScopeViewPort;
+  /**
+   * Stream-sync reads (`streamSync.read`). Absent = every read takes the
+   * existing path, unchanged. Present: a latest read of a name a stream view
+   * can serve is answered from the view (§2.10); a deleted connector's
+   * names are refused at every version.
+   */
+  streamSyncRead?: StreamSyncReadPort;
   auth: PersonalServerApiAuthPort;
   accessLogWriter: AccessLogWriter;
   syncManager?: PersonalServerIngestSyncManager | null;
@@ -386,6 +456,8 @@ export interface PersonalServerDataApiDeps {
    * serve. When false (default), reads bypass payment entirely.
    */
   paymentEnabled?: boolean;
+  /** Operator-selected Account authority. Never taken from a read request. */
+  ownAppAccountUrl?: string;
   /**
    * Test seam for the gateway forwarding fetch. Defaults to the global
    * `fetch`; tests inject a mock that returns specific gateway statuses.
@@ -465,7 +537,10 @@ export interface PersonalServerAccessLogsApiDeps {
 
 export interface PersonalServerSyncApiDeps {
   auth: Pick<PersonalServerApiAuthPort, "authorizeOwner">;
-  syncManager: Pick<SyncManager, "trigger" | "getStatus"> | null;
+  syncManager:
+    | (Pick<SyncManager, "trigger" | "getStatus"> &
+        Partial<Pick<SyncManager, "requestPull">>)
+    | null;
   logger?: PersonalServerApiLogger;
 }
 
@@ -506,6 +581,50 @@ export interface PersonalServerOauthTokenApiDeps {
 
 export interface PersonalServerApiDispatchOptions {
   basePath?: string;
+  /**
+   * In-process only, never set from an HTTP request. A same-process caller
+   * that answers a read for itself (the MCP read client) states how the
+   * handler treats that read. Absent, the handler behaves as it does for HTTP.
+   */
+  inProcess?: PersonalServerInProcessRead;
+}
+
+/** A read the handler served, in the terms a fulfilment report needs. */
+export interface PersonalServerServedRead {
+  scope: string;
+  builder: string;
+  grantId: string;
+  fileId?: string;
+  logId: string;
+  ipAddress: string;
+  servedAt: string;
+  userAgent: string;
+}
+
+export interface PersonalServerInProcessRead {
+  /** Ask the auth port for a metadata read: grant policy applies, nothing is charged. */
+  metadataOnly?: boolean;
+  /** Write the grant-gated access-log line. Defaults to true. */
+  logAccess?: boolean;
+  /**
+   * Receives the served read in place of the HTTP fulfilment report. The
+   * caller decides whether the read completes a scope.
+   */
+  onServed: (served: PersonalServerServedRead) => void;
+  /**
+   * Checks the body the handler is about to serve, before the read is charged
+   * or logged. Throwing refuses the read: nothing is charged, logged or served.
+   * `fromStreamView` says whether the body came from a stream view.
+   */
+  validateBody?: (
+    body: unknown,
+    served: { fromStreamView: boolean },
+  ) => Promise<void>;
+  /**
+   * Receives the legacy file a raw read selected, before the read is charged.
+   * The bytes served are that file's, so its identity is the one to report.
+   */
+  onRawSelected?: (selected: { fileId?: string; collectedAt: string }) => void;
 }
 
 type JsonStatus =
@@ -592,8 +711,43 @@ async function supersedeAfterCommit(
   }
 }
 
-function contractErrorResponse(err: DataContractError): Response {
-  return jsonResponse(err.body, { status: err.status });
+function contractErrorResponse(
+  err: DataContractError,
+  notes?: OwnerNotes,
+): Response {
+  return jsonResponse(withOwnerBody(err.body, notes), {
+    status: err.status,
+    headers: ownerNoteHeaders(notes),
+  });
+}
+
+/** What only the owner is told when the existing path answers a stream read. */
+function ownerNoteHeaders(
+  notes: OwnerNotes | undefined,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (notes?.withheld?.length) {
+    headers["X-Stream-Sync-Withheld"] = withheldReasons(notes.withheld);
+  }
+  if (notes?.pending) {
+    headers["X-Stream-Sync-Pending"] = String(notes.pending.runs);
+  }
+  if (notes?.awaitingImport) {
+    headers["X-Stream-Sync-Awaiting-Import"] = String(
+      notes.awaitingImport.runs,
+    );
+  }
+  if (notes?.notReflected) {
+    headers["X-Stream-Sync-Not-Reflected"] = String(notes.notReflected.streams);
+  }
+  return headers;
+}
+
+function withOwnerBody<T extends object>(
+  body: T,
+  notes: OwnerNotes | undefined,
+): T | (T & { withheld: readonly WithheldRun[] }) {
+  return notes?.withheld?.length ? { ...body, withheld: notes.withheld } : body;
 }
 
 function protocolErrorResponse(err: ProtocolError): Response {
@@ -604,17 +758,210 @@ function errorResponse(
   status: JsonStatus,
   errorCode: string,
   message: string,
+  notes?: OwnerNotes,
 ): Response {
   return jsonResponse(
-    {
-      error: {
-        code: status,
-        errorCode,
-        message,
+    withOwnerBody(
+      {
+        error: {
+          code: status,
+          errorCode,
+          message,
+        },
       },
-    },
-    { status },
+      notes,
+    ),
+    { status, headers: ownerNoteHeaders(notes) },
   );
+}
+
+type AccountMode = ReturnType<StorageModeRead["read"]>;
+
+function legacyMutationRefusal(mode: AccountMode): Response | undefined {
+  if (mode === "unknown") return accountModeUnknownResponse();
+  if (mode === "switched") return updateRequiredResponse();
+  return undefined;
+}
+
+/** The response for a stream-sync decision that serves nothing; `null` otherwise. */
+function streamSyncRefusal(decision: ReadDecision): Response | null {
+  switch (decision.kind) {
+    case "unavailable":
+      return decision.reason === "connection_not_found"
+        ? errorResponse(
+            404,
+            "CONNECTION_NOT_FOUND",
+            "No connection of this name's connector matches the connection parameter",
+            decision,
+          )
+        : null;
+    case "key_mismatch":
+      return errorResponse(
+        503,
+        "KEY_MISMATCH",
+        "This data was written with another owner key and cannot be read here",
+      );
+    case "cursor_stale":
+      return errorResponse(
+        409,
+        "CURSOR_STALE",
+        "The cursor names a version this server no longer holds; read again without it",
+      );
+    case "busy":
+      return jsonResponse(
+        {
+          error: {
+            code: 503,
+            errorCode: "STREAM_SYNC_READ_BUSY",
+            message: "This data is changing; read again shortly",
+          },
+        },
+        {
+          status: 503,
+          headers: { "Retry-After": String(decision.retryAfterSeconds) },
+        },
+      );
+    case "invalid_cursor":
+      return errorResponse(400, "INVALID_CURSOR", "cursor is not valid");
+    case "invalid_connection":
+      return errorResponse(
+        400,
+        "INVALID_CONNECTION",
+        "connection must be empty or 16 lowercase hex characters",
+      );
+    case "too_large":
+      return errorResponse(
+        503,
+        "TOO_LARGE",
+        "This legacy view is larger than this server can build; read its streams instead",
+      );
+    default:
+      return null;
+  }
+}
+
+/**
+ * An in-process stream read is checked against the body it will serve. The
+ * view is read in full first, so the check and the served bytes are one body.
+ * Without a check the stream passes through unchanged.
+ */
+async function validateStreamBody<
+  D extends Extract<ReadDecision, { kind: "view" }>,
+>(decision: D, inProcess: PersonalServerInProcessRead | undefined): Promise<D> {
+  if (!inProcess?.validateBody) return decision;
+  const text = await new Response(decision.body).text();
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw new ProtocolError(
+      422,
+      "NOT_BLOCK_READABLE",
+      "The stream view has no JSON body to read as blocks.",
+    );
+  }
+  await inProcess.validateBody(body, { fromStreamView: true });
+  return { ...decision, body: new Response(text).body as D["body"] };
+}
+
+/**
+ * Serve a stream view: the envelope streams part by part. A charged read
+ * has already paid (`paymentResponseHeader`).
+ */
+async function serveStreamSyncView(
+  deps: PersonalServerDataApiDeps,
+  request: Request,
+  input: {
+    scope: string;
+    grantId: string | undefined;
+    authResult: Awaited<
+      ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
+    >;
+    decision: Extract<ReadDecision, { kind: "view" }>;
+    paymentResponseHeader: string | undefined;
+    inProcess: PersonalServerInProcessRead | undefined;
+  },
+): Promise<Response> {
+  const { authResult, decision, inProcess } = input;
+  const logId = deps.createLogId?.() ?? crypto.randomUUID();
+  const timestamp = (deps.now ?? (() => new Date()))().toISOString();
+  const ipAddress =
+    request.headers.get("x-forwarded-for") ??
+    request.headers.get("x-real-ip") ??
+    "unknown";
+  const userAgent = request.headers.get("user-agent") ?? "unknown";
+  if (inProcess?.logAccess !== false) {
+    try {
+      await deps.accessLogWriter.write({
+        logId,
+        grantId: authResult?.grantId ?? input.grantId ?? "unknown",
+        builder: authResult?.builder ?? "unknown",
+        action: "read",
+        scope: input.scope,
+        timestamp,
+        ipAddress,
+        userAgent,
+      });
+    } catch (error) {
+      await decision.body.cancel();
+      throw error;
+    }
+  }
+  if (authResult?.grantId && authResult.builder) {
+    const served = {
+      builder: authResult.builder,
+      fileId: undefined,
+      grantId: authResult.grantId,
+      ipAddress,
+      logId,
+      outcome: "served" as const,
+      scope: input.scope,
+      servedAt: timestamp,
+      source: "api" as const,
+      userAgent,
+    };
+    // An in-process caller decides completion itself, after any paging.
+    if (inProcess) {
+      inProcess.onServed({
+        scope: input.scope,
+        builder: authResult.builder,
+        grantId: authResult.grantId,
+        fileId: undefined,
+        logId,
+        ipAddress,
+        servedAt: timestamp,
+        userAgent,
+      });
+    } else {
+      reportPersonalServerReadFulfillment(deps, served);
+    }
+  }
+  // A projection can fail after the 200 status. The client must then see
+  // the connection abort, never a complete shorter body. Chunked framing
+  // also keeps @hono/node-server from reading the body ahead of the status:
+  // a failure in that read-ahead would end the response with a
+  // content-length of the bytes read so far, as if it were whole.
+  return new Response(decision.body, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "X-Vana-Data-Source": "stream-sync",
+      "X-Stream-Sync-Cursor": decision.cursor,
+      // Owner only: the service attaches this to no other audience.
+      ...(decision.withheld?.length
+        ? { "X-Stream-Sync-Withheld": withheldReasons(decision.withheld) }
+        : {}),
+      ...(input.paymentResponseHeader
+        ? { "X-PAYMENT-RESPONSE": input.paymentResponseHeader }
+        : {}),
+    },
+  });
+}
+
+/** The distinct reasons of the withheld runs, for the response header. */
+function withheldReasons(withheld: readonly WithheldRun[]): string {
+  return [...new Set(withheld.map((w) => w.reason))].join(",");
 }
 
 function methodNotAllowed(): Response {
@@ -667,6 +1014,12 @@ async function withApiErrors(
   } catch (err) {
     if (err instanceof ProtocolError) {
       return protocolErrorResponse(err);
+    }
+    // A durable step refused by the legacy-write seal (the account switched,
+    // or its mode is not known) after the route's early check passed. The
+    // answer is the same 426 or 503 the early check gives, never a 500.
+    if (err instanceof LegacyWriteRefusedError) {
+      return err.response;
     }
     if (context) {
       context.logger?.error?.(
@@ -792,12 +1145,200 @@ function listAuthCovers(
   );
 }
 
+/**
+ * Whether the app reading is the data owner's own app, which is exempt from
+ * the read fee. `false` when no Account authority is configured or the read
+ * is owner-signalled; a `Response` (503) when eligibility cannot be
+ * verified, so a read is never served free on missing evidence.
+ */
+async function ownAppReadStatus(
+  deps: PersonalServerDataApiDeps,
+  authResult: Awaited<
+    ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
+  >,
+): Promise<boolean | Response> {
+  const isOwnerSignal =
+    authResult?.grantId === "owner" || authResult?.grantId === "policy-bypass";
+  const builder = authResult?.builder;
+  if (
+    !deps.paymentEnabled ||
+    isOwnerSignal ||
+    !authResult?.grantId ||
+    !builder ||
+    !deps.ownAppAccountUrl
+  ) {
+    return false;
+  }
+  const unavailable = () =>
+    errorResponse(
+      503,
+      "OWN_APP_ELIGIBILITY_UNAVAILABLE",
+      "Own-app fee eligibility could not be verified",
+    );
+  if (!deps.serverOwner || !deps.gatewayConfig) return unavailable();
+  try {
+    return await isOwnAppRead({
+      accountUrl: deps.ownAppAccountUrl,
+      appAddress: builder,
+      dataOwner: deps.serverOwner,
+      chainId: deps.gatewayConfig.chainId,
+    });
+  } catch {
+    return unavailable();
+  }
+}
+
+/** What a charged builder read pays with; see `readCharge`. */
+interface ReadCharge {
+  grantId: string;
+  builder: `0x${string}`;
+  gateway: Pick<GatewayClient, "getGrant">;
+  gatewayConfig: DataPortabilityGatewayConfig;
+  gatewayUrl: string;
+}
+
+/**
+ * Whether a read is charged, and with what. Owner-exempt reads (the grantId
+ * sentinels "owner" / "policy-bypass") are never charged: there is no
+ * payable op to attach the payment to. The grantId paid against is the one
+ * verifyDataReadPolicy resolved from the Web3Signed payload (authoritative
+ * source), not the URL / header hint, which may be absent when the payload
+ * carries it. `null` = served free.
+ */
+function readCharge(
+  deps: PersonalServerDataApiDeps,
+  scope: string,
+  authResult: Awaited<
+    ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
+  >,
+  ownAppRead: boolean,
+): ReadCharge | null {
+  const isOwnerSignal =
+    authResult?.grantId === "owner" || authResult?.grantId === "policy-bypass";
+  const builder = authResult?.builder;
+  const resolvedGrantId =
+    !isOwnerSignal && authResult?.grantId ? authResult.grantId : undefined;
+  const willCharge = Boolean(
+    deps.paymentEnabled &&
+    !isOwnerSignal &&
+    !ownAppRead &&
+    typeof builder === "string" &&
+    builder.startsWith("0x") &&
+    resolvedGrantId &&
+    deps.gateway &&
+    deps.gatewayConfig &&
+    deps.gatewayUrl,
+  );
+  // Diagnostic: makes it explicit why a read is/isn't charged. x402 has
+  // many "served free" branches (owner read, payment disabled, missing
+  // gateway deps); this surfaces the deciding inputs.
+  //
+  // Routing: when a logger is wired (the Node server always provides one),
+  // log the full detail through it at debug level so the operator's level
+  // controls + redaction apply and access metadata (scope/grantId/builder)
+  // doesn't unconditionally hit stdout. The browser PS-Lite runtime wires
+  // no logger; there we fall back to console but log ONLY the non-identifying
+  // decision booleans — never scope/grantId/builder.
+  if (deps.logger?.debug) {
+    deps.logger.debug(
+      {
+        scope,
+        grantId: authResult?.grantId,
+        isOwnerSignal,
+        builder,
+        resolvedGrantId,
+        paymentEnabled: Boolean(deps.paymentEnabled),
+        hasGateway: Boolean(deps.gateway),
+        hasGatewayConfig: Boolean(deps.gatewayConfig),
+        hasGatewayUrl: Boolean(deps.gatewayUrl),
+        willCharge,
+      },
+      "[x402-gate] read",
+    );
+  } else {
+    console.info("[x402-gate] read", {
+      isOwnerSignal,
+      paymentEnabled: Boolean(deps.paymentEnabled),
+      hasGateway: Boolean(deps.gateway),
+      hasGatewayConfig: Boolean(deps.gatewayConfig),
+      hasGatewayUrl: Boolean(deps.gatewayUrl),
+      willCharge,
+    });
+  }
+  if (
+    !willCharge ||
+    !resolvedGrantId ||
+    !deps.gateway ||
+    !deps.gatewayConfig ||
+    !deps.gatewayUrl
+  ) {
+    return null;
+  }
+  return {
+    grantId: resolvedGrantId,
+    builder: builder as `0x${string}`,
+    gateway: deps.gateway,
+    gatewayConfig: deps.gatewayConfig,
+    gatewayUrl: deps.gatewayUrl,
+  };
+}
+
+/**
+ * The X402 step of a charged read: a response to return instead of the
+ * body (a fresh 402 challenge, or the gateway's error relayed verbatim so
+ * the builder can dispatch on it), or the X-PAYMENT-RESPONSE value to send
+ * with the body once the gateway accepted the payment.
+ */
+async function payForRead(
+  deps: PersonalServerDataApiDeps,
+  request: Request,
+  charge: ReadCharge,
+  read: Pick<
+    X402CycleInput,
+    "scope" | "fileIdParam" | "atParam" | "servedEntry"
+  >,
+): Promise<
+  | { kind: "refused"; response: Response }
+  | { kind: "paid"; paymentResponseHeader: string | undefined }
+> {
+  const x402Result = await handleX402Cycle({
+    deps,
+    request,
+    ...read,
+    ...charge,
+  });
+  if (x402Result.kind === "challenge") {
+    return {
+      kind: "refused",
+      response: jsonResponse(x402Result.body, { status: 402 }),
+    };
+  }
+  if (x402Result.kind === "gateway-error") {
+    return {
+      kind: "refused",
+      response: jsonResponse(x402Result.body, { status: x402Result.status }),
+    };
+  }
+  // The gateway's success body goes back to the builder in
+  // X-PAYMENT-RESPONSE (canonical X402 convention) so callers can see
+  // breakdown / paidAt / paymentNonce without a second gateway round-trip.
+  return {
+    kind: "paid",
+    paymentResponseHeader: encodePaymentResponseHeader(x402Result.payResponse),
+  };
+}
+
 export interface X402CycleInput {
   deps: PersonalServerDataApiDeps;
   request: Request;
   scope: string;
   fileIdParam?: string;
   atParam?: string;
+  /**
+   * The registered data point version the served body comes from, when it
+   * is not the stored entry of `scope`: a stream view serves a stream head.
+   */
+  servedEntry?: { scope: string; version: number };
   grantId: string;
   builder: `0x${string}`;
   gateway: Pick<GatewayClient, "getGrant">;
@@ -850,19 +1391,30 @@ export async function handleX402Cycle(
   }
 
   // Bind the accessRecord to the entry being served, if it exists and has
-  // been registered with DPv2 yet.
-  const entryRow = deps.storage.findEntry({
-    scope,
-    fileId: input.fileIdParam,
-    at: input.atParam,
-  });
-  const entryForChallenge = entryRow
-    ? {
-        dataPointId: entryRow.dataPointId as `0x${string}` | null,
+  // been registered with DPv2 yet. A served stream head is registered: it
+  // was listed from the registry.
+  const entryRow = input.servedEntry
+    ? undefined
+    : deps.storage.findEntry({
         scope,
-        version: entryRow.version,
+        fileId: input.fileIdParam,
+        at: input.atParam,
+      });
+  const entryForChallenge = input.servedEntry
+    ? {
+        dataPointId: deps.serverOwner
+          ? computeDataPointId(deps.serverOwner, input.servedEntry.scope)
+          : null,
+        scope: input.servedEntry.scope,
+        version: input.servedEntry.version,
       }
-    : undefined;
+    : entryRow
+      ? {
+          dataPointId: entryRow.dataPointId as `0x${string}` | null,
+          scope,
+          version: entryRow.version,
+        }
+      : undefined;
 
   // `grant` is narrowed to non-null above, but that narrowing is not carried
   // into this closure (vana-sdk 3.14.0 made getGrant return `... | null`), so
@@ -1447,13 +1999,13 @@ function notifyDataWritten(
  * something this deployment could not verify — actionable, but not a failure
  * of the write, which has already committed.
  */
-function importIngestedIntoPdpp(
+async function importIngestedIntoPdpp(
   deps: Pick<PersonalServerDataApiDeps, "pdppImporter" | "logger">,
   envelope: { scope: string; collectedAt: string; data: unknown },
-): void {
+): Promise<void> {
   if (!deps.pdppImporter) return;
   try {
-    const outcome = deps.pdppImporter.importEnvelope(envelope);
+    const outcome = await deps.pdppImporter.importEnvelope(envelope);
     if (outcome.status === "rejected") {
       const permanent = isPermanentRejection(outcome.rejection);
       deps.logger?.warn?.(
@@ -1700,6 +2252,45 @@ export function redactEnvelopeForGrantee(
 }
 
 export { redactJsonEnvelopeBytesForGrantee } from "./raw-envelope.js";
+export {
+  ACCOUNT_MODE_RETRY_AFTER_SECONDS,
+  ACCOUNT_MODE_UNKNOWN_CODE,
+  ACCOUNT_MODE_UNKNOWN_STATUS,
+  accountModeUnknownResponse,
+  accountStorageModeFor,
+  selectAccountStorageMode,
+  type AccountStorageMode,
+  type AccountStorageModeValue,
+  type OwnedAccountStorageMode,
+  type StorageSelection,
+  type StorageSelectionDeps,
+} from "./account-storage-mode.js";
+export {
+  USE_CONNECTOR_DELETE_CODE,
+  USE_CONNECTOR_DELETE_MESSAGE,
+  USE_CONNECTOR_DELETE_STATUS,
+  switchedDeleteRefusalResponse,
+} from "./switched-delete-refusal.js";
+export {
+  STREAM_SYNC_CLIENT_HEADER,
+  UPDATE_REQUIRED_CODE,
+  UPDATE_REQUIRED_MESSAGE,
+  UPDATE_REQUIRED_STATUS,
+  LegacyWriteRefusedError,
+  legacyWriteRefusedErrorFor,
+  refuseLegacyWrite,
+  updateRequiredResponse,
+  type LegacyWriteMode,
+  type LegacyWriteVerdict,
+} from "./legacy-write-gate.js";
+
+export {
+  handleOwnerConnectorDelete,
+  ownerConnectorRefusal,
+  type ConnectionDeletePort,
+  type OwnerConnectorDeleteDeps,
+  type StorageModeRead,
+} from "./owner-connector-delete.js";
 
 /**
  * `/v1/data/:scope/uploads...`: an owner writes one new version of a scope as
@@ -1711,6 +2302,9 @@ async function handleScopeUploadRequest(
   deps: PersonalServerDataApiDeps,
   parts: string[],
   prepared?: PreparedScopeUploadBatch,
+  mode: AccountMode = deps.accountStorageMode?.read() ??
+    deps.accountMode?.read(deps.serverOwner) ??
+    "unknown",
 ): Promise<Response> {
   const route = (() => {
     if (parts.length === 2) return { kind: "begin", method: "POST" } as const;
@@ -1726,6 +2320,13 @@ async function handleScopeUploadRequest(
   }
   if (request.method !== route.method) return methodNotAllowed();
   await deps.auth.authorizeOwner(request);
+  // A switched account cannot mutate legacy import state, including abort.
+  const modeRefusal = legacyMutationRefusal(mode);
+  if (modeRefusal) return modeRefusal;
+  if (route.kind !== "abort") {
+    const refusal = refuseLegacyWrite(deps.accountStorageMode);
+    if (refusal) return refusal;
+  }
   const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
   if (!scopeResult.ok) return contractErrorResponse(scopeResult);
   const scope = scopeResult.scope;
@@ -1980,6 +2581,101 @@ function notifyReadGrantee(
   }
 }
 
+function historyInteger(
+  value: string | null,
+  fallback: number,
+  name: string,
+): number {
+  if (value === null) return fallback;
+  const parsed = /^\d+$/.test(value) ? Number(value) : Number.NaN;
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new ProtocolError(
+      400,
+      "invalid_request",
+      name + " must be a safe non-negative decimal integer",
+    );
+  }
+  return parsed;
+}
+
+/**
+ * One owner-listed scope. A `ScopeSummary` satisfies it; a stream listing row
+ * is mapped to it. `dataStatus: "ready"` means bounded read can serve it.
+ */
+export interface OwnerScopeSummary {
+  scope: string;
+  latestCollectedAt?: string;
+  dataStatus?: "ready" | "indexing";
+}
+
+/** The account's storage mode as one request freezes it before any read. */
+function readAccountStorageMode(deps: PersonalServerDataApiDeps) {
+  return (
+    deps.accountStorageMode?.read() ??
+    deps.accountMode?.read(deps.serverOwner) ??
+    "unknown"
+  );
+}
+
+/**
+ * One page of every scope this server holds data for, under the filters the
+ * `GET /v1/data` listing applies (tombstones, canonical-only scopes, system
+ * scopes) but with no grant filter. In-process only: the caller must itself
+ * decide who may see the result (MCP exposes it only through `notShared`).
+ *
+ * It takes the same account-mode decision as that listing: a switched account
+ * lists from the stream port and never touches legacy storage; an unknown
+ * account, or a switched one with no stream listing, throws rather than
+ * answering with an empty page.
+ */
+export async function listOwnerVisibleScopes(
+  deps: PersonalServerDataApiDeps,
+  page: { limit: number; offset: number },
+): Promise<{ scopes: OwnerScopeSummary[]; total: number }> {
+  const mode = readAccountStorageMode(deps);
+  if (mode === "unknown") {
+    throw new Error("Owner scope listing unavailable: account mode unknown");
+  }
+  if (mode === "switched") {
+    const listScopes = deps.streamSyncRead?.listScopes;
+    if (!listScopes) {
+      throw new Error("Owner scope listing unavailable: no stream listing");
+    }
+    const listed = await listScopes({
+      canRead: (scope) => !isSystemScope(scope),
+    });
+    return {
+      // The stream listing applies the resolver's own selection rule, so a
+      // listed scope is one a read can serve: that is its readiness.
+      scopes: listed
+        .slice(page.offset, page.offset + page.limit)
+        .map((row) => ({
+          scope: row.scope,
+          ...(row.latestCollectedAt && {
+            latestCollectedAt: row.latestCollectedAt,
+          }),
+          dataStatus: "ready" as const,
+        })),
+      total: listed.length,
+    };
+  }
+  const deletionDeadlineAtMs = Date.now() + 250;
+  const result = await listDataScopesContract({
+    storage: deps.storage,
+    limit: page.limit,
+    offset: page.offset,
+    isVisible: listingVisibility(deps, deletionDeadlineAtMs),
+    isListable: (scope) => !isSystemScope(scope),
+    extraScopes: canonicalOnlyScopes(deps, deletionDeadlineAtMs),
+  });
+  return {
+    scopes: result.response.scopes.map((summary) =>
+      withCanonicalListing(deps, summary),
+    ),
+    total: result.response.total,
+  };
+}
+
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
@@ -1995,14 +2691,50 @@ export async function handlePersonalServerDataRequest(
     requestId: crypto.randomUUID(),
   };
   return withApiErrors(async () => {
+    // Freeze the routing decision before consulting any data source.
+    const mode = readAccountStorageMode(deps);
     const url = new URL(request.url);
     const pathname = stripBasePath(url.pathname, options.basePath);
+
+    // The account's storage mode, decided once before any list, version,
+    // lineage or body branch. No read site acts on the decision yet (they are
+    // routed through it one by one), so a switched account still reads as
+    // before; it is recorded with every error this request logs.
+    if (request.method === "GET") {
+      logContext.detail = {
+        storageSelection: mode,
+      };
+    }
 
     if (pathname === "/" || pathname === "") {
       if (request.method !== "GET") return methodNotAllowed();
       const listAuth = await deps.auth.authorizeBuilderList(request, {
         grantId: selectedGrantId(request, url),
       });
+      if (mode === "unknown") return accountModeUnknownResponse();
+      if (mode === "switched") {
+        if (!deps.streamSyncRead?.listScopes)
+          return errorResponse(
+            503,
+            "STREAM_LIST_UNAVAILABLE",
+            "Stream scope listing is not available",
+          );
+        const scopes = await deps.streamSyncRead.listScopes({
+          canRead: (scope) =>
+            !isSystemScope(scope) &&
+            (!listAuth || listAuthCovers(listAuth, scope)),
+        });
+        const prefix = url.searchParams.get("scopePrefix") ?? "";
+        const filtered = scopes.filter((row) => row.scope.startsWith(prefix));
+        const offset = normalizeLimit(url.searchParams.get("offset"), 0);
+        const limit = normalizeLimit(url.searchParams.get("limit"), 20);
+        return jsonResponse({
+          scopes: filtered.slice(offset, offset + limit),
+          total: filtered.length,
+          limit,
+          offset,
+        });
+      }
       // One budget for every stored and canonical-only scope, not per row.
       const deletionDeadlineAtMs = Date.now() + 250;
       const result = await listDataScopesContract({
@@ -2030,32 +2762,76 @@ export async function handlePersonalServerDataRequest(
       if (request.method !== "GET") return methodNotAllowed();
       // The counts span every scope, so only the owner may read them.
       await deps.auth.authorizeOwner(request);
+      if (mode === "unknown") return accountModeUnknownResponse();
+
       const daysRaw = url.searchParams.get("days");
-      const result = await summarizeDataAdditionsContract({
-        additions: deps.additions,
-        storage: deps.storage,
-        isVisible: discoveryVisibility(deps),
-        timezone: url.searchParams.get("tz") ?? "UTC",
-        // Digits only: Number() would also accept "", "1e1", "0x7" and " 7".
-        days:
-          daysRaw === null
-            ? 7
-            : /^\d{1,3}$/.test(daysRaw)
-              ? Number(daysRaw)
-              : Number.NaN,
-        now: (deps.now ?? (() => new Date()))(),
-      });
-      if ("ok" in result) return contractErrorResponse(result);
-      return jsonResponse(result);
+      const timezone = url.searchParams.get("tz") ?? "UTC";
+      // Digits only: Number() would also accept "", "1e1", "0x7" and " 7".
+      const days =
+        daysRaw === null
+          ? 7
+          : /^\d{1,3}$/.test(daysRaw)
+            ? Number(daysRaw)
+            : Number.NaN;
+      if (!Number.isInteger(days) || days < 1 || days > 31) {
+        if (mode === "unswitched")
+          return contractErrorResponse({
+            ok: false,
+            status: 400,
+            body: {
+              error: "INVALID_QUERY",
+              message: "days must be an integer between 1 and 31",
+            },
+          });
+        return errorResponse(
+          400,
+          "invalid_request",
+          "days must be an integer from 1 to 31",
+        );
+      }
+      if (mode === "unswitched") {
+        // Preserve the legacy query error contract before any storage access.
+        const result = await summarizeDataAdditionsContract({
+          additions: deps.additions,
+          storage: deps.storage,
+          isVisible: discoveryVisibility(deps),
+          timezone,
+          days,
+          now: (deps.now ?? (() => new Date()))(),
+        });
+        if ("ok" in result) return contractErrorResponse(result);
+        return jsonResponse(result);
+      }
+      if (!deps.history) {
+        return errorResponse(
+          503,
+          "STREAM_SYNC_UNAVAILABLE",
+          "Local history is not available on this server.",
+        );
+      }
+      return jsonResponse(await deps.history.additions({ timezone, days }));
     }
 
     const parts = pathname.split("/").filter(Boolean);
     if (parts.length >= 2 && parts[1] === "uploads") {
-      return await handleScopeUploadRequest(request, deps, parts);
+      return await handleScopeUploadRequest(
+        request,
+        deps,
+        parts,
+        undefined,
+        mode,
+      );
     }
     if (parts.length === 3 && parts[1] === "imports") {
       if (request.method !== "PUT") return methodNotAllowed();
       await deps.auth.authorizeOwner(request);
+      const modeRefusal = legacyMutationRefusal(mode);
+      if (modeRefusal) return modeRefusal;
+      // Owner-only: a builder has no durable-import route, so a signature
+      // header earns no exemption here. This runs on the normalized path, so
+      // `/imports/<op>/` and repeated slashes land here too.
+      const refusal = refuseLegacyWrite(deps.accountStorageMode);
+      if (refusal) return refusal;
       const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
       const operation = decodePathPart(parts[2]);
@@ -2143,7 +2919,13 @@ export async function handlePersonalServerDataRequest(
           });
       // A scope's version history is as much its data as its content is, so
       // a non-owner needs a grant covering it, exactly like a read.
-      const scopeResult = parseDataScopeContract(versionsScopeParam);
+      // Switched history reads the stream-sync stream the read route names
+      // (`pdpp.<connector>.<stream>`), so it uses the read rule; legacy history
+      // keeps the strict rule.
+      const scopeResult =
+        mode === "switched"
+          ? parseDataReadScopeContract(versionsScopeParam)
+          : parseDataScopeContract(versionsScopeParam);
       if (
         scopeResult.ok &&
         listAuth &&
@@ -2154,11 +2936,65 @@ export async function handlePersonalServerDataRequest(
           requestedScope: scopeResult.scope,
         });
       }
+      if (mode !== "switched" && mode !== "unswitched") {
+        return accountModeUnknownResponse();
+      }
+      const limit = Math.min(
+        historyInteger(url.searchParams.get("limit"), 20, "limit"),
+        HISTORY_PAGE_LIMIT,
+      );
+      const offset = historyInteger(
+        url.searchParams.get("offset"),
+        0,
+        "offset",
+      );
+      const cursorRaw = url.searchParams.get("cursor");
+      const cursor =
+        cursorRaw === null ? undefined : historyInteger(cursorRaw, 0, "cursor");
+      if (
+        limit < 1 ||
+        cursor === 0 ||
+        (mode === "switched" && offset !== 0) ||
+        (mode === "unswitched" && cursor !== undefined)
+      ) {
+        return errorResponse(
+          400,
+          "invalid_request",
+          "Use a positive limit; switched history continues with cursor, not offset",
+        );
+      }
+      if (mode === "switched") {
+        if (!scopeResult.ok) return contractErrorResponse(scopeResult);
+        if (!deps.history) {
+          return errorResponse(
+            503,
+            "STREAM_SYNC_UNAVAILABLE",
+            "Local history is not available on this server.",
+          );
+        }
+        const result = await deps.history.versions({
+          scope: scopeResult.scope,
+          limit,
+          offset,
+          ...(cursor === undefined ? {} : { cursor }),
+        });
+        if (!result.ok) {
+          if (result.reason === "deleted") {
+            throw new DataDeletedError({ scope: scopeResult.scope });
+          }
+          return errorResponse(
+            404,
+            "NOT_FOUND",
+            `Scope "${scopeResult.scope}" has no history`,
+          );
+        }
+        return jsonResponse(result.value);
+      }
       const result = await listDataVersionsContract({
         storage: deps.storage,
         scopeParam: decodePathPart(parts[0]),
-        limit: normalizeLimit(url.searchParams.get("limit"), 20),
-        offset: normalizeLimit(url.searchParams.get("offset"), 0),
+        limit,
+        offset,
         isVisible: discoveryVisibility(deps),
       });
       if (!result.ok) return contractErrorResponse(result);
@@ -2172,7 +3008,11 @@ export async function handlePersonalServerDataRequest(
 
     if ((parts.length === 2 || parts.length === 3) && parts[1] === "lineage") {
       if (request.method !== "GET") return methodNotAllowed();
-      const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
+      // Like versions: switched lineage names the streams the read route does.
+      const scopeResult =
+        mode === "switched"
+          ? parseDataReadScopeContract(decodePathPart(parts[0]))
+          : parseDataScopeContract(decodePathPart(parts[0]));
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
       // The version is a PATH segment (/v1/data/:scope/lineage/:version), so
       // it is inside the signed request uri: a builder's signature for one
@@ -2209,6 +3049,60 @@ export async function handlePersonalServerDataRequest(
         scope: scopeResult.scope,
         grantId: selectedGrantId(request, url),
       });
+      if (mode !== "switched" && mode !== "unswitched") {
+        return accountModeUnknownResponse();
+      }
+      if (mode === "switched") {
+        resolveLineageGrantView(authResult);
+        const historyVersion =
+          version === undefined ? undefined : Number(version);
+        if (
+          historyVersion !== undefined &&
+          !Number.isSafeInteger(historyVersion)
+        ) {
+          return errorResponse(
+            400,
+            "INVALID_VERSION",
+            "version must be a safe positive decimal integer",
+          );
+        }
+        if (!deps.history) {
+          return errorResponse(
+            503,
+            "STREAM_SYNC_UNAVAILABLE",
+            "Local history is not available on this server.",
+          );
+        }
+        const result = await deps.history.lineage({
+          scope: scopeResult.scope,
+          version: historyVersion,
+        });
+        if (!result.ok) {
+          if (result.reason === "deleted") {
+            throw new DataDeletedError({ scope: scopeResult.scope });
+          }
+          return errorResponse(
+            404,
+            "NOT_FOUND",
+            `Scope "${scopeResult.scope}" has no history`,
+          );
+        }
+        await deps.accessLogWriter.write({
+          logId: deps.createLogId?.() ?? crypto.randomUUID(),
+          grantId: authResult?.grantId ?? "owner",
+          builder: authResult?.builder ?? "unknown",
+          action: "lineage",
+          scope: scopeResult.scope,
+          timestamp: (deps.now ?? (() => new Date()))().toISOString(),
+          ipAddress:
+            request.headers.get("x-forwarded-for") ??
+            request.headers.get("x-real-ip") ??
+            "unknown",
+          userAgent: request.headers.get("user-agent") ?? "unknown",
+        });
+        const { proof, ...data } = result.value;
+        return jsonResponse({ data, proof });
+      }
       if (!deps.serverOwner) {
         throw new ServerNotConfiguredError({
           reason: "serverOwner is required to resolve the data point id",
@@ -2278,9 +3172,16 @@ export async function handlePersonalServerDataRequest(
     logContext.route = `${request.method} ${options.basePath ?? "/v1/data"}/:scope`;
 
     if (request.method === "GET") {
-      const scopeResult = parseDataScopeContract(scopeParam);
+      // The account mode chooses the read surface, not reader availability.
+      const scopeResult =
+        mode === "switched"
+          ? parseDataReadScopeContract(scopeParam)
+          : parseDataScopeContract(scopeParam);
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
-      logContext.detail = { scope: scopeResult.scope };
+      logContext.detail = {
+        ...logContext.detail,
+        scope: scopeResult.scope,
+      };
       // An empty `fileId=` or `at=` selects no version: it is the latest
       // read, as storage already treats it.
       const fileIdParam = url.searchParams.get("fileId") || undefined;
@@ -2295,32 +3196,254 @@ export async function handlePersonalServerDataRequest(
           'view must be "stored" or absent',
         );
       }
-      const selectedEntry = deps.storage.findEntry({
-        scope: scopeResult.scope,
-        fileId: fileIdParam,
-        at: atParam,
-      });
+      const selectedEntry =
+        mode === "unswitched"
+          ? deps.storage.findEntry({
+              scope: scopeResult.scope,
+              fileId: fileIdParam,
+              at: atParam,
+            })
+          : undefined;
       // Holds the base64-encoded gateway payForOperation response body when
       // X402 succeeds — emitted on the final read response as X-PAYMENT-RESPONSE.
       let paymentResponseHeader: string | undefined;
       const grantId = selectedGrantId(request, url);
-      const authResult = await deps.auth.authorizeBuilderRead({
+      const wantsRawContent = url.searchParams.get("content") === "raw";
+      const inProcess = options.inProcess;
+      // Check the grant without charging before resolving a switched read.
+      // Settlement receives the exact served head, never a legacy lookup.
+      // In-process legacy reads also settle only after their refusal gates.
+      const settleLast =
+        (mode === "switched" || inProcess !== undefined) &&
+        !inProcess?.metadataOnly;
+      const authInput = {
         request,
         scope: scopeResult.scope,
         grantId,
-        fileId: fileIdParam ?? selectedEntry?.fileId ?? undefined,
+        // Only a file id that resolved inside this scope reaches policy. A
+        // wrong-scope id and a nonexistent one both resolve to nothing, so
+        // neither takes a different path and no foreign id leaves the process.
+        fileId: selectedEntry?.fileId ?? undefined,
         at: atParam,
+      };
+      const authResult = await deps.auth.authorizeBuilderRead({
+        ...authInput,
+        ...(mode === "unknown" || inProcess?.metadataOnly || settleLast
+          ? { metadataOnly: true }
+          : {}),
       });
       notifyReadGrantee(request, authResult);
+      if (mode === "unknown") return accountModeUnknownResponse();
+      // `served` is the stream head the read decision chose and validated.
+      // It is passed through as is: settlement never looks the head up again.
+      const settle = async (
+        served?: { scope: string; version: number } | null,
+      ): Promise<void> => {
+        if (!settleLast) return;
+        await deps.auth.authorizeBuilderRead(
+          served ? { ...authInput, servedEntry: served } : authInput,
+        );
+      };
 
       // Select the body after auth and before deletion or payment. A file's
       // version and re-add marker authorize that file, not canonical rows.
       // `?view=stored` asks for the stored file's body, so it never reads the
       // canonical view either.
       const latest =
-        fileIdParam === undefined && atParam === undefined && view === null
+        mode === "unswitched" &&
+        fileIdParam === undefined &&
+        atParam === undefined &&
+        view === null
           ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
           : undefined;
+      // On serves database stream views or a refusal, including historical
+      // selectors. Only Off reaches the separate legacy body path below.
+      const latestRead =
+        fileIdParam === undefined && atParam === undefined && view === null;
+      if (mode === "switched") {
+        let ownerNotes: OwnerNotes | undefined;
+        if (!deps.streamSyncRead) {
+          return errorResponse(
+            503,
+            "STREAM_READ_UNAVAILABLE",
+            "Stream reads are not available",
+          );
+        }
+        let historical: ReadDecision | undefined;
+        if (!latestRead) {
+          let selected:
+            { scope: string; version: number; observedAt: number } | undefined;
+          const body = await deps.streamSyncRead.olderVersions?.read(
+            scopeResult.scope,
+            { fileId: fileIdParam, at: atParam },
+            (head) => {
+              selected = head;
+            },
+          );
+          if (!body || body === "gone")
+            return errorResponse(
+              410,
+              "STREAM_HISTORY_UNAVAILABLE",
+              "Older versions are not available",
+            );
+          if (!selected) {
+            await body.cancel();
+            return errorResponse(
+              503,
+              "STREAM_READ_UNAVAILABLE",
+              "The selected stream head is unavailable",
+            );
+          }
+          const head = selected;
+          const encoder = new TextEncoder();
+          const reader = body.getReader();
+          let started = false;
+          const wrapped = new ReadableStream<Uint8Array>({
+            async pull(controller) {
+              if (!started) {
+                started = true;
+                controller.enqueue(
+                  encoder.encode(
+                    JSON.stringify({
+                      version: "1.0",
+                      scope: scopeResult.scope,
+                      collectedAt: new Date(head.observedAt).toISOString(),
+                    }).slice(0, -1) + ',"data":{"records":',
+                  ),
+                );
+                return;
+              }
+              try {
+                const chunk = await reader.read();
+                if (chunk.done) {
+                  controller.enqueue(encoder.encode("}}"));
+                  controller.close();
+                  reader.releaseLock();
+                } else controller.enqueue(chunk.value);
+              } catch (error) {
+                controller.error(error);
+                reader.releaseLock();
+              }
+            },
+            async cancel(reason) {
+              try {
+                await reader.cancel(reason);
+              } finally {
+                reader.releaseLock();
+              }
+            },
+          });
+          historical = {
+            kind: "view",
+            connector: "",
+            ns: "",
+            cursor: "",
+            served: head,
+            body: wrapped,
+          };
+        }
+        const decision =
+          historical ??
+          (await deps.streamSyncRead.resolve({
+            scope: scopeResult.scope,
+            connection: latestRead ? url.searchParams.get("connection") : null,
+            cursor: latestRead ? url.searchParams.get("cursor") : null,
+            legacyFile: false,
+            isOwnerView: isOwnerView(authResult),
+          }));
+        if (decision.kind === "local_pending") {
+          await decision.body.cancel();
+          return errorResponse(
+            404,
+            "STREAM_DATA_NOT_FOUND",
+            "No complete stream data is available for this scope",
+            decision,
+          );
+        }
+        if (decision.kind === "unavailable" && decision.reason === "deleted") {
+          throw new DataDeletedError({ scope: scopeResult.scope });
+        }
+        if (latestRead || historical) {
+          if (
+            decision.kind === "pass" ||
+            decision.kind === "legacy" ||
+            decision.kind === "unavailable"
+          ) {
+            ownerNotes = decision;
+          }
+          const refusal = streamSyncRefusal(decision);
+          if (refusal) return refusal;
+          if (inProcess && wantsRawContent && decision.kind === "view") {
+            // A view has no raw bytes. Refused before any charge, log or
+            // fulfilment, so a caller never pays for a read it cannot use.
+            await decision.body.cancel();
+            return jsonResponse(
+              {
+                error: "STREAM_VIEW_NOT_RAW",
+                message: `Scope "${scopeResult.scope}" is served from its stream view, which has no raw binary content.`,
+                scope: scopeResult.scope,
+              },
+              { status: 409 },
+            );
+          }
+          if (decision.kind === "view") {
+            notifyDataRead(deps, { scope: scopeResult.scope });
+            // The same charge as a file read; the access record binds the
+            // stream head the view serves.
+            let paymentResponseHeader: string | undefined;
+            // An owner-only view with no registered head has nothing to
+            // charge against: the service serves it to the owner alone.
+            if (decision.served !== null) {
+              const served = decision.served;
+              const ownApp = await ownAppReadStatus(deps, authResult);
+              if (ownApp instanceof Response) {
+                await decision.body.cancel();
+                return ownApp;
+              }
+              const charge = readCharge(
+                deps,
+                scopeResult.scope,
+                authResult,
+                ownApp,
+              );
+              if (charge) {
+                let paid: Awaited<ReturnType<typeof payForRead>>;
+                try {
+                  paid = await payForRead(deps, request, charge, {
+                    scope: scopeResult.scope,
+                    servedEntry: served,
+                  });
+                } catch (error) {
+                  await decision.body.cancel();
+                  throw error;
+                }
+                if (paid.kind === "refused") {
+                  await decision.body.cancel();
+                  return paid.response;
+                }
+                paymentResponseHeader = paid.paymentResponseHeader;
+              }
+            }
+            const checked = await validateStreamBody(decision, inProcess);
+            await settle(decision.served);
+            return serveStreamSyncView(deps, request, {
+              scope: scopeResult.scope,
+              grantId,
+              authResult,
+              decision: checked,
+              paymentResponseHeader,
+              inProcess,
+            });
+          }
+        }
+        return errorResponse(
+          404,
+          "STREAM_DATA_NOT_FOUND",
+          "No complete stream data is available for this scope",
+          ownerNotes,
+        );
+      }
+
       // The deletion history comes with the body the view chose, never from
       // a later ownership query a concurrent write could change.
       const canonicalOwned =
@@ -2362,113 +3485,28 @@ export async function handlePersonalServerDataRequest(
         return legacyViewRefusalResponse(scopeResult.scope, latest.refusal);
       }
 
-      // X402 payment dance for builder reads. Owner-exempt reads (the
-      // grantId sentinels "owner" / "policy-bypass") skip payment entirely
-      // since there's no payable op to attach the payment to.
-      //
-      // The grantId we pay against is the one verifyDataReadPolicy resolved
-      // from the Web3Signed payload (authoritative source) — not the URL /
-      // header hint, which may be absent when the payload carries it.
-      const isOwnerSignal =
-        authResult?.grantId === "owner" ||
-        authResult?.grantId === "policy-bypass";
-      const builder = authResult?.builder;
-      const resolvedGrantId =
-        !isOwnerSignal && authResult?.grantId ? authResult.grantId : undefined;
-      const willCharge = Boolean(
-        deps.paymentEnabled &&
-        !isOwnerSignal &&
-        typeof builder === "string" &&
-        builder.startsWith("0x") &&
-        resolvedGrantId &&
-        deps.gateway &&
-        deps.gatewayConfig &&
-        deps.gatewayUrl,
-      );
-      // Diagnostic: makes it explicit why a read is/isn't charged. x402 has
-      // many "served free" branches (owner read, payment disabled, missing
-      // gateway deps); this surfaces the deciding inputs.
-      //
-      // Routing: when a logger is wired (the Node server always provides one),
-      // log the full detail through it at debug level so the operator's level
-      // controls + redaction apply and access metadata (scope/grantId/builder)
-      // doesn't unconditionally hit stdout. The browser PS-Lite runtime wires
-      // no logger; there we fall back to console but log ONLY the non-identifying
-      // decision booleans — never scope/grantId/builder.
-      if (deps.logger?.debug) {
-        deps.logger.debug(
-          {
-            scope: scopeResult.scope,
-            grantId: authResult?.grantId,
-            isOwnerSignal,
-            builder,
-            resolvedGrantId,
-            paymentEnabled: Boolean(deps.paymentEnabled),
-            hasGateway: Boolean(deps.gateway),
-            hasGatewayConfig: Boolean(deps.gatewayConfig),
-            hasGatewayUrl: Boolean(deps.gatewayUrl),
-            willCharge,
-          },
-          "[x402-gate] read",
-        );
-      } else {
-        console.info("[x402-gate] read", {
-          isOwnerSignal,
-          paymentEnabled: Boolean(deps.paymentEnabled),
-          hasGateway: Boolean(deps.gateway),
-          hasGatewayConfig: Boolean(deps.gatewayConfig),
-          hasGatewayUrl: Boolean(deps.gatewayUrl),
-          willCharge,
-        });
-      }
-      if (willCharge && latest?.kind === "canonical") {
+      // X402 payment dance for builder reads (see `readCharge`).
+      const ownApp = await ownAppReadStatus(deps, authResult);
+      if (ownApp instanceof Response) return ownApp;
+      const charge = readCharge(deps, scopeResult.scope, authResult, ownApp);
+      if (charge && latest?.kind === "canonical") {
         return legacyViewRefusalResponse(scopeResult.scope, {
           status: "unavailable",
           reason: "paid_read_unsupported",
         });
       }
-      // Keep the full condition inline (not `if (willCharge)`) so TS narrows
-      // deps.gateway/gatewayConfig/gatewayUrl to non-undefined in the block.
-      if (
-        deps.paymentEnabled &&
-        !isOwnerSignal &&
-        typeof builder === "string" &&
-        builder.startsWith("0x") &&
-        resolvedGrantId &&
-        deps.gateway &&
-        deps.gatewayConfig &&
-        deps.gatewayUrl
-      ) {
-        const x402Result = await handleX402Cycle({
-          deps,
-          request,
+      if (charge) {
+        const paid = await payForRead(deps, request, charge, {
           scope: scopeResult.scope,
           fileIdParam,
           atParam,
-          grantId: resolvedGrantId,
-          builder: builder as `0x${string}`,
-          gateway: deps.gateway,
-          gatewayConfig: deps.gatewayConfig,
-          gatewayUrl: deps.gatewayUrl,
         });
-        if (x402Result.kind === "challenge") {
-          return jsonResponse(x402Result.body, { status: 402 });
-        }
-        if (x402Result.kind === "gateway-error") {
-          // Relay the gateway's structured body verbatim so the builder can
-          // dispatch on it (insufficient balance vs. replay vs. race etc.).
-          return jsonResponse(x402Result.body, { status: x402Result.status });
-        }
-        // x402Result.kind === "ok" — payment accepted, proceed to read.
-        // The gateway's success body is forwarded back to the builder via
-        // X-PAYMENT-RESPONSE (canonical X402 convention) so callers can see
-        // breakdown / paidAt / paymentNonce without a second gateway round-trip.
-        paymentResponseHeader = encodePaymentResponseHeader(
-          x402Result.payResponse,
-        );
+        if (paid.kind === "refused") return paid.response;
+        paymentResponseHeader = paid.paymentResponseHeader;
       }
 
       const headers: Record<string, string> = {};
+      if (ownApp) headers["X-Vana-Payment-Exemption"] = "own-app";
       headers["X-Vana-Data-Source"] =
         latest?.kind === "canonical" ? "canonical" : "legacy";
       let envelope: DataFileEnvelope;
@@ -2480,7 +3518,11 @@ export async function handlePersonalServerDataRequest(
         const result = await readDataContract({
           storage: deps.storage,
           scopeParam: scopeResult.scope,
-          fileId: fileIdParam,
+          // An in-process read names the version it selected above, so the
+          // body served is the version the payment and fulfilment name.
+          fileId: inProcess
+            ? (fileIdParam ?? selectedEntry?.fileId ?? undefined)
+            : fileIdParam,
           at: atParam,
           ...(view === "stored" ? { view } : {}),
         });
@@ -2500,6 +3542,33 @@ export async function handlePersonalServerDataRequest(
       const servedEnvelope = isOwnerView(authResult)
         ? envelope
         : redactEnvelopeForGrantee(envelope);
+      // An in-process raw read is refused, or decoded, before it pays or logs.
+      // HTTP keeps its order: the same checks run after the access log.
+      let rawBinary: ReturnType<typeof decodeBinaryEnvelope> | undefined;
+      if (inProcess && wantsRawContent) {
+        if (!isBinaryEnvelope(servedEnvelope)) {
+          return jsonResponse(
+            {
+              error: "NOT_BINARY_SCOPE",
+              message: `Scope "${scopeResult.scope}" does not expose raw binary content.`,
+            },
+            { status: 400, headers },
+          );
+        }
+        rawBinary = decodeBinaryEnvelope(servedEnvelope);
+        inProcess.onRawSelected?.({
+          fileId: servedFileId,
+          collectedAt: envelope.collectedAt,
+        });
+      }
+      // A JSON read is checked against the body it will serve, before it pays.
+      if (inProcess && !wantsRawContent) {
+        await inProcess.validateBody?.(servedEnvelope, {
+          fromStreamView: false,
+        });
+      }
+      // Every refusal above has run; only a read that will be served pays.
+      await settle();
 
       const logId = deps.createLogId?.() ?? crypto.randomUUID();
       const timestamp = (deps.now ?? (() => new Date()))().toISOString();
@@ -2510,18 +3579,33 @@ export async function handlePersonalServerDataRequest(
       const userAgent = request.headers.get("user-agent") ?? "unknown";
       const loggedGrantId = authResult?.grantId ?? grantId ?? "unknown";
       const loggedBuilder = authResult?.builder ?? "unknown";
-      await deps.accessLogWriter.write({
-        logId,
-        grantId: loggedGrantId,
-        builder: loggedBuilder,
-        action: "read",
-        scope: scopeResult.scope,
-        timestamp,
-        ipAddress,
-        userAgent,
-      });
+      if (options.inProcess?.logAccess !== false) {
+        await deps.accessLogWriter.write({
+          logId,
+          grantId: loggedGrantId,
+          builder: loggedBuilder,
+          action: "read",
+          scope: scopeResult.scope,
+          timestamp,
+          ipAddress,
+          userAgent,
+        });
+      }
       const reportReadFulfillment = () => {
         if (!authResult?.grantId || !authResult.builder) return;
+        if (options.inProcess) {
+          options.inProcess.onServed({
+            scope: scopeResult.scope,
+            builder: authResult.builder,
+            grantId: authResult.grantId,
+            fileId: servedFileId,
+            logId,
+            ipAddress,
+            servedAt: timestamp,
+            userAgent,
+          });
+          return;
+        }
         reportPersonalServerReadFulfillment(deps, {
           builder: authResult.builder,
           fileId: servedFileId,
@@ -2540,8 +3624,6 @@ export async function handlePersonalServerDataRequest(
         headers["X-PAYMENT-RESPONSE"] = paymentResponseHeader;
       }
 
-      const wantsRawContent = url.searchParams.get("content") === "raw";
-
       // `?content=raw` streams the decoded bytes of a binary envelope with its
       // original media type, so a builder can download the file directly. The
       // X-PAYMENT-RESPONSE header (if any) rides along on the raw response too.
@@ -2555,7 +3637,7 @@ export async function handlePersonalServerDataRequest(
             { status: 400, headers },
           );
         }
-        const decoded = decodeBinaryEnvelope(servedEnvelope);
+        const decoded = rawBinary ?? decodeBinaryEnvelope(servedEnvelope);
         headers["Content-Type"] = decoded.mimeType;
         headers["Content-Length"] = String(decoded.bytes.length);
         if (decoded.filename) {
@@ -2573,7 +3655,9 @@ export async function handlePersonalServerDataRequest(
         });
         return response;
       }
-      const response = jsonResponse(servedEnvelope, { headers });
+      const response = jsonResponse(servedEnvelope, {
+        headers,
+      });
       reportReadFulfillment();
       return response;
     }
@@ -2590,6 +3674,11 @@ export async function handlePersonalServerDataRequest(
           undefined;
       } else {
         await deps.auth.authorizeOwner(request);
+      }
+      const modeRefusal = legacyMutationRefusal(mode);
+      if (modeRefusal) {
+        await writeAuth?.releaseProof?.();
+        return modeRefusal;
       }
       // `?supersede=legacy`: once this write commits, delete the scope's
       // older legacy-form versions (see supersedeLegacyVersions). It deletes
@@ -2824,7 +3913,7 @@ export async function handlePersonalServerDataRequest(
         // The parsed body is the envelope's `data`, which is where a producer
         // stamps `$pdpp`. Offered here rather than inside the ingest contract
         // so the import stays strictly after the record is durable.
-        importIngestedIntoPdpp(deps, {
+        await importIngestedIntoPdpp(deps, {
           scope: scopeResult.scope,
           collectedAt: collectedAtValue,
           data: parsed.body,
@@ -2873,6 +3962,22 @@ export async function handlePersonalServerDataRequest(
 
     if (request.method === "DELETE") {
       await deps.auth.authorizeOwner(request);
+      // A data set is not a connection, and mapping one to streams needs the
+      // bindings (C2). Once the account is switched the connection delete is
+      // the way to erase data, so this refuses every client, one that declares
+      // stream sync included.
+      if (mode === "unknown") return accountModeUnknownResponse();
+      if (mode === "switched") {
+        const control = /^pdpp\.[^.~]+~[0-9a-f]{16}$/.test(scopeParam);
+        if (!control) return switchedDeleteRefusalResponse();
+        const response = errorResponse(
+          409,
+          "STREAM_SYNC_CONTROL_SCOPE",
+          "Delete the connection instead of an individual data scope",
+        );
+        response.headers.set("cache-control", "no-store");
+        return response;
+      }
       const cascade = url.searchParams.get("cascade");
       if (cascade !== null && cascade !== "lineage") {
         throw new InvalidCascadeError({ cascade });
@@ -2911,17 +4016,41 @@ export async function handlePersonalServerDataRequest(
       // sync manager owns the remote ports; without one (sync disabled or
       // no owner key material) only the local copy goes and the result says
       // so (`durable: false`) rather than pretending.
-      const result = deps.syncManager?.deleteScope
-        ? await deps.syncManager.deleteScope(parsed.scope)
-        : await deleteScopeLocally(
-            {
-              storage: deps.storage,
-              serverOwner: deps.serverOwner,
-              deleteData: null,
-              logger: apiLoggerAsLogger(deps.logger),
-            },
-            parsed.scope,
-          );
+      //
+      // The mode decision and the delete are one `commit`: on a switched
+      // account a legacy-only delete would report "deleted" while the stream
+      // rows stay readable, so it is refused (409) and the connector delete is
+      // the way to erase. An unknown mode (or a storage with no seal) is a
+      // retryable 503. An On cannot land between the decision and the delete.
+      const seal = deps.storage.legacyWriteSeal;
+      if (!seal) return accountModeUnknownResponse();
+      let result: DeleteScopeResult;
+      try {
+        result = deps.syncManager?.deleteScope
+          ? await deps.syncManager.deleteScope(
+              parsed.scope,
+              seal.commit.bind(seal),
+            )
+          : await seal.commit((hold) =>
+              deleteScopeLocally(
+                {
+                  storage: deps.storage,
+                  serverOwner: deps.serverOwner,
+                  deleteData: null,
+                  logger: apiLoggerAsLogger(deps.logger),
+                },
+                parsed.scope,
+                { hold },
+              ),
+            );
+      } catch (err) {
+        if (err instanceof LegacyWriteRefusedError) {
+          return err.verdict === "switched"
+            ? switchedDeleteRefusalResponse()
+            : err.response;
+        }
+        throw err;
+      }
 
       if (result.steps.gateway.status === "failed") {
         // Nothing was deleted: the local copy is kept on purpose so sync
@@ -3011,7 +4140,11 @@ export async function handlePersonalServerSyncRequest(
       if (pathname === "/trigger") {
         if (request.method !== "POST") return methodNotAllowed();
         await deps.auth.authorizeOwner(request);
-        return contractResponse(await triggerSyncContract(deps.syncManager));
+        return contractResponse(
+          await triggerSyncContract(deps.syncManager, {
+            whenChanged: url.searchParams.get("when") === "changed",
+          }),
+        );
       }
 
       if (pathname === "/status") {

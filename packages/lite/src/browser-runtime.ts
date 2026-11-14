@@ -1,8 +1,19 @@
+import { withStrictMcpGrantRegistration } from "@opendatalabs/personal-server-ts-core/mcp";
+import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
+import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import type {
+  LocalSync,
+  SeedIntake,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
 import { resolveLiteReplication } from "./replication-door.js";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { createReplicationNetworkPorts } from "@opendatalabs/personal-server-ts-core/replication/host-ports";
-import { createGatewayDataPointFeed } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  createGatewayDataPointFeed,
+  withCancellableRegistration,
+} from "@opendatalabs/personal-server-ts-core/sync";
+import type { RunIntake } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
   createLiteReplication,
   liteVanaReplicaObjects,
@@ -15,6 +26,20 @@ import type {
 } from "./replication-ports.js";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
+import {
+  createImportWaker,
+  createMemoryModeRecordStore,
+  createModeAuthority,
+  type ImportRunner,
+  type ImportWaker,
+  type ModeAuthority,
+  type ModeRecordStore,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import {
+  createLegacyWriteSeal,
+  type LegacyWriteSeal,
+} from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
+import { createIndexedDbModeRecordStore } from "./account-mode-store.js";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import type { InferenceProvider } from "@opendatalabs/personal-server-ts-core/derivatives";
 import {
@@ -28,10 +53,8 @@ import type {
   DataPointFeedPort,
   DataStoragePort,
 } from "@opendatalabs/personal-server-ts-core/ports";
-import {
-  createGatewayClient,
-  deriveMasterKey,
-} from "@opendatalabs/vana-sdk/browser";
+import { createGatewayClient } from "@opendatalabs/vana-sdk/browser";
+import { legacyMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import {
   createInMemoryWriteProofReplayStore,
   createInMemoryWriteSessionStore,
@@ -86,6 +109,22 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   | "tokenStore"
 > {
   ownerAddress?: `0x${string}`;
+  /** Host-owned local database, shared by stream intake and reads. */
+  localDb?: PsLiteSyncOptions["localDb"];
+  localDbDeviceId?: PsLiteSyncOptions["localDbDeviceId"];
+  olderVersionReads?: PsLiteSyncOptions["olderVersionReads"];
+  /**
+   * Where the account-mode module keeps its per-owner records. Default: its
+   * own IndexedDB database next to the data store's. A host with another
+   * durable place (a native bundle) injects a store.
+   */
+  accountModeStore?: ModeRecordStore;
+  /**
+   * The host's legacy importer. The runtime runs it when the Account says On
+   * and once at boot when the owner is already switched; what is owed and when
+   * it is done is the importer's own record. Without one no import starts.
+   */
+  legacyImporter?: ImportRunner;
   /**
    * Inference provider for the derivative compute layer. Defaults to the
    * OpenAI-compatible fetch client on `config.inference`; tests inject a
@@ -110,6 +149,18 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    */
   dataPointFeed?: DataPointFeedPort;
   /**
+   * Artifact digest -> stream declarations, filled by the host after it
+   * verified each artifact. The run intake trusts only this table; with none
+   * given, every digest answers `unknown_artifact`. Admission follows Account mode.
+   */
+  streamSyncDeclarations?: PsLiteSyncOptions["streamSyncDeclarations"];
+  streamSyncRegistry?: PsLiteSyncOptions["streamSyncRegistry"];
+  streamSyncBlobs?: PsLiteSyncOptions["streamSyncBlobs"];
+  /** Stream names per connector from verified manifests; see `PsLiteSyncOptions`. */
+  streamSyncDeclaredStreams: PsLiteSyncOptions["streamSyncDeclaredStreams"];
+  /** Retained manifest documents for the delete fence; see `PsLiteSyncOptions`. */
+  streamSyncRetainedManifests?: PsLiteSyncOptions["streamSyncRetainedManifests"];
+  /**
    * The host's replication ports (host contract §4): native persistence
    * with replica support and native object transfers. With the door on and
    * `config.enabled`, this factory builds replication over them and passes
@@ -130,8 +181,15 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    * identity/config/sync/auth/signer composition. This is all-or-nothing:
    * either omit it for the default Web IndexedDB/OPFS path, or provide every
    * port for a host-owned persistence implementation.
+   *
+   * A host may supply storageFactory to construct storage using the runtime seal.
    */
-  persistence?: PsLitePersistenceBundle;
+  persistence?: Omit<PsLitePersistenceBundle, "storage"> &
+    Partial<Pick<PsLitePersistenceBundle, "storage">>;
+  /** Constructs host storage with the runtime's account-mode seal. */
+  storageFactory?: (
+    seal: LegacyWriteSeal,
+  ) => DataStoragePort | Promise<DataStoragePort>;
 }
 
 export interface IndexedDbPsLiteRuntime {
@@ -143,12 +201,31 @@ export interface IndexedDbPsLiteRuntime {
   tokenStore: PsLiteRuntimeOptions["tokenStore"];
   accessLogStore: AccessLogReader & AccessLogWriter;
   syncManager: PsLiteRuntimeOptions["syncManager"];
+  /** Database facade when a host driver is supplied and available. */
+  localSync?: LocalSync | null;
+  /** Lazily open the database after Account mode is known. */
+  getLocalSync?(): Promise<LocalSync>;
+  /** Stop the sync manager before releasing its owner/network database. */
+  closeStreamSync?(): Promise<void>;
+  /**
+   * The database run intake for host code; admission follows Account mode.
+   */
+  streamSyncIntake: RunIntake | null;
+  streamSyncSeed: SeedIntake | null;
   /** The compute layer; hosts call `scheduler.stop()` on teardown. */
   derivatives: PsLiteRuntimeOptions["derivatives"];
   /** This boot's replication door, from `resolveLiteReplication`. */
   replication: ReplicationDoorStatus;
   /** Replication built over `replicaHost`, when the host passed it. */
   replicationHost?: LiteReplication;
+  /**
+   * The account-mode module. Web code gives it the Account's answer with
+   * `submitEvidence` before it starts the first collection. On teardown call
+   * `importWaker.stop()` first, then close the storage, then `close()`.
+   */
+  accountModeAuthority: ModeAuthority;
+  /** Wakes the host's importer; present when the host passed `legacyImporter`. */
+  importWaker?: ImportWaker;
 }
 
 export async function createIndexedDbPsLiteRuntime(
@@ -156,7 +233,11 @@ export async function createIndexedDbPsLiteRuntime(
 ): Promise<IndexedDbPsLiteRuntime> {
   const dbName = options.dbName ?? "personal-server-lite";
   const injected = options.persistence;
-  if (injected !== undefined) assertCompletePsLitePersistenceBundle(injected);
+  if (injected !== undefined)
+    assertCompletePsLitePersistenceBundle(
+      injected,
+      Boolean(options.storageFactory),
+    );
   // No bundle preserves the Web IndexedDB/OPFS path. A supplied bundle has
   // already been validated as complete, so hosts never silently mix native and
   // browser persistence. Config, identity, and sync remain generic over state.
@@ -190,22 +271,68 @@ export async function createIndexedDbPsLiteRuntime(
       dbName,
       storeName: "accessLogs",
     });
-  const storage =
-    injected?.storage ??
-    (await createPersistentPsLiteStorage(
-      { kind: "indexeddb" },
-      createIndexedDbPsLitePersistence({
-        dbName: options.storageDbName ?? `${dbName}-storage`,
-        storeName: options.storageStoreName ?? "state",
-        key: options.storageKey ?? "data-storage-v1",
-      }),
-      options.dataFileStore,
-    ));
-  const gateway = options.gateway ?? createGatewayClient(config.gateway.url);
   const serverOwner = await resolvePsLiteOwner({
     ownerAddress: options.ownerAddress,
     ownerSignature: options.ownerSignature,
   });
+  // One mode, from one place: the account-mode module. Its records live in
+  // their own IndexedDB database, never in the data store. Boot does not wait
+  // for the Account: before the first answer reads stay legacy and legacy
+  // writes pause. A host that injects its own persistence has not offered
+  // browser IndexedDB, so without an `accountModeStore` the records are in
+  // memory and the Account's answer at the next launch restores them.
+  let importWaker: ImportWaker | undefined;
+  const accountModeAuthority = createModeAuthority({
+    store:
+      options.accountModeStore ??
+      (options.persistence
+        ? createMemoryModeRecordStore()
+        : createIndexedDbModeRecordStore(`${dbName}-account-mode`)),
+    // An answer that leaves the owner On wakes the import.
+    onOn: () => void importWaker?.wake(),
+    onWarning: (message, detail) => console.warn(message, detail),
+  });
+  await accountModeAuthority.ready;
+  if (options.legacyImporter && serverOwner) {
+    importWaker = createImportWaker({
+      authority: accountModeAuthority,
+      owner: serverOwner,
+      importer: options.legacyImporter,
+      onWarning: (message, detail) => console.warn(message, detail),
+    });
+  }
+  // The one seal over that module. The storage makes a legacy version durable
+  // only inside it, so the lock that answers an On is the lock every legacy
+  // write holds. A runtime without an owner gets a seal that answers unknown.
+  const legacyWriteSeal = createLegacyWriteSeal({
+    authority: accountModeAuthority,
+    owner: serverOwner,
+  });
+  const storageFactory =
+    options.storageFactory ??
+    (injected?.storage
+      ? () => injected.storage!
+      : (seal: LegacyWriteSeal) =>
+          createPersistentPsLiteStorage(
+            { kind: "indexeddb" },
+            createIndexedDbPsLitePersistence({
+              dbName: options.storageDbName ?? `${dbName}-storage`,
+              storeName: options.storageStoreName ?? "state",
+              key: options.storageKey ?? "data-storage-v1",
+            }),
+            options.dataFileStore,
+            seal,
+          ));
+  const storage = await storageFactory(legacyWriteSeal);
+  const gateway =
+    options.gateway ??
+    withCancellableRegistration(
+      withStrictMcpGrantRegistration(
+        createGatewayClient(config.gateway.url),
+        config.gateway.url,
+      ),
+      config.gateway.url,
+    );
   const serverSigner =
     options.serverSigner ??
     createServerSigner(identity.account, {
@@ -229,6 +356,12 @@ export async function createIndexedDbPsLiteRuntime(
   let dataPointFeed = options.dataPointFeed;
   let scopeDeletions = options.scopeDeletions;
   let additions = options.additions;
+  let streamSyncRead = options.streamSyncRead;
+  let streamSyncIntake: RunIntake | null = null;
+  let streamSyncSeed: SeedIntake | null = null;
+  let syncRuntime:
+    Awaited<ReturnType<typeof createPsLiteSyncManager>> | undefined;
+  let closeStreamSync = async () => {};
   let runtimeRef: PsLiteRuntime | null = null;
   // Derivative compute: built before sync so downloads can mark questions
   // stale; it reaches the sync manager lazily to upload its results.
@@ -267,12 +400,20 @@ export async function createIndexedDbPsLiteRuntime(
       "Derivative compute disabled: inference.baseUrl is the direct-provider default; point it at the Vana inference relay",
     );
   }
-  if (!syncManager && config.sync.enabled) {
+  if (!syncManager && (config.sync.enabled || options.localDb)) {
     const sync = await createPsLiteSyncManager({
       config,
+      autoStartSync: config.sync.enabled,
+      localDb: options.localDb,
+      localDbDeviceId: options.localDbDeviceId,
+      olderVersionReads: options.olderVersionReads,
       stateStore,
       storage,
       ownerSignature: options.ownerSignature,
+      accountStorageMode: accountStorageModeFor(
+        accountStorageModeOf(accountModeAuthority),
+        serverOwner,
+      ),
       ownerAddress: options.ownerAddress,
       ownerSyncSigner: options.ownerSyncSigner,
       additionsWorkerFactory: options.additionsWorkerFactory,
@@ -280,6 +421,11 @@ export async function createIndexedDbPsLiteRuntime(
       gateway,
       dataPointFeed: options.dataPointFeed,
       scopeDeletions,
+      streamSyncDeclarations: options.streamSyncDeclarations,
+      streamSyncRegistry: options.streamSyncRegistry,
+      streamSyncBlobs: options.streamSyncBlobs,
+      streamSyncDeclaredStreams: options.streamSyncDeclaredStreams,
+      streamSyncRetainedManifests: options.streamSyncRetainedManifests,
       diagnostics,
       logger: options.logger,
       lineageGateway,
@@ -292,6 +438,11 @@ export async function createIndexedDbPsLiteRuntime(
     syncManager = sync.syncManager;
     scopeDeletions = sync.scopeDeletions;
     dataPointFeed = sync.dataPointFeed;
+    syncRuntime = sync;
+    closeStreamSync = sync.closeStreamSync;
+    streamSyncRead = sync.streamSyncRead;
+    streamSyncIntake = sync.streamSyncIntake;
+    streamSyncSeed = sync.streamSyncSeed;
   }
   const replicationHost = options.replicaHost
     ? await createLiteReplication({
@@ -307,7 +458,7 @@ export async function createIndexedDbPsLiteRuntime(
           createReplicationNetworkPorts({
             config,
             owner,
-            masterKey: deriveMasterKey(options.ownerSignature),
+            masterKey: legacyMasterKey(options.ownerSignature),
             storage: objectStorage,
             gateway,
             feed:
@@ -371,6 +522,7 @@ export async function createIndexedDbPsLiteRuntime(
     });
   const runtime = createPsLiteRuntime({
     ...options,
+    accountModeAuthority,
     replication: replicationHost?.runtime ?? options.replication,
     auth,
     serverOrigin,
@@ -388,6 +540,27 @@ export async function createIndexedDbPsLiteRuntime(
     syncManager,
     additions,
     scopeDeletions,
+    streamSyncRead,
+    localSync: syncRuntime?.getLocalSync,
+    streamSyncSeed,
+    history: syncRuntime
+      ? {
+          additions: async (input) =>
+            (await syncRuntime!.getLocalSync()).history.additions(input),
+          versions: async (input) =>
+            (await syncRuntime!.getLocalSync()).history.versions(input),
+          lineage: async (input) =>
+            (await syncRuntime!.getLocalSync()).history.lineage(input),
+        }
+      : undefined,
+    streamSyncConnectionDelete: syncRuntime
+      ? {
+          requestConnectionDelete: async (connector) =>
+            (await syncRuntime!.getLocalSync()).deleter.requestConnectionDelete(
+              connector,
+            ),
+        }
+      : null,
     diagnostics,
     lineageGateway,
     derivatives,
@@ -406,6 +579,8 @@ export async function createIndexedDbPsLiteRuntime(
       injected?.mcpOAuthAuthorizations ?? options.mcpOAuthAuthorizationStore,
   });
   runtimeRef = runtime;
+  // An import owed from a saved On needs no new answer from the Account.
+  void importWaker?.wake();
 
   return {
     runtime,
@@ -416,8 +591,17 @@ export async function createIndexedDbPsLiteRuntime(
     tokenStore,
     accessLogStore,
     syncManager,
+    get localSync() {
+      return syncRuntime?.localSync ?? null;
+    },
+    getLocalSync: syncRuntime?.getLocalSync,
+    closeStreamSync,
+    streamSyncIntake,
+    streamSyncSeed,
     derivatives,
     replication,
     replicationHost,
+    accountModeAuthority,
+    importWaker,
   };
 }
