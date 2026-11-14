@@ -46,7 +46,7 @@ async function world() {
   };
   const publishLines: Record<string, unknown>[] = [];
   const surfaces = [];
-  for (const name of ["desktop", "web"]) {
+  for (const name of ["desktop", "web", "phone"]) {
     const db = await openLocalDb(openBetterSqlite3(":memory:"), {
       owner,
       network: "test",
@@ -155,6 +155,7 @@ async function world() {
   return {
     desktop: surfaces[0]!,
     web: surfaces[1]!,
+    phone: surfaces[2]!,
     registry,
     puts,
     publishLines,
@@ -353,6 +354,29 @@ describe("a refresh that omits a record is an observation of its absence", () =>
     await w.web.refresh("w2", 2000, without, { cycle: false });
     await w.web.refresh("w4", 4000, [{ id: "p", v: "1" }], { full: false });
     await w.desktop.sync.apply();
+    expect(Object.keys(await w.desktop.values()).sort()).toEqual(["p", "z"]);
+  });
+
+  it("a publish from a device whose clock is behind does not lower the omission time", async () => {
+    const w = await world();
+    await w.desktop.refresh("r1", 1000, both); // all three hold k@t1
+    await w.web.sync.apply();
+    await w.phone.sync.apply();
+    // Phone saw k again at t2.5 and has not published or pulled since.
+    await w.phone.refresh("p2", 2500, both, { cycle: false });
+    // Web's full refresh omits k at t3.
+    await w.web.refresh("w3", 3000, without);
+    // Desktop pulls that head, then publishes an unrelated record from a
+    // partial run at t2, a clock behind the omission. The head's observedAt
+    // is t2; the omission is still t3.
+    await w.desktop.refresh("d4", 2000, [{ id: "p", v: "1" }], { full: false });
+    // Phone's sighting (t2.5) is older than the omission (t3): k is deleted.
+    await w.phone.sync.apply();
+    expect(Object.keys(await w.phone.values()).sort()).toEqual(["p", "z"]);
+    await w.phone.cycle();
+    await w.web.sync.apply();
+    await w.desktop.sync.apply();
+    expect(Object.keys(await w.web.values()).sort()).toEqual(["p", "z"]);
     expect(Object.keys(await w.desktop.values()).sort()).toEqual(["p", "z"]);
   });
 });
