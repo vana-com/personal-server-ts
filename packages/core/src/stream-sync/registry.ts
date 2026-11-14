@@ -43,6 +43,7 @@ export interface GatewayStreamSyncRegistryOptions {
 
 interface RegistryRow {
   readonly scope?: unknown;
+  readonly changedAt?: unknown;
   readonly expectedVersion?: unknown;
   readonly dataHash?: unknown;
   readonly metadataHash?: unknown;
@@ -383,6 +384,33 @@ export function createGatewayStreamSyncRegistry(
         const parsed = parseScope(scope);
         return parsed?.kind === "stream" && parsed.connector === connector;
       }),
+
+    async probeChange() {
+      const params = new URLSearchParams({
+        user: options.ownerAddress,
+        includeDeleted: "true",
+        limit: "1",
+      });
+      const res = await fetchImpl(`${base}/v1/data?${params.toString()}`);
+      if (!res.ok) {
+        throw new Error(`registry change probe failed: ${res.status}`);
+      }
+      const envelope = (await res.json()) as {
+        data?: { dataPoints?: RegistryRow[] };
+      };
+      const rows = envelope.data?.dataPoints ?? [];
+      if (rows.length === 0) return null;
+      // Newest change first (`changedAt`, then id): the gateway stamps it on
+      // every write, tombstone and revive of a row. The marker fingerprints
+      // this one row. Another row stamped in the same millisecond leaves it
+      // unchanged, so equal markers are not proof of "nothing changed": the
+      // caller's unconditional timer cycle is the completeness guarantee.
+      const newest = rows[0] as RegistryRow & { id?: unknown };
+      if (typeof newest.changedAt !== "string" || newest.changedAt === "") {
+        return undefined;
+      }
+      return `${newest.changedAt}|${String(newest.id)}|${String(newest.expectedVersion)}`;
+    },
 
     listConnectionRows: (connector, ns) =>
       listRows((scope) => {

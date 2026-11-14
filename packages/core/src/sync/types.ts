@@ -16,6 +16,15 @@ export interface SyncStatus {
   hydratedScopes: string[];
   errors: SyncError[];
   /**
+   * Period of the registry change probe in milliseconds; 0 when the server has
+   * none. A client that wants to start a pull when its window returns
+   * (`POST /trigger?when=changed`) may do so only when this is above 0: an
+   * older server lacks the field and answers that request with a full cycle.
+   * The probe period is also the least time between such requests that can
+   * find a new marker.
+   */
+  changeProbeMs?: number;
+  /**
    * Deletes whose gateway tombstone failed and rolled back (the data is live
    * again). `retrying`: re-submitted automatically, a new tombstone is due or
    * settling. `failed`: every allowed re-submission failed; the user must

@@ -63,6 +63,10 @@ export const DEFAULTS = {
     // removed after this server's own import of them finishes, for a switched
     // owner. When false the same step only reads them back and reports.
     retireLegacy: false,
+    // Period of the registry change probe, in milliseconds: one cheap read of
+    // "did anything change?" that starts a sync cycle early. 0 turns it off.
+    // See DEFAULT_CHANGE_PROBE_MS for why 5000.
+    changeProbeMs: 5_000,
   },
   olderVersionReads: true,
   replication: {
@@ -246,6 +250,11 @@ export const ServerConfigSchema = z.object({
       write: z.boolean().default(DEFAULTS.streamSync.write),
       read: z.boolean().default(DEFAULTS.streamSync.read),
       retireLegacy: z.boolean().default(DEFAULTS.streamSync.retireLegacy),
+      changeProbeMs: z
+        .number()
+        .int()
+        .min(0)
+        .default(DEFAULTS.streamSync.changeProbeMs),
     })
     .default(DEFAULTS.streamSync),
   olderVersionReads: z.boolean().default(DEFAULTS.olderVersionReads),

@@ -44,6 +44,7 @@ import {
 import {
   createGatewayDataPointFeed,
   createGatewayDeleteDataPort,
+  createRegistryChangeProbe,
   createInventoryTombstoneFinality,
   createPendingBlobDeletionStore,
   createScopeDeletionTracker,
@@ -565,6 +566,25 @@ export async function createPsLiteSyncManager(
     else await localDb?.close();
   }
 
+  // One registry client for the cycle's reads and the change probe.
+  const streamSyncRegistry: StreamSyncRegistry =
+    options.streamSyncRegistry ??
+    createGatewayStreamSyncRegistry({
+      gatewayUrl: options.config.gateway.url,
+      ownerAddress: serverOwner,
+    });
+  // A hidden tab has no one to show a change to: it skips the timed probe and
+  // probes once when shown again (`startPullSignals`). Where the document says
+  // nothing (a worker), the probe runs.
+  const changeProbe = options.localDb
+    ? createRegistryChangeProbe(streamSyncRegistry, {
+        intervalMs: options.config.streamSync.changeProbeMs,
+        active: () =>
+          (globalThis as { document?: { visibilityState?: string } }).document
+            ?.visibilityState !== "hidden",
+      })
+    : undefined;
+
   let syncManager!: ReturnType<typeof createSyncManager>;
   try {
     let closed = false;
@@ -581,12 +601,7 @@ export async function createPsLiteSyncManager(
           db: localDb,
           queue: connectionQueue(),
           ownerAddress: serverOwner.toLowerCase() as `0x${string}`,
-          registry:
-            options.streamSyncRegistry ??
-            createGatewayStreamSyncRegistry({
-              gatewayUrl: options.config.gateway.url,
-              ownerAddress: serverOwner,
-            }),
+          registry: streamSyncRegistry,
           blobs:
             options.streamSyncBlobs ??
             createStorageStreamSyncBlobs(storageAdapter),
@@ -704,6 +719,7 @@ export async function createPsLiteSyncManager(
       {
         accountStorageMode: mode,
         localSync: { cycle: async () => (await getLocalSync()).cycle() },
+        ...(changeProbe && { changeProbe }),
         deleteData,
         pendingBlobDeletions,
         uploadAttemptStore: uploadAttemptNamespace

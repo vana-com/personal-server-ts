@@ -29,6 +29,7 @@ describe("ServerConfigSchema — streamSync.retireLegacy", () => {
       write: false,
       read: false,
       retireLegacy: false,
+      changeProbeMs: 5_000,
     });
   });
 
@@ -74,8 +75,31 @@ describe("ServerConfigSchema — streamSync.refuseLegacyWrites (removed)", () =>
       write: true,
       read: false,
       retireLegacy: false,
+      changeProbeMs: 5_000,
     });
     expect("refuseLegacyWrites" in DEFAULTS.streamSync).toBe(false);
+  });
+});
+
+describe("ServerConfigSchema — streamSync.changeProbeMs", () => {
+  it("is the registry change probe period: 5 s by default, 0 turns it off", () => {
+    expect(DEFAULTS.streamSync.changeProbeMs).toBe(5_000);
+    expect(
+      ServerConfigSchema.parse({ streamSync: { changeProbeMs: 0 } }).streamSync
+        .changeProbeMs,
+    ).toBe(0);
+    expect(
+      ServerConfigSchema.parse({ streamSync: { changeProbeMs: 15_000 } })
+        .streamSync.changeProbeMs,
+    ).toBe(15_000);
+  });
+
+  it("refuses a negative or fractional period", () => {
+    for (const changeProbeMs of [-1, 2.5, "5000"]) {
+      expect(
+        ServerConfigSchema.safeParse({ streamSync: { changeProbeMs } }).success,
+      ).toBe(false);
+    }
   });
 });
 

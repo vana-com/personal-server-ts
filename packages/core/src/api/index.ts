@@ -537,7 +537,10 @@ export interface PersonalServerAccessLogsApiDeps {
 
 export interface PersonalServerSyncApiDeps {
   auth: Pick<PersonalServerApiAuthPort, "authorizeOwner">;
-  syncManager: Pick<SyncManager, "trigger" | "getStatus"> | null;
+  syncManager:
+    | (Pick<SyncManager, "trigger" | "getStatus"> &
+        Partial<Pick<SyncManager, "requestPull">>)
+    | null;
   logger?: PersonalServerApiLogger;
 }
 
@@ -4137,7 +4140,11 @@ export async function handlePersonalServerSyncRequest(
       if (pathname === "/trigger") {
         if (request.method !== "POST") return methodNotAllowed();
         await deps.auth.authorizeOwner(request);
-        return contractResponse(await triggerSyncContract(deps.syncManager));
+        return contractResponse(
+          await triggerSyncContract(deps.syncManager, {
+            whenChanged: url.searchParams.get("when") === "changed",
+          }),
+        );
       }
 
       if (pathname === "/status") {

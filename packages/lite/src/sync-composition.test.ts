@@ -507,7 +507,7 @@ describe("PS Lite local database composition", () => {
     }
   });
 
-  it("keeps the sync manager's default sixty-second interval without another timer", async () => {
+  it("keeps the sync manager's sixty-second interval and adds only the change probe's", async () => {
     const db = driver();
     facade(db);
     const interval = vi.spyOn(globalThis, "setInterval");
@@ -517,8 +517,10 @@ describe("PS Lite local database composition", () => {
     try {
       expect(interval).not.toHaveBeenCalled();
       lite.syncManager.start();
-      expect(interval).toHaveBeenCalledTimes(1);
+      // The cycle timer is the fallback; the probe timer is the only other.
+      expect(interval).toHaveBeenCalledTimes(2);
       expect(interval).toHaveBeenCalledWith(expect.any(Function), 60_000);
+      expect(interval).toHaveBeenCalledWith(expect.any(Function), 5_000);
     } finally {
       await lite.syncManager.stop();
       await lite.closeStreamSync();

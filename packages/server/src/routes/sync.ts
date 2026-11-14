@@ -72,13 +72,25 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
   app.post("/trigger", async (c, next) => {
     if (legacy()) return next();
     await auth.authorizeOwner(c.req.raw);
+    // A signal, not a sync request: through the manager, which coalesces it
+    // with the cycle that is running and cycles only if the registry moved.
+    if (c.req.query("when") === "changed" && deps.syncManager) {
+      void deps.syncManager.requestPull().catch(() => undefined);
+      return c.json({ status: "started", message: "Sync triggered" }, 202);
+    }
     await (await local()).cycle();
     return c.json({ status: "started", message: "Sync triggered" }, 202);
   });
   app.get("/status", async (c, next) => {
     if (legacy()) return next();
     await auth.authorizeOwner(c.req.raw);
-    return c.json(await (await local()).listing.status());
+    const status = await (await local()).listing.status();
+    // The probe period is how a client learns this server answers
+    // `?when=changed` with a pull and not a full cycle.
+    return c.json({
+      ...status,
+      changeProbeMs: deps.syncManager?.getStatus().changeProbeMs ?? 0,
+    });
   });
   app.post("/file/:id", async (c, next) => {
     if (legacy()) return next();

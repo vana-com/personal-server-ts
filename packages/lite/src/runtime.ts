@@ -139,6 +139,7 @@ import {
   type McpOAuthAuthorizationStore,
   type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
+import { startPullSignals } from "./pull-signals.js";
 import type { PsLiteStorageCapabilities } from "./storage.js";
 import type { LiteReplicationRuntime } from "./replication-runtime.js";
 import {
@@ -215,7 +216,9 @@ export interface PsLiteRuntimeOptions {
     >;
   syncManager?:
     | (Pick<SyncManager, "trigger" | "getStatus"> &
-        Partial<Pick<SyncManager, "start" | "stop" | "deleteScope">>)
+        Partial<
+          Pick<SyncManager, "start" | "stop" | "deleteScope" | "requestPull">
+        >)
     | null;
   /**
    * Read-side tombstone memory; reads of a scope the gateway reports deleted
@@ -931,6 +934,8 @@ export function createPsLiteRuntime(
   options: PsLiteRuntimeOptions,
 ): PsLiteRuntime {
   let active = options.active ?? false;
+  // Page signals start a pull while the runtime is active (D4-SYNC-TRIGGERS).
+  let stopPullSignals: (() => void) | undefined;
   const now = options.now ?? (() => new Date());
   const auth = options.auth ?? createMissingAuthAdapter();
   // Readers get legacy bodies projected from stored PDPP records; writes and
@@ -1224,11 +1229,20 @@ export function createPsLiteRuntime(
     activate() {
       active = true;
       options.syncManager?.start?.();
+      stopPullSignals?.();
+      const manager = options.syncManager;
+      stopPullSignals = manager?.requestPull
+        ? startPullSignals(() => {
+            manager.requestPull?.().catch(() => undefined);
+          })
+        : undefined;
       options.derivatives?.scheduler.start();
       options.replication?.resume();
     },
     deactivate() {
       active = false;
+      stopPullSignals?.();
+      stopPullSignals = undefined;
       void options.syncManager?.stop?.();
       options.derivatives?.scheduler.stop();
       void options.replication?.pause();
