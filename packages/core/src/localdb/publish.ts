@@ -499,6 +499,15 @@ type Prepared = {
   readonly verifiedHead: Head | null;
 };
 
+/** Why a stream's publish turn wrote nothing and left the stream for the next cycle. */
+type DeferralReason =
+  | "control_absent_after_first_generation"
+  | "control_unavailable"
+  | "control_generation_moved"
+  | "stream_head_from_later_generation"
+  | "stream_delete_not_proven_earlier"
+  | "run_order_not_settled";
+
 type Snapshot =
   | { readonly kind: "done"; readonly result: PublishResult }
   | { readonly kind: "retry" }
@@ -790,8 +799,15 @@ async function snapshotStream(
     context.view.invalidate();
     await applyConnection(deps, connectionId);
   };
-  const deferred = (): Snapshot =>
-    done({ stream, outcome: "deferred", watermark: run.watermark });
+  // A deferral writes nothing and retries next cycle. The log line is the only
+  // way to tell a stream that waits from one that is stuck for good.
+  const deferred = (reason: DeferralReason): Snapshot => {
+    deps.logger.warn(
+      { connectionId, stream, reason },
+      "stream sync: publish deferred",
+    );
+    return done({ stream, outcome: "deferred", watermark: run.watermark });
+  };
 
   // Step 1: snapshot W and the changes since the last publish.
   let [local] = await deps.db.query<LocalStream>(
@@ -837,7 +853,8 @@ async function snapshotStream(
     : await deps.registry.read(control);
   let controlState = classifyControl(controlRead, hashes);
   if (controlState.kind === "absent") {
-    if (connection.generation !== 1) return deferred();
+    if (connection.generation !== 1)
+      return deferred("control_absent_after_first_generation");
     const signature = await deps.signer.signAddData({
       ownerAddress: deps.ownerAddress,
       scope: control,
@@ -864,15 +881,11 @@ async function snapshotStream(
     return done({ stream, outcome: "purged", watermark });
   }
   if (controlState.kind === "foreign" || controlState.kind === "absent") {
-    deps.logger.warn(
-      {},
-      "publish: control unavailable for publishing; deferring stream",
-    );
-    return deferred();
+    return deferred("control_unavailable");
   }
   if (controlState.generation !== connection.generation) {
     await applyRegistry();
-    return deferred();
+    return deferred("control_generation_moved");
   }
   // A run that began before this control generation never joins it: it is
   // discarded here, before the binding below could give it the generation.
@@ -948,7 +961,8 @@ async function snapshotStream(
     );
     // A head of a later lifetime than this connection knows: it is not ours
     // to replace. Wait for this connection to catch up.
-    if (verified.generation > connection.generation) return deferred();
+    if (verified.generation > connection.generation)
+      return deferred("stream_head_from_later_generation");
     if (verified.generation === connection.generation) {
       registryHead = verified;
     } else {
@@ -975,7 +989,7 @@ async function snapshotStream(
       });
       // No proof this delete ended an earlier lifetime: it may be the delete
       // of this one, awaiting its control tombstone. Do not write over it.
-      if (!provenEarlier) return deferred();
+      if (!provenEarlier) return deferred("stream_delete_not_proven_earlier");
       local = {
         ...local,
         last_delete_version: Math.max(local.last_delete_version, fence),
@@ -1013,7 +1027,7 @@ async function snapshotStream(
     // No content base: a replacing run replaces nothing, as with an absent row.
     registryHead ? registryDataHash : null,
   );
-  if (plan.deferred) return deferred();
+  if (plan.deferred) return deferred("run_order_not_settled");
   if (plan.refused) {
     const stale = await confirmLive();
     if (stale) return stale;
