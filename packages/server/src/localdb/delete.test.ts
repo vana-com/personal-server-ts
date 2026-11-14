@@ -14,6 +14,7 @@ import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import { createConnectionDeleter } from "../../../core/src/localdb/delete.js";
 import { remoteFixture } from "./apply-fixture.js";
+import { postStreamDeleteOnly } from "./legacy-delete-fixture.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}`;
@@ -21,7 +22,11 @@ const drivers: SqlDriver[] = [];
 afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
 });
-async function world(file?: string) {
+async function world(
+  file?: string,
+  names: readonly string[] = ["items"],
+  withControl = true,
+) {
   const keys = {
     namespaceHmac: async () => new Uint8Array(32),
     encrypt: async (_s: string, b: Uint8Array) => b,
@@ -31,10 +36,13 @@ async function world(file?: string) {
   const fixture = await remoteFixture(keys);
   const registry = createMemoryStreamSyncRegistry() as MemoryStreamSyncRegistry;
   const blobs = createMemoryStreamSyncBlobs();
-  const h = await fixture.head("items", [{ id: "base" }]);
+  const heads = [];
+  for (const name of names)
+    heads.push(await fixture.head(name, [{ id: "base" }]));
+  const h = heads[0]!;
   for (const [key, value] of fixture.blobs) await blobs.put(key, value);
   for (const [scope, row] of fixture.reads)
-    if (row.found)
+    if (row.found && (withControl || scope !== fixture.control))
       await registry.post({
         ownerAddress: owner,
         scope,
@@ -70,7 +78,7 @@ async function world(file?: string) {
     await bootstrapConnections(deps);
     await applyConnection(deps, fixture.control);
     const deleter = createConnectionDeleter(deps, {
-      declaredStreams: () => ["items"],
+      declaredStreams: () => names,
     });
     devices.push({ db, deps, deleter });
   }
@@ -81,6 +89,7 @@ async function world(file?: string) {
     registry,
     blobs,
     head: h,
+    heads,
   };
 }
 it("persists intent before the first registry write and a second device stays deleted", async () => {
@@ -95,7 +104,8 @@ it("persists intent before the first registry write and a second device stays de
   const started = await f.a.deleter.requestConnectionDelete("fixture-source");
   expect(started.deleteId).toBeTruthy();
   expect(await f.a.deleter.resumeDeletes()).toEqual([]);
-  expect(events).toEqual([f.head.scope, f.control]);
+  // The control tombstone is the one linearization point: it lands first.
+  expect(events).toEqual([f.control, f.head.scope]);
   await applyConnection(f.b.deps, f.control);
   await applyConnection(f.b.deps, f.control);
   for (const device of [f.a, f.b]) {
@@ -153,8 +163,8 @@ it("pins a control reread rather than a stale listing", async () => {
 
 it("resumes a saved stream pin after a failed post without losing the intent", async () => {
   const f = await world();
-  f.registry.beforePost = async () => {
-    throw new Error("offline fixture");
+  f.registry.beforePost = async (post) => {
+    if (post.scope !== f.control) throw new Error("offline fixture");
   };
   const first = await f.a.deleter.requestConnectionDelete("fixture-source");
   expect(await f.a.deleter.resumeDeletes()).toHaveLength(1);
@@ -232,13 +242,14 @@ it("an intent blocks local apply and publish until its landing can finish", asyn
   await f.a.deleter.resumeDeletes();
 });
 
-it("supersession reports ConnectionDeleteSuperseded and never tombstones a reconnect", async () => {
+it("a reconnect that wins the fence race is never tombstoned, and the ended lifetime is still cleaned", async () => {
   const f = await world();
   let moved = false;
   f.registry.beforePost = async (post) => {
     if (post.scope !== f.control) return;
     f.registry.beforePost = undefined;
     moved = true;
+    // Another surface lands the same fence, then reconnects (active, version 3).
     await f.registry.post(post);
     await f.registry.post({
       ownerAddress: owner,
@@ -252,16 +263,14 @@ it("supersession reports ConnectionDeleteSuperseded and never tombstones a recon
   await f.a.deleter.requestConnectionDelete("fixture-source");
   const pending = await f.a.deleter.resumeDeletes();
   expect(moved).toBe(true);
-  expect(
-    pending.some((p) => p.why === "ConnectionDeleteSuperseded") ||
-      vi
-        .mocked(f.a.deps.logger.warn)
-        .mock.calls.some(([x]) => x.reason === "ConnectionDeleteSuperseded"),
-  ).toBe(true);
+  // No "superseded" exit: the fence landed (control version >= pin + 1), so the
+  // delete goes on to remove the data of the lifetime it ended.
+  expect(pending).toEqual([]);
   expect(await f.registry.read(f.control)).toMatchObject({
     version: 3,
     dataHash: f.hashes.activeData,
   });
+  expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 2 });
   expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
 });
 
@@ -295,7 +304,7 @@ it("the second device's unpublished rows are purged along with its imported rows
   expect(await f.b.db.query("SELECT * FROM records")).toEqual([]);
 });
 
-it("deletion fences declared rowless streams before the control tombstone", async () => {
+it("deletion fences declared rowless streams after the control tombstone", async () => {
   const f = await world();
   const store = createConnectionDeleter(f.a.deps, {
     declaredStreams: () => ["items", "rowless"],
@@ -306,20 +315,28 @@ it("deletion fences declared rowless streams before the control tombstone", asyn
     found: true,
     version: 1,
   });
-  expect(f.registry.log.slice(-3).map((row) => row.scope)).toEqual([
+  const scopes = f.registry.log.slice(-3).map((row) => row.scope);
+  expect(scopes[0]).toBe(f.control);
+  expect(scopes.slice(1).sort()).toEqual([
     f.head.scope,
     f.control + ".rowless",
-    f.control,
   ]);
 });
 
 it("L11 publishes an incremental run over a stream tombstone as incomplete and needs_full", async () => {
   const f = await world();
-  f.registry.beforePost = async (post) => {
-    if (post.scope === f.control) throw new Error("control landing paused");
-  };
-  await f.a.deleter.requestConnectionDelete("fixture-source");
-  await f.a.deleter.resumeDeletes();
+  // A stream delete of the active lifetime with the control row still active.
+  await postStreamDeleteOnly({
+    registry: f.registry,
+    blobs: f.blobs,
+    keys: f.a.deps.keys,
+    owner,
+    connector: "fixture-source",
+    ns: "",
+    stream: "items",
+    scope: f.head.scope,
+    endedGeneration: 1,
+  });
   await applyConnection(f.b.deps, f.control);
   await f.b.db.batch([
     {
@@ -658,4 +675,303 @@ it("rejected and overwritten stream posts share one budget of eight", async () =
   expect(posts()).toBe(EIGHT_ATTEMPTS);
   expect(pending).toEqual([{ connector: "fixture-source", why: "Error" }]);
   expect(await f.a.db.query("SELECT * FROM delete_intents")).toHaveLength(1);
+});
+
+// ---------------------------------------------------------------------------
+// The control fence. A delete lands the connection's control tombstone first:
+// one registry write that every other surface reads to decide the connection
+// is gone. Stream cleanup follows, stream by stream in parallel, and only ever
+// removes data of the lifetime the fence ended.
+// ---------------------------------------------------------------------------
+
+function deferred() {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => (release = resolve));
+  return { promise, release };
+}
+
+const FOUR = ["items", "events", "profile", "history"] as const;
+
+it("the fence is visible to another device before any stream is cleaned, and the request says so", async () => {
+  const f = await world(undefined, FOUR);
+  const gate = deferred();
+  const streamPosts: string[] = [];
+  f.registry.beforePost = async (post) => {
+    if (post.scope === f.control) return;
+    streamPosts.push(post.scope);
+    await gate.promise;
+  };
+  const started = await f.a.deleter.requestConnectionDelete("fixture-source");
+  // Cleanup is parked; the control tombstone has already landed.
+  expect(started.fenced).toBe(true);
+  expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
+  for (const head of f.heads)
+    expect(await f.registry.read(head.scope)).toMatchObject({ version: 1 });
+  await applyConnection(f.b.deps, f.control);
+  expect(await f.b.db.query("SELECT * FROM records")).toEqual([]);
+  expect(await f.b.db.query("SELECT control_state FROM connections")).toEqual([
+    { control_state: "deleted" },
+  ]);
+  gate.release();
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  for (const head of f.heads)
+    expect(await f.registry.read(head.scope)).toMatchObject({ version: 2 });
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+it("every stream's tombstone post is in flight at once", async () => {
+  const f = await world(undefined, FOUR);
+  const together = deferred();
+  let inFlight = 0;
+  f.registry.beforePost = async (post) => {
+    if (post.scope === f.control) return;
+    if (++inFlight === FOUR.length) together.release();
+    await Promise.race([
+      together.promise,
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () =>
+            reject(new Error(`serial: ${inFlight} stream post(s) in flight`)),
+          500,
+        ),
+      ),
+    ]);
+  };
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(inFlight).toBe(FOUR.length);
+});
+
+/**
+ * A registry and blob store whose every call takes LATENCY ms (the shape of the
+ * measured per-call cost; the ratio below does not depend on the number).
+ */
+const LATENCY = 25;
+async function timedDelete(streamCount: number) {
+  const names = FOUR.slice(0, streamCount);
+  const f = await world(undefined, names);
+  const wait = () =>
+    new Promise<void>((resolve) => setTimeout(resolve, LATENCY));
+  const slow = <A extends unknown[], T>(
+    call: (...args: A) => Promise<T>,
+  ): ((...args: A) => Promise<T>) => {
+    return async (...args) => {
+      await wait();
+      return call(...args);
+    };
+  };
+  f.registry.read = slow(f.registry.read.bind(f.registry));
+  f.registry.post = slow(f.registry.post.bind(f.registry));
+  f.registry.listControlRows = slow(
+    f.registry.listControlRows.bind(f.registry),
+  );
+  f.registry.listStreamRows = slow(f.registry.listStreamRows.bind(f.registry));
+  const blobs = f.a.deps.blobs;
+  blobs.put = slow(blobs.put.bind(blobs));
+  blobs.get = slow(blobs.get.bind(blobs));
+  const started = performance.now();
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  const answeredMs = performance.now() - started;
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  const totalMs = performance.now() - started;
+  for (const head of f.heads)
+    expect(await f.registry.read(head.scope)).toMatchObject({ version: 2 });
+  return { answeredMs, totalMs };
+}
+
+it("deleting four streams takes about the time of deleting one, not four times as long", async () => {
+  const one = await timedDelete(1);
+  const four = await timedDelete(4);
+  // Serial cleanup adds a whole stream chain per stream (about 3.5x here).
+  expect(four.totalMs).toBeLessThan(one.totalMs * 1.8);
+  // The request waits for the fence only: it answers before any stream chain ends.
+  expect(four.answeredMs).toBeLessThan(four.totalMs * 0.8);
+});
+
+it("the request answers pending when the registry refuses the fence, and the delete finishes later", async () => {
+  const f = await world();
+  f.registry.beforePost = async () => {
+    throw new Error("offline fixture");
+  };
+  const started = await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(started.fenced).toBe(false);
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toHaveLength(1);
+  expect(await f.registry.read(f.control)).toMatchObject({ version: 1 });
+  f.registry.beforePost = undefined;
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
+});
+
+it("a fence whose reply was lost is confirmed from the registry; it never lands twice", async () => {
+  const f = await world();
+  f.registry.afterPost = async (post) => {
+    if (post.scope === f.control) throw new Error("lost reply fixture");
+  };
+  // The tombstone committed and only its reply was lost: a read proves it, so
+  // the request already answers fenced.
+  const started = await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(started.fenced).toBe(true);
+  expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
+  f.registry.afterPost = undefined;
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(
+    f.registry.log
+      .filter((post) => post.scope === f.control)
+      .map((p) => p.version),
+  ).toEqual([1, 2]);
+  expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 2 });
+});
+
+it("a committed fence with a lost reply is confirmed by a read when every later control post fails", async () => {
+  const f = await world();
+  let controlPosts = 0;
+  f.registry.afterPost = async (post) => {
+    if (post.scope === f.control) throw new Error("lost reply fixture");
+  };
+  f.registry.beforePost = async (post) => {
+    if (post.scope !== f.control) return;
+    controlPosts += 1;
+    // Only the first post reaches the registry; the gateway then refuses
+    // every control post while it still answers reads.
+    if (controlPosts > 1) throw new Error("gateway refuses posts");
+  };
+  const started = await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(started.fenced).toBe(true);
+  // A restart before the fence phase was saved resumes through the same path.
+  await f.a.db.query(
+    "UPDATE delete_intents SET intent = json_remove(intent, '$.fences')",
+  );
+  f.registry.afterPost = undefined;
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  // Cleanup ran with no further successful control post.
+  expect(
+    f.registry.log
+      .filter((post) => post.scope === f.control)
+      .map((p) => p.version),
+  ).toEqual([1, 2]);
+  expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 2 });
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+it("a failed control post stays pending when the read cannot prove the fence", async () => {
+  const f = await world();
+  f.registry.beforePost = async (post) => {
+    if (post.scope === f.control) throw new Error("gateway refuses posts");
+  };
+  const started = await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(started.fenced).toBe(false);
+  expect(await f.registry.read(f.control)).toMatchObject({ version: 1 });
+  expect(await f.a.deleter.resumeDeletes()).toHaveLength(1);
+});
+
+it("a fence the next read does not show yet stays pending, then confirms the same version", async () => {
+  const f = await world();
+  const read = f.registry.read.bind(f.registry);
+  let lagging = false;
+  f.registry.afterPost = async (post) => {
+    if (post.scope === f.control) lagging = true;
+  };
+  f.registry.read = async (scope) => {
+    const row = await read(scope);
+    if (lagging && scope === f.control && row.found) {
+      lagging = false;
+      return {
+        ...row,
+        version: 1,
+        dataHash: f.hashes.activeData,
+        metadataHash: f.hashes.activeMetadata,
+        deleted: false,
+      };
+    }
+    return row;
+  };
+  const started = await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(started.fenced).toBe(false);
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(
+    f.registry.log
+      .filter((post) => post.scope === f.control)
+      .map((p) => p.version),
+  ).toEqual([1, 2]);
+});
+
+it("the fence phase is saved with the version it expects, and a restart resumes cleanup without a second fence post", async () => {
+  const f = await world();
+  const gate = deferred();
+  f.registry.beforePost = async (post) => {
+    if (post.scope !== f.control) {
+      await gate.promise;
+      throw new Error("stopped before cleanup");
+    }
+  };
+  gate.release();
+  const started = await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(started.fenced).toBe(true);
+  await f.a.deleter.resumeDeletes();
+  const [saved] = await f.a.db.query<{ intent: string }>(
+    "SELECT intent FROM delete_intents",
+  );
+  expect(JSON.parse(saved!.intent).fences).toEqual([{ ns: "", version: 2 }]);
+  f.registry.beforePost = undefined;
+  const posts = vi.spyOn(f.registry, "post");
+  const restarted = createConnectionDeleter(f.a.deps, {
+    declaredStreams: () => [],
+  });
+  expect(await restarted.resumeDeletes()).toEqual([]);
+  expect(posts.mock.calls.map(([post]) => post.scope)).toEqual([f.head.scope]);
+});
+
+it("an intent saved before the fence existed, with its streams landed, finishes with the control tombstone", async () => {
+  const f = await world();
+  f.registry.beforePost = async () => {
+    throw new Error("offline fixture");
+  };
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  const [saved] = await f.a.db.query<{ intent: string }>(
+    "SELECT intent FROM delete_intents",
+  );
+  const legacy = { ...JSON.parse(saved!.intent), streamsLanded: true };
+  delete legacy.fences;
+  await f.a.db.batch([
+    {
+      sql: "UPDATE delete_intents SET intent=?",
+      params: [JSON.stringify(legacy)],
+    },
+  ]);
+  f.registry.beforePost = undefined;
+  const resumed = createConnectionDeleter(f.a.deps, {
+    declaredStreams: () => [],
+  });
+  expect(await resumed.resumeDeletes()).toEqual([]);
+  expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+it("a connection with no control row cleans its streams under the old rule and posts no control tombstone", async () => {
+  const f = await world(undefined, ["items"], false);
+  const posts: string[] = [];
+  f.registry.beforePost = async (post) => {
+    posts.push(post.scope);
+  };
+  const started = await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(started.deleteId).toBeTruthy();
+  expect(posts).toEqual([f.head.scope]);
+  expect(await f.registry.read(f.control)).toEqual({ found: false });
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+it("cleanup of a stream whose head cannot be read after the fence still finishes while no reconnect happened", async () => {
+  const f = await world();
+  const real = f.a.deps.blobs.get.bind(f.a.deps.blobs);
+  f.a.deps.blobs.get = async () => {
+    throw new Error("unreadable old head fixture");
+  };
+  try {
+    await f.a.deleter.requestConnectionDelete("fixture-source");
+    expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  } finally {
+    f.a.deps.blobs.get = real;
+  }
+  expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 2 });
 });

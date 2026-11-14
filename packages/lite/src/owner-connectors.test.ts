@@ -26,7 +26,9 @@ async function runtimeWith(opts: {
   /** No mode is handed to the runtime. */
   unwired?: boolean;
   connectionDelete?: {
-    requestConnectionDelete: (c: string) => Promise<{ deleteId: string }>;
+    requestConnectionDelete: (
+      c: string,
+    ) => Promise<{ deleteId: string; fenced: boolean }>;
   } | null;
 }) {
   const accessLogStore = createMemoryPsLiteAccessLogStore();
@@ -54,7 +56,10 @@ async function runtimeWith(opts: {
     streamSyncConnectionDelete:
       opts.connectionDelete === undefined
         ? {
-            requestConnectionDelete: async (c) => ({ deleteId: `delete-${c}` }),
+            requestConnectionDelete: async (c) => ({
+              deleteId: `delete-${c}`,
+              fenced: true,
+            }),
           }
         : opts.connectionDelete,
   });
@@ -113,7 +118,10 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(202);
-    expect(await response.json()).toEqual({ deleteId: "delete-github" });
+    expect(await response.json()).toEqual({
+      deleteId: "delete-github",
+      fenced: true,
+    });
   });
 
   it("answers 503 when no stream-sync writer is wired (LITE_UNWIRED)", async () => {

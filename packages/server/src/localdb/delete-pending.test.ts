@@ -25,7 +25,7 @@ afterEach(async () => {
 
 /** One device with a delete that the gateway refuses to finish. */
 async function stuckDelete(
-  controlReply?: "conflict" | "refused" | "unconfirmed",
+  controlReply?: "conflict" | "refused" | "unconfirmed" | "hang",
 ) {
   const keys = {
     namespaceHmac: async () => new Uint8Array(32),
@@ -81,10 +81,16 @@ async function stuckDelete(
     deleteRetryMs: { first: 5, max: 20 },
   });
   syncs.push(sync);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
   if (controlReply) {
     const real = registry.post.bind(registry);
     vi.spyOn(registry, "post").mockImplementation(async (req) => {
       if (req.scope !== fixture.control) return real(req);
+      if (controlReply === "hang") {
+        await gate;
+        return real(req);
+      }
       if (controlReply === "refused")
         throw new RegistryRefusedError("refused", 409);
       return controlReply === "conflict"
@@ -95,7 +101,9 @@ async function stuckDelete(
     registry.beforePost = async () => {
       throw new Error("gateway refused");
     };
-  await sync.deleter.requestConnectionDelete("fixture-source");
+  const startedAt = Date.now();
+  const started = await sync.deleter.requestConnectionDelete("fixture-source");
+  const answeredMs = Date.now() - startedAt;
   const begin = (id: string, connect: boolean) =>
     sync.intake.begin(id, {
       connector: "fixture-source",
@@ -105,7 +113,17 @@ async function stuckDelete(
       ...(connect ? { connect: true } : {}),
     });
   const intents = () => db.query("SELECT connector FROM delete_intents");
-  return { db, registry, sync, begin, intents };
+  return {
+    db,
+    registry,
+    sync,
+    begin,
+    intents,
+    started,
+    answeredMs,
+    release,
+    control: fixture.control,
+  };
 }
 
 it.each([true, false])(
@@ -195,3 +213,19 @@ it.each(["conflict", "refused", "unconfirmed"] as const)(
     expect((await f.begin("reconnected", true)).status).toBe("collecting");
   },
 );
+
+it("a registry that never answers the fence gets fenced:false within the resume wait, and the fence lands when it recovers", async () => {
+  const f = await stuckDelete("hang");
+  // deleteRetryMs.first is 5 ms here: the request waits that long for the fence.
+  expect(f.started.fenced).toBe(false);
+  expect(f.answeredMs).toBeLessThan(1000);
+  expect(await f.intents()).toHaveLength(1);
+  f.release();
+  await vi.waitFor(async () => expect(await f.intents()).toEqual([]), {
+    timeout: 5000,
+  });
+  expect(await f.registry.read(f.control)).toMatchObject({
+    found: true,
+    version: 2,
+  });
+});
