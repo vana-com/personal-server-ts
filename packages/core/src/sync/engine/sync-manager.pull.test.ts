@@ -237,26 +237,6 @@ describe("requestPull with a change probe", () => {
     await manager.stop();
   });
 
-  it("treats a probe that cannot answer as a change", async () => {
-    const { manager, cycle } = probed([new Error("offline")]);
-    manager.start();
-    await vi.advanceTimersByTimeAsync(0);
-    cycle.mockClear();
-    await manager.requestPull();
-    await manager.requestPull();
-    expect(cycle).toHaveBeenCalledTimes(2);
-
-    const unsupported = probed([undefined]);
-    unsupported.manager.start();
-    await vi.advanceTimersByTimeAsync(0);
-    unsupported.cycle.mockClear();
-    await unsupported.manager.requestPull();
-    await unsupported.manager.requestPull();
-    expect(unsupported.cycle).toHaveBeenCalledTimes(2);
-    await manager.stop();
-    await unsupported.manager.stop();
-  });
-
   it("does not remember a marker whose cycle failed", async () => {
     let fail = true;
     const cycle = vi.fn(async () => {
@@ -345,6 +325,186 @@ describe("requestPull with a change probe", () => {
     // One probe in flight, never two at once. A signal that arrives while a
     // probe is out may postdate it, so the burst asks for one more read.
     expect(read).toHaveBeenCalledTimes(2);
+    expect(cycle).toHaveBeenCalledTimes(1);
+    await manager.stop();
+  });
+});
+
+// A probe that has not answered when the manager stops, or that fails.
+describe("a pull and the manager's lifecycle", () => {
+  /** A probe whose reads the test answers by hand. */
+  function deferredProbe() {
+    const pending: Array<(marker: string | null | undefined) => void> = [];
+    const read = vi.fn(
+      () =>
+        new Promise<string | null | undefined>((resolve) => {
+          pending.push(resolve);
+        }),
+    );
+    return {
+      read,
+      answer: (marker: string | null | undefined) => pending.shift()?.(marker),
+    };
+  }
+
+  it("starts no cycle when a probe answers after stop() has returned", async () => {
+    const probe = deferredProbe();
+    const cycle = vi.fn(async () => {});
+    const manager = build(cycle, {
+      changeProbe: { read: probe.read, intervalMs: 5_000 },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    cycle.mockClear();
+
+    void manager.requestPull();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(probe.read).toHaveBeenCalledTimes(1);
+
+    // stop() does not wait for a read-only probe that may never answer.
+    await manager.stop();
+    probe.answer("m-changed");
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(cycle).not.toHaveBeenCalled();
+  });
+
+  it("a probe from before a stop and start cannot start a cycle or set the baseline", async () => {
+    const probe = deferredProbe();
+    const cycle = vi.fn(async () => {});
+    const manager = build(cycle, {
+      changeProbe: { read: probe.read, intervalMs: 5_000 },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    void manager.requestPull(); // read 1, never answered in time
+    await vi.advanceTimersByTimeAsync(0);
+    await manager.stop();
+    manager.start(); // a new run; it starts one cycle itself
+    await vi.advanceTimersByTimeAsync(0);
+    cycle.mockClear();
+
+    // The new run asks too: the old pull must not swallow this request.
+    const fresh = manager.requestPull();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(probe.read).toHaveBeenCalledTimes(2);
+
+    probe.answer("m1"); // the old run's answer
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cycle).not.toHaveBeenCalled();
+
+    probe.answer("m1"); // the new run's answer: the baseline is still unset
+    await fresh;
+    expect(cycle).toHaveBeenCalledTimes(1);
+    await manager.stop();
+  });
+});
+
+describe("a probe that fails", () => {
+  const offline = () => {
+    throw new Error("offline");
+  };
+
+  it("runs no cycle: the 60 s timer is the only fallback", async () => {
+    const cycle = vi.fn(async () => {});
+    const manager = build(cycle, {
+      changeProbe: { read: async () => offline(), intervalMs: 5_000 },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    cycle.mockClear();
+
+    await manager.requestPull(); // a signal does not turn a failed probe into a cycle
+    await vi.advanceTimersByTimeAsync(55_000);
+    expect(cycle).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5_000); // the timer
+    expect(cycle).toHaveBeenCalledTimes(1);
+    await manager.stop();
+  });
+
+  it("backs off exponentially from the probe period to the timer period", async () => {
+    const readAt: number[] = [];
+    const t0 = Date.now();
+    const manager = build(async () => {}, {
+      changeProbe: {
+        read: async () => {
+          readAt.push((Date.now() - t0) / 1000);
+          return offline();
+        },
+        intervalMs: 5_000,
+      },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300_000);
+
+    // Gaps 10, 20, 40, then 60 (the timer period caps them): not 60 reads.
+    expect(readAt).toEqual([5, 15, 35, 75, 135, 195, 255]);
+    await manager.stop();
+  });
+
+  it("returns to the normal period after one answer", async () => {
+    const readAt: number[] = [];
+    const t0 = Date.now();
+    let failing = true;
+    const manager = build(async () => {}, {
+      changeProbe: {
+        read: async () => {
+          readAt.push((Date.now() - t0) / 1000);
+          if (failing) return offline();
+          return "m1";
+        },
+        intervalMs: 5_000,
+      },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(15_000); // reads at 5 and 15, next not before 35
+    failing = false;
+    await vi.advanceTimersByTimeAsync(20_000); // read at 35 answers
+    await vi.advanceTimersByTimeAsync(15_000); // then every 5 s
+    expect(readAt).toEqual([5, 15, 35, 40, 45, 50]);
+    await manager.stop();
+  });
+
+  it("is retried at once by a signal, which does not wait for the back-off", async () => {
+    let reads = 0;
+    const manager = build(async () => {}, {
+      changeProbe: {
+        read: async () => {
+          reads += 1;
+          return offline();
+        },
+        intervalMs: 5_000,
+      },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(15_000); // 2 reads: back-off now until 35 s
+    expect(reads).toBe(2);
+
+    await manager.requestPull(); // the network came back
+    expect(reads).toBe(3);
+    await manager.stop();
+  });
+});
+
+describe("a probe that cannot tell (the gateway sends no change time)", () => {
+  it("does not make the timed probe run a cycle, but a signal still does", async () => {
+    const cycle = vi.fn(async () => {});
+    const manager = build(cycle, {
+      changeProbe: { read: async () => undefined, intervalMs: 5_000 },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    cycle.mockClear();
+
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(cycle).not.toHaveBeenCalled();
+
+    await manager.requestPull(); // a person returned: as before, a full cycle
     expect(cycle).toHaveBeenCalledTimes(1);
     await manager.stop();
   });

@@ -8,10 +8,11 @@ import type { ChangeProbe } from "./sync-manager.js";
  *
  *  - Cost floor. One idle cycle of one connection of six streams makes 29
  *    registry requests (3 listings, 26 reads; `idle-cycle-requests.test.ts`),
- *    and the timer makes one per 60 s on every open device. A probe is one
- *    request, so it spends no more than that cycle does at any period of at
- *    least 60 s / 29 = 2.1 s. More connections raise the cycle's cost
- *    (1 + 28 per connection), so the floor only falls.
+ *    and the timer makes one per 60 s on every open device. The probe ADDS to
+ *    that: 60 s / P requests a minute (12 at 5 s). Below 60 s / 29 = 2.1 s the
+ *    probe alone would out-request the idle cycle it supplements. More
+ *    connections raise the cycle's cost (1 + 28 per connection), so the floor
+ *    only falls. The probe is not a saving; it buys latency.
  *  - Latency. A change waits half a period on average. The remaining path is
  *    the writer's publish (about 4.5 s) plus this device's apply (1 to 4 s), so
  *    waiting P/2 = 2.5 s keeps the added wait below the work it follows.

@@ -29,8 +29,15 @@ import type { LegacyWriteSeal } from "../../storage/legacy-write-seal.js";
  * A cheap read of "did anything in the owner's registry change?": one request,
  * whatever the number of rows. The marker is opaque and only compared for
  * equality; `null` is an empty registry; `undefined` is "cannot tell" (the
- * request failed or the gateway cannot answer), and a manager treats that as a
- * change, so a broken probe costs a cycle, never a missed change.
+ * gateway sent nothing to compare). A read that throws is a failed probe.
+ *
+ * The marker is a HINT, not a proof of "nothing changed". It fingerprints one
+ * row, so a change that leaves that row alone (two rows stamped in the same
+ * millisecond, a lower row changed under an unchanged top row) is invisible to
+ * it. A manager therefore uses it only to start a cycle early. It never uses
+ * it to skip the timer's cycle, and the unconditional timer cycle is what
+ * guarantees every change is applied. A failed or "cannot tell" probe never
+ * starts a cycle by itself (see `requestPull`).
  */
 export interface ChangeProbe {
   read(): Promise<string | null | undefined>;
@@ -56,8 +63,9 @@ export interface SyncManagerOptions {
   pollInterval?: number;
   /**
    * Starts a cycle when the registry changed, between the timer's cycles. The
-   * timer stays as the fallback: a probe that fails or misses a change
-   * (two writes in one millisecond) costs at most one poll interval.
+   * timer stays unconditional and is the completeness guarantee: a probe that
+   * fails or misses a change (see {@link ChangeProbe}) costs at most one poll
+   * interval, and the timer's cycle is never gated on the marker.
    */
   changeProbe?: ChangeProbe;
   /** Max upload batch size per cycle (default: 50) */
@@ -184,7 +192,18 @@ export function createSyncManager(
   let rerunRequested = false;
   // Pulls: one probe-and-cycle in flight; `pullRequested` is its dirty flag.
   let pullInFlight: Promise<void> | null = null;
+  let pullInFlightRun = 0;
+  let pullSeq = 0;
   let pullRequested = false;
+  // True when a person-driven signal (focus, online) joined the pull in flight.
+  let pullSignalled = false;
+  // One value per start() and per stop(). A pull remembers the value it began
+  // under and does nothing once it differs: a probe answering after stop(), or
+  // from before a stop and start, can start no cycle and set no baseline.
+  let lifecycle = 0;
+  // Failed probes in a row, and the earliest time the timed probe tries again.
+  let probeFailures = 0;
+  let nextTimedProbeAt = 0;
   // The registry marker as of the last cycle a pull ran and finished cleanly.
   // Only a pull moves it, and only to a marker read BEFORE its cycle started,
   // so every change up to it was in the registry when that cycle read.
@@ -518,46 +537,89 @@ export function createSyncManager(
     }
   }
 
-  async function pullIfChanged(probe: ChangeProbe): Promise<void> {
+  /**
+   * After a failed probe the timed probe waits probe period x 2^failures, capped
+   * at the poll interval, so an offline device probes about once a minute and
+   * the timer's own cycle stays the fallback. Both numbers are the host's.
+   */
+  function noteProbeFailure(probe: ChangeProbe): void {
+    probeFailures += 1;
+    const wait = Math.min(
+      probe.intervalMs * 2 ** probeFailures,
+      Math.max(pollInterval, probe.intervalMs),
+    );
+    nextTimedProbeAt = Date.now() + wait;
+  }
+
+  async function pullIfChanged(
+    probe: ChangeProbe,
+    run: number,
+    fromSignal: boolean,
+  ): Promise<void> {
     let marker: string | null | undefined;
     try {
       marker = await probe.read();
     } catch (err) {
+      if (run === lifecycle) noteProbeFailure(probe);
       uploadDeps.logger.debug(
         { error: (err as Error).message },
-        "Registry change probe failed; pulling",
+        "Registry change probe failed; the timer cycle is the fallback",
       );
+      return;
     }
+    // stop() does not wait for a probe; an answer from an earlier run is void.
+    if (run !== lifecycle || !isRunning) return;
+    probeFailures = 0;
+    nextTimedProbeAt = 0;
+    if (marker === undefined && !fromSignal) return; // cannot tell: the timer decides
     if (marker !== undefined && marker === pulledMarker) return;
     const errorsBefore = errorSeq;
     // A cycle already running may have read the registry before the change:
     // `runCycle` makes a joiner wait for a follow-up that starts after this call.
     await runCycle();
-    if (marker !== undefined && blocked === null && errorSeq === errorsBefore) {
+    if (
+      run === lifecycle &&
+      marker !== undefined &&
+      blocked === null &&
+      errorSeq === errorsBefore
+    ) {
       pulledMarker = marker;
     }
   }
 
-  function requestPull(): Promise<void> {
+  function pull(fromSignal: boolean): Promise<void> {
     if (!isRunning) return Promise.resolve();
     // No probe: a pull is a cycle request, and `runCycle` coalesces those.
     const probe = options?.changeProbe;
     if (!probe) return runCycle();
-    if (pullInFlight) {
+    const run = lifecycle;
+    if (pullInFlight && pullInFlightRun === run) {
       pullRequested = true;
+      pullSignalled ||= fromSignal;
       return pullInFlight;
     }
-    pullInFlight = (async () => {
+    pullSignalled = fromSignal;
+    const seq = ++pullSeq;
+    const current = (async () => {
       try {
         do {
           pullRequested = false;
-          await pullIfChanged(probe);
-        } while (pullRequested && isRunning);
+          const signalled = pullSignalled;
+          pullSignalled = false;
+          await pullIfChanged(probe, run, signalled);
+        } while (pullRequested && isRunning && run === lifecycle);
       } finally {
-        pullInFlight = null;
+        // Only the newest pull clears the slot; an older run's may end later.
+        if (pullSeq === seq) pullInFlight = null;
       }
     })();
-    return pullInFlight;
+    pullInFlight = current;
+    pullInFlightRun = run;
+    return current;
+  }
+
+  function requestPull(): Promise<void> {
+    return pull(true);
   }
 
   function scheduleNotifiedCycle(): void {
@@ -600,7 +662,8 @@ export function createSyncManager(
     if (!probe || probeIntervalId !== null) return;
     probeIntervalId = setInterval(() => {
       if (probe.active && !probe.active()) return;
-      requestPull().catch(() => {
+      if (Date.now() < nextTimedProbeAt) return; // backing off after failures
+      pull(false).catch(() => {
         // Errors already captured in ring buffer
       });
     }, probe.intervalMs);
@@ -628,6 +691,10 @@ export function createSyncManager(
     start() {
       if (isRunning) return; // Idempotent
       isRunning = true;
+      lifecycle += 1;
+      pulledMarker = undefined;
+      probeFailures = 0;
+      nextTimedProbeAt = 0;
 
       // Crash recovery: run one cycle immediately on start
       runCycle().catch(() => {
@@ -648,6 +715,8 @@ export function createSyncManager(
       clearProbeInterval();
       clearNotifyTimer();
       isRunning = false;
+      // Cancel pulls: a probe that answers later finds a new lifecycle value.
+      lifecycle += 1;
 
       // Wait for any in-flight cycle to complete
       if (cycleInFlight) {

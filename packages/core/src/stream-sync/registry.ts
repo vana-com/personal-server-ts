@@ -401,7 +401,10 @@ export function createGatewayStreamSyncRegistry(
       const rows = envelope.data?.dataPoints ?? [];
       if (rows.length === 0) return null;
       // Newest change first (`changedAt`, then id): the gateway stamps it on
-      // every write, tombstone and revive of a row.
+      // every write, tombstone and revive of a row. The marker fingerprints
+      // this one row. Another row stamped in the same millisecond leaves it
+      // unchanged, so equal markers are not proof of "nothing changed": the
+      // caller's unconditional timer cycle is the completeness guarantee.
       const newest = rows[0] as RegistryRow & { id?: unknown };
       if (typeof newest.changedAt !== "string" || newest.changedAt === "") {
         return undefined;

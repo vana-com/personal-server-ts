@@ -201,12 +201,15 @@ export interface StreamSyncRegistry {
   ): Promise<readonly { readonly scope: string; readonly read: ControlRead }[]>;
   /**
    * One request: a marker of the owner's newest registry change, whatever the
-   * number of rows (the gateway's change feed, newest first, one row). Two
-   * markers are equal when no row was written, tombstoned or revived between
-   * the reads. `null`: the owner has no rows. `undefined`: this gateway sends
-   * no change time, so the caller cannot tell and must not skip a pull on it.
-   * Throws when the read fails. A hint to start a pull early, never an
-   * authority: a pull still reads the rows it applies.
+   * number of rows (the gateway's change feed, newest first, one row). A
+   * different marker means a row was written, tombstoned or revived since the
+   * last read. An EQUAL marker does not prove that nothing changed: it
+   * fingerprints one row, so a change that leaves that row alone (another row
+   * stamped in the same millisecond) is invisible. `null`: the owner has no
+   * rows. `undefined`: this gateway sends no change time, so the caller cannot
+   * tell. Throws when the read fails. A hint to start a pull early, never an
+   * authority: the unconditional timer cycle is what guarantees completeness,
+   * and a pull still reads the rows it applies.
    */
   probeChange?(): Promise<string | null | undefined>;
 }
