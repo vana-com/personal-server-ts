@@ -607,7 +607,14 @@ export function createSyncManager(
           const signalled = pullSignalled;
           pullSignalled = false;
           await pullIfChanged(probe, run, signalled);
-        } while (pullRequested && isRunning && run === lifecycle);
+          // A tick that joined a read that then failed waits out the back-off;
+          // only a signal (focus, online) is read again at once.
+        } while (
+          pullRequested &&
+          isRunning &&
+          run === lifecycle &&
+          (pullSignalled || Date.now() >= nextTimedProbeAt)
+        );
       } finally {
         // Only the newest pull clears the slot; an older run's may end later.
         if (pullSeq === seq) pullInFlight = null;

@@ -491,6 +491,47 @@ describe("a probe that fails", () => {
   });
 });
 
+describe("a slow probe that fails", () => {
+  it("does not read again for a timer tick that joined it, but still for a signal", async () => {
+    const readAt: number[] = [];
+    const rejects: Array<(err: Error) => void> = [];
+    const t0 = Date.now();
+    const manager = build(async () => {}, {
+      changeProbe: {
+        read: () =>
+          new Promise<string>((_, reject) => {
+            readAt.push((Date.now() - t0) / 1000);
+            rejects.push(reject);
+          }),
+        intervalMs: 5_000,
+      },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(10_000); // read at 5; the tick at 10 joins it
+    expect(readAt).toEqual([5]);
+
+    await vi.advanceTimersByTimeAsync(1_000); // t=11: the read fails, back-off to 21
+    rejects.shift()?.(new Error("offline"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(readAt).toEqual([5]); // the joined tick is not a reason to read at once
+
+    await vi.advanceTimersByTimeAsync(9_000); // t=20, still backing off
+    expect(readAt).toEqual([5]);
+    await vi.advanceTimersByTimeAsync(5_000); // t=25: first tick past the back-off
+    expect(readAt).toEqual([5, 25]);
+
+    // A signal that joins a pending read is answered by a read of its own.
+    const joined = manager.requestPull();
+    rejects.shift()?.(new Error("offline"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(readAt).toEqual([5, 25, 25]);
+    rejects.shift()?.(new Error("offline"));
+    await joined;
+    await manager.stop();
+  });
+});
+
 describe("a probe that cannot tell (the gateway sends no change time)", () => {
   it("does not make the timed probe run a cycle, but a signal still does", async () => {
     const cycle = vi.fn(async () => {});
