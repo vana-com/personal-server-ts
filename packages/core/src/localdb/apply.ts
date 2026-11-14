@@ -427,7 +427,10 @@ async function applyOne(
               ...(await stage(op, stream, head, line.v, line.o, line.r, null)),
             );
           await deps.db.batch(
-            withOrigin("remote", [...rows, ...mergeIncoming(op, id)]),
+            withOrigin("remote", [
+              ...rows,
+              ...mergeIncoming(op, id, { promoteSeen: true }),
+            ]),
           );
         }
       } else {
@@ -480,7 +483,10 @@ async function applyOne(
           }
           if (records === end!.count || frame.parts.length > 1) {
             await deps.db.batch(
-              withOrigin("remote", [...rows, ...mergeIncoming(op, id)]),
+              withOrigin("remote", [
+                ...rows,
+                ...mergeIncoming(op, id, { promoteSeen: true }),
+              ]),
             );
             rows = [];
             records = 0;

@@ -1,6 +1,7 @@
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import type { ListedScope } from "../../../core/src/localdb/listing.js";
 import { createOlderVersions } from "../../../core/src/localdb/older-versions.js";
+import { seenStamp } from "../../../core/src/localdb/merge.js";
 import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import {
   createLocalResolver,
@@ -81,7 +82,7 @@ export async function referenceListScopes(
       records: number;
       updated_at: number | null;
     }>(
-      `SELECT COUNT(*) AS records, MAX(r.stamp_o) AS updated_at FROM records r JOIN connections c ON c.connection_id = r.connection_id WHERE c.connector = ? AND c.ns = ? AND r.stream IN (${placeholders})`,
+      `SELECT COUNT(*) AS records, MAX(${seenStamp("r.").o}) AS updated_at FROM records r JOIN connections c ON c.connection_id = r.connection_id WHERE c.connector = ? AND c.ns = ? AND r.stream IN (${placeholders})`,
       params,
     );
     const [head] = await deps.db.query<{ updated_at: number | null }>(

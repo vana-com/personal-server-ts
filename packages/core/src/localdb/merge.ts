@@ -15,6 +15,37 @@ export function withOrigin(
 }
 
 /**
+ * A record has two stamps. `stamp_o`/`stamp_r` travel in the published bytes
+ * and change only when the body changes (git and restic do the same: equal
+ * content, equal identity, nothing new written). The SEEN stamp is the newest
+ * run that observed the body, local only; it orders conflicts and decides what
+ * a full refresh keeps. `seen_o`/`seen_r` are NULL, or older than the stamp,
+ * until a run sees an unchanged body, so always read them through these.
+ */
+export function seenStamp(alias = ""): { o: string; r: string } {
+  const c = (name: string) => `${alias}${name}`;
+  const newer = `(${c("seen_o")}, ${c("seen_r")}) > (${c("stamp_o")}, ${c("stamp_r")})`;
+  return {
+    o: `(CASE WHEN ${newer} THEN ${c("seen_o")} ELSE ${c("stamp_o")} END)`,
+    r: `(CASE WHEN ${newer} THEN ${c("seen_r")} ELSE ${c("stamp_r")} END)`,
+  };
+}
+
+/** The SEEN stamp as a row value, for comparisons: `${seenPair("r.")} < (?, ?)`. */
+export function seenPair(alias = ""): string {
+  const seen = seenStamp(alias);
+  return `(${seen.o}, ${seen.r})`;
+}
+
+const SEEN = seenStamp();
+export const SEEN_PAIR = seenPair();
+/** `SEEN.o` as a column name for reads that show when a record was last collected. */
+export const SEEN_O = SEEN.o;
+
+const SAME_BODY =
+  "i.body_sha256 = records.body_sha256 AND i.body = records.body";
+
+/**
  * TEMP tables for multi-batch operations. Every row carries the id of its
  * operation (`op`); an operation reads and clears only its own rows. A crash
  * or close drops them, and the operation re-runs from its durable inputs.
@@ -32,18 +63,38 @@ const FIELDS = ["record_key", "stamp_o", "stamp_r", "body", "body_sha256"];
 
 /**
  * The only way rows enter `records`: rows staged in `incoming` under `op`.
- * A strictly newer stamp (o, then r) wins; an equal or older one changes
- * no stamped fields and logs nothing. Independently, first_o is the minimum
- * checkpoint with NULL as the bottom; imported rows have an unknown checkpoint.
+ *
+ * Equal bodies are one fact. A run (origin `local`) that sees the body a row
+ * already holds moves only the row's SEEN stamp: the stamp in the published
+ * bytes stays, no change is logged, and the next publish has nothing to send.
+ * Any other origin that brings an equal body under a newer stamp adopts the
+ * newer stamp, as before, so every device ends on the same bytes.
+ *
+ * A different body wins when its stamp (o, then r) is strictly newer than the
+ * row's SEEN stamp: the newest observation wins, whether or not this device
+ * had pulled the other write first. An equal or older one changes nothing.
+ * Independently, first_o is the minimum checkpoint with NULL as the bottom;
+ * imported rows have an unknown checkpoint.
+ *
+ * With `promoteSeen` (apply only, origin `remote`): a different body that is
+ * newer than the row's stamp but not than its SEEN stamp loses to the local
+ * observation, and the registry holds the loser. The observation then takes
+ * the stamp it was seen at and is logged as a local change, so the next
+ * publish tells the registry. Without it the other device's write would win by
+ * accident of pull timing.
+ *
  * Clears the operation's `incoming` rows.
  */
 export function mergeIncoming(
   op: string,
   connectionId: string,
+  options: { readonly promoteSeen?: boolean } = {},
 ): SqlStatement[] {
   const pick = (f: string) =>
     `(SELECT i.${f} FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash)`;
-  return [
+  const incomingKeys = `(connection_id, stream, pk_hash) IN
+   (SELECT ?, stream, pk_hash FROM incoming WHERE op = ?)`;
+  const statements: SqlStatement[] = [
     {
       // Until publication acknowledges an explicit delete, an older downloaded
       // row must not recreate it. Newer writes still win by the normal stamp.
@@ -69,13 +120,51 @@ export function mergeIncoming(
       params: [op, op, op, connectionId, op],
     },
     {
-      sql: `UPDATE records SET ${FIELDS.map((f) => `${f} = ${pick(f)}`).join(", ")}
- WHERE (connection_id, stream, pk_hash) IN
-   (SELECT ?, stream, pk_hash FROM incoming WHERE op = ?)
+      // A run saw a body the row already holds. Neither assigned column is
+      // watched by records_au, so nothing is logged.
+      sql: `UPDATE records SET seen_o = ${pick("stamp_o")}, seen_r = ${pick("stamp_r")}
+ WHERE ${incomingKeys}
+   AND (SELECT origin FROM write_ctx WHERE id = 1) = 'local'
    AND EXISTS (SELECT 1 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash
-               AND (i.stamp_o > records.stamp_o OR (i.stamp_o = records.stamp_o AND i.stamp_r > records.stamp_r)))`,
+               AND ${SAME_BODY}
+               AND (i.stamp_o, i.stamp_r) > ${seenPair("records.")})`,
+      params: [op, op, connectionId, op, op],
+    },
+    {
+      sql: `UPDATE records SET ${FIELDS.map((f) => `${f} = ${pick(f)}`).join(", ")}
+ WHERE ${incomingKeys}
+   AND EXISTS (SELECT 1 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash
+               AND CASE WHEN ${SAME_BODY}
+                        THEN (SELECT origin FROM write_ctx WHERE id = 1) <> 'local'
+                             AND (i.stamp_o, i.stamp_r) > (records.stamp_o, records.stamp_r)
+                        ELSE (i.stamp_o, i.stamp_r) > ${seenPair("records.")} END)`,
       params: [...FIELDS.map(() => op), connectionId, op, op],
     },
+  ];
+  if (options.promoteSeen) {
+    statements.push(
+      // The logging trigger reads the origin: log the promotion as a local
+      // change, which publish sends, then go back to the apply's origin.
+      {
+        sql: "UPDATE write_ctx SET origin = 'local' WHERE id = 1 AND origin = 'remote'",
+        params: [],
+      },
+      {
+        sql: `UPDATE records SET stamp_o = ${SEEN.o}, stamp_r = ${SEEN.r}
+ WHERE ${incomingKeys}
+   AND (seen_o, seen_r) > (stamp_o, stamp_r)
+   AND EXISTS (SELECT 1 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash
+               AND NOT (${SAME_BODY})
+               AND (i.stamp_o, i.stamp_r) > (records.stamp_o, records.stamp_r))`,
+        params: [connectionId, op, op],
+      },
+      {
+        sql: "UPDATE write_ctx SET origin = 'remote' WHERE id = 1 AND origin = 'local'",
+        params: [],
+      },
+    );
+  }
+  statements.push(
     {
       sql: `INSERT INTO records (connection_id, stream, pk_hash, ${FIELDS.join(", ")}, first_o)
 SELECT ?, i.stream, i.pk_hash, ${FIELDS.map((f) => `i.${f}`).join(", ")},
@@ -85,7 +174,8 @@ SELECT ?, i.stream, i.pk_hash, ${FIELDS.map((f) => `i.${f}`).join(", ")},
       params: [connectionId, op, connectionId],
     },
     { sql: "DELETE FROM incoming WHERE op = ?", params: [op] },
-  ];
+  );
+  return statements;
 }
 
 /**
@@ -118,7 +208,8 @@ export function applyDelete(
 
 /**
  * After a full-refresh replace passed the registry CAS (origin `refresh`):
- * drops the stream's rows stamped below the run's stamp (o, then run id).
+ * drops the stream's rows no run at or above the run's stamp (o, then run id)
+ * has observed.
  */
 export function replaceDelete(
   connectionId: string,
@@ -128,8 +219,8 @@ export function replaceDelete(
 ): SqlStatement {
   return {
     sql: `DELETE FROM records WHERE connection_id = ? AND stream = ?
-   AND (stamp_o < ? OR (stamp_o = ? AND stamp_r < ?))`,
-    params: [connectionId, stream, stampO, stampO, stampR],
+   AND ${SEEN_PAIR} < (?, ?)`,
+    params: [connectionId, stream, stampO, stampR],
   };
 }
 
@@ -152,16 +243,8 @@ export function deleteRunRecords(
     {
       sql: `DELETE FROM records WHERE connection_id=? AND stream=?
         AND pk_hash IN (SELECT pk_hash FROM run_rows WHERE run_id=? AND stream=? AND op='delete')
-        AND (stamp_o < ? OR (stamp_o=? AND stamp_r<=?))`,
-      params: [
-        connectionId,
-        stream,
-        runId,
-        stream,
-        observedAt,
-        observedAt,
-        runId,
-      ],
+        AND ${SEEN_PAIR} <= (?, ?)`,
+      params: [connectionId, stream, runId, stream, observedAt, runId],
     },
     {
       // The DELETE trigger logs the prior row stamp. Publish/apply need the
@@ -169,6 +252,31 @@ export function deleteRunRecords(
       sql: `UPDATE record_changes SET stamp_o=?,stamp_r=?,explicit_delete=1
         WHERE connection_id=? AND stream=? AND seq>? AND op='remove'`,
       params: [observedAt, runId, connectionId, stream, afterSeq],
+    },
+  ];
+}
+
+/**
+ * A run that was refused or discarded is un-written: delete the rows it
+ * changed (they carry its stamp), and forget that it observed the rest. The
+ * rows it only observed were there before it, so they stay.
+ */
+export function dropRunRows(
+  connectionId: string,
+  stream: string,
+  o: number,
+  runId: string,
+): SqlStatement[] {
+  return [
+    {
+      sql: `DELETE FROM records WHERE connection_id = ? AND stream = ?
+   AND stamp_o = ? AND stamp_r = ?`,
+      params: [connectionId, stream, o, runId],
+    },
+    {
+      sql: `UPDATE records SET seen_o = NULL, seen_r = NULL
+ WHERE connection_id = ? AND stream = ? AND seen_o = ? AND seen_r = ?`,
+      params: [connectionId, stream, o, runId],
     },
   ];
 }

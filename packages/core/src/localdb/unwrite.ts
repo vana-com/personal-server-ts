@@ -1,5 +1,5 @@
 import type { LocalSyncDeps } from "./deps.js";
-import { withOrigin } from "./merge.js";
+import { dropRunRows, withOrigin } from "./merge.js";
 
 /**
  * C.2 step 3: a run accepted at `end` but now refused is un-written in ONE
@@ -38,11 +38,7 @@ export async function unwriteRefusedRun(
   }
   const { changes } = await deps.db.batch(
     withOrigin("purge", [
-      {
-        sql: `DELETE FROM records WHERE connection_id = ? AND stream = ?
-   AND stamp_o = ? AND stamp_r = ?`,
-        params: [input.connectionId, input.stream, run.o, input.runId],
-      },
+      ...dropRunRows(input.connectionId, input.stream, run.o, input.runId),
       {
         sql: `DELETE FROM head_parts WHERE connection_id = ? AND stream = ?`,
         params: [input.connectionId, input.stream],
@@ -62,7 +58,7 @@ export async function unwriteRefusedRun(
       runId: input.runId,
       reason: input.reason,
       rowsRemoved: changes[1],
-      headPartsRemoved: changes[2],
+      headPartsRemoved: changes[3],
     },
     "unwrite refused run",
   );

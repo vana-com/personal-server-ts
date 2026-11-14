@@ -128,10 +128,7 @@ async function world() {
         limit: 1000,
       });
       return Object.fromEntries(
-        page.records.map((r) => [
-          r.recordKey,
-          (JSON.parse(r.body) as Row).v,
-        ]),
+        page.records.map((r) => [r.recordKey, (JSON.parse(r.body) as Row).v]),
       );
     };
     const emittedAt = async (): Promise<Record<string, number>> => {
@@ -140,7 +137,9 @@ async function world() {
         stream: "A",
         limit: 1000,
       });
-      return Object.fromEntries(page.records.map((r) => [r.recordKey, r.emittedAt]));
+      return Object.fromEntries(
+        page.records.map((r) => [r.recordKey, r.emittedAt]),
+      );
     };
     surfaces.push({ db, sync, refresh, cycle, values, emittedAt });
   }
@@ -177,7 +176,9 @@ describe("an unchanged refresh", () => {
     expect(w.puts).toHaveLength(puts);
     // A stream with nothing to publish logs no publish line, so no part went up.
     expect(
-      w.publishLines.slice(lines).reduce((n, l) => n + Number(l.partsUploaded), 0),
+      w.publishLines
+        .slice(lines)
+        .reduce((n, l) => n + Number(l.partsUploaded), 0),
     ).toBe(0);
   });
 
@@ -185,7 +186,9 @@ describe("an unchanged refresh", () => {
     const w = await world();
     await w.desktop.refresh("r1", 1000, rows(3));
     await w.desktop.refresh("r2", 2000, rows(3));
-    expect(Object.values(await w.desktop.emittedAt())).toEqual([2000, 2000, 2000]);
+    expect(Object.values(await w.desktop.emittedAt())).toEqual([
+      2000, 2000, 2000,
+    ]);
   });
 
   it("is stable on a second device too: it applies nothing and posts nothing", async () => {
@@ -224,7 +227,11 @@ describe("a change in the source", () => {
     const w = await world();
     await w.desktop.refresh("r1", 1000, rows(10));
     await w.web.sync.apply();
-    await w.desktop.refresh("r2", 2000, rows(10).filter((r) => r.id !== "row-0003"));
+    await w.desktop.refresh(
+      "r2",
+      2000,
+      rows(10).filter((r) => r.id !== "row-0003"),
+    );
     expect(Object.keys(await w.desktop.values())).not.toContain("row-0003");
     await w.web.sync.apply();
     expect(Object.keys(await w.web.values())).toHaveLength(9);

@@ -582,12 +582,30 @@ describe("participants that do not commit", () => {
     });
     const first = await publishConnection(w.deps, CONNECTION_ID);
     expect(first.every((r) => r.outcome === "published")).toBe(true);
-    // The same rows again: the head is the registry's, so there is no write.
-    await w.run("run-2", [
-      { stream: "s0", id: "s0-1" },
-      { stream: "s0", id: "s0-2" },
-      { stream: "s1", id: "s1-1" },
-      { stream: "s1", id: "s1-2" },
+    // Rows edited and put back: both changes are logged and the head is the
+    // registry's, so there is no write. (Rows only re-observed log nothing.)
+    const held = await w.db.query<{
+      record_key: string;
+      body: string;
+      body_sha256: string;
+    }>(`SELECT record_key, body, body_sha256 FROM records`);
+    const setOrigin = {
+      sql: `UPDATE write_ctx SET origin = 'local' WHERE id = 1`,
+      params: [],
+    };
+    await w.db.batch([
+      setOrigin,
+      ...held.map((row) => ({
+        sql: `UPDATE records SET body_sha256 = 'edited' WHERE record_key = ?`,
+        params: [row.record_key],
+      })),
+    ]);
+    await w.db.batch([
+      setOrigin,
+      ...held.map((row) => ({
+        sql: `UPDATE records SET body_sha256 = ? WHERE record_key = ?`,
+        params: [row.body_sha256, row.record_key],
+      })),
     ]);
     const batchesBefore = w.gateway.batches().length;
     // The remote delete lands during the transfer, after the snapshot.
