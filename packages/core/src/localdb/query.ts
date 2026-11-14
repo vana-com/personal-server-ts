@@ -9,8 +9,12 @@ import {
 import type { ConnectionLink } from "./connection-link.js";
 
 import type { SqlReader } from "./driver.js";
+import { SEEN_O, seenStamp } from "./merge.js";
 
-/** One stored record as reads see it. `emittedAt` is `stamp_o`. */
+/**
+ * One stored record as reads see it. `emittedAt` is when a run last observed
+ * the body (the SEEN stamp), so an unchanged refresh still reads as collected.
+ */
 export interface StoredRecord {
   readonly stream: string;
   readonly recordKey: string;
@@ -75,7 +79,7 @@ type RecordRow = {
   stamp_o: number;
 };
 
-const RECORD_COLUMNS = "stream, record_key, pk_hash, body, stamp_o";
+const RECORD_COLUMNS = `stream, record_key, pk_hash, body, ${SEEN_O} AS stamp_o`;
 const STREAM_PAGE_SIZE = 100;
 
 const LIST_CURSOR_PREFIX = "v2.";
@@ -208,7 +212,7 @@ export function createRecordQuery(db: SqlReader): RecordQuery {
            ORDER BY seq LIMIT ?
          )
          SELECT floor.floor, page.seq, page.op, page.record_key AS change_key,
-                r.stream, r.record_key, r.pk_hash, r.body, r.stamp_o
+                r.stream, r.record_key, r.pk_hash, r.body, ${seenStamp("r.").o} AS stamp_o
          FROM floor LEFT JOIN page ON 1 = 1
          LEFT JOIN records r ON page.op = 'upsert'
            AND r.connection_id = ? AND r.stream = ? AND r.pk_hash = page.pk_hash
@@ -411,7 +415,7 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
         stamp_o: number;
       }>(
         `WITH targets(instance,connection_id) AS (VALUES ${targets.map(() => "(?,?)").join(",")})
-         SELECT t.instance,r.record_key,r.pk_hash,r.body,r.stamp_o FROM records r JOIN targets t ON t.connection_id=r.connection_id
+         SELECT t.instance,r.record_key,r.pk_hash,r.body,${seenStamp("r.").o} AS stamp_o FROM records r JOIN targets t ON t.connection_id=r.connection_id
          WHERE r.stream=? ${after ? "AND (r.record_key,t.instance,r.pk_hash)>(?,?,?)" : ""}
          ${since === null ? "" : "AND EXISTS (SELECT 1 FROM record_changes c WHERE c.connection_id=r.connection_id AND c.stream=r.stream AND c.pk_hash=r.pk_hash AND c.seq<=? AND c.seq>?)"}
          AND NOT EXISTS (SELECT 1 FROM record_changes c WHERE c.connection_id=r.connection_id AND c.stream=r.stream AND c.pk_hash=r.pk_hash AND c.seq>?)

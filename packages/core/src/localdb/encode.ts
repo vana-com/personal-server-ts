@@ -1,4 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2";
+import { SEEN_PAIR } from "./merge.js";
 import {
   encodeFramePart,
   encodePiece,
@@ -190,12 +191,9 @@ export async function freezePrefixRows(
       ...range.params,
     ];
     if (input.replaceBelow) {
-      where += " AND (stamp_o > ? OR (stamp_o = ? AND stamp_r >= ?))";
-      params.push(
-        input.replaceBelow.o,
-        input.replaceBelow.o,
-        input.replaceBelow.r,
-      );
+      // A row an equal-body run only observed still belongs to the replacement.
+      where += ` AND ${SEEN_PAIR} >= (?, ?)`;
+      params.push(input.replaceBelow.o, input.replaceBelow.r);
     }
     const { changes } = await deps.db.batch([
       {
@@ -265,7 +263,7 @@ async function* readSpool(
 
 /**
  * C.2 step 4, after the freeze: read the attempt's spool page by page, encode
- * the rows as v3 frames (format 4 head) in parts of at most `partTargetBytes`,
+ * the rows as v3 frames (format 4 or later head) in parts of at most `partTargetBytes`,
  * STREAM-encrypted, and upload each part that does not exist. Identical rows
  * give an identical part, so a repeat run makes zero PUTs.
  *

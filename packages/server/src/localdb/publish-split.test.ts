@@ -164,23 +164,24 @@ describe("a publish sends from a spool", () => {
       )
     )[0]!.n;
 
-  it("publishes in the cycle that began when unread rows are restamped during its transfers", async () => {
+  it("publishes in the cycle that began when rows are written during its transfers", async () => {
     const { stores, a } = await started();
     await a.run("r1", ["seed-row", "one"]);
     const w1 = await a.newestChange();
     let hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
-    // A collector re-emits unchanged rows (new stamps) during every transfer
-    // the cycle starts. Up to five: more than the invalidation budget.
-    const restamped: string[] = [];
+    // A collector writes a new row during every transfer the cycle starts. Up
+    // to five: more than the invalidation budget. (Unchanged rows it saw again
+    // would log nothing, so they could not invalidate anything.)
+    const lateRuns: string[] = [];
     for (let n = 1; n <= 5; n++) {
       const reached = await Promise.race([
         hold.reached.then(() => true),
         cycle.then(() => false),
       ]);
       if (!reached) break;
-      await a.run(`late-${n}`, ["seed-row", "one"]);
-      restamped.push(`late-${n}`);
+      await a.run(`late-${n}`, ["seed-row", "one", `extra-${n}`]);
+      lateRuns.push(`late-${n}`);
       const next = stores.storage.holdNext(putting);
       hold.release();
       hold = next;
@@ -192,12 +193,14 @@ describe("a publish sends from a spool", () => {
     expect(await a.watermark()).toBe(w1);
     expect(receiptRunIds(first)).toContain("r1");
     expect(await readerKeys(stores)).toEqual(["one", "seed-row"]);
-    // The restamps are pending above W and publish in the next cycle.
+    // The late runs are pending above W and publish in the next cycle.
     hold.release();
     const second = await settle(a);
-    expect(restamped.length).toBeGreaterThanOrEqual(1);
-    expect(receiptRunIds(second)).toEqual(expect.arrayContaining(restamped));
-    expect(await readerKeys(stores)).toEqual(["one", "seed-row"]);
+    expect(lateRuns.length).toBeGreaterThanOrEqual(1);
+    expect(receiptRunIds(second)).toEqual(expect.arrayContaining(lateRuns));
+    expect(await readerKeys(stores)).toEqual(
+      ["one", "seed-row", ...lateRuns.map((_, i) => `extra-${i + 1}`)].sort(),
+    );
   });
 
   it("holds the candidate's rows in the spool during the transfer and none after the commit", async () => {

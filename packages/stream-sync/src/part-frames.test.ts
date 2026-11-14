@@ -209,7 +209,7 @@ describe("FrameReducer", () => {
 describe("v3 parts", () => {
   const body = utf8('{"a":1}');
   const lines = async (
-    format: 1 | 2 | 3 | 4,
+    format: 1 | 2 | 3 | 4 | 5,
     encoded: EncodedPart[],
   ): Promise<unknown[]> => {
     const out: unknown[] = [];
@@ -247,7 +247,7 @@ describe("v3 parts", () => {
     }
   });
 
-  it("a published format 4 head reads back through the v3 reader", async () => {
+  it("a published format 5 head reads back through the v3 reader", async () => {
     const big = utf8('{"big":"' + "z".repeat(5000) + '"}');
     const frames = [
       frame(key(1), body, 5, "run-1", 3),
@@ -255,7 +255,7 @@ describe("v3 parts", () => {
       frame(key(3), body, 7, "run-3", 0),
     ];
     const encoded = await partsOf(frames);
-    expect(HEAD_FORMAT).toBe(4);
+    expect(HEAD_FORMAT).toBe(5);
     const read = await lines(HEAD_FORMAT, encoded);
     expect(read).toEqual([
       { o: 5, r: "run-1", v: { a: 1 }, f: 3 },

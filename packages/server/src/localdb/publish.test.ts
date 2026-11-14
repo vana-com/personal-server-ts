@@ -217,6 +217,21 @@ async function seedRun(
   ]);
 }
 
+/** A local edit and its undo: two logged changes that leave the row as the head has it. */
+async function changeAndRestore(deps: LocalSyncDeps, recordKey: string) {
+  const original = canonicalJson({ id: recordKey });
+  const edited = canonicalJson({ id: recordKey, edited: true });
+  const write = (body: string) => [
+    { sql: `UPDATE write_ctx SET origin = 'local' WHERE id = 1`, params: [] },
+    {
+      sql: `UPDATE records SET body = ?, body_sha256 = ? WHERE connection_id = ? AND record_key = ?`,
+      params: [body, sha256Hex(body), CONNECTION_ID, recordKey],
+    },
+  ];
+  await deps.db.batch(write(edited));
+  await deps.db.batch(write(original));
+}
+
 async function seedRecord(
   deps: LocalSyncDeps,
   recordKey: string,
@@ -498,6 +513,7 @@ describe("publishConnection", () => {
           primaryKey: ["id"],
           profile: { key: CONNECTOR, version: "1.0.0" },
           recordCount: 0,
+          replacedAt: NOW,
           stream: STREAM,
         };
         const winnerBytes = encodeHead(winner);
@@ -653,11 +669,15 @@ async function registryHead(
     generation?: number;
     profile?: Head["profile"];
     partition?: boolean;
+    o?: number;
+    replacedAt?: number;
   } = {},
 ) {
   const remote = await remoteFixture(world.deps.keys, CONNECTOR, NS);
   const generated = await remote.head(STREAM, values, {
     format: options.format,
+    o: options.o,
+    replacedAt: options.replacedAt,
     generation: options.generation,
     f: 23,
   });
@@ -742,7 +762,7 @@ async function localRun(
 }
 
 describe("publish with real apply", () => {
-  it("publishes format 4 with f and installs it on another database", async () => {
+  it("publishes format 5 with f and installs it on another database", async () => {
     const world = await makeWorld();
     await seedConnection(world.deps);
     await seedStream(world.deps);
@@ -752,7 +772,7 @@ describe("publish with real apply", () => {
     expect(
       (await publishConnection(world.deps, CONNECTION_ID))[0]?.outcome,
     ).toBe("published");
-    expect((await published(world)).head.format).toBe(4);
+    expect((await published(world)).head.format).toBe(5);
     const reader = await makeWorld(world.registry);
     await seedConnection(reader.deps);
     await applyConnection(
@@ -767,7 +787,73 @@ describe("publish with real apply", () => {
     ).toEqual([{ complete: 1 }]);
   });
 
-  it("upgrades every retained old-format part before publishing format 4", async () => {
+  it("leaves a format 4 head alone when nothing changed", async () => {
+    const world = await makeWorld();
+    await seedConnection(world.deps);
+    await seedStream(world.deps);
+    const basis = await registryHead(world, [{ id: "old" }], { format: 4 });
+    await applyConnection(world.deps, CONNECTION_ID);
+    await localRun(world);
+    expect(
+      (await publishConnection(world.deps, CONNECTION_ID))[0]?.outcome,
+    ).toBe("noop");
+    const read = await world.registry.read(SCOPE);
+    expect(read.found && read.version).toBe(basis.version);
+    expect((await published(world)).head.format).toBe(4);
+  });
+
+  it("the next publish over a format 4 head writes format 5, with the old head's observedAt as its cutoff", async () => {
+    const world = await makeWorld();
+    await seedConnection(world.deps);
+    await seedStream(world.deps);
+    await registryHead(world, [{ id: "old" }], { format: 4 });
+    await applyConnection(world.deps, CONNECTION_ID);
+    await localRun(world); // a partial run at 1000: it replaces nothing
+    await seedRecord(world.deps, "new", canonicalJson({ id: "new" }));
+    await publishConnection(world.deps, CONNECTION_ID);
+    const { head } = await published(world);
+    expect(head.format).toBe(5);
+    expect(head.observedAt).toBe(1000);
+    expect(head.replacedAt).toBe(100);
+  });
+
+  it("a publish from a clock behind the head's keeps the head's cutoff", async () => {
+    const world = await makeWorld();
+    await seedConnection(world.deps);
+    await seedStream(world.deps);
+    // The registry head dropped records at 3000. This device's run is at 1000.
+    await registryHead(world, [{ id: "old" }], {
+      format: 5,
+      o: 3000,
+      replacedAt: 3000,
+    });
+    await applyConnection(world.deps, CONNECTION_ID);
+    await localRun(world); // a partial run at 1000
+    await seedRecord(world.deps, "new", canonicalJson({ id: "new" }));
+    await publishConnection(world.deps, CONNECTION_ID);
+    const { head } = await published(world);
+    expect(head.observedAt).toBe(1000);
+    expect(head.replacedAt).toBe(3000);
+  });
+
+  it("a replacing run's time is the cutoff of the head it publishes", async () => {
+    const world = await makeWorld();
+    await seedConnection(world.deps);
+    await seedStream(world.deps);
+    const basis = await registryHead(world, [{ id: "old" }]);
+    await applyConnection(world.deps, CONNECTION_ID);
+    await localRun(world, "r1", {
+      replace: true,
+      basisVersion: basis.version,
+      basisHash: basis.dataHash,
+    });
+    await seedRecord(world.deps, "new", canonicalJson({ id: "new" }));
+    await publishConnection(world.deps, CONNECTION_ID);
+    const { head } = await published(world);
+    expect(head.replacedAt).toBe(1000);
+  });
+
+  it("upgrades every retained old-format part before publishing format 5", async () => {
     const world = await makeWorld();
     await seedConnection(world.deps);
     await seedStream(world.deps);
@@ -792,7 +878,7 @@ describe("publish with real apply", () => {
     await seedRecord(world.deps, "new", canonicalJson({ id: "new" }));
     await publishConnection(world.deps, CONNECTION_ID);
     const image = await published(world);
-    expect(image.head.format).toBe(4);
+    expect(image.head.format).toBe(5);
     expect(image.values.map((v) => v.id).sort()).toEqual(
       ["new", ...oldValues.map((v) => v.id)].sort(),
     );
@@ -1985,13 +2071,16 @@ describe("the commit step's stream-row fence", () => {
     await publishConnection(world.deps, CONNECTION_ID);
     counted.reads.clear();
     counted.posts.length = 0;
+    await changeAndRestore(world.deps, "a");
 
-    // An identical head is a no-op: two reads (snapshot, then the fence).
+    // A change that was undone builds an identical head, which is a no-op: two
+    // reads (snapshot, then the fence). Rows only re-observed log no change.
     expect(
       (await publishConnection(world.deps, CONNECTION_ID))[0]?.outcome,
     ).toBe("noop");
     expect(counted.reads.get(SCOPE)).toBe(2);
     expect(counted.posts).toEqual([]);
+    await changeAndRestore(world.deps, "a");
 
     // Another device's head lands just after that snapshot's read of the row.
     const read = counted.read;

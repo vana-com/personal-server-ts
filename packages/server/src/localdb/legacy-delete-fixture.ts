@@ -44,6 +44,7 @@ export async function postStreamDeleteOnly(input: {
     lastDeleteVersion: version,
     complete: false,
     observedAt: 1000,
+    replacedAt: 1000,
     parts: [],
     primaryKey: ["id"],
     profile: { key: null, version: "0.0.0" },

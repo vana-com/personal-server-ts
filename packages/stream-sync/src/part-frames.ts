@@ -159,7 +159,7 @@ export async function* framesOfParts(
   load: (part: HeadPart, index: number) => Promise<Uint8Array>,
   options: {
     readonly verify?: boolean;
-    /** Frame generation of these parts: "v3" for a format 4 head, else "v2". */
+    /** Frame generation of these parts: "v3" for a format 4 or later head, else "v2". */
     readonly generation?: "v2" | "v3";
   } = {},
 ): AsyncGenerator<PartFrame> {
@@ -300,15 +300,15 @@ const textDecoder = new TextDecoder();
 /**
  * Every record of a head's parts as `{o, r, v}`, in key order, for a
  * consumer that needs objects (it holds one parsed record at a time). Reads
- * format 1 (NDJSON), formats 2 and 3 (v2 frames) and format 4 (v3 frames).
+ * format 1 (NDJSON), formats 2 and 3 (v2 frames) and formats 4 and 5 (v3 frames).
  * `f` is the first-seen checkpoint from a v3 frame; lines of formats 1-3
- * carry `f: null`. A v2 frame in a format 4 head, or a v3 frame in a format
+ * carry `f: null`. A v2 frame in a format 4 or 5 head, or a v3 frame in a format
  * 1-3 head, is refused.
  */
 export async function* linesOfParts(
   sha256: Sha256,
   head: {
-    readonly format: 1 | 2 | 3 | 4;
+    readonly format: 1 | 2 | 3 | 4 | 5;
     readonly parts: readonly HeadPart[];
     readonly primaryKey: readonly string[];
   },
