@@ -648,7 +648,7 @@ export function createReplicationJournal(
           .get() as { instance: string } | undefined;
         if (transitioned)
           throw new Error(
-            `replication cannot be enabled: connection ${transitioned.instance} has a Strava or Claude method transition`,
+            `replication cannot be enabled: connection ${transitioned.instance} has a method transition`,
           );
         const prior = settings();
         if (prior) {
