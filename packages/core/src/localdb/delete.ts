@@ -104,12 +104,32 @@ interface Landing {
 const keccak = async (bytes: Uint8Array) => keccak_256(bytes);
 const ATTEMPTS = 8;
 
+/** `work`'s answer, or `false` once `ms` has passed (never: wait for `work`). */
+function withinBudget(work: Promise<boolean>, ms?: number): Promise<boolean> {
+  if (ms === undefined) return work;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    void work
+      .then(resolve, () => resolve(false))
+      .finally(() => clearTimeout(timer));
+  });
+}
+
 export function createConnectionDeleter(
   deps: LocalSyncDeps,
   options: {
     readonly declaredStreams: (connector: string) => readonly string[];
     readonly retainedManifests?: () => readonly string[];
     readonly eraseLegacy?: (connector: string) => Promise<void>;
+    /**
+     * How long a request waits for the fence before it answers
+     * `fenced: false`. The landing keeps going in the background and the
+     * resume loop re-checks it. Production passes the loop's first resume
+     * wait, so a delete that has not fenced by then is the one the loop would
+     * pick up next. Absent: the request waits for the fence however long it
+     * takes (tests only).
+     */
+    readonly fenceWaitMs?: number;
   },
 ): ConnectionDeleter {
   const flights = new Map<string, Landing>();
@@ -301,8 +321,9 @@ export function createConnectionDeleter(
    * a lost reply, a reply that never arrives, a conflict and a registry that
    * lags all end in the same read. Any control version at or above the
    * tombstone's proves it landed, whoever wrote it (it may already have been
-   * followed by a reconnect), so a fence is never posted twice and never
-   * judged "superseded".
+   * followed by a reconnect), so a fence never lands twice (a retry resends the
+   * same `pin + 1`, and the registry refuses it) and is never judged
+   * "superseded".
    */
   async function landFence(
     connector: string,
@@ -310,6 +331,12 @@ export function createConnectionDeleter(
     hashes: Awaited<ReturnType<typeof keyInfo>>["hashes"],
   ) {
     const scope = controlScope(connector, pin.ns);
+    const landed = async () => {
+      const after = classifyControl(await deps.registry.read(scope), hashes);
+      return after.kind === "deleted"
+        ? after.version >= pin.version + 1
+        : after.kind === "active" && after.generation > pin.version;
+    };
     try {
       await signPost(
         scope,
@@ -318,15 +345,16 @@ export function createConnectionDeleter(
         pin.version + 1,
       );
     } catch (error) {
-      if (!(error instanceof RegistryRefusedError && error.status === 409))
+      if (!(error instanceof RegistryRefusedError && error.status === 409)) {
+        // Uncertain: the tombstone may have committed and only its reply
+        // been lost. A read decides, so a registry that now refuses every
+        // post but still answers reads does not hold the delete pending.
+        // When the read cannot prove the fence either, the failure stands.
+        if (await landed().catch(() => false)) return;
         throw error;
+      }
     }
-    const after = classifyControl(await deps.registry.read(scope), hashes);
-    const landed =
-      after.kind === "deleted"
-        ? after.version >= pin.version + 1
-        : after.kind === "active" && after.generation > pin.version;
-    if (!landed)
+    if (!(await landed()))
       throw new Error("control fence pending without confirmed tombstone");
   }
 
@@ -765,8 +793,13 @@ export function createConnectionDeleter(
         ),
       );
       // The request waits for the fence only: one registry write and its
-      // confirming read. Cleanup keeps running after the answer.
-      return { deleteId: intent.id!, fenced: await landing.fenced };
+      // confirming read. Cleanup keeps running after the answer. A registry
+      // that is slower than the budget answers "not fenced yet"; the landing
+      // is not cancelled and the resume loop re-checks it.
+      return {
+        deleteId: intent.id!,
+        fenced: await withinBudget(landing.fenced, options.fenceWaitMs),
+      };
     },
     async resumeDeletes() {
       const rows = await deps.db.query<{ connector: string }>(

@@ -802,13 +802,15 @@ it("the request answers pending when the registry refuses the fence, and the del
   expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
 });
 
-it("a fence whose reply was lost is confirmed from the registry and never posted twice", async () => {
+it("a fence whose reply was lost is confirmed from the registry; it never lands twice", async () => {
   const f = await world();
   f.registry.afterPost = async (post) => {
     if (post.scope === f.control) throw new Error("lost reply fixture");
   };
+  // The tombstone committed and only its reply was lost: a read proves it, so
+  // the request already answers fenced.
   const started = await f.a.deleter.requestConnectionDelete("fixture-source");
-  expect(started.fenced).toBe(false);
+  expect(started.fenced).toBe(true);
   expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
   f.registry.afterPost = undefined;
   expect(await f.a.deleter.resumeDeletes()).toEqual([]);
@@ -818,6 +820,48 @@ it("a fence whose reply was lost is confirmed from the registry and never posted
       .map((p) => p.version),
   ).toEqual([1, 2]);
   expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 2 });
+});
+
+it("a committed fence with a lost reply is confirmed by a read when every later control post fails", async () => {
+  const f = await world();
+  let controlPosts = 0;
+  f.registry.afterPost = async (post) => {
+    if (post.scope === f.control) throw new Error("lost reply fixture");
+  };
+  f.registry.beforePost = async (post) => {
+    if (post.scope !== f.control) return;
+    controlPosts += 1;
+    // Only the first post reaches the registry; the gateway then refuses
+    // every control post while it still answers reads.
+    if (controlPosts > 1) throw new Error("gateway refuses posts");
+  };
+  const started = await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(started.fenced).toBe(true);
+  // A restart before the fence phase was saved resumes through the same path.
+  await f.a.db.query(
+    "UPDATE delete_intents SET intent = json_remove(intent, '$.fences')",
+  );
+  f.registry.afterPost = undefined;
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  // Cleanup ran with no further successful control post.
+  expect(
+    f.registry.log
+      .filter((post) => post.scope === f.control)
+      .map((p) => p.version),
+  ).toEqual([1, 2]);
+  expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 2 });
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+it("a failed control post stays pending when the read cannot prove the fence", async () => {
+  const f = await world();
+  f.registry.beforePost = async (post) => {
+    if (post.scope === f.control) throw new Error("gateway refuses posts");
+  };
+  const started = await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(started.fenced).toBe(false);
+  expect(await f.registry.read(f.control)).toMatchObject({ version: 1 });
+  expect(await f.a.deleter.resumeDeletes()).toHaveLength(1);
 });
 
 it("a fence the next read does not show yet stays pending, then confirms the same version", async () => {

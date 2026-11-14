@@ -20,7 +20,9 @@
  *                               already sees the source as deleted and its
  *                               streams are being cleaned in the background.
  *                               `fenced: false` means the registry has not
- *                               confirmed it (unreachable, refused): the
+ *                               confirmed it (unreachable, refused, or slower
+ *                               than the writer's first resume wait, 5 s by
+ *                               default): the
  *                               delete is only saved here, other surfaces
  *                               still see the source, and what they publish
  *                               before the fence lands is deleted with it.

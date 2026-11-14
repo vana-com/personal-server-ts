@@ -16,6 +16,8 @@
  * "tombstoned" and skip the head read.
  */
 import { afterEach, expect, it, vi } from "vitest";
+import { createLocalHistory } from "../../../core/src/localdb/history.js";
+import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import {
   connectionQueue,
   openLocalDb,
@@ -1296,4 +1298,39 @@ it("after the fence and before cleanup, every reader hides the streams, includin
     version: 2,
     metadataHash: endedGenerationDeleteMetadataHash(w.scope, 2, 1),
   });
+});
+
+it("after the fence, direct history and query reads answer deleted and empty on a device that applied it", async () => {
+  const w = await world(2);
+  await published(w, ["old"]);
+  await applyConnection(w.b.deps, w.fixture.control);
+  const [{ connection_id: connectionId }] = await w.b.db.query<{
+    connection_id: string;
+  }>("SELECT connection_id FROM connections");
+  const history = createLocalHistory(w.b.deps, {
+    olderVersionReads: () => true,
+  });
+  const query = createRecordQuery(w.b.db);
+  const versions = () =>
+    history.versions({ scope: w.scope, limit: 10, offset: 0 });
+  // Before the delete: the stream is readable.
+  expect(await versions()).toMatchObject({ ok: true });
+  expect(
+    (await query.listRecords({ connectionId, stream: "items" })).records,
+  ).toHaveLength(1);
+  await fencedThenStopped(w, w.a.deleter);
+  // The stream row is still live in the registry (cleanup has not run); the
+  // device reads the fence on its next apply and then serves nothing.
+  await applyConnection(w.b.deps, w.fixture.control);
+  expect(await versions()).toEqual({ ok: false, reason: "deleted" });
+  expect(await history.lineage({ scope: w.scope })).toEqual({
+    ok: false,
+    reason: "deleted",
+  });
+  expect(
+    (await query.listRecords({ connectionId, stream: "items" })).records,
+  ).toEqual([]);
+  expect(
+    await query.getRecord({ connectionId, stream: "items", recordKey: "old" }),
+  ).toBeNull();
 });
