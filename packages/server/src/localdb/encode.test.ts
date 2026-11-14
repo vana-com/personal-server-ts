@@ -19,6 +19,7 @@ import {
   uploadFrozenParts,
   type EncodedPart,
 } from "../../../core/src/localdb/encode.js";
+import { readerOf } from "../../../core/src/localdb/driver.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import { newPublishMeter } from "../../../core/src/localdb/publish-meter.js";
 import {
@@ -174,7 +175,7 @@ describe("encodePrefixes", () => {
       { k: keyHash("1"), connectionId: "another-connection" },
       { k: keyHash("b"), stream: "another-stream" },
     ]);
-    const query = vi.spyOn(f.db, "query");
+    const query = vi.spyOn(readerOf(f.db), "query");
     const headExtras = Object.freeze({
       checkpoint: Object.freeze({ cursor: "opaque" }),
     });
@@ -299,7 +300,7 @@ describe("encodePrefixes", () => {
       { k: keyHash("c0"), o: 11 },
       { k: keyHash("a3"), o: 11, stream: "another-stream" },
     ]);
-    const query = vi.spyOn(f.db, "query");
+    const query = vi.spyOn(readerOf(f.db), "query");
     const parts = await encodePrefixes(f.deps, {
       ...input,
       changedPrefixes: ["101"],
@@ -440,9 +441,10 @@ describe("encodePrefixes under writes and large bodies", () => {
     f: Awaited<ReturnType<typeof fresh>>,
     onBodies?: (calls: number) => Promise<void>,
   ) {
-    const real = f.db.query.bind(f.db);
+    const reader = readerOf(f.db);
+    const real = reader.query.bind(reader);
     const seen = { maxBodyChars: 0, bodyPages: 0 };
-    vi.spyOn(f.db, "query").mockImplementation((async (
+    vi.spyOn(readerOf(f.db), "query").mockImplementation((async (
       sql: string,
       params?: never,
     ) => {

@@ -130,11 +130,12 @@ import {
   FrozenRowsChanged,
   dropSpool,
   freezePrefixRows,
+  newFrozenFeed,
   newSpoolAttempt,
   partTargetOf,
   startFrozenParts,
   type EncodedPart,
-  type FrozenPrefix,
+  type FrozenFeed,
   type HeadExtras,
 } from "./encode.js";
 import { planChangedPrefixes, replacedPrefixGroups } from "./part-layout.js";
@@ -455,31 +456,38 @@ type StreamContext = {
 };
 
 /**
- * Everything a transfer and a commit need, frozen under the slot. Nothing
- * here is read again from local state; `basis` is how the commit learns the
- * local state it rests on has moved.
+ * What the transfer needs, known once the snapshot has planned and before it
+ * has copied any row: where each part goes, what the head says, which
+ * attachments to send. The rows themselves arrive on a `FrozenFeed`.
  */
-type Candidate = {
-  readonly basis: string;
-  /** The change watermark W of the snapshot; the commit acknowledges this. */
-  readonly watermark: number;
-  readonly localWatermark: number;
+type TransferPlan = {
   readonly registryVersion: number;
   readonly registryDataHash: string | null;
-  /**
-   * The control row's data hash at the snapshot (its active hash), which the
-   * commit's `requires` names with the generation.
-   */
-  readonly controlDataHash: `0x${string}`;
   readonly baseParts: readonly HeadPart[];
   readonly changedPrefixes: readonly string[];
-  readonly frozen: readonly FrozenPrefix[];
-  /** The spool rows of `frozen`; the transfer reads them, nothing else does. */
+  /** The spool rows the feed announces; the transfer reads them, nothing else does. */
   readonly attempt: string;
   readonly blobs: readonly BlobDescriptor[];
   readonly headGeneration: number;
   /** The head but for its parts, which the transfer produces. */
   readonly head: Omit<Head, "parts" | "recordCount">;
+};
+
+/**
+ * Everything a commit needs, frozen under the slot: the transfer's plan, and
+ * the basis the commit compares. Nothing here is read again from local state;
+ * `basis` is how the commit learns the local state it rests on has moved.
+ */
+type Candidate = TransferPlan & {
+  readonly basis: string;
+  /** The change watermark W of the snapshot; the commit acknowledges this. */
+  readonly watermark: number;
+  readonly localWatermark: number;
+  /**
+   * The control row's data hash at the snapshot (its active hash), which the
+   * commit's `requires` names with the generation.
+   */
+  readonly controlDataHash: `0x${string}`;
   readonly replaceBelow: { o: number; r: string } | undefined;
   readonly runIds: readonly string[];
   readonly sawRefusal: boolean;
@@ -509,6 +517,20 @@ type DeferralReason =
   | "stream_head_from_later_generation"
   | "stream_delete_not_proven_earlier"
   | "run_order_not_settled";
+
+/**
+ * How the snapshot hands the transfer its work. The snapshot calls it once,
+ * after the last read that can still end the turn without a candidate and
+ * before it copies the first row. The transfer then runs beside the rest of
+ * the snapshot: it encodes and uploads each prefix as the feed announces it,
+ * so the part of the plan that is a copy of rows is no longer a wait before
+ * the first upload.
+ *
+ * The snapshot owns the feed from then on: it ends it when every prefix is
+ * copied, and fails it if the turn throws. The transfer abandons it if it stops
+ * first.
+ */
+type TransferLauncher = (plan: TransferPlan, feed: FrozenFeed) => void;
 
 type Snapshot =
   | { readonly kind: "done"; readonly result: PublishResult }
@@ -709,11 +731,32 @@ async function publishAttempts(
     }
     // The last attempt's copy is of no use now: it was discarded or ended.
     await endSpool(deps, run);
-    const snapshot = await timed(
-      deps,
-      (ms) => (run.meter.planMs += ms),
-      () => slot((held) => snapshotStream(held, context, run)),
-    );
+    // The snapshot starts the transfer itself, as soon as it has planned and
+    // before it has copied a row (see `TransferLauncher`).
+    const started: { transfer?: Promise<Prepared> } = {};
+    const launch: TransferLauncher = (plan, feed) => {
+      const transfer = timed(
+        deps,
+        (ms) => (run.meter.transferMs += ms),
+        () => transferPlan(deps, context, plan, feed, run.meter),
+      );
+      // Its outcome is read after the snapshot; until then it is not unhandled.
+      transfer.catch(() => undefined);
+      started.transfer = transfer;
+    };
+    let snapshot: Snapshot;
+    try {
+      snapshot = await timed(
+        deps,
+        (ms) => (run.meter.planMs += ms),
+        () => slot((held) => snapshotStream(held, context, run, launch)),
+      );
+    } catch (error) {
+      // The snapshot failed the feed it opened, so the transfer ends; nothing
+      // of it runs on after this attempt.
+      await started.transfer?.catch(() => undefined);
+      throw error;
+    }
     if (snapshot.kind === "done") return snapshot.result;
     if (snapshot.kind === "retry") continue;
     if (snapshot.kind === "idle" || snapshot.kind === "blobs") {
@@ -751,11 +794,9 @@ async function publishAttempts(
     stopIfPurged(latch);
     let prepared: Prepared;
     try {
-      prepared = await timed(
-        deps,
-        (ms) => (run.meter.transferMs += ms),
-        () => transferCandidate(deps, context, candidate, run.meter),
-      );
+      // The snapshot's slot turn has ended, so every row is frozen. The
+      // transfer returns once every part, attachment and the head is stored.
+      prepared = await started.transfer!;
     } catch (error) {
       if (error instanceof ConnectionPurged) throw error;
       // A transfer that lost its input because local state moved (a purge
@@ -791,6 +832,7 @@ async function snapshotStream(
   deps: LocalSyncDeps,
   context: StreamContext,
   run: StreamRun,
+  launch: TransferLauncher,
 ): Promise<Snapshot> {
   const { connectionId, connection, stream, scope, keyCheck, hashes } = context;
   const control = controlScope(connection.connector, connection.ns);
@@ -1169,23 +1211,13 @@ async function snapshotStream(
     targetBytes: partTargetOf(deps),
     rewriteAll,
   });
-  // Read the caller's head extras, the rows to encode and the clock now: the
-  // transfer reads none of them again.
+  // Read the caller's head extras and the clock now: the transfer reads
+  // neither again.
   await context.options?.headExtras?.(stream);
   const attempt = newSpoolAttempt();
   // Recorded before the freeze, so a freeze that fails part-way is still dropped.
   if (changedPrefixes.length > 0)
     run.spool = { attempt, prefixes: changedPrefixes };
-  const frozen =
-    changedPrefixes.length === 0
-      ? []
-      : await freezePrefixRows(deps, {
-          connectionId,
-          stream,
-          attempt,
-          changedPrefixes,
-          replaceBelow: plan.replaceBelow,
-        });
   const observedAt =
     plan.newestRunObservedAt ?? registryHead?.observedAt ?? deps.now();
   const head: Omit<Head, "parts" | "recordCount"> = {
@@ -1222,12 +1254,45 @@ async function snapshotStream(
     ),
     stream,
   };
+  // The transfer starts here. Everything it needs but the rows is known; the
+  // rows reach it prefix by prefix as they are copied, still inside this slot
+  // turn (see `freezePrefixRows` for why that is one consistent state).
+  const feed = newFrozenFeed();
+  launch(
+    {
+      registryVersion,
+      registryDataHash,
+      baseParts: registryHead?.parts ?? [],
+      changedPrefixes,
+      attempt,
+      blobs,
+      headGeneration,
+      head,
+    },
+    feed,
+  );
   const runIds = plan.steps.map((step) => step.runId);
-  const basis = await readBasis(deps, context, {
-    watermark,
-    localWatermark: local.publish_watermark,
-    runIds,
-  });
+  let basis: string;
+  try {
+    await freezePrefixRows(deps, {
+      connectionId,
+      stream,
+      attempt,
+      changedPrefixes,
+      replaceBelow: plan.replaceBelow,
+      onFrozen: (frozen) => feed.push(frozen),
+      stopped: () => feed.abandoned(),
+    });
+    basis = await readBasis(deps, context, {
+      watermark,
+      localWatermark: local.publish_watermark,
+      runIds,
+    });
+    feed.end();
+  } catch (error) {
+    feed.fail(error);
+    throw error;
+  }
   return {
     kind: "candidate",
     candidate: {
@@ -1241,7 +1306,6 @@ async function snapshotStream(
         : hashes.activeData) as `0x${string}`,
       baseParts: registryHead?.parts ?? [],
       changedPrefixes,
-      frozen,
       attempt,
       blobs,
       headGeneration,
@@ -1260,17 +1324,23 @@ async function snapshotStream(
  * not freeze, and no write to `records` can invalidate it. A spool that lost
  * rows throws FrozenRowsChanged.
  *
+ * It starts while the snapshot is still copying rows: `feed` announces each
+ * prefix once it is copied, and the transfer encodes and uploads it then. It
+ * returns only after the feed has ended (every prefix copied and the snapshot's
+ * basis read) and every upload is stored, so the commit (the registry write)
+ * never runs before the stream's last file is in storage, nor before the
+ * snapshot is whole.
+ *
  * The uploads are not ordered among themselves: nothing points at any of them
  * until the registry CAS, and the head names its parts by hash, which are
- * known once they are encoded. Each upload starts when it is ready and the
- * transfer returns once all of them are stored, so the commit (the registry
- * write) never runs before the stream's last file is in storage. The storage
- * client's limits decide how many go on the wire at once.
+ * known once they are encoded. Each upload starts when it is ready. The
+ * storage client's limits decide how many go on the wire at once.
  */
-async function transferCandidate(
+async function transferPlan(
   deps: LocalSyncDeps,
   context: StreamContext,
-  candidate: Candidate,
+  plan: TransferPlan,
+  feed: FrozenFeed,
   meter: PublishMeter,
 ): Promise<Prepared> {
   const wave = newUploadWave();
@@ -1278,7 +1348,8 @@ async function transferCandidate(
     const prepared = await transferOnWave(
       deps,
       context,
-      candidate,
+      plan,
+      feed,
       meter,
       wave,
     );
@@ -1288,13 +1359,17 @@ async function transferCandidate(
     // Nothing of this transfer runs on after it returns, nor reports unseen.
     await wave.settle();
     throw error;
+  } finally {
+    // A snapshot still copying has no reader left: it stops.
+    feed.abandon();
   }
 }
 
 async function transferOnWave(
   deps: LocalSyncDeps,
   context: StreamContext,
-  candidate: Candidate,
+  plan: TransferPlan,
+  feed: FrozenFeed,
   meter: PublishMeter,
   wave: UploadWave,
 ): Promise<Prepared> {
@@ -1306,34 +1381,24 @@ async function transferOnWave(
   // resume, a refresh) files may well be stored, and a probe saves the upload.
   // The rule is "no registry row", never "this device uploaded it before":
   // storage can delete or overwrite objects.
-  const probe = candidate.registryVersion > 0;
-  if (candidate.blobs.length > 0) {
+  const probe = plan.registryVersion > 0;
+  if (plan.blobs.length > 0) {
     wave.start(() =>
-      uploadBlobs(
-        deps,
-        candidate.blobs,
-        meter,
-        () => stopIfPurged(latch),
-        probe,
-      ),
+      uploadBlobs(deps, plan.blobs, meter, () => stopIfPurged(latch), probe),
     );
   }
   const encoded = await startFrozenParts(deps, {
-    attempt: candidate.attempt,
+    attempt: plan.attempt,
     scope,
-    generation: candidate.headGeneration,
-    frozen: candidate.frozen,
+    generation: plan.headGeneration,
+    frozen: feed,
     wave,
     probe,
     meter,
     // A purge by another stream ends this transfer before its next upload.
     beforeUpload: () => stopIfPurged(latch),
   });
-  const parts = mergedParts(
-    candidate.baseParts,
-    encoded,
-    candidate.changedPrefixes,
-  );
+  const parts = mergedParts(plan.baseParts, encoded, plan.changedPrefixes);
   const recordCount = parts.reduce((sum, part) => sum + part.count, 0);
   const blobs = meteredBlobs(deps, meter);
   // The head is built, verified and encrypted in memory and stays there until
@@ -1343,12 +1408,12 @@ async function transferOnWave(
   const release = await holdMemory(blobs, partTargetOf(deps));
   let handedOver = false;
   try {
-    const headBytes = encodeHead({ ...candidate.head, parts, recordCount });
+    const headBytes = encodeHead({ ...plan.head, parts, recordCount });
     const { dataHash, blobName } = await digestHead(keccak, headBytes);
     // The same data hash as the registry head: nothing to upload or post.
     if (
-      candidate.registryDataHash !== null &&
-      dataHash.toLowerCase() === candidate.registryDataHash.toLowerCase()
+      plan.registryDataHash !== null &&
+      dataHash.toLowerCase() === plan.registryDataHash.toLowerCase()
     ) {
       return {
         parts,
