@@ -102,6 +102,7 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   planStreamStep,
+  sameHead,
   type PlanHead,
   type PlanRun,
   type StepDecision,
@@ -135,7 +136,7 @@ import {
   type FrozenPrefix,
   type HeadExtras,
 } from "./encode.js";
-import { planChangedPrefixes } from "./part-layout.js";
+import { planChangedPrefixes, replacedPrefixGroups } from "./part-layout.js";
 import {
   StorageDeferredError,
   type SendWindowStats,
@@ -147,7 +148,7 @@ import {
   timed,
   type PublishMeter,
 } from "./publish-meter.js";
-import { replaceDelete, withOrigin } from "./merge.js";
+import { dropRunRows, replaceDelete, withOrigin } from "./merge.js";
 import {
   endsEarlierLifetime,
   hydrateLifetimeBoundary,
@@ -1049,10 +1050,38 @@ async function snapshotStream(
     scope,
     generation: headGeneration,
   });
-  const hasWork =
-    changes.length > 0 ||
-    plan.replaceBelow !== undefined ||
-    plan.steps.some((step) => step.decision.kind === "publish");
+  // A full refresh drops what the source no longer lists. The replace is
+  // work only where some local row was last observed before the replacing
+  // run: a row a run saw again, even unchanged, stays as it is and costs no
+  // upload. Read as one entry per 16-bit key prefix, so memory does not grow
+  // with the number of rows dropped, and as a seek on the observation index,
+  // so a refresh that dropped nothing does not read the stream.
+  const replaced =
+    registryHead && plan.replaceBelow
+      ? await replacedPrefixGroups(
+          deps.db,
+          connectionId,
+          stream,
+          plan.replaceBelow,
+        )
+      : [];
+  const hasWork = registryHead
+    ? changes.length > 0 ||
+      replaced.length > 0 ||
+      registryHead.format !== HEAD_FORMAT ||
+      (plan.steps.some((step) => step.decision.kind === "publish") &&
+        !(
+          plan.finalHead &&
+          sameHead(plan.finalHead, {
+            generation: registryHead.generation,
+            primaryKey: registryHead.primaryKey,
+            profile: registryHead.profile,
+            complete: registryHead.complete,
+          })
+        ))
+    : plan.replaceBelow !== undefined ||
+      changes.length > 0 ||
+      plan.steps.some((step) => step.decision.kind === "publish");
   if (!hasWork) {
     // On the batch path a snapshot that rests on hints and has nothing to
     // upload confirms them as conditions of its commit request (the gateway
@@ -1123,12 +1152,13 @@ async function snapshotStream(
   // Step 4 input: the changed prefixes, planned by the spec's bucket planner
   // so parts are sized by the byte target (see part-layout.ts).
   const rewriteAll = Boolean(
-    registryHead && (registryHead.format !== HEAD_FORMAT || plan.replaceBelow),
+    registryHead && registryHead.format !== HEAD_FORMAT,
   );
   const changedPrefixes = await planChangedPrefixes(deps, {
     connectionId,
     stream,
     changedKeys: changes.map((change) => change.pk_hash),
+    replaced,
     baseParts: registryHead?.parts ?? [],
     targetBytes: partTargetOf(deps),
     rewriteAll,
@@ -2317,10 +2347,7 @@ export async function discardForeignLifetimeRuns(
   const statements: SqlStatement[] = [];
   for (const run of foreign) {
     statements.push(
-      {
-        sql: "DELETE FROM records WHERE connection_id=? AND stream=? AND stamp_o=? AND stamp_r=?",
-        params: [connectionId, run.stream, run.o, run.run_id],
-      },
+      ...dropRunRows(connectionId, run.stream, run.o, run.run_id),
       {
         sql: "UPDATE run_streams SET decision='discarded',reason='lifetime_changed',replace=0,publication_state='superseded',publication_reason='lifetime_changed' WHERE run_id=? AND stream=?",
         params: [run.run_id, run.stream],
@@ -2364,10 +2391,7 @@ async function discardFencedRuns(
     );
     if (!trip) continue;
     statements.push(
-      {
-        sql: "DELETE FROM records WHERE connection_id=? AND stream=? AND stamp_o=? AND stamp_r=?",
-        params: [id, stream, run.o, run.run_id],
-      },
+      ...dropRunRows(id, stream, run.o, run.run_id),
       {
         sql: "UPDATE run_streams SET decision='discarded',reason=?,replace=0,publication_state='superseded',publication_reason=? WHERE run_id=? AND stream=?",
         params: [trip.trip, trip.trip, run.run_id, stream],

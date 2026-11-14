@@ -217,6 +217,21 @@ async function seedRun(
   ]);
 }
 
+/** A local edit and its undo: two logged changes that leave the row as the head has it. */
+async function changeAndRestore(deps: LocalSyncDeps, recordKey: string) {
+  const original = canonicalJson({ id: recordKey });
+  const edited = canonicalJson({ id: recordKey, edited: true });
+  const write = (body: string) => [
+    { sql: `UPDATE write_ctx SET origin = 'local' WHERE id = 1`, params: [] },
+    {
+      sql: `UPDATE records SET body = ?, body_sha256 = ? WHERE connection_id = ? AND record_key = ?`,
+      params: [body, sha256Hex(body), CONNECTION_ID, recordKey],
+    },
+  ];
+  await deps.db.batch(write(edited));
+  await deps.db.batch(write(original));
+}
+
 async function seedRecord(
   deps: LocalSyncDeps,
   recordKey: string,
@@ -1981,13 +1996,16 @@ describe("the commit step's stream-row fence", () => {
     await publishConnection(world.deps, CONNECTION_ID);
     counted.reads.clear();
     counted.posts.length = 0;
+    await changeAndRestore(world.deps, "a");
 
-    // An identical head is a no-op: two reads (snapshot, then the fence).
+    // A change that was undone builds an identical head, which is a no-op: two
+    // reads (snapshot, then the fence). Rows only re-observed log no change.
     expect(
       (await publishConnection(world.deps, CONNECTION_ID))[0]?.outcome,
     ).toBe("noop");
     expect(counted.reads.get(SCOPE)).toBe(2);
     expect(counted.posts).toEqual([]);
+    await changeAndRestore(world.deps, "a");
 
     // Another device's head lands just after that snapshot's read of the row.
     const read = counted.read;

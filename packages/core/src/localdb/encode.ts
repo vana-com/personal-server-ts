@@ -1,4 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2";
+import { SEEN_PAIR } from "./merge.js";
 import {
   encodeFramePart,
   encodePiece,
@@ -190,12 +191,9 @@ export async function freezePrefixRows(
       ...range.params,
     ];
     if (input.replaceBelow) {
-      where += " AND (stamp_o > ? OR (stamp_o = ? AND stamp_r >= ?))";
-      params.push(
-        input.replaceBelow.o,
-        input.replaceBelow.o,
-        input.replaceBelow.r,
-      );
+      // A row an equal-body run only observed still belongs to the replacement.
+      where += ` AND ${SEEN_PAIR} >= (?, ?)`;
+      params.push(input.replaceBelow.o, input.replaceBelow.r);
     }
     const { changes } = await deps.db.batch([
       {

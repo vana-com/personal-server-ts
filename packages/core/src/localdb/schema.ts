@@ -170,4 +170,19 @@ END;`,
   PRIMARY KEY (attempt, pk_hash)) WITHOUT ROWID;`,
     `CREATE INDEX publish_spool_by_connection ON publish_spool(connection_id)`,
   ],
+  [
+    // The newest stamp of a run that observed this row's body, when that is
+    // newer than the stamp in the published bytes. Local only: never in a
+    // part, and not watched by `records_au`, so moving it logs no change. NULL
+    // means the row was last observed at its own stamp. Read it through
+    // `SEEN_O` and `SEEN_R` in merge.ts, never as the bare column.
+    `ALTER TABLE records ADD COLUMN seen_o INTEGER`,
+    `ALTER TABLE records ADD COLUMN seen_r TEXT`,
+  ],
+  [
+    // "Rows last observed before run R" (a full refresh's replace) is a range
+    // on the effective observation. This holds it, in the same terms as
+    // `seenStamp` in merge.ts, so that read seeks and does not scan the stream.
+    `CREATE INDEX records_by_observation ON records(connection_id, stream, COALESCE(seen_o, stamp_o), COALESCE(seen_r, stamp_r))`,
+  ],
 ];

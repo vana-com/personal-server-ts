@@ -4,6 +4,7 @@ import {
   type HeadPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { LocalSyncDeps } from "./deps.js";
+import { SEEN_BEFORE, seenBeforeParams } from "./merge.js";
 
 /**
  * What a record adds to a part beyond its body: the frame envelope (key hash,
@@ -123,13 +124,17 @@ export async function planChangedPrefixes(
     readonly connectionId: string;
     readonly stream: string;
     readonly changedKeys: readonly string[];
+    /** Rows a replace drops, by 16-bit key prefix (see `replacedPrefixGroups`). */
+    readonly replaced?: readonly { prefix: string; bytes: number }[];
     readonly baseParts: readonly HeadPart[];
     readonly targetBytes: number;
     readonly rewriteAll: boolean;
   },
 ): Promise<string[]> {
   const keys = [...new Set(input.changedKeys)];
-  if (keys.length === 0 && !input.rewriteAll) return [];
+  const replaced = input.replaced ?? [];
+  if (keys.length === 0 && replaced.length === 0 && !input.rewriteAll)
+    return [];
   const shardBytes = new Array<number>(SHARD_COUNT).fill(0);
   const prefix16Bytes: Record<number, number[]> = {};
   for (let at = 0; at < keys.length; at += KEYS_PER_QUERY) {
@@ -150,6 +155,14 @@ export async function planChangedPrefixes(
       ]! += bytes;
     }
   }
+  for (const { prefix, bytes } of replaced) {
+    const shard = parseInt(prefix.slice(0, 2), 16);
+    const second = parseInt(prefix.slice(2, 4), 16);
+    shardBytes[shard]! += bytes;
+    (prefix16Bytes[shard] ??= new Array<number>(SHARD_COUNT).fill(0))[
+      second
+    ]! += bytes;
+  }
   // A shard with no surviving changed row has zero delta bytes. Its counts are
   // known, so they are zeros, not missing: the planner splits a base group that
   // is heavier than the target there without a counting pass.
@@ -167,8 +180,42 @@ export async function planChangedPrefixes(
   }
   return selectChangedBuckets(
     plan.buckets.map((bucket) => bucket.prefix),
-    keys,
+    // A prefix of four hex digits marks the same bucket as any key under it.
+    [...keys, ...replaced.map((group) => group.prefix)],
     input.baseParts,
     input.rewriteAll,
   );
+}
+
+/**
+ * The rows a full refresh will drop, as one entry per 16-bit key prefix: the
+ * first four hex digits of the key hash, the rows there and their estimated
+ * part bytes. That is at most 65,536 entries however many rows go, which is
+ * all the part planner reads (it sizes buckets of at most 16 bits). The rows
+ * are the ones last observed before the replacing run `marker`; the read seeks
+ * on `records_by_observation`.
+ */
+export async function replacedPrefixGroups(
+  db: LocalSyncDeps["db"],
+  connectionId: string,
+  stream: string,
+  marker: { readonly o: number; readonly r: string },
+): Promise<{ prefix: string; rows: number; bytes: number }[]> {
+  const groups = await db.query<{
+    prefix: string;
+    rows: number;
+    bytes: number;
+  }>(
+    `SELECT SUBSTR(pk_hash, 1, 4) AS prefix, COUNT(*) AS rows,
+            SUM(LENGTH(CAST(body AS BLOB)) + ${FRAME_OVERHEAD_BYTES}) AS bytes
+       FROM records
+      WHERE connection_id = ? AND stream = ? AND ${SEEN_BEFORE}
+      GROUP BY prefix`,
+    [connectionId, stream, ...seenBeforeParams(marker.o, marker.r)],
+  );
+  return groups.map((g) => ({
+    prefix: g.prefix,
+    rows: Number(g.rows),
+    bytes: Number(g.bytes),
+  }));
 }

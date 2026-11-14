@@ -3,6 +3,7 @@ import type { StreamSyncReadStatus } from "../stream-sync-read/service.js";
 import { logicalStreamScopeParts } from "../stream-sync-read/routing.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
+import { SEEN_O } from "./merge.js";
 import type { OlderVersionCounts } from "./older-versions.js";
 import { createRecordQuery } from "./query.js";
 import {
@@ -133,7 +134,7 @@ export function createLocalListing(
       records: number;
       stamped_at: number | null;
     }>(
-      "SELECT connection_id, stream, COUNT(*) AS records, MAX(stamp_o) AS stamped_at FROM records GROUP BY connection_id, stream",
+      `SELECT connection_id, stream, COUNT(*) AS records, MAX(${SEEN_O}) AS stamped_at FROM records GROUP BY connection_id, stream`,
     );
     const heads = await reads.db.query<{
       connection_id: string;

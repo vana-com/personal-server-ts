@@ -1,3 +1,4 @@
+import { seenStamp } from "./merge.js";
 import { holdMemory } from "./transfer-memory.js";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
@@ -70,7 +71,7 @@ export function createBlobStore(deps: LocalSyncDeps): BlobStore {
         `SELECT stream, pk_hash, body, 1 AS staged FROM run_rows WHERE run_id = ?
          UNION ALL
          SELECT stream, pk_hash, body, 0 AS staged FROM records
-         WHERE connection_id = ? AND stamp_r = ?`,
+         WHERE connection_id = ? AND ${seenStamp().r} = ?`,
         [input.runId, run.connection_id, input.runId],
       );
       const statements: SqlStatement[] = [
@@ -118,7 +119,7 @@ export function createBlobStore(deps: LocalSyncDeps): BlobStore {
                 sql: `INSERT OR IGNORE INTO blob_refs(blob_id, connection_id, stream, pk_hash)
                 SELECT ?, connection_id, stream, pk_hash FROM records
                 WHERE connection_id = ? AND stream = ? AND pk_hash = ?
-                  AND stamp_r = ? AND body = ?`,
+                  AND ${seenStamp().r} = ? AND body = ?`,
                 params: [
                   input.sha256,
                   run.connection_id,
