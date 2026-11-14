@@ -285,94 +285,33 @@ describe("one listing of the connection's registry rows", () => {
       expect(count(w.calls, "read", streamScope(CONNECTOR, "", n))).toBe(1);
   });
 
-  it("is taken again after a lost CAS, never reused across the retry", async () => {
+  it("publishes every stream after a lost CAS, the loser reading its row again", async () => {
+    // All streams start at once and queue their first snapshot turn before any
+    // commit turn, so no first snapshot follows the conflict: the listing is
+    // taken once. The loser applies the winner and retries from a live read.
     const w = await world({ streams: 4 });
-    // s1's first upload is held until s0 has lost its CAS, retried and
-    // finished, so s2 takes its first snapshot after the conflict.
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => (release = resolve));
     const s0 = streamScope(CONNECTOR, "", "s0");
-    const s1 = streamScope(CONNECTOR, "", "s1");
-    const held = w.deps.blobs.put;
-    w.deps.blobs.put = async (key, bytes, before) => {
-      if (scopeOfKey(key) === s1) await gate;
-      return held(key, bytes, before);
-    };
     let beaten = false;
     w.inner.beforePost = async (post) => {
       if (post.scope !== s0 || beaten) return;
       beaten = true;
       await foreignHead(w, "s0", 1);
     };
-    const published = publishConnection(w.deps, CONNECTION_ID, {
-      streamConcurrency: 2,
-    });
-    // s0 finishes (conflict, apply, retry, publish); then release s1.
-    const settled = new Promise<void>((resolve) => {
-      const timer = setInterval(() => {
-        if (count(w.calls, "post", s0) >= 2) {
-          clearInterval(timer);
-          resolve();
-        }
-      }, 5);
-    });
-    await settled;
-    // Give s2 its first snapshot while s1 is still held.
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    release();
-    const results = await published;
+    const results = await publishConnection(w.deps, CONNECTION_ID);
     expect(results.map((r) => r.outcome)).toEqual(Array(4).fill("published"));
-    // The conflict on s0 dropped the first listing: s2 listed again, and s3
-    // (which started later still) used that second one.
-    expect(count(w.calls, "list")).toBe(2);
-    const secondList = w.calls
-      .map((c, i) => (c.kind === "list" ? i : -1))
-      .filter((i) => i >= 0)[1]!;
-    const conflict = w.calls.findIndex(
-      (c) => c.kind === "post" && c.scope === s0,
-    );
-    expect(secondList).toBeGreaterThan(conflict);
-    // s0's retry read its row live.
+    expect(count(w.calls, "list")).toBe(1);
     expect(count(w.calls, "read", s0)).toBeGreaterThanOrEqual(2);
+    expect(count(w.calls, "post", s0)).toBeGreaterThanOrEqual(2);
   });
 });
 
-describe("a listing taken before the last lost CAS", () => {
-  it("is taken again by a stream that starts after a stream gave up", async () => {
-    // Four streams, two at a time. s0 loses all five of its CASes (a foreign
-    // head wins each) and backs off: its last loss is not followed by a
-    // retry. s1's upload is held until s0 has lost four, so that s2, the next
-    // to start, takes its listing after the fourth loss and before the fifth.
-    // That listing predates the last winner: s3, which starts after s0 gave
-    // up, must list again.
+describe("a stream that loses every CAS", () => {
+  it("gives up with backoff while the other streams publish, and the listing is taken once", async () => {
+    // A foreign head wins each of s0's five CASes, so s0 backs off. Every
+    // stream starts at once and queues its first snapshot before any commit,
+    // so no first snapshot follows a loss and no second listing is needed.
     const w = await world({ streams: 4 });
     const s0 = streamScope(CONNECTOR, "", "s0");
-    const s1 = streamScope(CONNECTOR, "", "s1");
-    const s2 = streamScope(CONNECTOR, "", "s2");
-    const waitFor = async (until: () => boolean) => {
-      while (!until()) await new Promise((r) => setTimeout(r, 5));
-    };
-    const held = w.deps.blobs.put;
-    w.deps.blobs.put = async (key, bytes, before) => {
-      // s1 finishes only once s0 is in its fourth post.
-      if (scopeOfKey(key) === s1)
-        await waitFor(() => count(w.calls, "post", s0) >= 4);
-      // s2 finishes only after s0 has given up.
-      if (scopeOfKey(key) === s2) {
-        await waitFor(() => count(w.calls, "post", s0) >= 5);
-        await new Promise((r) => setTimeout(r, 100));
-      }
-      return held(key, bytes, before);
-    };
-    // The fifth attempt's transfer (outside the connection's turn) waits for
-    // s2's listing, which the fourth loss left to take.
-    const probed = w.deps.blobs.exists;
-    w.deps.blobs.exists = async (key) => {
-      if (scopeOfKey(key) === s0 && count(w.calls, "post", s0) === 4) {
-        await waitFor(() => count(w.calls, "list") >= 2);
-      }
-      return probed(key);
-    };
     let posts = 0;
     let winning = false;
     w.inner.beforePost = async (post) => {
@@ -386,9 +325,7 @@ describe("a listing taken before the last lost CAS", () => {
         winning = false;
       }
     };
-    const results = await publishConnection(w.deps, CONNECTION_ID, {
-      streamConcurrency: 2,
-    });
+    const results = await publishConnection(w.deps, CONNECTION_ID);
     expect(results.map((r) => r.outcome)).toEqual([
       "backoff",
       "published",
@@ -396,8 +333,7 @@ describe("a listing taken before the last lost CAS", () => {
       "published",
     ]);
     expect(count(w.calls, "post", s0)).toBe(5);
-    // s1's listing, s2's (after the fourth loss), and s3's (after the fifth).
-    expect(count(w.calls, "list")).toBe(3);
+    expect(count(w.calls, "list")).toBe(1);
   });
 });
 
@@ -407,9 +343,7 @@ describe("a listing taken before an apply", () => {
     // Another device already wrote s1's head. s1 learns it from the listing the
     // second stream took, and applies it: the listing predates that apply.
     await foreignHead(w, "s1", 1);
-    const results = await publishConnection(w.deps, CONNECTION_ID, {
-      streamConcurrency: 1,
-    });
+    const results = await publishConnection(w.deps, CONNECTION_ID);
     expect(results).toHaveLength(4);
     // s2 took a new listing after s1's apply; s3 used that one.
     expect(count(w.calls, "list")).toBe(2);
@@ -487,9 +421,7 @@ describe("a stream with no work, served by a listing older than its turn", () =>
 
   it("purges when the control row was deleted after the listing, and does not say noop", async () => {
     const { w, runId } = await refreshWorld(tombstoneControl);
-    const results = await publishConnection(w.deps, CONNECTION_ID, {
-      streamConcurrency: 1,
-    });
+    const results = await publishConnection(w.deps, CONNECTION_ID);
     expect(count(w.calls, "list")).toBe(1);
     // Only the stream that read its own rows has evidence for the run.
     const evidence = await evidenceOf(w, runId);
@@ -515,9 +447,7 @@ describe("a stream with no work, served by a listing older than its turn", () =>
         await tombstoneControl(world);
       },
     );
-    const results = await publishConnection(w.deps, CONNECTION_ID, {
-      streamConcurrency: 1,
-    });
+    const results = await publishConnection(w.deps, CONNECTION_ID);
     expect(deleted).toBe(true);
     expect(results[1]!.outcome).toBe("purged");
     expect((await evidenceOf(w, runId)).s1).toBeNull();
@@ -527,7 +457,7 @@ describe("a stream with no work, served by a listing older than its turn", () =>
     const { w, runId } = await refreshWorld((world) =>
       foreignHead(world, "s1", 2),
     );
-    await publishConnection(w.deps, CONNECTION_ID, { streamConcurrency: 1 });
+    await publishConnection(w.deps, CONNECTION_ID);
     const evidence = await evidenceOf(w, runId);
     // s0 read the row itself: its evidence names version 1. s1's listed row
     // (version 1) was not current by its turn: no evidence for that version.
@@ -594,9 +524,7 @@ describe("a stream with no work whose rows were all read live", () => {
       const runId = await w.idle();
       w.calls.length = 0;
       armed = true;
-      const results = await publishConnection(w.deps, CONNECTION_ID, {
-        streamConcurrency: 1,
-      });
+      const results = await publishConnection(w.deps, CONNECTION_ID);
       expect(deleted).toBe(true);
       expect(results[stream]!.outcome).toBe("purged");
       expect(

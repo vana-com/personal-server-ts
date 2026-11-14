@@ -4,9 +4,9 @@
  *
  * Only "every file of the stream is stored before its registry write" matters.
  * Parts, attachments and the head are content addressed and unreachable until
- * that write, so none of them has to wait for another. The storage client
- * decides how many run on the wire (`maxConcurrent`, `maxConcurrentPuts`);
- * this holds only the uploads that are started and not yet finished.
+ * that write, so none of them has to wait for another. The store's send gate
+ * decides how many run on the wire; this holds only the uploads that are
+ * started and not yet finished.
  *
  * A wave never leaves a started upload running after it is settled, and never
  * leaves a rejection unobserved: a failed upload is kept, no further upload

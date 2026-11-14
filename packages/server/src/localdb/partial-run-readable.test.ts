@@ -174,6 +174,14 @@ async function world(options: WorldOptions = {}) {
       const report = await (await context.getLocalSync!()).cycle();
       return report.connections.map((c) => c.error);
     },
+    /** The outcome of each stream's publish in one cycle. */
+    async cycleOutcomes() {
+      const report = await (await context.getLocalSync!()).cycle();
+      return report.connections.flatMap((c) => [
+        ...(c.error ? [`error:${c.error}`] : []),
+        ...c.published.map((p) => `${p.stream}:${p.outcome}`),
+      ]);
+    },
     async publish() {
       const report = await (await context.getLocalSync!()).cycle();
       expect(report.connections.map((c) => c.error)).toEqual([null]);
@@ -336,7 +344,9 @@ describe("a failed run's finished streams are served", () => {
  * then answers HTTP 500 until the rate recovers (measured against the dev
  * service: about 25 of 32 concurrent reads succeed, the rest get 500, and
  * about two reads a second are served without a failure). Time is virtual:
- * the client's backoff sleep advances the clock, so the test does not wait.
+ * every wait the client asks for advances the clock, so the test does not
+ * wait. No timer fires the retry deadline; the client checks it against this
+ * clock before every attempt.
  */
 function burstLimitedStorage(raw: {
   get(key: string): Promise<Uint8Array | null>;
@@ -393,14 +403,20 @@ function burstLimitedStorage(raw: {
   };
   return {
     stats,
-    blobs(over: { maxAttempts?: number } = {}) {
+    blobs(over: { retryBudgetMs?: number } = {}) {
+      const budget =
+        over.retryBudgetMs ?? DEFAULT_STORAGE_ACCESS_POLICY.retryBudgetMs;
       return createStorageStreamSyncBlobs(adapter, {
         ...DEFAULT_STORAGE_ACCESS_POLICY,
         ...over,
         random,
         now: () => clock,
-        sleep: async (ms) => {
+        after: (ms, fn) => {
+          // The deadline's own timer never fires here: the clock decides it.
+          if (ms === budget) return () => {};
           clock += ms;
+          queueMicrotask(fn);
+          return () => {};
         },
       });
     },
@@ -422,13 +438,13 @@ describe("a stream of many parts publishes while storage refuses read bursts", (
     provenFullStreams: ALL,
   };
 
-  async function twoPublishes(maxAttempts: number) {
+  async function twoPublishes(retryBudgetMs: number) {
     let storage!: ReturnType<typeof burstLimitedStorage>;
     const w = await world({
       partTargetBytes: PART_BYTES,
       blobs: (raw) => {
         storage = burstLimitedStorage(raw);
-        return storage.blobs({ maxAttempts });
+        return storage.blobs({ retryBudgetMs });
       },
     });
     // One cycle a minute: storage has recovered by the time the next starts.
@@ -446,7 +462,9 @@ describe("a stream of many parts publishes while storage refuses read bursts", (
   }
 
   it("publishes complete and serves 200 although reads are refused", async () => {
-    const { w, storage, first, second } = await twoPublishes(6);
+    const { w, storage, first, second } = await twoPublishes(
+      DEFAULT_STORAGE_ACCESS_POLICY.retryBudgetMs,
+    );
     // Two publishes of a head of about 25 parts need more reads than the burst
     // storage serves, so some were refused and retried.
     expect(storage.stats.partUploads).toBeGreaterThanOrEqual(2 * 20);
@@ -458,14 +476,32 @@ describe("a stream of many parts publishes while storage refuses read bursts", (
     expect(await w.read("profile")).toBe(200);
   });
 
-  it("stalls the same publish when a refused read is not retried", async () => {
-    const { w, storage, first, second } = await twoPublishes(1);
+  it("reports storage as unavailable, and leaves the stream at its first version, when the deadline passes while reads are refused", async () => {
+    // A deadline of one second of storage time: about two reads recover in it.
+    let storage!: ReturnType<typeof burstLimitedStorage>;
+    const w = await world({
+      partTargetBytes: PART_BYTES,
+      blobs: (raw) => {
+        storage = burstLimitedStorage(raw);
+        return storage.blobs({ retryBudgetMs: 1_000 });
+      },
+    });
+    storage.rest(60_000);
+    await w.run("first", 1_000, { profile: 1, following: ROWS }, whole, 0);
+    storage.rest(60_000);
+    expect(await w.cycle()).toEqual([null]);
+    // Every row changes, so the second publish downloads each base part.
+    storage.rest(60_000);
+    await w.run("second", 2_000, { profile: 1, following: ROWS }, whole, 1);
+    storage.rest(60_000);
+    const outcomes = await w.cycleOutcomes();
     expect(storage.stats.refused).toBeGreaterThan(0);
-    // A first publish probes nothing, so it reads nothing and publishes. The
-    // second downloads each base part: a refused read there is reported, and
-    // the stream stays at its first version.
-    expect(first).toEqual([null]);
-    expect(second.some((error) => error !== null)).toBe(true);
+    // Deferred, not failed on the data: the error names storage, and the
+    // work waits for the next cycle.
+    expect(outcomes.join(" | ")).toMatch(
+      /error:storage unavailable: still failing after 1 s/,
+    );
+    // The stream stays readable at its first version.
     expect(await w.read("following")).toBe(200);
   });
 });

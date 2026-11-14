@@ -1,48 +1,94 @@
+import type {
+  QuotaListener,
+  QuotaPolicy,
+} from "../storage/adapters/rate-limit-policy.js";
+import {
+  createByteBudget,
+  createSendGate,
+  realAfter,
+  type GateTicket,
+  type RequestKind,
+  type SendGateStats,
+} from "./send-gate.js";
+
 /**
- * Bounded, retrying access to storage blobs.
+ * Bounded, retrying, rate-governed access to storage blobs.
  *
  * Stream-sync blob names are content addressed, so a read or a write of the
  * same key can be repeated without changing the outcome (a second upload of a
  * key keeps the stored copy). That makes a retry of a transient failure safe.
  *
- * Retry follows the usual client practice (AWS SDK "standard" mode, Stripe's
- * idempotent retries): only failures that can pass by themselves are retried
- * (HTTP 5xx and 429, network errors), never other 4xx, with capped exponential
- * backoff and full jitter, and a small fixed number of attempts.
+ * Three separate layers (see `send-gate.ts` for the first):
+ *  1. the send gate: one gate in front of every request, with a quota input
+ *     (429 and a published `RateLimit-Policy`) and a congestion input (503);
+ *  2. the retry layer here: only failures that can pass by themselves are
+ *     retried (HTTP 5xx and 429, network errors), never other 4xx, with
+ *     capped exponential backoff and full jitter, a Retry-After answer as a
+ *     floor, and a deadline per operation that covers its wait at the gate and
+ *     every transfer. At the deadline the wait ends, the transfer is aborted
+ *     and `StorageDeferredError` is thrown, which the publish loop reads as
+ *     "leave this work in the durable queue", not as a failure of the data;
+ *  3. the byte budget for encoded data not yet uploaded.
+ * A wait after a failure is a shared resume time, so every caller waits, and
+ * the retry then passes through the gate again like any other request.
  */
 
 export interface StorageAccessPolicy {
-  /** Operations in flight at once, across every caller sharing the limiter. */
-  readonly maxConcurrent: number;
   /**
-   * Uploads in flight at once, a limit under `maxConcurrent` that only uploads
-   * pass through. Reads, the gateway and the other uploads' share of
-   * `maxConcurrent` are unaffected. The default of 1 is a conservative choice;
-   * the storage 500s seen with concurrent uploads were fixed server-side
-   * (vana-storage #39).
+   * A quota known before any response (for tests, or a configured store).
+   * The service's own `RateLimit-Policy` replaces it. It paces every kind.
    */
-  readonly maxConcurrentPuts: number;
-  /** Total tries per operation, the first one included. */
-  readonly maxAttempts: number;
+  readonly quota?: QuotaPolicy;
+  /**
+   * The deadline of one operation, counted from its first request for a place
+   * at the gate: its queue wait, its transfers and its waits between tries all
+   * spend it. It is a time and not a try count, so a 60 s Retry-After
+   * (vana-storage's 429) fits in it. At the deadline a queued request leaves
+   * the queue, a running transfer is aborted through its `AbortSignal`, and
+   * `StorageDeferredError` is thrown. There is no separate per-request timeout.
+   * It also bounds how long one Retry-After may hold the whole gate.
+   */
+  readonly retryBudgetMs: number;
   /** Upper bound of the wait before the second try; it doubles each time. */
   readonly baseDelayMs: number;
-  /** No wait is longer than this. */
+  /** No backoff wait is longer than this. */
   readonly maxDelayMs: number;
-  /** Replaceable, with `sleep`, so tests need not wait. */
+  /**
+   * Bytes of encoded data not yet uploaded that may sit in memory at once.
+   * A safety ceiling, not a throughput setting: at 4 PUTs a second and about
+   * 1 s per 3.4 MB upload, about 4 parts (about 14 MB) are in flight, so a
+   * normal network never reaches it. It only binds when uploads stall while
+   * many streams keep encoding. It also caps the send gate's in-flight
+   * window: this many bytes over `partBytes`.
+   */
+  readonly maxBytesInFlight: number;
+  /** The usual part size, which turns the byte budget into a window cap. */
+  readonly partBytes: number;
+  /**
+   * The largest object the store accepts. It is storage's own limit, not ours:
+   * vana-storage refuses a larger body with PAYLOAD_TOO_LARGE
+   * (`DEFAULT_MAX_BLOB_SIZE` in vana-storage `src/config.ts`, set to
+   * 104857600 by `MAX_BLOB_SIZE` in its `wrangler.toml`). A reservation for
+   * a larger object is refused, since it could never be uploaded.
+   */
+  readonly maxObjectBytes: number;
+  /** Replaceable, with `after`, so tests need not wait. */
   readonly now: () => number;
-  readonly sleep: (ms: number) => Promise<void>;
+  /** Runs `fn` after `ms`; the returned function cancels it. */
+  readonly after: (ms: number, fn: () => void) => () => void;
   /** Replaceable so tests can pin jitter. Returns a value in [0, 1). */
   readonly random: () => number;
 }
 
 export const DEFAULT_STORAGE_ACCESS_POLICY: StorageAccessPolicy = {
-  maxConcurrent: 2,
-  maxConcurrentPuts: 1,
-  maxAttempts: 6,
+  retryBudgetMs: 180_000,
   baseDelayMs: 250,
   maxDelayMs: 4_000,
+  maxBytesInFlight: 64 * 1024 * 1024,
+  partBytes: 4 * 1024 * 1024,
+  maxObjectBytes: 100 * 1024 * 1024,
   now: Date.now,
-  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  after: realAfter,
   random: Math.random,
 };
 
@@ -98,74 +144,286 @@ export function backoffDelayMs(
 }
 
 /**
- * One shared gate for every storage call of a blob store: at most
- * `maxConcurrent` calls run at once, and a transient failure is repeated, up to
- * `maxAttempts` tries in all (the last error is thrown unchanged).
- *
- * The backoff is shared. When storage signals overload, the wait that follows
- * a failure holds back every caller, not only the one that failed. Otherwise
- * the calls that did not fail yet keep sending, drain whatever capacity storage
- * regains, and the failed call spends its few attempts without a chance.
+ * A Retry-After header as milliseconds: whole or fractional seconds, or an
+ * HTTP date (measured from `nowMs`). `undefined` when it is absent or unreadable.
  */
-export function createStorageAccess(
-  policy: StorageAccessPolicy,
-): <T>(operation: () => Promise<T>, beforeAttempt?: () => void) => Promise<T> {
-  const limit = createConcurrencyLimit(policy.maxConcurrent, "maxConcurrent");
-  let resumeAt = 0;
-  return (operation, beforeAttempt) =>
-    limit(async () => {
-      for (let attempt = 1; ; attempt++) {
-        const wait = resumeAt - policy.now();
-        if (wait > 0) await policy.sleep(wait);
-        // After every wait, so a call that queued or slept while the caller
-        // went stale does not start. Its throw is final: it is not retried.
-        beforeAttempt?.();
-        try {
-          return await operation();
-        } catch (error) {
-          if (attempt >= policy.maxAttempts || !isTransientStorageError(error))
-            throw error;
-          resumeAt = Math.max(
-            resumeAt,
-            policy.now() + backoffDelayMs(attempt, policy),
-          );
-        }
-      }
-    });
+export function parseRetryAfterHeader(
+  value: string | null | undefined,
+  nowMs: number,
+): number | undefined {
+  const text = value?.trim();
+  if (!text) return undefined;
+  if (/^\d+(\.\d+)?$/.test(text)) return finiteMs(Number(text) * 1000);
+  const date = Date.parse(text);
+  return Number.isFinite(date) ? Math.max(0, date - nowMs) : undefined;
+}
+
+const RETRY_AFTER_IN_BODY = /"retryAfter"\s*:\s*"?(\d+(?:\.\d+)?)"?/;
+
+/** The JSON body's `retryAfter` (seconds), for a browser that cannot read the header. */
+export function parseRetryAfterBody(
+  text: string | null | undefined,
+): number | undefined {
+  const match = text ? RETRY_AFTER_IN_BODY.exec(text) : null;
+  return match ? finiteMs(Number(match[1]) * 1000) : undefined;
+}
+
+/** A wait from the wire is a whole number of milliseconds or nothing. */
+function finiteMs(ms: number): number | undefined {
+  return Number.isFinite(ms) ? Math.round(ms) : undefined;
 }
 
 /**
- * A limit of 0, a negative or fractional number, NaN or undefined would make
- * every operation wait for ever or let in more than asked; refuse it.
+ * Whether the storage service answered "slow down" (HTTP 429 or 503), which
+ * one, and how long it asked to wait. The adapters put `retryAfterMs` on the
+ * error they throw; the SDK's own errors carry the JSON body in the message
+ * and the adapter's error is its `cause`, so the whole chain is read.
  */
-export function requirePositiveWhole(name: string, value: unknown): void {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
-    throw new RangeError(
-      `storage access: ${name} must be a positive whole number, got ${String(value)}`,
+export function throttleOf(
+  error: unknown,
+  depth = 0,
+): { readonly status: 429 | 503; readonly retryAfterMs?: number } | undefined {
+  if (typeof error !== "object" || error === null || depth > 3)
+    return undefined;
+  const record = error as Record<string, unknown>;
+  const message = typeof record.message === "string" ? record.message : "";
+  const status = statusOf(error);
+  const inner = throttleOf(record.cause, depth + 1);
+  const own = status === 429 || status === 503 ? status : inner?.status;
+  if (own === undefined) return undefined;
+  const retryAfterMs =
+    typeof record.retryAfterMs === "number" &&
+    Number.isFinite(record.retryAfterMs) &&
+    record.retryAfterMs >= 0
+      ? record.retryAfterMs
+      : (parseRetryAfterBody(message) ?? inner?.retryAfterMs);
+  return retryAfterMs === undefined
+    ? { status: own }
+    : { status: own, retryAfterMs };
+}
+
+/** What the governor did over one publish, for its single log line. */
+export interface SendWindowStats {
+  /** The in-flight window when the publish ended. */
+  readonly window: number;
+  /** The published quota in requests per second, when the service published one. */
+  readonly quotaPerSec?: SendGateStats["quotaPerSec"];
+  readonly requests: number;
+  readonly throttles: number;
+  /** Time the shared resume time was pushed out by Retry-After answers. */
+  readonly retryAfterWaitMs: number;
+  /** Most bytes reserved at once while the window was open. */
+  readonly peakBytesInFlight: number;
+}
+
+export interface SendRequest {
+  /** The kind of request: the quota a service names for it is the one that paces it. */
+  readonly kind: RequestKind;
+  /** Runs after every wait at the gate, so a stale caller does not send. Its throw is final. */
+  readonly beforeAttempt?: () => void;
+}
+
+export interface SendGovernor {
+  /**
+   * One storage request, through the gate, within the retry budget. A
+   * transient failure waits (a shared wait, Retry-After as its floor) and goes
+   * through the gate again. `operation` gets a signal that aborts at the
+   * deadline; it must pass it to the transfer. At the deadline this throws
+   * `StorageDeferredError` and no transfer of this call is left running.
+   */
+  run<T>(
+    request: SendRequest,
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T>;
+  /**
+   * Hold `bytes` of the memory budget until the returned function is called.
+   * `objectBytes` is the size of the object this memory becomes, when that
+   * differs (an attachment is held twice, as plain and as encrypted bytes).
+   * Rejects with `StorageObjectTooLargeError` when that object is over the
+   * store's limit.
+   */
+  reserve(bytes: number, objectBytes?: number): Promise<() => void>;
+  /** Watch the governor; `end()` reports what happened since this call. */
+  window(): { end(): SendWindowStats };
+  /** Follow the quota a service publishes. Returns a function that stops it. */
+  follow(source: {
+    onRateLimitPolicy?: (l: QuotaListener) => () => void;
+  }): () => void;
+}
+
+/**
+ * Storage did not answer within the retry budget. The data is not at fault:
+ * the work stays in the durable queue and the next cycle tries again. Callers
+ * must not report it as a failure of the data.
+ */
+export class StorageDeferredError extends Error {
+  readonly status?: number;
+  constructor(
+    readonly budgetMs: number,
+    readonly last?: unknown,
+  ) {
+    const seconds = Math.round(budgetMs / 1000);
+    super(
+      last === undefined
+        ? `storage unavailable: no answer within ${seconds} s`
+        : `storage unavailable: still failing after ${seconds} s of retries (${last instanceof Error ? last.message : String(last)})`,
+      last === undefined ? undefined : { cause: last },
     );
+    this.name = "StorageDeferredError";
+    const status = statusOf(last);
+    if (status !== undefined) this.status = status;
   }
 }
 
-/** A counting semaphore: at most `limit` operations run, the rest queue. */
-export function createConcurrencyLimit(
-  limit: number,
-  name = "limit",
-): <T>(operation: () => Promise<T>) => Promise<T> {
-  requirePositiveWhole(name, limit);
-  let active = 0;
-  const waiting: (() => void)[] = [];
-  const release = () => {
-    const next = waiting.shift();
-    if (next) next();
-    else active--;
-  };
-  return async (operation) => {
-    if (active < limit) active++;
-    else await new Promise<void>((resolve) => waiting.push(resolve));
-    try {
-      return await operation();
-    } finally {
-      release();
-    }
+/** An object larger than the store accepts: it can never be uploaded. */
+export class StorageObjectTooLargeError extends Error {
+  constructor(
+    readonly objectBytes: number,
+    readonly limitBytes: number,
+  ) {
+    super(
+      `object of ${objectBytes} bytes is over the storage limit of ${limitBytes} bytes`,
+    );
+    this.name = "StorageObjectTooLargeError";
+  }
+}
+
+/** Resolves or rejects with `work`, or rejects with the signal's reason once it aborts. */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * One governor: a gate, a retry layer and a byte budget. It stands for one
+ * store, so there is one per store (`createStorageStreamSyncBlobs` keeps it
+ * with the adapter instance).
+ */
+export function createStorageAccess(policy: StorageAccessPolicy): SendGovernor {
+  const gate = createSendGate({
+    maxWindow: Math.max(
+      1,
+      Math.floor(policy.maxBytesInFlight / policy.partBytes),
+    ),
+    maxHoldMs: policy.retryBudgetMs,
+    now: policy.now,
+    after: policy.after,
+  });
+  if (policy.quota) gate.setQuota({ named: {}, unnamed: policy.quota });
+  const windows = new Set<{ peak: number }>();
+  const budget = createByteBudget(policy.maxBytesInFlight, (inUse) => {
+    for (const open of windows) open.peak = Math.max(open.peak, inUse);
+  });
+  return {
+    reserve(bytes, objectBytes = bytes) {
+      if (objectBytes > policy.maxObjectBytes) {
+        return Promise.reject(
+          new StorageObjectTooLargeError(objectBytes, policy.maxObjectBytes),
+        );
+      }
+      return budget.reserve(bytes);
+    },
+    follow: (source) =>
+      source.onRateLimitPolicy?.((quota) => gate.setQuota(quota)) ?? (() => {}),
+    window() {
+      const open = { peak: budget.inUse() };
+      const before = gate.stats();
+      windows.add(open);
+      return {
+        end() {
+          windows.delete(open);
+          const after = gate.stats();
+          return {
+            window: after.window,
+            ...(after.quotaPerSec === undefined
+              ? {}
+              : { quotaPerSec: after.quotaPerSec }),
+            requests: after.requests - before.requests,
+            throttles: after.throttles - before.throttles,
+            retryAfterWaitMs: after.retryAfterWaitMs - before.retryAfterWaitMs,
+            peakBytesInFlight: open.peak,
+          };
+        },
+      };
+    },
+    async run(request, operation) {
+      const deadline = policy.now() + policy.retryBudgetMs;
+      const expiry = new AbortController();
+      const cancelExpiry = policy.after(policy.retryBudgetMs, () =>
+        expiry.abort(),
+      );
+      const { signal } = expiry;
+      let last: unknown;
+      const deferred = () =>
+        new StorageDeferredError(policy.retryBudgetMs, last);
+      try {
+        for (let attempt = 1; ; attempt++) {
+          let ticket: GateTicket;
+          try {
+            ticket = await gate.admit(request.kind, signal);
+          } catch (error) {
+            throw signal.aborted ? deferred() : error;
+          }
+          // The deadline is checked before every attempt, not only after a failure.
+          if (signal.aborted || policy.now() >= deadline) {
+            ticket.abandon();
+            throw deferred();
+          }
+          // After every wait, so a call that queued or slept while the caller
+          // went stale does not start. Its throw is final: it is not retried.
+          try {
+            request.beforeAttempt?.();
+          } catch (error) {
+            ticket.abandon();
+            throw error;
+          }
+          try {
+            const result = await untilAborted(operation(signal), signal);
+            ticket.success();
+            return result;
+          } catch (error) {
+            if (signal.aborted) {
+              ticket.abandon();
+              throw deferred();
+            }
+            if (!isTransientStorageError(error)) {
+              ticket.abandon();
+              throw error;
+            }
+            last = error;
+            const throttle = throttleOf(error);
+            if (throttle?.status === 429) {
+              ticket.quotaExceeded(throttle.retryAfterMs);
+            } else if (throttle?.status === 503) {
+              ticket.congested(throttle.retryAfterMs);
+            } else {
+              ticket.abandon();
+            }
+            // Backoff and Retry-After are one shared wait, the longer of the
+            // two. A wait that would pass the deadline is not waited for.
+            const wait = Math.max(
+              backoffDelayMs(attempt, policy),
+              throttle?.retryAfterMs ?? 0,
+            );
+            if (policy.now() + wait > deadline) throw deferred();
+            gate.holdFor(wait);
+          }
+        }
+      } finally {
+        cancelExpiry();
+      }
+    },
   };
 }

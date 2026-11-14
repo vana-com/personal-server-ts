@@ -9,6 +9,7 @@
  */
 
 import type { ControlRead } from "@opendatalabs/personal-server-ts-stream-sync";
+import type { SendGovernor } from "./storage-retry.js";
 
 /** The network a gateway deployment names: `vana:<chainId>:<origin>`. */
 export function streamSyncNetwork(gateway: {
@@ -202,6 +203,13 @@ export interface StreamSyncRegistry {
 
 /** Encrypted blob storage, keyed `<physical scope>/<blob name>`. */
 export interface StreamSyncBlobs {
+  /**
+   * The store's send governor, when it has one: the memory budget a transfer
+   * reserves from before it encodes a part, and a window that reports what the
+   * gate did during one publish. A store without one (an in-memory test store)
+   * is unbounded.
+   */
+  readonly governor?: Pick<SendGovernor, "reserve" | "window">;
   /**
    * `beforeAttempt` runs immediately before each request that sends the bytes,
    * after every wait for a turn or a retry delay; a throw stops the upload and

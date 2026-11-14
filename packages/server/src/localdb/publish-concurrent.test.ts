@@ -28,8 +28,12 @@ import {
   type SqlDriver,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
+  DEFAULT_STORAGE_ACCESS_POLICY,
   createMemoryStreamSyncBlobs,
   createMemoryStreamSyncRegistry,
+  createStorageStreamSyncBlobs,
+  StorageDeferredError,
+  StorageObjectTooLargeError,
   type StreamSyncBlobs,
   type StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
@@ -70,6 +74,12 @@ type Options = {
   readonly holdAttachmentEncrypt?: () => Promise<void>;
   /** Give every stream's record an attachment of its own. */
   readonly attachments?: boolean;
+  /** The store's memory budget, as the blob store exposes it. */
+  readonly governor?: StreamSyncBlobs["governor"];
+  /** Wraps the in-memory store, for a test that runs the real storage client over it. */
+  readonly store?: (inner: StreamSyncBlobs) => StreamSyncBlobs;
+  /** Called at every encrypt (a head, an attachment) and encryptPart call. */
+  readonly onEncrypt?: (kind: "encrypt" | "encryptPart") => void;
 };
 
 const drivers: SqlDriver[] = [];
@@ -115,6 +125,7 @@ async function world(options: Options) {
   const hidden = new Set<string>();
   const guards: { key: string; guard: (() => void) | undefined }[] = [];
   const timedBlobs: StreamSyncBlobs = {
+    governor: options.governor,
     async get(key) {
       record("get", key);
       await options.holdGet?.(key);
@@ -149,18 +160,22 @@ async function world(options: Options) {
     db,
     queue: connectionQueue(),
     registry,
-    blobs: timedBlobs,
+    blobs: options.store ? options.store(innerBlobs) : timedBlobs,
     ownerAddress: OWNER,
     keys: {
       namespaceHmac: async () => new Uint8Array(32),
       encrypt: async (scope, b) => {
+        options.onEncrypt?.("encrypt");
         if (options.holdAttachmentEncrypt && !encrypting.has(scope)) {
           encrypting.add(scope);
           await options.holdAttachmentEncrypt();
         }
         return b;
       },
-      encryptPart: async (_s, b) => b,
+      encryptPart: async (_s, b) => {
+        options.onEncrypt?.("encryptPart");
+        return b;
+      },
       decrypt: async (_s, b) => b,
     },
     signer: { signAddData: async () => "0x00" },
@@ -303,53 +318,46 @@ const timeIt = async <T>(fn: () => Promise<T>) => {
 describe("streams of one connection publish together", () => {
   it("six streams take well under six streams' time", async () => {
     const slow = { streams: 6, registryMs: 3, blobMs: 40 };
-    const serial = await world(slow);
-    const one = await timeIt(() =>
-      publishConnection(serial.deps, CONNECTION_ID, { streamConcurrency: 1 }),
-    );
     const together = await world(slow);
     const many = await timeIt(() =>
       publishConnection(together.deps, CONNECTION_ID),
     );
-    expect(one.value.map((r) => r.outcome)).toEqual(Array(6).fill("published"));
     expect(many.value.map((r) => r.outcome)).toEqual(
       Array(6).fill("published"),
     );
-    // Serial: about 6 x 4 blob calls x 40 ms. Together the transfers overlap;
-    // only the slot turns (registry calls) stay one after another.
-    expect(many.ms).toBeLessThan(one.ms * 0.55);
+    // One after another it could not be quicker than 6 streams x 4 blob calls
+    // x 40 ms. Together the transfers overlap; only the slot turns (registry
+    // calls) stay one after another.
+    expect(many.ms).toBeLessThan(6 * 4 * 40 * 0.55);
   });
 
-  it("never runs more streams at once than the option says", async () => {
-    const { deps } = await world({ streams: 6, blobMs: 25 });
-    // A stream is active while one of its blob calls is out.
-    const out = new Map<string, number>();
-    let peak = 0;
-    const original = deps.blobs;
-    const during = async <T>(key: string, call: () => Promise<T>) => {
-      const stream = streamOfKey(key)!;
-      out.set(stream, (out.get(stream) ?? 0) + 1);
-      peak = Math.max(peak, out.size);
-      try {
-        return await call();
-      } finally {
-        const left = out.get(stream)! - 1;
-        if (left === 0) out.delete(stream);
-        else out.set(stream, left);
-      }
-    };
-    const watched: LocalSyncDeps = {
-      ...deps,
-      blobs: {
-        get: (key) => during(key, () => original.get(key)),
-        exists: (key) => during(key, () => original.exists(key)),
-        put: (key, bytes, beforeAttempt) =>
-          during(key, () => original.put(key, bytes, beforeAttempt)),
-      },
-    };
-    await publishConnection(watched, CONNECTION_ID, { streamConcurrency: 2 });
-    expect(peak).toBeGreaterThan(1);
-    expect(peak).toBeLessThanOrEqual(2);
+  it("starts every stream at once: no stream count bounds them", async () => {
+    // Every upload parks until all six streams have one out. A bound below six
+    // would leave a stream unstarted, and the wait would never be satisfied.
+    const parked: { stream: string; release: () => void }[] = [];
+    const { deps } = await world({
+      streams: 6,
+      holdPut: (key) =>
+        new Promise<void>((release) =>
+          parked.push({ stream: streamOfKey(key)!, release }),
+        ),
+    });
+    const publishing = publishConnection(deps, CONNECTION_ID);
+    await vi.waitFor(() =>
+      expect(new Set(parked.map((p) => p.stream)).size).toBe(6),
+    );
+    for (let i = 0; i < parked.length; i++) parked[i]!.release();
+    // Uploads started after the first release park too: let them all go.
+    const open = setInterval(() => {
+      for (const p of parked.splice(0)) p.release();
+    }, 5);
+    try {
+      expect((await publishing).map((r) => r.outcome)).toEqual(
+        Array(6).fill("published"),
+      );
+    } finally {
+      clearInterval(open);
+    }
   });
 
   it("settles the control row once when streams start together", async () => {
@@ -388,16 +396,14 @@ describe("streams of one connection publish together", () => {
         },
       },
     };
-    const results = await publishConnection(logged, CONNECTION_ID, {
-      streamConcurrency: 6,
-    });
+    const results = await publishConnection(logged, CONNECTION_ID);
     expect(results.map((r) => r.stream)).toEqual(names);
     expect(finished).not.toEqual(names);
     expect(finished).toHaveLength(6);
   });
 
   it("a control row deleted mid-publish purges, and nothing is written after the purge", async () => {
-    // Every part upload waits for the test, so four streams sit in transfer.
+    // Every part upload waits for the test, so all six streams sit in transfer.
     const parked: { key: string; release: () => void }[] = [];
     const { deps, calls, purges, innerRegistry } = await world({
       streams: 6,
@@ -407,7 +413,7 @@ describe("streams of one connection publish together", () => {
           : Promise.resolve(),
     });
     const publishing = publishConnection(deps, CONNECTION_ID);
-    await vi.waitFor(() => expect(parked).toHaveLength(4));
+    await vi.waitFor(() => expect(parked).toHaveLength(6));
     // Another writer deletes the connection. The control row is at version 1.
     await tombstoneControl(innerRegistry, 2);
     // Only the first stream continues: its head upload and commit find it.
@@ -462,9 +468,7 @@ describe("streams of one connection publish together", () => {
       streams: 2,
       holdPut: (key) => (/\.s0\/.*-p-/.test(key) ? parked : Promise.resolve()),
     });
-    const publishing = publishConnection(deps, CONNECTION_ID, {
-      streamConcurrency: 2,
-    });
+    const publishing = publishConnection(deps, CONNECTION_ID);
     await vi.waitFor(async () =>
       expect(
         await db.query(
@@ -486,9 +490,7 @@ describe("streams of one connection publish together", () => {
 
   it("every stream that started reports the purge and nothing is written", async () => {
     const { deps, calls, innerRegistry } = await world({ streams: 4 });
-    const first = await publishConnection(deps, CONNECTION_ID, {
-      streamConcurrency: 1,
-    });
+    const first = await publishConnection(deps, CONNECTION_ID);
     expect(first.every((r) => r.outcome === "published")).toBe(true);
     // New rows in every stream, so every stream has work; then the control
     // row is deleted before the next publish starts.
@@ -529,7 +531,6 @@ describe("streams of one connection publish together", () => {
     const results: readonly PublishResult[] = await publishConnection(
       deps,
       CONNECTION_ID,
-      { streamConcurrency: 4 },
     );
     // All four started together; each found the purge.
     expect(results.map((r) => [r.stream, r.outcome])).toEqual([
@@ -693,10 +694,10 @@ describe("streams of one connection publish together", () => {
     );
   });
 
-  it("on a failure starts no new stream, drains the running ones and throws the earliest stream's error", async () => {
-    // Three of six streams run at once. Each parks at its first part upload
-    // on a gate the test controls: s0 will succeed, s1 and s2 will fail, in the
-    // reverse of stream order. s3 to s5 wait for a free worker.
+  it("on a failure waits for every running stream and throws the earliest stream's error", async () => {
+    // All six streams start. Each parks at its first part upload on a gate the
+    // test controls: s1 and s2 will fail, in the reverse of stream order, and
+    // the others will succeed.
     type Gate = { settle: (error?: Error) => void; promise: Promise<void> };
     const gates = new Map<string, Gate>();
     const gateFor = (stream: string): Gate => {
@@ -720,55 +721,266 @@ describe("streams of one connection publish together", () => {
           : Promise.resolve(),
     });
     let settled = false;
-    const publishing = publishConnection(deps, CONNECTION_ID, {
-      streamConcurrency: 3,
-    });
+    const publishing = publishConnection(deps, CONNECTION_ID);
     const outcome = publishing.then(
       () => (settled = true),
       () => (settled = true),
     );
-    // Deferred gates control upload order. A few setImmediate turns, not
-    // timers: whatever a failure would set going has run.
+    // A few setImmediate turns, not timers: whatever a failure would set going
+    // has run.
     const quiet = async () => {
       for (let turn = 0; turn < 10; turn++)
         await new Promise<void>((r) => setImmediate(r));
     };
-    const started = (pattern: RegExp) =>
-      calls.some((c) => pattern.test(c.scope));
     await vi.waitFor(() =>
-      expect([...gates.keys()].sort()).toEqual(["s0", "s1", "s2"]),
+      expect([...gates.keys()].sort()).toEqual([
+        "s0",
+        "s1",
+        "s2",
+        "s3",
+        "s4",
+        "s5",
+      ]),
     );
 
-    // The later stream fails first: nothing new starts, nothing is rejected yet.
+    // The later stream fails first: nothing is rejected yet.
     gates.get("s2")!.settle(new Error("s2 upload failed"));
     await quiet();
     expect(settled).toBe(false);
-    expect(started(/\.s[345]\b/)).toBe(false);
 
-    // The earlier stream fails second: still waiting for s0.
+    // The earlier stream fails second: still waiting for the others.
     gates.get("s1")!.settle(new Error("s1 upload failed"));
     await quiet();
     expect(settled).toBe(false);
-    expect(started(/\.s[345]\b/)).toBe(false);
 
-    // s0 finishes; only then does the publish end, with the earliest error.
-    gates.get("s0")!.settle();
+    // The rest finish; only then does the publish end, with the earliest error.
+    for (const stream of ["s0", "s3", "s4", "s5"]) gates.get(stream)!.settle();
     await expect(publishing).rejects.toThrow("s1 upload failed");
     await outcome;
-    // The running stream was waited for: its head is posted before the rejection.
-    expect(
-      calls.some((c) => c.kind === "post" && c.scope.endsWith(".s0")),
-    ).toBe(true);
-    expect(started(/\.s[345]\b/)).toBe(false);
+    // The running streams were waited for: their heads are posted before the rejection.
+    for (const stream of ["s0", "s3", "s4", "s5"])
+      expect(
+        calls.some((c) => c.kind === "post" && c.scope.endsWith(`.${stream}`)),
+      ).toBe(true);
     // Every stream dropped its spool rows, the failed ones too.
     expect(await db.query("SELECT 1 FROM publish_spool")).toEqual([]);
   });
 
-  it("refuses a stream concurrency that is not a positive whole number", async () => {
-    const { deps } = await world({ streams: 1 });
-    for (const bad of [0, -1, 1.5, Number.NaN])
-      await expect(
-        publishConnection(deps, CONNECTION_ID, { streamConcurrency: bad }),
-      ).rejects.toThrow(/streamConcurrency/);
+  it("leaves a stream in the queue, not failed, when storage defers its upload", async () => {
+    const { deps, calls, db } = await world({
+      streams: 3,
+      holdPut: (key) =>
+        streamOfKey(key) === "s1" && /-p-/.test(key)
+          ? Promise.reject(
+              new StorageDeferredError(
+                180_000,
+                new Error("Storage PUT failed (429)"),
+              ),
+            )
+          : Promise.resolve(),
+    });
+    const results = await publishConnection(deps, CONNECTION_ID);
+    expect(results.map((r) => [r.stream, r.outcome])).toEqual([
+      ["s0", "published"],
+      ["s1", "backoff"],
+      ["s2", "published"],
+    ]);
+    // Nothing of the deferred stream was posted: its watermark did not move,
+    // so the next cycle sends it again.
+    expect(
+      calls.some((c) => c.kind === "post" && c.scope.endsWith(".s1")),
+    ).toBe(false);
+    expect(await db.query("SELECT 1 FROM publish_spool")).toEqual([]);
+  });
+});
+
+/** A memory budget that logs what is reserved and released, and can be made to wait or refuse. */
+function recordingGovernor(
+  reserveFirst?: (bytes: number, objectBytes?: number) => Promise<void>,
+) {
+  const state = { held: 0, peak: 0, reserves: [] as string[] };
+  const governor: NonNullable<StreamSyncBlobs["governor"]> = {
+    async reserve(bytes, objectBytes) {
+      state.reserves.push(`${bytes}/${objectBytes ?? "-"}`);
+      await reserveFirst?.(bytes, objectBytes);
+      state.held += bytes;
+      state.peak = Math.max(state.peak, state.held);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        state.held -= bytes;
+      };
+    },
+    window: () => ({
+      end: () => ({
+        window: 1,
+        requests: 0,
+        throttles: 0,
+        retryAfterWaitMs: 0,
+        peakBytesInFlight: 0,
+      }),
+    }),
+  };
+  return { state, governor };
+}
+
+describe("the memory budget is taken before data is built", () => {
+  it("holds a reservation at every encrypt and every upload, and gives all of it back", async () => {
+    const { state, governor } = recordingGovernor();
+    const heldAt = {
+      encrypt: [] as number[],
+      encryptPart: [] as number[],
+      put: [] as number[],
+    };
+    const { deps } = await world({
+      streams: 3,
+      attachments: true,
+      governor,
+      onEncrypt: (kind) => heldAt[kind].push(state.held),
+      holdPut: async () => void heldAt.put.push(state.held),
+    });
+    const results = await publishConnection(deps, CONNECTION_ID);
+    expect(results.map((r) => r.outcome)).toEqual(Array(3).fill("published"));
+    // 3 attachments and 3 heads are encrypted, 3 parts are encrypted: each
+    // with memory held, and each upload (attachment, part, head) too.
+    expect(heldAt.encrypt).toHaveLength(6);
+    expect(heldAt.encryptPart).toHaveLength(3);
+    expect(heldAt.put).toHaveLength(9);
+    for (const held of [
+      ...heldAt.encrypt,
+      ...heldAt.encryptPart,
+      ...heldAt.put,
+    ])
+      expect(held).toBeGreaterThan(0);
+    // An attachment is held twice (plain and encrypted) and named by its own size.
+    const attachment = new TextEncoder().encode("attachment of s0").length;
+    expect(state.reserves).toContain(`${2 * attachment}/${attachment}`);
+    // One reservation per part and one per head (each a part-target unit
+    // that names no object), and one per attachment: nothing is built
+    // unreserved, and a sibling's reservation cannot stand in for it.
+    expect(state.reserves.filter((r) => r.endsWith("/-"))).toHaveLength(6);
+    expect(state.reserves).toHaveLength(9);
+    expect(state.held).toBe(0);
+  });
+
+  it("keeps a part's own reservation until its upload has ended", async () => {
+    // One stream, so no sibling's reservation can stand in for the part's.
+    const { state, governor } = recordingGovernor();
+    const heldAtPut: Array<{ head: boolean; held: number }> = [];
+    const { deps } = await world({
+      streams: 1,
+      governor,
+      holdPut: async (key) => {
+        heldAtPut.push({ head: /\/h-/.test(key), held: state.held });
+      },
+    });
+    const results = await publishConnection(deps, CONNECTION_ID);
+    expect(results.map((r) => r.outcome)).toEqual(["published"]);
+    const part = heldAtPut.find((p) => !p.head);
+    const head = heldAtPut.find((p) => p.head);
+    expect(part?.held).toBe(4 * 1024 * 1024);
+    expect(head?.held).toBeGreaterThanOrEqual(4 * 1024 * 1024);
+    expect(state.held).toBe(0);
+  });
+
+  it("builds and encrypts nothing for any stream while the budget is full", async () => {
+    let open!: () => void;
+    const full = new Promise<void>((resolve) => (open = resolve));
+    const { state, governor } = recordingGovernor(() => full);
+    let built = 0;
+    const { deps } = await world({
+      streams: 6,
+      attachments: true,
+      governor,
+      onEncrypt: () => built++,
+    });
+    const publishing = publishConnection(deps, CONNECTION_ID);
+    await vi.waitFor(() => expect(state.reserves.length).toBeGreaterThan(0));
+    await sleep(100);
+    expect(built).toBe(0);
+    expect(state.held).toBe(0);
+    open();
+    expect((await publishing).map((r) => r.outcome)).toEqual(
+      Array(6).fill("published"),
+    );
+    expect(state.held).toBe(0);
+  });
+
+  it("gives the memory back when an upload fails", async () => {
+    const { state, governor } = recordingGovernor();
+    const { deps } = await world({
+      streams: 2,
+      attachments: true,
+      governor,
+      holdPut: async (key) => {
+        if (/\/h-/.test(key)) throw new Error("head upload refused");
+      },
+    });
+    await expect(publishConnection(deps, CONNECTION_ID)).rejects.toThrow(
+      "head upload refused",
+    );
+    await vi.waitFor(() => expect(state.held).toBe(0));
+  });
+
+  it("fails with the store's own limit error, and posts no head, for an attachment it could never accept", async () => {
+    const { governor } = recordingGovernor(async (_bytes, objectBytes) => {
+      if (objectBytes !== undefined && objectBytes > 10)
+        throw new StorageObjectTooLargeError(objectBytes, 10);
+    });
+    const w = await world({ streams: 1, attachments: true, governor });
+    await expect(
+      publishConnection(w.deps, CONNECTION_ID),
+    ).rejects.toBeInstanceOf(StorageObjectTooLargeError);
+    // The control row is settled before any transfer; no stream head is posted.
+    expect(
+      w.calls.filter((c) => c.kind === "post" && c.scope !== CONTROL),
+    ).toEqual([]);
+  });
+});
+
+describe("the uploads of every stream's wave go through one send gate", () => {
+  it("never has more requests on the wire than the gate's window, with every stream's wave started", async () => {
+    let onWire = 0;
+    let peak = 0;
+    const wire = async <T>(work: () => Promise<T>): Promise<T> => {
+      onWire += 1;
+      peak = Math.max(peak, onWire);
+      try {
+        await sleep(40);
+        return await work();
+      } finally {
+        onWire -= 1;
+      }
+    };
+    const partBytes = 4 * 1024 * 1024;
+    const { deps } = await world({
+      streams: 6,
+      attachments: true,
+      store: (inner) =>
+        createStorageStreamSyncBlobs(
+          {
+            urlForKey: (key: string) => key,
+            upload: (key: string, bytes: Uint8Array) =>
+              wire(async () => (await inner.put(key, bytes), key)),
+            download: (url: string) =>
+              wire(async () => (await inner.get(url)) ?? new Uint8Array()),
+            exists: (url: string) => wire(() => inner.exists(url)),
+            delete: async () => true,
+          } as never,
+          {
+            ...DEFAULT_STORAGE_ACCESS_POLICY,
+            // The window may grow to two requests, no further.
+            maxBytesInFlight: 2 * partBytes,
+            partBytes,
+          },
+        ),
+    });
+    const results = await publishConnection(deps, CONNECTION_ID);
+    expect(results.map((r) => r.outcome)).toEqual(Array(6).fill("published"));
+    // Six streams each start an attachment, a part and a head together: 18
+    // uploads want to leave. The gate lets two out at most.
+    expect(peak).toBeGreaterThanOrEqual(1);
+    expect(peak).toBeLessThanOrEqual(2);
   });
 });
