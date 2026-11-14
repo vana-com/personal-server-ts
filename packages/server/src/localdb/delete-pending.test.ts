@@ -9,6 +9,7 @@ import {
   createMemoryStreamSyncRegistry,
   type MemoryStreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { RegistryRefusedError } from "../../../core/src/stream-sync/ports.js";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import { createLocalSync } from "../../../core/src/localdb/sync.js";
@@ -23,7 +24,9 @@ afterEach(async () => {
 });
 
 /** One device with a delete that the gateway refuses to finish. */
-async function stuckDelete() {
+async function stuckDelete(
+  controlReply?: "conflict" | "refused" | "unconfirmed",
+) {
   const keys = {
     namespaceHmac: async () => new Uint8Array(32),
     encrypt: async (_s: string, b: Uint8Array) => b,
@@ -78,9 +81,20 @@ async function stuckDelete() {
     deleteRetryMs: { first: 5, max: 20 },
   });
   syncs.push(sync);
-  registry.beforePost = async () => {
-    throw new Error("gateway refused");
-  };
+  if (controlReply) {
+    const real = registry.post.bind(registry);
+    vi.spyOn(registry, "post").mockImplementation(async (req) => {
+      if (req.scope !== fixture.control) return real(req);
+      if (controlReply === "refused")
+        throw new RegistryRefusedError("refused", 409);
+      return controlReply === "conflict"
+        ? { kind: "conflict", latestVersion: "1" }
+        : { kind: "committed" };
+    });
+  } else
+    registry.beforePost = async () => {
+      throw new Error("gateway refused");
+    };
   await sync.deleter.requestConnectionDelete("fixture-source");
   const begin = (id: string, connect: boolean) =>
     sync.intake.begin(id, {
@@ -166,3 +180,18 @@ it("explicit resume clears the armed retry after finishing the delete", async ()
   await vi.advanceTimersByTimeAsync(100);
   expect(queries).not.toHaveBeenCalled();
 });
+
+it.each(["conflict", "refused", "unconfirmed"] as const)(
+  "unchanged control %s keeps reconnect retriable through the sync API",
+  async (reply) => {
+    const f = await stuckDelete(reply);
+    await expect(f.begin("blocked", true)).rejects.toMatchObject({
+      code: "delete_pending",
+      status: 409,
+    });
+    expect(await f.intents()).toHaveLength(1);
+    vi.mocked(f.registry.post).mockRestore();
+    expect(await f.sync.deleter.resumeDeletes()).toEqual([]);
+    expect((await f.begin("reconnected", true)).status).toBe("collecting");
+  },
+);
