@@ -60,17 +60,46 @@ export interface DeleteIntent {
   readonly id?: string;
   readonly pins: readonly { readonly ns: string; readonly version: number }[];
   readonly streams?: readonly StreamPin[];
+  /**
+   * The control tombstones this delete confirmed, one per namespace. `version`
+   * is the tombstone's registry version, always its pin + 1. A namespace named
+   * here is fenced: stream cleanup under it removes only data of the lifetime
+   * the pin names or an earlier one. A namespace not named here (an older
+   * intent, a control row of another key, no control row) is cleaned and
+   * finished the way it was before fences existed.
+   */
+  readonly fences?: readonly {
+    readonly ns: string;
+    readonly version: number;
+  }[];
+  /** Cleanup only: every stream of the intent is tombstoned. Says nothing of the control row. */
   readonly streamsLanded?: true;
 }
 export interface PendingDelete {
   readonly connector: string;
   readonly why: string;
 }
+/**
+ * What a delete request tells its caller. `fenced` is true when the control
+ * tombstone is confirmed in the registry (or there is no control row to
+ * tombstone): every other surface now sees the connection as deleted and
+ * refuses its data. It is false while the registry has not confirmed it: other
+ * surfaces still see the connection, and data they publish before the fence
+ * lands is deleted with the rest. Either way stream cleanup goes on in the
+ * background until it finishes.
+ */
+export interface ConnectionDeleteRequest {
+  readonly deleteId: string;
+  readonly fenced: boolean;
+}
 export interface ConnectionDeleter {
-  requestConnectionDelete(
-    connector: string,
-  ): Promise<{ readonly deleteId: string }>;
+  requestConnectionDelete(connector: string): Promise<ConnectionDeleteRequest>;
   resumeDeletes(): Promise<readonly PendingDelete[]>;
+}
+/** One running landing: when its fence phase ended, and when all of it did. */
+interface Landing {
+  readonly fenced: Promise<boolean>;
+  readonly done: Promise<void>;
 }
 const keccak = async (bytes: Uint8Array) => keccak_256(bytes);
 const ATTEMPTS = 8;
@@ -83,7 +112,7 @@ export function createConnectionDeleter(
     readonly eraseLegacy?: (connector: string) => Promise<void>;
   },
 ): ConnectionDeleter {
-  const flights = new Map<string, Promise<void>>();
+  const flights = new Map<string, Landing>();
   const keyInfo = async () => {
     const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
     return { keyCheck, hashes: await controlHashes(keccak, keyCheck) };
@@ -105,6 +134,11 @@ export function createConnectionDeleter(
       (intent.streams !== undefined && !Array.isArray(intent.streams))
     )
       throw new Error("invalid stored delete intent");
+    for (const fence of intent.fences ?? []) {
+      const pin = intent.pins.find((p) => p.ns === fence.ns);
+      if (!pin || fence.version !== pin.version + 1)
+        throw new Error("invalid stored delete intent");
+    }
     for (const pin of intent.pins) controlScope(connector, pin.ns);
     for (const pin of intent.streams ?? [])
       streamScope(connector, pin.ns, pin.stream);
@@ -257,187 +291,390 @@ export function createConnectionDeleter(
       signature,
     });
   }
-  async function land(connector: string) {
-    let intent = await readIntent(connector);
-    if (!intent) return;
-    const { keyCheck, hashes } = await keyInfo();
+  /**
+   * Land the control tombstone of one namespace: the delete's single
+   * linearization point. Other surfaces read the control row to decide the
+   * connection exists, and the gateway checks it in the transaction of every
+   * publish, so once it is tombstoned no publish of the ended lifetime lands.
+   *
+   * The post is a CAS at `pin + 1`, sent blind and then confirmed by a read:
+   * a lost reply, a reply that never arrives, a conflict and a registry that
+   * lags all end in the same read. Any control version at or above the
+   * tombstone's proves it landed, whoever wrote it (it may already have been
+   * followed by a reconnect), so a fence is never posted twice and never
+   * judged "superseded".
+   */
+  async function landFence(
+    connector: string,
+    pin: { readonly ns: string; readonly version: number },
+    hashes: Awaited<ReturnType<typeof keyInfo>>["hashes"],
+  ) {
+    const scope = controlScope(connector, pin.ns);
     try {
-      if (!intent.streamsLanded) {
-        for (const target of intent.streams ?? []) {
-          const scope = streamScope(connector, target.ns, target.stream);
-          let finished = false;
-          let signedPin = target.pin;
-          // A rejected CAS spends one of ATTEMPTS, and so does a landed CAS that
-          // the next read no longer shows. A landed CAS the next read confirms
-          // is free: confirming it must not consume the attempt that won.
-          let spent = 0;
-          let landed = false;
-          for (;;) {
-            const row = await deps.registry.read(scope);
-            const now = classifyControl(
-              await deps.registry.read(controlScope(connector, target.ns)),
-              hashes,
-            );
-            const pin = intent.pins.find((p) => p.ns === target.ns);
-            const holds = target.control
-              ? sameControl(now, target.control)
-              : pin
-                ? (now.kind === "active"
-                    ? now.generation
-                    : now.kind === "foreign"
-                      ? now.version
-                      : -1) === pin.version
-                : now.kind === "absent";
-            if (!holds) throw new ConnectionDeleteSuperseded(connector);
-            // A completed delete already fences this lifetime. Keep its row,
-            // including its version and hashes, even on a device with no local state.
-            if (
-              now.kind === "deleted" &&
-              row.found &&
-              deleteEndedEarlierLifetime(scope, row, now.version)
-            ) {
-              finished = true;
-              break;
-            }
-            if (now.kind === "foreign")
-              throw new Error(
-                "stream delete pending without ended generation proof",
+      await signPost(
+        scope,
+        hashes.tombstoneData,
+        hashes.tombstoneMetadata,
+        pin.version + 1,
+      );
+    } catch (error) {
+      if (!(error instanceof RegistryRefusedError && error.status === 409))
+        throw error;
+    }
+    const after = classifyControl(await deps.registry.read(scope), hashes);
+    const landed =
+      after.kind === "deleted"
+        ? after.version >= pin.version + 1
+        : after.kind === "active" && after.generation > pin.version;
+    if (!landed)
+      throw new Error("control fence pending without confirmed tombstone");
+  }
+
+  /** Wait for every promise; throw the first failure, a supersession only if nothing else failed. */
+  async function settleAll(work: readonly Promise<unknown>[]) {
+    const results = await Promise.allSettled(work);
+    const failures = results.flatMap((r) =>
+      r.status === "rejected" ? [r.reason] : [],
+    );
+    const real = failures.find(
+      (e) => !(e instanceof ConnectionDeleteSuperseded),
+    );
+    if (real !== undefined) throw real;
+    if (failures.length > 0) throw failures[0];
+  }
+
+  async function land(
+    connector: string,
+    fencePhaseEnded: (fenced: boolean) => void,
+  ) {
+    const stored = await readIntent(connector);
+    if (!stored) {
+      fencePhaseEnded(true);
+      return;
+    }
+    let intent: DeleteIntent = stored;
+    const { keyCheck, hashes } = await keyInfo();
+    // Streams are cleaned in parallel and each saves its own pin, so saves
+    // run in the order the intent changed.
+    let saved: Promise<unknown> = Promise.resolve();
+    const persist = (change: (current: DeleteIntent) => DeleteIntent) => {
+      const next = change(intent);
+      intent = next;
+      saved = saved.then(() => save(connector, next));
+      return saved;
+    };
+    const fencedAt = (ns: string) => {
+      const fence = intent.fences?.find((f) => f.ns === ns);
+      return fence && intent.pins.find((p) => p.ns === ns)?.version;
+    };
+    /**
+     * One stream's tombstone. Under a fence the stream is cleaned against the
+     * lifetime the fence ended (`ended`), not against the control row, which
+     * has since been tombstoned and may have been reconnected: the row is
+     * tombstoned only when it holds data of that lifetime or an earlier one,
+     * and a row of a later lifetime is left as it is. Without a fence the
+     * control row must still be the one the plan saw.
+     */
+    async function cleanStream(
+      connector: string,
+      target: StreamPin,
+      hashes: Awaited<ReturnType<typeof keyInfo>>["hashes"],
+      keyCheck: string,
+    ) {
+      const scope = streamScope(connector, target.ns, target.stream);
+      let finished = false;
+      let signedPin = target.pin;
+      // A rejected CAS spends one of ATTEMPTS, and so does a landed CAS that
+      // the next read no longer shows. A landed CAS the next read confirms
+      // is free: confirming it must not consume the attempt that won.
+      let spent = 0;
+      let landed = false;
+      for (;;) {
+        const row = await deps.registry.read(scope);
+        const ended = fencedAt(target.ns);
+        // Fenced: the lifetime this delete ended, as the control row said
+        // before the fence. Otherwise the control row now.
+        const now: ControlState =
+          ended !== undefined
+            ? { kind: "active", generation: ended }
+            : classifyControl(
+                await deps.registry.read(controlScope(connector, target.ns)),
+                hashes,
               );
-            // A deleted control at v fences every active generation <= v.
-            // Use v as a conservative boundary when the old marker has lost
-            // its proof: reconnect must create active(v+1). This does not
-            // infer a lost active generation or weaken the reader's rule.
-            // With no control, the first lifetime is generation 1, matching
-            // the empty delete head, so the legacy v1 marker remains usable.
-            const ended =
-              now.kind === "active"
-                ? now.generation
-                : now.kind === "deleted"
-                  ? now.version
-                  : undefined;
-            // With a known lifetime, only its v2 metadata proves the boundary.
-            // A tombstoned row or a head fence cannot substitute for that proof.
-            const marked = (version: number, hash: string) =>
-              (now.kind === "absent" &&
-                hash.toLowerCase() === deleteMetadataHash(scope, version)) ||
-              (ended !== undefined &&
-                hash.toLowerCase() ===
-                  endedGenerationDeleteMetadataHash(scope, version, ended));
-            let lastDelete =
-              row.found &&
-              ((now.kind === "absent" &&
-                classifyStreamRow(row, hashes) === "tombstoned") ||
-                marked(row.version, row.metadataHash))
-                ? row.version
-                : 0;
-            if (
-              now.kind === "absent" &&
-              row.found &&
-              lastDelete === 0 &&
-              signedPin !== undefined
-            ) {
-              try {
-                const cipher = await deps.blobs.get(
-                  `${scope}/${headBlobName(row.dataHash)}`,
-                );
-                if (cipher) {
-                  const verified = await verifyHead(
-                    keccak,
-                    await deps.keys.decrypt(scope, cipher),
-                    {
-                      dataHash: row.dataHash,
-                      connector,
-                      ns: target.ns,
-                      stream: target.stream,
-                      keyCheck,
-                    },
-                  );
-                  if (verified.kind === "ok")
-                    lastDelete = verified.head.lastDeleteVersion ?? 0;
-                }
-              } catch {
-                // Deleting requires the control pin and CAS, never a readable old head.
-              }
-            }
-            if (
-              signedPin === undefined ? lastDelete > 0 : lastDelete >= signedPin
-            ) {
-              finished = true;
-              break;
-            }
-            if (landed) spent++;
-            if (spent >= ATTEMPTS) break;
-            const version = row.found ? row.version + 1 : 1;
-            const head = encodeHead({
-              format: HEAD_FORMAT,
-              connector,
-              ns: target.ns,
-              stream: target.stream,
-              generation: 1,
-              keyCheck,
-              lastDeleteVersion: version,
-              complete: false,
-              observedAt: deps.now(),
-              parts: [],
-              primaryKey: ["id"],
-              profile: { key: null, version: "0.0.0" },
-              recordCount: 0,
-            });
-            const digest = await digestHead(keccak, head);
-            await deps.blobs.put(
-              `${scope}/${digest.blobName}`,
-              await deps.keys.encrypt(scope, head),
-            );
-            intent = {
-              ...intent,
-              streams: intent.streams!.map((p) =>
-                p.ns === target.ns && p.stream === target.stream
-                  ? { ...p, pin: version }
-                  : p,
-              ),
-            };
-            await save(connector, intent);
-            let conflict = false;
-            try {
-              conflict =
-                (
-                  await signPost(
-                    scope,
-                    digest.dataHash,
-                    ended === undefined
-                      ? deleteMetadataHash(scope, version)
-                      : endedGenerationDeleteMetadataHash(
-                          scope,
-                          version,
-                          ended,
-                        ),
-                    version,
-                  )
-                ).kind === "conflict";
-            } catch (error) {
-              if (!(
-                error instanceof RegistryRefusedError && error.status === 409
-              ))
-                throw error;
-              conflict = true;
-            }
-            if (conflict) {
-              await new Promise<void>((resolve) =>
-                setTimeout(resolve, Math.min(10 * 2 ** spent, 1000)),
-              );
-              spent++;
-            }
-            landed = !conflict;
-            // The next authoritative read proves whether this pin landed.
-            signedPin = version;
-          }
-          if (!finished)
-            throw new Error("stream delete pending after version conflicts");
+        if (ended === undefined) {
+          const pin = intent.pins.find((p) => p.ns === target.ns);
+          const holds = target.control
+            ? sameControl(now, target.control)
+            : pin
+              ? (now.kind === "active"
+                  ? now.generation
+                  : now.kind === "foreign"
+                    ? now.version
+                    : -1) === pin.version
+              : now.kind === "absent";
+          if (!holds) throw new ConnectionDeleteSuperseded(connector);
         }
-        intent = { ...intent, streamsLanded: true };
-        await save(connector, intent);
+        // A completed delete already fences this lifetime. Keep its row,
+        // including its version and hashes, even on a device with no local state.
+        if (
+          now.kind === "deleted" &&
+          row.found &&
+          deleteEndedEarlierLifetime(scope, row, now.version)
+        ) {
+          finished = true;
+          break;
+        }
+        if (now.kind === "foreign")
+          throw new Error(
+            "stream delete pending without ended generation proof",
+          );
+        // A deleted control at v fences every active generation <= v.
+        // Use v as a conservative boundary when the old marker has lost
+        // its proof: reconnect must create active(v+1). This does not
+        // infer a lost active generation or weaken the reader's rule.
+        // With no control, the first lifetime is generation 1, matching
+        // the empty delete head, so the legacy v1 marker remains usable.
+        const endedGeneration =
+          now.kind === "active"
+            ? now.generation
+            : now.kind === "deleted"
+              ? now.version
+              : undefined;
+        // With a known lifetime, only its v2 metadata proves the boundary.
+        // A tombstoned row or a head fence cannot substitute for that proof.
+        const marked = (version: number, hash: string) =>
+          (now.kind === "absent" &&
+            hash.toLowerCase() === deleteMetadataHash(scope, version)) ||
+          (endedGeneration !== undefined &&
+            hash.toLowerCase() ===
+              endedGenerationDeleteMetadataHash(
+                scope,
+                version,
+                endedGeneration,
+              ));
+        let lastDelete =
+          row.found &&
+          ((now.kind === "absent" &&
+            classifyStreamRow(row, hashes) === "tombstoned") ||
+            marked(row.version, row.metadataHash))
+            ? row.version
+            : 0;
+        if (
+          now.kind === "absent" &&
+          row.found &&
+          lastDelete === 0 &&
+          signedPin !== undefined
+        ) {
+          try {
+            const cipher = await deps.blobs.get(
+              `${scope}/${headBlobName(row.dataHash)}`,
+            );
+            if (cipher) {
+              const verified = await verifyHead(
+                keccak,
+                await deps.keys.decrypt(scope, cipher),
+                {
+                  dataHash: row.dataHash,
+                  connector,
+                  ns: target.ns,
+                  stream: target.stream,
+                  keyCheck,
+                },
+              );
+              if (verified.kind === "ok")
+                lastDelete = verified.head.lastDeleteVersion ?? 0;
+            }
+          } catch {
+            // Deleting requires the control pin and CAS, never a readable old head.
+          }
+        }
+        if (
+          signedPin === undefined ? lastDelete > 0 : lastDelete >= signedPin
+        ) {
+          finished = true;
+          break;
+        }
+        if (landed) spent++;
+        if (spent >= ATTEMPTS) break;
+        const version = row.found ? row.version + 1 : 1;
+        const head = encodeHead({
+          format: HEAD_FORMAT,
+          connector,
+          ns: target.ns,
+          stream: target.stream,
+          generation: 1,
+          keyCheck,
+          lastDeleteVersion: version,
+          complete: false,
+          observedAt: deps.now(),
+          parts: [],
+          primaryKey: ["id"],
+          profile: { key: null, version: "0.0.0" },
+          recordCount: 0,
+        });
+        const digest = await digestHead(keccak, head);
+        // Under a fence, the row must hold nothing newer than the ended
+        // lifetime before it is tombstoned. The check runs beside the head
+        // upload (a head blob is content-addressed and harmless if unused).
+        const oldDataOnly =
+          ended !== undefined &&
+          row.found &&
+          classifyStreamRow(row, hashes) !== "tombstoned"
+            ? holdsEndedLifetimeOnly(
+                connector,
+                target,
+                row,
+                ended,
+                hashes,
+                keyCheck,
+              )
+            : Promise.resolve(true);
+        const [olderOnly] = await Promise.all([
+          oldDataOnly,
+          deps.keys
+            .encrypt(scope, head)
+            .then((cipher) =>
+              deps.blobs.put(`${scope}/${digest.blobName}`, cipher),
+            ),
+        ]);
+        if (!olderOnly) {
+          // A later lifetime owns this row. It is not this delete's to remove.
+          finished = true;
+          break;
+        }
+        await persist((current) => ({
+          ...current,
+          streams: current.streams!.map((p) =>
+            p.ns === target.ns && p.stream === target.stream
+              ? { ...p, pin: version }
+              : p,
+          ),
+        }));
+        let conflict = false;
+        try {
+          conflict =
+            (
+              await signPost(
+                scope,
+                digest.dataHash,
+                endedGeneration === undefined
+                  ? deleteMetadataHash(scope, version)
+                  : endedGenerationDeleteMetadataHash(
+                      scope,
+                      version,
+                      endedGeneration,
+                    ),
+                version,
+              )
+            ).kind === "conflict";
+        } catch (error) {
+          if (!(error instanceof RegistryRefusedError && error.status === 409))
+            throw error;
+          conflict = true;
+        }
+        if (conflict) {
+          await new Promise<void>((resolve) =>
+            setTimeout(resolve, Math.min(10 * 2 ** spent, 1000)),
+          );
+          spent++;
+        }
+        landed = !conflict;
+        // The next authoritative read proves whether this pin landed.
+        signedPin = version;
       }
-      for (const pin of intent.pins) {
+      if (!finished)
+        throw new Error("stream delete pending after version conflicts");
+    }
+
+    /**
+     * Whether a live stream row holds data of the ended lifetime (`ended`) or
+     * an earlier one only. `row` was read before this runs.
+     *
+     * While the control row still reads exactly the fence (deleted at
+     * `ended + 1`), no later lifetime exists, and none can have published
+     * before this read: a publish needs an active control row of its own
+     * generation. Otherwise the control row has moved (a reconnect), and the
+     * head's own generation says which lifetime wrote the row. A head that
+     * cannot be read then leaves the question open, and the delete stays
+     * pending rather than guess.
+     */
+    async function holdsEndedLifetimeOnly(
+      connector: string,
+      target: StreamPin,
+      row: Extract<
+        Awaited<ReturnType<LocalSyncDeps["registry"]["read"]>>,
+        { found: true }
+      >,
+      ended: number,
+      hashes: Awaited<ReturnType<typeof keyInfo>>["hashes"],
+      keyCheck: string,
+    ): Promise<boolean> {
+      const control = classifyControl(
+        await deps.registry.read(controlScope(connector, target.ns)),
+        hashes,
+      );
+      if (control.kind === "deleted" && control.version === ended + 1)
+        return true;
+      const scope = streamScope(connector, target.ns, target.stream);
+      const cipher = await deps.blobs.get(
+        `${scope}/${headBlobName(row.dataHash)}`,
+      );
+      if (cipher) {
+        const verified = await verifyHead(
+          keccak,
+          await deps.keys.decrypt(scope, cipher),
+          {
+            dataHash: row.dataHash,
+            connector,
+            ns: target.ns,
+            stream: target.stream,
+            keyCheck,
+          },
+        );
+        if (verified.kind === "ok") return verified.head.generation <= ended;
+      }
+      throw new Error(
+        "stream delete pending: the lifetime of the stream's head is unproven",
+      );
+    }
+
+    try {
+      // Phase 1, the fence. A control row of another key is not tombstoned
+      // here: its streams cannot be proven and stay pending as before.
+      const foreign = new Set(
+        (intent.streams ?? [])
+          .filter((s) => s.control?.kind === "foreign")
+          .map((s) => s.ns),
+      );
+      await settleAll(
+        intent.pins
+          .filter((p) => fencedAt(p.ns) === undefined && !foreign.has(p.ns))
+          .map(async (pin) => {
+            await landFence(connector, pin, hashes);
+            await persist((current) => ({
+              ...current,
+              fences: [
+                ...(current.fences ?? []),
+                { ns: pin.ns, version: pin.version + 1 },
+              ],
+            }));
+          }),
+      );
+      const unfenced = () =>
+        intent.pins.filter((p) => fencedAt(p.ns) === undefined);
+      fencePhaseEnded(unfenced().length === 0);
+      // Phase 2, cleanup. Each stream is its own scope with its own CAS, so
+      // streams do not wait for one another.
+      if (!intent.streamsLanded) {
+        await settleAll(
+          (intent.streams ?? []).map((target) =>
+            cleanStream(connector, target, hashes, keyCheck),
+          ),
+        );
+        await persist((current) => ({ ...current, streamsLanded: true }));
+      }
+      // Control rows that no fence covered (another key's): the old order.
+      for (const pin of unfenced()) {
         const scope = controlScope(connector, pin.ns);
         try {
           await signPost(
@@ -462,25 +699,35 @@ export function createConnectionDeleter(
           throw new ConnectionDeleteSuperseded(connector);
         }
       }
+      await saved;
       await purgeLocal(connector, intent);
       await options.eraseLegacy?.(connector);
       await clear(connector, intent.id!);
     } catch (error) {
+      await saved.catch(() => undefined);
       if (error instanceof ConnectionDeleteSuperseded)
         await clear(connector, intent.id!);
       throw error;
     }
   }
-  function schedule(connector: string): Promise<void> {
+  function schedule(connector: string): Landing {
     const held = flights.get(connector);
     if (held) return held;
-    const task = deps.queue
-      .run(`delete:${connector}`, "purge", () => land(connector))
+    let fencePhaseEnded!: (fenced: boolean) => void;
+    const fenced = new Promise<boolean>(
+      (resolve) => (fencePhaseEnded = resolve),
+    );
+    const done: Promise<void> = deps.queue
+      .run(`delete:${connector}`, "purge", () =>
+        land(connector, fencePhaseEnded),
+      )
       .finally(() => {
-        if (flights.get(connector) === task) flights.delete(connector);
+        fencePhaseEnded(false); // a landing that failed before its fence says "not fenced"
+        if (flights.get(connector) === landing) flights.delete(connector);
       });
-    flights.set(connector, task);
-    return task;
+    const landing: Landing = { fenced, done };
+    flights.set(connector, landing);
+    return landing;
   }
   return {
     async requestConnectionDelete(connector) {
@@ -509,14 +756,17 @@ export function createConnectionDeleter(
           return planned.intent;
         },
       );
-      if (!intent) return { deleteId: deps.newOp() };
-      void schedule(connector).catch((error) =>
+      if (!intent) return { deleteId: deps.newOp(), fenced: true };
+      const landing = schedule(connector);
+      landing.done.catch((error) =>
         deps.logger.warn(
           { connector, reason: error instanceof Error ? error.name : "Error" },
           "connection delete pending",
         ),
       );
-      return { deleteId: intent.id! };
+      // The request waits for the fence only: one registry write and its
+      // confirming read. Cleanup keeps running after the answer.
+      return { deleteId: intent.id!, fenced: await landing.fenced };
     },
     async resumeDeletes() {
       const rows = await deps.db.query<{ connector: string }>(
@@ -525,7 +775,7 @@ export function createConnectionDeleter(
       const pending: PendingDelete[] = [];
       for (const { connector } of rows) {
         try {
-          await schedule(connector);
+          await schedule(connector).done;
         } catch (error) {
           pending.push({
             connector,

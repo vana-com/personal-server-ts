@@ -12,13 +12,24 @@
  * storage-mode change owns it, after owner authorization.
  *
  * Answers:
- *   202 { deleteId }            the delete intent is durable; the landing runs
- *                               in the writer and retries until it lands. When
- *                               the registry lists nothing of the connector,
- *                               the writer purges this device's local state
- *                               and the delete is already done. A reconnect
- *                               that lands before the delete keeps its data:
- *                               the delete skips what the reconnect moved
+ *   202 { deleteId, fenced }    the delete intent is durable; the landing runs
+ *                               in the writer and retries until it lands. The
+ *                               control tombstone lands first and the request
+ *                               waits for it: `fenced: true` means the
+ *                               registry confirmed it, so every other surface
+ *                               already sees the source as deleted and its
+ *                               streams are being cleaned in the background.
+ *                               `fenced: false` means the registry has not
+ *                               confirmed it (unreachable, refused): the
+ *                               delete is only saved here, other surfaces
+ *                               still see the source, and what they publish
+ *                               before the fence lands is deleted with it.
+ *                               When the registry lists nothing of the
+ *                               connector, the writer purges this device's
+ *                               local state and the delete is already done
+ *                               (`fenced: true`). A reconnect that lands
+ *                               before the cleanup keeps its data: cleanup
+ *                               removes only the lifetime the fence ended
  *   400 INVALID_CONNECTOR       the id is not a connector key
  *   409 NOT_SWITCHED            the account has not moved to stream sync
  *   503 ACCOUNT_MODE_UNKNOWN    the storage mode cannot be read yet; retry
@@ -46,7 +57,7 @@ export interface StorageModeRead {
 export interface ConnectionDeletePort {
   requestConnectionDelete(
     connector: string,
-  ): Promise<{ readonly deleteId: string }>;
+  ): Promise<{ readonly deleteId: string; readonly fenced: boolean }>;
 }
 
 export interface OwnerConnectorDeleteDeps {
@@ -78,8 +89,8 @@ export function ownerConnectorRefusal(
   );
 }
 
-function accepted(deleteId: string): Response {
-  return new Response(JSON.stringify({ deleteId }), {
+function accepted(deleteId: string, fenced: boolean): Response {
+  return new Response(JSON.stringify({ deleteId, fenced }), {
     status: 202,
     headers: {
       "content-type": "application/json",
@@ -142,7 +153,7 @@ export async function handleOwnerConnectorDelete(
   try {
     const started =
       await deps.connectionDelete.requestConnectionDelete(connectorId);
-    return accepted(started.deleteId);
+    return accepted(started.deleteId, started.fenced);
   } catch (error) {
     if (error instanceof ConnectorNotVerifiedError) {
       return ownerConnectorRefusal(
