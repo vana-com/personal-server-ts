@@ -1,4 +1,5 @@
 /** Encrypted registry fixtures shared by apply and Node composition tests. */
+import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/memory-registry.js";
 import { sha256 } from "@noble/hashes/sha2";
 import { keccak_256 } from "@noble/hashes/sha3";
 import {
@@ -58,6 +59,7 @@ export async function remoteFixture(
     },
   };
   const storage = {
+    governor: createMemoryStreamSyncBlobs().governor,
     get: async (key: string) => blobs.get(key) ?? null,
     exists: async (key: string) => blobs.has(key),
     put: async (key: string, bytes: Uint8Array) => {

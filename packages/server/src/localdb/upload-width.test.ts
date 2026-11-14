@@ -14,6 +14,7 @@ import type { SqlDriver } from "@opendatalabs/personal-server-ts-core/localdb";
 import { encodePrefixes } from "../../../core/src/localdb/encode.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import { createStorageStreamSyncBlobs } from "../../../core/src/stream-sync/blobs.js";
+import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/memory-registry.js";
 import {
   fakeClock,
   type FakeClock,
@@ -22,6 +23,7 @@ import {
   DEFAULT_STORAGE_ACCESS_POLICY,
   type StorageAccessPolicy,
 } from "../../../core/src/stream-sync/storage-retry.js";
+import type { StreamSyncBlobs } from "../../../core/src/stream-sync/ports.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 /** One PUT takes this long in storage, as measured: about 1 s each. */
@@ -77,9 +79,11 @@ interface Rig {
     peakHeldBytes: number;
     readonly startTimes: number[];
   };
-  readonly governor: NonNullable<
-    ReturnType<typeof createStorageStreamSyncBlobs>["governor"]
-  >;
+  readonly governor: ReturnType<
+    typeof createStorageStreamSyncBlobs
+  >["governor"];
+  /** Lets every parked PUT finish. */
+  readonly release: () => void;
   /** Runs `work` while stepping the fake clock whenever everything has gone quiet. */
   readonly drive: <T>(work: Promise<T>) => Promise<T>;
 }
@@ -93,6 +97,11 @@ async function rig(options: {
   readonly onFailureAnswer?: (put: PutContext) => void;
   /** Called for every PUT as it starts. */
   readonly onPutStart?: (put: PutContext) => void;
+  /**
+   * Use the in-memory store, with this policy, in place of the storage client,
+   * and park every PUT until `release` is called.
+   */
+  readonly parked?: { readonly policy: Partial<StorageAccessPolicy> };
 }): Promise<Rig> {
   const dir = mkdtempSync(join(process.cwd(), ".upload-width-"));
   dirs.push(dir);
@@ -167,14 +176,29 @@ async function rig(options: {
       return "";
     },
   };
-  const blobs = createStorageStreamSyncBlobs(adapter as never, {
-    ...DEFAULT_STORAGE_ACCESS_POLICY,
-    now: clock.now,
-    after: clock.after,
-    random: () => 0,
-    ...options.policy,
-  });
-  gate.governor = blobs.governor!;
+  let release!: () => void;
+  const parkedUntil = new Promise<void>((resolve) => (release = resolve));
+  const blobs: StreamSyncBlobs = options.parked
+    ? {
+        ...createMemoryStreamSyncBlobs(options.parked.policy),
+        put: async (_key, bytes) => {
+          stats.started += 1;
+          stats.onWire += 1;
+          stats.peakOnWire = Math.max(stats.peakOnWire, stats.onWire);
+          await parkedUntil;
+          stats.onWire -= 1;
+          stats.stored += 1;
+          stats.heldBytes -= 2 * bytes.length;
+        },
+      }
+    : createStorageStreamSyncBlobs(adapter as never, {
+        ...DEFAULT_STORAGE_ACCESS_POLICY,
+        now: clock.now,
+        after: clock.after,
+        random: () => 0,
+        ...options.policy,
+      });
+  gate.governor = blobs.governor;
   const deps = {
     db,
     blobs,
@@ -215,6 +239,7 @@ async function rig(options: {
     clock,
     stats,
     governor: gate.governor,
+    release,
     drive,
     publish: () => encodePrefixes(deps, INPUT),
   };
@@ -257,6 +282,30 @@ describe("a stream's part uploads are limited by the send gate and the byte budg
     expect(window.end().peakBytesInFlight).toBeLessThanOrEqual(
       budgetParts * 2 * PART,
     );
+  });
+
+  it("starts a bounded number of PUTs of a store whose PUTs stay parked, however many parts the stream has", async () => {
+    const budgetParts = 4;
+    const r = await rig({
+      parts: 48,
+      policy: {},
+      parked: { policy: { maxBytesInFlight: budgetParts * 2 * PART } },
+    });
+    const publishing = r.publish();
+    // Let the encoder run until it stops: every part it can encode has started.
+    let last = -1;
+    for (let quiet = 0; quiet < 6;) {
+      await realSleep(25);
+      quiet = r.stats.started === last ? quiet + 1 : 0;
+      last = r.stats.started;
+    }
+    expect(r.stats.started).toBeGreaterThan(0);
+    expect(r.stats.started).toBeLessThanOrEqual(budgetParts);
+    expect(r.stats.peakHeldBytes).toBeLessThanOrEqual(budgetParts * 2 * PART);
+    r.release();
+    await publishing;
+    expect(r.stats.stored).toBe(48);
+    expect(r.stats.peakHeldBytes).toBeLessThanOrEqual(budgetParts * 2 * PART);
   });
 
   it("starts no request while a 429's Retry-After lasts, then goes on at the same window", async () => {

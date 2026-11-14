@@ -106,6 +106,7 @@ async function world(options: Options) {
   };
   const innerBlobs = createMemoryStreamSyncBlobs();
   const blobs = {
+    governor: innerBlobs.governor,
     get: (key: string) => innerBlobs.get(key),
     async exists(key: string) {
       calls.push({ kind: "probe", scope: scopeOfKey(key), key });

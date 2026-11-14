@@ -384,6 +384,7 @@ describe("publishConnection", () => {
         warn: () => {},
       },
       blobs: {
+        governor: blobs.governor,
         get: async (key: string) => {
           clock += 2;
           return blobs.get(key);
@@ -1129,6 +1130,7 @@ describe("part layout of records with no covering part", () => {
     const deps: LocalSyncDeps = {
       ...world.deps,
       blobs: {
+        governor: world.blobs.governor,
         get: (key) => {
           gets.push(key);
           return world.blobs.get(key);
@@ -1273,6 +1275,7 @@ describe("part layout of records with no covering part", () => {
       const deps: LocalSyncDeps = {
         ...world.deps,
         blobs: {
+          governor: world.blobs.governor,
           get: async (key) => {
             const body = await world.blobs.get(key);
             bytesServed += body?.length ?? 0;
@@ -1479,6 +1482,7 @@ describe("the head this device committed", () => {
     const hidden = new Set<string>();
     const replaced = new Map<string, Uint8Array>();
     const port = {
+      governor: inner.governor,
       gets,
       puts,
       hidden,

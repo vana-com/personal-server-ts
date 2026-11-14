@@ -129,12 +129,16 @@ async function world(options: Options) {
     listConnectionRows: (connector, ns) =>
       innerRegistry.listConnectionRows(connector, ns),
   };
-  const innerBlobs = createMemoryStreamSyncBlobs();
+  // A budget that never binds: these tests are about streams, not memory. The
+  // tests that are about the budget pass a governor of their own.
+  const innerBlobs = createMemoryStreamSyncBlobs({
+    maxBytesInFlight: 1024 * 1024 * 1024,
+  });
   /** Keys storage answers "absent" for, as if removed from outside. */
   const hidden = new Set<string>();
   const guards: { key: string; guard: (() => void) | undefined }[] = [];
   const timedBlobs: StreamSyncBlobs = {
-    governor: options.governor,
+    governor: options.governor ?? innerBlobs.governor,
     async get(key) {
       record("get", key);
       await options.holdGet?.(key);

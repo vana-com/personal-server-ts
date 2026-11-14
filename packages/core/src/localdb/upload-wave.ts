@@ -11,8 +11,9 @@
  * and how many encoded parts wait in memory is the store's byte budget: the
  * encoder reserves a part's bytes before it reads the rows for it, and an
  * upload releases them once the part is stored. Both are shared by every
- * stream and connection on the store, so the total is bounded across them. A
- * store with no governor (an in-memory test store) has neither bound.
+ * stream and connection on the store, so the total is bounded across them.
+ * Every store has a governor (`StreamSyncBlobs.governor` is required), so the
+ * bounds hold for every store, however slow its PUTs.
  *
  * A wave never leaves a started upload running after it is settled, and never
  * leaves a rejection unobserved: a failed upload is kept, no further upload

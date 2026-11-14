@@ -254,7 +254,7 @@ export async function publishConnection(
   const { connection, keyCheck, hashes, streams } = opened;
   const latch: PurgeLatch = { purged: false };
   const view = openRegistryView(deps, connection, streams.length);
-  const sendWindow = deps.blobs.governor?.window();
+  const sendWindow = deps.blobs.governor.window();
   const commits = connectionCommits(deps, connectionId, latch);
   const published = await publishEach(
     streams.map(({ stream }) => stream),

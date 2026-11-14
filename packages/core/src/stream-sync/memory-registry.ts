@@ -15,6 +15,11 @@ import type {
   StreamSyncBlobs,
   StreamSyncRegistry,
 } from "./ports.js";
+import {
+  createStorageAccess,
+  DEFAULT_STORAGE_ACCESS_POLICY,
+  type StorageAccessPolicy,
+} from "./storage-retry.js";
 
 interface Version {
   readonly dataHash: string;
@@ -110,10 +115,20 @@ export function createMemoryStreamSyncRegistry(): StreamSyncRegistry {
   return new MemoryStreamSyncRegistry();
 }
 
-/** An in-memory `StreamSyncBlobs`: the blob store a test host passes where the storage service would go. */
-export function createMemoryStreamSyncBlobs(): StreamSyncBlobs {
+/**
+ * An in-memory `StreamSyncBlobs`: the blob store a test host passes where the
+ * storage service would go. It has a real send governor, so a transfer over it
+ * holds no more than the byte budget while its PUTs are pending.
+ */
+export function createMemoryStreamSyncBlobs(
+  policy: Partial<StorageAccessPolicy> = {},
+): StreamSyncBlobs {
   const blobs = new Map<string, Uint8Array>();
   return {
+    governor: createStorageAccess({
+      ...DEFAULT_STORAGE_ACCESS_POLICY,
+      ...policy,
+    }),
     async put(key, bytes) {
       blobs.set(key, bytes.slice());
     },
