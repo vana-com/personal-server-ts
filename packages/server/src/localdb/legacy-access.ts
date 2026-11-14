@@ -50,6 +50,8 @@ export interface LegacyAccessOptions {
   /** Re-read trusted mode; unknown/off refuse before opening any store. */
   readonly isSwitched: (owner: string) => Promise<boolean>;
   readonly root: string;
+  /** Canonical data directory bound to the server's index; defaults to root/data. */
+  readonly dataDir?: string;
   readonly declarations: readonly DeclarationSnapshot[];
   /** Existing storage removal authority; no new parallel lock/seal. */
   readonly legacyWriteSeal: LegacyWriteSeal;
@@ -65,7 +67,7 @@ export interface LegacyAccess {
   /** Includes descriptors with exclusions for unmapped data; never silently omit a store. */
   sources(): AsyncIterable<ImportInventoryEntry>;
   copies(): AsyncIterable<LegacyCopy>;
-  erase(copy: LegacyCopy): Promise<boolean>;
+  erase(copy: LegacyCopy, signal?: AbortSignal): Promise<boolean>;
   erasedWithIntent(copy: LegacyCopy): Promise<boolean>;
   finishErase(copy: LegacyCopy): Promise<void>;
   close(): Promise<void>;
@@ -76,9 +78,9 @@ export interface LegacyAccess {
  * then openRecordStore(db,false). No replica wrappers, even when env enables
  * replication. Door stays closed. Must not close caller-owned db in close().
  * All raw SQL and file access for switched legacy stores is private here.
- * Inventory root/data using hierarchy's finalized-envelope layout and index
+ * Inventory the bound data directory using hierarchy's finalized-envelope layout and index
  * entries (including orphan/unmapped files); pending stages/blocks/sidecars
- * are counted with the remaining old files. Reject symlinks and paths outside root.
+ * are counted with the remaining old files. Reject symlinks and paths outside it.
  * Read/hash exact bytes with SHA-256. Erase uses withScopeLock(scope, work)
  * and legacyWriteSeal.remove, matching node-data-storage; these are not
  * reentrant: do not call a storage delete method while holding the same lock.
@@ -100,7 +102,7 @@ export async function openLegacyAccess(
   )
     throw new Error("legacy_identity_mismatch");
   const indexIdentity = await lstat(join(root, "index.db"));
-  const dataRoot = join(root, "data");
+  const dataRoot = options.dataDir ?? join(root, "data");
   if ((await realpath(dataRoot)) !== dataRoot)
     throw new Error("legacy_path_refused");
   retireReplication(db);
@@ -494,11 +496,14 @@ export async function openLegacyAccess(
         }
       }
     },
-    async erase(copy) {
+    async erase(copy, signal) {
+      signal?.throwIfAborted();
       await authorized();
       await safePath(copy.path, true);
-      return withScopeLock(copy.dataSet, () =>
-        options.legacyWriteSeal.remove(async () => {
+      return withScopeLock(copy.dataSet, () => {
+        signal?.throwIfAborted();
+        return options.legacyWriteSeal.remove(async () => {
+          signal?.throwIfAborted();
           await authorized();
           let current: LegacyCopy;
           try {
@@ -517,6 +522,7 @@ export async function openLegacyAccess(
             throw error;
           }
           if (!sameCopy(copy, current)) return false;
+          signal?.throwIfAborted();
           await eraseLedger.record(copy);
           // Recheck after the journal commit; an old descriptor never grants a
           // second removal. No gateway call or legacy tombstone is involved.
@@ -526,11 +532,12 @@ export async function openLegacyAccess(
             .update(canonicalJson([copy.path, entry?.id ?? null]))
             .digest("hex");
           if (contentHash !== copy.contentHash || id !== copy.id) return false;
+          signal?.throwIfAborted();
           await unlink(copy.path);
           index.deleteByPath(relative(dataRoot, copy.path));
           return true;
-        }),
-      );
+        });
+      });
     },
     erasedWithIntent,
     async finishErase(copy) {

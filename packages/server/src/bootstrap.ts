@@ -10,6 +10,7 @@ import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
 import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { createServerLocalSync } from "./localdb/sync.js";
+import { createLegacyStoreRunner } from "./localdb/legacy-store-import.js";
 import { createLocalSeed } from "./localdb/seed.js";
 import { createSeedStaging } from "./stream-sync/seed-staging.js";
 import { createFsStreamSyncFiles } from "./stream-sync/fs-files.js";
@@ -27,6 +28,7 @@ import {
   open,
   readFile,
   readdir,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -53,7 +55,6 @@ import { type PersonalServerReadFulfillmentReporter } from "@opendatalabs/person
 import {
   createImportWaker,
   createModeAuthority,
-  type ImportRunner,
   type ImportWaker,
   type ModeAuthority,
   type ModeRecordStore,
@@ -231,12 +232,6 @@ export interface CreateServerOptions {
    * under the storage root, outside the data database. Tests inject a store.
    */
   accountModeStore?: ModeRecordStore;
-  /**
-   * The host's legacy importer. The server runs it when the Account says On
-   * and once at boot when the owner is already switched; what is owed and when
-   * it is done is the importer's own record. Without one no import starts.
-   */
-  legacyImporter?: ImportRunner;
   /** Owner-authorized HTTP signing capability supplied by the trusted host. */
   ownerRequestSigner?: RequestSigner;
   /** Inventory-route-only signer; never used by the owner-only scope feed. */
@@ -401,7 +396,7 @@ async function bootstrapServer(
   const storageRoot = resolveRootPath(
     options?.rootPath ?? options?.serverDir ?? DEFAULT_ROOT_PATH,
   );
-  const dataDir = options?.dataDir ?? join(storageRoot, "data");
+  let dataDir = options?.dataDir ?? join(storageRoot, "data");
   const indexPath = join(storageRoot, "index.db");
   const configPath = join(storageRoot, "config.json");
   const syncCursorPath = join(storageRoot, "sync-cursor.json");
@@ -452,6 +447,7 @@ async function bootstrapServer(
   }
   await mkdir(storageRoot, { recursive: true });
   await mkdir(dataDir, { recursive: true });
+  dataDir = await realpath(dataDir);
   for (const parent of [...newDirectoryParents].sort(
     (a, b) => a.length - b.length,
   )) {
@@ -507,15 +503,6 @@ async function bootstrapServer(
     authority: accountModeAuthority,
     owner: serverOwner,
   });
-  if (options?.legacyImporter && serverOwner) {
-    importWaker = createImportWaker({
-      authority: accountModeAuthority,
-      owner: serverOwner,
-      importer: options.legacyImporter,
-      onWarning: (message, detail) => logger.warn({ detail }, message),
-    });
-  }
-
   const reindexInProgressPath = join(storageRoot, "reindex-in-progress");
   const hasReindexInProgress = async (): Promise<boolean> => {
     return pathExists(reindexInProgressPath);
@@ -1522,6 +1509,34 @@ async function bootstrapServer(
           (await localSyncSource()).intake.publicationStatus(...args),
       }
     : undefined;
+
+  // The server's own legacy store is a one-time seed for a switched owner.
+  // The waker runs the import, then the retirement, when the Account answers
+  // On and once at boot for an owner already switched. No host supplies a port.
+  if (localSyncSource && serverOwner) {
+    importWaker = createImportWaker({
+      authority: accountModeAuthority,
+      owner: serverOwner,
+      importer: createLegacyStoreRunner({
+        db,
+        root: storageRoot,
+        dataDir,
+        owner: serverOwner,
+        network: streamSyncNetwork(config.gateway),
+        legacyWriteSeal,
+        getDeps: async () => {
+          await localSyncSource();
+          return localSyncDeps!;
+        },
+        declarations: () => pdppAuth?.retainedDeclarations ?? [],
+        methods: () => pdppAuth?.configuredMethods ?? [],
+        manifests: () => pdppAuth?.retainedManifests ?? [],
+        streamSync: () => config.streamSync,
+        logger,
+      }),
+      onWarning: (message, detail) => logger.warn({ detail }, message),
+    });
+  }
 
   const streamSyncSeed = localSyncSource
     ? createLocalSeed({

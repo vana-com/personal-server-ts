@@ -22,6 +22,7 @@ export interface LegacyRetireAccess {
 export interface LegacyRetireOptions {
   readonly streamSync?: { readonly retireLegacy?: boolean };
   readonly dryRun?: boolean;
+  readonly signal?: AbortSignal;
   readonly reportFile: (report: LegacyRetireFileReport) => void;
 }
 
@@ -73,6 +74,7 @@ export async function retireLegacyCopies(
       ...new Set(copy.sources.map((s) => s.connectionId)),
     ].sort();
     const locked = async (index: number): Promise<void> => {
+      options.signal?.throwIfAborted();
       if (index < connections.length)
         return deps.queue.run(connections[index]!, "end", () =>
           locked(index + 1),
@@ -104,6 +106,7 @@ export async function retireLegacyCopies(
         report("ready", diagnostic);
         return;
       }
+      if (!reconciled) options.signal?.throwIfAborted();
       if (!reconciled && !(await access.erase(copy))) {
         ready--;
         report("changed", "copy-changed-or-absent");

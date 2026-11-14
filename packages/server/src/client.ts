@@ -65,7 +65,6 @@ export interface StartPersonalServerNodeOptions
       | "mcpRequestableScopes"
       | "mcpGrantTtlSeconds"
       | "rotateReplicaWriterIdentity"
-      | "legacyImporter"
     >,
     LoadConfigOptions {
   config?: ServerConfig;
@@ -126,7 +125,6 @@ export async function startPersonalServer(
     mcpRequestableScopes: options.mcpRequestableScopes,
     mcpGrantTtlSeconds: options.mcpGrantTtlSeconds,
     rotateReplicaWriterIdentity: options.rotateReplicaWriterIdentity,
-    legacyImporter: options.legacyImporter,
   });
   const mainServer = await listenHttpServer({
     fetch: context.app.fetch,

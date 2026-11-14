@@ -28,7 +28,6 @@ describe("ServerConfigSchema — streamSync.retireLegacy", () => {
     expect(ServerConfigSchema.parse({ streamSync: {} }).streamSync).toEqual({
       write: false,
       read: false,
-      refuseLegacyWrites: false,
       retireLegacy: false,
     });
   });
@@ -63,6 +62,20 @@ describe("ServerConfigSchema — streamSync.retireLegacy", () => {
         ServerConfigSchema.parse(hostOptions).streamSync.retireLegacy,
       ).toBe(false);
     }
+  });
+});
+
+describe("ServerConfigSchema — streamSync.refuseLegacyWrites (removed)", () => {
+  it("a saved config that still names it parses, and the key is dropped", () => {
+    const parsed = ServerConfigSchema.parse({
+      streamSync: { write: true, refuseLegacyWrites: true },
+    });
+    expect(parsed.streamSync).toEqual({
+      write: true,
+      read: false,
+      retireLegacy: false,
+    });
+    expect("refuseLegacyWrites" in DEFAULTS.streamSync).toBe(false);
   });
 });
 

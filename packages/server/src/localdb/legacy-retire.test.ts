@@ -206,6 +206,35 @@ function identityCopy(copy: LegacyCopy): string {
   ]);
 }
 
+it("does not start erase after shutdown during read-back", async () => {
+  const f = await fixture();
+  let release!: () => void;
+  let entered!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  f.access.readBack = async () => {
+    entered();
+    await gate;
+    return [];
+  };
+  const controller = new AbortController();
+  const run = retireLegacyCopies(f.deps, f.access, {
+    streamSync: { retireLegacy: true },
+    signal: controller.signal,
+    reportFile: () => {},
+  });
+  await waiting;
+  controller.abort();
+  release();
+  await expect(run).rejects.toMatchObject({ name: "AbortError" });
+  expect(f.access.erase).not.toHaveBeenCalled();
+  expect(f.present()).not.toBeNull();
+});
+
 it("read-back bugs are reported and do not block enabled replacement", async () => {
   const f = await fixture();
   f.access.readBack = async () => [

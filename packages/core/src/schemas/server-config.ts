@@ -59,12 +59,9 @@ export const DEFAULTS = {
     // serves logical reads from complete stream views (§2.10). When false,
     // reads are exactly as before.
     read: false,
-    // Off by default. With `write` also on, a legacy write that does not
-    // declare a stream-sync client is refused with `update_required`. Turn it
-    // on only after the clients that send `Vana-Stream-Sync-Client` ship.
-    refuseLegacyWrites: false,
-    // Off by default. Legacy copies may be retired only after an explicit
-    // opt-in and the import, read-back, and publication safety checks.
+    // Off by default. When true, the old legacy files, a one-time seed, are
+    // removed after this server's own import of them finishes, for a switched
+    // owner. When false the same step only reads them back and reports.
     retireLegacy: false,
   },
   olderVersionReads: true,
@@ -248,9 +245,6 @@ export const ServerConfigSchema = z.object({
     .object({
       write: z.boolean().default(DEFAULTS.streamSync.write),
       read: z.boolean().default(DEFAULTS.streamSync.read),
-      refuseLegacyWrites: z
-        .boolean()
-        .default(DEFAULTS.streamSync.refuseLegacyWrites),
       retireLegacy: z.boolean().default(DEFAULTS.streamSync.retireLegacy),
     })
     .default(DEFAULTS.streamSync),
