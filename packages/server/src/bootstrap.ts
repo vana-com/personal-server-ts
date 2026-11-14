@@ -105,6 +105,7 @@ import {
   createGatewayDataPointFeed,
   createGatewayDeleteDataPort,
   createInventoryTombstoneFinality,
+  createRegistryChangeProbe,
   createScopeDeletionTracker,
   createSyncManager,
   withCancellableRegistration,
@@ -867,6 +868,16 @@ async function bootstrapServer(
         "Stream sync is unavailable on this server",
       );
   }
+  // One registry client for the cycle's reads and the change probe.
+  let streamSyncRegistryClient: StreamSyncRegistry | undefined;
+  function streamSyncRegistry(): StreamSyncRegistry {
+    return (streamSyncRegistryClient ??=
+      options?.streamSyncRegistry ??
+      createGatewayStreamSyncRegistry({
+        gatewayUrl: config.gateway.url,
+        ownerAddress: serverOwner!,
+      }));
+  }
   async function getLocalSync(): Promise<LocalSync> {
     requireStreamMode();
     if (localSync) return localSync;
@@ -897,12 +908,7 @@ async function bootstrapServer(
           db: driver,
           ownerAddress: serverOwner!,
           queue: connectionQueue(),
-          registry:
-            options?.streamSyncRegistry ??
-            createGatewayStreamSyncRegistry({
-              gatewayUrl: config.gateway.url,
-              ownerAddress: serverOwner!,
-            }),
+          registry: streamSyncRegistry(),
           blobs:
             options?.streamSyncBlobs ?? createStorageStreamSyncBlobs(storage),
           keys: createStreamSyncKeyPorts(masterKeySignature!),
@@ -1227,8 +1233,17 @@ async function bootstrapServer(
       pdppImporter,
     };
 
+    // The Desktop PS runs in the tray with no window of its own: the timed
+    // probe is what reaches a change made while the app is in the background.
+    const changeProbe =
+      localSyncSource &&
+      createRegistryChangeProbe(streamSyncRegistry(), {
+        intervalMs: config.streamSync.changeProbeMs,
+      });
+
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
       accountStorageMode,
+      ...(changeProbe && { changeProbe }),
       ...(localSyncSource && {
         localSync: { cycle: async () => (await localSyncSource()).cycle() },
       }),

@@ -72,6 +72,10 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
     return { kind: "committed" };
   }
 
+  async probeChange() {
+    return this.log.length === 0 ? null : String(this.log.length);
+  }
+
   async listControlRows() {
     const out: { scope: string; read: ControlRead }[] = [];
     for (const scope of this.versions.keys()) {

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createBearerTokenPsLiteAuth,
   createPsLiteRuntime,
@@ -304,6 +304,84 @@ describe("createPsLiteRuntime", () => {
 
     expect(syncManager.start).toHaveBeenCalledTimes(1);
     expect(syncManager.stop).toHaveBeenCalledTimes(1);
+  });
+
+  describe("page signals start a pull", () => {
+    function pageStub(visibilityState = "visible") {
+      const doc = Object.assign(new EventTarget(), { visibilityState });
+      const win = new EventTarget();
+      vi.stubGlobal("document", doc);
+      vi.stubGlobal("window", win);
+      return { doc, win };
+    }
+    function managerStub() {
+      return {
+        start: vi.fn(),
+        stop: vi.fn().mockResolvedValue(undefined),
+        trigger: vi.fn().mockResolvedValue(undefined),
+        requestPull: vi.fn().mockResolvedValue(undefined),
+        getStatus: vi.fn(),
+      };
+    }
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("a visibility change to visible and a focus each ask the manager for one pull", () => {
+      const { doc, win } = pageStub();
+      const syncManager = managerStub();
+      const runtime = createTestRuntime({ active: false, syncManager });
+      runtime.activate();
+
+      doc.dispatchEvent(new Event("visibilitychange"));
+      expect(syncManager.requestPull).toHaveBeenCalledTimes(1);
+      win.dispatchEvent(new Event("focus"));
+      expect(syncManager.requestPull).toHaveBeenCalledTimes(2);
+      // A pull is not a plain trigger: the manager decides whether a cycle runs.
+      expect(syncManager.trigger).not.toHaveBeenCalled();
+      runtime.deactivate();
+    });
+
+    it("a hidden document asks for nothing", () => {
+      const { doc } = pageStub("hidden");
+      const syncManager = managerStub();
+      const runtime = createTestRuntime({ active: false, syncManager });
+      runtime.activate();
+      doc.dispatchEvent(new Event("visibilitychange"));
+      expect(syncManager.requestPull).not.toHaveBeenCalled();
+      runtime.deactivate();
+    });
+
+    it("stops listening on deactivate, and activate twice listens once", () => {
+      const { win } = pageStub();
+      const syncManager = managerStub();
+      const runtime = createTestRuntime({ active: false, syncManager });
+      runtime.activate();
+      runtime.activate();
+      win.dispatchEvent(new Event("focus"));
+      expect(syncManager.requestPull).toHaveBeenCalledTimes(1);
+
+      runtime.deactivate();
+      win.dispatchEvent(new Event("focus"));
+      expect(syncManager.requestPull).toHaveBeenCalledTimes(1);
+    });
+
+    it("a manager that cannot pull on request adds no listeners", () => {
+      const { win } = pageStub();
+      const add = vi.spyOn(win, "addEventListener");
+      const runtime = createTestRuntime({
+        active: false,
+        syncManager: {
+          start: vi.fn(),
+          stop: vi.fn().mockResolvedValue(undefined),
+          trigger: vi.fn().mockResolvedValue(undefined),
+          getStatus: vi.fn(),
+        },
+      });
+      runtime.activate();
+      expect(add).not.toHaveBeenCalled();
+      runtime.deactivate();
+    });
   });
 
   it("returns PS_UNAVAILABLE while the browser runtime is inactive", async () => {

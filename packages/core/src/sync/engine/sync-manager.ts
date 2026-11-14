@@ -25,6 +25,28 @@ import type {
 } from "../../ports/index.js";
 import type { LegacyWriteSeal } from "../../storage/legacy-write-seal.js";
 
+/**
+ * A cheap read of "did anything in the owner's registry change?": one request,
+ * whatever the number of rows. The marker is opaque and only compared for
+ * equality; `null` is an empty registry; `undefined` is "cannot tell" (the
+ * request failed or the gateway cannot answer), and a manager treats that as a
+ * change, so a broken probe costs a cycle, never a missed change.
+ */
+export interface ChangeProbe {
+  read(): Promise<string | null | undefined>;
+  /**
+   * Period of the timed probe in milliseconds. Signals (`requestPull`) probe
+   * at once and do not wait for it. See D4-SYNC-TRIGGERS for how the host
+   * derives it from the cost of one idle cycle.
+   */
+  intervalMs: number;
+  /**
+   * Whether the timed probe is worth sending now. A hidden Web tab has no one
+   * to show a change to and re-probes when it is shown (a signal). Absent: always.
+   */
+  active?: () => boolean;
+}
+
 export interface SyncManagerOptions {
   /** Personal Server hosts always supply their owner-bound Account mode. */
   accountStorageMode?: Pick<OwnedAccountStorageMode, "read">;
@@ -32,6 +54,12 @@ export interface SyncManagerOptions {
 
   /** Polling interval in milliseconds (default: 60_000 = 1 minute) */
   pollInterval?: number;
+  /**
+   * Starts a cycle when the registry changed, between the timer's cycles. The
+   * timer stays as the fallback: a probe that fails or misses a change
+   * (two writes in one millisecond) costs at most one poll interval.
+   */
+  changeProbe?: ChangeProbe;
   /** Max upload batch size per cycle (default: 50) */
   uploadBatchSize?: number;
   /** Debounce for immediate sync after local ingest (default: 500ms) */
@@ -84,6 +112,17 @@ export interface SyncManager {
 
   /** Trigger an immediate sync cycle (skips wait) */
   trigger(): Promise<void>;
+
+  /**
+   * A signal that remote state may have changed: a tab or window came back, the
+   * network returned, a probe period passed. With a `changeProbe`, one cheap
+   * registry read decides: a cycle runs only when the registry moved since the
+   * last cycle this method ran. Without one, it requests a cycle. Requests
+   * coalesce (one probe in flight, one cycle running, one follow-up for any
+   * number of requests during it) and never reset the timer. Does nothing
+   * while stopped. Rejects when the cycle it ran rejects.
+   */
+  requestPull(): Promise<void>;
 
   /** Get current sync status */
   getStatus(): SyncStatus;
@@ -143,6 +182,15 @@ export function createSyncManager(
   let errors: SyncError[] = [];
   let cycleInFlight: Promise<void> | null = null;
   let rerunRequested = false;
+  // Pulls: one probe-and-cycle in flight; `pullRequested` is its dirty flag.
+  let pullInFlight: Promise<void> | null = null;
+  let pullRequested = false;
+  // The registry marker as of the last cycle a pull ran and finished cleanly.
+  // Only a pull moves it, and only to a marker read BEFORE its cycle started,
+  // so every change up to it was in the registry when that cycle read.
+  let pulledMarker: string | null | undefined;
+  let errorSeq = 0;
+  let probeIntervalId: ReturnType<typeof setInterval> | null = null;
   let needsFullReconcile = true;
   // Once per boot, then only the scopes whose lookup failed, a few times.
   let lostDataPointRetryScopes: string[] | null = null;
@@ -470,6 +518,48 @@ export function createSyncManager(
     }
   }
 
+  async function pullIfChanged(probe: ChangeProbe): Promise<void> {
+    let marker: string | null | undefined;
+    try {
+      marker = await probe.read();
+    } catch (err) {
+      uploadDeps.logger.debug(
+        { error: (err as Error).message },
+        "Registry change probe failed; pulling",
+      );
+    }
+    if (marker !== undefined && marker === pulledMarker) return;
+    const errorsBefore = errorSeq;
+    // A cycle already running may have read the registry before the change:
+    // `runCycle` makes a joiner wait for a follow-up that starts after this call.
+    await runCycle();
+    if (marker !== undefined && blocked === null && errorSeq === errorsBefore) {
+      pulledMarker = marker;
+    }
+  }
+
+  function requestPull(): Promise<void> {
+    if (!isRunning) return Promise.resolve();
+    // No probe: a pull is a cycle request, and `runCycle` coalesces those.
+    const probe = options?.changeProbe;
+    if (!probe) return runCycle();
+    if (pullInFlight) {
+      pullRequested = true;
+      return pullInFlight;
+    }
+    pullInFlight = (async () => {
+      try {
+        do {
+          pullRequested = false;
+          await pullIfChanged(probe);
+        } while (pullRequested && isRunning);
+      } finally {
+        pullInFlight = null;
+      }
+    })();
+    return pullInFlight;
+  }
+
   function scheduleNotifiedCycle(): void {
     if (!isRunning || notifyTimerId !== null) return;
     notifyTimerId = setTimeout(() => {
@@ -482,6 +572,7 @@ export function createSyncManager(
   }
 
   function pushError(error: SyncError): void {
+    errorSeq += 1;
     errors.push(error);
     if (errors.length > MAX_ERRORS) {
       errors = errors.slice(-MAX_ERRORS);
@@ -501,6 +592,24 @@ export function createSyncManager(
     if (intervalId !== null) {
       clearInterval(intervalId);
       intervalId = null;
+    }
+  }
+
+  function startProbeInterval(): void {
+    const probe = options?.changeProbe;
+    if (!probe || probeIntervalId !== null) return;
+    probeIntervalId = setInterval(() => {
+      if (probe.active && !probe.active()) return;
+      requestPull().catch(() => {
+        // Errors already captured in ring buffer
+      });
+    }, probe.intervalMs);
+  }
+
+  function clearProbeInterval(): void {
+    if (probeIntervalId !== null) {
+      clearInterval(probeIntervalId);
+      probeIntervalId = null;
     }
   }
 
@@ -526,6 +635,7 @@ export function createSyncManager(
       });
 
       startInterval();
+      startProbeInterval();
     },
 
     async stop() {
@@ -535,6 +645,7 @@ export function createSyncManager(
         .close(namelessAttempts ? Infinity : undefined)
         .catch((err: unknown) => err);
       clearIntervalTimer();
+      clearProbeInterval();
       clearNotifyTimer();
       isRunning = false;
 
@@ -572,6 +683,8 @@ export function createSyncManager(
         startInterval();
       }
     },
+
+    requestPull,
 
     getStatus(): SyncStatus {
       const pendingFiles =

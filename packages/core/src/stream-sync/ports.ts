@@ -199,6 +199,16 @@ export interface StreamSyncRegistry {
     connector: string,
     ns: string,
   ): Promise<readonly { readonly scope: string; readonly read: ControlRead }[]>;
+  /**
+   * One request: a marker of the owner's newest registry change, whatever the
+   * number of rows (the gateway's change feed, newest first, one row). Two
+   * markers are equal when no row was written, tombstoned or revived between
+   * the reads. `null`: the owner has no rows. `undefined`: this gateway sends
+   * no change time, so the caller cannot tell and must not skip a pull on it.
+   * Throws when the read fails. A hint to start a pull early, never an
+   * authority: a pull still reads the rows it applies.
+   */
+  probeChange?(): Promise<string | null | undefined>;
 }
 
 /** Encrypted blob storage, keyed `<physical scope>/<blob name>`. */

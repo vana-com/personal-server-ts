@@ -418,3 +418,75 @@ describe("requires on the single write", () => {
     expect("requires" in (sent[0]!.body as object)).toBe(false);
   });
 });
+
+describe("probeChange", () => {
+  const newest = (changedAt: unknown, version = 3) => ({
+    id: hash("cd"),
+    scope: streamScope("acme", "", "items"),
+    expectedVersion: String(version),
+    dataHash: hash("aa"),
+    metadataHash: hash("bb"),
+    ...(changedAt === undefined ? {} : { changedAt }),
+  });
+
+  function probing(responses: Array<unknown[] | Response>) {
+    const urls: string[] = [];
+    let call = 0;
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test",
+      ownerAddress: "0x" + "11".repeat(20),
+      fetch: (async (url: string) => {
+        urls.push(url);
+        const next = responses[Math.min(call, responses.length - 1)]!;
+        call += 1;
+        if (next instanceof Response) return next.clone();
+        return new Response(
+          JSON.stringify({
+            data: { dataPoints: next },
+            pagination: { hasMore: next.length > 0, nextCursor: "n" },
+          }),
+        );
+      }) as typeof fetch,
+    });
+    return { registry, urls };
+  }
+
+  it("asks for the owner's newest row with one request, however many rows exist", async () => {
+    const { registry, urls } = probing([[newest("2026-11-14T10:00:00.000Z")]]);
+    const marker = await registry.probeChange!();
+    expect(urls).toHaveLength(1);
+    const query = new URL(urls[0]!).searchParams;
+    expect(query.get("limit")).toBe("1");
+    expect(query.get("includeDeleted")).toBe("true");
+    expect(query.get("user")).toBe("0x" + "11".repeat(20));
+    expect(query.has("cursor")).toBe(false);
+    expect(marker).toEqual(expect.any(String));
+  });
+
+  it("moves with the newest change and stays put without one", async () => {
+    const at = (iso: string, version?: number) => [newest(iso, version)];
+    const { registry } = probing([
+      at("2026-11-14T10:00:00.000Z"),
+      at("2026-11-14T10:00:00.000Z"),
+      at("2026-11-14T10:00:07.000Z", 4),
+    ]);
+    const first = await registry.probeChange!();
+    expect(await registry.probeChange!()).toBe(first);
+    expect(await registry.probeChange!()).not.toBe(first);
+  });
+
+  it("is null for an owner with no rows", async () => {
+    const { registry } = probing([[]]);
+    expect(await registry.probeChange!()).toBeNull();
+  });
+
+  it("cannot tell when the gateway sends no change time", async () => {
+    const { registry } = probing([[newest(undefined)]]);
+    expect(await registry.probeChange!()).toBeUndefined();
+  });
+
+  it("throws on a failed read: a failure is not 'nothing changed'", async () => {
+    const { registry } = probing([new Response("no", { status: 503 })]);
+    await expect(registry.probeChange!()).rejects.toThrow(/503/);
+  });
+});
