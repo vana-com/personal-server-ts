@@ -67,7 +67,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
   const writer: ConnectionDeletePort = {
     async requestConnectionDelete(connector) {
       calls.push(connector);
-      return { deleteId: `delete-${connector}` };
+      return { deleteId: `delete-${connector}`, fenced: true };
     },
   };
 
@@ -145,7 +145,10 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(202);
-    expect(await response.json()).toEqual({ deleteId: "delete-github" });
+    expect(await response.json()).toEqual({
+      deleteId: "delete-github",
+      fenced: true,
+    });
     expect(calls).toEqual(["github"]);
   });
 

@@ -192,6 +192,9 @@ export function createLocalSync(
         retainedManifests: options.retainedManifests,
       }),
       ...(options.eraseLegacy && { eraseLegacy: options.eraseLegacy }),
+      // A request waits for the fence no longer than the loop waits to look
+      // at a delete that has not landed.
+      fenceWaitMs: retryFirst,
     });
   let deleteStore: ConnectionDeleter | undefined;
   const deletes = () => (deleteStore ??= makeDeleter());

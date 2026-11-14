@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { createMemoryStreamSyncBlobs } from "../stream-sync/memory-registry.js";
 import { describe, expect, it, vi } from "vitest";
 import type { BlobDescriptor } from "./blobs.js";
 import { uploadBlobs } from "./blobs.js";
@@ -21,6 +22,7 @@ function countingStore(initial: Record<string, Uint8Array>) {
     bytesServed: () => bytesServed,
     puts,
     blobs: {
+      governor: createMemoryStreamSyncBlobs().governor,
       get: async (key: string) => {
         const body = bodies.get(key) ?? null;
         bytesServed += body?.length ?? 0;

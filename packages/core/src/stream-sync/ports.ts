@@ -199,17 +199,31 @@ export interface StreamSyncRegistry {
     connector: string,
     ns: string,
   ): Promise<readonly { readonly scope: string; readonly read: ControlRead }[]>;
+  /**
+   * One request: a marker of the owner's newest registry change, whatever the
+   * number of rows (the gateway's change feed, newest first, one row). A
+   * different marker means a row was written, tombstoned or revived since the
+   * last read. An EQUAL marker does not prove that nothing changed: it
+   * fingerprints one row, so a change that leaves that row alone (another row
+   * stamped in the same millisecond) is invisible. `null`: the owner has no
+   * rows. `undefined`: this gateway sends no change time, so the caller cannot
+   * tell. Throws when the read fails. A hint to start a pull early, never an
+   * authority: the unconditional timer cycle is what guarantees completeness,
+   * and a pull still reads the rows it applies.
+   */
+  probeChange?(): Promise<string | null | undefined>;
 }
 
 /** Encrypted blob storage, keyed `<physical scope>/<blob name>`. */
 export interface StreamSyncBlobs {
   /**
-   * The store's send governor, when it has one: the memory budget a transfer
-   * reserves from before it encodes a part, and a window that reports what the
-   * gate did during one publish. A store without one (an in-memory test store)
-   * is unbounded.
+   * The store's send governor: the memory budget a transfer reserves from
+   * before it encodes a part, and a window that reports what the gate did
+   * during one publish. It is required, because nothing else bounds the parts
+   * a stream holds in memory while their PUTs are pending. An in-memory test
+   * store gets one too (`createMemoryStreamSyncBlobs`).
    */
-  readonly governor?: Pick<SendGovernor, "reserve" | "window">;
+  readonly governor: Pick<SendGovernor, "reserve" | "window">;
   /**
    * `beforeAttempt` runs immediately before each request that sends the bytes,
    * after every wait for a turn or a retry delay; a throw stops the upload and

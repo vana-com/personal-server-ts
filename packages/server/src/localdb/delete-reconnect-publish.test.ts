@@ -16,6 +16,8 @@
  * "tombstoned" and skip the head read.
  */
 import { afterEach, expect, it, vi } from "vitest";
+import { createLocalHistory } from "../../../core/src/localdb/history.js";
+import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import {
   connectionQueue,
   openLocalDb,
@@ -51,6 +53,7 @@ import {
   endedGenerationDeleteMetadataHash,
 } from "../../../core/src/stream-sync/delete-metadata.js";
 import { remoteFixture } from "./apply-fixture.js";
+import { postStreamDeleteOnly } from "./legacy-delete-fixture.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}`;
@@ -178,9 +181,14 @@ let runs = 0;
 async function collect(
   device: Device,
   ids: string[],
-  options: { connect?: boolean; decl?: typeof declaration } = {},
+  options: {
+    connect?: boolean;
+    decl?: typeof declaration;
+    stream?: string;
+  } = {},
 ) {
   const decl = options.decl ?? declaration;
+  const stream = options.stream ?? "items";
   const key = decl.streams[0]!.primaryKey[0]!;
   const runId = `run-${++runs}`;
   const intake = createRunIntakeStore(device.deps);
@@ -197,13 +205,13 @@ async function collect(
   );
   await intake.batch(runId, {
     batch: 0,
-    records: ids.map((id) => ({ stream: "items", data: { [key]: id } })),
+    records: ids.map((id) => ({ stream, data: { [key]: id } })),
   });
   await createRunEndStore(device.deps).end(runId, {
     outcome: "succeeded",
-    coveredStreams: ["items"],
+    coveredStreams: [stream],
     lastBatch: 0,
-    provenFullStreams: ["items"],
+    provenFullStreams: [stream],
   });
   return { runId, mode: begun.start.collection_mode };
 }
@@ -252,9 +260,10 @@ async function generationOf(device: Device) {
 }
 
 /** The record ids a device holds for the stream, by the first key field. */
-async function held(device: Device, field = "id") {
+async function held(device: Device, field = "id", stream = "items") {
   const rows = await device.db.query<{ body: string }>(
-    "SELECT body FROM records WHERE stream = 'items'",
+    "SELECT body FROM records WHERE stream = ?",
+    [stream],
   );
   return rows
     .map((r) => (JSON.parse(r.body) as Record<string, string>)[field]!)
@@ -314,6 +323,20 @@ async function published(w: World, ids = ["old"]) {
     classification: "present",
   });
 }
+
+/** The stream row of a delete of lifetime `generation` that never reached the control row. */
+const legacyStreamDelete = (w: World, generation: number) =>
+  postStreamDeleteOnly({
+    registry: w.registry,
+    blobs: w.blobs,
+    keys,
+    owner,
+    connector: declaration.connector,
+    ns: "",
+    stream: "items",
+    scope: w.scope,
+    endedGeneration: generation,
+  });
 
 const cycle = (device: Device, w: World) =>
   syncConnection(device.deps, w.fixture.control);
@@ -751,25 +774,9 @@ it("a stream delete whose control tombstone has not landed keeps an older pre-de
   expect(await generationOf(w.b)).toBe(3);
   // B collected rows under generation 3, before the delete, and has not published.
   const pre = await collect(w.b, ["pre-delete"]);
-  // A deletes the generation-3 connection and stops after the stream delete
-  // post, before the control tombstone lands.
-  const real = w.registry.post.bind(w.registry);
-  const paused = vi
-    .spyOn(w.registry, "post")
-    .mockImplementation(async (req) => {
-      if (
-        req.scope === w.fixture.control &&
-        req.dataHash === w.fixture.hashes.tombstoneData
-      )
-        throw new Error("device A stopped before the control tombstone");
-      return real(req);
-    });
-  await w.a.deleter.requestConnectionDelete(declaration.connector);
-  // The delete stays pending: the tombstone post failed.
-  expect(await w.a.deleter.resumeDeletes()).toMatchObject([
-    { connector: declaration.connector },
-  ]);
-  paused.mockRestore();
+  // A delete of the generation-3 connection that wrote the stream delete and
+  // stopped before the control tombstone (an older build's order).
+  await legacyStreamDelete(w, 3);
   const delRow = await observeHead(w);
   expect(delRow).toMatchObject({ version: 4, generation: 1, recordCount: 0 });
   const posts = vi.spyOn(w.registry, "post");
@@ -792,23 +799,10 @@ it("a stream that waits on an unproven delete says why in the log, naming the st
   await lifetime(w, w.a, w.a, "one"); // generation 3, head v3
   await applyConnection(w.b.deps, w.fixture.control);
   await collect(w.b, ["pre-delete"]);
-  // A deletes the generation-3 connection and stops after the stream delete
-  // post, before the control tombstone lands: the stream row is a delete the
+  // A delete of the generation-3 connection wrote the stream delete and
+  // stopped before the control tombstone: the stream row is a delete the
   // reader cannot place in an earlier lifetime.
-  const real = w.registry.post.bind(w.registry);
-  const paused = vi
-    .spyOn(w.registry, "post")
-    .mockImplementation(async (req) => {
-      if (
-        req.scope === w.fixture.control &&
-        req.dataHash === w.fixture.hashes.tombstoneData
-      )
-        throw new Error("device A stopped before the control tombstone");
-      return real(req);
-    });
-  await w.a.deleter.requestConnectionDelete(declaration.connector);
-  await w.a.deleter.resumeDeletes();
-  paused.mockRestore();
+  await legacyStreamDelete(w, 3);
   const warn = w.b.deps.logger.warn as ReturnType<typeof vi.fn>;
   warn.mockClear();
   const r = await cycle(w.b, w);
@@ -1159,4 +1153,184 @@ it("a resumed signed pin and head fence cannot replace ended-generation proof", 
     "published",
   ]);
   expect(await held(w.a)).toEqual(["second"]);
+});
+
+// ---------------------------------------------------------------------------
+// The control fence: a delete lands the control tombstone first. A delete that
+// finishes late (its device was closed after the fence) removes the data of
+// the lifetime it ended and nothing of a later one.
+// ---------------------------------------------------------------------------
+
+const twoStreams = {
+  ...declaration,
+  streams: [
+    ...declaration.streams,
+    {
+      name: "events",
+      semantics: "mutable_state" as const,
+      primaryKey: ["id"],
+    },
+  ],
+};
+
+/** A deleter of `device` that knows both streams, so "events" is a declared stream with no row yet. */
+const twoStreamDeleter = (device: Device) =>
+  createConnectionDeleter(device.deps, {
+    declaredStreams: () => ["items", "events"],
+  });
+
+/** `deleter` lands the fence, then stops before any stream is cleaned. */
+async function fencedThenStopped(
+  w: World,
+  deleter: ReturnType<typeof createConnectionDeleter>,
+) {
+  w.registry.beforePost = async (post) => {
+    if (post.scope !== w.fixture.control)
+      throw new Error("device closed after the fence");
+  };
+  const started = await deleter.requestConnectionDelete(declaration.connector);
+  expect(await deleter.resumeDeletes()).toHaveLength(1);
+  w.registry.beforePost = undefined;
+  return started;
+}
+
+it("a delete that finishes late keeps what another device published in a later lifetime, and cleans the rest", async () => {
+  const w = await world();
+  await published(w);
+  const deleter = twoStreamDeleter(w.a);
+  const started = await fencedThenStopped(w, deleter);
+  // Every surface can see the delete now: the control tombstone is version 2.
+  expect(await w.registry.read(w.fixture.control)).toMatchObject({
+    version: 2,
+  });
+  expect(started.fenced).toBe(true);
+  // Device B learns it and reconnects (generation 3 = tombstone version + 1).
+  // "events" had no row when the delete was planned; B publishes it now.
+  await applyConnection(w.b.deps, w.fixture.control);
+  await collect(w.b, ["new-event"], {
+    connect: true,
+    decl: twoStreams,
+    stream: "events",
+  });
+  expect(await generationOf(w.b)).toBe(3);
+  expect((await cycle(w.b, w)).published.map((p) => p.outcome)).toContain(
+    "published",
+  );
+  const events = `${w.fixture.control}.events`;
+  const newRow = await w.registry.read(events);
+  expect(newRow).toMatchObject({ found: true, version: 1 });
+  expect(await observeHead(w)).toMatchObject({ generation: 1, recordCount: 1 });
+  // The stopped delete resumes later. It cleans "items" (generation 1) and
+  // leaves "events" (generation 3) alone.
+  expect(await deleter.resumeDeletes()).toEqual([]);
+  expect(await w.registry.read(events)).toEqual(newRow);
+  expect(await w.registry.read(w.scope)).toMatchObject({
+    version: 2,
+    metadataHash: endedGenerationDeleteMetadataHash(w.scope, 2, 1),
+  });
+  expect(await w.registry.read(w.fixture.control)).toMatchObject({
+    version: 3,
+    dataHash: w.fixture.hashes.activeData,
+  });
+  expect(await w.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+  expect(await held(w.b, "id", "events")).toEqual(["new-event"]);
+});
+
+it("a device that reconnects before a late delete cleans waits for it, then publishes over the cleaned row", async () => {
+  const w = await world();
+  await published(w, ["old-1", "old-2"]);
+  const deleter = twoStreamDeleter(w.a);
+  await fencedThenStopped(w, deleter);
+  await applyConnection(w.b.deps, w.fixture.control);
+  await collect(w.b, ["new"], { connect: true });
+  expect(await generationOf(w.b)).toBe(3);
+  // The old rows are still in the registry. The publisher does not write over a
+  // stream row it cannot prove ended: it waits for the delete's cleanup.
+  expect((await cycle(w.b, w)).published.map((p) => p.outcome)).not.toContain(
+    "published",
+  );
+  expect(await observeHead(w)).toMatchObject({ generation: 1, recordCount: 2 });
+  expect(await deleter.resumeDeletes()).toEqual([]);
+  expect(await w.registry.read(w.scope)).toMatchObject({
+    version: 2,
+    metadataHash: endedGenerationDeleteMetadataHash(w.scope, 2, 1),
+  });
+  expect((await cycle(w.b, w)).published.map((p) => p.outcome)).toContain(
+    "published",
+  );
+  expect(await held(w.b)).toEqual(["new"]);
+  expect(await observeHead(w)).toMatchObject({ generation: 3, recordCount: 1 });
+});
+
+it("after the fence and before cleanup, every reader hides the streams, including a device that joins now", async () => {
+  const w = await world(2);
+  await published(w, ["old"]);
+  await applyConnection(w.b.deps, w.fixture.control);
+  expect(await held(w.b)).toEqual(["old"]);
+  await fencedThenStopped(w, w.a.deleter);
+  // The stream row is still live data in the registry: cleanup has not run.
+  expect(await observeHead(w)).toMatchObject({
+    generation: 1,
+    recordCount: 1,
+    classification: "present",
+  });
+  // A device that already had the data drops it on its next apply.
+  await applyConnection(w.b.deps, w.fixture.control);
+  expect(await held(w.b)).toEqual([]);
+  expect(await w.b.db.query("SELECT control_state FROM connections")).toEqual([
+    { control_state: "deleted" },
+  ]);
+  // A device that joins now bootstraps from the registry and sees nothing.
+  const joined = await addDevice(w, true);
+  expect(await held(joined)).toEqual([]);
+  expect(
+    await joined.db.query("SELECT control_state FROM connections"),
+  ).toEqual([{ control_state: "deleted" }]);
+  // A publish from a device that still holds the old lifetime is refused.
+  const outcomes = (await publishConnection(w.b.deps, w.fixture.control)).map(
+    (p) => p.outcome,
+  );
+  expect(outcomes).not.toContain("published");
+  expect(await observeHead(w)).toMatchObject({ generation: 1, recordCount: 1 });
+  // The stopped delete resumes and finishes: the row ends as a delete marker.
+  expect(await w.a.deleter.resumeDeletes()).toEqual([]);
+  expect(await w.registry.read(w.scope)).toMatchObject({
+    version: 2,
+    metadataHash: endedGenerationDeleteMetadataHash(w.scope, 2, 1),
+  });
+});
+
+it("after the fence, direct history and query reads answer deleted and empty on a device that applied it", async () => {
+  const w = await world(2);
+  await published(w, ["old"]);
+  await applyConnection(w.b.deps, w.fixture.control);
+  const [{ connection_id: connectionId }] = await w.b.db.query<{
+    connection_id: string;
+  }>("SELECT connection_id FROM connections");
+  const history = createLocalHistory(w.b.deps, {
+    olderVersionReads: () => true,
+  });
+  const query = createRecordQuery(w.b.db);
+  const versions = () =>
+    history.versions({ scope: w.scope, limit: 10, offset: 0 });
+  // Before the delete: the stream is readable.
+  expect(await versions()).toMatchObject({ ok: true });
+  expect(
+    (await query.listRecords({ connectionId, stream: "items" })).records,
+  ).toHaveLength(1);
+  await fencedThenStopped(w, w.a.deleter);
+  // The stream row is still live in the registry (cleanup has not run); the
+  // device reads the fence on its next apply and then serves nothing.
+  await applyConnection(w.b.deps, w.fixture.control);
+  expect(await versions()).toEqual({ ok: false, reason: "deleted" });
+  expect(await history.lineage({ scope: w.scope })).toEqual({
+    ok: false,
+    reason: "deleted",
+  });
+  expect(
+    (await query.listRecords({ connectionId, stream: "items" })).records,
+  ).toEqual([]);
+  expect(
+    await query.getRecord({ connectionId, stream: "items", recordKey: "old" }),
+  ).toBeNull();
 });

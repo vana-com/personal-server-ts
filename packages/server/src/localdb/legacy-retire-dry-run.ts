@@ -20,6 +20,10 @@ import {
 } from "node:path";
 import { homedir } from "node:os";
 import { createLegacyEraseLedger } from "@opendatalabs/personal-server-ts-core/localdb";
+import {
+  createStorageAccess,
+  DEFAULT_STORAGE_ACCESS_POLICY,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type { Database } from "better-sqlite3";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type {
@@ -192,7 +196,14 @@ export async function runLegacyRetireDryRun(
         listControlRows: unavailable,
         listStreamRows: unavailable,
       },
-      blobs: { get: unavailable, put: unavailable, exists: unavailable },
+      blobs: {
+        // Every request refuses, so nothing is ever held: a governor of its
+        // own keeps the port whole without borrowing the opened store's.
+        governor: createStorageAccess(DEFAULT_STORAGE_ACCESS_POLICY),
+        get: unavailable,
+        put: unavailable,
+        exists: unavailable,
+      },
       keys: {
         namespaceHmac: unavailable,
         encrypt: unavailable,

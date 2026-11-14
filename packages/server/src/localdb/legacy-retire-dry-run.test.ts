@@ -1,3 +1,4 @@
+import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/memory-registry.js";
 import { importProjection } from "./sync.js";
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
@@ -126,7 +127,11 @@ async function fixture(missing = false, createTemp = mkdtempSync) {
           listControlRows: unavailable,
           listStreamRows: unavailable,
         },
-        blobs: { get: unavailable, put: unavailable },
+        blobs: {
+          governor: createMemoryStreamSyncBlobs().governor,
+          get: unavailable,
+          put: unavailable,
+        },
         keys: {
           namespaceHmac: unavailable,
           encrypt: unavailable,

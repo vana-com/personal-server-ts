@@ -1,3 +1,4 @@
+import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/memory-registry.js";
 import { importProjection } from "./sync.js";
 import { afterEach, expect, it } from "vitest";
 import { mkdtempSync, mkdirSync, cpSync, rmSync, readFileSync } from "node:fs";
@@ -96,7 +97,11 @@ it.each([false, true])(
             listControlRows: unavailable,
             listStreamRows: unavailable,
           },
-          blobs: { get: unavailable, put: unavailable },
+          blobs: {
+            governor: createMemoryStreamSyncBlobs().governor,
+            get: unavailable,
+            put: unavailable,
+          },
           keys: {
             namespaceHmac: unavailable,
             encrypt: unavailable,

@@ -54,12 +54,12 @@ export interface StorageAccessPolicy {
   /** No backoff wait is longer than this. */
   readonly maxDelayMs: number;
   /**
-   * Bytes of encoded data not yet uploaded that may sit in memory at once.
-   * A safety ceiling, not a throughput setting: at 4 PUTs a second and about
-   * 1 s per 3.4 MB upload, about 4 parts (about 14 MB) are in flight, so a
-   * normal network never reaches it. It only binds when uploads stall while
-   * many streams keep encoding. It also caps the send gate's in-flight
-   * window: this many bytes over `partBytes`.
+   * Bytes of data not yet uploaded that may sit in memory at once. A part
+   * counts twice, as an attachment does: its plain encoded bytes and its
+   * ciphertext are both held while the PUT runs. So the default 64 MiB holds
+   * 8 parts of 4 MiB. It is the memory ceiling the send gate works under, so
+   * a store that is slow or stalled cannot pile up parts. It also caps the
+   * send gate's in-flight window: this many bytes over `partBytes`.
    */
   readonly maxBytesInFlight: number;
   /** The usual part size, which turns the byte budget into a window cap. */

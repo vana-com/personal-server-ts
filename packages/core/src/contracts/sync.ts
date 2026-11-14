@@ -6,13 +6,30 @@ export interface SyncFileContractInput {
   fileId: string;
 }
 
+export interface TriggerSyncOptions {
+  /**
+   * The caller is a signal (a window came back, the network returned), not a
+   * request to sync. The manager reads the registry's change marker and runs a
+   * cycle only when it moved (`SyncManager.requestPull`).
+   */
+  whenChanged?: boolean;
+}
+
 export async function triggerSyncContract(
-  syncManager: Pick<SyncManager, "trigger"> | null,
+  syncManager:
+    | (Pick<SyncManager, "trigger"> & Partial<Pick<SyncManager, "requestPull">>)
+    | null,
+  options: TriggerSyncOptions = {},
 ): Promise<ContractResult> {
   if (!syncManager) {
     return contractOk({ status: "disabled", message: "Sync is not enabled" });
   }
-  void syncManager.trigger().catch(() => undefined);
+  // A manager that cannot pull on a signal answers it with a full cycle.
+  const start =
+    options.whenChanged && syncManager.requestPull
+      ? syncManager.requestPull()
+      : syncManager.trigger();
+  void start.catch(() => undefined);
   return contractOk({ status: "started", message: "Sync triggered" }, 202);
 }
 

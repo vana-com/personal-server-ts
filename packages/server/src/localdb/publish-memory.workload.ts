@@ -1,6 +1,7 @@
 // Workload for the publish memory test: a first publish of a many-row stream,
 // measured in a fresh child by the memory oracle. The database is built by the
 // parent (not measured); the child opens it and publishes once.
+import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/memory-registry.js";
 import { createHash } from "node:crypto";
 import { keccak_256 } from "@noble/hashes/sha3";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
@@ -48,6 +49,7 @@ async function makeDeps(
     // Uploaded objects are counted and dropped: a test double that kept them
     // would itself grow with the stream and hide what the publisher holds.
     blobs: {
+      governor: createMemoryStreamSyncBlobs().governor,
       get: async () => null,
       exists: async () => false,
       put: async (_key, bytes) => {

@@ -27,6 +27,7 @@ function createMockSyncManager(overrides?: Partial<SyncManager>): SyncManager {
     start: vi.fn(),
     stop: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
     trigger: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
+    requestPull: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
     getStatus: vi.fn<() => SyncStatus>().mockReturnValue(status),
     notifyNewData: vi.fn(),
     running: true,
@@ -64,6 +65,52 @@ describe("syncRoutes", () => {
           message: "Sync triggered",
         });
         expect(mockSyncManager.trigger).toHaveBeenCalled();
+      });
+
+      it("?when=changed asks for a pull, which the manager gates on a registry probe", async () => {
+        const manager = createMockSyncManager();
+        const pulling = syncRoutes({
+          logger,
+          serverOrigin: SERVER_ORIGIN,
+          serverOwner: owner.address,
+          syncManager: manager,
+        });
+        const auth = await buildWeb3SignedHeader({
+          wallet: owner,
+          aud: SERVER_ORIGIN,
+          method: "POST",
+          uri: "/trigger",
+        });
+        const res = await pulling.request("/trigger?when=changed", {
+          method: "POST",
+          headers: { authorization: auth },
+        });
+
+        expect(res.status).toBe(202);
+        expect(manager.requestPull).toHaveBeenCalledTimes(1);
+        expect(manager.trigger).not.toHaveBeenCalled();
+      });
+
+      it("any other `when` is a plain trigger", async () => {
+        const manager = createMockSyncManager();
+        const pulling = syncRoutes({
+          logger,
+          serverOrigin: SERVER_ORIGIN,
+          serverOwner: owner.address,
+          syncManager: manager,
+        });
+        const auth = await buildWeb3SignedHeader({
+          wallet: owner,
+          aud: SERVER_ORIGIN,
+          method: "POST",
+          uri: "/trigger",
+        });
+        await pulling.request("/trigger?when=now", {
+          method: "POST",
+          headers: { authorization: auth },
+        });
+        expect(manager.trigger).toHaveBeenCalledTimes(1);
+        expect(manager.requestPull).not.toHaveBeenCalled();
       });
 
       it("returns immediately while sync continues in the background", async () => {

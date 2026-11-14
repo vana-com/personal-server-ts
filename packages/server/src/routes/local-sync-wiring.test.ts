@@ -58,9 +58,11 @@ describe("database route wiring", () => {
       (await app.request("/trigger", { method: "POST", headers })).status,
     ).toBe(202);
     expect(order).toEqual(["sync", "read", "cycle"]);
-    expect(await (await app.request("/status", { headers })).json()).toEqual(
-      status,
-    );
+    // No manager here, so no probe: 0 tells a client not to ask for a pull.
+    expect(await (await app.request("/status", { headers })).json()).toEqual({
+      ...status,
+      changeProbeMs: 0,
+    });
     const readStatus = streamSyncReadStatusRoutes({
       ...auth,
       streamSyncRead: undefined,

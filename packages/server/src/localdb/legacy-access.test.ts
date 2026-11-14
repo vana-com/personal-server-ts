@@ -1,3 +1,4 @@
+import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/memory-registry.js";
 import { fixtureProjections } from "./import-projection.test-utils.js";
 import { readBackLegacyImport } from "../../../core/src/localdb/import-readback.js";
 import { afterEach, expect, it, vi } from "vitest";
@@ -382,7 +383,11 @@ it.each(["after-unlink", "before-receipt"])(
         listControlRows: unexpected,
         listStreamRows: unexpected,
       },
-      blobs: { get: unexpected, put: unexpected },
+      blobs: {
+        governor: createMemoryStreamSyncBlobs().governor,
+        get: unexpected,
+        put: unexpected,
+      },
       keys: {
         namespaceHmac: unexpected,
         encrypt: unexpected,

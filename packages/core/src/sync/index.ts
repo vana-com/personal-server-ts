@@ -13,9 +13,15 @@ export {
 } from "./issues.js";
 export {
   createSyncManager,
+  type ChangeProbe,
   type SyncManager,
   type SyncManagerOptions,
 } from "./engine/sync-manager.js";
+export {
+  DEFAULT_CHANGE_PROBE_MS,
+  createRegistryChangeProbe,
+  type RegistryChangeProbeOptions,
+} from "./engine/change-probe.js";
 export type {
   DownloadDiagnosticsHook,
   DownloadWorkerDeps,

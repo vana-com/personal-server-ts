@@ -1,3 +1,4 @@
+import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/memory-registry.js";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -35,7 +36,11 @@ async function fresh() {
     db,
     queue: { run: async (_connection, _kind, fn) => fn() },
     ownerAddress: "0xabc",
-    blobs: { get, put: vi.fn() },
+    blobs: {
+      governor: createMemoryStreamSyncBlobs().governor,
+      get,
+      put: vi.fn(),
+    },
     keys: {
       namespaceHmac: vi.fn(),
       encrypt: vi.fn(),

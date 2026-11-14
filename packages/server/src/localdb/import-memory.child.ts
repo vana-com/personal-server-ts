@@ -1,3 +1,4 @@
+import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/memory-registry.js";
 import { join } from "node:path";
 import { createReadStream } from "node:fs";
 import { monitorEventLoopDelay } from "node:perf_hooks";
@@ -186,7 +187,11 @@ export async function importMemoryWorkload(input: {
         listControlRows: unused,
         listStreamRows: unused,
       },
-      blobs: { get: unused, put: unused },
+      blobs: {
+        governor: createMemoryStreamSyncBlobs().governor,
+        get: unused,
+        put: unused,
+      },
       keys: {
         namespaceHmac: unused,
         encrypt: unused,

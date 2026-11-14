@@ -76,6 +76,7 @@ function fakeStorage(inner: StreamSyncBlobs): FakeStorage {
     }
   };
   return {
+    governor: inner.governor,
     puts,
     holdNext(when = () => true) {
       const next = gate();

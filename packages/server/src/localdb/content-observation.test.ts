@@ -33,6 +33,7 @@ async function world() {
   const blobs: typeof store = {
     get: (key) => store.get(key),
     exists: (key) => store.exists(key),
+    governor: store.governor,
     put: async (key, bytes) => {
       puts.push(key);
       return store.put(key, bytes);

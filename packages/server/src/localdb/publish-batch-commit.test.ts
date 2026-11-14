@@ -69,6 +69,7 @@ async function world(options: Options) {
   const innerBlobs = createMemoryStreamSyncBlobs();
   const putsDone: string[] = [];
   const blobs: StreamSyncBlobs = {
+    governor: innerBlobs.governor,
     get: (key) => innerBlobs.get(key),
     async exists(key) {
       await options.onExists?.(key);

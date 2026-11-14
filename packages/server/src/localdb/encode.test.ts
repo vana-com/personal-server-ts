@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/memory-registry.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -69,7 +70,12 @@ async function fresh(partTargetBytes?: number) {
   // Encoding must not call registry, queue, signer, or another PS-2 body.
   const deps = {
     db,
-    blobs: { get, exists, put },
+    blobs: {
+      governor: createMemoryStreamSyncBlobs().governor,
+      get,
+      exists,
+      put,
+    },
     keys: { encryptPart },
     ...(partTargetBytes === undefined ? {} : { partTargetBytes }),
   } as LocalSyncDeps;

@@ -26,6 +26,7 @@ function makeDeps(): {
   const readMode = vi.fn(() => "switched" as const);
   const requestConnectionDelete = vi.fn(async () => ({
     deleteId: "delete-1",
+    fenced: true,
   }));
   const connectionDelete: ConnectionDeletePort = {
     requestConnectionDelete,
@@ -60,7 +61,29 @@ describe("handleOwnerConnectorDelete (PS-2 W6 owner-delete)", () => {
     expect(requestConnectionDelete).toHaveBeenCalledTimes(1);
     expect(requestConnectionDelete).toHaveBeenCalledWith("fixture");
     expect(response.status).toBe(202);
-    expect(await response.json()).toEqual({ deleteId: "delete-1" });
+    expect(await response.json()).toEqual({
+      deleteId: "delete-1",
+      fenced: true,
+    });
+  });
+
+  it("tells a caller whose delete could not reach the registry that it is still pending", async () => {
+    const { deps, requestConnectionDelete } = makeDeps();
+    requestConnectionDelete.mockResolvedValueOnce({
+      deleteId: "delete-2",
+      fenced: false,
+    });
+    const response = await handleOwnerConnectorDelete(
+      deleteRequest(),
+      "fixture",
+      deps,
+    );
+
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({
+      deleteId: "delete-2",
+      fenced: false,
+    });
   });
 
   it("for a switched owner, the delete touches no scope path, not even the connector's five-part additions ledger", async () => {
