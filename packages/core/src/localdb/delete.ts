@@ -299,17 +299,28 @@ export function createConnectionDeleter(
               finished = true;
               break;
             }
-            // Only an active control proves the generation a new fence ends.
-            // Foreign/absent controls (and unproven deleted rows) must wait.
-            if (now.kind !== "active")
+            if (now.kind === "foreign")
               throw new Error(
                 "stream delete pending without ended generation proof",
               );
-            const ended = now.generation;
+            // A deleted control at v fences every active generation <= v.
+            // Use v as a conservative boundary when the old marker has lost
+            // its proof: reconnect must create active(v+1). This does not
+            // infer a lost active generation or weaken the reader's rule.
+            // With no control, the first lifetime is generation 1, matching
+            // the empty delete head, so the legacy v1 marker remains usable.
+            const ended =
+              now.kind === "active"
+                ? now.generation
+                : now.kind === "deleted"
+                  ? now.version
+                  : undefined;
             const marked = (version: number, hash: string) =>
-              hash.toLowerCase() === deleteMetadataHash(scope, version) ||
-              hash.toLowerCase() ===
-                endedGenerationDeleteMetadataHash(scope, version, ended);
+              (now.kind !== "deleted" &&
+                hash.toLowerCase() === deleteMetadataHash(scope, version)) ||
+              (ended !== undefined &&
+                hash.toLowerCase() ===
+                  endedGenerationDeleteMetadataHash(scope, version, ended));
             let lastDelete =
               row.found &&
               (classifyStreamRow(row, hashes) === "tombstoned" ||
@@ -385,7 +396,13 @@ export function createConnectionDeleter(
                   await signPost(
                     scope,
                     digest.dataHash,
-                    endedGenerationDeleteMetadataHash(scope, version, ended),
+                    ended === undefined
+                      ? deleteMetadataHash(scope, version)
+                      : endedGenerationDeleteMetadataHash(
+                          scope,
+                          version,
+                          ended,
+                        ),
                     version,
                   )
                 ).kind === "conflict";

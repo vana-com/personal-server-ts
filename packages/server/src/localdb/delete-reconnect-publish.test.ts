@@ -32,6 +32,8 @@ import { keccak_256 } from "@noble/hashes/sha3";
 import {
   classifyStreamRow,
   decodeHead,
+  controlHashes,
+  deriveKeyCheck,
   digestHead,
   encodeHead,
   headBlobName,
@@ -43,7 +45,10 @@ import { publishConnection } from "../../../core/src/localdb/publish.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
 import { createRunIntakeStore } from "../../../core/src/localdb/run-intake.js";
 import { syncConnection } from "../../../core/src/localdb/cycle.js";
-import { endedGenerationDeleteMetadataHash } from "../../../core/src/stream-sync/delete-metadata.js";
+import {
+  deleteMetadataHash,
+  endedGenerationDeleteMetadataHash,
+} from "../../../core/src/stream-sync/delete-metadata.js";
 import { remoteFixture } from "./apply-fixture.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
@@ -72,19 +77,20 @@ const keys = {
   decrypt: async (_s: string, b: Uint8Array) => b,
 };
 
-async function world(deviceCount = 2) {
+async function world(deviceCount = 2, withControl = true) {
   const fixture = await remoteFixture(keys);
   const registry = createMemoryStreamSyncRegistry() as MemoryStreamSyncRegistry;
   const blobs = createMemoryStreamSyncBlobs();
   // Only the control row is seeded; no stream head exists until a real publish.
-  await registry.post({
-    ownerAddress: owner,
-    scope: fixture.control,
-    dataHash: fixture.hashes.activeData as `0x${string}`,
-    metadataHash: fixture.hashes.activeMetadata as `0x${string}`,
-    expectedVersion: "1",
-    signature: "0x00",
-  });
+  if (withControl)
+    await registry.post({
+      ownerAddress: owner,
+      scope: fixture.control,
+      dataHash: fixture.hashes.activeData as `0x${string}`,
+      metadataHash: fixture.hashes.activeMetadata as `0x${string}`,
+      expectedVersion: "1",
+      signature: "0x00",
+    });
   const scope = `${fixture.control}.items`;
   const w = { fixture, registry, blobs, scope, devices: [] as Device[] };
   for (let n = 0; n < deviceCount; n++) await addDevice(w);
@@ -815,40 +821,119 @@ it("a stream that waits on an unproven delete says why in the log, naming the st
   );
 });
 
-it.each(["absent", "foreign", "deleted"] as const)(
-  "a %s control without ended-generation proof keeps the delete pending without writes",
-  async (kind) => {
-    const w = await world(1);
-    await published(w);
-    const original = w.registry.read.bind(w.registry);
-    const active = await original(w.fixture.control);
-    if (!active.found) throw new Error("missing fixture control");
-    vi.spyOn(w.registry, "read").mockImplementation(async (scope) =>
-      scope !== w.fixture.control
-        ? original(scope)
-        : kind === "absent"
-          ? { found: false }
-          : {
-              ...active,
-              version: 2,
-              dataHash:
-                kind === "deleted"
-                  ? w.fixture.hashes.tombstoneData
-                  : `0x${"ff".repeat(32)}`,
-              metadataHash:
-                kind === "deleted"
-                  ? w.fixture.hashes.tombstoneMetadata
-                  : active.metadataHash,
-            },
-    );
-    const posts = vi.spyOn(w.registry, "post");
-    const before = await original(w.scope);
-    await w.a.deleter.requestConnectionDelete(declaration.connector);
-    expect(await w.a.deleter.resumeDeletes()).toMatchObject([
-      { connector: declaration.connector },
-    ]);
-    expect(await w.a.db.query("SELECT * FROM delete_intents")).toHaveLength(1);
-    expect(await original(w.scope)).toEqual(before);
-    expect(posts).not.toHaveBeenCalled();
+it.each([true, false])(
+  "absent control deletion permits generation-one publication (cached source: %s)",
+  async (cached) => {
+    const w = await world(0, false);
+    await w.fixture.head("items", [{ id: "legacy" }]);
+    for (const [key, bytes] of w.fixture.blobs) await w.blobs.put(key, bytes);
+    const row = w.fixture.reads.get(w.scope)!;
+    if (!row.found) throw new Error("missing legacy row");
+    await w.registry.post({
+      ownerAddress: owner,
+      scope: w.scope,
+      dataHash: row.dataHash as `0x${string}`,
+      metadataHash: row.metadataHash as `0x${string}`,
+      expectedVersion: "1",
+      signature: "0x00",
+    });
+    const device = await addDevice(w);
+    if (cached) await collect(device, ["legacy-local"]);
+    await deleteConnection(device);
+    expect(await w.registry.read(w.fixture.control)).toEqual({ found: false });
+    expect(await w.registry.read(w.scope)).toMatchObject({
+      metadataHash: deleteMetadataHash(w.scope, 2),
+    });
+    expect(await device.db.query("SELECT * FROM delete_intents")).toEqual([]);
+    await collect(device, ["reconnected"], { connect: true });
+    const first = (await cycle(device, w)).published.map((p) => p.outcome);
+    if (cached) expect(first).toEqual(["published"]);
+    else {
+      // Base behavior on a cold device: the unbound first run pinned snapshot
+      // 0 before apply learns the v1 fence. A fresh full run can publish.
+      expect(first).toEqual(["noop"]);
+      await collect(device, ["reconnected"], { connect: true });
+      expect((await cycle(device, w)).published.map((p) => p.outcome)).toEqual([
+        "published",
+      ]);
+    }
+    expect(await observeHead(w)).toMatchObject({
+      generation: 1,
+      recordCount: 1,
+    });
+    expect(await held(device)).toEqual(["reconnected"]);
   },
 );
+
+it("deleted control repairs an orphan v1 marker before reconnect", async () => {
+  const w = await world(1);
+  await published(w);
+  await deleteConnection(w.a);
+  const row = await w.registry.read(w.scope);
+  if (!row.found) throw new Error("missing delete row");
+  await w.registry.post({
+    ownerAddress: owner,
+    scope: w.scope,
+    dataHash: row.dataHash as `0x${string}`,
+    metadataHash: deleteMetadataHash(w.scope, 3),
+    expectedVersion: "3",
+    signature: "0x00",
+  });
+  const device = await addDevice(w, false);
+  await deleteConnection(device);
+  expect(await device.db.query("SELECT * FROM delete_intents")).toEqual([]);
+  const repaired = await w.registry.read(w.scope);
+  expect(repaired).toMatchObject({
+    version: 4,
+    metadataHash: endedGenerationDeleteMetadataHash(w.scope, 4, 2),
+  });
+  await deleteConnection(device);
+  expect(await w.registry.read(w.scope)).toEqual(repaired);
+  await collect(device, ["reconnected"], { connect: true });
+  expect((await cycle(device, w)).published.map((p) => p.outcome)).toEqual([
+    "published",
+  ]);
+  expect(await held(device)).toEqual(["reconnected"]);
+});
+
+it("foreign control deletion recovers after restoring the matching key", async () => {
+  const w = await world(1);
+  await published(w);
+  const restored = new Uint8Array(32).fill(1);
+  const hashes = await controlHashes(
+    async (b) => keccak_256(b),
+    await deriveKeyCheck(async () => restored),
+  );
+  await w.registry.post({
+    ownerAddress: owner,
+    scope: w.fixture.control,
+    dataHash: hashes.activeData,
+    metadataHash: hashes.activeMetadata,
+    expectedVersion: "2",
+    signature: "0x00",
+  });
+  const posts = vi.spyOn(w.registry, "post");
+  await w.a.deleter.requestConnectionDelete(declaration.connector);
+  expect(await w.a.deleter.resumeDeletes()).toHaveLength(1);
+  expect(posts).not.toHaveBeenCalled();
+  await expect(
+    collect(w.a, ["blocked"], { connect: true }),
+  ).rejects.toMatchObject({ code: "connection_stopped" });
+  // Restoring the key changes foreign(v2) to active(g2). The old plan is
+  // superseded, clears its intent, and a new delete can use that generation.
+  const key = vi.spyOn(keys, "namespaceHmac").mockResolvedValue(restored);
+  try {
+    expect(await w.a.deleter.resumeDeletes()).toMatchObject([
+      { why: "ConnectionDeleteSuperseded" },
+    ]);
+    expect(await w.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+    await deleteConnection(w.a);
+    await collect(w.a, ["recovered"], { connect: true });
+    expect((await cycle(w.a, w)).published.map((p) => p.outcome)).toEqual([
+      "published",
+    ]);
+    expect(await held(w.a)).toEqual(["recovered"]);
+  } finally {
+    key.mockRestore();
+  }
+});
