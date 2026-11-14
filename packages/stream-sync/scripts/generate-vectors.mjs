@@ -2031,7 +2031,9 @@ const vectors = {
 // Every v1 case is kept. Only the two format-4 head cases change (format 6 is
 // now the unsupported one), and format-4 and format-5 heads are added to encode
 // and verify. Format 5 adds `replacedAt`: the time the newest full run dropped
-// what the source no longer listed, at most `observedAt`.
+// what the source no longer listed. It is independent of `observedAt`: a later
+// partial run puts observedAt after it, a publisher whose clock is behind puts
+// observedAt before it.
 const f4 = { ...baseHead, format: 4, lastDeleteVersion: 2 };
 const f4Text = cj(f4);
 const f5 = {
@@ -2041,6 +2043,8 @@ const f5 = {
   replacedAt: baseHead.observedAt - 1000,
 };
 const f5Text = cj(f5);
+const f5Behind = { ...f5, replacedAt: f5.observedAt + 1000 };
+const f5BehindText = cj(f5Behind);
 const f6Text = mutate({ format: 6, lastDeleteVersion: 2 });
 // v3 frames (head format 4): the envelope adds `f`, the record's first-seen
 // checkpoint (an integer, or null when unknown).
@@ -2218,6 +2222,13 @@ const vectorsV2 = {
         dataHash: keccak(f5Text),
         blobName: `h-${keccak(f5Text).slice(2)}`,
       },
+      {
+        name: "format 5 head with replacedAt after observedAt",
+        head: f5Behind,
+        text: f5BehindText,
+        dataHash: keccak(f5BehindText),
+        blobName: `h-${keccak(f5BehindText).slice(2)}`,
+      },
     ],
     decode: [
       ...vectors.heads.decode.map((c) =>
@@ -2240,7 +2251,7 @@ const vectorsV2 = {
       {
         name: "format 5 replacedAt after observedAt",
         text: cj({ ...f5, replacedAt: f5.observedAt + 1 }),
-        expected: "malformed",
+        expected: "ok",
       },
       {
         name: "format 5 negative replacedAt",

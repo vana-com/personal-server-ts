@@ -1213,15 +1213,13 @@ async function snapshotStream(
       },
     // When the source last dropped what it no longer lists: the replacing
     // run's time, else the registry head's, so a later partial run in this
-    // head does not widen it (see omissionCutoff). Never after observedAt: a
-    // device whose clock is behind the registry head's may publish an
-    // earlier observedAt, and the earlier cutoff then keeps more, not less.
-    replacedAt: Math.min(
-      observedAt,
-      Math.max(
-        plan.replaceBelow?.o ?? 0,
-        registryHead ? omissionCutoff(registryHead) : 0,
-      ),
+    // head does not widen it (see omissionCutoff). A known cutoff is never
+    // lowered: a device whose clock is behind the registry head's publishes
+    // an earlier observedAt, and the omission is no earlier for that. The two
+    // times are independent; observedAt stays the time of the newest run.
+    replacedAt: Math.max(
+      plan.replaceBelow?.o ?? 0,
+      registryHead ? omissionCutoff(registryHead) : 0,
     ),
     stream,
   };

@@ -71,8 +71,9 @@ export interface Head {
    * Format 5 and later. The `observedAt` of the newest full run that dropped
    * what the source no longer listed, carried unchanged through the partial
    * runs and publishes after it. A record this head omits was dropped at this
-   * time; `observedAt` may be later, because a partial run can follow the
-   * replacing one in the same head. At most `observedAt`.
+   * time. `observedAt` may be later, because a partial run can follow the
+   * replacing one in the same head, or earlier, because a later publish can
+   * come from a device whose clock is behind. The two are independent.
    */
   readonly replacedAt?: number;
   readonly stream: string;
@@ -165,8 +166,6 @@ function headProblem(
     const replacedAt = v["replacedAt"];
     if (!isCount(replacedAt, 0))
       return "replacedAt must be a non-negative integer";
-    if (replacedAt > v["observedAt"])
-      return "replacedAt must be at most observedAt";
   }
   if (typeof v["stream"] !== "string" || v["stream"] === "") {
     return "stream must be a non-empty string";

@@ -668,11 +668,15 @@ async function registryHead(
     generation?: number;
     profile?: Head["profile"];
     partition?: boolean;
+    o?: number;
+    replacedAt?: number;
   } = {},
 ) {
   const remote = await remoteFixture(world.deps.keys, CONNECTOR, NS);
   const generated = await remote.head(STREAM, values, {
     format: options.format,
+    o: options.o,
+    replacedAt: options.replacedAt,
     generation: options.generation,
     f: 23,
   });
@@ -810,6 +814,25 @@ describe("publish with real apply", () => {
     expect(head.format).toBe(5);
     expect(head.observedAt).toBe(1000);
     expect(head.replacedAt).toBe(100);
+  });
+
+  it("a publish from a clock behind the head's keeps the head's cutoff", async () => {
+    const world = await makeWorld();
+    await seedConnection(world.deps);
+    await seedStream(world.deps);
+    // The registry head dropped records at 3000. This device's run is at 1000.
+    await registryHead(world, [{ id: "old" }], {
+      format: 5,
+      o: 3000,
+      replacedAt: 3000,
+    });
+    await applyConnection(world.deps, CONNECTION_ID);
+    await localRun(world); // a partial run at 1000
+    await seedRecord(world.deps, "new", canonicalJson({ id: "new" }));
+    await publishConnection(world.deps, CONNECTION_ID);
+    const { head } = await published(world);
+    expect(head.observedAt).toBe(1000);
+    expect(head.replacedAt).toBe(3000);
   });
 
   it("a replacing run's time is the cutoff of the head it publishes", async () => {

@@ -1843,6 +1843,44 @@
         "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":5,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":2,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"replacedAt\":1699999999000,\"stream\":\"conversations\"}",
         "dataHash": "0x4cd4114a89a40d6f367f8de93fdf422791aa2f4d7e711a22f1791d09fb5e2743",
         "blobName": "h-4cd4114a89a40d6f367f8de93fdf422791aa2f4d7e711a22f1791d09fb5e2743"
+      },
+      {
+        "name": "format 5 head with replacedAt after observedAt",
+        "head": {
+          "complete": true,
+          "connector": "chatgpt",
+          "format": 5,
+          "generation": "3",
+          "keyCheck": "94e0f0e1aa1f8175",
+          "ns": "834ab4c2636bcdd5",
+          "observedAt": 1700000000000,
+          "parts": [
+            {
+              "bytes": 120,
+              "count": 2,
+              "hash": "169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0",
+              "prefix": "0"
+            },
+            {
+              "bytes": 64,
+              "count": 1,
+              "hash": "f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a",
+              "prefix": "10"
+            }
+          ],
+          "primaryKey": ["id"],
+          "profile": {
+            "key": "conversations",
+            "version": "1.4.0"
+          },
+          "recordCount": 3,
+          "stream": "conversations",
+          "lastDeleteVersion": 2,
+          "replacedAt": 1700000001000
+        },
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":5,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":2,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"replacedAt\":1700000001000,\"stream\":\"conversations\"}",
+        "dataHash": "0xd0801dca46c82e897af9771d682234d95f747dbd22a9a39725ec51acf96d3f8c",
+        "blobName": "h-d0801dca46c82e897af9771d682234d95f747dbd22a9a39725ec51acf96d3f8c"
       }
     ],
     "decode": [
@@ -1984,7 +2022,7 @@
       {
         "name": "format 5 replacedAt after observedAt",
         "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":5,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":2,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"replacedAt\":1700000000001,\"stream\":\"conversations\"}",
-        "expected": "malformed"
+        "expected": "ok"
       },
       {
         "name": "format 5 negative replacedAt",

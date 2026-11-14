@@ -57,7 +57,7 @@ function randomHead(random: () => number): Head {
     generation: 1 + int(random, 1e9),
     ns: random() < 0.3 ? "" : head.ns,
     observedAt,
-    replacedAt: int(random, observedAt + 1),
+    replacedAt: int(random, 2 ** 45),
     parts,
     primaryKey: random() < 0.5 ? ["id"] : ["a", "é"],
     profile: { key: random() < 0.5 ? null : "pk ✓", version: "2.0.0-beta.1" },
@@ -112,10 +112,19 @@ describe("head", () => {
     });
   });
 
-  it("replacedAt is a format 5 field: required there, refused earlier, never after observedAt", () => {
+  it("replacedAt is a format 5 field: required there, refused earlier, independent of observedAt", () => {
     const { replacedAt: _drop, ...without } = head;
     expect(() => encodeHead(without)).toThrow(InvalidArgumentError);
-    expect(() => encodeHead({ ...head, observedAt: 5, replacedAt: 6 })).toThrow(
+    // Either order of the two times round-trips: a later partial run puts
+    // observedAt after replacedAt, a clock that is behind puts it before.
+    for (const times of [
+      { observedAt: 5, replacedAt: 6 },
+      { observedAt: 6, replacedAt: 5 },
+    ]) {
+      const h = { ...head, ...times };
+      expect(decodeHead(encodeHead(h))).toEqual({ kind: "ok", head: h });
+    }
+    expect(() => encodeHead({ ...head, replacedAt: -1 })).toThrow(
       InvalidArgumentError,
     );
     const four = decodeHead(
