@@ -18,6 +18,7 @@ import {
 import { manifestStreamLister } from "../stream-sync/artifacts.js";
 import {
   deleteMetadataHash,
+  deleteEndedEarlierLifetime,
   endedGenerationDeleteMetadataHash,
 } from "../stream-sync/delete-metadata.js";
 import { RegistryRefusedError } from "../stream-sync/ports.js";
@@ -288,14 +289,27 @@ export function createConnectionDeleter(
                       : -1) === pin.version
                 : now.kind === "absent";
             if (!holds) throw new ConnectionDeleteSuperseded(connector);
-            // The generation this delete ends: the active control row it holds
-            // against. Any other control state keeps the unmarked delete.
-            const ended = now.kind === "active" ? now.generation : undefined;
+            // A completed delete already fences this lifetime. Keep its row,
+            // including its version and hashes, even on a device with no local state.
+            if (
+              now.kind === "deleted" &&
+              row.found &&
+              deleteEndedEarlierLifetime(scope, row, now.version)
+            ) {
+              finished = true;
+              break;
+            }
+            // Only an active control proves the generation a new fence ends.
+            // Foreign/absent controls (and unproven deleted rows) must wait.
+            if (now.kind !== "active")
+              throw new Error(
+                "stream delete pending without ended generation proof",
+              );
+            const ended = now.generation;
             const marked = (version: number, hash: string) =>
               hash.toLowerCase() === deleteMetadataHash(scope, version) ||
-              (ended !== undefined &&
-                hash.toLowerCase() ===
-                  endedGenerationDeleteMetadataHash(scope, version, ended));
+              hash.toLowerCase() ===
+                endedGenerationDeleteMetadataHash(scope, version, ended);
             let lastDelete =
               row.found &&
               (classifyStreamRow(row, hashes) === "tombstoned" ||
@@ -371,13 +385,7 @@ export function createConnectionDeleter(
                   await signPost(
                     scope,
                     digest.dataHash,
-                    ended === undefined
-                      ? deleteMetadataHash(scope, version)
-                      : endedGenerationDeleteMetadataHash(
-                          scope,
-                          version,
-                          ended,
-                        ),
+                    endedGenerationDeleteMetadataHash(scope, version, ended),
                     version,
                   )
                 ).kind === "conflict";

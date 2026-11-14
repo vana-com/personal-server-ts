@@ -96,12 +96,15 @@ async function world(deviceCount = 2) {
 }
 
 /** A device: its own database over the shared registry and blob store. */
-async function addDevice(w: {
-  fixture: Awaited<ReturnType<typeof remoteFixture>>;
-  registry: MemoryStreamSyncRegistry;
-  blobs: ReturnType<typeof createMemoryStreamSyncBlobs>;
-  devices: Device[];
-}) {
+async function addDevice(
+  w: {
+    fixture: Awaited<ReturnType<typeof remoteFixture>>;
+    registry: MemoryStreamSyncRegistry;
+    blobs: ReturnType<typeof createMemoryStreamSyncBlobs>;
+    devices: Device[];
+  },
+  bootstrap = true,
+) {
   const n = w.devices.length;
   const db = await openLocalDb(openBetterSqlite3(":memory:"), {
     owner,
@@ -140,8 +143,10 @@ async function addDevice(w: {
     now: () => ++now,
     newOp: () => `repro-${n}-${++op}`,
   };
-  await bootstrapConnections(deps);
-  await applyConnection(deps, w.fixture.control);
+  if (bootstrap) {
+    await bootstrapConnections(deps);
+    await applyConnection(deps, w.fixture.control);
+  }
   const device = {
     db,
     deps,
@@ -400,6 +405,32 @@ it("a device that joins after the delete publishes the new lifetime from an empt
     lastDeleteVersion: 2,
   });
 });
+
+it.each([false, true])(
+  "repeat delete preserves v2 and reconnect publishes (fresh device: %s)",
+  async (fresh) => {
+    const w = await world(1);
+    await published(w);
+    await deleteConnection(w.a);
+    const marker = await w.registry.read(w.scope);
+    expect(marker).toMatchObject({
+      metadataHash: endedGenerationDeleteMetadataHash(w.scope, 2, 1),
+    });
+    const deleting = fresh ? await addDevice(w, false) : w.a;
+    if (fresh)
+      expect(await deleting.db.query("SELECT * FROM connections")).toEqual([]);
+    const posts = vi.spyOn(w.registry, "post");
+    await deleteConnection(deleting);
+    expect(await w.registry.read(w.scope)).toEqual(marker);
+    expect(posts).not.toHaveBeenCalled();
+    const run = await collect(deleting, ["reconnected"], { connect: true });
+    expect(run.mode).toBe("full_refresh");
+    expect((await cycle(deleting, w)).published.map((p) => p.outcome)).toEqual([
+      "published",
+    ]);
+    expect(await held(deleting)).toEqual(["reconnected"]);
+  },
+);
 
 // 3. Two rounds.
 it("a second delete and reconnect saves again, with the latest delete as the fence", async () => {
@@ -783,3 +814,41 @@ it("a stream that waits on an unproven delete says why in the log, naming the st
     "stream sync: publish deferred",
   );
 });
+
+it.each(["absent", "foreign", "deleted"] as const)(
+  "a %s control without ended-generation proof keeps the delete pending without writes",
+  async (kind) => {
+    const w = await world(1);
+    await published(w);
+    const original = w.registry.read.bind(w.registry);
+    const active = await original(w.fixture.control);
+    if (!active.found) throw new Error("missing fixture control");
+    vi.spyOn(w.registry, "read").mockImplementation(async (scope) =>
+      scope !== w.fixture.control
+        ? original(scope)
+        : kind === "absent"
+          ? { found: false }
+          : {
+              ...active,
+              version: 2,
+              dataHash:
+                kind === "deleted"
+                  ? w.fixture.hashes.tombstoneData
+                  : `0x${"ff".repeat(32)}`,
+              metadataHash:
+                kind === "deleted"
+                  ? w.fixture.hashes.tombstoneMetadata
+                  : active.metadataHash,
+            },
+    );
+    const posts = vi.spyOn(w.registry, "post");
+    const before = await original(w.scope);
+    await w.a.deleter.requestConnectionDelete(declaration.connector);
+    expect(await w.a.deleter.resumeDeletes()).toMatchObject([
+      { connector: declaration.connector },
+    ]);
+    expect(await w.a.db.query("SELECT * FROM delete_intents")).toHaveLength(1);
+    expect(await original(w.scope)).toEqual(before);
+    expect(posts).not.toHaveBeenCalled();
+  },
+);
