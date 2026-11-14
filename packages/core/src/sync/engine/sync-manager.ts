@@ -772,6 +772,7 @@ export function createSyncManager(
         pendingFiles,
         hydratedScopes: [...hydratedScopes],
         errors: [...errors],
+        changeProbeMs: options?.changeProbe?.intervalMs ?? 0,
         deletions: tombstoneResubmits.snapshot(),
         uploads: uploadState.snapshot(),
       };

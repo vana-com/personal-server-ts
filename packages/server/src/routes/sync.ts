@@ -84,7 +84,13 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
   app.get("/status", async (c, next) => {
     if (legacy()) return next();
     await auth.authorizeOwner(c.req.raw);
-    return c.json(await (await local()).listing.status());
+    const status = await (await local()).listing.status();
+    // The probe period is how a client learns this server answers
+    // `?when=changed` with a pull and not a full cycle.
+    return c.json({
+      ...status,
+      changeProbeMs: deps.syncManager?.getStatus().changeProbeMs ?? 0,
+    });
   });
   app.post("/file/:id", async (c, next) => {
     if (legacy()) return next();

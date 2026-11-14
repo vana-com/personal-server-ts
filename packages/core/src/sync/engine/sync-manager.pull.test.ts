@@ -509,3 +509,16 @@ describe("a probe that cannot tell (the gateway sends no change time)", () => {
     await manager.stop();
   });
 });
+
+describe("getStatus().changeProbeMs", () => {
+  it("is the probe period, so a client can tell the server answers a pull", () => {
+    const probed = build(async () => {}, {
+      changeProbe: { read: async () => "m", intervalMs: 5_000 },
+    });
+    expect(probed.getStatus().changeProbeMs).toBe(5_000);
+  });
+
+  it("is 0 without a probe", () => {
+    expect(build(async () => {}).getStatus().changeProbeMs).toBe(0);
+  });
+});
