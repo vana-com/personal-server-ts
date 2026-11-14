@@ -19,6 +19,7 @@ const owner = `0x${"12".repeat(20)}` as const;
 const syncs: { close(): Promise<void> }[] = [];
 afterEach(async () => {
   for (const sync of syncs.splice(0)) await sync.close();
+  vi.useRealTimers();
 });
 
 /** One device with a delete that the gateway refuses to finish. */
@@ -149,4 +150,19 @@ it("stops retrying once the sync is closed", async () => {
   const settled = seen.mock.calls.length;
   await new Promise((resolve) => setTimeout(resolve, 100));
   expect(seen.mock.calls.length).toBeLessThanOrEqual(settled + 1);
+});
+
+it("explicit resume clears the armed retry after finishing the delete", async () => {
+  vi.useFakeTimers();
+  const f = await stuckDelete();
+  await expect(f.begin("blocked", true)).rejects.toMatchObject({
+    code: "delete_pending",
+  });
+  expect(vi.getTimerCount()).toBe(1);
+  f.registry.beforePost = undefined;
+  expect(await f.sync.deleter.resumeDeletes()).toEqual([]);
+  const queries = vi.spyOn(f.db, "query");
+  expect(vi.getTimerCount()).toBe(0);
+  await vi.advanceTimersByTimeAsync(100);
+  expect(queries).not.toHaveBeenCalled();
 });

@@ -17,6 +17,7 @@ import {
   createMemoryStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
   type IntakeDeclarations,
+  RunIntakeError,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { canonicalJson } from "@opendatalabs/personal-server-ts-stream-sync";
 import { openBetterSqlite3 } from "../localdb/better-sqlite3-driver.js";
@@ -323,5 +324,23 @@ describe("stream-sync run intake route", () => {
     expect((await call("PUT", "a1", beginBody(), "wrong-token")).status).toBe(
       401,
     );
+  });
+});
+
+it("delete_pending exposes only fixed error names", async () => {
+  const f = await build("delete-error");
+  vi.spyOn(f.sync.intake, "begin").mockRejectedValue(
+    new RunIntakeError(
+      "delete_pending",
+      "delete_pending",
+      undefined,
+      "https://example.invalid/?token=private-record",
+    ),
+  );
+  const response = await f.call("PUT", "run", beginBody());
+  expect(response.status).toBe(409);
+  expect(await response.json()).toMatchObject({
+    error: "delete_pending",
+    lastError: "Error",
   });
 });

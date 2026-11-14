@@ -213,7 +213,11 @@ export function createLocalSync(
   const resume = async () => {
     const pending = await deletes().resumeDeletes();
     if (pending.length > 0) armRetry();
-    else retryDelay = retryFirst;
+    else {
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = undefined;
+      retryDelay = retryFirst;
+    }
     return pending;
   };
   const deleter: ConnectionDeleter = {

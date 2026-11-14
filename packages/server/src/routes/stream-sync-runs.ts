@@ -90,7 +90,18 @@ export function streamSyncRunsRoutes(deps: StreamSyncRunsRouteDeps): Hono {
               ? { nextBatch: error.nextBatch }
               : {}),
             ...(error.lastError !== undefined
-              ? { lastError: error.lastError }
+              ? {
+                  lastError:
+                    error.code === "delete_pending" &&
+                    ![
+                      "Error",
+                      "ConnectionDeleteSuperseded",
+                      "RegistryRefusedError",
+                      "AmbiguousRegistryReplyError",
+                    ].includes(error.lastError)
+                      ? "Error"
+                      : error.lastError,
+                }
               : {}),
           },
           error.status as 400 | 409 | 410 | 422 | 503,
