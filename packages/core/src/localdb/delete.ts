@@ -18,6 +18,7 @@ import {
 import { manifestStreamLister } from "../stream-sync/artifacts.js";
 import {
   deleteMetadataHash,
+  deleteEndedEarlierLifetime,
   endedGenerationDeleteMetadataHash,
 } from "../stream-sync/delete-metadata.js";
 import { RegistryRefusedError } from "../stream-sync/ports.js";
@@ -288,11 +289,35 @@ export function createConnectionDeleter(
                       : -1) === pin.version
                 : now.kind === "absent";
             if (!holds) throw new ConnectionDeleteSuperseded(connector);
-            // The generation this delete ends: the active control row it holds
-            // against. Any other control state keeps the unmarked delete.
-            const ended = now.kind === "active" ? now.generation : undefined;
+            // A completed delete already fences this lifetime. Keep its row,
+            // including its version and hashes, even on a device with no local state.
+            if (
+              now.kind === "deleted" &&
+              row.found &&
+              deleteEndedEarlierLifetime(scope, row, now.version)
+            ) {
+              finished = true;
+              break;
+            }
+            if (now.kind === "foreign")
+              throw new Error(
+                "stream delete pending without ended generation proof",
+              );
+            // A deleted control at v fences every active generation <= v.
+            // Use v as a conservative boundary when the old marker has lost
+            // its proof: reconnect must create active(v+1). This does not
+            // infer a lost active generation or weaken the reader's rule.
+            // With no control, the first lifetime is generation 1, matching
+            // the empty delete head, so the legacy v1 marker remains usable.
+            const ended =
+              now.kind === "active"
+                ? now.generation
+                : now.kind === "deleted"
+                  ? now.version
+                  : undefined;
             const marked = (version: number, hash: string) =>
-              hash.toLowerCase() === deleteMetadataHash(scope, version) ||
+              (now.kind !== "deleted" &&
+                hash.toLowerCase() === deleteMetadataHash(scope, version)) ||
               (ended !== undefined &&
                 hash.toLowerCase() ===
                   endedGenerationDeleteMetadataHash(scope, version, ended));

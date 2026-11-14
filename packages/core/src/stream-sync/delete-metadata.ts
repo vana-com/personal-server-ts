@@ -13,10 +13,12 @@ export function deleteMetadataHash(
 }
 
 /**
- * Row-only delete marker that also records the connection generation the
- * delete ended. The head of a delete is always generation 1, so the head
- * cannot say which lifetime it ended; this marker can, with no change to the
- * head format. A reader that does not know it sees an unmarked row and still
+ * Row-only delete marker that records an upper bound on the generation the
+ * delete ended: an active control gives the exact generation; a deleted
+ * control's version is a conservative bound, below any later reconnect.
+ * The head of a delete is always generation 1, so it cannot prove this
+ * boundary. The marker can, with no change to the head format. A reader
+ * that does not know it sees an unmarked row and still
  * reads the head's own `lastDeleteVersion`.
  */
 export function endedGenerationDeleteMetadataHash(
