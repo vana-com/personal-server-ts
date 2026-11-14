@@ -128,7 +128,6 @@ import {
   dropSpool,
   freezePrefixRows,
   newSpoolAttempt,
-  PARTS_IN_FLIGHT,
   partTargetOf,
   startFrozenParts,
   type EncodedPart,
@@ -255,7 +254,7 @@ export async function publishConnection(
   const { connection, keyCheck, hashes, streams } = opened;
   const latch: PurgeLatch = { purged: false };
   const view = openRegistryView(deps, connection, streams.length);
-  const sendWindow = deps.blobs.governor?.window();
+  const sendWindow = deps.blobs.governor.window();
   const commits = connectionCommits(deps, connectionId, latch);
   const published = await publishEach(
     streams.map(({ stream }) => stream),
@@ -1227,7 +1226,7 @@ async function transferCandidate(
   candidate: Candidate,
   meter: PublishMeter,
 ): Promise<Prepared> {
-  const wave = newUploadWave(PARTS_IN_FLIGHT);
+  const wave = newUploadWave();
   try {
     const prepared = await transferOnWave(
       deps,
@@ -1262,7 +1261,7 @@ async function transferOnWave(
   // storage can delete or overwrite objects.
   const probe = candidate.registryVersion > 0;
   if (candidate.blobs.length > 0) {
-    await wave.start(() =>
+    wave.start(() =>
       uploadBlobs(
         deps,
         candidate.blobs,
@@ -1330,7 +1329,7 @@ async function transferOnWave(
     const encrypted = await deps.keys.encrypt(scope, headBytes);
     stopIfPurged(latch);
     // Started with the parts still going: the head names them by hash.
-    wave.startAlongside(async () => {
+    wave.start(async () => {
       try {
         if (!probe || !(await blobs.exists(`${scope}/${blobName}`))) {
           // A sibling may have purged the connection while the probe was out.

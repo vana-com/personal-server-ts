@@ -1,3 +1,4 @@
+import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/memory-registry.js";
 import { afterEach, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -52,7 +53,11 @@ async function fixture(path = ":memory:") {
       listControlRows: unexpected,
       listStreamRows: unexpected,
     },
-    blobs: { get: unexpected, put: unexpected },
+    blobs: {
+      governor: createMemoryStreamSyncBlobs().governor,
+      get: unexpected,
+      put: unexpected,
+    },
     keys: {
       namespaceHmac: unexpected,
       encrypt: unexpected,

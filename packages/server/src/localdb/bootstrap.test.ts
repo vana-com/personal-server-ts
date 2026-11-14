@@ -1,3 +1,4 @@
+import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/memory-registry.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -50,7 +51,11 @@ function deps(db: SqlDriver, registry: StreamSyncRegistry): LocalSyncDeps {
     registry,
     queue: connectionQueue(),
     ownerAddress: "0xabc",
-    blobs: { get: unused, put: unused },
+    blobs: {
+      governor: createMemoryStreamSyncBlobs().governor,
+      get: unused,
+      put: unused,
+    },
     keys: {
       namespaceHmac: async () => new Uint8Array(32).fill(7),
       encrypt: unused,

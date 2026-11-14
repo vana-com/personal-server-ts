@@ -1,3 +1,4 @@
+import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/memory-registry.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { sha256 } from "@noble/hashes/sha2";
@@ -69,7 +70,7 @@ async function fixture() {
     db,
     queue: connectionQueue(),
     ownerAddress: "0xabc",
-    blobs: { get, put },
+    blobs: { governor: createMemoryStreamSyncBlobs().governor, get, put },
     keys: {
       namespaceHmac: async () => new Uint8Array(32),
       decrypt: vi.fn(async (_scope: string, bytes: Uint8Array) => bytes),

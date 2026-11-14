@@ -16,10 +16,15 @@
  *    order cannot give back tokens already spent. With no policy known there
  *    is nothing to pace to, so there are no tokens.
  *  - Congestion (HTTP 503). The in-flight window is how many requests may be
- *    open at once. It starts at 1, grows by one after a window's worth of
- *    successes, and halves on a 503: AIMD, as in TCP congestion avoidance. Its
- *    cap is the memory budget divided by the part size. Latency is not a
- *    signal yet: that needs a measured baseline from the real store.
+ *    open at once. It follows TCP congestion control (RFC 5681). It starts at 1
+ *    and doubles after each window's worth of successes (slow start) until the
+ *    first 503 or the first 429. A 503 halves it and sets the slow start
+ *    threshold there; a 429 sets the threshold at the window as it is. From
+ *    the threshold on, the window grows by one after a window's worth of
+ *    successes and halves on a 503 (AIMD, congestion avoidance). The ramp is
+ *    not re-entered. Its cap is the memory budget divided by the part size.
+ *    Latency is not a signal yet: that needs a measured baseline from the real
+ *    store.
  *
  * A request waits in one FIFO queue, served by one loop, and leaves when all
  * three hold: the window has a free slot, the shared resume time has passed
@@ -136,8 +141,11 @@ export function createSendGate(
   if (!(policy.maxHoldMs >= 0) || !Number.isFinite(policy.maxHoldMs)) {
     throw new RangeError("send gate: maxHoldMs must be a finite time");
   }
-  // Congestion state.
+  // Congestion state. The window doubles while it is below `ssthresh` (slow
+  // start) and grows by one from there (congestion avoidance). The threshold
+  // is unset until the first throttle answer.
   let window = 1;
+  let ssthresh = Infinity;
   let epoch = 0;
   let streak = 0;
   let inFlight = 0;
@@ -279,6 +287,7 @@ export function createSendGate(
     epoch += 1;
     streak = 0;
     window = Math.max(1, Math.floor(window / 2));
+    ssthresh = window;
   }
 
   function ticketFor(kind: RequestKind): GateTicket {
@@ -296,13 +305,19 @@ export function createSendGate(
         // Only a request sent in the current epoch counts toward growth.
         if (ticketEpoch === epoch && ++streak >= window) {
           streak = 0;
-          window = Math.min(policy.maxWindow, window + 1);
+          window =
+            window < ssthresh
+              ? Math.min(policy.maxWindow, ssthresh, window * 2)
+              : Math.min(policy.maxWindow, window + 1);
         }
         wakeLoop();
       },
       quotaExceeded(retryAfterMs) {
         if (!settle()) return;
         throttles += 1;
+        // The service's rate is reached: the ramp ends where it is. The window
+        // does not shrink.
+        ssthresh = Math.min(ssthresh, window);
         // The tokens spent are not given back, and none is free until the
         // wait is over.
         const bucket = bucketFor(kind);

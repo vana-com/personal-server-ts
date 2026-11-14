@@ -106,6 +106,7 @@ async function world(options: Options) {
   };
   const innerBlobs = createMemoryStreamSyncBlobs();
   const blobs = {
+    governor: innerBlobs.governor,
     get: (key: string) => innerBlobs.get(key),
     async exists(key: string) {
       calls.push({ kind: "probe", scope: scopeOfKey(key), key });
@@ -708,8 +709,8 @@ describe("a stream's uploads overlap and the registry write waits for all", () =
 describe("the upload wave", () => {
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-  it("holds at most `limit` unfinished uploads, and startAlongside is not held", async () => {
-    const wave = newUploadWave(2);
+  it("starts every upload at once and holds none back", async () => {
+    const wave = newUploadWave();
     let running = 0;
     let peak = 0;
     const work = async () => {
@@ -718,39 +719,34 @@ describe("the upload wave", () => {
       await sleep(10);
       running -= 1;
     };
-    for (let i = 0; i < 6; i++) await wave.start(work);
-    wave.startAlongside(work);
+    for (let i = 0; i < 7; i++) wave.start(work);
     await wave.drain();
-    expect(peak).toBe(3);
+    expect(peak).toBe(7);
   });
 
   it("throws the first failure, starts nothing after it, and settles the rest", async () => {
-    const wave = newUploadWave(2);
+    const wave = newUploadWave();
     let started = 0;
     let finished = 0;
-    await wave.start(async () => {
+    wave.start(async () => {
       started += 1;
       await sleep(5);
       throw new Error("first");
     });
-    await wave.start(async () => {
+    wave.start(async () => {
       started += 1;
       await sleep(30);
       finished += 1;
     });
-    await expect(
+    await sleep(15);
+    expect(() =>
       wave.start(async () => {
         started += 1;
       }),
-    ).rejects.toThrow("first");
+    ).toThrow("first");
     expect(started).toBe(2);
     await wave.settle();
     expect(finished).toBe(1);
     await expect(wave.drain()).rejects.toThrow("first");
-  });
-
-  it("refuses a limit that is not a positive whole number", () => {
-    expect(() => newUploadWave(0)).toThrow(RangeError);
-    expect(() => newUploadWave(1.5)).toThrow(RangeError);
   });
 });

@@ -1,3 +1,4 @@
+import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/memory-registry.js";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -48,7 +49,11 @@ async function fixture(path = ":memory:") {
       listControlRows: unused,
       listStreamRows: unused,
     },
-    blobs: { get: unused, put: unused },
+    blobs: {
+      governor: createMemoryStreamSyncBlobs().governor,
+      get: unused,
+      put: unused,
+    },
     keys: {
       namespaceHmac: unused,
       encrypt: unused,
