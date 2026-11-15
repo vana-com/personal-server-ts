@@ -21,6 +21,76 @@ export const BODY_BYTES = "LENGTH(CAST(body AS BLOB))";
 /** Changed keys per row-size query, under the SQL variable limit. */
 const KEYS_PER_QUERY = 500;
 
+/** One size per key, `KEYS_PER_QUERY` keys to a query. `expression` is the size column or measure. */
+async function sizesOf(
+  reader: SqlReader,
+  connectionId: string,
+  stream: string,
+  keys: readonly string[],
+  expression: string,
+): Promise<{ pk_hash: string; n: number | null }[]> {
+  const sizes: { pk_hash: string; n: number | null }[] = [];
+  for (let at = 0; at < keys.length; at += KEYS_PER_QUERY) {
+    const page = keys.slice(at, at + KEYS_PER_QUERY);
+    const rows = await reader.query<{ pk_hash: string; n: number | null }>(
+      `SELECT pk_hash, ${expression} AS n FROM records
+        WHERE connection_id = ? AND stream = ?
+          AND pk_hash IN (${page.map(() => "?").join(",")})`,
+      [connectionId, stream, ...page],
+    );
+    for (const { pk_hash, n } of rows)
+      sizes.push({ pk_hash, n: n === null ? null : Number(n) });
+  }
+  return sizes;
+}
+
+/** The bytes of the rows `keys` name, read from their bodies. */
+async function measuredBodies(
+  reader: SqlReader,
+  connectionId: string,
+  stream: string,
+  keys: readonly string[],
+): Promise<{ pk_hash: string; n: number }[]> {
+  const rows = await sizesOf(reader, connectionId, stream, keys, BODY_BYTES);
+  return rows.map(({ pk_hash, n }) => ({ pk_hash, n: n ?? 0 }));
+}
+
+/**
+ * The bytes of the rows `keys` name, as `mergeIncoming` stored them in
+ * `body_bytes`. The `records_size` index answers that read without touching
+ * `records`, whose wide rows cost a page read per key. A row written before the
+ * column existed has NULL there: it is measured from its body, as it was before
+ * the column.
+ */
+export async function bodySizes(
+  reader: SqlReader,
+  connectionId: string,
+  stream: string,
+  keys: readonly string[],
+): Promise<{ pk_hash: string; n: number }[]> {
+  const stored = await sizesOf(
+    reader,
+    connectionId,
+    stream,
+    keys,
+    "body_bytes",
+  );
+  const sized = stored.filter(
+    (row): row is { pk_hash: string; n: number } => row.n !== null,
+  );
+  const unsized = stored.filter((row) => row.n === null);
+  if (unsized.length === 0) return sized;
+  return [
+    ...sized,
+    ...(await measuredBodies(
+      reader,
+      connectionId,
+      stream,
+      unsized.map((row) => row.pk_hash),
+    )),
+  ];
+}
+
 /** The first `bits` bits of a hex string, as a bit string. */
 export function prefixBits(hex: string, bits: number): string {
   if (bits === 0) return "";
@@ -143,23 +213,19 @@ export async function planChangedPrefixes(
     return [];
   const shardBytes = new Array<number>(SHARD_COUNT).fill(0);
   const prefix16Bytes: Record<number, number[]> = {};
-  for (let at = 0; at < keys.length; at += KEYS_PER_QUERY) {
-    const page = keys.slice(at, at + KEYS_PER_QUERY);
-    const rows = await reader.query<{ pk_hash: string; n: number }>(
-      `SELECT pk_hash, ${BODY_BYTES} AS n FROM records
-        WHERE connection_id = ? AND stream = ?
-          AND pk_hash IN (${page.map(() => "?").join(",")})`,
-      [input.connectionId, input.stream, ...page],
-    );
-    for (const { pk_hash, n } of rows) {
-      const bytes = n + FRAME_OVERHEAD_BYTES;
-      const shard = parseInt(pk_hash.slice(0, 2), 16);
-      const second = parseInt(pk_hash.slice(2, 4), 16);
-      shardBytes[shard]! += bytes;
-      (prefix16Bytes[shard] ??= new Array<number>(SHARD_COUNT).fill(0))[
-        second
-      ]! += bytes;
-    }
+  for (const { pk_hash, n } of await bodySizes(
+    reader,
+    input.connectionId,
+    input.stream,
+    keys,
+  )) {
+    const bytes = n + FRAME_OVERHEAD_BYTES;
+    const shard = parseInt(pk_hash.slice(0, 2), 16);
+    const second = parseInt(pk_hash.slice(2, 4), 16);
+    shardBytes[shard]! += bytes;
+    (prefix16Bytes[shard] ??= new Array<number>(SHARD_COUNT).fill(0))[
+      second
+    ]! += bytes;
   }
   for (const { prefix, bytes } of replaced) {
     const shard = parseInt(prefix.slice(0, 2), 16);
