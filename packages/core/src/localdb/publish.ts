@@ -139,11 +139,7 @@ import {
   type FrozenFeed,
   type HeadExtras,
 } from "./encode.js";
-import {
-  planChangedPrefixes,
-  planChangedPrefixesIn,
-  replacedPrefixGroups,
-} from "./part-layout.js";
+import { planChangedPrefixes, replacedPrefixGroups } from "./part-layout.js";
 import {
   StorageDeferredError,
   type SendWindowStats,
@@ -1222,8 +1218,15 @@ async function snapshotStream(
   let snapshot: TransferPlan["snapshot"];
   let changedPrefixes: string[];
   try {
-    if (deps.db.snapshot) {
-      const view = await deps.db.snapshot();
+    // A driver that cannot give a view now (not WAL) keeps the copy.
+    const view = await deps.db.snapshot?.().catch((error: unknown) => {
+      deps.logger.warn(
+        { connectionId, stream, error: String(error) },
+        "publish_snapshot_unavailable",
+      );
+      return undefined;
+    });
+    if (view) {
       snapshot = {
         frozen: {
           view,
@@ -1248,28 +1251,15 @@ async function snapshotStream(
         await snapshot.release();
         return { kind: "retry" };
       }
-      // Prototype switch: the grouped read or the keyed lookups, in the view.
-      changedPrefixes =
-        process.env.PUBLISH_PLAN_GROUPED === "1"
-          ? await planChangedPrefixesIn(view, {
-              connectionId,
-              stream,
-              from: local.publish_watermark,
-              to: watermark,
-              replaced,
-              baseParts: registryHead?.parts ?? [],
-              targetBytes: partTargetOf(deps),
-              rewriteAll,
-            })
-          : await planChangedPrefixes(view, {
-              connectionId,
-              stream,
-              changedKeys: changes.map((change) => change.pk_hash),
-              replaced,
-              baseParts: registryHead?.parts ?? [],
-              targetBytes: partTargetOf(deps),
-              rewriteAll,
-            });
+      changedPrefixes = await planChangedPrefixes(view, {
+        connectionId,
+        stream,
+        changedKeys: changes.map((change) => change.pk_hash),
+        replaced,
+        baseParts: registryHead?.parts ?? [],
+        targetBytes: partTargetOf(deps),
+        rewriteAll,
+      });
     } else {
       changedPrefixes = await planChangedPrefixes(deps.db, {
         connectionId,

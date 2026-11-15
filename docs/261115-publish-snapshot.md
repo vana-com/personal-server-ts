@@ -1,6 +1,6 @@
 # Stream publish: read a frozen view, copy nothing
 
-Status: prototype measured; build pending (Phase 2). Scope: one stream's publish,
+Status: built on 46cd4c55 (Phase 2), measured against it; see Measurement for what it does and does not buy. Scope: one stream's publish,
 `packages/core/src/localdb/{publish,encode,part-layout}.ts` and the
 better-sqlite3 driver. Baseline: PS #690 (pipelined copy and upload), merged as
 46cd4c55.
@@ -93,8 +93,18 @@ checkpoint that must wait is not stuck: the next one after release finishes it.
 Phase 2 adds a metric for view hold time and WAL size at release, so growth is
 observable per publish.
 
-The bench has no concurrent writer, so it shows the base WAL, not the growth.
-Peak WAL there was 51 MB with a view and 67 MB (median) with the copy.
+Measured with a held view and 100 MB of other writes (a probe, not the
+bench): writes commit while the view is open; the WAL grows by the 100 MB; a
+PASSIVE checkpoint reclaims nothing (`checkpointed: 0`); the view still
+reads its original rows; after release a TRUNCATE checkpoint takes the WAL to
+0 bytes. A test holds the same facts at 10 MB. In the bench there is no
+concurrent writer, so its WAL peak (51 MB with a view, 67 MB median with the
+copy) is the base WAL, not growth.
+
+A hazard the probe found: on a non-WAL database (rollback journal) an open
+read transaction blocks every write until it ends. `begin` therefore refuses
+unless `journal_mode` is `wal`, and the publish falls back to the copy and logs
+`publish_snapshot_unavailable`. A test covers it.
 
 ## Interactions
 
@@ -149,6 +159,10 @@ r2 25.1 / 23.8 / 31.8 / 36.8; r3 21.4 / 20.6 / 23.8 / 20.8.
 With no storage latency (`--put-ms 0`, A B B A, load 35 to 48): stored
 A 35.1 and 33.5 s, B 31.4 and 19.4 s.
 
+Final code (switches removed), one pair at load 11 to 12: A plan 13.5 s,
+first PUT 4.8 s, stored 19.8 s; B plan 5.3 s, first PUT 5.4 s, stored 20.3 s.
+At low load the first-PUT gap is 0.6 s and stored time is equal.
+
 What the numbers say:
 
 - Stored time is not distinguishable between A, B and D at this load. The
@@ -176,6 +190,7 @@ the bench cannot show. Do not promise a latency win.
 
 - A long read holds the WAL. Bounded by concurrent writes during the transfer;
   observed, not capped. Add the metric.
+- A view on a non-WAL database would block writes. Refused in `begin`.
 - First PUT is later than #690 unless the plan is pipelined too (below).
 - A driver without `snapshot()` keeps the copy, so two paths exist. The part
   hashes of both paths are equal (test), so they are interchangeable.
@@ -188,14 +203,13 @@ the bench cannot show. Do not promise a latency win.
 
 ## Phase 2 (after #690)
 
-1. Rebase on 46cd4c55. Remove the prototype switches
-   (`PUBLISH_PLAN_GROUPED`, `PUBLISH_BODY_BYTES`) and the grouped planner;
-   keep the keyed planner. No migration.
+1. Done: rebased on 46cd4c55; the prototype switches
+   (`PUBLISH_PLAN_GROUPED`, `PUBLISH_BODY_BYTES`) and the grouped planner are
+   gone; the keyed planner stays. No migration.
 2. Pipeline the plan: hand the transfer each prefix as soon as its size is
    known, instead of after the last. This recovers the first PUT.
 3. Metric: view hold time and WAL size at release, per publish.
-4. A WAL growth test: hold a view, commit writes of known size, release,
-   checkpoint, check the WAL returns to its base size.
+4. Done: the WAL growth test (above).
 5. Phone driver: decide whether it offers `snapshot()`.
 6. Profile the encode and encrypt path. That is where the time is now.
 

@@ -235,6 +235,10 @@ const run = {
     );
     try {
       opened.pragma("query_only = ON");
+      // Only a WAL database lets the writer commit while a read transaction is
+      // open. Any other journal mode would block every write until release.
+      if (opened.pragma("journal_mode", { simple: true }) !== "wal")
+        throw new Error("sqlite_snapshot_needs_wal");
       opened.exec("BEGIN");
       // The read transaction starts at its first read: take it now.
       opened.prepare("SELECT 1 FROM sqlite_master LIMIT 1").get();
