@@ -28,18 +28,17 @@ import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js"
 import type { ConnectionQueue, LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { announceApplied } from "./apply-progress.js";
-import {
-  applyDelete,
-  deleteOmitted,
-  mergeIncoming,
-  withOrigin,
-} from "./merge.js";
+import { applyDelete, mergeIncoming, withOrigin } from "./merge.js";
 import {
   endsEarlierLifetime,
   hydrateLifetimeBoundary,
   olderLifetimeFence,
 } from "./lifetime-boundary.js";
 import { purgeConnection } from "./purge.js";
+import {
+  RegistryUnavailableBeforeWriteError,
+  RegistryUnavailableError,
+} from "../stream-sync/ports.js";
 
 /** What one apply did, for the caller's status line. */
 export interface ApplyResult {
@@ -53,6 +52,7 @@ type Connection = {
   connector: string;
   ns: string;
   generation: number;
+  apply_partial: number;
 };
 type State = {
   primary_key: string;
@@ -70,6 +70,35 @@ type SavedPart = {
   bytes: number;
   count: number;
 };
+/**
+ * Apply has no rollback, so before a job's first write it records, in the
+ * database, that the connection may be partly applied. The mark is committed
+ * ahead of the write: a crash between the two leaves a mark with nothing
+ * written, which only asks for a repair. It outlives the job and a restart. An
+ * apply of the whole connection that completes clears it.
+ */
+async function markPartial(deps: LocalSyncDeps, id: string, job: Reuse) {
+  if (job.partial) return;
+  job.partial = true;
+  await deps.db.batch([
+    {
+      sql: "UPDATE connections SET apply_partial=1 WHERE connection_id=?",
+      params: [id],
+    },
+  ]);
+}
+
+async function clearPartial(deps: LocalSyncDeps, id: string, job: Reuse) {
+  if (!job.partial) return;
+  await deps.db.batch([
+    {
+      sql: "UPDATE connections SET apply_partial=0 WHERE connection_id=?",
+      params: [id],
+    },
+  ]);
+  job.partial = false;
+}
+
 const sha = async (bytes: Uint8Array) => sha256(bytes);
 const keccak = async (bytes: Uint8Array) => keccak_256(bytes);
 const result = (
@@ -145,6 +174,19 @@ function launch(
   });
 }
 function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
+  const reuse: Reuse = {
+    listed: new Map(),
+    stale: false,
+    partial: false,
+    proved: new Set(),
+  };
+  return runJob(deps, id, flight, reuse).catch((error: unknown) => {
+    throw error instanceof RegistryUnavailableError && !reuse.partial
+      ? new RegistryUnavailableBeforeWriteError(error)
+      : error;
+  });
+}
+function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
   return deps.queue.run(id, "apply", async () => {
     flight.closed = true;
 
@@ -157,10 +199,11 @@ function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
       },
     };
     const [connection] = await deps.db.query<Connection>(
-      "SELECT connector, ns, generation FROM connections WHERE connection_id = ?",
+      "SELECT connector, ns, generation, apply_partial FROM connections WHERE connection_id = ?",
       [id],
     );
     if (!connection) return [...flight.streams].map((s) => result(s, "gone"));
+    reuse.partial = connection.apply_partial === 1;
     if (
       (
         await deps.db.query("SELECT 1 FROM delete_intents WHERE connector=?", [
@@ -186,7 +229,7 @@ function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
     }
     const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
     const hashes = await controlHashes(keccak, keyCheck);
-    const initial = await control(locked, id, connection, hashes);
+    const initial = await control(locked, id, connection, hashes, reuse);
     if (initial.kind !== "active") {
       if (flight.all)
         for (const row of await deps.db.query<{ stream: string }>(
@@ -194,12 +237,14 @@ function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
           [id],
         ))
           flight.streams.add(row.stream);
+      // A purged connection has nothing left to repair.
+      if (initial.kind === "deleted") await clearPartial(deps, id, reuse);
       return [...flight.streams].map((s) =>
         result(s, initial.kind === "deleted" ? "purged" : "gone"),
       );
     }
     const answers = new Map<string, ApplyResult>();
-    const reuse: Reuse = { control: initial, listed: new Map(), stale: false };
+    reuse.control = initial;
     let listed = false;
     while (true) {
       if (flight.all && !listed) {
@@ -225,6 +270,11 @@ function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
         await applyOne(locked, id, connection, next, keyCheck, hashes, reuse),
       );
     }
+    // The mark clears only on proof of repair: a whole-connection apply in
+    // which every stream ended in an answer that settled it (see `proved`).
+    // A stream that gave up for any reason leaves the mark in place.
+    if (flight.all && [...answers.keys()].every((s) => reuse.proved.has(s)))
+      await clearPartial(deps, id, reuse);
     return [...answers.values()];
   });
 }
@@ -270,6 +320,7 @@ async function control(
   id: string,
   connection: Connection,
   hashes: ControlHashes,
+  reuse: Reuse,
 ) {
   const read = await deps.registry.read(
     controlScope(connection.connector, connection.ns),
@@ -290,14 +341,17 @@ async function control(
     state.generation <= local.control_version
   )
     return { kind: "deleted" as const, version: local.control_version };
-  if (state.kind === "deleted")
+  if (state.kind === "deleted") {
+    await markPartial(deps, id, reuse);
     await purgeConnection(deps, id, { controlVersion: state.version });
+  }
   if (state.kind === "active") {
     const old = await deps.db.query<{ generation: number }>(
       `SELECT head_generation AS generation FROM stream_state WHERE connection_id = ? AND head_generation IS NOT NULL AND head_generation <> ? LIMIT 1`,
       [id, state.generation],
     );
     if (connection.generation !== state.generation || old.length > 0) {
+      await markPartial(deps, id, reuse);
       await purgeConnection(deps, id, { controlVersion: state.generation - 1 });
       await deps.db.batch([
         {
@@ -340,6 +394,22 @@ interface Reuse {
   listed: Map<string, ControlRead>;
   /** A stream has downloaded since the job's reads were taken. */
   stale: boolean;
+  /**
+   * Local data may hold a partial apply: this job has begun a write (a purge,
+   * a reset, a stream replaced or tombstoned), or an earlier job did and no
+   * apply of the whole connection has completed since
+   * (`connections.apply_partial`). The control row's own bookkeeping update
+   * does not count: it records what the registry said.
+   */
+  partial: boolean;
+  /**
+   * Streams whose answer settled them against an active control of their
+   * generation: applied through the final commit, already current, already past
+   * a consumed delete, purged, or an earlier lifetime's fence stored. A stream
+   * that answered "gone" because its control, row or head moved is not in the
+   * set: whatever it merged stays unrepaired. Nothing else clears the mark.
+   */
+  proved: Set<string>;
 }
 
 /**
@@ -395,9 +465,18 @@ async function applyOneOnce(
   const reused = fence !== undefined || listedRead !== undefined;
   const rerun = reuse.stale && reused;
   const early = (answer: ApplyResult) => (rerun ? undefined : answer);
-  const active = fence ?? (await control(deps, id, connection, hashes));
+  // An answer that settles the stream. Only these let a whole apply clear the
+  // half-applied mark.
+  const settled = (answer: ApplyResult) => {
+    const out = early(answer);
+    if (out) reuse.proved.add(stream);
+    return out;
+  };
+  const active = fence ?? (await control(deps, id, connection, hashes, reuse));
   if (active.kind !== "active")
-    return early(result(stream, active.kind === "deleted" ? "purged" : "gone"));
+    return active.kind === "deleted"
+      ? settled(result(stream, "purged"))
+      : early(result(stream, "gone"));
   const scope = streamScope(connection.connector, connection.ns, stream);
   const read = listedRead ?? (await deps.registry.read(scope));
   const classification = classifyStreamRow(read, hashes);
@@ -412,9 +491,10 @@ async function applyOneOnce(
     // collection staged or committed after that fence are newer than the
     // delete and stay; only a later delete version purges them.
     if (state && read.version <= state.last_delete_version)
-      return early(result(stream, "noop"));
+      return settled(result(stream, "noop"));
     // A purge is destructive: never decide it on reused reads.
     if (reused) return undefined;
+    await markPartial(deps, id, reuse);
     await deps.db.batch(
       withOrigin("purge", [
         {
@@ -443,10 +523,11 @@ async function applyOneOnce(
         },
       ]),
     );
+    reuse.proved.add(stream);
     return result(stream, "purged");
   }
   if (state && read.version <= state.last_delete_version)
-    return early(result(stream, "gone"));
+    return settled(result(stream, "gone"));
   const saved = await deps.db.query<SavedPart>(
     "SELECT prefix,seq,part_hash,bytes,count FROM head_parts WHERE connection_id=? AND stream=? ORDER BY prefix,seq",
     [id, stream],
@@ -457,7 +538,7 @@ async function applyOneOnce(
     state.head_generation === active.generation &&
     saved.length > 0
   )
-    return early(result(stream, "noop"));
+    return settled(result(stream, "noop"));
   const blob = headBlobName(read.dataHash);
   const cipher = await deps.blobs.get(`${scope}/${blob}`);
   if (cipher === null) {
@@ -483,6 +564,7 @@ async function applyOneOnce(
   if (head.generation < active.generation) {
     // This writes stream state: never decide it on reused reads.
     if (reused) return undefined;
+    await markPartial(deps, id, reuse);
     // A head of an earlier lifetime (a delete marker). It is no content base:
     // keep only its delete fence, so a run that begins now pins it.
     await hydrateLifetimeBoundary(deps, {
@@ -493,6 +575,7 @@ async function applyOneOnce(
       provenEarlier: endsEarlierLifetime(scope, read, active.generation),
       primaryKey: head.primaryKey,
     });
+    reuse.proved.add(stream);
     return result(stream, "gone");
   }
   if (head.generation !== active.generation)
@@ -558,17 +641,41 @@ async function applyOneOnce(
           params: [id, stream],
         });
       } else {
-        // The stream's row, which a first load has none of yet; the omitted
-        // delete below reads its publish watermark. Then, for a head the
-        // load did not begin, the rows of every other head go in this same
-        // transaction as the first part, so no reader sees both.
+        // The stream's row, which a first load has none of yet.
         begin.push({
           sql: `INSERT OR IGNORE INTO stream_state (connection_id,stream,primary_key,semantics,incremental) VALUES (?,?,?,'mutable_state',1)`,
           params: [id, stream, JSON.stringify(head.primaryKey)],
         });
-        if (!sameHead) begin.push(deleteOmitted(op, id, stream));
+        // A head the load did not begin hides every row the stream holds
+        // outside the unchanged parts, in this same transaction as the first
+        // part. Nothing is deleted: only the complete state decides which of
+        // them go (a row seen again since the head's cutoff, a local change
+        // not yet published, a key a later part holds). A part shows its
+        // keys by taking them off the list.
+        if (!sameHead)
+          begin.push(
+            {
+              sql: "DELETE FROM partial_hidden WHERE connection_id=? AND stream=?",
+              params: [id, stream],
+            },
+            {
+              sql: `INSERT INTO partial_hidden (connection_id,stream,pk_hash)
+ SELECT connection_id, stream, pk_hash FROM records
+  WHERE connection_id = ? AND stream = ?
+    AND NOT EXISTS (SELECT 1 FROM temp.keep_ranges k WHERE k.op = ? AND records.pk_hash >= k.lo AND records.pk_hash < k.hi)`,
+              params: [id, stream, op],
+            },
+          );
       }
     }
+    if (progressive)
+      begin.push({
+        // The keys of this part, which `mergeIncoming` then clears.
+        sql: `DELETE FROM partial_hidden WHERE connection_id = ? AND stream = ?
+   AND pk_hash IN (SELECT pk_hash FROM temp.incoming WHERE op = ?)`,
+        params: [id, stream, op],
+      });
+    await markPartial(deps, id, reuse);
     await deps.db.batch(
       withOrigin("remote", [
         ...rows,
@@ -715,13 +822,16 @@ async function applyOneOnce(
         if (rows.length > 0) throw new Error("apply: incomplete part");
       }
     }
-    const stillActive = await control(deps, id, connection, hashes);
+    const stillActive = await control(deps, id, connection, hashes, reuse);
     reuse.control = stillActive;
     if (
       stillActive.kind !== "active" ||
       stillActive.generation !== active.generation
-    )
+    ) {
+      // A control found deleted purged the connection: that finishes it.
+      if (stillActive.kind === "deleted") reuse.proved.add(stream);
       return result(stream, stillActive.kind === "deleted" ? "purged" : "gone");
+    }
     const latest = await deps.registry.read(scope);
     if (
       !latest.found ||
@@ -786,13 +896,39 @@ async function applyOneOnce(
           params: [id, stream, prefix, seq, part.hash, part.bytes, part.count],
         }),
       );
+    await markPartial(deps, id, reuse);
     await deps.db.batch(withOrigin("remote", statements));
+    reuse.proved.add(stream);
     return {
       stream,
       outcome: "applied",
       partsDownloaded: downloaded,
       partsKept: kept,
     };
+  } catch (error) {
+    // The load stopped short of its last part: say so on its row, for a
+    // reader to tell this from a load that is still going. The next part
+    // clears it. A failure here must not hide the one being thrown.
+    if (progressive && began)
+      await deps.db
+        .batch([
+          {
+            sql: "UPDATE stream_partial SET failed = 1, last_error = ? WHERE connection_id = ? AND stream = ? AND version = ? AND generation = ? AND data_hash = ?",
+            params: [
+              failureCode(error),
+              id,
+              stream,
+              read.version,
+              head.generation,
+              read.dataHash,
+            ],
+          },
+        ])
+        .then(
+          () => announceApplied(deps, id),
+          () => undefined,
+        );
+    throw error;
   } finally {
     await deps.db.batch(
       ["incoming", "apply_keys", "keep_ranges"].map((table) => ({
@@ -801,6 +937,29 @@ async function applyOneOnce(
       })),
     );
   }
+}
+
+/**
+ * A short, stable name for why an apply stopped, for a reader to show or
+ * log: the error's own `code` if it has one, else its message as a slug
+ * (`apply: missing part blob` is `missing_part_blob`).
+ */
+function failureCode(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  const text =
+    typeof code === "string" && code !== ""
+      ? code
+      : error instanceof Error
+        ? error.message
+        : String(error);
+  return (
+    text
+      .replace(/^apply:\s*/i, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 64) || "unknown"
+  );
 }
 
 async function stage(

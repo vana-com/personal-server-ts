@@ -4,6 +4,7 @@
  * production projection catalogue binds, so nothing here is a test seam: the
  * server's own composition imports and retires the store.
  */
+import { RegistryUnavailableError } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
@@ -458,7 +459,12 @@ export async function direct(
     queue: connectionQueue(),
     ownerAddress: owner,
     registry: options.registryDown
-      ? { ...remote.registry, read: unexpected }
+      ? {
+          ...remote.registry,
+          read: async () => {
+            throw new RegistryUnavailableError("registry unreachable");
+          },
+        }
       : remote.registry,
     blobs: remote.storage,
     keys: createStreamSyncKeyPorts(await signature()),

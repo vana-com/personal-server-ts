@@ -48,9 +48,15 @@ export interface ImportIssue {
 /**
  * How far a first load has come when a read serves its rows before the head
  * is complete. A `view` carries it only then; a view without it is complete.
- * The body holds at least the rows of the applied parts, all of one head,
- * never rows of another head or generation. Owner reads only: a grantee is
+ * The body holds the rows of the applied parts, all of one head and all in
+ * the finished result: never rows of another head or generation, and no local
+ * row whose part has not applied yet. It can hold rows of parts applied after
+ * the counts below were read, never fewer. Owner reads only: a grantee is
  * never served a stream that is still loading.
+ *
+ * The `cursor` of a partial view is a head and schema pin, not a position in
+ * the finished list. When the stream completes, the finished view replaces
+ * the partial one: a consumer replaces its rows, never appends to them.
  */
 export interface PartialView {
   /** Parts of the head applied when the read began. */
@@ -59,6 +65,12 @@ export interface PartialView {
   readonly partsTotal: number;
   /** Records the complete head holds, from the head itself. */
   readonly recordsTotal: number;
+  /**
+   * Set when the apply stopped before the last part. The load is not going on
+   * now and will retry (the next read or sync cycle starts it again), so a
+   * screen says "will retry", not "loading". Absent: the load is going on.
+   */
+  readonly failed?: { readonly code: string };
 }
 
 export interface ResolveInput {

@@ -28,8 +28,11 @@ export class PartialViewMoved extends Error {
 const PAGE_SIZE = 100;
 
 /**
- * The records of one stream's first load, as the JSON body of a read: every
- * row applied so far, in primary-key hash order, a page at a time.
+ * The records of one stream's first load, as the JSON body of a read: the rows
+ * of the parts applied so far, in primary-key hash order, a page at a time.
+ * A row the stream held before the load began stays out of it (`partial_hidden`)
+ * until a part holds its key: the complete state, not this read, decides
+ * whether it stays, so a view never shows a row the finished result lacks.
  *
  * A body streams while apply goes on committing parts, so each page checks,
  * in the same statement that reads the rows, that the head is still the one
@@ -60,6 +63,8 @@ export async function* partialBody(
                     AND c.control_state = 'active' AND c.deleted_at IS NULL)) AS ok)
        SELECT g.ok AS ok, r.pk_hash AS pk_hash, r.body AS body
        FROM g LEFT JOIN records r ON g.ok = 1 AND r.connection_id = ? AND r.stream = ?
+         AND NOT EXISTS (SELECT 1 FROM partial_hidden h WHERE h.connection_id = r.connection_id
+                           AND h.stream = r.stream AND h.pk_hash = r.pk_hash)
          ${after === undefined ? "" : "AND r.pk_hash > ?"}
        ORDER BY r.pk_hash LIMIT ?`,
       [

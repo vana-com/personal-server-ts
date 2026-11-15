@@ -904,12 +904,21 @@ describe("view changes", () => {
       "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'view\\_%' ESCAPE '\\'",
     );
     expect(added.length).toBeGreaterThan(0);
+    // The view counters' migration, found by what it creates; the database is
+    // put back to just before it.
+    const viewCounters = MIGRATIONS.findIndex((m) =>
+      m.some((sql) => sql.includes("CREATE TABLE view_versions")),
+    );
+    expect(viewCounters).toBeGreaterThan(0);
     await raw.batch([
       ...added.map((t) => ({ sql: `DROP TRIGGER ${t.name}` })),
       { sql: "DROP TABLE view_versions" },
-      // The migrations after the view counters (the load rows) come back too.
+      // Every migration after the view counters comes back with them: its
+      // table or column goes, and the upgrade makes it again.
+      { sql: "DROP TABLE partial_hidden" },
       { sql: "DROP TABLE stream_partial" },
-      { sql: `PRAGMA user_version = ${MIGRATIONS.length - 2}` },
+      { sql: "ALTER TABLE connections DROP COLUMN apply_partial" },
+      { sql: `PRAGMA user_version = ${viewCounters}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");
 

@@ -18,7 +18,11 @@ import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { streamSyncHashes } from "../../../core/src/stream-sync/crypto.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
-import type { StreamSyncRegistry } from "../../../core/src/stream-sync/ports.js";
+import {
+  RegistryUnavailableBeforeWriteError,
+  RegistryUnavailableError,
+  type StreamSyncRegistry,
+} from "../../../core/src/stream-sync/ports.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 vi.mock("../../../core/src/localdb/apply.js", () => ({
@@ -203,7 +207,9 @@ describe("local database bootstrap", () => {
     const db = await fresh();
     const d = deps(db, registry);
     const [known] = await bootstrapConnections(d);
-    vi.mocked(registry.read).mockRejectedValue(new Error("offline"));
+    vi.mocked(registry.read).mockRejectedValue(
+      new RegistryUnavailableError("registry unreachable: offline"),
+    );
     expect(await syncBeforeBegin(d, connector)).toEqual({
       connection: known,
       unreachable: true,
@@ -224,20 +230,46 @@ describe("local database bootstrap", () => {
     ]);
     expect(applyConnection).not.toHaveBeenCalled();
 
-    // A failed stream listing does not erase a successful control read.
+    // A refusal, an unreadable answer or a bad control shape is not "offline".
+    for (const failure of [
+      new Error("registry read of control failed: 403"),
+      new SyntaxError("Unexpected end of JSON input"),
+    ]) {
+      vi.mocked(registry.read).mockRejectedValueOnce(failure);
+      await expect(syncBeforeBegin(d, connector)).rejects.toBe(failure);
+    }
+    expect(applyConnection).not.toHaveBeenCalled();
+
+    // Apply's own read finding the registry unavailable before it wrote
+    // anything does not erase a successful control read. Unavailability after
+    // a write, and any other apply failure, still reject.
     vi.mocked(registry.read).mockResolvedValue({ ...active, version: 8 });
-    vi.mocked(registry.listStreamRows).mockRejectedValue(new Error("offline"));
+    const afterWrite = new RegistryUnavailableError(
+      "registry read failed: 503",
+    );
+    vi.mocked(applyConnection).mockRejectedValueOnce(afterWrite);
+    await expect(syncBeforeBegin(d, connector)).rejects.toBe(afterWrite);
+    vi.mocked(applyConnection).mockRejectedValueOnce(
+      new RegistryUnavailableBeforeWriteError(
+        new RegistryUnavailableError("registry listing failed: 503"),
+      ),
+    );
     expect(await syncBeforeBegin(d, connector)).toMatchObject({
       connection: { generation: 8, controlVersion: 8 },
       unreachable: true,
     });
-    expect(applyConnection).not.toHaveBeenCalled();
-    vi.mocked(registry.listStreamRows).mockResolvedValue([]);
+    expect(applyConnection).toHaveBeenCalledTimes(2);
+    vi.mocked(applyConnection).mockRejectedValueOnce(
+      new Error("apply: invalid head (wrong_key)"),
+    );
+    await expect(syncBeforeBegin(d, connector)).rejects.toThrow("wrong_key");
     expect(await syncBeforeBegin(d, connector)).toMatchObject({
       connection: { generation: 8, controlVersion: 8 },
       unreachable: false,
     });
-    expect(applyConnection).toHaveBeenCalledTimes(1);
+    expect(applyConnection).toHaveBeenCalledTimes(4);
+    // The registry listing is apply's to take: bootstrap makes no probe.
+    expect(registry.listStreamRows).not.toHaveBeenCalled();
     expect(purgeConnection).not.toHaveBeenCalled();
   });
 });

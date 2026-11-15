@@ -306,22 +306,40 @@ END`,
 END`,
   ],
   [
+    // Apply has no rollback. Set before an apply's first write to a
+    // connection, cleared when an apply of the whole connection completes. A
+    // begin never goes on offline while it is set: the registry cannot say
+    // what the half-applied local data lacks.
+    `ALTER TABLE connections ADD COLUMN apply_partial INTEGER NOT NULL DEFAULT 0`,
+  ],
+  [
     // A stream's first load, while its parts are still being applied. One row
     // per stream, written by apply in the same transaction as each part's
     // rows, so a reader that sees rows of the load sees the row that names
     // their head. It names the head (`version`, `generation`, `data_hash`) the
-    // rows belong to and how many of its parts are applied. The first commit
-    // of a head's load drops the rows of every other head in that same
-    // transaction, so the rows of a stream with a row here are of that head,
-    // plus the local rows the head's completion would also keep. Completion,
-    // purge and a tombstone delete the row. Local only: never in a part. A
-    // reader serves it only when asked to (`progressiveFirstLoad`).
+    // rows belong to and how many of its parts are applied. `failed` and
+    // `last_error` say the apply stopped before the last part, and why; the
+    // next part clears them. Completion, purge and a tombstone delete the row.
+    // Local only: never in a part. A reader serves it only when asked to
+    // (`progressiveFirstLoad`).
     `CREATE TABLE stream_partial (
   connection_id TEXT NOT NULL, stream TEXT NOT NULL,
   version INTEGER NOT NULL, generation INTEGER NOT NULL, data_hash TEXT NOT NULL, head_blob TEXT NOT NULL,
   observed_at INTEGER NOT NULL,
   parts_applied INTEGER NOT NULL, parts_total INTEGER NOT NULL, records_total INTEGER NOT NULL,
+  failed INTEGER NOT NULL DEFAULT 0, last_error TEXT,
   PRIMARY KEY (connection_id, stream)) WITHOUT ROWID`,
+    // The rows a stream held when its load began, which the load has not yet
+    // matched with a part: rows of an earlier head, and local rows the
+    // complete state keeps. They stay stored, because only the complete state
+    // knows which go, and a partial view leaves them out until a part holds
+    // their key. Gone with the row of `stream_partial` they belong to.
+    `CREATE TABLE partial_hidden (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL,
+  PRIMARY KEY (connection_id, stream, pk_hash)) WITHOUT ROWID`,
+    `CREATE TRIGGER partial_hidden_ad AFTER DELETE ON stream_partial BEGIN
+  DELETE FROM partial_hidden WHERE connection_id = OLD.connection_id AND stream = OLD.stream;
+END`,
     // Each part moves the row, and a screen shows the progress, so any change
     // of it is a change of the view. `INSERT OR REPLACE` fires no delete
     // trigger, so a BEFORE trigger bumps unless an identical row is stored.
@@ -329,7 +347,10 @@ END`,
 WHEN NOT EXISTS (SELECT 1 FROM stream_partial o WHERE o.connection_id = NEW.connection_id AND o.stream = NEW.stream
   AND o.version = NEW.version AND o.generation = NEW.generation AND o.data_hash = NEW.data_hash AND o.head_blob = NEW.head_blob
   AND o.observed_at = NEW.observed_at AND o.parts_applied = NEW.parts_applied AND o.parts_total = NEW.parts_total
-  AND o.records_total = NEW.records_total) BEGIN
+  AND o.records_total = NEW.records_total AND o.failed = NEW.failed AND o.last_error IS NEW.last_error) BEGIN
+  ${bumpView("NEW")}
+END`,
+    `CREATE TRIGGER view_partial_au AFTER UPDATE ON stream_partial BEGIN
   ${bumpView("NEW")}
 END`,
     `CREATE TRIGGER view_partial_ad AFTER DELETE ON stream_partial BEGIN

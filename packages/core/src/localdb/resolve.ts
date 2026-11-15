@@ -317,6 +317,7 @@ export function createLocalResolver(
         partsApplied: load.partsApplied,
         partsTotal: load.partsTotal,
         recordsTotal: load.recordsTotal,
+        ...(load.failed === null ? {} : { failed: { code: load.failed } }),
       },
       body: bodyStream(
         envelope(

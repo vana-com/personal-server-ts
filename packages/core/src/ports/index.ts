@@ -206,6 +206,13 @@ export interface DataStoragePort extends RuntimeStoragePort {
    * not used.
    */
   maxUnsyncedId?(): number;
+  /**
+   * How many rows are unsynced. A status read needs only this number, so a
+   * host answers it without listing the rows (on Node, `COUNT(*)` over the
+   * `data_point_id` index). Without it the sync manager counts through
+   * `findUnsynced`, which materializes every row.
+   */
+  countUnsynced?(): number;
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
   /**
    * The envelope exactly as stored, bypassing any read-time view. Only a

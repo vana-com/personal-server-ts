@@ -40,7 +40,10 @@ import {
   encodeHead,
   headBlobName,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { RegistryRefusedError } from "../../../core/src/stream-sync/ports.js";
+import {
+  RegistryRefusedError,
+  RegistryUnavailableError,
+} from "../../../core/src/stream-sync/ports.js";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import { createConnectionDeleter } from "../../../core/src/localdb/delete.js";
@@ -131,7 +134,8 @@ async function addDevice(
     call: (...args: A) => Promise<T>,
   ): ((...args: A) => Promise<T>) => {
     return async (...args) => {
-      if (offline.on) throw new Error("registry unreachable");
+      if (offline.on)
+        throw new RegistryUnavailableError("registry unreachable");
       return call(...args);
     };
   };

@@ -14,6 +14,7 @@ import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import { createRecordQuery } from "../../../core/src/localdb/query.js";
+import { createLocalListing } from "../../../core/src/localdb/listing.js";
 import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import {
@@ -213,7 +214,7 @@ describe("progressive first load", () => {
     expect(state).toEqual({ complete: 1, head_version: 1 });
   });
 
-  it("a head that moves mid-load drops the old head's rows with the new head's first part", async () => {
+  it("a head that moves mid-load hides the old head's rows from the new head's first part", async () => {
     const f = await harness({ progressive: true });
     const one = await f.remote.head("items", values(["a1", "a2", "a3"]));
     const oneThree = f.hold(one, 2);
@@ -239,11 +240,16 @@ describe("progressive first load", () => {
     expect(view.ids).toHaveLength(1);
     expect(view.ids[0]).toMatch(/^b/);
     expect(view.partial).toMatchObject({ partsApplied: 1, partsTotal: 3 });
-    expect((await f.rows()).every((id) => id.startsWith("b"))).toBe(true);
+    // The old head's rows are not shown, and are not dropped before the end:
+    // the complete state decides which of them go.
+    expect(await f.rows()).toEqual(
+      expect.arrayContaining(["a1", "a2", "a3", view.ids[0]!]),
+    );
 
     twoSecond.release();
     await second;
     expect((await f.read()).ids).toEqual(["b1", "b2", "b3"]);
+    expect(await f.rows()).toEqual(["b1", "b2", "b3"]);
   });
 
   it("rows an earlier incomplete head left, which the complete state would drop, are never shown", async () => {
@@ -314,7 +320,7 @@ describe("progressive first load", () => {
     );
   });
 
-  it("a local row the complete state keeps is in the partial view", async () => {
+  it("a local row the complete state keeps is withheld from the partial view and stays stored", async () => {
     const f = await harness({ progressive: true });
     await f.db.batch([
       {
@@ -338,7 +344,9 @@ describe("progressive first load", () => {
     const two = f.hold(h, 1);
     const applying = applyConnection(f.deps, f.id);
     await f.until(1);
-    expect((await f.read()).ids).toContain("mine");
+    // Its outcome is not known until the head has been applied.
+    expect((await f.read()).ids).not.toContain("mine");
+    expect(await f.rows()).toContain("mine");
     two.release();
     await applying;
     expect((await f.read()).ids).toEqual(["a", "b", "mine"]);
@@ -534,6 +542,218 @@ describe("progressive first load", () => {
     expect(await counter()).toBe(before);
     await write(Number(row!.parts_applied) + 1);
     expect(await counter()).toBe(before + 1);
+    two.release();
+    await applying;
+  });
+});
+
+describe("a partial view is a subset of the finished result", () => {
+  /** One body per key, as the records table holds them. */
+  const bodies = async (f: Awaited<ReturnType<typeof harness>>) =>
+    Object.fromEntries(
+      (
+        await f.db.query<{ body: string }>(
+          "SELECT body FROM records WHERE stream = 'items'",
+        )
+      ).map((r) => {
+        const v = JSON.parse(r.body) as { id: string; v?: string };
+        return [v.id, v.v ?? null];
+      }),
+    );
+
+  async function omittedRowSeenSince(progressive: boolean) {
+    const f = await harness({ progressive });
+    // An earlier head left K. A run on this device saw K's body after the new
+    // head's cutoff and only moved its seen stamp, which logs no change.
+    await f.remote.head("items", values(["k", "x"]), {
+      complete: false,
+      o: 50,
+    });
+    await applyConnection(f.deps, f.id);
+    await f.db.batch([
+      {
+        sql: "UPDATE records SET seen_o = 500, seen_r = 'local-run' WHERE record_key = 'k' OR body LIKE '%\"k\"%'",
+      },
+    ]);
+    const h = await f.remote.head("items", values(["a", "b", "c"]), {
+      version: 2,
+      o: 100,
+    });
+    const hold = f.hold(h, 1);
+    const applying = applyConnection(f.deps, f.id);
+    if (progressive) await f.until(1, 2);
+    else await new Promise((r) => setTimeout(r, 30));
+    const mid = progressive ? await f.read() : undefined;
+    const stored = await f.rows();
+    hold.release();
+    await applying;
+    return { f, mid, stored, final: await f.rows() };
+  }
+
+  it("an omitted row that was recently re-observed is kept, as it is with the flag off", async () => {
+    const off = await omittedRowSeenSince(false);
+    expect(off.final).toContain("k");
+    const on = await omittedRowSeenSince(true);
+    // Not dropped by the first part, so the end can still promote it.
+    expect(on.stored).toContain("k");
+    expect(on.mid?.ids).not.toContain("k");
+    expect(on.final).toEqual(off.final);
+    expect((await on.f.read()).ids).toEqual(off.final);
+  });
+
+  async function laterKeyObservedSince(progressive: boolean) {
+    const f = await harness({ progressive });
+    const order = await applyOrder(["a", "b", "c"]);
+    const last = order[2]!;
+    // An earlier head left `last` with a local body; this device saw that body
+    // after the stamp the next head gives its different body.
+    await f.remote.head("items", [{ id: last, v: "local" }], {
+      complete: false,
+      o: 50,
+    });
+    await applyConnection(f.deps, f.id);
+    await f.db.batch([
+      {
+        sql: "UPDATE records SET seen_o = 500, seen_r = 'local-run' WHERE stream = 'items'",
+      },
+    ]);
+    const h = await f.remote.head(
+      "items",
+      [
+        { id: order[0]!, v: "remote" },
+        { id: order[1]!, v: "remote" },
+        { id: last, v: "remote" },
+      ],
+      { version: 2, o: 300 },
+    );
+    const hold = f.hold(h, 2);
+    const applying = applyConnection(f.deps, f.id);
+    if (progressive) await f.until(2, 2);
+    else await new Promise((r) => setTimeout(r, 30));
+    const mid = progressive ? await f.read() : undefined;
+    hold.release();
+    await applying;
+    return { f, last, mid, final: await bodies(f) };
+  }
+
+  it("a key of a later part keeps the local observation that is newer than the head's row", async () => {
+    const off = await laterKeyObservedSince(false);
+    expect(off.final[off.last]).toBe("local");
+    const on = await laterKeyObservedSince(true);
+    expect(on.mid?.ids).not.toContain(on.last);
+    expect(on.final).toEqual(off.final);
+  });
+
+  it("a held second part with a conflicting dirty local row: the view never shows the old body", async () => {
+    const f = await harness({ progressive: true });
+    const order = await applyOrder(["a", "b"]);
+    const k = order[1]!;
+    await f.db.batch([
+      { sql: "UPDATE write_ctx SET origin='local' WHERE id=1" },
+      {
+        sql: "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,?,?,?,?,?,?,?)",
+        params: [
+          f.id,
+          "items",
+          await pkHash(SHA, { id: k }, ["id"]),
+          k,
+          100,
+          "run-local",
+          JSON.stringify({ id: k, v: "old" }),
+          "00",
+        ],
+      },
+    ]);
+    const h = await f.remote.head(
+      "items",
+      [
+        { id: order[0]!, v: "new" },
+        { id: k, v: "new" },
+      ],
+      { o: 200 },
+    );
+    const two = f.hold(h, 1);
+    const applying = applyConnection(f.deps, f.id);
+    await f.until(1);
+    const view = await f.read();
+    // Neither body of K: the local one is replaced by the next part, and the
+    // finished result does not hold it.
+    expect(view.ids).toEqual([order[0]]);
+    expect((await bodies(f))[k]).toBe("old");
+    two.release();
+    await applying;
+    expect((await bodies(f))[k]).toBe("new");
+    expect((await f.read()).ids).toEqual([...order].sort());
+  });
+
+  it("every row a partial view shows is in the finished result", async () => {
+    const f = await harness({ progressive: true });
+    await f.remote.head("items", values(["a", "b", "c"]), {
+      complete: false,
+      o: 50,
+    });
+    await applyConnection(f.deps, f.id);
+    const ids = ["b", "d", "e", "f"];
+    const h = await f.remote.head("items", values(ids), { version: 2 });
+    const holds = [1, 2, 3].map((i) => f.hold(h, i));
+    const applying = applyConnection(f.deps, f.id);
+    const shown = new Set<string>();
+    for (let n = 1; n <= 3; n++) {
+      await f.until(n, 2);
+      for (const id of (await f.read()).ids) shown.add(id);
+      holds[n - 1]!.release();
+    }
+    await applying;
+    const finished = (await f.read()).ids;
+    expect(finished).toEqual([...ids].sort());
+    for (const id of shown) expect(finished).toContain(id);
+  });
+});
+
+describe("a first load that failed", () => {
+  it("says so in the view and in the status, until the next part lands", async () => {
+    const f = await harness({ progressive: true });
+    const h = await f.remote.head("items", values(["a", "b", "c"]));
+    const third = `${h.scope}/${partBlobName(1, h.parts[2]!.hash)}`;
+    const blob = f.remote.blobs.get(third)!;
+    f.remote.blobs.delete(third);
+    const listing = createLocalListing(f.deps, (() => ({})) as never);
+    await expect(applyConnection(f.deps, f.id)).rejects.toThrow(
+      "missing part blob",
+    );
+    await f.until(2);
+
+    const view = await f.read();
+    expect(view.partial).toMatchObject({
+      partsApplied: 2,
+      failed: { code: "missing_part_blob" },
+    });
+    const status = await listing.status();
+    expect(status.connections[0]!.streams.items!.partial).toMatchObject({
+      partsApplied: 2,
+      failed: { code: "missing_part_blob" },
+    });
+
+    // A load that is only still going has no failure to report.
+    f.remote.blobs.set(third, blob);
+    const two = f.hold(h, 2);
+    const again = applyConnection(f.deps, f.id);
+    await new Promise((r) => setTimeout(r, 50));
+    expect((await f.read()).partial?.failed).toBeUndefined();
+    two.release();
+    await again;
+    expect((await f.read()).partial).toBeUndefined();
+  });
+
+  it("a load that is only still going has no failure", async () => {
+    const f = await harness({ progressive: true });
+    const h = await f.remote.head("items", values(["a", "b", "c"]));
+    const two = f.hold(h, 1);
+    const applying = applyConnection(f.deps, f.id);
+    await f.until(1);
+    const view = await f.read();
+    expect(view.partial).toBeDefined();
+    expect(view.partial?.failed).toBeUndefined();
     two.release();
     await applying;
   });

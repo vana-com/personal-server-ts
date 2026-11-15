@@ -341,8 +341,10 @@ export function createLocalListing(
           parts_applied: number;
           parts_total: number;
           records_total: number;
+          failed: number;
+          last_error: string | null;
         }>(
-          "SELECT connection_id, stream, version, generation, parts_applied, parts_total, records_total FROM stream_partial",
+          "SELECT connection_id, stream, version, generation, parts_applied, parts_total, records_total, failed, last_error FROM stream_partial",
         )) {
           const owner = rows.find((c) => c.connection_id === p.connection_id);
           if (
@@ -354,6 +356,9 @@ export function createLocalListing(
               partsApplied: p.parts_applied,
               partsTotal: p.parts_total,
               recordsTotal: p.records_total,
+              ...(p.failed === 1
+                ? { failed: { code: p.last_error ?? "unknown" } }
+                : {}),
             });
         }
       }

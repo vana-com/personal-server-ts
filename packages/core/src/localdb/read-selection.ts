@@ -37,6 +37,8 @@ export type PartialLoad = {
   readonly partsApplied: number;
   readonly partsTotal: number;
   readonly recordsTotal: number;
+  /** The apply stopped before the last part, and why (a short slug). */
+  readonly failed: string | null;
 };
 export type Stream = {
   /** Set by `loadStreams`; absent on a stream that has no first load running. */
@@ -195,6 +197,8 @@ export async function loadStreams(
       partial_parts_applied: number | null;
       partial_parts_total: number | null;
       partial_records_total: number | null;
+      partial_failed: number | null;
+      partial_last_error: string | null;
     }
   >(
     `SELECT s.connection_id, s.head_version AS installed_version, s.stream, s.profile_key, s.profile_version, s.primary_key,
@@ -205,7 +209,8 @@ export async function loadStreams(
               p.version AS partial_version, p.generation AS partial_generation, p.data_hash AS partial_data_hash,
               p.head_blob AS partial_head_blob, p.observed_at AS partial_observed_at,
               p.parts_applied AS partial_parts_applied, p.parts_total AS partial_parts_total,
-              p.records_total AS partial_records_total
+              p.records_total AS partial_records_total,
+              p.failed AS partial_failed, p.last_error AS partial_last_error
        FROM stream_state s
        LEFT JOIN stream_versions v ON v.connection_id = s.connection_id
          AND v.stream = s.stream AND v.version = (
@@ -230,6 +235,8 @@ export async function loadStreams(
       partial_parts_applied,
       partial_parts_total,
       partial_records_total,
+      partial_failed,
+      partial_last_error,
       ...stream
     } = row;
     return partial_version === null
@@ -245,6 +252,8 @@ export async function loadStreams(
             partsApplied: partial_parts_applied!,
             partsTotal: partial_parts_total!,
             recordsTotal: partial_records_total!,
+            failed:
+              partial_failed === 1 ? (partial_last_error ?? "unknown") : null,
           },
         };
   });

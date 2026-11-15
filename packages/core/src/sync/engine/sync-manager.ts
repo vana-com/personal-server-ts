@@ -175,6 +175,39 @@ export interface SyncManager {
   /** Get current sync status */
   getStatus(): SyncStatus;
 
+  /**
+   * Calls `listener` with the new `getStatus()` value after each change of it:
+   * a cycle starting or ending, a pass finishing, an error, a blocked or
+   * unblocked state, scopes hydrated, the pending count moving, the manager
+   * starting or stopping. A change is found by comparing the whole status with
+   * the last one delivered at each of those points, so a point that changed
+   * nothing is silent, and a subscriber is never told twice for one value.
+   *
+   * Listeners run after the state change, one at a time and never nested: a
+   * change made while they run (for instance by a `trigger` they call) is
+   * delivered after they return, once, and only if the value still differs. A
+   * listener that throws is logged and skipped. `getStatus` only reads, so a
+   * listener that calls it cannot cause an event. No timer is involved.
+   *
+   * A subscription belongs to the subscriber, not to a run: it works before
+   * `start`, and `stop` leaves it registered (the stop itself is delivered as
+   * `running: false`), so a manager that starts again is heard again. With no
+   * subscriber the manager reads nothing extra; the first subscriber's value is
+   * the baseline and is not delivered. Returns the unsubscribe.
+   *
+   * Do not call `trigger` on every event. Each cycle changes `lastSync`, so
+   * each cycle ends with an event that would start the next one, and nothing
+   * here bounds that loop: delivery is never nested and coalesces events, but
+   * it does not stop a listener that always triggers. Trigger only on a change
+   * the listener acts on, such as the first `lastSync`.
+   *
+   * Disposal: the manager does not close with its host. Unsubscribe before the
+   * storage or the stream database the status reads is closed (in Lite,
+   * before `closeStreamSync`), because a stop, or a cycle that is still ending,
+   * can deliver one more event after the host has begun to close.
+   */
+  subscribeStatus(listener: (status: SyncStatus) => void): () => void;
+
   /** Download exact owner scopes without advancing the registry cursor. */
   hydrateScopes(scopes: string[]): Promise<void>;
 
@@ -296,6 +329,11 @@ export function createSyncManager(
   // alone: the next probe then runs one conservative follow-up.
   let pulledMarker: string | null | undefined;
   let errorSeq = 0;
+  // Status subscribers (`subscribeStatus`). `statusSeen` is the serialized
+  // value last delivered or taken as the baseline; null while no one listens.
+  const statusListeners = new Set<(status: SyncStatus) => void>();
+  let statusSeen: string | null = null;
+  let statusDelivering = false;
   let probeIntervalId: ReturnType<typeof setInterval> | null = null;
   let needsFullReconcile = true;
   // Once per boot, then only the scopes whose lookup failed, a few times.
@@ -373,6 +411,7 @@ export function createSyncManager(
       // data point or tombstone; it does not guarantee local bytes exist.
       hydratedScopes.add(scope);
       downloadDeps.logger.info({ scope }, "Hydrated requested scope");
+      statusMayHaveChanged();
     }
   }
 
@@ -400,6 +439,7 @@ export function createSyncManager(
           continue;
         }
         blocked = null;
+        statusMayHaveChanged();
         // canSync can yield while Account changes. Sample only after it returns.
         if (options?.accountStorageMode) {
           const mode = options.accountStorageMode.read();
@@ -407,6 +447,7 @@ export function createSyncManager(
             if (mode === "switched" && options.localSync) {
               await options.localSync.cycle();
               lastSync = new Date().toISOString();
+              statusMayHaveChanged();
             } else {
               blocked = {
                 reason:
@@ -459,6 +500,7 @@ export function createSyncManager(
             }
           }
           await runUploadCycle();
+          statusMayHaveChanged(); // uploads moved, the pending count with them
         }
 
         try {
@@ -495,6 +537,7 @@ export function createSyncManager(
         }
 
         lastSync = new Date().toISOString();
+        statusMayHaveChanged(); // the cursor and lastSync, at the pass boundary
       } while (rerunRequested && isRunning && !paused);
     };
 
@@ -502,6 +545,7 @@ export function createSyncManager(
     // error and queued mutations run. A follow-up it still owes (the dirty
     // flag) waits out a cooldown first: see `scheduleRetry`.
     cycleInFlight = exclusive(passes);
+    statusMayHaveChanged(); // syncing: true
 
     try {
       await cycleInFlight;
@@ -511,6 +555,7 @@ export function createSyncManager(
       throw error;
     } finally {
       cycleInFlight = null;
+      statusMayHaveChanged(); // syncing: false, and whatever the cycle moved
     }
   }
 
@@ -622,12 +667,16 @@ export function createSyncManager(
       const uploadResults = await uploadAll(workerUploadDeps, {
         batchSize: uploadBatchSize,
         onError(entry, error) {
-          pushError({
-            fileId: entry.fileId,
-            scope: entry.scope,
-            message: `Upload failed for ${entry.path}: ${error.message}`,
-            timestamp: new Date().toISOString(),
-          });
+          // One notification for the whole upload cycle, from the caller.
+          pushError(
+            {
+              fileId: entry.fileId,
+              scope: entry.scope,
+              message: `Upload failed for ${entry.path}: ${error.message}`,
+              timestamp: new Date().toISOString(),
+            },
+            false,
+          );
         },
       });
       uploadDeps.logger.debug(
@@ -777,11 +826,75 @@ export function createSyncManager(
     }, notifyDebounceMs);
   }
 
-  function pushError(error: SyncError): void {
+  /**
+   * Record an error for the status. `notify: false` leaves the notification to
+   * the caller, which owes one at the end of its batch: the upload worker
+   * reports one error per failed file, and a status read per file would cost
+   * a count each.
+   */
+  function pushError(error: SyncError, notify = true): void {
     errorSeq += 1;
     errors.push(error);
     if (errors.length > MAX_ERRORS) {
       errors = errors.slice(-MAX_ERRORS);
+    }
+    if (notify) statusMayHaveChanged();
+  }
+
+  /**
+   * Log a failure of delivery. Anything can be thrown (`null`, a string), and
+   * the logger can throw too; neither may leave delivery, or a caller such as
+   * `start` would stop before its first cycle.
+   */
+  function reportQuietly(message: string, thrown: unknown): void {
+    try {
+      uploadDeps.logger.warn(
+        { error: thrown instanceof Error ? thrown.message : String(thrown) },
+        message,
+      );
+    } catch {
+      // A failing logger has no one left to tell.
+    }
+  }
+
+  /**
+   * Called at every point where a field of `getStatus()` can change. Reads the
+   * status only when someone listens, and tells them only if it differs from
+   * what they last had. Not reentrant: a change a listener causes is picked up
+   * by the loop below after the listeners return.
+   */
+  function statusMayHaveChanged(): void {
+    if (statusListeners.size === 0) {
+      statusSeen = null; // unknown from here: the next subscriber re-baselines
+      return;
+    }
+    if (statusDelivering) return;
+    statusDelivering = true;
+    try {
+      for (;;) {
+        let status: SyncStatus;
+        let seen: string;
+        try {
+          status = manager.getStatus();
+          seen = JSON.stringify(status);
+        } catch (error) {
+          reportQuietly("sync status could not be read for subscribers", error);
+          return;
+        }
+        if (seen === statusSeen) return;
+        const first = statusSeen === null;
+        statusSeen = seen;
+        if (first) return; // the baseline, not a change
+        for (const listener of [...statusListeners]) {
+          try {
+            listener(status);
+          } catch (error) {
+            reportQuietly("a sync status listener threw", error);
+          }
+        }
+      }
+    } finally {
+      statusDelivering = false;
     }
   }
 
@@ -885,6 +998,7 @@ export function createSyncManager(
       probeFailures = 0;
       nextTimedProbeAt = 0;
       lastProbeAt = Date.now();
+      statusMayHaveChanged(); // running: true
 
       // Crash recovery: run one cycle immediately on start
       runCycle().catch(() => {
@@ -913,6 +1027,7 @@ export function createSyncManager(
       owedWhilePaused = false;
       // Cancel pulls: a probe that answers later finds a new lifecycle value.
       nextLifecycle("stopped");
+      statusMayHaveChanged(); // running: false
 
       // Wait for any in-flight cycle to complete
       if (cycleInFlight) {
@@ -989,7 +1104,8 @@ export function createSyncManager(
         options?.accountStorageMode &&
         options.accountStorageMode.read() !== "unswitched"
           ? 0
-          : uploadDeps.storage.findUnsynced().length;
+          : (uploadDeps.storage.countUnsynced?.() ??
+            uploadDeps.storage.findUnsynced().length);
 
       return {
         enabled: true,
@@ -1007,25 +1123,39 @@ export function createSyncManager(
       };
     },
 
+    subscribeStatus(listener) {
+      statusListeners.add(listener);
+      // The first subscriber's value is the baseline, not an event.
+      if (statusListeners.size === 1) statusMayHaveChanged();
+      return () => {
+        statusListeners.delete(listener);
+        if (statusListeners.size === 0) statusSeen = null;
+      };
+    },
+
     hydrateScopes(scopes) {
       return exclusive(async () => {
         const canRun = await (options?.canSync?.() ?? { ok: true });
         if (!canRun.ok) {
           blocked = { reason: canRun.reason, message: canRun.message };
           downloadDeps.logger.warn(blocked, "Scope hydration blocked");
+          statusMayHaveChanged();
           return;
         }
         blocked = null;
+        statusMayHaveChanged();
         if (options?.accountStorageMode) {
           const mode = options.accountStorageMode.read();
           if (mode !== "unswitched") {
             if (mode === "switched" && options.localSync)
               await options.localSync.cycle();
-            else
+            else {
               blocked = {
                 reason: "account_mode_unknown",
                 message: "Waiting for the account or its stream database",
               };
+              statusMayHaveChanged();
+            }
             return;
           }
         }
@@ -1035,13 +1165,20 @@ export function createSyncManager(
 
     notifyNewData() {
       uploadDeps.logger.debug("New data notification received");
+      statusMayHaveChanged(); // the new data is pending until a cycle takes it
       scheduleNotifiedCycle();
     },
 
     async retryQuarantinedUploads(scope) {
       if (!(await uploadAttempts.recover())) return;
-      for (const path of await uploadAttempts.release(scope))
-        uploadState.clear(path);
+      try {
+        for (const path of await uploadAttempts.release(scope))
+          uploadState.clear(path);
+      } finally {
+        // The tracker's snapshot is part of the status, and a release that
+        // fails part way has still cleared the paths before it.
+        statusMayHaveChanged();
+      }
     },
 
     async deleteScope(scope: string, within?: LegacyWriteSeal["commit"]) {
@@ -1057,6 +1194,7 @@ export function createSyncManager(
         // its entries keep their budget and status; entries the delete did
         // remove are forgotten by comparing with what is still unsynced.
         uploadState.reconcile(uploadDeps.storage.findUnsynced());
+        statusMayHaveChanged();
         return outcome;
       });
       if (result.durable && uploadDeps.additions)
