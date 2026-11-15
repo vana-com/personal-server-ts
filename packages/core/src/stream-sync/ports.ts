@@ -153,12 +153,14 @@ export class RegistryUnavailableError extends Error {
 }
 
 /**
- * An apply met an unavailable registry before its first local write: it could
- * not learn anything new, and the local state is exactly what it was. That is
- * the only unavailability a caller may treat as "offline". Apply has no
- * rollback: an unavailable error after its first write is thrown as the plain
- * `RegistryUnavailableError`, and the writes already committed (a purge, a
- * reset, a stream replaced or tombstoned) stay.
+ * An apply met an unavailable registry before its first local write, and no
+ * earlier apply of the connection is left half done: it could not learn
+ * anything new, and the local data is as complete as the last full apply left
+ * it. That is the only unavailability a caller may treat as "offline". Apply
+ * has no rollback: an unavailable error after its first write is thrown as the
+ * plain `RegistryUnavailableError`, the writes already committed (a purge, a
+ * reset, a stream replaced or tombstoned) stay, and `connections.apply_partial`
+ * keeps later applies from reading as "before the first write".
  */
 export class RegistryUnavailableBeforeWriteError extends RegistryUnavailableError {
   constructor(cause: RegistryUnavailableError) {

@@ -51,6 +51,7 @@ type Connection = {
   connector: string;
   ns: string;
   generation: number;
+  apply_partial: number;
 };
 type State = {
   primary_key: string;
@@ -67,6 +68,35 @@ type SavedPart = {
   bytes: number;
   count: number;
 };
+/**
+ * Apply has no rollback, so before a job's first write it records, in the
+ * database, that the connection may be partly applied. The mark is committed
+ * ahead of the write: a crash between the two leaves a mark with nothing
+ * written, which only asks for a repair. It outlives the job and a restart. An
+ * apply of the whole connection that completes clears it.
+ */
+async function markPartial(deps: LocalSyncDeps, id: string, job: Reuse) {
+  if (job.partial) return;
+  job.partial = true;
+  await deps.db.batch([
+    {
+      sql: "UPDATE connections SET apply_partial=1 WHERE connection_id=?",
+      params: [id],
+    },
+  ]);
+}
+
+async function clearPartial(deps: LocalSyncDeps, id: string, job: Reuse) {
+  if (!job.partial) return;
+  await deps.db.batch([
+    {
+      sql: "UPDATE connections SET apply_partial=0 WHERE connection_id=?",
+      params: [id],
+    },
+  ]);
+  job.partial = false;
+}
+
 const sha = async (bytes: Uint8Array) => sha256(bytes);
 const keccak = async (bytes: Uint8Array) => keccak_256(bytes);
 const result = (
@@ -145,10 +175,10 @@ function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
   const reuse: Reuse = {
     listed: new Map(),
     stale: false,
-    wrote: false,
+    partial: false,
   };
   return runJob(deps, id, flight, reuse).catch((error: unknown) => {
-    throw error instanceof RegistryUnavailableError && !reuse.wrote
+    throw error instanceof RegistryUnavailableError && !reuse.partial
       ? new RegistryUnavailableBeforeWriteError(error)
       : error;
   });
@@ -166,10 +196,11 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
       },
     };
     const [connection] = await deps.db.query<Connection>(
-      "SELECT connector, ns, generation FROM connections WHERE connection_id = ?",
+      "SELECT connector, ns, generation, apply_partial FROM connections WHERE connection_id = ?",
       [id],
     );
     if (!connection) return [...flight.streams].map((s) => result(s, "gone"));
+    reuse.partial = connection.apply_partial === 1;
     if (
       (
         await deps.db.query("SELECT 1 FROM delete_intents WHERE connector=?", [
@@ -203,6 +234,8 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
           [id],
         ))
           flight.streams.add(row.stream);
+      // A purged connection has nothing left to repair.
+      if (initial.kind === "deleted") await clearPartial(deps, id, reuse);
       return [...flight.streams].map((s) =>
         result(s, initial.kind === "deleted" ? "purged" : "gone"),
       );
@@ -234,6 +267,8 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
         await applyOne(locked, id, connection, next, keyCheck, hashes, reuse),
       );
     }
+    // Only an apply of the whole connection repairs it.
+    if (flight.all) await clearPartial(deps, id, reuse);
     return [...answers.values()];
   });
 }
@@ -301,7 +336,7 @@ async function control(
   )
     return { kind: "deleted" as const, version: local.control_version };
   if (state.kind === "deleted") {
-    reuse.wrote = true;
+    await markPartial(deps, id, reuse);
     await purgeConnection(deps, id, { controlVersion: state.version });
   }
   if (state.kind === "active") {
@@ -310,7 +345,7 @@ async function control(
       [id, state.generation],
     );
     if (connection.generation !== state.generation || old.length > 0) {
-      reuse.wrote = true;
+      await markPartial(deps, id, reuse);
       await purgeConnection(deps, id, { controlVersion: state.generation - 1 });
       await deps.db.batch([
         {
@@ -354,12 +389,13 @@ interface Reuse {
   /** A stream has downloaded since the job's reads were taken. */
   stale: boolean;
   /**
-   * The job has begun a write to local data (a purge, a reset, a stream
-   * replaced or tombstoned). Set before the write starts, since a failing
-   * write can have partly committed. The control row's own bookkeeping update
+   * Local data may hold a partial apply: this job has begun a write (a purge,
+   * a reset, a stream replaced or tombstoned), or an earlier job did and no
+   * apply of the whole connection has completed since
+   * (`connections.apply_partial`). The control row's own bookkeeping update
    * does not count: it records what the registry said.
    */
-  wrote: boolean;
+  partial: boolean;
 }
 
 /**
@@ -435,7 +471,7 @@ async function applyOneOnce(
       return early(result(stream, "noop"));
     // A purge is destructive: never decide it on reused reads.
     if (reused) return undefined;
-    reuse.wrote = true;
+    await markPartial(deps, id, reuse);
     await deps.db.batch(
       withOrigin("purge", [
         {
@@ -500,7 +536,7 @@ async function applyOneOnce(
   if (head.generation < active.generation) {
     // This writes stream state: never decide it on reused reads.
     if (reused) return undefined;
-    reuse.wrote = true;
+    await markPartial(deps, id, reuse);
     // A head of an earlier lifetime (a delete marker). It is no content base:
     // keep only its delete fence, so a run that begins now pins it.
     await hydrateLifetimeBoundary(deps, {
@@ -575,7 +611,7 @@ async function applyOneOnce(
             rows.push(
               ...(await stage(op, stream, head, line.v, line.o, line.r, null)),
             );
-          reuse.wrote = true;
+          await markPartial(deps, id, reuse);
           await deps.db.batch(
             withOrigin("remote", [
               ...rows,
@@ -632,7 +668,7 @@ async function applyOneOnce(
             end = frame.parts[0];
           }
           if (records === end!.count || frame.parts.length > 1) {
-            reuse.wrote = true;
+            await markPartial(deps, id, reuse);
             await deps.db.batch(
               withOrigin("remote", [
                 ...rows,
@@ -714,7 +750,7 @@ async function applyOneOnce(
           params: [id, stream, prefix, seq, part.hash, part.bytes, part.count],
         }),
       );
-    reuse.wrote = true;
+    await markPartial(deps, id, reuse);
     await deps.db.batch(withOrigin("remote", statements));
     return {
       stream,

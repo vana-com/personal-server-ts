@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import {
   connectionQueue,
@@ -20,15 +23,14 @@ import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.js";
 
 const drivers: SqlDriver[] = [];
+const dirs: string[] = [];
 afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true });
 });
-async function fixture() {
-  const db = await openLocalDb(openBetterSqlite3(":memory:"), {
-    owner: "0xabc",
-    network: "test",
-    deviceId: "pipeline",
-  });
+const identity = { owner: "0xabc", network: "test", deviceId: "pipeline" };
+async function fixture(path = ":memory:") {
+  const db = await openLocalDb(openBetterSqlite3(path), identity);
   drivers.push(db);
   const keys = {
     namespaceHmac: async () => new Uint8Array(32),
@@ -242,8 +244,8 @@ it("two unchanged streams cost one control read and no stream reads", async () =
   ).toHaveLength(0);
 });
 
-async function bothApplied() {
-  const f = await fixture();
+async function bothApplied(path?: string) {
+  const f = await fixture(path);
   const a = await f.head("a", [{ id: "a" }]);
   const b = await f.head("b", [{ id: "b" }]);
   await applyConnection(f.deps, f.id);
@@ -589,8 +591,8 @@ it("bootstrap's apply sees a stream that advanced after bootstrap read the contr
     await f.db.query("SELECT head_version FROM stream_state WHERE stream='b'"),
   ).toEqual([{ head_version: 2 }]);
 });
-async function bootstrapFixture() {
-  const f = await bothApplied();
+async function bootstrapFixture(path?: string) {
+  const f = await bothApplied(path);
   f.read.mockClear();
   f.list.mockClear();
   return f;
@@ -777,4 +779,179 @@ it("an unavailable error before any write is typed as such, with the registry's 
   expect(error).toBeInstanceOf(RegistryUnavailableBeforeWriteError);
   expect((error as Error).cause).toBe(cause);
   expect(await f.db.query("SELECT stream FROM records")).toHaveLength(2);
+  // Nothing was written, so nothing is marked.
+  expect(await f.db.query("SELECT apply_partial FROM connections")).toEqual([
+    { apply_partial: 0 },
+  ]);
+});
+
+// A rejected begin leaves the connection half applied. The mark in the
+// database is what makes the next begin see that, in the same process and
+// after a restart, whichever way the registry fails then.
+type Half = Awaited<ReturnType<typeof bootstrapFixture>>;
+type Registry = Half["deps"]["registry"];
+const unavailableB =
+  (f: Half) =>
+  (base: Registry): Registry => ({
+    ...base,
+    read: async (scope) => {
+      if (scope === f.b.scope) throw unavailable();
+      return base.read(scope);
+    },
+  });
+const heads = async (f: Half) =>
+  f.db.query(
+    "SELECT stream,head_version FROM stream_state WHERE stream IN ('a','b') ORDER BY stream",
+  );
+const recordStreams = async (f: Half) =>
+  f.db.query("SELECT DISTINCT stream FROM records ORDER BY stream");
+const tombstoneBoth = (f: Half) => {
+  for (const stream of [f.a, f.b])
+    f.reads.set(stream.scope, {
+      found: true,
+      version: 2,
+      dataHash: f.hashes.tombstoneData,
+      metadataHash: f.hashes.tombstoneMetadata,
+      deleted: true,
+    });
+};
+// What each scenario leaves after the rejected begin, and after the repair.
+const scenarios: [
+  string,
+  (f: Half) => Promise<void> | void,
+  (f: Half) => (base: Registry) => Registry,
+  (f: Half) => Promise<unknown>,
+  unknown,
+  unknown,
+][] = [
+  [
+    "stream a replaced, then stream b's read unavailable",
+    async (f) => {
+      await f.head("a", [{ id: "a2" }], { version: 2 });
+    },
+    unavailableB,
+    heads,
+    [
+      { stream: "a", head_version: 2 },
+      { stream: "b", head_version: 1 },
+    ],
+    [
+      { stream: "a", head_version: 2 },
+      { stream: "b", head_version: 1 },
+    ],
+  ],
+  [
+    "stream a tombstoned, then stream b's read unavailable",
+    tombstoneBoth,
+    unavailableB,
+    recordStreams,
+    [{ stream: "b" }],
+    [],
+  ],
+  [
+    "a generation purge, then the listing unavailable",
+    (f) => f.setControl(2),
+    () => (base) => ({
+      ...base,
+      listStreamRows: async () => {
+        throw unavailable();
+      },
+    }),
+    recordStreams,
+    [],
+    [],
+  ],
+];
+const partial = async (f: Half) =>
+  (
+    await f.db.query<{ apply_partial: number }>(
+      "SELECT apply_partial FROM connections",
+    )
+  ).map((r) => r.apply_partial);
+const down = (base: Half["deps"]["registry"]) => ({
+  ...base,
+  read: async () => {
+    throw unavailable();
+  },
+  listStreamRows: async () => {
+    throw unavailable();
+  },
+});
+/** The registry answers the control row but not the listing. */
+const listingDown = (base: Half["deps"]["registry"]) => ({
+  ...base,
+  listStreamRows: async () => {
+    throw unavailable();
+  },
+});
+async function beginOn(deps: Half["deps"], run: string) {
+  return createRunIntakeStore({
+    ...deps,
+    ownerAddress: beginRequest.owner.address,
+  })
+    .begin(run, beginRequest, beginDeclaration)
+    .catch((e: unknown) => e);
+}
+it.each(scenarios)(
+  "after %s, a later begin is not offline: same store, reopened database, then repaired",
+  async (_name, change, failure, observe, afterFailure, afterRepair) => {
+    const dir = mkdtempSync(join(tmpdir(), "apply-partial-"));
+    dirs.push(dir);
+    const path = join(dir, "local.db");
+    const f = await bootstrapFixture(path);
+    const working = f.deps.registry;
+    await change(f);
+    f.deps.registry = failure(f)(working);
+    await rejectsBeginAfterAWrite(f);
+    expect(await observe(f)).toEqual(afterFailure);
+    expect(await partial(f)).toEqual([1]);
+
+    // Same store: the registry is still down, whole or in part.
+    for (const registry of [down(working), listingDown(working)]) {
+      f.deps.registry = registry;
+      const again = await beginOn(f.deps, "again");
+      expect(again).toBeInstanceOf(RegistryUnavailableError);
+      expect(await f.db.query("SELECT run_id FROM runs")).toEqual([]);
+    }
+
+    // A restart: a new queue and a new connection to the same file.
+    await f.db.close();
+    drivers.splice(drivers.indexOf(f.db), 1);
+    const db = await openLocalDb(openBetterSqlite3(path), identity);
+    drivers.push(db);
+    const reopened: Half = {
+      ...f,
+      db,
+      deps: { ...f.deps, db, queue: connectionQueue() },
+    };
+    expect(await partial(reopened)).toEqual([1]);
+    for (const registry of [down(working), listingDown(working)]) {
+      reopened.deps.registry = registry;
+      const again = await beginOn(reopened.deps, "restarted");
+      expect(again).toBeInstanceOf(RegistryUnavailableError);
+      expect(await db.query("SELECT run_id FROM runs")).toEqual([]);
+    }
+
+    // The registry is back: apply repairs the connection and begin goes on.
+    reopened.deps.registry = working;
+    expect(await beginOn(reopened.deps, "repaired")).toMatchObject({
+      status: "collecting",
+    });
+    expect(await partial(reopened)).toEqual([0]);
+    expect(await observe(reopened)).toEqual(afterRepair);
+  },
+);
+it("an apply of one stream does not clear the mark; only an apply of the whole connection does", async () => {
+  const f = await bootstrapFixture();
+  await f.head("a", [{ id: "a2" }], { version: 2 });
+  const working = f.deps.registry;
+  f.deps.registry = unavailableB(f)(working);
+  await applyConnection(f.deps, f.id).catch(() => undefined);
+  const marked = () => f.db.query("SELECT apply_partial FROM connections");
+  expect(await marked()).toEqual([{ apply_partial: 1 }]);
+  f.deps.registry = working;
+  await applyStream(f.deps, f.id, "b");
+  expect(await marked()).toEqual([{ apply_partial: 1 }]);
+  await applyConnection(f.deps, f.id);
+  expect(await marked()).toEqual([{ apply_partial: 0 }]);
 });

@@ -83,6 +83,14 @@ async function saveControl(
   return (await cachedConnection(deps, id))!;
 }
 
+async function partiallyApplied(deps: LocalSyncDeps, id: string) {
+  const rows = await deps.db.query(
+    "SELECT 1 FROM connections WHERE connection_id = ? AND apply_partial = 1",
+    [id],
+  );
+  return rows.length > 0;
+}
+
 async function purgeDeleted(deps: LocalSyncDeps, row: ConnectionRow) {
   if (row.controlState !== "deleted") return;
   const present = await deps.db.query<{ present: number }>(
@@ -162,6 +170,9 @@ export async function syncBeforeBegin(
       // Only an unreachable registry goes on offline. A refusal (403), an
       // unreadable answer or a control row of the wrong shape is not "offline".
       if (!(error instanceof RegistryUnavailableError)) throw error;
+      // An earlier apply left this connection half applied. Going on offline
+      // would start a run on it, with no way to learn what it lacks.
+      if (await partiallyApplied(locked, id)) throw error;
       return {
         connection: await cachedConnection(locked, id),
         unreachable: true,
@@ -173,9 +184,10 @@ export async function syncBeforeBegin(
       try {
         // Apply reads the control row and lists the streams itself, after this
         // call began. Only an unreachable registry that apply met before its
-        // first local write goes on offline: nothing new was learned and
-        // nothing changed. Apply has no rollback, so an unavailable error after
-        // a write rejects, as do integrity, key and database failures.
+        // first local write, with no earlier apply left half done, goes on
+        // offline: nothing new was learned and nothing changed. Apply has no
+        // rollback, so an unavailable error after a write rejects, as do
+        // integrity, key and database failures.
         await applyConnection(locked, id);
       } catch (error) {
         if (!(error instanceof RegistryUnavailableBeforeWriteError))
