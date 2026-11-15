@@ -2,9 +2,15 @@
 const bumpView = (row: "NEW" | "OLD") =>
   `INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (${row}.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = ${row}.connection_id), 0) + 1);`;
 
-/** The same bump for every connection of the intent's connector. */
+/**
+ * The same bump for the connections of the intent's connector that a reader
+ * can reach: every read gate is `control_state = 'active'` and no intent. An
+ * intent changes what a reader sees only for such a connection. One that is
+ * deleted, as a purge leaves it and as the resolver marks it when it meets an
+ * intent, stays unreadable whether the intent exists or not.
+ */
 const bumpConnector = (row: "NEW" | "OLD") =>
-  `INSERT OR REPLACE INTO view_versions(connection_id, version) SELECT c.connection_id, COALESCE(v.version, 0) + 1 FROM connections c LEFT JOIN view_versions v ON v.connection_id = c.connection_id WHERE c.connector = ${row}.connector;`;
+  `INSERT OR REPLACE INTO view_versions(connection_id, version) SELECT c.connection_id, COALESCE(v.version, 0) + 1 FROM connections c LEFT JOIN view_versions v ON v.connection_id = c.connection_id WHERE c.connector = ${row}.connector AND c.control_state = 'active';`;
 
 /**
  * Migration 1 of the local database, taken from the SQL proof. Shared SQL keeps
@@ -222,7 +228,8 @@ END;`,
     //     what a version listing reports (`record_count`) and a historical
     //     read checks (`head_format`);
     //   delete_intents: a connector's intent starting or ending to exist, which
-    //     hides or restores every connection of that connector to a reader;
+    //     hides or restores the active connections of that connector to a
+    //     reader (a deleted one is unreadable with or without the intent);
     //     replacing one intent with another of the same connector is
     //     bookkeeping and stays silent;
     //   connections: identity and control state.

@@ -726,6 +726,140 @@ describe("view changes", () => {
     await requested;
   });
 
+  /** The delete a person requested, run to its end: purged, tombstoned, cleared. */
+  async function deleted(d: Device, connector: string) {
+    await d.deleter.requestConnectionDelete(connector);
+    await d.deleter.resumeDeletes();
+    expect(await d.raw.query("SELECT 1 FROM delete_intents")).toEqual([]);
+  }
+  const stateOf = async (d: Device, id: string) =>
+    (
+      await d.raw.query<{ control_state: string }>(
+        "SELECT control_state FROM connections WHERE connection_id = ?",
+        [id],
+      )
+    )[0]?.control_state;
+
+  it("(q) a connection the purge has deleted is unreadable with or without an intent, so an intent that starts or ends to exist is silent", async () => {
+    const a = await device(shared(), "a");
+    await collect(a, "c0");
+    await collect(a, "c1");
+    await a.cycle();
+    const shown = await listed(a);
+    await deleted(a, "c0"); // the purge marks it deleted; the landing clears the intent
+    expect(await stateOf(a, "pdpp.c0~")).toBe("deleted");
+    await a.views.settled();
+    const { seen } = listen(a);
+    const gone = await listed(a);
+    expect(gone).toEqual({ c0: 0, c1: shown.c1 });
+
+    await a.db.batch([{ sql: intent("late") }]); // an intent on a deleted connection
+    await a.views.settled();
+    expect(seen).toEqual([]);
+    await a.db.batch([
+      { sql: "DELETE FROM delete_intents WHERE connector = 'c0'" },
+    ]); // the clear after a purge has nothing to restore
+    await a.views.settled();
+    expect(seen).toEqual([]);
+    expect(await listed(a)).toEqual(gone);
+    expect(await stateOf(a, "pdpp.c0~")).toBe("deleted");
+  });
+
+  it("(q) an intent on a connector with one deleted and one active connection names the active one only", async () => {
+    const a = await device(shared(), "a");
+    await collect(a, "c0");
+    await a.cycle();
+    await cloneConnection(a, "pdpp.c0~", OTHER_NS);
+    await a.db.batch([
+      {
+        sql: "UPDATE connections SET control_state = 'deleted' WHERE connection_id = ?",
+        params: [`pdpp.c0~${OTHER_NS}`],
+      },
+    ]);
+    await a.views.settled();
+    const { seen } = listen(a);
+    await a.db.batch([{ sql: intent("first") }]);
+    await a.views.settled();
+    onlyConnection(seen, "pdpp.c0~");
+  });
+
+  it("(q) an intent hides what a reader sees without changing the connection; a clear restores it; once a read has marked the connection deleted, a clear restores nothing", async () => {
+    const a = await device(shared(), "a");
+    await collect(a, "c0");
+    await a.cycle();
+    const shown = await listed(a);
+    expect(shown.c0).toBeGreaterThan(0);
+    await a.views.settled();
+    const { seen } = listen(a);
+
+    // Hidden by the intent alone: the connection row is untouched.
+    await a.db.batch([{ sql: intent("first") }]);
+    await a.views.settled();
+    onlyConnection(seen, "pdpp.c0~");
+    expect(await stateOf(a, "pdpp.c0~")).toBe("active");
+    seen.length = 0;
+    await a.db.batch([
+      { sql: "DELETE FROM delete_intents WHERE connector = 'c0'" },
+    ]);
+    await a.views.settled();
+    onlyConnection(seen, "pdpp.c0~"); // restored, and told
+    expect(await listed(a)).toEqual(shown);
+
+    // The same intent, but a resolver read meets it first. That read is the
+    // production path (apply.ts), and it marks the connection deleted.
+    await a.db.batch([{ sql: intent("second") }]);
+    await a.views.settled();
+    seen.length = 0;
+    const answer = await a.resolver.resolve(scopeOf("c0", "s0"));
+    if ("body" in answer) await answer.body.cancel();
+    await a.views.settled();
+    expect(await stateOf(a, "pdpp.c0~")).toBe("deleted");
+    onlyConnection(seen, "pdpp.c0~"); // the mark is a change of its own
+    seen.length = 0;
+    await a.db.batch([
+      { sql: "DELETE FROM delete_intents WHERE connector = 'c0'" },
+    ]);
+    await a.views.settled();
+    expect(seen).toEqual([]); // nothing came back, so nothing is announced
+    expect(await stateOf(a, "pdpp.c0~")).toBe("deleted");
+    expect((await listed(a)).c0).toBe(0);
+  });
+
+  it("(q) a purge that fails keeps its intent and its hide signal, and the rolled-back writes tell nothing", async () => {
+    const a = await device(shared(), "a");
+    await collect(a, "c0");
+    await a.cycle();
+    expect((await listed(a)).c0).toBeGreaterThan(0);
+    const rows = async () =>
+      (
+        await a.raw.query<{ n: number }>(
+          "SELECT count(*) AS n FROM records WHERE connection_id = 'pdpp.c0~'",
+        )
+      )[0]!.n;
+    const before = await rows();
+    expect(before).toBeGreaterThan(0);
+    // The purge's last write fails, after its deletes of the records ran.
+    await a.raw.batch([
+      {
+        sql: `CREATE TRIGGER fail_purge BEFORE UPDATE ON connections
+              WHEN NEW.control_state = 'deleted'
+              BEGIN SELECT RAISE(ABORT, 'purge failed'); END`,
+      },
+    ]);
+    await a.views.settled();
+    const { seen } = listen(a);
+    await expect(a.deleter.requestConnectionDelete("c0")).rejects.toThrow();
+    await a.views.settled();
+    expect(
+      (await a.raw.query("SELECT 1 FROM delete_intents")).length,
+    ).toBeGreaterThan(0); // the intent is kept
+    expect(await rows()).toBe(before); // the purge batch rolled back
+    expect(await stateOf(a, "pdpp.c0~")).toBe("active");
+    expect((await listed(a)).c0).toBe(0); // still hidden by the intent
+    expect(seen.length).toBe(1); // the hide, and nothing from the rolled-back writes
+    expect([...seen[0]!.connectionIds]).toEqual(["pdpp.c0~"]);
+  });
+
   it("(m) a listener that makes one idempotent write after each event is heard once", async () => {
     const a = await device(shared(), "a");
     await collect(a, "c0");
