@@ -1102,3 +1102,55 @@ it("a whole single-stream apply that finds the head newer than the control keeps
   await applyConnection(reopened.deps, reopened.id);
   expect(await partial(reopened)).toEqual([0]);
 });
+
+// A failed apply can leave rows in a range that the stream's saved parts still
+// describe as the previous head's. Those saved parts are a cache of what the
+// local range holds; a repair must not keep a range on their word.
+it.each([
+  ["on the same store", false],
+  ["after a reopen", true],
+])(
+  "a partially applied head, then a later head with the first head's exact part: the range is read again, not kept, and its extra row is gone before the mark clears (%s)",
+  async (_name, reopen) => {
+    const dir = mkdtempSync(join(tmpdir(), "apply-partial-"));
+    dirs.push(dir);
+    const path = join(dir, "local.db");
+    let f = await fixture(path);
+    // H1: one row, one part.
+    await f.head("a", [{ id: "a" }]);
+    await applyConnection(f.deps, f.id);
+    const keys = async (g: typeof f) =>
+      (
+        await g.db.query<{ record_key: string }>(
+          "SELECT record_key FROM records WHERE stream='a'",
+        )
+      ).length;
+    expect(await keys(f)).toBe(1);
+
+    // H2 adds two remote-only rows; the third part download fails. The parts
+    // before it merged, so at least one extra row is local.
+    await f.head("a", [{ id: "a" }, { id: "x1" }, { id: "x2" }], {
+      version: 2,
+    });
+    const get = f.deps.blobs.get.bind(f.deps.blobs);
+    let parts = 0;
+    f.deps.blobs.get = async (key) => {
+      if (key.includes("/g1-p-") && ++parts === 3)
+        throw new Error("part blob transfer failed");
+      return get(key);
+    };
+    await expect(applyConnection(f.deps, f.id)).rejects.toThrow(
+      "part blob transfer failed",
+    );
+    f.deps.blobs.get = get;
+    expect(await keys(f)).toBeGreaterThan(1);
+    expect(await partial(f)).toEqual([1]);
+
+    // H3 is H1 again, byte for byte, at a newer version: X is not in it.
+    await f.head("a", [{ id: "a" }], { version: 3 });
+    if (reopen) f = await restart(f, path);
+    await applyConnection(f.deps, f.id);
+    expect(await keys(f)).toBe(1);
+    expect(await partial(f)).toEqual([0]);
+  },
+);
