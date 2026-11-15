@@ -13,11 +13,14 @@
  *
  * Both directions hold at most two chunks (one of lookahead, because the
  * last chunk must be marked), whatever the payload size.
+ *
+ * The chunk cipher goes through a `StreamCryptoPort` (default: noble), so a
+ * host can supply a native one. The wire form does not depend on the port.
  */
 
-import { chacha20poly1305 } from "@noble/ciphers/chacha";
 import { hkdf } from "@noble/hashes/hkdf";
 import { sha256 } from "@noble/hashes/sha256";
+import { nobleStreamCrypto, type StreamCryptoPort } from "./crypto-port.js";
 
 export const STREAM_CHUNK_BYTES = 64 * 1024;
 const TAG_BYTES = 16;
@@ -91,6 +94,7 @@ export async function* sealStream(
   key: Uint8Array,
   source: AsyncIterable<Uint8Array>,
   random: (n: number) => Uint8Array,
+  port: StreamCryptoPort = nobleStreamCrypto,
 ): AsyncGenerator<Uint8Array> {
   const nonce = random(NONCE_BYTES);
   const sealKey = payloadKey(key, nonce);
@@ -100,7 +104,7 @@ export async function* sealStream(
   yield header;
   let counter = 0;
   for await (const { bytes, last } of blocks(source, STREAM_CHUNK_BYTES)) {
-    yield chacha20poly1305(sealKey, chunkNonce(counter, last)).encrypt(bytes);
+    yield port.seal(sealKey, chunkNonce(counter, last), bytes);
     counter += 1;
   }
 }
@@ -108,6 +112,7 @@ export async function* sealStream(
 export async function* openStream(
   key: Uint8Array,
   source: AsyncIterable<Uint8Array>,
+  port: StreamCryptoPort = nobleStreamCrypto,
 ): AsyncGenerator<Uint8Array> {
   // Peel the header off the front, then block the rest.
   const iterator = source[Symbol.asyncIterator]();
@@ -143,9 +148,7 @@ export async function* openStream(
     if (bytes.length < TAG_BYTES) throw new StreamAeadError("chunk is short");
     let plain: Uint8Array;
     try {
-      plain = chacha20poly1305(openKey, chunkNonce(counter, last)).decrypt(
-        bytes,
-      );
+      plain = port.open(openKey, chunkNonce(counter, last), bytes);
     } catch {
       throw new StreamAeadError(
         "chunk failed authentication (tampered, reordered or truncated)",
@@ -158,6 +161,32 @@ export async function* openStream(
     yield plain;
     counter += 1;
   }
+}
+
+/** Seal one part (at most 16 MiB) as a single blob, into one allocation. */
+export function sealBytes(
+  key: Uint8Array,
+  clear: Uint8Array,
+  random: (n: number) => Uint8Array,
+  port: StreamCryptoPort = nobleStreamCrypto,
+): Promise<Uint8Array> {
+  const nonce = random(NONCE_BYTES);
+  const sealKey = payloadKey(key, nonce);
+  const chunks = Math.max(1, Math.ceil(clear.length / STREAM_CHUNK_BYTES));
+  const out = new Uint8Array(HEADER_BYTES + clear.length + chunks * TAG_BYTES);
+  out.set(STREAM_MAGIC);
+  out.set(nonce, STREAM_MAGIC.length);
+  let at = HEADER_BYTES;
+  for (let i = 0; i < chunks; i += 1) {
+    const piece = clear.subarray(
+      i * STREAM_CHUNK_BYTES,
+      (i + 1) * STREAM_CHUNK_BYTES,
+    );
+    const sealed = port.seal(sealKey, chunkNonce(i, i === chunks - 1), piece);
+    out.set(sealed, at);
+    at += sealed.length;
+  }
+  return Promise.resolve(out);
 }
 
 async function* once(bytes: Uint8Array): AsyncGenerator<Uint8Array> {
@@ -180,19 +209,11 @@ async function joined(source: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
   return out;
 }
 
-/** Seal one part (at most 16 MiB) as a single blob. */
-export function sealBytes(
-  key: Uint8Array,
-  clear: Uint8Array,
-  random: (n: number) => Uint8Array,
-): Promise<Uint8Array> {
-  return joined(sealStream(key, once(clear), random));
-}
-
 /** Open one blob made by {@link sealBytes}. */
 export function openBytes(
   key: Uint8Array,
   cipher: Uint8Array,
+  port: StreamCryptoPort = nobleStreamCrypto,
 ): Promise<Uint8Array> {
-  return joined(openStream(key, once(cipher)));
+  return joined(openStream(key, once(cipher), port));
 }
