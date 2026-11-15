@@ -73,6 +73,9 @@ export const TEMP_TABLES: readonly string[] = [
 
 const FIELDS = ["record_key", "stamp_o", "stamp_r", "body", "body_sha256"];
 
+/** `records.body_bytes` is written with `body`, from the staged body. */
+const STORED_BYTES = "LENGTH(CAST(i.body AS BLOB))";
+
 /**
  * The only way rows enter `records`: rows staged in `incoming` under `op`.
  *
@@ -146,6 +149,7 @@ export function mergeIncoming(
       // A seen stamp newer than the incoming one survives; an older one is
       // the incoming row's own observation.
       sql: `UPDATE records SET ${FIELDS.map((f) => `${f} = ${pick(f)}`).join(", ")},
+   body_bytes = (SELECT ${STORED_BYTES} FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash),
    seen_o = CASE WHEN (seen_o, seen_r) > (${pick("stamp_o")}, ${pick("stamp_r")}) THEN seen_o END,
    seen_r = CASE WHEN (seen_o, seen_r) > (${pick("stamp_o")}, ${pick("stamp_r")}) THEN seen_r END
  WHERE ${incomingKeys}
@@ -154,7 +158,17 @@ export function mergeIncoming(
                         THEN (SELECT origin FROM write_ctx WHERE id = 1) <> 'local'
                              AND (i.stamp_o, i.stamp_r) > (records.stamp_o, records.stamp_r)
                         ELSE (i.stamp_o, i.stamp_r) > ${seenPair("records.")} END)`,
-      params: [...FIELDS.map(() => op), op, op, op, op, connectionId, op, op],
+      params: [
+        ...FIELDS.map(() => op),
+        op,
+        op,
+        op,
+        op,
+        op,
+        connectionId,
+        op,
+        op,
+      ],
     },
   ];
   if (options.promoteSeen) {
@@ -182,8 +196,8 @@ export function mergeIncoming(
   }
   statements.push(
     {
-      sql: `INSERT INTO records (connection_id, stream, pk_hash, ${FIELDS.join(", ")}, first_o)
-SELECT ?, i.stream, i.pk_hash, ${FIELDS.map((f) => `i.${f}`).join(", ")},
+      sql: `INSERT INTO records (connection_id, stream, pk_hash, ${FIELDS.join(", ")}, body_bytes, first_o)
+SELECT ?, i.stream, i.pk_hash, ${FIELDS.map((f) => `i.${f}`).join(", ")}, ${STORED_BYTES},
        CASE WHEN (SELECT origin FROM write_ctx WHERE id = 1) = 'import' THEN NULL ELSE i.first_o END
  FROM incoming i
  WHERE i.op = ? AND NOT EXISTS (SELECT 1 FROM records r WHERE r.connection_id = ? AND r.stream = i.stream AND r.pk_hash = i.pk_hash)`,

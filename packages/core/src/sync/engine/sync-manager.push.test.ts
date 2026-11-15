@@ -410,6 +410,42 @@ describe("a pushed change does not wait for the optional probe", () => {
       await manager.stop();
     });
 
+    it("starts the back-off over after a cycle succeeds, even when its dirty flag runs the next pass at once", async () => {
+      // A fails (1 s), retry B succeeds and its own push starts pass C in the
+      // same cycle, C fails: the cooldown is the first step again, not the second.
+      vi.spyOn(Math, "random").mockReturnValue(0.5);
+      const { push, state } = fakePush();
+      const held: Array<{ ok: () => void; fail: (e: Error) => void }> = [];
+      const cycle = vi.fn(
+        () =>
+          new Promise<void>((resolve, reject) =>
+            held.push({ ok: resolve, fail: reject }),
+          ),
+      );
+      const manager = build({
+        localSync: { cycle },
+        changeProbe: quietProbe(push),
+      });
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      state.handlers!.onChange(); // during A
+      held[0]!.fail(new Error("A fails"));
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(cycle).toHaveBeenCalledTimes(2); // retry B
+      state.handlers!.onChange(); // during B: its pass repeats
+      held[1]!.ok();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cycle).toHaveBeenCalledTimes(3); // C, straight after B
+      state.handlers!.onChange(); // during C
+      held[2]!.fail(new Error("C fails"));
+      await vi.advanceTimersByTimeAsync(999);
+      expect(cycle).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(1); // 1 s after C: B's success reset the step
+      expect(cycle).toHaveBeenCalledTimes(4);
+      held[3]!.fail(new Error("D fails")); // let stop() drain it
+      await manager.stop().catch(() => {});
+    });
+
     it("still reports the failure to the caller that asked for the failed cycle", async () => {
       const { push, state } = fakePush();
       const { cycle, rejects } = failingCycles();

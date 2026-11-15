@@ -353,7 +353,13 @@ export function createSyncManager(
 
     // One cycle's passes: repeats while a request arrived during a pass.
     const passes = async () => {
+      let first = true;
       do {
+        // Reaching another pass means the previous one succeeded: the failure
+        // streak ends at that boundary, not when the whole cycle returns, or a
+        // failure in a pass that follows a success would back off as a repeat.
+        if (!first) cycleFailures = 0;
+        first = false;
         rerunRequested = false;
         const canRun = await (options?.canSync?.() ?? { ok: true });
         if (!canRun.ok) {
