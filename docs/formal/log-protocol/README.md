@@ -157,33 +157,32 @@ is claimed. Host validation remains necessary before relying on this model.
 ## TLC results (host run)
 
 Run on 2026-11-15 with TLC 2.19 (`tla2tools.jar` 1.7.4, Java 17), `-workers 4`,
-under `nice -n 19 ionice -c3`, one job at a time, from the commit that adds this
-section. Each config had its own metadir, deleted after its run.
+under `nice -n 19 ionice -c3`, one job at a time, foreground. Each config had its
+own metadir, deleted after its run.
 
-All seven configs stop at the same point: semantic analysis of `LogProtocol.tla`
-fails before any state is explored.
-
-```
-Semantic errors:
-*** Errors: 1
-line 108, col 25 to line 108, col 25 of module LogProtocol
-The operator > requires 2 arguments.
-Error: Parsing or semantic analysis failed.
-```
-
-Line 108 is `/\ epoch'=2 /\ log'=<<>> /\ ...` in `Reset`. Unverified hypothesis:
-in TLA+ ASCII, `=<` is the `≤` token, so `'=<<>>` may not lex as `'= <<>>`.
-No fix was applied; the spec is unchanged from the patch.
+Spec change for this run: one lexical edit, line 108 of `LogProtocol.tla`,
+`log'=<<>>` → `log' = <<>>`. In TLA+ ASCII, `=<` is the `≤` token, so `'=<<>>`
+did not lex. A grep for `=<<` found no other hit. No other spec or config
+change.
 
 | Configuration | Expected | Actual | Distinct states | Depth | Wall time |
 | --- | --- | --- | --- | --- | --- |
-| Good.cfg | PASS | Parse/semantic error (line 108) | n/a | n/a | 1.3 s |
-| LostPush.cfg | PASS | Parse/semantic error (line 108) | n/a | n/a | <1 s |
-| DropGap.cfg | FAIL P2 | Parse/semantic error (line 108) | n/a | n/a | <1 s |
-| OutOfOrder.cfg | FAIL P2 | Parse/semantic error (line 108) | n/a | n/a | 1 s |
-| DropTombstone.cfg | FAIL P1 | Parse/semantic error (line 108) | n/a | n/a | <1 s |
-| OmissionWithoutCutoff.cfg | FAIL P3 | Parse/semantic error (line 108) | n/a | n/a | 1 s |
-| LamportDifference.cfg | FAIL StampEqualsLamport | Parse/semantic error (line 108) | n/a | n/a | <1 s |
+| Good.cfg | PASS | PASS: no error (95,264,783 generated) | 6,160,198 | 31 | 14 min 46 s |
+| LostPush.cfg | PASS | PASS: no error (50,450,693 generated) | 6,160,198 | 31 | 8 min 56 s |
+| DropGap.cfg | FAIL P2 | FAIL P2 as expected (`Invariant P2 is violated`) | 146 at failure | 6 | <1 s |
+| OutOfOrder.cfg | FAIL P2 | FAIL P2 as expected (`Invariant P2 is violated`) | 154 at failure | 6 | <1 s |
+| DropTombstone.cfg | FAIL P1 | FAIL P1 as expected (`Invariant P1 is violated`) | 2,883 at failure | 8 | <1 s |
+| OmissionWithoutCutoff.cfg | FAIL P3 | FAIL P3 as expected (`Invariant P3 is violated`) | 6,473 at failure | 9 | <1 s |
+| LamportDifference.cfg | FAIL StampEqualsLamport | FAIL StampEqualsLamport as expected | 4 at failure | 3 | <1 s |
 
-No config reached its expected result. A parse error does not count as a pass
-or as mutation detection. The model is not yet checked by TLC.
+For the FAIL rows, the distinct-state count is what TLC had reached when it
+stopped on the violation. It is not a full state-space size. The PASS rows
+completed their search (`0 states left on queue`). Good and LostPush report the
+same distinct-state count; I did not check why.
+
+No config hit the bound (20M distinct states or 45 min). No trace was needed,
+because every result matched its expected outcome.
+
+These are the first TLC results for this model. They are a check of the finite
+abstraction only, within the scope limits above. They do not show a refinement
+to the implementation.

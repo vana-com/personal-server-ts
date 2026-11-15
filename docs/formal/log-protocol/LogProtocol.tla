@@ -105,7 +105,7 @@ Stop ==
 \* Offline devices do not learn it instantly; their old view remains until read.
 Reset ==
  /\ AllowReset /\ ~stopped /\ epoch=1 /\ Len(log)>=2 /\ budget<MaxSteps
- /\ epoch'=2 /\ log'=<<>> /\ retained'={} /\ cut'=0 /\ snapshot'=Empty
+ /\ epoch'=2 /\ log' = <<>> /\ retained'={} /\ cut'=0 /\ snapshot'=Empty
  /\ budget'=budget+1
  /\ UNCHANGED <<stopped,deviceEpoch,position,known,data,hints,
                 prefixOK,monotoneOK,omissionOK>>
