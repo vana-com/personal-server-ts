@@ -179,6 +179,9 @@ if (role === "writer") {
     }
     cache = createStatementCache(db);
     if (!isFile) db.pragma("locking_mode = EXCLUSIVE");
+    // A file database checkpoints its WAL after a write has replied (see
+    // `checkpointAfterReply`), not inside the write's COMMIT.
+    else db.pragma("wal_autocheckpoint = 0");
   } catch (error) {
     openError = error;
     try {
@@ -313,6 +316,30 @@ const run = {
   },
 };
 
+/**
+ * SQLite's own checkpoint mark: a WAL of this many frames is moved into the
+ * database file. SQLite does it inside the COMMIT that crosses the mark, so the
+ * commit's caller waits for the pages to be written and synced. A publish's
+ * commit deletes its whole change log in one batch (about 12,400 pages for a
+ * 198,001-row stream), and that COMMIT took 5 to 6 s, 23 ms without the
+ * checkpoint. The writer replies first and then does the same PASSIVE
+ * checkpoint at the same mark, so a write's caller no longer waits for it.
+ * Calls to the writer run in order, so the next call waits for the checkpoint
+ * instead: the work is the same and the log stays as short as before.
+ */
+const CHECKPOINT_FRAMES = 1000;
+
+function checkpointAfterReply() {
+  try {
+    // NOOP only reports: it writes nothing and takes no lock.
+    const [{ log, checkpointed }] = db.pragma("wal_checkpoint(NOOP)");
+    if (log - checkpointed >= CHECKPOINT_FRAMES)
+      db.pragma("wal_checkpoint(PASSIVE)");
+  } catch {
+    // The next call or the close checkpoints it: a failure here changes no data.
+  }
+}
+
 // The worker allocates almost no JavaScript, so V8 would collect the memory
 // behind received messages (blobs, strings) late and RSS would grow with the
 // volume of data written. Collect on a message count instead.
@@ -325,6 +352,7 @@ parentPort.on("message", (message) => {
   try {
     if (openError) throw openError;
     parentPort.postMessage({ id, ok: true, result: run[op](message) });
+    if (op === "batch" && role === "writer" && isFile) checkpointAfterReply();
   } catch (error) {
     parentPort.postMessage({
       id,

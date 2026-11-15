@@ -114,6 +114,8 @@ export interface PipelineBenchOptions {
   /** The storage guard: PUTs allowed per 60 s (vana-storage: 600). None when absent. */
   readonly putsPerMinute?: number;
   readonly profile?: boolean;
+  /** With `profile`: time a commit batch's statements one by one. */
+  readonly profileStatements?: boolean;
   /** Queue a write to `records` as soon as the first PUT starts. */
   readonly writeDuringPublish?: boolean;
 }
@@ -177,7 +179,24 @@ export async function benchPublish(
         info: driver.info,
         reads: driver.reads,
         // Kept, so a profiled run takes the same frozen-view path as a plain one.
-        ...(driver.snapshot ? { snapshot: () => driver.snapshot!() } : {}),
+        ...(driver.snapshot
+          ? {
+              snapshot: async () => {
+                const view = await driver.snapshot!();
+                return {
+                  release: () => view.release(),
+                  query: async (text, params) => {
+                    const started = at();
+                    try {
+                      return await view.query(text, params);
+                    } finally {
+                      note(`VIEW: ${shapeOf(text)}`, started);
+                    }
+                  },
+                } as Awaited<ReturnType<NonNullable<SqlDriver["snapshot"]>>>;
+              },
+            }
+          : {}),
         close: () => driver.close(),
         query: async (text, params) => {
           const started = at();
@@ -189,6 +208,26 @@ export async function benchPublish(
         },
         batch: async (statements) => {
           const started = at();
+          // A commit batch is timed statement by statement (profiling only: the
+          // pieces run one after another, not in one transaction; the
+          // write_ctx origin is a table row, so it carries from the first
+          // piece to the rest).
+          if (
+            options.profileStatements &&
+            statements.length > 5 &&
+            statements[0]?.sql.startsWith("UPDATE write_ctx")
+          ) {
+            const changes: number[] = [];
+            for (const statement of statements) {
+              const one = at();
+              try {
+                changes.push(...(await driver.batch([statement])).changes);
+              } finally {
+                note(`COMMIT: ${shapeOf(statement.sql)}`, one);
+              }
+            }
+            return { changes };
+          }
           try {
             return await driver.batch(statements);
           } finally {
@@ -332,7 +371,7 @@ export async function benchPublish(
             sql: [...sql.entries()]
               .map(([shape, v]) => ({ shape, ...v }))
               .sort((a, b) => b.ms - a.ms)
-              .slice(0, 14),
+              .slice(0, 24),
             slots,
           }
         : {}),
@@ -383,6 +422,7 @@ async function main(): Promise<void> {
       ? { putsPerMinute: Number(arg("puts-per-minute")) }
       : {}),
     profile: process.argv.includes("--profile"),
+    profileStatements: process.argv.includes("--profile-statements"),
   });
   console.log(JSON.stringify(result, null, 2));
 }

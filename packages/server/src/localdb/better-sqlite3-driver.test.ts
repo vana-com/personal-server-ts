@@ -1,6 +1,9 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import Database from "better-sqlite3";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
 import {
   createStatementCache,
@@ -195,4 +198,64 @@ it("falls back to inline text past the id limit", async () => {
   expect(await db.query("SELECT ? AS value /* 299 */", [7])).toEqual([
     { value: 7 },
   ]);
+});
+
+// A commit that writes many pages crosses SQLite's auto-checkpoint mark, and
+// the connection that commits then checkpoints inside the COMMIT call: it
+// writes the pages to the database file and syncs it before the call returns.
+// Measured on the 198,001-row first publish, the commit's one DELETE of its
+// change log (about 12,400 pages) took 5 to 6 s in COMMIT and 23 ms with the
+// auto-checkpoint off. The caller, and the slot turn it holds, waited for it.
+// So the writer checkpoints after it has replied.
+describe("the writer's WAL checkpoint", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true });
+  });
+  async function fileDb() {
+    const dir = mkdtempSync(join(tmpdir(), "bs3-checkpoint-"));
+    dirs.push(dir);
+    const path = join(dir, "test.db");
+    const db = openBetterSqlite3(path);
+    opened.push(db);
+    await db.query("PRAGMA journal_mode = WAL");
+    await db.batch([
+      { sql: "CREATE TABLE rows (id INTEGER PRIMARY KEY, body BLOB)" },
+    ]);
+    return { db, path };
+  }
+
+  it("does not run inside a commit", async () => {
+    const { db } = await fileDb();
+    const writer = await db.query<{ wal_autocheckpoint: number }>(
+      "PRAGMA wal_autocheckpoint",
+    );
+    expect(writer).toEqual([{ wal_autocheckpoint: 0 }]);
+  });
+
+  it("still keeps the WAL checkpointed after a write of many pages", async () => {
+    const { db, path } = await fileDb();
+    const body = new Uint8Array(2048).fill(7);
+    // 3000 rows of 2 KiB: about 1500 pages, past the default mark of 1000.
+    await db.batch(
+      Array.from({ length: 3000 }, (_, id) => ({
+        sql: "INSERT INTO rows VALUES (?, ?)",
+        params: [id, body],
+      })),
+    );
+    // Calls run in order on the writer, so this one returns after the
+    // checkpoint that followed the batch's reply.
+    await db.batch([{ sql: "SELECT 1" }]);
+    const probe = new Database(path, { readonly: true });
+    try {
+      const [mark] = probe.pragma("wal_checkpoint(NOOP)") as {
+        log: number;
+        checkpointed: number;
+      }[];
+      expect(mark!.log).toBeGreaterThan(1000);
+      expect(mark!.checkpointed).toBe(mark!.log);
+    } finally {
+      probe.close();
+    }
+  });
 });
