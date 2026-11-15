@@ -77,6 +77,12 @@ async function peak(rows: number): Promise<number> {
       module: childModule,
       exportName: "publishMemoryWorkload",
       args: { path },
+      // A fixed new space gives both stream sizes the same capacity. With
+      // V8's default the process peak keeps rising as a run gets longer (about
+      // 70, 93 and 98 MB at 1,500, 6,000 and 12,000 rows) while heap and Buffer
+      // bytes stay flat, so the 4x comparison read that ramp as growth: 22 MB
+      // locally, 33 MB on CI against a 33.5 MB bound. See `memory-oracle.ts`.
+      maxSemiSpaceMiB: 4,
     });
     process.stdout.write(
       "PUBLISH_MEMORY " + JSON.stringify({ rows, ...measured }) + "\n",
