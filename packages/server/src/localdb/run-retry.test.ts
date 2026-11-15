@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { RegistryUnavailableError } from "../../../core/src/stream-sync/ports.js";
 import {
   createLocalSync,
   connectionQueue,
@@ -218,7 +219,7 @@ it("an explicit retry basis fails closed when the registry cannot be read", asyn
   const { a, registry } = await world();
   const posts = registry.log.length;
   registry.beforeRead = async () => {
-    throw new Error("offline fixture");
+    throw new RegistryUnavailableError("offline fixture");
   };
   await expect(
     a.sync.intake.begin(
@@ -231,7 +232,7 @@ it("an explicit retry basis fails closed when the registry cannot be read", asyn
 it("an offline end remains queued and its local receipt replays without publication", async () => {
   const { a, registry } = await world();
   registry.beforeRead = async () => {
-    throw new Error("offline fixture");
+    throw new RegistryUnavailableError("offline fixture");
   };
   const posts = registry.log.length;
   await a.sync.intake.begin("offline", request());

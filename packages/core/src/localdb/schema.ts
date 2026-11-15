@@ -306,6 +306,13 @@ END`,
 END`,
   ],
   [
+    // Apply has no rollback. Set before an apply's first write to a
+    // connection, cleared when an apply of the whole connection completes. A
+    // begin never goes on offline while it is set: the registry cannot say
+    // what the half-applied local data lacks.
+    `ALTER TABLE connections ADD COLUMN apply_partial INTEGER NOT NULL DEFAULT 0`,
+  ],
+  [
     // The stream-sync log (stream-sync/src/log.ts). `log_state` is one row per
     // connection: the position this device has applied, the position the log
     // began after (`base`), the refs of positions base+1..position as JSON,

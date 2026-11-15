@@ -10,6 +10,7 @@ import {
   createMemoryStreamSyncBlobs,
   createMemoryStreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { RegistryUnavailableError } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}` as const;
@@ -341,7 +342,7 @@ it("an offline unknown basis merges; a later verified basis can replace", async 
   });
   const read = registry.read.bind(registry);
   registry.read = async () => {
-    throw new Error("offline fixture");
+    throw new RegistryUnavailableError("offline fixture");
   };
   try {
     await a.collect("offline", 5000, {

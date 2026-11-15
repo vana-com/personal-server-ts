@@ -913,6 +913,8 @@ describe("view changes", () => {
     await raw.batch([
       ...added.map((t) => ({ sql: `DROP TRIGGER ${t.name}` })),
       { sql: "DROP TABLE view_versions" },
+      // Later migrations add the apply_partial column and the log's tables.
+      { sql: "ALTER TABLE connections DROP COLUMN apply_partial" },
       ...MIGRATIONS.slice(viewMigration + 1)
         .flat()
         .flatMap((sql) => /^CREATE TABLE (\w+)/.exec(sql)?.[1] ?? [])
