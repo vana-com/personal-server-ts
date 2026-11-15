@@ -14,7 +14,7 @@ PROPERTIES (invariants unless noted):
 P1 NoOmissionBeforeProof: no key is removed by omission in D or R unless a run that observed a proven-full pass has ended successfully.
 P2 FailedRunNeverDeletes: a failed run removes no key from D's records.
 P3 NoResurrection: an upsert whose stamp is older than a delete (explicit or by a proven omission) for the same key never makes that key present again.
-P4 RemoteNewerSurvives: the run-end omission delete never removes a key whose current row has a stamp newer than the pass's replacedAt cutoff (e.g. W wrote it during the run).
+P4 LaterWriteKept: the omission delete at run end keeps every key whose row stamp is later than the pass cutoff stamp (the head replacement cutoff), for example a row that the other writer changed while the run was in progress.
 P5 StampConvergence (liveness under fairness, or a quiescence invariant): when no run is active and all changes have been applied, D and R hold, per key, the greatest-stamp observation or delete.
 P6 CheckpointSoundness: for checkpoint_window, the checkpoint never moves past a batch that has not been merged.
 Model coverage strategy as at least {full_inventory, checkpoint_window} (two constants are enough).
@@ -25,4 +25,4 @@ RUN: if TLC (tla2tools.jar) and Java are available in your sandbox, run every co
 
 docs/formal/batch-visibility/README.md must also answer, with file:line: which of the five coverage strategies need a different visibility rule (e.g. snapshot_import_receipt only at the receipt), and whether today's run-end code already enforces P4 or whether the proposed design would need a new check.
 
-Expect it to work because: the proposed change only moves when non-destructive upserts become visible; all destructive steps (omission, replace) keep today's single gate at run end. Stamps make upserts commutative and idempotent per key, so earlier visibility should not change the final state. The riskiest assumption is P3/P4: an upsert merged early may now race with a remote delete or a remote newer write that today would have been resolved inside one run-end transaction. The model exists to find that race.
+Expect it to work because: the proposed change only moves the time at which non-destructive upserts become visible; all destructive steps (omission, replace) keep the single gate at run end that they have today. Stamps make upserts commutative and idempotent per key, so earlier visibility should not change the final state. The most likely wrong assumption is in P3 and P4: an upsert merged early may now interleave with a delete or a later write from the other writer, which today is resolved inside one run-end transaction. The model exists to find that interleaving.
