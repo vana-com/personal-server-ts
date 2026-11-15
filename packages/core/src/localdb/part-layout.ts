@@ -3,7 +3,7 @@ import {
   planBuckets,
   type HeadPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import type { LocalSyncDeps } from "./deps.js";
+import type { SqlReader } from "./driver.js";
 import { SEEN_BEFORE, seenBeforeParams } from "./merge.js";
 
 /**
@@ -11,6 +11,12 @@ import { SEEN_BEFORE, seenBeforeParams } from "./merge.js";
  * body hash, length, stamp, first-seen). An estimate, only used to size parts.
  */
 export const FRAME_OVERHEAD_BYTES = 160;
+
+/**
+ * The bytes of a record's body. `length(body)` counts characters, so the text is
+ * cast to bytes first.
+ */
+export const BODY_BYTES = "LENGTH(CAST(body AS BLOB))";
 
 /** Changed keys per row-size query, under the SQL variable limit. */
 const KEYS_PER_QUERY = 500;
@@ -119,7 +125,7 @@ export function selectChangedBuckets(
  * target into several parts of the same prefix.
  */
 export async function planChangedPrefixes(
-  deps: LocalSyncDeps,
+  reader: SqlReader,
   input: {
     readonly connectionId: string;
     readonly stream: string;
@@ -139,8 +145,8 @@ export async function planChangedPrefixes(
   const prefix16Bytes: Record<number, number[]> = {};
   for (let at = 0; at < keys.length; at += KEYS_PER_QUERY) {
     const page = keys.slice(at, at + KEYS_PER_QUERY);
-    const rows = await deps.db.query<{ pk_hash: string; n: number }>(
-      `SELECT pk_hash, LENGTH(CAST(body AS BLOB)) AS n FROM records
+    const rows = await reader.query<{ pk_hash: string; n: number }>(
+      `SELECT pk_hash, ${BODY_BYTES} AS n FROM records
         WHERE connection_id = ? AND stream = ?
           AND pk_hash IN (${page.map(() => "?").join(",")})`,
       [input.connectionId, input.stream, ...page],
@@ -196,7 +202,7 @@ export async function planChangedPrefixes(
  * on `records_by_observation`.
  */
 export async function replacedPrefixGroups(
-  db: LocalSyncDeps["db"],
+  db: SqlReader,
   connectionId: string,
   stream: string,
   marker: { readonly o: number; readonly r: string },

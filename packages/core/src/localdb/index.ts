@@ -1,4 +1,10 @@
-export type { SqlDriver, SqlReader, SqlStatement, SqlValue } from "./driver.js";
+export type {
+  SqlDriver,
+  SqlReader,
+  SqlSnapshot,
+  SqlStatement,
+  SqlValue,
+} from "./driver.js";
 export { readerOf } from "./driver.js";
 export { localDatabaseName } from "./name.js";
 export { LocalDbTooNew, migrate } from "./migrate.js";

@@ -28,6 +28,17 @@ export interface SqlStatement {
  */
 export type SqlReader = Pick<SqlDriver, "query">;
 
+/**
+ * A read-only view of the database frozen at the moment it was opened: every
+ * `query` sees the same committed state, whatever commits meanwhile. It is
+ * its own connection, so it pins the shared read connection to nothing. It
+ * holds a read transaction until `release`, which the owner must call on every
+ * path; the host can then reuse the log it pinned.
+ */
+export interface SqlSnapshot extends SqlReader {
+  release(): Promise<void>;
+}
+
 export interface SqlDriver {
   readonly info: {
     readonly sqliteVersion: string;
@@ -51,6 +62,12 @@ export interface SqlDriver {
    * closes it too. Absent: use the driver itself (see `readerOf`).
    */
   readonly reads?: SqlReader;
+  /**
+   * A frozen read view (see `SqlSnapshot`), when the host has a write-ahead
+   * log whose readers do not block its writer. Absent: the caller copies the
+   * rows it needs to freeze (see `freezePrefixRows`).
+   */
+  snapshot?(): Promise<SqlSnapshot>;
 }
 
 /** The connection an HTTP read uses: the read connection if the host has one. */

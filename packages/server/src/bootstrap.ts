@@ -166,6 +166,7 @@ import {
   streamSyncNetwork,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { eraseConnectorLeftovers } from "./stream-sync/erase-connector-leftovers.js";
+import { nodeStreamCrypto } from "./stream-sync/node-stream-crypto.js";
 import {
   computeQuestion,
   createOpenAiCompatibleInferenceProvider,
@@ -911,7 +912,8 @@ async function bootstrapServer(
           registry: streamSyncRegistry(),
           blobs:
             options?.streamSyncBlobs ?? createStorageStreamSyncBlobs(storage),
-          keys: createStreamSyncKeyPorts(masterKeySignature!),
+          keys: createStreamSyncKeyPorts(masterKeySignature!, nodeStreamCrypto),
+          streamCrypto: nodeStreamCrypto,
           signer: serverSigner!,
           logger,
           now: Date.now,

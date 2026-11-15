@@ -1,5 +1,5 @@
-import { sha256 } from "@noble/hashes/sha2";
 import { SEEN_PAIR } from "./merge.js";
+import { BODY_BYTES } from "./part-layout.js";
 import {
   encodeFramePart,
   encodePiece,
@@ -8,13 +8,12 @@ import {
   type FrameBytes,
   type JsonValue,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { readerOf, type SqlValue } from "./driver.js";
+import { readerOf, type SqlReader, type SqlValue } from "./driver.js";
 import type { LocalSyncDeps } from "./deps.js";
+import { nobleStreamCrypto } from "../stream-sync/crypto-port.js";
 import { meteredBlobs, type PublishMeter } from "./publish-meter.js";
 import { newUploadWave, type UploadWave } from "./upload-wave.js";
 import { holdMemory } from "./transfer-memory.js";
-
-const hash = async (bytes: Uint8Array): Promise<Uint8Array> => sha256(bytes);
 
 /**
  * Extra fields a head carries beside its parts (pending r5.2: the first-seen
@@ -51,7 +50,19 @@ export type FrozenRow = {
  */
 export interface FrozenPrefix {
   readonly prefix: string;
-  readonly rows: number;
+  /** Rows copied into the spool; `null` for a frozen view, which cannot lose any. */
+  readonly rows: number | null;
+}
+
+/**
+ * Rows read straight from `records` through a `SqlSnapshot`, so the version's
+ * content is the state the snapshot was opened on and no row is copied.
+ */
+export interface FrozenView {
+  readonly view: SqlReader;
+  readonly connectionId: string;
+  readonly stream: string;
+  readonly replaceBelow?: { readonly o: number; readonly r: string };
 }
 
 /**
@@ -134,11 +145,12 @@ export class FrozenRowsChanged extends Error {
 }
 
 /**
- * A transfer page holds at most this many rows and, when two or more rows
- * fit, at most `PAGE_BYTES` of bodies. A row larger than that is a page of
- * its own: one body is the floor, because a body is encoded whole.
+ * A transfer page holds at most `PAGE_BYTES` of bodies when two or more rows
+ * fit. A row larger than that is a page of its own: one body is the floor,
+ * because a body is encoded whole. Row sizes are read `META_ROWS` at a time
+ * and cut into pages; a page also holds at most `META_ROWS` rows.
  */
-const PAGE_ROWS = 64;
+const META_ROWS = 2048;
 const PAGE_BYTES = 2 * 1024 * 1024;
 
 /** The byte target a part is cut at: `deps.partTargetBytes`, default 4 MiB. */
@@ -295,54 +307,87 @@ export async function freezePrefixRows(
 type SpoolRow = Omit<FrozenRow, "body"> & { readonly body: string };
 
 /**
- * Read one prefix of an attempt's spool in key order. A page is found by
- * metadata first (key and body size, no body), cut at `PAGE_ROWS` rows or
- * `PAGE_BYTES` of bodies (at least one row), and only then are its bodies
- * read. The spool does not change while the attempt runs, so a range read
- * returns exactly the rows the metadata named; fewer means the spool was
- * emptied under the transfer.
+ * Read one prefix of the frozen rows in key order, from the attempt's spool or
+ * from a frozen view of `records`. A page is found by metadata first (key and
+ * body size, no body, `META_ROWS` rows at a time), cut at `PAGE_BYTES` of
+ * bodies (at least one row), and only then are its bodies read. Neither source changes
+ * while the attempt runs, so a range read returns exactly the rows the
+ * metadata named; fewer means the spool was emptied under the transfer.
  */
-async function* readSpool(
+async function* readFrozen(
   deps: LocalSyncDeps,
-  attempt: string,
+  source: { readonly attempt: string; readonly view?: FrozenView },
   prefix: string,
 ): AsyncGenerator<readonly SpoolRow[]> {
   const range = keyRange(prefix);
   // A prefix is read after its batch committed, and nothing writes it again,
   // so the read connection sees all of it. It does not queue behind the
   // freeze of the next prefixes.
-  const reader = readerOf(deps.db);
-  let after: string | null = null;
+  const reader: SqlReader = source.view?.view ?? readerOf(deps.db);
+  const frozen = source.view;
+  // The two sources differ only in the table, its scope and the size column.
+  let from: string;
+  let scope: string;
+  let size: string;
+  let scopeParams: SqlValue[];
+  if (frozen) {
+    from = "records";
+    scope = "connection_id = ? AND stream = ?";
+    size = BODY_BYTES;
+    scopeParams = [frozen.connectionId, frozen.stream];
+    if (frozen.replaceBelow) {
+      // Rows below the replacing run are left out, as the copy leaves them.
+      scope += ` AND ${SEEN_PAIR} >= (?, ?)`;
+      scopeParams.push(frozen.replaceBelow.o, frozen.replaceBelow.r);
+    }
+  } else {
+    from = "publish_spool";
+    scope = "attempt = ?";
+    size = "body_bytes";
+    scopeParams = [source.attempt];
+  }
+  let meta: { pk_hash: string; body_bytes: number }[] = [];
+  let at = 0;
+  let more = true;
   for (;;) {
-    const meta: { pk_hash: string; body_bytes: number }[] = await reader.query(
-      `SELECT pk_hash, body_bytes FROM publish_spool
-          WHERE attempt = ?${range.sql}${after === null ? "" : " AND pk_hash > ?"}
-          ORDER BY pk_hash LIMIT ${PAGE_ROWS}`,
-      [attempt, ...range.params, ...(after === null ? [] : [after])],
-    );
-    if (meta.length === 0) return;
+    if (at === meta.length) {
+      if (!more) return;
+      const after: string | undefined = meta[meta.length - 1]?.pk_hash;
+      meta = await reader.query(
+        `SELECT pk_hash, ${size} AS body_bytes FROM ${from}
+          WHERE ${scope}${range.sql}${after === undefined ? "" : " AND pk_hash > ?"}
+          ORDER BY pk_hash LIMIT ${META_ROWS}`,
+        [
+          ...scopeParams,
+          ...range.params,
+          ...(after === undefined ? [] : [after]),
+        ],
+      );
+      at = 0;
+      more = meta.length === META_ROWS;
+      if (meta.length === 0) return;
+    }
     let take = 0;
     let bytes = 0;
     while (
-      take < meta.length &&
-      (take === 0 || bytes + Number(meta[take]!.body_bytes) <= PAGE_BYTES)
+      at + take < meta.length &&
+      (take === 0 || bytes + Number(meta[at + take]!.body_bytes) <= PAGE_BYTES)
     ) {
-      bytes += Number(meta[take]!.body_bytes);
+      bytes += Number(meta[at + take]!.body_bytes);
       take += 1;
     }
-    const first = meta[0]!.pk_hash;
-    const last = meta[take - 1]!.pk_hash;
+    const first = meta[at]!.pk_hash;
+    const last = meta[at + take - 1]!.pk_hash;
     const page: SpoolRow[] = await reader.query(
       `SELECT pk_hash, stamp_o, stamp_r, first_o, body_sha256, body
-         FROM publish_spool
-        WHERE attempt = ? AND pk_hash >= ? AND pk_hash <= ?
+         FROM ${from}
+        WHERE ${scope} AND pk_hash >= ? AND pk_hash <= ?
         ORDER BY pk_hash`,
-      [attempt, first, last],
+      [...scopeParams, first, last],
     );
     if (page.length !== take) throw new FrozenRowsChanged(prefix);
     yield page;
-    if (take === meta.length && meta.length < PAGE_ROWS) return;
-    after = last;
+    at += take;
   }
 }
 
@@ -410,6 +455,8 @@ export async function startFrozenParts(
   deps: LocalSyncDeps,
   input: {
     readonly attempt: string;
+    /** Read `records` through this view instead of the attempt's spool. */
+    readonly view?: FrozenView;
     readonly scope: string;
     readonly generation: number;
     /**
@@ -468,6 +515,9 @@ async function encodeFrozenParts(
   },
 ): Promise<readonly EncodedPart[]> {
   const result: EncodedPart[] = [];
+  const port = deps.streamCrypto ?? nobleStreamCrypto;
+  const hash = async (bytes: Uint8Array): Promise<Uint8Array> =>
+    port.sha256(bytes);
   // The next prefix is awaited here, while no memory is held: `flush` has
   // dropped the last reservation and `hold` has not asked for the next.
   for await (const frozen of input.frozen) {
@@ -516,7 +566,7 @@ async function encodeFrozenParts(
       }
     };
     let seen = 0;
-    const pages = readSpool(deps, input.attempt, prefix);
+    const pages = readFrozen(deps, input, prefix);
     for (;;) {
       await memory.hold();
       const next = await pages.next();
@@ -562,7 +612,8 @@ async function encodeFrozenParts(
         }
       }
     }
-    if (seen !== frozen.rows) throw new FrozenRowsChanged(prefix);
+    if (frozen.rows !== null && seen !== frozen.rows)
+      throw new FrozenRowsChanged(prefix);
     await flush();
   }
   return result;
