@@ -111,7 +111,9 @@ commit (slot)                                                          after BOT
    did before; it lands after the copy and is excluded from this version.
    Test: "leaves a run that ends during the copy out of this version" (an `end`
    fired when the copy starts is excluded). First-PUT timing: "starts the first
-   upload before the snapshot has copied every prefix".
+   upload before the snapshot has copied every prefix". On a database file with the production driver's separate read
+   connection: "reads only prefixes whose copy has committed ... and leaves a write
+   made during the publish out".
 
 ## What this does not change
 
