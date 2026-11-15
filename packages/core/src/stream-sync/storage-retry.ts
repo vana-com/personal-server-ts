@@ -8,6 +8,7 @@ import {
   realAfter,
   type GateTicket,
   type RequestKind,
+  type Reservation,
   type SendGateStats,
 } from "./send-gate.js";
 
@@ -54,16 +55,24 @@ export interface StorageAccessPolicy {
   /** No backoff wait is longer than this. */
   readonly maxDelayMs: number;
   /**
-   * Bytes of data not yet uploaded that may sit in memory at once. A part
-   * counts twice, as an attachment does: its plain encoded bytes and its
-   * ciphertext are both held while the PUT runs. So the default 64 MiB holds
-   * 8 parts of 4 MiB. It is the memory ceiling the send gate works under, so
-   * a store that is slow or stalled cannot pile up parts. It also caps the
-   * send gate's in-flight window: this many bytes over `partBytes`.
+   * Bytes of data not yet uploaded that may sit in memory at once. A part is
+   * held as its plain encoded bytes and room for its ciphertext (two parts'
+   * bytes) until it is encrypted, and as its ciphertext alone (one part's
+   * bytes) from then until its PUT settles (see `Reservation.shrink`). So the
+   * default holds `PARTS_IN_FLIGHT` parts in flight and the part being built:
+   * `(PARTS_IN_FLIGHT + 2) * partBytes`, 72 MiB. It is the memory ceiling the
+   * send gate works under, so a store that is slow or stalled cannot pile up
+   * parts. It also caps the send gate's in-flight window: this many bytes over
+   * `partBytes`.
    */
   readonly maxBytesInFlight: number;
   /** The usual part size, which turns the byte budget into a window cap. */
   readonly partBytes: number;
+  /**
+   * The most requests the send gate puts on the wire at once (its window cap),
+   * where the byte budget would allow more. See `PARTS_IN_FLIGHT`.
+   */
+  readonly maxPartsInFlight: number;
   /**
    * The largest object the store accepts. It is storage's own limit, not ours:
    * vana-storage refuses a larger body with PAYLOAD_TOO_LARGE
@@ -80,12 +89,56 @@ export interface StorageAccessPolicy {
   readonly random: () => number;
 }
 
+/** The usual part: 4 MiB, the encoder's default target (`partTargetOf`). */
+const PART_BYTES = 4 * 1024 * 1024;
+
+/**
+ * vana-storage's PUT guard: 600 PUTs per 60 s, which is 10 a second. It is the
+ * `put` quota the service publishes (`quotaPerSec { put: 10 }` in the publish
+ * gate's log line). Measured 2026-11-14 on storage-dev: 0 throttles over a
+ * 129-PUT first publish.
+ */
+export const GUARD_PUTS_PER_SEC = 10;
+
+/**
+ * How long one part's PUT takes in storage when the wire is not yet full:
+ * 1.26 s (the 25.2 s first publish of ChatGPT `memories`, 439 MB in 128 parts,
+ * measured 2026-11-14 on storage-dev), 0.99 s in an earlier run of the same
+ * stream. A 16 KiB PUT takes about 0.52 s, so about 0.5 s of it is fixed cost
+ * and the rest is the part's bytes. Use the part's figure, not the small one.
+ */
+export const PART_PUT_SECONDS = 1.26;
+
+/**
+ * The parts on the wire at once: the width of the upload pipeline.
+ *
+ * A request spends its latency in storage whatever its size, so the pipe
+ * carries `width / latency` PUTs a second (Little's law). The width that
+ * reaches the guard's rate is
+ *
+ *   ceil(GUARD_PUTS_PER_SEC * PART_PUT_SECONDS) = ceil(10 * 1.26) = 13.
+ *
+ * Fewer leave the guard unused. More only queue behind it. At that rate a
+ * 4 MiB part moves 42 MB/s, which is the measured uplink (34.9 MB/s with 16
+ * in flight), so the guard and the uplink meet near this width. The value is
+ * 16: the next step of the gate's slow start (1, 2, 4, 8, 16) above 13, and the
+ * width the 34.9 MB/s was measured at.
+ */
+export const PARTS_IN_FLIGHT = 16;
+
+/**
+ * The part being built holds its plain bytes and room for its ciphertext:
+ * two parts of memory, on top of the parts in flight.
+ */
+const BUILDING_PARTS = 2;
+
 export const DEFAULT_STORAGE_ACCESS_POLICY: StorageAccessPolicy = {
   retryBudgetMs: 180_000,
   baseDelayMs: 250,
   maxDelayMs: 4_000,
-  maxBytesInFlight: 64 * 1024 * 1024,
-  partBytes: 4 * 1024 * 1024,
+  maxBytesInFlight: (PARTS_IN_FLIGHT + BUILDING_PARTS) * PART_BYTES,
+  partBytes: PART_BYTES,
+  maxPartsInFlight: PARTS_IN_FLIGHT,
   maxObjectBytes: 100 * 1024 * 1024,
   now: Date.now,
   after: realAfter,
@@ -237,12 +290,13 @@ export interface SendGovernor {
   ): Promise<T>;
   /**
    * Hold `bytes` of the memory budget until the returned function is called.
+   * A holder that needs less later gives the rest back with `shrink`.
    * `objectBytes` is the size of the object this memory becomes, when that
    * differs (an attachment is held twice, as plain and as encrypted bytes).
    * Rejects with `StorageObjectTooLargeError` when that object is over the
    * store's limit.
    */
-  reserve(bytes: number, objectBytes?: number): Promise<() => void>;
+  reserve(bytes: number, objectBytes?: number): Promise<Reservation>;
   /** Watch the governor; `end()` reports what happened since this call. */
   window(): { end(): SendWindowStats };
   /** Follow the quota a service publishes. Returns a function that stops it. */
@@ -315,7 +369,10 @@ export function createStorageAccess(policy: StorageAccessPolicy): SendGovernor {
   const gate = createSendGate({
     maxWindow: Math.max(
       1,
-      Math.floor(policy.maxBytesInFlight / policy.partBytes),
+      Math.min(
+        policy.maxPartsInFlight,
+        Math.floor(policy.maxBytesInFlight / policy.partBytes),
+      ),
     ),
     maxHoldMs: policy.retryBudgetMs,
     now: policy.now,

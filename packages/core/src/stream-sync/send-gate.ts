@@ -400,14 +400,27 @@ export function createSendGate(
   };
 }
 
+/**
+ * Bytes held from a budget. Call it to give them back. It is safe to call
+ * twice.
+ */
+export interface Reservation {
+  (): void;
+  /**
+   * Keep only `bytes` of what is held and give the rest back now, so a waiter
+   * that fits may start. It never grows a reservation (a larger size changes
+   * nothing), and it does nothing after the release.
+   */
+  shrink(bytes: number): void;
+}
+
 export interface ByteBudget {
   /**
-   * Resolves with a release function once `bytes` fit under the budget. A
-   * request larger than the whole budget waits until nothing else is held,
-   * then runs alone: it never waits for ever. Waiters are served in order.
-   * The release is safe to call twice.
+   * Resolves with a reservation once `bytes` fit under the budget. A request
+   * larger than the whole budget waits until nothing else is held, then runs
+   * alone: it never waits for ever. Waiters are served in order.
    */
-  reserve(bytes: number): Promise<() => void>;
+  reserve(bytes: number): Promise<Reservation>;
   readonly inUse: () => number;
 }
 
@@ -432,23 +445,34 @@ export function createByteBudget(
   return {
     inUse: () => inUse,
     reserve(bytes) {
-      const size = Math.max(0, bytes);
-      const hold = () => {
+      const requested = Math.max(0, bytes);
+      const hold = (): Reservation => {
+        let held = requested;
         let released = false;
-        return () => {
+        const release = () => {
           if (released) return;
           released = true;
-          inUse -= size;
+          inUse -= held;
           drain();
         };
+        return Object.assign(release, {
+          shrink(keep: number) {
+            if (released) return;
+            const next = Math.max(0, Math.min(held, keep));
+            if (next === held) return;
+            inUse -= held - next;
+            held = next;
+            drain();
+          },
+        });
       };
-      if (waiting.length === 0 && fits(size)) {
-        inUse += size;
+      if (waiting.length === 0 && fits(requested)) {
+        inUse += requested;
         onChange?.(inUse);
         return Promise.resolve(hold());
       }
       return new Promise((resolve) => {
-        waiting.push({ bytes: size, grant: () => resolve(hold()) });
+        waiting.push({ bytes: requested, grant: () => resolve(hold()) });
       });
     },
   };

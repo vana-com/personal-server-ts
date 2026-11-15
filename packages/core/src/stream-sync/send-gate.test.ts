@@ -585,4 +585,37 @@ describe("createByteBudget", () => {
     await b;
     expect(order).toEqual(["a", "b"]);
   });
+
+  it("gives back the bytes a reservation no longer needs, at once, to the next waiter", async () => {
+    const budget = createByteBudget(10);
+    // A part reserves its plain bytes and room for its ciphertext (8), then
+    // keeps only the ciphertext (4) once it is encrypted.
+    const part = await budget.reserve(8);
+    let granted = false;
+    void budget.reserve(6).then(() => (granted = true));
+    await flush();
+    expect(granted).toBe(false);
+    part.shrink(4);
+    await flush();
+    expect(budget.inUse()).toBe(10);
+    expect(granted).toBe(true);
+    // The release frees what is left, once: 4 of the part, not the 8 it began with.
+    part();
+    part();
+    expect(budget.inUse()).toBe(6);
+  });
+
+  it("never grows a reservation, and a shrink after the release does nothing", async () => {
+    const budget = createByteBudget(10);
+    const part = await budget.reserve(4);
+    part.shrink(9);
+    expect(budget.inUse()).toBe(4);
+    part.shrink(-3);
+    // A negative size is no bytes.
+    expect(budget.inUse()).toBe(0);
+    part();
+    expect(budget.inUse()).toBe(0);
+    part.shrink(1);
+    expect(budget.inUse()).toBe(0);
+  });
 });

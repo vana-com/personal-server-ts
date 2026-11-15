@@ -70,7 +70,7 @@ type Options = {
   /** Extra wait before a blob call on a key, by stream index. */
   readonly blobMsFor?: (stream: string) => number;
   /** Called when an upload starts, after it is logged; the upload waits for it. */
-  readonly holdPut?: (key: string) => Promise<void>;
+  readonly holdPut?: (key: string, bytes: number) => Promise<void>;
   /** Called when a blob read starts, after it is logged; the read waits for it. */
   readonly holdGet?: (key: string) => Promise<void>;
   /** Called when a stream's first encrypt call (its attachment's) starts. */
@@ -170,7 +170,7 @@ async function world(options: Options) {
     async put(key, bytes, beforeAttempt) {
       record("put", key);
       guards.push({ key, guard: beforeAttempt });
-      await options.holdPut?.(key);
+      await options.holdPut?.(key, bytes.length);
       await sleep(
         (options.blobMs ?? 0) + (options.blobMsFor?.(streamOfKey(key)!) ?? 0),
       );
@@ -837,12 +837,20 @@ function recordingGovernor(
       await reserveFirst?.(bytes, objectBytes);
       state.held += bytes;
       state.peak = Math.max(state.peak, state.held);
-      let released = false;
-      return () => {
-        if (released) return;
-        released = true;
-        state.held -= bytes;
-      };
+      let kept = bytes;
+      return Object.assign(
+        () => {
+          state.held -= kept;
+          kept = 0;
+        },
+        {
+          shrink(keep: number) {
+            const next = Math.max(0, Math.min(kept, keep));
+            state.held -= kept - next;
+            kept = next;
+          },
+        },
+      );
     },
     window: () => ({
       end: () => ({
@@ -904,20 +912,26 @@ describe("the memory budget is taken before data is built", () => {
   it("keeps a part's own reservation until its upload has ended", async () => {
     // One stream, so no sibling's reservation can stand in for the part's.
     const { state, governor } = recordingGovernor();
-    const heldAtPut: Array<{ head: boolean; held: number }> = [];
+    const heldAtPut: Array<{ head: boolean; held: number; bytes: number }> = [];
     const { deps } = await world({
       streams: 1,
       governor,
-      holdPut: async (key) => {
-        heldAtPut.push({ head: /\/h-/.test(key), held: state.held });
+      holdPut: async (key, bytes) => {
+        heldAtPut.push({
+          head: /\/h-/.test(key),
+          held: state.held,
+          bytes,
+        });
       },
     });
     const results = await publishConnection(deps, CONNECTION_ID);
     expect(results.map((r) => r.outcome)).toEqual(["published"]);
     const part = heldAtPut.find((p) => !p.head);
     const head = heldAtPut.find((p) => p.head);
-    // A part is held twice: plain encoded bytes and ciphertext.
-    expect(part?.held).toBe(2 * 4 * 1024 * 1024);
+    // Once encrypted a part holds only its ciphertext: the plain bytes are
+    // dropped and the reservation shrinks to what the PUT still carries.
+    expect(part?.held).toBe(part?.bytes);
+    expect(part?.held).toBeGreaterThan(0);
     expect(head?.held).toBeGreaterThanOrEqual(4 * 1024 * 1024);
     expect(state.held).toBe(0);
   });
@@ -1288,8 +1302,12 @@ describe("a stream's transfer starts while its snapshot is still copying rows", 
 
   it("holds no more than the byte budget while the snapshot copies ahead of the uploads", async () => {
     const partTarget = 2048;
-    // Four parts fit; a part is held twice (plain and ciphertext).
-    const budget = 4 * 2 * partTarget;
+    // A part waiting on its PUT holds its ciphertext (part target plus the
+    // seal's overhead). The part being built holds the plain bytes and room
+    // for the ciphertext, and joins the waiting parts when sealed. This budget
+    // fits three waiting parts and the builder: four PUTs start in all.
+    const sealOverhead = 64;
+    const budget = 3 * (partTarget + sealOverhead) + 2 * partTarget;
     const state = { held: 0, peak: 0 };
     const waiting: (() => void)[] = [];
     const governor: NonNullable<StreamSyncBlobs["governor"]> = {
@@ -1298,13 +1316,25 @@ describe("a stream's transfer starts while its snapshot is still copying rows", 
           await new Promise<void>((resolve) => waiting.push(resolve));
         state.held += bytes;
         state.peak = Math.max(state.peak, state.held);
-        let done = false;
-        return () => {
-          if (done) return;
-          done = true;
-          state.held -= bytes;
+        let kept = bytes;
+        const wakeAll = () => {
           for (const wake of waiting.splice(0)) wake();
         };
+        return Object.assign(
+          () => {
+            state.held -= kept;
+            kept = 0;
+            wakeAll();
+          },
+          {
+            shrink(keep: number) {
+              const next = Math.max(0, Math.min(kept, keep));
+              state.held -= kept - next;
+              kept = next;
+              wakeAll();
+            },
+          },
+        );
       },
       window: () => ({
         end: () => ({

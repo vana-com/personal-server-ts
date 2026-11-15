@@ -11,6 +11,9 @@ import { createStorageStreamSyncBlobs } from "./blobs.js";
 import { fakeClock, type FakeClock } from "./fake-clock.test-helper.js";
 import {
   DEFAULT_STORAGE_ACCESS_POLICY,
+  GUARD_PUTS_PER_SEC,
+  PARTS_IN_FLIGHT,
+  PART_PUT_SECONDS,
   StorageDeferredError,
   StorageObjectTooLargeError,
   backoffDelayMs,
@@ -204,6 +207,40 @@ describe("Retry-After parsing", () => {
     expect(throttleOf(wrapped)).toEqual({ status: 503, retryAfterMs: 1_000 });
     expect(throttleOf(failed(500))).toBeUndefined();
     expect(throttleOf(failed(503))).toEqual({ status: 503 });
+  });
+});
+
+describe("DEFAULT_STORAGE_ACCESS_POLICY width", () => {
+  it("runs at least as many parts at once as it takes to reach the storage guard's rate", () => {
+    // Little's law: parts in flight = PUTs a second x seconds a PUT takes.
+    expect(PARTS_IN_FLIGHT).toBeGreaterThanOrEqual(
+      Math.ceil(GUARD_PUTS_PER_SEC * PART_PUT_SECONDS),
+    );
+    expect(DEFAULT_STORAGE_ACCESS_POLICY.maxPartsInFlight).toBe(
+      PARTS_IN_FLIGHT,
+    );
+  });
+
+  it("budgets the parts in flight, as ciphertext, and the part being built, as two parts", () => {
+    const { maxBytesInFlight, partBytes } = DEFAULT_STORAGE_ACCESS_POLICY;
+    expect(maxBytesInFlight).toBe((PARTS_IN_FLIGHT + 2) * partBytes);
+  });
+
+  it("lets the window of the default store grow to the width, and no further", async () => {
+    const clock = fakeClock();
+    const access = createStorageAccess({
+      ...DEFAULT_STORAGE_ACCESS_POLICY,
+      now: clock.now,
+      after: clock.after,
+    });
+    const window = access.window();
+    const work = Array.from({ length: 200 }, () =>
+      access.run(NO_REQUEST, async () => {
+        await new Promise<void>((resolve) => clock.after(1_000, resolve));
+      }),
+    );
+    await clock.drive(Promise.all(work), 1_000);
+    expect(window.end().window).toBe(PARTS_IN_FLIGHT);
   });
 });
 

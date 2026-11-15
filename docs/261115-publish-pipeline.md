@@ -115,9 +115,38 @@ commit (slot)                                                          after BOT
    connection: "reads only prefixes whose copy has committed ... and leaves a write
    made during the publish out".
 
+## Width of the upload (follow-up)
+
+The pipeline above overlaps the copy and the uploads. What was left was the
+width of the uploads. The send gate's window cap was 16 (64 MiB over 4 MiB), but
+the byte budget counted each part twice, plain and ciphertext, until its PUT
+settled. The same 64 MiB therefore held 8 parts, and 8 was the real width in
+production. The gate never reached 16.
+
+Two changes, no format change:
+
+1. An upload keeps only its ciphertext while its PUT waits and runs. It drops
+   the plain bytes once encrypted and `Reservation.shrink`s its reservation to
+   the ciphertext's size, so a part in flight costs one part of the budget.
+2. The width is a named constant, `PARTS_IN_FLIGHT = 16`, derived in
+   `storage-retry.ts` from the storage guard's rate (10 PUT/s) and the measured
+   time of one part's PUT (1.26 s): `ceil(10 * 1.26) = 13`, rounded up to the
+   next step of the gate's slow start. The budget is the parts in flight plus
+   the part being built (two parts): `(16 + 2) * 4 MiB = 72 MiB`, up from 64 MiB.
+
+Bytes and order are unchanged. The part and head names are content hashes; a
+run before and after stores the same set of names (`objectsDigest` in
+`publish-pipeline.workload.ts`).
+
+Open: the plan before the first PUT (the record-changes read, the part-layout
+sizes, `planBuckets`) still finishes before the transfer starts, about 1.3 to
+2 s on the 198k-row stream. `planBuckets` needs the byte count of every
+changed row's shard before it can name the first bucket, so it is a whole-input
+step. Overlapping it would need a different planner. Not done here.
+
 ## What this does not change
 
-- The send gate, governor, quota, window and byte budget. Width is unchanged.
+- The send gate's window rules, quota and retry. Width is `PARTS_IN_FLIGHT`.
 - The slot turn's length. The snapshot is as long as before (the copy is the
   same work), so a write to the same connection waits as long as before. The
   PUTs now run during that wait instead of after it.

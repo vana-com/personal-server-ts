@@ -5,13 +5,17 @@
 //
 //   npx tsx packages/server/src/localdb/publish-pipeline.workload.ts \
 //     --db ~/.tmp/<dir>/stream.sqlite --rows 198001 --row-bytes 2200 \
-//     --put-ms 1200 --width 16 [--profile]
+//     --put-ms 1200 (--production | --width 16) [--profile]
+//
+// `--production` runs under the store's default policy, whatever commit this is
+// run at, which is what a release does. `--width N` runs N parts in flight with
+// a budget sized for them.
 //
 // It prints one JSON object: the stream's own publish timings (`planMs`,
 // `transferMs`, `uploadMs`, `totalMs`), when the first PUT started and the last
 // one ended, and with `--profile` the time spent in each SQL statement shape
 // and the connection's slot turns (wait and run).
-import { createCipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { createStorageStreamSyncBlobs } from "../../../core/src/stream-sync/blobs.js";
 import { createMemoryStreamSyncRegistry } from "../../../core/src/stream-sync/memory-registry.js";
@@ -105,6 +109,10 @@ export interface PipelineBenchOptions {
   readonly putMs: number;
   /** The send gate's window cap. The byte budget is sized to hold that many parts. */
   readonly width: number;
+  /** Use the store's default policy as it is, and ignore `width`. */
+  readonly production?: boolean;
+  /** The storage guard: PUTs allowed per 60 s (vana-storage: 600). None when absent. */
+  readonly putsPerMinute?: number;
   readonly profile?: boolean;
   /** Queue a write to `records` as soon as the first PUT starts. */
   readonly writeDuringPublish?: boolean;
@@ -119,6 +127,12 @@ export interface PipelineBenchResult {
   readonly lastPutEndAtMs: number | null;
   readonly puts: number;
   readonly peakOnWire: number;
+  /** The most resident memory the process had while the publish ran, in MiB. */
+  readonly peakRssMiB: number;
+  /** The most buffer memory outside the JS heap, in MiB. */
+  readonly peakExternalMiB: number;
+  /** SHA-256 over the sorted names of every object stored: equal digests, equal parts and head. */
+  readonly objectsDigest: string;
   readonly sql?: readonly {
     readonly shape: string;
     readonly n: number;
@@ -162,6 +176,8 @@ export async function benchPublish(
     ? {
         info: driver.info,
         reads: driver.reads,
+        // Kept, so a profiled run takes the same frozen-view path as a plain one.
+        ...(driver.snapshot ? { snapshot: () => driver.snapshot!() } : {}),
         close: () => driver.close(),
         query: async (text, params) => {
           const started = at();
@@ -198,6 +214,7 @@ export async function benchPublish(
     lastPutEndAtMs: null as number | null,
   };
   let wrote = false;
+  const stored: string[] = [];
   const key = randomBytes(32);
   const partBytes = 4 * 1024 * 1024;
   const blobs = createStorageStreamSyncBlobs(
@@ -206,7 +223,8 @@ export async function benchPublish(
       exists: async () => false,
       download: async () => new Uint8Array(),
       delete: async () => true,
-      upload: async () => {
+      upload: async (objectKey: string) => {
+        stored.push(objectKey);
         stats.puts += 1;
         stats.onWire += 1;
         stats.peakOnWire = Math.max(stats.peakOnWire, stats.onWire);
@@ -221,13 +239,20 @@ export async function benchPublish(
         return "";
       },
     } as never,
-    {
-      ...DEFAULT_STORAGE_ACCESS_POLICY,
-      // One part holds 2x its bytes (plain and ciphertext) while its PUT
-      // runs, so the window cap is the budget over that.
-      partBytes: 2 * partBytes,
-      maxBytesInFlight: options.width * 2 * partBytes,
-    },
+    options.production
+      ? {
+          ...DEFAULT_STORAGE_ACCESS_POLICY,
+          ...(options.putsPerMinute
+            ? { quota: { limit: options.putsPerMinute, windowMs: 60_000 } }
+            : {}),
+        }
+      : {
+          ...DEFAULT_STORAGE_ACCESS_POLICY,
+          // `width` parts in flight and the part being built (two parts).
+          partBytes,
+          maxPartsInFlight: options.width,
+          maxBytesInFlight: (options.width + 2) * partBytes,
+        },
   );
   const deps: LocalSyncDeps = {
     db,
@@ -275,10 +300,20 @@ export async function benchPublish(
       return () => `pipeline-${++n}`;
     })(),
   };
+  let peakRss = 0;
+  let peakExternal = 0;
+  const sample = () => {
+    const use = process.memoryUsage();
+    peakRss = Math.max(peakRss, use.rss);
+    peakExternal = Math.max(peakExternal, use.external + use.arrayBuffers);
+  };
+  const sampler = setInterval(sample, 25);
   try {
     t0 = performance.now();
     const results = await publishConnection(deps, PIPELINE_CONNECTION);
     const wallMs = at();
+    clearInterval(sampler);
+    sample();
     return {
       outcome: results.map((r) => r.outcome).join(","),
       timings,
@@ -287,6 +322,11 @@ export async function benchPublish(
       lastPutEndAtMs: stats.lastPutEndAtMs,
       puts: stats.puts,
       peakOnWire: stats.peakOnWire,
+      peakRssMiB: Math.round(peakRss / 1048576),
+      peakExternalMiB: Math.round(peakExternal / 1048576),
+      objectsDigest: createHash("sha256")
+        .update([...stored].sort().join("\n"))
+        .digest("hex"),
       ...(options.profile
         ? {
             sql: [...sql.entries()]
@@ -298,6 +338,7 @@ export async function benchPublish(
         : {}),
     };
   } finally {
+    clearInterval(sampler);
     await db.close();
   }
 }
@@ -337,6 +378,10 @@ async function main(): Promise<void> {
     path,
     putMs: Number(arg("put-ms", "1200")),
     width: Number(arg("width", "16")),
+    production: process.argv.includes("--production"),
+    ...(process.argv.includes("--puts-per-minute")
+      ? { putsPerMinute: Number(arg("puts-per-minute")) }
+      : {}),
     profile: process.argv.includes("--profile"),
   });
   console.log(JSON.stringify(result, null, 2));
