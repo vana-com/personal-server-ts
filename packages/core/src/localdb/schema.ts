@@ -305,4 +305,20 @@ END`,
   ${bumpConnector("OLD")}
 END`,
   ],
+  [
+    // The stream-sync log (stream-sync/src/log.ts). `log_state` is one row per
+    // connection: the position this device has applied, the position the log
+    // began after (`base`), and the refs of positions base+1..position as JSON,
+    // which is what the next segment this device writes lists. `log_tombstones`
+    // keeps the stamp of every delete and omission the log carried, so a
+    // reordered or repeated upsert cannot bring a deleted record back. Both
+    // are local only, and empty until a connection runs with the log flag.
+    `CREATE TABLE log_state (
+  connection_id TEXT PRIMARY KEY, position INTEGER NOT NULL, base INTEGER NOT NULL,
+  refs TEXT NOT NULL) WITHOUT ROWID;`,
+    `CREATE TABLE log_tombstones (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL,
+  stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL,
+  PRIMARY KEY (connection_id, stream, pk_hash)) WITHOUT ROWID;`,
+  ],
 ];

@@ -11,6 +11,7 @@ import {
   framesOfParts,
   headBlobName,
   isPlainObject,
+  isLogStream,
   omissionCutoff,
   parseScope,
   partBlobName,
@@ -33,6 +34,7 @@ import {
   hydrateLifetimeBoundary,
   olderLifetimeFence,
 } from "./lifetime-boundary.js";
+import { applyLog } from "./log-apply.js";
 import { purgeConnection } from "./purge.js";
 
 /** What one apply did, for the caller's status line. */
@@ -205,6 +207,11 @@ function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
             scope.connector === connection.connector &&
             scope.ns === connection.ns
           ) {
+            // The log row is read by `applyLog`, never as a stream head.
+            if (isLogStream(scope.stream)) {
+              reuse.log = row.read;
+              continue;
+            }
             flight.streams.add(scope.stream);
             reuse.listed.set(scope.stream, row.read);
           }
@@ -217,6 +224,29 @@ function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
         next,
         await applyOne(locked, id, connection, next, keyCheck, hashes, reuse),
       );
+    }
+    if (deps.logProtocol && flight.all) {
+      // Streams published before the log, then the log on top of them.
+      const [now] = await deps.db.query<{
+        generation: number;
+        control_state: string;
+      }>(
+        "SELECT generation, control_state FROM connections WHERE connection_id = ?",
+        [id],
+      );
+      if (
+        now?.control_state === "active" &&
+        now.generation === initial.generation
+      )
+        await applyLog(locked, id, {
+          connector: connection.connector,
+          ns: connection.ns,
+          generation: initial.generation,
+          keyCheck,
+          hashes,
+          // A listing taken before a stream downloaded may predate a segment.
+          read: reuse.stale ? undefined : reuse.log,
+        });
     }
     return [...answers.values()];
   });
@@ -331,6 +361,8 @@ async function control(
 interface Reuse {
   control?: Awaited<ReturnType<typeof control>>;
   listed: Map<string, ControlRead>;
+  /** The log row from the listing, when the flight listed. */
+  log?: ControlRead;
   /** A stream has downloaded since the job's reads were taken. */
   stale: boolean;
 }
@@ -436,6 +468,11 @@ async function applyOneOnce(
   }
   if (state && read.version <= state.last_delete_version)
     return early(result(stream, "gone"));
+  // With the log on, a stream the log wrote reads from a local version above
+  // the registry's own stream row (see `applySegmentOperations`): that row is
+  // older than what this device holds and replaces nothing.
+  if (deps.logProtocol && state && state.head_version > read.version)
+    return early(result(stream, "noop"));
   const saved = await deps.db.query<SavedPart>(
     "SELECT prefix,seq,part_hash,bytes,count FROM head_parts WHERE connection_id=? AND stream=? ORDER BY prefix,seq",
     [id, stream],

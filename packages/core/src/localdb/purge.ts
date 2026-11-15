@@ -59,6 +59,15 @@ export async function purgeConnection(
    WHERE connection_id = ?`,
           params: [connectionId],
         },
+        // The log position and tombstones belong to the lifetime that ended.
+        {
+          sql: "DELETE FROM log_state WHERE connection_id = ?",
+          params: [connectionId],
+        },
+        {
+          sql: "DELETE FROM log_tombstones WHERE connection_id = ?",
+          params: [connectionId],
+        },
         // A publish copy of the deleted rows. Its transfer sees the rows gone
         // and stops; the commit would refuse it in any case.
         {

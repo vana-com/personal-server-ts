@@ -1,6 +1,7 @@
 import { applyConnection, type ApplyResult } from "./apply.js";
 import { bootstrapConnections } from "./bootstrap.js";
 import type { LocalSyncDeps } from "./deps.js";
+import { publishLog } from "./log-publish.js";
 import { publishConnection, type PublishResult } from "./publish.js";
 import { insideQueue } from "./slot.js";
 
@@ -52,7 +53,12 @@ export async function syncConnection(
     applied = await deps.queue.run(connectionId, "publish", () =>
       applyConnection(insideQueue(deps, connectionId), connectionId),
     );
-    published = await publishConnection(deps, connectionId);
+    // With the log flag on, a connection publishes one segment and one commit
+    // per batch; `null` means this registry has no batch route, so the
+    // per-stream path publishes instead.
+    published =
+      (deps.logProtocol ? await publishLog(deps, connectionId) : null) ??
+      (await publishConnection(deps, connectionId));
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause);
     // The timer and `/sync/trigger` drop the report. A connection whose

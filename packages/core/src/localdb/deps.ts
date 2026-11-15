@@ -46,6 +46,13 @@ export interface LocalSyncDeps {
    * costs latency, and a throw here never fails the commit.
    */
   readonly recordsCommitted?: () => void;
+  /**
+   * Publish and apply through the stream-sync log (one segment and one
+   * registry commit per batch, across streams) instead of per-stream heads.
+   * Default off. A connection that has published to the log is read through it
+   * by every device, so turn it on for all devices of an owner together.
+   */
+  readonly logProtocol?: boolean;
 }
 
 /** The one call every commit of local rows makes (run end, import). */
