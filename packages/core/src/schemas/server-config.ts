@@ -67,6 +67,12 @@ export const DEFAULTS = {
     // "did anything change?" that starts a sync cycle early. 0 turns it off.
     // See DEFAULT_CHANGE_PROBE_MS for why 5000.
     changeProbeMs: 5_000,
+    // The gateway tells this server when the registry changed (a held request
+    // answered on a write), so a save on another device is pulled at once.
+    // The probe above stays as the fallback and stretches to
+    // `changeProbeHealthyMs` while that push is healthy. false: probe only.
+    changePush: true,
+    changeProbeHealthyMs: 60_000,
   },
   olderVersionReads: true,
   replication: {
@@ -255,6 +261,12 @@ export const ServerConfigSchema = z.object({
         .int()
         .min(0)
         .default(DEFAULTS.streamSync.changeProbeMs),
+      changePush: z.boolean().default(DEFAULTS.streamSync.changePush),
+      changeProbeHealthyMs: z
+        .number()
+        .int()
+        .min(0)
+        .default(DEFAULTS.streamSync.changeProbeHealthyMs),
     })
     .default(DEFAULTS.streamSync),
   olderVersionReads: z.boolean().default(DEFAULTS.olderVersionReads),

@@ -18,6 +18,7 @@ import {
 } from "../workers/delete.js";
 import { createDownloadRetryMemory } from "../retry-memory.js";
 import { createTombstoneResubmitTracker } from "../tombstone-resubmits.js";
+import { changePushBackoffMs } from "./change-push.js";
 import type {
   DeleteDataPort,
   PendingBlobDeletionStore,
@@ -48,10 +49,49 @@ export interface ChangeProbe {
    */
   intervalMs: number;
   /**
+   * A server push that tells the manager when to pull. While it is healthy the
+   * timed probe stretches to `push.healthyProbeMs`; otherwise nothing differs.
+   */
+  push?: ChangePush;
+  /**
    * Whether the timed probe is worth sending now. A hidden Web tab has no one
    * to show a change to and re-probes when it is shown (a signal). Absent: always.
    */
   active?: () => boolean;
+}
+
+/**
+ * A server-pushed hint that the registry changed. It is lossy by design: a
+ * poke can be lost, doubled or late, and nothing here depends on one arriving.
+ * A poke runs a cycle. It does not go through the marker comparison that a
+ * focus or a probe tick uses, because the marker is the lossy part (it
+ * fingerprints one row, and another row stamped in the same millisecond leaves
+ * it equal) while a poke is the gateway's exact sequence changing, or the
+ * first answer after a failure. It does not wait for the probe either: a probe
+ * that never answers cannot hold it up. A failed attempt is not a poke. The
+ * unconditional timer cycle stays the completeness guarantee. The push only
+ * shortens the wait, and it says when it cannot be trusted so the short probe
+ * returns.
+ */
+export interface ChangePush {
+  /**
+   * The timed probe's period while the push is healthy. Longer than the
+   * probe's own `intervalMs`; the unconditional timer cycle bounds it.
+   */
+  healthyProbeMs: number;
+  /**
+   * Start a subscription; the returned function ends it. `onChange` means the
+   * registry's sequence moved since the last answer, or the first answer after
+   * a failure came back: run a cycle. It is called on a successful answer
+   * only; a failed attempt calls nothing, so with every answer lost the timer
+   * cycle is the bound. `onHealth(true)`:
+   * the channel answered lately, so pokes can be expected; `onHealth(false)`:
+   * it failed or went quiet, so do not rely on one.
+   */
+  subscribe(handlers: {
+    onChange(): void;
+    onHealth(healthy: boolean): void;
+  }): () => void;
 }
 
 export interface SyncManagerOptions {
@@ -189,7 +229,14 @@ export function createSyncManager(
   let blocked: SyncBlockedReason | null = null;
   let errors: SyncError[] = [];
   let cycleInFlight: Promise<void> | null = null;
+  // The dirty follow-up flag: a request arrived that the running cycle may not
+  // have seen. It is owed one more cycle and is dropped only by running one (or
+  // by a stop). A pass clears it on entry, so it never re-arms itself.
   let rerunRequested = false;
+  // Failed cycles in a row, and the pending retry of the follow-up they owe.
+  // `retryTimer` set means cooling down: a pushed change only marks the flag.
+  let cycleFailures = 0;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
   // Pulls: one probe-and-cycle in flight; `pullRequested` is its dirty flag.
   let pullInFlight: Promise<void> | null = null;
   let pullInFlightRun = 0;
@@ -204,9 +251,17 @@ export function createSyncManager(
   // Failed probes in a row, and the earliest time the timed probe tries again.
   let probeFailures = 0;
   let nextTimedProbeAt = 0;
+  // The change push (`ChangeProbe.push`): whether it can be trusted now, when
+  // the registry was last probed (a tick within the healthy period of one is
+  // skipped), and how to end the subscription of this run.
+  let pushHealthy = false;
+  let lastProbeAt = 0;
+  let stopPush: (() => void) | null = null;
   // The registry marker as of the last cycle a pull ran and finished cleanly.
-  // Only a pull moves it, and only to a marker read BEFORE its cycle started,
-  // so every change up to it was in the registry when that cycle read.
+  // Only `pullIfChanged` moves it, and only to a marker read BEFORE its cycle
+  // started, so every change up to it was in the registry when that cycle read.
+  // A cycle that does not read its own marker first (a pushed change) leaves it
+  // alone: the next probe then runs one conservative follow-up.
   let pulledMarker: string | null | undefined;
   let errorSeq = 0;
   let probeIntervalId: ReturnType<typeof setInterval> | null = null;
@@ -296,7 +351,8 @@ export function createSyncManager(
       return cycleInFlight;
     }
 
-    cycleInFlight = exclusive(async () => {
+    // One cycle's passes: repeats while a request arrived during a pass.
+    const passes = async () => {
       do {
         rerunRequested = false;
         const canRun = await (options?.canSync?.() ?? { ok: true });
@@ -402,13 +458,48 @@ export function createSyncManager(
 
         lastSync = new Date().toISOString();
       } while (rerunRequested && isRunning);
-    });
+    };
+
+    // A failed cycle ends its exclusive operation at once: callers get its
+    // error and queued mutations run. A follow-up it still owes (the dirty
+    // flag) waits out a cooldown first: see `scheduleRetry`.
+    cycleInFlight = exclusive(passes);
 
     try {
       await cycleInFlight;
+      cycleFailures = 0;
+    } catch (error) {
+      cycleFailed();
+      throw error;
     } finally {
       cycleInFlight = null;
     }
+  }
+
+  /**
+   * A cycle failed. If a request arrived while it ran, one follow-up is owed:
+   * run it after a cooldown from the push's back-off schedule (1 s doubling to
+   * 30 s over consecutive failures), never at once. Pushes cannot shorten or
+   * restart the cooldown: while it runs they only mark the dirty flag, and the
+   * one timer runs the follow-up. Without a request nothing retries; the timed
+   * cycle is the fallback.
+   */
+  function cycleFailed(): void {
+    const failures = cycleFailures;
+    cycleFailures += 1;
+    if (!rerunRequested || !isRunning || retryTimer !== null) return;
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      if (!isRunning || !rerunRequested) return;
+      runCycle().catch(() => {
+        // Errors already captured in ring buffer
+      });
+    }, changePushBackoffMs(failures));
+  }
+
+  function clearRetryTimer(): void {
+    if (retryTimer !== null) clearTimeout(retryTimer);
+    retryTimer = null;
   }
 
   function deleteScopeDeps() {
@@ -557,6 +648,7 @@ export function createSyncManager(
     fromSignal: boolean,
   ): Promise<void> {
     let marker: string | null | undefined;
+    lastProbeAt = Date.now();
     try {
       marker = await probe.read();
     } catch (err) {
@@ -670,10 +762,53 @@ export function createSyncManager(
     probeIntervalId = setInterval(() => {
       if (probe.active && !probe.active()) return;
       if (Date.now() < nextTimedProbeAt) return; // backing off after failures
+      // A healthy push pokes on a change; the timer cycle still runs every
+      // poll interval, so this probe only has to back it up now and then.
+      if (
+        pushHealthy &&
+        probe.push &&
+        Date.now() - lastProbeAt < probe.push.healthyProbeMs
+      ) {
+        return;
+      }
       pull(false).catch(() => {
         // Errors already captured in ring buffer
       });
     }, probe.intervalMs);
+  }
+
+  function startChangePush(): void {
+    const push = options?.changeProbe?.push;
+    if (!push || stopPush !== null) return;
+    const run = lifecycle;
+    stopPush = push.subscribe({
+      onChange() {
+        if (run !== lifecycle || !isRunning) return;
+        // A verified change cycles at once. It does not wait for the optional
+        // probe or join a timed probe read in flight, so a probe that never
+        // answers cannot hold it up; `runCycle` still runs one cycle at a time.
+        // It reads no marker and publishes none: see `pulledMarker`.
+        if (retryTimer !== null) {
+          // Cooling down after a failed cycle: the request is owed, and the
+          // retry timer runs it. A push neither skips nor restarts the wait.
+          rerunRequested = true;
+          return;
+        }
+        runCycle().catch(() => {
+          // Errors already captured in ring buffer
+        });
+      },
+      onHealth(healthy) {
+        if (run !== lifecycle) return;
+        pushHealthy = healthy;
+      },
+    });
+  }
+
+  function stopChangePush(): void {
+    stopPush?.();
+    stopPush = null;
+    pushHealthy = false;
   }
 
   function clearProbeInterval(): void {
@@ -700,8 +835,10 @@ export function createSyncManager(
       isRunning = true;
       lifecycle += 1;
       pulledMarker = undefined;
+      cycleFailures = 0;
       probeFailures = 0;
       nextTimedProbeAt = 0;
+      lastProbeAt = Date.now();
 
       // Crash recovery: run one cycle immediately on start
       runCycle().catch(() => {
@@ -710,6 +847,7 @@ export function createSyncManager(
 
       startInterval();
       startProbeInterval();
+      startChangePush();
     },
 
     async stop() {
@@ -720,7 +858,10 @@ export function createSyncManager(
         .catch((err: unknown) => err);
       clearIntervalTimer();
       clearProbeInterval();
+      stopChangePush();
       clearNotifyTimer();
+      clearRetryTimer();
+      rerunRequested = false;
       isRunning = false;
       // Cancel pulls: a probe that answers later finds a new lifecycle value.
       lifecycle += 1;
