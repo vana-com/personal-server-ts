@@ -199,10 +199,11 @@ describe("encodePrefixes", () => {
     expect(second).toEqual(first);
     expect(f.put).not.toHaveBeenCalled();
     expect(f.encryptPart).not.toHaveBeenCalled();
-    // Per call and prefix: one query for the one-row page, one that finds no
-    // more rows (the copy into the spool is a batch, not a query). A page is
-    // one query: its rows, their sizes and their bodies together.
-    expect(query).toHaveBeenCalledTimes(8);
+    // Per call: a one-row page and a read that finds no more for the first
+    // prefix, then one read for the second, which asks for the two rows the
+    // first prefix's sizing allows and finds one (the copy into the spool is a
+    // batch, not a query). A page is one query: rows, sizes and bodies together.
+    expect(query).toHaveBeenCalledTimes(6);
     expect(
       query.mock.calls.every(
         ([sql]) =>

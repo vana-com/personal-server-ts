@@ -319,11 +319,18 @@ export async function freezePrefixRows(
 type SpoolRow = FrozenRow & { readonly body_bytes: number };
 
 /**
+ * How many rows the next page asks for, and the largest row of the last pages.
+ * One per transfer, carried from prefix to prefix: rows of a stream are
+ * exchangeable across key ranges, so a new prefix does not start from one row.
+ */
+type PageSizing = { rows: number; recentMax: number[] };
+
+/**
  * Read one prefix of the frozen rows in key order, from the attempt's spool or
  * from a frozen view of `records`, one query per page. A page asks for `rows`
  * rows after the last key read; the rows come with their body size, and the
  * next page asks for as many rows as fit `pageBytes` at the largest row of the
- * last `PAGE_HISTORY` pages. The first page is one row and each page at most
+ * last `PAGE_HISTORY` pages. The first page of a transfer is one row and each page at most
  * doubles, so a stream of large rows is never read in a wide page to learn its
  * size. A page can pass `pageBytes` only when it holds rows larger than any of
  * those pages' rows; a single row larger than `pageBytes` is a page of its own,
@@ -336,6 +343,7 @@ async function* readFrozen(
   source: { readonly attempt: string; readonly view?: FrozenView },
   prefix: string,
   pageBytes: number,
+  size: PageSizing,
 ): AsyncGenerator<readonly SpoolRow[]> {
   const range = keyRange(prefix);
   // A prefix is read after its batch committed, and nothing writes it again,
@@ -346,12 +354,12 @@ async function* readFrozen(
   // The two sources differ only in the table, its scope and the size column.
   let from: string;
   let scope: string;
-  let size: string;
+  let sizeColumn: string;
   let scopeParams: SqlValue[];
   if (frozen) {
     from = "records";
     scope = "connection_id = ? AND stream = ?";
-    size = BODY_BYTES;
+    sizeColumn = BODY_BYTES;
     scopeParams = [frozen.connectionId, frozen.stream];
     if (frozen.replaceBelow) {
       // Rows below the replacing run are left out, as the copy leaves them.
@@ -361,29 +369,27 @@ async function* readFrozen(
   } else {
     from = "publish_spool";
     scope = "attempt = ?";
-    size = "body_bytes";
+    sizeColumn = "body_bytes";
     scopeParams = [source.attempt];
   }
   let after: string | null = null;
-  let rows = 1;
-  const recentMax: number[] = [];
   for (;;) {
     const page: SpoolRow[] = await reader.query(
       `SELECT pk_hash, stamp_o, stamp_r, first_o, body_sha256,
-              ${size} AS body_bytes, body
+              ${sizeColumn} AS body_bytes, body
          FROM ${from}
         WHERE ${scope}${range.sql}${after === null ? "" : " AND pk_hash > ?"}
-        ORDER BY pk_hash LIMIT ${rows}`,
+        ORDER BY pk_hash LIMIT ${size.rows}`,
       [...scopeParams, ...range.params, ...(after === null ? [] : [after])],
     );
     if (page.length === 0) return;
     yield page;
-    if (page.length < rows) return;
+    if (page.length < size.rows) return;
     after = page[page.length - 1]!.pk_hash;
-    recentMax.push(Math.max(...page.map((row) => Number(row.body_bytes))));
-    if (recentMax.length > PAGE_HISTORY) recentMax.shift();
-    const fit = Math.floor(pageBytes / Math.max(1, ...recentMax));
-    rows = Math.max(1, Math.min(PAGE_ROWS_MAX, rows * 2, fit));
+    size.recentMax.push(Math.max(...page.map((row) => Number(row.body_bytes))));
+    if (size.recentMax.length > PAGE_HISTORY) size.recentMax.shift();
+    const fit = Math.floor(pageBytes / Math.max(1, ...size.recentMax));
+    size.rows = Math.max(1, Math.min(PAGE_ROWS_MAX, size.rows * 2, fit));
   }
 }
 
@@ -512,6 +518,7 @@ async function encodeFrozenParts(
 ): Promise<readonly EncodedPart[]> {
   const result: EncodedPart[] = [];
   const pageBytes = pageBytesOf(target);
+  const pageSizing: PageSizing = { rows: 1, recentMax: [] };
   const port = deps.streamCrypto ?? nobleStreamCrypto;
   const hash = async (bytes: Uint8Array): Promise<Uint8Array> =>
     port.sha256(bytes);
@@ -566,7 +573,9 @@ async function encodeFrozenParts(
     // One page is read ahead while the one in hand is encoded. It starts only
     // after the builder holds its reservation (below), and `pageBytes` keeps the
     // two pages inside the `2 * target` that reservation counts.
-    const pages = readAhead(readFrozen(deps, input, prefix, pageBytes));
+    const pages = readAhead(
+      readFrozen(deps, input, prefix, pageBytes, pageSizing),
+    );
     try {
       for (;;) {
         await memory.hold();
