@@ -354,6 +354,39 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
     await context.closeStreamSync?.();
   });
 
+  it("subscribeSyncStatus hears a manager that has not started, through its first cycle", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const context = await createSwitchedIndexedDbPsLiteRuntime(
+      options({
+        localDb: { openDriver: async () => openBetterSqlite3(":memory:") },
+        configDefaults: {
+          gateway: { url: "https://gateway.local" },
+          sync: { enabled: false },
+          streamSync: { write: true },
+        },
+      }),
+    );
+    expect(context.syncManager).not.toBeNull();
+    expect(context.syncManager?.getStatus().running).toBe(false);
+    const events: { syncing: boolean; blocked: unknown }[] = [];
+    const unsubscribe = context.subscribeSyncStatus((s) =>
+      events.push({ syncing: s.syncing, blocked: s.blocked?.reason ?? null }),
+    );
+    expect(events).toEqual([]); // taking the subscription is not a change
+    await context.syncManager?.trigger();
+    const last = events.at(-1);
+    // This runtime is not registered with the gateway, so the cycle is blocked:
+    // the first cycle ends with no sync, and the subscriber still hears it.
+    expect(last).toEqual({ syncing: false, blocked: "unregistered" });
+    expect(events.some((e) => e.syncing)).toBe(true);
+    unsubscribe();
+    const delivered = events.length;
+    await context.syncManager?.trigger();
+    expect(events).toHaveLength(delivered);
+    await context.syncManager?.stop();
+    await context.closeStreamSync?.();
+  });
+
   it("refuses intake while Account is Off regardless of the old write flag", async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());
     const { streamSyncIntake } = await createUnswitchedIndexedDbPsLiteRuntime(

@@ -225,6 +225,7 @@ export interface PsLiteRuntimeOptions {
             | "requestPull"
             | "pause"
             | "resume"
+            | "subscribeStatus"
           >
         >)
     | null;

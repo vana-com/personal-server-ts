@@ -16,6 +16,7 @@ import {
   withCancellableRegistration,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { RunIntake } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import type { SyncStatus } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   createLiteReplication,
   liteVanaReplicaObjects,
@@ -203,6 +204,15 @@ export interface IndexedDbPsLiteRuntime {
   tokenStore: PsLiteRuntimeOptions["tokenStore"];
   accessLogStore: AccessLogReader & AccessLogWriter;
   syncManager: PsLiteRuntimeOptions["syncManager"];
+  /**
+   * Calls `listener` with the new sync status after each change of it: a cycle
+   * starting or ending, the first sync finishing with no data, an error, the
+   * pending count moving. Pass it what `syncManager.getStatus()` returns, so a
+   * host that shows sync state needs no timer. Works before the manager
+   * starts; the subscription stays when the manager stops and starts again.
+   * Returns the unsubscribe; with no sync manager it hears nothing.
+   */
+  subscribeSyncStatus(listener: (status: SyncStatus) => void): () => void;
   /** Database facade when a host driver is supplied and available. */
   localSync?: LocalSync | null;
   /** Lazily open the database after Account mode is known. */
@@ -604,6 +614,8 @@ export async function createIndexedDbPsLiteRuntime(
     syncManager,
     subscribeViewChanges: (listener) =>
       (syncRuntime?.viewChanges ?? NO_VIEW_CHANGES).subscribe(listener),
+    subscribeSyncStatus: (listener) =>
+      syncManager?.subscribeStatus?.(listener) ?? (() => {}),
     get localSync() {
       return syncRuntime?.localSync ?? null;
     },
