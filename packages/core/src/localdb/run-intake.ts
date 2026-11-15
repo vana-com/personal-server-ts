@@ -528,8 +528,11 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           let bodySha256: string;
           let recordKey: string;
           let hash: string;
+          let keyValues: string;
           try {
-            primaryKeyValues(record.data, primaryKey);
+            keyValues = canonicalJson(
+              primaryKeyValues(record.data, primaryKey) as JsonValue,
+            );
             recordKey = computeRecordKeyFromData(record.data, primaryKey);
             if (
               record.key !== undefined &&
@@ -547,8 +550,8 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             throw invalid("invalid record or primary key");
           }
           rows.push({
-            sql: `INSERT OR REPLACE INTO run_rows(run_id,stream,pk_hash,record_key,body,body_sha256,op)
-          SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM runs WHERE run_id=? AND state='collecting' AND last_batch=?)`,
+            sql: `INSERT OR REPLACE INTO run_rows(run_id,stream,pk_hash,record_key,body,body_sha256,op,pk_values)
+          SELECT ?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM runs WHERE run_id=? AND state='collecting' AND last_batch=?)`,
             params: [
               runId,
               record.stream,
@@ -557,6 +560,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
               body,
               bodySha256,
               record.op === "delete" ? "delete" : "upsert",
+              keyValues,
               runId,
               run.last_batch,
             ],

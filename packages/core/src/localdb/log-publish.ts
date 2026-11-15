@@ -34,6 +34,7 @@
 // or the head's bound says so, the segment carries a snapshot pointer, a new
 // `base`, and no refs at or below it.
 
+import { sha256 } from "@noble/hashes/sha2";
 import { keccak_256 } from "@noble/hashes/sha3";
 import {
   LOG_FORMAT,
@@ -45,10 +46,13 @@ import {
   deriveKeyCheck,
   digestSegment,
   encodeSegment,
+  firstDeletionKeyMismatch,
   logScope,
+  primaryKeyValues,
   streamScope,
   verifySegment,
   type ControlHashes,
+  type LogKey,
   type LogOmission,
   type LogOperation,
   type LogStreamMeta,
@@ -395,7 +399,13 @@ async function snapshotRound(
     // segment touched the stream since the run began.
     const replace = plan.replaceBelow ?? null;
     const omitted = replace
-      ? await omittedBy(held, connectionId, stream, replace)
+      ? await omittedBy(
+          held,
+          connectionId,
+          stream,
+          plan.finalHead?.primaryKey ?? JSON.parse(row.primary_key),
+          replace,
+        )
       : [];
     const groups = await changedKeys(
       held,
@@ -600,6 +610,16 @@ async function snapshotRound(
     streams: included.map((p) => p.meta!),
     operations: included.flatMap((p) => p.operations),
   };
+  // A deletion's key is the one its hash covers, or the segment is not written.
+  const mismatch = await firstDeletionKeyMismatch(
+    async (bytes) => sha256(bytes),
+    segment.streams,
+    segment.operations,
+  );
+  if (mismatch)
+    throw new Error(
+      `publish: a deletion's key does not match its hash (${mismatch.stream}/${mismatch.pkHash})`,
+    );
   const clear = encodeSegment(segment);
   const { dataHash, blobName } = await digestSegment(keccak, clear);
   // A segment that would not verify is never uploaded or posted.
@@ -643,13 +663,13 @@ function opSize(op: LogOperation): number {
   return op.kind === "upsert"
     ? 160 + JSON.stringify(op.value).length
     : op.kind === "delete"
-      ? 160 + op.recordKey.length
+      ? 160 + JSON.stringify(op.key).length
       : 100 + omittedSize(op.omitted);
 }
 
-/** An omission lists its hash and its canonical key. */
+/** An omission lists its hash and its typed key. */
 function omittedSize(omitted: readonly LogOmission[]): number {
-  return omitted.reduce((n, o) => n + 70 + o.recordKey.length, 0);
+  return omitted.reduce((n, o) => n + 70 + JSON.stringify(o.key).length, 0);
 }
 
 /** A stream that has not been published has its own scope for blobs only. */
@@ -698,24 +718,41 @@ async function establishControl(
 
 /**
  * The keys a replacing run dropped: held rows last observed before it. Each
- * names its canonical key from the row it drops, which is held until the run
- * deletes it, so no hash needs mapping back.
+ * names its typed primary-key values from the row it drops, which is held until
+ * the run deletes it: the row's data holds them with their types, and a
+ * deletion's key is exactly what its hash was computed from.
  */
 async function omittedBy(
   deps: LocalSyncDeps,
   connectionId: string,
   stream: string,
+  primaryKey: readonly string[],
   replace: { o: number; r: string },
 ): Promise<LogOmission[]> {
-  const rows = await deps.db.query<{ pk_hash: string; record_key: string }>(
-    `SELECT pk_hash, record_key FROM records WHERE connection_id = ? AND stream = ?
+  const rows = await deps.db.query<{ pk_hash: string; body: string }>(
+    `SELECT pk_hash, body FROM records WHERE connection_id = ? AND stream = ?
         AND ${SEEN_BEFORE} ORDER BY pk_hash`,
     [connectionId, stream, ...seenBeforeParams(replace.o, replace.r)],
   );
   return rows.map((row) => ({
     pkHash: row.pk_hash,
-    recordKey: row.record_key,
+    key: primaryKeyValues(JSON.parse(row.body), primaryKey) as LogKey,
   }));
+}
+
+/** The hashes `omittedBy` names, for a comparison that needs no key. */
+async function omittedHashes(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  stream: string,
+  replace: { o: number; r: string },
+): Promise<string[]> {
+  const rows = await deps.db.query<{ pk_hash: string }>(
+    `SELECT pk_hash FROM records WHERE connection_id = ? AND stream = ?
+        AND ${SEEN_BEFORE} ORDER BY pk_hash`,
+    [connectionId, stream, ...seenBeforeParams(replace.o, replace.r)],
+  );
+  return rows.map((row) => row.pk_hash);
 }
 
 /** Changed keys since the watermark, oldest change first. */
@@ -785,24 +822,34 @@ async function operationsFor(
     const goneMarks = gone.map(() => "?").join(",");
     const deletes = await deps.db.query<{
       pk_hash: string;
-      record_key: string;
+      pk_values: string | null;
       stamp_o: number;
       stamp_r: string;
     }>(
-      `SELECT pk_hash, record_key, stamp_o, stamp_r, MAX(seq) FROM record_changes
+      `SELECT pk_hash, pk_values, stamp_o, stamp_r, MAX(seq) FROM record_changes
         WHERE connection_id = ? AND stream = ? AND seq > ? AND seq <= ?
           AND op = 'remove' AND explicit_delete = 1 AND pk_hash IN (${goneMarks})
         GROUP BY pk_hash`,
       [connectionId, stream, from, to, ...gone],
     );
-    for (const row of deletes)
+    for (const row of deletes) {
+      // A delete made before `pk_values` existed has only the lossy string
+      // key; the log never carried it, so there is nothing to say.
+      if (row.pk_values === null) {
+        deps.logger.warn(
+          { connectionId, stream, pkHash: row.pk_hash },
+          "stream sync: an explicit delete has no typed key and is not published",
+        );
+        continue;
+      }
       ops.set(row.pk_hash, {
         kind: "delete",
         stream,
         pkHash: row.pk_hash,
-        recordKey: row.record_key,
+        key: JSON.parse(row.pk_values) as LogKey,
         stamp: { o: row.stamp_o, r: row.stamp_r },
       });
+    }
   }
   return ops;
 }
@@ -860,7 +907,7 @@ async function basisOf(
       [connectionId, p.stream, p.local.publish_watermark, p.ack],
     );
     const omitted = p.replace
-      ? await omittedBy(deps, connectionId, p.stream, p.replace)
+      ? await omittedHashes(deps, connectionId, p.stream, p.replace)
       : [];
     streams.push([p.stream, state, runs, covered, omitted]);
   }

@@ -929,6 +929,9 @@ describe("view changes", () => {
       { sql: "ALTER TABLE run_streams DROP COLUMN unadmitted" },
       { sql: "ALTER TABLE connections DROP COLUMN tombstone_wm_o" },
       { sql: "ALTER TABLE connections DROP COLUMN tombstone_wm_r" },
+      // The log's typed deletion keys are columns on tables that stay.
+      { sql: "ALTER TABLE run_rows DROP COLUMN pk_values" },
+      { sql: "ALTER TABLE record_changes DROP COLUMN pk_values" },
       { sql: `PRAGMA user_version = ${viewMigration}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");

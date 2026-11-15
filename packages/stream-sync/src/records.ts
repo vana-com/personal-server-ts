@@ -111,6 +111,33 @@ export async function pkHash(
   );
 }
 
+/**
+ * True when `key` is the primary-key tuple `hash` names for a stream with this
+ * `primaryKey`: one value per key field, each a string, finite number or
+ * boolean, and `sha256(canonicalJson(key)) === hash`. That is the same input
+ * `pkHash` hashes, so a deletion that carries the tuple needs no search and
+ * names exactly one record.
+ */
+export async function deletionKeyMatchesHash(
+  sha256: Sha256,
+  primaryKey: readonly string[],
+  key: readonly unknown[],
+  hash: string,
+): Promise<boolean> {
+  if (!HEX64.test(hash) || primaryKey.length === 0) return false;
+  if (key.length !== primaryKey.length) return false;
+  if (
+    !key.every(
+      (v) =>
+        typeof v === "string" ||
+        typeof v === "boolean" ||
+        (typeof v === "number" && Number.isFinite(v)),
+    )
+  )
+    return false;
+  return (await sha256Hex(sha256, utf8(canonicalJson(key)))) === hash;
+}
+
 function checkPkHash(hash: string): void {
   if (!HEX64.test(hash)) {
     throw new InvalidArgumentError(

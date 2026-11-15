@@ -418,4 +418,14 @@ END`,
     // tombstone written before the column; format 1 wrote none that shipped.
     `ALTER TABLE log_tombstones ADD COLUMN record_key TEXT`,
   ],
+  [
+    // A deletion in the log names its key as the typed primary-key values its
+    // pk hash is computed from (log format 2). A run row holds the record's
+    // data, which run end purges, and a change keeps only the lossy string
+    // `record_key`; so an explicit delete keeps the values themselves, as
+    // canonical JSON, from the run row that made it. NULL for a change made
+    // before the column: its typed key is gone, and the log never carried it.
+    `ALTER TABLE run_rows ADD COLUMN pk_values TEXT`,
+    `ALTER TABLE record_changes ADD COLUMN pk_values TEXT`,
+  ],
 ];

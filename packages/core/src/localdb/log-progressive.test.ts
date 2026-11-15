@@ -25,12 +25,14 @@ const remove = (stream: string, pkHash: string): LogOperation => ({
   kind: "delete",
   stream,
   pkHash,
+  key: [pkHash],
   stamp,
 });
 const omit = (stream: string, pkHash: string): LogOmitted => ({
   kind: "omitted",
   stream,
   pkHash,
+  key: [pkHash],
   stamp,
 });
 const batch = (
@@ -93,7 +95,14 @@ describe("planLogLoad", () => {
         batch([meta("a")], [upsert("a", "k1"), upsert("a", "k2")]),
         batch(
           [meta("a")],
-          [{ kind: "complete", stream: "a", cutoff: stamp, omitted: ["k2"] }],
+          [
+            {
+              kind: "complete",
+              stream: "a",
+              cutoff: stamp,
+              omitted: [{ pkHash: "k2", key: ["k2"] }],
+            },
+          ],
         ),
       ],
       new Set(),

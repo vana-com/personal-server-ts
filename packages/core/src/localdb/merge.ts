@@ -301,8 +301,8 @@ export function deleteRunRecords(
 ): SqlStatement[] {
   return [
     {
-      sql: `INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin,explicit_delete)
-        SELECT ?,r.stream,r.pk_hash,r.record_key,'remove',?,?,'local',1 FROM run_rows r
+      sql: `INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin,explicit_delete,pk_values)
+        SELECT ?,r.stream,r.pk_hash,r.record_key,'remove',?,?,'local',1,r.pk_values FROM run_rows r
         WHERE r.run_id=? AND r.stream=? AND r.op='delete'
           AND NOT EXISTS (SELECT 1 FROM records x WHERE x.connection_id=? AND x.stream=r.stream AND x.pk_hash=r.pk_hash)`,
       params: [connectionId, observedAt, runId, runId, stream, connectionId],
@@ -316,9 +316,14 @@ export function deleteRunRecords(
     {
       // The DELETE trigger logs the prior row stamp. Publish/apply need the
       // deletion's stamp; readers see only this transaction's final event.
-      sql: `UPDATE record_changes SET stamp_o=?,stamp_r=?,explicit_delete=1
+      // The deleted row's typed key comes from the run row that deleted it:
+      // run end purges the run rows, and the change keeps only a string.
+      sql: `UPDATE record_changes SET stamp_o=?,stamp_r=?,explicit_delete=1,
+          pk_values=COALESCE((SELECT x.pk_values FROM run_rows x
+            WHERE x.run_id=? AND x.stream=record_changes.stream
+              AND x.pk_hash=record_changes.pk_hash AND x.op='delete'), pk_values)
         WHERE connection_id=? AND stream=? AND seq>? AND op='remove'`,
-      params: [observedAt, runId, connectionId, stream, afterSeq],
+      params: [observedAt, runId, runId, connectionId, stream, afterSeq],
     },
   ];
 }

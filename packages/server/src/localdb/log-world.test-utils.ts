@@ -34,7 +34,7 @@ export const CONNECTION_ID = `pdpp.${CONNECTOR}~`;
 export const CONTROL = controlScope(CONNECTOR, "");
 export const LOG = logScope(CONNECTOR, "");
 export const sName = (i: number) => `s${i}`;
-export const idHash = (id: string) =>
+export const idHash = (id: string | number) =>
   pkHash(async (b) => sha256(b), { id }, ["id"]);
 
 const drivers: SqlDriver[] = [];
@@ -148,7 +148,7 @@ export async function world(options: {
       runId: string,
       records: readonly {
         stream: string;
-        id: string;
+        id: string | number;
         v?: number;
         pad?: number;
         blobId?: string;
