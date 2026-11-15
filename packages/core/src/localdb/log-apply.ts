@@ -243,23 +243,27 @@ async function applyBatch(
   // cutoff ranks below an observation at its stamp (a pass proved a key absent
   // only before its cutoff), an explicit delete above it. A key keeps the
   // greatest (stamp, rank), which is the one that refuses the most.
+  // The tombstone also keeps the deletion's canonical record key, as the
+  // operation names it, so a record-level reader of this table needs no map
+  // from hash to key (a key this device never held has no row to ask).
   const tombstone = (
     stream: string,
     pk: string,
+    recordKey: string,
     o: number,
     r: string,
     rank: number,
   ): SqlStatement[] => [
     {
-      sql: `INSERT OR IGNORE INTO log_tombstones (connection_id, stream, pk_hash, stamp_o, stamp_r, rank)
-            VALUES (?, ?, ?, ?, ?, ?)`,
-      params: [connectionId, stream, pk, o, r, rank],
+      sql: `INSERT OR IGNORE INTO log_tombstones (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, rank)
+            VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      params: [connectionId, stream, pk, recordKey, o, r, rank],
     },
     {
-      sql: `UPDATE log_tombstones SET stamp_o = ?, stamp_r = ?, rank = ?
+      sql: `UPDATE log_tombstones SET record_key = ?, stamp_o = ?, stamp_r = ?, rank = ?
              WHERE connection_id = ? AND stream = ? AND pk_hash = ?
                AND (stamp_o, stamp_r, rank) < (?, ?, ?)`,
-      params: [o, r, rank, connectionId, stream, pk, o, r, rank],
+      params: [recordKey, o, r, rank, connectionId, stream, pk, o, r, rank],
     },
   ];
   for (const operation of segment.operations) {
@@ -268,6 +272,7 @@ async function applyBatch(
         ...tombstone(
           operation.stream,
           operation.pkHash,
+          operation.recordKey,
           operation.stamp.o,
           operation.stamp.r,
           EXPLICIT_DELETE_RANK,
@@ -278,17 +283,19 @@ async function applyBatch(
         ...tombstone(
           operation.stream,
           operation.pkHash,
+          operation.recordKey,
           operation.stamp.o,
           operation.stamp.r,
           OMISSION_RANK,
         ),
       );
     else if (operation.kind === "complete")
-      for (const pk of operation.omitted)
+      for (const omission of operation.omitted)
         statements.push(
           ...tombstone(
             operation.stream,
-            pk,
+            omission.pkHash,
+            omission.recordKey,
             operation.cutoff.o,
             operation.cutoff.r,
             OMISSION_RANK,
@@ -363,7 +370,7 @@ async function applyBatch(
       statements.push(
         ...survivors(
           operation.stream,
-          operation.omitted,
+          operation.omitted.map((omission) => omission.pkHash),
           operation.cutoff.o,
           operation.cutoff.r,
           false,

@@ -38,6 +38,10 @@
  *    again unchanged moves only its local SEEN stamp (`merge.ts`), publishes
  *    nothing, and so a receiver cannot tell it from a dropped one by stamp.
  *    The writer therefore names the dropped keys exactly (`LogCompletion`).
+ *    Every deletion (explicit delete, omission, and their snapshot forms) names
+ *    its key twice: `pkHash`, the log's identity, and `recordKey`, the
+ *    canonical key a record-level replica needs and cannot recover from the
+ *    hash (format 2). The key rides only inside the encrypted segment or part.
  * 3. NO PER-WRITER CHAIN. Profile v1 chains batches per writer (`sequence`,
  *    `previous`). The log has one chain per connection, ordered by the
  *    registry's compare-and-set on the log row.
@@ -83,8 +87,20 @@ import {
 } from "./json.js";
 import { streamScope } from "./names.js";
 
-/** The segment format this build writes and reads. */
-export const LOG_FORMAT = 1;
+/**
+ * The segment and snapshot-part format this build writes and reads.
+ *
+ * 1  A delete, an omitted entry and a completion's omitted list named a key by
+ *    `pkHash` alone. No device wrote one: the log was behind a default-off flag.
+ * 2  They also name the canonical record key (`recordKey`). A hash is one-way
+ *    and drops the key's types, so a deletion that carries only a hash cannot
+ *    tell a replica that never held the record which key it removes.
+ *
+ * Format 1 is `unsupported_format`: not read, and not read as keyless. Nothing
+ * wrote it, so there is nothing to carry forward, and a reader that took a
+ * hash-only deletion would apply it in a form this format forbids.
+ */
+export const LOG_FORMAT = 2;
 
 /**
  * The reserved stream name of the log row. A connector stream is a manifest
@@ -149,17 +165,28 @@ export interface LogUpsert {
  * The record is gone as of `stamp`. A reader keeps a tombstone `(stream,
  * pkHash, stamp)` so an upsert that arrives later with a stamp at or before it
  * (a re-delivered or reordered segment) does not bring the record back.
+ *
+ * `recordKey` is the record's canonical key (`computeRecordKeyFromData`). An
+ * upsert carries its data, so its key derives from the value and the stream's
+ * primary key; a deletion carries no data and must say the key itself.
  */
 export interface LogDelete {
   readonly kind: "delete";
   readonly stream: string;
   readonly pkHash: string;
+  readonly recordKey: string;
   readonly stamp: LogStamp;
+}
+
+/** One key a completion dropped: its hash (the log's identity) and canonical key. */
+export interface LogOmission {
+  readonly pkHash: string;
+  readonly recordKey: string;
 }
 
 /**
  * A full pass proved these keys absent. `cutoff` is the replacing run's stamp.
- * `omitted` is every key the pass dropped, ascending, each a tombstone at
+ * `omitted` is every key the pass dropped, ascending by `pkHash`, each a tombstone at
  * `cutoff`. A key the pass saw again (even unchanged) is NOT in it. A reader
  * deletes a listed record only if it has not observed the record at or after
  * `cutoff`.
@@ -168,7 +195,7 @@ export interface LogCompletion {
   readonly kind: "complete";
   readonly stream: string;
   readonly cutoff: LogStamp;
-  readonly omitted: readonly string[];
+  readonly omitted: readonly LogOmission[];
 }
 
 export type LogOperation = LogUpsert | LogDelete | LogCompletion;
@@ -263,6 +290,7 @@ export interface LogOmitted {
   readonly kind: "omitted";
   readonly stream: string;
   readonly pkHash: string;
+  readonly recordKey: string;
   readonly stamp: LogStamp;
 }
 
@@ -345,7 +373,7 @@ export function foldLog(input: {
   readonly snapshot: readonly SnapshotPart[];
   readonly segments: readonly Segment[];
 }): LogFold {
-  type Deletion = { stamp: LogStamp; explicit: boolean };
+  type Deletion = { stamp: LogStamp; explicit: boolean; recordKey: string };
   type Cell = {
     upsert: LogUpsert | null;
     deletion: Deletion | null;
@@ -366,6 +394,7 @@ export function foldLog(input: {
     pk: string,
     stamp: LogStamp,
     explicit: boolean,
+    recordKey: string,
   ) => {
     const c = cell(stream, pk);
     const d = c.deletion;
@@ -374,7 +403,7 @@ export function foldLog(input: {
       stampAfter(stamp, d.stamp) ||
       (explicit && !d.explicit && !stampAfter(d.stamp, stamp))
     )
-      c.deletion = { stamp, explicit };
+      c.deletion = { stamp, explicit, recordKey };
   };
   /** An upsert is above a deletion: later, or tied with an omission. */
   const outlives = (stamp: LogStamp, d: Deletion | null) =>
@@ -392,6 +421,7 @@ export function foldLog(input: {
           entry.pkHash,
           entry.stamp,
           entry.kind === "delete",
+          entry.recordKey,
         );
   }
   const ordered = [...input.segments].sort((a, b) => a.position - b.position);
@@ -400,19 +430,20 @@ export function foldLog(input: {
     for (const op of segment.operations)
       if (op.kind === "upsert") upsert(op);
       else if (op.kind === "delete")
-        deletion(op.stream, op.pkHash, op.stamp, true);
+        deletion(op.stream, op.pkHash, op.stamp, true, op.recordKey);
       else
-        for (const pk of op.omitted) deletion(op.stream, pk, op.cutoff, false);
+        for (const o of op.omitted)
+          deletion(op.stream, o.pkHash, op.cutoff, false, o.recordKey);
   }
   const entries: LogEntry[] = [];
   for (const [key, c] of cells) {
     const [stream, pkHash] = key.split("\u0000") as [string, string];
     const d = c.deletion;
     const tombstone = (): LogEntry => {
-      const stamp = d!.stamp;
+      const { stamp, recordKey } = d!;
       return d!.explicit
-        ? { kind: "delete", stream, pkHash, stamp }
-        : { kind: "omitted", stream, pkHash, stamp };
+        ? { kind: "delete", stream, pkHash, recordKey, stamp }
+        : { kind: "omitted", stream, pkHash, recordKey, stamp };
     };
     if (c.upsert && outlives(c.upsert.stamp, d)) {
       // Only a deletion the winner is strictly after has erased anything.
@@ -628,8 +659,9 @@ const SEGMENT_FIELDS = [
 const REF_FIELDS = ["bytes", "dataHash", "position"];
 const META_FIELDS = ["complete", "primaryKey", "profile", "stream"];
 const UPSERT_FIELDS = ["f", "k", "o", "p", "r", "s", "v"];
-const DELETE_FIELDS = ["k", "o", "p", "r", "s"];
+const DELETE_FIELDS = ["k", "o", "p", "r", "rk", "s"];
 const COMPLETE_FIELDS = ["k", "o", "omit", "r", "s"];
+const OMISSION_FIELDS = ["p", "rk"];
 const SNAPSHOT_FIELDS = ["parts", "position"];
 const SNAPSHOT_PART_REF_FIELDS = ["bytes", "dataHash"];
 const SNAPSHOT_PART_FIELDS = [
@@ -686,10 +718,20 @@ function operationProblem(op: unknown, at: string): string | null {
   } else if (kind === "c") {
     if (!exactKeys(op, COMPLETE_FIELDS)) return `${at} completion fields`;
     const omit = op["omit"];
-    if (!Array.isArray(omit) || omit.some((k) => !isHex64(k)))
-      return `${at} omit must list 64-hex keys`;
-    for (let i = 1; i < omit.length; i += 1)
-      if ((omit[i] as string) <= (omit[i - 1] as string))
+    if (
+      !Array.isArray(omit) ||
+      omit.some(
+        (k) =>
+          !isPlainObject(k) ||
+          !exactKeys(k, OMISSION_FIELDS) ||
+          !isHex64(k["p"]) ||
+          typeof k["rk"] !== "string",
+      )
+    )
+      return `${at} omit must list {p: 64 hex, rk: record key}`;
+    const hashes = omit.map((k) => (k as { p: string }).p);
+    for (let i = 1; i < hashes.length; i += 1)
+      if (hashes[i]! <= hashes[i - 1]!)
         return `${at} omit must be ascending and distinct`;
   } else {
     return `${at} unknown operation kind`;
@@ -698,6 +740,8 @@ function operationProblem(op: unknown, at: string): string | null {
     return `${at} stream must be non-empty`;
   if (isLogStream(op["s"])) return `${at} names the reserved log stream`;
   if (kind !== "c" && !isHex64(op["p"])) return `${at} pkHash must be 64 hex`;
+  if (kind !== "c" && kind !== "u" && typeof op["rk"] !== "string")
+    return `${at} record key must be a string`;
   if (!isStamp(op["o"], op["r"])) return `${at} stamp must be (count, run id)`;
   return null;
 }
@@ -831,6 +875,7 @@ function opToWire(op: LogOperation | LogOmitted): Record<string, unknown> {
         o: op.stamp.o,
         p: op.pkHash,
         r: op.stamp.r,
+        rk: op.recordKey,
         s: op.stream,
       };
     case "omitted":
@@ -839,13 +884,14 @@ function opToWire(op: LogOperation | LogOmitted): Record<string, unknown> {
         o: op.stamp.o,
         p: op.pkHash,
         r: op.stamp.r,
+        rk: op.recordKey,
         s: op.stream,
       };
     case "complete":
       return {
         k: "c",
         o: op.cutoff.o,
-        omit: [...op.omitted],
+        omit: op.omitted.map((o) => ({ p: o.pkHash, rk: o.recordKey })),
         r: op.cutoff.r,
         s: op.stream,
       };
@@ -931,14 +977,29 @@ function opFromWire(op: Record<string, unknown>): LogOperation | LogOmitted {
       value: op["v"] as JsonObject,
     };
   if (op["k"] === "d")
-    return { kind: "delete", stream, pkHash: op["p"] as string, stamp };
+    return {
+      kind: "delete",
+      stream,
+      pkHash: op["p"] as string,
+      recordKey: op["rk"] as string,
+      stamp,
+    };
   if (op["k"] === "o")
-    return { kind: "omitted", stream, pkHash: op["p"] as string, stamp };
+    return {
+      kind: "omitted",
+      stream,
+      pkHash: op["p"] as string,
+      recordKey: op["rk"] as string,
+      stamp,
+    };
   return {
     kind: "complete",
     stream,
     cutoff: stamp,
-    omitted: op["omit"] as string[],
+    omitted: (op["omit"] as { p: string; rk: string }[]).map((o) => ({
+      pkHash: o.p,
+      recordKey: o.rk,
+    })),
   };
 }
 

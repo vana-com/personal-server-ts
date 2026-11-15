@@ -49,6 +49,7 @@ import {
   streamScope,
   verifySegment,
   type ControlHashes,
+  type LogOmission,
   type LogOperation,
   type LogStreamMeta,
   type Segment,
@@ -115,7 +116,7 @@ type Planned = {
   readonly meta: LogStreamMeta | null;
   readonly runIds: readonly string[];
   readonly replace: { readonly o: number; readonly r: string } | null;
-  readonly omitted: readonly string[];
+  readonly omitted: readonly LogOmission[];
   readonly bytes: number;
 };
 
@@ -447,7 +448,7 @@ async function snapshotRound(
     const atomic = replace !== null;
     const selected: { pk: string; seq: number }[] = [];
     const taken: LogOperation[] = [];
-    let bytes = omitted.length * 70 + 100;
+    let bytes = omittedSize(omitted) + 100;
     let rest = false;
     if (atomic) {
       const found = await operationsFor(
@@ -642,8 +643,13 @@ function opSize(op: LogOperation): number {
   return op.kind === "upsert"
     ? 160 + JSON.stringify(op.value).length
     : op.kind === "delete"
-      ? 160
-      : 100 + op.omitted.length * 70;
+      ? 160 + op.recordKey.length
+      : 100 + omittedSize(op.omitted);
+}
+
+/** An omission lists its hash and its canonical key. */
+function omittedSize(omitted: readonly LogOmission[]): number {
+  return omitted.reduce((n, o) => n + 70 + o.recordKey.length, 0);
 }
 
 /** A stream that has not been published has its own scope for blobs only. */
@@ -690,19 +696,26 @@ async function establishControl(
   return "active";
 }
 
-/** The keys a replacing run dropped: held rows last observed before it. */
+/**
+ * The keys a replacing run dropped: held rows last observed before it. Each
+ * names its canonical key from the row it drops, which is held until the run
+ * deletes it, so no hash needs mapping back.
+ */
 async function omittedBy(
   deps: LocalSyncDeps,
   connectionId: string,
   stream: string,
   replace: { o: number; r: string },
-): Promise<string[]> {
-  const rows = await deps.db.query<{ pk_hash: string }>(
-    `SELECT pk_hash FROM records WHERE connection_id = ? AND stream = ?
+): Promise<LogOmission[]> {
+  const rows = await deps.db.query<{ pk_hash: string; record_key: string }>(
+    `SELECT pk_hash, record_key FROM records WHERE connection_id = ? AND stream = ?
         AND ${SEEN_BEFORE} ORDER BY pk_hash`,
     [connectionId, stream, ...seenBeforeParams(replace.o, replace.r)],
   );
-  return rows.map((row) => row.pk_hash);
+  return rows.map((row) => ({
+    pkHash: row.pk_hash,
+    recordKey: row.record_key,
+  }));
 }
 
 /** Changed keys since the watermark, oldest change first. */
@@ -772,10 +785,11 @@ async function operationsFor(
     const goneMarks = gone.map(() => "?").join(",");
     const deletes = await deps.db.query<{
       pk_hash: string;
+      record_key: string;
       stamp_o: number;
       stamp_r: string;
     }>(
-      `SELECT pk_hash, stamp_o, stamp_r, MAX(seq) FROM record_changes
+      `SELECT pk_hash, record_key, stamp_o, stamp_r, MAX(seq) FROM record_changes
         WHERE connection_id = ? AND stream = ? AND seq > ? AND seq <= ?
           AND op = 'remove' AND explicit_delete = 1 AND pk_hash IN (${goneMarks})
         GROUP BY pk_hash`,
@@ -786,6 +800,7 @@ async function operationsFor(
         kind: "delete",
         stream,
         pkHash: row.pk_hash,
+        recordKey: row.record_key,
         stamp: { o: row.stamp_o, r: row.stamp_r },
       });
   }

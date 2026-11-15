@@ -411,4 +411,11 @@ END`,
   ${bumpView("OLD")}
 END`,
   ],
+  [
+    // A log tombstone also keeps the canonical record key of the deletion it
+    // records (log format 2): the key a record-level reader needs for a key it
+    // never held, which the hash cannot give back. Local only. NULL only for a
+    // tombstone written before the column; format 1 wrote none that shipped.
+    `ALTER TABLE log_tombstones ADD COLUMN record_key TEXT`,
+  ],
 ];

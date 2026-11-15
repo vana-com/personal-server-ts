@@ -10,6 +10,10 @@ import {
   controlHashes,
   decodeSegment,
   deriveKeyCheck,
+  digestSegment,
+  encodeSegment,
+  LOG_FORMAT,
+  pkHash,
   shouldCompact,
   streamScope,
   foldLog,
@@ -19,6 +23,7 @@ import {
   type SnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { sha256 } from "@noble/hashes/sha2";
+import { fetchSegment } from "../../../core/src/localdb/log-apply.js";
 import {
   applyConnection,
   applySegmentOperations,
@@ -264,7 +269,7 @@ describe("log protocol, flag on", () => {
     }
     for (const op of ops)
       if (op.kind === "complete")
-        for (const pk of op.omitted) {
+        for (const { pkHash: pk } of op.omitted) {
           const held = winners.get(`${op.stream}/${pk}`);
           if (
             held &&
@@ -371,7 +376,7 @@ describe("log protocol, flag on", () => {
     expect(completion).toMatchObject({
       kind: "complete",
       stream: sName(0),
-      omitted: [await idHash("3")],
+      omitted: [{ pkHash: await idHash("3"), recordKey: "3" }],
     });
     await b.cycle();
     // 1 and 2 stay; 3 was observed by B after the cutoff, so B keeps it.
@@ -579,7 +584,7 @@ function oracleFold(segments: readonly Segment[]) {
       } else if (op.kind === "delete")
         deleted(at(op.stream, op.pkHash), op.stamp, true);
       else
-        for (const pk of op.omitted)
+        for (const { pkHash: pk } of op.omitted)
           deleted(at(op.stream, pk), op.cutoff, false);
     }
   const out = new Map<
@@ -955,7 +960,7 @@ async function crafted(
 ): Promise<Segment> {
   const hash = (n: number) => `0x${n.toString(16).padStart(64, "0")}` as const;
   return {
-    format: 1,
+    format: LOG_FORMAT,
     connector: CONNECTOR,
     ns: "",
     generation: 1,
@@ -1014,12 +1019,13 @@ describe("log protocol: boundary kinds at equal stamps (P2-1)", () => {
     kind: "complete" as const,
     stream: sName(0),
     cutoff: S,
-    omitted: [await idHash("k")],
+    omitted: [{ pkHash: await idHash("k"), recordKey: "k" }],
   });
   const deleteK = async () => ({
     kind: "delete" as const,
     stream: sName(0),
     pkHash: await idHash("k"),
+    recordKey: "k",
     stamp: S,
   });
 
@@ -1212,6 +1218,7 @@ describe("log protocol: a resurrection after a deletion (P2-3)", () => {
       kind: "delete" as const,
       stream: sName(0),
       pkHash: K,
+      recordKey: "k",
       stamp: { o: 6000, r: "run-6000" },
     };
     const separate = await joined(w, "separate");
@@ -1275,6 +1282,7 @@ describe("log protocol: first-seen travels with the winning observation (P2-a, P
           kind: "delete",
           stream: sName(0),
           pkHash: await K(),
+          recordKey: "k",
           stamp: { o: obs.o, r: `run-${obs.o}` },
         };
   const context = {
@@ -1519,4 +1527,177 @@ describe("log protocol: the log noop shortcut and unresolved partial state", () 
     // The log's own state is intact.
     expect(await rowsLocal(b)).toEqual(expect.arrayContaining(logRows));
   }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// The canonical record key travels with every deletion (log format 2).
+// ---------------------------------------------------------------------------
+
+describe("log protocol: deletions carry the canonical record key", () => {
+  const SEEN = sName(0);
+  /** Records 1, 2, 3; 2 deleted and a never-held `ghost` deleted; a full pass then omits 3. */
+  async function omissionWorld(compact: boolean) {
+    const w = await world({ streams: 1, logProtocol: true });
+    const a = await w.device("a");
+    await a.run(
+      "run-1",
+      [
+        { stream: SEEN, id: "1" },
+        { stream: SEEN, id: "2" },
+        { stream: SEEN, id: "3" },
+      ],
+      { observedAt: 1100 },
+    );
+    await a.cycle();
+    await a.run(
+      "run-2",
+      [
+        { stream: SEEN, id: "2", remove: true },
+        { stream: SEEN, id: "ghost", remove: true },
+      ],
+      { full: false, covered: [SEEN], observedAt: 1200 },
+    );
+    await a.cycle();
+    await a.run("run-3", [{ stream: SEEN, id: "1" }], { observedAt: 1300 });
+    await a.cycle();
+    if (compact) await grow(a, 40);
+    return { w, a };
+  }
+  const operations = async (w: Awaited<ReturnType<typeof world>>) =>
+    [...(await w.segments()).values()]
+      .sort((x, y) => x.position - y.position)
+      .flatMap((g) => g.operations);
+  const tombstones = (d: Device) =>
+    d.db.query<{
+      stream: string;
+      pk_hash: string;
+      record_key: string | null;
+      rank: number;
+    }>(
+      "SELECT stream, pk_hash, record_key, rank FROM log_tombstones ORDER BY pk_hash",
+    );
+
+  it("an explicit delete carries the key of a held row and of a key the writer never held", async () => {
+    const { w } = await omissionWorld(false);
+    const deletes = (await operations(w)).filter((o) => o.kind === "delete");
+    expect(
+      deletes.map((o) => (o as { recordKey: string }).recordKey).sort(),
+    ).toEqual(["2", "ghost"]);
+    for (const op of deletes)
+      expect((op as { pkHash: string }).pkHash).toBe(
+        await idHash((op as { recordKey: string }).recordKey),
+      );
+  });
+
+  it("an omission names the key of each row it drops", async () => {
+    const { w } = await omissionWorld(false);
+    const completion = (await operations(w)).find(
+      (o) => o.kind === "complete" && o.omitted.length > 0,
+    );
+    expect(completion).toMatchObject({
+      omitted: [{ pkHash: await idHash("3"), recordKey: "3" }],
+    });
+  });
+
+  it("the snapshot form of a delete and of an omission carries the key", async () => {
+    const { w } = await omissionWorld(true);
+    const segments = await w.segments();
+    const head = segments.get(Math.max(...segments.keys()))!;
+    expect(head.snapshot).not.toBeNull();
+    const entries = (await w.snapshotParts(head)).flatMap((p) => p.entries);
+    const tombstone = (kind: string, id: string) =>
+      entries.find((e) => e.kind === kind && e.recordKey === id);
+    expect(tombstone("delete", "2")).toMatchObject({
+      pkHash: await idHash("2"),
+    });
+    expect(tombstone("delete", "ghost")).toMatchObject({
+      pkHash: await idHash("ghost"),
+    });
+    expect(tombstone("omitted", "3")).toMatchObject({
+      pkHash: await idHash("3"),
+    });
+  });
+
+  it("a reader applies a delete for a key it never held, and keeps the key with the tombstone", async () => {
+    const { w, a } = await omissionWorld(false);
+    const c = await w.device("c");
+    await c.cycle();
+    // The reader never held `ghost` or `2` (it joined after both were deleted).
+    expect((await c.records()).map((r) => r.split("=")[0])).toEqual(["s0/1"]);
+    expect(await c.rows()).toEqual(await a.rows());
+    const kept = await tombstones(c);
+    expect(kept.map((t) => [t.record_key, t.rank]).sort()).toEqual([
+      ["2", 2],
+      ["3", 0],
+      ["ghost", 2],
+    ]);
+    for (const t of kept) expect(t.pk_hash).toBe(await idHash(t.record_key!));
+  });
+
+  it("a reader that installs a snapshot keeps the key of the tombstones in it", async () => {
+    const { w } = await omissionWorld(true);
+    const c = await w.device("c");
+    await c.cycle();
+    const keys = (await tombstones(c)).map((t) => [t.record_key, t.rank]);
+    expect(keys).toEqual(
+      expect.arrayContaining([
+        ["2", 2],
+        ["3", 0],
+        ["ghost", 2],
+      ]),
+    );
+    expect(c.gets.some((k) => k.includes(`${LOG}/q-`))).toBe(true);
+  });
+
+  it("the key is only inside the encrypted segment: no object name, registry row or scope carries it", async () => {
+    const { w } = await omissionWorld(true);
+    const seen = [
+      ...w.innerBlobs.keys(),
+      ...w.gateway.versions.keys(),
+      ...[...w.gateway.versions.values()].flatMap((rows) =>
+        rows.flatMap((r) => [r.dataHash, r.metadataHash]),
+      ),
+    ];
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.filter((name) => name.includes("ghost"))).toEqual([]);
+  });
+
+  it("a hash-only segment (format 1) is refused, not applied as keyless", async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    const a = await w.device("a");
+    await a.run("run-1", [{ stream: SEEN, id: "seed" }], { observedAt: 1100 });
+    await a.cycle();
+    const hashOnly = new TextDecoder()
+      .decode(
+        encodeSegment(
+          await crafted(2, [
+            {
+              kind: "delete",
+              stream: SEEN,
+              pkHash: await idHash("k"),
+              recordKey: "k",
+              stamp: { o: 5000, r: "run-k" },
+            },
+          ]),
+        ),
+      )
+      .replace(`"format":${LOG_FORMAT}`, '"format":1')
+      .replace(`"rk":"k",`, "");
+    const bytes = new TextEncoder().encode(hashOnly);
+    const { dataHash } = await digestSegment(async (b) => keccak_256(b), bytes);
+    await w.innerBlobs.put(`${LOG}/s-${dataHash.slice(2)}`, bytes);
+    await expect(
+      fetchSegment(
+        a.deps,
+        LOG,
+        {
+          connector: CONNECTOR,
+          ns: "",
+          keyCheck: "0123456789abcdef",
+        },
+        dataHash,
+        2,
+      ),
+    ).rejects.toThrow(/unsupported_format/);
+  });
 });
