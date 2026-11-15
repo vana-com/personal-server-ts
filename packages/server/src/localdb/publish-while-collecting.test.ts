@@ -371,6 +371,18 @@ it("a connection delete after a batch purges the batch's rows and fences the run
   expect(await a.keys()).toEqual([]);
 });
 
+it("a connection delete clears the tombstones of the lifetime it ended", async () => {
+  const { a } = await world(true, "checkpoint_window");
+  await a.run("seed", ["gone"], { observedAt: 1100 });
+  await a.begin("older", { observedAt: 1200 });
+  await a.begin("newer", { observedAt: 3000 });
+  await a.batch("newer", 0, [{ id: "gone", remove: true }]);
+  await a.end("newer", 0);
+  expect(await a.tombstones()).toBeGreaterThan(0);
+  await a.sync.deleter.requestConnectionDelete("fixture");
+  expect(await a.tombstones()).toBe(0);
+});
+
 it("a fenced batch is rejected and merges nothing", async () => {
   const { a } = await world(true);
   await a.begin("r1");
