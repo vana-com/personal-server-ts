@@ -11,7 +11,10 @@
 // `transferMs`, `uploadMs`, `totalMs`), when the first PUT started and the last
 // one ended, and with `--profile` the time spent in each SQL statement shape
 // and the connection's slot turns (wait and run).
-import { createCipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createHash, randomBytes } from "node:crypto";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import type * as WorkerThreadsModule from "node:worker_threads";
+import type { Worker } from "node:worker_threads";
 import { existsSync, statSync } from "node:fs";
 import { sealBytes } from "../../../core/src/stream-sync/stream-aead.js";
 import { createStorageStreamSyncBlobs } from "../../../core/src/stream-sync/blobs.js";
@@ -108,6 +111,8 @@ export interface PipelineBenchOptions {
   readonly width: number;
   readonly profile?: boolean;
   readonly cipher?: "prod" | "aes";
+  /** Who seals and hashes the parts: the pure-JS default, or the Node server's OpenSSL port. */
+  readonly crypto?: "noble" | "node";
   /** Queue a write to `records` as soon as the first PUT starts. */
   readonly writeDuringPublish?: boolean;
   /**
@@ -129,6 +134,9 @@ export interface PipelineBenchResult {
   readonly peakOnWire: number;
   /** Largest size of the `-wal` file seen, sampled every 25 ms. */
   readonly walPeakBytes: number;
+  /** CPU of the publish by thread, in milliseconds: main, each driver worker role, the rest, the process total. */
+  readonly cpuMs: Record<string, number>;
+  readonly partKeysSha256: string;
   /** Open to release of each frozen view, in milliseconds. */
   readonly snapshotHoldMs: readonly number[];
   readonly sql?: readonly {
@@ -148,9 +156,77 @@ export interface PipelineBenchResult {
 
 const shapeOf = (sql: string) => sql.replace(/\s+/g, " ").trim().slice(0, 90);
 
+/**
+ * Per-thread CPU: the driver's worker threads are wrapped so each one can be
+ * asked for its CPU time (`Worker.cpuUsage`), and the main thread reports its
+ * own (`process.threadCpuUsage`). Called before the driver opens.
+ */
+const workers: { role: string; worker: Worker }[] = [];
+function trackWorkers(): void {
+  const wt = createRequire(import.meta.url)(
+    "node:worker_threads",
+  ) as typeof WorkerThreadsModule;
+  if ((wt.Worker as { tracked?: boolean }).tracked) return;
+  const Original = wt.Worker;
+  class Tracked extends Original {
+    static tracked = true;
+    constructor(...args: ConstructorParameters<typeof Original>) {
+      super(...args);
+      const data = args[1]?.workerData as { role?: string } | undefined;
+      workers.push({ role: data?.role ?? "worker", worker: this });
+    }
+  }
+  wt.Worker = Tracked;
+  syncBuiltinESMExports();
+}
+
+const ms = (usage: { user: number; system: number }): number =>
+  Math.round((usage.user + usage.system) / 1000);
+
+async function cpuNow() {
+  return {
+    main: process.threadCpuUsage(),
+    total: process.cpuUsage(),
+    workers: await Promise.all(
+      workers.map(async ({ role, worker }) => ({
+        role,
+        usage: await worker.cpuUsage().catch(() => ({ user: 0, system: 0 })),
+      })),
+    ),
+  };
+}
+
+function cpuBetween(
+  a: Awaited<ReturnType<typeof cpuNow>>,
+  b: Awaited<ReturnType<typeof cpuNow>>,
+) {
+  const diff = (x: { user: number; system: number }, y: typeof x) => ({
+    user: y.user - x.user,
+    system: y.system - x.system,
+  });
+  const byRole: Record<string, number> = {};
+  b.workers.forEach((w, i) => {
+    byRole[w.role] =
+      (byRole[w.role] ?? 0) +
+      ms(diff(a.workers[i]?.usage ?? { user: 0, system: 0 }, w.usage));
+  });
+  const main = ms(diff(a.main, b.main));
+  const total = ms(diff(a.total, b.total));
+  const threads = main + Object.values(byRole).reduce((n, v) => n + v, 0);
+  return {
+    mainMs: main,
+    ...Object.fromEntries(
+      Object.entries(byRole).map(([k, v]) => [`${k}Ms`, v]),
+    ),
+    otherMs: total - threads,
+    totalMs: total,
+  };
+}
+
 export async function benchPublish(
   options: PipelineBenchOptions,
 ): Promise<PipelineBenchResult> {
+  trackWorkers();
   const driver = openBetterSqlite3(options.path);
   let t0 = performance.now();
   const at = () => performance.now() - t0;
@@ -230,6 +306,10 @@ export async function benchPublish(
   }[] = [];
   const real = connectionQueue();
   let timings: Record<string, unknown> | null = null;
+  const port =
+    options.crypto === "node"
+      ? (await import("../stream-sync/node-stream-crypto.js")).nodeStreamCrypto
+      : undefined;
   const stats = {
     puts: 0,
     onWire: 0,
@@ -238,6 +318,7 @@ export async function benchPublish(
     lastPutEndAtMs: null as number | null,
   };
   let wrote = false;
+  const partKeys: string[] = [];
   const key = randomBytes(32);
   const partBytes = 4 * 1024 * 1024;
   const blobs = createStorageStreamSyncBlobs(
@@ -246,7 +327,8 @@ export async function benchPublish(
       exists: async () => false,
       download: async () => new Uint8Array(),
       delete: async () => true,
-      upload: async () => {
+      upload: async (key: string) => {
+        if (key.includes("-p-")) partKeys.push(key);
         stats.puts += 1;
         stats.onWire += 1;
         stats.peakOnWire = Math.max(stats.peakOnWire, stats.onWire);
@@ -297,13 +379,14 @@ export async function benchPublish(
       encrypt: async (_s, b) => b,
       encryptPart: async (_s, clear) => {
         if (options.cipher === "prod")
-          return sealBytes(key, clear, randomBytes);
+          return sealBytes(key, clear, randomBytes, port);
         const nonce = randomBytes(12);
         const cipher = createCipheriv("aes-256-gcm", key, nonce);
         return Buffer.concat([nonce, cipher.update(clear), cipher.final()]);
       },
       decrypt: async (_s, b) => b,
     },
+    ...(port ? { streamCrypto: port } : {}),
     signer: { signAddData: async () => "0x00" },
     logger: {
       info: (obj, msg) => {
@@ -325,9 +408,11 @@ export async function benchPublish(
   };
   const sampler = setInterval(sample, 25);
   try {
+    const cpuBefore = await cpuNow();
     t0 = performance.now();
     const results = await publishConnection(deps, PIPELINE_CONNECTION);
     const wallMs = at();
+    const cpuMs = cpuBetween(cpuBefore, await cpuNow());
     clearInterval(sampler);
     sample();
     return {
@@ -339,6 +424,11 @@ export async function benchPublish(
       puts: stats.puts,
       peakOnWire: stats.peakOnWire,
       walPeakBytes: walPeak,
+      cpuMs,
+      /** SHA-256 of the sorted part blob names, which carry the part hashes: equal across code versions. */
+      partKeysSha256: createHash("sha256")
+        .update(partKeys.sort().join("\n"))
+        .digest("hex"),
       snapshotHoldMs: holds,
       ...(options.profile
         ? {
@@ -394,6 +484,7 @@ async function main(): Promise<void> {
     profile: process.argv.includes("--profile"),
     variant: arg("variant", "snapshot") === "spool" ? "spool" : "snapshot",
     cipher: arg("cipher", "aes") === "prod" ? "prod" : "aes",
+    crypto: arg("crypto", "noble") === "node" ? "node" : "noble",
   });
   console.log(JSON.stringify(result, null, 2));
 }
