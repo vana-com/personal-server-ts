@@ -14,6 +14,12 @@ import { nobleStreamCrypto } from "../stream-sync/crypto-port.js";
 import { meteredBlobs, type PublishMeter } from "./publish-meter.js";
 import { newUploadWave, type UploadWave } from "./upload-wave.js";
 import { holdMemory } from "./transfer-memory.js";
+import type { Reservation } from "../stream-sync/send-gate.js";
+
+/** A reservation of nothing: the part has no memory held for it. */
+const NO_RESERVATION: Reservation = Object.assign(() => {}, {
+  shrink: () => {},
+});
 
 /**
  * Extra fields a head carries beside its parts (pending r5.2: the first-seen
@@ -493,23 +499,25 @@ export async function startFrozenParts(
   const blobs = input.meter ? meteredBlobs(deps, input.meter) : deps.blobs;
   // Memory budget (see `holdMemory`): two parts' worth, `2 * target` bytes, is
   // reserved before a page of rows is read for a part: the plain encoded part
-  // and its ciphertext are both in memory while the PUT runs, as for an
-  // attachment. The budget is then the real peak, not half of it. When the
-  // part is encoded its upload takes the reservation and releases it once the
+  // and room for its ciphertext are both in memory until it is encrypted. When
+  // the part is encoded its upload takes the reservation. It keeps only the
+  // ciphertext once the part is encrypted (the plain bytes are dropped, and the
+  // reservation shrinks to the ciphertext's size), and releases that once the
   // part is stored (or skipped), so the bytes of a part waiting for the send
-  // gate stay counted. The builder asks for the next reservation only while it holds
-  // none, and an upload never asks for bytes, so a held reservation always
-  // ends and reservations cannot wait on each other.
-  let held: (() => void) | undefined;
+  // gate stay counted but are one part's bytes, not two: the budget holds the
+  // send gate's width in parts. The builder asks for the next reservation only
+  // while it holds none, and an upload never asks for bytes, so a held
+  // reservation always ends and reservations cannot wait on each other.
+  let held: Reservation | undefined;
   const memory = {
     hold: async () => {
       held ??= await holdMemory(blobs, 2 * target, target);
     },
     /** Passes the reservation to the caller, who must release it. */
-    take: (): (() => void) => {
-      const release = held ?? (() => {});
+    take: (): Reservation => {
+      const reservation = held ?? NO_RESERVATION;
       held = undefined;
-      return release;
+      return reservation;
     },
     drop: () => memory.take()(),
   };
@@ -527,7 +535,7 @@ async function encodeFrozenParts(
   blobs: ReturnType<typeof meteredBlobs>,
   memory: {
     readonly hold: () => Promise<void>;
-    readonly take: () => () => void;
+    readonly take: () => Reservation;
     readonly drop: () => void;
   },
 ): Promise<readonly EncodedPart[]> {
@@ -545,20 +553,25 @@ async function encodeFrozenParts(
       const blobName = `g${input.generation}-p-${partHash}`;
       const key = `${input.scope}/${blobName}`;
       const release = memory.take();
+      // The task's own handle on the plain bytes, so it can drop them as soon
+      // as they are encrypted: it must not read `part`, whose `data` it would
+      // keep alive until the PUT settles.
+      let plain: Uint8Array | undefined = part.data;
       try {
         input.wave.start(async () => {
           try {
             input.beforeUpload?.();
             if (!input.probe || !(await blobs.exists(key))) {
-              const cipher = await deps.keys.encryptPart(
-                input.scope,
-                part.data,
-              );
+              const cipher = await deps.keys.encryptPart(input.scope, plain!);
+              // Only the ciphertext is kept while the PUT waits and runs.
+              plain = undefined;
+              release.shrink(cipher.length);
               input.beforeUpload?.();
               await blobs.put(key, cipher, input.beforeUpload);
               if (input.meter) input.meter.partsUploaded += 1;
             }
           } finally {
+            plain = undefined;
             release();
           }
         });
