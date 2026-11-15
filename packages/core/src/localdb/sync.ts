@@ -101,22 +101,25 @@ export function createLocalSync(
     }
   };
   // Runs live in `bindings`, which dies with the process: whatever the database
-  // still holds as `collecting` when this sync starts has no one to end it. End
-  // those once, at start; `begin` waits for it, so no new run starts before and
-  // compaction only ever waits for live runs. A sweep that could not end every
-  // run is tried again at the next `begin`.
-  let swept: Promise<void> | undefined;
-  const sweepOnce = (): Promise<void> =>
-    (swept ??= endStore
-      .sweepOrphans()
-      .then((failed) => {
-        if (failed > 0) swept = undefined;
-      })
-      .catch((error) => {
-        swept = undefined;
-        deps.logger.warn({ error: String(error) }, "orphaned-run sweep failed");
-      }));
-  void sweepOnce();
+  // still holds as `collecting` when this sync starts has no one to end it. The
+  // list is read once, before any run of this sync can begin, and only those
+  // runs are ever ended here: a read at a later begin would also return live
+  // runs. `begin` waits for the sweep. A run it could not end is retried at the
+  // next `begin`; a failed read of the list fails `begin`, since without it no
+  // run could be told from an orphan.
+  let orphans: readonly string[] | undefined;
+  let sweeping: Promise<void> = Promise.resolve();
+  const sweepOnce = (): Promise<void> => {
+    const sweep = sweeping.then(async () => {
+      orphans ??= await endStore.orphans();
+      if (orphans.length > 0) orphans = await endStore.endOrphans(orphans);
+    });
+    sweeping = sweep.catch(() => {});
+    return sweep;
+  };
+  sweepOnce().catch((error) =>
+    deps.logger.warn({ error: String(error) }, "orphaned-run sweep failed"),
+  );
   const checkRun = async (runId: string) => {
     const binding = bindings.get(runId);
     if (!binding) throw new RunIntakeError("gone");

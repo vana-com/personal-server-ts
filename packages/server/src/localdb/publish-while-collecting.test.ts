@@ -747,22 +747,31 @@ it("after a restart a newer run's delete still beats the orphan's late rows", as
   expect(await again.keys()).toEqual([]);
 });
 
-it("a restart with the flag off ends a run left collecting and drops its staged rows", async () => {
+it("a restart with the flag off leaves a run that never admitted exactly as it was", async () => {
   const { a, restart } = await world(false, "checkpoint_window");
   await a.begin("orphan", { observedAt: 1200 });
   await a.batch("orphan", 0, ["staged"]);
-  expect(
-    await a.query("SELECT 1 FROM run_rows WHERE run_id = 'orphan'"),
-  ).toHaveLength(1);
+  const read = () =>
+    a.query(
+      "SELECT r.state, (SELECT COUNT(*) FROM run_rows w WHERE w.run_id = r.run_id) AS staged FROM runs r WHERE r.run_id = 'orphan'",
+    );
+  const before = await read();
+  const again = await restart(a, false);
+  await again.begin("fresh", { observedAt: 4000 });
+  expect(await read()).toEqual(before);
+  expect(before).toEqual([{ state: "collecting", staged: 1 }]);
+});
+
+it("a restart with the flag off still ends a run that admitted while the flag was on", async () => {
+  const { a, restart } = await world(true, "checkpoint_window");
+  await a.begin("orphan", { observedAt: 1200 });
+  await a.batch("orphan", 0, ["early"]);
   const again = await restart(a, false);
   await again.begin("fresh", { observedAt: 4000 });
   expect(
     await again.query("SELECT state FROM runs WHERE run_id = 'orphan'"),
   ).toEqual([{ state: "ended" }]);
-  expect(
-    await again.query("SELECT 1 FROM run_rows WHERE run_id = 'orphan'"),
-  ).toEqual([]);
-  expect(await again.keys()).toEqual([]);
+  expect(await again.keys()).toEqual(["early"]);
 });
 
 it("a restart with no run left collecting changes nothing", async () => {
@@ -782,6 +791,109 @@ it("a restart with no run left collecting changes nothing", async () => {
   const again = await restart(a, false);
   await again.begin("fresh", { observedAt: 4000 });
   expect(await read()).toEqual(before);
+});
+
+/**
+ * The driver of a restarted process with faults armed from the start, so they
+ * hit the sweep that runs when the sync is built: `snapshot` fails that many
+ * reads of the orphans (the one at start and one more), `end` fails the first batch that ends a run.
+ */
+function faulty(db: SqlDriver, faults: { snapshot?: number; end?: boolean }) {
+  const handler: ProxyHandler<SqlDriver> = {
+    get(target, key) {
+      if (key === "query")
+        return (sql: string, params?: never) => {
+          if (
+            faults.snapshot &&
+            sql.includes("FROM runs WHERE state = 'collecting'")
+          ) {
+            faults.snapshot -= 1;
+            return Promise.reject(new Error("fault: orphan read"));
+          }
+          return target.query(sql, params);
+        };
+      if (key === "batch")
+        return (statements: readonly { sql: string }[]) => {
+          if (
+            faults.end &&
+            statements.some((x) => x.sql.includes("SET state = 'ended'"))
+          ) {
+            faults.end = false;
+            return Promise.reject(new Error("fault: end batch"));
+          }
+          return target.batch(statements);
+        };
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  };
+  return new Proxy(db, handler);
+}
+
+async function openRunAfterFaultedSweep(faults: {
+  snapshot?: number;
+  end?: boolean;
+}) {
+  const { a, restart } = await world(true, "checkpoint_window");
+  await a.run("seed", ["gone"], { observedAt: 1100 });
+  await a.begin("O1", { observedAt: 1200 });
+  await a.batch("O1", 0, ["o1"]);
+  await a.begin("O2", { observedAt: 1300 });
+  await a.batch("O2", 0, ["o2"]);
+  const again = await restart({ db: faulty(a.db, faults) }, true);
+  return { a, again };
+}
+
+const stateOf = (d: {
+  query: (sql: string) => Promise<Record<string, unknown>[]>;
+}) => d.query("SELECT run_id, state FROM runs ORDER BY o, run_id");
+
+it("a sweep that could not end every orphan retries only those, never a run begun after it", async () => {
+  const { again } = await openRunAfterFaultedSweep({ end: true });
+  // The first orphan's end fails; the second ends. A new run still begins.
+  await again.begin("A", { observedAt: 4000 });
+  await again.batch("A", 0, ["a1"]);
+  // The fault is spent. The next begin retries the orphan, and only it.
+  await again.begin("B", { observedAt: 5000 });
+  expect(await stateOf(again)).toEqual([
+    { run_id: "seed", state: "ended" },
+    { run_id: "O1", state: "ended" },
+    { run_id: "O2", state: "ended" },
+    { run_id: "A", state: "collecting" },
+    { run_id: "B", state: "collecting" },
+  ]);
+  await again.batch("A", 1, ["a2"]);
+  expect(await again.end("A", 1)).not.toMatchObject({ result: "aborted" });
+  expect(await again.keys()).toEqual(expect.arrayContaining(["a1", "a2"]));
+  expect(
+    await again.query(
+      "SELECT decision FROM run_streams WHERE run_id = 'A' AND stream = 'items'",
+    ),
+  ).not.toEqual([{ decision: "discarded" }]);
+});
+
+it("a sweep that cannot read the orphans fails the begin, and the retry never reaches a later run", async () => {
+  const { again } = await openRunAfterFaultedSweep({ snapshot: 2 });
+  // Without the list of orphans the sweep cannot tell them from a live run, so
+  // no run begins until it has the list.
+  await expect(again.begin("A", { observedAt: 4000 })).rejects.toThrow(
+    /orphan read/,
+  );
+  expect(
+    await again.query("SELECT run_id FROM runs WHERE run_id = 'A'"),
+  ).toEqual([]);
+  await again.begin("A", { observedAt: 4000 });
+  await again.batch("A", 0, ["a1"]);
+  await again.begin("B", { observedAt: 5000 });
+  expect(await stateOf(again)).toEqual([
+    { run_id: "seed", state: "ended" },
+    { run_id: "O1", state: "ended" },
+    { run_id: "O2", state: "ended" },
+    { run_id: "A", state: "collecting" },
+    { run_id: "B", state: "collecting" },
+  ]);
+  await again.batch("A", 1, ["a2"]);
+  expect(await again.end("A", 1)).not.toMatchObject({ result: "aborted" });
 });
 
 // GAP, not fixed here: a head commit that changes the primary key does not move

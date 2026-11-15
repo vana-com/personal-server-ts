@@ -39,13 +39,20 @@ export interface RunEndStore {
   end(runId: string, req: EndRequest): Promise<RunEndResponse>;
   abort(runId: string, reason: "failed" | "cancelled"): Promise<void>;
   /**
-   * Ends every run still `collecting` as failed, and returns how many it could
-   * not end. Run bindings live in memory, so when a sync starts, a `collecting`
-   * row is a run of a process that is gone, and nothing can end it. The host
-   * holds the database exclusively (`LiteDatabasePort`), so no live run of
-   * another sync shares it. Admitted rows stay, as for any failed run.
+   * The runs of a process that is gone: those `collecting` now. Run bindings
+   * live in memory, so when a sync starts nothing can end them. Read once, at
+   * start, before any run of this sync begins: a later read would also return
+   * live runs. The host holds the database exclusively (`LiteDatabasePort`),
+   * so no live run of another sync shares it. With the flag off only runs that
+   * admitted their batches count (`runs.admitting`, set while it was on): they
+   * hold tombstones back. A flag-off run stays exactly as it was.
    */
-  sweepOrphans(): Promise<number>;
+  orphans(): Promise<string[]>;
+  /**
+   * Ends each run of `ids` as failed (rows it admitted stay, as for any failed
+   * run) and returns the ids it could not end. Never rejects.
+   */
+  endOrphans(ids: readonly string[]): Promise<string[]>;
 }
 
 type Run = {
@@ -415,14 +422,18 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
     async abort(runId, reason) {
       await end(runId, { outcome: reason, coveredStreams: [], lastBatch: -1 });
     },
-    async sweepOrphans() {
-      const orphans = await db.query<{ run_id: string }>(
-        "SELECT run_id FROM runs WHERE state = 'collecting' ORDER BY o, run_id",
+    async orphans() {
+      const rows = await db.query<{ run_id: string }>(
+        "SELECT run_id FROM runs WHERE state = 'collecting' AND (admitting = 1 OR ? = 1) ORDER BY o, run_id",
+        [deps.publishWhileCollecting === true ? 1 : 0],
       );
-      let failed = 0;
-      for (const { run_id } of orphans) {
+      return rows.map((row) => row.run_id);
+    },
+    async endOrphans(ids) {
+      const left: string[] = [];
+      for (const runId of ids) {
         try {
-          await end(run_id, {
+          await end(runId, {
             outcome: "failed",
             coveredStreams: [],
             lastBatch: -1,
@@ -431,14 +442,14 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           // Gone (deleted) or already ended: nothing left to end.
           if (error instanceof RunIntakeError && error.code === "gone")
             continue;
-          failed++;
+          left.push(runId);
           deps.logger.warn(
-            { runId: run_id, error: String(error) },
+            { runId, error: String(error) },
             "could not end an orphaned run",
           );
         }
       }
-      return failed;
+      return left;
     },
   };
 }
