@@ -48,7 +48,11 @@ function overridesStreamListing(source: string): boolean {
           ts.isParameter(node) ||
           ts.isBindingElement(node) ||
           ts.isFunctionDeclaration(node) ||
+          ts.isFunctionExpression(node) ||
           ts.isClassDeclaration(node) ||
+          ts.isClassExpression(node) ||
+          ts.isModuleDeclaration(node) ||
+          ts.isImportEqualsDeclaration(node) ||
           ts.isEnumDeclaration(node) ||
           ts.isImportSpecifier(node) ||
           ts.isImportClause(node) ||
@@ -113,6 +117,10 @@ it("the check sees every way to define a stream listing and nothing else", () =>
     // Only the global Symbol's well-known symbols are exempt.
     "const Symbol = { custom: 'listStreamRows' }; const r = { [Symbol.asyncIterator]: () => rows };",
     "function f(Symbol) { return { [Symbol.iterator]: () => rows }; }",
+    "const f = function Symbol(){ return {[Symbol.iterator]: () => rows} }",
+    "const C = class Symbol { static m() { return { [Symbol.iterator]: () => rows }; } };",
+    "namespace Symbol { export const k = 1; } const r = { [Symbol.iterator]: () => rows };",
+    "try {} catch (Symbol) { const r = { [Symbol.iterator]: () => rows }; }",
     "import { Symbol } from 'x'; const r = { [Symbol.iterator]: () => rows };",
     "const r = { ...reg, [Symbol.custom]: () => rows };",
     "const r = { ...reg, [Symbol.for('listStreamRows')]: () => rows };",

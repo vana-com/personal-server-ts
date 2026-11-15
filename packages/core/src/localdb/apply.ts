@@ -176,6 +176,7 @@ function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
     listed: new Map(),
     stale: false,
     partial: false,
+    interrupted: false,
   };
   return runJob(deps, id, flight, reuse).catch((error: unknown) => {
     throw error instanceof RegistryUnavailableError && !reuse.partial
@@ -267,8 +268,9 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
         await applyOne(locked, id, connection, next, keyCheck, hashes, reuse),
       );
     }
-    // Only an apply of the whole connection repairs it.
-    if (flight.all) await clearPartial(deps, id, reuse);
+    // Only a whole-connection apply that ran to the end on an active control
+    // repairs it. One that gave up on a stream is not proof.
+    if (flight.all && !reuse.interrupted) await clearPartial(deps, id, reuse);
     return [...answers.values()];
   });
 }
@@ -396,6 +398,13 @@ interface Reuse {
    * does not count: it records what the registry said.
    */
   partial: boolean;
+  /**
+   * A stream merged rows and then found the control row absent, foreign or in
+   * another generation, and answered "gone" without finishing: the rows stay.
+   * The job did not repair the connection, so it must not clear the mark. A
+   * control found deleted purges the connection, which does finish.
+   */
+  interrupted: boolean;
 }
 
 /**
@@ -689,8 +698,10 @@ async function applyOneOnce(
     if (
       stillActive.kind !== "active" ||
       stillActive.generation !== active.generation
-    )
+    ) {
+      if (stillActive.kind !== "deleted") reuse.interrupted = true;
       return result(stream, stillActive.kind === "deleted" ? "purged" : "gone");
+    }
     const latest = await deps.registry.read(scope);
     if (
       !latest.found ||

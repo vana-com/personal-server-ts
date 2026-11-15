@@ -892,6 +892,17 @@ async function beginOn(deps: Half["deps"], run: string) {
     .begin(run, beginRequest, beginDeclaration)
     .catch((e: unknown) => e);
 }
+/** A restart: a new queue and a new connection to the same file. */
+async function restart<T extends { db: SqlDriver; deps: LocalSyncDeps }>(
+  f: T,
+  path: string,
+): Promise<T> {
+  await f.db.close();
+  drivers.splice(drivers.indexOf(f.db), 1);
+  const db = await openLocalDb(openBetterSqlite3(path), identity);
+  drivers.push(db);
+  return { ...f, db, deps: { ...f.deps, db, queue: connectionQueue() } };
+}
 it.each(scenarios)(
   "after %s, a later begin is not offline: same store, reopened database, then repaired",
   async (_name, change, failure, observe, afterFailure, afterRepair) => {
@@ -914,22 +925,13 @@ it.each(scenarios)(
       expect(await f.db.query("SELECT run_id FROM runs")).toEqual([]);
     }
 
-    // A restart: a new queue and a new connection to the same file.
-    await f.db.close();
-    drivers.splice(drivers.indexOf(f.db), 1);
-    const db = await openLocalDb(openBetterSqlite3(path), identity);
-    drivers.push(db);
-    const reopened: Half = {
-      ...f,
-      db,
-      deps: { ...f.deps, db, queue: connectionQueue() },
-    };
+    const reopened = await restart(f, path);
     expect(await partial(reopened)).toEqual([1]);
     for (const registry of [down(working), listingDown(working)]) {
       reopened.deps.registry = registry;
       const again = await beginOn(reopened.deps, "restarted");
       expect(again).toBeInstanceOf(RegistryUnavailableError);
-      expect(await db.query("SELECT run_id FROM runs")).toEqual([]);
+      expect(await reopened.db.query("SELECT run_id FROM runs")).toEqual([]);
     }
 
     // The registry is back: apply repairs the connection and begin goes on.
@@ -954,4 +956,97 @@ it("an apply of one stream does not clear the mark; only an apply of the whole c
   expect(await marked()).toEqual([{ apply_partial: 1 }]);
   await applyConnection(f.deps, f.id);
   expect(await marked()).toEqual([{ apply_partial: 0 }]);
+});
+
+// A whole apply that merged rows and then found the control row changed gives
+// up on the stream ("gone"). The rows it merged stay, so the mark stays.
+const lateControl = {
+  absent: (f: Half) => f.reads.set(f.control, { found: false }),
+  foreign: (f: Half) =>
+    f.reads.set(f.control, {
+      found: true,
+      version: 2,
+      dataHash: "0x" + "ab".repeat(32),
+      metadataHash: f.hashes.activeMetadata,
+      deleted: false,
+    }),
+  "in another generation": (f: Half) => f.setControl(2),
+};
+it.each(Object.entries(lateControl))(
+  "a whole apply whose control is %s after a part merged keeps the mark: a later begin is not offline, same store or restarted, until repaired",
+  async (name, change) => {
+    const dir = mkdtempSync(join(tmpdir(), "apply-partial-"));
+    dirs.push(dir);
+    const path = join(dir, "local.db");
+    const f = await bootstrapFixture(path);
+    // Stream a changes, so its part downloads; the control row changes while
+    // it does, after the first part's rows merge and before the final recheck.
+    await f.head("a", [{ id: "a2" }], { version: 2 });
+    const working = f.deps.registry;
+    const get = f.deps.blobs.get.bind(f.deps.blobs);
+    let merged = 0;
+    f.deps.blobs.get = async (key) => {
+      const out = await get(key);
+      if (
+        key.startsWith(`${f.a.scope}/`) &&
+        key.includes("/g1-p-") &&
+        !merged++
+      )
+        change(f);
+      return out;
+    };
+    const results = await applyConnection(f.deps, f.id);
+    f.deps.blobs.get = get;
+    expect(results.find((r) => r.stream === "a")?.outcome).toBe("gone");
+    expect(await partial(f)).toEqual([1]);
+
+    // With the control row absent or foreign the registry answers a begin
+    // online; only an unreadable control row is the offline case here.
+    const outages = (base: Registry) =>
+      name === "in another generation"
+        ? [down(base), listingDown(base)]
+        : [down(base)];
+    for (const registry of outages(working)) {
+      f.deps.registry = registry;
+      expect(await beginOn(f.deps, "again")).toBeInstanceOf(
+        RegistryUnavailableError,
+      );
+    }
+    const reopened = await restart(f, path);
+    expect(await partial(reopened)).toEqual([1]);
+    for (const registry of outages(working)) {
+      reopened.deps.registry = registry;
+      expect(await beginOn(reopened.deps, "restarted")).toBeInstanceOf(
+        RegistryUnavailableError,
+      );
+      expect(await reopened.db.query("SELECT run_id FROM runs")).toEqual([]);
+    }
+
+    // The control row is active again: a whole apply repairs, begin goes on.
+    // A foreign row took version 2 and a generation change is generation 2:
+    // the row that returns is newer than both.
+    reopened.setControl(name === "absent" ? 1 : 3);
+    reopened.deps.registry = working;
+    expect(await beginOn(reopened.deps, "repaired")).toMatchObject({
+      status: "collecting",
+    });
+    expect(await partial(reopened)).toEqual([0]);
+  },
+);
+it("a control found deleted after a part merged purges the connection, which finishes: the mark clears", async () => {
+  const f = await bootstrapFixture();
+  await f.head("a", [{ id: "a2" }], { version: 2 });
+  const get = f.deps.blobs.get.bind(f.deps.blobs);
+  let fired = false;
+  f.deps.blobs.get = async (key) => {
+    const out = await get(key);
+    if (!fired && key.startsWith(`${f.a.scope}/`) && key.includes("/g1-p-")) {
+      fired = true;
+      f.setControl(2, true);
+    }
+    return out;
+  };
+  await applyConnection(f.deps, f.id);
+  expect(await f.db.query("SELECT stream FROM records")).toEqual([]);
+  expect(await partial(f)).toEqual([0]);
 });
