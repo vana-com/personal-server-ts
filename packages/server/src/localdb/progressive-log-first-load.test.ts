@@ -2,7 +2,7 @@
 // of is readable from its first applied segment (or snapshot part), in the
 // partial state, and fills in as the log applies, even with the log protocol
 // on. Real publisher, real gateway adapter, real SQLite, the real apply and
-// the real resolver (log-world.ts). The apply is stopped between two batches by
+// the real resolver (log-world.test-utils.ts). The apply is stopped between two batches by
 // a gate on the database write that carries the next log position, or where it
 // fetches one snapshot part's blob, so each state is read while it is still the
 // state.
@@ -32,7 +32,7 @@ import {
   idHash,
   sName,
   world,
-} from "./log-world.js";
+} from "./log-world.test-utils.js";
 
 afterEach(closeWorldDrivers);
 

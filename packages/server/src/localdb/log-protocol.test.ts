@@ -34,7 +34,7 @@ import {
   idHash,
   sName,
   world,
-} from "./log-world.js";
+} from "./log-world.test-utils.js";
 
 afterEach(closeWorldDrivers);
 
