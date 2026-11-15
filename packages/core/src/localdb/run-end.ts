@@ -11,11 +11,12 @@ import {
 import {
   compareConnectorVersions,
   planStreamStep,
-  type PlanHead,
 } from "../stream-sync/publish-plan.js";
 import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
+import { compactTombstones, tombstoneRunDeletes } from "./admit.js";
 import type { SqlStatement } from "./driver.js";
 import { checkRunFence } from "./fence.js";
+import { planInputs } from "./plan-inputs.js";
 import { deleteRunRecords, mergeIncoming, withOrigin } from "./merge.js";
 import { decideReplace } from "./replace.js";
 
@@ -43,6 +44,7 @@ type Run = {
   collection_mode: "full_refresh" | "incremental";
   state: "collecting" | "ended";
   last_batch: number;
+  admitting: number;
 };
 
 type Stream = {
@@ -65,6 +67,8 @@ type Stream = {
   floor_o: number | null;
   floor_r: string | null;
   row_count: number;
+  /** Set by batch admission: the connector is below the head's version or key. */
+  marked_reason: string | null;
 };
 
 export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
@@ -96,6 +100,11 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             sql: "UPDATE runs SET state = 'ended',end_response=? WHERE run_id = ?",
             params: [JSON.stringify(receipt), runId],
           },
+          // This run no longer holds back older tombstones. Last, so the
+          // compaction sees the run as ended.
+          ...(deps.publishWhileCollecting === true
+            ? [compactTombstones(run.connection_id)]
+            : []),
         ];
         if (req.outcome === "failed" || req.outcome === "cancelled") {
           await db.batch([
@@ -154,7 +163,8 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
                 s.primary_key AS local_primary_key, s.profile_key AS local_profile_key,
                 s.profile_version AS local_profile_version, s.complete,
                 s.head_version, s.head_generation, s.floor_version, s.floor_o, s.floor_r,
-                (SELECT COUNT(*) FROM run_rows rr WHERE rr.run_id = rs.run_id AND rr.stream = rs.stream) AS row_count
+                (SELECT COUNT(*) FROM run_rows rr WHERE rr.run_id = rs.run_id AND rr.stream = rs.stream) AS row_count,
+                rs.reason AS marked_reason
            FROM run_streams rs LEFT JOIN stream_state s
              ON s.connection_id = ? AND s.stream = rs.stream
           WHERE rs.run_id = ? ORDER BY rs.stream`,
@@ -173,28 +183,11 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           if (stream.local_primary_key === null) {
             throw new Error("Missing local stream state");
           }
-          const primaryKey = JSON.parse(
-            stream.primary_key ?? stream.local_primary_key,
-          ) as string[];
-          const profile = {
-            key: stream.profile_key ?? connection.connector,
-            version: stream.profile_version ?? run.artifact_version,
-          };
-          const head: PlanHead | null =
-            stream.head_version > 0 || stream.floor_o !== null
-              ? {
-                  generation: stream.head_generation ?? run.generation,
-                  primaryKey: JSON.parse(stream.local_primary_key) as string[],
-                  profile: {
-                    key: stream.local_profile_key ?? connection.connector,
-                    version:
-                      stream.local_profile_version ??
-                      stream.floor_version ??
-                      run.artifact_version,
-                  },
-                  complete: stream.complete === 1,
-                }
-              : null;
+          const { primaryKey, profile, head } = planInputs(
+            { ...stream, local_primary_key: stream.local_primary_key },
+            run,
+            connection.connector,
+          );
           // A partial run proves success per stream (r5 H), not for every
           // stream it initially requested whole. Publish must replay this
           // result, never the optimistic mode recorded at begin.
@@ -228,8 +221,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             },
           );
           updateRequired ||=
-            decision.kind === "refused" &&
-            decision.reason === "connector_update_required";
+            stream.marked_reason === "connector_update_required" ||
+            (decision.kind === "refused" &&
+              decision.reason === "connector_update_required");
           const accepted = decision.kind !== "refused";
           const replace =
             accepted &&
@@ -261,12 +255,14 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             results[stream.stream] = { state: "discarded" };
             continue;
           }
-          statements.push({
-            sql: `INSERT INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
+          // A run that admitted its batches has its upserts in `records` already.
+          if (run.admitting !== 1)
+            statements.push({
+              sql: `INSERT INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
               SELECT ?, stream, pk_hash, record_key, ?, ?, body, body_sha256, ?
                 FROM run_rows WHERE run_id = ? AND stream = ? AND op = 'upsert'`,
-            params: [op, run.o, runId, run.o, runId, stream.stream],
-          });
+              params: [op, run.o, runId, run.o, runId, stream.stream],
+            });
           statements.push(
             ...deleteRunRecords(
               run.connection_id,
@@ -275,6 +271,14 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               run.o,
               before!.seq,
             ),
+            ...(deps.publishWhileCollecting === true
+              ? tombstoneRunDeletes(
+                  run.connection_id,
+                  stream.stream,
+                  runId,
+                  run.o,
+                )
+              : []),
           );
           merged ||= stream.row_count > 0;
           const nextVersion =

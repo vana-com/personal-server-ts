@@ -152,6 +152,7 @@ import {
   type PublishMeter,
 } from "./publish-meter.js";
 import { dropRunRows, replaceDelete, withOrigin } from "./merge.js";
+import { tombstoneOmissions } from "./admit.js";
 import {
   endsEarlierLifetime,
   hydrateLifetimeBoundary,
@@ -2936,6 +2937,17 @@ async function commitBatch(
 ): Promise<void> {
   const statements: SqlStatement[] = [];
   if (input.replaceBelow) {
+    // Remember what the replace drops, by the replacing run's stamp, so an
+    // older run admitting a batch later cannot bring those rows back.
+    if (deps.publishWhileCollecting === true)
+      statements.push(
+        tombstoneOmissions(
+          connectionId,
+          stream,
+          input.replaceBelow.o,
+          input.replaceBelow.r,
+        ),
+      );
     statements.push(
       replaceDelete(
         connectionId,

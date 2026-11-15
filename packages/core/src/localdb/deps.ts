@@ -46,6 +46,14 @@ export interface LocalSyncDeps {
    * costs latency, and a throw here never fails the commit.
    */
   readonly recordsCommitted?: () => void;
+  /**
+   * Publish while collecting, default off. A run that begins with it on has each
+   * batch admitted into `records` as it arrives (same fences as run end), so
+   * the publisher relays rows during the run; run end keeps only omission
+   * deletes, explicit deletes and the checkpoint. A run keeps the mode it began
+   * in. Off: batches stay staged until run end, exactly as before.
+   */
+  readonly publishWhileCollecting?: boolean;
 }
 
 /** The one call every commit of local rows makes (run end, import). */

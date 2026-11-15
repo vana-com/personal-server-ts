@@ -161,6 +161,17 @@ export interface BatchResponse {
   readonly accepted: number;
   /** Compatibility count: explicit deletes are accepted, so this is always zero. */
   readonly deletesSkipped: number;
+  /**
+   * Publish while collecting only: upserts not admitted because a newer delete
+   * is remembered for their key.
+   */
+  readonly tombstoned?: number;
+  /**
+   * Publish while collecting only: this batch carried upserts of a stream whose
+   * connector is below the version floor or head key. They were staged, not
+   * admitted; run end refuses the stream with `updateRequired`.
+   */
+  readonly updateRequired?: boolean;
 }
 
 export interface EndRequest {
