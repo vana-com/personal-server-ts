@@ -2938,16 +2938,17 @@ async function commitBatch(
   const statements: SqlStatement[] = [];
   if (input.replaceBelow) {
     // Remember what the replace drops, by the replacing run's stamp, so an
-    // older run admitting a batch later cannot bring those rows back.
-    if (deps.publishWhileCollecting === true)
-      statements.push(
-        tombstoneOmissions(
-          connectionId,
-          stream,
-          input.replaceBelow.o,
-          input.replaceBelow.r,
-        ),
-      );
+    // older run admitting a batch later cannot bring those rows back. Written
+    // while the flag is on and while an older admitting run still collects.
+    statements.push(
+      tombstoneOmissions(
+        connectionId,
+        stream,
+        input.replaceBelow.o,
+        input.replaceBelow.r,
+        deps.publishWhileCollecting === true,
+      ),
+    );
     statements.push(
       replaceDelete(
         connectionId,

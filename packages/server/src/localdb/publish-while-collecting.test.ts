@@ -34,7 +34,7 @@ const versions: Record<string, { version: string; primaryKey: string[] }> = {
 };
 
 async function world(
-  flag: boolean,
+  flagOn: boolean,
   coverageStrategy: "full_inventory" | "checkpoint_window" = "full_inventory",
 ) {
   const registry = createMemoryStreamSyncRegistry();
@@ -49,46 +49,44 @@ async function world(
     drivers.push(db);
     let op = 0;
     const wake = vi.fn();
-    const sync = createLocalSync(
-      {
-        db,
-        queue: connectionQueue(),
-        registry,
-        blobs,
-        ownerAddress: owner,
-        keys: {
-          namespaceHmac: async () => new Uint8Array(32),
-          encrypt: async (_s, b) => b,
-          encryptPart: async (_s, b) => b,
-          decrypt: async (_s, b) => b,
-        },
-        signer: { signAddData: async () => "0x00" },
-        logger: { info: vi.fn(), warn: vi.fn() },
-        now: () => now,
-        newOp: () => `${deviceId}-${++op}`,
-        recordsCommitted: wake,
-        ...(flag ? { publishWhileCollecting: true } : {}),
+    const deps = {
+      db,
+      queue: connectionQueue(),
+      registry,
+      blobs,
+      ownerAddress: owner,
+      keys: {
+        namespaceHmac: async () => new Uint8Array(32),
+        encrypt: async (_s, b) => b,
+        encryptPart: async (_s, b) => b,
+        decrypt: async (_s, b) => b,
       },
-      {
-        resolveArtifact: (digest) => {
-          const v = versions[digest] ?? versions.fixture!;
-          return {
-            connector: "fixture",
-            version: v.version,
-            streams: [
-              {
-                name: "items",
-                semantics: "mutable_state",
-                primaryKey: v.primaryKey,
-                coverageStrategy,
-              },
-            ],
-          };
-        },
-        declaredStreams: () => ["items"],
-        olderVersionReads: () => true,
+      signer: { signAddData: async () => "0x00" },
+      logger: { info: vi.fn(), warn: vi.fn() },
+      now: () => now,
+      newOp: () => `${deviceId}-${++op}`,
+      recordsCommitted: wake,
+      ...(flagOn ? { publishWhileCollecting: true } : {}),
+    };
+    const sync = createLocalSync(deps, {
+      resolveArtifact: (digest) => {
+        const v = versions[digest] ?? versions.fixture!;
+        return {
+          connector: "fixture",
+          version: v.version,
+          streams: [
+            {
+              name: "items",
+              semantics: "mutable_state",
+              primaryKey: v.primaryKey,
+              coverageStrategy,
+            },
+          ],
+        };
       },
-    );
+      declaredStreams: () => ["items"],
+      olderVersionReads: () => true,
+    });
     const begin = (
       id: string,
       options: {
@@ -148,6 +146,11 @@ async function world(
     return {
       db,
       sync,
+      // Flip the flag while runs are open. A run keeps the mode it began in.
+      setFlag: (on: boolean) => {
+        (deps as { publishWhileCollecting?: boolean }).publishWhileCollecting =
+          on;
+      },
       wake,
       begin,
       batch,
@@ -207,7 +210,11 @@ async function world(
       },
     };
   };
-  return { a: await make("a"), b: await make("b"), registry };
+  return {
+    a: await make("a"),
+    b: await make("b"),
+    registry,
+  };
 }
 
 it("a batch is readable through the read path before the run ends", async () => {
@@ -597,6 +604,70 @@ it("compaction at run begin drops a tombstone whose older run ended without comp
   expect(await a.query("SELECT tombstone_wm_o AS o FROM connections")).toEqual([
     { o: 3000 },
   ]);
+});
+
+it("turning the flag off while a run is admitting does not let that run bring back a delete", async () => {
+  const { a } = await world(true, "checkpoint_window");
+  await a.run("seed", ["gone"], { observedAt: 1100 });
+  await a.publish();
+  // Run `older` begins with the flag on: it stays an admitting run.
+  await a.begin("older", { observedAt: 1200 });
+  // The flag goes off. A newer run deletes the key and publishes.
+  a.setFlag(false);
+  await a.begin("deleter", { observedAt: 3000 });
+  await a.batch("deleter", 0, [{ id: "gone", remove: true }]);
+  await a.end("deleter", 0);
+  await a.publish();
+  expect(await a.keys()).toEqual([]);
+  // The older run's late batch still admits: its mode is persisted.
+  await a.batch("older", 0, ["gone"]);
+  expect(await a.keys()).toEqual([]);
+  expect(await a.tombstones()).toBe(1);
+  await a.end("older", 0);
+  await a.publish();
+  expect(await a.keys()).toEqual([]);
+  // Compaction runs with the flag off too: the tombstone goes with the run.
+  expect(await a.tombstones()).toBe(0);
+});
+
+it("with the flag off and no admitting run, deletes write no tombstone", async () => {
+  const { a } = await world(false, "checkpoint_window");
+  await a.run("seed", ["gone"], { observedAt: 1100 });
+  await a.begin("deleter", { observedAt: 3000 });
+  await a.batch("deleter", 0, [{ id: "gone", remove: true }]);
+  await a.end("deleter", 0);
+  expect(await a.tombstones()).toBe(0);
+});
+
+it("a late publish refusal of an accepted admitting run keeps rows a newer collecting run also admitted", async () => {
+  const { a, b } = await world(true, "full_inventory");
+  await a.run("seed", ["s"], { observedAt: 1050 });
+  await a.publish();
+  await b.sync.apply();
+  // Run A admits K and ends accepted locally. Newer run B still collects and
+  // admits the same body, so K's seen stamp moves to B.
+  await a.begin("A", { digest: "v1", observedAt: 1100 });
+  await a.batch("A", 0, ["K"]);
+  await a.end("A", 0);
+  await a.begin("B", { digest: "v1", observedAt: 1500 });
+  await a.batch("B", 0, ["K"]);
+  // A newer connector publishes elsewhere and raises the floor.
+  await b.run("R", ["other"], {
+    digest: "v2",
+    observedAt: 2000,
+    proven: true,
+  });
+  await b.publish();
+  // Publication replans A against that head and refuses it.
+  await a.publish();
+  expect(
+    await a.query(
+      "SELECT decision, reason FROM run_streams WHERE run_id='A' AND stream='items'",
+    ),
+  ).toEqual([{ decision: "refused", reason: "connector_update_required" }]);
+  expect(await a.keys()).toContain("K");
+  await a.end("B", 0);
+  expect(await a.keys()).toContain("K");
 });
 
 // GAP, not fixed here: a head commit that changes the primary key does not move

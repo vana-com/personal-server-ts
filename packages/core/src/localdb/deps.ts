@@ -51,7 +51,9 @@ export interface LocalSyncDeps {
    * batch admitted into `records` as it arrives (same fences as run end), so
    * the publisher relays rows during the run; run end keeps only omission
    * deletes, explicit deletes and the checkpoint. A run keeps the mode it began
-   * in. Off: batches stay staged until run end, exactly as before.
+   * in (`runs.admitting`), and every later step reads that persisted mode, not
+   * this flag: a run that was admitting stays so if the flag goes off. Off:
+   * batches stay staged until run end, exactly as before.
    */
   readonly publishWhileCollecting?: boolean;
 }

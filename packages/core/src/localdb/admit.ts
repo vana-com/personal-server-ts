@@ -185,12 +185,25 @@ export function replaceOwnRunRows(
   };
 }
 
-/** Remember a run's explicit deletes by the deleting run's stamp. */
+// An older admitting run that still collects can admit the key later. Whether a
+// delete needs a tombstone is a fact about those persisted runs, not about the
+// flag now: the flag may have gone off since the run began.
+const OLDER_ADMITTING_RUN = `EXISTS (SELECT 1 FROM runs r
+    WHERE r.connection_id = ? AND r.state = 'collecting' AND r.admitting = 1
+      AND (r.o, r.run_id) < (?, ?))`;
+
+/**
+ * Remember a run's explicit deletes by the deleting run's stamp. Written when
+ * the flag is on, and when an older admitting run still collects (it began with
+ * the flag on and keeps that mode), so turning the flag off cannot let that
+ * run bring a delete back.
+ */
 export function tombstoneRunDeletes(
   connectionId: string,
   stream: string,
   runId: string,
   observedAt: number,
+  flagOn: boolean,
 ): SqlStatement[] {
   return [
     {
@@ -202,26 +215,40 @@ export function tombstoneRunDeletes(
     },
     {
       sql: `INSERT OR IGNORE INTO record_tombstones (connection_id, stream, pk_hash, stamp_o, stamp_r)
-        SELECT ?, stream, pk_hash, ?, ? FROM run_rows WHERE run_id = ? AND stream = ? AND op = 'delete'`,
-      params: [connectionId, observedAt, runId, runId, stream],
+        SELECT ?, stream, pk_hash, ?, ? FROM run_rows WHERE run_id = ? AND stream = ? AND op = 'delete'
+          AND (? = 1 OR ${OLDER_ADMITTING_RUN})`,
+      params: [
+        connectionId,
+        observedAt,
+        runId,
+        runId,
+        stream,
+        flagOn ? 1 : 0,
+        connectionId,
+        observedAt,
+        runId,
+      ],
     },
   ];
 }
 
 /**
  * Remember the rows a full refresh is about to drop (`replaceDelete`) by the
- * replacing run's stamp. Runs before that delete, in the same batch.
+ * replacing run's stamp. Runs before that delete, in the same batch. Written
+ * under the same rule as `tombstoneRunDeletes`.
  */
 export function tombstoneOmissions(
   connectionId: string,
   stream: string,
   stampO: number,
   stampR: string,
+  flagOn: boolean,
 ): SqlStatement {
   return {
     sql: `INSERT OR REPLACE INTO record_tombstones (connection_id, stream, pk_hash, stamp_o, stamp_r)
       SELECT connection_id, stream, pk_hash, ?, ? FROM records
        WHERE connection_id = ? AND stream = ? AND ${SEEN_BEFORE}
+         AND (? = 1 OR ${OLDER_ADMITTING_RUN})
          AND NOT EXISTS (SELECT 1 FROM record_tombstones t
            WHERE t.connection_id = records.connection_id AND t.stream = records.stream
              AND t.pk_hash = records.pk_hash AND (t.stamp_o, t.stamp_r) > (?, ?))`,
@@ -231,6 +258,10 @@ export function tombstoneOmissions(
       connectionId,
       stream,
       ...seenBeforeParams(stampO, stampR),
+      flagOn ? 1 : 0,
+      connectionId,
+      stampO,
+      stampR,
       stampO,
       stampR,
     ],

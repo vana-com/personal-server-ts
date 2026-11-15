@@ -904,10 +904,22 @@ describe("view changes", () => {
       "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'view\\_%' ESCAPE '\\'",
     );
     expect(added.length).toBeGreaterThan(0);
+    // The view counters are the migration before the last one: publish while
+    // collecting adds tables and columns after it, so the previous build did
+    // not have those either.
+    const viewMigration = MIGRATIONS.findIndex((m) =>
+      m.some((sql) => sql.includes("CREATE TABLE view_versions")),
+    );
+    expect(viewMigration).toBe(MIGRATIONS.length - 2);
     await raw.batch([
       ...added.map((t) => ({ sql: `DROP TRIGGER ${t.name}` })),
       { sql: "DROP TABLE view_versions" },
-      { sql: `PRAGMA user_version = ${MIGRATIONS.length - 1}` },
+      { sql: "DROP TABLE record_tombstones" },
+      { sql: "ALTER TABLE runs DROP COLUMN admitting" },
+      { sql: "ALTER TABLE run_streams DROP COLUMN unadmitted" },
+      { sql: "ALTER TABLE connections DROP COLUMN tombstone_wm_o" },
+      { sql: "ALTER TABLE connections DROP COLUMN tombstone_wm_r" },
+      { sql: `PRAGMA user_version = ${viewMigration}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");
 

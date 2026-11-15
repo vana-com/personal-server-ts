@@ -107,9 +107,8 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           },
           // This run no longer holds back older tombstones. Last, so the
           // compaction sees the run as ended.
-          ...(deps.publishWhileCollecting === true
-            ? compactTombstones(run.connection_id)
-            : []),
+          // Whatever the flag says now: tombstones outlive a flag that went off.
+          ...compactTombstones(run.connection_id),
         ];
         if (req.outcome === "failed" || req.outcome === "cancelled") {
           await db.batch([
@@ -280,14 +279,13 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               run.o,
               before!.seq,
             ),
-            ...(deps.publishWhileCollecting === true
-              ? tombstoneRunDeletes(
-                  run.connection_id,
-                  stream.stream,
-                  runId,
-                  run.o,
-                )
-              : []),
+            ...tombstoneRunDeletes(
+              run.connection_id,
+              stream.stream,
+              runId,
+              run.o,
+              deps.publishWhileCollecting === true,
+            ),
           );
           merged ||= stream.row_count > 0;
           const nextVersion =
