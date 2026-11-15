@@ -153,3 +153,37 @@ writer CAS retries, per-writer fragment reassembly, bulk schema/attachment
 semantics, local SEEN promotion internals, operation-id tie cases, and physical
 snapshot garbage collection. No refinement mapping to the current implementation
 is claimed. Host validation remains necessary before relying on this model.
+
+## TLC results (host run)
+
+Run on 2026-11-15 with TLC 2.19 (`tla2tools.jar` 1.7.4, Java 17), `-workers 4`,
+under `nice -n 19 ionice -c3`, one job at a time, from the commit that adds this
+section. Each config had its own metadir, deleted after its run.
+
+All seven configs stop at the same point: semantic analysis of `LogProtocol.tla`
+fails before any state is explored.
+
+```
+Semantic errors:
+*** Errors: 1
+line 108, col 25 to line 108, col 25 of module LogProtocol
+The operator > requires 2 arguments.
+Error: Parsing or semantic analysis failed.
+```
+
+Line 108 is `/\ epoch'=2 /\ log'=<<>> /\ ...` in `Reset`. Unverified hypothesis:
+in TLA+ ASCII, `=<` is the `≤` token, so `'=<<>>` may not lex as `'= <<>>`.
+No fix was applied; the spec is unchanged from the patch.
+
+| Configuration | Expected | Actual | Distinct states | Depth | Wall time |
+| --- | --- | --- | --- | --- | --- |
+| Good.cfg | PASS | Parse/semantic error (line 108) | n/a | n/a | 1.3 s |
+| LostPush.cfg | PASS | Parse/semantic error (line 108) | n/a | n/a | <1 s |
+| DropGap.cfg | FAIL P2 | Parse/semantic error (line 108) | n/a | n/a | <1 s |
+| OutOfOrder.cfg | FAIL P2 | Parse/semantic error (line 108) | n/a | n/a | 1 s |
+| DropTombstone.cfg | FAIL P1 | Parse/semantic error (line 108) | n/a | n/a | <1 s |
+| OmissionWithoutCutoff.cfg | FAIL P3 | Parse/semantic error (line 108) | n/a | n/a | 1 s |
+| LamportDifference.cfg | FAIL StampEqualsLamport | Parse/semantic error (line 108) | n/a | n/a | <1 s |
+
+No config reached its expected result. A parse error does not count as a pass
+or as mutation detection. The model is not yet checked by TLC.
