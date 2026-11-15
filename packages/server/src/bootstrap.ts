@@ -349,6 +349,20 @@ export interface CreateServerOptions {
    */
   streamSyncPublishWhileCollecting?: boolean;
   /**
+   * Publish and apply through the stream-sync log (default off; env
+   * `PS_STREAM_SYNC_LOG_PROTOCOL=true`). A connection that has published to
+   * the log is read through it by every device, so turn it on for all devices
+   * of an owner together. See `LocalSyncDeps.logProtocol`.
+   */
+  streamSyncLogProtocol?: boolean;
+  /**
+   * Serve a first load's applied parts while it fills (default off; env
+   * `PS_STREAM_SYNC_PROGRESSIVE_FIRST_LOAD=true` turns it on; the config key
+   * `streamSync.progressiveFirstLoad` also does). An explicit option wins over
+   * both. See `LocalSyncDeps.progressiveFirstLoad`.
+   */
+  streamSyncProgressiveFirstLoad?: boolean;
+  /**
    * Rotate the replica writer identity before this boot writes anything
    * (host contract §3.2). A host sets it when this database may be a copy:
    * a restore, a clone, or a reinstall onto existing data. PS cannot detect
@@ -925,13 +939,20 @@ async function bootstrapServer(
           now: Date.now,
           newOp: randomUUID,
           recordsCommitted: () => syncManager?.notifyNewData(),
-          progressiveFirstLoad: config.streamSync.progressiveFirstLoad,
+          progressiveFirstLoad:
+            options?.streamSyncProgressiveFirstLoad ??
+            (process.env.PS_STREAM_SYNC_PROGRESSIVE_FIRST_LOAD === "true" ||
+              config.streamSync.progressiveFirstLoad),
           ...(options?.streamSyncPartTargetBytes === undefined
             ? {}
             : { partTargetBytes: options.streamSyncPartTargetBytes }),
           ...((options?.streamSyncPublishWhileCollecting ??
           process.env.PS_PUBLISH_WHILE_COLLECTING === "true")
             ? { publishWhileCollecting: true }
+            : {}),
+          ...((options?.streamSyncLogProtocol ??
+          process.env.PS_STREAM_SYNC_LOG_PROTOCOL === "true")
+            ? { logProtocol: true }
             : {}),
         };
         const facade = createServerLocalSync(deps, {

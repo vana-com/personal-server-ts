@@ -163,6 +163,10 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   streamSyncDeclaredStreams: PsLiteSyncOptions["streamSyncDeclaredStreams"];
   /** Retained manifest documents for the delete fence; see `PsLiteSyncOptions`. */
   streamSyncRetainedManifests?: PsLiteSyncOptions["streamSyncRetainedManifests"];
+  /** Stream-sync design flags, default off; see `PsLiteSyncOptions`. */
+  streamSyncPublishWhileCollecting?: PsLiteSyncOptions["streamSyncPublishWhileCollecting"];
+  streamSyncLogProtocol?: PsLiteSyncOptions["streamSyncLogProtocol"];
+  streamSyncProgressiveFirstLoad?: PsLiteSyncOptions["streamSyncProgressiveFirstLoad"];
   /**
    * The host's replication ports (host contract §4): native persistence
    * with replica support and native object transfers. With the door on and
@@ -462,6 +466,10 @@ export async function createIndexedDbPsLiteRuntime(
       streamSyncBlobs: options.streamSyncBlobs,
       streamSyncDeclaredStreams: options.streamSyncDeclaredStreams,
       streamSyncRetainedManifests: options.streamSyncRetainedManifests,
+      streamSyncPublishWhileCollecting:
+        options.streamSyncPublishWhileCollecting,
+      streamSyncLogProtocol: options.streamSyncLogProtocol,
+      streamSyncProgressiveFirstLoad: options.streamSyncProgressiveFirstLoad,
       diagnostics,
       logger: options.logger,
       lineageGateway,

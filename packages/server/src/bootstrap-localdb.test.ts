@@ -88,6 +88,56 @@ describe("Node database composition", () => {
     }
     expect(runner).toHaveBeenCalledTimes(3);
   });
+  describe.each([
+    [
+      "publishWhileCollecting",
+      "streamSyncPublishWhileCollecting",
+      "PS_PUBLISH_WHILE_COLLECTING",
+    ],
+    ["logProtocol", "streamSyncLogProtocol", "PS_STREAM_SYNC_LOG_PROTOCOL"],
+    [
+      "progressiveFirstLoad",
+      "streamSyncProgressiveFirstLoad",
+      "PS_STREAM_SYNC_PROGRESSIVE_FIRST_LOAD",
+    ],
+  ] as const)("design flag %s", (flag, option, env) => {
+    async function depsOf(options: Record<string, boolean>) {
+      const root = await directory();
+      const runner = vi.spyOn(legacyImport, "createLegacyStoreRunner");
+      vi.stubEnv("PS_ACCESS_TOKEN", "node-database-fixture");
+      vi.stubEnv("VANA_OWNER_PRIVATE_KEY", "");
+      const context = await createServer(config, {
+        rootPath: root,
+        ownerSignature: await signature(),
+        accountModeStore: createMemoryModeRecordStore(),
+        ...options,
+      });
+      contexts.push(context);
+      await context.accountModeAuthority.submitEvidence({
+        owner: context.serverOwner!,
+        state: "on",
+      });
+      return runner.mock.calls.at(-1)![0].getDeps();
+    }
+    it("is off by default", async () => {
+      const deps = await depsOf({});
+      expect(deps[flag] ?? false).toBe(false);
+    });
+    it("reaches the sync deps from the bootstrap option", async () => {
+      const deps = await depsOf({ [option]: true });
+      expect(deps).toMatchObject({ [flag]: true });
+    });
+    it("reaches the sync deps from the environment", async () => {
+      vi.stubEnv(env, "true");
+      const deps = await depsOf({});
+      expect(deps).toMatchObject({ [flag]: true });
+    });
+    it("lets an explicit false option override the environment", async () => {
+      vi.stubEnv(env, "true");
+      const deps = await depsOf({ [option]: false });
+      expect(deps[flag] ?? false).toBe(false);
+    });
+  });
   it("boots with sync disabled and opens no database before Account says On", async () => {
     const root = await directory();
     const context = await boot(root);
