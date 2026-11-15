@@ -75,6 +75,12 @@ const result = (
 type Flight = {
   all: boolean;
   streams: Set<string>;
+  /** Counts the requests that joined this flight after it began. */
+  epoch: number;
+  /** The epoch at which a connection-wide request last joined. */
+  joinedAll: number;
+  /** The epoch at which a request for one stream last joined. */
+  joined: Map<string, number>;
   promise: Promise<readonly ApplyResult[]>;
 };
 const flights = new WeakMap<ConnectionQueue, Map<string, Flight>>();
@@ -86,13 +92,22 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
   }
   const running = pending.get(id);
   if (running) {
-    if (stream === undefined) running.all = true;
-    else running.streams.add(stream);
+    running.epoch++;
+    if (stream === undefined) {
+      running.all = true;
+      running.joinedAll = running.epoch;
+    } else {
+      running.streams.add(stream);
+      running.joined.set(stream, running.epoch);
+    }
     return running.promise;
   }
   const flight: Flight = {
     all: stream === undefined,
     streams: new Set(stream === undefined ? [] : [stream]),
+    epoch: 0,
+    joinedAll: 0,
+    joined: new Map(),
     promise: Promise.resolve([]),
   };
   pending.set(id, flight);
@@ -137,6 +152,7 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
       }
       const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
       const hashes = await controlHashes(keccak, keyCheck);
+      const initialEpoch = flight.epoch;
       const initial = await control(locked, id, connection, hashes);
       if (initial.kind !== "active") {
         if (flight.all)
@@ -149,20 +165,19 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
           result(s, initial.kind === "deleted" ? "purged" : "gone"),
         );
       }
-      const answers = new Map<string, ApplyResult>();
-      // Registry reads this job already holds. A stream that goes on to
-      // download reuses them, because the final control and stream rechecks
-      // still run. A stream that would end early (noop, gone, purge) reads
-      // fresh once a download has run: a listing or fence taken before that
-      // download can predate a delete, a new head or a tombstone.
+      const answers = new Map<string, { result: ApplyResult; epoch: number }>();
       const reuse: Reuse = {
-        control: initial,
+        flight,
+        control: { read: initial, epoch: initialEpoch },
         listed: new Map(),
         stale: false,
       };
-      let listed = false;
+      let listedAt = -1;
       while (true) {
-        if (flight.all && !listed) {
+        if (flight.all && listedAt < flight.joinedAll) {
+          // A connection-wide request that joined after the last listing needs
+          // its own: a stream published since is not in the old one.
+          listedAt = flight.epoch;
           for (const row of await deps.registry.listStreamRows(
             connection.connector,
           )) {
@@ -173,19 +188,35 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
               scope.ns === connection.ns
             ) {
               flight.streams.add(scope.stream);
-              reuse.listed.set(scope.stream, row.read);
+              reuse.listed.set(scope.stream, {
+                read: row.read,
+                epoch: listedAt,
+              });
             }
           }
-          listed = true;
         }
-        const next = [...flight.streams].find((s) => !answers.has(s));
+        // A stream is answered again when a request joined for it after the
+        // reads of its last answer began.
+        const next = [...flight.streams].find((s) => {
+          const answer = answers.get(s);
+          return answer === undefined || answer.epoch < joinEpoch(flight, s);
+        });
         if (next === undefined) break;
-        answers.set(
-          next,
-          await applyOne(locked, id, connection, next, keyCheck, hashes, reuse),
-        );
+        const epoch = flight.epoch;
+        answers.set(next, {
+          result: await applyOne(
+            locked,
+            id,
+            connection,
+            next,
+            keyCheck,
+            hashes,
+            reuse,
+          ),
+          epoch,
+        });
       }
-      return [...answers.values()];
+      return [...answers.values()].map((a) => a.result);
     })
     .finally(() => {
       if (pending.get(id) === flight) pending.delete(id);
@@ -289,9 +320,26 @@ async function control(
   return state;
 }
 
+/** The epoch from which a read is new enough for a stream's waiting callers. */
+const joinEpoch = (flight: Flight, stream: string) =>
+  Math.max(flight.joinedAll, flight.joined.get(stream) ?? 0);
+
+/**
+ * Freshness contract. Each ApplyResult reflects registry reads taken after
+ * the call that requested that stream began. Calls share one flight, so a
+ * read the job already holds serves a stream only if it began at or after the
+ * epoch at which every caller waiting on that stream had joined; otherwise
+ * the stream reads fresh. Within that, a stream that ends early reads fresh
+ * once any stream has downloaded (a download's duration is the one window long
+ * enough to matter), and a stream that would delete local data always does.
+ * The per-stream entry read of the base made the same promise, and no caller
+ * could see when that read happened. A registry snapshot sequence number
+ * would make it checkable.
+ */
 interface Reuse {
-  control?: Awaited<ReturnType<typeof control>>;
-  listed: Map<string, ControlRead>;
+  flight: Flight;
+  control?: { read: Awaited<ReturnType<typeof control>>; epoch: number };
+  listed: Map<string, { read: ControlRead; epoch: number }>;
   /** A stream has downloaded since the job's reads were taken. */
   stale: boolean;
 }
@@ -344,10 +392,16 @@ async function applyOneOnce(
   reuse: Reuse,
   fresh: boolean,
 ): Promise<ApplyResult | undefined> {
-  const fence = fresh ? undefined : reuse.control;
-  const listedRead = fresh ? undefined : reuse.listed.get(stream);
-  const rerun =
-    reuse.stale && (fence !== undefined || listedRead !== undefined);
+  const needed = joinEpoch(reuse.flight, stream);
+  const fence =
+    !fresh && reuse.control && reuse.control.epoch >= needed
+      ? reuse.control.read
+      : undefined;
+  const listing = reuse.listed.get(stream);
+  const listedRead =
+    !fresh && listing && listing.epoch >= needed ? listing.read : undefined;
+  const reused = fence !== undefined || listedRead !== undefined;
+  const rerun = reuse.stale && reused;
   const early = (answer: ApplyResult) => (rerun ? undefined : answer);
   const active = fence ?? (await control(deps, id, connection, hashes));
   if (active.kind !== "active")
@@ -367,8 +421,8 @@ async function applyOneOnce(
     // delete and stay; only a later delete version purges them.
     if (state && read.version <= state.last_delete_version)
       return early(result(stream, "noop"));
-    // A purge is destructive: never decide it on reads from before a download.
-    if (rerun) return undefined;
+    // A purge is destructive: never decide it on reused reads.
+    if (reused) return undefined;
     await deps.db.batch(
       withOrigin("purge", [
         {
@@ -431,7 +485,8 @@ async function applyOneOnce(
   }
   const { head } = verified;
   if (head.generation < active.generation) {
-    if (rerun) return undefined;
+    // This writes stream state: never decide it on reused reads.
+    if (reused) return undefined;
     // A head of an earlier lifetime (a delete marker). It is no content base:
     // keep only its delete fence, so a run that begins now pins it.
     await hydrateLifetimeBoundary(deps, {
@@ -577,8 +632,9 @@ async function applyOneOnce(
         if (rows.length > 0) throw new Error("apply: incomplete part");
       }
     }
+    const fenceEpoch = reuse.flight.epoch;
     const stillActive = await control(deps, id, connection, hashes);
-    reuse.control = stillActive;
+    reuse.control = { read: stillActive, epoch: fenceEpoch };
     if (
       stillActive.kind !== "active" ||
       stillActive.generation !== active.generation
