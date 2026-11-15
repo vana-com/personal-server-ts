@@ -320,6 +320,8 @@ describe("createPsLiteRuntime", () => {
         stop: vi.fn().mockResolvedValue(undefined),
         trigger: vi.fn().mockResolvedValue(undefined),
         requestPull: vi.fn().mockResolvedValue(undefined),
+        pause: vi.fn(),
+        resume: vi.fn(),
         getStatus: vi.fn(),
       };
     }
@@ -339,6 +341,45 @@ describe("createPsLiteRuntime", () => {
       expect(syncManager.requestPull).toHaveBeenCalledTimes(2);
       // A pull is not a plain trigger: the manager decides whether a cycle runs.
       expect(syncManager.trigger).not.toHaveBeenCalled();
+      runtime.deactivate();
+    });
+
+    it("a hide pauses the manager; the show resumes it before it asks for the pull", () => {
+      const { doc } = pageStub();
+      const syncManager = managerStub();
+      const order: string[] = [];
+      syncManager.resume.mockImplementation(() => order.push("resume"));
+      syncManager.requestPull.mockImplementation(async () => {
+        order.push("pull");
+      });
+      const runtime = createTestRuntime({ active: false, syncManager });
+      runtime.activate();
+      expect(syncManager.pause).not.toHaveBeenCalled();
+
+      doc.visibilityState = "hidden";
+      doc.dispatchEvent(new Event("visibilitychange"));
+      expect(syncManager.pause).toHaveBeenCalledTimes(1);
+      expect(syncManager.requestPull).not.toHaveBeenCalled();
+
+      doc.visibilityState = "visible";
+      doc.dispatchEvent(new Event("visibilitychange"));
+      expect(order).toEqual(["resume", "pull"]);
+      runtime.deactivate();
+      doc.visibilityState = "hidden";
+      doc.dispatchEvent(new Event("visibilitychange"));
+      expect(syncManager.pause).toHaveBeenCalledTimes(1);
+    });
+
+    it("a page that starts hidden pauses the manager as soon as it starts", () => {
+      pageStub("hidden");
+      const syncManager = managerStub();
+      const runtime = createTestRuntime({ active: false, syncManager });
+      runtime.activate();
+      expect(syncManager.start).toHaveBeenCalledTimes(1);
+      expect(syncManager.pause).toHaveBeenCalledTimes(1);
+      expect(syncManager.start.mock.invocationCallOrder[0]).toBeLessThan(
+        syncManager.pause.mock.invocationCallOrder[0]!,
+      );
       runtime.deactivate();
     });
 

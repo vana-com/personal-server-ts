@@ -250,17 +250,6 @@ describe("stopping and parking", () => {
     expect(t.pokes).not.toHaveBeenCalled();
     expect(t.calls).toHaveLength(1);
   });
-
-  it("holds no request while the host says nobody is looking, and resumes when they are", async () => {
-    let active = false;
-    const t = subscribed({ active: () => active });
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(t.calls).toHaveLength(0);
-    active = true;
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(t.calls).toHaveLength(1);
-    t.stop();
-  });
 });
 
 describe("listeners on the subscription's lifetime signal", () => {
@@ -281,18 +270,6 @@ describe("listeners on the subscription's lifetime signal", () => {
   }
   const abortListeners = (c: AbortController) =>
     getEventListeners(c.signal, "abort").length;
-
-  it("a hidden tab that parks every 2 s keeps one listener, not one per park", async () => {
-    const created = captureLifetime();
-    const { stop } = subscribed({ active: () => false });
-    await flush();
-    const lifetime = created[0];
-    await vi.advanceTimersByTimeAsync(2_000 * 50); // 50 parked intervals
-    expect(abortListeners(lifetime)).toBeLessThanOrEqual(1);
-    stop();
-    expect(abortListeners(lifetime)).toBe(0);
-    vi.unstubAllGlobals();
-  });
 
   it("a gateway outage that backs off repeatedly keeps one listener, not one per back-off", async () => {
     const created = captureLifetime();

@@ -92,17 +92,12 @@ describe("createRegistryChangeProbe", () => {
     ).toBeUndefined();
   });
 
-  it("passes the host's period and visibility gate through", () => {
-    const active = () => false;
+  it("passes the host's period through", () => {
     const probe = createRegistryChangeProbe(
       registry(async () => "m"),
-      {
-        intervalMs: 9_000,
-        active,
-      },
+      { intervalMs: 9_000 },
     )!;
     expect(probe.intervalMs).toBe(9_000);
-    expect(probe.active).toBe(active);
   });
 
   it("keeps the period above the cost-parity floor of the smallest idle cycle", () => {
@@ -113,15 +108,14 @@ describe("createRegistryChangeProbe", () => {
     expect(DEFAULT_CHANGE_PROBE_MS).toBeGreaterThan(floorMs);
   });
 
-  it("adds a push when the registry can hold a change request, with the host's visibility gate", () => {
+  it("adds a push when the registry can hold a change request", () => {
     const waitForChange = vi.fn();
-    const active = () => true;
     const probe = createRegistryChangeProbe(
       {
         probeChange: async () => "m",
         waitForChange,
       } as unknown as StreamSyncRegistry,
-      { active, push: { healthyProbeMs: 90_000 } },
+      { push: { healthyProbeMs: 90_000 } },
     )!;
     expect(probe.push?.healthyProbeMs).toBe(90_000);
   });

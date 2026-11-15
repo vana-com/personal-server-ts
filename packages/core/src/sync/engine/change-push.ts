@@ -39,8 +39,6 @@ export function changePushBackoffMs(
   const base = BACKOFF_MIN_MS * 2 ** Math.min(failures, 5);
   return Math.min(BACKOFF_MAX_MS, base * (0.5 + random()));
 }
-/** How often a parked subscription (no one is looking) re-checks the host. */
-const PARK_CHECK_MS = 2_000;
 
 /**
  * The timed probe's period while the push is healthy. The unconditional timer
@@ -56,11 +54,6 @@ export interface RegistryChangePushOptions {
   healthyProbeMs?: number;
   /** Default {@link CHANGE_PUSH_WAIT_MS}. */
   waitMs?: number;
-  /**
-   * Whether anyone is looking now. A hidden Web tab holds no request and
-   * pulls once when it is shown again (the host's own signal).
-   */
-  active?: () => boolean;
 }
 
 /**
@@ -103,10 +96,9 @@ export function createRegistryChangePush(
         handlers.onHealth(next);
       };
 
-      // The abort listener goes away on both ways out. A hidden tab sleeps
-      // every PARK_CHECK_MS for as long as the subscription lives, and an
-      // outage sleeps once per attempt; a listener left behind by each sleep
-      // is a leak that grows with the subscription's age.
+      // The abort listener goes away on both ways out. An outage sleeps once
+      // per attempt; a listener left behind by each sleep is a leak that grows
+      // with the subscription's age.
       const sleep = (ms: number) =>
         new Promise<void>((resolve) => {
           const done = () => {
@@ -148,11 +140,6 @@ export function createRegistryChangePush(
 
       void (async () => {
         while (!lifetime.signal.aborted) {
-          if (options.active && !options.active()) {
-            setHealth(false);
-            await sleep(PARK_CHECK_MS);
-            continue;
-          }
           const outcome = await once();
           if (lifetime.signal.aborted) return;
           if (outcome === "absent") {

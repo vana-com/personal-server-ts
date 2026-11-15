@@ -36,13 +36,12 @@ export const PROBE_TIMEOUT_MS = 10_000;
 export interface RegistryChangeProbeOptions {
   /** Default {@link DEFAULT_CHANGE_PROBE_MS}; 0 or less: no probe. */
   intervalMs?: number;
-  active?: () => boolean;
   /**
    * The server push that relieves the probe, when the registry can hold a
-   * change request. `{ enabled: false }` keeps the probe alone. The host's
-   * `active` gate applies to it too: a hidden tab holds no request.
+   * change request. `{ enabled: false }` keeps the probe alone. A hidden tab
+   * is the host's `SyncManager.pause`, not an option here.
    */
-  push?: Omit<RegistryChangePushOptions, "active">;
+  push?: RegistryChangePushOptions;
 }
 
 /** The manager's probe over a registry that can answer one; none otherwise. */
@@ -53,15 +52,11 @@ export function createRegistryChangeProbe(
   const intervalMs = options.intervalMs ?? DEFAULT_CHANGE_PROBE_MS;
   const probeChange = registry.probeChange?.bind(registry);
   if (!probeChange || !(intervalMs > 0)) return undefined;
-  const push = createRegistryChangePush(registry, {
-    ...options.push,
-    ...(options.active && { active: options.active }),
-  });
+  const push = createRegistryChangePush(registry, options.push);
   return {
     read: () => readWithDeadline(probeChange),
     intervalMs,
     ...(push && { push }),
-    ...(options.active && { active: options.active }),
   };
 }
 

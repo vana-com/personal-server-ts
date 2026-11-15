@@ -53,11 +53,6 @@ export interface ChangeProbe {
    * timed probe stretches to `push.healthyProbeMs`; otherwise nothing differs.
    */
   push?: ChangePush;
-  /**
-   * Whether the timed probe is worth sending now. A hidden Web tab has no one
-   * to show a change to and re-probes when it is shown (a signal). Absent: always.
-   */
-  active?: () => boolean;
 }
 
 /**
@@ -188,6 +183,26 @@ export interface SyncManager {
   notifyNewData(): void;
 
   /**
+   * The host says no one is looking (a hidden Web tab). The manager holds no
+   * request and no timer until `resume`: it aborts the held push request and
+   * clears the push's cooldown, the failure retry, the poll, the probe and the
+   * ingest-debounce timers, and forgets the push's health and the failure
+   * streak. A cycle already running finishes. Work that came in meanwhile (a
+   * follow-up it owes, a local ingest) is remembered, not run. Pulls and
+   * signals do nothing while paused; `trigger` still runs. Does nothing when
+   * stopped or already paused.
+   */
+  pause(): void;
+
+  /**
+   * The host says someone is looking again. Restarts the timers and starts
+   * exactly one push subscription, and runs one cycle if work was owed while
+   * paused. A signal that follows (`requestPull`) still does its own probe.
+   * Does nothing when stopped or not paused.
+   */
+  resume(): void;
+
+  /**
    * Durable scope deletion: gateway tombstone, then storage blobs, then the
    * local copy (see workers/delete.ts for why that order is the only safe
    * one). Resolves with a per-step result; a gateway failure leaves the
@@ -257,6 +272,10 @@ export function createSyncManager(
   let pushHealthy = false;
   let lastProbeAt = 0;
   let stopPush: (() => void) | null = null;
+  // The host paused the manager (no one is looking): no request, no timer.
+  // `owedWhilePaused` remembers a local ingest that arrived meanwhile.
+  let paused = false;
+  let owedWhilePaused = false;
   // The registry marker as of the last cycle a pull ran and finished cleanly.
   // Only `pullIfChanged` moves it, and only to a marker read BEFORE its cycle
   // started, so every change up to it was in the registry when that cycle read.
@@ -463,7 +482,7 @@ export function createSyncManager(
         }
 
         lastSync = new Date().toISOString();
-      } while (rerunRequested && isRunning);
+      } while (rerunRequested && isRunning && !paused);
     };
 
     // A failed cycle ends its exclusive operation at once: callers get its
@@ -493,10 +512,10 @@ export function createSyncManager(
   function cycleFailed(): void {
     const failures = cycleFailures;
     cycleFailures += 1;
-    if (!rerunRequested || !isRunning || retryTimer !== null) return;
+    if (!rerunRequested || !isRunning || paused || retryTimer !== null) return;
     retryTimer = setTimeout(() => {
       retryTimer = null;
-      if (!isRunning || !rerunRequested) return;
+      if (!isRunning || paused || !rerunRequested) return;
       runCycle().catch(() => {
         // Errors already captured in ring buffer
       });
@@ -686,7 +705,7 @@ export function createSyncManager(
   }
 
   function pull(fromSignal: boolean): Promise<void> {
-    if (!isRunning) return Promise.resolve();
+    if (!isRunning || paused) return Promise.resolve();
     // No probe: a pull is a cycle request, and `runCycle` coalesces those.
     const probe = options?.changeProbe;
     if (!probe) return runCycle();
@@ -728,7 +747,12 @@ export function createSyncManager(
   }
 
   function scheduleNotifiedCycle(): void {
-    if (!isRunning || notifyTimerId !== null) return;
+    if (!isRunning) return;
+    if (paused) {
+      owedWhilePaused = true;
+      return;
+    }
+    if (notifyTimerId !== null) return;
     notifyTimerId = setTimeout(() => {
       notifyTimerId = null;
       if (!isRunning) return;
@@ -766,7 +790,6 @@ export function createSyncManager(
     const probe = options?.changeProbe;
     if (!probe || probeIntervalId !== null) return;
     probeIntervalId = setInterval(() => {
-      if (probe.active && !probe.active()) return;
       if (Date.now() < nextTimedProbeAt) return; // backing off after failures
       // A healthy push pokes on a change; the timer cycle still runs every
       // poll interval, so this probe only has to back it up now and then.
@@ -839,6 +862,8 @@ export function createSyncManager(
     start() {
       if (isRunning) return; // Idempotent
       isRunning = true;
+      paused = false;
+      owedWhilePaused = false;
       lifecycle += 1;
       pulledMarker = undefined;
       cycleFailures = 0;
@@ -869,6 +894,8 @@ export function createSyncManager(
       clearRetryTimer();
       rerunRequested = false;
       isRunning = false;
+      paused = false;
+      owedWhilePaused = false;
       // Cancel pulls: a probe that answers later finds a new lifecycle value.
       lifecycle += 1;
 
@@ -902,8 +929,41 @@ export function createSyncManager(
       clearIntervalTimer();
       clearNotifyTimer();
       await runCycle();
-      if (isRunning) {
+      if (isRunning && !paused) {
         startInterval();
+      }
+    },
+
+    pause() {
+      if (!isRunning || paused) return;
+      paused = true;
+      // Stale answers (a probe, a poke) of the run before the hide are void.
+      lifecycle += 1;
+      // A debounced ingest still waiting for its timer is owed, not dropped.
+      if (notifyTimerId !== null) owedWhilePaused = true;
+      clearIntervalTimer();
+      clearProbeInterval();
+      clearNotifyTimer();
+      clearRetryTimer();
+      stopChangePush(); // aborts the held request and the push's own timers
+      cycleFailures = 0;
+      probeFailures = 0;
+      nextTimedProbeAt = 0;
+    },
+
+    resume() {
+      if (!isRunning || !paused) return;
+      paused = false;
+      startInterval();
+      startProbeInterval();
+      startChangePush();
+      // A follow-up the last cycle owed, or an ingest, waited for this.
+      const owed = owedWhilePaused || rerunRequested;
+      owedWhilePaused = false;
+      if (owed) {
+        runCycle().catch(() => {
+          // Errors already captured in ring buffer
+        });
       }
     },
 
