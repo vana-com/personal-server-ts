@@ -1050,3 +1050,55 @@ it("a control found deleted after a part merged purges the connection, which fin
   expect(await f.db.query("SELECT stream FROM records")).toEqual([]);
   expect(await partial(f)).toEqual([0]);
 });
+
+// The mark clears only on proof of repair. A whole apply that ends on an early
+// "gone" repaired nothing, whatever the stream count.
+it("a whole single-stream apply that finds the head newer than the control keeps a standing mark: a later begin is not offline, same store or restarted", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "apply-partial-"));
+  dirs.push(dir);
+  const path = join(dir, "local.db");
+  const f = await fixture(path);
+  await f.head("a", [{ id: "a" }]);
+  await applyConnection(f.deps, f.id);
+  // An earlier failed apply merged generation-1 rows and left the mark.
+  await f.db.batch([{ sql: "UPDATE connections SET apply_partial=1" }]);
+  expect(await partial(f)).toEqual([1]);
+
+  // Another publisher advances control and head to generation 2, after this
+  // apply read the control at generation 1 and before it fetches the head.
+  await f.head("a", [{ id: "a2" }], { generation: 2, version: 2 });
+  f.setControl(1);
+  const working = f.deps.registry;
+  let flipped = false;
+  f.deps.registry = {
+    ...working,
+    read: async (scope) => {
+      const out = await working.read(scope);
+      if (scope === f.control && !flipped) {
+        flipped = true;
+        f.setControl(2);
+      }
+      return out;
+    },
+  };
+  const results = await applyConnection(f.deps, f.id);
+  expect(results.map((r) => [r.stream, r.outcome])).toEqual([["a", "gone"]]);
+  expect(await partial(f)).toEqual([1]);
+
+  f.deps.registry = down(working);
+  expect(await beginOn(f.deps, "again")).toBeInstanceOf(
+    RegistryUnavailableError,
+  );
+  const reopened = await restart(f, path);
+  expect(await partial(reopened)).toEqual([1]);
+  reopened.deps.registry = down(working);
+  expect(await beginOn(reopened.deps, "restarted")).toBeInstanceOf(
+    RegistryUnavailableError,
+  );
+  expect(await reopened.db.query("SELECT run_id FROM runs")).toEqual([]);
+
+  // Control and head agree on generation 2: a whole apply repairs.
+  reopened.deps.registry = working;
+  await applyConnection(reopened.deps, reopened.id);
+  expect(await partial(reopened)).toEqual([0]);
+});

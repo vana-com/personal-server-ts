@@ -176,7 +176,7 @@ function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
     listed: new Map(),
     stale: false,
     partial: false,
-    interrupted: false,
+    proved: new Set(),
   };
   return runJob(deps, id, flight, reuse).catch((error: unknown) => {
     throw error instanceof RegistryUnavailableError && !reuse.partial
@@ -268,9 +268,11 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
         await applyOne(locked, id, connection, next, keyCheck, hashes, reuse),
       );
     }
-    // Only a whole-connection apply that ran to the end on an active control
-    // repairs it. One that gave up on a stream is not proof.
-    if (flight.all && !reuse.interrupted) await clearPartial(deps, id, reuse);
+    // The mark clears only on proof of repair: a whole-connection apply in
+    // which every stream ended in an answer that settled it (see `proved`).
+    // A stream that gave up for any reason leaves the mark in place.
+    if (flight.all && [...answers.keys()].every((s) => reuse.proved.has(s)))
+      await clearPartial(deps, id, reuse);
     return [...answers.values()];
   });
 }
@@ -399,12 +401,13 @@ interface Reuse {
    */
   partial: boolean;
   /**
-   * A stream merged rows and then found the control row absent, foreign or in
-   * another generation, and answered "gone" without finishing: the rows stay.
-   * The job did not repair the connection, so it must not clear the mark. A
-   * control found deleted purges the connection, which does finish.
+   * Streams whose answer settled them against an active control of their
+   * generation: applied through the final commit, already current, already past
+   * a consumed delete, purged, or an earlier lifetime's fence stored. A stream
+   * that answered "gone" because its control, row or head moved is not in the
+   * set: whatever it merged stays unrepaired. Nothing else clears the mark.
    */
-  interrupted: boolean;
+  proved: Set<string>;
 }
 
 /**
@@ -460,9 +463,18 @@ async function applyOneOnce(
   const reused = fence !== undefined || listedRead !== undefined;
   const rerun = reuse.stale && reused;
   const early = (answer: ApplyResult) => (rerun ? undefined : answer);
+  // An answer that settles the stream. Only these let a whole apply clear the
+  // half-applied mark.
+  const settled = (answer: ApplyResult) => {
+    const out = early(answer);
+    if (out) reuse.proved.add(stream);
+    return out;
+  };
   const active = fence ?? (await control(deps, id, connection, hashes, reuse));
   if (active.kind !== "active")
-    return early(result(stream, active.kind === "deleted" ? "purged" : "gone"));
+    return active.kind === "deleted"
+      ? settled(result(stream, "purged"))
+      : early(result(stream, "gone"));
   const scope = streamScope(connection.connector, connection.ns, stream);
   const read = listedRead ?? (await deps.registry.read(scope));
   const classification = classifyStreamRow(read, hashes);
@@ -477,7 +489,7 @@ async function applyOneOnce(
     // collection staged or committed after that fence are newer than the
     // delete and stay; only a later delete version purges them.
     if (state && read.version <= state.last_delete_version)
-      return early(result(stream, "noop"));
+      return settled(result(stream, "noop"));
     // A purge is destructive: never decide it on reused reads.
     if (reused) return undefined;
     await markPartial(deps, id, reuse);
@@ -505,10 +517,11 @@ async function applyOneOnce(
         },
       ]),
     );
+    reuse.proved.add(stream);
     return result(stream, "purged");
   }
   if (state && read.version <= state.last_delete_version)
-    return early(result(stream, "gone"));
+    return settled(result(stream, "gone"));
   const saved = await deps.db.query<SavedPart>(
     "SELECT prefix,seq,part_hash,bytes,count FROM head_parts WHERE connection_id=? AND stream=? ORDER BY prefix,seq",
     [id, stream],
@@ -519,7 +532,7 @@ async function applyOneOnce(
     state.head_generation === active.generation &&
     saved.length > 0
   )
-    return early(result(stream, "noop"));
+    return settled(result(stream, "noop"));
   const blob = headBlobName(read.dataHash);
   const cipher = await deps.blobs.get(`${scope}/${blob}`);
   if (cipher === null) {
@@ -556,6 +569,7 @@ async function applyOneOnce(
       provenEarlier: endsEarlierLifetime(scope, read, active.generation),
       primaryKey: head.primaryKey,
     });
+    reuse.proved.add(stream);
     return result(stream, "gone");
   }
   if (head.generation !== active.generation)
@@ -699,7 +713,8 @@ async function applyOneOnce(
       stillActive.kind !== "active" ||
       stillActive.generation !== active.generation
     ) {
-      if (stillActive.kind !== "deleted") reuse.interrupted = true;
+      // A control found deleted purged the connection: that finishes it.
+      if (stillActive.kind === "deleted") reuse.proved.add(stream);
       return result(stream, stillActive.kind === "deleted" ? "purged" : "gone");
     }
     const latest = await deps.registry.read(scope);
@@ -763,6 +778,7 @@ async function applyOneOnce(
       );
     await markPartial(deps, id, reuse);
     await deps.db.batch(withOrigin("remote", statements));
+    reuse.proved.add(stream);
     return {
       stream,
       outcome: "applied",
