@@ -100,17 +100,17 @@ adopting a newer epoch, so monotonicity means the pair (epoch, position).
 
 ## Properties and expected host results
 
-| Configuration | Expected result | Target |
-| --- | --- | --- |
-| Good.cfg | PASS within this finite abstraction | TypeOK, P1–P5; eventual convergence |
-| LostPush.cfg | PASS, even with no Deliver action | P2 full-check recovery and eventual convergence |
-| DropGap.cfg | FAIL P2 | skipped missing predecessors |
-| OutOfOrder.cfg | FAIL P2 | later segment applied first |
-| DroppedDeleteEffect.cfg | FAIL P1 after snapshot+tail | snapshot built without delete operations |
-| ForgetTombstone.cfg | FAIL P1 via replay | correct delete, then snapshot forgets its tombstone; a later replayed upsert resurrects the key |
-| OmissionWithoutCutoff.cfg | FAIL P3 | newer observed row erased by old omission |
-| OmissionInclusive.cfg | FAIL P3 | omission at equal stamp erases an observation AT the cutoff (`<=` boundary) |
-| LamportDifference.cfg | FAIL StampEqualsLamport | P6 orders choose different winners |
+| Configuration             | Expected result                     | Target                                                                                          |
+| ------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Good.cfg                  | PASS within this finite abstraction | TypeOK, P1–P5; eventual convergence                                                             |
+| LostPush.cfg              | PASS, even with no Deliver action   | P2 full-check recovery and eventual convergence                                                 |
+| DropGap.cfg               | FAIL P2                             | skipped missing predecessors                                                                    |
+| OutOfOrder.cfg            | FAIL P2                             | later segment applied first                                                                     |
+| DroppedDeleteEffect.cfg   | FAIL P1 after snapshot+tail         | snapshot built without delete operations                                                        |
+| ForgetTombstone.cfg       | FAIL P1 via replay                  | correct delete, then snapshot forgets its tombstone; a later replayed upsert resurrects the key |
+| OmissionWithoutCutoff.cfg | FAIL P3                             | newer observed row erased by old omission                                                       |
+| OmissionInclusive.cfg     | FAIL P3                             | omission at equal stamp erases an observation AT the cutoff (`<=` boundary)                     |
+| LamportDifference.cfg     | FAIL StampEqualsLamport             | P6 orders choose different winners                                                              |
 
 Corpus (batch 6): an equal-cutoff omission (key 1, stamp 5) meets the live
 stamp-5 row, and an older omission (key 2, stamp 1) sits below the live delete.
@@ -172,17 +172,17 @@ Spec change for this run: one lexical edit, line 108 of `LogProtocol.tla`,
 did not lex. A grep for `=<<` found no other hit. No other spec or config
 change.
 
-| Configuration | Expected | Actual | Distinct states | Depth | Wall time |
-| --- | --- | --- | --- | --- | --- |
-| Good.cfg | PASS | BOUNDED: stopped at 20.3M distinct, no invariant error in explored states; EventuallyConverged not checked | at least 20,309,206 (partial) | n/a | 47 min 51 s, stopped |
-| LostPush.cfg | PASS | BFS COMPLETE, no invariant error (23,019,334 distinct, 0 left on queue); temporal check cut at bound | 23,019,334 | n/a | 46 min 7 s, stopped in temporal check |
-| DropGap.cfg | FAIL P2 | FAIL P2 as expected (`Invariant P2 is violated`) | 130 at failure | 6 | <1 s |
-| OutOfOrder.cfg | FAIL P2 | FAIL P2 as expected (`Invariant P2 is violated`) | 131 at failure | 6 | <1 s |
-| DroppedDeleteEffect.cfg | FAIL P1 | FAIL P1 as expected (`Invariant P1 is violated`) | 2,509 at failure | 8 | <1 s |
-| ForgetTombstone.cfg | FAIL P1 | FAIL P1 as expected; trace: Install, then replayed batch 5 resurrects key 2 | 16,135 at failure | 10 | 2 s |
-| OmissionWithoutCutoff.cfg | FAIL P3 | FAIL P3 as expected (`Invariant P3 is violated`) | 7,842 at failure | 9 | <1 s |
-| OmissionInclusive.cfg | FAIL P3 | FAIL P3 as expected; trace: stamp-5 omission erases the stamp-5 row | 45,443 at failure | 11 | <1 s |
-| LamportDifference.cfg | FAIL StampEqualsLamport | FAIL StampEqualsLamport as expected | 4 at failure | 3 | <1 s |
+| Configuration             | Expected                | Actual                                                                                                     | Distinct states               | Depth | Wall time                             |
+| ------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------- | ----------------------------- | ----- | ------------------------------------- |
+| Good.cfg                  | PASS                    | BOUNDED: stopped at 20.3M distinct, no invariant error in explored states; EventuallyConverged not checked | at least 20,309,206 (partial) | n/a   | 47 min 51 s, stopped                  |
+| LostPush.cfg              | PASS                    | BFS COMPLETE, no invariant error (23,019,334 distinct, 0 left on queue); temporal check cut at bound       | 23,019,334                    | n/a   | 46 min 7 s, stopped in temporal check |
+| DropGap.cfg               | FAIL P2                 | FAIL P2 as expected (`Invariant P2 is violated`)                                                           | 130 at failure                | 6     | <1 s                                  |
+| OutOfOrder.cfg            | FAIL P2                 | FAIL P2 as expected (`Invariant P2 is violated`)                                                           | 131 at failure                | 6     | <1 s                                  |
+| DroppedDeleteEffect.cfg   | FAIL P1                 | FAIL P1 as expected (`Invariant P1 is violated`)                                                           | 2,509 at failure              | 8     | <1 s                                  |
+| ForgetTombstone.cfg       | FAIL P1                 | FAIL P1 as expected; trace: Install, then replayed batch 5 resurrects key 2                                | 16,135 at failure             | 10    | 2 s                                   |
+| OmissionWithoutCutoff.cfg | FAIL P3                 | FAIL P3 as expected (`Invariant P3 is violated`)                                                           | 7,842 at failure              | 9     | <1 s                                  |
+| OmissionInclusive.cfg     | FAIL P3                 | FAIL P3 as expected; trace: stamp-5 omission erases the stamp-5 row                                        | 45,443 at failure             | 11    | <1 s                                  |
+| LamportDifference.cfg     | FAIL StampEqualsLamport | FAIL StampEqualsLamport as expected                                                                        | 4 at failure                  | 3     | <1 s                                  |
 
 Good and LostPush hit the bound before TLC finished (20M distinct states or 45
 min), so their PASS is not established. Good stopped with no invariant violation
@@ -199,3 +199,54 @@ old `DropTombstone` mutant, renamed.
 These are the first TLC results for this model. They are a check of the finite
 abstraction only, within the scope limits above. They do not show a refinement
 to the implementation.
+
+## #705 r3 extension (host run, 2026-11-15)
+
+Scope: the model now represents the r3 rules of the log-segments PR (head
+`664c5d10`, `packages/stream-sync/src/log.ts` and `packages/core/src/localdb/log-apply.ts`):
+
+- Tombstone kinds rank omission < upsert < explicit delete at equal stamp.
+  Mutant `dropKind` gives delete the upsert rank.
+- Each row carries `first` (firstSeen): the smallest batch position at which an
+  observation with the winning rank was applied. Equal-rank observations merge
+  by minimum.
+- Install merges the snapshot into the reader's existing rows (`MergeRow`),
+  not a replacement. Lagging, fresh and uninterrupted readers are checked by
+  P5 at every position, on body, stamp, rank and `first`.
+- A registry rollback (`Rollback`, at most one, needs epoch 1 and leaves
+  epoch 2) moves the head back one batch, or drops it, or replaces it with
+  another corpus batch, and rebases the snapshot to Empty. Under Good, devices
+  on the old lifetime fail closed through `FullCheck`. Mutant `replayFromBase`
+  keeps the rows and position of such a device.
+- Corpus batch 7: an upsert and an explicit delete at stamp 4 in one batch.
+  `OrderOK` checks each batch folds the same forwards and backwards. Batch 7
+  is reached only by Rollback's replacement path, since commits are capped by
+  MaxSteps.
+- P5 now fails on a device whose position is past the head, instead of
+  comparing a prefix that does not exist.
+
+Not represented: hintApplied (job 1 item c, not done), the transport and
+generation fences of the real gateway, and firstSeen as a wall-clock value.
+
+Expected results were written down before any run, in
+`~/.tmp/job3-scratch/EXPECTED.md` (not committed), and are restated here.
+
+| Configuration           | Invariant                                  | Expected                                                                     | Actual                                                                                                                    | Distinct states                                      | Depth | Wall time                       |
+| ----------------------- | ------------------------------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- | ----- | ------------------------------- |
+| Good.cfg (r3 model)     | TypeOK P1–P5, OrderOK; EventuallyConverged | no violation; bounded, not PASS                                              | BOUNDED: stopped at 45 min (exit 124); no invariant error in explored states; liveness not finished                       | at least 31,812,556 distinct (343,151,617 generated) | n/a   | 45 min                          |
+| DropKind.cfg            | OrderOK                                    | violated, depth 1                                                            | FAIL as expected (`The invariant of OrderOK is equal to FALSE`, reported before any step; the check is state-independent) | 1                                                    | 0     | 241 s, mostly queued for a slot |
+| ReplayFromBase.cfg      | P5                                         | violated after Rollback + FullCheck, depth ~6–9                              | FAIL as expected at depth 8: device 1 at position 2 over a one-batch log is labelled current                              | 135,191 at failure                                   | 8     | 1 s                             |
+| ForgetTombstone.cfg     | P1, P5                                     | P5 violated: a fresh device installs a snapshot missing the delete, depth ~6 | FAIL P5 at depth 7 (3 commits, Compact, FullCheck, Install); P1 not reached first                                         | 867 at failure                                       | 7     | <1 s                            |
+| DroppedDeleteEffect.cfg | P1                                         | not predicted                                                                | FAIL P1 at depth 8                                                                                                        | 2,700 at failure                                     | 8     | <1 s                            |
+| OmissionInclusive.cfg   | P3                                         | not predicted                                                                | FAIL P3 at depth 11                                                                                                       | 55,581 at failure                                    | 11    | <1 s                            |
+
+Expected-versus-actual: every prediction matched. The DropKind failure is
+reported as a constant-level invariant error, not as a counterexample trace.
+Its trace file holds only that line. Good was not run to completion, so
+`EventuallyConverged` is not established.
+
+Traces for the failing r3 runs are in `traces/r3-*.txt`. The earlier traces
+(`traces/DroppedDeleteEffect.txt`, `ForgetTombstone.txt`, `OmissionInclusive.txt`)
+are from the pre-r3 model. The earlier table above is also from the pre-r3 model:
+the delete rank changed, rows carry `first`, and Install merges, so its state
+counts and depths do not apply to this file.
