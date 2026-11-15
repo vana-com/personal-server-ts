@@ -1,9 +1,11 @@
 import { withStrictMcpGrantRegistration } from "@opendatalabs/personal-server-ts-core/mcp";
 import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
 import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
-import type {
-  LocalSync,
-  SeedIntake,
+import {
+  NO_VIEW_CHANGES,
+  type LocalSync,
+  type SeedIntake,
+  type ViewChangeListener,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
 import { resolveLiteReplication } from "./replication-door.js";
@@ -205,6 +207,15 @@ export interface IndexedDbPsLiteRuntime {
   localSync?: LocalSync | null;
   /** Lazily open the database after Account mode is known. */
   getLocalSync?(): Promise<LocalSync>;
+  /**
+   * Calls `listener` once after each operation that changed what the local
+   * database serves: records applied, purged or deleted, connections added
+   * or removed, control state moved. An operation that changed nothing
+   * (an idle cycle, a publish) is silent. The event names the changed
+   * connection ids and carries no record data; re-read what you show. Works
+   * before the database opens. Returns the unsubscribe.
+   */
+  subscribeViewChanges(listener: ViewChangeListener): () => void;
   /** Stop the sync manager before releasing its owner/network database. */
   closeStreamSync?(): Promise<void>;
   /**
@@ -591,6 +602,8 @@ export async function createIndexedDbPsLiteRuntime(
     tokenStore,
     accessLogStore,
     syncManager,
+    subscribeViewChanges: (listener) =>
+      (syncRuntime?.viewChanges ?? NO_VIEW_CHANGES).subscribe(listener),
     get localSync() {
       return syncRuntime?.localSync ?? null;
     },

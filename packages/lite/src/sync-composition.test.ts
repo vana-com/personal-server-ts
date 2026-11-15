@@ -457,7 +457,9 @@ describe("PS Lite local database composition", () => {
       expect(createLocalSync).toHaveBeenCalledTimes(1);
       expect(createLocalSync).toHaveBeenCalledWith(
         expect.objectContaining({
-          db,
+          // The view-change recorder wraps the opened driver; reads, writes
+          // and close reach it unchanged.
+          db: expect.objectContaining({ info: db.info }),
           ownerAddress: owner,
           queue: { run: expect.any(Function) },
         }),
@@ -467,6 +469,11 @@ describe("PS Lite local database composition", () => {
           olderVersionReads: expect.any(Function),
         }),
       );
+      const passed = vi.mocked(createLocalSync).mock.calls[0]![0].db;
+      await passed.query("SELECT 'through'");
+      expect(db.query).toHaveBeenCalledWith("SELECT 'through'");
+      await passed.batch([{ sql: "SELECT 1" }]);
+      expect(db.batch).toHaveBeenCalledWith([{ sql: "SELECT 1" }]);
       expect(lite.localSync).toBe(localSync);
       expect(lite.streamSyncIntake).not.toBeNull();
       const request = {} as Parameters<
