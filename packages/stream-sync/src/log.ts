@@ -44,14 +44,28 @@
  *
  * ## Bounds, derived
  *
- * `refs` is the head's list of segments, so it is bounded by the head's own
- * limit (`HEAD_LIMIT_BYTES`): `maxSegmentRefs()`. A writer whose next segment
- * would exceed it must compact first. COMPACTION IS NOT BUILT: this file only
- * names the bound (`maxSegmentRefs`) and the pointer (`SnapshotPointer`, always
- * `null` for now).
+ * `refs` and the snapshot's part list are both listed in the head, so together
+ * they are bounded by the head's own limit (`HEAD_LIMIT_BYTES`):
+ * `maxSegmentRefs()`. `compactionRequired` is the hard backstop: a writer whose
+ * next segment would pass it must compact first.
+ *
+ * ## Compaction
+ *
+ * Compaction folds the log's prefix up to the head's position into SNAPSHOT
+ * PARTS (`SnapshotPart`, blob `q-<hex>`): the latest winner per key, as an
+ * upsert, or as a delete when the latest word on the key is a deletion or an
+ * omission. Tombstones stay in the snapshot, because a reader behind the
+ * snapshot may hold the record the tombstone deletes (P4). The next segment
+ * is written with `base` = the folded position, `snapshot` pointing at the
+ * parts, and no refs at or below `base`. A reader behind `base` installs the
+ * parts (an idempotent apply, in any order) and then applies the tail.
+ *
+ * WHEN TO COMPACT is a cost comparison (`shouldCompact`), derived below from
+ * measured primitives, with the hard backstop above.
  */
 
 import {
+  DEFAULT_PART_TARGET_BYTES,
   HEAD_LIMIT_BYTES,
   HEX16,
   PART_LIMIT_BYTES,
@@ -174,19 +188,23 @@ export interface SegmentRef {
   readonly bytes: number;
 }
 
+/** One snapshot part, as the head names it. */
+export interface SnapshotPartRef {
+  /** Keccak-256 of the clear part: blob `q-<hex>` (`snapshotPartBlobName`). */
+  readonly dataHash: `0x${string}`;
+  /** The CLEAR length. */
+  readonly bytes: number;
+}
+
 /**
- * The snapshot a compacted log rests on: the per-stream heads (format 5
- * parts) that hold the state at `position`. Reserved. Writers emit `null`
- * until compaction is built; a reader that meets a non-null pointer reads the
- * heads it names before the segments after `position`.
+ * The snapshot a compacted log rests on: the parts that hold the fold of
+ * every segment up to `position`, which is the head's `base`. `null` until the
+ * log has been compacted once. A reader behind `base` installs every part,
+ * then applies the segments after `position`.
  */
 export interface SnapshotPointer {
   readonly position: number;
-  readonly heads: readonly {
-    readonly stream: string;
-    readonly version: number;
-    readonly dataHash: `0x${string}`;
-  }[];
+  readonly parts: readonly SnapshotPartRef[];
 }
 
 export interface Segment {
@@ -223,8 +241,278 @@ export function maxSegmentRefs(): number {
 }
 
 /** Why a head cannot take another segment without compaction, or `null`. */
-export function compactionRequired(refs: number): boolean {
-  return refs + 1 > maxSegmentRefs();
+export function compactionRequired(refs: number, parts = 0): boolean {
+  return refs + parts + 1 > maxSegmentRefs();
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot parts, the fold, and when to compact.
+// ---------------------------------------------------------------------------
+
+/** One key's latest word: an upsert, or the deletion that beat every upsert. */
+export type LogEntry = LogUpsert | LogDelete;
+
+/**
+ * One part of a snapshot: the winners of a key range, sorted by (stream,
+ * pkHash). Each part carries the stream metas, so a part applies by itself.
+ */
+export interface SnapshotPart {
+  readonly format: typeof LOG_FORMAT;
+  readonly connector: string;
+  readonly ns: string;
+  readonly generation: number;
+  readonly keyCheck: string;
+  /** The snapshot's position: the head's `base`. */
+  readonly position: number;
+  /** 0-based, in the order the pointer lists the parts. */
+  readonly index: number;
+  readonly streams: readonly LogStreamMeta[];
+  readonly entries: readonly LogEntry[];
+}
+
+const SNAPSHOT_BLOB = /^q-([0-9a-f]{64})$/;
+
+/** `q-<hex>`: the blob name of a snapshot part, from its data hash. */
+export function snapshotPartBlobName(dataHash: string): string {
+  const hex = dataHash.startsWith("0x") ? dataHash.slice(2) : dataHash;
+  if (!/^[0-9a-f]{64}$/.test(hex)) {
+    throw new InvalidArgumentError(
+      `snapshot part hash is not 64 lowercase hex characters: ${dataHash}`,
+    );
+  }
+  return `q-${hex}`;
+}
+
+export function isSnapshotPartBlobName(name: string): boolean {
+  return SNAPSHOT_BLOB.test(name);
+}
+
+export interface LogFold {
+  readonly streams: readonly LogStreamMeta[];
+  readonly entries: readonly LogEntry[];
+}
+
+const entryKey = (stream: string, pk: string) => `${stream}\u0000${pk}`;
+
+/**
+ * The fold of a log prefix: for every key, the latest winner, INCLUDING the
+ * deletions (P4). `snapshot` is the previous snapshot's parts (none for the
+ * first compaction); `segments` are the segments after it, any order.
+ *
+ * The rule is the reader's (`applySegmentOperations`): per key, the greatest
+ * upsert stamp and the greatest deletion stamp (an explicit delete, or the
+ * cutoff of a completion that omitted the key) are kept apart; the upsert
+ * wins only if it is strictly after the deletion. A winning upsert makes the
+ * deletion redundant, since every older upsert loses to the winner anyway. A
+ * deletion that wins stays as a `delete` entry, so a reader that is behind the
+ * snapshot and holds the record still loses it. The first-seen checkpoint is
+ * the least known one over the upserts that are after the key's deletion (all
+ * of them if it has none): the reader drops a deleted row's checkpoint with it.
+ *
+ * Applying the fold gives the same records as applying the prefix in order.
+ */
+export function foldLog(input: {
+  readonly snapshot: readonly SnapshotPart[];
+  readonly segments: readonly Segment[];
+}): LogFold {
+  type Cell = {
+    upsert: LogUpsert | null;
+    /** Every upsert's stamp and first-seen checkpoint, to settle after the deletion is known. */
+    seen: { stamp: LogStamp; firstSeen: number }[];
+    deletion: LogStamp | null;
+  };
+  const cells = new Map<string, Cell>();
+  const cell = (stream: string, pk: string): Cell => {
+    const key = entryKey(stream, pk);
+    let c = cells.get(key);
+    if (!c) cells.set(key, (c = { upsert: null, seen: [], deletion: null }));
+    return c;
+  };
+  const upsert = (op: LogUpsert) => {
+    const c = cell(op.stream, op.pkHash);
+    if (!c.upsert || stampAfter(op.stamp, c.upsert.stamp)) c.upsert = op;
+    if (op.firstSeen !== null)
+      c.seen.push({ stamp: op.stamp, firstSeen: op.firstSeen });
+  };
+  const deletion = (stream: string, pk: string, stamp: LogStamp) => {
+    const c = cell(stream, pk);
+    if (!c.deletion || stampAfter(stamp, c.deletion)) c.deletion = stamp;
+  };
+  const metas = new Map<string, LogStreamMeta>();
+  for (const part of input.snapshot) {
+    for (const meta of part.streams) metas.set(meta.stream, meta);
+    for (const entry of part.entries)
+      if (entry.kind === "upsert") upsert(entry);
+      else deletion(entry.stream, entry.pkHash, entry.stamp);
+  }
+  const ordered = [...input.segments].sort((a, b) => a.position - b.position);
+  for (const segment of ordered) {
+    for (const meta of segment.streams) metas.set(meta.stream, meta);
+    for (const op of segment.operations)
+      if (op.kind === "upsert") upsert(op);
+      else if (op.kind === "delete") deletion(op.stream, op.pkHash, op.stamp);
+      else for (const pk of op.omitted) deletion(op.stream, pk, op.cutoff);
+  }
+  const entries: LogEntry[] = [];
+  for (const [key, c] of cells) {
+    const [stream, pkHash] = key.split("\u0000") as [string, string];
+    if (c.upsert && (!c.deletion || stampAfter(c.upsert.stamp, c.deletion))) {
+      // The least first-seen checkpoint over the upserts that outlive the
+      // deletion: a reader that applied the deletion dropped the row and its
+      // checkpoint with it, so only later observations count.
+      let firstSeen: number | null = null;
+      for (const s of c.seen)
+        if (
+          (!c.deletion || stampAfter(s.stamp, c.deletion)) &&
+          (firstSeen === null || s.firstSeen < firstSeen)
+        )
+          firstSeen = s.firstSeen;
+      entries.push({ ...c.upsert, stream, pkHash, firstSeen });
+    } else if (c.deletion)
+      entries.push({ kind: "delete", stream, pkHash, stamp: c.deletion });
+  }
+  entries.sort(
+    (a, b) =>
+      (a.stream < b.stream ? -1 : a.stream > b.stream ? 1 : 0) ||
+      (a.pkHash < b.pkHash ? -1 : a.pkHash > b.pkHash ? 1 : 0),
+  );
+  return {
+    streams: [...metas.values()].sort((a, b) =>
+      a.stream < b.stream ? -1 : a.stream > b.stream ? 1 : 0,
+    ),
+    entries,
+  };
+}
+
+/**
+ * Split a fold into parts of about `targetBytes` each, in key order. A part
+ * holds at least one entry, and a fold with none still yields one part, which
+ * carries the stream metas. The size of an entry is its wire size.
+ */
+export function partitionFold(
+  fold: LogFold,
+  context: {
+    readonly connector: string;
+    readonly ns: string;
+    readonly generation: number;
+    readonly keyCheck: string;
+    readonly position: number;
+  },
+  targetBytes: number = DEFAULT_PART_TARGET_BYTES,
+): SnapshotPart[] {
+  const base = (index: number, entries: LogEntry[]): SnapshotPart => ({
+    format: LOG_FORMAT,
+    ...context,
+    index,
+    streams: fold.streams,
+    entries,
+  });
+  const metaBytes =
+    JSON.stringify(fold.streams.map((m) => m.stream)).length +
+    200 * fold.streams.length;
+  const parts: SnapshotPart[] = [];
+  let current: LogEntry[] = [];
+  let size = metaBytes;
+  for (const entry of fold.entries) {
+    const bytes = JSON.stringify(opToWire(entry)).length + 1;
+    if (current.length > 0 && size + bytes > targetBytes) {
+      parts.push(base(parts.length, current));
+      current = [];
+      size = metaBytes;
+    }
+    current.push(entry);
+    size += bytes;
+  }
+  parts.push(base(parts.length, current));
+  return parts;
+}
+
+// ---------------------------------------------------------------------------
+// When to compact: a cost comparison from measured primitives.
+// ---------------------------------------------------------------------------
+//
+// A reader that is far behind has two ways to catch up:
+//
+//   replay    GET the n segments after `base` (in parallel) and apply them one
+//             after another:
+//               replayMs   = TTFB + tailBytes / BANDWIDTH + n * APPLY
+//   snapshot  GET the snapshot parts (in parallel) and apply each, with
+//             nothing after them to replay:
+//               snapshotMs = TTFB + snapshotBytes / BANDWIDTH + parts * APPLY
+//
+// The saving per catch-up is replayMs - snapshotMs. Compacting costs the writer
+// one time: it reads the previous snapshot and the tail, and writes the parts:
+//               compactMs  = TTFB + (previousSnapshotBytes + tailBytes) /
+//                            BANDWIDTH + parts * PUT
+//
+// Compact when one catch-up repays it: replayMs - snapshotMs > compactMs.
+// Every further reader that has to catch up is then a gain. The snapshot is
+// not built yet, so its size is bounded from above by the sum of what it folds
+// (`previousSnapshotBytes + tailBytes`; a fold only drops bytes). That bound
+// makes the rule late, never early: whenever it fires, the real snapshot is no
+// larger than the estimate, so the saving is at least as large.
+//
+// What this leaves out, on purpose: the apply cost per record (a replay
+// applies superseded versions that the snapshot does not, so ignoring it
+// favours waiting), and the TTFB of each ref GET beyond the first (they run in
+// parallel). The hard backstop (`compactionRequired`) applies regardless.
+
+/** One GET's time to first byte. Measured by the Lead, 2026-11: ~100 ms. */
+export const GET_TTFB_MS = 100;
+/**
+ * Transfer rate of a GET. Measured: 4 MiB takes ~0.46 s end to end, of which
+ * ~0.10 s is TTFB, so 4 MiB / 0.36 s.
+ */
+export const BLOB_BYTES_PER_MS = Math.round((4 * 1024 * 1024) / 360);
+/**
+ * Applying one small segment: measured 20-31 ms (stream-sync apply
+ * benchmarks); the midpoint.
+ */
+export const APPLY_MS_PER_SEGMENT = 25;
+/**
+ * One object store write. Measured: ~520 ms each, even for 16 KiB (the
+ * reason the log exists).
+ */
+export const PUT_MS = 520;
+
+export interface CompactionInputs {
+  /** Segments after `base`, including the head. */
+  readonly tailSegments: number;
+  /** Their clear bytes: the sum of the refs' `bytes`. */
+  readonly tailBytes: number;
+  /** The current snapshot's clear bytes; 0 if there is none. */
+  readonly snapshotBytes: number;
+  readonly partTargetBytes?: number;
+}
+
+export interface CompactionCost {
+  readonly replayMs: number;
+  readonly snapshotMs: number;
+  readonly compactMs: number;
+  readonly parts: number;
+}
+
+export function compactionCost(input: CompactionInputs): CompactionCost {
+  const target = input.partTargetBytes ?? DEFAULT_PART_TARGET_BYTES;
+  const folded = input.snapshotBytes + input.tailBytes;
+  const parts = Math.max(1, Math.ceil(folded / target));
+  return {
+    parts,
+    replayMs:
+      GET_TTFB_MS +
+      input.tailBytes / BLOB_BYTES_PER_MS +
+      input.tailSegments * APPLY_MS_PER_SEGMENT,
+    snapshotMs:
+      GET_TTFB_MS + folded / BLOB_BYTES_PER_MS + parts * APPLY_MS_PER_SEGMENT,
+    compactMs: GET_TTFB_MS + folded / BLOB_BYTES_PER_MS + parts * PUT_MS,
+  };
+}
+
+/** True when one catch-up through a snapshot would repay building it. */
+export function shouldCompact(input: CompactionInputs): boolean {
+  if (input.tailSegments === 0) return false;
+  const cost = compactionCost(input);
+  return cost.replayMs - cost.snapshotMs > cost.compactMs;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,8 +577,19 @@ const META_FIELDS = ["complete", "primaryKey", "profile", "stream"];
 const UPSERT_FIELDS = ["f", "k", "o", "p", "r", "s", "v"];
 const DELETE_FIELDS = ["k", "o", "p", "r", "s"];
 const COMPLETE_FIELDS = ["k", "o", "omit", "r", "s"];
-const SNAPSHOT_FIELDS = ["heads", "position"];
-const SNAPSHOT_HEAD_FIELDS = ["dataHash", "stream", "version"];
+const SNAPSHOT_FIELDS = ["parts", "position"];
+const SNAPSHOT_PART_REF_FIELDS = ["bytes", "dataHash"];
+const SNAPSHOT_PART_FIELDS = [
+  "connector",
+  "entries",
+  "format",
+  "generation",
+  "index",
+  "keyCheck",
+  "ns",
+  "position",
+  "streams",
+];
 
 function exactKeys(value: object, expected: readonly string[]): boolean {
   const keys = Object.keys(value).sort();
@@ -350,6 +649,50 @@ function operationProblem(op: unknown, at: string): string | null {
   return null;
 }
 
+function streamsProblem(streams: unknown): {
+  readonly problem: string | null;
+  readonly seen: Set<string>;
+} {
+  const seen = new Set<string>();
+  if (!Array.isArray(streams))
+    return { problem: "streams must be an array", seen };
+  for (let i = 0; i < streams.length; i += 1) {
+    const meta: unknown = streams[i];
+    if (!isPlainObject(meta) || !exactKeys(meta, META_FIELDS))
+      return {
+        problem: `stream ${i} must have exactly ${META_FIELDS.join(", ")}`,
+        seen,
+      };
+    const name = meta["stream"];
+    if (typeof name !== "string" || name === "" || isLogStream(name))
+      return { problem: `stream ${i} name is invalid`, seen };
+    if (seen.has(name)) return { problem: `stream ${i} is listed twice`, seen };
+    seen.add(name);
+    if (typeof meta["complete"] !== "boolean")
+      return { problem: `stream ${i} complete must be a boolean`, seen };
+    const pk = meta["primaryKey"];
+    if (
+      !Array.isArray(pk) ||
+      pk.length === 0 ||
+      pk.some((f) => typeof f !== "string" || f === "")
+    )
+      return {
+        problem: `stream ${i} primaryKey must be non-empty strings`,
+        seen,
+      };
+    const profile = meta["profile"];
+    if (
+      !isPlainObject(profile) ||
+      !exactKeys(profile, ["key", "version"]) ||
+      (profile["key"] !== null && typeof profile["key"] !== "string") ||
+      typeof profile["version"] !== "string" ||
+      profile["version"] === ""
+    )
+      return { problem: `stream ${i} profile must be {key, version}`, seen };
+  }
+  return { problem: null, seen };
+}
+
 function segmentProblem(value: Record<string, unknown>): string | null {
   if (!exactKeys(value, SEGMENT_FIELDS))
     return `fields must be exactly: ${SEGMENT_FIELDS.join(", ")}`;
@@ -368,7 +711,6 @@ function segmentProblem(value: Record<string, unknown>): string | null {
   const position = v["position"] as number;
   const refs = v["refs"];
   if (!Array.isArray(refs)) return "refs must be an array";
-  if (refs.length > maxSegmentRefs()) return "refs exceed the head bound";
   if (base + refs.length + 1 !== position)
     return "refs must be the dense positions base+1 .. position-1";
   for (let i = 0; i < refs.length; i += 1) {
@@ -378,57 +720,33 @@ function segmentProblem(value: Record<string, unknown>): string | null {
       return `ref ${i} must be position ${base + 1 + i}`;
   }
   const snapshot = v["snapshot"];
+  let snapshotParts = 0;
   if (snapshot !== null) {
     if (!isPlainObject(snapshot) || !exactKeys(snapshot, SNAPSHOT_FIELDS))
-      return "snapshot must be null or {heads, position}";
-    if (!isCount(snapshot["position"], 1) || snapshot["position"] > base)
-      return "snapshot position must be in 1..base";
-    const heads = snapshot["heads"];
+      return "snapshot must be null or {parts, position}";
+    if (!isCount(snapshot["position"], 1) || snapshot["position"] !== base)
+      return "snapshot position must equal base";
+    const parts = snapshot["parts"];
     if (
-      !Array.isArray(heads) ||
-      heads.some(
+      !Array.isArray(parts) ||
+      parts.length === 0 ||
+      parts.some(
         (h) =>
           !isPlainObject(h) ||
-          !exactKeys(h, SNAPSHOT_HEAD_FIELDS) ||
-          typeof h["stream"] !== "string" ||
-          !isCount(h["version"], 1) ||
+          !exactKeys(h, SNAPSHOT_PART_REF_FIELDS) ||
           typeof h["dataHash"] !== "string" ||
-          !REGISTRY_HASH.test(h["dataHash"]),
+          !REGISTRY_HASH.test(h["dataHash"]) ||
+          !isCount(h["bytes"], 1),
       )
     )
-      return "snapshot heads must be {stream, version, dataHash}";
+      return "snapshot parts must be a non-empty list of {dataHash, bytes}";
+    snapshotParts = parts.length;
   }
-  const streams = v["streams"];
-  if (!Array.isArray(streams)) return "streams must be an array";
-  const seen = new Set<string>();
-  for (let i = 0; i < streams.length; i += 1) {
-    const meta: unknown = streams[i];
-    if (!isPlainObject(meta) || !exactKeys(meta, META_FIELDS))
-      return `stream ${i} must have exactly ${META_FIELDS.join(", ")}`;
-    const name = meta["stream"];
-    if (typeof name !== "string" || name === "" || isLogStream(name))
-      return `stream ${i} name is invalid`;
-    if (seen.has(name)) return `stream ${i} is listed twice`;
-    seen.add(name);
-    if (typeof meta["complete"] !== "boolean")
-      return `stream ${i} complete must be a boolean`;
-    const pk = meta["primaryKey"];
-    if (
-      !Array.isArray(pk) ||
-      pk.length === 0 ||
-      pk.some((f) => typeof f !== "string" || f === "")
-    )
-      return `stream ${i} primaryKey must be non-empty strings`;
-    const profile = meta["profile"];
-    if (
-      !isPlainObject(profile) ||
-      !exactKeys(profile, ["key", "version"]) ||
-      (profile["key"] !== null && typeof profile["key"] !== "string") ||
-      typeof profile["version"] !== "string" ||
-      profile["version"] === ""
-    )
-      return `stream ${i} profile must be {key, version}`;
-  }
+  if (refs.length + snapshotParts > maxSegmentRefs())
+    return "refs and snapshot parts exceed the head bound";
+  const checked = streamsProblem(v["streams"]);
+  if (checked.problem) return checked.problem;
+  const seen = checked.seen;
   const operations = v["operations"];
   if (!Array.isArray(operations)) return "operations must be an array";
   for (let i = 0; i < operations.length; i += 1) {
@@ -489,10 +807,9 @@ function toWire(segment: Segment): Record<string, unknown> {
     })),
     snapshot: segment.snapshot
       ? {
-          heads: segment.snapshot.heads.map((h) => ({
+          parts: segment.snapshot.parts.map((h) => ({
+            bytes: h.bytes,
             dataHash: h.dataHash,
-            stream: h.stream,
-            version: h.version,
           })),
           position: segment.snapshot.position,
         }
@@ -638,4 +955,157 @@ export async function verifySegment(
   if (expected.position !== undefined && segment.position !== expected.position)
     return { kind: "position_mismatch" };
   return { kind: "ok", segment, bytes: bytes.length };
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot part codec.
+// ---------------------------------------------------------------------------
+
+function partProblem(value: Record<string, unknown>): string | null {
+  if (!exactKeys(value, SNAPSHOT_PART_FIELDS))
+    return `fields must be exactly: ${SNAPSHOT_PART_FIELDS.join(", ")}`;
+  if (typeof value["connector"] !== "string" || value["connector"] === "")
+    return "connector must be non-empty";
+  if (
+    typeof value["ns"] !== "string" ||
+    (value["ns"] !== "" && !HEX16.test(value["ns"]))
+  )
+    return "ns must be empty or 16 lowercase hex";
+  if (!isCount(value["generation"], 1)) return "generation must be >= 1";
+  if (typeof value["keyCheck"] !== "string" || !HEX16.test(value["keyCheck"]))
+    return "keyCheck must be 16 lowercase hex";
+  if (!isCount(value["position"], 1)) return "position must be >= 1";
+  if (!isCount(value["index"], 0)) return "index must be a count";
+  const checked = streamsProblem(value["streams"]);
+  if (checked.problem) return checked.problem;
+  const entries = value["entries"];
+  if (!Array.isArray(entries)) return "entries must be an array";
+  let previous = "";
+  for (let i = 0; i < entries.length; i += 1) {
+    const entry = entries[i] as unknown;
+    const problem = operationProblem(entry, `entry ${i}`);
+    if (problem) return problem;
+    const op = entry as { k: string; s: string; p: string };
+    if (op.k === "c") return `entry ${i} must be an upsert or a delete`;
+    if (!checked.seen.has(op.s))
+      return `entry ${i} names a stream with no meta`;
+    const key = entryKey(op.s, op.p);
+    if (i > 0 && key <= previous)
+      return `entry ${i} must be after the previous key`;
+    previous = key;
+  }
+  return null;
+}
+
+/** Canonical clear part bytes. Throws on a part that would not decode. */
+export function encodeSnapshotPart(part: SnapshotPart): Uint8Array {
+  const wire = {
+    connector: part.connector,
+    entries: part.entries.map(opToWire),
+    format: part.format,
+    generation: part.generation,
+    index: part.index,
+    keyCheck: part.keyCheck,
+    ns: part.ns,
+    position: part.position,
+    streams: part.streams.map((m) => ({
+      complete: m.complete,
+      primaryKey: [...m.primaryKey],
+      profile: { key: m.profile.key, version: m.profile.version },
+      stream: m.stream,
+    })),
+  };
+  const problem = partProblem(wire);
+  if (problem)
+    throw new InvalidArgumentError(`invalid snapshot part: ${problem}`);
+  const bytes = utf8(canonicalJson(wire));
+  if (bytes.length > PART_LIMIT_BYTES)
+    throw new InvalidArgumentError("snapshot part exceeds the 16 MiB limit");
+  return bytes;
+}
+
+export async function digestSnapshotPart(
+  keccak256: Keccak256,
+  bytes: Uint8Array,
+): Promise<SegmentDigest> {
+  const dataHash = await keccakHex(keccak256, bytes);
+  return { dataHash, blobName: snapshotPartBlobName(dataHash) };
+}
+
+export type DecodedSnapshotPart =
+  | { readonly kind: "ok"; readonly part: SnapshotPart }
+  | { readonly kind: "unsupported_format"; readonly format: unknown }
+  | { readonly kind: "malformed"; readonly reason: string };
+
+export function decodeSnapshotPart(bytes: Uint8Array): DecodedSnapshotPart {
+  if (bytes.length > PART_LIMIT_BYTES)
+    return { kind: "malformed", reason: "part exceeds the 16 MiB limit" };
+  let text: string;
+  let parsed: unknown;
+  try {
+    text = decoder.decode(bytes);
+    parsed = JSON.parse(text);
+  } catch {
+    return { kind: "malformed", reason: "part is not UTF-8 JSON" };
+  }
+  if (!isPlainObject(parsed))
+    return { kind: "malformed", reason: "part is not an object" };
+  const format = hasOwn(parsed, "format") ? parsed["format"] : undefined;
+  if (format !== LOG_FORMAT) return { kind: "unsupported_format", format };
+  const problem = partProblem(parsed);
+  if (problem) return { kind: "malformed", reason: problem };
+  if (canonicalJson(parsed) !== text)
+    return { kind: "malformed", reason: "part is not canonical JSON" };
+  const p = parsed as Record<string, unknown>;
+  return {
+    kind: "ok",
+    part: {
+      format: LOG_FORMAT,
+      connector: p["connector"] as string,
+      ns: p["ns"] as string,
+      generation: p["generation"] as number,
+      keyCheck: p["keyCheck"] as string,
+      position: p["position"] as number,
+      index: p["index"] as number,
+      streams: p["streams"] as LogStreamMeta[],
+      entries: (p["entries"] as Record<string, unknown>[]).map(
+        opFromWire,
+      ) as LogEntry[],
+    },
+  };
+}
+
+export type VerifiedSnapshotPart =
+  | { readonly kind: "ok"; readonly part: SnapshotPart; readonly bytes: number }
+  | { readonly kind: "hash_mismatch" }
+  | { readonly kind: "unsupported_format"; readonly format: unknown }
+  | { readonly kind: "malformed"; readonly reason: string }
+  | { readonly kind: "name_mismatch" }
+  | { readonly kind: "key_mismatch" }
+  | { readonly kind: "position_mismatch" };
+
+/** The reader's checks on a decrypted part, as `verifySegment` does. */
+export async function verifySnapshotPart(
+  keccak256: Keccak256,
+  bytes: Uint8Array,
+  expected: {
+    readonly dataHash: string;
+    readonly connector: string;
+    readonly ns: string;
+    readonly keyCheck: string;
+    readonly position?: number;
+  },
+): Promise<VerifiedSnapshotPart> {
+  const dataHash = await keccakHex(keccak256, bytes);
+  if (dataHash !== expected.dataHash.toLowerCase())
+    return { kind: "hash_mismatch" };
+  const decoded = decodeSnapshotPart(bytes);
+  if (decoded.kind !== "ok") return decoded;
+  const { part } = decoded;
+  if (part.connector !== expected.connector || part.ns !== expected.ns)
+    return { kind: "name_mismatch" };
+  if (part.keyCheck !== expected.keyCheck) return { kind: "key_mismatch" };
+  if (expected.position !== undefined && part.position !== expected.position)
+    return { kind: "position_mismatch" };
+  return { kind: "ok", part, bytes: bytes.length };
 }

@@ -10,15 +10,20 @@ import {
   controlHashes,
   controlScope,
   decodeSegment,
+  decodeSnapshotPart,
   deriveKeyCheck,
   logScope,
   pkHash,
+  shouldCompact,
   streamScope,
+  type LogEntry,
   type Segment,
+  type SnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { sha256 } from "@noble/hashes/sha2";
 import {
   applySegmentOperations,
+  applySnapshotPart,
   connectionQueue,
   createLocalSync,
   openLocalDb,
@@ -45,7 +50,11 @@ afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
 });
 
-async function world(options: { streams: number; logProtocol: boolean }) {
+async function world(options: {
+  streams: number;
+  logProtocol: boolean;
+  partTargetBytes?: number;
+}) {
   const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
   const hashes = await controlHashes(async (b) => keccak_256(b), keyCheck);
   const gateway = createFakeGateway({
@@ -68,7 +77,11 @@ async function world(options: { streams: number; logProtocol: boolean }) {
   const names = Array.from({ length: options.streams }, (_, i) => sName(i));
   let clock = 1000;
 
-  async function device(deviceId: string, logProtocol = options.logProtocol) {
+  async function device(
+    deviceId: string,
+    logProtocol = options.logProtocol,
+    hooks: { beforePut?: (key: string) => Promise<void> } = {},
+  ) {
     const db = await openLocalDb(openBetterSqlite3(":memory:"), {
       owner: OWNER,
       network: "test",
@@ -94,6 +107,7 @@ async function world(options: { streams: number; logProtocol: boolean }) {
         },
         exists: (key) => innerBlobs.exists(key),
         async put(key, bytes) {
+          await hooks.beforePut?.(key);
           await innerBlobs.put(key, bytes);
           puts.push(key);
         },
@@ -110,6 +124,9 @@ async function world(options: { streams: number; logProtocol: boolean }) {
       now: () => clock,
       newOp: () => `${deviceId}-${++op}`,
       ...(logProtocol ? { logProtocol: true } : {}),
+      ...(options.partTargetBytes !== undefined
+        ? { partTargetBytes: options.partTargetBytes }
+        : {}),
     };
     const sync = createLocalSync(deps, {
       resolveArtifact: (digest) => ({
@@ -132,12 +149,16 @@ async function world(options: { streams: number; logProtocol: boolean }) {
         stream: string;
         id: string;
         v?: number;
+        pad?: number;
+        blobId?: string;
         remove?: boolean;
       }[],
       opts: {
         covered?: readonly string[];
         full?: boolean;
         observedAt?: number;
+        /** Bytes the record named by `blobId` carries, sent before the run ends. */
+        blob?: { hash: string; bytes: Uint8Array };
       } = {},
     ) => {
       clock++;
@@ -150,12 +171,24 @@ async function world(options: { streams: number; logProtocol: boolean }) {
       });
       await sync.intake.batch(runId, {
         batch: 0,
-        records: records.map(({ stream, id, v, remove }) => ({
+        records: records.map(({ stream, id, v, pad, blobId, remove }) => ({
           stream,
           ...(remove ? { op: "delete" as const } : {}),
-          data: v === undefined ? { id } : { id, v },
+          data: {
+            id,
+            ...(v === undefined ? {} : { v }),
+            ...(pad === undefined ? {} : { pad: "p".repeat(pad) }),
+            ...(blobId === undefined ? {} : { blob_ref: { blob_id: blobId } }),
+          },
         })),
       });
+      if (opts.blob)
+        await sync.blobs.put({
+          runId,
+          sha256: opts.blob.hash,
+          mimeType: "application/octet-stream",
+          bytes: opts.blob.bytes,
+        });
       await sync.intake.end(runId, {
         outcome: "succeeded",
         coveredStreams: opts.covered ?? names,
@@ -197,6 +230,29 @@ async function world(options: { streams: number; logProtocol: boolean }) {
     }
     return out;
   };
+  /** Segment blob keys by position. */
+  const segmentKeys = async () => {
+    const out = new Map<number, string>();
+    for (const key of innerBlobs.keys()) {
+      if (!key.startsWith(`${LOG}/s-`)) continue;
+      const decoded = decodeSegment((await innerBlobs.get(key))!);
+      if (decoded.kind === "ok") out.set(decoded.segment.position, key);
+    }
+    return out;
+  };
+  /** The snapshot parts a head points at, decoded, in pointer order. */
+  const snapshotParts = async (head: Segment) => {
+    const parts: SnapshotPart[] = [];
+    for (const ref of head.snapshot!.parts) {
+      const decoded = decodeSnapshotPart(
+        (await innerBlobs.get(`${LOG}/q-${ref.dataHash.slice(2)}`))!,
+      );
+      if (decoded.kind !== "ok")
+        throw new Error("snapshot part did not decode");
+      parts.push(decoded.part);
+    }
+    return parts;
+  };
   const writes = () => ({
     batches: gateway.batches().length,
     posts: gateway.calls.filter((c) => c.kind === "post").length,
@@ -207,6 +263,8 @@ async function world(options: { streams: number; logProtocol: boolean }) {
     names,
     innerBlobs,
     segments,
+    segmentKeys,
+    snapshotParts,
     writes,
     setClock: (t: number) => (clock = t),
   };
@@ -498,10 +556,6 @@ describe("log protocol, flag on", () => {
     expect(gen2).toHaveLength(1);
   });
 
-  it.todo(
-    "P4: a compacted snapshot keeps the latest winner per key, including tombstones (compaction is a later slice)",
-  );
-
   it("P3: an omission completion deletes only records not observed at or after the cutoff", async () => {
     const w = await world({ streams: 1, logProtocol: true });
     const a = await w.device("a");
@@ -668,4 +722,386 @@ describe("request counts", () => {
       expect(counts.legacy!.puts).toBeGreaterThan(counts.log!.puts);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Compaction, size splitting, attachments.
+// ---------------------------------------------------------------------------
+
+type Device = Awaited<ReturnType<Awaited<ReturnType<typeof world>>["device"]>>;
+
+/** One more small segment: one update of one record. */
+async function grow(d: Device, count: number, from = 0) {
+  for (let i = from; i < from + count; i++) {
+    await d.run(`run-g${i}`, [{ stream: sName(0), id: "x", v: i }], {
+      full: false,
+      covered: [sName(0)],
+      observedAt: 2000 + i,
+    });
+    await d.cycle();
+  }
+}
+
+/** Whether this device's next publish would compact: the library's own rule. */
+async function compactionDue(d: Device): Promise<boolean> {
+  const [row] = await d.db.query<{ refs: string; snapshot: string | null }>(
+    "SELECT refs, snapshot FROM log_state WHERE connection_id = ?",
+    [CONNECTION_ID],
+  );
+  const refs = JSON.parse(row!.refs) as { bytes: number }[];
+  const snapshot = row!.snapshot
+    ? (JSON.parse(row!.snapshot) as { parts: { bytes: number }[] })
+    : null;
+  return shouldCompact({
+    tailSegments: refs.length,
+    tailBytes: refs.reduce((n, r) => n + r.bytes, 0),
+    snapshotBytes: snapshot?.parts.reduce((n, p) => n + p.bytes, 0) ?? 0,
+  });
+}
+
+/**
+ * The fold of a prefix, written independently of `foldLog`: per key the
+ * greatest upsert and the greatest deletion (an explicit delete, or the cutoff
+ * of a completion that omitted the key); the upsert wins only if strictly
+ * after the deletion.
+ */
+function oracleFold(segments: readonly Segment[]) {
+  const after = (x: { o: number; r: string }, y: { o: number; r: string }) =>
+    x.o > y.o || (x.o === y.o && x.r > y.r);
+  const best = new Map<
+    string,
+    {
+      up?: { stamp: { o: number; r: string }; value: unknown };
+      del?: { o: number; r: string };
+    }
+  >();
+  const at = (stream: string, pk: string) => {
+    const key = `${stream}/${pk}`;
+    if (!best.has(key)) best.set(key, {});
+    return best.get(key)!;
+  };
+  for (const g of segments)
+    for (const op of g.operations) {
+      if (op.kind === "upsert") {
+        const c = at(op.stream, op.pkHash);
+        if (!c.up || after(op.stamp, c.up.stamp))
+          c.up = { stamp: op.stamp, value: op.value };
+      } else if (op.kind === "delete") {
+        const c = at(op.stream, op.pkHash);
+        if (!c.del || after(op.stamp, c.del)) c.del = op.stamp;
+      } else
+        for (const pk of op.omitted) {
+          const c = at(op.stream, pk);
+          if (!c.del || after(op.cutoff, c.del)) c.del = op.cutoff;
+        }
+    }
+  const out = new Map<string, unknown>();
+  for (const [key, c] of best)
+    if (c.up && (!c.del || after(c.up.stamp, c.del)))
+      out.set(key, { kind: "upsert", stamp: c.up.stamp, value: c.up.value });
+    else if (c.del) out.set(key, { kind: "delete", stamp: c.del });
+  return out;
+}
+
+const entriesOf = (parts: readonly SnapshotPart[]) => {
+  const out = new Map<string, unknown>();
+  for (const part of parts)
+    for (const e of part.entries as readonly LogEntry[])
+      out.set(
+        `${e.stream}/${e.pkHash}`,
+        e.kind === "upsert"
+          ? { kind: "upsert", stamp: e.stamp, value: e.value }
+          : { kind: "delete", stamp: e.stamp },
+      );
+  return out;
+};
+
+/** A log with an early deletion, grown until it has compacted once. */
+async function compactedWorld() {
+  const w = await world({ streams: 2, logProtocol: true });
+  const a = await w.device("a");
+  const b = await w.device("b");
+  const m = await w.device("m");
+  await a.run(
+    "run-1",
+    [
+      { stream: sName(0), id: "x", v: 0 },
+      { stream: sName(0), id: "y" },
+      { stream: sName(1), id: "z" },
+    ],
+    { observedAt: 1100 },
+  );
+  await a.cycle();
+  // b and m hold x, y and z at position 1 and then stay behind.
+  await b.cycle();
+  await m.cycle();
+  await a.run("run-2", [{ stream: sName(0), id: "y", remove: true }], {
+    full: false,
+    covered: [sName(0)],
+    observedAt: 1200,
+  });
+  await a.cycle();
+  await grow(a, 40);
+  const segments = await w.segments();
+  const head = segments.get(Math.max(...segments.keys()))!;
+  return { w, a, b, m, segments, head };
+}
+
+describe("log protocol: compaction", () => {
+  it("P4: a snapshot is the fold of its prefix, tombstones included; a snapshot that drops them breaks P1", async () => {
+    const { w, a, b, m, segments, head } = await compactedWorld();
+    expect(head.snapshot).not.toBeNull();
+    const p = head.snapshot!.position;
+    expect(head.base).toBe(p);
+    expect(head.refs.every((r) => r.position > p)).toBe(true);
+
+    const prefix = [...segments.values()].filter((g) => g.position <= p);
+    const parts = await w.snapshotParts(head);
+    const snapshot = entriesOf(parts);
+    expect(snapshot).toEqual(oracleFold(prefix));
+    // y was deleted before the snapshot: its tombstone is in it.
+    expect(snapshot.get(`${sName(0)}/${await idHash("y")}`)).toMatchObject({
+      kind: "delete",
+    });
+
+    // A reader that was behind the snapshot and holds y converges (P1).
+    expect((await b.records()).some((r) => r.includes('"id":"y"'))).toBe(true);
+    await b.cycle();
+    expect(await b.records()).toEqual(await a.records());
+    expect((await b.records()).some((r) => r.includes('"id":"y"'))).toBe(false);
+
+    // The mutant: the same snapshot with its deletions dropped. The same kind
+    // of reader keeps y, so it no longer equals the caught-up reader.
+    for (const part of parts)
+      await applySnapshotPart(m.deps, CONNECTION_ID, {
+        ...part,
+        entries: part.entries.filter((e) => e.kind === "upsert"),
+      });
+    for (const position of [...segments.keys()].sort((x, y) => x - y))
+      if (position > p)
+        await applySegmentOperations(
+          m.deps,
+          CONNECTION_ID,
+          segments.get(position)!,
+        );
+    const mutant = await m.records();
+    expect(mutant).not.toEqual(await a.records());
+    expect(mutant.some((r) => r.includes('"id":"y"'))).toBe(true);
+  });
+
+  it("P1: a reader at 0 installs the snapshot and the tail, and equals a caught-up reader", async () => {
+    const { w, a, head } = await compactedWorld();
+    const c = await w.device("c");
+    await c.cycle();
+    expect(await c.records()).toEqual(await a.records());
+    expect(await c.position()).toBe(head.position);
+
+    // It fetched the snapshot's parts and only the segments after the base.
+    const keys = await w.segmentKeys();
+    const folded = [...keys].filter(([position]) => position <= head.base);
+    expect(folded.length).toBeGreaterThan(0);
+    expect(c.gets.some((k) => k.includes(`${LOG}/q-`))).toBe(true);
+    for (const [, key] of folded) expect(c.gets).not.toContain(key);
+    expect(c.gets.filter((k) => k.includes(`${LOG}/s-`))).toHaveLength(
+      head.position - head.base,
+    );
+  });
+
+  it("a compaction races a writer's commit: the compare-and-set on the head decides, and every device converges", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    let armed = false;
+    let raced = 0;
+    const b = await w.device("b");
+    const a = await w.device("a", true, {
+      beforePut: async (key) => {
+        if (!armed || !key.includes(`${LOG}/q-`)) return;
+        armed = false;
+        raced++;
+        // Another writer commits at the position `a` is about to take.
+        await b.run("run-b", [{ stream: sName(1), id: "from-b" }], {
+          full: false,
+          covered: [sName(1)],
+          observedAt: 9000,
+        });
+        await b.cycle();
+      },
+    });
+    await a.run("run-1", [{ stream: sName(0), id: "x", v: 0 }], {
+      observedAt: 1100,
+    });
+    await a.cycle();
+    await b.cycle();
+    for (let i = 0; !(await compactionDue(a)); i++) {
+      expect(i).toBeLessThan(60);
+      await grow(a, 1, i);
+    }
+    const before = Math.max(...(await w.segments()).keys());
+    armed = true;
+    await a.run("run-a", [{ stream: sName(0), id: "x", v: 99 }], {
+      full: false,
+      covered: [sName(0)],
+      observedAt: 9500,
+    });
+    await a.cycle();
+    expect(raced).toBe(1); // `a` built its compaction and uploaded its parts
+
+    // `a` also PUT a segment for position before+1 before it lost the compare-
+    // and-set; that blob is an orphan. The chain is what the final head's refs
+    // name, not every blob in the store.
+    const all = await w.segments();
+    const loser = all.get(before + 2)!;
+    const winnerRef = loser.refs.find((r) => r.position === before + 1)!;
+    const winner = decodeSegment(
+      (await w.innerBlobs.get(`${LOG}/s-${winnerRef.dataHash.slice(2)}`))!,
+    );
+    if (winner.kind !== "ok") throw new Error("winner did not decode");
+    const won = winner.segment;
+    expect(Math.max(...all.keys())).toBe(before + 2);
+    expect(won.operations.some((o) => o.stream === sName(1))).toBe(true);
+    expect(loser.operations.some((o) => o.stream === sName(1))).toBe(false);
+    // Both sides folded the same prefix, so both name the same snapshot, and
+    // no other compaction exists in the chain.
+    expect(won.snapshot?.position).toBe(before);
+    expect(loser.base).toBe(before);
+    expect(loser.snapshot).toEqual(won.snapshot);
+    expect(loser.refs.map((r) => r.position)).toEqual([before + 1]);
+
+    await b.cycle();
+    const c = await w.device("c");
+    await c.cycle();
+    const records = await a.records();
+    expect(await b.records()).toEqual(records);
+    expect(await c.records()).toEqual(records);
+    expect(records).toContain(`${sName(0)}/x={"id":"x","v":99}`);
+    expect(records.some((r) => r.includes("from-b"))).toBe(true);
+  });
+});
+
+describe("log protocol: size splitting", () => {
+  it("a batch over the part target is written as several whole segments, in order, in rounds", async () => {
+    const target = 3000;
+    const w = await world({
+      streams: 6,
+      logProtocol: true,
+      partTargetBytes: target,
+    });
+    const reader = await w.device("reader");
+    let segmentPuts = 0;
+    let midway: string[] | null = null;
+    let midwayPosition = -1;
+    const a = await w.device("a", true, {
+      beforePut: async (key) => {
+        if (!key.includes(`${LOG}/s-`) || ++segmentPuts !== 2) return;
+        // Segment 1 is committed and segment 2 is not: a reader here sees
+        // exactly one whole segment.
+        await reader.cycle();
+        midway = await reader.records();
+        midwayPosition = await reader.position();
+      },
+    });
+    const records = Array.from({ length: 6 }, (_, i) => [
+      { stream: sName(i), id: `r${i}-1`, pad: 500 },
+      { stream: sName(i), id: `r${i}-2`, pad: 500 },
+    ]).flat();
+    await a.run("run-1", records);
+    await a.cycle();
+
+    const segments = await w.segments();
+    const positions = [...segments.keys()].sort((x, y) => x - y);
+    expect(positions.length).toBeGreaterThan(2);
+    expect(positions).toEqual(positions.map((_, i) => i + 1));
+    expect(await a.position()).toBe(positions.length);
+    expect(w.writes().batches).toBe(positions.length);
+    // One commit per segment, at consecutive versions.
+    expect(
+      w.gateway.batches().map((b) => b.body.rows.map((r) => r.expectedVersion)),
+    ).toEqual(positions.map((p) => [String(p)]));
+
+    // Streams go in order, each in exactly one segment, none split.
+    const order = positions.flatMap((p) =>
+      segments.get(p)!.streams.map((m) => m.stream),
+    );
+    expect(order).toEqual(w.names);
+    for (const p of positions) {
+      const g = segments.get(p)!;
+      expect(g.streams.length).toBeLessThan(6);
+      for (const m of g.streams)
+        expect(
+          g.operations.filter(
+            (o) => o.kind === "upsert" && o.stream === m.stream,
+          ),
+        ).toHaveLength(2);
+    }
+
+    // Mid-way, the reader had position 1 and exactly segment 1's records.
+    const first = segments.get(1)!;
+    expect(midwayPosition).toBe(1);
+    expect(midway).toEqual(
+      first.operations
+        .flatMap((o) =>
+          o.kind === "upsert"
+            ? [
+                `${o.stream}/${(o.value as { id: string }).id}=${JSON.stringify(o.value)}`,
+              ]
+            : [],
+        )
+        .sort(),
+    );
+    await reader.cycle();
+    expect(await reader.records()).toEqual(await a.records());
+    expect(await reader.records()).toHaveLength(12);
+    expect(await reader.position()).toBe(positions.length);
+  });
+});
+
+describe("log protocol: attachments", () => {
+  const bytes = new Uint8Array(5000).fill(7);
+  const hash = Buffer.from(sha256(bytes)).toString("hex");
+
+  it("a blob uploaded with a log-mode publish is readable on another device", async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    const a = await w.device("a");
+    const b = await w.device("b");
+    await a.run(
+      "run-1",
+      [{ stream: sName(0), id: "m", blobId: `sha256:${hash}` }],
+      {
+        blob: { hash, bytes },
+      },
+    );
+    await a.cycle();
+    const key = `${streamScope(CONNECTOR, "", sName(0))}/g1-b-${hash}`;
+    expect(a.puts).toContain(key);
+    // The blob went up before the segment that names its record.
+    expect(a.puts.indexOf(key)).toBeLessThan(
+      a.puts.findIndex((k) => k.includes(`${LOG}/s-`)),
+    );
+    await b.cycle();
+    expect(new Uint8Array((await b.sync.blobs.get(hash))!.bytes)).toEqual(
+      bytes,
+    );
+  });
+
+  it("bytes that arrive after their records were published are uploaded by the next pass", async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    const a = await w.device("a");
+    const b = await w.device("b");
+    await a.run("run-1", [
+      { stream: sName(0), id: "m", blobId: `sha256:${hash}` },
+    ]);
+    await a.cycle();
+    await b.cycle();
+    expect(await b.sync.blobs.get(hash)).toBeNull();
+    await a.sync.blobs.put({
+      runId: "run-1",
+      sha256: hash,
+      mimeType: "application/octet-stream",
+      bytes,
+    });
+    await a.cycle();
+    expect(w.writes().batches).toBe(1); // no new segment: the records are unchanged
+    expect(new Uint8Array((await b.sync.blobs.get(hash))!.bytes)).toEqual(
+      bytes,
+    );
+  });
 });

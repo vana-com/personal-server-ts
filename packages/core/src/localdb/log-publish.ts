@@ -30,9 +30,9 @@
 // cleaned up with the same helpers publish uses, and the round starts over;
 // runs it cannot order yet (deferred) hold only their own stream.
 //
-// Not built here: compaction. A head whose ref list reaches the bound
-// (`compactionRequired`) stops publishing (outcome "deferred", logged) until a
-// snapshot can fold the log.
+// Compaction rides the batch's own commit (log-compact.ts): when the cost rule
+// or the head's bound says so, the segment carries a snapshot pointer, a new
+// `base`, and no refs at or below it.
 
 import { keccak_256 } from "@noble/hashes/sha3";
 import {
@@ -53,6 +53,7 @@ import {
   type LogStreamMeta,
   type Segment,
   type SegmentRef,
+  type SnapshotPointer,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { type StreamSyncRegistry } from "../stream-sync/ports.js";
 import { sameHead } from "../stream-sync/publish-plan.js";
@@ -61,6 +62,7 @@ import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 import { settleRequirementFailure, settleRow } from "./batch-commit.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
+import { planCompaction } from "./log-compact.js";
 import { readLogState, writeLogState, type LogState } from "./log-apply.js";
 import {
   replaceDelete,
@@ -119,6 +121,15 @@ type Planned = {
 type Candidate = {
   readonly basis: string;
   readonly state: LogState;
+  /** What the segment carries: after a compaction, `base` is the folded position and `refs` is empty. */
+  readonly base: number;
+  readonly refs: readonly SegmentRef[];
+  readonly snapshot: SnapshotPointer | null;
+  /** Snapshot part objects to upload before the segment. */
+  readonly snapshotParts: readonly {
+    readonly name: string;
+    readonly cipher: Uint8Array;
+  }[];
   readonly position: number;
   readonly generation: number;
   readonly dataHash: `0x${string}`;
@@ -133,7 +144,12 @@ type Candidate = {
 };
 
 type Snapshot =
-  | { readonly kind: "done"; readonly results: PublishResult[] }
+  | {
+      readonly kind: "done";
+      readonly results: PublishResult[];
+      /** Attachments to upload even though no segment is committed. */
+      readonly attachments?: readonly BlobDescriptor[];
+    }
   | { readonly kind: "retry" }
   | { readonly kind: "candidate"; readonly candidate: Candidate };
 
@@ -169,11 +185,12 @@ export async function publishLog(
   for (;;) {
     const turn = await deps.queue.run(connectionId, "publish", async () => {
       const held = insideQueue(deps, connectionId);
-      const snapshot = await snapshotRound(held, connectionId);
-      if (snapshot.kind !== "candidate") return snapshot;
-      return { kind: "candidate" as const, candidate: snapshot.candidate };
+      return snapshotRound(held, connectionId);
     });
     if (turn.kind === "done") {
+      // Bytes that arrived after their records were published still go up.
+      if (turn.attachments && turn.attachments.length > 0)
+        await uploadBlobs(deps, turn.attachments);
       keep(turn.results);
       break;
     }
@@ -190,6 +207,12 @@ export async function publishLog(
     if (candidate.attachments.length > 0)
       await uploadBlobs(deps, candidate.attachments);
     const scope = await logScopeOf(deps, connectionId);
+    // Snapshot parts, then the segment that names them.
+    await Promise.all(
+      candidate.snapshotParts.map((part) =>
+        deps.blobs.put(`${scope}/${part.name}`, part.cipher),
+      ),
+    );
     await deps.blobs.put(`${scope}/${candidate.blobName}`, candidate.cipher);
 
     const committed = await deps.queue.run(connectionId, "publish", () =>
@@ -400,34 +423,64 @@ async function snapshotRound(
       planned.push({ ...base, runIds: base.runIds });
       continue;
     }
-    // Items in order, until the target; a replacing stream goes whole.
+    // Changes go in the order they were made, until the segment reaches the
+    // part target, measured on the operations themselves. A stream that
+    // replaces goes whole (its completion and its changes are one unit), but
+    // still waits for the next round if the segment is full. The first thing
+    // in a segment always goes, however large, so a round always progresses.
+    const room = (size: number) => first || budget + size <= target;
     const atomic = replace !== null;
     const selected: { pk: string; seq: number }[] = [];
-    let bytes = 100 + omitted.length * 70;
+    const taken: LogOperation[] = [];
+    let bytes = omitted.length * 70 + 100;
     let rest = false;
-    for (const group of groups) {
-      if (!atomic && !first && budget + bytes >= target) {
-        rest = true;
-        break;
+    if (atomic) {
+      const found = await operationsFor(
+        held,
+        connectionId,
+        stream,
+        groups.map((g) => g.pk),
+        row.publish_watermark,
+        watermark,
+      );
+      const size =
+        bytes + [...found.values()].reduce((n, op) => n + opSize(op), 0);
+      if (!room(size)) {
+        planned.push({ ...base, ack: row.publish_watermark, rest: true });
+        continue;
       }
-      selected.push(group);
-      bytes += 200;
-      first = false;
+      selected.push(...groups);
+      taken.push(...found.values());
+      bytes = size;
+    } else {
+      scan: for (const batch of chunked(groups, KEYS_PER_QUERY)) {
+        const found = await operationsFor(
+          held,
+          connectionId,
+          stream,
+          batch.map((g) => g.pk),
+          row.publish_watermark,
+          watermark,
+        );
+        for (const group of batch) {
+          const op = found.get(group.pk);
+          const size = op ? opSize(op) : 0;
+          if (!room(bytes + size)) {
+            rest = true;
+            break scan;
+          }
+          selected.push(group);
+          if (op) taken.push(op);
+          bytes += size;
+          first = false;
+        }
+      }
+      if (selected.length === 0 && groups.length > 0) {
+        planned.push({ ...base, ack: row.publish_watermark, rest: true });
+        continue;
+      }
     }
-    if (selected.length === 0 && groups.length > 0) {
-      planned.push({ ...base, ack: row.publish_watermark, rest: true });
-      continue;
-    }
-    const ops = await operationsFor(
-      held,
-      connectionId,
-      stream,
-      selected.map((g) => g.pk),
-      row.publish_watermark,
-      watermark,
-    );
-    const opBytes = ops.reduce((sum, op) => sum + opSize(op), 0);
-    budget += opBytes + omitted.length * 70;
+    budget += bytes;
     first = false;
     const ack = rest ? selected.at(-1)!.seq : watermark;
     planned.push({
@@ -436,7 +489,7 @@ async function snapshotRound(
       rest,
       ack,
       operations: [
-        ...ops,
+        ...orderedOperations(taken),
         ...(replace
           ? [
               {
@@ -456,9 +509,8 @@ async function snapshotRound(
       },
       replace,
       omitted,
-      bytes: opBytes,
+      bytes,
     });
-    if (budget >= target) first = false;
   }
 
   const included = planned.filter((p) => p.included);
@@ -468,6 +520,19 @@ async function snapshotRound(
       outcome: outcomeFor(p),
       watermark: p.watermark,
     }));
+  // Attachments named by any stream's records, published or not yet: bytes can
+  // arrive after the records that name them were published.
+  const attachments: BlobDescriptor[] = [];
+  for (const p of planned)
+    if (!p.plan.deferred)
+      attachments.push(
+        ...(await listStreamBlobs(held, {
+          connectionId,
+          stream: p.stream,
+          scope: streamScope(connection.connector, connection.ns, p.stream),
+          generation: connection.generation,
+        })),
+      );
   if (included.length === 0) {
     // Nothing to publish. Record that every covered run was already saved by
     // what the log holds, move the watermarks, and compact.
@@ -475,13 +540,28 @@ async function snapshotRound(
     return {
       kind: "done",
       results: settle((p) => (p.plan.deferred ? "deferred" : "noop")),
+      attachments,
     };
   }
 
-  if (compactionRequired(log.refs.length)) {
+  const scope = logScope(connection.connector, connection.ns);
+  // The log is folded into a snapshot when that is cheaper than replaying it
+  // (or it is at the head's bound), and this segment carries the result.
+  const compaction = await planCompaction(held, {
+    connector: connection.connector,
+    ns: connection.ns,
+    generation: connection.generation,
+    keyCheck,
+    scope,
+    log,
+  });
+  const base = compaction ? log.position : log.base;
+  const refs = compaction ? [] : log.refs;
+  const snapshot = compaction ? compaction.snapshot : log.snapshot;
+  if (compactionRequired(refs.length, snapshot?.parts.length ?? 0)) {
     held.logger.warn(
-      { connectionId, refs: log.refs.length },
-      "stream sync: the log needs compaction before it can take another segment",
+      { connectionId, refs: refs.length, parts: snapshot?.parts.length ?? 0 },
+      "stream sync: the log head is full even after compaction",
     );
     return all("deferred");
   }
@@ -498,15 +578,14 @@ async function snapshotRound(
     keyCheck,
     position,
     observedAt: observedAt || held.now(),
-    base: log.base,
-    snapshot: null,
-    refs: log.refs,
+    base,
+    snapshot,
+    refs,
     streams: included.map((p) => p.meta!),
     operations: included.flatMap((p) => p.operations),
   };
   const clear = encodeSegment(segment);
   const { dataHash, blobName } = await digestSegment(keccak, clear);
-  const scope = logScope(connection.connector, connection.ns);
   // A segment that would not verify is never uploaded or posted.
   const verified = await verifySegment(keccak, clear, {
     dataHash,
@@ -520,22 +599,15 @@ async function snapshotRound(
       `publish: the log segment failed verification: ${verified.kind}`,
     );
   const cipher = await held.keys.encrypt(scope, clear);
-  const attachments: BlobDescriptor[] = [];
-  for (const p of included)
-    if (p.operations.some((op) => op.kind === "upsert"))
-      attachments.push(
-        ...(await listStreamBlobs(held, {
-          connectionId,
-          stream: p.stream,
-          scope: streamScope(connection.connector, connection.ns, p.stream),
-          generation: connection.generation,
-        })),
-      );
   return {
     kind: "candidate",
     candidate: {
       basis: await basisOf(held, connectionId, planned, log),
       state: log,
+      base,
+      refs,
+      snapshot,
+      snapshotParts: compaction?.parts ?? [],
       position,
       generation: connection.generation,
       dataHash,
@@ -654,8 +726,8 @@ async function operationsFor(
   keys: readonly string[],
   from: number,
   to: number,
-): Promise<LogOperation[]> {
-  const ops: LogOperation[] = [];
+): Promise<Map<string, LogOperation>> {
+  const ops = new Map<string, LogOperation>();
   for (const group of chunked(keys, KEYS_PER_QUERY)) {
     const marks = group.map(() => "?").join(",");
     const rows = await deps.db.query<{
@@ -671,7 +743,7 @@ async function operationsFor(
     );
     const held = new Set(rows.map((row) => row.pk_hash));
     for (const row of rows)
-      ops.push({
+      ops.set(row.pk_hash, {
         kind: "upsert",
         stream,
         pkHash: row.pk_hash,
@@ -694,14 +766,19 @@ async function operationsFor(
       [connectionId, stream, from, to, ...gone],
     );
     for (const row of deletes)
-      ops.push({
+      ops.set(row.pk_hash, {
         kind: "delete",
         stream,
         pkHash: row.pk_hash,
         stamp: { o: row.stamp_o, r: row.stamp_r },
       });
   }
-  return ops.sort(
+  return ops;
+}
+
+/** Upserts, then deletes, each by key: one order for every writer. */
+function orderedOperations(ops: readonly LogOperation[]): LogOperation[] {
+  return [...ops].sort(
     (a, b) =>
       (a.kind === "upsert" ? 0 : 1) - (b.kind === "upsert" ? 0 : 1) ||
       (a as { pkHash: string }).pkHash.localeCompare(
@@ -991,8 +1068,9 @@ async function commitRound(
   statements.push(
     writeLogState(connectionId, {
       position: candidate.position,
-      base: candidate.state.base,
-      refs: [...candidate.state.refs, newRef],
+      base: candidate.base,
+      refs: [...candidate.refs, newRef],
+      snapshot: candidate.snapshot,
     }),
     ...(await compaction(held, connectionId, candidate.planned)),
   );
