@@ -187,6 +187,35 @@ describe("Lite database intake", () => {
     await collect(lite.streamSyncIntake!, "lite-wake", "item", 1000);
     expect(wake).toHaveBeenCalledTimes(1);
   });
+  it("a subscriber taken before the database opens hears the sync manager's applies, and an idle cycle is silent", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        throw new Error("unexpected legacy or gateway fetch");
+      }),
+    );
+    let mode: "unknown" | "unswitched" | "switched" = "unknown";
+    const { lite, node, openDriver } = await fixture(() => mode);
+    const heard: string[][] = [];
+    const unsubscribe = lite.viewChanges.subscribe((change) =>
+      heard.push([...change.connectionIds]),
+    );
+    expect(openDriver).not.toHaveBeenCalled();
+    mode = "switched";
+    await lite.getLocalSync();
+    await new Promise((r) => setTimeout(r, 20));
+    await collect(node.intake, "node-run", "from-node", 2000);
+    await node.cycle();
+    await lite.syncManager.trigger();
+    expect(heard).toEqual([[id]]);
+    await lite.syncManager.trigger(); // nothing changed anywhere
+    expect(heard).toEqual([[id]]);
+    unsubscribe();
+    await collect(node.intake, "node-run-2", "again", 3000);
+    await node.cycle();
+    await lite.syncManager.trigger();
+    expect(heard).toEqual([[id]]);
+  });
   it("unknown and explicit Off never open a database or fall back to writer files", async () => {
     let mode: "unknown" | "unswitched" | "switched" = "unknown";
     const { lite, openDriver } = await fixture(() => mode);

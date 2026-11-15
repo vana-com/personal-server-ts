@@ -1,4 +1,8 @@
-export type { PublicationReceipt } from "@opendatalabs/personal-server-ts-core/localdb";
+export type {
+  PublicationReceipt,
+  ViewChange,
+  ViewChangeListener,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 export {
   createIndexedDbPsLiteRuntime,
   type IndexedDbPsLiteRuntime,

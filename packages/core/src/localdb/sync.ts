@@ -19,6 +19,7 @@ import { createBlobStore, type BlobStore } from "./blobs.js";
 import { runCycle, syncConnection, type CycleReport } from "./cycle.js";
 import { createConnectionDeleter, type ConnectionDeleter } from "./delete.js";
 import type { LocalSyncDeps } from "./deps.js";
+import { createViewChanges, type ViewChanges } from "./view-changes.js";
 import { readerOf } from "./driver.js";
 import { createLocalHistory, type LocalHistory } from "./history.js";
 import { createLocalListing, type LocalListing } from "./listing.js";
@@ -57,6 +58,13 @@ export interface LocalSync {
   syncConnection(
     connectionId: string,
   ): Promise<CycleReport["connections"][number]>;
+  /**
+   * Announces each change of the view this database serves: records applied,
+   * purged or deleted, connections added or removed, control state moved.
+   * One call per operation that changed something; none for an operation that
+   * changed nothing.
+   */
+  readonly viewChanges: ViewChanges;
   close(): Promise<void>;
 }
 
@@ -65,7 +73,7 @@ const RESUME_RETRY_FIRST_MS = 5_000;
 const RESUME_RETRY_MAX_MS = 5 * 60_000;
 
 export function createLocalSync(
-  deps: LocalSyncDeps,
+  hostDeps: LocalSyncDeps,
   options: {
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
@@ -80,6 +88,9 @@ export function createLocalSync(
     readonly deleteRetryMs?: { readonly first: number; readonly max: number };
   },
 ): LocalSync {
+  const views = hostDeps.viewChanges ?? createViewChanges();
+  const deps: LocalSyncDeps = { ...hostDeps, viewChanges: views };
+  views.bind(deps);
   const retryFirst = options.deleteRetryMs?.first ?? RESUME_RETRY_FIRST_MS;
   const retryMax = options.deleteRetryMs?.max ?? RESUME_RETRY_MAX_MS;
   let intakeStore: ReturnType<typeof createRunIntakeStore> | undefined;
@@ -214,7 +225,7 @@ export function createLocalSync(
     retryTimer.unref?.();
   };
   const resume = async () => {
-    const pending = await deletes().resumeDeletes();
+    const pending = await views.observe(deps, () => deletes().resumeDeletes());
     if (pending.length > 0) armRetry();
     else {
       if (retryTimer) clearTimeout(retryTimer);
@@ -225,7 +236,9 @@ export function createLocalSync(
   };
   const deleter: ConnectionDeleter = {
     async requestConnectionDelete(connector) {
-      const result = await deletes().requestConnectionDelete(connector);
+      const result = await views.observe(deps, () =>
+        deletes().requestConnectionDelete(connector),
+      );
       // Its landing runs in the background; check back whether it landed.
       armRetry();
       return result;
@@ -262,16 +275,19 @@ export function createLocalSync(
       await resume();
       return runCycle(deps);
     },
-    async apply() {
-      await resume();
-      for (const connection of await bootstrapConnections(deps)) {
-        await applyConnection(deps, connection.connectionId);
-      }
+    apply() {
+      return views.observe(deps, async () => {
+        await resume();
+        for (const connection of await bootstrapConnections(deps)) {
+          await applyConnection(deps, connection.connectionId);
+        }
+      });
     },
     async syncConnection(connectionId) {
       await resume();
       return syncConnection(deps, connectionId);
     },
+    viewChanges: views,
     close: () => {
       closed = true;
       clearTimeout(retryTimer);

@@ -354,10 +354,12 @@ describe("local sync intake adapter", () => {
     ports.connection.mockResolvedValue(connection);
     expect(await sync.cycle()).toBe(report);
     expect(ports.cycle).toHaveBeenCalledTimes(1);
-    expect(ports.cycle).toHaveBeenCalledWith(deps);
+    // The facade adds the view-change recorder to the deps it passes on.
+    const passed = { ...deps, viewChanges: expect.anything() };
+    expect(ports.cycle).toHaveBeenCalledWith(passed);
     expect(await sync.syncConnection("c")).toBe(connection);
     expect(ports.connection).toHaveBeenCalledTimes(1);
-    expect(ports.connection).toHaveBeenCalledWith(deps, "c");
+    expect(ports.connection).toHaveBeenCalledWith(passed, "c");
     expect(vi.getTimerCount()).toBe(0);
   });
 });

@@ -13,10 +13,12 @@ import {
   createLocalSync,
   createLocalSeed,
   createSeedIntake,
+  createViewChanges,
   type LocalSyncDeps,
   type SeedIntake,
   type LocalSync,
   type SqlDriver,
+  type ViewChanges,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import { openLiteLocalDb, type LiteLocalDbOptions } from "./localdb-port.js";
 import {
@@ -391,6 +393,8 @@ export async function createPsLiteSyncManager(
   syncManager: SyncManager;
   /** Database-backed facade, or null when the host cannot open it. */
   localSync?: LocalSync | null;
+  /** Changes of the local view; see `IndexedDbPsLiteRuntime.subscribeViewChanges`. */
+  viewChanges: ViewChanges;
   additions?: DurableAdditionsService;
   serverOwner: `0x${string}`;
   dataPointFeed: DataPointFeedPort;
@@ -560,6 +564,8 @@ export async function createPsLiteSyncManager(
   };
   let localDb: SqlDriver | null = null;
   let localSync: LocalSync | null = null;
+  // Built before the database opens, so a subscriber never waits for it.
+  const viewChanges = createViewChanges();
   let localSyncDeps: LocalSyncDeps | null = null;
   async function closeDatabase() {
     if (localSync) await localSync.close();
@@ -615,6 +621,7 @@ export async function createPsLiteSyncManager(
           now: Date.now,
           newOp: () => globalThis.crypto.randomUUID(),
           recordsCommitted: () => syncManager?.notifyNewData(),
+          viewChanges,
           partTargetBytes: LITE_PART_TARGET_BYTES,
         };
         localSync = createLocalSync(localSyncDeps, {
@@ -764,6 +771,7 @@ export async function createPsLiteSyncManager(
       get localSync() {
         return localSync;
       },
+      viewChanges,
       getLocalSync,
       additions,
       serverOwner,
