@@ -904,21 +904,27 @@ describe("view changes", () => {
       "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'view\\_%' ESCAPE '\\'",
     );
     expect(added.length).toBeGreaterThan(0);
-    // The view counters' migration, found by what it creates; the database is
-    // put back to just before it.
-    const viewCounters = MIGRATIONS.findIndex((m) =>
-      m.some((sql) => sql.includes("CREATE TABLE view_versions")),
+    // The view counters came with one migration; the build before it had none
+    // of that migration or of any after it (the log's tables are later).
+    const viewMigration = MIGRATIONS.findIndex((statements) =>
+      statements.some((sql) => sql.includes("CREATE TABLE view_versions")),
     );
-    expect(viewCounters).toBeGreaterThan(0);
+    expect(viewMigration).toBeGreaterThan(0);
     await raw.batch([
       ...added.map((t) => ({ sql: `DROP TRIGGER ${t.name}` })),
       { sql: "DROP TABLE view_versions" },
-      // Every migration after the view counters comes back with them: its
-      // table or column goes, and the upgrade makes it again.
-      { sql: "DROP TABLE partial_hidden" },
-      { sql: "DROP TABLE stream_partial" },
+      // Later migrations add the apply_partial column and the log's tables.
       { sql: "ALTER TABLE connections DROP COLUMN apply_partial" },
-      { sql: `PRAGMA user_version = ${viewCounters}` },
+      // A later migration's trigger can sit on a table that stays.
+      ...MIGRATIONS.slice(viewMigration + 1)
+        .flat()
+        .flatMap((sql) => /^CREATE TRIGGER (\w+)/.exec(sql)?.[1] ?? [])
+        .map((trigger) => ({ sql: `DROP TRIGGER IF EXISTS ${trigger}` })),
+      ...MIGRATIONS.slice(viewMigration + 1)
+        .flat()
+        .flatMap((sql) => /^CREATE TABLE (\w+)/.exec(sql)?.[1] ?? [])
+        .map((table) => ({ sql: `DROP TABLE ${table}` })),
+      { sql: `PRAGMA user_version = ${viewMigration}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");
 

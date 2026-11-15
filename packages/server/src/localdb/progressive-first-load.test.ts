@@ -48,7 +48,10 @@ type Head = Awaited<
   ReturnType<Awaited<ReturnType<typeof remoteFixture>>["head"]>
 >;
 
-async function harness(options: { progressive: boolean }) {
+async function harness(options: {
+  progressive: boolean;
+  logProtocol?: boolean;
+}) {
   const views = createViewChanges();
   const raw = await openLocalDb(openBetterSqlite3(":memory:"), {
     owner: "0xabc",
@@ -77,6 +80,7 @@ async function harness(options: { progressive: boolean }) {
     now: () => 1000,
     newOp: () => `progressive-${++op}`,
     progressiveFirstLoad: options.progressive,
+    ...(options.logProtocol ? { logProtocol: true } : {}),
   };
   const id = remote.control;
   await db.batch([
@@ -839,6 +843,81 @@ describe("a load that stops partway", () => {
     expect(await count(f, "stream_partial")).toBe(0);
     expect(await count(f, "partial_hidden")).toBe(0);
     expect((await f.read()).ids).toEqual(["b", "d", "e"]);
+  });
+});
+
+describe("with the log protocol", () => {
+  it("on, a connection with no log still loads progressively", async () => {
+    const f = await harness({ progressive: true, logProtocol: true });
+    const h = await f.remote.head("items", values(["a", "b", "c"]));
+    const two = f.hold(h, 1);
+    const applying = applyConnection(f.deps, f.id);
+    await f.until(1);
+    const view = await f.read();
+    expect(view.ids).toHaveLength(1);
+    expect(view.partial).toMatchObject({ partsApplied: 1, partsTotal: 3 });
+    two.release();
+    await applying;
+    expect((await f.read()).ids).toEqual(["a", "b", "c"]);
+    expect(await f.partialRows()).toEqual([]);
+  });
+
+  it("on, a connection that has a log is not loaded progressively: the log can change what a head holds", async () => {
+    const f = await harness({ progressive: true, logProtocol: true });
+    await f.db.batch([
+      {
+        sql: "INSERT INTO log_state (connection_id, position, base, refs, snapshot) VALUES (?, 0, 0, '[]', NULL)",
+        params: [f.id],
+      },
+    ]);
+    const h = await f.remote.head("items", values(["a", "b", "c"]));
+    const two = f.hold(h, 1);
+    const applying = applyConnection(f.deps, f.id);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(await f.partialRows()).toEqual([]);
+    // The read waits for the whole apply, as a flag-off read does.
+    const settled = vi.fn();
+    const reading = f.read().then((view) => {
+      settled();
+      return view;
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    expect(settled).not.toHaveBeenCalled();
+    two.release();
+    await applying;
+    const view = await reading;
+    expect(view.ids).toEqual(["a", "b", "c"]);
+    expect(view.partial).toBeUndefined();
+  });
+
+  it("whichever path completes a stream ends its load row and hidden list", async () => {
+    const f = await harness({ progressive: true });
+    await f.remote.head("items", values(["a", "b", "c"]), {
+      complete: false,
+      o: 50,
+    });
+    await applyConnection(f.deps, f.id);
+    const next = await f.remote.head("items", values(["b", "d", "e"]), {
+      version: 2,
+    });
+    const last = `${next.scope}/${partBlobName(1, next.parts[2]!.hash)}`;
+    f.remote.blobs.delete(last);
+    await expect(applyConnection(f.deps, f.id)).rejects.toThrow();
+    const count = async (table: string) =>
+      (
+        await f.db.query<{ n: number }>(`SELECT count(*) AS n FROM ${table}`)
+      )[0]!.n;
+    expect(await count("stream_partial")).toBe(1);
+    expect(await count("partial_hidden")).toBeGreaterThan(0);
+    // What the log's apply does to a stream it finishes.
+    await f.db.batch([
+      {
+        sql: "UPDATE stream_state SET complete = 1, head_version = head_version + 1 WHERE connection_id = ? AND stream = 'items'",
+        params: [f.id],
+      },
+    ]);
+    expect(await count("stream_partial")).toBe(0);
+    expect(await count("partial_hidden")).toBe(0);
   });
 });
 
