@@ -332,19 +332,15 @@ describe("a transfer reads the spool the snapshot made", () => {
       await f.db.query<{ n: number }>("SELECT count(*) AS n FROM publish_spool")
     )[0]!.n;
 
-  it("encodes the same parts whether the stream fits one page or spans many", async () => {
+  it("reads every row once, in key order, across several windows of row sizes", async () => {
     const f = await fresh();
-    await f.insert(
-      Array.from({ length: 150 }, (_, i) => ({
-        k: String(i).padStart(3, "0").padEnd(64, "0"),
-      })),
-    );
+    // 4,200 rows are two full windows of 2,048 sizes and a partial third.
+    const key = (i: number) => String(i).padStart(4, "0").padEnd(64, "0");
+    await f.insert(Array.from({ length: 4200 }, (_, i) => ({ k: key(i) })));
     const parts = await upload(f, await frozen(f));
-    expect(parts.reduce((n, part) => n + part.count, 0)).toBe(150);
+    expect(parts.reduce((n, part) => n + part.count, 0)).toBe(4200);
     expect((await f.read(parts)).map((row) => row.k)).toEqual(
-      Array.from({ length: 150 }, (_, i) =>
-        String(i).padStart(3, "0").padEnd(64, "0"),
-      ),
+      Array.from({ length: 4200 }, (_, i) => key(i)),
     );
   });
 

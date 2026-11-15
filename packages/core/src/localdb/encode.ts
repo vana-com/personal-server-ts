@@ -145,11 +145,12 @@ export class FrozenRowsChanged extends Error {
 }
 
 /**
- * A transfer page holds at most this many rows and, when two or more rows
- * fit, at most `PAGE_BYTES` of bodies. A row larger than that is a page of
- * its own: one body is the floor, because a body is encoded whole.
+ * A transfer page holds at most `PAGE_BYTES` of bodies when two or more rows
+ * fit. A row larger than that is a page of its own: one body is the floor,
+ * because a body is encoded whole. Row sizes are read `META_ROWS` at a time
+ * and cut into pages; a page also holds at most `META_ROWS` rows.
  */
-const PAGE_ROWS = 64;
+const META_ROWS = 2048;
 const PAGE_BYTES = 2 * 1024 * 1024;
 
 /** The byte target a part is cut at: `deps.partTargetBytes`, default 4 MiB. */
@@ -308,8 +309,8 @@ type SpoolRow = Omit<FrozenRow, "body"> & { readonly body: string };
 /**
  * Read one prefix of the frozen rows in key order, from the attempt's spool or
  * from a frozen view of `records`. A page is found by metadata first (key and
- * body size, no body), cut at `PAGE_ROWS` rows or `PAGE_BYTES` of bodies (at
- * least one row), and only then are its bodies read. Neither source changes
+ * body size, no body, `META_ROWS` rows at a time), cut at `PAGE_BYTES` of
+ * bodies (at least one row), and only then are its bodies read. Neither source changes
  * while the attempt runs, so a range read returns exactly the rows the
  * metadata named; fewer means the spool was emptied under the transfer.
  */
@@ -345,26 +346,38 @@ async function* readFrozen(
     size = "body_bytes";
     scopeParams = [source.attempt];
   }
-  let after: string | null = null;
+  let meta: { pk_hash: string; body_bytes: number }[] = [];
+  let at = 0;
+  let more = true;
   for (;;) {
-    const meta: { pk_hash: string; body_bytes: number }[] = await reader.query(
-      `SELECT pk_hash, ${size} AS body_bytes FROM ${from}
-          WHERE ${scope}${range.sql}${after === null ? "" : " AND pk_hash > ?"}
-          ORDER BY pk_hash LIMIT ${PAGE_ROWS}`,
-      [...scopeParams, ...range.params, ...(after === null ? [] : [after])],
-    );
-    if (meta.length === 0) return;
+    if (at === meta.length) {
+      if (!more) return;
+      const after: string | undefined = meta[meta.length - 1]?.pk_hash;
+      meta = await reader.query(
+        `SELECT pk_hash, ${size} AS body_bytes FROM ${from}
+          WHERE ${scope}${range.sql}${after === undefined ? "" : " AND pk_hash > ?"}
+          ORDER BY pk_hash LIMIT ${META_ROWS}`,
+        [
+          ...scopeParams,
+          ...range.params,
+          ...(after === undefined ? [] : [after]),
+        ],
+      );
+      at = 0;
+      more = meta.length === META_ROWS;
+      if (meta.length === 0) return;
+    }
     let take = 0;
     let bytes = 0;
     while (
-      take < meta.length &&
-      (take === 0 || bytes + Number(meta[take]!.body_bytes) <= PAGE_BYTES)
+      at + take < meta.length &&
+      (take === 0 || bytes + Number(meta[at + take]!.body_bytes) <= PAGE_BYTES)
     ) {
-      bytes += Number(meta[take]!.body_bytes);
+      bytes += Number(meta[at + take]!.body_bytes);
       take += 1;
     }
-    const first = meta[0]!.pk_hash;
-    const last = meta[take - 1]!.pk_hash;
+    const first = meta[at]!.pk_hash;
+    const last = meta[at + take - 1]!.pk_hash;
     const page: SpoolRow[] = await reader.query(
       `SELECT pk_hash, stamp_o, stamp_r, first_o, body_sha256, body
          FROM ${from}
@@ -374,8 +387,7 @@ async function* readFrozen(
     );
     if (page.length !== take) throw new FrozenRowsChanged(prefix);
     yield page;
-    if (take === meta.length && meta.length < PAGE_ROWS) return;
-    after = last;
+    at += take;
   }
 }
 
