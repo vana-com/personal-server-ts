@@ -106,9 +106,16 @@ adopting a newer epoch, so monotonicity means the pair (epoch, position).
 | LostPush.cfg | PASS, even with no Deliver action | P2 full-check recovery and eventual convergence |
 | DropGap.cfg | FAIL P2 | skipped missing predecessors |
 | OutOfOrder.cfg | FAIL P2 | later segment applied first |
-| DropTombstone.cfg | FAIL P1 after snapshot+tail | P4 compaction must retain latest deletion |
+| DroppedDeleteEffect.cfg | FAIL P1 after snapshot+tail | snapshot built without delete operations |
+| ForgetTombstone.cfg | FAIL P1 via replay | correct delete, then snapshot forgets its tombstone; a later replayed upsert resurrects the key |
 | OmissionWithoutCutoff.cfg | FAIL P3 | newer observed row erased by old omission |
+| OmissionInclusive.cfg | FAIL P3 | omission at equal stamp erases an observation AT the cutoff (`<=` boundary) |
 | LamportDifference.cfg | FAIL StampEqualsLamport | P6 orders choose different winners |
+
+Corpus (batch 6): an equal-cutoff omission (key 1, stamp 5) meets the live
+stamp-5 row, and an older omission (key 2, stamp 1) sits below the live delete.
+Good requires the correct boundary: omission rejects `<`, so an observation AT
+the cutoff wins. Traces of each failing mutant are in `traces/`.
 
 P1 compares every caught-up replica with greatest-stamp reference state, not
 just replicas with each other. P2 records actual step-order and lexicographic
@@ -167,21 +174,27 @@ change.
 
 | Configuration | Expected | Actual | Distinct states | Depth | Wall time |
 | --- | --- | --- | --- | --- | --- |
-| Good.cfg | PASS | PASS: no error (95,264,783 generated) | 6,160,198 | 31 | 14 min 46 s |
-| LostPush.cfg | PASS | PASS: no error (50,450,693 generated) | 6,160,198 | 31 | 8 min 56 s |
-| DropGap.cfg | FAIL P2 | FAIL P2 as expected (`Invariant P2 is violated`) | 146 at failure | 6 | <1 s |
-| OutOfOrder.cfg | FAIL P2 | FAIL P2 as expected (`Invariant P2 is violated`) | 154 at failure | 6 | <1 s |
-| DropTombstone.cfg | FAIL P1 | FAIL P1 as expected (`Invariant P1 is violated`) | 2,883 at failure | 8 | <1 s |
-| OmissionWithoutCutoff.cfg | FAIL P3 | FAIL P3 as expected (`Invariant P3 is violated`) | 6,473 at failure | 9 | <1 s |
+| Good.cfg | PASS | BOUNDED: stopped at 20.3M distinct, no invariant error in explored states; EventuallyConverged not checked | at least 20,309,206 (partial) | n/a | 47 min 51 s, stopped |
+| LostPush.cfg | PASS | BFS COMPLETE, no invariant error (23,019,334 distinct, 0 left on queue); temporal check cut at bound | 23,019,334 | n/a | 46 min 7 s, stopped in temporal check |
+| DropGap.cfg | FAIL P2 | FAIL P2 as expected (`Invariant P2 is violated`) | 130 at failure | 6 | <1 s |
+| OutOfOrder.cfg | FAIL P2 | FAIL P2 as expected (`Invariant P2 is violated`) | 131 at failure | 6 | <1 s |
+| DroppedDeleteEffect.cfg | FAIL P1 | FAIL P1 as expected (`Invariant P1 is violated`) | 2,509 at failure | 8 | <1 s |
+| ForgetTombstone.cfg | FAIL P1 | FAIL P1 as expected; trace: Install, then replayed batch 5 resurrects key 2 | 16,135 at failure | 10 | 2 s |
+| OmissionWithoutCutoff.cfg | FAIL P3 | FAIL P3 as expected (`Invariant P3 is violated`) | 7,842 at failure | 9 | <1 s |
+| OmissionInclusive.cfg | FAIL P3 | FAIL P3 as expected; trace: stamp-5 omission erases the stamp-5 row | 45,443 at failure | 11 | <1 s |
 | LamportDifference.cfg | FAIL StampEqualsLamport | FAIL StampEqualsLamport as expected | 4 at failure | 3 | <1 s |
 
-For the FAIL rows, the distinct-state count is what TLC had reached when it
-stopped on the violation. It is not a full state-space size. The PASS rows
-completed their search (`0 states left on queue`). Good and LostPush report the
-same distinct-state count; I did not check why.
+Good and LostPush hit the bound before TLC finished (20M distinct states or 45
+min), so their PASS is not established. Good stopped with no invariant violation
+in its explored states; LostPush finished the state space with no invariant
+violation, and its liveness check did not finish. Earlier, under the 5-batch
+corpus, both completed (6,160,198 distinct states, depth 31); the batch-6
+corpus grew the space by roughly 3.7x (23.0M vs 6.16M).
 
-No config hit the bound (20M distinct states or 45 min). No trace was needed,
-because every result matched its expected outcome.
+For FAIL rows, the distinct-state count is what TLC had reached when it stopped
+on the violation. It is not a full state-space size. Counterexample traces for
+every failing mutant are in `traces/`. The `DroppedDeleteEffect` trace is the
+old `DropTombstone` mutant, renamed.
 
 These are the first TLC results for this model. They are a check of the finite
 abstraction only, within the scope limits above. They do not show a refinement

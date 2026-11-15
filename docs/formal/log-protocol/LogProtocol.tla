@@ -3,7 +3,8 @@ EXTENDS Naturals, Integers, Sequences, FiniteSets, TLC
 CONSTANTS MaxSteps, Mode, AllowReset, KeepTail
 ASSUME /\ MaxSteps \in 6..8
        /\ KeepTail = 1
-       /\ Mode \in {"good","gap","outOfOrder","dropTombstone","omitNoCutoff"}
+       /\ Mode \in {"good","gap","outOfOrder","droppedDeleteEffect","forgetTombstone",
+                    "omitNoCutoff","omitInclusive"}
 Devices == {1,2,3}
 Keys == {1,2}
 Writers == {1,2}
@@ -20,8 +21,14 @@ Batches ==
     <<Op(1,2,12,2,2,"upsert"), Op(2,2,0,2,2,"delete")>>,
     <<Op(1,5,13,1,3,"upsert")>>,
     <<Op(1,4,0,2,4,"omit")>>,
-    <<Op(2,1,21,1,5,"upsert")>> >>
-Rank(op) == IF op.kind = "omit" THEN 2 * op.stamp - 1 ELSE 2 * op.stamp
+    <<Op(2,1,21,1,5,"upsert")>>,
+    \* Equal cutoff: stamp 5 omission on key 1 meets the live batch-3 row (stamp 5).
+    \* Older observation: stamp 1 omission on key 2 is below the live delete (stamp 2).
+    <<Op(1,5,0,2,6,"omit"), Op(2,1,0,2,6,"omit")>> >>
+\* omitInclusive mutant: an omission at a cutoff also beats an observation AT that cutoff.
+Rank(op) == IF op.kind = "omit"
+            THEN (IF Mode = "omitInclusive" THEN 2 * op.stamp + 1 ELSE 2 * op.stamp - 1)
+            ELSE 2 * op.stamp
 \* An omission cutoff is a strict boundary: an observation AT cutoff wins.
 Merge(state,op,bad) ==
  IF bad /\ op.kind = "omit"
@@ -48,6 +55,9 @@ BadSnapshot(state,log) ==
  IF Len(log)=0 THEN state
  ELSE BadSnapshot(FoldOps(state,WithoutDeletes(Head(log)),FALSE),Tail(log))
 Visible(state) == [k \in Keys |-> state[k].body]
+\* forgetTombstone mutant: a correct delete leaves no tombstone row in the snapshot.
+ForgetTombstones(state) ==
+ [k \in Keys |-> IF state[k].body = 0 THEN EmptyRow ELSE state[k]]
 Prefix(log,n) == SubSeq(log,1,n)
 \* P6 deliberately tests a restricted profile-v1 comparison: distinct counters,
 \* so all remaining compareRevisions tie fields are irrelevant in this witness.
@@ -132,8 +142,10 @@ Drop(h) ==
 Compact ==
  /\ Len(log)>KeepTail /\ cut < Len(log)-KeepTail
  /\ cut'=Len(log)-KeepTail
- /\ snapshot'=IF Mode="dropTombstone"
+ /\ snapshot'=IF Mode="droppedDeleteEffect"
               THEN BadSnapshot(Empty,Prefix(log,cut'))
+              ELSE IF Mode="forgetTombstone"
+              THEN ForgetTombstones(FoldLog(Empty,Prefix(log,cut')))
               ELSE FoldLog(Empty,Prefix(log,cut'))
  /\ retained'={p \in retained : p>cut'}
  /\ UNCHANGED <<epoch,log,budget,stopped,deviceEpoch,position,known,data,hints,
