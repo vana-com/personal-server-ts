@@ -252,6 +252,39 @@ describe("stopping and parking", () => {
   });
 });
 
+describe("a request the registry never cancels", () => {
+  /** A registry that ignores the signal: only `answer` ends the request. */
+  function deaf() {
+    const answers: Array<(a: Answer) => void> = [];
+    const waitForChange: Wait = () =>
+      new Promise<Answer>((resolve) => answers.push(resolve));
+    return {
+      registry: { waitForChange } as unknown as StreamSyncRegistry,
+      answers,
+    };
+  }
+
+  it("unsubscribing clears the request deadline at once, and a late answer does nothing", async () => {
+    const d = deaf();
+    const push = createRegistryChangePush(d.registry)!;
+    const pokes = vi.fn();
+    const health: boolean[] = [];
+    const stop = push.subscribe({
+      onChange: pokes,
+      onHealth: (h) => health.push(h),
+    });
+    await flush();
+    expect(vi.getTimerCount()).toBe(1); // the request's deadline
+    stop();
+    expect(vi.getTimerCount()).toBe(0); // gone before any time passes
+    d.answers[0]!({ seq: "9", changed: true }); // the registry answers late
+    await vi.advanceTimersByTimeAsync(CHANGE_PUSH_WAIT_MS * 3);
+    expect(pokes).not.toHaveBeenCalled();
+    expect(health).toEqual([]);
+    expect(d.answers).toHaveLength(1); // and asks for nothing more
+  });
+});
+
 describe("listeners on the subscription's lifetime signal", () => {
   /** The subscription's own AbortController: the first one it creates. */
   function captureLifetime() {

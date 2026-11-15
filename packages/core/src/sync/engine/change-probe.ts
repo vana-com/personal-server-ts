@@ -54,32 +54,54 @@ export function createRegistryChangeProbe(
   if (!probeChange || !(intervalMs > 0)) return undefined;
   const push = createRegistryChangePush(registry, options.push);
   return {
-    read: () => readWithDeadline(probeChange),
+    read: (lifecycle) => readWithDeadline(probeChange, lifecycle),
     intervalMs,
     ...(push && { push }),
   };
 }
 
 /**
- * One probe read that ends: it is aborted at the deadline (so the request frees
- * its connection) and rejects at the deadline even when the registry ignores
- * the signal.
+ * One probe read that ends. It ends on the first of: the registry's answer,
+ * the deadline, or the manager's lifecycle signal (a hide or a stop). Deadline
+ * and lifecycle abort the request so it frees its connection, and both settle
+ * the read at once even when the registry ignores the signal. Every way out
+ * clears the deadline timer and the lifecycle listener, and a late answer from
+ * the registry finds the read already settled.
  */
-async function readWithDeadline(
+function readWithDeadline(
   probeChange: (signal?: AbortSignal) => Promise<string | null | undefined>,
+  lifecycle: AbortSignal,
 ): Promise<string | null | undefined> {
+  const asError = (reason: unknown) =>
+    reason instanceof Error ? reason : new Error("registry change probe ended");
+  if (lifecycle.aborted) return Promise.reject(asError(lifecycle.reason));
   const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      const error = new Error("registry change probe got no answer");
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (settle: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      lifecycle.removeEventListener("abort", onLifecycle);
+      settle();
+    };
+    const fail = (error: Error) => {
       controller.abort(error);
-      reject(error);
-    }, PROBE_TIMEOUT_MS);
+      finish(() => reject(error));
+    };
+    const onLifecycle = () => fail(asError(lifecycle.reason));
+    const timer = setTimeout(
+      () => fail(new Error("registry change probe got no answer")),
+      PROBE_TIMEOUT_MS,
+    );
+    lifecycle.addEventListener("abort", onLifecycle, { once: true });
+    try {
+      probeChange(controller.signal).then(
+        (marker) => finish(() => resolve(marker)),
+        (error: unknown) => finish(() => reject(error)),
+      );
+    } catch (error) {
+      finish(() => reject(error));
+    }
   });
-  try {
-    return await Promise.race([probeChange(controller.signal), deadline]);
-  } finally {
-    clearTimeout(timer);
-  }
 }

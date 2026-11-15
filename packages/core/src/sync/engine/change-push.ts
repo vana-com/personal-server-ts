@@ -112,14 +112,29 @@ export function createRegistryChangePush(
 
       async function once(): Promise<"answer" | "failed" | "absent"> {
         const request = new AbortController();
-        const onStop = () => request.abort(lifetime.signal.reason);
-        lifetime.signal.addEventListener("abort", onStop, { once: true });
-        const deadline = setTimeout(
-          () => request.abort(new Error("change request got no answer")),
-          waitMs + REQUEST_GRACE_MS,
-        );
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let onStop: (() => void) | undefined;
+        // The request ends on the first of: the registry's answer, the
+        // deadline, or the subscription's end. The last two settle it at once
+        // and clear the deadline timer in the same turn, even when the
+        // registry ignores the abort; a late answer then finds nobody waiting.
+        const ended = new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            const error = new Error("change request got no answer");
+            request.abort(error);
+            reject(error);
+          }, waitMs + REQUEST_GRACE_MS);
+          onStop = () => {
+            clearTimeout(timer);
+            request.abort(lifetime.signal.reason);
+            reject(lifetime.signal.reason);
+          };
+          lifetime.signal.addEventListener("abort", onStop, { once: true });
+        });
         try {
-          const answer = await waitForChange!(cursor, waitMs, request.signal);
+          const wait = waitForChange!(cursor, waitMs, request.signal);
+          wait.catch(() => {}); // a late failure after the race is not ours
+          const answer = await Promise.race([wait, ended]);
           if (lifetime.signal.aborted) return "failed";
           cursor = answer.seq;
           failures = 0;
@@ -133,8 +148,8 @@ export function createRegistryChangePush(
           if (error instanceof ChangeFeedAbsentError) return "absent";
           return "failed";
         } finally {
-          clearTimeout(deadline);
-          lifetime.signal.removeEventListener("abort", onStop);
+          clearTimeout(timer);
+          lifetime.signal.removeEventListener("abort", onStop!);
         }
       }
 

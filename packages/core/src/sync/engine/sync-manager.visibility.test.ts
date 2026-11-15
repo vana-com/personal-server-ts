@@ -39,10 +39,30 @@ function build(options: Partial<SyncManagerOptions>) {
 /** A registry whose held change requests end only when aborted or answered. */
 function heldRegistry() {
   const held: { signal: AbortSignal; fail(error: Error): void }[] = [];
+  /** Probe reads held open; the registry ignores their cancellation. */
+  const probes: {
+    signal: AbortSignal;
+    settled: boolean;
+    answer(marker: string): void;
+  }[] = [];
   let requests = 0;
   let failNext = false;
+  let holdProbes = false;
   const registry = {
-    probeChange: async () => "m1",
+    probeChange: (signal: AbortSignal) => {
+      if (!holdProbes) return Promise.resolve("m1");
+      return new Promise<string>((resolve) => {
+        const probe = {
+          signal,
+          settled: false,
+          answer: (marker: string) => {
+            probe.settled = true;
+            resolve(marker);
+          },
+        };
+        probes.push(probe);
+      });
+    },
     waitForChange: (_after: unknown, _ms: number, signal: AbortSignal) => {
       requests += 1;
       if (failNext) return Promise.reject(new Error("gateway down"));
@@ -66,6 +86,14 @@ function heldRegistry() {
     },
     set failing(value: boolean) {
       failNext = value;
+    },
+    set holdProbes(value: boolean) {
+      holdProbes = value;
+    },
+    probes,
+    /** Probe reads neither aborted nor answered. */
+    get openProbes() {
+      return probes.filter((p) => !p.settled && !p.signal.aborted).length;
     },
   };
 }
@@ -112,6 +140,77 @@ describe("pause and resume", () => {
     await vi.advanceTimersByTimeAsync(HOUR);
     expect(gateway.requests).toBe(requests);
     expect(cycle).not.toHaveBeenCalled();
+    await manager.stop();
+  });
+
+  it("a hide during a held probe aborts it and clears its deadline; hide and show never overlap reads; a late answer changes nothing", async () => {
+    const gateway = heldRegistry();
+    gateway.holdProbes = true;
+    const cycle = vi.fn(async () => {});
+    const manager = managerOver(gateway, cycle);
+    manager.start();
+    await settle();
+    cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(5_000); // the timed probe goes out, held
+    expect(gateway.probes).toHaveLength(1);
+    const old = gateway.probes[0]!;
+
+    manager.pause();
+    expect(old.signal.aborted).toBe(true); // before any time passes
+    await settle();
+    expect(vi.getTimerCount()).toBe(0); // the probe's deadline included
+
+    manager.resume();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(gateway.probes).toHaveLength(2);
+    expect(gateway.openProbes).toBe(1); // the old read does not overlap the new
+
+    old.answer("m1"); // the registry ignored the cancel and answers late
+    await settle();
+    expect(cycle).not.toHaveBeenCalled();
+    gateway.probes[1]!.answer("m1");
+    await settle();
+    // The new read is compared with no baseline: the late answer set none.
+    expect(cycle).toHaveBeenCalledTimes(1);
+    await manager.stop();
+  });
+
+  it("stop aborts a held probe and leaves no timer", async () => {
+    const gateway = heldRegistry();
+    gateway.holdProbes = true;
+    const manager = managerOver(
+      gateway,
+      vi.fn(async () => {}),
+    );
+    manager.start();
+    await settle();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(gateway.openProbes).toBe(1);
+    await manager.stop();
+    expect(gateway.openProbes).toBe(0);
+    expect(gateway.probes[0]!.signal.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a local ingest while visible, then a hide before its debounce ends: no timer while hidden, one owed cycle on show", async () => {
+    const gateway = heldRegistry();
+    const cycle = vi.fn(async () => {});
+    const manager = managerOver(gateway, cycle);
+    manager.start();
+    await settle();
+    cycle.mockClear();
+
+    manager.notifyNewData(); // the debounce timer starts
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    manager.pause(); // before it fires
+    await settle();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(HOUR);
+    expect(cycle).not.toHaveBeenCalled();
+
+    manager.resume();
+    await settle();
+    expect(cycle).toHaveBeenCalledTimes(1);
     await manager.stop();
   });
 

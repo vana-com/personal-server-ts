@@ -41,7 +41,12 @@ import type { LegacyWriteSeal } from "../../storage/legacy-write-seal.js";
  * starts a cycle by itself (see `requestPull`).
  */
 export interface ChangeProbe {
-  read(): Promise<string | null | undefined>;
+  /**
+   * One read. `lifecycle` is the manager's: it aborts on a pause and on a stop,
+   * and the read must then end at once (reject, abort its request, clear its
+   * timers) whether or not the registry honours the signal.
+   */
+  read(lifecycle: AbortSignal): Promise<string | null | undefined>;
   /**
    * Period of the timed probe in milliseconds. Signals (`requestPull`) probe
    * at once and do not wait for it. See D4-SYNC-TRIGGERS for how the host
@@ -263,6 +268,14 @@ export function createSyncManager(
   // under and does nothing once it differs: a probe answering after stop(), or
   // from before a stop and start, can start no cycle and set no baseline.
   let lifecycle = 0;
+  // Ends with the lifecycle value it belongs to: a pause or a stop aborts every
+  // request and timer the run before it still holds (the probe's read).
+  let lifecycleEnd = new AbortController();
+  const nextLifecycle = (why: string): void => {
+    lifecycle += 1;
+    lifecycleEnd.abort(new Error(`sync manager ${why}`));
+    lifecycleEnd = new AbortController();
+  };
   // Failed probes in a row, and the earliest time the timed probe tries again.
   let probeFailures = 0;
   let nextTimedProbeAt = 0;
@@ -671,11 +684,12 @@ export function createSyncManager(
     probe: ChangeProbe,
     run: number,
     fromSignal: boolean,
+    ended: AbortSignal,
   ): Promise<void> {
     let marker: string | null | undefined;
     lastProbeAt = Date.now();
     try {
-      marker = await probe.read();
+      marker = await probe.read(ended);
     } catch (err) {
       if (run === lifecycle) noteProbeFailure(probe);
       uploadDeps.logger.debug(
@@ -710,6 +724,7 @@ export function createSyncManager(
     const probe = options?.changeProbe;
     if (!probe) return runCycle();
     const run = lifecycle;
+    const ended = lifecycleEnd.signal;
     if (pullInFlight && pullInFlightRun === run) {
       pullRequested = true;
       pullSignalled ||= fromSignal;
@@ -723,7 +738,7 @@ export function createSyncManager(
           pullRequested = false;
           const signalled = pullSignalled;
           pullSignalled = false;
-          await pullIfChanged(probe, run, signalled);
+          await pullIfChanged(probe, run, signalled, ended);
           // A tick that joined a read that then failed waits out the back-off;
           // only a signal (focus, online) is read again at once.
         } while (
@@ -864,7 +879,7 @@ export function createSyncManager(
       isRunning = true;
       paused = false;
       owedWhilePaused = false;
-      lifecycle += 1;
+      nextLifecycle("started");
       pulledMarker = undefined;
       cycleFailures = 0;
       probeFailures = 0;
@@ -897,7 +912,7 @@ export function createSyncManager(
       paused = false;
       owedWhilePaused = false;
       // Cancel pulls: a probe that answers later finds a new lifecycle value.
-      lifecycle += 1;
+      nextLifecycle("stopped");
 
       // Wait for any in-flight cycle to complete
       if (cycleInFlight) {
@@ -938,7 +953,7 @@ export function createSyncManager(
       if (!isRunning || paused) return;
       paused = true;
       // Stale answers (a probe, a poke) of the run before the hide are void.
-      lifecycle += 1;
+      nextLifecycle("paused");
       // A debounced ingest still waiting for its timer is owed, not dropped.
       if (notifyTimerId !== null) owedWhilePaused = true;
       clearIntervalTimer();
