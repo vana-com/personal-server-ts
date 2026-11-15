@@ -9,6 +9,7 @@ import {
   applyConnection,
   applyStream,
 } from "../../../core/src/localdb/apply.js";
+import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.js";
 
@@ -134,4 +135,103 @@ it("a late applyStream joins the existing connection flight and falls back to re
   expect((await joining).outcome).toBe("applied");
   expect(f.list).toHaveBeenCalledTimes(1);
   expect(f.read.mock.calls.filter(([s]) => s === b.scope)).toHaveLength(2);
+});
+async function appliedStreamB() {
+  const f = await fixture();
+  await f.head("a", [{ id: "a" }]);
+  const b = await f.head("b", [{ id: "b" }]);
+  await applyStream(f.deps, f.id, "b");
+  // Stream a downloads on its first part blob; the hook fires once.
+  const get = f.deps.blobs.get.bind(f.deps.blobs);
+  const onDownloadOfA = (change: () => void | Promise<void>) => {
+    let fired = false;
+    f.deps.blobs.get = async (key) => {
+      if (
+        !fired &&
+        key.startsWith(`${streamScope("fixture-source", "", "a")}/`) &&
+        key.includes("/g1-p-")
+      ) {
+        fired = true;
+        await change();
+      }
+      return get(key);
+    };
+  };
+  return { ...f, b, onDownloadOfA };
+}
+it("a connection deleted while stream one commits still purges the already-applied stream two", async () => {
+  const f = await appliedStreamB();
+  const batch = f.db.batch.bind(f.db);
+  vi.spyOn(f.db, "batch").mockImplementation(async (statements) => {
+    const out = await batch(statements);
+    if (
+      statements.some(
+        (s) =>
+          s.sql.includes("INSERT OR REPLACE INTO stream_versions") &&
+          s.params![1] === "a",
+      )
+    )
+      f.setControl(2, true);
+    return out;
+  });
+  const results = await applyConnection(f.deps, f.id);
+  expect(results.map((r) => [r.stream, r.outcome])).toEqual([
+    ["a", "applied"],
+    ["b", "purged"],
+  ]);
+  expect(
+    await f.db.query("SELECT stream FROM records WHERE stream='b'"),
+  ).toEqual([]);
+});
+it("a stream replaced while stream one downloads is applied at its new version, not skipped as unchanged", async () => {
+  const f = await appliedStreamB();
+  f.onDownloadOfA(async () => {
+    await f.head("b", [{ id: "b2" }], { version: 2 });
+  });
+  const results = await applyConnection(f.deps, f.id);
+  expect(results.map((r) => [r.stream, r.outcome])).toEqual([
+    ["a", "applied"],
+    ["b", "applied"],
+  ]);
+  expect(
+    await f.db.query("SELECT record_key FROM records WHERE stream='b'"),
+  ).toHaveLength(1);
+  expect(
+    await f.db.query("SELECT head_version FROM stream_state WHERE stream='b'"),
+  ).toEqual([{ head_version: 2 }]);
+});
+it("a stream tombstoned while stream one downloads is purged, not skipped as unchanged", async () => {
+  const f = await appliedStreamB();
+  f.onDownloadOfA(() => {
+    f.reads.set(f.b.scope, {
+      found: true,
+      version: 2,
+      dataHash: f.hashes.tombstoneData,
+      metadataHash: f.hashes.tombstoneMetadata,
+      deleted: true,
+    });
+  });
+  const results = await applyConnection(f.deps, f.id);
+  expect(results.map((r) => [r.stream, r.outcome])).toEqual([
+    ["a", "applied"],
+    ["b", "purged"],
+  ]);
+  expect(
+    await f.db.query("SELECT stream FROM records WHERE stream='b'"),
+  ).toEqual([]);
+});
+it("two unchanged streams cost one control read and no stream reads", async () => {
+  const f = await fixture();
+  const a = await f.head("a", [{ id: "a" }]),
+    b = await f.head("b", [{ id: "b" }]);
+  await applyConnection(f.deps, f.id);
+  f.read.mockClear();
+  expect((await applyConnection(f.deps, f.id)).map((r) => r.outcome)).toEqual([
+    "noop",
+    "noop",
+  ]);
+  expect(f.read.mock.calls.filter(([s]) => s === f.control)).toHaveLength(1);
+  expect(
+    f.read.mock.calls.filter(([s]) => s === a.scope || s === b.scope),
+  ).toHaveLength(0);
 });

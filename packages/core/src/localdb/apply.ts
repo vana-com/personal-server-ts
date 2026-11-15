@@ -150,10 +150,15 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
         );
       }
       const answers = new Map<string, ApplyResult>();
-      const listedReads = new Map<string, ControlRead>();
-      // Reuse the last serial download fence; early returns consume it.
-      const controlRead: { value?: Awaited<ReturnType<typeof control>> } = {
-        value: initial,
+      // Registry reads this job already holds. A stream that goes on to
+      // download reuses them, because the final control and stream rechecks
+      // still run. A stream that would end early (noop, gone, purge) reads
+      // fresh once a download has run: a listing or fence taken before that
+      // download can predate a delete, a new head or a tombstone.
+      const reuse: Reuse = {
+        control: initial,
+        listed: new Map(),
+        stale: false,
       };
       let listed = false;
       while (true) {
@@ -168,7 +173,7 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
               scope.ns === connection.ns
             ) {
               flight.streams.add(scope.stream);
-              listedReads.set(scope.stream, row.read);
+              reuse.listed.set(scope.stream, row.read);
             }
           }
           listed = true;
@@ -177,16 +182,7 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
         if (next === undefined) break;
         answers.set(
           next,
-          await applyOne(
-            locked,
-            id,
-            connection,
-            next,
-            keyCheck,
-            hashes,
-            controlRead,
-            listedReads.get(next),
-          ),
+          await applyOne(locked, id, connection, next, keyCheck, hashes, reuse),
         );
       }
       return [...answers.values()];
@@ -293,6 +289,17 @@ async function control(
   return state;
 }
 
+interface Reuse {
+  control?: Awaited<ReturnType<typeof control>>;
+  listed: Map<string, ControlRead>;
+  /** A stream has downloaded since the job's reads were taken. */
+  stale: boolean;
+}
+
+/**
+ * Apply one stream. Work that ends before the download, on reads that predate
+ * an earlier stream's download, runs again on fresh reads.
+ */
 async function applyOne(
   deps: LocalSyncDeps,
   id: string,
@@ -300,18 +307,56 @@ async function applyOne(
   stream: string,
   keyCheck: string,
   hashes: ControlHashes,
-  controlRead: { value?: Awaited<ReturnType<typeof control>> },
-  listedRead?: ControlRead,
+  reuse: Reuse,
 ): Promise<ApplyResult> {
-  const active =
-    controlRead.value ?? (await control(deps, id, connection, hashes));
-  delete controlRead.value;
+  return (
+    (await applyOneOnce(
+      deps,
+      id,
+      connection,
+      stream,
+      keyCheck,
+      hashes,
+      reuse,
+      false,
+    )) ??
+    (await applyOneOnce(
+      deps,
+      id,
+      connection,
+      stream,
+      keyCheck,
+      hashes,
+      reuse,
+      true,
+    ))!
+  );
+}
+
+/** Returns undefined when reused reads are stale and the stream must rerun. */
+async function applyOneOnce(
+  deps: LocalSyncDeps,
+  id: string,
+  connection: Connection,
+  stream: string,
+  keyCheck: string,
+  hashes: ControlHashes,
+  reuse: Reuse,
+  fresh: boolean,
+): Promise<ApplyResult | undefined> {
+  const fence = fresh ? undefined : reuse.control;
+  const listedRead = fresh ? undefined : reuse.listed.get(stream);
+  const rerun =
+    reuse.stale && (fence !== undefined || listedRead !== undefined);
+  const early = (answer: ApplyResult) => (rerun ? undefined : answer);
+  const active = fence ?? (await control(deps, id, connection, hashes));
   if (active.kind !== "active")
-    return result(stream, active.kind === "deleted" ? "purged" : "gone");
+    return early(result(stream, active.kind === "deleted" ? "purged" : "gone"));
   const scope = streamScope(connection.connector, connection.ns, stream);
   const read = listedRead ?? (await deps.registry.read(scope));
   const classification = classifyStreamRow(read, hashes);
-  if (!read.found || classification === "absent") return result(stream, "gone");
+  if (!read.found || classification === "absent")
+    return early(result(stream, "gone"));
   const [state] = await deps.db.query<State>(
     `SELECT s.primary_key,s.last_delete_version,s.head_version,s.head_generation,s.head_data_hash,v.head_format FROM stream_state s LEFT JOIN stream_versions v ON v.connection_id=s.connection_id AND v.stream=s.stream AND v.version=s.head_version AND v.generation=s.head_generation WHERE s.connection_id=? AND s.stream=?`,
     [id, stream],
@@ -321,7 +366,9 @@ async function applyOne(
     // collection staged or committed after that fence are newer than the
     // delete and stay; only a later delete version purges them.
     if (state && read.version <= state.last_delete_version)
-      return result(stream, "noop");
+      return early(result(stream, "noop"));
+    // A purge is destructive: never decide it on reads from before a download.
+    if (rerun) return undefined;
     await deps.db.batch(
       withOrigin("purge", [
         {
@@ -349,7 +396,7 @@ async function applyOne(
     return result(stream, "purged");
   }
   if (state && read.version <= state.last_delete_version)
-    return result(stream, "gone");
+    return early(result(stream, "gone"));
   const saved = await deps.db.query<SavedPart>(
     "SELECT prefix,seq,part_hash,bytes,count FROM head_parts WHERE connection_id=? AND stream=? ORDER BY prefix,seq",
     [id, stream],
@@ -360,10 +407,13 @@ async function applyOne(
     state.head_generation === active.generation &&
     saved.length > 0
   )
-    return result(stream, "noop");
+    return early(result(stream, "noop"));
   const blob = headBlobName(read.dataHash);
   const cipher = await deps.blobs.get(`${scope}/${blob}`);
-  if (cipher === null) throw new Error("apply: missing head blob");
+  if (cipher === null) {
+    if (rerun) return undefined;
+    throw new Error("apply: missing head blob");
+  }
   const verified = await verifyHead(
     keccak,
     await deps.keys.decrypt(scope, cipher),
@@ -375,10 +425,13 @@ async function applyOne(
       keyCheck,
     },
   );
-  if (verified.kind !== "ok")
+  if (verified.kind !== "ok") {
+    if (rerun) return undefined;
     throw new Error(`apply: invalid head (${verified.kind})`);
+  }
   const { head } = verified;
   if (head.generation < active.generation) {
+    if (rerun) return undefined;
     // A head of an earlier lifetime (a delete marker). It is no content base:
     // keep only its delete fence, so a run that begins now pins it.
     await hydrateLifetimeBoundary(deps, {
@@ -391,7 +444,12 @@ async function applyOne(
     });
     return result(stream, "gone");
   }
-  if (head.generation !== active.generation) return result(stream, "gone");
+  if (head.generation !== active.generation)
+    return early(result(stream, "gone"));
+  // From here the stream reaches the final rechecks, so the job's earlier
+  // reads stay usable for it. They are stale for any stream that ends early.
+  reuse.control = undefined;
+  reuse.stale = true;
   const op = deps.newOp();
   let downloaded = 0;
   let kept = 0;
@@ -520,7 +578,7 @@ async function applyOne(
       }
     }
     const stillActive = await control(deps, id, connection, hashes);
-    controlRead.value = stillActive;
+    reuse.control = stillActive;
     if (
       stillActive.kind !== "active" ||
       stillActive.generation !== active.generation
