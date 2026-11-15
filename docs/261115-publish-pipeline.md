@@ -138,11 +138,71 @@ Bytes and order are unchanged. The part and head names are content hashes; a
 run before and after stores the same set of names (`objectsDigest` in
 `publish-pipeline.workload.ts`).
 
-Open: the plan before the first PUT (the record-changes read, the part-layout
-sizes, `planBuckets`) still finishes before the transfer starts, about 1.3 to
-2 s on the 198k-row stream. `planBuckets` needs the byte count of every
-changed row's shard before it can name the first bucket, so it is a whole-input
-step. Overlapping it would need a different planner. Not done here.
+### Three more costs, in order (follow-up 2)
+
+With the width at 13 under the guard, the upload phase still did not meet the
+guard's floor (129 PUTs at 10 PUT/s is 12.9 s, plus one PUT time). Three
+costs sat around it. Measured on the 198,001-row stream.
+
+**1. The commit tail (0.7 to 4.5 s after the last PUT).** Cause: the WAL
+auto-checkpoint, inside the commit's `COMMIT`. Evidence, from timing the commit
+batch statement by statement (`--profile-statements`): the slot turn that
+commits took 3.2 s, and 3.17 s of it was one statement, the compaction
+`DELETE FROM record_changes WHERE seq <= W` (198,001 rows). On a copy of the
+database the same DELETE alone takes 0.30 s (0.16 s with its per-row
+`record_changes_compacted` trigger dropped), and its `COMMIT` takes 5.2 to 6.3 s
+with SQLite's default `wal_autocheckpoint = 1000` and 23 ms with it off; the
+checkpoint then costs 5.9 s when run on its own. The DELETE rewrites 12,417
+pages, so the commit crosses the mark, and the connection that commits
+checkpoints before `COMMIT` returns: the caller, and the slot turn it holds,
+wait for 12,417 pages to be written and synced. The disk here is shared, so the
+size is not portable; the mechanism is. Fix: the writer connection has
+`wal_autocheckpoint = 0` and, after it has replied to a batch, runs the same
+PASSIVE checkpoint at the same mark (1000 frames, read with `wal_checkpoint(NOOP)`).
+The next call to the writer waits for it, so the log stays as short as before
+and the work is the same; only the commit's reply no longer waits. The tail
+fell from 0.8 to 2.8 s to 0.5 to 0.75 s: the DELETE itself.
+
+**2. The slow-start ramp (about 4 s under the guard).** The ramp probes a rate
+nobody has told us. vana-storage publishes its quota (`RateLimit-Policy`), so
+the gate now takes it as the rate: the first published `put` quota opens the
+window to `ceil(rate * partPutSeconds)` (13 for 10 PUT/s and 1.26 s), capped at
+the window cap, and ends slow start there; from there the window grows by one,
+and a 503 halves it as before. Tokens still pace every request, so a wider
+window never sends faster than the quota. Two cases keep the ramp from 1: a
+store that publishes no quota (nothing is known about it), and a gate that has
+already seen a 429 or 503 (the service has answered). In production the quota
+comes from a response header, so the window opens when the first response that
+carries it arrives: one PUT time at window 1, not four ramp steps. The rate
+limit feed replays the policy it has seen to a new subscriber, so later
+publishes in the same process start open. The harness sets the quota up front,
+so it shows the best case.
+
+**3. The plan before the first PUT (1.2 to 2 s).** Left as it is. A bucket's
+name does not strictly need the whole input: a prefix is a leaf when its own
+range is at or under the target, and a prefix above it is split once the part
+of its range already seen passes the target, so the buckets could be named in
+order as the shards are sized. But the plan feeds `TransferPlan.changedPrefixes`
+and the candidate's `changedPrefixes` as whole arrays, so naming them early
+changes the hand-off between the snapshot and the transfer: a protocol change
+that needs its model checked first, for a gain bounded by the sizing step
+(0.3 to 0.5 s of it). The planning time splits into the changed-key read (0.25 s
+in the worker, 0.5 to 1 s as the main thread sees it, because 198,001 rows
+cross the thread boundary), 397 size queries of 500 keys through the view's
+reader (0.3 to 0.5 s), and the planner. Folding the sizing into one SQL
+statement per 16-bit prefix was measured and is slower (5.8 to 6.3 s: SQLite
+drives it from `record_changes` with the correlated `NOT EXISTS`), so it is not
+a cheap win either.
+
+Result, guard 600/60 s and 1.26 s per PUT, three base/head triples run back to
+back inside one slot (load 10 to 17): base 28.5 s median (27.1 to 31.2), #706
+23.7 s (20.3 to 23.7), this change 16.1 s (16.0 to 16.1). Upload phase 14.2 s in
+all three runs, against 129 PUTs at 10 PUT/s plus one PUT time (about 14.2 s):
+at the floor. Tail after the last PUT 0.36 to 0.54 s (base 1.0 to 5.1 s).
+`objectsDigest` is the same in all nine runs.
+
+Attachments now shrink to their ciphertext as parts do: they were the one place
+still held at twice their size until the PUT ended.
 
 ## What this does not change
 
