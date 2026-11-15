@@ -344,10 +344,10 @@ const run = {
 const CHECKPOINT_FRAMES = 1000;
 
 function checkpointAfterReply() {
-  // A transaction left open by `query("BEGIN")` commits in a later call, and
-  // that call checkpoints.
-  if (db.inTransaction) return;
   try {
+    // A transaction left open by `query("BEGIN")` commits in a later call, and
+    // that call checkpoints.
+    if (!db.open || db.inTransaction) return;
     // NOOP only reports: it writes nothing and takes no lock.
     const [{ log, checkpointed }] = db.pragma("wal_checkpoint(NOOP)");
     if (log - checkpointed >= CHECKPOINT_FRAMES)
@@ -363,22 +363,27 @@ function checkpointAfterReply() {
 require("node:v8").setFlagsFromString("--expose-gc");
 const gc = require("node:vm").runInNewContext("gc");
 let handled = 0;
+/**
+ * Every call that can write on the writer's own connection checkpoints after
+ * its reply, whichever reply it was: `batch`, and `query` (a statement, or a
+ * write with RETURNING). A write that throws can still have committed rows
+ * (`INSERT OR FAIL` keeps the rows before the failing one), so an error reply
+ * is no reason to skip it. A snapshot's query runs on its own read-only
+ * connection; `close` and a handle that never opened have nothing to
+ * checkpoint.
+ */
+const writesOwnConnection = ({ op, snap }) =>
+  role === "writer" &&
+  isFile &&
+  !openError &&
+  (op === "batch" || (op === "query" && snap === undefined));
+
 parentPort.on("message", (message) => {
   if (++handled % 25 === 0) gc();
   const { id, op } = message;
   try {
     if (openError) throw openError;
     parentPort.postMessage({ id, ok: true, result: run[op](message) });
-    // Every call that can write on the writer's own connection ends here, so
-    // no write path is left without a checkpoint now that SQLite's is off:
-    // `batch`, and `query` (a statement, or a write with RETURNING). A
-    // snapshot's query runs on its own read-only connection.
-    if (
-      role === "writer" &&
-      isFile &&
-      (op === "batch" || (op === "query" && message.snap === undefined))
-    )
-      checkpointAfterReply();
   } catch (error) {
     parentPort.postMessage({
       id,
@@ -390,5 +395,8 @@ parentPort.on("message", (message) => {
         code: error.code,
       },
     });
+  } finally {
+    // The reply is already sent; this changes neither outcome.
+    if (writesOwnConnection(message)) checkpointAfterReply();
   }
 });
