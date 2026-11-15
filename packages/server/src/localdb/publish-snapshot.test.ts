@@ -1,7 +1,8 @@
 // A publish on a host with a frozen read view (`SqlDriver.snapshot`) reads
 // `records` in the view and copies nothing. These tests use a file database
 // and the real driver. The same publish with the view hidden (the spool path)
-// is the oracle.
+// is the oracle. The last group is the stored row size, `records.body_bytes`,
+// which the view's page cuts read.
 import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
@@ -128,30 +129,60 @@ async function world(options: { view: boolean; journal?: string } & Hooks) {
     artifactDigest: "fixture",
     owner: { address: owner, leaseId: null },
   };
-  const rows = (ids: string[]) =>
+  const rows = (ids: string[], tag = "", pad = 300) =>
     ids.map((id) => ({
       stream: "items",
-      data: { id, text: `${id}:`.padEnd(300, "x") },
+      data: { id, text: `${id}:${tag}`.padEnd(pad, "x") },
     }));
   const end = {
     outcome: "succeeded" as const,
     coveredStreams: ["items"],
     lastBatch: 0,
   };
-  const load = async (runId: string, ids: string[], finish = true) => {
+  const load = async (
+    runId: string,
+    ids: string[],
+    finish = true,
+    tag = "",
+    pad = 300,
+  ) => {
     await sync.intake.begin(runId, request);
-    await sync.intake.batch(runId, { batch: 0, records: rows(ids) });
+    await sync.intake.batch(runId, {
+      batch: 0,
+      records: rows(ids, tag, pad),
+    });
     if (finish) await sync.intake.end(runId, end);
   };
-  const text = () =>
-    [...puts.values()].map((b) => Buffer.from(b).toString("latin1")).join("\n");
+  /** A run that deletes `keys` explicitly; it commits when finished. */
+  const loadDeletes = async (runId: string, keys: string[], finish = true) => {
+    await sync.intake.begin(runId, request);
+    await sync.intake.batch(runId, {
+      batch: 0,
+      records: keys.map((key) => ({
+        stream: "items",
+        op: "delete" as const,
+        key,
+        data: { id: key },
+      })),
+    });
+    if (finish) await sync.intake.end(runId, end);
+  };
+  const text = (from = new Set<string>()) =>
+    [...puts]
+      .filter(([key]) => !from.has(key))
+      .map(([, b]) => Buffer.from(b).toString("latin1"))
+      .join("\n");
   return {
     sync,
+    db: inner,
     load,
+    loadDeletes,
     finish: (runId: string) => sync.intake.end(runId, end),
     counts,
     puts,
     text,
+    /** The blobs stored so far, for `text` to leave out later. */
+    stored: () => new Set(puts.keys()),
   };
 }
 
@@ -257,4 +288,139 @@ it("holds the WAL while a view is open, lets writes commit, and frees it on rele
   await view.release();
   await db.query("PRAGMA wal_checkpoint(TRUNCATE)", []);
   expect(statSync(`${path}-wal`).size).toBe(0);
+});
+
+/** Park the transfer at its first read of `records`, with the view open. */
+async function parkedWorld() {
+  let release!: () => void;
+  const parked = new Promise<void>((resolve) => (release = resolve));
+  let reached!: () => void;
+  const atFirstRead = new Promise<void>((resolve) => (reached = resolve));
+  const w = await world({
+    view: true,
+    onFirstPage: async () => {
+      reached();
+      await parked;
+    },
+  });
+  return { w, release, atFirstRead };
+}
+
+it("keeps the version's row when a run updates it after the view opens", async () => {
+  const { w, release, atFirstRead } = await parkedWorld();
+  await w.load("r1", ids(600));
+  await w.load("late", ["row-3"], false, "UPDATED", 2000);
+  const publishing = w.sync.cycle();
+  await atFirstRead;
+  await w.finish("late"); // a longer body, committed while the view is open
+  release();
+  await publishing;
+  expect(w.text()).toContain("row-3:");
+  expect(w.text()).not.toContain("UPDATED");
+  const first = w.stored();
+  await w.sync.cycle();
+  expect(w.text(first)).toContain("row-3:UPDATED");
+  expect(w.counts.released).toBe(w.counts.opened);
+});
+
+it("rebuilds the version when a run deletes a row after the view opens", async () => {
+  const { w, release, atFirstRead } = await parkedWorld();
+  await w.load("r1", ids(600));
+  await w.loadDeletes("late", ["row-3"], false);
+  const publishing = w.sync.cycle();
+  await atFirstRead;
+  await w.finish("late"); // a removal above the snapshot's watermark
+  release();
+  const [first] = (await publishing).connections[0]!.published;
+  // The view held the row, so the publish read a second view and re-planned.
+  expect(first).toMatchObject({ outcome: "published", watermark: 601 });
+  expect(w.counts.opened).toBe(2);
+  expect(w.counts.released).toBe(2);
+  // Only the part the first view built holds the row; the rebuilt one does not.
+  const holding = [...w.puts.values()].filter((bytes) =>
+    Buffer.from(bytes).toString("latin1").includes("row-3:"),
+  );
+  expect(holding).toHaveLength(1);
+  expect(w.text()).toContain("row-4:");
+  expect((await w.sync.cycle()).connections[0]?.published[0]?.outcome).toBe(
+    "noop",
+  );
+});
+
+const sizes = (w: Awaited<ReturnType<typeof world>>) =>
+  w.db.query<{ k: string; stored: number | null; real: number }>(
+    `SELECT record_key AS k, body_bytes AS stored,
+            LENGTH(CAST(body AS BLOB)) AS real FROM records ORDER BY record_key`,
+    [],
+  );
+
+it("records the stored size on insert, on a body change and on a restamp", async () => {
+  const w = await world({ view: true });
+  // "é" is two bytes, so a length in characters would be wrong.
+  const multibyte = "é".repeat(150);
+  await w.sync.intake.begin("r1", {
+    connector: "fixture",
+    artifactDigest: "fixture",
+    owner: { address: owner, leaseId: null },
+  });
+  await w.sync.intake.batch("r1", {
+    batch: 0,
+    records: [
+      { stream: "items", data: { id: "a", text: multibyte } },
+      { stream: "items", data: { id: "b", text: "plain" } },
+    ],
+  });
+  await w.sync.intake.end("r1", {
+    outcome: "succeeded",
+    coveredStreams: ["items"],
+    lastBatch: 0,
+  });
+  const inserted = await sizes(w);
+  expect(inserted.map((r) => r.k)).toEqual(["a", "b"]);
+  for (const row of inserted) expect(row.stored).toBe(row.real);
+  const [first] = inserted;
+  const chars = (
+    await w.db.query<{ n: number }>(
+      "SELECT LENGTH(body) AS n FROM records WHERE record_key = 'a'",
+      [],
+    )
+  )[0]!.n;
+  expect(first!.stored).toBeGreaterThan(chars);
+
+  await w.load("r2", ["a"], true, "longer", 900); // a changed body
+  await w.load("r3", ["a"], true, "longer", 900); // the same body, newer stamp
+  for (const row of await sizes(w)) expect(row.stored).toBe(row.real);
+  expect((await sizes(w))[0]!.real).toBeGreaterThan(900);
+});
+
+it("logs no change when only the stored size is written", async () => {
+  const w = await world({ view: true });
+  await w.load("r1", ids(40));
+  const changes = () =>
+    w.db.query<{ n: number }>("SELECT COUNT(*) AS n FROM record_changes", []);
+  const before = (await changes())[0]!.n;
+  expect(before).toBeGreaterThan(0);
+  await w.db.query("UPDATE records SET body_bytes = NULL", []);
+  await w.db.query(
+    "UPDATE records SET body_bytes = LENGTH(CAST(body AS BLOB)) WHERE body_bytes IS NULL",
+    [],
+  );
+  expect((await changes())[0]!.n).toBe(before);
+  for (const row of await sizes(w)) expect(row.stored).toBe(row.real);
+});
+
+it("publishes the same blobs for rows with no stored size", async () => {
+  const sized = await world({ view: true });
+  const old = await world({ view: true });
+  await sized.load("r1", ids(600));
+  await old.load("r1", ids(600));
+  // Rows from before the column: NULL, measured from the body when read.
+  await old.db.query("UPDATE records SET body_bytes = NULL", []);
+  await sized.sync.cycle();
+  await old.sync.cycle();
+  expect(old.counts.opened).toBeGreaterThan(0);
+  expect(sized.puts.size).toBeGreaterThan(3);
+  expect([...old.puts.keys()].sort()).toEqual([...sized.puts.keys()].sort());
+  for (const [key, bytes] of sized.puts)
+    expect(Buffer.from(old.puts.get(key)!)).toEqual(Buffer.from(bytes));
 });

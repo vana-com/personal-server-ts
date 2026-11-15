@@ -16,11 +16,14 @@ import {
   dropSpool,
   encodePrefixes,
   freezePrefixRows,
+  startFrozenParts,
   uploadFrozenParts,
   type EncodedPart,
 } from "../../../core/src/localdb/encode.js";
+import { planChangedPrefixes } from "../../../core/src/localdb/part-layout.js";
 import { readerOf } from "../../../core/src/localdb/driver.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
+import { newUploadWave } from "../../../core/src/localdb/upload-wave.js";
 import { newPublishMeter } from "../../../core/src/localdb/publish-meter.js";
 import {
   openBytes,
@@ -90,6 +93,8 @@ async function fresh(partTargetBytes?: number) {
       value?: string;
       connectionId?: string;
       stream?: string;
+      /** `body_bytes`: the body's real length, or this number; NULL when absent (a row from before the column). */
+      size?: "stored" | number;
     }[],
   ) => {
     const fixtures = rows.map((row) => {
@@ -107,7 +112,7 @@ async function fresh(partTargetBytes?: number) {
     });
     await db.batch(
       fixtures.map(({ row, body, envelope }) => ({
-        sql: "INSERT INTO records (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        sql: "INSERT INTO records (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, body_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params: [
           row.connectionId ?? input.connectionId,
           row.stream ?? input.stream,
@@ -118,6 +123,11 @@ async function fresh(partTargetBytes?: number) {
           body,
           envelope.h,
           envelope.f,
+          row.size === undefined
+            ? null
+            : row.size === "stored"
+              ? envelope.n
+              : row.size,
         ],
       })),
     );
@@ -439,11 +449,17 @@ describe("encodePrefixes under writes and large bodies", () => {
   ) {
     const reader = readerOf(f.db);
     const real = reader.query.bind(reader);
-    const seen = { maxBodyChars: 0, bodyPages: 0 };
+    const seen = {
+      maxBodyChars: 0,
+      bodyPages: 0,
+      pageRows: [] as number[],
+      queries: [] as { sql: string; params: never }[],
+    };
     vi.spyOn(readerOf(f.db), "query").mockImplementation((async (
       sql: string,
       params?: never,
     ) => {
+      seen.queries.push({ sql, params: params as never });
       const rows = (await real(sql, params)) as { body?: string }[];
       const chars = rows.reduce(
         (n, row) => n + (typeof row.body === "string" ? row.body.length : 0),
@@ -451,6 +467,7 @@ describe("encodePrefixes under writes and large bodies", () => {
       );
       if (chars > 0) {
         seen.bodyPages += 1;
+        seen.pageRows.push(rows.length);
         seen.maxBodyChars = Math.max(seen.maxBodyChars, chars);
         await onBodies?.(seen.bodyPages);
       }
@@ -515,6 +532,179 @@ describe("encodePrefixes under writes and large bodies", () => {
     expect(seen.maxBodyChars).toBeGreaterThan(3 * 1024 * 1024);
     expect(seen.maxBodyChars).toBeLessThan(3 * 1024 * 1024 + 1024);
     expect(seen.bodyPages).toBe(2);
+  });
+
+  describe("page cuts read the stored size and fall back to the body", () => {
+    const MIB = 1024 * 1024;
+    const key = (i: number) => String(i).padStart(4, "0").padEnd(64, "0");
+    /** The `value` length that makes a row's body exactly `bytes` long. */
+    const valueFor = (k: string, bytes: number) =>
+      "x".repeat(
+        bytes -
+          new TextEncoder().encode(JSON.stringify({ id: k, value: "" })).length,
+      );
+    /** Transfer the whole stream through a read view of `records`, as a publish does. */
+    const pages = async (
+      f: Awaited<ReturnType<typeof fresh>>,
+      watching?: ReturnType<typeof watch>,
+    ) => {
+      const seen = watching ?? watch(f);
+      const wave = newUploadWave();
+      const parts = await startFrozenParts(f.deps, {
+        attempt: "view-attempt",
+        view: {
+          view: readerOf(f.db),
+          connectionId: input.connectionId,
+          stream: input.stream,
+        },
+        scope: input.scope,
+        generation: input.generation,
+        frozen: [{ prefix: "", rows: null }],
+        wave,
+        probe: true,
+      });
+      await wave.drain();
+      return { seen, rows: await f.read(parts) };
+    };
+
+    it("walks a run across the size windows: 4,200 rows are 2,048, 2,048 and 104", async () => {
+      const f = await fresh();
+      await f.insert(
+        Array.from({ length: 4200 }, (_, i) => ({ k: key(i), size: "stored" })),
+      );
+      const { seen, rows } = await pages(f);
+      expect(seen.pageRows).toEqual([2048, 2048, 104]);
+      expect(rows.map((row) => row.k)).toEqual(
+        Array.from({ length: 4200 }, (_, i) => key(i)),
+      );
+    });
+
+    it("ends after two full windows when no row is left", async () => {
+      const f = await fresh();
+      await f.insert(
+        Array.from({ length: 4096 }, (_, i) => ({ k: key(i), size: "stored" })),
+      );
+      const { seen, rows } = await pages(f);
+      expect(seen.pageRows).toEqual([2048, 2048]);
+      expect(rows).toHaveLength(4096);
+    });
+
+    it("fills a page to exactly 2 MiB and cuts one byte over", async () => {
+      const exact = await fresh();
+      await exact.insert(
+        Array.from({ length: 5 }, (_, i) => ({
+          k: key(i),
+          value: valueFor(key(i), MIB / 2),
+          size: "stored",
+        })),
+      );
+      // Four rows of 512 KiB are 2 MiB: they are one page, the fifth is the next.
+      expect((await pages(exact)).seen.pageRows).toEqual([4, 1]);
+
+      const over = await fresh();
+      await over.insert(
+        Array.from({ length: 5 }, (_, i) => ({
+          k: key(i),
+          value: valueFor(key(i), MIB / 2 + (i === 0 ? 1 : 0)),
+          size: "stored",
+        })),
+      );
+      expect((await pages(over)).seen.pageRows).toEqual([3, 2]);
+    });
+
+    it("gives a row over 2 MiB a page of its own between small rows, and goes on", async () => {
+      const f = await fresh();
+      await f.insert([
+        { k: key(0), size: "stored" },
+        { k: key(1), size: "stored" },
+        { k: key(2), value: "y".repeat(3 * MIB), size: "stored" },
+        { k: key(3), size: "stored" },
+        { k: key(4), size: "stored" },
+      ]);
+      const { seen, rows } = await pages(f);
+      expect(seen.pageRows).toEqual([2, 1, 2]);
+      expect(rows.map((row) => row.k)).toEqual([0, 1, 2, 3, 4].map(key));
+    });
+
+    it("reads a stored size in preference to the body", async () => {
+      const f = await fresh();
+      // Each body is a few bytes; the column says 1 MiB, so two rows fill a page.
+      await f.insert(
+        Array.from({ length: 6 }, (_, i) => ({ k: key(i), size: MIB })),
+      );
+      expect((await pages(f)).seen.pageRows).toEqual([2, 2, 2]);
+    });
+
+    it("reads the sizes of stored rows from the records_size index, never from a body", async () => {
+      const f = await fresh();
+      const rows = Array.from({ length: 30 }, (_, i) => ({
+        k: key(i),
+        size: "stored" as const,
+      }));
+      await f.insert(rows);
+      const seen = watch(f);
+      await planChangedPrefixes(readerOf(f.db), {
+        connectionId: input.connectionId,
+        stream: input.stream,
+        changedKeys: rows.map((row) => row.k),
+        baseParts: [],
+        targetBytes: 4 * MIB,
+        rewriteAll: false,
+      });
+      await pages(f, seen);
+      const sizeReads = seen.queries.filter(({ sql }) =>
+        /SELECT pk_hash, body_bytes/.test(sql),
+      );
+      expect(sizeReads.length).toBeGreaterThanOrEqual(2); // the plan's, the transfer's
+      expect(seen.queries.some(({ sql }) => /LENGTH\(/i.test(sql))).toBe(false);
+      for (const { sql, params } of sizeReads) {
+        const plan = await f.db.query<{ detail: string }>(
+          `EXPLAIN QUERY PLAN ${sql}`,
+          params,
+        );
+        expect(plan.map((row) => row.detail).join(" | ")).toContain(
+          "COVERING INDEX records_size",
+        );
+      }
+    });
+
+    it("plans the same prefixes from stored sizes, from bodies, and from a mix", async () => {
+      const planOf = async (size: (i: number) => "stored" | undefined) => {
+        const f = await fresh();
+        const rows = Array.from({ length: 400 }, (_, i) => ({
+          k: key(i),
+          value: "v".repeat(2000),
+          ...(size(i) ? { size: size(i)! } : {}),
+        }));
+        await f.insert(rows);
+        return planChangedPrefixes(readerOf(f.db), {
+          connectionId: input.connectionId,
+          stream: input.stream,
+          changedKeys: rows.map((row) => row.k),
+          baseParts: [],
+          targetBytes: 64 * 1024,
+          rewriteAll: false,
+        });
+      };
+      const stored = await planOf(() => "stored");
+      expect(stored.length).toBeGreaterThan(4); // 400 rows of 2 KB split the stream
+      expect(await planOf(() => undefined)).toEqual(stored);
+      expect(await planOf((i) => (i % 3 === 0 ? "stored" : undefined))).toEqual(
+        stored,
+      );
+    });
+
+    it("measures the body of a row with no stored size", async () => {
+      const f = await fresh();
+      await f.insert([
+        { k: key(0), value: valueFor(key(0), MIB), size: MIB },
+        { k: key(1), value: valueFor(key(1), MIB) }, // NULL: measured, 1 MiB
+        { k: key(2), value: valueFor(key(2), MIB) }, // NULL: measured, 1 MiB
+        { k: key(3), size: "stored" },
+      ]);
+      // Rows 0 and 1 fill 2 MiB; row 2 (1 MiB) does not fit beside them.
+      expect((await pages(f)).seen.pageRows).toEqual([2, 2]);
+    });
   });
 });
 

@@ -185,4 +185,16 @@ END;`,
     // `seenStamp` in merge.ts, so that read seeks and does not scan the stream.
     `CREATE INDEX records_by_observation ON records(connection_id, stream, COALESCE(seen_o, stamp_o), COALESCE(seen_r, stamp_r))`,
   ],
+  [
+    // The bytes of `body`, set by `mergeIncoming` with the body. Local only:
+    // never in a part, and not watched by `records_au`. NULL means the row was
+    // written before this column existed; `bodySizes` in part-layout.ts
+    // measures the body for those rows.
+    `ALTER TABLE records ADD COLUMN body_bytes INTEGER`,
+    // The size alone, in an index. A column after `body` is stored behind the
+    // body's overflow pages, and a lookup in `records` reads a wide row page
+    // for each key, so the column by itself leaves the size reads as slow as
+    // measuring the body. This index answers them without touching `records`.
+    `CREATE INDEX records_size ON records(connection_id, stream, pk_hash, body_bytes)`,
+  ],
 ];
