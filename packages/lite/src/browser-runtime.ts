@@ -16,6 +16,7 @@ import {
   withCancellableRegistration,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { RunIntake } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import type { SyncStatus } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   createLiteReplication,
   liteVanaReplicaObjects,
@@ -203,6 +204,25 @@ export interface IndexedDbPsLiteRuntime {
   tokenStore: PsLiteRuntimeOptions["tokenStore"];
   accessLogStore: AccessLogReader & AccessLogWriter;
   syncManager: PsLiteRuntimeOptions["syncManager"];
+  /**
+   * Calls `listener` with the new sync status after each change of it: a cycle
+   * starting or ending, the first sync finishing with no data, an error, the
+   * pending count moving. Pass it what `syncManager.getStatus()` returns, so a
+   * host that shows sync state needs no timer. Works before the manager
+   * starts; the subscription stays when the manager stops and starts again.
+   * Returns the unsubscribe; with no sync manager it hears nothing.
+   *
+   * Do not call `syncManager.trigger()` on every event: each cycle changes
+   * `lastSync`, so each ends with an event that would start the next, and
+   * nothing bounds that loop. Trigger only on a change the listener acts on.
+   *
+   * Unsubscribe before `closeStreamSync`. If the caller forgot, `closeStreamSync`
+   * removes every subscription this runtime made from the manager, at its
+   * start and before it awaits, and no listener is called after that. A
+   * subscribe after close registers nothing. Subscriptions other users made
+   * on an injected manager stay.
+   */
+  subscribeSyncStatus(listener: (status: SyncStatus) => void): () => void;
   /** Database facade when a host driver is supplied and available. */
   localSync?: LocalSync | null;
   /** Lazily open the database after Account mode is known. */
@@ -373,6 +393,11 @@ export async function createIndexedDbPsLiteRuntime(
   let syncRuntime:
     Awaited<ReturnType<typeof createPsLiteSyncManager>> | undefined;
   let closeStreamSync = async () => {};
+  // Set when closeStreamSync begins: sync status listeners hear nothing after.
+  let streamSyncClosing = false;
+  // The manager unsubscribes this runtime holds. An injected or shared manager
+  // outlives the runtime, so close removes these and nothing else.
+  const statusSubscriptions = new Set<() => void>();
   let runtimeRef: PsLiteRuntime | null = null;
   // Derivative compute: built before sync so downloads can mark questions
   // stale; it reaches the sync manager lazily to upload its results.
@@ -604,11 +629,30 @@ export async function createIndexedDbPsLiteRuntime(
     syncManager,
     subscribeViewChanges: (listener) =>
       (syncRuntime?.viewChanges ?? NO_VIEW_CHANGES).subscribe(listener),
+    subscribeSyncStatus: (listener) => {
+      if (streamSyncClosing || !syncManager?.subscribeStatus) return () => {};
+      let live = true;
+      const release = syncManager.subscribeStatus((status) => {
+        if (live) listener(status); // close ends every subscription first
+      });
+      const unsubscribe = () => {
+        if (!live) return;
+        live = false;
+        statusSubscriptions.delete(unsubscribe);
+        release();
+      };
+      statusSubscriptions.add(unsubscribe);
+      return unsubscribe;
+    },
     get localSync() {
       return syncRuntime?.localSync ?? null;
     },
     getLocalSync: syncRuntime?.getLocalSync,
-    closeStreamSync,
+    closeStreamSync: async () => {
+      streamSyncClosing = true;
+      for (const unsubscribe of [...statusSubscriptions]) unsubscribe();
+      await closeStreamSync();
+    },
     streamSyncIntake,
     streamSyncSeed,
     derivatives,

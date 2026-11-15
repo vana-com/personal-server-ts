@@ -9,6 +9,9 @@ import {
   createMemoryStreamSyncBlobs,
   createMemoryStreamSyncRegistry,
   type MemoryStreamSyncRegistry,
+  type RegistryBatchResult,
+  type SignedRegistryBatch,
+  type StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
@@ -976,4 +979,277 @@ it("cleanup of a stream whose head cannot be read after the fence still finishes
     f.a.deps.blobs.get = real;
   }
   expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 2 });
+});
+
+// ---------------------------------------------------------------------------
+// Reads: a landing reuses the plan's listing and observes each unfenced
+// control row once. Counts are of `registry.read` during the delete only.
+// ---------------------------------------------------------------------------
+
+function countReads(registry: MemoryStreamSyncRegistry) {
+  const reads: string[] = [];
+  const read = registry.read.bind(registry);
+  registry.read = async (scope) => {
+    reads.push(scope);
+    return read(scope);
+  };
+  // The plan's listing reads every row it returns; the landing starts after it.
+  const listed = registry.listStreamRows.bind(registry);
+  registry.listStreamRows = async (connector) => {
+    const rows = await listed(connector);
+    reads.length = 0;
+    return rows;
+  };
+  return reads;
+}
+
+const FIVE = ["s1", "s2", "s3", "s4", "s5"] as const;
+
+it("five unfenced streams cost five confirming stream reads and one control read", async () => {
+  const f = await world(undefined, FIVE, false);
+  const reads = countReads(f.registry);
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  // Before: 5 first reads + 5 confirming reads + 10 control reads = 20.
+  expect(reads.filter((scope) => scope === f.control)).toHaveLength(1);
+  expect(reads).toHaveLength(6);
+  for (const head of f.heads)
+    expect(await f.registry.read(head.scope)).toMatchObject({ version: 2 });
+});
+
+it("a stale listed row costs one rejected write, one refresh read of the row and of its control", async () => {
+  const f = await world(undefined, ["items"], false);
+  const listed = f.registry.listStreamRows.bind(f.registry);
+  f.registry.listStreamRows = async (connector) => {
+    const stale = await listed(connector);
+    await rivalWrite(f.registry, f.head.scope);
+    return stale;
+  };
+  let rejected = 0;
+  const post = f.registry.post.bind(f.registry);
+  f.registry.post = async (request) => {
+    const answer = await post(request);
+    if (answer.kind === "conflict") rejected++;
+    return answer;
+  };
+  const reads = countReads(f.registry);
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(rejected).toBe(1);
+  expect(reads.filter((scope) => scope === f.head.scope)).toHaveLength(2);
+  expect(reads.filter((scope) => scope === f.control)).toHaveLength(2);
+  expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 3 });
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// One commit: with a batch route the fence and every stream row of the
+// connection go in one POST /v1/data/batch (split at the gateway's 16 rows).
+// ---------------------------------------------------------------------------
+
+const names = (n: number) => Array.from({ length: n }, (_, i) => `s${i + 1}`);
+
+/**
+ * Gives the memory registry the batch route's contract: conditions are judged
+ * first against the state before the writes; then each row is its own
+ * compare-and-set (version, and the head's data hash when the row names it).
+ */
+function withBatchRoute(f: World, route: "present" | 405 = "present") {
+  const registry: StreamSyncRegistry = f.registry;
+  const batches: SignedRegistryBatch[] = [];
+  const singles: string[] = [];
+  let inBatch = false;
+  const post = f.registry.post.bind(f.registry);
+  f.registry.post = async (request) => {
+    if (!inBatch) singles.push(request.scope);
+    return post(request);
+  };
+  registry.postBatch = async (request): Promise<RegistryBatchResult> => {
+    batches.push(request);
+    if (route === 405) return { kind: "unsupported" };
+    for (const need of request.requires) {
+      const row = await f.registry.read(need.scope);
+      const tombstoned = row.found && row.dataHash === f.hashes.tombstoneData;
+      if (
+        !row.found ||
+        String(row.version) !== need.expectedVersion ||
+        (need.notDeleted && tombstoned) ||
+        (need.expectedDataHash !== undefined &&
+          row.dataHash.toLowerCase() !== need.expectedDataHash.toLowerCase())
+      )
+        return { kind: "precondition_failed", failure: null };
+    }
+    const rows: Extract<
+      RegistryBatchResult,
+      { kind: "rows" }
+    >["rows"][number][] = [];
+    inBatch = true;
+    try {
+      for (const row of request.rows) {
+        const head = await f.registry.read(row.scope);
+        const answer =
+          row.expectedHeadDataHash !== undefined &&
+          (!head.found || head.dataHash !== row.expectedHeadDataHash)
+            ? ({
+                kind: "conflict",
+                latestVersion: head.found ? String(head.version) : null,
+              } as const)
+            : await f.registry.post({
+                ownerAddress: request.ownerAddress,
+                ...row,
+              });
+        rows.push(
+          answer.kind === "committed"
+            ? { kind: "committed" }
+            : {
+                kind: "conflict",
+                latestVersion: answer.latestVersion,
+                latestDataHash: head.found ? head.dataHash : null,
+              },
+        );
+      }
+    } finally {
+      inBatch = false;
+    }
+    return { kind: "rows", rows };
+  };
+  return { batches, singles };
+}
+
+it("a six-stream delete is one POST that carries the fence and every stream row", async () => {
+  const f = await world(undefined, names(6));
+  const { batches, singles } = withBatchRoute(f);
+  const started = await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(started.fenced).toBe(true);
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(batches).toHaveLength(1);
+  expect(singles).toEqual([]);
+  const [batch] = batches;
+  expect(batch!.rows.map((r) => r.scope)).toEqual([
+    f.control,
+    ...f.heads.map((h) => h.scope).sort(),
+  ]);
+  // The stream rows rest on the control row still being the one planned over.
+  expect(batch!.requires).toEqual([
+    {
+      scope: f.control,
+      expectedVersion: "1",
+      notDeleted: true,
+      expectedDataHash: f.hashes.activeData,
+    },
+  ]);
+  expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
+  for (const head of f.heads)
+    expect(await f.registry.read(head.scope)).toMatchObject({ version: 2 });
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+it("without a batch route the same delete is a fence post and one post per stream", async () => {
+  const f = await world(undefined, names(6));
+  const before = f.registry.log.length;
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(f.registry.log.length - before).toBe(7);
+});
+
+it("above sixteen rows the first request holds every fence and the rest follow it", async () => {
+  const f = await world(undefined, names(20));
+  const { batches, singles } = withBatchRoute(f);
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(singles).toEqual([]);
+  expect(batches.map((b) => b.rows.length)).toEqual([16, 5]);
+  expect(batches[0]!.rows[0]!.scope).toBe(f.control);
+  expect(batches[1]!.rows.some((r) => r.scope === f.control)).toBe(false);
+  // The second request has no fence of its own: it rests on the fence that
+  // the first one wrote.
+  expect(batches[1]!.requires).toEqual([
+    {
+      scope: f.control,
+      expectedVersion: "2",
+      notDeleted: false,
+      expectedDataHash: f.hashes.tombstoneData,
+    },
+  ]);
+  expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
+  for (const head of f.heads)
+    expect(await f.registry.read(head.scope)).toMatchObject({ version: 2 });
+});
+
+it("a stream row that loses its compare-and-set is retried alone; the rest stay in the one commit", async () => {
+  const f = await world(undefined, names(6));
+  const { batches, singles } = withBatchRoute(f);
+  const loser = f.heads[2]!.scope;
+  f.registry.beforePost = async (request) => {
+    if (request.scope === loser) {
+      f.registry.beforePost = undefined;
+      await rivalWrite(f.registry, loser);
+    }
+  };
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(batches).toHaveLength(1);
+  expect(singles).toEqual([loser]);
+  expect(await f.registry.read(loser)).toMatchObject({ version: 3 });
+  for (const head of f.heads.filter((h) => h.scope !== loser))
+    expect(await f.registry.read(head.scope)).toMatchObject({ version: 2 });
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+it("a reconnect before the request writes nothing in it, and the per-stream path ends the delete", async () => {
+  const f = await world(undefined, names(3));
+  const { batches, singles } = withBatchRoute(f);
+  const send = f.registry.postBatch!.bind(f.registry);
+  (f.registry as StreamSyncRegistry).postBatch = async (request) => {
+    // Another device deletes and reconnects after the plan read the control row.
+    for (const [version, hashes] of [
+      ["2", [f.hashes.tombstoneData, f.hashes.tombstoneMetadata]],
+      ["3", [f.hashes.activeData, f.hashes.activeMetadata]],
+    ] as const)
+      await f.registry.post({
+        ownerAddress: owner,
+        scope: f.control,
+        dataHash: hashes[0],
+        metadataHash: hashes[1],
+        expectedVersion: version,
+        signature: "0x00",
+      });
+    return send(request);
+  };
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  // The condition (control active at version 1) failed: the request wrote
+  // nothing, the per-stream path cleaned each stream of the ended lifetime,
+  // and the reconnected lifetime was never tombstoned.
+  expect(batches).toHaveLength(1);
+  expect(singles.filter((scope) => scope !== f.control)).toHaveLength(3);
+  expect(await f.registry.read(f.control)).toMatchObject({
+    version: 3,
+    dataHash: f.hashes.activeData,
+  });
+  for (const head of f.heads)
+    expect(await f.registry.read(head.scope)).toMatchObject({ version: 2 });
+});
+
+it("a gateway without the batch route (405) is asked once; the old path ends the delete and later deletes do not ask", async () => {
+  const f = await world(undefined, names(6));
+  const { batches, singles } = withBatchRoute(f, 405);
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(batches).toHaveLength(1);
+  expect(singles).toHaveLength(7);
+  expect(singles[0]).toBe(f.control);
+  expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
+  // A reconnect, then a second delete in the same session.
+  await f.registry.post({
+    ownerAddress: owner,
+    scope: f.control,
+    dataHash: f.hashes.activeData,
+    metadataHash: f.hashes.activeMetadata,
+    expectedVersion: "3",
+    signature: "0x00",
+  });
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(batches).toHaveLength(1);
 });
