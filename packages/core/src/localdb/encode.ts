@@ -1,4 +1,3 @@
-import { sha256 } from "@noble/hashes/sha2";
 import { SEEN_PAIR } from "./merge.js";
 import { BODY_BYTES } from "./part-layout.js";
 import {
@@ -11,11 +10,10 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { readerOf, type SqlReader, type SqlValue } from "./driver.js";
 import type { LocalSyncDeps } from "./deps.js";
+import { nobleStreamCrypto } from "../stream-sync/crypto-port.js";
 import { meteredBlobs, type PublishMeter } from "./publish-meter.js";
 import { newUploadWave, type UploadWave } from "./upload-wave.js";
 import { holdMemory } from "./transfer-memory.js";
-
-const hash = async (bytes: Uint8Array): Promise<Uint8Array> => sha256(bytes);
 
 /**
  * Extra fields a head carries beside its parts (pending r5.2: the first-seen
@@ -505,6 +503,9 @@ async function encodeFrozenParts(
   },
 ): Promise<readonly EncodedPart[]> {
   const result: EncodedPart[] = [];
+  const port = deps.streamCrypto ?? nobleStreamCrypto;
+  const hash = async (bytes: Uint8Array): Promise<Uint8Array> =>
+    port.sha256(bytes);
   // The next prefix is awaited here, while no memory is held: `flush` has
   // dropped the last reservation and `hold` has not asked for the next.
   for await (const frozen of input.frozen) {

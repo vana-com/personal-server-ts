@@ -6,6 +6,7 @@ import type {
   StreamSyncRegistry,
   StreamSyncSigner,
 } from "../stream-sync/ports.js";
+import type { StreamCryptoPort } from "../stream-sync/crypto-port.js";
 
 /** The queue every multi-batch operation of one database runs through (B.1). */
 export type ConnectionQueue = ReturnType<typeof connectionQueue>;
@@ -30,6 +31,12 @@ export interface LocalSyncDeps {
   readonly now: () => number;
   /** A fresh random id for one operation (`op` in the TEMP tables). */
   readonly newOp: () => string;
+  /**
+   * SHA-256 of a part, from the host. Default: noble (pure JS). A host with a
+   * native one passes it here and to `createStreamSyncKeyPorts`; part hashes and
+   * blobs are the same bytes either way.
+   */
+  readonly streamCrypto?: StreamCryptoPort;
   /** Part target in bytes; default 4 MiB (C.2). */
   readonly partTargetBytes?: number;
   /**

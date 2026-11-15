@@ -20,6 +20,7 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { streamMasterKey } from "../keys/owner-master-key.js";
 import type { StreamSyncKeyPorts } from "./ports.js";
+import { nobleStreamCrypto, type StreamCryptoPort } from "./crypto-port.js";
 import { isStreamAead, openBytes, sealBytes } from "./stream-aead.js";
 
 export const streamSyncHashes: HashPorts = {
@@ -43,6 +44,9 @@ function hex(bytes: Uint8Array): string {
 /**
  * Key ports bound to the stream-sync master key of the owner signature.
  *
+ * `port` is the chunk cipher of format-2 parts (default: noble); the bytes
+ * sealed do not depend on it.
+ *
  * The ports take the signature, not a master key: the stream-sync master key
  * is the signature in one normal form (`streamMasterKey`), so
  * every encoding of one signature gives the same `ns`, `keyCheck`, head and
@@ -53,6 +57,7 @@ function hex(bytes: Uint8Array): string {
  */
 export function createStreamSyncKeyPorts(
   ownerSignature: Uint8Array | string,
+  port: StreamCryptoPort = nobleStreamCrypto,
 ): StreamSyncKeyPorts {
   const masterKey = streamMasterKey(ownerSignature);
   const kNs = deriveScopeKey(masterKey, NAMESPACE_KEY_LABEL);
@@ -66,12 +71,12 @@ export function createStreamSyncKeyPorts(
       return encryptWithPassword(clear, password(scope));
     },
     async encryptPart(scope, clear) {
-      return sealBytes(scopeKey(scope), clear, randomBytes);
+      return sealBytes(scopeKey(scope), clear, randomBytes, port);
     },
     async decrypt(scope, cipher) {
       // A format-2 part is a STREAM blob; a head and a format-1 part are OpenPGP.
       return isStreamAead(cipher)
-        ? openBytes(scopeKey(scope), cipher)
+        ? openBytes(scopeKey(scope), cipher, port)
         : decryptWithPassword(cipher, password(scope));
     },
   };
