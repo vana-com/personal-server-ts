@@ -62,6 +62,12 @@ export interface FakeGatewayOptions {
    * gateway refreshes a pending row, unless the row's head fence refuses it.
    */
   readonly refresh?: boolean;
+  /**
+   * The bounds the gateway advertises in `Batch-Policy` on every batch answer
+   * and enforces with a 400. Absent: an old gateway that sends no header and
+   * accepts 16 rows and 16 conditions.
+   */
+  readonly policy?: { rows: number; requires: number; bytes: number };
 }
 
 export function createFakeGateway(options: FakeGatewayOptions) {
@@ -118,7 +124,15 @@ export function createFakeGateway(options: FakeGatewayOptions) {
       const url = new URL(input);
       const method = init?.method ?? "GET";
       const json = (status: number, body: unknown) =>
-        new Response(JSON.stringify(body), { status });
+        new Response(JSON.stringify(body), {
+          status,
+          headers:
+            options.policy && url.pathname === "/v1/data/batch"
+              ? {
+                  "batch-policy": `rows=${options.policy.rows};bytes=${options.policy.bytes};requires=${options.policy.requires}`,
+                }
+              : {},
+        });
       const rowJson = (scope: string) => {
         const rows = versions.get(scope)!;
         const head = rows[rows.length - 1]!;
@@ -230,17 +244,26 @@ export function createFakeGateway(options: FakeGatewayOptions) {
         return json(batchRoute, { error: "not here" });
       }
       await gateway.beforeBatch?.(call);
-      // As the gateway: 1 to 16 rows, or none when `requires` names something.
+      // As the gateway: 1 to `maxRows` rows, or none when `requires` names
+      // something, and at most `maxRequires` conditions.
+      const maxRows = options.policy?.rows ?? 16;
+      const maxRequires = options.policy?.requires ?? 16;
       const hasRequires =
         Array.isArray(body.requires) && body.requires.length > 0;
       if (
         !Array.isArray(body.rows) ||
-        (body.rows.length === 0 && !hasRequires)
+        (body.rows.length === 0 && !hasRequires) ||
+        body.rows.length > maxRows
       ) {
         return json(400, {
           success: false,
-          error:
-            "rows must be an array of 1 to 16 entries (0 when requires is not empty)",
+          error: `rows must be an array of 1 to ${maxRows} entries (0 when requires is not empty)`,
+        });
+      }
+      if (hasRequires && body.requires.length > maxRequires) {
+        return json(400, {
+          success: false,
+          error: `requires has at most ${maxRequires} entries`,
         });
       }
       const bad = requirementFails(body.requires ?? []);

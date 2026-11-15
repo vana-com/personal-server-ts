@@ -102,6 +102,18 @@ export interface SignedRegistryBatch {
   readonly requires: readonly RegistryRequirement[];
 }
 
+/**
+ * What the gateway says one batch request may hold (its `Batch-Policy`
+ * response header). `rows` and `requires` are item counts, and both can be full
+ * in one request; `bytes` is the size of that full request of the largest
+ * legal items, so a request within the counts is within `bytes`.
+ */
+export interface RegistryBatchPolicy {
+  readonly rows: number;
+  readonly requires: number;
+  readonly bytes: number;
+}
+
 export type RegistryBatchRow =
   /** 201: written. */
   | { readonly kind: "committed" }
@@ -225,6 +237,13 @@ export interface StreamSyncRegistry {
    * (or as committed).
    */
   postBatch?(request: SignedRegistryBatch): Promise<RegistryBatchResult>;
+  /**
+   * The bounds the gateway advertised on its last batch answer, or `undefined`
+   * before any answer (and from a gateway that predates the header). A caller
+   * that has none sends no more than the old gateway's fixed 16 rows and 16
+   * conditions.
+   */
+  batchPolicy?(): RegistryBatchPolicy | undefined;
   /**
    * Every control scope row of the owner (`pdpp.<c>~<ns>`), deleted or not.
    * Used for the per-session control listing (§2.4 `controls`).

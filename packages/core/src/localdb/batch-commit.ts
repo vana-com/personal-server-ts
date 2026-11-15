@@ -22,19 +22,29 @@ import type {
 import type { LocalSyncDeps } from "./deps.js";
 
 /**
- * The gateway's limit on rows in one batch request: it answers 400 ("rows must
- * be an array of 1 to 16 entries") above it. Mirrored from `MAX_BATCH_ROWS` in
- * the data gateway's `lib/data-point-batch.ts`, which owns the number. It is a
- * protocol limit, not a tuning knob: a turn with more waiting commits sends
- * the first rows and the rest take the next turn.
+ * What every gateway that has the batch route accepts: 16 rows and 16
+ * conditions in one request (the fixed caps of the first gateway to ship it).
+ * A caller uses these until a batch answer advertises the gateway's own bounds
+ * (`Batch-Policy`, read by `registry.batchPolicy()`), and for a gateway that
+ * never does. They are not tuning knobs: see `batchBounds`.
  */
 export const GATEWAY_MAX_BATCH_ROWS = 16;
+export const GATEWAY_MAX_BATCH_REQUIRES = 16;
 
 /**
- * The gateway's limit on conditions in one batch request (`MAX_BATCH_REQUIRES`
- * in the same file). One of them is the connection's control row.
+ * The bounds of one batch request on this registry: what its last batch answer
+ * advertised, else the fixed caps every gateway accepts.
  */
-export const GATEWAY_MAX_BATCH_REQUIRES = 16;
+export function batchBounds(registry: LocalSyncDeps["registry"]): {
+  readonly rows: number;
+  readonly requires: number;
+} {
+  const policy = registry.batchPolicy?.();
+  return {
+    rows: policy?.rows ?? GATEWAY_MAX_BATCH_ROWS,
+    requires: policy?.requires ?? GATEWAY_MAX_BATCH_REQUIRES,
+  };
+}
 
 export interface CommitGroup<E, R> {
   /** Resolves when the entry's commit turn ends; rejects if the turn failed. */
