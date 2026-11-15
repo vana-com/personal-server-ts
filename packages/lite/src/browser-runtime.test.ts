@@ -412,6 +412,118 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
     await context.syncManager?.stop();
   });
 
+  /**
+   * A manager that outlives the runtime, with a subscriber count to read. Its
+   * delivery walks a snapshot, as a loop that a listener may change would.
+   */
+  function sharedManager() {
+    const listeners = new Set<(s: unknown) => void>();
+    let unsubscribeCalls = 0;
+    const status = { syncing: false };
+    return {
+      manager: {
+        trigger: async () => {},
+        getStatus: () => status as never,
+        subscribeStatus: (listener: (s: never) => void) => {
+          listeners.add(listener as never);
+          return () => {
+            unsubscribeCalls += 1;
+            listeners.delete(listener as never);
+          };
+        },
+      },
+      count: () => listeners.size,
+      unsubscribeCalls: () => unsubscribeCalls,
+      emit: () => {
+        for (const listener of [...listeners]) listener(status);
+      },
+    };
+  }
+  async function runtimeOn(shared: ReturnType<typeof sharedManager>) {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    return createSwitchedIndexedDbPsLiteRuntime(
+      options({
+        syncManager: shared.manager,
+        configDefaults: {
+          gateway: { url: "https://gateway.local" },
+          sync: { enabled: false },
+          streamSync: { write: true },
+        },
+      }),
+    );
+  }
+
+  it("closeStreamSync removes the subscriptions it was never told to, and only those", async () => {
+    const shared = sharedManager();
+    const context = await runtimeOn(shared);
+    const other = vi.fn();
+    shared.manager.subscribeStatus(other); // another user of the same manager
+    const forgotten = vi.fn();
+    const unsubscribed = vi.fn();
+    context.subscribeSyncStatus(forgotten);
+    context.subscribeSyncStatus(forgotten); // twice: two subscriptions
+    const gone = context.subscribeSyncStatus(unsubscribed);
+    gone();
+    expect(shared.count()).toBe(3); // other, and the runtime's two
+    shared.emit();
+    expect(forgotten).toHaveBeenCalledTimes(2);
+
+    const closing = context.closeStreamSync?.();
+    expect(shared.count()).toBe(1); // drained before the close awaits anything
+    await closing;
+    shared.emit();
+    expect(shared.count()).toBe(1);
+    expect(other).toHaveBeenCalledTimes(2); // the other user still hears
+    expect(forgotten).toHaveBeenCalledTimes(2);
+    expect(unsubscribed).not.toHaveBeenCalled();
+  });
+
+  it("a subscription's unsubscribe releases it once, however often it is called, also after close", async () => {
+    const shared = sharedManager();
+    const context = await runtimeOn(shared);
+    const first = context.subscribeSyncStatus(() => {});
+    context.subscribeSyncStatus(() => {});
+    first();
+    first();
+    expect(shared.unsubscribeCalls()).toBe(1);
+    expect(shared.count()).toBe(1);
+    await context.closeStreamSync?.();
+    expect(shared.count()).toBe(0);
+    expect(shared.unsubscribeCalls()).toBe(2);
+    first();
+    await context.closeStreamSync?.(); // a second close finds nothing to drain
+    expect(shared.unsubscribeCalls()).toBe(2);
+  });
+
+  it("a subscribe after close registers nothing", async () => {
+    const shared = sharedManager();
+    const context = await runtimeOn(shared);
+    await context.closeStreamSync?.();
+    const late = vi.fn();
+    const unsubscribe = context.subscribeSyncStatus(late);
+    expect(shared.count()).toBe(0);
+    shared.emit();
+    expect(late).not.toHaveBeenCalled();
+    expect(() => unsubscribe()).not.toThrow();
+    expect(shared.unsubscribeCalls()).toBe(0);
+  });
+
+  it("no listener is called after close begins, including the rest of a delivery in progress", async () => {
+    const shared = sharedManager();
+    const context = await runtimeOn(shared);
+    const calls: string[] = [];
+    context.subscribeSyncStatus(() => {
+      calls.push("first");
+      void context.closeStreamSync?.(); // closes while the manager is delivering
+    });
+    context.subscribeSyncStatus(() => calls.push("second"));
+    shared.emit();
+    expect(calls).toEqual(["first"]); // the second was queued, and is not called
+    shared.emit();
+    expect(calls).toEqual(["first"]);
+    expect(shared.count()).toBe(0);
+  });
+
   it("refuses intake while Account is Off regardless of the old write flag", async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());
     const { streamSyncIntake } = await createUnswitchedIndexedDbPsLiteRuntime(
