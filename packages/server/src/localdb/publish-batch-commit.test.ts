@@ -21,6 +21,7 @@ import {
 import {
   createGatewayStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
+  parseBatchPolicy,
   type StreamSyncBlobs,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
@@ -42,6 +43,8 @@ type Options = {
   /** Runs when the transfer probes whether a blob exists. */
   readonly onExists?: (key: string) => Promise<void> | void;
   readonly gateway?: Partial<FakeGatewayOptions>;
+  /** The send gate's policy: parked parts hold its byte budget. */
+  readonly blobPolicy?: Parameters<typeof createMemoryStreamSyncBlobs>[0];
 };
 
 const drivers: SqlDriver[] = [];
@@ -66,7 +69,7 @@ async function world(options: Options) {
       v.metadataHash === hashes.tombstoneMetadata,
     ...options.gateway,
   });
-  const innerBlobs = createMemoryStreamSyncBlobs();
+  const innerBlobs = createMemoryStreamSyncBlobs(options.blobPolicy);
   const putsDone: string[] = [];
   const blobs: StreamSyncBlobs = {
     governor: innerBlobs.governor,
@@ -1169,5 +1172,94 @@ describe("a stream with nothing to publish, served by the connection's listing",
     ).toBe(true);
     const evidence = await evidenceOf(w);
     for (const name of w.names) expect(evidence[name]).toBe(1);
+  });
+});
+
+describe("the size of a request is the gateway's advertised bound", () => {
+  /**
+   * Hold the first request in flight until every other stream's commit is
+   * waiting, so the second turn takes everything that is waiting at once.
+   */
+  async function cycle(options: Options) {
+    const hold = holdParts();
+    const w = await world({ ...options, holdPut: hold.holdPut });
+    let sent!: () => void;
+    const firstSent = new Promise<void>((r) => (sent = r));
+    let reply!: () => void;
+    const firstHeld = new Promise<void>((r) => (reply = r));
+    w.gateway.beforeBatch = async () => {
+      w.gateway.beforeBatch = undefined;
+      sent();
+      await firstHeld;
+    };
+    const publishing = publishConnection(w.deps, CONNECTION_ID);
+    await vi.waitFor(() => expect(hold.parked).toHaveLength(options.streams));
+    const [lead, ...others] = hold.parked;
+    lead!.release();
+    await firstSent;
+    for (const part of others) part.release();
+    await vi.waitFor(() =>
+      expect(w.putsDone().filter((k) => !/-p-/.test(k))).toHaveLength(
+        options.streams,
+      ),
+    );
+    await new Promise((r) => setTimeout(r, 25));
+    reply();
+    const results = await publishing;
+    expect(results.map((r) => r.outcome)).toEqual(
+      Array(options.streams).fill("published"),
+    );
+    return w.gateway.batches().map((b) => b.body.rows.length);
+  }
+  const wide = { maxBytesInFlight: 1024 * 1024 * 1024 };
+
+  it("no Batch-Policy seen: the fixed 16 rows of the first gateway", async () => {
+    expect(await cycle({ streams: 20, blobPolicy: wide })).toEqual([1, 16, 3]);
+  });
+
+  it("a gateway that advertises 24 rows gets 24, not 16", async () => {
+    const sizes = await cycle({
+      streams: 26,
+      blobPolicy: wide,
+      gateway: { policy: { rows: 24, requires: 40, bytes: 1_000_000 } },
+    });
+    expect(sizes).toEqual([1, 24, 1]);
+  });
+
+  it("a gateway that advertises fewer rows gets fewer", async () => {
+    const sizes = await cycle({
+      streams: 8,
+      gateway: { policy: { rows: 4, requires: 6, bytes: 100_000 } },
+    });
+    expect(sizes).toEqual([1, 4, 3]);
+  });
+
+  it("a gateway without the batch route: every stream commits alone, the bound is never asked", async () => {
+    const w = await world({ streams: 3, gateway: { batchRoute: 404 } });
+    const results = await publishConnection(w.deps, CONNECTION_ID);
+    expect(results.map((r) => r.outcome)).toEqual(Array(3).fill("published"));
+    expect(w.deps.registry.batchPolicy?.()).toBeUndefined();
+  });
+});
+
+describe("Batch-Policy", () => {
+  it("parses the header the gateway sends", () => {
+    expect(parseBatchPolicy("rows=36;bytes=3849121;requires=2080")).toEqual({
+      rows: 36,
+      bytes: 3849121,
+      requires: 2080,
+    });
+  });
+  it("reads nothing from a header it cannot read", () => {
+    for (const bad of [
+      null,
+      "",
+      "rows=16",
+      "rows=0;bytes=1;requires=1",
+      "rows=x;bytes=1;requires=1",
+      "rows=1;bytes=1",
+    ]) {
+      expect(parseBatchPolicy(bad)).toBeUndefined();
+    }
   });
 });

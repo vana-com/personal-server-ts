@@ -117,9 +117,8 @@ import {
 } from "../stream-sync/ports.js";
 import { applyConnection } from "./apply.js";
 import {
+  batchBounds,
   createCommitGroup,
-  GATEWAY_MAX_BATCH_REQUIRES,
-  GATEWAY_MAX_BATCH_ROWS,
   settleRequirementFailure,
   settleRow,
   type CommitGroup,
@@ -1892,11 +1891,12 @@ function connectionCommits(
       // that write, and each stream that does not write is one more condition
       // beside the control row's.
       canJoin: (taken, next) => {
+        const bounds = batchBounds(deps.registry);
         const writes = (list: readonly CommitEntry[]) =>
           list.filter(writesHead).length;
         return writesHead(next)
-          ? writes(taken) < GATEWAY_MAX_BATCH_ROWS
-          : taken.length - writes(taken) < GATEWAY_MAX_BATCH_REQUIRES - 1;
+          ? writes(taken) < bounds.rows
+          : taken.length - writes(taken) < bounds.requires - 1;
       },
     }),
   };
