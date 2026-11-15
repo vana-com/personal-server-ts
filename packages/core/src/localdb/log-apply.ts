@@ -50,9 +50,20 @@ import {
   type SnapshotPointer,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
+import { announceApplied } from "./apply-progress.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
+import { heldKeys, planLogLoad, type PlannedBatch } from "./log-progressive.js";
 import { mergeIncoming, seenPair, withOrigin } from "./merge.js";
+import {
+  failedRowStatement,
+  failureCode,
+  holdKeys,
+  partialRowStatement,
+  showIncomingKeys,
+  hideStoredRows,
+  type PartialIdentity,
+} from "./partial-load.js";
 
 const sha = async (bytes: Uint8Array) => sha256(bytes);
 const keccak = async (bytes: Uint8Array) => keccak_256(bytes);
@@ -143,6 +154,25 @@ interface OperationBatch {
   readonly operations: readonly (LogOperation | LogOmitted)[];
 }
 
+/**
+ * What one batch does for a stream that loads progressively (see
+ * `log-progressive.ts`). The stream's head, and with it `complete`, is written
+ * only by the batch that `final` names.
+ */
+interface BatchStep {
+  /** The first batch of a load that is not a resumed one hides the stored rows. */
+  readonly begin: boolean;
+  readonly final: boolean;
+  /** Keys of this batch a later, fetched batch deletes or omits. */
+  readonly held: readonly string[];
+  /** The stream's row after this batch; absent in the final batch. */
+  readonly row?: {
+    readonly head: PartialIdentity;
+    readonly applied: number;
+    readonly total: number;
+  };
+}
+
 export async function applySegmentOperations(
   deps: LocalSyncDeps,
   connectionId: string,
@@ -188,6 +218,7 @@ async function applyBatch(
   segment: OperationBatch,
   identity: { readonly dataHash: string; readonly blobName: string },
   state?: LogState,
+  steps: ReadonlyMap<string, BatchStep> = new Map(),
 ): Promise<void> {
   const { dataHash, blobName } = identity;
   const op = deps.newOp();
@@ -202,6 +233,10 @@ async function applyBatch(
             VALUES (?, ?, ?, 'mutable_state', 1)`,
       params: [connectionId, meta.stream, JSON.stringify(meta.primaryKey)],
     });
+  // A progressive load's first batch hides what the stream held, in the same
+  // transaction as its first rows (see `hideStoredRows`).
+  for (const [stream, step] of steps)
+    if (step.begin) statements.push(...hideStoredRows(connectionId, stream));
 
   // 1. Tombstones first, so the upserts of this very segment see them. A
   // tombstone has a rank beside its stamp, the model's order: an omission's
@@ -362,28 +397,40 @@ async function applyBatch(
     });
     staged++;
   }
-  if (staged > 0)
-    statements.push(
-      {
-        // An upsert ranks between the two tombstone kinds at its stamp: an
-        // explicit delete at the stamp refuses it, an omission there does not.
-        sql: `DELETE FROM temp.incoming WHERE op = ? AND EXISTS (
+  if (staged > 0) {
+    statements.push({
+      // An upsert ranks between the two tombstone kinds at its stamp: an
+      // explicit delete at the stamp refuses it, an omission there does not.
+      sql: `DELETE FROM temp.incoming WHERE op = ? AND EXISTS (
                 SELECT 1 FROM log_tombstones t
                  WHERE t.connection_id = ? AND t.stream = incoming.stream
                    AND t.pk_hash = incoming.pk_hash
                    AND (t.stamp_o, t.stamp_r, t.rank) > (incoming.stamp_o, incoming.stamp_r, ${UPSERT_RANK}))`,
-        params: [op, connectionId],
-      },
+      params: [op, connectionId],
+    });
+    // The rows this batch writes show in a progressive view, but for the keys
+    // a later batch removes.
+    for (const [stream, step] of steps)
+      if (!step.final)
+        statements.push(
+          showIncomingKeys(connectionId, stream, op),
+          ...holdKeys(connectionId, stream, step.held),
+        );
+    statements.push(
       ...mergeIncoming(op, connectionId, {
         promoteSeen: true,
         firstSeenOfWinner: true,
       }),
     );
+  }
 
   // 4. Each stream the segment touched now reads from it: a local version
   // above anything the registry's own stream row holds, so the per-stream
   // path never replaces what the log wrote (see `applyOneOnce`).
   for (const meta of segment.streams) {
+    // A stream still loading progressively has no head yet; its last batch
+    // writes it, with `complete`.
+    if (steps.get(meta.stream)?.final === false) continue;
     statements.push(
       {
         sql: `INSERT OR REPLACE INTO stream_versions (connection_id, stream, version, generation,
@@ -425,6 +472,11 @@ async function applyBatch(
       },
     );
   }
+  for (const step of steps.values())
+    if (step.row)
+      statements.push(
+        partialRowStatement(step.row.head, step.row.applied, step.row.total, 0),
+      );
   if (state) statements.push(writeLogState(connectionId, state));
 
   try {
@@ -558,6 +610,21 @@ export async function applyLog(
     // A full check. Behind `base` the log no longer holds the prefix: a
     // snapshot does, and it is installed first. Without one (a log that began
     // after the streams were published) the per-stream path holds it.
+    if (deps.progressiveFirstLoad === true) {
+      const after = planOpsSince(head, headRef, head.base);
+      return {
+        applied: await loadProgressively(
+          deps,
+          connectionId,
+          scope,
+          context,
+          head,
+          allRefs,
+          head.snapshot ?? null,
+          after.kind === "segments" ? after.refs : [],
+        ),
+      };
+    }
     if (head.snapshot) {
       await installSnapshot(deps, connectionId, scope, context, head, allRefs);
       applied += head.snapshot.parts.length;
@@ -566,6 +633,19 @@ export async function applyLog(
     plan = planOpsSince(head, headRef, since);
   }
   if (plan.kind !== "segments") return { applied };
+  if (deps.progressiveFirstLoad === true)
+    return {
+      applied: await loadProgressively(
+        deps,
+        connectionId,
+        scope,
+        context,
+        head,
+        allRefs,
+        null,
+        plan.refs,
+      ),
+    };
 
   // Older segments in parallel; they are applied strictly in position order.
   const fetched = new Map<number, Segment>();
@@ -686,4 +766,269 @@ async function installSnapshot(
           }
         : undefined,
     );
+}
+
+/** Snapshot parts fetched ahead of the one being applied. */
+const PART_WINDOW = 4;
+
+/**
+ * The pass of `applyLog` for a device that serves a first load while it
+ * applies (`progressiveFirstLoad`): the same batches in the same order, with
+ * `stream_partial` rows between them. See `log-progressive.ts` for which
+ * streams load so and why a row of a key a later batch removes stays hidden.
+ *
+ * Every segment of the tail is fetched, and the first snapshot part with it,
+ * before the first batch applies: the pass then knows what each later batch
+ * removes. The other parts arrive a few ahead of the one applying.
+ */
+async function loadProgressively(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  scope: string,
+  context: LogApplyContext,
+  head: Segment,
+  allRefs: readonly SegmentRef[],
+  snapshot: SnapshotPointer | null,
+  tail: readonly SegmentRef[],
+): Promise<number> {
+  const partRefs = snapshot?.parts ?? [];
+  const parts: (Promise<SnapshotPart> | undefined)[] = [];
+  const startPart = (index: number) => {
+    if (index >= partRefs.length || parts[index]) return;
+    const fetching = fetchSnapshotPart(
+      deps,
+      scope,
+      context,
+      partRefs[index]!.dataHash,
+      snapshot!.position,
+    );
+    fetching.catch(() => undefined);
+    parts[index] = fetching;
+  };
+  for (let i = 0; i < PART_WINDOW; i++) startPart(i);
+
+  const fetched = new Map<number, Segment>([[head.position, head]]);
+  const [firstPart] = await Promise.all([
+    parts[0] ?? Promise.resolve(undefined),
+    Promise.all(
+      tail
+        .filter((ref) => ref.position !== head.position)
+        .map(async (ref) => {
+          fetched.set(
+            ref.position,
+            (
+              await fetchSegment(
+                deps,
+                scope,
+                context,
+                ref.dataHash,
+                ref.position,
+              )
+            ).segment,
+          );
+        }),
+    ),
+  ]);
+  const tailSegments = tail.map((ref) => fetched.get(ref.position)!);
+
+  // Every batch's identity: the hash and blob its stream head will name.
+  const identities = [
+    ...partRefs.map((ref) => ({
+      dataHash: ref.dataHash.toLowerCase(),
+      blobName: snapshotPartBlobName(ref.dataHash),
+    })),
+    ...tail.map((ref) => ({
+      dataHash: ref.dataHash.toLowerCase(),
+      blobName: segmentBlobName(ref.dataHash),
+    })),
+  ];
+  const observedAts = [
+    ...partRefs.map(() => 0),
+    ...tailSegments.map((segment) => segment.observedAt),
+  ];
+  const planned: PlannedBatch[] = [
+    // The parts of one snapshot all carry the fold's streams. Their entries
+    // are one fold, which names a key once: nothing in them is removed later.
+    ...partRefs.map(() => ({ streams: firstPart!.streams, operations: [] })),
+    ...tailSegments,
+  ];
+
+  const stored = await deps.db.query<{
+    stream: string;
+    complete: number;
+    head_generation: number;
+    head_version: number;
+    last_delete_version: number;
+  }>(
+    `SELECT stream, complete, head_generation, head_version, last_delete_version
+       FROM stream_state WHERE connection_id = ?`,
+    [connectionId],
+  );
+  const complete = new Set(
+    stored
+      .filter(
+        (row) =>
+          row.complete === 1 &&
+          row.head_generation === context.generation &&
+          row.head_version > row.last_delete_version,
+      )
+      .map((row) => row.stream),
+  );
+  const versionOf = new Map(
+    stored.map((row) => [
+      row.stream,
+      Math.max(row.head_version, row.last_delete_version) + 1,
+    ]),
+  );
+  const plans = planLogLoad(planned, complete);
+
+  // The row a stream's load shows is the head it ends as: the version its
+  // last batch writes, that batch's hash and blob. A body that is reading
+  // when the load completes then goes on to its end.
+  const heads = new Map<string, PartialIdentity>();
+  for (const plan of plans.values())
+    heads.set(plan.stream, {
+      connectionId,
+      stream: plan.stream,
+      version: versionOf.get(plan.stream) ?? 1,
+      generation: context.generation,
+      dataHash: identities[plan.last]!.dataHash,
+      headBlob: identities[plan.last]!.blobName,
+      observedAt: observedAts[plan.last]!,
+    });
+  // A load of the same head that stopped continues: its rows keep showing.
+  const markers = await deps.db.query<{
+    stream: string;
+    version: number;
+    generation: number;
+    data_hash: string;
+    parts_applied: number;
+    parts_total: number;
+  }>(
+    `SELECT stream, version, generation, data_hash, parts_applied, parts_total
+       FROM stream_partial WHERE connection_id = ?`,
+    [connectionId],
+  );
+  const resumed = new Map<string, { applied: number; total: number }>();
+  const ended: SqlStatement[] = [];
+  for (const marker of markers) {
+    const mine = heads.get(marker.stream);
+    if (
+      mine &&
+      marker.version === mine.version &&
+      marker.generation === mine.generation &&
+      marker.data_hash === mine.dataHash
+    )
+      resumed.set(marker.stream, {
+        applied: marker.parts_applied,
+        total: marker.parts_total,
+      });
+    else if (
+      !mine &&
+      planned.some((b) => b.streams.some((m) => m.stream === marker.stream))
+    )
+      // A load this pass does not continue, of a stream it now writes whole.
+      ended.push({
+        sql: "DELETE FROM stream_partial WHERE connection_id = ? AND stream = ?",
+        params: [connectionId, marker.stream],
+      });
+  }
+  if (ended.length > 0) await deps.db.batch(ended);
+
+  const seen = new Map<string, number>();
+  const begun = new Map<string, PartialIdentity>();
+  const finished = new Set<string>();
+  try {
+    for (let index = 0; index < planned.length; index++) {
+      let batch: OperationBatch;
+      const isPart = index < partRefs.length;
+      if (isPart) {
+        const part = await parts[index]!;
+        startPart(index + PART_WINDOW);
+        if (
+          part.index !== index ||
+          JSON.stringify(part.streams) !== JSON.stringify(firstPart!.streams)
+        )
+          throw new Error("apply: invalid log snapshot part (inconsistent)");
+        batch = {
+          generation: part.generation,
+          observedAt: 0,
+          streams: part.streams,
+          operations: part.entries,
+        };
+      } else batch = tailSegments[index - partRefs.length]!;
+
+      const steps = new Map<string, BatchStep>();
+      for (const meta of batch.streams) {
+        const plan = plans.get(meta.stream);
+        if (!plan) continue;
+        const resume = resumed.get(meta.stream);
+        const count = (seen.get(meta.stream) ?? 0) + 1;
+        seen.set(meta.stream, count);
+        const final = index === plan.last;
+        const total = resume?.total ?? plan.total;
+        steps.set(meta.stream, {
+          begin: index === plan.first && resume === undefined,
+          final,
+          held: final ? [] : heldKeys(plan, index, batch.operations),
+          row: final
+            ? undefined
+            : {
+                head: heads.get(meta.stream)!,
+                applied: Math.min((resume?.applied ?? 0) + count, total - 1),
+                total,
+              },
+        });
+      }
+
+      const lastPart = isPart && index === partRefs.length - 1;
+      const position = index - partRefs.length;
+      const state: LogState | undefined = lastPart
+        ? {
+            position: snapshot!.position,
+            base: head.base,
+            refs: allRefs.filter((r) => r.position <= snapshot!.position),
+            snapshot,
+          }
+        : !isPart
+          ? {
+              position: tail[position]!.position,
+              base: head.base,
+              refs: allRefs.filter(
+                (r) => r.position <= tail[position]!.position,
+              ),
+              snapshot: head.snapshot,
+            }
+          : undefined;
+      await applyBatch(
+        deps,
+        connectionId,
+        batch,
+        identities[index]!,
+        state,
+        steps,
+      );
+      for (const [stream, step] of steps)
+        if (step.final) finished.add(stream);
+        else begun.set(stream, heads.get(stream)!);
+      if (steps.size > 0) announceApplied(deps, connectionId);
+    }
+  } catch (error) {
+    // The load stopped short of its last batch: say so on its rows, for a
+    // reader to tell this from a load that is still going. The next batch
+    // clears it. A failure here must not hide the one being thrown.
+    const code = failureCode(error);
+    const stopped = [...begun.values()].filter(
+      (identity) => !finished.has(identity.stream),
+    );
+    if (stopped.length > 0)
+      await deps.db
+        .batch(stopped.map((identity) => failedRowStatement(identity, code)))
+        .then(
+          () => announceApplied(deps, connectionId),
+          () => undefined,
+        );
+    throw error;
+  }
+  return planned.length;
 }

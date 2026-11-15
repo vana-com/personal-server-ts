@@ -29,6 +29,13 @@ import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js"
 import type { ConnectionQueue, LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { announceApplied } from "./apply-progress.js";
+import {
+  failedRowStatement,
+  failureCode,
+  hideStoredRows,
+  partialRowStatement,
+  showIncomingKeys,
+} from "./partial-load.js";
 import { applyDelete, mergeIncoming, withOrigin } from "./merge.js";
 import {
   endsEarlierLifetime,
@@ -657,8 +664,10 @@ async function applyOneOnce(
   // With the log on, a connection that has a log is finished by `applyLog`
   // after its heads: the log can delete or replace rows a head holds. A
   // partial view of a head would show rows the finished result lacks, so such
-  // a connection does not load progressively. A connection with no log, and a
-  // device with the log off, do.
+  // a connection's heads do not load progressively. The log's own pass does
+  // (`loadProgressively` in `log-apply.ts`), holding back the keys a later
+  // batch removes. A connection with no log, and a device with the log off,
+  // load their heads progressively.
   const progressive =
     deps.progressiveFirstLoad === true &&
     head.complete &&
@@ -722,35 +731,13 @@ async function applyOneOnce(
           sql: `INSERT OR IGNORE INTO stream_state (connection_id,stream,primary_key,semantics,incremental) VALUES (?,?,?,'mutable_state',1)`,
           params: [id, stream, JSON.stringify(head.primaryKey)],
         });
-        // A head the load did not begin hides every row the stream holds
+        // A head the load did not begin hides the rows the stream holds
         // outside the unchanged parts, in this same transaction as the first
-        // part. Nothing is deleted: only the complete state decides which of
-        // them go (a row seen again since the head's cutoff, a local change
-        // not yet published, a key a later part holds). A part shows its
-        // keys by taking them off the list.
-        if (!sameHead)
-          begin.push(
-            {
-              sql: "DELETE FROM partial_hidden WHERE connection_id=? AND stream=?",
-              params: [id, stream],
-            },
-            {
-              sql: `INSERT INTO partial_hidden (connection_id,stream,pk_hash)
- SELECT connection_id, stream, pk_hash FROM records
-  WHERE connection_id = ? AND stream = ?
-    AND NOT EXISTS (SELECT 1 FROM temp.keep_ranges k WHERE k.op = ? AND records.pk_hash >= k.lo AND records.pk_hash < k.hi)`,
-              params: [id, stream, op],
-            },
-          );
+        // part (see `hideStoredRows`).
+        if (!sameHead) begin.push(...hideStoredRows(id, stream, op));
       }
     }
-    if (progressive)
-      begin.push({
-        // The keys of this part, which `mergeIncoming` then clears.
-        sql: `DELETE FROM partial_hidden WHERE connection_id = ? AND stream = ?
-   AND pk_hash IN (SELECT pk_hash FROM temp.incoming WHERE op = ?)`,
-        params: [id, stream, op],
-      });
+    if (progressive) begin.push(showIncomingKeys(id, stream, op));
     await markPartial(deps, id, reuse);
     await deps.db.batch(
       withOrigin("remote", [
@@ -759,28 +746,20 @@ async function applyOneOnce(
         ...mergeIncoming(op, id, { promoteSeen: true }),
         ...(progressive
           ? [
-              {
-                // Never fewer parts than a load of this head already showed.
-                sql: `INSERT OR REPLACE INTO stream_partial (connection_id,stream,version,generation,data_hash,head_blob,observed_at,parts_applied,parts_total,records_total)
- VALUES (?,?,?,?,?,?,?,MAX(?,COALESCE((SELECT parts_applied FROM stream_partial WHERE connection_id=? AND stream=? AND version=? AND generation=? AND data_hash=?),0)),?,?)`,
-                params: [
-                  id,
+              partialRowStatement(
+                {
+                  connectionId: id,
                   stream,
-                  read.version,
-                  head.generation,
-                  read.dataHash,
-                  blob,
-                  head.observedAt,
-                  applied,
-                  id,
-                  stream,
-                  read.version,
-                  head.generation,
-                  read.dataHash,
-                  head.parts.length,
-                  head.recordCount,
-                ],
-              },
+                  version: read.version,
+                  generation: head.generation,
+                  dataHash: read.dataHash,
+                  headBlob: blob,
+                  observedAt: head.observedAt,
+                },
+                applied,
+                head.parts.length,
+                head.recordCount,
+              ),
             ]
           : []),
       ]),
@@ -988,17 +967,18 @@ async function applyOneOnce(
     if (progressive && began)
       await deps.db
         .batch([
-          {
-            sql: "UPDATE stream_partial SET failed = 1, last_error = ? WHERE connection_id = ? AND stream = ? AND version = ? AND generation = ? AND data_hash = ?",
-            params: [
-              failureCode(error),
-              id,
+          failedRowStatement(
+            {
+              connectionId: id,
               stream,
-              read.version,
-              head.generation,
-              read.dataHash,
-            ],
-          },
+              version: read.version,
+              generation: head.generation,
+              dataHash: read.dataHash,
+              headBlob: blob,
+              observedAt: head.observedAt,
+            },
+            failureCode(error),
+          ),
         ])
         .then(
           () => announceApplied(deps, id),
@@ -1013,29 +993,6 @@ async function applyOneOnce(
       })),
     );
   }
-}
-
-/**
- * A short, stable name for why an apply stopped, for a reader to show or
- * log: the error's own `code` if it has one, else its message as a slug
- * (`apply: missing part blob` is `missing_part_blob`).
- */
-function failureCode(error: unknown): string {
-  const code = (error as { code?: unknown } | null)?.code;
-  const text =
-    typeof code === "string" && code !== ""
-      ? code
-      : error instanceof Error
-        ? error.message
-        : String(error);
-  return (
-    text
-      .replace(/^apply:\s*/i, "")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "_")
-      .replace(/^_+|_+$/g, "")
-      .slice(0, 64) || "unknown"
-  );
 }
 
 async function stage(

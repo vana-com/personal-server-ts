@@ -59,11 +59,17 @@ export interface ImportIssue {
  * the partial one: a consumer replaces its rows, never appends to them.
  */
 export interface PartialView {
-  /** Parts of the head applied when the read began. */
+  /**
+   * Parts of the head applied when the read began. For a load of the log, the
+   * batches (snapshot parts and segments) the stream appears in.
+   */
   readonly partsApplied: number;
-  /** Parts the head has. */
+  /** Parts the head has (a log's batches that name the stream). */
   readonly partsTotal: number;
-  /** Records the complete head holds, from the head itself. */
+  /**
+   * Records the complete head holds, from the head itself. 0 when it is not
+   * known: a load of the log has no count before its fold is complete.
+   */
   readonly recordsTotal: number;
   /**
    * Set when the apply stopped before the last part. The load is not going on
