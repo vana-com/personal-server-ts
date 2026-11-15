@@ -244,6 +244,50 @@ describe("DEFAULT_STORAGE_ACCESS_POLICY width", () => {
   });
 });
 
+describe("DEFAULT_STORAGE_ACCESS_POLICY with the guard's quota", () => {
+  it("opens the window to the width the guard's rate needs, before any request", () => {
+    const clock = fakeClock();
+    const access = createStorageAccess({
+      ...DEFAULT_STORAGE_ACCESS_POLICY,
+      quota: { limit: 600, windowMs: 60_000 },
+      now: clock.now,
+      after: clock.after,
+    });
+    expect(access.window().end().window).toBe(
+      Math.ceil(GUARD_PUTS_PER_SEC * PART_PUT_SECONDS),
+    );
+  });
+
+  it("opens it when the service publishes the quota, not before", () => {
+    const clock = fakeClock();
+    let publish!: (quota: QuotaPolicies) => void;
+    const access = createStorageAccess({
+      ...DEFAULT_STORAGE_ACCESS_POLICY,
+      now: clock.now,
+      after: clock.after,
+    });
+    access.follow({
+      onRateLimitPolicy: (listener: (quota: QuotaPolicies) => void) => {
+        publish = listener;
+        return () => {};
+      },
+    } as never);
+    expect(access.window().end().window).toBe(1);
+    publish({ named: {}, unnamed: { limit: 600, windowMs: 60_000 } });
+    expect(access.window().end().window).toBe(13);
+  });
+
+  it("keeps the ramp from 1 for a store that publishes no quota", () => {
+    const clock = fakeClock();
+    const access = createStorageAccess({
+      ...DEFAULT_STORAGE_ACCESS_POLICY,
+      now: clock.now,
+      after: clock.after,
+    });
+    expect(access.window().end().window).toBe(1);
+  });
+});
+
 describe("createStorageAccess", () => {
   it("repeats a transient failure with a growing wait, then returns", async () => {
     const clock = fakeClock();

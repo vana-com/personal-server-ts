@@ -51,6 +51,26 @@ afterEach(async () => {
 });
 
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Waits until the encoder has stopped: at least `atLeast` uploads have started
+ * and no more has started for 150 ms. Waiting for the count first keeps a slow
+ * host, where the first upload starts late, from reading a quiet start as a stop.
+ */
+async function parked(
+  r: { stats: { started: number } },
+  atLeast: number,
+): Promise<void> {
+  const deadline = Date.now() + 60_000;
+  while (r.stats.started < atLeast && Date.now() < deadline)
+    await realSleep(25);
+  let last = -1;
+  for (let quiet = 0; quiet < 6;) {
+    await realSleep(25);
+    quiet = r.stats.started === last ? quiet + 1 : 0;
+    last = r.stats.started;
+  }
+}
 const throttle = (status: 429 | 503, retryAfterMs?: number) =>
   Object.assign(new Error(`storage request failed (${status})`), {
     status,
@@ -367,12 +387,7 @@ describe("a stream's part uploads are limited by the send gate and the byte budg
     });
     const publishing = r.publish();
     // Let the encoder run until it stops: every part it can encode has started.
-    let last = -1;
-    for (let quiet = 0; quiet < 6;) {
-      await realSleep(25);
-      quiet = r.stats.started === last ? quiet + 1 : 0;
-      last = r.stats.started;
-    }
+    await parked(r, budgetParts);
     const budget = (budgetParts + 2) * PART;
     expect(r.stats.started).toBeGreaterThan(0);
     // The parts of one budget are the parts it holds: at most its parts in
@@ -530,12 +545,7 @@ describe("the part upload pipeline at the production policy", () => {
       parked: { policy: productionPolicy() },
     });
     const publishing = r.publish();
-    let last = -1;
-    for (let quiet = 0; quiet < 6;) {
-      await realSleep(25);
-      quiet = r.stats.started === last ? quiet + 1 : 0;
-      last = r.stats.started;
-    }
+    await parked(r, WIDTH);
     // Every started upload is parked holding its ciphertext; the encoder has
     // stopped on the byte budget.
     expect(r.stats.started).toBeGreaterThanOrEqual(WIDTH);
@@ -554,12 +564,7 @@ describe("the part upload pipeline at the production policy", () => {
       parked: { policy: productionPolicy() },
     });
     const publishing = r.publish();
-    let last = -1;
-    for (let quiet = 0; quiet < 6;) {
-      await realSleep(25);
-      quiet = r.stats.started === last ? quiet + 1 : 0;
-      last = r.stats.started;
-    }
+    await parked(r, WIDTH);
     expect(r.stats.encrypted).toBeGreaterThanOrEqual(WIDTH);
     await collect();
     const alive = r.stats.plain.filter((ref) => ref.deref() !== undefined);

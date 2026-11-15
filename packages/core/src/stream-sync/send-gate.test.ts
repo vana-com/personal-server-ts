@@ -231,6 +231,122 @@ describe("the in-flight window", () => {
   });
 });
 
+describe("a published quota opens the window", () => {
+  // The width a quota of `rate` a second needs when a request takes 1.26 s.
+  const widthFor = (rate: number) => rate * 1.26;
+  const guard = allKinds({ limit: 600, windowMs: 60_000 }); // 10 a second
+
+  it("opens to the width the quota needs, and the ramp ends there", async () => {
+    const clock = fakeClock();
+    const gate = gateOn(clock, { maxWindow: 16, windowForRate: widthFor });
+    expect(gate.stats().window).toBe(1);
+    gate.setQuota(guard);
+    expect(gate.stats().window).toBe(13); // ceil(10 * 1.26)
+    // Past the opened width it grows by one, not by doubling: 13 successes,
+    // then 14.
+    await succeed(gate, clock, 12);
+    expect(gate.stats().window).toBe(13);
+    await succeed(gate, clock, 1);
+    expect(gate.stats().window).toBe(14);
+  });
+
+  it("still sends no faster than the quota", async () => {
+    const clock = fakeClock();
+    const gate = gateOn(clock, { maxWindow: 16, windowForRate: widthFor });
+    gate.setQuota(guard);
+    const left: number[] = [];
+    for (let i = 0; i < 30; i++) {
+      void gate.admit("put").then((ticket) => {
+        left.push(clock.now());
+        void clock.after(1_260, () => ticket.success());
+      });
+    }
+    await clock.advance(60_000);
+    expect(left.length).toBe(30);
+    // All 13 are in flight at once, a token (100 ms) apart.
+    expect(left[12]! - left[0]!).toBeGreaterThanOrEqual(1_200);
+    for (const start of left) {
+      const inSecond = left.filter((t) => t >= start && t < start + 1_000);
+      expect(inSecond.length).toBeLessThanOrEqual(10);
+    }
+  });
+
+  it("never opens above the window cap", () => {
+    const clock = fakeClock();
+    const gate = gateOn(clock, { maxWindow: 8, windowForRate: widthFor });
+    gate.setQuota(guard);
+    expect(gate.stats().window).toBe(8);
+  });
+
+  it("lifts a window that is still ramping, and never lowers one that is wider", async () => {
+    const clock = fakeClock();
+    const ramping = gateOn(clock, { maxWindow: 16, windowForRate: widthFor });
+    await succeed(ramping, clock, 2); // 1, then 2
+    expect(ramping.stats().window).toBe(2);
+    ramping.setQuota(guard);
+    expect(ramping.stats().window).toBe(13);
+    const wide = gateOn(clock, { maxWindow: 16, windowForRate: widthFor });
+    await openTo(wide, clock, 16);
+    wide.setQuota(allKinds({ limit: 60, windowMs: 60_000 })); // needs 2
+    expect(wide.stats().window).toBe(16);
+  });
+
+  it("opens once: a later quota only changes the pacing", () => {
+    const clock = fakeClock();
+    const gate = gateOn(clock, { maxWindow: 16, windowForRate: widthFor });
+    gate.setQuota(allKinds({ limit: 300, windowMs: 60_000 })); // 5 a second: 7
+    expect(gate.stats().window).toBe(7);
+    gate.setQuota(guard);
+    expect(gate.stats().window).toBe(7);
+  });
+
+  it("keeps the ramp from 1 when the service publishes no quota", async () => {
+    const clock = fakeClock();
+    const gate = gateOn(clock, { maxWindow: 16, windowForRate: widthFor });
+    gate.setQuota(undefined);
+    expect(gate.stats().window).toBe(1);
+    await succeed(gate, clock, 1);
+    expect(gate.stats().window).toBe(2);
+  });
+
+  it("keeps the ramp from 1 when no width function is given", () => {
+    const clock = fakeClock();
+    const gate = gateOn(clock, { maxWindow: 16 });
+    gate.setQuota(guard);
+    expect(gate.stats().window).toBe(1);
+  });
+
+  it("opens only for a quota that paces puts", () => {
+    const clock = fakeClock();
+    const gate = gateOn(clock, { maxWindow: 16, windowForRate: widthFor });
+    gate.setQuota({
+      named: { get: { limit: 600, windowMs: 60_000 } },
+    });
+    expect(gate.stats().window).toBe(1);
+  });
+
+  it("does not open after a throttle: the service has already answered", async () => {
+    const clock = fakeClock();
+    const gate = gateOn(clock, { maxWindow: 16, windowForRate: widthFor });
+    (await next(gate, clock)).quotaExceeded();
+    gate.setQuota(guard);
+    expect(gate.stats().window).toBe(1);
+  });
+
+  it("halves from the opened width on a 503, and a 429 only holds", async () => {
+    const clock = fakeClock();
+    const gate = gateOn(clock, { maxWindow: 16, windowForRate: widthFor });
+    gate.setQuota(guard);
+    (await next(gate, clock)).congested();
+    expect(gate.stats().window).toBe(6);
+    const other = gateOn(clock, { maxWindow: 16, windowForRate: widthFor });
+    other.setQuota(guard);
+    (await next(other, clock)).quotaExceeded(2_000);
+    expect(other.stats().window).toBe(13);
+    expect(other.stats().retryAfterWaitMs).toBe(2_000);
+  });
+});
+
 describe("a caller that stops waiting", () => {
   it("leaves the queue when its signal aborts, and never takes a slot", async () => {
     const clock = fakeClock();

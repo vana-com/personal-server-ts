@@ -69,6 +69,12 @@ export interface StorageAccessPolicy {
   /** The usual part size, which turns the byte budget into a window cap. */
   readonly partBytes: number;
   /**
+   * How long one part's PUT takes in storage, in seconds. With a published put
+   * quota it gives the width that quota needs: rate times this time. See
+   * `PART_PUT_SECONDS`.
+   */
+  readonly partPutSeconds: number;
+  /**
    * The most requests the send gate puts on the wire at once (its window cap),
    * where the byte budget would allow more. See `PARTS_IN_FLIGHT`.
    */
@@ -138,6 +144,7 @@ export const DEFAULT_STORAGE_ACCESS_POLICY: StorageAccessPolicy = {
   maxDelayMs: 4_000,
   maxBytesInFlight: (PARTS_IN_FLIGHT + BUILDING_PARTS) * PART_BYTES,
   partBytes: PART_BYTES,
+  partPutSeconds: PART_PUT_SECONDS,
   maxPartsInFlight: PARTS_IN_FLIGHT,
   maxObjectBytes: 100 * 1024 * 1024,
   now: Date.now,
@@ -374,6 +381,9 @@ export function createStorageAccess(policy: StorageAccessPolicy): SendGovernor {
         Math.floor(policy.maxBytesInFlight / policy.partBytes),
       ),
     ),
+    // A published put quota opens the window to the width it needs: the
+    // quota's rate times the time one part's PUT takes (`PARTS_IN_FLIGHT`).
+    windowForRate: (perSecond) => perSecond * policy.partPutSeconds,
     maxHoldMs: policy.retryBudgetMs,
     now: policy.now,
     after: policy.after,
