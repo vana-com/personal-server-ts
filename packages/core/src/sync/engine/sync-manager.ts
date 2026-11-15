@@ -343,7 +343,8 @@ export function createSyncManager(
       return cycleInFlight;
     }
 
-    cycleInFlight = exclusive(async () => {
+    // One cycle's passes: repeats while a request arrived during a pass.
+    const passes = async () => {
       do {
         rerunRequested = false;
         const canRun = await (options?.canSync?.() ?? { ok: true });
@@ -449,6 +450,23 @@ export function createSyncManager(
 
         lastSync = new Date().toISOString();
       } while (rerunRequested && isRunning);
+    };
+
+    // A request accepted while a cycle ran is owed one more cycle whether or
+    // not that cycle succeeds: a failing pass leaves `passes` before its own
+    // check, so the check is repeated here. The next pass resets the request,
+    // so a failure with no new request ends the loop and nothing retries on
+    // its own. Callers still get the first failure.
+    cycleInFlight = exclusive(async () => {
+      let failure: { error: unknown } | null = null;
+      do {
+        try {
+          await passes();
+        } catch (error) {
+          failure ??= { error };
+        }
+      } while (rerunRequested && isRunning);
+      if (failure) throw failure.error;
     });
 
     try {
