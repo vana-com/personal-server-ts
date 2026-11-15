@@ -13,6 +13,7 @@
 // and the connection's slot turns (wait and run).
 import { createCipheriv, randomBytes } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
+import { sealBytes } from "../../../core/src/stream-sync/stream-aead.js";
 import { createStorageStreamSyncBlobs } from "../../../core/src/stream-sync/blobs.js";
 import { createMemoryStreamSyncRegistry } from "../../../core/src/stream-sync/memory-registry.js";
 import { DEFAULT_STORAGE_ACCESS_POLICY } from "../../../core/src/stream-sync/storage-retry.js";
@@ -106,6 +107,7 @@ export interface PipelineBenchOptions {
   /** The send gate's window cap. The byte budget is sized to hold that many parts. */
   readonly width: number;
   readonly profile?: boolean;
+  readonly cipher?: "prod" | "aes";
   /** Queue a write to `records` as soon as the first PUT starts. */
   readonly writeDuringPublish?: boolean;
   /**
@@ -294,6 +296,8 @@ export async function benchPublish(
       namespaceHmac: async () => new Uint8Array(32),
       encrypt: async (_s, b) => b,
       encryptPart: async (_s, clear) => {
+        if (options.cipher === "prod")
+          return sealBytes(key, clear, randomBytes);
         const nonce = randomBytes(12);
         const cipher = createCipheriv("aes-256-gcm", key, nonce);
         return Buffer.concat([nonce, cipher.update(clear), cipher.final()]);
@@ -389,6 +393,7 @@ async function main(): Promise<void> {
     width: Number(arg("width", "16")),
     profile: process.argv.includes("--profile"),
     variant: arg("variant", "snapshot") === "spool" ? "spool" : "snapshot",
+    cipher: arg("cipher", "aes") === "prod" ? "prod" : "aes",
   });
   console.log(JSON.stringify(result, null, 2));
 }
