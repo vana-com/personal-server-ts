@@ -297,4 +297,92 @@ describe("the writer's WAL checkpoint", () => {
       expect(await uncheckpointedFrames(path)).toBeLessThan(1000);
     });
   });
+
+  describe("when a write fails part way", () => {
+    // Messages to the worker run in order and each handler is synchronous, so
+    // a reply to a later message means the earlier message's checkpoint is
+    // done. `identity` is not a write, so it checkpoints nothing itself:
+    // unlike `SELECT 1`, it cannot hide a missing checkpoint.
+    function writerWorker(path: string) {
+      const worker = new Worker(
+        new URL("./better-sqlite3-worker.cjs", import.meta.url),
+        { workerData: { path, role: "writer" } },
+      );
+      const waiting = new Map<number, (reply: { ok: boolean }) => void>();
+      let next = 0;
+      worker.on("message", (reply: { id: number; ok: boolean }) => {
+        waiting.get(reply.id)?.(reply);
+        waiting.delete(reply.id);
+      });
+      const send = (message: Record<string, unknown>) =>
+        new Promise<{ ok: boolean; result?: unknown }>((resolve) => {
+          const id = next++;
+          waiting.set(id, resolve);
+          worker.postMessage({ id, ...message });
+        });
+      return {
+        send,
+        async close() {
+          await send({ op: "close" });
+          await worker.terminate();
+        },
+      };
+    }
+
+    it("still checkpoints after a `query` write that throws", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "bs3-checkpoint-"));
+      dirs.push(dir);
+      const path = join(dir, "test.db");
+      const writer = writerWorker(path);
+      try {
+        await writer.send({ op: "query", sql: "PRAGMA journal_mode = WAL" });
+        await writer.send({
+          op: "batch",
+          statements: [
+            { sql: "CREATE TABLE rows (id INTEGER PRIMARY KEY, body BLOB)" },
+          ],
+        });
+        const body = new Uint8Array(2048).fill(7);
+        // Each statement inserts 1500 rows and fails on the last (its id is
+        // taken). OR FAIL keeps the 1499 rows before it, so the failed
+        // statement still commits and grows the WAL.
+        const fill =
+          "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 1499) " +
+          "INSERT OR FAIL INTO rows SELECT ? + i, ? FROM n";
+        for (let k = 0; k < 3; k++) {
+          const start = k * 10_000;
+          await writer.send({
+            op: "query",
+            sql: "INSERT INTO rows VALUES (?, ?)",
+            params: [start + 1499, body],
+          });
+          const failed = await writer.send({
+            op: "query",
+            sql: fill,
+            params: [start, body],
+          });
+          expect(failed.ok).toBe(false);
+        }
+        await writer.send({ op: "identity" });
+        const probe = new Database(path, { readonly: true });
+        try {
+          // The failed statements kept their rows (so they committed).
+          expect(probe.prepare("SELECT count(*) AS n FROM rows").get()).toEqual(
+            {
+              n: 3 * 1500,
+            },
+          );
+          const [mark] = probe.pragma("wal_checkpoint(NOOP)") as {
+            log: number;
+            checkpointed: number;
+          }[];
+          expect(mark!.log - mark!.checkpointed).toBeLessThan(1000);
+        } finally {
+          probe.close();
+        }
+      } finally {
+        await writer.close();
+      }
+    });
+  });
 });
