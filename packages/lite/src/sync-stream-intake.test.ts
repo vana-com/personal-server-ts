@@ -187,6 +187,50 @@ describe("Lite database intake", () => {
     await collect(lite.streamSyncIntake!, "lite-wake", "item", 1000);
     expect(wake).toHaveBeenCalledTimes(1);
   });
+  it("a subscriber taken before the database opens hears the first local run, with no sync manager running", async () => {
+    let mode: "unknown" | "unswitched" | "switched" = "unknown";
+    const { lite, openDriver } = await fixture(() => mode);
+    const heard: string[][] = [];
+    lite.viewChanges.subscribe((change) =>
+      heard.push([...change.connectionIds]),
+    );
+    expect(openDriver).not.toHaveBeenCalled();
+    mode = "switched";
+    await collect(lite.streamSyncIntake!, "lite-first", "first", 1000);
+    await lite.viewChanges.settled();
+    expect(heard.length).toBeGreaterThan(0);
+    expect(new Set(heard.flat())).toEqual(new Set([id]));
+  });
+  it("a subscriber hears an apply from the sync manager, an idle cycle is silent, and unsubscribe stops delivery", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        throw new Error("unexpected legacy or gateway fetch");
+      }),
+    );
+    const { lite, node } = await fixture();
+    await lite.getLocalSync();
+    const heard: string[][] = [];
+    const unsubscribe = lite.viewChanges.subscribe((change) =>
+      heard.push([...change.connectionIds]),
+    );
+    await collect(node.intake, "node-run", "from-node", 2000);
+    await node.cycle();
+    await lite.syncManager.trigger();
+    await lite.viewChanges.settled();
+    expect(heard.length).toBeGreaterThan(0);
+    expect(new Set(heard.flat())).toEqual(new Set([id]));
+    const applied = heard.length;
+    await lite.syncManager.trigger(); // nothing changed anywhere
+    await lite.viewChanges.settled();
+    expect(heard).toHaveLength(applied);
+    unsubscribe();
+    await collect(node.intake, "node-run-2", "again", 3000);
+    await node.cycle();
+    await lite.syncManager.trigger();
+    await lite.viewChanges.settled();
+    expect(heard).toHaveLength(applied);
+  });
   it("unknown and explicit Off never open a database or fall back to writer files", async () => {
     let mode: "unknown" | "unswitched" | "switched" = "unknown";
     const { lite, openDriver } = await fixture(() => mode);

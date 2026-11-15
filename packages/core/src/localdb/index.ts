@@ -83,6 +83,14 @@ export {
 } from "./listing.js";
 export { createLocalSync, type LocalSync } from "./sync.js";
 export {
+  createViewChanges,
+  NO_VIEW_CHANGES,
+  type ViewChange,
+  type ViewChangeListener,
+  type ViewChangeRecorder,
+  type ViewChanges,
+} from "./view-changes.js";
+export {
   createLocalHistory,
   type HistoryLineage,
   type HistoryResult,
