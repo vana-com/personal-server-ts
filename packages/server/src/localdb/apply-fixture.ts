@@ -78,6 +78,8 @@ export async function remoteFixture(
       f?: number | null;
       format?: Head["format"];
       pieceBytes?: number;
+      /** Group parts by the first bits of the key hash: `1` makes prefixes `0` and `1`. */
+      prefixBits?: number;
       complete?: boolean;
       primaryKey?: string[];
       profile?: { key: string | null; version: string };
@@ -86,6 +88,13 @@ export async function remoteFixture(
     const scope = streamScope(connector, ns, stream);
     const generation = options.generation ?? 1;
     const format = options.format ?? 4;
+    const prefixOf = (k: string) =>
+      (options.prefixBits ?? 0) === 0
+        ? ""
+        : [...k.slice(0, Math.ceil((options.prefixBits ?? 0) / 4))]
+            .map((c) => parseInt(c, 16).toString(2).padStart(4, "0"))
+            .join("")
+            .slice(0, options.prefixBits);
     const frames = await Promise.all(
       values.map(async (v) => {
         const body = new TextEncoder().encode(canonicalJson(v));
@@ -111,7 +120,7 @@ export async function remoteFixture(
         const bytes = frame.bytes.slice(at, at + size);
         const hash = toHex(sha256(bytes));
         parts.push({
-          prefix: "",
+          prefix: prefixOf(frame.k),
           hash,
           bytes: bytes.length,
           count: at === 0 ? 1 : 0,

@@ -915,6 +915,11 @@ describe("view changes", () => {
       { sql: "DROP TABLE view_versions" },
       // Later migrations add the apply_partial column and the log's tables.
       { sql: "ALTER TABLE connections DROP COLUMN apply_partial" },
+      // A later migration's trigger can sit on a table that stays.
+      ...MIGRATIONS.slice(viewMigration + 1)
+        .flat()
+        .flatMap((sql) => /^CREATE TRIGGER (\w+)/.exec(sql)?.[1] ?? [])
+        .map((trigger) => ({ sql: `DROP TRIGGER IF EXISTS ${trigger}` })),
       ...MIGRATIONS.slice(viewMigration + 1)
         .flat()
         .flatMap((sql) => /^CREATE TABLE (\w+)/.exec(sql)?.[1] ?? [])

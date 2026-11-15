@@ -73,6 +73,11 @@ export const DEFAULTS = {
     // `changeProbeHealthyMs` while that push is healthy. false: probe only.
     changePush: true,
     changeProbeHealthyMs: 60_000,
+    // Off by default. When true, an owner read of a stream that has no complete
+    // head yet serves the parts applied so far, marked partial, and a reader
+    // fills in as parts apply. When false, a stream is readable only when its
+    // head is complete, as before.
+    progressiveFirstLoad: false,
   },
   olderVersionReads: true,
   replication: {
@@ -267,6 +272,9 @@ export const ServerConfigSchema = z.object({
         .int()
         .min(0)
         .default(DEFAULTS.streamSync.changeProbeHealthyMs),
+      progressiveFirstLoad: z
+        .boolean()
+        .default(DEFAULTS.streamSync.progressiveFirstLoad),
     })
     .default(DEFAULTS.streamSync),
   olderVersionReads: z.boolean().default(DEFAULTS.olderVersionReads),

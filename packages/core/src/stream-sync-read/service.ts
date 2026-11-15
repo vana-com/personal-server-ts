@@ -45,6 +45,34 @@ export interface ImportIssue {
   readonly detail?: string;
 }
 
+/**
+ * How far a first load has come when a read serves its rows before the head
+ * is complete. A `view` carries it only then; a view without it is complete.
+ * The body holds the rows of the applied parts, all of one head and all in
+ * the finished result: never rows of another head or generation, and no local
+ * row whose part has not applied yet. It can hold rows of parts applied after
+ * the counts below were read, never fewer. Owner reads only: a grantee is
+ * never served a stream that is still loading.
+ *
+ * The `cursor` of a partial view is a head and schema pin, not a position in
+ * the finished list. When the stream completes, the finished view replaces
+ * the partial one: a consumer replaces its rows, never appends to them.
+ */
+export interface PartialView {
+  /** Parts of the head applied when the read began. */
+  readonly partsApplied: number;
+  /** Parts the head has. */
+  readonly partsTotal: number;
+  /** Records the complete head holds, from the head itself. */
+  readonly recordsTotal: number;
+  /**
+   * Set when the apply stopped before the last part. The load is not going on
+   * now and will retry (the next read or sync cycle starts it again), so a
+   * screen says "will retry", not "loading". Absent: the load is going on.
+   */
+  readonly failed?: { readonly code: string };
+}
+
 export interface ResolveInput {
   readonly scope: string;
   /** `connection=<ns>`; `null` when absent. */
@@ -159,6 +187,11 @@ export type ReadDecision =
       } | null;
       /** Owner only; absent when none. */
       readonly withheld?: readonly WithheldRun[];
+      /**
+       * Present only while a first load is still applying parts: the body is
+       * the rows applied so far. Absent: the view is complete.
+       */
+      readonly partial?: PartialView;
       readonly body: ReadableStream<Uint8Array>;
     };
 
@@ -172,6 +205,8 @@ export interface StreamSyncConnectionStatus {
       StreamHeadView & {
         readonly version: number | null;
         readonly records: number | null;
+        /** Set while a first load serves its applied parts; owner diagnostics. */
+        readonly partial?: PartialView & { readonly version: number };
       }
     >
   >;

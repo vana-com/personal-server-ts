@@ -952,6 +952,13 @@ async function serveStreamSyncView(
       ...(decision.withheld?.length
         ? { "X-Stream-Sync-Withheld": withheldReasons(decision.withheld) }
         : {}),
+      // Present only while a first load is still applying parts: the body is
+      // the rows applied so far, `<parts applied>/<parts>`. Owner reads only.
+      ...(decision.partial
+        ? {
+            "X-Stream-Sync-Partial": `${decision.partial.partsApplied}/${decision.partial.partsTotal}`,
+          }
+        : {}),
       ...(input.paymentResponseHeader
         ? { "X-PAYMENT-RESPONSE": input.paymentResponseHeader }
         : {}),

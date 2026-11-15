@@ -57,6 +57,13 @@ export interface LocalSyncDeps {
    */
   readonly publishWhileCollecting?: boolean;
   /**
+   * Default off. On: a stream with no complete head is readable by its owner
+   * from its first applied part, in an explicit partial state, and fills in
+   * as parts apply (`stream_partial`). Off: a stream is readable only when
+   * its head is complete, as before.
+   */
+  readonly progressiveFirstLoad?: boolean;
+  /**
    * Publish and apply through the stream-sync log (one segment and one
    * registry commit per batch, across streams) instead of per-stream heads.
    * Default off. A connection that has published to the log is read through it
