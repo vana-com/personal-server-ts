@@ -197,4 +197,43 @@ END;`,
     // measuring the body. This index answers them without touching `records`.
     `CREATE INDEX records_size ON records(connection_id, stream, pk_hash, body_bytes)`,
   ],
+  [
+    // What a screen shows of a connection, as one counter per connection. A
+    // trigger bumps it in the same transaction as every change a reader can
+    // see: a record written, replaced or removed, the connection appearing,
+    // disappearing or changing identity or control state, a stream appearing,
+    // disappearing or changing completeness or delete version. Nothing prunes
+    // it, unlike `record_changes`, so a change is never lost to compaction.
+    // Local only: never in a part. Head versions, watermarks and checkpoints
+    // are publish bookkeeping and do not bump it.
+    `CREATE TABLE view_versions (
+  connection_id TEXT PRIMARY KEY, version INTEGER NOT NULL) WITHOUT ROWID`,
+    `CREATE TRIGGER view_records_ai AFTER INSERT ON records BEGIN
+  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (NEW.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = NEW.connection_id), 0) + 1);
+END`,
+    `CREATE TRIGGER view_records_au AFTER UPDATE OF stamp_o, stamp_r, body_sha256 ON records BEGIN
+  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (NEW.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = NEW.connection_id), 0) + 1);
+END`,
+    `CREATE TRIGGER view_records_ad AFTER DELETE ON records BEGIN
+  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (OLD.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = OLD.connection_id), 0) + 1);
+END`,
+    `CREATE TRIGGER view_connections_ai AFTER INSERT ON connections BEGIN
+  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (NEW.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = NEW.connection_id), 0) + 1);
+END`,
+    `CREATE TRIGGER view_connections_ad AFTER DELETE ON connections BEGIN
+  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (OLD.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = OLD.connection_id), 0) + 1);
+END`,
+    `CREATE TRIGGER view_connections_au AFTER UPDATE OF generation, control_state, control_version, deleted_at ON connections WHEN OLD.generation IS NOT NEW.generation OR OLD.control_state IS NOT NEW.control_state OR OLD.control_version IS NOT NEW.control_version OR OLD.deleted_at IS NOT NEW.deleted_at BEGIN
+  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (NEW.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = NEW.connection_id), 0) + 1);
+END`,
+    `CREATE TRIGGER view_streams_ai AFTER INSERT ON stream_state BEGIN
+  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (NEW.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = NEW.connection_id), 0) + 1);
+END`,
+    `CREATE TRIGGER view_streams_ad AFTER DELETE ON stream_state BEGIN
+  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (OLD.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = OLD.connection_id), 0) + 1);
+END`,
+    `CREATE TRIGGER view_streams_au AFTER UPDATE OF complete, last_delete_version ON stream_state WHEN OLD.complete IS NOT NEW.complete OR OLD.last_delete_version IS NOT NEW.last_delete_version BEGIN
+  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (NEW.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = NEW.connection_id), 0) + 1);
+END`,
+  ],
 ];

@@ -18,7 +18,7 @@ import {
   type SeedIntake,
   type LocalSync,
   type SqlDriver,
-  type ViewChanges,
+  type ViewChangeRecorder,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import { openLiteLocalDb, type LiteLocalDbOptions } from "./localdb-port.js";
 import {
@@ -394,7 +394,7 @@ export async function createPsLiteSyncManager(
   /** Database-backed facade, or null when the host cannot open it. */
   localSync?: LocalSync | null;
   /** Changes of the local view; see `IndexedDbPsLiteRuntime.subscribeViewChanges`. */
-  viewChanges: ViewChanges;
+  viewChanges: ViewChangeRecorder;
   additions?: DurableAdditionsService;
   serverOwner: `0x${string}`;
   dataPointFeed: DataPointFeedPort;
@@ -601,11 +601,14 @@ export async function createPsLiteSyncManager(
     let opening: Promise<LocalSync | null> | undefined;
     async function openDatabase(): Promise<LocalSync | null> {
       if (!options.localDb) return null;
-      localDb = await openLiteLocalDb(options.localDb, {
+      const opened = await openLiteLocalDb(options.localDb, {
         owner: serverOwner,
         network: streamSyncNet,
         deviceId: options.localDbDeviceId ?? options.serverAccount.address,
       });
+      // Every write the sync engine makes goes through this driver, so the
+      // recorder sees each commit (and starts a new baseline per open).
+      localDb = opened ? viewChanges.attach(opened, logger) : null;
       if (localDb) {
         localSyncDeps = {
           db: localDb,
@@ -621,7 +624,6 @@ export async function createPsLiteSyncManager(
           now: Date.now,
           newOp: () => globalThis.crypto.randomUUID(),
           recordsCommitted: () => syncManager?.notifyNewData(),
-          viewChanges,
           partTargetBytes: LITE_PART_TARGET_BYTES,
         };
         localSync = createLocalSync(localSyncDeps, {

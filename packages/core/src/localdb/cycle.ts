@@ -22,20 +22,13 @@ export interface CycleReport {
  * connection, then read).
  */
 export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
-  const connections = await observed(deps, () => bootstrapConnections(deps));
+  const connections = await bootstrapConnections(deps);
   return {
     connections: await Promise.all(
       connections.map(({ connectionId }) => syncConnection(deps, connectionId)),
     ),
   };
 }
-
-/** One operation of the cycle; its committed part is announced even on a throw. */
-const observed = <T>(
-  deps: LocalSyncDeps,
-  work: () => Promise<T>,
-): Promise<T> =>
-  deps.viewChanges ? deps.viewChanges.observe(deps, work) : work();
 
 /**
  * One connection: apply, then publish.
@@ -47,14 +40,7 @@ const observed = <T>(
  * its commit and releases it while it uploads, so a run's begin waits for at
  * most one of those short turns, never for an upload.
  */
-export function syncConnection(
-  deps: LocalSyncDeps,
-  connectionId: string,
-): Promise<CycleReport["connections"][number]> {
-  return observed(deps, () => passOf(deps, connectionId));
-}
-
-async function passOf(
+export async function syncConnection(
   deps: LocalSyncDeps,
   connectionId: string,
 ): Promise<CycleReport["connections"][number]> {

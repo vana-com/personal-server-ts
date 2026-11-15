@@ -1,6 +1,5 @@
 import type { SqlDriver } from "./driver.js";
 import type { connectionQueue } from "./queue.js";
-import type { ViewChangeRecorder } from "./view-changes.js";
 import type {
   StreamSyncBlobs,
   StreamSyncKeyPorts,
@@ -47,17 +46,10 @@ export interface LocalSyncDeps {
    * costs latency, and a throw here never fails the commit.
    */
   readonly recordsCommitted?: () => void;
-  /**
-   * Where operations announce a change of the local view (see
-   * `view-changes.ts`). Without one, nothing is announced.
-   */
-  readonly viewChanges?: ViewChangeRecorder;
 }
 
 /** The one call every commit of local rows makes (run end, import). */
 export function announceRecordsCommitted(deps: LocalSyncDeps): void {
-  // These commits run outside an observed operation, so compare here.
-  void deps.viewChanges?.settle(deps);
   try {
     deps.recordsCommitted?.();
   } catch (error) {
