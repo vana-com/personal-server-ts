@@ -15,7 +15,8 @@ export interface PartialHead {
 /**
  * The head a body was reading is no longer the stream's head: another head
  * began loading (and dropped these rows), the connection's generation moved,
- * or the connection was deleted. The body stops there, so a reader sees an
+ * or the connection was deleted or has a delete intent saved (the purge that
+ * follows removes these rows, and waits behind the apply that serves them). The body stops there, so a reader sees an
  * aborted read and asks again, never a body of two heads.
  */
 export class PartialViewMoved extends Error {
@@ -60,7 +61,8 @@ export async function* partialBody(
           OR EXISTS (SELECT 1 FROM stream_state s WHERE s.connection_id = ? AND s.stream = ?
                     AND s.complete = 1 AND s.head_version = ? AND s.head_generation = ? AND s.head_data_hash = ?))
          AND EXISTS (SELECT 1 FROM connections c WHERE c.connection_id = ? AND c.generation = ?
-                    AND c.control_state = 'active' AND c.deleted_at IS NULL)) AS ok)
+                    AND c.control_state = 'active' AND c.deleted_at IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM delete_intents d WHERE d.connector = c.connector))) AS ok)
        SELECT g.ok AS ok, r.pk_hash AS pk_hash, r.body AS body
        FROM g LEFT JOIN records r ON g.ok = 1 AND r.connection_id = ? AND r.stream = ?
          AND NOT EXISTS (SELECT 1 FROM partial_hidden h WHERE h.connection_id = r.connection_id

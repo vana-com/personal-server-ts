@@ -19,6 +19,7 @@ import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import { createLocalListing } from "../../../core/src/localdb/listing.js";
 import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
+import { createConnectionDeleter } from "../../../core/src/localdb/delete.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import {
   PartialViewMoved,
@@ -485,6 +486,49 @@ describe("progressive first load", () => {
       { sql: "UPDATE stream_partial SET version = 2, data_hash = 'moved'" },
     ]);
     await expect(body.next()).rejects.toBeInstanceOf(PartialViewMoved);
+  });
+
+  it("a body that is reading when a delete intent is saved ends in an error while the purge waits for the apply", async () => {
+    const f = await harness({ progressive: true });
+    const ids = Array.from({ length: 205 }, (_, i) => `r${i}`);
+    const h = await f.remote.head("items", values(ids));
+    expect(h.parts).toHaveLength(205);
+    const last = f.hold(h, 204);
+    const applying = applyConnection(f.deps, f.id);
+    await f.until(204);
+    const [load] = await f.db.query<{ data_hash: string }>(
+      "SELECT data_hash FROM stream_partial",
+    );
+    const body = partialBody(f.db, {
+      connectionId: f.id,
+      generation: 1,
+      stream: "items",
+      version: 1,
+      dataHash: load!.data_hash,
+    });
+    expect((await body.next()).value).toBe('{"records":[');
+    for (let i = 0; i < 100; i++) expect((await body.next()).done).toBe(false); // the first page
+    // The delete saves its intent, then waits for the connection's queue, which
+    // the apply holds until the held part arrives.
+    const deleter = createConnectionDeleter(f.deps, {
+      declaredStreams: () => ["items"],
+    });
+    const requested = deleter
+      .requestConnectionDelete("fixture-source")
+      .catch(() => undefined);
+    for (let turn = 0; turn < 500; turn++) {
+      if (
+        (await f.db.query("SELECT 1 FROM delete_intents")).length > 0 ||
+        turn === 499
+      )
+        break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(await f.db.query("SELECT 1 FROM delete_intents")).toHaveLength(1);
+    expect(await f.partialRows()).toHaveLength(1); // the purge has not run
+    await expect(body.next()).rejects.toBeInstanceOf(PartialViewMoved);
+    last.release();
+    await Promise.allSettled([applying, requested]);
   });
 
   it("a view event fires with each part", async () => {
