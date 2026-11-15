@@ -5,16 +5,22 @@
 // segments after n, and applies them in position order, one batch each. A
 // segment's operations are order- and duplicate-insensitive: an upsert merges
 // by greatest observation stamp, and every delete and omission leaves a
-// tombstone `(stream, pk_hash, stamp)` that an upsert at or before it cannot
-// pass. So the order of delivery matters only for gap detection: position n+1
+// tombstone `(stream, pk_hash, stamp, rank)` that an upsert below it cannot
+// pass (see `OMISSION_RANK`: an observation at an omission's cutoff passes, one
+// at an explicit delete's stamp does not). So the order of delivery matters only for gap detection: position n+1
 // is never applied before n, and a segment that cannot be fetched stops the
 // pass there (the position stays; the next pass tries again).
 //
-// A gap (the registry is behind this device, or the log begins after it) is a
-// full check: the position goes back to the log's `base` and every segment
-// the head lists is applied again. That is safe because re-applying is
-// idempotent. What the log does not hold below `base` (a snapshot, or the
-// streams published before the log began) is read by the per-stream path.
+// A device that is behind the log's `base` installs the snapshot the head
+// names, then applies the tail. A registry that is BEHIND this device (a
+// rollback or restore), or that names another segment at a position this
+// device already applied, is not a continuation: the rows, tombstones and
+// checkpoints this device holds came from segments the log no longer has, and
+// replaying into them is not the log's fold. That fails closed
+// (`LogDivergedError`, nothing applied, the position unchanged). A rebaseline
+// that rebuilds them from the log, with the local overlay kept apart, is later
+// work. What the log does not hold below `base` (a log that began after the
+// streams were published) is read by the per-stream path.
 
 import { sha256 } from "@noble/hashes/sha2";
 import { keccak_256 } from "@noble/hashes/sha3";
@@ -35,6 +41,7 @@ import {
   verifySegment,
   verifySnapshotPart,
   type ControlHashes,
+  type LogOmitted,
   type LogOperation,
   type LogStreamMeta,
   type Segment,
@@ -49,6 +56,15 @@ import { mergeIncoming, seenPair, withOrigin } from "./merge.js";
 
 const sha = async (bytes: Uint8Array) => sha256(bytes);
 const keccak = async (bytes: Uint8Array) => keccak_256(bytes);
+
+/**
+ * The rank of a tombstone beside its stamp (`log_tombstones.rank`), as the
+ * model orders them: an omission's cutoff, then an observation at that stamp,
+ * then an explicit delete at that stamp.
+ */
+const OMISSION_RANK = 0;
+const UPSERT_RANK = 1;
+const EXPLICIT_DELETE_RANK = 2;
 
 /** Rows a statement list binds at most; a long omitted set goes in chunks. */
 const KEYS_PER_STATEMENT = 400;
@@ -124,7 +140,7 @@ interface OperationBatch {
   readonly generation: number;
   readonly observedAt: number;
   readonly streams: readonly LogStreamMeta[];
-  readonly operations: readonly LogOperation[];
+  readonly operations: readonly (LogOperation | LogOmitted)[];
 }
 
 export async function applySegmentOperations(
@@ -187,23 +203,28 @@ async function applyBatch(
       params: [connectionId, meta.stream, JSON.stringify(meta.primaryKey)],
     });
 
-  // 1. Tombstones first, so the upserts of this very segment see them.
+  // 1. Tombstones first, so the upserts of this very segment see them. A
+  // tombstone has a rank beside its stamp, the model's order: an omission's
+  // cutoff ranks below an observation at its stamp (a pass proved a key absent
+  // only before its cutoff), an explicit delete above it. A key keeps the
+  // greatest (stamp, rank), which is the one that refuses the most.
   const tombstone = (
     stream: string,
     pk: string,
     o: number,
     r: string,
+    rank: number,
   ): SqlStatement[] => [
     {
-      sql: `INSERT OR IGNORE INTO log_tombstones (connection_id, stream, pk_hash, stamp_o, stamp_r)
-            VALUES (?, ?, ?, ?, ?)`,
-      params: [connectionId, stream, pk, o, r],
+      sql: `INSERT OR IGNORE INTO log_tombstones (connection_id, stream, pk_hash, stamp_o, stamp_r, rank)
+            VALUES (?, ?, ?, ?, ?, ?)`,
+      params: [connectionId, stream, pk, o, r, rank],
     },
     {
-      sql: `UPDATE log_tombstones SET stamp_o = ?, stamp_r = ?
+      sql: `UPDATE log_tombstones SET stamp_o = ?, stamp_r = ?, rank = ?
              WHERE connection_id = ? AND stream = ? AND pk_hash = ?
-               AND (stamp_o, stamp_r) < (?, ?)`,
-      params: [o, r, connectionId, stream, pk, o, r],
+               AND (stamp_o, stamp_r, rank) < (?, ?, ?)`,
+      params: [o, r, rank, connectionId, stream, pk, o, r, rank],
     },
   ];
   for (const operation of segment.operations) {
@@ -214,6 +235,17 @@ async function applyBatch(
           operation.pkHash,
           operation.stamp.o,
           operation.stamp.r,
+          EXPLICIT_DELETE_RANK,
+        ),
+      );
+    else if (operation.kind === "omitted")
+      statements.push(
+        ...tombstone(
+          operation.stream,
+          operation.pkHash,
+          operation.stamp.o,
+          operation.stamp.r,
+          OMISSION_RANK,
         ),
       );
     else if (operation.kind === "complete")
@@ -224,51 +256,15 @@ async function applyBatch(
             pk,
             operation.cutoff.o,
             operation.cutoff.r,
+            OMISSION_RANK,
           ),
         );
   }
 
-  // 2. Upserts: staged, filtered by the tombstones, merged by stamp.
-  let staged = 0;
-  for (const operation of segment.operations) {
-    if (operation.kind !== "upsert") continue;
-    const primaryKey = primaryKeyOf.get(operation.stream)!;
-    // The body the merge compares is the value's canonical form.
-    const canonical = canonicalJson(operation.value);
-    if ((await pkHash(sha, operation.value, primaryKey)) !== operation.pkHash)
-      throw new Error("apply: invalid log record key");
-    statements.push({
-      sql: `INSERT OR REPLACE INTO temp.incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      params: [
-        op,
-        operation.stream,
-        operation.pkHash,
-        computeRecordKeyFromData(operation.value, [...primaryKey]),
-        operation.stamp.o,
-        operation.stamp.r,
-        canonical,
-        toHex(sha256(new TextEncoder().encode(canonical))),
-        operation.firstSeen,
-      ],
-    });
-    staged++;
-  }
-  if (staged > 0)
-    statements.push(
-      {
-        // A delete wins a tie, as an explicit delete does everywhere else.
-        sql: `DELETE FROM temp.incoming WHERE op = ? AND EXISTS (
-                SELECT 1 FROM log_tombstones t
-                 WHERE t.connection_id = ? AND t.stream = incoming.stream
-                   AND t.pk_hash = incoming.pk_hash
-                   AND (t.stamp_o, t.stamp_r) >= (incoming.stamp_o, incoming.stamp_r))`,
-        params: [op, connectionId],
-      },
-      ...mergeIncoming(op, connectionId, { promoteSeen: true }),
-    );
-
-  // 3. Deletes and omissions of rows this device holds. A row some run of this
+  // 2. Deletes and omissions of rows this device holds, before the upserts: a
+  // resurrection that follows a deletion then merges into no row, so its row
+  // has the resurrection's own first-seen checkpoint, as it does for a reader
+  // that applied the two in separate segments. A row some run of this
   // device observed at or after the stamp survives, and is published again
   // under that observation (as `applyDelete` does for a head that omits it).
   const survivors = (
@@ -318,6 +314,16 @@ async function applyBatch(
           true,
         ),
       );
+    else if (operation.kind === "omitted")
+      statements.push(
+        ...survivors(
+          operation.stream,
+          [operation.pkHash],
+          operation.stamp.o,
+          operation.stamp.r,
+          false,
+        ),
+      );
     else if (operation.kind === "complete")
       statements.push(
         ...survivors(
@@ -329,6 +335,47 @@ async function applyBatch(
         ),
       );
   }
+
+  // 3. Upserts: staged, filtered by the tombstones, merged by stamp.
+  let staged = 0;
+  for (const operation of segment.operations) {
+    if (operation.kind !== "upsert") continue;
+    const primaryKey = primaryKeyOf.get(operation.stream)!;
+    // The body the merge compares is the value's canonical form.
+    const canonical = canonicalJson(operation.value);
+    if ((await pkHash(sha, operation.value, primaryKey)) !== operation.pkHash)
+      throw new Error("apply: invalid log record key");
+    statements.push({
+      sql: `INSERT OR REPLACE INTO temp.incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      params: [
+        op,
+        operation.stream,
+        operation.pkHash,
+        computeRecordKeyFromData(operation.value, [...primaryKey]),
+        operation.stamp.o,
+        operation.stamp.r,
+        canonical,
+        toHex(sha256(new TextEncoder().encode(canonical))),
+        operation.firstSeen,
+      ],
+    });
+    staged++;
+  }
+  if (staged > 0)
+    statements.push(
+      {
+        // An upsert ranks between the two tombstone kinds at its stamp: an
+        // explicit delete at the stamp refuses it, an omission there does not.
+        sql: `DELETE FROM temp.incoming WHERE op = ? AND EXISTS (
+                SELECT 1 FROM log_tombstones t
+                 WHERE t.connection_id = ? AND t.stream = incoming.stream
+                   AND t.pk_hash = incoming.pk_hash
+                   AND (t.stamp_o, t.stamp_r, t.rank) > (incoming.stamp_o, incoming.stamp_r, ${UPSERT_RANK}))`,
+        params: [op, connectionId],
+      },
+      ...mergeIncoming(op, connectionId, { promoteSeen: true }),
+    );
 
   // 4. Each stream the segment touched now reads from it: a local version
   // above anything the registry's own stream row holds, so the per-stream
@@ -386,6 +433,20 @@ async function applyBatch(
   }
 }
 
+/**
+ * The registry's log is not a continuation of the one this device applied: it
+ * is behind this device, or names another segment at a position this device
+ * holds. A real rebaseline (rows, tombstones and checkpoints rebuilt from the
+ * log, the local overlay kept apart) is not built; until it is, the device
+ * refuses to read on top of state the log no longer vouches for.
+ */
+export class LogDivergedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LogDivergedError";
+  }
+}
+
 export interface LogApplyContext {
   readonly connector: string;
   readonly ns: string;
@@ -425,6 +486,16 @@ export async function applyLog(
     return { applied: 0 };
   }
 
+  // A registry behind this device is a rollback or a restore. What this device
+  // applied from the segments above the registry's position is still in its
+  // rows, tombstones and checkpoints, and replaying the log into them does not
+  // give the log's fold. Failing closed keeps the position true: it is not
+  // moved back, and nothing is applied.
+  if (local.position > read.version)
+    throw new LogDivergedError(
+      `apply: the log registry is at position ${read.version}, behind this device at ${local.position}`,
+    );
+
   const lastRef = local.refs.at(-1);
   if (
     read.version === local.position &&
@@ -460,10 +531,27 @@ export async function applyLog(
     bytes: newest.bytes,
   };
   const allRefs: SegmentRef[] = [...head.refs, headRef];
+  // The segment this device applied last must be the one the log names at that
+  // position. Another history that reuses the position (a rolled-back log that
+  // grew again) is not a tail to apply on top of what this device holds.
+  if (lastRef && lastRef.position === local.position) {
+    const named = allRefs.find((ref) => ref.position === lastRef.position);
+    if (
+      named &&
+      named.dataHash.toLowerCase() !== lastRef.dataHash.toLowerCase()
+    )
+      throw new LogDivergedError(
+        `apply: the log names a different segment at position ${lastRef.position} than this device applied`,
+      );
+  }
   let since = local.position;
   let plan = planOpsSince(head, headRef, since);
   let applied = 0;
   if (plan.kind === "gap") {
+    if (plan.reason === "ahead_of_head")
+      throw new LogDivergedError(
+        `apply: the log's newest position ${head.position} is behind this device at ${since}`,
+      );
     // A full check. Behind `base` the log no longer holds the prefix: a
     // snapshot does, and it is installed first. Without one (a log that began
     // after the streams were published) the per-stream path holds it.

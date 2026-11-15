@@ -249,8 +249,26 @@ export function compactionRequired(refs: number, parts = 0): boolean {
 // Snapshot parts, the fold, and when to compact.
 // ---------------------------------------------------------------------------
 
-/** One key's latest word: an upsert, or the deletion that beat every upsert. */
-export type LogEntry = LogUpsert | LogDelete;
+/**
+ * A completion's cutoff on one key, as a snapshot part keeps it. A snapshot
+ * entry must say which boundary it is: an explicit delete at a stamp removes
+ * an observation at that stamp, an omission at that stamp does not (the model's
+ * rank: an omission ranks just below an observation at its stamp, an explicit
+ * delete above it). Only parts carry this kind; a segment lists the omitted
+ * keys in its completion.
+ */
+export interface LogOmitted {
+  readonly kind: "omitted";
+  readonly stream: string;
+  readonly pkHash: string;
+  readonly stamp: LogStamp;
+}
+
+/**
+ * One key's words in a snapshot: the deletion frontier when a deletion erased
+ * something (it comes first), then the winning upsert if there is one.
+ */
+export type LogEntry = LogUpsert | LogDelete | LogOmitted;
 
 /**
  * One part of a snapshot: the winners of a key range, sorted by (stream,
@@ -299,15 +317,22 @@ const entryKey = (stream: string, pk: string) => `${stream}\u0000${pk}`;
  * deletions (P4). `snapshot` is the previous snapshot's parts (none for the
  * first compaction); `segments` are the segments after it, any order.
  *
- * The rule is the reader's (`applySegmentOperations`): per key, the greatest
- * upsert stamp and the greatest deletion stamp (an explicit delete, or the
- * cutoff of a completion that omitted the key) are kept apart; the upsert
- * wins only if it is strictly after the deletion. A winning upsert makes the
- * deletion redundant, since every older upsert loses to the winner anyway. A
- * deletion that wins stays as a `delete` entry, so a reader that is behind the
- * snapshot and holds the record still loses it. The first-seen checkpoint is
- * the least known one over the upserts that are after the key's deletion (all
- * of them if it has none): the reader drops a deleted row's checkpoint with it.
+ * The rule is the reader's (`applySegmentOperations`), with the model's ranks:
+ * per key, the greatest upsert and the greatest deletion are kept apart. A
+ * deletion is an explicit delete or the cutoff of a completion that omitted
+ * the key. At one stamp an omission ranks below an observation (the pass
+ * proved the key absent only before its cutoff) and an explicit delete ranks
+ * above it. The upsert wins if its (stamp, rank) is above the deletion's.
+ *
+ * A deletion that wins stays as a `delete` or `omitted` entry, so a reader that
+ * is behind the snapshot and holds the record still loses it. A deletion that a
+ * later upsert came strictly after stays too, in front of the upsert: the
+ * reader drops the row it holds, and with it the row's first-seen checkpoint,
+ * before it merges the resurrection. A deletion the upsert only ties (an
+ * omission at the observation's stamp) erased nothing and is left out.
+ *
+ * The first-seen checkpoint is the least known one over the upserts that
+ * outlive the deletion; an older one went with the row it described.
  *
  * Applying the fold gives the same records as applying the prefix in order.
  */
@@ -315,11 +340,12 @@ export function foldLog(input: {
   readonly snapshot: readonly SnapshotPart[];
   readonly segments: readonly Segment[];
 }): LogFold {
+  type Deletion = { stamp: LogStamp; explicit: boolean };
   type Cell = {
     upsert: LogUpsert | null;
     /** Every upsert's stamp and first-seen checkpoint, to settle after the deletion is known. */
     seen: { stamp: LogStamp; firstSeen: number }[];
-    deletion: LogStamp | null;
+    deletion: Deletion | null;
   };
   const cells = new Map<string, Cell>();
   const cell = (stream: string, pk: string): Cell => {
@@ -334,47 +360,80 @@ export function foldLog(input: {
     if (op.firstSeen !== null)
       c.seen.push({ stamp: op.stamp, firstSeen: op.firstSeen });
   };
-  const deletion = (stream: string, pk: string, stamp: LogStamp) => {
+  const deletion = (
+    stream: string,
+    pk: string,
+    stamp: LogStamp,
+    explicit: boolean,
+  ) => {
     const c = cell(stream, pk);
-    if (!c.deletion || stampAfter(stamp, c.deletion)) c.deletion = stamp;
+    const d = c.deletion;
+    if (
+      !d ||
+      stampAfter(stamp, d.stamp) ||
+      (explicit && !d.explicit && !stampAfter(d.stamp, stamp))
+    )
+      c.deletion = { stamp, explicit };
   };
+  /** An upsert is above a deletion: later, or tied with an omission. */
+  const outlives = (stamp: LogStamp, d: Deletion | null) =>
+    !d ||
+    stampAfter(stamp, d.stamp) ||
+    (!d.explicit && !stampAfter(d.stamp, stamp));
   const metas = new Map<string, LogStreamMeta>();
   for (const part of input.snapshot) {
     for (const meta of part.streams) metas.set(meta.stream, meta);
     for (const entry of part.entries)
       if (entry.kind === "upsert") upsert(entry);
-      else deletion(entry.stream, entry.pkHash, entry.stamp);
+      else
+        deletion(
+          entry.stream,
+          entry.pkHash,
+          entry.stamp,
+          entry.kind === "delete",
+        );
   }
   const ordered = [...input.segments].sort((a, b) => a.position - b.position);
   for (const segment of ordered) {
     for (const meta of segment.streams) metas.set(meta.stream, meta);
     for (const op of segment.operations)
       if (op.kind === "upsert") upsert(op);
-      else if (op.kind === "delete") deletion(op.stream, op.pkHash, op.stamp);
-      else for (const pk of op.omitted) deletion(op.stream, pk, op.cutoff);
+      else if (op.kind === "delete")
+        deletion(op.stream, op.pkHash, op.stamp, true);
+      else
+        for (const pk of op.omitted) deletion(op.stream, pk, op.cutoff, false);
   }
   const entries: LogEntry[] = [];
   for (const [key, c] of cells) {
     const [stream, pkHash] = key.split("\u0000") as [string, string];
-    if (c.upsert && (!c.deletion || stampAfter(c.upsert.stamp, c.deletion))) {
-      // The least first-seen checkpoint over the upserts that outlive the
-      // deletion: a reader that applied the deletion dropped the row and its
-      // checkpoint with it, so only later observations count.
+    const d = c.deletion;
+    const tombstone = (): LogEntry => {
+      const stamp = d!.stamp;
+      return d!.explicit
+        ? { kind: "delete", stream, pkHash, stamp }
+        : { kind: "omitted", stream, pkHash, stamp };
+    };
+    if (c.upsert && outlives(c.upsert.stamp, d)) {
+      // Only a deletion the winner is strictly after has erased anything.
+      if (d && stampAfter(c.upsert.stamp, d.stamp)) entries.push(tombstone());
       let firstSeen: number | null = null;
       for (const s of c.seen)
         if (
-          (!c.deletion || stampAfter(s.stamp, c.deletion)) &&
+          outlives(s.stamp, d) &&
           (firstSeen === null || s.firstSeen < firstSeen)
         )
           firstSeen = s.firstSeen;
       entries.push({ ...c.upsert, stream, pkHash, firstSeen });
-    } else if (c.deletion)
-      entries.push({ kind: "delete", stream, pkHash, stamp: c.deletion });
+    } else if (d) {
+      entries.push(tombstone());
+    }
   }
   entries.sort(
     (a, b) =>
       (a.stream < b.stream ? -1 : a.stream > b.stream ? 1 : 0) ||
-      (a.pkHash < b.pkHash ? -1 : a.pkHash > b.pkHash ? 1 : 0),
+      (a.pkHash < b.pkHash ? -1 : a.pkHash > b.pkHash ? 1 : 0) ||
+      // Within a key the stable sort keeps the deletion before the upsert.
+      0,
   );
   return {
     streams: [...metas.values()].sort((a, b) =>
@@ -628,7 +687,7 @@ function operationProblem(op: unknown, at: string): string | null {
     if (!isPlainObject(op["v"])) return `${at} value must be an object`;
     if (op["f"] !== null && !isCount(op["f"], 0))
       return `${at} first-seen must be null or a count`;
-  } else if (kind === "d") {
+  } else if (kind === "d" || kind === "o") {
     if (!exactKeys(op, DELETE_FIELDS)) return `${at} delete fields`;
   } else if (kind === "c") {
     if (!exactKeys(op, COMPLETE_FIELDS)) return `${at} completion fields`;
@@ -752,13 +811,15 @@ function segmentProblem(value: Record<string, unknown>): string | null {
   for (let i = 0; i < operations.length; i += 1) {
     const problem = operationProblem(operations[i], `operation ${i}`);
     if (problem) return problem;
+    if ((operations[i] as { k: string }).k === "o")
+      return `operation ${i} is a snapshot entry, not an operation`;
     if (!seen.has((operations[i] as { s: string }).s))
       return `operation ${i} names a stream with no meta`;
   }
   return null;
 }
 
-function opToWire(op: LogOperation): Record<string, unknown> {
+function opToWire(op: LogOperation | LogOmitted): Record<string, unknown> {
   switch (op.kind) {
     case "upsert":
       return {
@@ -773,6 +834,14 @@ function opToWire(op: LogOperation): Record<string, unknown> {
     case "delete":
       return {
         k: "d",
+        o: op.stamp.o,
+        p: op.pkHash,
+        r: op.stamp.r,
+        s: op.stream,
+      };
+    case "omitted":
+      return {
+        k: "o",
         o: op.stamp.o,
         p: op.pkHash,
         r: op.stamp.r,
@@ -855,7 +924,7 @@ export type DecodedSegment =
 
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
-function opFromWire(op: Record<string, unknown>): LogOperation {
+function opFromWire(op: Record<string, unknown>): LogOperation | LogOmitted {
   const stream = op["s"] as string;
   const stamp = { o: op["o"] as number, r: op["r"] as string };
   if (op["k"] === "u")
@@ -869,6 +938,8 @@ function opFromWire(op: Record<string, unknown>): LogOperation {
     };
   if (op["k"] === "d")
     return { kind: "delete", stream, pkHash: op["p"] as string, stamp };
+  if (op["k"] === "o")
+    return { kind: "omitted", stream, pkHash: op["p"] as string, stamp };
   return {
     kind: "complete",
     stream,
@@ -911,9 +982,10 @@ export function decodeSegment(bytes: Uint8Array): DecodedSegment {
       snapshot: p["snapshot"] as Segment["snapshot"],
       refs: p["refs"] as SegmentRef[],
       streams: p["streams"] as LogStreamMeta[],
+      // `segmentProblem` refuses a snapshot-only entry kind, so none is here.
       operations: (p["operations"] as Record<string, unknown>[]).map(
         opFromWire,
-      ),
+      ) as LogOperation[],
     },
   };
 }
@@ -981,6 +1053,7 @@ function partProblem(value: Record<string, unknown>): string | null {
   const entries = value["entries"];
   if (!Array.isArray(entries)) return "entries must be an array";
   let previous = "";
+  let previousKind = "";
   for (let i = 0; i < entries.length; i += 1) {
     const entry = entries[i] as unknown;
     const problem = operationProblem(entry, `entry ${i}`);
@@ -989,10 +1062,15 @@ function partProblem(value: Record<string, unknown>): string | null {
     if (op.k === "c") return `entry ${i} must be an upsert or a delete`;
     if (!checked.seen.has(op.s))
       return `entry ${i} names a stream with no meta`;
+    // Keys ascend. A key repeats once, as its deletion frontier (`d` or `o`)
+    // followed by its winning upsert (`u`).
     const key = entryKey(op.s, op.p);
-    if (i > 0 && key <= previous)
+    if (i > 0 && key < previous)
       return `entry ${i} must be after the previous key`;
+    if (i > 0 && key === previous && !(op.k === "u" && previousKind !== "u"))
+      return `entry ${i} repeats a key other than as its upsert after its deletion`;
     previous = key;
+    previousKind = op.k;
   }
   return null;
 }

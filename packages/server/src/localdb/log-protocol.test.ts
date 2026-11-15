@@ -208,6 +208,20 @@ async function world(options: {
           "SELECT stream, record_key, body FROM records ORDER BY stream, record_key",
         )
       ).map((r) => `${r.stream}/${r.record_key}=${r.body}`);
+    /** Every column the log promises a caught-up reader agrees on. */
+    const rows = async () =>
+      (
+        await db.query<{
+          stream: string;
+          record_key: string;
+          body: string;
+          stamp_o: number;
+          stamp_r: string;
+          first_o: number | null;
+        }>(
+          "SELECT stream, record_key, body, stamp_o, stamp_r, first_o FROM records ORDER BY stream, record_key",
+        )
+      ).map((r) => JSON.stringify(r));
     const position = async () =>
       (
         await db.query<{ position: number }>(
@@ -215,7 +229,7 @@ async function world(options: {
           [CONNECTION_ID],
         )
       )[0]?.position ?? 0;
-    return { db, deps, sync, run, cycle, records, position, puts, gets };
+    return { db, deps, sync, run, cycle, records, rows, position, puts, gets };
   }
 
   /** The decoded segments in the blob store, by position. */
@@ -388,7 +402,8 @@ describe("log protocol, flag on", () => {
     await b.cycle();
     expect(await b.position()).toBe(1);
 
-    // Ahead of the registry (a restored registry): replay from the start.
+    // Ahead of the registry (a restored registry): fail closed, with nothing
+    // fetched or applied and the position kept (see the P2-2 tests).
     await b.db.batch([
       {
         sql: "UPDATE log_state SET position = 9 WHERE connection_id = ?",
@@ -396,11 +411,17 @@ describe("log protocol, flag on", () => {
       },
     ]);
     const before = b.gets.length;
-    await b.cycle();
-    expect(await b.position()).toBe(1);
+    await expect(b.cycle()).rejects.toThrow(/behind this device/);
+    expect(await b.position()).toBe(9);
     expect(b.gets.slice(before).some((k) => k.startsWith(`${LOG}/s-`))).toBe(
-      true,
+      false,
     );
+    await b.db.batch([
+      {
+        sql: "UPDATE log_state SET position = 1 WHERE connection_id = ?",
+        params: [CONNECTION_ID],
+      },
+    ]);
 
     // Segment 2 is missing: segment 3 must not apply.
     await a.run("run-2", [{ stream: sName(0), id: "two" }], {
@@ -759,60 +780,126 @@ async function compactionDue(d: Device): Promise<boolean> {
   });
 }
 
+type Stamp = { o: number; r: string };
+type OracleKey = {
+  upsert: { stamp: Stamp; value: unknown; firstSeen: number | null } | null;
+  /** The greatest deletion: an explicit delete, or a completion's cutoff. */
+  deletion: { stamp: Stamp; explicit: boolean } | null;
+  seen: { stamp: Stamp; firstSeen: number }[];
+};
+
 /**
- * The fold of a prefix, written independently of `foldLog`: per key the
- * greatest upsert and the greatest deletion (an explicit delete, or the cutoff
- * of a completion that omitted the key); the upsert wins only if strictly
- * after the deletion.
+ * The fold of a prefix, written independently of `foldLog`, as a map from key
+ * to what a snapshot must say about it: the winning upsert (with the least
+ * first-seen over the upserts that outlive the deletion) and the deletion
+ * frontier when it erased something. Order of ranks, as the model has it: an
+ * omission at a stamp ranks below an observation at that stamp; an explicit
+ * delete at that stamp ranks above it.
  */
 function oracleFold(segments: readonly Segment[]) {
-  const after = (x: { o: number; r: string }, y: { o: number; r: string }) =>
-    x.o > y.o || (x.o === y.o && x.r > y.r);
-  const best = new Map<
-    string,
-    {
-      up?: { stamp: { o: number; r: string }; value: unknown };
-      del?: { o: number; r: string };
-    }
-  >();
+  const after = (x: Stamp, y: Stamp) => x.o > y.o || (x.o === y.o && x.r > y.r);
+  const same = (x: Stamp, y: Stamp) => x.o === y.o && x.r === y.r;
+  const keys = new Map<string, OracleKey>();
   const at = (stream: string, pk: string) => {
     const key = `${stream}/${pk}`;
-    if (!best.has(key)) best.set(key, {});
-    return best.get(key)!;
+    if (!keys.has(key))
+      keys.set(key, { upsert: null, deletion: null, seen: [] });
+    return keys.get(key)!;
+  };
+  const deleted = (c: OracleKey, stamp: Stamp, explicit: boolean) => {
+    const d = c.deletion;
+    if (
+      !d ||
+      after(stamp, d.stamp) ||
+      (same(stamp, d.stamp) && explicit && !d.explicit)
+    )
+      c.deletion = { stamp, explicit };
   };
   for (const g of segments)
     for (const op of g.operations) {
       if (op.kind === "upsert") {
         const c = at(op.stream, op.pkHash);
-        if (!c.up || after(op.stamp, c.up.stamp))
-          c.up = { stamp: op.stamp, value: op.value };
-      } else if (op.kind === "delete") {
-        const c = at(op.stream, op.pkHash);
-        if (!c.del || after(op.stamp, c.del)) c.del = op.stamp;
-      } else
-        for (const pk of op.omitted) {
-          const c = at(op.stream, pk);
-          if (!c.del || after(op.cutoff, c.del)) c.del = op.cutoff;
-        }
+        if (!c.upsert || after(op.stamp, c.upsert.stamp))
+          c.upsert = {
+            stamp: op.stamp,
+            value: op.value,
+            firstSeen: op.firstSeen,
+          };
+        if (op.firstSeen !== null)
+          c.seen.push({ stamp: op.stamp, firstSeen: op.firstSeen });
+      } else if (op.kind === "delete")
+        deleted(at(op.stream, op.pkHash), op.stamp, true);
+      else
+        for (const pk of op.omitted)
+          deleted(at(op.stream, pk), op.cutoff, false);
     }
-  const out = new Map<string, unknown>();
-  for (const [key, c] of best)
-    if (c.up && (!c.del || after(c.up.stamp, c.del)))
-      out.set(key, { kind: "upsert", stamp: c.up.stamp, value: c.up.value });
-    else if (c.del) out.set(key, { kind: "delete", stamp: c.del });
+  const out = new Map<
+    string,
+    {
+      upsert?: { stamp: Stamp; value: unknown; firstSeen: number | null };
+      tombstone?: { kind: "delete" | "omitted"; stamp: Stamp };
+    }
+  >();
+  for (const [key, c] of keys) {
+    const d = c.deletion;
+    const survives =
+      c.upsert !== null &&
+      (!d ||
+        after(c.upsert.stamp, d.stamp) ||
+        (same(c.upsert.stamp, d.stamp) && !d.explicit));
+    const entry: typeof out extends Map<string, infer V> ? V : never = {};
+    if (survives) {
+      const live = c.seen.filter(
+        (s) =>
+          !d ||
+          after(s.stamp, d.stamp) ||
+          (same(s.stamp, d.stamp) && !d.explicit),
+      );
+      entry.upsert = {
+        ...c.upsert!,
+        firstSeen: live.length
+          ? Math.min(...live.map((s) => s.firstSeen))
+          : null,
+      };
+      // Only a deletion the winner is strictly after has erased anything older.
+      if (d && after(c.upsert!.stamp, d.stamp))
+        entry.tombstone = {
+          kind: d.explicit ? "delete" : "omitted",
+          stamp: d.stamp,
+        };
+    } else if (d) {
+      entry.tombstone = {
+        kind: d.explicit ? "delete" : "omitted",
+        stamp: d.stamp,
+      };
+    }
+    out.set(key, entry);
+  }
   return out;
 }
 
+/** What the parts of a snapshot say, in the oracle's shape. */
 const entriesOf = (parts: readonly SnapshotPart[]) => {
-  const out = new Map<string, unknown>();
+  const out = new Map<
+    string,
+    {
+      upsert?: { stamp: Stamp; value: unknown; firstSeen: number | null };
+      tombstone?: { kind: "delete" | "omitted"; stamp: Stamp };
+    }
+  >();
   for (const part of parts)
-    for (const e of part.entries as readonly LogEntry[])
-      out.set(
-        `${e.stream}/${e.pkHash}`,
-        e.kind === "upsert"
-          ? { kind: "upsert", stamp: e.stamp, value: e.value }
-          : { kind: "delete", stamp: e.stamp },
-      );
+    for (const e of part.entries as readonly LogEntry[]) {
+      const key = `${e.stream}/${e.pkHash}`;
+      const cell = out.get(key) ?? {};
+      if (e.kind === "upsert")
+        cell.upsert = {
+          stamp: e.stamp,
+          value: e.value,
+          firstSeen: e.firstSeen,
+        };
+      else cell.tombstone = { kind: e.kind, stamp: e.stamp };
+      out.set(key, cell);
+    }
   return out;
 };
 
@@ -841,6 +928,19 @@ async function compactedWorld() {
     observedAt: 1200,
   });
   await a.cycle();
+  // z: observed at 1100 (in run-1), deleted at 1300, observed again at 1400.
+  await a.run("run-3", [{ stream: sName(1), id: "z", remove: true }], {
+    full: false,
+    covered: [sName(1)],
+    observedAt: 1300,
+  });
+  await a.cycle();
+  await a.run("run-4", [{ stream: sName(1), id: "z", v: 4 }], {
+    full: false,
+    covered: [sName(1)],
+    observedAt: 1400,
+  });
+  await a.cycle();
   await grow(a, 40);
   const segments = await w.segments();
   const head = segments.get(Math.max(...segments.keys()))!;
@@ -861,13 +961,13 @@ describe("log protocol: compaction", () => {
     expect(snapshot).toEqual(oracleFold(prefix));
     // y was deleted before the snapshot: its tombstone is in it.
     expect(snapshot.get(`${sName(0)}/${await idHash("y")}`)).toMatchObject({
-      kind: "delete",
+      tombstone: { kind: "delete" },
     });
 
     // A reader that was behind the snapshot and holds y converges (P1).
     expect((await b.records()).some((r) => r.includes('"id":"y"'))).toBe(true);
     await b.cycle();
-    expect(await b.records()).toEqual(await a.records());
+    expect(await b.rows()).toEqual(await a.rows());
     expect((await b.records()).some((r) => r.includes('"id":"y"'))).toBe(false);
 
     // The mutant: the same snapshot with its deletions dropped. The same kind
@@ -1103,5 +1203,309 @@ describe("log protocol: attachments", () => {
     expect(new Uint8Array((await b.sync.blobs.get(hash))!.bytes)).toEqual(
       bytes,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes: boundary kinds, rolled-back registry, deletion frontier.
+// ---------------------------------------------------------------------------
+
+/** A segment built by hand: operations against stream `s0`, applied directly. */
+async function crafted(
+  position: number,
+  operations: Segment["operations"],
+): Promise<Segment> {
+  const hash = (n: number) => `0x${n.toString(16).padStart(64, "0")}` as const;
+  return {
+    format: 1,
+    connector: CONNECTOR,
+    ns: "",
+    generation: 1,
+    keyCheck: "0123456789abcdef",
+    position,
+    observedAt: 5000,
+    base: 0,
+    snapshot: null,
+    refs: Array.from({ length: position - 1 }, (_, i) => ({
+      position: i + 1,
+      dataHash: hash(i + 1),
+      bytes: 100,
+    })),
+    streams: [
+      {
+        stream: sName(0),
+        primaryKey: ["id"],
+        profile: { key: null, version: "1.0.0" },
+        complete: true,
+      },
+    ],
+    operations,
+  };
+}
+
+/** A reader that has joined the connection (so its rows can be written) and nothing else. */
+async function joined(w: Awaited<ReturnType<typeof world>>, id: string) {
+  const d = await w.device(id);
+  await d.cycle();
+  return d;
+}
+
+describe("log protocol: boundary kinds at equal stamps (P2-1)", () => {
+  const S = { o: 5000, r: "run-k" };
+  const kept = (d: Device) =>
+    d.records().then((rs) => rs.some((r) => r.includes('"id":"k"')));
+
+  const seeded = async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    const a = await w.device("a");
+    await a.run("run-1", [{ stream: sName(0), id: "seed" }], {
+      observedAt: 1100,
+    });
+    await a.cycle();
+    return w;
+  };
+  const upsertK = async () => ({
+    kind: "upsert" as const,
+    stream: sName(0),
+    pkHash: await idHash("k"),
+    stamp: S,
+    firstSeen: 5000,
+    value: { id: "k" },
+  });
+  const omitK = async () => ({
+    kind: "complete" as const,
+    stream: sName(0),
+    cutoff: S,
+    omitted: [await idHash("k")],
+  });
+  const deleteK = async () => ({
+    kind: "delete" as const,
+    stream: sName(0),
+    pkHash: await idHash("k"),
+    stamp: S,
+  });
+
+  for (const order of ["upsert first", "omission first", "repeated"] as const) {
+    it(`an omission at the stamp of an observation does not remove it (${order})`, async () => {
+      const w = await seeded();
+      const m = await joined(w, "m");
+      const up = await crafted(2, [await upsertK()]);
+      const om = await crafted(3, [await omitK()]);
+      const steps =
+        order === "upsert first"
+          ? [up, om]
+          : order === "omission first"
+            ? [om, up]
+            : [up, om, up, om, om, up];
+      for (const g of steps)
+        await applySegmentOperations(m.deps, CONNECTION_ID, g);
+      expect(await kept(m)).toBe(true);
+    });
+
+    it(`an explicit delete at the stamp of an observation removes it (${order})`, async () => {
+      const w = await seeded();
+      const m = await joined(w, "m");
+      const up = await crafted(2, [await upsertK()]);
+      const del = await crafted(3, [await deleteK()]);
+      const steps =
+        order === "upsert first"
+          ? [up, del]
+          : order === "omission first"
+            ? [del, up]
+            : [up, del, up, del, del, up];
+      for (const g of steps)
+        await applySegmentOperations(m.deps, CONNECTION_ID, g);
+      expect(await kept(m)).toBe(false);
+    });
+  }
+
+  it("an explicit delete and an omission at one stamp remove the record, in any order", async () => {
+    const w = await seeded();
+    for (const order of [0, 1]) {
+      const m = await joined(w, `m${order}`);
+      const steps = [
+        await crafted(2, [await upsertK()]),
+        await crafted(3, [await omitK()]),
+        await crafted(4, [await deleteK()]),
+      ];
+      if (order === 1) steps.reverse();
+      for (const g of steps)
+        await applySegmentOperations(m.deps, CONNECTION_ID, g);
+      expect(await kept(m)).toBe(false);
+    }
+  });
+});
+
+describe("log protocol: a registry that is behind or on another history fails closed (P2-2)", () => {
+  /** a writes an insert (position 1) and a delete (position 2); b applies both. */
+  const history = async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    const a = await w.device("a");
+    const b = await w.device("b");
+    await a.run(
+      "run-1",
+      [
+        { stream: sName(0), id: "x" },
+        { stream: sName(0), id: "y" },
+      ],
+      { observedAt: 1100 },
+    );
+    await a.cycle();
+    await a.run("run-2", [{ stream: sName(0), id: "y", remove: true }], {
+      full: false,
+      covered: [sName(0)],
+      observedAt: 1200,
+    });
+    await a.cycle();
+    await b.cycle();
+    expect(await b.position()).toBe(2);
+    return { w, a, b };
+  };
+
+  it("a registry rolled back below the applied position is not read as caught up", async () => {
+    const { w, b } = await history();
+    const before = { rows: await b.rows(), position: await b.position() };
+    w.gateway.versions.get(LOG)!.pop(); // the registry is at position 1 again
+    await expect(b.cycle()).rejects.toThrow(/behind this device/);
+    expect(await b.position()).toBe(before.position);
+    expect(await b.rows()).toEqual(before.rows);
+  });
+
+  it("the same position under a different segment is not read as caught up", async () => {
+    const { w, b } = await history();
+    const before = { rows: await b.rows(), position: await b.position() };
+    w.gateway.versions.get(LOG)!.pop();
+    // Another device continues the rolled-back log with its own segment 2.
+    const c = await w.device("c");
+    await c.cycle();
+    await c.run("run-c", [{ stream: sName(0), id: "from-c" }], {
+      full: false,
+      covered: [sName(0)],
+      observedAt: 1300,
+    });
+    await c.cycle();
+    expect(await c.position()).toBe(2);
+    await expect(b.cycle()).rejects.toThrow(/different segment/);
+    expect(await b.position()).toBe(before.position);
+    expect(await b.rows()).toEqual(before.rows);
+  });
+});
+
+describe("log protocol: a resurrection after a deletion (P2-3)", () => {
+  it("a lagging, a fresh and an uninterrupted reader agree on every column, first-seen included", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    const a = await w.device("a");
+    const lagging = await w.device("lagging");
+    const uninterrupted = await w.device("uninterrupted");
+    const step = async () => {
+      await a.cycle();
+      await uninterrupted.cycle();
+    };
+    await a.run(
+      "run-1",
+      [
+        { stream: sName(0), id: "x", v: 0 },
+        { stream: sName(1), id: "z" },
+      ],
+      { observedAt: 1100 },
+    );
+    await step();
+    await lagging.cycle(); // holds z, first seen at 1100, and stops here
+    await a.run("run-2", [{ stream: sName(1), id: "z", remove: true }], {
+      full: false,
+      covered: [sName(1)],
+      observedAt: 1300,
+    });
+    await step();
+    await a.run("run-3", [{ stream: sName(1), id: "z", v: 4 }], {
+      full: false,
+      covered: [sName(1)],
+      observedAt: 1400,
+    });
+    await step();
+    for (let i = 0; i < 40; i++) {
+      await grow(a, 1, i);
+      await uninterrupted.cycle();
+    }
+    const segments = await w.segments();
+    const head = segments.get(Math.max(...segments.keys()))!;
+    expect(head.snapshot).not.toBeNull();
+
+    // The snapshot says what the oracle says, the deletion frontier included.
+    const prefix = [...segments.values()].filter(
+      (g) => g.position <= head.snapshot!.position,
+    );
+    const parts = await w.snapshotParts(head);
+    expect(entriesOf(parts)).toEqual(oracleFold(prefix));
+    const z = entriesOf(parts).get(`${sName(1)}/${await idHash("z")}`)!;
+    expect(z.tombstone).toMatchObject({ kind: "delete", stamp: { o: 1300 } });
+    expect(z.upsert?.firstSeen).toBe(1400);
+
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    await lagging.cycle();
+    const caughtUp = await uninterrupted.rows();
+    expect(await a.rows()).toEqual(caughtUp);
+    expect(await fresh.rows()).toEqual(caughtUp);
+    expect(await lagging.rows()).toEqual(caughtUp);
+    const row = caughtUp
+      .map((r) => JSON.parse(r) as { record_key: string; first_o: number })
+      .find((r) => r.record_key === "z")!;
+    expect(row.first_o).toBe(1400);
+  });
+
+  it("a deletion and its resurrection in one segment give the resurrection's first-seen, as two segments do", async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    const a = await w.device("a");
+    await a.run("run-1", [{ stream: sName(0), id: "seed" }], {
+      observedAt: 1100,
+    });
+    await a.cycle();
+    const K = await idHash("k");
+    const upsert = (o: number) => ({
+      kind: "upsert" as const,
+      stream: sName(0),
+      pkHash: K,
+      stamp: { o, r: `run-${o}` },
+      firstSeen: o,
+      value: { id: "k" },
+    });
+    const remove = {
+      kind: "delete" as const,
+      stream: sName(0),
+      pkHash: K,
+      stamp: { o: 6000, r: "run-6000" },
+    };
+    const separate = await joined(w, "separate");
+    const together = await joined(w, "together");
+    for (const d of [separate, together])
+      await applySegmentOperations(
+        d.deps,
+        CONNECTION_ID,
+        await crafted(2, [upsert(5000)]),
+      );
+    await applySegmentOperations(
+      separate.deps,
+      CONNECTION_ID,
+      await crafted(3, [remove]),
+    );
+    await applySegmentOperations(
+      separate.deps,
+      CONNECTION_ID,
+      await crafted(4, [upsert(7000)]),
+    );
+    await applySegmentOperations(
+      together.deps,
+      CONNECTION_ID,
+      await crafted(3, [remove, upsert(7000)]),
+    );
+    const firstSeen = async (d: Device) =>
+      (
+        await d.db.query<{ first_o: number }>(
+          "SELECT first_o FROM records WHERE record_key = 'k'",
+        )
+      )[0]!.first_o;
+    expect(await firstSeen(separate)).toBe(7000);
+    expect(await firstSeen(together)).toBe(7000);
   });
 });

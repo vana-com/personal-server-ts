@@ -41,6 +41,7 @@ export {
 } from "./publish.js";
 export {
   applyLog,
+  LogDivergedError,
   applySegmentOperations,
   applySnapshotPart,
 } from "./log-apply.js";

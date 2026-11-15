@@ -318,7 +318,10 @@ describe("fold (P4)", () => {
     // key 1: the later upsert; keys 2 and 3: deleted after their last upsert
     expect(byKey.get(pk(1))).toMatchObject({ kind: "upsert", stamp: { o: 9 } });
     expect(byKey.get(pk(2))).toMatchObject({ kind: "delete", stamp: { o: 8 } });
-    expect(byKey.get(pk(3))).toMatchObject({ kind: "delete", stamp: { o: 7 } });
+    expect(byKey.get(pk(3))).toMatchObject({
+      kind: "omitted",
+      stamp: { o: 7 },
+    });
     expect(fold.entries).toHaveLength(3);
   });
 
@@ -458,5 +461,152 @@ describe("when to compact", () => {
     expect(shouldCompact({ ...tail, snapshotBytes: 64 * 1024 * 1024 })).toBe(
       false,
     );
+  });
+});
+
+const complete = (stream: string, omitted: number[], o: number, r = "r") => ({
+  kind: "complete" as const,
+  stream,
+  cutoff: { o, r },
+  omitted: omitted.map(pk).sort(),
+});
+const kindsOf = (
+  entries: readonly { kind: string; pkHash: string }[],
+  n: number,
+) => entries.filter((e) => e.pkHash === pk(n)).map((e) => e.kind);
+
+describe("fold: boundary kinds (P2-1)", () => {
+  it("an omission at the stamp of an upsert loses to it; an explicit delete there wins", () => {
+    const fold = foldLog({
+      snapshot: [],
+      segments: [
+        seg(1, [up("a", 1, 5), complete("a", [1], 5)]),
+        seg(2, [up("a", 2, 5), del("a", 2, 5)]),
+      ],
+    });
+    // 1: the observation at the cutoff survives, and no tombstone is needed
+    expect(kindsOf(fold.entries, 1)).toEqual(["upsert"]);
+    // 2: an explicit delete at the same stamp wins
+    expect(kindsOf(fold.entries, 2)).toEqual(["delete"]);
+  });
+
+  it("an omission that wins is its own entry kind, not an explicit delete", () => {
+    const fold = foldLog({
+      snapshot: [],
+      segments: [seg(1, [up("a", 1, 4), complete("a", [1], 5)])],
+    });
+    expect(kindsOf(fold.entries, 1)).toEqual(["omitted"]);
+  });
+
+  it("an explicit delete and an omission at one stamp keep the explicit delete", () => {
+    const fold = foldLog({
+      snapshot: [],
+      segments: [seg(1, [complete("a", [1], 5), del("a", 1, 5)])],
+    });
+    expect(kindsOf(fold.entries, 1)).toEqual(["delete"]);
+  });
+
+  it("the fold is the same in either order of the same operations at equality", () => {
+    const ops = [
+      up("a", 1, 5),
+      complete("a", [1], 5),
+      up("a", 2, 5),
+      del("a", 2, 5),
+    ];
+    const forward = foldLog({ snapshot: [], segments: [seg(1, ops)] });
+    const reverse = foldLog({
+      snapshot: [],
+      segments: [seg(1, [...ops].reverse())],
+    });
+    expect(reverse).toEqual(forward);
+  });
+});
+
+describe("fold: the deletion frontier (P2-3)", () => {
+  it("a resurrection keeps the deletion it came after, and its first-seen is the resurrection's", () => {
+    const fold = foldLog({
+      snapshot: [],
+      segments: [
+        seg(1, [up("a", 1, 10)]),
+        seg(2, [del("a", 1, 20)]),
+        seg(3, [{ ...up("a", 1, 30), firstSeen: 30 }]),
+      ],
+    });
+    expect(fold.entries.filter((e) => e.pkHash === pk(1))).toEqual([
+      { kind: "delete", stream: "a", pkHash: pk(1), stamp: { o: 20, r: "r" } },
+      expect.objectContaining({
+        kind: "upsert",
+        firstSeen: 30,
+        stamp: { o: 30, r: "r" },
+      }),
+    ]);
+  });
+
+  it("folding in two steps keeps the frontier", () => {
+    const all = [
+      seg(1, [up("a", 1, 10)]),
+      seg(2, [del("a", 1, 20)]),
+      seg(3, [{ ...up("a", 1, 30), firstSeen: 30 }]),
+      seg(4, [up("a", 2, 40)]),
+    ];
+    const context = {
+      connector: "c",
+      ns: "fedcba9876543210",
+      generation: 1,
+      keyCheck: "0123456789abcdef",
+      position: 3,
+    };
+    const prefix = partitionFold(
+      foldLog({ snapshot: [], segments: all.slice(0, 3) }),
+      context,
+      1,
+    );
+    expect(foldLog({ snapshot: prefix, segments: all.slice(3) })).toEqual(
+      foldLog({ snapshot: [], segments: all }),
+    );
+  });
+
+  it("a part holds a tombstone and the upsert of one key, in that order, and no other repeat", () => {
+    const fold = foldLog({
+      snapshot: [],
+      segments: [seg(1, [up("a", 1, 10), del("a", 1, 20), up("a", 1, 30)])],
+    });
+    const part = partitionFold(fold, {
+      connector: "c",
+      ns: "fedcba9876543210",
+      generation: 1,
+      keyCheck: "0123456789abcdef",
+      position: 1,
+    })[0]!;
+    const decoded = decodeSnapshotPart(encodeSnapshotPart(part));
+    expect(decoded.kind).toBe("ok");
+    if (decoded.kind !== "ok") return;
+    const twice = {
+      ...decoded.part,
+      entries: [part.entries[1]!, part.entries[1]!],
+    };
+    expect(() => encodeSnapshotPart(twice)).toThrow();
+    const reversed = {
+      ...decoded.part,
+      entries: [part.entries[1]!, part.entries[0]!],
+    };
+    expect(() => encodeSnapshotPart(reversed)).toThrow();
+  });
+
+  it("a segment cannot carry a snapshot-only omission entry", () => {
+    const omitted = {
+      kind: "omitted" as const,
+      stream: "a",
+      pkHash: pk(1),
+      stamp: { o: 5, r: "r" },
+    };
+    expect(() =>
+      encodeSegment(segment({ operations: [omitted as never] })),
+    ).toThrow(/snapshot entry/);
+    // Bytes that a hostile writer made by hand are refused on decode too.
+    const bytes = new TextDecoder()
+      .decode(encodeSegment(segment()))
+      .replace('"k":"d"', '"k":"o"');
+    expect(decodeSegment(utf8(bytes)).kind).toBe("malformed");
   });
 });
