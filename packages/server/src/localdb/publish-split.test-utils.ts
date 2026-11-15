@@ -56,7 +56,9 @@ type StorageOp = "get" | "put";
 export type FakeStorage = StreamSyncBlobs & {
   readonly puts: string[];
   /** Hold the next operation `when` accepts until the test releases it. */
-  holdNext(when?: (op: StorageOp, key: string) => boolean): Gate;
+  holdNext(
+    when?: (op: StorageOp, key: string, probe: boolean) => boolean,
+  ): Gate;
   /** Fail the next put once. */
   failNextPut(): void;
 };
@@ -64,12 +66,12 @@ export type FakeStorage = StreamSyncBlobs & {
 function fakeStorage(inner: StreamSyncBlobs): FakeStorage {
   const puts: string[] = [];
   let held: {
-    when: (op: StorageOp, key: string) => boolean;
+    when: (op: StorageOp, key: string, probe: boolean) => boolean;
     gate: ReturnType<typeof gate>;
   } | null = null;
   let failing = false;
-  const pause = async (op: StorageOp, key: string) => {
-    if (held?.when(op, key)) {
+  const pause = async (op: StorageOp, key: string, probe = false) => {
+    if (held?.when(op, key, probe)) {
       const { gate: pending } = held;
       held = null;
       await pending.arrive();
@@ -92,7 +94,7 @@ function fakeStorage(inner: StreamSyncBlobs): FakeStorage {
     },
     async exists(key) {
       // A probe was a GET before it became a HEAD; a hold on gets still holds it.
-      await pause("get", key);
+      await pause("get", key, true);
       return inner.exists(key);
     },
     async put(key, bytes) {
@@ -317,6 +319,16 @@ export async function makeDevice(
     deps,
     /** True while any operation holds or awaits the connection's slot. */
     inSlot: () => pending > 0,
+    /**
+     * Resolves when `held` has caught an operation and the slot is free again.
+     * A transfer starts while the snapshot still holds the slot, so the
+     * operation can be caught inside it. What these tests need is the upload
+     * blocked with the slot free: a blocked upload must never keep the slot.
+     */
+    async parked(held: Gate): Promise<void> {
+      await held.reached;
+      while (pending > 0) await new Promise((r) => setImmediate(r));
+    },
     requests,
     /** Resolves when the next queue request arrives; resolves its entry. */
     async nextRequest(): Promise<{ kind: OperationKind; behind: number }> {

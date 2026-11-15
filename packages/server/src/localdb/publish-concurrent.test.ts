@@ -5,6 +5,9 @@
 // snapshot and commit still take the queue slot one at a time; what overlaps is
 // every stream's transfer and the waits between slot turns.
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { keccak_256 } from "@noble/hashes/sha3";
 import {
@@ -88,22 +91,30 @@ type Options = {
   readonly partTargetBytes?: number;
   /** Called when the registry is asked to post, before it answers. */
   readonly onPost?: (scope: string) => void;
+  /** A database file: the production driver with a separate read connection. Default: in memory. */
+  readonly dbPath?: string;
 };
 
 const drivers: SqlDriver[] = [];
+const scratchDirs: string[] = [];
 afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
+  for (const dir of scratchDirs.splice(0))
+    rmSync(dir, { recursive: true, force: true });
 });
 
 const streamName = (i: number) => `s${i}`;
 const streamOfKey = (key: string) => /\.(s\d+)\//.exec(key)?.[1] ?? null;
 
 async function world(options: Options) {
-  const db = await openLocalDb(openBetterSqlite3(":memory:"), {
-    owner: OWNER,
-    network: "test",
-    deviceId: "d",
-  });
+  const db = await openLocalDb(
+    openBetterSqlite3(options.dbPath ?? ":memory:"),
+    {
+      owner: OWNER,
+      network: "test",
+      deviceId: "d",
+    },
+  );
   drivers.push(db);
   const names = Array.from({ length: options.streams }, (_, i) =>
     streamName(i),
@@ -1074,5 +1085,516 @@ describe("the uploads of every stream's wave go through one send gate", () => {
     // At the stream's registry write, every upload that ever started was stored.
     expect(startedAtPost).toBe(stored);
     expect(storedAtPost).toBe(stored);
+  });
+});
+
+// The transfer starts while the snapshot is still copying rows into the spool.
+// What stays true: the registry row waits for every file, memory stays inside
+// the store's budget, and the version holds exactly the rows of one slot turn.
+describe("a stream's transfer starts while its snapshot is still copying rows", () => {
+  // About one part per record, so the snapshot copies many prefixes.
+  const MANY_PARTS = {
+    streams: 1,
+    recordsPerStream: 24,
+    padBytes: 1500,
+    partTargetBytes: 2048,
+  } as const;
+
+  /** `db` that calls `before(n)` ahead of the n-th prefix the snapshot copies. */
+  const watchFreeze = (
+    db: SqlDriver,
+    before: (nth: number) => Promise<void> | void,
+  ): SqlDriver => {
+    let nth = 0;
+    return {
+      info: db.info,
+      reads: db.reads,
+      query: db.query.bind(db),
+      close: () => db.close(),
+      async batch(statements) {
+        if (statements[0]?.sql.includes("INSERT INTO publish_spool")) {
+          nth += 1;
+          await before(nth);
+        }
+        return db.batch(statements);
+      },
+    };
+  };
+
+  /** A put hold that parks every upload until `releaseAll`. */
+  const parking = () => {
+    const parked: (() => void)[] = [];
+    const starts: string[] = [];
+    let first!: () => void;
+    const firstPut = new Promise<void>((resolve) => (first = resolve));
+    return {
+      starts,
+      parked,
+      firstPut,
+      hold: (key: string) =>
+        new Promise<void>((release) => {
+          starts.push(key);
+          parked.push(release);
+          first();
+        }),
+      releaseAll: () => {
+        for (const release of parked.splice(0)) release();
+      },
+      /** Let every upload through, now and later. */
+      open: () => {
+        const timer = setInterval(() => {
+          for (const release of parked.splice(0)) release();
+        }, 2);
+        return () => clearInterval(timer);
+      },
+    };
+  };
+
+  it("starts the first upload before the snapshot has copied every prefix", async () => {
+    const puts = parking();
+    const w = await world({ ...MANY_PARTS, holdPut: puts.hold });
+    let copied = 0;
+    let stalled = false;
+    const deps = {
+      ...w.deps,
+      db: watchFreeze(w.db, async (nth) => {
+        copied = nth;
+        // The third prefix is copied only once an upload is out: a snapshot
+        // that finishes first never lets that happen.
+        if (nth === 3) {
+          const outcome = await Promise.race([
+            puts.firstPut.then(() => "put"),
+            sleep(1500).then(() => "stalled"),
+          ]);
+          stalled = outcome === "stalled";
+        }
+      }),
+    };
+    const stop = puts.open();
+    try {
+      const results = await publishConnection(deps, CONNECTION_ID);
+      expect(results.map((r) => r.outcome)).toEqual(["published"]);
+    } finally {
+      stop();
+    }
+    // The test is not vacuous: the snapshot copied more prefixes than it waited at.
+    expect(copied).toBeGreaterThan(3);
+    expect(stalled).toBe(false);
+  });
+
+  it("posts the registry row only after every part and the head are stored, though the snapshot ended first", async () => {
+    const puts = parking();
+    const posts: { scope: string; uploadsReleased: boolean }[] = [];
+    let released = false;
+    const w = await world({
+      ...MANY_PARTS,
+      holdPut: puts.hold,
+      onPost: (scope) => posts.push({ scope, uploadsReleased: released }),
+    });
+    const publishing = publishConnection(w.deps, CONNECTION_ID);
+    await vi.waitFor(() => expect(puts.starts.length).toBeGreaterThan(20));
+    // The snapshot is long over and every part is encoded and out, parked.
+    await sleep(150);
+    expect(posts.filter((p) => p.scope !== CONTROL)).toEqual([]);
+    released = true;
+    const stop = puts.open();
+    try {
+      expect((await publishing).map((r) => r.outcome)).toEqual(["published"]);
+    } finally {
+      stop();
+    }
+    const stream = posts.filter((p) => p.scope !== CONTROL);
+    expect(stream).toHaveLength(1);
+    expect(stream[0]!.uploadsReleased).toBe(true);
+  });
+
+  it("posts nothing and stops copying when an upload fails while the snapshot is still copying", async () => {
+    const puts = parking();
+    let uploads = 0;
+    const w = await world({
+      ...MANY_PARTS,
+      holdPut: (key) => {
+        uploads += 1;
+        return uploads === 1
+          ? Promise.reject(new Error("storage said no"))
+          : puts.hold(key);
+      },
+    });
+    let copied = 0;
+    const deps = {
+      ...w.deps,
+      db: watchFreeze(w.db, async (nth) => {
+        copied = nth;
+        // Give the failed upload time to end the transfer before the copy goes on.
+        if (nth === 3) await sleep(200);
+      }),
+    };
+    const stop = puts.open();
+    try {
+      await expect(publishConnection(deps, CONNECTION_ID)).rejects.toThrow(
+        "storage said no",
+      );
+    } finally {
+      stop();
+    }
+    // Nobody reads more prefixes, so the snapshot copies no more of them.
+    expect(copied).toBeLessThanOrEqual(5);
+    expect(
+      w.calls.filter((c) => c.kind === "post" && c.scope !== CONTROL),
+    ).toEqual([]);
+    // And the spool is dropped.
+    expect(await w.db.query("SELECT COUNT(*) AS n FROM publish_spool")).toEqual(
+      [{ n: 0 }],
+    );
+  });
+
+  it("ends the transfer and posts nothing when the snapshot fails after uploads started", async () => {
+    const puts = parking();
+    let settled = 0;
+    const w = await world({
+      ...MANY_PARTS,
+      holdPut: (key) => puts.hold(key).finally(() => (settled += 1)),
+    });
+    let startedAtFailure = 0;
+    const deps = {
+      ...w.deps,
+      db: watchFreeze(w.db, async (nth) => {
+        if (nth === 3) {
+          await Promise.race([puts.firstPut, sleep(1500)]);
+          // The failure is injected with an upload out, or the test proves nothing.
+          startedAtFailure = puts.starts.length;
+          throw new Error("copy failed");
+        }
+      }),
+    };
+    const stop = puts.open();
+    try {
+      await expect(publishConnection(deps, CONNECTION_ID)).rejects.toThrow(
+        "copy failed",
+      );
+      // Every upload that started has ended: nothing of the transfer runs on.
+      await vi.waitFor(() => expect(settled).toBe(puts.starts.length));
+    } finally {
+      stop();
+    }
+    expect(startedAtFailure).toBeGreaterThan(0);
+    expect(
+      w.calls.filter((c) => c.kind === "post" && c.scope !== CONTROL),
+    ).toEqual([]);
+    expect(await w.db.query("SELECT COUNT(*) AS n FROM publish_spool")).toEqual(
+      [{ n: 0 }],
+    );
+  });
+
+  it("holds no more than the byte budget while the snapshot copies ahead of the uploads", async () => {
+    const partTarget = 2048;
+    // Four parts fit; a part is held twice (plain and ciphertext).
+    const budget = 4 * 2 * partTarget;
+    const state = { held: 0, peak: 0 };
+    const waiting: (() => void)[] = [];
+    const governor: NonNullable<StreamSyncBlobs["governor"]> = {
+      async reserve(bytes) {
+        while (state.held + bytes > budget)
+          await new Promise<void>((resolve) => waiting.push(resolve));
+        state.held += bytes;
+        state.peak = Math.max(state.peak, state.held);
+        let done = false;
+        return () => {
+          if (done) return;
+          done = true;
+          state.held -= bytes;
+          for (const wake of waiting.splice(0)) wake();
+        };
+      },
+      window: () => ({
+        end: () => ({
+          window: 1,
+          requests: 0,
+          throttles: 0,
+          retryAfterWaitMs: 0,
+          peakBytesInFlight: 0,
+        }),
+      }),
+    };
+    const puts = parking();
+    const w = await world({
+      ...MANY_PARTS,
+      governor,
+      holdPut: puts.hold,
+    });
+    let copied = 0;
+    const deps = {
+      ...w.deps,
+      db: watchFreeze(w.db, (nth) => void (copied = nth)),
+    };
+    const publishing = publishConnection(deps, CONNECTION_ID);
+    // Uploads are parked, so the encoder stops at the budget...
+    await vi.waitFor(() => expect(puts.starts.length).toBe(4));
+    await sleep(150);
+    expect(puts.starts.length).toBe(4);
+    // ...while the snapshot, which holds rows on disk and not in memory, has
+    // copied every prefix.
+    expect(copied).toBeGreaterThan(20);
+    const stop = puts.open();
+    try {
+      expect((await publishing).map((r) => r.outcome)).toEqual(["published"]);
+    } finally {
+      stop();
+    }
+    expect(state.peak).toBeLessThanOrEqual(budget);
+    expect(state.peak).toBeGreaterThan(0);
+    expect(state.held).toBe(0);
+  });
+
+  it("leaves a run that ends during the copy out of this version", async () => {
+    const puts = parking();
+    const w = await world({ ...MANY_PARTS, holdPut: puts.hold });
+    // The run collects before the publish and ends during it. Collecting takes
+    // no slot; the end does, so it waits for the snapshot's turn.
+    await w.sync.intake.begin("run-late", {
+      connector: CONNECTOR,
+      artifactDigest: CONNECTOR,
+      wantFull: false,
+      owner: { address: OWNER, leaseId: null },
+    });
+    await w.sync.intake.batch("run-late", {
+      batch: 0,
+      records: [{ stream: "s0", data: { id: "late-marker-row" } }],
+    });
+    let lateEnded: Promise<unknown> | undefined;
+    let uploadsOutAtEnd = 0;
+    const deps = {
+      ...w.deps,
+      db: watchFreeze(w.db, async (nth) => {
+        if (nth !== 3) return;
+        // An upload is out and the snapshot is still copying: the run ends now.
+        await Promise.race([puts.firstPut, sleep(1500)]);
+        uploadsOutAtEnd = puts.starts.length;
+        lateEnded = w.sync.intake.end("run-late", {
+          outcome: "succeeded",
+          coveredStreams: ["s0"],
+          lastBatch: 0,
+        });
+        await sleep(30);
+      }),
+    };
+    const stop = puts.open();
+    try {
+      const first = await publishConnection(deps, CONNECTION_ID);
+      expect(first.map((r) => r.outcome)).toEqual(["published"]);
+      await lateEnded;
+      const stored = async () => {
+        const texts: string[] = [];
+        for (const { key } of w.guards.map((g) => ({ key: g.key }))) {
+          const bytes = await w.innerBlobs.get(key);
+          if (bytes) texts.push(new TextDecoder("latin1").decode(bytes));
+        }
+        return texts.join("\n");
+      };
+      // The run ended while the snapshot was still copying and an upload was out.
+      expect(uploadsOutAtEnd).toBeGreaterThan(0);
+      const afterFirst = await stored();
+      // The check can see rows: an original record is in what was uploaded.
+      expect(afterFirst).toContain("s0-1");
+      expect(afterFirst).not.toContain("late-marker-row");
+      // The late run is still pending, and the next publish carries it.
+      const second = await publishConnection(deps, CONNECTION_ID);
+      expect(second.map((r) => r.outcome)).toEqual(["published"]);
+      expect(await stored()).toContain("late-marker-row");
+    } finally {
+      stop();
+    }
+  });
+
+  describe("on a database file, with the production driver's separate read connection", () => {
+    // 200 records of about 1.5 KB at a 32 KiB part target: about ten prefixes
+    // of some twenty rows each, so a copy batch is more than one row.
+    const FILE_PARTS = {
+      streams: 1,
+      recordsPerStream: 200,
+      padBytes: 1500,
+      partTargetBytes: 32 * 1024,
+    } as const;
+
+    const fileWorld = async (
+      hold: (key: string) => Promise<void>,
+    ): Promise<Awaited<ReturnType<typeof world>>> => {
+      const dir = mkdtempSync(join(tmpdir(), "publish-wal-"));
+      scratchDirs.push(dir);
+      return world({
+        ...FILE_PARTS,
+        dbPath: join(dir, "local.sqlite"),
+        holdPut: hold,
+      });
+    };
+
+    /** A pk_hash range a copy batch covers (or `all` for the one-prefix stream). */
+    type Range = { readonly lo: string; readonly hi: string };
+    const rangeOfCopy = (params: readonly unknown[] | undefined): Range =>
+      params && params.length > 3
+        ? { lo: String(params[3]), hi: String(params[4]) }
+        : { lo: "", hi: "g" };
+
+    it("reads only prefixes whose copy has committed, though the snapshot is copying the next ones, and leaves a write made during the publish out", async () => {
+      const puts = parking();
+      const w = await fileWorld(puts.hold);
+      const writer = w.db;
+      const reader = writer.reads;
+      // The production driver offers a read connection on a file database.
+      expect(reader).toBeDefined();
+
+      const committed: Range[] = [];
+      const seen = {
+        readerSpool: 0,
+        writerSpool: 0,
+        unannounced: [] as string[],
+        overlapped: false,
+        copyBatches: 0,
+        probes: [] as number[],
+        probeTotal: -1,
+        probeEnough: 0,
+      };
+      let firstRead!: () => void;
+      const readServed = new Promise<void>((resolve) => (firstRead = resolve));
+      const announced = (key: string) =>
+        committed.some((r) => key >= r.lo && key < r.hi);
+
+      const spiedReads = {
+        async query(text: string, params?: readonly never[]) {
+          if (text.includes("FROM publish_spool")) {
+            seen.readerSpool += 1;
+            // Every spool read's first key bound lies inside a prefix whose copy
+            // batch has already returned: it is one the feed announced.
+            const key = String(params?.[1] ?? "");
+            if (!announced(key))
+              seen.unannounced.push(`${text.slice(0, 40)} ${key}`);
+            firstRead();
+          }
+          return reader!.query(text, params);
+        },
+      } as NonNullable<SqlDriver["reads"]>;
+
+      let late: Promise<unknown> | undefined;
+      const db: SqlDriver = {
+        info: writer.info,
+        reads: spiedReads,
+        close: () => writer.close(),
+        async query(text, params) {
+          if (text.includes("FROM publish_spool")) seen.writerSpool += 1;
+          return writer.query(text, params);
+        },
+        async batch(statements) {
+          const first = statements[0];
+          if (!first?.sql.includes("INSERT INTO publish_spool"))
+            return writer.batch(statements);
+          seen.copyBatches += 1;
+          const range = rangeOfCopy(first.params);
+          if (seen.copyBatches === 4) {
+            // Three prefixes are copied. Copy the fourth only once the transfer
+            // has read from the spool through the read connection and an upload
+            // is out: this batch then runs beside a transfer that is working.
+            const outcome = await Promise.race([
+              Promise.all([readServed, puts.firstPut]).then(() => "both"),
+              sleep(1500).then(() => "stalled"),
+            ]);
+            seen.overlapped = outcome === "both";
+            // A write during the publish: a run that collects and ends now. It
+            // queues behind the snapshot's slot turn.
+            late = (async () => {
+              await w.sync.intake.begin("run-late", {
+                connector: CONNECTOR,
+                artifactDigest: CONNECTOR,
+                wantFull: false,
+                owner: { address: OWNER, leaseId: null },
+              });
+              await w.sync.intake.batch("run-late", {
+                batch: 0,
+                records: [{ stream: "s0", data: { id: "late-marker-row" } }],
+              });
+              await w.sync.intake.end("run-late", {
+                outcome: "succeeded",
+                coveredStreams: ["s0"],
+                lastBatch: 0,
+              });
+            })();
+            // Count this prefix's spool rows over the read connection while its
+            // batch runs: the reader sees none of them or all of them.
+            const attempt = String(first.params![0]);
+            const bounds = range.lo === "" ? [] : [range.lo, range.hi];
+            const count = () =>
+              reader!.query<{ n: number }>(
+                `SELECT COUNT(*) AS n FROM publish_spool WHERE attempt = ?${bounds.length ? " AND pk_hash >= ? AND pk_hash < ?" : ""}`,
+                [attempt, ...bounds],
+              );
+            let done = false;
+            const batch = writer.batch(statements).finally(() => (done = true));
+            while (!done) seen.probes.push((await count())[0]!.n);
+            const result = await batch;
+            seen.probeTotal = result.changes[0]!;
+            seen.probes.push((await count())[0]!.n);
+            committed.push(range);
+            return result;
+          }
+          // Slow each copy down, so a prefix announced before its batch has
+          // returned would be read while its rows are not yet there.
+          await sleep(10);
+          const result = await writer.batch(statements);
+          committed.push(range);
+          return result;
+        },
+      };
+      const deps = { ...w.deps, db };
+
+      const stop = puts.open();
+      try {
+        await verify();
+      } finally {
+        stop();
+      }
+
+      async function verify() {
+        const first = await publishConnection(deps, CONNECTION_ID);
+        await late;
+        expect(first.map((r) => r.outcome)).toEqual(["published"]);
+
+        // It read no prefix before that prefix's copy had committed.
+        expect(seen.unannounced).toEqual([]);
+        // The transfer's spool reads used the read connection, never the writer's.
+        expect(seen.writerSpool).toBe(0);
+        expect(seen.readerSpool).toBeGreaterThan(0);
+        // The snapshot was still copying while the transfer read and uploaded.
+        expect(seen.overlapped).toBe(true);
+        expect(seen.copyBatches).toBeGreaterThan(4);
+        // A reader checking the prefix in flight saw none of its rows or all of them.
+        expect(seen.probeTotal).toBeGreaterThan(1);
+        expect(seen.probes.length).toBeGreaterThan(0);
+        for (const n of seen.probes) expect([0, seen.probeTotal]).toContain(n);
+        expect(seen.probes.at(-1)).toBe(seen.probeTotal);
+
+        // The published version is exactly the 200 rows of the snapshot.
+        const stored = async () => {
+          const texts: string[] = [];
+          for (const { key } of w.guards) {
+            const bytes = await w.innerBlobs.get(key);
+            if (bytes) texts.push(new TextDecoder("latin1").decode(bytes));
+          }
+          return texts.join("\n");
+        };
+        const afterFirst = await stored();
+        const ids = afterFirst.match(/s0-\d+/g) ?? [];
+        expect(ids).toHaveLength(200);
+        expect(new Set(ids)).toEqual(
+          new Set(Array.from({ length: 200 }, (_, i) => `s0-${i + 1}`)),
+        );
+        expect(afterFirst).not.toContain("late-marker-row");
+        // The write is not lost: the next publish carries it.
+        const second = await publishConnection(deps, CONNECTION_ID);
+        expect(second.map((r) => r.outcome)).toEqual(["published"]);
+        expect(await stored()).toContain("late-marker-row");
+        expect(
+          await w.db.query("SELECT COUNT(*) AS n FROM publish_spool"),
+        ).toEqual([{ n: 0 }]);
+      }
+    });
   });
 });

@@ -51,7 +51,7 @@ describe("a publish upload does not hold the queue slot", () => {
     await a.run("r1", ["seed-row", "one"]);
     const hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
-    await hold.reached;
+    await a.parked(hold);
     const request = a.nextRequest();
     const began = a.begin("r2");
     try {
@@ -71,7 +71,7 @@ describe("a publish upload does not hold the queue slot", () => {
     const w1 = await a.newestChange();
     const hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
-    await hold.reached;
+    await a.parked(hold);
     // "two" lies in no prefix the candidate re-encodes.
     await a.run("r2", ["two"]);
     const w2 = await a.newestChange();
@@ -99,7 +99,7 @@ describe("a publish upload does not hold the queue slot", () => {
     const w1 = await a.newestChange();
     const hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
-    await hold.reached;
+    await a.parked(hold);
     // r2 re-stamps "one", which the candidate re-encodes. The transfer reads
     // its own copy, so this cannot stale it.
     await a.run("r2", ["seed-row", "one", "two"]);
@@ -131,10 +131,12 @@ describe("a publish upload does not hold the queue slot", () => {
     const w1 = await a.newestChange();
 
     // The retry rebuilds the identical head, so its hash equals the
-    // registry's. Hold its first transfer step, which is outside the slot.
-    const hold = stores.storage.holdNext(() => !a.inSlot());
+    // registry's. Hold its first transfer step, a probe for a stored part
+    // (the snapshot's apply only reads); `parked` waits until the snapshot's
+    // turn is over, so the step is held with the slot free.
+    const hold = stores.storage.holdNext((_op, _key, probe) => probe);
     const cycle = a.cycle();
-    await hold.reached;
+    await a.parked(hold);
     await a.run("r2", ["two"]);
     const w2 = await a.newestChange();
     hold.release();
@@ -209,7 +211,7 @@ describe("a publish sends from a spool", () => {
     expect(await spoolRows(a)).toBe(0);
     const hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
-    await hold.reached;
+    await a.parked(hold);
     expect(await spoolRows(a)).toBe(2);
     expect(await attempts(a)).toBe(1);
     hold.release();
@@ -259,7 +261,7 @@ describe("a publish sends from a spool", () => {
     await a.run("r1", ["seed-row", "one"]);
     const hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
-    await hold.reached;
+    await a.parked(hold);
     expect(await spoolRows(a)).toBe(2);
     await a.sync.deleter.requestConnectionDelete("fixture");
     // The purge took the copy with the records.
@@ -282,7 +284,7 @@ describe("run publication evidence follows the candidate's runs", () => {
     await a.run("r1", ["seed-row", "one"]);
     const hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
-    await hold.reached;
+    await a.parked(hold);
     // "two" lies in no prefix the candidate re-encodes, so the candidate stands.
     await a.run("r2", ["two"]);
     hold.release();
@@ -331,7 +333,7 @@ describe("another device publishing during an upload", () => {
     await a.run("r1", ["seed-row", "one"]);
     const hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
-    await hold.reached;
+    await a.parked(hold);
     // b publishes v2 while a's candidate (built over v1) is in flight.
     await b.run("rb", ["seed-row", "bee"]);
     await settle(b);
@@ -354,7 +356,7 @@ describe("a delete during an upload wins", () => {
     await a.run("r1", ["seed-row", "one"]);
     const hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
-    await hold.reached;
+    await a.parked(hold);
     await a.sync.deleter.requestConnectionDelete("fixture");
     hold.release();
     const report = await cycle;
@@ -372,7 +374,7 @@ describe("a delete during an upload wins", () => {
     await a.run("r1", ["seed-row", "one"]);
     const hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
-    await hold.reached;
+    await a.parked(hold);
     await a.deps.queue.run(a.connectionId, "purge", () =>
       unwriteRefusedRun(a.deps, {
         connectionId: a.connectionId,
@@ -397,7 +399,7 @@ describe("an explicit record delete during an upload", () => {
     await a.run("r1", ["seed-row", "one", "x"]);
     const hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
-    await hold.reached;
+    await a.parked(hold);
     // A real intake delete of x, begun and ended while the part PUT is held.
     await a.remove("r2", ["x"]);
     expect(await a.keys()).not.toContain("x");
@@ -416,7 +418,7 @@ describe("an explicit record delete during an upload", () => {
     await a.run("r1", ["seed-row", "one", "x"]);
     const hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
-    await hold.reached;
+    await a.parked(hold);
     await a.remove("r2", ["x"]);
     hold.release();
     await cycle;
@@ -489,7 +491,7 @@ describe("connections do not wait on each other", () => {
       (op, key) => op === "put" && key.includes("fixture"),
     );
     const blocked = a.sync.syncConnection(a.connectionId);
-    await hold.reached;
+    await a.parked(hold);
     const done = await a.sync.syncConnection(other.connectionId);
     expect(done.error).toBeNull();
     expect(await other.head()).toMatchObject({ version: 1 });
@@ -595,7 +597,7 @@ describe("a generation-bound run is dropped when another writer deletes and reco
     const { stores, a } = await bound();
     const hold = stores.storage.holdNext(putting);
     const cycle = a.cycle();
-    await hold.reached;
+    await a.parked(hold);
     await webDeleteAndReconnect(stores);
     hold.release();
     const report = await cycle;

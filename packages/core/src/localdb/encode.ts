@@ -8,7 +8,7 @@ import {
   type FrameBytes,
   type JsonValue,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import type { SqlValue } from "./driver.js";
+import { readerOf, type SqlValue } from "./driver.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { meteredBlobs, type PublishMeter } from "./publish-meter.js";
 import { newUploadWave, type UploadWave } from "./upload-wave.js";
@@ -52,6 +52,72 @@ export type FrozenRow = {
 export interface FrozenPrefix {
   readonly prefix: string;
   readonly rows: number;
+}
+
+/**
+ * The prefixes a snapshot has frozen, handed to the transfer one at a time
+ * while the snapshot is still freezing the next ones. One producer (the freeze)
+ * and one consumer (the encoder). The feed holds a count per prefix, never
+ * rows, so it adds no memory that grows with the stream.
+ *
+ * `end` says the freeze finished. `fail` says it did not: the consumer throws
+ * the error at once and gets none of the prefixes still waiting. `abandon` is
+ * the consumer's way to say it stopped (a failed upload, a purge): the
+ * producer sees `abandoned()` and stops freezing prefixes nobody will read.
+ */
+export interface FrozenFeed extends AsyncIterable<FrozenPrefix> {
+  push(frozen: FrozenPrefix): void;
+  end(): void;
+  fail(error: unknown): void;
+  abandon(): void;
+  abandoned(): boolean;
+}
+
+export function newFrozenFeed(): FrozenFeed {
+  const waiting: FrozenPrefix[] = [];
+  let finished: { readonly error?: unknown } | undefined;
+  let gone = false;
+  let wake: (() => void) | undefined;
+  const signal = () => {
+    const resume = wake;
+    wake = undefined;
+    resume?.();
+  };
+  return {
+    push(frozen) {
+      if (finished || gone) return;
+      waiting.push(frozen);
+      signal();
+    },
+    end() {
+      finished ??= {};
+      signal();
+    },
+    fail(error) {
+      if (finished) return;
+      finished = { error };
+      waiting.length = 0;
+      signal();
+    },
+    abandon() {
+      gone = true;
+      waiting.length = 0;
+    },
+    abandoned: () => gone,
+    async *[Symbol.asyncIterator]() {
+      for (;;) {
+        const next = waiting.shift();
+        if (next) {
+          yield next;
+        } else if (finished) {
+          if ("error" in finished) throw finished.error;
+          return;
+        } else {
+          await new Promise<void>((resolve) => (wake = resolve));
+        }
+      }
+    },
+  };
 }
 
 /**
@@ -171,17 +237,30 @@ export async function dropSpool(
  * The transfer reads only this copy, so a write to `records` after this call
  * cannot change what is sent. A write that makes the snapshot wrong is the
  * commit's to catch.
+ *
+ * `onFrozen` lets the transfer start on a prefix as soon as its batch has
+ * committed, while later prefixes are still being copied. That does not weaken
+ * the snapshot: its consistency comes from the slot (no writer of `records`
+ * runs between the batches), not from the order the transfer reads in.
  */
 export async function freezePrefixRows(
   deps: LocalSyncDeps,
   input: PrefixQuery & {
     readonly attempt: string;
     readonly changedPrefixes: readonly string[];
+    /**
+     * Called with each prefix once its batch has committed, in key order, so a
+     * transfer can read it while the next prefixes are still being copied.
+     */
+    readonly onFrozen?: (frozen: FrozenPrefix) => void;
+    /** Asked before each prefix: true means nobody will read more, so stop. */
+    readonly stopped?: () => boolean;
   },
 ): Promise<readonly FrozenPrefix[]> {
   const prefixes = checkedPrefixes(input.changedPrefixes);
   const frozen: FrozenPrefix[] = [];
   for (const prefix of prefixes) {
+    if (input.stopped?.()) break;
     const range = keyRange(prefix);
     let where = "connection_id = ? AND stream = ?" + range.sql;
     const params: SqlValue[] = [
@@ -206,7 +285,9 @@ export async function freezePrefixRows(
         params,
       },
     ]);
-    frozen.push({ prefix, rows: changes[0]! });
+    const done = { prefix, rows: changes[0]! };
+    frozen.push(done);
+    input.onFrozen?.(done);
   }
   return frozen;
 }
@@ -227,9 +308,13 @@ async function* readSpool(
   prefix: string,
 ): AsyncGenerator<readonly SpoolRow[]> {
   const range = keyRange(prefix);
+  // A prefix is read after its batch committed, and nothing writes it again,
+  // so the read connection sees all of it. It does not queue behind the
+  // freeze of the next prefixes.
+  const reader = readerOf(deps.db);
   let after: string | null = null;
   for (;;) {
-    const meta: { pk_hash: string; body_bytes: number }[] = await deps.db.query(
+    const meta: { pk_hash: string; body_bytes: number }[] = await reader.query(
       `SELECT pk_hash, body_bytes FROM publish_spool
           WHERE attempt = ?${range.sql}${after === null ? "" : " AND pk_hash > ?"}
           ORDER BY pk_hash LIMIT ${PAGE_ROWS}`,
@@ -247,7 +332,7 @@ async function* readSpool(
     }
     const first = meta[0]!.pk_hash;
     const last = meta[take - 1]!.pk_hash;
-    const page: SpoolRow[] = await deps.db.query(
+    const page: SpoolRow[] = await reader.query(
       `SELECT pk_hash, stamp_o, stamp_r, first_o, body_sha256, body
          FROM publish_spool
         WHERE attempt = ? AND pk_hash >= ? AND pk_hash <= ?
@@ -327,7 +412,11 @@ export async function startFrozenParts(
     readonly attempt: string;
     readonly scope: string;
     readonly generation: number;
-    readonly frozen: readonly FrozenPrefix[];
+    /**
+     * The prefixes to encode, in key order. A feed delivers each one as the
+     * snapshot finishes copying it.
+     */
+    readonly frozen: Iterable<FrozenPrefix> | AsyncIterable<FrozenPrefix>;
     readonly wave: UploadWave;
     readonly probe: boolean;
     /** Counts the blob calls and parts written; the bytes stay the same. */
@@ -379,7 +468,9 @@ async function encodeFrozenParts(
   },
 ): Promise<readonly EncodedPart[]> {
   const result: EncodedPart[] = [];
-  for (const frozen of input.frozen) {
+  // The next prefix is awaited here, while no memory is held: `flush` has
+  // dropped the last reservation and `hold` has not asked for the next.
+  for await (const frozen of input.frozen) {
     const { prefix } = frozen;
     let seq = 0;
     const upload = async (part: Awaited<ReturnType<typeof encodePiece>>) => {
