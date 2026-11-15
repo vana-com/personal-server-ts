@@ -1,4 +1,8 @@
 import type { StreamSyncRegistry } from "../../stream-sync/ports.js";
+import {
+  createRegistryChangePush,
+  type RegistryChangePushOptions,
+} from "./change-push.js";
 import type { ChangeProbe } from "./sync-manager.js";
 
 /**
@@ -21,23 +25,66 @@ import type { ChangeProbe } from "./sync-manager.js";
  */
 export const DEFAULT_CHANGE_PROBE_MS = 5_000;
 
+/**
+ * A probe read that has not answered after this long failed. A probe is
+ * optional: a read that never settles must not hold a pull in flight, so the
+ * ordinary timed path and every later poke stay free. It matches the push
+ * request's grace (`REQUEST_GRACE_MS`), the same "this connection is dead" bar.
+ */
+export const PROBE_TIMEOUT_MS = 10_000;
+
 export interface RegistryChangeProbeOptions {
   /** Default {@link DEFAULT_CHANGE_PROBE_MS}; 0 or less: no probe. */
   intervalMs?: number;
   active?: () => boolean;
+  /**
+   * The server push that relieves the probe, when the registry can hold a
+   * change request. `{ enabled: false }` keeps the probe alone. The host's
+   * `active` gate applies to it too: a hidden tab holds no request.
+   */
+  push?: Omit<RegistryChangePushOptions, "active">;
 }
 
 /** The manager's probe over a registry that can answer one; none otherwise. */
 export function createRegistryChangeProbe(
-  registry: Pick<StreamSyncRegistry, "probeChange">,
+  registry: Pick<StreamSyncRegistry, "probeChange" | "waitForChange">,
   options: RegistryChangeProbeOptions = {},
 ): ChangeProbe | undefined {
   const intervalMs = options.intervalMs ?? DEFAULT_CHANGE_PROBE_MS;
   const probeChange = registry.probeChange?.bind(registry);
   if (!probeChange || !(intervalMs > 0)) return undefined;
+  const push = createRegistryChangePush(registry, {
+    ...options.push,
+    ...(options.active && { active: options.active }),
+  });
   return {
-    read: probeChange,
+    read: () => readWithDeadline(probeChange),
     intervalMs,
+    ...(push && { push }),
     ...(options.active && { active: options.active }),
   };
+}
+
+/**
+ * One probe read that ends: it is aborted at the deadline (so the request frees
+ * its connection) and rejects at the deadline even when the registry ignores
+ * the signal.
+ */
+async function readWithDeadline(
+  probeChange: (signal?: AbortSignal) => Promise<string | null | undefined>,
+): Promise<string | null | undefined> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error("registry change probe got no answer");
+      controller.abort(error);
+      reject(error);
+    }, PROBE_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([probeChange(controller.signal), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }

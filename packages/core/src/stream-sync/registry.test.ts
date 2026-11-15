@@ -485,8 +485,104 @@ describe("probeChange", () => {
     expect(await registry.probeChange!()).toBeUndefined();
   });
 
+  it("hands the caller's abort signal to the request, so a stalled read can be ended", async () => {
+    const seen: Array<AbortSignal | null | undefined> = [];
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test",
+      ownerAddress: "0x" + "11".repeat(20),
+      fetch: (async (_url: string, init?: RequestInit) => {
+        seen.push(init?.signal);
+        return new Response(JSON.stringify({ data: { dataPoints: [] } }));
+      }) as typeof fetch,
+    });
+    const controller = new AbortController();
+    await registry.probeChange!(controller.signal);
+    expect(seen).toHaveLength(1);
+    controller.abort();
+    expect(seen[0]?.aborted).toBe(true);
+  });
+
   it("throws on a failed read: a failure is not 'nothing changed'", async () => {
     const { registry } = probing([new Response("no", { status: 503 })]);
     await expect(registry.probeChange!()).rejects.toThrow(/503/);
+  });
+});
+
+describe("waitForChange", () => {
+  const owner = "0x" + "11".repeat(20);
+
+  function waiting(respond: (url: string) => Response | Promise<Response>) {
+    const urls: string[] = [];
+    const signals: Array<AbortSignal | undefined> = [];
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test/",
+      ownerAddress: owner,
+      fetch: (async (url: string, init?: RequestInit) => {
+        urls.push(url);
+        signals.push(init?.signal ?? undefined);
+        return respond(url);
+      }) as typeof fetch,
+    });
+    return { registry, urls, signals };
+  }
+
+  it("holds a request on the change route with the owner, cursor and wait in seconds", async () => {
+    const { registry, urls, signals } = waiting(
+      () => new Response(JSON.stringify({ seq: "12", changed: true })),
+    );
+    const controller = new AbortController();
+    const answer = await registry.waitForChange!(
+      "9",
+      25_000,
+      controller.signal,
+    );
+    expect(answer).toEqual({ seq: "12", changed: true });
+    const url = new URL(urls[0]!);
+    expect(url.origin + url.pathname).toBe(
+      "https://gateway.test/v1/data/changes",
+    );
+    expect(url.searchParams.get("user")).toBe(owner);
+    expect(url.searchParams.get("after")).toBe("9");
+    expect(url.searchParams.get("wait")).toBe("25");
+    expect(signals[0]).toBe(controller.signal);
+  });
+
+  it("sends no cursor when it has none", async () => {
+    const { registry, urls } = waiting(
+      () => new Response(JSON.stringify({ seq: "0", changed: true })),
+    );
+    await registry.waitForChange!(
+      undefined,
+      25_000,
+      new AbortController().signal,
+    );
+    expect(new URL(urls[0]!).searchParams.has("after")).toBe(false);
+  });
+
+  it("says the gateway has no change route on 404 or 405, so the caller stops asking", async () => {
+    for (const status of [404, 405]) {
+      const { registry } = waiting(() => new Response("no", { status }));
+      await expect(
+        registry.waitForChange!("1", 25_000, new AbortController().signal),
+      ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
+    }
+  });
+
+  it("throws on any other failure, and on an answer that is not a sequence", async () => {
+    const down = waiting(() => new Response("no", { status: 503 }));
+    await expect(
+      down.registry.waitForChange!("1", 25_000, new AbortController().signal),
+    ).rejects.toThrow(/503/);
+    for (const body of [
+      {},
+      { seq: 7, changed: true },
+      { seq: "x", changed: true },
+      { seq: "7" },
+    ]) {
+      const bad = waiting(() => new Response(JSON.stringify(body)));
+      await expect(
+        bad.registry.waitForChange!("1", 25_000, new AbortController().signal),
+      ).rejects.toThrow(/change answer/);
+    }
   });
 });
