@@ -106,7 +106,7 @@ it("missing stream two aborts after stream one with no stream three commit", asy
     await f.db.query("SELECT stream FROM stream_versions ORDER BY stream"),
   ).toEqual([{ stream: "a" }]);
 });
-it("a late applyStream joins the existing connection flight and falls back to read when unlisted", async () => {
+it("a late applyStream runs in the next flight and reads its stream itself", async () => {
   const f = await fixture();
   await f.head("a", [{ id: "a" }]);
   let release!: () => void, started!: () => void;
@@ -131,7 +131,7 @@ it("a late applyStream joins the existing connection flight and falls back to re
   const b = await f.head("b", [{ id: "b" }]);
   const joining = applyStream(f.deps, f.id, "b");
   release();
-  expect((await all).map((r) => r.stream)).toEqual(["a", "b"]);
+  expect((await all).map((r) => r.stream)).toEqual(["a"]);
   expect((await joining).outcome).toBe("applied");
   expect(f.list).toHaveBeenCalledTimes(1);
   expect(f.read.mock.calls.filter(([s]) => s === b.scope)).toHaveLength(2);
@@ -402,4 +402,151 @@ it("a joiner for a stream the flight already answered gets a new answer", async 
   expect(
     await f.db.query("SELECT head_version FROM stream_state WHERE stream='a'"),
   ).toEqual([{ head_version: 3 }]);
+});
+
+/** Holds each local query that starts a stream's work until the test releases it. */
+function holdStreams(f: { db: SqlDriver }, streams: string[]) {
+  const holds = new Map<string, Array<() => void>>(streams.map((s) => [s, []]));
+  const query = f.db.query.bind(f.db);
+  const spy = vi.spyOn(f.db, "query") as unknown as {
+    mockImplementation: (fn: unknown) => void;
+  };
+  spy.mockImplementation(async (sql: string, params?: unknown[]) => {
+    const mine = holds.get(String(params?.[1]));
+    if (
+      mine &&
+      sql.includes("FROM head_parts WHERE connection_id=? AND stream=?")
+    )
+      await new Promise<void>((release) => mine.push(release));
+    return query(sql, params as never);
+  });
+  return (stream: string) => ({
+    held: (n: number) =>
+      vi.waitFor(() => expect(holds.get(stream)!.length).toBe(n)),
+    release: (n: number) => holds.get(stream)![n - 1]!(),
+  });
+}
+function countFlights(f: { deps: LocalSyncDeps }) {
+  const queue = f.deps.queue;
+  let runs = 0;
+  f.deps.queue = {
+    run: (id, kind, work) => {
+      if (kind === "apply") runs++;
+      return queue.run(id, kind, work);
+    },
+  };
+  return () => runs;
+}
+it("a caller resolves when its own flight ends, while a later caller's flight is still held", async () => {
+  const f = await bothApplied();
+  const holdAt = holdStreams(f, ["a", "b"]);
+  const hold = holdAt("a");
+  const holdB = holdAt("b");
+  const c0 = applyStream(f.deps, f.id, "a");
+  await hold.held(1);
+  const c1 = applyStream(f.deps, f.id, "b");
+  hold.release(1);
+  const first = await Promise.race([
+    c0.then(() => "c0"),
+    holdB.held(1).then(() => "later caller's work"),
+  ]);
+  expect(first).toBe("c0");
+  expect((await c0).outcome).toBe("noop");
+  await holdB.held(1);
+  holdB.release(1);
+  expect((await c1).outcome).toBe("noop");
+});
+it("callers arriving during a flight make exactly one next flight, and that flight's arrivals one more", async () => {
+  const f = await bothApplied();
+  const runs = countFlights(f);
+  const hold = holdStreams(f, ["a"])("a");
+  const first = applyStream(f.deps, f.id, "a");
+  await hold.held(1);
+  const second = Array.from({ length: 5 }, () =>
+    applyStream(f.deps, f.id, "a"),
+  );
+  expect(runs()).toBe(1);
+  hold.release(1);
+  await first;
+  await hold.held(2);
+  expect(runs()).toBe(2);
+  const third = Array.from({ length: 5 }, () => applyStream(f.deps, f.id, "a"));
+  hold.release(2);
+  await Promise.all(second);
+  await hold.held(3);
+  expect(runs()).toBe(3);
+  hold.release(3);
+  await Promise.all(third);
+  expect(runs()).toBe(3);
+});
+it("an absent control read held while the remote goes active does not answer a caller who called after", async () => {
+  const f = await fixture();
+  await f.head("a", [{ id: "a" }]);
+  const absent = { found: false } as const;
+  const read = f.deps.registry.read;
+  let entered!: () => void, release!: () => void;
+  const hasEntered = new Promise<void>((r) => {
+    entered = r;
+  });
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  let first = true;
+  f.deps.registry = {
+    ...f.deps.registry,
+    read: async (scope) => {
+      if (scope === f.control && first) {
+        first = false;
+        entered();
+        await gate;
+        return absent;
+      }
+      return read(scope);
+    },
+  };
+  const c0 = applyStream(f.deps, f.id, "a");
+  await hasEntered;
+  const c1 = applyStream(f.deps, f.id, "a");
+  release();
+  expect((await c0).outcome).toBe("gone");
+  expect((await c1).outcome).toBe("applied");
+});
+it("a failure in the next flight does not reject the callers of the flight before it", async () => {
+  const f = await bothApplied();
+  const hold = holdStreams(f, ["a"])("a");
+  const c0 = applyStream(f.deps, f.id, "a");
+  await hold.held(1);
+  const c1 = applyStream(f.deps, f.id, "b");
+  f.reads.set(f.b.scope, {
+    found: true,
+    version: 2,
+    dataHash: "ab".repeat(32),
+    metadataHash: f.hashes.activeMetadata,
+    deleted: false,
+  });
+  const failed = expect(c1).rejects.toThrow("apply: missing head blob");
+  hold.release(1);
+  expect((await c0).outcome).toBe("noop");
+  await failed;
+});
+it("five callers asking at once for unchanged streams share one flight: one control read, one listing, no stream reads", async () => {
+  const f = await fixture();
+  const a = await f.head("a", [{ id: "a" }]);
+  const b = await f.head("b", [{ id: "b" }]);
+  await applyConnection(f.deps, f.id);
+  f.read.mockClear();
+  f.list.mockClear();
+  const runs = countFlights(f);
+  const results = await Promise.all(
+    Array.from({ length: 5 }, () => applyConnection(f.deps, f.id)),
+  );
+  expect(results.map((r) => r.map((x) => x.outcome))).toEqual(
+    Array(5).fill(["noop", "noop"]),
+  );
+  expect(runs()).toBe(1);
+  expect(f.list).toHaveBeenCalledTimes(1);
+  expect(f.read.mock.calls.filter(([s]) => s === f.control)).toHaveLength(1);
+  expect(
+    f.read.mock.calls.filter(([s]) => s === a.scope || s === b.scope),
+  ).toHaveLength(0);
 });

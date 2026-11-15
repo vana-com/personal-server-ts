@@ -70,158 +70,156 @@ const result = (
   outcome: ApplyResult["outcome"],
 ): ApplyResult => ({ stream, outcome, partsDownloaded: 0, partsKept: 0 });
 
-// The queue's apply single-flight is connection-wide. Accumulate requests in
-// that same flight so two different applyStream calls cannot lose a stream.
+// A connection's apply work runs in flights, one at a time. A flight answers
+// only the callers admitted before it started: its registry reads are all
+// taken after each of those calls began. A caller arriving while a flight runs
+// joins the one pending next flight, which starts when this one exits and
+// takes its own reads. A caller settles when its own flight ends, so a late
+// caller's work or failure never reaches an earlier one, and no stream of
+// arrivals can keep a flight open.
 type Flight = {
   all: boolean;
   streams: Set<string>;
-  /** Counts the requests that joined this flight after it began. */
-  epoch: number;
-  /** The epoch at which a connection-wide request last joined. */
-  joinedAll: number;
-  /** The epoch at which a request for one stream last joined. */
-  joined: Map<string, number>;
+  /** Closed at the start of the job; later callers join the next flight. */
+  closed: boolean;
   promise: Promise<readonly ApplyResult[]>;
 };
-const flights = new WeakMap<ConnectionQueue, Map<string, Flight>>();
+type Slot = { running: Flight; next?: Flight };
+const slots = new WeakMap<ConnectionQueue, Map<string, Slot>>();
 function request(deps: LocalSyncDeps, id: string, stream?: string) {
-  let pending = flights.get(deps.queue);
-  if (!pending) {
-    pending = new Map();
-    flights.set(deps.queue, pending);
+  let byId = slots.get(deps.queue);
+  if (!byId) {
+    byId = new Map();
+    slots.set(deps.queue, byId);
   }
-  const running = pending.get(id);
-  if (running) {
-    running.epoch++;
-    if (stream === undefined) {
-      running.all = true;
-      running.joinedAll = running.epoch;
-    } else {
-      running.streams.add(stream);
-      running.joined.set(stream, running.epoch);
-    }
-    return running.promise;
-  }
-  const flight: Flight = {
-    all: stream === undefined,
-    streams: new Set(stream === undefined ? [] : [stream]),
-    epoch: 0,
-    joinedAll: 0,
-    joined: new Map(),
-    promise: Promise.resolve([]),
+  const join = (flight: Flight) => {
+    if (stream === undefined) flight.all = true;
+    else flight.streams.add(stream);
+    return flight.promise;
   };
-  pending.set(id, flight);
-  flight.promise = deps.queue
-    .run(id, "apply", async () => {
-      // Purge is a nested operation; this job already holds this connection.
-      const locked: LocalSyncDeps = {
-        ...deps,
-        queue: {
-          run: (other, kind, work) =>
-            other === id ? work() : deps.queue.run(other, kind, work),
+  const slot = byId.get(id);
+  if (slot) {
+    if (!slot.running.closed) return join(slot.running);
+    if (slot.next) return join(slot.next);
+    const next = newFlight();
+    slot.next = next;
+    next.promise = slot.running.promise
+      .then(
+        () => undefined,
+        () => undefined,
+      )
+      .then(() => launch(deps, id, next, byId, slot));
+    return join(next);
+  }
+  const flight = newFlight();
+  const created: Slot = { running: flight };
+  byId.set(id, created);
+  flight.promise = launch(deps, id, flight, byId, created);
+  return join(flight);
+}
+const newFlight = (): Flight => ({
+  all: false,
+  streams: new Set(),
+  closed: false,
+  promise: Promise.resolve([]),
+});
+function launch(
+  deps: LocalSyncDeps,
+  id: string,
+  flight: Flight,
+  byId: Map<string, Slot>,
+  slot: Slot,
+): Promise<readonly ApplyResult[]> {
+  return runFlight(deps, id, flight).finally(() => {
+    if (slot.next) {
+      slot.running = slot.next;
+      slot.next = undefined;
+    } else if (byId.get(id) === slot) byId.delete(id);
+  });
+}
+function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
+  return deps.queue.run(id, "apply", async () => {
+    flight.closed = true;
+
+    // Purge is a nested operation; this job already holds this connection.
+    const locked: LocalSyncDeps = {
+      ...deps,
+      queue: {
+        run: (other, kind, work) =>
+          other === id ? work() : deps.queue.run(other, kind, work),
+      },
+    };
+    const [connection] = await deps.db.query<Connection>(
+      "SELECT connector, ns, generation FROM connections WHERE connection_id = ?",
+      [id],
+    );
+    if (!connection) return [...flight.streams].map((s) => result(s, "gone"));
+    if (
+      (
+        await deps.db.query("SELECT 1 FROM delete_intents WHERE connector=?", [
+          connection.connector,
+        ])
+      ).length
+    ) {
+      // Only the pinned delete owner may purge this intent. Another device
+      // can have reconnected after its pins were captured.
+      await deps.db.batch([
+        {
+          sql: "UPDATE connections SET control_state='deleted',checkpoint=NULL WHERE connection_id=?",
+          params: [id],
         },
-      };
-      const [connection] = await deps.db.query<Connection>(
-        "SELECT connector, ns, generation FROM connections WHERE connection_id = ?",
-        [id],
+      ]);
+      if (flight.all)
+        for (const row of await deps.db.query<{ stream: string }>(
+          "SELECT stream FROM stream_state WHERE connection_id=?",
+          [id],
+        ))
+          flight.streams.add(row.stream);
+      return [...flight.streams].map((s) => result(s, "gone"));
+    }
+    const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
+    const hashes = await controlHashes(keccak, keyCheck);
+    const initial = await control(locked, id, connection, hashes);
+    if (initial.kind !== "active") {
+      if (flight.all)
+        for (const row of await deps.db.query<{ stream: string }>(
+          "SELECT stream FROM stream_state WHERE connection_id=?",
+          [id],
+        ))
+          flight.streams.add(row.stream);
+      return [...flight.streams].map((s) =>
+        result(s, initial.kind === "deleted" ? "purged" : "gone"),
       );
-      if (!connection) return [...flight.streams].map((s) => result(s, "gone"));
-      if (
-        (
-          await deps.db.query(
-            "SELECT 1 FROM delete_intents WHERE connector=?",
-            [connection.connector],
-          )
-        ).length
-      ) {
-        // Only the pinned delete owner may purge this intent. Another device
-        // can have reconnected after its pins were captured.
-        await deps.db.batch([
-          {
-            sql: "UPDATE connections SET control_state='deleted',checkpoint=NULL WHERE connection_id=?",
-            params: [id],
-          },
-        ]);
-        if (flight.all)
-          for (const row of await deps.db.query<{ stream: string }>(
-            "SELECT stream FROM stream_state WHERE connection_id=?",
-            [id],
-          ))
-            flight.streams.add(row.stream);
-        return [...flight.streams].map((s) => result(s, "gone"));
-      }
-      const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
-      const hashes = await controlHashes(keccak, keyCheck);
-      const initialEpoch = flight.epoch;
-      const initial = await control(locked, id, connection, hashes);
-      if (initial.kind !== "active") {
-        if (flight.all)
-          for (const row of await deps.db.query<{ stream: string }>(
-            "SELECT stream FROM stream_state WHERE connection_id=?",
-            [id],
-          ))
-            flight.streams.add(row.stream);
-        return [...flight.streams].map((s) =>
-          result(s, initial.kind === "deleted" ? "purged" : "gone"),
-        );
-      }
-      const answers = new Map<string, { result: ApplyResult; epoch: number }>();
-      const reuse: Reuse = {
-        flight,
-        control: { read: initial, epoch: initialEpoch },
-        listed: new Map(),
-        stale: false,
-      };
-      let listedAt = -1;
-      while (true) {
-        if (flight.all && listedAt < flight.joinedAll) {
-          // A connection-wide request that joined after the last listing needs
-          // its own: a stream published since is not in the old one.
-          listedAt = flight.epoch;
-          for (const row of await deps.registry.listStreamRows(
-            connection.connector,
-          )) {
-            const scope = parseScope(row.scope);
-            if (
-              scope?.kind === "stream" &&
-              scope.connector === connection.connector &&
-              scope.ns === connection.ns
-            ) {
-              flight.streams.add(scope.stream);
-              reuse.listed.set(scope.stream, {
-                read: row.read,
-                epoch: listedAt,
-              });
-            }
+    }
+    const answers = new Map<string, ApplyResult>();
+    const reuse: Reuse = { control: initial, listed: new Map(), stale: false };
+    let listed = false;
+    while (true) {
+      if (flight.all && !listed) {
+        for (const row of await deps.registry.listStreamRows(
+          connection.connector,
+        )) {
+          const scope = parseScope(row.scope);
+          if (
+            scope?.kind === "stream" &&
+            scope.connector === connection.connector &&
+            scope.ns === connection.ns
+          ) {
+            flight.streams.add(scope.stream);
+            reuse.listed.set(scope.stream, row.read);
           }
         }
-        // A stream is answered again when a request joined for it after the
-        // reads of its last answer began.
-        const next = [...flight.streams].find((s) => {
-          const answer = answers.get(s);
-          return answer === undefined || answer.epoch < joinEpoch(flight, s);
-        });
-        if (next === undefined) break;
-        const epoch = flight.epoch;
-        answers.set(next, {
-          result: await applyOne(
-            locked,
-            id,
-            connection,
-            next,
-            keyCheck,
-            hashes,
-            reuse,
-          ),
-          epoch,
-        });
+        listed = true;
       }
-      return [...answers.values()].map((a) => a.result);
-    })
-    .finally(() => {
-      if (pending.get(id) === flight) pending.delete(id);
-    });
-  return flight.promise;
+      const next = [...flight.streams].find((s) => !answers.has(s));
+      if (next === undefined) break;
+      answers.set(
+        next,
+        await applyOne(locked, id, connection, next, keyCheck, hashes, reuse),
+      );
+    }
+    return [...answers.values()];
+  });
 }
 
 /** Apply one stream; concurrent requests share the connection's apply job. */
@@ -320,26 +318,19 @@ async function control(
   return state;
 }
 
-/** The epoch from which a read is new enough for a stream's waiting callers. */
-const joinEpoch = (flight: Flight, stream: string) =>
-  Math.max(flight.joinedAll, flight.joined.get(stream) ?? 0);
-
 /**
  * Freshness contract. Each ApplyResult reflects registry reads taken after
- * the call that requested that stream began. Calls share one flight, so a
- * read the job already holds serves a stream only if it began at or after the
- * epoch at which every caller waiting on that stream had joined; otherwise
- * the stream reads fresh. Within that, a stream that ends early reads fresh
- * once any stream has downloaded (a download's duration is the one window long
- * enough to matter), and a stream that would delete local data always does.
- * The per-stream entry read of the base made the same promise, and no caller
- * could see when that read happened. A registry snapshot sequence number
- * would make it checkable.
+ * the call that requested that stream began. A flight is admitted before its
+ * first read, so the control read and listing it holds are fresh for every
+ * caller it answers. A stream reuses them only while nothing has downloaded
+ * since (a download's duration is the one window long enough to matter), and a
+ * stream that would delete local data never does. The base's per-stream entry
+ * read made the same promise. A registry snapshot sequence number would make
+ * it checkable.
  */
 interface Reuse {
-  flight: Flight;
-  control?: { read: Awaited<ReturnType<typeof control>>; epoch: number };
-  listed: Map<string, { read: ControlRead; epoch: number }>;
+  control?: Awaited<ReturnType<typeof control>>;
+  listed: Map<string, ControlRead>;
   /** A stream has downloaded since the job's reads were taken. */
   stale: boolean;
 }
@@ -392,14 +383,8 @@ async function applyOneOnce(
   reuse: Reuse,
   fresh: boolean,
 ): Promise<ApplyResult | undefined> {
-  const needed = joinEpoch(reuse.flight, stream);
-  const fence =
-    !fresh && reuse.control && reuse.control.epoch >= needed
-      ? reuse.control.read
-      : undefined;
-  const listing = reuse.listed.get(stream);
-  const listedRead =
-    !fresh && listing && listing.epoch >= needed ? listing.read : undefined;
+  const fence = fresh ? undefined : reuse.control;
+  const listedRead = fresh ? undefined : reuse.listed.get(stream);
   const reused = fence !== undefined || listedRead !== undefined;
   const rerun = reuse.stale && reused;
   const early = (answer: ApplyResult) => (rerun ? undefined : answer);
@@ -632,9 +617,8 @@ async function applyOneOnce(
         if (rows.length > 0) throw new Error("apply: incomplete part");
       }
     }
-    const fenceEpoch = reuse.flight.epoch;
     const stillActive = await control(deps, id, connection, hashes);
-    reuse.control = { read: stillActive, epoch: fenceEpoch };
+    reuse.control = stillActive;
     if (
       stillActive.kind !== "active" ||
       stillActive.generation !== active.generation
