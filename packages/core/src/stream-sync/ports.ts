@@ -139,6 +139,19 @@ export class AmbiguousRegistryReplyError extends Error {
   }
 }
 
+/**
+ * The registry could not be reached or did not answer: a network failure, a
+ * timeout or a 5xx. Nothing says the request was refused or that the data is
+ * wrong, so a caller may go on offline. It is the only registry error a caller
+ * may treat that way.
+ */
+export class RegistryUnavailableError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "RegistryUnavailableError";
+  }
+}
+
 /** The registry refused the request for good (4xx other than 409). */
 /**
  * The gateway has no change route (404 or 405): it predates the change push.

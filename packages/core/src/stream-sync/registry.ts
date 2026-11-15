@@ -20,6 +20,7 @@ import {
 import { computeDataPointId } from "../sync/data-point-id.js";
 import {
   AmbiguousRegistryReplyError,
+  RegistryUnavailableError,
   ChangeFeedAbsentError,
   RegistryRefusedError,
   type ConditionalPostResult,
@@ -178,6 +179,26 @@ export function createGatewayStreamSyncRegistry(
 ): StreamSyncRegistry {
   const base = options.gatewayUrl.replace(/\/+$/, "");
   const fetchImpl = options.fetch ?? globalThis.fetch;
+  /**
+   * A read that cannot reach the registry (a network failure or timeout) or
+   * that it answers with a 5xx says nothing about the data: it is
+   * unavailability, which a caller may go on offline from. Writes keep their
+   * own ambiguity handling.
+   */
+  async function fetchForRead(url: string): Promise<Response> {
+    let res: Response;
+    try {
+      res = await fetchImpl(url);
+    } catch (cause) {
+      throw new RegistryUnavailableError(
+        `registry unreachable: ${cause instanceof Error ? cause.message : String(cause)}`,
+        { cause },
+      );
+    }
+    if (res.status >= 500)
+      throw new RegistryUnavailableError(`registry answered ${res.status}`);
+    return res;
+  }
   const pageSize = options.listPageSize ?? 500;
 
   /** Page through every owner row and keep the scopes `keep` accepts. */
@@ -191,7 +212,7 @@ export function createGatewayStreamSyncRegistry(
         limit: String(pageSize),
       });
       if (cursor !== null) params.set("cursor", cursor);
-      const res = await fetchImpl(`${base}/v1/data?${params.toString()}`);
+      const res = await fetchForRead(`${base}/v1/data?${params.toString()}`);
       if (!res.ok) {
         throw new Error(`registry listing failed: ${res.status}`);
       }
@@ -301,7 +322,9 @@ export function createGatewayStreamSyncRegistry(
   return {
     async read(scope) {
       const id = computeDataPointId(options.ownerAddress, scope);
-      const res = await fetchImpl(`${base}/v1/data/${id}?includeDeleted=true`);
+      const res = await fetchForRead(
+        `${base}/v1/data/${id}?includeDeleted=true`,
+      );
       if (res.status === 404) return { found: false };
       if (res.status !== 200) {
         throw new Error(`registry read of ${scope} failed: ${res.status}`);

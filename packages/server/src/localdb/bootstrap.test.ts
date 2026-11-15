@@ -18,7 +18,10 @@ import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { streamSyncHashes } from "../../../core/src/stream-sync/crypto.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
-import type { StreamSyncRegistry } from "../../../core/src/stream-sync/ports.js";
+import {
+  RegistryUnavailableError,
+  type StreamSyncRegistry,
+} from "../../../core/src/stream-sync/ports.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 vi.mock("../../../core/src/localdb/apply.js", () => ({
@@ -224,20 +227,28 @@ describe("local database bootstrap", () => {
     ]);
     expect(applyConnection).not.toHaveBeenCalled();
 
-    // A failed stream listing does not erase a successful control read.
+    // Apply's own read finding the registry unavailable does not erase a
+    // successful control read; any other apply failure still rejects.
     vi.mocked(registry.read).mockResolvedValue({ ...active, version: 8 });
-    vi.mocked(registry.listStreamRows).mockRejectedValue(new Error("offline"));
+    vi.mocked(applyConnection).mockRejectedValueOnce(
+      new RegistryUnavailableError("registry listing failed: 503"),
+    );
     expect(await syncBeforeBegin(d, connector)).toMatchObject({
       connection: { generation: 8, controlVersion: 8 },
       unreachable: true,
     });
-    expect(applyConnection).not.toHaveBeenCalled();
-    vi.mocked(registry.listStreamRows).mockResolvedValue([]);
+    expect(applyConnection).toHaveBeenCalledTimes(1);
+    vi.mocked(applyConnection).mockRejectedValueOnce(
+      new Error("apply: invalid head (wrong_key)"),
+    );
+    await expect(syncBeforeBegin(d, connector)).rejects.toThrow("wrong_key");
     expect(await syncBeforeBegin(d, connector)).toMatchObject({
       connection: { generation: 8, controlVersion: 8 },
       unreachable: false,
     });
-    expect(applyConnection).toHaveBeenCalledTimes(1);
+    expect(applyConnection).toHaveBeenCalledTimes(3);
+    // The registry listing is apply's to take: bootstrap makes no probe.
+    expect(registry.listStreamRows).not.toHaveBeenCalled();
     expect(purgeConnection).not.toHaveBeenCalled();
   });
 });

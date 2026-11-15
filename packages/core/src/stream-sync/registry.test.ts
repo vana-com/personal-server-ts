@@ -4,6 +4,7 @@ import {
   streamScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { createGatewayStreamSyncRegistry } from "./registry.js";
+import { RegistryUnavailableError } from "./ports.js";
 
 const hash = (byte: string) => `0x${byte.repeat(32)}`;
 const row = (scope: string, version: number, deletedAt?: string) => ({
@@ -584,5 +585,54 @@ describe("waitForChange", () => {
         bad.registry.waitForChange!("1", 25_000, new AbortController().signal),
       ).rejects.toThrow(/change answer/);
     }
+  });
+});
+
+describe("an unreachable registry is told apart from a refusing one", () => {
+  const over = (fetch: unknown) =>
+    createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test",
+      ownerAddress: "0x" + "11".repeat(20),
+      fetch: fetch as typeof globalThis.fetch,
+    });
+  const scope = controlScope("acme", "");
+  const refuse = (status: number) => async () => new Response("", { status });
+  it.each([
+    [
+      "a network failure",
+      async () => Promise.reject(new TypeError("fetch failed")),
+    ],
+    [
+      "a timeout",
+      async () => Promise.reject(new DOMException("timed out", "TimeoutError")),
+    ],
+    ["a 503", refuse(503)],
+  ])(
+    "read and listing reject with RegistryUnavailableError on %s",
+    async (_name, fetch) => {
+      await expect(over(fetch).read(scope)).rejects.toBeInstanceOf(
+        RegistryUnavailableError,
+      );
+      await expect(over(fetch).listStreamRows("acme")).rejects.toBeInstanceOf(
+        RegistryUnavailableError,
+      );
+      await expect(over(fetch).listControlRows()).rejects.toBeInstanceOf(
+        RegistryUnavailableError,
+      );
+    },
+  );
+  it("a 4xx or an unparsable answer is not unavailability", async () => {
+    for (const status of [400, 401, 403]) {
+      const error = await over(refuse(status))
+        .read(scope)
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(RegistryUnavailableError);
+      const listing = await over(refuse(status))
+        .listStreamRows("acme")
+        .catch((e: unknown) => e);
+      expect(listing).not.toBeInstanceOf(RegistryUnavailableError);
+    }
+    expect(await over(refuse(404)).read(scope)).toEqual({ found: false });
   });
 });

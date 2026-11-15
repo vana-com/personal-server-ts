@@ -10,6 +10,7 @@ import {
   applyStream,
 } from "../../../core/src/localdb/apply.js";
 import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import { RegistryUnavailableError } from "../../../core/src/stream-sync/ports.js";
 import { syncBeforeBegin } from "../../../core/src/localdb/bootstrap.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.js";
@@ -551,9 +552,9 @@ it("five callers asking at once for unchanged streams share one flight: one cont
     f.read.mock.calls.filter(([s]) => s === a.scope || s === b.scope),
   ).toHaveLength(0);
 });
-it("bootstrap's apply sees a stream that advanced after bootstrap listed the registry", async () => {
+it("bootstrap's apply sees a stream that advanced after bootstrap read the control row", async () => {
   const f = await bothApplied();
-  const inner = f.deps.registry.listStreamRows;
+  const inner = f.deps.registry.read;
   let entered!: () => void, release!: () => void;
   const hasEntered = new Promise<void>((r) => {
     entered = r;
@@ -564,23 +565,102 @@ it("bootstrap's apply sees a stream that advanced after bootstrap listed the reg
   let first = true;
   f.deps.registry = {
     ...f.deps.registry,
-    listStreamRows: async (key) => {
-      const rows = await inner(key);
+    read: async (scope) => {
+      const read = await inner(scope);
       if (first) {
         first = false;
         entered();
         await gate;
       }
-      return rows;
+      return read;
     },
   };
   const running = syncBeforeBegin(f.deps, "fixture-source");
   await hasEntered;
-  // The listing is taken (b v1) and held; the remote advances before apply.
+  // Bootstrap's control read is taken and held; the remote advances before apply.
   await f.head("b", [{ id: "b2" }], { version: 2 });
   release();
   await running;
   expect(
     await f.db.query("SELECT head_version FROM stream_state WHERE stream='b'"),
   ).toEqual([{ head_version: 2 }]);
+});
+async function bootstrapFixture() {
+  const f = await bothApplied();
+  f.read.mockClear();
+  f.list.mockClear();
+  return f;
+}
+it("an unchanged active bootstrap makes three registry calls: the control read twice and one listing", async () => {
+  const f = await bootstrapFixture();
+  const { unreachable } = await syncBeforeBegin(f.deps, "fixture-source");
+  expect(unreachable).toBe(false);
+  // Bootstrap's control read, apply's control read, apply's listing. No stream reads.
+  expect(f.read.mock.calls.map(([scope]) => scope)).toEqual([
+    f.control,
+    f.control,
+  ]);
+  expect(f.list).toHaveBeenCalledTimes(1);
+});
+it("begin goes on offline when apply's own listing finds the registry unavailable", async () => {
+  const f = await bootstrapFixture();
+  f.deps.registry = {
+    ...f.deps.registry,
+    listStreamRows: async (key) => {
+      // Fails only after bootstrap's own control read and apply's.
+      if (f.read.mock.calls.length >= 2)
+        throw new RegistryUnavailableError("registry listing failed: 503");
+      return f.list(key);
+    },
+  };
+  expect(await syncBeforeBegin(f.deps, "fixture-source")).toMatchObject({
+    unreachable: true,
+  });
+});
+it("begin goes on offline when apply's own control read finds the registry unavailable", async () => {
+  const f = await bootstrapFixture();
+  const read = f.deps.registry.read;
+  let calls = 0;
+  f.deps.registry = {
+    ...f.deps.registry,
+    read: async (scope) => {
+      if (++calls === 2)
+        throw new RegistryUnavailableError("registry read failed: 503");
+      return read(scope);
+    },
+  };
+  expect(await syncBeforeBegin(f.deps, "fixture-source")).toMatchObject({
+    unreachable: true,
+  });
+});
+it("begin still rejects when apply fails on integrity, on the database, or on a plain registry error", async () => {
+  const integrity = await bootstrapFixture();
+  // A corrupt head: the stream changes, and its part blob is gone.
+  const b = await integrity.head("b", [{ id: "b2" }], { version: 2 });
+  integrity.blobs.delete(`${b.scope}/g1-p-${b.parts[0]!.hash}`);
+  await expect(
+    syncBeforeBegin(integrity.deps, "fixture-source"),
+  ).rejects.toThrow("apply: missing part blob");
+
+  const database = await bootstrapFixture();
+  await database.head("b", [{ id: "b2" }], { version: 2 });
+  vi.spyOn(database.db, "batch").mockRejectedValue(
+    new Error("SQLITE_IOERR: disk I/O error"),
+  );
+  await expect(
+    syncBeforeBegin(database.deps, "fixture-source"),
+  ).rejects.toThrow("SQLITE_IOERR");
+
+  const refused = await bootstrapFixture();
+  refused.deps.registry = {
+    ...refused.deps.registry,
+    listStreamRows: async () => {
+      if (refused.read.mock.calls.length >= 2)
+        throw new Error("registry listing failed: 403");
+      return refused.list("fixture-source");
+    },
+  };
+  await expect(syncBeforeBegin(refused.deps, "fixture-source")).rejects.toThrow(
+    "403",
+  );
 });
