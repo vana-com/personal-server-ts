@@ -37,6 +37,12 @@ export interface LocalSyncDeps {
    * blobs are the same bytes either way.
    */
   readonly streamCrypto?: StreamCryptoPort;
+  /**
+   * Commit the dirty connections of one sync cycle in shared batch requests
+   * (rows of several connections in one gateway transaction) instead of one
+   * request per connection. Default off.
+   */
+  readonly crossConnectionBatch?: boolean;
   /** Part target in bytes; default 4 MiB (C.2). */
   readonly partTargetBytes?: number;
   /**

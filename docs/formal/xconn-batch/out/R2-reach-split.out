@@ -1,0 +1,142 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 7 and seed 5702235374548675548 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 2387792] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file docs/formal/xconn-batch/XConnBatch.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module XConnBatch
+Starting... (2026-11-15 11:53:19)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-15 11:53:19.
+Error: Invariant NoSplitCycle is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ inflight = {}
+/\ ctrl = [a |-> TRUE, b |-> TRUE]
+/\ remaining = {}
+/\ frozen = ( <<"s1", "head">> :> 0 @@
+  <<"s1", "pos">> :> 0 @@
+  <<"s2", "head">> :> 0 @@
+  <<"s2", "pos">> :> 0 @@
+  <<"s3", "head">> :> 0 @@
+  <<"s3", "pos">> :> 0 )
+/\ reg = ( <<"s1", "head">> :> 0 @@
+  <<"s1", "pos">> :> 0 @@
+  <<"s2", "head">> :> 0 @@
+  <<"s2", "pos">> :> 0 @@
+  <<"s3", "head">> :> 0 @@
+  <<"s3", "pos">> :> 0 )
+/\ sent = {}
+/\ phase = "idle"
+/\ planV = [s1 |-> 0, s2 |-> 0, s3 |-> 0]
+/\ hist = {}
+
+State 2: <OtherWrite line 130, col 3 to line 136, col 72 of module XConnBatch>
+/\ inflight = {}
+/\ ctrl = [a |-> TRUE, b |-> TRUE]
+/\ remaining = {}
+/\ frozen = ( <<"s1", "head">> :> 0 @@
+  <<"s1", "pos">> :> 0 @@
+  <<"s2", "head">> :> 0 @@
+  <<"s2", "pos">> :> 0 @@
+  <<"s3", "head">> :> 0 @@
+  <<"s3", "pos">> :> 0 )
+/\ reg = ( <<"s1", "head">> :> 1 @@
+  <<"s1", "pos">> :> 1 @@
+  <<"s2", "head">> :> 0 @@
+  <<"s2", "pos">> :> 0 @@
+  <<"s3", "head">> :> 0 @@
+  <<"s3", "pos">> :> 0 )
+/\ sent = {}
+/\ phase = "idle"
+/\ planV = [s1 |-> 0, s2 |-> 0, s3 |-> 0]
+/\ hist = {{[row |-> <<"s1", "head">>, ver |-> 1], [row |-> <<"s1", "pos">>, ver |-> 1]}}
+
+State 3: <Plan line 82, col 3 to line 86, col 58 of module XConnBatch>
+/\ inflight = {}
+/\ ctrl = [a |-> TRUE, b |-> TRUE]
+/\ remaining = { <<"s1", "head">>,
+  <<"s1", "pos">>,
+  <<"s2", "head">>,
+  <<"s2", "pos">>,
+  <<"s3", "head">>,
+  <<"s3", "pos">> }
+/\ frozen = ( <<"s1", "head">> :> 0 @@
+  <<"s1", "pos">> :> 0 @@
+  <<"s2", "head">> :> 0 @@
+  <<"s2", "pos">> :> 0 @@
+  <<"s3", "head">> :> 0 @@
+  <<"s3", "pos">> :> 0 )
+/\ reg = ( <<"s1", "head">> :> 1 @@
+  <<"s1", "pos">> :> 1 @@
+  <<"s2", "head">> :> 0 @@
+  <<"s2", "pos">> :> 0 @@
+  <<"s3", "head">> :> 0 @@
+  <<"s3", "pos">> :> 0 )
+/\ sent = {}
+/\ phase = "sending"
+/\ planV = [s1 |-> 1, s2 |-> 0, s3 |-> 0]
+/\ hist = {{[row |-> <<"s1", "head">>, ver |-> 1], [row |-> <<"s1", "pos">>, ver |-> 1]}}
+
+State 4: <Send line 100, col 3 to line 119, col 53 of module XConnBatch>
+/\ inflight = {}
+/\ ctrl = [a |-> TRUE, b |-> TRUE]
+/\ remaining = {<<"s2", "head">>, <<"s2", "pos">>, <<"s3", "head">>, <<"s3", "pos">>}
+/\ frozen = ( <<"s1", "head">> :> 0 @@
+  <<"s1", "pos">> :> 0 @@
+  <<"s2", "head">> :> 0 @@
+  <<"s2", "pos">> :> 0 @@
+  <<"s3", "head">> :> 0 @@
+  <<"s3", "pos">> :> 0 )
+/\ reg = ( <<"s1", "head">> :> 2 @@
+  <<"s1", "pos">> :> 2 @@
+  <<"s2", "head">> :> 0 @@
+  <<"s2", "pos">> :> 0 @@
+  <<"s3", "head">> :> 0 @@
+  <<"s3", "pos">> :> 0 )
+/\ sent = { [ W |-> {<<"s1", "head">>, <<"s1", "pos">>},
+    rows |-> {<<"s1", "head">>, <<"s1", "pos">>},
+    reqFail |-> FALSE ] }
+/\ phase = "sending"
+/\ planV = [s1 |-> 1, s2 |-> 0, s3 |-> 0]
+/\ hist = { {[row |-> <<"s1", "head">>, ver |-> 1], [row |-> <<"s1", "pos">>, ver |-> 1]},
+  { [row |-> <<"s1", "head">>, ver |-> 2],
+    [row |-> <<"s1", "pos">>, ver |-> 2] } }
+
+State 5: <Send line 100, col 3 to line 119, col 53 of module XConnBatch>
+/\ inflight = {}
+/\ ctrl = [a |-> TRUE, b |-> TRUE]
+/\ remaining = {<<"s3", "head">>, <<"s3", "pos">>}
+/\ frozen = ( <<"s1", "head">> :> 0 @@
+  <<"s1", "pos">> :> 0 @@
+  <<"s2", "head">> :> 0 @@
+  <<"s2", "pos">> :> 0 @@
+  <<"s3", "head">> :> 0 @@
+  <<"s3", "pos">> :> 0 )
+/\ reg = ( <<"s1", "head">> :> 2 @@
+  <<"s1", "pos">> :> 2 @@
+  <<"s2", "head">> :> 1 @@
+  <<"s2", "pos">> :> 1 @@
+  <<"s3", "head">> :> 0 @@
+  <<"s3", "pos">> :> 0 )
+/\ sent = { [ W |-> {<<"s1", "head">>, <<"s1", "pos">>},
+    rows |-> {<<"s1", "head">>, <<"s1", "pos">>},
+    reqFail |-> FALSE ],
+  [ W |-> {<<"s2", "head">>, <<"s2", "pos">>},
+    rows |-> {<<"s2", "head">>, <<"s2", "pos">>},
+    reqFail |-> FALSE ] }
+/\ phase = "sending"
+/\ planV = [s1 |-> 1, s2 |-> 0, s3 |-> 0]
+/\ hist = { {[row |-> <<"s1", "head">>, ver |-> 1], [row |-> <<"s1", "pos">>, ver |-> 1]},
+  {[row |-> <<"s1", "head">>, ver |-> 2], [row |-> <<"s1", "pos">>, ver |-> 2]},
+  { [row |-> <<"s2", "head">>, ver |-> 1],
+    [row |-> <<"s2", "pos">>, ver |-> 1] } }
+
+143 states generated, 108 distinct states found, 75 states left on queue.
+The depth of the complete state graph search is 5.
+The average outdegree of the complete state graph is 4 (minimum is 0, the maximum 8 and the 95th percentile is 8).
+Finished in 00s at (2026-11-15 11:53:19)
+exit 12

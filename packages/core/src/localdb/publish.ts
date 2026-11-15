@@ -117,9 +117,8 @@ import {
 } from "../stream-sync/ports.js";
 import { applyConnection } from "./apply.js";
 import {
+  batchBounds,
   createCommitGroup,
-  GATEWAY_MAX_BATCH_REQUIRES,
-  GATEWAY_MAX_BATCH_ROWS,
   settleRequirementFailure,
   settleRow,
   type CommitGroup,
@@ -161,7 +160,7 @@ import { purgeConnection } from "./purge.js";
 import { checkRunFence } from "./fence.js";
 import { replaceMayApply } from "./replace.js";
 import { openRegistryView, type RegistryView } from "./registry-view.js";
-import { insideQueue } from "./slot.js";
+import { holdSlots, insideQueue } from "./slot.js";
 import { recallHead, rememberHead, rememberOwnHead } from "./verified-heads.js";
 import { newUploadWave, type UploadWave } from "./upload-wave.js";
 import { unwriteRefusedRun } from "./unwrite.js";
@@ -205,6 +204,12 @@ export interface PublishResult {
  */
 export interface PublishOptions {
   readonly headExtras?: (stream: string) => Promise<HeadExtras | undefined>;
+  /**
+   * The commit coalescer of the whole sync cycle: the streams of every
+   * connection hand their commits to it, and one request can hold rows of
+   * several connections. Absent: each connection commits alone.
+   */
+  readonly cycleCommits?: CycleCommits;
 }
 
 export async function publishConnection(
@@ -260,7 +265,9 @@ export async function publishConnection(
   const latch: PurgeLatch = { purged: false };
   const view = openRegistryView(deps, connection, streams.length);
   const sendWindow = deps.blobs.governor.window();
-  const commits = connectionCommits(deps, connectionId, latch);
+  const commits =
+    options?.cycleCommits?.commits ??
+    connectionCommits(deps, connectionId, latch);
   const published = await publishEach(
     streams.map(({ stream }) => stream),
     latch,
@@ -1888,19 +1895,102 @@ function connectionCommits(
           return work(insideQueue(deps, connectionId));
         }),
       flush: (held, entries) => commitBatchTurn(held, entries, commits),
-      // A turn is bounded by what the gateway accepts: rows are the streams
-      // that write, and each stream that does not write is one more condition
-      // beside the control row's.
-      canJoin: (taken, next) => {
-        const writes = (list: readonly CommitEntry[]) =>
-          list.filter(writesHead).length;
-        return writesHead(next)
-          ? writes(taken) < GATEWAY_MAX_BATCH_ROWS
-          : taken.length - writes(taken) < GATEWAY_MAX_BATCH_REQUIRES - 1;
-      },
+      canJoin: (taken, next) => fitsBatch(deps.registry, taken, next),
     }),
   };
   return commits;
+}
+
+/**
+ * Whether `next` fits in the request that already holds `taken`, under the
+ * gateway's bounds (`batchBounds`): rows are the streams that write; every
+ * connection in the request is one condition on its control row, and each
+ * stream that does not write is one more condition. The bytes of such a
+ * request are within the gateway's advertised size whenever the counts are,
+ * because that size is the size of a request full of the largest legal items.
+ * A stream is one entry and is never split.
+ */
+function fitsBatch(
+  registry: StreamSyncRegistry,
+  taken: readonly CommitEntry[],
+  next: CommitEntry,
+): boolean {
+  const bounds = batchBounds(registry);
+  const all = [...taken, next];
+  const rows = all.filter(writesHead).length;
+  const connections = new Set(all.map(({ context }) => context.connectionId))
+    .size;
+  return (
+    rows <= bounds.rows && connections + (all.length - rows) <= bounds.requires
+  );
+}
+
+/**
+ * The commit coalescer of one sync cycle (`deps.crossConnectionBatch`). Its
+ * group takes the commits of every connection that is ready, and a turn holds
+ * the slots of the connections it carries, in id order, for the one request.
+ * One turn is in flight at a time: the commits that become ready meanwhile
+ * are the next turn's, as in a connection's own group.
+ */
+export type CycleCommits = { readonly commits: ConnectionCommits };
+
+export function createCycleCommits(deps: LocalSyncDeps): CycleCommits {
+  let tail: Promise<unknown> = Promise.resolve();
+  const commits: ConnectionCommits = {
+    unsupported: deps.registry.postBatch === undefined,
+    group: createCommitGroup<CommitEntry, CommitTurn>({
+      // The group, not a slot, serializes turns: a turn takes its slots after
+      // it knows which connections it carries.
+      runInSlot: (work) => {
+        const turn = tail.then(
+          () => work(deps),
+          () => work(deps),
+        );
+        tail = turn.catch(() => undefined);
+        return turn;
+      },
+      flush: (_, entries) => flushAcrossConnections(deps, entries, commits),
+      canJoin: (taken, next) => fitsBatch(deps.registry, taken, next),
+    }),
+  };
+  return { commits };
+}
+
+/**
+ * One turn of the cycle's group: hold the slot of every connection that has
+ * an entry, drop the entries of a connection a purge stopped, and commit the
+ * rest in one request.
+ */
+async function flushAcrossConnections(
+  deps: LocalSyncDeps,
+  entries: readonly CommitEntry[],
+  commits: ConnectionCommits,
+): Promise<PromiseSettledResult<CommitTurn>[]> {
+  return holdSlots(
+    deps,
+    entries.map(({ context }) => context.connectionId),
+    async (held) => {
+      const results: PromiseSettledResult<CommitTurn>[] = [];
+      const live: { entry: CommitEntry; at: number }[] = [];
+      for (const [at, entry] of entries.entries()) {
+        try {
+          stopIfPurged(entry.context.latch);
+          live.push({ entry, at });
+        } catch (reason) {
+          results[at] = { status: "rejected", reason };
+        }
+      }
+      if (live.length > 0) {
+        const settled = await commitBatchTurn(
+          held,
+          live.map(({ entry }) => entry),
+          commits,
+        );
+        for (const [i, { at }] of live.entries()) results[at] = settled[i]!;
+      }
+      return results;
+    },
+  );
 }
 
 /**
@@ -2006,6 +2096,10 @@ async function postBatchOnce(
 
 /**
  * COMMIT of the streams that wait at one slot turn, in the slot: one request.
+ * With `deps.crossConnectionBatch` the turn holds the slots of every connection
+ * it carries and the request holds rows of all of them, each connection with
+ * its own control condition; a failed condition leaves that connection out and
+ * the rest go again (see `CycleCommits`).
  *
  * Each stream's local basis is still the snapshot's. A stream whose head
  * differs from the registry's gets a signed row; its `expectedHeadDataHash` is
@@ -2054,8 +2148,22 @@ async function commitBatchTurn(
   entries: readonly CommitEntry[],
   commits: ConnectionCommits,
 ): Promise<PromiseSettledResult<CommitTurn>[]> {
-  const { connectionId, connection } = entries[0]!.context;
-  const control = controlScope(connection.connector, connection.ns);
+  // The request can carry streams of several connections (`CycleCommits`);
+  // each connection brings its own control condition and its own outcome when
+  // that condition fails. `held` holds the slot of every one of them.
+  const members = new Map<string, Member>();
+  for (const entry of entries) {
+    const { connectionId, connection } = entry.context;
+    if (!members.has(connectionId)) {
+      members.set(connectionId, {
+        connectionId,
+        connection,
+        control: controlScope(connection.connector, connection.ns),
+      });
+    }
+  }
+  const connectionOf = (at: number): string =>
+    entries[at]!.context.connectionId;
   const outcomes = new Map<number, PromiseSettledResult<CommitTurn>>();
   const ok = (at: number, value: CommitTurn) =>
     outcomes.set(at, { status: "fulfilled", value });
@@ -2085,11 +2193,12 @@ async function commitBatchTurn(
         },
     );
 
-  const signed: {
+  type Signed = {
     readonly at: number;
     readonly newVersion: number;
     readonly row: SignedRegistryBatch["rows"][number];
-  }[] = [];
+  };
+  let signed: Signed[] = [];
   /** Streams with nothing to write: a condition on their row, recorded on success. */
   const fenced: number[] = [];
   for (const [at, entry] of entries.entries()) {
@@ -2141,28 +2250,51 @@ async function commitBatchTurn(
   }
   /** The streams still in the request: one that moved leaves it. */
   let live = fenced;
+  /** The first entry of `member` still in the request: its control hash. */
+  const firstOf = (member: Member): CommitEntry | undefined => {
+    const at =
+      signed.find(({ at }) => connectionOf(at) === member.connectionId)?.at ??
+      live.find((at) => connectionOf(at) === member.connectionId);
+    return at === undefined ? undefined : entries[at];
+  };
+  /** The connections that still have a stream in the request. */
+  const carried = (): Member[] =>
+    [...members.values()].filter((member) => firstOf(member) !== undefined);
+  /** A connection leaves the request: every stream of it ends with `outcome`. */
+  const leave = (member: Member, outcome: PublishResult["outcome"]): void => {
+    for (const { at } of signed) {
+      if (connectionOf(at) === member.connectionId) done(at, outcome);
+    }
+    for (const at of live) {
+      if (connectionOf(at) === member.connectionId) done(at, outcome);
+    }
+    signed = signed.filter(
+      ({ at }) => connectionOf(at) !== member.connectionId,
+    );
+    live = live.filter((at) => connectionOf(at) !== member.connectionId);
+  };
   let rows: Extract<RegistryBatchResult, { kind: "rows" }>["rows"];
   for (;;) {
     if (signed.length === 0 && live.length === 0) return settle();
     // The local veto, under the slot, right before the request: a delete
     // intent can appear after the snapshot recorded it in its basis, which
     // then still compares equal.
-    if (await hasDeleteIntent(held, connection.connector)) {
-      for (const { at } of signed) done(at, "deferred");
-      for (const at of live) done(at, "deferred");
-      return settle();
+    for (const member of carried()) {
+      if (await hasDeleteIntent(held, member.connection.connector)) {
+        leave(member, "deferred");
+      }
     }
-    const first = entries[signed[0]?.at ?? live[0]!]!;
+    if (signed.length === 0 && live.length === 0) return settle();
     const request: SignedRegistryBatch = {
       ownerAddress: held.ownerAddress,
       rows: signed.map(({ row }) => row),
       requires: [
-        {
-          scope: control,
-          expectedVersion: String(connection.generation),
+        ...carried().map((member) => ({
+          scope: member.control,
+          expectedVersion: String(member.connection.generation),
           notDeleted: true,
-          expectedDataHash: controlHashOf(first),
-        },
+          expectedDataHash: controlHashOf(firstOf(member)!),
+        })),
         ...live.flatMap((at) => {
           const fence = fenceOf(entries[at]!);
           return fence
@@ -2196,13 +2328,15 @@ async function commitBatchTurn(
       break;
     }
 
-    // Nothing was written. Without the gateway's detail, read the control row.
-    const verdict = answer.failure
-      ? settleRequirementFailure(answer.failure, control)
-      : null;
-    if (verdict?.kind === "stream_moved") {
+    // Nothing was written, for any connection in the request. Whose condition
+    // failed? A control row is a connection's; a stream row is a stream's.
+    const failure = answer.failure;
+    const owner = failure
+      ? carried().find((member) => member.control === failure.scope)
+      : undefined;
+    if (failure && !owner) {
       const moved = live.find(
-        (at) => entries[at]!.context.scope === verdict.scope,
+        (at) => entries[at]!.context.scope === failure.scope,
       );
       if (moved !== undefined) {
         // One stream's row is not the one it was planned over. It re-plans.
@@ -2220,38 +2354,63 @@ async function commitBatchTurn(
         live = live.filter((at) => at !== moved);
         continue;
       }
+      // A condition this request cannot place: every stream tries again later.
+      for (const member of carried()) leave(member, "deferred");
+      return settle();
     }
-    let outcome: "purged" | "deferred";
-    if (verdict?.kind === "purge") {
-      await purgeConnection(held, connectionId, {
-        controlVersion: verdict.controlVersion,
-      });
-      for (const { context } of entries) context.latch.purged = true;
-      outcome = "purged";
-    } else if (verdict === null) {
-      outcome = (await checkControl(held, first.context)) ?? "deferred";
-    } else {
-      outcome = "deferred";
+    if (failure && owner) {
+      // One connection's lifetime is not the one it planned over. It leaves;
+      // the others decided nothing and go again in the next request, sent at
+      // once from this same turn, without it.
+      const verdict = settleRequirementFailure(failure, owner.control);
+      if (verdict.kind === "purge") {
+        await purgeConnection(held, owner.connectionId, {
+          controlVersion: verdict.controlVersion,
+        });
+        for (const entry of entries) {
+          if (entry.context.connectionId === owner.connectionId)
+            entry.context.latch.purged = true;
+        }
+        leave(owner, "purged");
+      } else {
+        leave(owner, "deferred");
+      }
+      continue;
     }
-    for (const { at } of signed) done(at, outcome);
-    for (const at of live) done(at, outcome);
+    // Without the gateway's detail, read each control row.
+    for (const member of carried()) {
+      leave(
+        member,
+        (await checkControl(held, firstOf(member)!.context)) ?? "deferred",
+      );
+    }
     return settle();
   }
 
   // A reply, stored or fresh, is for the lifetime the request carried. If the
   // local one moved meanwhile (a purge and a reconnect), settling would record
-  // this lifetime's rows under another: discard the reply.
-  if (!(await lifetimeHolds(held, connectionId, connection.generation))) {
-    for (const { at } of signed) done(at, "deferred");
-    for (const at of live) done(at, "deferred");
-    return settle();
+  // this lifetime's rows under another: discard the reply for that connection.
+  const answered = signed.map((entry, i) => ({ ...entry, answer: rows[i]! }));
+  for (const member of carried()) {
+    if (
+      !(await lifetimeHolds(
+        held,
+        member.connectionId,
+        member.connection.generation,
+      ))
+    ) {
+      leave(member, "deferred");
+    }
   }
-  for (const { at } of signed) headAt(at).run.attempts++;
-  const answerRows = rows;
+  const kept = new Set(signed.map(({ at }) => at));
+  for (const { at } of answered) {
+    if (kept.has(at)) headAt(at).run.attempts++;
+  }
 
   const conflicted: number[] = [];
-  for (const [i, { at, newVersion, row }] of signed.entries()) {
-    const settlement = settleRow(answerRows[i]!, {
+  for (const { at, newVersion, row, answer } of answered) {
+    if (!kept.has(at)) continue;
+    const settlement = settleRow(answer, {
       expectedVersion: row.expectedVersion,
       dataHash: row.dataHash,
     });
@@ -2261,7 +2420,7 @@ async function commitBatchTurn(
     }
     const { context, candidate, prepared } = headAt(at);
     try {
-      if (await hasDeleteIntent(held, connection.connector)) {
+      if (await hasDeleteIntent(held, context.connection.connector)) {
         done(at, "deferred");
       } else {
         ok(
@@ -2278,7 +2437,7 @@ async function commitBatchTurn(
   for (const at of live) {
     const entry = entries[at]!;
     try {
-      if (await hasDeleteIntent(held, connection.connector)) {
+      if (await hasDeleteIntent(held, entry.context.connection.connector)) {
         done(at, "deferred");
       } else if (entry.kind === "idle") {
         // The hints held: the evidence the plan matched is recorded.
@@ -2310,10 +2469,20 @@ async function commitBatchTurn(
     // Another writer moved those rows, so a listing read before that is no
     // starting point for any stream not yet started, including after the last
     // try, which ends a stream without a retry (as in `commitCandidate`).
-    entries[conflicted[0]!]!.context.view.invalidate();
+    for (const view of new Set(
+      conflicted.map((at) => entries[at]!.context.view),
+    )) {
+      view.invalidate();
+    }
     try {
-      // Apply the winners once, after the rows that committed are recorded.
-      if (conflicted.some((at) => entries[at]!.run.attempts < MAX_ATTEMPTS)) {
+      // Apply the winners once per connection, after the rows that committed
+      // are recorded.
+      const toApply = new Set(
+        conflicted
+          .filter((at) => entries[at]!.run.attempts < MAX_ATTEMPTS)
+          .map(connectionOf),
+      );
+      for (const connectionId of toApply) {
         await applyConnection(held, connectionId);
       }
       for (const at of conflicted) {
@@ -2326,6 +2495,13 @@ async function commitBatchTurn(
   }
   return settle();
 }
+
+/** A connection that has streams in a commit request. */
+type Member = {
+  readonly connectionId: string;
+  readonly connection: ConnectionRow;
+  readonly control: string;
+};
 
 /** Whether the connection's local lifetime is still generation `generation`. */
 async function lifetimeHolds(

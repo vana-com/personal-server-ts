@@ -1,7 +1,12 @@
 import { applyConnection, type ApplyResult } from "./apply.js";
 import { bootstrapConnections } from "./bootstrap.js";
 import type { LocalSyncDeps } from "./deps.js";
-import { publishConnection, type PublishResult } from "./publish.js";
+import {
+  createCycleCommits,
+  publishConnection,
+  type CycleCommits,
+  type PublishResult,
+} from "./publish.js";
 import { insideQueue } from "./slot.js";
 
 export interface CycleReport {
@@ -20,12 +25,21 @@ export interface CycleReport {
  * time each. Used by the sync-manager timer, `/sync/trigger` and
  * `/sync/file/:id` (trigger = this; file = `syncConnection` for the one
  * connection, then read).
+ *
+ * With `deps.crossConnectionBatch` the connections of the cycle share one
+ * commit coalescer: the commits that are ready together travel in the same
+ * registry request, whoever's they are.
  */
 export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
   const connections = await bootstrapConnections(deps);
+  const cycleCommits = deps.crossConnectionBatch
+    ? createCycleCommits(deps)
+    : undefined;
   return {
     connections: await Promise.all(
-      connections.map(({ connectionId }) => syncConnection(deps, connectionId)),
+      connections.map(({ connectionId }) =>
+        syncConnection(deps, connectionId, cycleCommits),
+      ),
     ),
   };
 }
@@ -43,6 +57,7 @@ export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
 export async function syncConnection(
   deps: LocalSyncDeps,
   connectionId: string,
+  cycleCommits?: CycleCommits,
 ): Promise<CycleReport["connections"][number]> {
   let applied: readonly ApplyResult[] = [];
   let published: readonly PublishResult[] = [];
@@ -52,7 +67,11 @@ export async function syncConnection(
     applied = await deps.queue.run(connectionId, "publish", () =>
       applyConnection(insideQueue(deps, connectionId), connectionId),
     );
-    published = await publishConnection(deps, connectionId);
+    published = await publishConnection(
+      deps,
+      connectionId,
+      cycleCommits && { cycleCommits },
+    );
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause);
     // The timer and `/sync/trigger` drop the report. A connection whose

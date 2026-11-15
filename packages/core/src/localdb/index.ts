@@ -42,6 +42,7 @@ export {
 export { encodePrefixes, type EncodedPart } from "./encode.js";
 export { unwriteRefusedRun } from "./unwrite.js";
 export { runCycle, syncConnection, type CycleReport } from "./cycle.js";
+export { holdSlots } from "./slot.js";
 export { purgeConnection } from "./purge.js";
 export {
   createConnectionDeleter,

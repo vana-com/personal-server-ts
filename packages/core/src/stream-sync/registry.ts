@@ -25,6 +25,7 @@ import {
   RegistryRefusedError,
   type ConditionalPostResult,
   type ConditionalRegistryPost,
+  type RegistryBatchPolicy,
   type RegistryBatchResult,
   type RegistryBatchRow,
   type RegistryPostResult,
@@ -266,6 +267,7 @@ export function createGatewayStreamSyncRegistry(
 
   /** `undefined` until the gateway answers the batch route once. */
   let batchRoute: "absent" | undefined;
+  let batchPolicy: RegistryBatchPolicy | undefined;
 
   /** One `POST /v1/data`, with `requires` when the caller has conditions. */
   async function sendPost(
@@ -402,6 +404,9 @@ export function createGatewayStreamSyncRegistry(
         batchRoute = "absent";
         return { kind: "unsupported" as const };
       }
+      // Every answer of the route, errors included, carries the bounds.
+      batchPolicy =
+        parseBatchPolicy(res.headers.get("batch-policy")) ?? batchPolicy;
       const what = `batch POST of ${request.rows.length} rows`;
       if (res.status === 409) {
         // The batch route answers 409 only when a condition failed (a row that
@@ -417,6 +422,8 @@ export function createGatewayStreamSyncRegistry(
       }
       return batchRowsOf(request, await jsonOf(res));
     },
+
+    batchPolicy: () => batchPolicy,
 
     listControlRows: () =>
       listRows((scope) => parseScope(scope)?.kind === "control"),
@@ -493,4 +500,35 @@ export function createGatewayStreamSyncRegistry(
         );
       }),
   };
+}
+
+/**
+ * `Batch-Policy: rows=<R>;bytes=<B>;requires=<Q>`. `undefined` when the header
+ * is absent or any field is not a positive integer: a client that cannot read
+ * the bounds keeps the ones it had.
+ */
+export function parseBatchPolicy(
+  header: string | null,
+): RegistryBatchPolicy | undefined {
+  if (header === null) return undefined;
+  const fields = new Map<string, number>();
+  for (const part of header.split(";")) {
+    const [key, value] = part.trim().split("=");
+    if (key === undefined || value === undefined || !/^[1-9]\d*$/.test(value))
+      return undefined;
+    fields.set(key, Number(value));
+  }
+  const rows = fields.get("rows");
+  const requires = fields.get("requires");
+  const bytes = fields.get("bytes");
+  if (
+    rows === undefined ||
+    requires === undefined ||
+    bytes === undefined ||
+    !Number.isSafeInteger(rows) ||
+    !Number.isSafeInteger(requires) ||
+    !Number.isSafeInteger(bytes)
+  )
+    return undefined;
+  return { rows, requires, bytes };
 }

@@ -343,6 +343,12 @@ export interface CreateServerOptions {
    */
   streamSyncPartTargetBytes?: number;
   /**
+   * Commit the dirty connections of one sync cycle in shared registry batch
+   * requests, one gateway transaction for rows of several connections.
+   * Default off.
+   */
+  streamSyncCrossConnectionBatch?: boolean;
+  /**
    * Rotate the replica writer identity before this boot writes anything
    * (host contract §3.2). A host sets it when this database may be a copy:
    * a restore, a clone, or a reinstall onto existing data. PS cannot detect
@@ -922,6 +928,9 @@ async function bootstrapServer(
           ...(options?.streamSyncPartTargetBytes === undefined
             ? {}
             : { partTargetBytes: options.streamSyncPartTargetBytes }),
+          ...(options?.streamSyncCrossConnectionBatch === true
+            ? { crossConnectionBatch: true }
+            : {}),
         };
         const facade = createServerLocalSync(deps, {
           resolveArtifact: (digest) =>
