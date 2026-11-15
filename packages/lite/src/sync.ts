@@ -166,6 +166,8 @@ export interface PsLiteSyncOptions {
   streamSyncRegistry?: StreamSyncRegistry;
   /** Host transport for encrypted parts, heads and run blobs. */
   streamSyncBlobs?: StreamSyncBlobs;
+  /** Publish while collecting, default off. See `LocalSyncDeps.publishWhileCollecting`. */
+  streamSyncPublishWhileCollecting?: boolean;
   stateStore: PsLiteStateStore;
   storage: DataStoragePort;
   ownerAddress?: `0x${string}`;
@@ -623,6 +625,9 @@ export async function createPsLiteSyncManager(
           newOp: () => globalThis.crypto.randomUUID(),
           recordsCommitted: () => syncManager?.notifyNewData(),
           partTargetBytes: LITE_PART_TARGET_BYTES,
+          ...(options.streamSyncPublishWhileCollecting === true
+            ? { publishWhileCollecting: true }
+            : {}),
         };
         localSync = createLocalSync(localSyncDeps, {
           aliasScopes: () => LEGACY_SCOPE_BINDINGS.keys(),

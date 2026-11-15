@@ -56,12 +56,13 @@ import {
   type SnapshotPointer,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { type StreamSyncRegistry } from "../stream-sync/ports.js";
-import { sameHead } from "../stream-sync/publish-plan.js";
+import { sameHead, type PlanHead } from "../stream-sync/publish-plan.js";
 import { applyConnection } from "./apply.js";
 import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 import { settleRequirementFailure, settleRow } from "./batch-commit.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
+import { tombstoneOmissions } from "./admit.js";
 import { planCompaction } from "./log-compact.js";
 import { readLogState, writeLogState, type LogState } from "./log-apply.js";
 import {
@@ -402,7 +403,21 @@ async function snapshotRound(
       row.publish_watermark,
       watermark,
     );
-    const head = plan.finalHead;
+    // A stream with no head yet (a first collection that publishes while it
+    // collects) is described by its local state, as the per-stream path does.
+    const head: PlanHead | null =
+      plan.finalHead ??
+      (groups.length > 0
+        ? {
+            generation: row.head_generation ?? connection.generation,
+            primaryKey: JSON.parse(row.primary_key),
+            profile: {
+              key: row.profile_key ?? connection.connector,
+              version: row.profile_version ?? row.floor_version ?? "0",
+            },
+            complete: false,
+          }
+        : null);
     const metaChanged =
       head !== null &&
       (row.head_version === 0 ||
@@ -705,6 +720,7 @@ async function changedKeys(
         AND NOT EXISTS (SELECT 1 FROM runs r JOIN run_streams rs ON rs.run_id=r.run_id
           WHERE r.connection_id=record_changes.connection_id AND rs.stream=record_changes.stream
             AND r.run_id=record_changes.stamp_r AND r.o=record_changes.stamp_o
+            AND r.admitting = 0
             AND rs.decision IN ('refused','discarded'))
       GROUP BY pk_hash ORDER BY MAX(seq)`,
     [connectionId, stream, from, to],
@@ -998,6 +1014,15 @@ async function commitRound(
   for (const p of touched) {
     if (p.replace)
       statements.push(
+        // Remember what the replace drops before it drops it (admit.ts), so a
+        // run still collecting cannot bring those rows back.
+        tombstoneOmissions(
+          connectionId,
+          p.stream,
+          p.replace.o,
+          p.replace.r,
+          held.publishWhileCollecting === true,
+        ),
         replaceDelete(connectionId, p.stream, p.replace.o, p.replace.r),
       );
   }

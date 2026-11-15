@@ -332,4 +332,31 @@ END`,
   stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL, rank INTEGER NOT NULL,
   PRIMARY KEY (connection_id, stream, pk_hash)) WITHOUT ROWID;`,
   ],
+  [
+    // Publish while collecting (flag `publishWhileCollecting`). A run's batch
+    // is admitted into `records` as it arrives, so an older run can admit a row
+    // after a newer run deleted it. This remembers each delete by the stamp of
+    // the run that made it (never the stamp of the row it removed), so admission
+    // skips an upsert that an equal-or-newer delete already covers. Local only:
+    // never published or applied. A tombstone is kept only while a collecting run
+    // older than it exists (`compactTombstones` in admit.ts); with none open,
+    // every later run starts later and carries a newer stamp.
+    `CREATE TABLE record_tombstones (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL,
+  stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL,
+  PRIMARY KEY (connection_id, stream, pk_hash)) WITHOUT ROWID;`,
+    // 1 = the run's batches were admitted into `records` as they arrived, so
+    // run end does not merge its upserts again. Fixed at begin from the flag.
+    `ALTER TABLE runs ADD COLUMN admitting INTEGER NOT NULL DEFAULT 0`,
+    // The highest tombstone stamp compaction ever dropped for the connection.
+    // A run that begins later takes an `o` that puts its stamp above it
+    // (`clampRunStart` in admit.ts), so "a later run has a newer stamp" holds
+    // even when the caller passes an old `observedAt`.
+    `ALTER TABLE connections ADD COLUMN tombstone_wm_o INTEGER`,
+    `ALTER TABLE connections ADD COLUMN tombstone_wm_r TEXT`,
+    // 1 = some upserts of this stream were staged in `run_rows` and not
+    // admitted (the connector check blocked them, or the stream's head or floor
+    // changed between that check and the batch commit). Run end merges them.
+    `ALTER TABLE run_streams ADD COLUMN unadmitted INTEGER NOT NULL DEFAULT 0`,
+  ],
 ];

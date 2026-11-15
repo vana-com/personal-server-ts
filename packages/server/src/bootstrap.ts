@@ -343,6 +343,12 @@ export interface CreateServerOptions {
    */
   streamSyncPartTargetBytes?: number;
   /**
+   * Publish while collecting (default off; env `PS_PUBLISH_WHILE_COLLECTING=true`):
+   * run batches are admitted into the local database as they arrive, so
+   * publish starts during collection. See `LocalSyncDeps.publishWhileCollecting`.
+   */
+  streamSyncPublishWhileCollecting?: boolean;
+  /**
    * Rotate the replica writer identity before this boot writes anything
    * (host contract §3.2). A host sets it when this database may be a copy:
    * a restore, a clone, or a reinstall onto existing data. PS cannot detect
@@ -922,6 +928,10 @@ async function bootstrapServer(
           ...(options?.streamSyncPartTargetBytes === undefined
             ? {}
             : { partTargetBytes: options.streamSyncPartTargetBytes }),
+          ...((options?.streamSyncPublishWhileCollecting ??
+          process.env.PS_PUBLISH_WHILE_COLLECTING === "true")
+            ? { publishWhileCollecting: true }
+            : {}),
         };
         const facade = createServerLocalSync(deps, {
           resolveArtifact: (digest) =>
