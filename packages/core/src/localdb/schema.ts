@@ -2,6 +2,10 @@
 const bumpView = (row: "NEW" | "OLD") =>
   `INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (${row}.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = ${row}.connection_id), 0) + 1);`;
 
+/** The same bump for every connection of the intent's connector. */
+const bumpConnector = (row: "NEW" | "OLD") =>
+  `INSERT OR REPLACE INTO view_versions(connection_id, version) SELECT c.connection_id, COALESCE(v.version, 0) + 1 FROM connections c LEFT JOIN view_versions v ON v.connection_id = c.connection_id WHERE c.connector = ${row}.connector;`;
+
 /**
  * Migration 1 of the local database, taken from the SQL proof. Shared SQL keeps
  * to SQLite 3.22: no UPSERT, RETURNING, JSON1, window functions or STRICT.
@@ -214,7 +218,13 @@ END;`,
     //     delete version and the installed head (version, generation, data
     //     hash, blob);
     //   stream_versions: a version row inserted, changed or deleted, which is
-    //     what picks the head, its completeness and its observation time;
+    //     what picks the head, its completeness and its observation time, and
+    //     what a version listing reports (`record_count`) and a historical
+    //     read checks (`head_format`);
+    //   delete_intents: a connector's intent starting or ending to exist, which
+    //     hides or restores every connection of that connector to a reader;
+    //     replacing one intent with another of the same connector is
+    //     bookkeeping and stays silent;
     //   connections: identity and control state.
     // Not watched: publish and apply bookkeeping no read shows (watermarks,
     // floors, `needs_full`, checkpoints, labels). Nothing prunes the counter,
@@ -262,16 +272,30 @@ END`,
     // unless an identical row is already there.
     `CREATE TRIGGER view_versions_bi BEFORE INSERT ON stream_versions
 WHEN NOT EXISTS (SELECT 1 FROM stream_versions o WHERE o.connection_id = NEW.connection_id AND o.stream = NEW.stream AND o.version = NEW.version
-  AND o.generation IS NEW.generation AND o.head_blob IS NEW.head_blob AND o.complete IS NEW.complete AND o.observed_at IS NEW.observed_at AND o.kind IS NEW.kind) BEGIN
+  AND o.generation IS NEW.generation AND o.head_blob IS NEW.head_blob AND o.head_format IS NEW.head_format AND o.record_count IS NEW.record_count
+  AND o.complete IS NEW.complete AND o.observed_at IS NEW.observed_at AND o.kind IS NEW.kind) BEGIN
   ${bumpView("NEW")}
 END`,
-    `CREATE TRIGGER view_versions_au AFTER UPDATE OF generation, head_blob, complete, observed_at, kind ON stream_versions
-WHEN OLD.generation IS NOT NEW.generation OR OLD.head_blob IS NOT NEW.head_blob OR OLD.complete IS NOT NEW.complete
+    `CREATE TRIGGER view_versions_au AFTER UPDATE OF generation, head_blob, head_format, record_count, complete, observed_at, kind ON stream_versions
+WHEN OLD.generation IS NOT NEW.generation OR OLD.head_blob IS NOT NEW.head_blob OR OLD.head_format IS NOT NEW.head_format
+  OR OLD.record_count IS NOT NEW.record_count OR OLD.complete IS NOT NEW.complete
   OR OLD.observed_at IS NOT NEW.observed_at OR OLD.kind IS NOT NEW.kind BEGIN
   ${bumpView("NEW")}
 END`,
     `CREATE TRIGGER view_versions_ad AFTER DELETE ON stream_versions BEGIN
   ${bumpView("OLD")}
+END`,
+    // Every read of a connection hides it while its connector has an intent,
+    // so the intent existing is part of the view. `INSERT OR REPLACE` of an
+    // existing connector's intent fires no delete trigger (recursive triggers
+    // are off), and an AFTER INSERT trigger cannot tell it from a first
+    // insert, so a BEFORE trigger bumps only when no intent is stored yet.
+    `CREATE TRIGGER view_intents_bi BEFORE INSERT ON delete_intents
+WHEN NOT EXISTS (SELECT 1 FROM delete_intents o WHERE o.connector = NEW.connector) BEGIN
+  ${bumpConnector("NEW")}
+END`,
+    `CREATE TRIGGER view_intents_ad AFTER DELETE ON delete_intents BEGIN
+  ${bumpConnector("OLD")}
 END`,
   ],
 ];

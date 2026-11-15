@@ -593,6 +593,139 @@ describe("view changes", () => {
     expect(ids(seen).flat()).toEqual([id]);
   });
 
+  /**
+   * What a version listing and a historical read answer for c0/s0: the
+   * record count each version reports, and the body of the newest version
+   * (or `gone`, as the read gives when the stored head format does not match
+   * the head it fetched).
+   */
+  async function versionReads(d: Device) {
+    const listed = await d.olderVersions.list("pdpp.c0~", "s0");
+    const read = await d.olderVersions.read("pdpp.c0.s0", {
+      at: "9999999999999",
+    });
+    return {
+      counts: listed.map((v) => v.recordCount),
+      read: read === "gone" ? read : await new Response(read).text(),
+    };
+  }
+
+  async function versioned() {
+    const a = await device(shared(), "a");
+    await collect(a, "c0");
+    await a.cycle();
+    const before = await versionReads(a);
+    await a.views.settled();
+    expect(before.read).not.toBe("gone"); // the read serves before the change
+    return { a, before, ...listen(a) };
+  }
+
+  const versionColumns = {
+    record_count: "record_count + 7",
+    head_format: "head_format + 7",
+  };
+  for (const [column, next] of Object.entries(versionColumns)) {
+    it(`(p) a change of ${column} on a version row changes what a reader sees, and emits`, async () => {
+      for (const how of ["an update", "a replacement"]) {
+        const { a, before, seen } = await versioned();
+        await a.db.batch([
+          {
+            sql:
+              how === "an update"
+                ? `UPDATE stream_versions SET ${column} = ${next}`
+                : `INSERT OR REPLACE INTO stream_versions (connection_id, stream, version, generation, head_blob, head_format, record_count, observed_at, complete, kind)
+                   SELECT connection_id, stream, version, generation, head_blob, ${column === "head_format" ? next : "head_format"}, ${column === "record_count" ? next : "record_count"}, observed_at, complete, kind FROM stream_versions`,
+          },
+        ]);
+        await a.views.settled();
+        onlyConnection(seen, "pdpp.c0~");
+        expect(await versionReads(a)).not.toEqual(before);
+      }
+    });
+  }
+
+  it("(p) the same version rows written again, by update or by replacement, emit nothing", async () => {
+    const { a, before, seen } = await versioned();
+    await a.db.batch([
+      {
+        sql: "UPDATE stream_versions SET record_count = record_count, head_format = head_format",
+      },
+      {
+        sql: "INSERT OR REPLACE INTO stream_versions SELECT * FROM stream_versions",
+      },
+    ]);
+    await a.views.settled();
+    expect(seen).toEqual([]);
+    expect(await versionReads(a)).toEqual(before);
+  });
+
+  const intent = (id: string) =>
+    `INSERT OR REPLACE INTO delete_intents(connector, delete_id, intent) VALUES ('c0', '${id}', '{}')`;
+
+  /**
+   * The versions a reader can list per connection. A connection under a
+   * delete intent lists none, as it serves no record or version.
+   */
+  const listed = async (d: Device) => ({
+    c0: (await d.olderVersions.list("pdpp.c0~", "s0")).length,
+    c1: (await d.olderVersions.list("pdpp.c1~", "s0")).length,
+  });
+
+  it("(q) a delete intent that starts to exist hides the connection, and emits; replacing it is silent; clearing it restores the connection, and emits", async () => {
+    const a = await device(shared(), "a");
+    await collect(a, "c0");
+    await collect(a, "c1");
+    await a.cycle();
+    const shown = await listed(a);
+    expect(shown.c0).toBeGreaterThan(0);
+    await a.views.settled();
+    const { seen } = listen(a);
+
+    await a.db.batch([{ sql: intent("first") }]);
+    await a.views.settled();
+    onlyConnection(seen, "pdpp.c0~"); // c1 has no intent and is not named
+    const hidden = await listed(a);
+    expect(hidden).toEqual({ c0: 0, c1: shown.c1 }); // the reader no longer sees c0
+
+    seen.length = 0;
+    await a.db.batch([{ sql: intent("second") }]); // the same connector's intent, replaced
+    await a.views.settled();
+    expect(seen).toEqual([]);
+    expect(await listed(a)).toEqual(hidden);
+
+    await a.db.batch([
+      { sql: "DELETE FROM delete_intents WHERE connector = 'c0'" },
+    ]);
+    await a.views.settled();
+    onlyConnection(seen, "pdpp.c0~");
+    expect(await listed(a)).toEqual(shown);
+  });
+
+  it("(q) a purge that waits after its intent is saved has already told the listener", async () => {
+    const a = await device(shared(), "a");
+    await collect(a, "c0");
+    await a.cycle();
+    expect((await listed(a)).c0).toBeGreaterThan(0);
+    await a.views.settled();
+    const { seen } = listen(a);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    // Another job holds the connection's queue, so the purge cannot start.
+    const holding = a.deps.queue.run("pdpp.c0~", "purge", () => held);
+    const requested = a.deleter.requestConnectionDelete("c0");
+    for (let turn = 0; turn < 10_000; turn++) {
+      const rows = await a.raw.query("SELECT 1 FROM delete_intents");
+      if (rows.length > 0) break;
+      await Promise.resolve();
+    }
+    await a.views.settled();
+    onlyConnection(seen, "pdpp.c0~"); // heard while the purge has not run
+    expect((await listed(a)).c0).toBe(0);
+    release();
+    await holding;
+    await requested;
+  });
+
   it("(m) a listener that makes one idempotent write after each event is heard once", async () => {
     const a = await device(shared(), "a");
     await collect(a, "c0");
