@@ -9,7 +9,10 @@ import {
   type ControlHashes,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { streamSyncHashes } from "../stream-sync/crypto.js";
-import { RegistryUnavailableError } from "../stream-sync/ports.js";
+import {
+  RegistryUnavailableBeforeWriteError,
+  RegistryUnavailableError,
+} from "../stream-sync/ports.js";
 import { applyConnection } from "./apply.js";
 import type { ConnectionRow, LocalSyncDeps } from "./deps.js";
 import { purgeConnection } from "./purge.js";
@@ -155,7 +158,10 @@ export async function syncBeforeBegin(
     let read: ControlRead;
     try {
       read = await deps.registry.read(controlScope(connector, ns));
-    } catch {
+    } catch (error) {
+      // Only an unreachable registry goes on offline. A refusal (403), an
+      // unreadable answer or a control row of the wrong shape is not "offline".
+      if (!(error instanceof RegistryUnavailableError)) throw error;
       return {
         connection: await cachedConnection(locked, id),
         unreachable: true,
@@ -166,11 +172,14 @@ export async function syncBeforeBegin(
     if (connection.controlState === "active") {
       try {
         // Apply reads the control row and lists the streams itself, after this
-        // call began. Only an unreachable registry goes on offline: an
-        // integrity, key, database or purge failure still rejects.
+        // call began. Only an unreachable registry that apply met before its
+        // first local write goes on offline: nothing new was learned and
+        // nothing changed. Apply has no rollback, so an unavailable error after
+        // a write rejects, as do integrity, key and database failures.
         await applyConnection(locked, id);
       } catch (error) {
-        if (!(error instanceof RegistryUnavailableError)) throw error;
+        if (!(error instanceof RegistryUnavailableBeforeWriteError))
+          throw error;
         return {
           connection: await cachedConnection(locked, id),
           unreachable: true,

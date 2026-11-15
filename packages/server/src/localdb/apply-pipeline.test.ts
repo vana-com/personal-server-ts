@@ -9,8 +9,12 @@ import {
   applyConnection,
   applyStream,
 } from "../../../core/src/localdb/apply.js";
+import { createRunIntakeStore } from "../../../core/src/localdb/run-intake.js";
 import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
-import { RegistryUnavailableError } from "../../../core/src/stream-sync/ports.js";
+import {
+  RegistryUnavailableBeforeWriteError,
+  RegistryUnavailableError,
+} from "../../../core/src/stream-sync/ports.js";
 import { syncBeforeBegin } from "../../../core/src/localdb/bootstrap.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.js";
@@ -663,4 +667,114 @@ it("begin still rejects when apply fails on integrity, on the database, or on a 
   await expect(syncBeforeBegin(refused.deps, "fixture-source")).rejects.toThrow(
     "403",
   );
+});
+
+// Apply has no rollback. An unavailable error after its first local write
+// rejects begin, so a collector never starts on a half-applied connection.
+// The writes already committed stay; these tests pin them as they are.
+const beginRequest = {
+  connector: "fixture-source",
+  artifactDigest: "fixture-artifact",
+  owner: { address: `0x${"12".repeat(20)}`, leaseId: null },
+  observedAt: 40,
+};
+const beginDeclaration = {
+  connector: "fixture-source",
+  version: "1",
+  streams: [{ name: "items", semantics: "mutable_state", primaryKey: ["id"] }],
+} as const;
+const unavailable = () =>
+  new RegistryUnavailableError("registry read failed: 503");
+async function rejectsBeginAfterAWrite(
+  f: Awaited<ReturnType<typeof bootstrapFixture>>,
+) {
+  const error = await createRunIntakeStore({
+    ...f.deps,
+    ownerAddress: beginRequest.owner.address,
+  })
+    .begin("run", beginRequest, beginDeclaration)
+    .catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(RegistryUnavailableError);
+  expect(error).not.toBeInstanceOf(RegistryUnavailableBeforeWriteError);
+  expect(await f.db.query("SELECT run_id FROM runs")).toEqual([]);
+}
+it.each([
+  [
+    "replaced",
+    (f: Awaited<ReturnType<typeof bootstrapFixture>>) =>
+      f.head("a", [{ id: "a2" }], { version: 2 }),
+    // Stream a's replacement committed before stream b's read failed.
+    async (f: Awaited<ReturnType<typeof bootstrapFixture>>) =>
+      expect(
+        await f.db.query(
+          "SELECT head_version FROM stream_state WHERE stream='a'",
+        ),
+      ).toEqual([{ head_version: 2 }]),
+  ],
+  [
+    "tombstoned",
+    async (f: Awaited<ReturnType<typeof bootstrapFixture>>) => {
+      // Stream b is tombstoned too: its purge is never decided on the
+      // listing, so apply reads it again after stream a's purge committed.
+      for (const stream of [f.a, f.b])
+        f.reads.set(stream.scope, {
+          found: true,
+          version: 2,
+          dataHash: f.hashes.tombstoneData,
+          metadataHash: f.hashes.tombstoneMetadata,
+          deleted: true,
+        });
+    },
+    // Stream a's purge committed before stream b's read failed.
+    async (f: Awaited<ReturnType<typeof bootstrapFixture>>) =>
+      expect(
+        await f.db.query("SELECT stream FROM records WHERE stream='a'"),
+      ).toEqual([]),
+  ],
+])(
+  "begin rejects and starts no run when stream a is %s and stream b's read is then unavailable",
+  async (_name, change, committed) => {
+    const f = await bootstrapFixture();
+    await change(f);
+    const read = f.deps.registry.read;
+    f.deps.registry = {
+      ...f.deps.registry,
+      read: async (scope) => {
+        if (scope === f.b.scope) throw unavailable();
+        return read(scope);
+      },
+    };
+    await rejectsBeginAfterAWrite(f);
+    await committed(f);
+  },
+);
+it("begin rejects and starts no run when a generation purge is followed by an unavailable listing", async () => {
+  const f = await bootstrapFixture();
+  f.setControl(2);
+  f.deps.registry = {
+    ...f.deps.registry,
+    listStreamRows: async () => {
+      throw unavailable();
+    },
+  };
+  await rejectsBeginAfterAWrite(f);
+  // The purge and reset committed before the listing failed.
+  expect(await f.db.query("SELECT stream FROM records")).toEqual([]);
+  expect(
+    await f.db.query("SELECT head_version FROM stream_state ORDER BY stream"),
+  ).toEqual([{ head_version: 0 }, { head_version: 0 }]);
+});
+it("an unavailable error before any write is typed as such, with the registry's error as its cause", async () => {
+  const f = await bootstrapFixture();
+  const cause = unavailable();
+  f.deps.registry = {
+    ...f.deps.registry,
+    listStreamRows: async () => {
+      throw cause;
+    },
+  };
+  const error = await applyConnection(f.deps, f.id).catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(RegistryUnavailableBeforeWriteError);
+  expect((error as Error).cause).toBe(cause);
+  expect(await f.db.query("SELECT stream FROM records")).toHaveLength(2);
 });

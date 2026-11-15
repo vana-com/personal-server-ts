@@ -152,6 +152,21 @@ export class RegistryUnavailableError extends Error {
   }
 }
 
+/**
+ * An apply met an unavailable registry before its first local write: it could
+ * not learn anything new, and the local state is exactly what it was. That is
+ * the only unavailability a caller may treat as "offline". Apply has no
+ * rollback: an unavailable error after its first write is thrown as the plain
+ * `RegistryUnavailableError`, and the writes already committed (a purge, a
+ * reset, a stream replaced or tombstoned) stay.
+ */
+export class RegistryUnavailableBeforeWriteError extends RegistryUnavailableError {
+  constructor(cause: RegistryUnavailableError) {
+    super(cause.message, { cause });
+    this.name = "RegistryUnavailableBeforeWriteError";
+  }
+}
+
 /** The registry refused the request for good (4xx other than 409). */
 /**
  * The gateway has no change route (404 or 405): it predates the change push.

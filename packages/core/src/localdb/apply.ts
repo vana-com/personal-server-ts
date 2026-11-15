@@ -34,6 +34,10 @@ import {
   olderLifetimeFence,
 } from "./lifetime-boundary.js";
 import { purgeConnection } from "./purge.js";
+import {
+  RegistryUnavailableBeforeWriteError,
+  RegistryUnavailableError,
+} from "../stream-sync/ports.js";
 
 /** What one apply did, for the caller's status line. */
 export interface ApplyResult {
@@ -138,6 +142,18 @@ function launch(
   });
 }
 function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
+  const reuse: Reuse = {
+    listed: new Map(),
+    stale: false,
+    wrote: false,
+  };
+  return runJob(deps, id, flight, reuse).catch((error: unknown) => {
+    throw error instanceof RegistryUnavailableError && !reuse.wrote
+      ? new RegistryUnavailableBeforeWriteError(error)
+      : error;
+  });
+}
+function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
   return deps.queue.run(id, "apply", async () => {
     flight.closed = true;
 
@@ -179,7 +195,7 @@ function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
     }
     const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
     const hashes = await controlHashes(keccak, keyCheck);
-    const initial = await control(locked, id, connection, hashes);
+    const initial = await control(locked, id, connection, hashes, reuse);
     if (initial.kind !== "active") {
       if (flight.all)
         for (const row of await deps.db.query<{ stream: string }>(
@@ -192,7 +208,7 @@ function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
       );
     }
     const answers = new Map<string, ApplyResult>();
-    const reuse: Reuse = { control: initial, listed: new Map(), stale: false };
+    reuse.control = initial;
     let listed = false;
     while (true) {
       if (flight.all && !listed) {
@@ -263,6 +279,7 @@ async function control(
   id: string,
   connection: Connection,
   hashes: ControlHashes,
+  reuse: Reuse,
 ) {
   const read = await deps.registry.read(
     controlScope(connection.connector, connection.ns),
@@ -283,14 +300,17 @@ async function control(
     state.generation <= local.control_version
   )
     return { kind: "deleted" as const, version: local.control_version };
-  if (state.kind === "deleted")
+  if (state.kind === "deleted") {
+    reuse.wrote = true;
     await purgeConnection(deps, id, { controlVersion: state.version });
+  }
   if (state.kind === "active") {
     const old = await deps.db.query<{ generation: number }>(
       `SELECT head_generation AS generation FROM stream_state WHERE connection_id = ? AND head_generation IS NOT NULL AND head_generation <> ? LIMIT 1`,
       [id, state.generation],
     );
     if (connection.generation !== state.generation || old.length > 0) {
+      reuse.wrote = true;
       await purgeConnection(deps, id, { controlVersion: state.generation - 1 });
       await deps.db.batch([
         {
@@ -333,6 +353,13 @@ interface Reuse {
   listed: Map<string, ControlRead>;
   /** A stream has downloaded since the job's reads were taken. */
   stale: boolean;
+  /**
+   * The job has begun a write to local data (a purge, a reset, a stream
+   * replaced or tombstoned). Set before the write starts, since a failing
+   * write can have partly committed. The control row's own bookkeeping update
+   * does not count: it records what the registry said.
+   */
+  wrote: boolean;
 }
 
 /**
@@ -388,7 +415,7 @@ async function applyOneOnce(
   const reused = fence !== undefined || listedRead !== undefined;
   const rerun = reuse.stale && reused;
   const early = (answer: ApplyResult) => (rerun ? undefined : answer);
-  const active = fence ?? (await control(deps, id, connection, hashes));
+  const active = fence ?? (await control(deps, id, connection, hashes, reuse));
   if (active.kind !== "active")
     return early(result(stream, active.kind === "deleted" ? "purged" : "gone"));
   const scope = streamScope(connection.connector, connection.ns, stream);
@@ -408,6 +435,7 @@ async function applyOneOnce(
       return early(result(stream, "noop"));
     // A purge is destructive: never decide it on reused reads.
     if (reused) return undefined;
+    reuse.wrote = true;
     await deps.db.batch(
       withOrigin("purge", [
         {
@@ -472,6 +500,7 @@ async function applyOneOnce(
   if (head.generation < active.generation) {
     // This writes stream state: never decide it on reused reads.
     if (reused) return undefined;
+    reuse.wrote = true;
     // A head of an earlier lifetime (a delete marker). It is no content base:
     // keep only its delete fence, so a run that begins now pins it.
     await hydrateLifetimeBoundary(deps, {
@@ -546,6 +575,7 @@ async function applyOneOnce(
             rows.push(
               ...(await stage(op, stream, head, line.v, line.o, line.r, null)),
             );
+          reuse.wrote = true;
           await deps.db.batch(
             withOrigin("remote", [
               ...rows,
@@ -602,6 +632,7 @@ async function applyOneOnce(
             end = frame.parts[0];
           }
           if (records === end!.count || frame.parts.length > 1) {
+            reuse.wrote = true;
             await deps.db.batch(
               withOrigin("remote", [
                 ...rows,
@@ -617,7 +648,7 @@ async function applyOneOnce(
         if (rows.length > 0) throw new Error("apply: incomplete part");
       }
     }
-    const stillActive = await control(deps, id, connection, hashes);
+    const stillActive = await control(deps, id, connection, hashes, reuse);
     reuse.control = stillActive;
     if (
       stillActive.kind !== "active" ||
@@ -683,6 +714,7 @@ async function applyOneOnce(
           params: [id, stream, prefix, seq, part.hash, part.bytes, part.count],
         }),
       );
+    reuse.wrote = true;
     await deps.db.batch(withOrigin("remote", statements));
     return {
       stream,

@@ -621,7 +621,7 @@ describe("an unreachable registry is told apart from a refusing one", () => {
       );
     },
   );
-  it("a 4xx or an unparsable answer is not unavailability", async () => {
+  it("a 4xx is not unavailability", async () => {
     for (const status of [400, 401, 403]) {
       const error = await over(refuse(status))
         .read(scope)
@@ -634,5 +634,92 @@ describe("an unreachable registry is told apart from a refusing one", () => {
       expect(listing).not.toBeInstanceOf(RegistryUnavailableError);
     }
     expect(await over(refuse(404)).read(scope)).toEqual({ found: false });
+  });
+
+  // A 200 whose body stream fails after the headers: the connection dropped
+  // or a timeout fired while the body was read.
+  const failingBody = (error: unknown) => () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.error(error);
+        },
+      }),
+      { status: 200 },
+    );
+  const page = (hasMore: boolean) =>
+    new Response(
+      JSON.stringify({
+        data: { dataPoints: [] },
+        pagination: hasMore
+          ? { hasMore: true, nextCursor: "next" }
+          : { hasMore: false },
+      }),
+      { status: 200 },
+    );
+  const listings = {
+    listStreamRows: (r: ReturnType<typeof over>) => r.listStreamRows("acme"),
+    listControlRows: (r: ReturnType<typeof over>) => r.listControlRows(),
+    listConnectionRows: (r: ReturnType<typeof over>) =>
+      r.listConnectionRows("acme", ""),
+  };
+  it.each([
+    ["a network error", new TypeError("terminated")],
+    ["a timeout", new DOMException("timed out", "TimeoutError")],
+    ["an abort", new DOMException("aborted", "AbortError")],
+  ])(
+    "a body that fails after the headers (%s) is unavailability, for read and every listing",
+    async (_name, failure) => {
+      await expect(
+        over(failingBody(failure)).read(scope),
+      ).rejects.toBeInstanceOf(RegistryUnavailableError);
+      for (const list of Object.values(listings))
+        await expect(list(over(failingBody(failure)))).rejects.toBeInstanceOf(
+          RegistryUnavailableError,
+        );
+    },
+  );
+  it("a body that fails on a later listing page is unavailability", async () => {
+    for (const list of Object.values(listings)) {
+      let calls = 0;
+      const registry = over(() =>
+        ++calls === 1 ? page(true) : failingBody(new TypeError("terminated"))(),
+      );
+      await expect(list(registry)).rejects.toBeInstanceOf(
+        RegistryUnavailableError,
+      );
+      expect(calls).toBe(2);
+    }
+  });
+  it("a body that arrives whole but is not JSON is a plain error, not unavailability", async () => {
+    const malformed = () => new Response('{"data": {', { status: 200 });
+    const read = await over(malformed)
+      .read(scope)
+      .catch((e: unknown) => e);
+    expect(read).toBeInstanceOf(SyntaxError);
+    expect(read).not.toBeInstanceOf(RegistryUnavailableError);
+    for (const list of Object.values(listings)) {
+      const error = await list(over(malformed)).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(SyntaxError);
+      expect(error).not.toBeInstanceOf(RegistryUnavailableError);
+    }
+    // A later page that is malformed is not unavailability either.
+    let calls = 0;
+    const later = await over(() => (++calls === 1 ? page(true) : malformed()))
+      .listStreamRows("acme")
+      .catch((e: unknown) => e);
+    expect(later).toBeInstanceOf(SyntaxError);
+  });
+  it("a listing with no pagination marker is a plain error, not unavailability", async () => {
+    const error = await over(
+      () =>
+        new Response(JSON.stringify({ data: { dataPoints: [] } }), {
+          status: 200,
+        }),
+    )
+      .listStreamRows("acme")
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(RegistryUnavailableError);
   });
 });

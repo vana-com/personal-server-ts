@@ -199,6 +199,24 @@ export function createGatewayStreamSyncRegistry(
       throw new RegistryUnavailableError(`registry answered ${res.status}`);
     return res;
   }
+  /**
+   * The body of a read answer. A body that fails in transit (a dropped
+   * connection, a timeout after the headers) is unavailability like a failed
+   * fetch; text that arrived whole but does not parse, or has the wrong shape,
+   * is a bad answer and stays a plain error.
+   */
+  async function bodyForRead(res: Response): Promise<unknown> {
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (cause) {
+      throw new RegistryUnavailableError(
+        `registry unreachable: ${cause instanceof Error ? cause.message : String(cause)}`,
+        { cause },
+      );
+    }
+    return JSON.parse(text);
+  }
   const pageSize = options.listPageSize ?? 500;
 
   /** Page through every owner row and keep the scopes `keep` accepts. */
@@ -216,7 +234,7 @@ export function createGatewayStreamSyncRegistry(
       if (!res.ok) {
         throw new Error(`registry listing failed: ${res.status}`);
       }
-      const envelope = (await res.json()) as {
+      const envelope = (await bodyForRead(res)) as {
         data?: { dataPoints?: RegistryRow[] };
         pagination?: { hasMore?: boolean; nextCursor?: string | null };
       };
@@ -329,7 +347,7 @@ export function createGatewayStreamSyncRegistry(
       if (res.status !== 200) {
         throw new Error(`registry read of ${scope} failed: ${res.status}`);
       }
-      return toControlRead(unwrap(await res.json()));
+      return toControlRead(unwrap(await bodyForRead(res)));
     },
 
     async post(request: SignedRegistryPost): Promise<RegistryPostResult> {
