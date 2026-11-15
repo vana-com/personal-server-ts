@@ -27,9 +27,18 @@ import {
   type IntakeDeclarations,
 } from "../stream-sync/intake.js";
 import { syncBeforeBegin } from "./bootstrap.js";
-import type { LocalSyncDeps } from "./deps.js";
+import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { checkRunFence } from "./fence.js";
+import {
+  ADMIT_ROW_OFFSET,
+  admitUpserts,
+  clampRunStart,
+  compactTombstones,
+  connectorBlockedStreams,
+  guardFailureMarks,
+  type AdmitRow,
+} from "./admit.js";
 
 export interface RunIntakeStore {
   begin(
@@ -40,7 +49,15 @@ export interface RunIntakeStore {
   batch(runId: string, req: BatchRequest): Promise<BatchResponse>;
 }
 
-type Run = { connection_id: string; state: string; last_batch: number };
+type Run = {
+  connection_id: string;
+  state: string;
+  last_batch: number;
+  o: number;
+  generation: number | null;
+  artifact_version: string;
+  admitting: number;
+};
 const invalid = (message: string) =>
   new RunIntakeError("invalid_request", message);
 const replay: BatchResponse = {
@@ -136,7 +153,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
   }
   async function live(id: string): Promise<Run> {
     const [run] = await db.query<Run>(
-      "SELECT connection_id,state,last_batch FROM runs WHERE run_id=?",
+      "SELECT connection_id,state,last_batch,o,generation,artifact_version,admitting FROM runs WHERE run_id=?",
       [id],
     );
     if (!run || run.state !== "collecting") {
@@ -424,6 +441,18 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             },
           );
         }
+        if (deps.publishWhileCollecting === true) {
+          // The run keeps this mode to its end. Compaction counts the new run.
+          statements.push(
+            {
+              sql: "UPDATE runs SET admitting=1 WHERE run_id=?",
+              params: [runId],
+            },
+            // Stamp above every compacted tombstone, then count this run.
+            clampRunStart(runId),
+            ...compactTombstones(id),
+          );
+        }
         statements.push({ sql: "DROP TRIGGER temp.intake_begin_check" });
         try {
           await db.batch(statements);
@@ -473,6 +502,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           ]),
         );
         const rows: SqlStatement[] = [];
+        const upserts: AdmitRow[] = [];
         let accepted = 0;
         for (const record of req.records) {
           if (
@@ -495,6 +525,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             throw invalid("delete requires a mutable_state stream");
           const primaryKey = declaration.primaryKey;
           let body: string;
+          let bodySha256: string;
           let recordKey: string;
           let hash: string;
           try {
@@ -506,6 +537,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             )
               throw invalid("record key does not match data");
             body = canonicalJson(record.data);
+            bodySha256 = toHex(sha256(new TextEncoder().encode(body)));
             hash = await pkHash(
               async (b) => sha256(b),
               record.data,
@@ -523,27 +555,88 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
               hash,
               recordKey,
               body,
-              toHex(sha256(new TextEncoder().encode(body))),
+              bodySha256,
               record.op === "delete" ? "delete" : "upsert",
               runId,
               run.last_batch,
             ],
           });
+          if (record.op !== "delete")
+            upserts.push({
+              stream: record.stream,
+              pkHash: hash,
+              recordKey,
+              body,
+              bodySha256,
+            });
           accepted++;
         }
+        const admitting = run.admitting === 1;
+        // A stream whose connector the head refuses (version floor or key) has
+        // its upserts staged, not admitted: run end refuses it the same way.
+        const { blocked, facts } = admitting
+          ? await connectorBlockedStreams(deps, runId, run)
+          : { blocked: new Set<string>(), facts: new Map() };
+        const admitted = upserts.filter((u) => !blocked.has(u.stream));
+        const admittedStreams = [...new Set(admitted.map((u) => u.stream))];
+        const admission =
+          admitting && admitted.length > 0
+            ? admitUpserts({
+                op: deps.newOp(),
+                connectionId: run.connection_id,
+                runId,
+                o: run.o,
+                rows: admitted,
+                facts,
+                guard: {
+                  sql: "EXISTS (SELECT 1 FROM runs WHERE run_id=? AND state='collecting' AND last_batch=?)",
+                  params: [runId, run.last_batch],
+                },
+              })
+            : [];
+        // A stream whose facts changed since the check is staged, not admitted:
+        // run end merges it.
+        const guardMarks =
+          admission.length > 0
+            ? guardFailureMarks(
+                run.connection_id,
+                runId,
+                facts,
+                admittedStreams,
+              )
+            : [];
+        // The mark outlives the batch: run end reports `updateRequired` for it
+        // even when another refusal (commit order) comes first there.
+        const blockedStreams = [
+          ...new Set(
+            upserts.filter((u) => blocked.has(u.stream)).map((u) => u.stream),
+          ),
+        ];
+        const marks: SqlStatement[] = blockedStreams.map((stream) => ({
+          sql: "UPDATE run_streams SET reason='connector_update_required', unadmitted=1 WHERE run_id=? AND stream=?",
+          params: [runId, stream],
+        }));
+        let outcome: Awaited<ReturnType<typeof db.batch>>;
         try {
-          const outcome = await db.batch([
+          outcome = await db.batch([
             { sql: ROW_CHECK },
             { sql: BATCH_CHECK },
             ...rows,
+            ...admission,
+            ...guardMarks,
             {
               sql: "UPDATE runs SET last_batch=? WHERE run_id=? AND state='collecting' AND last_batch=?",
               params: [req.batch, runId, run.last_batch],
             },
+            ...marks,
             { sql: "DROP TRIGGER temp.intake_rows_check" },
             { sql: "DROP TRIGGER temp.intake_batch_check" },
           ]);
-          if (outcome.changes[rows.length + 2] === 0) {
+          if (
+            outcome.changes[
+              rows.length + admission.length + guardMarks.length + 2
+            ] === 0
+          ) {
             await live(runId);
             return replay;
           }
@@ -556,7 +649,29 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           }
           throw error;
         }
-        return { applied: true, accepted, deletesSkipped: 0 };
+        if (!admitting) return { applied: true, accepted, deletesSkipped: 0 };
+        const base = 2 + rows.length + ADMIT_ROW_OFFSET;
+        const markBase = 2 + rows.length + admission.length;
+        const notAdmitted = new Set(
+          admittedStreams.filter((_, i) => outcome.changes[markBase + i] === 1),
+        );
+        // A row skipped for a remembered delete; rows of a stream whose facts
+        // changed are counted as staged, not as skipped.
+        const tombstoned = admitted.filter(
+          (u, i) =>
+            outcome.changes[base + i] === 0 && !notAdmitted.has(u.stream),
+        ).length;
+        const landed = admitted.filter(
+          (_, i) => outcome.changes[base + i] !== 0,
+        ).length;
+        if (landed > 0) announceRecordsCommitted(deps);
+        return {
+          applied: true,
+          accepted,
+          deletesSkipped: 0,
+          tombstoned,
+          ...(marks.length > 0 ? { updateRequired: true } : {}),
+        };
       }),
   };
 }

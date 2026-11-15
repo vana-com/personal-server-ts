@@ -24,6 +24,7 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { sha256 } from "@noble/hashes/sha2";
 import {
+  applyConnection,
   applySegmentOperations,
   applySnapshotPart,
   connectionQueue,
@@ -1672,4 +1673,99 @@ describe("log protocol: first-seen travels with the winning observation (P2-a, P
       }
     }
   }, 120_000);
+});
+
+describe("log protocol: the log noop shortcut and unresolved partial state", () => {
+  // With the log on, a stream the log wrote reads from a local version above the
+  // registry's own stream row, and the apply of that stream answers noop without
+  // reading it. That answer says nothing about rows an earlier failed apply of a
+  // newer per-stream head merged: neither the per-stream head nor the log holds
+  // them. So it must not count as proof that the stream is repaired.
+  it("a partial per-stream apply, the per-stream registry back at an older version, and an unchanged log: the mark stays and nothing claims a repair", async () => {
+    const w = await world({
+      streams: 1,
+      logProtocol: false,
+      partTargetBytes: 400,
+    });
+    const s0 = streamScope(CONNECTOR, "", sName(0));
+    const rowsLocal = async (d: Device) =>
+      (
+        await d.db.query<{ record_key: string }>(
+          "SELECT record_key FROM records WHERE stream = ?",
+          [sName(0)],
+        )
+      ).map((r) => r.record_key);
+    const state = async (d: Device) =>
+      (
+        await d.db.query<{ head_version: number; apply_partial: number }>(
+          `SELECT s.head_version, c.apply_partial FROM stream_state s
+             JOIN connections c ON c.connection_id = s.connection_id
+            WHERE s.stream = ?`,
+          [sName(0)],
+        )
+      )[0]!;
+
+    // The per-stream registry holds version 1.
+    const legacy = await w.device("legacy", false);
+    await legacy.run("run-1", [{ stream: sName(0), id: "a" }]);
+    await legacy.cycle();
+
+    // This device reads version 1, then the log carries it to local version 3.
+    const b = await w.device("b", true);
+    await b.cycle();
+    for (const id of ["b1", "b2"]) {
+      await b.run(`run-${id}`, [{ stream: sName(0), id }], {
+        full: false,
+        covered: [sName(0)],
+      });
+      await b.cycle();
+    }
+    expect((await state(b)).head_version).toBe(3);
+    const logRows = await rowsLocal(b);
+    expect(logRows).toEqual(expect.arrayContaining(["a", "b1", "b2"]));
+
+    // The per-stream registry grows to version 4 with many rows in many parts.
+    for (let i = 0; i < 3; i++) {
+      await legacy.run(
+        `run-L${i}`,
+        Array.from({ length: 12 }, (_, j) => ({
+          stream: sName(0),
+          id: `x${i}-${j}`,
+          pad: 60,
+        })),
+        { full: false, covered: [sName(0)] },
+      );
+      await legacy.cycle();
+    }
+    expect(w.gateway.rowsOf(s0)).toBe(4);
+
+    // Applying it merges some parts and then a part download fails.
+    const get = b.deps.blobs.get.bind(b.deps.blobs);
+    let parts = 0;
+    b.deps.blobs.get = async (key) => {
+      if (key.startsWith(`${s0}/`) && key.includes("-p-") && ++parts === 3)
+        throw new Error("part blob transfer failed");
+      return get(key);
+    };
+    await expect(applyConnection(b.deps, CONNECTION_ID)).rejects.toThrow(
+      "part blob transfer failed",
+    );
+    b.deps.blobs.get = get;
+    expect(await state(b)).toEqual({ head_version: 3, apply_partial: 1 });
+    const merged = (await rowsLocal(b)).filter((k) => k.startsWith("x"));
+    expect(merged.length).toBeGreaterThan(0);
+
+    // The per-stream registry goes back to version 1; the log has not moved.
+    const rows = w.gateway.versions.get(s0)!;
+    while (rows.length > 1) rows.pop();
+    await applyConnection(b.deps, CONNECTION_ID);
+
+    // Rows the version-4 head merged are in neither source, and the mark says so.
+    expect(await state(b)).toEqual({ head_version: 3, apply_partial: 1 });
+    expect((await rowsLocal(b)).filter((k) => k.startsWith("x"))).toEqual(
+      merged,
+    );
+    // The log's own state is intact.
+    expect(await rowsLocal(b)).toEqual(expect.arrayContaining(logRows));
+  }, 60_000);
 });

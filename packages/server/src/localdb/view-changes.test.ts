@@ -924,6 +924,11 @@ describe("view changes", () => {
         .flat()
         .flatMap((sql) => /^CREATE TABLE (\w+)/.exec(sql)?.[1] ?? [])
         .map((table) => ({ sql: `DROP TABLE ${table}` })),
+      // Publish while collecting adds columns after the view counters too.
+      { sql: "ALTER TABLE runs DROP COLUMN admitting" },
+      { sql: "ALTER TABLE run_streams DROP COLUMN unadmitted" },
+      { sql: "ALTER TABLE connections DROP COLUMN tombstone_wm_o" },
+      { sql: "ALTER TABLE connections DROP COLUMN tombstone_wm_r" },
       { sql: `PRAGMA user_version = ${viewMigration}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");

@@ -68,6 +68,11 @@ export async function purgeConnection(
           sql: "DELETE FROM log_tombstones WHERE connection_id = ?",
           params: [connectionId],
         },
+        // Publish while collecting remembers deletes of the same lifetime.
+        {
+          sql: "DELETE FROM record_tombstones WHERE connection_id = ?",
+          params: [connectionId],
+        },
         // A publish copy of the deleted rows. Its transfer sees the rows gone
         // and stops; the commit would refuse it in any case.
         {

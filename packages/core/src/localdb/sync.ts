@@ -100,6 +100,26 @@ export function createLocalSync(
       throw new RunIntakeError("connection_busy");
     }
   };
+  // Runs live in `bindings`, which dies with the process: whatever the database
+  // still holds as `collecting` when this sync starts has no one to end it. The
+  // list is read once, before any run of this sync can begin, and only those
+  // runs are ever ended here: a read at a later begin would also return live
+  // runs. `begin` waits for the sweep. A run it could not end is retried at the
+  // next `begin`; a failed read of the list fails `begin`, since without it no
+  // run could be told from an orphan.
+  let orphans: readonly string[] | undefined;
+  let sweeping: Promise<void> = Promise.resolve();
+  const sweepOnce = (): Promise<void> => {
+    const sweep = sweeping.then(async () => {
+      orphans ??= await endStore.orphans();
+      if (orphans.length > 0) orphans = await endStore.endOrphans(orphans);
+    });
+    sweeping = sweep.catch(() => {});
+    return sweep;
+  };
+  sweepOnce().catch((error) =>
+    deps.logger.warn({ error: String(error) }, "orphaned-run sweep failed"),
+  );
   const checkRun = async (runId: string) => {
     const binding = bindings.get(runId);
     if (!binding) throw new RunIntakeError("gone");
@@ -118,6 +138,7 @@ export function createLocalSync(
       if (req.owner.address.toLowerCase() !== deps.ownerAddress.toLowerCase()) {
         throw new RunIntakeError("owner_mismatch");
       }
+      await sweepOnce();
       const receipt = await readBeginReceipt(deps.db, runId, req);
       if (receipt) return receipt;
       const binding = {

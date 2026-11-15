@@ -47,6 +47,16 @@ export interface LocalSyncDeps {
    */
   readonly recordsCommitted?: () => void;
   /**
+   * Publish while collecting, default off. A run that begins with it on has each
+   * batch admitted into `records` as it arrives (same fences as run end), so
+   * the publisher relays rows during the run; run end keeps only omission
+   * deletes, explicit deletes and the checkpoint. A run keeps the mode it began
+   * in (`runs.admitting`), and every later step reads that persisted mode, not
+   * this flag: a run that was admitting stays so if the flag goes off. Off:
+   * batches stay staged until run end, exactly as before.
+   */
+  readonly publishWhileCollecting?: boolean;
+  /**
    * Default off. On: a stream with no complete head is readable by its owner
    * from its first applied part, in an explicit partial state, and fills in
    * as parts apply (`stream_partial`). Off: a stream is readable only when
