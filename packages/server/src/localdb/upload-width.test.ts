@@ -8,6 +8,8 @@
 // steps the clock only when the encoder and the uploads have stopped moving.
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import v8 from "node:v8";
+import vm from "node:vm";
 import { afterEach, describe, expect, it } from "vitest";
 import { openLocalDb } from "@opendatalabs/personal-server-ts-core/localdb";
 import type { SqlDriver } from "@opendatalabs/personal-server-ts-core/localdb";
@@ -30,7 +32,7 @@ import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 const PUT_MS = 1_000;
 const PART = 2_048;
 /** A row of this many bytes fills a part of its own. */
-const ROW_VALUE_BYTES = 1_500;
+const ROW_VALUE_BYTES = 1_700;
 const INPUT = {
   connectionId: "connection",
   stream: "items",
@@ -49,6 +51,26 @@ afterEach(async () => {
 });
 
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Waits until the encoder has stopped: at least `atLeast` uploads have started
+ * and no more has started for 150 ms. Waiting for the count first keeps a slow
+ * host, where the first upload starts late, from reading a quiet start as a stop.
+ */
+async function parked(
+  r: { stats: { started: number } },
+  atLeast: number,
+): Promise<void> {
+  const deadline = Date.now() + 60_000;
+  while (r.stats.started < atLeast && Date.now() < deadline)
+    await realSleep(25);
+  let last = -1;
+  for (let quiet = 0; quiet < 6;) {
+    await realSleep(25);
+    quiet = r.stats.started === last ? quiet + 1 : 0;
+    last = r.stats.started;
+  }
+}
 const throttle = (status: 429 | 503, retryAfterMs?: number) =>
   Object.assign(new Error(`storage request failed (${status})`), {
     status,
@@ -78,12 +100,20 @@ interface Rig {
     heldBytes: number;
     peakHeldBytes: number;
     readonly startTimes: number[];
+    /** In order: each part encrypted, each PUT started. */
+    readonly events: string[];
+    /** Every object stored, by key. */
+    readonly objects: Map<string, Uint8Array>;
+    /** A weak reference to the plain bytes of each part, taken as it is encrypted. */
+    readonly plain: WeakRef<Uint8Array>[];
+    encrypted: number;
   };
   readonly governor: ReturnType<
     typeof createStorageStreamSyncBlobs
   >["governor"];
   /** Lets every parked PUT finish. */
   readonly release: () => void;
+  readonly budgetIsFree: () => Promise<boolean>;
   /** Runs `work` while stepping the fake clock whenever everything has gone quiet. */
   readonly drive: <T>(work: Promise<T>) => Promise<T>;
 }
@@ -136,6 +166,12 @@ async function rig(options: {
       };
     }),
   );
+  const maxBytes = Math.max(
+    1,
+    (options.parked?.policy.maxBytesInFlight ??
+      options.policy.maxBytesInFlight ??
+      DEFAULT_STORAGE_ACCESS_POLICY.maxBytesInFlight) as number,
+  );
   const clock = fakeClock();
   const stats: Rig["stats"] = {
     started: 0,
@@ -145,6 +181,10 @@ async function rig(options: {
     heldBytes: 0,
     peakHeldBytes: 0,
     startTimes: [],
+    events: [],
+    objects: new Map(),
+    plain: [],
+    encrypted: 0,
   };
   const gate: { governor?: Rig["governor"] } = {};
   const adapter = {
@@ -152,8 +192,9 @@ async function rig(options: {
     exists: async () => false,
     download: async () => new Uint8Array(),
     delete: async () => true,
-    upload: async (_key: string, bytes: Uint8Array) => {
+    upload: async (key: string, bytes: Uint8Array) => {
       stats.started += 1;
+      stats.events.push("put");
       stats.startTimes.push(clock.now());
       stats.onWire += 1;
       stats.peakOnWire = Math.max(stats.peakOnWire, stats.onWire);
@@ -172,7 +213,8 @@ async function rig(options: {
       if (failure) options.onFailureAnswer?.({ ...context(), n: started.n });
       if (failure) throw failure;
       stats.stored += 1;
-      stats.heldBytes -= 2 * bytes.length;
+      stats.heldBytes -= bytes.length;
+      stats.objects.set(key, bytes.slice());
       return "";
     },
   };
@@ -181,14 +223,16 @@ async function rig(options: {
   const blobs: StreamSyncBlobs = options.parked
     ? {
         ...createMemoryStreamSyncBlobs(options.parked.policy),
-        put: async (_key, bytes) => {
+        put: async (key, bytes) => {
           stats.started += 1;
+          stats.events.push("put");
           stats.onWire += 1;
           stats.peakOnWire = Math.max(stats.peakOnWire, stats.onWire);
           await parkedUntil;
           stats.onWire -= 1;
           stats.stored += 1;
-          stats.heldBytes -= 2 * bytes.length;
+          stats.heldBytes -= bytes.length;
+          stats.objects.set(key, bytes.slice());
         },
       }
     : createStorageStreamSyncBlobs(adapter as never, {
@@ -204,10 +248,18 @@ async function rig(options: {
     blobs,
     keys: {
       encryptPart: async (_scope: string, clear: Uint8Array) => {
-        // The encoder still holds `clear` while the ciphertext is uploaded.
-        stats.heldBytes += 2 * clear.length;
-        stats.peakHeldBytes = Math.max(stats.peakHeldBytes, stats.heldBytes);
-        return clear.slice();
+        const cipher = clear.slice();
+        stats.events.push("encrypt");
+        stats.encrypted += 1;
+        stats.plain.push(new WeakRef(clear));
+        // The plain bytes and the ciphertext exist together while it runs;
+        // when it returns only the ciphertext is kept for the PUT.
+        stats.peakHeldBytes = Math.max(
+          stats.peakHeldBytes,
+          stats.heldBytes + clear.length + cipher.length,
+        );
+        stats.heldBytes += cipher.length;
+        return cipher;
       },
     },
     partTargetBytes: PART,
@@ -242,19 +294,60 @@ async function rig(options: {
     release,
     drive,
     publish: () => encodePrefixes(deps, INPUT),
+    /** Whether every reserved byte was given back: a reservation of the whole budget is granted at once. */
+    budgetIsFree: async () => {
+      const all = await Promise.race([
+        gate.governor!.reserve(maxBytes),
+        realSleep(50).then(() => "held" as const),
+      ]);
+      if (all === "held") return false;
+      all();
+      return true;
+    },
   };
 }
 
 /**
- * The window may grow to `cap` parts; the budget holds `budgetParts` of them.
- * A part counts twice (plain and ciphertext), so the budget is two parts' bytes
- * for each.
+ * The window may grow to `cap` parts, and the budget holds `budgetParts` parts
+ * in flight and the part being built. An uploading part keeps its ciphertext
+ * (one part's bytes); the builder's reservation is the plain bytes and room for
+ * their ciphertext (two).
  */
 const policyFor = (cap: number, budgetParts: number) => ({
-  // The gate's cap is maxBytesInFlight / partBytes.
-  maxBytesInFlight: budgetParts * 2 * PART,
-  partBytes: Math.floor((budgetParts * 2 * PART) / cap),
+  maxPartsInFlight: cap,
+  partBytes: PART,
+  maxBytesInFlight: (budgetParts + 2) * PART,
 });
+
+/** The production policy, scaled from 4 MiB parts to this test's part size. */
+const productionPolicy = (): Partial<StorageAccessPolicy> => {
+  const scale = PART / DEFAULT_STORAGE_ACCESS_POLICY.partBytes;
+  return {
+    partBytes: PART,
+    maxBytesInFlight: Math.round(
+      DEFAULT_STORAGE_ACCESS_POLICY.maxBytesInFlight * scale,
+    ),
+  };
+};
+
+/** One part at a time: the serial path every wider policy must equal in bytes. */
+const serialPolicy = (): Partial<StorageAccessPolicy> => ({
+  maxPartsInFlight: 1,
+  partBytes: 2 * PART,
+  maxBytesInFlight: 2 * PART,
+});
+
+/** Run the gc the test runner does not expose. */
+const collect = (() => {
+  v8.setFlagsFromString("--expose-gc");
+  const gc = vm.runInNewContext("gc") as () => void;
+  return async () => {
+    for (let i = 0; i < 3; i++) {
+      await realSleep(5);
+      gc();
+    }
+  };
+})();
 
 describe("a stream's part uploads are limited by the send gate and the byte budget, not by a width of their own", () => {
   it("puts more than two parts on the wire at once, up to the gate's window", async () => {
@@ -265,7 +358,7 @@ describe("a stream's part uploads are limited by the send gate and the byte budg
     expect(r.stats.peakOnWire).toBeLessThanOrEqual(8);
   });
 
-  it("never holds more bytes in memory (plain and ciphertext) than the byte budget, however wide the gate allows", async () => {
+  it("never holds more bytes in memory than the byte budget, however wide the gate allows", async () => {
     const budgetParts = 5;
     const r = await rig({
       parts: 48,
@@ -276,12 +369,13 @@ describe("a stream's part uploads are limited by the send gate and the byte budg
     await r.drive(r.publish());
     expect(r.stats.stored).toBe(48);
     expect(r.stats.peakOnWire).toBeGreaterThan(2);
-    expect(r.stats.peakHeldBytes).toBeLessThanOrEqual(budgetParts * 2 * PART);
-    expect(r.stats.peakOnWire).toBeLessThanOrEqual(budgetParts);
+    const budget = (budgetParts + 2) * PART;
+    expect(r.stats.peakHeldBytes).toBeLessThanOrEqual(budget);
+    // The budget's parts in flight, and the part that was being built and has
+    // just become one of them.
+    expect(r.stats.peakOnWire).toBeLessThanOrEqual(budgetParts + 1);
     // The governor's own count of reserved bytes agrees.
-    expect(window.end().peakBytesInFlight).toBeLessThanOrEqual(
-      budgetParts * 2 * PART,
-    );
+    expect(window.end().peakBytesInFlight).toBeLessThanOrEqual(budget);
   });
 
   it("starts a bounded number of PUTs of a store whose PUTs stay parked, however many parts the stream has", async () => {
@@ -289,23 +383,21 @@ describe("a stream's part uploads are limited by the send gate and the byte budg
     const r = await rig({
       parts: 48,
       policy: {},
-      parked: { policy: { maxBytesInFlight: budgetParts * 2 * PART } },
+      parked: { policy: policyFor(budgetParts, budgetParts) },
     });
     const publishing = r.publish();
     // Let the encoder run until it stops: every part it can encode has started.
-    let last = -1;
-    for (let quiet = 0; quiet < 6;) {
-      await realSleep(25);
-      quiet = r.stats.started === last ? quiet + 1 : 0;
-      last = r.stats.started;
-    }
+    await parked(r, budgetParts);
+    const budget = (budgetParts + 2) * PART;
     expect(r.stats.started).toBeGreaterThan(0);
-    expect(r.stats.started).toBeLessThanOrEqual(budgetParts);
-    expect(r.stats.peakHeldBytes).toBeLessThanOrEqual(budgetParts * 2 * PART);
+    // The parts of one budget are the parts it holds: at most its parts in
+    // flight and the one being built.
+    expect(r.stats.started).toBeLessThanOrEqual(budgetParts + 1);
+    expect(r.stats.peakHeldBytes).toBeLessThanOrEqual(budget);
     r.release();
     await publishing;
     expect(r.stats.stored).toBe(48);
-    expect(r.stats.peakHeldBytes).toBeLessThanOrEqual(budgetParts * 2 * PART);
+    expect(r.stats.peakHeldBytes).toBeLessThanOrEqual(budget);
   });
 
   it("starts no request while a 429's Retry-After lasts, then goes on at the same window", async () => {
@@ -402,5 +494,150 @@ describe("a stream's part uploads are limited by the send gate and the byte budg
     expect(spentMs).toBeLessThan(19_000);
     // The guard's 10 PUT/s is the floor.
     expect(spentMs).toBeGreaterThanOrEqual((parts / 10) * 1_000);
+  });
+});
+
+/**
+ * The upload pipeline at the production geometry: how wide it runs, how much
+ * it holds, and what it must not change. The geometry is the production
+ * policy (`DEFAULT_STORAGE_ACCESS_POLICY`) scaled to this test's part size, so
+ * a change to the width or the budget there is what these tests read.
+ */
+describe("the part upload pipeline at the production policy", () => {
+  const WIDTH = 16;
+  const PARTS = 64;
+
+  it("keeps the production width of parts on the wire once the window has ramped up", async () => {
+    const r = await rig({ parts: PARTS, policy: productionPolicy() });
+    await r.drive(r.publish());
+    expect(r.stats.stored).toBe(PARTS);
+    expect(r.stats.peakOnWire).toBe(WIDTH);
+  });
+
+  it("never has more than the width on the wire, with a wider window offered", async () => {
+    const r = await rig({
+      parts: PARTS,
+      policy: { ...productionPolicy(), maxBytesInFlight: 64 * PART },
+    });
+    await r.drive(r.publish());
+    expect(r.stats.stored).toBe(PARTS);
+    expect(r.stats.peakOnWire).toBeLessThanOrEqual(WIDTH);
+  });
+
+  it("starts the first upload before the later parts are read and encoded", async () => {
+    const r = await rig({ parts: PARTS, policy: productionPolicy() });
+    await r.drive(r.publish());
+    const first = r.stats.events.indexOf("put");
+    const lastEncoded = r.stats.events.lastIndexOf("encrypt");
+    expect(first).toBeGreaterThanOrEqual(0);
+    expect(first).toBeLessThan(lastEncoded);
+    // Not just the first: parts are on the wire while others are still encoded.
+    const putsBeforeLastEncode = r.stats.events
+      .slice(0, lastEncoded)
+      .filter((event) => event === "put").length;
+    expect(putsBeforeLastEncode).toBeGreaterThanOrEqual(WIDTH / 2);
+  });
+
+  it("holds no more than the width of parts, plus the part being built, while every PUT is parked", async () => {
+    const r = await rig({
+      parts: PARTS,
+      policy: {},
+      parked: { policy: productionPolicy() },
+    });
+    const publishing = r.publish();
+    await parked(r, WIDTH);
+    // Every started upload is parked holding its ciphertext; the encoder has
+    // stopped on the byte budget.
+    expect(r.stats.started).toBeGreaterThanOrEqual(WIDTH);
+    expect(r.stats.started).toBeLessThanOrEqual(WIDTH + 1);
+    expect(r.stats.peakHeldBytes).toBeLessThanOrEqual((WIDTH + 2) * PART);
+    r.release();
+    await publishing;
+    expect(r.stats.stored).toBe(PARTS);
+    expect(await r.budgetIsFree()).toBe(true);
+  });
+
+  it("does not keep a part's plain bytes while its PUT is pending", async () => {
+    const r = await rig({
+      parts: PARTS,
+      policy: {},
+      parked: { policy: productionPolicy() },
+    });
+    const publishing = r.publish();
+    await parked(r, WIDTH);
+    expect(r.stats.encrypted).toBeGreaterThanOrEqual(WIDTH);
+    await collect();
+    const alive = r.stats.plain.filter((ref) => ref.deref() !== undefined);
+    // Parked PUTs hold the ciphertext only. The encoder may still hold the
+    // plain bytes of the part it has just encoded and not yet handed over.
+    expect(alive.length).toBeLessThanOrEqual(1);
+    r.release();
+    await publishing;
+  });
+
+  it("starts no more PUTs per second than the storage guard allows", async () => {
+    const r = await rig({
+      parts: PARTS,
+      // vana-storage: 600 PUTs per 60 s, which is 10 a second.
+      policy: {
+        ...productionPolicy(),
+        quota: { limit: 600, windowMs: 60_000 },
+      },
+    });
+    await r.drive(r.publish());
+    expect(r.stats.stored).toBe(PARTS);
+    const starts = r.stats.startTimes;
+    for (let i = 0; i + 10 < starts.length; i++) {
+      // Any eleven PUTs span at least a second.
+      expect(starts[i + 10]! - starts[i]!).toBeGreaterThanOrEqual(1_000 - 1);
+    }
+    // The guard, not the window, set the pace: the window had room for more.
+    expect(r.stats.peakOnWire).toBeGreaterThan(2);
+  });
+
+  it("stores the same parts, byte for byte, as one part at a time", async () => {
+    const serial = await rig({ parts: PARTS, policy: serialPolicy() });
+    await serial.drive(serial.publish());
+    const wide = await rig({ parts: PARTS, policy: productionPolicy() });
+    await wide.drive(wide.publish());
+    expect(serial.stats.objects.size).toBe(PARTS);
+    expect([...wide.stats.objects.keys()].sort()).toEqual(
+      [...serial.stats.objects.keys()].sort(),
+    );
+    for (const [key, bytes] of serial.stats.objects) {
+      expect(
+        Buffer.from(wide.stats.objects.get(key)!).equals(Buffer.from(bytes)),
+      ).toBe(true);
+    }
+    // And the two runs differ in how they got there: one wide, one narrow.
+    expect(serial.stats.peakOnWire).toBe(1);
+    expect(wide.stats.peakOnWire).toBeGreaterThan(8);
+  });
+
+  it("stops at the first final failure: no PUT starts after it, nothing stays reserved", async () => {
+    let failedAt: number | undefined;
+    const r = await rig({
+      parts: PARTS,
+      policy: productionPolicy(),
+      failPut: ({ n, now }) => {
+        if (n !== 20) return undefined;
+        failedAt = now;
+        return Object.assign(new Error("storage request failed (400)"), {
+          status: 400,
+        });
+      },
+    });
+    await expect(r.drive(r.publish())).rejects.toThrow(/400/);
+    expect(failedAt).toBeDefined();
+    const startedAtFailure = r.stats.started;
+    const encryptedAtFailure = r.stats.encrypted;
+    // Later time does nothing: nothing of the stream runs on after the throw.
+    await r.clock.advance(10 * PUT_MS);
+    await realSleep(50);
+    expect(r.stats.started).toBe(startedAtFailure);
+    expect(r.stats.encrypted).toBe(encryptedAtFailure);
+    expect(r.stats.stored).toBeLessThan(PARTS);
+    expect(r.stats.onWire).toBe(0);
+    expect(await r.budgetIsFree()).toBe(true);
   });
 });

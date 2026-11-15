@@ -93,10 +93,17 @@ describe("uploadBlobs memory reservation", () => {
         reserve: async (bytes: number, objectBytes?: number) => {
           log.push(`reserve ${bytes} ${objectBytes}`);
           const release = await reserve();
-          return () => {
-            log.push("release");
-            release();
-          };
+          return Object.assign(
+            () => {
+              log.push("release");
+              release();
+            },
+            {
+              shrink: (keep: number) => {
+                log.push(`shrink ${keep}`);
+              },
+            },
+          );
         },
         window: () => ({ end: () => ({}) }),
       },
@@ -114,7 +121,7 @@ describe("uploadBlobs memory reservation", () => {
     return { log, deps: deps as unknown as LocalSyncDeps };
   }
 
-  it("holds plain and encrypted size before it reads or encrypts, and releases after the upload", async () => {
+  it("holds plain and encrypted size before it reads or encrypts, keeps the ciphertext's size once encrypted, and releases after the upload", async () => {
     const { log, deps } = governed(async () => () => {});
     await uploadBlobs(deps, [ATTACHMENT]);
     expect(log).toEqual([
@@ -122,6 +129,7 @@ describe("uploadBlobs memory reservation", () => {
       `reserve ${2 * BYTES.length} ${BYTES.length}`,
       "read bytes",
       "encrypt",
+      `shrink ${BYTES.length}`,
       "put",
       "release",
     ]);

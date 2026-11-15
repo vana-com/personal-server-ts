@@ -1,4 +1,5 @@
 import type { StreamSyncBlobs } from "../stream-sync/ports.js";
+import type { Reservation } from "../stream-sync/send-gate.js";
 
 /**
  * Hold `bytes` of the store's memory budget (see
@@ -17,6 +18,6 @@ export async function holdMemory(
   blobs: Pick<StreamSyncBlobs, "governor">,
   bytes: number,
   objectBytes?: number,
-): Promise<() => void> {
+): Promise<Reservation> {
   return blobs.governor.reserve(bytes, objectBytes);
 }

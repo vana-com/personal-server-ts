@@ -179,6 +179,9 @@ if (role === "writer") {
     }
     cache = createStatementCache(db);
     if (!isFile) db.pragma("locking_mode = EXCLUSIVE");
+    // A file database checkpoints its WAL after a write has replied (see
+    // `checkpointAfterReply`), not inside the write's COMMIT.
+    else db.pragma("wal_autocheckpoint = 0");
   } catch (error) {
     openError = error;
     try {
@@ -313,6 +316,47 @@ const run = {
   },
 };
 
+/**
+ * SQLite's own checkpoint mark: a WAL of this many frames is moved into the
+ * database file. SQLite does it inside the COMMIT that crosses the mark, so the
+ * commit's caller waits for the pages to be written and synced. A publish's
+ * commit deletes its whole change log in one batch (about 12,400 pages for a
+ * 198,001-row stream), and that COMMIT took 5 to 6 s, 23 ms without the
+ * checkpoint. The writer replies first and then does the same PASSIVE
+ * checkpoint at the same mark, so a write's caller no longer waits for it.
+ * Calls to the writer run in order, so the next call waits for the checkpoint
+ * instead: the work is the same and the log stays as short as before.
+ *
+ * Why not leave SQLite's checkpoint on and switch it off around the publish
+ * commit: that needs the driver to tell the worker which commit is the slow
+ * one, a new message in a contract every caller shares. Here the hook sits at
+ * the one place every write completes, so a write path cannot miss it.
+ *
+ * Durability: `open.ts` sets `synchronous = NORMAL`, under which a WAL commit is
+ * written but not synced; the sync happens at a checkpoint. At base the commit
+ * that crossed the mark was synced before it was acknowledged, and every other
+ * commit was not. Now that one is acknowledged first, like the rest. A process
+ * crash loses nothing (the write is in the OS cache); a power loss in that
+ * window can lose the last acknowledged transactions, whole, never half.
+ * A PASSIVE checkpoint stops at frames a reader still needs, so the log is not
+ * bounded while a run's read transaction is open; that was true before too.
+ */
+const CHECKPOINT_FRAMES = 1000;
+
+function checkpointAfterReply() {
+  // A transaction left open by `query("BEGIN")` commits in a later call, and
+  // that call checkpoints.
+  if (db.inTransaction) return;
+  try {
+    // NOOP only reports: it writes nothing and takes no lock.
+    const [{ log, checkpointed }] = db.pragma("wal_checkpoint(NOOP)");
+    if (log - checkpointed >= CHECKPOINT_FRAMES)
+      db.pragma("wal_checkpoint(PASSIVE)");
+  } catch {
+    // The next call or the close checkpoints it: a failure here changes no data.
+  }
+}
+
 // The worker allocates almost no JavaScript, so V8 would collect the memory
 // behind received messages (blobs, strings) late and RSS would grow with the
 // volume of data written. Collect on a message count instead.
@@ -325,6 +369,16 @@ parentPort.on("message", (message) => {
   try {
     if (openError) throw openError;
     parentPort.postMessage({ id, ok: true, result: run[op](message) });
+    // Every call that can write on the writer's own connection ends here, so
+    // no write path is left without a checkpoint now that SQLite's is off:
+    // `batch`, and `query` (a statement, or a write with RETURNING). A
+    // snapshot's query runs on its own read-only connection.
+    if (
+      role === "writer" &&
+      isFile &&
+      (op === "batch" || (op === "query" && message.snap === undefined))
+    )
+      checkpointAfterReply();
   } catch (error) {
     parentPort.postMessage({
       id,
