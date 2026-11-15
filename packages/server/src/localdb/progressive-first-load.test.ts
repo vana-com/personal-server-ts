@@ -9,7 +9,10 @@ import {
   partBlobName,
   pkHash,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { applyConnection } from "../../../core/src/localdb/apply.js";
+import {
+  applyConnection,
+  applyStream,
+} from "../../../core/src/localdb/apply.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
@@ -756,6 +759,86 @@ describe("a first load that failed", () => {
     expect(view.partial?.failed).toBeUndefined();
     two.release();
     await applying;
+  });
+});
+
+describe("a load that stops partway", () => {
+  const count = async (f: Awaited<ReturnType<typeof harness>>, table: string) =>
+    (await f.db.query<{ n: number }>(`SELECT count(*) AS n FROM ${table}`))[0]!
+      .n;
+
+  it("leaves no head_parts for the keep and noop shortcuts to trust, and the retry reads the stream whole", async () => {
+    const f = await harness({ progressive: true });
+    // A complete head, with the parts its rows were built from.
+    await f.remote.head("items", values(["a", "b", "c"]));
+    await applyConnection(f.deps, f.id);
+    expect(await count(f, "head_parts")).toBe(3);
+
+    const next = await f.remote.head("items", values(["a", "b", "d"]), {
+      version: 2,
+    });
+    const order = next.parts.map((p) => p.hash);
+    const last = `${next.scope}/${partBlobName(1, order[order.length - 1]!)}`;
+    const blob = f.remote.blobs.get(last)!;
+    f.remote.blobs.delete(last);
+    await expect(applyConnection(f.deps, f.id)).rejects.toThrow();
+    // Rows of the new head's earlier parts are merged: no claim about which
+    // parts built the rows of a range.
+    expect(await count(f, "head_parts")).toBe(0);
+
+    f.remote.blobs.set(last, blob);
+    expect(await applyStream(f.deps, f.id, "items")).toMatchObject({
+      outcome: "applied",
+      partsKept: 0,
+    });
+    expect(await count(f, "head_parts")).toBe(3);
+    expect((await f.read()).ids).toEqual(["a", "b", "d"]);
+  });
+
+  it("keeps its hidden rows while it can resume, and clears them when the stream completes or another apply takes over", async () => {
+    const f = await harness({ progressive: true });
+    await f.remote.head("items", values(["a", "b", "c"]), {
+      complete: false,
+      o: 50,
+    });
+    await applyConnection(f.deps, f.id);
+    const next = await f.remote.head("items", values(["b", "d", "e"]), {
+      version: 2,
+    });
+    const last = `${next.scope}/${partBlobName(1, next.parts[2]!.hash)}`;
+    const blob = f.remote.blobs.get(last)!;
+    f.remote.blobs.delete(last);
+    await expect(applyConnection(f.deps, f.id)).rejects.toThrow();
+    expect(await count(f, "partial_hidden")).toBeGreaterThan(0);
+    expect(await count(f, "stream_partial")).toBe(1);
+
+    // An apply that does not serve partial loads takes the load over.
+    f.remote.blobs.set(last, blob);
+    await applyConnection({ ...f.deps, progressiveFirstLoad: false }, f.id);
+    expect(await count(f, "stream_partial")).toBe(0);
+    expect(await count(f, "partial_hidden")).toBe(0);
+    expect(await f.rows()).toEqual(["b", "d", "e"]);
+  });
+
+  it("clears them at completion of a resumed load", async () => {
+    const f = await harness({ progressive: true });
+    await f.remote.head("items", values(["a", "b", "c"]), {
+      complete: false,
+      o: 50,
+    });
+    await applyConnection(f.deps, f.id);
+    const next = await f.remote.head("items", values(["b", "d", "e"]), {
+      version: 2,
+    });
+    const last = `${next.scope}/${partBlobName(1, next.parts[2]!.hash)}`;
+    const blob = f.remote.blobs.get(last)!;
+    f.remote.blobs.delete(last);
+    await expect(applyConnection(f.deps, f.id)).rejects.toThrow();
+    f.remote.blobs.set(last, blob);
+    await applyConnection(f.deps, f.id);
+    expect(await count(f, "stream_partial")).toBe(0);
+    expect(await count(f, "partial_hidden")).toBe(0);
+    expect((await f.read()).ids).toEqual(["b", "d", "e"]);
   });
 });
 

@@ -25,6 +25,11 @@
  *    not re-entered. Its cap is the memory budget divided by the part size.
  *    Latency is not a signal yet: that needs a measured baseline from the real
  *    store.
+ *    The ramp probes a rate nobody has told us. A service that publishes its
+ *    quota has told us: the window opens at once to the width that rate needs
+ *    (`windowForRate`) and the ramp ends there, so a first publish does not
+ *    spend its first seconds finding a number the service already gave. A
+ *    store that publishes no quota keeps the ramp from 1.
  *
  * A request waits in one FIFO queue, served by one loop, and leaves when all
  * three hold: the window has a free slot, the shared resume time has passed
@@ -58,6 +63,15 @@ export interface SendGatePolicy {
    * can take; the window earns its way up to it.
    */
   readonly maxWindow: number;
+  /**
+   * How many requests must be in flight to use a published `put` quota of
+   * `perSecond` requests a second. When set, the first quota the gate learns
+   * opens the window to this width (never above `maxWindow`, never below the
+   * window it already has) and ends slow start there. Unset: the window only
+   * ramps. The width is rate times the time one request takes (Little's law);
+   * the gate knows the rate, so the caller supplies the time.
+   */
+  readonly windowForRate?: (perSecond: number) => number;
   /**
    * The longest a wait the server asked for (Retry-After) may hold every
    * caller. A longer ask is cut to this, so one answer cannot stall the store
@@ -283,6 +297,24 @@ export function createSendGate(
     }
   }
 
+  // The first published `put` quota, while the gate is still in its first
+  // ramp (no throttle answer yet, so `ssthresh` is unset): the window opens to
+  // the width that rate needs, and the ramp ends there. Later quotas, and any
+  // quota after a throttle, only change the pacing. Tokens pace the requests
+  // either way, so a wider window never sends faster than the quota.
+  function openWindowToQuota(next: QuotaPolicies | undefined): void {
+    if (!policy.windowForRate || !next || ssthresh !== Infinity) return;
+    const put = quotaFor(next, "put");
+    if (!put) return;
+    const width = Math.ceil(
+      policy.windowForRate((put.quota.limit * 1000) / put.quota.windowMs),
+    );
+    if (!Number.isFinite(width) || width < 1) return;
+    window = Math.max(window, Math.min(policy.maxWindow, width));
+    ssthresh = window;
+    streak = 0;
+  }
+
   function halve(): void {
     epoch += 1;
     streak = 0;
@@ -375,6 +407,7 @@ export function createSendGate(
       });
     },
     setQuota(next) {
+      openWindowToQuota(next);
       // Tokens earned at the old rate are kept; a kind the new quotas do not
       // pace loses its bucket, and one they pace for the first time gets a
       // new bucket with its one token free.
@@ -400,14 +433,27 @@ export function createSendGate(
   };
 }
 
+/**
+ * Bytes held from a budget. Call it to give them back. It is safe to call
+ * twice.
+ */
+export interface Reservation {
+  (): void;
+  /**
+   * Keep only `bytes` of what is held and give the rest back now, so a waiter
+   * that fits may start. It never grows a reservation (a larger size changes
+   * nothing), and it does nothing after the release.
+   */
+  shrink(bytes: number): void;
+}
+
 export interface ByteBudget {
   /**
-   * Resolves with a release function once `bytes` fit under the budget. A
-   * request larger than the whole budget waits until nothing else is held,
-   * then runs alone: it never waits for ever. Waiters are served in order.
-   * The release is safe to call twice.
+   * Resolves with a reservation once `bytes` fit under the budget. A request
+   * larger than the whole budget waits until nothing else is held, then runs
+   * alone: it never waits for ever. Waiters are served in order.
    */
-  reserve(bytes: number): Promise<() => void>;
+  reserve(bytes: number): Promise<Reservation>;
   readonly inUse: () => number;
 }
 
@@ -432,23 +478,34 @@ export function createByteBudget(
   return {
     inUse: () => inUse,
     reserve(bytes) {
-      const size = Math.max(0, bytes);
-      const hold = () => {
+      const requested = Math.max(0, bytes);
+      const hold = (): Reservation => {
+        let held = requested;
         let released = false;
-        return () => {
+        const release = () => {
           if (released) return;
           released = true;
-          inUse -= size;
+          inUse -= held;
           drain();
         };
+        return Object.assign(release, {
+          shrink(keep: number) {
+            if (released) return;
+            const next = Math.max(0, Math.min(held, keep));
+            if (next === held) return;
+            inUse -= held - next;
+            held = next;
+            drain();
+          },
+        });
       };
-      if (waiting.length === 0 && fits(size)) {
-        inUse += size;
+      if (waiting.length === 0 && fits(requested)) {
+        inUse += requested;
         onChange?.(inUse);
         return Promise.resolve(hold());
       }
       return new Promise((resolve) => {
-        waiting.push({ bytes: size, grant: () => resolve(hold()) });
+        waiting.push({ bytes: requested, grant: () => resolve(hold()) });
       });
     },
   };

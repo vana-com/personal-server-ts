@@ -629,8 +629,22 @@ async function applyOneOnce(
   let began = false;
   // Parts applied, kept parts included. A row of a kept part is of this head.
   let applied = 0;
+  // `head_parts` says which parts the local rows of each range were built
+  // from. Merged rows make that untrue until the final commit rewrites it, so
+  // the first commit that merges rows drops it, in the same batch, whether or
+  // not the load is progressive. A failed apply then leaves no claim for the
+  // keep and noop shortcuts to trust; the next one reads the stream whole.
+  let cached = true;
   const commit = async (rows: SqlStatement[]) => {
-    const begin: SqlStatement[] = [];
+    const begin: SqlStatement[] = cached
+      ? [
+          {
+            sql: "DELETE FROM head_parts WHERE connection_id=? AND stream=?",
+            params: [id, stream],
+          },
+        ]
+      : [];
+    cached = false;
     if (!began) {
       began = true;
       if (!progressive) {
