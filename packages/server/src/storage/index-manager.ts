@@ -71,6 +71,8 @@ export interface IndexManager {
   findUnsyncedPage(options: { afterId: number; limit: number }): IndexEntry[];
   /** Highest `id` among the unsynced rows; 0 when there are none. */
   maxUnsyncedId(): number;
+  /** Number of unsynced rows, counted from the `data_point_id` index. */
+  countUnsynced(): number;
   /**
    * Update the fileId for an index entry (after successful upload + on-chain registration).
    * @returns true if row was updated, false if path not found
@@ -375,6 +377,10 @@ export function createIndexManager(
     "SELECT MAX(id) AS maxId FROM data_files WHERE data_point_id IS NULL",
   );
 
+  const countUnsyncedStmt = db.prepare(
+    "SELECT COUNT(*) AS n FROM data_files WHERE data_point_id IS NULL",
+  );
+
   const updateFileIdStmt = db.prepare<{ file_id: string; path: string }>(
     "UPDATE data_files SET file_id = @file_id WHERE path = @path",
   );
@@ -670,6 +676,10 @@ export function createIndexManager(
     maxUnsyncedId() {
       const row = maxUnsyncedIdStmt.get() as { maxId: number | null };
       return row.maxId ?? 0;
+    },
+
+    countUnsynced() {
+      return (countUnsyncedStmt.get() as { n: number }).n;
     },
 
     findUnsynced(options) {

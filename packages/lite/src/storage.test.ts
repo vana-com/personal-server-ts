@@ -308,9 +308,11 @@ describe("createOpenPersistentPsLiteStorage", () => {
     });
 
     expect(storage.findUnsynced()).toHaveLength(1);
+    expect(storage.countUnsynced?.()).toBe(1); // the count a status read uses
     expect(
       await storage.updateDataPointId(write.relativePath, "0xdp-synced-1"),
     ).toBe(true);
+    expect(storage.countUnsynced?.()).toBe(0);
 
     const reloaded = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },

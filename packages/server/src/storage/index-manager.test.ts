@@ -17,6 +17,32 @@ describe("IndexManager", () => {
     db.close();
   });
 
+  it("countUnsynced counts the rows findUnsynced lists, from the data_point_id index", () => {
+    const add = (n: number) =>
+      manager.insert(HOLD_FOR_TESTS, {
+        fileId: null,
+        path: `test/scope/${n}.json`,
+        scope: "test.scope",
+        collectedAt: `2026-01-21T10:00:0${n}Z`,
+        sizeBytes: 1,
+      });
+    expect(manager.countUnsynced()).toBe(0);
+    const rows = [add(1), add(2), add(3)];
+    expect(manager.countUnsynced()).toBe(3);
+    expect(manager.countUnsynced()).toBe(manager.findUnsynced().length);
+    manager.updateDataPointId(rows[0]!.path, "0xdp-1", null);
+    expect(manager.countUnsynced()).toBe(2);
+    expect(manager.countUnsynced()).toBe(manager.findUnsynced().length);
+    const plan = db
+      .prepare(
+        "EXPLAIN QUERY PLAN SELECT COUNT(*) AS n FROM data_files WHERE data_point_id IS NULL",
+      )
+      .all() as { detail: string }[];
+    expect(plan.map((row) => row.detail).join(" ")).toContain(
+      "COVERING INDEX idx_data_files_data_point_id",
+    );
+  });
+
   it("insert returns IndexEntry with auto-generated id and createdAt", () => {
     const entry = manager.insert(HOLD_FOR_TESTS, {
       fileId: null,

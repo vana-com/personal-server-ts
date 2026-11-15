@@ -67,6 +67,8 @@ export interface IndexManager {
   findUnsyncedPage(options: { afterId: number; limit: number }): IndexEntry[];
   /** Highest `id` among the unsynced rows; 0 when there are none. */
   maxUnsyncedId(): number;
+  /** Number of unsynced rows, counted without reading them. */
+  countUnsynced(): number;
   /**
    * Update the fileId for an index entry (after successful upload + on-chain registration).
    * @returns true if row was updated, false if path not found

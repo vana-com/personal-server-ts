@@ -302,6 +302,9 @@ export function createNodeDataStorage(
     maxUnsyncedId() {
       return deps.indexManager.maxUnsyncedId();
     },
+    countUnsynced() {
+      return deps.indexManager.countUnsynced();
+    },
     readEnvelope(scope: string, collectedAt: string) {
       return readDataFile(deps.hierarchyOptions, scope, collectedAt);
     },
