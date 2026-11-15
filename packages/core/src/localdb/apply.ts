@@ -595,6 +595,29 @@ async function applyOneOnce(
     downloaded++;
     return deps.keys.decrypt(scope, bytes);
   };
+  // `head_parts` says which parts the local rows of each range were built
+  // from. Merged rows make that untrue until the final commit rewrites it, so
+  // the first commit that merges rows drops it, in the same batch. A failed
+  // apply then leaves no claim for the keep and noop shortcuts to trust; the
+  // next one reads the stream whole. (`unwrite` does the same: no parts, with
+  // a head version, means apply the stream again.)
+  let cached = true;
+  const merge = (rows: SqlStatement[]): SqlStatement[] => {
+    const drop: SqlStatement[] = cached
+      ? [
+          {
+            sql: "DELETE FROM head_parts WHERE connection_id=? AND stream=?",
+            params: [id, stream],
+          },
+        ]
+      : [];
+    cached = false;
+    return withOrigin("remote", [
+      ...drop,
+      ...rows,
+      ...mergeIncoming(op, id, { promoteSeen: true }),
+    ]);
+  };
   try {
     for (const [prefix, parts] of grouped) {
       const previous = saved.filter((p) => p.prefix === prefix);
@@ -635,12 +658,7 @@ async function applyOneOnce(
               ...(await stage(op, stream, head, line.v, line.o, line.r, null)),
             );
           await markPartial(deps, id, reuse);
-          await deps.db.batch(
-            withOrigin("remote", [
-              ...rows,
-              ...mergeIncoming(op, id, { promoteSeen: true }),
-            ]),
-          );
+          await deps.db.batch(merge(rows));
         }
       } else {
         // framesOfParts verifies hashes, counts, key order, prefix membership and
@@ -692,12 +710,7 @@ async function applyOneOnce(
           }
           if (records === end!.count || frame.parts.length > 1) {
             await markPartial(deps, id, reuse);
-            await deps.db.batch(
-              withOrigin("remote", [
-                ...rows,
-                ...mergeIncoming(op, id, { promoteSeen: true }),
-              ]),
-            );
+            await deps.db.batch(merge(rows));
             rows = [];
             records = 0;
             end =
