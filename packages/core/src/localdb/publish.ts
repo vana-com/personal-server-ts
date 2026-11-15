@@ -128,6 +128,7 @@ import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import {
   FrozenRowsChanged,
+  type FrozenView,
   dropSpool,
   freezePrefixRows,
   newFrozenFeed,
@@ -138,7 +139,11 @@ import {
   type FrozenFeed,
   type HeadExtras,
 } from "./encode.js";
-import { planChangedPrefixes, replacedPrefixGroups } from "./part-layout.js";
+import {
+  planChangedPrefixes,
+  planChangedPrefixesIn,
+  replacedPrefixGroups,
+} from "./part-layout.js";
 import {
   StorageDeferredError,
   type SendWindowStats,
@@ -467,6 +472,15 @@ type TransferPlan = {
   readonly changedPrefixes: readonly string[];
   /** The spool rows the feed announces; the transfer reads them, nothing else does. */
   readonly attempt: string;
+  /**
+   * Set when the rows are read from a frozen view of `records` and not copied
+   * to the spool. The transfer owns the view: it releases it as soon as the
+   * last row is read, and on every way out.
+   */
+  readonly snapshot?: {
+    readonly frozen: FrozenView;
+    release(): Promise<void>;
+  };
   readonly blobs: readonly BlobDescriptor[];
   readonly headGeneration: number;
   /** The head but for its parts, which the transfer produces. */
@@ -1202,21 +1216,81 @@ async function snapshotStream(
   // Step 4 input: the changed prefixes, planned by the spec's bucket planner
   // so parts are sized by the byte target (see part-layout.ts).
   const rewriteAll = framesStale;
-  const changedPrefixes = await planChangedPrefixes(deps, {
-    connectionId,
-    stream,
-    changedKeys: changes.map((change) => change.pk_hash),
-    replaced,
-    baseParts: registryHead?.parts ?? [],
-    targetBytes: partTargetOf(deps),
-    rewriteAll,
-  });
-  // Read the caller's head extras and the clock now: the transfer reads
-  // neither again.
-  await context.options?.headExtras?.(stream);
+  // A host with a frozen read view needs no copy: the rows are read from
+  // `records` in a view opened now, in this slot turn, so it holds exactly the
+  // state this turn has read. The transfer releases it.
+  let snapshot: TransferPlan["snapshot"];
+  let changedPrefixes: string[];
+  try {
+    if (deps.db.snapshot) {
+      const view = await deps.db.snapshot();
+      snapshot = {
+        frozen: {
+          view,
+          connectionId,
+          stream,
+          replaceBelow: plan.replaceBelow,
+        },
+        // Once only: the transfer and the plan's `finally` both release it.
+        release: (() => {
+          let released: Promise<void> | undefined;
+          return () => (released ??= view.release());
+        })(),
+      };
+      // Records change only inside a slot turn, and this one has the slot, so
+      // the view holds what step 1 read. Check it: a view that disagrees with
+      // the snapshot's W must not be published.
+      const [seen] = await view.query<{ w: number | null }>(
+        `SELECT MAX(seq) AS w FROM record_changes WHERE connection_id = ? AND stream = ?`,
+        [connectionId, stream],
+      );
+      if ((seen?.w ?? local.publish_watermark) !== watermark) {
+        await snapshot.release();
+        return { kind: "retry" };
+      }
+      // Prototype switch: the grouped read or the keyed lookups, in the view.
+      changedPrefixes =
+        process.env.PUBLISH_PLAN_GROUPED === "1"
+          ? await planChangedPrefixesIn(view, {
+              connectionId,
+              stream,
+              from: local.publish_watermark,
+              to: watermark,
+              replaced,
+              baseParts: registryHead?.parts ?? [],
+              targetBytes: partTargetOf(deps),
+              rewriteAll,
+            })
+          : await planChangedPrefixes(view, {
+              connectionId,
+              stream,
+              changedKeys: changes.map((change) => change.pk_hash),
+              replaced,
+              baseParts: registryHead?.parts ?? [],
+              targetBytes: partTargetOf(deps),
+              rewriteAll,
+            });
+    } else {
+      changedPrefixes = await planChangedPrefixes(deps.db, {
+        connectionId,
+        stream,
+        changedKeys: changes.map((change) => change.pk_hash),
+        replaced,
+        baseParts: registryHead?.parts ?? [],
+        targetBytes: partTargetOf(deps),
+        rewriteAll,
+      });
+    }
+    // Read the caller's head extras and the clock now: the transfer reads
+    // neither again.
+    await context.options?.headExtras?.(stream);
+  } catch (error) {
+    await snapshot?.release().catch(() => undefined);
+    throw error;
+  }
   const attempt = newSpoolAttempt();
   // Recorded before the freeze, so a freeze that fails part-way is still dropped.
-  if (changedPrefixes.length > 0)
+  if (changedPrefixes.length > 0 && !snapshot)
     run.spool = { attempt, prefixes: changedPrefixes };
   const observedAt =
     plan.newestRunObservedAt ?? registryHead?.observedAt ?? deps.now();
@@ -1254,44 +1328,61 @@ async function snapshotStream(
     ),
     stream,
   };
-  // The transfer starts here. Everything it needs but the rows is known; the
-  // rows reach it prefix by prefix as they are copied, still inside this slot
-  // turn (see `freezePrefixRows` for why that is one consistent state).
+  // The transfer starts here. Everything it needs but the rows is known.
   const feed = newFrozenFeed();
-  launch(
-    {
-      registryVersion,
-      registryDataHash,
-      baseParts: registryHead?.parts ?? [],
-      changedPrefixes,
-      attempt,
-      blobs,
-      headGeneration,
-      head,
-    },
-    feed,
-  );
+  const plannedTransfer: TransferPlan = {
+    registryVersion,
+    registryDataHash,
+    baseParts: registryHead?.parts ?? [],
+    changedPrefixes,
+    attempt,
+    snapshot,
+    blobs,
+    headGeneration,
+    head,
+  };
   const runIds = plan.steps.map((step) => step.runId);
-  let basis: string;
-  try {
-    await freezePrefixRows(deps, {
-      connectionId,
-      stream,
-      attempt,
-      changedPrefixes,
-      replaceBelow: plan.replaceBelow,
-      onFrozen: (frozen) => feed.push(frozen),
-      stopped: () => feed.abandoned(),
-    });
-    basis = await readBasis(deps, context, {
+  const readThisBasis = () =>
+    readBasis(deps, context, {
       watermark,
       localWatermark: local.publish_watermark,
       runIds,
     });
+  let basis: string;
+  if (snapshot) {
+    // Nothing to copy, so nothing to overlap: the turn ends after the basis,
+    // and the transfer reads the frozen view from then on. A view that is
+    // not handed over is released here.
+    try {
+      basis = await readThisBasis();
+    } catch (error) {
+      await snapshot.release().catch(() => undefined);
+      throw error;
+    }
+    launch(plannedTransfer, feed);
+    for (const prefix of changedPrefixes) feed.push({ prefix, rows: null });
     feed.end();
-  } catch (error) {
-    feed.fail(error);
-    throw error;
+  } else {
+    // The rows reach the transfer prefix by prefix as they are copied, still
+    // inside this slot turn (see `freezePrefixRows` for why that is one
+    // consistent state).
+    launch(plannedTransfer, feed);
+    try {
+      await freezePrefixRows(deps, {
+        connectionId,
+        stream,
+        attempt,
+        changedPrefixes,
+        replaceBelow: plan.replaceBelow,
+        onFrozen: (frozen) => feed.push(frozen),
+        stopped: () => feed.abandoned(),
+      });
+      basis = await readThisBasis();
+      feed.end();
+    } catch (error) {
+      feed.fail(error);
+      throw error;
+    }
   }
   return {
     kind: "candidate",
@@ -1362,6 +1453,8 @@ async function transferPlan(
   } finally {
     // A snapshot still copying has no reader left: it stops.
     feed.abandon();
+    // The frozen view ends here on every way out (it ends earlier on success).
+    await plan.snapshot?.release().catch(() => undefined);
   }
 }
 
@@ -1389,6 +1482,7 @@ async function transferOnWave(
   }
   const encoded = await startFrozenParts(deps, {
     attempt: plan.attempt,
+    view: plan.snapshot?.frozen,
     scope,
     generation: plan.headGeneration,
     frozen: feed,
@@ -1398,6 +1492,9 @@ async function transferOnWave(
     // A purge by another stream ends this transfer before its next upload.
     beforeUpload: () => stopIfPurged(latch),
   });
+  // Every row is read: the view's read transaction ends now, not when the
+  // uploads end, so it holds the log back no longer than the reads need it.
+  await plan.snapshot?.release();
   const parts = mergedParts(plan.baseParts, encoded, plan.changedPrefixes);
   const recordCount = parts.reduce((sum, part) => sum + part.count, 0);
   const blobs = meteredBlobs(deps, meter);

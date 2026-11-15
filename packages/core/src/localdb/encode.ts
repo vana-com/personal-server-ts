@@ -1,5 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2";
 import { SEEN_PAIR } from "./merge.js";
+import { BODY_BYTES } from "./part-layout.js";
 import {
   encodeFramePart,
   encodePiece,
@@ -8,7 +9,7 @@ import {
   type FrameBytes,
   type JsonValue,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { readerOf, type SqlValue } from "./driver.js";
+import { readerOf, type SqlReader, type SqlValue } from "./driver.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { meteredBlobs, type PublishMeter } from "./publish-meter.js";
 import { newUploadWave, type UploadWave } from "./upload-wave.js";
@@ -51,7 +52,19 @@ export type FrozenRow = {
  */
 export interface FrozenPrefix {
   readonly prefix: string;
-  readonly rows: number;
+  /** Rows copied into the spool; `null` for a frozen view, which cannot lose any. */
+  readonly rows: number | null;
+}
+
+/**
+ * Rows read straight from `records` through a `SqlSnapshot`, so the version's
+ * content is the state the snapshot was opened on and no row is copied.
+ */
+export interface FrozenView {
+  readonly view: SqlReader;
+  readonly connectionId: string;
+  readonly stream: string;
+  readonly replaceBelow?: { readonly o: number; readonly r: string };
 }
 
 /**
@@ -295,30 +308,52 @@ export async function freezePrefixRows(
 type SpoolRow = Omit<FrozenRow, "body"> & { readonly body: string };
 
 /**
- * Read one prefix of an attempt's spool in key order. A page is found by
- * metadata first (key and body size, no body), cut at `PAGE_ROWS` rows or
- * `PAGE_BYTES` of bodies (at least one row), and only then are its bodies
- * read. The spool does not change while the attempt runs, so a range read
- * returns exactly the rows the metadata named; fewer means the spool was
- * emptied under the transfer.
+ * Read one prefix of the frozen rows in key order, from the attempt's spool or
+ * from a frozen view of `records`. A page is found by metadata first (key and
+ * body size, no body), cut at `PAGE_ROWS` rows or `PAGE_BYTES` of bodies (at
+ * least one row), and only then are its bodies read. Neither source changes
+ * while the attempt runs, so a range read returns exactly the rows the
+ * metadata named; fewer means the spool was emptied under the transfer.
  */
-async function* readSpool(
+async function* readFrozen(
   deps: LocalSyncDeps,
-  attempt: string,
+  source: { readonly attempt: string; readonly view?: FrozenView },
   prefix: string,
 ): AsyncGenerator<readonly SpoolRow[]> {
   const range = keyRange(prefix);
   // A prefix is read after its batch committed, and nothing writes it again,
   // so the read connection sees all of it. It does not queue behind the
   // freeze of the next prefixes.
-  const reader = readerOf(deps.db);
+  const reader: SqlReader = source.view?.view ?? readerOf(deps.db);
+  const frozen = source.view;
+  // The two sources differ only in the table, its scope and the size column.
+  let from: string;
+  let scope: string;
+  let size: string;
+  let scopeParams: SqlValue[];
+  if (frozen) {
+    from = "records";
+    scope = "connection_id = ? AND stream = ?";
+    size = BODY_BYTES;
+    scopeParams = [frozen.connectionId, frozen.stream];
+    if (frozen.replaceBelow) {
+      // Rows below the replacing run are left out, as the copy leaves them.
+      scope += ` AND ${SEEN_PAIR} >= (?, ?)`;
+      scopeParams.push(frozen.replaceBelow.o, frozen.replaceBelow.r);
+    }
+  } else {
+    from = "publish_spool";
+    scope = "attempt = ?";
+    size = "body_bytes";
+    scopeParams = [source.attempt];
+  }
   let after: string | null = null;
   for (;;) {
     const meta: { pk_hash: string; body_bytes: number }[] = await reader.query(
-      `SELECT pk_hash, body_bytes FROM publish_spool
-          WHERE attempt = ?${range.sql}${after === null ? "" : " AND pk_hash > ?"}
+      `SELECT pk_hash, ${size} AS body_bytes FROM ${from}
+          WHERE ${scope}${range.sql}${after === null ? "" : " AND pk_hash > ?"}
           ORDER BY pk_hash LIMIT ${PAGE_ROWS}`,
-      [attempt, ...range.params, ...(after === null ? [] : [after])],
+      [...scopeParams, ...range.params, ...(after === null ? [] : [after])],
     );
     if (meta.length === 0) return;
     let take = 0;
@@ -334,10 +369,10 @@ async function* readSpool(
     const last = meta[take - 1]!.pk_hash;
     const page: SpoolRow[] = await reader.query(
       `SELECT pk_hash, stamp_o, stamp_r, first_o, body_sha256, body
-         FROM publish_spool
-        WHERE attempt = ? AND pk_hash >= ? AND pk_hash <= ?
+         FROM ${from}
+        WHERE ${scope} AND pk_hash >= ? AND pk_hash <= ?
         ORDER BY pk_hash`,
-      [attempt, first, last],
+      [...scopeParams, first, last],
     );
     if (page.length !== take) throw new FrozenRowsChanged(prefix);
     yield page;
@@ -410,6 +445,8 @@ export async function startFrozenParts(
   deps: LocalSyncDeps,
   input: {
     readonly attempt: string;
+    /** Read `records` through this view instead of the attempt's spool. */
+    readonly view?: FrozenView;
     readonly scope: string;
     readonly generation: number;
     /**
@@ -516,7 +553,7 @@ async function encodeFrozenParts(
       }
     };
     let seen = 0;
-    const pages = readSpool(deps, input.attempt, prefix);
+    const pages = readFrozen(deps, input, prefix);
     for (;;) {
       await memory.hold();
       const next = await pages.next();
@@ -562,7 +599,8 @@ async function encodeFrozenParts(
         }
       }
     }
-    if (seen !== frozen.rows) throw new FrozenRowsChanged(prefix);
+    if (frozen.rows !== null && seen !== frozen.rows)
+      throw new FrozenRowsChanged(prefix);
     await flush();
   }
   return result;

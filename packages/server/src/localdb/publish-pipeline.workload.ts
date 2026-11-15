@@ -12,7 +12,7 @@
 // one ended, and with `--profile` the time spent in each SQL statement shape
 // and the connection's slot turns (wait and run).
 import { createCipheriv, randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { createStorageStreamSyncBlobs } from "../../../core/src/stream-sync/blobs.js";
 import { createMemoryStreamSyncRegistry } from "../../../core/src/stream-sync/memory-registry.js";
 import { DEFAULT_STORAGE_ACCESS_POLICY } from "../../../core/src/stream-sync/storage-retry.js";
@@ -108,6 +108,12 @@ export interface PipelineBenchOptions {
   readonly profile?: boolean;
   /** Queue a write to `records` as soon as the first PUT starts. */
   readonly writeDuringPublish?: boolean;
+  /**
+   * `spool` hides the driver's frozen read view, so the publish copies rows
+   * into the spool as before; `snapshot` (the default) reads `records` in a
+   * view.
+   */
+  readonly variant?: "spool" | "snapshot";
 }
 
 export interface PipelineBenchResult {
@@ -119,6 +125,10 @@ export interface PipelineBenchResult {
   readonly lastPutEndAtMs: number | null;
   readonly puts: number;
   readonly peakOnWire: number;
+  /** Largest size of the `-wal` file seen, sampled every 25 ms. */
+  readonly walPeakBytes: number;
+  /** Open to release of each frozen view, in milliseconds. */
+  readonly snapshotHoldMs: readonly number[];
   readonly sql?: readonly {
     readonly shape: string;
     readonly n: number;
@@ -158,10 +168,31 @@ export async function benchPublish(
     entry.lastEndAtMs = at();
     sql.set(shape, entry);
   };
+  const holds: number[] = [];
+  const viewOf = async () => {
+    const view = await driver.snapshot!();
+    const opened = at();
+    return {
+      query: async (text, params) => {
+        const started = at();
+        try {
+          return await view.query(text, params);
+        } finally {
+          if (options.profile) note(`view: ${shapeOf(text)}`, started);
+        }
+      },
+      release: async () => {
+        await view.release();
+        holds.push(Math.round(at() - opened));
+      },
+    };
+  };
+  const frozen = options.variant === "spool" ? undefined : viewOf;
   const profiled: SqlDriver = options.profile
     ? {
         info: driver.info,
         reads: driver.reads,
+        ...(frozen ? { snapshot: frozen } : {}),
         close: () => driver.close(),
         query: async (text, params) => {
           const started = at();
@@ -180,7 +211,14 @@ export async function benchPublish(
           }
         },
       }
-    : driver;
+    : {
+        info: driver.info,
+        reads: driver.reads,
+        ...(frozen ? { snapshot: frozen } : {}),
+        close: () => driver.close(),
+        query: (text, params) => driver.query(text, params),
+        batch: (statements) => driver.batch(statements),
+      };
   const db = await openLocalDb(profiled, identity);
   const slots: {
     kind: string;
@@ -275,10 +313,19 @@ export async function benchPublish(
       return () => `pipeline-${++n}`;
     })(),
   };
+  let walPeak = 0;
+  const sample = () => {
+    try {
+      walPeak = Math.max(walPeak, statSync(`${options.path}-wal`).size);
+    } catch {}
+  };
+  const sampler = setInterval(sample, 25);
   try {
     t0 = performance.now();
     const results = await publishConnection(deps, PIPELINE_CONNECTION);
     const wallMs = at();
+    clearInterval(sampler);
+    sample();
     return {
       outcome: results.map((r) => r.outcome).join(","),
       timings,
@@ -287,6 +334,8 @@ export async function benchPublish(
       lastPutEndAtMs: stats.lastPutEndAtMs,
       puts: stats.puts,
       peakOnWire: stats.peakOnWire,
+      walPeakBytes: walPeak,
+      snapshotHoldMs: holds,
       ...(options.profile
         ? {
             sql: [...sql.entries()]
@@ -298,6 +347,7 @@ export async function benchPublish(
         : {}),
     };
   } finally {
+    clearInterval(sampler);
     await db.close();
   }
 }
@@ -338,6 +388,7 @@ async function main(): Promise<void> {
     putMs: Number(arg("put-ms", "1200")),
     width: Number(arg("width", "16")),
     profile: process.argv.includes("--profile"),
+    variant: arg("variant", "snapshot") === "spool" ? "spool" : "snapshot",
   });
   console.log(JSON.stringify(result, null, 2));
 }

@@ -3,6 +3,7 @@ import Database from "better-sqlite3";
 import type {
   SqlDriver,
   SqlReader,
+  SqlSnapshot,
   SqlStatement,
   SqlValue,
 } from "@opendatalabs/personal-server-ts-core/localdb";
@@ -52,11 +53,16 @@ interface Connection {
   query<R extends Record<string, SqlValue>>(
     sql: string,
     params?: readonly SqlValue[],
+    snap?: number,
   ): Promise<R[]>;
   batch(
     statements: readonly SqlStatement[],
   ): Promise<{ changes: readonly number[] }>;
   close(): Promise<void>;
+  /** Reader only: open a connection frozen at the committed state now; its id. */
+  begin(): Promise<number>;
+  /** Reader only: end snapshot `snap`'s read transaction and close it. */
+  release(snap: number): Promise<void>;
   /** The writer's real path and file identity (`dev:ino`). Writer only. */
   identify(): Promise<{ path: string; identity: string }>;
   /** Fails every pending call with `error` and ends the worker. */
@@ -148,10 +154,17 @@ function connect(
     async query<R extends Record<string, SqlValue>>(
       sql: string,
       params?: readonly SqlValue[],
+      snap?: number,
     ) {
       return asBuffers(
-        await call<R[]>({ op: "query", ...wire({ sql, params }) }),
+        await call<R[]>({ op: "query", ...wire({ sql, params }), snap }),
       );
+    },
+    begin() {
+      return call<number>({ op: "begin" });
+    },
+    async release(snap) {
+      await call({ op: "release", snap });
     },
     batch(statements) {
       return call<{ changes: readonly number[] }>({
@@ -251,11 +264,38 @@ export function openBetterSqlite3(
       }
     : undefined;
 
+  const snapshot = persistent
+    ? async (): Promise<SqlSnapshot> => {
+        if (closed) throw new Error("sqlite_driver_closed");
+        if (writerFailure) throw writerFailure;
+        readerReady ??= startReader();
+        const reader = await readerReady;
+        const snap = await reader.begin();
+        let released = false;
+        return {
+          async query<R extends Record<string, SqlValue>>(
+            sql: string,
+            params?: readonly SqlValue[],
+          ) {
+            if (released) throw new Error("sqlite_snapshot_released");
+            return reader.query<R>(sql, params, snap);
+          },
+          async release() {
+            if (released) return;
+            released = true;
+            // The driver may have closed first: its close ended the snapshot.
+            await reader.release(snap).catch(() => undefined);
+          },
+        };
+      }
+    : undefined;
+
   return {
     info: { sqliteVersion: v, host: "node", persistent },
     query: writer.query,
     batch: writer.batch,
     ...(reads ? { reads } : {}),
+    ...(snapshot ? { snapshot } : {}),
     async close() {
       closed = true;
       try {

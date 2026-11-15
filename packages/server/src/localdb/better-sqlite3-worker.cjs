@@ -213,15 +213,61 @@ const textOf = ({ sid, sql }) => {
   return sql;
 };
 
+/**
+ * Snapshots (reader only): each is its own connection holding one read
+ * transaction, pinned when `begin` returns. The WAL gives it the state
+ * committed at that moment, whatever the writer commits after.
+ */
+const snapshots = new Map();
+let snapshotSeq = 0;
+
 const run = {
   /** The writer's resolved path and file identity, for the reader to serve. */
   identity() {
     return { path, identity };
   },
+  begin() {
+    if (role !== "reader") throw new Error("sqlite_writer_cannot_snapshot");
+    checkReader();
+    const { opened } = openChecked(
+      () => new Database(path, { readonly: true, fileMustExist: true }),
+      identity,
+    );
+    try {
+      opened.pragma("query_only = ON");
+      opened.exec("BEGIN");
+      // The read transaction starts at its first read: take it now.
+      opened.prepare("SELECT 1 FROM sqlite_master LIMIT 1").get();
+    } catch (error) {
+      opened.close();
+      throw error;
+    }
+    const snap = ++snapshotSeq;
+    snapshots.set(snap, { db: opened, cache: createStatementCache(opened) });
+    return snap;
+  },
+  release({ snap }) {
+    const held = snapshots.get(snap);
+    if (!held) return null;
+    snapshots.delete(snap);
+    try {
+      held.cache.clear();
+      held.db.close();
+    } catch {}
+    return null;
+  },
   query(statement) {
-    if (role === "reader") checkReader();
-    const { params } = statement;
-    const stmt = cache.prepare(textOf(statement));
+    const { params, snap } = statement;
+    let cached;
+    if (snap !== undefined) {
+      const held = snapshots.get(snap);
+      if (!held) throw new Error("sqlite_snapshot_released");
+      cached = held.cache;
+    } else {
+      if (role === "reader") checkReader();
+      cached = cache;
+    }
+    const stmt = cached.prepare(textOf(statement));
     if (stmt.reader) return stmt.all(...bind(params));
     stmt.run(...bind(params));
     return [];
@@ -247,6 +293,12 @@ const run = {
     }
   },
   close() {
+    for (const { db: held } of snapshots.values()) {
+      try {
+        held.close();
+      } catch {}
+    }
+    snapshots.clear();
     try {
       cache?.clear();
       db?.close();
