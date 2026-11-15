@@ -919,6 +919,7 @@ async function bootstrapServer(
           now: Date.now,
           newOp: randomUUID,
           recordsCommitted: () => syncManager?.notifyNewData(),
+          progressiveFirstLoad: config.streamSync.progressiveFirstLoad,
           ...(options?.streamSyncPartTargetBytes === undefined
             ? {}
             : { partTargetBytes: options.streamSyncPartTargetBytes }),

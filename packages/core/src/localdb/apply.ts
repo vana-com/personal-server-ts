@@ -27,7 +27,13 @@ import {
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { ConnectionQueue, LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
-import { applyDelete, mergeIncoming, withOrigin } from "./merge.js";
+import { announceApplied } from "./apply-progress.js";
+import {
+  applyDelete,
+  deleteOmitted,
+  mergeIncoming,
+  withOrigin,
+} from "./merge.js";
 import {
   endsEarlierLifetime,
   hydrateLifetimeBoundary,
@@ -50,6 +56,7 @@ type Connection = {
 };
 type State = {
   primary_key: string;
+  complete: number;
   last_delete_version: number;
   head_version: number;
   head_generation: number | null;
@@ -397,7 +404,7 @@ async function applyOneOnce(
   if (!read.found || classification === "absent")
     return early(result(stream, "gone"));
   const [state] = await deps.db.query<State>(
-    `SELECT s.primary_key,s.last_delete_version,s.head_version,s.head_generation,s.head_data_hash,v.head_format FROM stream_state s LEFT JOIN stream_versions v ON v.connection_id=s.connection_id AND v.stream=s.stream AND v.version=s.head_version AND v.generation=s.head_generation WHERE s.connection_id=? AND s.stream=?`,
+    `SELECT s.primary_key,s.complete,s.last_delete_version,s.head_version,s.head_generation,s.head_data_hash,v.head_format FROM stream_state s LEFT JOIN stream_versions v ON v.connection_id=s.connection_id AND v.stream=s.stream AND v.version=s.head_version AND v.generation=s.head_generation WHERE s.connection_id=? AND s.stream=?`,
     [id, stream],
   );
   if (classification === "tombstoned") {
@@ -420,6 +427,10 @@ async function applyOneOnce(
         },
         {
           sql: "DELETE FROM head_parts WHERE connection_id=? AND stream=?",
+          params: [id, stream],
+        },
+        {
+          sql: "DELETE FROM stream_partial WHERE connection_id=? AND stream=?",
           params: [id, stream],
         },
         {
@@ -507,7 +518,97 @@ async function applyOneOnce(
     downloaded++;
     return deps.keys.decrypt(scope, bytes);
   };
+  // A stream with no complete head loads progressively, when asked: each
+  // part's commit also moves the stream's partial row, so a reader sees the
+  // applied parts of this one head (see `stream_partial`).
+  const hasCompleteHead =
+    state !== undefined &&
+    state.complete === 1 &&
+    state.head_version > state.last_delete_version &&
+    state.head_generation === head.generation;
+  const progressive =
+    deps.progressiveFirstLoad === true && head.complete && !hasCompleteHead;
+  const [marker] = progressive
+    ? await deps.db.query<{
+        version: number;
+        generation: number;
+        data_hash: string;
+      }>(
+        "SELECT version,generation,data_hash FROM stream_partial WHERE connection_id=? AND stream=?",
+        [id, stream],
+      )
+    : [];
+  const sameHead =
+    marker !== undefined &&
+    marker.version === read.version &&
+    marker.generation === head.generation &&
+    marker.data_hash === read.dataHash;
+  let began = false;
+  // Parts applied, kept parts included. A row of a kept part is of this head.
+  let applied = 0;
+  const commit = async (rows: SqlStatement[]) => {
+    const begin: SqlStatement[] = [];
+    if (!began) {
+      began = true;
+      if (!progressive) {
+        // Whatever load a marker names ends: this commit writes rows of
+        // another head, or of one no reader may show.
+        begin.push({
+          sql: "DELETE FROM stream_partial WHERE connection_id=? AND stream=?",
+          params: [id, stream],
+        });
+      } else {
+        // The stream's row, which a first load has none of yet; the omitted
+        // delete below reads its publish watermark. Then, for a head the
+        // load did not begin, the rows of every other head go in this same
+        // transaction as the first part, so no reader sees both.
+        begin.push({
+          sql: `INSERT OR IGNORE INTO stream_state (connection_id,stream,primary_key,semantics,incremental) VALUES (?,?,?,'mutable_state',1)`,
+          params: [id, stream, JSON.stringify(head.primaryKey)],
+        });
+        if (!sameHead) begin.push(deleteOmitted(op, id, stream));
+      }
+    }
+    await deps.db.batch(
+      withOrigin("remote", [
+        ...rows,
+        ...begin,
+        ...mergeIncoming(op, id, { promoteSeen: true }),
+        ...(progressive
+          ? [
+              {
+                // Never fewer parts than a load of this head already showed.
+                sql: `INSERT OR REPLACE INTO stream_partial (connection_id,stream,version,generation,data_hash,head_blob,observed_at,parts_applied,parts_total,records_total)
+ VALUES (?,?,?,?,?,?,?,MAX(?,COALESCE((SELECT parts_applied FROM stream_partial WHERE connection_id=? AND stream=? AND version=? AND generation=? AND data_hash=?),0)),?,?)`,
+                params: [
+                  id,
+                  stream,
+                  read.version,
+                  head.generation,
+                  read.dataHash,
+                  blob,
+                  head.observedAt,
+                  applied,
+                  id,
+                  stream,
+                  read.version,
+                  head.generation,
+                  read.dataHash,
+                  head.parts.length,
+                  head.recordCount,
+                ],
+              },
+            ]
+          : []),
+      ]),
+    );
+    if (progressive) announceApplied(deps, id);
+  };
   try {
+    // A prefix whose parts all match the saved ones is kept as it is. Decide
+    // every prefix first: a first load's drop of other heads' rows spares
+    // exactly these ranges.
+    const keptPrefixes = new Set<string>();
     for (const [prefix, parts] of grouped) {
       const previous = saved.filter((p) => p.prefix === prefix);
       if (
@@ -531,8 +632,13 @@ async function applyOneOnce(
           },
         ]);
         kept += parts.length;
-        continue;
+        keptPrefixes.add(prefix);
       }
+    }
+    applied = kept;
+    for (const [prefix, parts] of grouped) {
+      if (keptPrefixes.has(prefix)) continue;
+      const groupStart = applied;
       if (head.format === 1) {
         for (const part of parts) {
           const lines = await decodePart(
@@ -546,12 +652,8 @@ async function applyOneOnce(
             rows.push(
               ...(await stage(op, stream, head, line.v, line.o, line.r, null)),
             );
-          await deps.db.batch(
-            withOrigin("remote", [
-              ...rows,
-              ...mergeIncoming(op, id, { promoteSeen: true }),
-            ]),
-          );
+          applied++;
+          await commit(rows);
         }
       } else {
         // framesOfParts verifies hashes, counts, key order, prefix membership and
@@ -602,16 +704,12 @@ async function applyOneOnce(
             end = frame.parts[0];
           }
           if (records === end!.count || frame.parts.length > 1) {
-            await deps.db.batch(
-              withOrigin("remote", [
-                ...rows,
-                ...mergeIncoming(op, id, { promoteSeen: true }),
-              ]),
-            );
+            const last = frame.parts[frame.parts.length - 1]!;
+            applied = groupStart + parts.indexOf(last) + 1;
+            await commit(rows);
             rows = [];
             records = 0;
-            end =
-              parts[parts.indexOf(frame.parts[frame.parts.length - 1]!) + 1];
+            end = parts[parts.indexOf(last) + 1];
           }
         }
         if (rows.length > 0) throw new Error("apply: incomplete part");
@@ -659,6 +757,11 @@ async function applyOneOnce(
       },
       {
         sql: "DELETE FROM head_parts WHERE connection_id=? AND stream=?",
+        params: [id, stream],
+      },
+      {
+        // The load is complete: the stream serves as a complete head now.
+        sql: "DELETE FROM stream_partial WHERE connection_id=? AND stream=?",
         params: [id, stream],
       },
       {

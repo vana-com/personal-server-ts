@@ -323,6 +323,40 @@ export function createLocalListing(
       const states = await reads.db.query<StreamState>(
         "SELECT s.*, (SELECT COUNT(*) FROM records r WHERE r.connection_id = s.connection_id AND r.stream = s.stream) AS records FROM stream_state s ORDER BY s.connection_id, s.stream",
       );
+      // A first load in progress, for the owner's diagnostics. Only when the
+      // host serves them: with the flag off a stream with no complete head
+      // reports as it always did.
+      const partials = new Map<
+        string,
+        NonNullable<
+          StreamSyncReadStatus["connections"][number]["streams"][string]["partial"]
+        >
+      >();
+      if (deps.progressiveFirstLoad === true) {
+        for (const p of await reads.db.query<{
+          connection_id: string;
+          stream: string;
+          version: number;
+          generation: number;
+          parts_applied: number;
+          parts_total: number;
+          records_total: number;
+        }>(
+          "SELECT connection_id, stream, version, generation, parts_applied, parts_total, records_total FROM stream_partial",
+        )) {
+          const owner = rows.find((c) => c.connection_id === p.connection_id);
+          if (
+            owner?.control_state === "active" &&
+            owner.generation === p.generation
+          )
+            partials.set(JSON.stringify([p.connection_id, p.stream]), {
+              version: p.version,
+              partsApplied: p.parts_applied,
+              partsTotal: p.parts_total,
+              recordsTotal: p.records_total,
+            });
+        }
+      }
       const result: StreamSyncReadStatus["connections"][number][] = [];
       for (const row of rows) {
         const streams: Record<
@@ -345,6 +379,15 @@ export function createLocalListing(
             complete: live && state.complete === 1,
             version: live ? state.head_version : null,
             records: live ? state.records : null,
+            ...(partials.has(
+              JSON.stringify([row.connection_id, state.stream]),
+            ) && !(live && state.complete === 1)
+              ? {
+                  partial: partials.get(
+                    JSON.stringify([row.connection_id, state.stream]),
+                  )!,
+                }
+              : {}),
           };
         }
         result.push({

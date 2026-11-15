@@ -622,6 +622,7 @@ export async function createPsLiteSyncManager(
           now: Date.now,
           newOp: () => globalThis.crypto.randomUUID(),
           recordsCommitted: () => syncManager?.notifyNewData(),
+          progressiveFirstLoad: options.config.streamSync.progressiveFirstLoad,
           partTargetBytes: LITE_PART_TARGET_BYTES,
         };
         localSync = createLocalSync(localSyncDeps, {

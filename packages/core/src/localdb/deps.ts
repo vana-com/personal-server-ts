@@ -46,6 +46,13 @@ export interface LocalSyncDeps {
    * costs latency, and a throw here never fails the commit.
    */
   readonly recordsCommitted?: () => void;
+  /**
+   * Default off. On: a stream with no complete head is readable by its owner
+   * from its first applied part, in an explicit partial state, and fills in
+   * as parts apply (`stream_partial`). Off: a stream is readable only when
+   * its head is complete, as before.
+   */
+  readonly progressiveFirstLoad?: boolean;
 }
 
 /** The one call every commit of local rows makes (run end, import). */

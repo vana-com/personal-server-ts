@@ -229,9 +229,6 @@ export function applyDelete(
   droppedAt: number = Number.MAX_SAFE_INTEGER,
 ): SqlStatement[] {
   const keys: SqlValue[] = [connectionId, stream];
-  const omitted = `connection_id = ? AND stream = ?
-   AND pk_hash NOT IN (SELECT pk_hash FROM temp.apply_keys WHERE op = ?)
-   AND NOT EXISTS (SELECT 1 FROM temp.keep_ranges k WHERE k.op = ? AND records.pk_hash >= k.lo AND records.pk_hash < k.hi)`;
   return [
     {
       sql: "UPDATE write_ctx SET origin = 'local' WHERE id = 1 AND origin = 'remote'",
@@ -239,7 +236,7 @@ export function applyDelete(
     },
     {
       sql: `UPDATE records SET stamp_o = seen_o, stamp_r = seen_r
- WHERE ${omitted}
+ WHERE ${OMITTED}
    AND seen_o > ?`,
       params: [...keys, op, op, droppedAt],
     },
@@ -247,18 +244,43 @@ export function applyDelete(
       sql: "UPDATE write_ctx SET origin = 'remote' WHERE id = 1 AND origin = 'local'",
       params: [],
     },
-    {
-      sql: `DELETE FROM records
- WHERE ${omitted}
+    deleteOmitted(op, connectionId, stream),
+    { sql: "DELETE FROM temp.apply_keys WHERE op = ?", params: [op] },
+    { sql: "DELETE FROM temp.keep_ranges WHERE op = ?", params: [op] },
+  ];
+}
+
+/**
+ * The rows of a stream that the head being applied does not hold: not staged
+ * under `op` (`temp.apply_keys`) and outside the unchanged parts
+ * (`temp.keep_ranges`).
+ */
+const OMITTED = `connection_id = ? AND stream = ?
+   AND pk_hash NOT IN (SELECT pk_hash FROM temp.apply_keys WHERE op = ?)
+   AND NOT EXISTS (SELECT 1 FROM temp.keep_ranges k WHERE k.op = ? AND records.pk_hash >= k.lo AND records.pk_hash < k.hi)`;
+
+/**
+ * Deletes the omitted rows (see `OMITTED`), sparing a row a local write
+ * changed after the publish watermark. It is `applyDelete`'s delete, and a
+ * first load runs it before its first part lands, to drop the rows an earlier
+ * head left, so a reader of the load never sees rows of two heads. It leaves
+ * the operation's TEMP rows alone.
+ */
+export function deleteOmitted(
+  op: string,
+  connectionId: string,
+  stream: string,
+): SqlStatement {
+  const keys: SqlValue[] = [connectionId, stream];
+  return {
+    sql: `DELETE FROM records
+ WHERE ${OMITTED}
    AND NOT EXISTS (SELECT 1 FROM record_changes ch
                     WHERE ch.connection_id = records.connection_id AND ch.stream = records.stream
                       AND ch.pk_hash = records.pk_hash AND ch.origin IN ('local','import','refresh')
                       AND ch.seq > (SELECT publish_watermark FROM stream_state WHERE connection_id = ? AND stream = ?))`,
-      params: [...keys, op, op, ...keys],
-    },
-    { sql: "DELETE FROM temp.apply_keys WHERE op = ?", params: [op] },
-    { sql: "DELETE FROM temp.keep_ranges WHERE op = ?", params: [op] },
-  ];
+    params: [...keys, op, op, ...keys],
+  };
 }
 
 /**

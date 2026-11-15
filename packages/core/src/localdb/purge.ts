@@ -5,7 +5,7 @@ import { withOrigin } from "./merge.js";
 /**
  * F.5 step 1: the local purge of one connection, in the connection queue
  * (kind "purge"), in ONE batch with origin `purge`: delete the connection's
- * `records`, `run_rows`, `head_parts`, `blob_refs`, `publish_spool` rows and
+ * `records`, `run_rows`, `head_parts`, `blob_refs`, `publish_spool`, `stream_partial` rows and
  * unreferenced `blobs`;
  * set `control_state='deleted'`; set `last_delete_version`; clear
  * `connections.checkpoint`. DELETES USER DATA. Spec: F.5, C.0 step 1.
@@ -63,6 +63,11 @@ export async function purgeConnection(
         // and stops; the commit would refuse it in any case.
         {
           sql: "DELETE FROM publish_spool WHERE connection_id = ?",
+          params: [connectionId],
+        },
+        // A first load in progress ends with the connection's rows.
+        {
+          sql: "DELETE FROM stream_partial WHERE connection_id = ?",
           params: [connectionId],
         },
       ]),

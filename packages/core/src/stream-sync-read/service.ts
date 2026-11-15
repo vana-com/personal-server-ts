@@ -45,6 +45,22 @@ export interface ImportIssue {
   readonly detail?: string;
 }
 
+/**
+ * How far a first load has come when a read serves its rows before the head
+ * is complete. A `view` carries it only then; a view without it is complete.
+ * The body holds at least the rows of the applied parts, all of one head,
+ * never rows of another head or generation. Owner reads only: a grantee is
+ * never served a stream that is still loading.
+ */
+export interface PartialView {
+  /** Parts of the head applied when the read began. */
+  readonly partsApplied: number;
+  /** Parts the head has. */
+  readonly partsTotal: number;
+  /** Records the complete head holds, from the head itself. */
+  readonly recordsTotal: number;
+}
+
 export interface ResolveInput {
   readonly scope: string;
   /** `connection=<ns>`; `null` when absent. */
@@ -159,6 +175,11 @@ export type ReadDecision =
       } | null;
       /** Owner only; absent when none. */
       readonly withheld?: readonly WithheldRun[];
+      /**
+       * Present only while a first load is still applying parts: the body is
+       * the rows applied so far. Absent: the view is complete.
+       */
+      readonly partial?: PartialView;
       readonly body: ReadableStream<Uint8Array>;
     };
 
@@ -172,6 +193,8 @@ export interface StreamSyncConnectionStatus {
       StreamHeadView & {
         readonly version: number | null;
         readonly records: number | null;
+        /** Set while a first load serves its applied parts; owner diagnostics. */
+        readonly partial?: PartialView & { readonly version: number };
       }
     >
   >;
