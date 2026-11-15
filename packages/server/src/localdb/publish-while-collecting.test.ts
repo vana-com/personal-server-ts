@@ -40,13 +40,21 @@ async function world(
   const registry = createMemoryStreamSyncRegistry();
   const blobs = createMemoryStreamSyncBlobs();
   let now = 1000;
-  const make = async (deviceId: string) => {
-    const db = await openLocalDb(openBetterSqlite3(":memory:"), {
-      owner,
-      network: "test",
-      deviceId,
-    });
-    drivers.push(db);
+  // `again` builds the device over a database an earlier sync held: a restart
+  // keeps what the database holds and nothing in memory.
+  const make = async (
+    deviceId: string,
+    again?: { db: SqlDriver; flag: boolean },
+  ) => {
+    const db =
+      again?.db ??
+      (await openLocalDb(openBetterSqlite3(":memory:"), {
+        owner,
+        network: "test",
+        deviceId,
+      }));
+    if (!again) drivers.push(db);
+    const flag = again ? again.flag : flagOn;
     let op = 0;
     const wake = vi.fn();
     const deps = {
@@ -66,7 +74,7 @@ async function world(
       now: () => now,
       newOp: () => `${deviceId}-${++op}`,
       recordsCommitted: wake,
-      ...(flagOn ? { publishWhileCollecting: true } : {}),
+      ...(flag ? { publishWhileCollecting: true } : {}),
     };
     const sync = createLocalSync(deps, {
       resolveArtifact: (digest) => {
@@ -210,10 +218,14 @@ async function world(
       },
     };
   };
+  let restarts = 0;
   return {
     a: await make("a"),
     b: await make("b"),
     registry,
+    // The process restarts: a new sync over the same database, no bindings.
+    restart: (device: { db: SqlDriver }, flag: boolean) =>
+      make(`restart-${++restarts}`, { db: device.db, flag }),
   };
 }
 
@@ -668,6 +680,96 @@ it("a late publish refusal of an accepted admitting run keeps rows a newer colle
   expect(await a.keys()).toContain("K");
   await a.end("B", 0);
   expect(await a.keys()).toContain("K");
+});
+
+it("a restart ends the runs the old process left collecting, and compaction moves past them", async () => {
+  const { a, restart } = await world(true, "checkpoint_window");
+  await a.run("seed", ["gone"], { observedAt: 1100 });
+  await a.begin("orphan", { observedAt: 1200 });
+  await a.batch("orphan", 0, ["early"]);
+  await a.begin("deleter", { observedAt: 3000 });
+  await a.batch("deleter", 0, [{ id: "gone", remove: true }]);
+  await a.end("deleter", 0);
+  // The open older run holds the tombstone.
+  expect(await a.tombstones()).toBe(1);
+
+  const again = await restart(a, true);
+  await again.begin("fresh", { observedAt: 4000 });
+  expect(
+    await again.query("SELECT run_id, state FROM runs WHERE run_id = 'orphan'"),
+  ).toEqual([{ run_id: "orphan", state: "ended" }]);
+  // Ended as a failed run: its staged rows are gone, nothing was decided for
+  // omissions or the cursor, and what it admitted stays.
+  expect(
+    await again.query(
+      "SELECT decision, reason FROM run_streams WHERE run_id = 'orphan'",
+    ),
+  ).toEqual([{ decision: "discarded", reason: "failed" }]);
+  expect(
+    await again.query("SELECT 1 FROM run_rows WHERE run_id = 'orphan'"),
+  ).toEqual([]);
+  expect(await again.keys()).toEqual(["early"]);
+  expect(await again.checkpoint()).toBeNull();
+  // Nothing older than the live run is open: the tombstone is gone.
+  expect(await again.tombstones()).toBe(0);
+  // The host that ends the orphan after the restart reads its outcome.
+  expect(await again.end("orphan", 0)).toMatchObject({ result: "aborted" });
+});
+
+it("after a restart a newer run's delete still beats the orphan's late rows", async () => {
+  const { a, restart } = await world(true, "checkpoint_window");
+  await a.run("seed", ["gone"], { observedAt: 1100 });
+  await a.publish();
+  await a.begin("orphan", { observedAt: 1200 });
+  await a.begin("deleter", { observedAt: 3000 });
+  await a.batch("deleter", 0, [{ id: "gone", remove: true }]);
+  await a.end("deleter", 0);
+  await a.publish();
+
+  const again = await restart(a, true);
+  await again.begin("fresh", { observedAt: 4000 });
+  // No batch of the orphan can arrive: its binding died with the process.
+  await expect(again.batch("orphan", 0, ["gone"])).rejects.toMatchObject({
+    code: "gone",
+  });
+  expect(await again.keys()).toEqual([]);
+});
+
+it("a restart with the flag off ends a run left collecting and drops its staged rows", async () => {
+  const { a, restart } = await world(false, "checkpoint_window");
+  await a.begin("orphan", { observedAt: 1200 });
+  await a.batch("orphan", 0, ["staged"]);
+  expect(
+    await a.query("SELECT 1 FROM run_rows WHERE run_id = 'orphan'"),
+  ).toHaveLength(1);
+  const again = await restart(a, false);
+  await again.begin("fresh", { observedAt: 4000 });
+  expect(
+    await again.query("SELECT state FROM runs WHERE run_id = 'orphan'"),
+  ).toEqual([{ state: "ended" }]);
+  expect(
+    await again.query("SELECT 1 FROM run_rows WHERE run_id = 'orphan'"),
+  ).toEqual([]);
+  expect(await again.keys()).toEqual([]);
+});
+
+it("a restart with no run left collecting changes nothing", async () => {
+  const { a, restart } = await world(false, "checkpoint_window");
+  await a.run("r1", ["x"], { observedAt: 1100 });
+  const read = async () => ({
+    runs: await a.query(
+      "SELECT * FROM runs WHERE run_id <> 'fresh' ORDER BY run_id",
+    ),
+    streams: await a.query(
+      "SELECT * FROM run_streams WHERE run_id <> 'fresh' ORDER BY run_id, stream",
+    ),
+    records: await a.query("SELECT * FROM records ORDER BY pk_hash"),
+    changes: await a.query("SELECT * FROM record_changes ORDER BY seq"),
+  });
+  const before = await read();
+  const again = await restart(a, false);
+  await again.begin("fresh", { observedAt: 4000 });
+  expect(await read()).toEqual(before);
 });
 
 // GAP, not fixed here: a head commit that changes the primary key does not move

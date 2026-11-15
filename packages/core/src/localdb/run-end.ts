@@ -38,6 +38,14 @@ type RunEndResponse = Pick<EndResponse, "result" | "updateRequired">;
 export interface RunEndStore {
   end(runId: string, req: EndRequest): Promise<RunEndResponse>;
   abort(runId: string, reason: "failed" | "cancelled"): Promise<void>;
+  /**
+   * Ends every run still `collecting` as failed, and returns how many it could
+   * not end. Run bindings live in memory, so when a sync starts, a `collecting`
+   * row is a run of a process that is gone, and nothing can end it. The host
+   * holds the database exclusively (`LiteDatabasePort`), so no live run of
+   * another sync shares it. Admitted rows stay, as for any failed run.
+   */
+  sweepOrphans(): Promise<number>;
 }
 
 type Run = {
@@ -406,6 +414,31 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
     end,
     async abort(runId, reason) {
       await end(runId, { outcome: reason, coveredStreams: [], lastBatch: -1 });
+    },
+    async sweepOrphans() {
+      const orphans = await db.query<{ run_id: string }>(
+        "SELECT run_id FROM runs WHERE state = 'collecting' ORDER BY o, run_id",
+      );
+      let failed = 0;
+      for (const { run_id } of orphans) {
+        try {
+          await end(run_id, {
+            outcome: "failed",
+            coveredStreams: [],
+            lastBatch: -1,
+          });
+        } catch (error) {
+          // Gone (deleted) or already ended: nothing left to end.
+          if (error instanceof RunIntakeError && error.code === "gone")
+            continue;
+          failed++;
+          deps.logger.warn(
+            { runId: run_id, error: String(error) },
+            "could not end an orphaned run",
+          );
+        }
+      }
+      return failed;
     },
   };
 }
