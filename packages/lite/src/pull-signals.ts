@@ -48,3 +48,40 @@ export function startPullSignals(
     sources.window?.removeEventListener("online", signal);
   };
 }
+
+export interface VisibilityPausable {
+  pause?: () => void;
+  resume?: () => void;
+}
+
+/**
+ * Hides stop the sync manager's requests and timers; shows start them again
+ * (`SyncManager.pause` and `resume`). A hidden tab has no one to show a change
+ * to, so it holds no push request and runs no timer, and `startPullSignals`
+ * pulls once when it is shown. Start this before `startPullSignals`: both
+ * listen to `visibilitychange`, and the manager must be running again before
+ * the pull asks it for a probe. A page that starts hidden pauses at once.
+ * Where there is no page (a worker, Node), nothing is paused. The returned
+ * function removes the listener.
+ */
+export function startVisibilityPause(
+  manager: VisibilityPausable,
+  sources: Pick<PullSignalSources, "document"> = {
+    document: (globalThis as { document?: PullSignalSources["document"] })
+      .document,
+  },
+): () => void {
+  const doc = sources.document;
+  if (!doc) return () => {};
+  const apply = () => {
+    try {
+      if (doc.visibilityState === "hidden") manager.pause?.();
+      else manager.resume?.();
+    } catch {
+      // A manager that refuses is not the page's problem.
+    }
+  };
+  doc.addEventListener("visibilitychange", apply);
+  if (doc.visibilityState === "hidden") apply();
+  return () => doc.removeEventListener("visibilitychange", apply);
+}

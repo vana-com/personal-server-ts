@@ -250,16 +250,38 @@ describe("stopping and parking", () => {
     expect(t.pokes).not.toHaveBeenCalled();
     expect(t.calls).toHaveLength(1);
   });
+});
 
-  it("holds no request while the host says nobody is looking, and resumes when they are", async () => {
-    let active = false;
-    const t = subscribed({ active: () => active });
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(t.calls).toHaveLength(0);
-    active = true;
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(t.calls).toHaveLength(1);
-    t.stop();
+describe("a request the registry never cancels", () => {
+  /** A registry that ignores the signal: only `answer` ends the request. */
+  function deaf() {
+    const answers: Array<(a: Answer) => void> = [];
+    const waitForChange: Wait = () =>
+      new Promise<Answer>((resolve) => answers.push(resolve));
+    return {
+      registry: { waitForChange } as unknown as StreamSyncRegistry,
+      answers,
+    };
+  }
+
+  it("unsubscribing clears the request deadline at once, and a late answer does nothing", async () => {
+    const d = deaf();
+    const push = createRegistryChangePush(d.registry)!;
+    const pokes = vi.fn();
+    const health: boolean[] = [];
+    const stop = push.subscribe({
+      onChange: pokes,
+      onHealth: (h) => health.push(h),
+    });
+    await flush();
+    expect(vi.getTimerCount()).toBe(1); // the request's deadline
+    stop();
+    expect(vi.getTimerCount()).toBe(0); // gone before any time passes
+    d.answers[0]!({ seq: "9", changed: true }); // the registry answers late
+    await vi.advanceTimersByTimeAsync(CHANGE_PUSH_WAIT_MS * 3);
+    expect(pokes).not.toHaveBeenCalled();
+    expect(health).toEqual([]);
+    expect(d.answers).toHaveLength(1); // and asks for nothing more
   });
 });
 
@@ -281,18 +303,6 @@ describe("listeners on the subscription's lifetime signal", () => {
   }
   const abortListeners = (c: AbortController) =>
     getEventListeners(c.signal, "abort").length;
-
-  it("a hidden tab that parks every 2 s keeps one listener, not one per park", async () => {
-    const created = captureLifetime();
-    const { stop } = subscribed({ active: () => false });
-    await flush();
-    const lifetime = created[0];
-    await vi.advanceTimersByTimeAsync(2_000 * 50); // 50 parked intervals
-    expect(abortListeners(lifetime)).toBeLessThanOrEqual(1);
-    stop();
-    expect(abortListeners(lifetime)).toBe(0);
-    vi.unstubAllGlobals();
-  });
 
   it("a gateway outage that backs off repeatedly keeps one listener, not one per back-off", async () => {
     const created = captureLifetime();

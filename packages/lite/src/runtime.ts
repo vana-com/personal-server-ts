@@ -139,7 +139,7 @@ import {
   type McpOAuthAuthorizationStore,
   type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
-import { startPullSignals } from "./pull-signals.js";
+import { startPullSignals, startVisibilityPause } from "./pull-signals.js";
 import type { PsLiteStorageCapabilities } from "./storage.js";
 import type { LiteReplicationRuntime } from "./replication-runtime.js";
 import {
@@ -217,7 +217,15 @@ export interface PsLiteRuntimeOptions {
   syncManager?:
     | (Pick<SyncManager, "trigger" | "getStatus"> &
         Partial<
-          Pick<SyncManager, "start" | "stop" | "deleteScope" | "requestPull">
+          Pick<
+            SyncManager,
+            | "start"
+            | "stop"
+            | "deleteScope"
+            | "requestPull"
+            | "pause"
+            | "resume"
+          >
         >)
     | null;
   /**
@@ -1231,11 +1239,19 @@ export function createPsLiteRuntime(
       options.syncManager?.start?.();
       stopPullSignals?.();
       const manager = options.syncManager;
-      stopPullSignals = manager?.requestPull
+      // Hides pause the manager; shows resume it, then the pull below probes.
+      const stopVisibility = manager
+        ? startVisibilityPause(manager)
+        : undefined;
+      const stopPulls = manager?.requestPull
         ? startPullSignals(() => {
             manager.requestPull?.().catch(() => undefined);
           })
         : undefined;
+      stopPullSignals = () => {
+        stopVisibility?.();
+        stopPulls?.();
+      };
       options.derivatives?.scheduler.start();
       options.replication?.resume();
     },
