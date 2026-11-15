@@ -830,7 +830,13 @@ describe("streams of one connection publish together", () => {
 function recordingGovernor(
   reserveFirst?: (bytes: number, objectBytes?: number) => Promise<void>,
 ) {
-  const state = { held: 0, peak: 0, reserves: [] as string[] };
+  const state = {
+    held: 0,
+    peak: 0,
+    reserves: [] as string[],
+    /** What each reservation was shrunk to, in order. */
+    shrinks: [] as number[],
+  };
   const governor: NonNullable<StreamSyncBlobs["governor"]> = {
     async reserve(bytes, objectBytes) {
       state.reserves.push(`${bytes}/${objectBytes ?? "-"}`);
@@ -845,6 +851,7 @@ function recordingGovernor(
         },
         {
           shrink(keep: number) {
+            state.shrinks.push(keep);
             const next = Math.max(0, Math.min(kept, keep));
             state.held -= kept - next;
             kept = next;
@@ -933,6 +940,18 @@ describe("the memory budget is taken before data is built", () => {
     expect(part?.held).toBe(part?.bytes);
     expect(part?.held).toBeGreaterThan(0);
     expect(head?.held).toBeGreaterThanOrEqual(4 * 1024 * 1024);
+    expect(state.held).toBe(0);
+  });
+
+  it("shrinks an attachment's reservation to its ciphertext once it is encrypted", async () => {
+    const { state, governor } = recordingGovernor();
+    const { deps } = await world({ streams: 1, attachments: true, governor });
+    const results = await publishConnection(deps, CONNECTION_ID);
+    expect(results.map((r) => r.outcome)).toEqual(["published"]);
+    // The plain bytes are dropped, as a part's are: what the upload keeps is
+    // the attachment's own size (the test cipher adds nothing).
+    const attachment = new TextEncoder().encode("attachment of s0").length;
+    expect(state.shrinks).toContain(attachment);
     expect(state.held).toBe(0);
   });
 

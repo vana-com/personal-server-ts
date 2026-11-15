@@ -368,18 +368,26 @@ export async function uploadBlobs(
       throw new MissingAttachmentError(blobId);
     }
     // The attachment is in memory as plain bytes and again as ciphertext, so
-    // twice its size is held from before the read until its upload settles.
+    // twice its size is held from before the read until it is encrypted. The
+    // plain bytes are then dropped and the reservation shrinks to the
+    // ciphertext, which is all the PUT still holds.
     const release = await holdMemory(store, 2 * stored.size, stored.size);
     try {
-      const [local] = await deps.db.query<{ bytes: Uint8Array | null }>(
-        "SELECT bytes FROM blobs WHERE blob_id = ?",
-        [blobId],
-      );
-      if (local?.bytes === null || local?.bytes === undefined) {
+      let plain: Uint8Array | null | undefined;
+      {
+        const [local] = await deps.db.query<{ bytes: Uint8Array | null }>(
+          "SELECT bytes FROM blobs WHERE blob_id = ?",
+          [blobId],
+        );
+        plain = local?.bytes;
+      }
+      if (plain === null || plain === undefined) {
         throw new MissingAttachmentError(blobId);
       }
-      checkBytes(blobId, local.bytes);
-      const cipher = await deps.keys.encrypt(scope, local.bytes);
+      checkBytes(blobId, plain);
+      const cipher = await deps.keys.encrypt(scope, plain);
+      plain = undefined;
+      release.shrink(cipher.length);
       beforeUpload?.();
       await store.put(key, cipher, beforeUpload);
     } finally {
