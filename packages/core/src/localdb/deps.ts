@@ -56,6 +56,13 @@ export interface LocalSyncDeps {
    * batches stay staged until run end, exactly as before.
    */
   readonly publishWhileCollecting?: boolean;
+  /**
+   * Publish and apply through the stream-sync log (one segment and one
+   * registry commit per batch, across streams) instead of per-stream heads.
+   * Default off. A connection that has published to the log is read through it
+   * by every device, so turn it on for all devices of an owner together.
+   */
+  readonly logProtocol?: boolean;
 }
 
 /** The one call every commit of local rows makes (run end, import). */

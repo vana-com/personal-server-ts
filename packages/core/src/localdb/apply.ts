@@ -11,6 +11,7 @@ import {
   framesOfParts,
   headBlobName,
   isPlainObject,
+  isLogStream,
   omissionCutoff,
   parseScope,
   partBlobName,
@@ -33,6 +34,7 @@ import {
   hydrateLifetimeBoundary,
   olderLifetimeFence,
 } from "./lifetime-boundary.js";
+import { applyLog } from "./log-apply.js";
 import { purgeConnection } from "./purge.js";
 import {
   RegistryUnavailableBeforeWriteError,
@@ -255,6 +257,11 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
             scope.connector === connection.connector &&
             scope.ns === connection.ns
           ) {
+            // The log row is read by `applyLog`, never as a stream head.
+            if (isLogStream(scope.stream)) {
+              reuse.log = row.read;
+              continue;
+            }
             flight.streams.add(scope.stream);
             reuse.listed.set(scope.stream, row.read);
           }
@@ -267,6 +274,29 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
         next,
         await applyOne(locked, id, connection, next, keyCheck, hashes, reuse),
       );
+    }
+    if (deps.logProtocol && flight.all) {
+      // Streams published before the log, then the log on top of them.
+      const [now] = await deps.db.query<{
+        generation: number;
+        control_state: string;
+      }>(
+        "SELECT generation, control_state FROM connections WHERE connection_id = ?",
+        [id],
+      );
+      if (
+        now?.control_state === "active" &&
+        now.generation === initial.generation
+      )
+        await applyLog(locked, id, {
+          connector: connection.connector,
+          ns: connection.ns,
+          generation: initial.generation,
+          keyCheck,
+          hashes,
+          // A listing taken before a stream downloaded may predate a segment.
+          read: reuse.stale ? undefined : reuse.log,
+        });
     }
     // The mark clears only on proof of repair: a whole-connection apply in
     // which every stream ended in an answer that settled it (see `proved`).
@@ -390,6 +420,8 @@ async function control(
 interface Reuse {
   control?: Awaited<ReturnType<typeof control>>;
   listed: Map<string, ControlRead>;
+  /** The log row from the listing, when the flight listed. */
+  log?: ControlRead;
   /** A stream has downloaded since the job's reads were taken. */
   stale: boolean;
   /**
@@ -522,6 +554,11 @@ async function applyOneOnce(
   }
   if (state && read.version <= state.last_delete_version)
     return settled(result(stream, "gone"));
+  // With the log on, a stream the log wrote reads from a local version above
+  // the registry's own stream row (see `applySegmentOperations`): that row is
+  // older than what this device holds and replaces nothing.
+  if (deps.logProtocol && state && state.head_version > read.version)
+    return settled(result(stream, "noop"));
   const saved = await deps.db.query<SavedPart>(
     "SELECT prefix,seq,part_hash,bytes,count FROM head_parts WHERE connection_id=? AND stream=? ORDER BY prefix,seq",
     [id, stream],
@@ -595,6 +632,29 @@ async function applyOneOnce(
     downloaded++;
     return deps.keys.decrypt(scope, bytes);
   };
+  // `head_parts` says which parts the local rows of each range were built
+  // from. Merged rows make that untrue until the final commit rewrites it, so
+  // the first commit that merges rows drops it, in the same batch. A failed
+  // apply then leaves no claim for the keep and noop shortcuts to trust; the
+  // next one reads the stream whole. (`unwrite` does the same: no parts, with
+  // a head version, means apply the stream again.)
+  let cached = true;
+  const merge = (rows: SqlStatement[]): SqlStatement[] => {
+    const drop: SqlStatement[] = cached
+      ? [
+          {
+            sql: "DELETE FROM head_parts WHERE connection_id=? AND stream=?",
+            params: [id, stream],
+          },
+        ]
+      : [];
+    cached = false;
+    return withOrigin("remote", [
+      ...drop,
+      ...rows,
+      ...mergeIncoming(op, id, { promoteSeen: true }),
+    ]);
+  };
   try {
     for (const [prefix, parts] of grouped) {
       const previous = saved.filter((p) => p.prefix === prefix);
@@ -635,12 +695,7 @@ async function applyOneOnce(
               ...(await stage(op, stream, head, line.v, line.o, line.r, null)),
             );
           await markPartial(deps, id, reuse);
-          await deps.db.batch(
-            withOrigin("remote", [
-              ...rows,
-              ...mergeIncoming(op, id, { promoteSeen: true }),
-            ]),
-          );
+          await deps.db.batch(merge(rows));
         }
       } else {
         // framesOfParts verifies hashes, counts, key order, prefix membership and
@@ -692,12 +747,7 @@ async function applyOneOnce(
           }
           if (records === end!.count || frame.parts.length > 1) {
             await markPartial(deps, id, reuse);
-            await deps.db.batch(
-              withOrigin("remote", [
-                ...rows,
-                ...mergeIncoming(op, id, { promoteSeen: true }),
-              ]),
-            );
+            await deps.db.batch(merge(rows));
             rows = [];
             records = 0;
             end =

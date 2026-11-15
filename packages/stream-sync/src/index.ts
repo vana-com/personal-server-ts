@@ -18,3 +18,4 @@ export * from "./outbox.js";
 export * from "./vectors.js";
 export * from "./frames.js";
 export * from "./part-frames.js";
+export * from "./log.js";

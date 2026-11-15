@@ -365,7 +365,7 @@ function logSendGate(
 const keccak: Keccak256 = async (data) => keccak_256(data);
 
 /** metadataHash for a head: keccak over the UTF-8 JSON of the envelope facts. */
-function metadataHashFor(
+export function metadataHashFor(
   scope: string,
   collectedAt: string,
   sizeBytes: number,
@@ -373,13 +373,13 @@ function metadataHashFor(
   return `0x${toHex(keccak_256(utf8(JSON.stringify({ scope, collectedAt, sizeBytes }))))}`;
 }
 
-type ConnectionRow = {
+export type ConnectionRow = {
   connector: string;
   ns: string;
   generation: number;
 };
 
-type LocalStream = {
+export type LocalStream = {
   primary_key: string;
   profile_key: string | null;
   profile_version: string | null;
@@ -1990,7 +1990,7 @@ async function confirmIdle(
 }
 
 /** The identical request twice at most: a lost reply is resent once. */
-async function postBatchOnce(
+export async function postBatchOnce(
   registry: StreamSyncRegistry,
   request: SignedRegistryBatch,
 ): Promise<RegistryBatchResult> {
@@ -2329,7 +2329,7 @@ async function commitBatchTurn(
 }
 
 /** Whether the connection's local lifetime is still generation `generation`. */
-async function lifetimeHolds(
+export async function lifetimeHolds(
   deps: LocalSyncDeps,
   connectionId: string,
   generation: number,
@@ -2424,7 +2424,7 @@ async function readBasis(
 }
 
 /** A local delete of the connector is under way: nothing is published. */
-async function hasDeleteIntent(
+export async function hasDeleteIntent(
   deps: LocalSyncDeps,
   connector: string,
 ): Promise<boolean> {
@@ -2543,7 +2543,7 @@ export async function discardForeignLifetimeRuns(
   return true;
 }
 
-async function discardFencedRuns(
+export async function discardFencedRuns(
   deps: LocalSyncDeps,
   id: string,
   stream: string,
@@ -2614,7 +2614,7 @@ async function readRegistryHead(
   return verified.head;
 }
 
-type StreamPlan = {
+export type StreamPlan = {
   readonly steps: readonly { runId: string; decision: StepDecision }[];
   readonly finalHead: PlanHead | null;
   readonly deferred: boolean;
@@ -2626,7 +2626,7 @@ type StreamPlan = {
   readonly newestRunObservedAt: number | null;
 };
 
-async function planStream(
+export async function planStream(
   deps: LocalSyncDeps,
   connectionId: string,
   connection: ConnectionRow,
@@ -2760,7 +2760,7 @@ async function planStream(
 }
 
 /** Purge seed rows for a stream whose head generation is not 1. */
-async function excludeSeedsIfAny(
+export async function excludeSeedsIfAny(
   deps: LocalSyncDeps,
   connectionId: string,
   stream: string,
@@ -2852,7 +2852,7 @@ type CommitInput = {
 };
 
 /** What a publication confirmed, and the runs it covered. */
-type RunEvidence = Pick<
+export type RunEvidence = Pick<
   CommitInput,
   | "version"
   | "generation"
@@ -2872,7 +2872,7 @@ const RUN_ID_CHUNK = 400;
  * The watermark is stored as evidence only; it is a local change sequence and
  * is never compared with a run's `o`.
  */
-async function runPublicationStatements(
+export async function runPublicationStatements(
   deps: LocalSyncDeps,
   connectionId: string,
   stream: string,

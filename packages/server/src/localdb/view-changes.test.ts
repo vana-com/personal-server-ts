@@ -904,23 +904,26 @@ describe("view changes", () => {
       "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'view\\_%' ESCAPE '\\'",
     );
     expect(added.length).toBeGreaterThan(0);
-    // The view counters are found by content, not position: the apply_partial
-    // column and publish while collecting add migrations after it, so the
-    // previous build had none of those either.
-    const viewMigration = MIGRATIONS.findIndex((m) =>
-      m.some((sql) => sql.includes("CREATE TABLE view_versions")),
+    // The view counters came with one migration; the build before it had none
+    // of that migration or of any after it (the log's tables are later).
+    const viewMigration = MIGRATIONS.findIndex((statements) =>
+      statements.some((sql) => sql.includes("CREATE TABLE view_versions")),
     );
-    expect(viewMigration).toBe(MIGRATIONS.length - 3);
+    expect(viewMigration).toBeGreaterThan(0);
     await raw.batch([
       ...added.map((t) => ({ sql: `DROP TRIGGER ${t.name}` })),
       { sql: "DROP TABLE view_versions" },
-      { sql: "DROP TABLE record_tombstones" },
+      // Later migrations add the apply_partial column and the log's tables.
+      { sql: "ALTER TABLE connections DROP COLUMN apply_partial" },
+      ...MIGRATIONS.slice(viewMigration + 1)
+        .flat()
+        .flatMap((sql) => /^CREATE TABLE (\w+)/.exec(sql)?.[1] ?? [])
+        .map((table) => ({ sql: `DROP TABLE ${table}` })),
+      // Publish while collecting adds columns after the view counters too.
       { sql: "ALTER TABLE runs DROP COLUMN admitting" },
       { sql: "ALTER TABLE run_streams DROP COLUMN unadmitted" },
       { sql: "ALTER TABLE connections DROP COLUMN tombstone_wm_o" },
       { sql: "ALTER TABLE connections DROP COLUMN tombstone_wm_r" },
-      // The migration after the view counters adds one column; undo it too.
-      { sql: "ALTER TABLE connections DROP COLUMN apply_partial" },
       { sql: `PRAGMA user_version = ${viewMigration}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");
