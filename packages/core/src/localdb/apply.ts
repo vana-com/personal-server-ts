@@ -556,9 +556,17 @@ async function applyOneOnce(
     return settled(result(stream, "gone"));
   // With the log on, a stream the log wrote reads from a local version above
   // the registry's own stream row (see `applySegmentOperations`): that row is
-  // older than what this device holds and replaces nothing.
-  if (deps.logProtocol && state && state.head_version > read.version)
-    return settled(result(stream, "noop"));
+  // older than what this device holds and replaces nothing. The answer is a
+  // version comparison and reads no data, so it proves nothing about rows an
+  // earlier failed apply of a newer per-stream head merged: neither this row
+  // nor the log holds them. While the connection is marked partial it is not
+  // `settled`, the mark stays, and only a read of a head that replaces the
+  // stream (or a rebuild) clears it. Dropping the shortcut instead would replay
+  // an older head over valid log state.
+  if (deps.logProtocol && state && state.head_version > read.version) {
+    const answer = result(stream, "noop");
+    return reuse.partial ? early(answer) : settled(answer);
+  }
   const saved = await deps.db.query<SavedPart>(
     "SELECT prefix,seq,part_hash,bytes,count FROM head_parts WHERE connection_id=? AND stream=? ORDER BY prefix,seq",
     [id, stream],
