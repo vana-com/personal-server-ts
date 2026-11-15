@@ -14,6 +14,7 @@ import {
   STAGED_KEY_CONFLICTS,
 } from "../../../core/src/localdb/run-intake.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
+import { RegistryUnavailableError } from "../../../core/src/stream-sync/ports.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.js";
 
@@ -258,7 +259,7 @@ it("replays a live begin, refuses a changed request and a replay after restart",
 it("retains offline collection as collecting, with a fresh run generation-unbound", async () => {
   const f = await fixture();
   f.registry.read = async () => {
-    throw new Error("offline fixture");
+    throw new RegistryUnavailableError("offline fixture");
   };
   const response = await f.store.begin("offline", request, declaration);
   expect(response).toMatchObject({ status: "collecting", discardReason: null });

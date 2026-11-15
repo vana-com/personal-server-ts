@@ -907,7 +907,9 @@ describe("view changes", () => {
     await raw.batch([
       ...added.map((t) => ({ sql: `DROP TRIGGER ${t.name}` })),
       { sql: "DROP TABLE view_versions" },
-      { sql: `PRAGMA user_version = ${MIGRATIONS.length - 1}` },
+      // The migration after the view counters adds one column; undo it too.
+      { sql: "ALTER TABLE connections DROP COLUMN apply_partial" },
+      { sql: `PRAGMA user_version = ${MIGRATIONS.length - 2}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");
 

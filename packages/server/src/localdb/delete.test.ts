@@ -16,6 +16,7 @@ import {
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import { createConnectionDeleter } from "../../../core/src/localdb/delete.js";
+import { RegistryUnavailableError } from "../../../core/src/stream-sync/ports.js";
 import { remoteFixture } from "./apply-fixture.js";
 import { postStreamDeleteOnly } from "./legacy-delete-fixture.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
@@ -505,7 +506,7 @@ it("an absent registry answer never clears a local-only delete, but explicit con
     observedAt: 2000,
   };
   registry.beforeRead = async () => {
-    throw new Error("offline fixture");
+    throw new RegistryUnavailableError("offline fixture");
   };
   expect((await intake.begin("offline-run", request, decl)).status).toBe(
     "collecting",
