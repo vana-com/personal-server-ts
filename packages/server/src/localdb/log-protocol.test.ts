@@ -242,7 +242,7 @@ describe("log protocol, flag on", () => {
     );
   });
 
-  it("a receiver at position n fetches and applies only n+1..m", async () => {
+  it("P2: a receiver at position n fetches and applies only n+1..m", async () => {
     const w = await world({ streams: 6, logProtocol: true });
     const a = await w.device("a");
     const b = await w.device("b");
@@ -272,7 +272,7 @@ describe("log protocol, flag on", () => {
     expect(await b.records()).toEqual(await a.records());
   });
 
-  it("out-of-order and duplicated segments converge to the same records", async () => {
+  it("P1: out-of-order and duplicated segments converge to the same records", async () => {
     const w = await world({ streams: 2, logProtocol: true });
     const a = await w.device("a");
     await a.run("run-1", [
@@ -321,7 +321,7 @@ describe("log protocol, flag on", () => {
     );
   });
 
-  it("a gap triggers a full check, and a missing segment never lets n+1 apply before n", async () => {
+  it("P2: a gap triggers a full check, and a missing segment never lets n+1 apply before n", async () => {
     const w = await world({ streams: 2, logProtocol: true });
     const a = await w.device("a");
     const b = await w.device("b");
@@ -373,7 +373,136 @@ describe("log protocol, flag on", () => {
     expect((await b.records()).some((r) => r.includes("three"))).toBe(false);
   });
 
-  it("an omission completion deletes only records not observed at or after the cutoff", async () => {
+  it("P1: caught-up readers equal the greatest-stamp fold of the whole log", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    const a = await w.device("a");
+    const b = await w.device("b");
+    await a.run(
+      "run-1",
+      [
+        { stream: sName(0), id: "x", v: 1 },
+        { stream: sName(0), id: "y", v: 1 },
+        { stream: sName(1), id: "z", v: 1 },
+      ],
+      { observedAt: 1100 },
+    );
+    await a.cycle();
+    await b.cycle();
+    await b.run("run-2", [{ stream: sName(0), id: "x", v: 2 }], {
+      full: false,
+      covered: [sName(0)],
+      observedAt: 1200,
+    });
+    await b.cycle();
+    await a.cycle();
+    await a.run("run-3", [{ stream: sName(0), id: "y", remove: true }], {
+      full: false,
+      covered: [sName(0)],
+      observedAt: 1300,
+    });
+    await a.run("run-4", [{ stream: sName(1), id: "w", v: 1 }], {
+      full: false,
+      covered: [sName(1)],
+      observedAt: 1400,
+    });
+    await a.cycle();
+    await b.cycle();
+    const c = await w.device("c");
+    await c.cycle();
+
+    // The oracle reads only the segments: per key the greatest stamp wins, a
+    // delete wins a tie, and an omission removes what is below its cutoff.
+    const stampOf = (op: { stamp: { o: number; r: string } }) => op.stamp;
+    const after = (x: { o: number; r: string }, y: { o: number; r: string }) =>
+      x.o > y.o || (x.o === y.o && x.r > y.r);
+    const ops = [...(await w.segments()).values()].flatMap((g) => g.operations);
+    const winners = new Map<string, (typeof ops)[number]>();
+    for (const op of ops) {
+      if (op.kind === "complete") continue;
+      const key = `${op.stream}/${op.pkHash}`;
+      const held = winners.get(key);
+      if (
+        !held ||
+        held.kind === "complete" ||
+        after(stampOf(op), stampOf(held)) ||
+        (!after(stampOf(held), stampOf(op)) && op.kind === "delete")
+      )
+        winners.set(key, op);
+    }
+    for (const op of ops)
+      if (op.kind === "complete")
+        for (const pk of op.omitted) {
+          const held = winners.get(`${op.stream}/${pk}`);
+          if (
+            held &&
+            !after(stampOf(held), op.cutoff) &&
+            !(held.stamp.o === op.cutoff.o && held.stamp.r === op.cutoff.r)
+          )
+            winners.delete(`${op.stream}/${pk}`);
+        }
+    const expected = [...winners.values()]
+      .flatMap((op) =>
+        op.kind === "upsert"
+          ? [
+              `${op.stream}/${(op.value as { id: string }).id}=${JSON.stringify(op.value)}`,
+            ]
+          : [],
+      )
+      .sort();
+    expect(expected).toEqual([
+      `s0/x={"id":"x","v":2}`,
+      `s1/w={"id":"w","v":1}`,
+      `s1/z={"id":"z","v":1}`,
+    ]);
+    for (const d of [a, b, c]) expect(await d.records()).toEqual(expected);
+  });
+
+  it("P5: after a reset a reader adopts the new lifetime and clears the old view", async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    const a = await w.device("a");
+    const b = await w.device("b");
+    await a.run("run-1", [
+      { stream: sName(0), id: "x" },
+      { stream: sName(0), id: "y" },
+    ]);
+    await a.cycle();
+    await b.cycle();
+    expect(await b.records()).toHaveLength(2);
+
+    // The connection is deleted and made again: the control row moves to a
+    // new generation and the old log row stays behind in the registry.
+    const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
+    const hashes = await controlHashes(async (x) => keccak_256(x), keyCheck);
+    await a.deps.registry.post({
+      ownerAddress: OWNER,
+      scope: CONTROL,
+      dataHash: hashes.activeData,
+      metadataHash: hashes.activeMetadata,
+      expectedVersion: "2",
+      signature: "0x00",
+    });
+    await a.cycle();
+    expect(await a.records()).toEqual([]);
+    await a.run("run-2", [{ stream: sName(0), id: "z" }]);
+    await a.cycle();
+
+    // B was offline across the reset. It adopts the new lifetime: none of the
+    // old records survive, and the new log segment applies on top of the old
+    // row's position.
+    await b.cycle();
+    expect(await b.records()).toEqual([`s0/z={"id":"z"}`]);
+    expect(await b.position()).toBe(await a.position());
+    const gen2 = [...(await w.segments()).values()].filter(
+      (g) => g.generation === 2,
+    );
+    expect(gen2).toHaveLength(1);
+  });
+
+  it.todo(
+    "P4: a compacted snapshot keeps the latest winner per key, including tombstones (compaction is a later slice)",
+  );
+
+  it("P3: an omission completion deletes only records not observed at or after the cutoff", async () => {
     const w = await world({ streams: 1, logProtocol: true });
     const a = await w.device("a");
     const b = await w.device("b");
