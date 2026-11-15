@@ -4,18 +4,16 @@ The BRIEF names df94f29aa2b48cc241ae6ac07c6d46d43817dd7f as the conceptual base;
 source grounding here uses the assigned checkout, not an inferred older checkout.
 
 ## Status
-TLC and SANY were NOT RUN. Java/jar availability was NOT probed. This worker
-uses only authorized Dalan workspace reads/patches, not shell or metered tools.
-No checked state count, distinct count, depth, counterexample length, or successful
-verification is claimed. All eight configs are unexecuted host acceptance gates.
-The model and configs are a private patch, not a production implementation.
+SANY passes on the spec. TLC ran on the host (see TLC results) and produced:
+- Baselines at K=2: all eight configs pass at MaxSteps=6 with no error. At
+  MaxSteps=8 all four K=2 baselines hit the 900 s timeout unfinished.
+- Mutants at K=2, MaxSteps=6 (m1-K2-S6 to m5): each violates its expected
+  invariant. m5 is new and breaks CheckpointSoundness.
+- Mutants m1-m4 at K=3, MaxSteps=8 (earlier run) also violate their invariants.
+- Not checked: K=3 baselines, MaxSteps=8 at K=2, any unbounded proof.
 
-BRIEF line 27 was returned as "[redacted secret]". Line 26 before it is blank;
-line 28 after it is blank. Nearest nonblank visible predecessor is line 25, the
-RUN paragraph requesting TLC (-workers 2), exact results, or an explicit not-run
-statement and SANY if available. There is no visible nonblank successor.
-TODO in the spec marks this unknown obligation. No reconstruction or alternate
-read route was attempted. Any questions present only in that line remain unanswered.
+BRIEF line 27 is redacted, so one obligation is unknown. The spec TODO marks it.
+Nothing was reconstructed for it.
 
 ## Source grounding and abstraction
 - run-intake.ts:89 and :515-546 stage run_rows and advance last_batch atomically;
@@ -78,8 +76,8 @@ fairness/liveness claim: inactive run and fully replayed log imply both stores
 equal an independent greatest-stamp oracle. P6 checks acknowledged batches are
 included in merged batches.
 
-Expected witnesses below are reasoning examples, NOT TLC results or measured
-counterexample lengths. Exact/minimal lengths: UNAVAILABLE until host execution.
+Witnesses below were reasoning examples. TLC has since run each at K=2,
+MaxSteps=6; the counterexample lengths are in TLC results.
 - m1.cfg: W seeds k1; Begin; Batch(k2) with k1 absent from that batch. Early omission
   violates P1 before proof. R can then publish that premature removal.
 - m2.cfg: W seeds k1; Begin with source absent; Prove; End(FALSE). Failed replace
@@ -88,11 +86,16 @@ counterexample lengths. Exact/minimal lengths: UNAVAILABLE until host execution.
   removes a later row, violating P4; after draining Publish, P5 also fails.
 - m4.cfg: Begin with source k1; W deletes k1; Batch(k1). Unconditional old-stamp
   overwrite violates P3; after failure/end and draining publication, P5 fails.
+- m5.cfg (TODAY, checkpoint_window, Mutant=5): the Checkpoint action sets
+  checkpoint to seen, not merged. TODAY never merges during a run, so seen holds
+  keys that are not in merged. Checkpoint(k1) after Batch(k1) breaks P6. PROPOSED
+  cannot show this: its Batch merges each key at once, so seen = merged during
+  a run. The Checkpoint guard also reads seen for Mutant=5; without that change
+  the action never fires in TODAY, because checkpoint and merged both stay {}.
 TLC stops at the first invariant failure, so to observe subsequent P5 witnesses,
 rerun a copied mutant config checking only TypeOK and StampConvergence.
-P6 is NOT discriminated by these four mandated mutants: none advances checkpoints
-ahead of merge. Add an independently authorized premature-checkpoint mutant for a
-future discrimination test rather than pretending these four test that rule.
+P6 (CheckpointSoundness) is discriminated only by m5. The four mandated mutants
+do not advance checkpoints ahead of merge.
 
 ## Host gate
 From this directory, with an independently available trusted tla2tools.jar:
@@ -139,12 +142,29 @@ Mutants (earlier runs, not rerun):
 | m3 | k1,k2,k3 | 8 | Invariant LaterWriteKept violated | 815,117 | 419,263 | not printed | 4 s |
 | m4 | k1,k2,k3 | 8 | Invariant NoResurrection violated | 11,627 | 6,357 | not printed | <1 s |
 
+Mutants at K=2, MaxSteps=6 (this run, `-workers 2 -deadlock`, one run at a time).
+Counts are at the point TLC stopped on the violation. Trace length is the number
+of states TLC printed, including the initial state.
+
+| Config | Design / Coverage / Mutant | Violated invariant | States generated | Distinct states | Counterexample length | Runtime |
+|---|---|---|---|---|---|---|
+| m1-K2-S6 | PROPOSED / full_inventory / 1 | NoOmissionBeforeProof | 1,764 | 1,027 | 4 | <1 s |
+| m2-K2-S6 | PROPOSED / full_inventory / 2 | NoOmissionBeforeProof | 71,330 | 37,207 | 5 | <1 s |
+| m3-K2-S6 | PROPOSED / full_inventory / 3 | LaterWriteKept | 77,341 | 40,258 | 5 | <1 s |
+| m4-K2-S6 | PROPOSED / full_inventory / 4 | NoResurrection | 3,415 | 1,880 | 4 | <1 s |
+| m5 | TODAY / checkpoint_window / 5 | CheckpointSoundness | 3,466 | 1,901 | 4 | <1 s |
+
 Notes:
 - No baseline reported an invariant violation, so there is no counterexample trace.
+- The two checkpoint_window K=2, MaxSteps=6 baselines were re-run after the
+  Checkpoint edit for m5. They gave the same counts as before (TODAY 23,943,077 /
+  9,717,346; PROPOSED 28,787,923 / 12,191,646), so Mutant=0 behaviour is unchanged.
+  The full_inventory baselines were not re-run; that action is untouched.
+- m5 trace: Initial, Begin, Batch(k1), Checkpoint. checkpoint = {k1} while merged = {}.
 - Every K=2 run at MaxSteps=8 hit the 900 s timeout. Dropping from 3 keys to 2 did
   not make MaxSteps=8 tractable: distinct states were still growing at about
   6M per minute when the timeout hit.
-- MaxSteps=6 completed for all four baselines (0 states left on queue, no error).
+- MaxSteps=6 completed for all eight baselines (0 states left on queue, no error).
   Depth 13 is larger than MaxSteps because `Publish` may drain after the bound
   (see Host gate).
 - The MaxSteps=6, K=2 result is a bounded check only. It does not cover K=3 or

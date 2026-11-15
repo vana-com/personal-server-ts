@@ -3,7 +3,7 @@ EXTENDS Naturals, Sequences, FiniteSets
 CONSTANTS K, Values, Design, Coverage, Mutant, MaxSteps
 ASSUME /\ Design \in {"TODAY", "PROPOSED"}
        /\ Coverage \in {"full_inventory", "checkpoint_window"}
-       /\ Mutant \in 0..4
+       /\ Mutant \in 0..5
        /\ MaxSteps \in Nat
 VARIABLES source, d, r, best, del, rdel, log, cursor, active, cutoff,
           seen, staged, merged, checkpoint, proof, clock, steps,
@@ -82,7 +82,8 @@ Prove ==
                 staged,merged,checkpoint,clock,omissionOK,failureOK,laterOK>>
 Checkpoint ==
   /\ Tick /\ active /\ Coverage="checkpoint_window"
-  /\ checkpoint # merged /\ checkpoint'=merged
+  /\ checkpoint # (IF Mutant=5 THEN seen ELSE merged)
+  /\ checkpoint'=(IF Mutant=5 THEN seen ELSE merged)
   /\ UNCHANGED <<source,d,r,best,del,rdel,log,cursor,active,cutoff,seen,
                 staged,merged,proof,clock,omissionOK,failureOK,laterOK>>
 End(success) ==
