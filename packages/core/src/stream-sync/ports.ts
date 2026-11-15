@@ -139,6 +139,36 @@ export class AmbiguousRegistryReplyError extends Error {
   }
 }
 
+/**
+ * The registry could not be reached or did not answer: a network failure, a
+ * timeout or a 5xx. Nothing says the request was refused or that the data is
+ * wrong, so a caller may go on offline. It is the only registry error a caller
+ * may treat that way.
+ */
+export class RegistryUnavailableError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "RegistryUnavailableError";
+  }
+}
+
+/**
+ * An apply met an unavailable registry before its first local write, and no
+ * earlier apply of the connection is left half done: it could not learn
+ * anything new, and the local data is as complete as the last full apply left
+ * it. That is the only unavailability a caller may treat as "offline". Apply
+ * has no rollback: an unavailable error after its first write is thrown as the
+ * plain `RegistryUnavailableError`, the writes already committed (a purge, a
+ * reset, a stream replaced or tombstoned) stay, and `connections.apply_partial`
+ * keeps later applies from reading as "before the first write".
+ */
+export class RegistryUnavailableBeforeWriteError extends RegistryUnavailableError {
+  constructor(cause: RegistryUnavailableError) {
+    super(cause.message, { cause });
+    this.name = "RegistryUnavailableBeforeWriteError";
+  }
+}
+
 /** The registry refused the request for good (4xx other than 409). */
 /**
  * The gateway has no change route (404 or 405): it predates the change push.

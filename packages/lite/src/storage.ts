@@ -857,6 +857,14 @@ export async function createPersistentPsLiteStorage(
       return page.sort((a, b) => a.id - b.id).slice(0, limit);
     },
 
+    countUnsynced() {
+      let count = 0;
+      for (const entry of state.entries) {
+        if (entry.dataPointId === null) count += 1;
+      }
+      return count;
+    },
+
     maxUnsyncedId() {
       let max = 0;
       for (const entry of state.entries) {

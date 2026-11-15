@@ -9,6 +9,10 @@ import {
   type ControlHashes,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { streamSyncHashes } from "../stream-sync/crypto.js";
+import {
+  RegistryUnavailableBeforeWriteError,
+  RegistryUnavailableError,
+} from "../stream-sync/ports.js";
 import { applyConnection } from "./apply.js";
 import type { ConnectionRow, LocalSyncDeps } from "./deps.js";
 import { purgeConnection } from "./purge.js";
@@ -77,6 +81,14 @@ async function saveControl(
     },
   ]);
   return (await cachedConnection(deps, id))!;
+}
+
+async function partiallyApplied(deps: LocalSyncDeps, id: string) {
+  const rows = await deps.db.query(
+    "SELECT 1 FROM connections WHERE connection_id = ? AND apply_partial = 1",
+    [id],
+  );
+  return rows.length > 0;
 }
 
 async function purgeDeleted(deps: LocalSyncDeps, row: ConnectionRow) {
@@ -154,7 +166,13 @@ export async function syncBeforeBegin(
     let read: ControlRead;
     try {
       read = await deps.registry.read(controlScope(connector, ns));
-    } catch {
+    } catch (error) {
+      // Only an unreachable registry goes on offline. A refusal (403), an
+      // unreadable answer or a control row of the wrong shape is not "offline".
+      if (!(error instanceof RegistryUnavailableError)) throw error;
+      // An earlier apply left this connection half applied. Going on offline
+      // would start a run on it, with no way to learn what it lacks.
+      if (await partiallyApplied(locked, id)) throw error;
       return {
         connection: await cachedConnection(locked, id),
         unreachable: true,
@@ -162,19 +180,23 @@ export async function syncBeforeBegin(
     }
     const connection = await saveControl(locked, connector, ns, read, control);
     await purgeDeleted(locked, connection);
-    try {
-      // Availability only. The rows are not handed on: apply lists for
-      // itself, so its answer reflects reads taken after this call began.
-      await deps.registry.listStreamRows(connector);
-    } catch {
-      return {
-        connection: await cachedConnection(locked, id),
-        unreachable: true,
-      };
-    }
     if (connection.controlState === "active") {
-      // applyConnection owns version/empty-head-parts selection.
-      await applyConnection(locked, id);
+      try {
+        // Apply reads the control row and lists the streams itself, after this
+        // call began. Only an unreachable registry that apply met before its
+        // first local write, with no earlier apply left half done, goes on
+        // offline: nothing new was learned and nothing changed. Apply has no
+        // rollback, so an unavailable error after a write rejects, as do
+        // integrity, key and database failures.
+        await applyConnection(locked, id);
+      } catch (error) {
+        if (!(error instanceof RegistryUnavailableBeforeWriteError))
+          throw error;
+        return {
+          connection: await cachedConnection(locked, id),
+          unreachable: true,
+        };
+      }
     }
     return {
       connection: await cachedConnection(locked, id),

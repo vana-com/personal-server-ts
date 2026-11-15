@@ -194,6 +194,12 @@ export function createMemoryDataStorage(
         .sort((a, b) => a.id - b.id)
         .slice(0, limit);
     },
+    countUnsynced() {
+      return entries.reduce(
+        (n, entry) => (entry.dataPointId === null ? n + 1 : n),
+        0,
+      );
+    },
     maxUnsyncedId() {
       return entries.reduce(
         (max, entry) =>
