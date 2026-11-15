@@ -326,10 +326,27 @@ const run = {
  * checkpoint at the same mark, so a write's caller no longer waits for it.
  * Calls to the writer run in order, so the next call waits for the checkpoint
  * instead: the work is the same and the log stays as short as before.
+ *
+ * Why not leave SQLite's checkpoint on and switch it off around the publish
+ * commit: that needs the driver to tell the worker which commit is the slow
+ * one, a new message in a contract every caller shares. Here the hook sits at
+ * the one place every write completes, so a write path cannot miss it.
+ *
+ * Durability: `open.ts` sets `synchronous = NORMAL`, under which a WAL commit is
+ * written but not synced; the sync happens at a checkpoint. At base the commit
+ * that crossed the mark was synced before it was acknowledged, and every other
+ * commit was not. Now that one is acknowledged first, like the rest. A process
+ * crash loses nothing (the write is in the OS cache); a power loss in that
+ * window can lose the last acknowledged transactions, whole, never half.
+ * A PASSIVE checkpoint stops at frames a reader still needs, so the log is not
+ * bounded while a run's read transaction is open; that was true before too.
  */
 const CHECKPOINT_FRAMES = 1000;
 
 function checkpointAfterReply() {
+  // A transaction left open by `query("BEGIN")` commits in a later call, and
+  // that call checkpoints.
+  if (db.inTransaction) return;
   try {
     // NOOP only reports: it writes nothing and takes no lock.
     const [{ log, checkpointed }] = db.pragma("wal_checkpoint(NOOP)");
@@ -352,7 +369,16 @@ parentPort.on("message", (message) => {
   try {
     if (openError) throw openError;
     parentPort.postMessage({ id, ok: true, result: run[op](message) });
-    if (op === "batch" && role === "writer" && isFile) checkpointAfterReply();
+    // Every call that can write on the writer's own connection ends here, so
+    // no write path is left without a checkpoint now that SQLite's is off:
+    // `batch`, and `query` (a statement, or a write with RETURNING). A
+    // snapshot's query runs on its own read-only connection.
+    if (
+      role === "writer" &&
+      isFile &&
+      (op === "batch" || (op === "query" && message.snap === undefined))
+    )
+      checkpointAfterReply();
   } catch (error) {
     parentPort.postMessage({
       id,

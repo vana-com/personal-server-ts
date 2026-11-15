@@ -157,8 +157,9 @@ pages, so the commit crosses the mark, and the connection that commits
 checkpoints before `COMMIT` returns: the caller, and the slot turn it holds,
 wait for 12,417 pages to be written and synced. The disk here is shared, so the
 size is not portable; the mechanism is. Fix: the writer connection has
-`wal_autocheckpoint = 0` and, after it has replied to a batch, runs the same
-PASSIVE checkpoint at the same mark (1000 frames, read with `wal_checkpoint(NOOP)`).
+`wal_autocheckpoint = 0` and, after it has replied to any write on its own connection (a
+`batch`, or a `query` that writes), runs the same PASSIVE checkpoint at the same
+mark (1000 frames, read with `wal_checkpoint(NOOP)`).
 The next call to the writer waits for it, so the log stays as short as before
 and the work is the same; only the commit's reply no longer waits. The tail
 fell from 0.8 to 2.8 s to 0.5 to 0.75 s: the DELETE itself.

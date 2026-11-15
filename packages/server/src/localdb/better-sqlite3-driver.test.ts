@@ -258,4 +258,43 @@ describe("the writer's WAL checkpoint", () => {
       probe.close();
     }
   });
+
+  describe("keeps the WAL bounded when a write is not a batch", () => {
+    const body = new Uint8Array(2048).fill(7);
+    async function uncheckpointedFrames(path: string) {
+      const probe = new Database(path, { readonly: true });
+      try {
+        const [mark] = probe.pragma("wal_checkpoint(NOOP)") as {
+          log: number;
+          checkpointed: number;
+        }[];
+        return mark!.log - mark!.checkpointed;
+      } finally {
+        probe.close();
+      }
+    }
+
+    it("for `query` writes, one commit each", async () => {
+      const { db, path } = await fileDb();
+      // 2500 commits of 2 KiB rows: well over the 1000-frame mark, and no
+      // `batch` among them.
+      for (let id = 0; id < 2500; id++)
+        await db.query("INSERT INTO rows VALUES (?, ?)", [id, body]);
+      // Calls run in order on the writer: this returns after the checkpoint
+      // that followed the last write's reply.
+      await db.query("SELECT 1");
+      expect(await uncheckpointedFrames(path)).toBeLessThan(1000);
+    });
+
+    it("for a `query` write that returns rows (RETURNING)", async () => {
+      const { db, path } = await fileDb();
+      for (let id = 0; id < 2500; id++)
+        await db.query("INSERT INTO rows VALUES (?, ?) RETURNING id", [
+          id,
+          body,
+        ]);
+      await db.query("SELECT 1");
+      expect(await uncheckpointedFrames(path)).toBeLessThan(1000);
+    });
+  });
 });
