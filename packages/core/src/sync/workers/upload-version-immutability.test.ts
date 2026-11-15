@@ -962,14 +962,15 @@ describe("upload worker against write-once storage", () => {
   it("commits to the size of the stored ciphertext when a retry reuses it", async () => {
     const content = envelope("reused");
     // An earlier attempt, made with other encryption settings, stored a
-    // differently sized encryption of the same plaintext.
+    // differently sized encryption of the same plaintext. AEAD framing adds a
+    // fixed number of bytes, so the sizes differ on every run. A zlib stream
+    // did not: its size moves with the message timestamp, and on about 3% of
+    // timestamps it matched the default size exactly.
     const earlier = await openpgp.encrypt({
       message: await openpgp.createMessage({ binary: plaintextOf(content) }),
       passwords: [scopeKeyHex],
       format: "binary",
-      config: {
-        preferredCompressionAlgorithm: openpgp.enums.compression.zlib,
-      },
+      config: { aeadProtect: true },
     });
     const fresh = await encryptWithPassword(plaintextOf(content), scopeKeyHex);
     expect(earlier.byteLength).not.toBe(fresh.byteLength);
