@@ -168,6 +168,17 @@ export interface PsLiteSyncOptions {
   streamSyncBlobs?: StreamSyncBlobs;
   /** Publish while collecting, default off. See `LocalSyncDeps.publishWhileCollecting`. */
   streamSyncPublishWhileCollecting?: boolean;
+  /**
+   * Publish and apply through the stream-sync log, default off. Turn it on for
+   * all devices of an owner together. See `LocalSyncDeps.logProtocol`.
+   */
+  streamSyncLogProtocol?: boolean;
+  /**
+   * Serve a first load's applied parts while it fills. Default: the config key
+   * `streamSync.progressiveFirstLoad`, off. An explicit option wins. See
+   * `LocalSyncDeps.progressiveFirstLoad`.
+   */
+  streamSyncProgressiveFirstLoad?: boolean;
   stateStore: PsLiteStateStore;
   storage: DataStoragePort;
   ownerAddress?: `0x${string}`;
@@ -624,10 +635,15 @@ export async function createPsLiteSyncManager(
           now: Date.now,
           newOp: () => globalThis.crypto.randomUUID(),
           recordsCommitted: () => syncManager?.notifyNewData(),
-          progressiveFirstLoad: options.config.streamSync.progressiveFirstLoad,
+          progressiveFirstLoad:
+            options.streamSyncProgressiveFirstLoad ??
+            options.config.streamSync.progressiveFirstLoad,
           partTargetBytes: LITE_PART_TARGET_BYTES,
           ...(options.streamSyncPublishWhileCollecting === true
             ? { publishWhileCollecting: true }
+            : {}),
+          ...(options.streamSyncLogProtocol === true
+            ? { logProtocol: true }
             : {}),
         };
         localSync = createLocalSync(localSyncDeps, {
