@@ -1,6 +1,7 @@
 ## R4: D1-D4 model, source reconciliation and host gate
+
 Pinned source: personal-server-ts 49d1e3d4d3700022af9e9a9a03f332e215331796.
-Use **BatchVisibilityR4.tla with R4-*.cfg**, not the historical module/configs
+Use **BatchVisibilityR4.tla with R4-\*.cfg**, not the historical module/configs
 below. This section redoes/supersedes the R3 README reconciliation (receipt
 report_dc8d7bb0-392e-4696-bb33-4c4b159ca7f4, diff 300530409e04ecc2...).
 The three helper definitions and writerCompatibility are now in scope and read.
@@ -9,6 +10,7 @@ The predicted outcomes below were checked by the host run in "R4 host TLC
 results" (SANY parse, then TLC on every R4 config). Historical counts do not transfer.
 
 ### Model and actions
+
 One connection, one mutable-state stream, two keys, two simultaneously open
 runs with fixed scalar ranks 1 (older), 2 (newer), embedding their (o,r) order.
 Both begin at generation 1/delete snapshot 0. Each can receive up to three
@@ -50,6 +52,7 @@ clears the one modeled stream and checkpoint. Stale runs stay fenced; there is
 no new post-purge run in this bounded experiment.
 
 ### Properties and mutant discrimination
+
 - AcceptedEndOnly: explicit/omission side effects and checkpoint have accepted
   end evidence; acceptance history remains even if later publication refuses.
 - NoPurgedRows: no visible row from the pre-purge lifetime/delete snapshot.
@@ -68,23 +71,24 @@ All configs have two keys and MaxSteps=8; the two initial open runs eliminate
 two Begin actions from each trace. No liveness/fairness claim; bound exhaustion
 stutters and CHECK_DEADLOCK is FALSE.
 
-| Config | Predicted TLC result |
-| --- | --- |
-| R4-PROPOSED-full_inventory | PASS all configured invariants |
-| R4-PROPOSED-checkpoint_window | PASS all configured invariants |
-| R4-TODAY-full_inventory | PASS configured local-phase invariants |
-| R4-TODAY-checkpoint_window | PASS configured local-phase invariants |
-| R4-new-connector | PASS; older connector's next batch is rejected |
-| R4-pk-known-gap | FAIL CurrentPrimaryKeyOnly, intentionally |
-| R4-m7 | FAIL NoPurgedRows |
-| R4-m8 | FAIL CompatibleAdmission |
-| R4-m9-full_inventory | FAIL NoOlderResurrection, omission only |
-| R4-m9-checkpoint_window | FAIL NoOlderResurrection, explicit only |
-| R4-m10-full_inventory | FAIL NoOlderResurrection, omission only |
-| R4-m10-checkpoint_window | FAIL NoOlderResurrection, explicit only |
-| R4-m11 | FAIL SameRunLaterBatch |
+| Config                        | Predicted TLC result                           |
+| ----------------------------- | ---------------------------------------------- |
+| R4-PROPOSED-full_inventory    | PASS all configured invariants                 |
+| R4-PROPOSED-checkpoint_window | PASS all configured invariants                 |
+| R4-TODAY-full_inventory       | PASS configured local-phase invariants         |
+| R4-TODAY-checkpoint_window    | PASS configured local-phase invariants         |
+| R4-new-connector              | PASS; older connector's next batch is rejected |
+| R4-pk-known-gap               | FAIL CurrentPrimaryKeyOnly, intentionally      |
+| R4-m7                         | FAIL NoPurgedRows                              |
+| R4-m8                         | FAIL CompatibleAdmission                       |
+| R4-m9-full_inventory          | FAIL NoOlderResurrection, omission only        |
+| R4-m9-checkpoint_window       | FAIL NoOlderResurrection, explicit only        |
+| R4-m10-full_inventory         | FAIL NoOlderResurrection, omission only        |
+| R4-m10-checkpoint_window      | FAIL NoOlderResurrection, explicit only        |
+| R4-m11                        | FAIL SameRunLaterBatch                         |
 
 Predicted witness recipes (not executed TLC traces):
+
 - M7: Purge, then stale Batch(1,x,upsert).
 - M8: End(2,success), Publish(2), Batch(1,x,upsert), with version 2.
 - M9/M10 explicit: Batch(1,x,upsert), Batch(2,x,delete),
@@ -112,21 +116,21 @@ cap. The PASS configs completed their search; the FAIL configs stopped at their
 first violation. None hit the cap.
 Traces for failing configs are in `traces/`.
 
-| Config | Predicted | Actual | Distinct states | Depth |
-| --- | --- | --- | --- | --- |
-| R4-PROPOSED-full_inventory | PASS | PASS, no error | 160,880 | 9 |
-| R4-PROPOSED-checkpoint_window | PASS | PASS, no error | 80,973 | 9 |
-| R4-TODAY-full_inventory | PASS | PASS, no error | 153,296 | 9 |
-| R4-TODAY-checkpoint_window | PASS | PASS, no error | 75,387 | 9 |
-| R4-new-connector | PASS | PASS, no error (rejection witness not separately checked) | 89,931 | 9 |
-| R4-pk-known-gap | FAIL CurrentPrimaryKeyOnly | FAIL CurrentPrimaryKeyOnly (intended) | 503 at failure | 6 |
-| R4-m7 | FAIL NoPurgedRows | FAIL NoPurgedRows | 455 at failure | 5 |
-| R4-m8 | FAIL CompatibleAdmission | FAIL CompatibleAdmission | 432 at failure | 5 |
-| R4-m9-full_inventory | FAIL NoOlderResurrection | FAIL NoOlderResurrection | 1,427 at failure | 6 |
-| R4-m9-checkpoint_window | FAIL NoOlderResurrection | FAIL NoOlderResurrection | 1,651 at failure | 6 |
-| R4-m10-full_inventory | FAIL NoOlderResurrection | FAIL NoOlderResurrection | 1,430 at failure | 6 |
-| R4-m10-checkpoint_window | FAIL NoOlderResurrection | FAIL NoOlderResurrection | 7,042 at failure | 7 |
-| R4-m11 | FAIL SameRunLaterBatch | FAIL SameRunLaterBatch | 21 at failure | 4 |
+| Config                        | Predicted                  | Actual                                                    | Distinct states  | Depth |
+| ----------------------------- | -------------------------- | --------------------------------------------------------- | ---------------- | ----- |
+| R4-PROPOSED-full_inventory    | PASS                       | PASS, no error                                            | 160,880          | 9     |
+| R4-PROPOSED-checkpoint_window | PASS                       | PASS, no error                                            | 80,973           | 9     |
+| R4-TODAY-full_inventory       | PASS                       | PASS, no error                                            | 153,296          | 9     |
+| R4-TODAY-checkpoint_window    | PASS                       | PASS, no error                                            | 75,387           | 9     |
+| R4-new-connector              | PASS                       | PASS, no error (rejection witness not separately checked) | 89,931           | 9     |
+| R4-pk-known-gap               | FAIL CurrentPrimaryKeyOnly | FAIL CurrentPrimaryKeyOnly (intended)                     | 503 at failure   | 6     |
+| R4-m7                         | FAIL NoPurgedRows          | FAIL NoPurgedRows                                         | 455 at failure   | 5     |
+| R4-m8                         | FAIL CompatibleAdmission   | FAIL CompatibleAdmission                                  | 432 at failure   | 5     |
+| R4-m9-full_inventory          | FAIL NoOlderResurrection   | FAIL NoOlderResurrection                                  | 1,427 at failure | 6     |
+| R4-m9-checkpoint_window       | FAIL NoOlderResurrection   | FAIL NoOlderResurrection                                  | 1,651 at failure | 6     |
+| R4-m10-full_inventory         | FAIL NoOlderResurrection   | FAIL NoOlderResurrection                                  | 1,430 at failure | 6     |
+| R4-m10-checkpoint_window      | FAIL NoOlderResurrection   | FAIL NoOlderResurrection                                  | 7,042 at failure | 7     |
+| R4-m11                        | FAIL SameRunLaterBatch     | FAIL SameRunLaterBatch                                    | 21 at failure    | 4     |
 
 No expected/actual mismatch. The "at failure" counts are the states TLC had
 reached when it stopped on the violation, not full state-space sizes.
@@ -134,7 +138,9 @@ Not checked: the new-connector "next batch is rejected" witness is a prediction
 about the trace; the config's invariants passed, but this run did not verify it.
 
 ### Source matrix and remaining other causes
+
 Paths are relative to packages/core/src unless qualified otherwise.
+
 - localdb/fence.ts:20-43,94-106: control_deleted, generation_moved_by_delete,
   stream_deleted_after_start. Null admission/undefined connection branches are
   real but excluded by this model's initially bound, existing connection.
@@ -185,12 +191,15 @@ finite design experiment and not an implementation refinement proof.
 ---
 
 # Batch visibility: finite design model (unexecuted)
+
 Pinned source: vana-com/personal-server-ts 03b809316abf86c4c9b429e63d64578c7e508524.
 The BRIEF names df94f29aa2b48cc241ae6ac07c6d46d43817dd7f as the conceptual base;
 source grounding here uses the assigned checkout, not an inferred older checkout.
 
 ## Status
+
 SANY passes on the spec. TLC ran on the host (see TLC results) and produced:
+
 - Baselines at K=2: all eight configs pass at MaxSteps=6 with no error. At
   MaxSteps=8 all four K=2 baselines hit the 900 s timeout unfinished.
 - Mutants at K=2, MaxSteps=6 (m1-K2-S6 to m5): each violates its expected
@@ -202,6 +211,7 @@ BRIEF line 27 is redacted, so one obligation is unknown. The spec TODO marks it.
 Nothing was reconstructed for it.
 
 ## Source grounding and abstraction
+
 - run-intake.ts:89 and :515-546 stage run_rows and advance last_batch atomically;
   the latter is ingestion sequencing, NOT an asserted connector checkpoint.
 - run-end.ts:198-240 derives full proof and decides replace, :263-280 stages accepted
@@ -226,6 +236,7 @@ Nothing was reconstructed for it.
 All paths above are under packages/core/src/ except the two formal model examples.
 
 ## State and design choices
+
 K has three keys; values have two non-absent values. Each batch contains one
 arbitrarily selected source key, once per run, so batch order is arbitrary.
 ChangeSource may alter values/membership before or during runs. Begin reserves a
@@ -252,6 +263,7 @@ results as implementation evidence. Content/SEEN stamp compaction is collapsed t
 the effective observation stamp. Source mutation itself is not a committed record.
 
 ## Properties and discrimination
+
 P1 NoOmissionBeforeProof tracks actual omission removals, whether committed to D
 or subsequently visible in any R prefix. P2 tracks removal by failed End only;
 an independent W delete is not attributed to a failed run.
@@ -264,6 +276,7 @@ included in merged batches.
 
 Witnesses below were reasoning examples. TLC has since run each at K=2,
 MaxSteps=6; the counterexample lengths are in TLC results.
+
 - m1.cfg: W seeds k1; Begin; Batch(k2) with k1 absent from that batch. Early omission
   violates P1 before proof. R can then publish that premature removal.
 - m2.cfg: W seeds k1; Begin with source absent; Prove; End(FALSE). Failed replace
@@ -278,19 +291,22 @@ MaxSteps=6; the counterexample lengths are in TLC results.
   cannot show this: its Batch merges each key at once, so seen = merged during
   a run. The Checkpoint guard also reads seen for Mutant=5; without that change
   the action never fires in TODAY, because checkpoint and merged both stay {}.
-TLC stops at the first invariant failure, so to observe subsequent P5 witnesses,
-rerun a copied mutant config checking only TypeOK and StampConvergence.
-P6 (CheckpointSoundness) is discriminated only by m5. The four mandated mutants
-do not advance checkpoints ahead of merge.
+  TLC stops at the first invariant failure, so to observe subsequent P5 witnesses,
+  rerun a copied mutant config checking only TypeOK and StampConvergence.
+  P6 (CheckpointSoundness) is discriminated only by m5. The four mandated mutants
+  do not advance checkpoints ahead of merge.
 
 ## Host gate
+
 From this directory, with an independently available trusted tla2tools.jar:
+
 ```
 java -cp /path/to/tla2tools.jar tla2sany.SANY BatchVisibility.tla
 for cfg in TODAY-*.cfg PROPOSED-*.cfg m?.cfg; do
   java -cp /path/to/tla2tools.jar tlc2.TLC -workers 2 -config "$cfg" BatchVisibility.tla
 done
 ```
+
 Record each config's generated states, distinct states, depth, Error/No error
 lines and measured counterexample length here. Baselines must pass; mutants must
 fail semantically, not from parser/type/runtime errors. MaxSteps=8 bounds source,
@@ -300,6 +316,7 @@ report cost/results. Deadlock checking is disabled because exhaustion intentiona
 stutters; no liveness property is asserted.
 
 ## TLC results (host, 2026-11-15)
+
 Command: `java -XX:+UseParallelGC -Xmx2g -cp tla2tools.jar tlc2.TLC -workers 2 -deadlock`
 (tla2tools 1.7.4, `nice -n 19 ionice -c3`, 900 s timeout per run). Each run ran
 alone. Depth for completed runs is TLC's "complete state graph search" depth. For
@@ -307,40 +324,41 @@ unfinished runs it is the last `Progress(n)` level. Counts for unfinished runs a
 the last Progress line before the timeout. Logs are in `~/.tmp/tla-brief-meta/`
 (not committed); state dirs were deleted after each run.
 
-| Config | K | MaxSteps | Result | States generated | Distinct states | Depth | Runtime |
-|---|---|---|---|---|---|---|---|
-| TODAY-full_inventory | k1,k2,k3 | 8 | unfinished (not run at K=3; 74.7M distinct per brief) | n/a | n/a | n/a | n/a |
-| TODAY-full_inventory-K2 | k1,k2 | 8 | unfinished | 205,638,194 (last Progress) | 97,515,271 (last Progress) | >=10 (last Progress(10)) | 900 s timeout |
-| TODAY-full_inventory-K2-S6 | k1,k2 | 6 | No error | 24,217,061 | 9,823,939 | 13 | 1m 12s |
-| TODAY-checkpoint_window-K2 | k1,k2 | 8 | unfinished | 208,949,589 (last Progress) | 99,681,765 (last Progress) | >=10 (last Progress(10)) | 900 s timeout |
-| TODAY-checkpoint_window-K2-S6 | k1,k2 | 6 | No error | 23,943,077 | 9,717,346 | 13 | 1m 08s |
-| PROPOSED-full_inventory-K2 | k1,k2 | 8 | unfinished | 153,418,766 (last Progress) | 78,257,208 (last Progress) | >=9 (last Progress(9)) | 900 s timeout |
-| PROPOSED-full_inventory-K2-S6 | k1,k2 | 6 | No error | 27,911,023 | 11,703,559 | 13 | 1m 48s |
-| PROPOSED-checkpoint_window-K2 | k1,k2 | 8 | unfinished | 152,716,748 (last Progress) | 79,146,279 (last Progress) | >=9 (last Progress(9)) | 900 s timeout |
-| PROPOSED-checkpoint_window-K2-S6 | k1,k2 | 6 | No error | 28,787,923 | 12,191,646 | 13 | 1m 38s |
+| Config                           | K        | MaxSteps | Result                                                | States generated            | Distinct states            | Depth                    | Runtime       |
+| -------------------------------- | -------- | -------- | ----------------------------------------------------- | --------------------------- | -------------------------- | ------------------------ | ------------- |
+| TODAY-full_inventory             | k1,k2,k3 | 8        | unfinished (not run at K=3; 74.7M distinct per brief) | n/a                         | n/a                        | n/a                      | n/a           |
+| TODAY-full_inventory-K2          | k1,k2    | 8        | unfinished                                            | 205,638,194 (last Progress) | 97,515,271 (last Progress) | >=10 (last Progress(10)) | 900 s timeout |
+| TODAY-full_inventory-K2-S6       | k1,k2    | 6        | No error                                              | 24,217,061                  | 9,823,939                  | 13                       | 1m 12s        |
+| TODAY-checkpoint_window-K2       | k1,k2    | 8        | unfinished                                            | 208,949,589 (last Progress) | 99,681,765 (last Progress) | >=10 (last Progress(10)) | 900 s timeout |
+| TODAY-checkpoint_window-K2-S6    | k1,k2    | 6        | No error                                              | 23,943,077                  | 9,717,346                  | 13                       | 1m 08s        |
+| PROPOSED-full_inventory-K2       | k1,k2    | 8        | unfinished                                            | 153,418,766 (last Progress) | 78,257,208 (last Progress) | >=9 (last Progress(9))   | 900 s timeout |
+| PROPOSED-full_inventory-K2-S6    | k1,k2    | 6        | No error                                              | 27,911,023                  | 11,703,559                 | 13                       | 1m 48s        |
+| PROPOSED-checkpoint_window-K2    | k1,k2    | 8        | unfinished                                            | 152,716,748 (last Progress) | 79,146,279 (last Progress) | >=9 (last Progress(9))   | 900 s timeout |
+| PROPOSED-checkpoint_window-K2-S6 | k1,k2    | 6        | No error                                              | 28,787,923                  | 12,191,646                 | 13                       | 1m 38s        |
 
 Mutants (earlier runs, not rerun):
 
-| Config | K | MaxSteps | Result | States generated | Distinct states | Depth | Runtime |
-|---|---|---|---|---|---|---|---|
-| m1 | k1,k2,k3 | 8 | Invariant NoOmissionBeforeProof violated | 7,742 | 4,324 | not printed | 1 s |
-| m2 | k1,k2,k3 | 8 | Invariant NoOmissionBeforeProof violated | 770,626 | 396,488 | not printed | 4 s |
-| m3 | k1,k2,k3 | 8 | Invariant LaterWriteKept violated | 815,117 | 419,263 | not printed | 4 s |
-| m4 | k1,k2,k3 | 8 | Invariant NoResurrection violated | 11,627 | 6,357 | not printed | <1 s |
+| Config | K        | MaxSteps | Result                                   | States generated | Distinct states | Depth       | Runtime |
+| ------ | -------- | -------- | ---------------------------------------- | ---------------- | --------------- | ----------- | ------- |
+| m1     | k1,k2,k3 | 8        | Invariant NoOmissionBeforeProof violated | 7,742            | 4,324           | not printed | 1 s     |
+| m2     | k1,k2,k3 | 8        | Invariant NoOmissionBeforeProof violated | 770,626          | 396,488         | not printed | 4 s     |
+| m3     | k1,k2,k3 | 8        | Invariant LaterWriteKept violated        | 815,117          | 419,263         | not printed | 4 s     |
+| m4     | k1,k2,k3 | 8        | Invariant NoResurrection violated        | 11,627           | 6,357           | not printed | <1 s    |
 
 Mutants at K=2, MaxSteps=6 (this run, `-workers 2 -deadlock`, one run at a time).
 Counts are at the point TLC stopped on the violation. Trace length is the number
 of states TLC printed, including the initial state.
 
-| Config | Design / Coverage / Mutant | Violated invariant | States generated | Distinct states | Counterexample length | Runtime |
-|---|---|---|---|---|---|---|
-| m1-K2-S6 | PROPOSED / full_inventory / 1 | NoOmissionBeforeProof | 1,764 | 1,027 | 4 | <1 s |
-| m2-K2-S6 | PROPOSED / full_inventory / 2 | NoOmissionBeforeProof | 71,330 | 37,207 | 5 | <1 s |
-| m3-K2-S6 | PROPOSED / full_inventory / 3 | LaterWriteKept | 77,341 | 40,258 | 5 | <1 s |
-| m4-K2-S6 | PROPOSED / full_inventory / 4 | NoResurrection | 3,415 | 1,880 | 4 | <1 s |
-| m5 | TODAY / checkpoint_window / 5 | CheckpointSoundness | 3,466 | 1,901 | 4 | <1 s |
+| Config   | Design / Coverage / Mutant    | Violated invariant    | States generated | Distinct states | Counterexample length | Runtime |
+| -------- | ----------------------------- | --------------------- | ---------------- | --------------- | --------------------- | ------- |
+| m1-K2-S6 | PROPOSED / full_inventory / 1 | NoOmissionBeforeProof | 1,764            | 1,027           | 4                     | <1 s    |
+| m2-K2-S6 | PROPOSED / full_inventory / 2 | NoOmissionBeforeProof | 71,330           | 37,207          | 5                     | <1 s    |
+| m3-K2-S6 | PROPOSED / full_inventory / 3 | LaterWriteKept        | 77,341           | 40,258          | 5                     | <1 s    |
+| m4-K2-S6 | PROPOSED / full_inventory / 4 | NoResurrection        | 3,415            | 1,880           | 4                     | <1 s    |
+| m5       | TODAY / checkpoint_window / 5 | CheckpointSoundness   | 3,466            | 1,901           | 4                     | <1 s    |
 
 Notes:
+
 - No baseline reported an invariant violation, so there is no counterexample trace.
 - The two checkpoint_window K=2, MaxSteps=6 baselines were re-run after the
   Checkpoint edit for m5. They gave the same counts as before (TODAY 23,943,077 /
