@@ -1,3 +1,7 @@
+/** The statement every view trigger runs: add one to the connection's counter. */
+const bumpView = (row: "NEW" | "OLD") =>
+  `INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (${row}.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = ${row}.connection_id), 0) + 1);`;
+
 /**
  * Migration 1 of the local database, taken from the SQL proof. Shared SQL keeps
  * to SQLite 3.22: no UPSERT, RETURNING, JSON1, window functions or STRICT.
@@ -198,42 +202,76 @@ END;`,
     `CREATE INDEX records_size ON records(connection_id, stream, pk_hash, body_bytes)`,
   ],
   [
-    // What a screen shows of a connection, as one counter per connection. A
-    // trigger bumps it in the same transaction as every change a reader can
-    // see: a record written, replaced or removed, the connection appearing,
-    // disappearing or changing identity or control state, a stream appearing,
-    // disappearing or changing completeness or delete version. Nothing prunes
-    // it, unlike `record_changes`, so a change is never lost to compaction.
-    // Local only: never in a part. Head versions, watermarks and checkpoints
-    // are publish bookkeeping and do not bump it.
+    // What a reader sees of a connection, as one counter per connection. A
+    // trigger bumps it in the same transaction as every change of a column the
+    // read path uses, and only when the value differs (`IS NOT`), so a write
+    // that keeps a value changes nothing and a listener that rewrites a value
+    // cannot cause an event. Watched:
+    //   records: the body hash, the stamp, the first-seen time and the
+    //     effective seen time `COALESCE(seen_o, stamp_o)` (a run that saw the
+    //     same body moves it, and so does un-writing that run);
+    //   stream_state: the primary key and profile binding, completeness, the
+    //     delete version and the installed head (version, generation, data
+    //     hash, blob);
+    //   stream_versions: a version row inserted, changed or deleted, which is
+    //     what picks the head, its completeness and its observation time;
+    //   connections: identity and control state.
+    // Not watched: publish and apply bookkeeping no read shows (watermarks,
+    // floors, `needs_full`, checkpoints, labels). Nothing prunes the counter,
+    // unlike `record_changes`, so a compaction cannot erase a change. Local
+    // only: never in a part.
     `CREATE TABLE view_versions (
   connection_id TEXT PRIMARY KEY, version INTEGER NOT NULL) WITHOUT ROWID`,
     `CREATE TRIGGER view_records_ai AFTER INSERT ON records BEGIN
-  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (NEW.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = NEW.connection_id), 0) + 1);
+  ${bumpView("NEW")}
 END`,
-    `CREATE TRIGGER view_records_au AFTER UPDATE OF stamp_o, stamp_r, body_sha256 ON records BEGIN
-  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (NEW.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = NEW.connection_id), 0) + 1);
+    `CREATE TRIGGER view_records_au AFTER UPDATE OF stamp_o, stamp_r, body_sha256, seen_o, first_o ON records
+WHEN OLD.stamp_o IS NOT NEW.stamp_o OR OLD.stamp_r IS NOT NEW.stamp_r OR OLD.body_sha256 IS NOT NEW.body_sha256
+  OR OLD.first_o IS NOT NEW.first_o OR COALESCE(OLD.seen_o, OLD.stamp_o) IS NOT COALESCE(NEW.seen_o, NEW.stamp_o) BEGIN
+  ${bumpView("NEW")}
 END`,
     `CREATE TRIGGER view_records_ad AFTER DELETE ON records BEGIN
-  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (OLD.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = OLD.connection_id), 0) + 1);
+  ${bumpView("OLD")}
 END`,
     `CREATE TRIGGER view_connections_ai AFTER INSERT ON connections BEGIN
-  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (NEW.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = NEW.connection_id), 0) + 1);
+  ${bumpView("NEW")}
 END`,
     `CREATE TRIGGER view_connections_ad AFTER DELETE ON connections BEGIN
-  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (OLD.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = OLD.connection_id), 0) + 1);
+  ${bumpView("OLD")}
 END`,
-    `CREATE TRIGGER view_connections_au AFTER UPDATE OF generation, control_state, control_version, deleted_at ON connections WHEN OLD.generation IS NOT NEW.generation OR OLD.control_state IS NOT NEW.control_state OR OLD.control_version IS NOT NEW.control_version OR OLD.deleted_at IS NOT NEW.deleted_at BEGIN
-  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (NEW.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = NEW.connection_id), 0) + 1);
+    `CREATE TRIGGER view_connections_au AFTER UPDATE OF generation, control_state, control_version, deleted_at ON connections
+WHEN OLD.generation IS NOT NEW.generation OR OLD.control_state IS NOT NEW.control_state OR OLD.control_version IS NOT NEW.control_version OR OLD.deleted_at IS NOT NEW.deleted_at BEGIN
+  ${bumpView("NEW")}
 END`,
     `CREATE TRIGGER view_streams_ai AFTER INSERT ON stream_state BEGIN
-  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (NEW.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = NEW.connection_id), 0) + 1);
+  ${bumpView("NEW")}
 END`,
     `CREATE TRIGGER view_streams_ad AFTER DELETE ON stream_state BEGIN
-  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (OLD.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = OLD.connection_id), 0) + 1);
+  ${bumpView("OLD")}
 END`,
-    `CREATE TRIGGER view_streams_au AFTER UPDATE OF complete, last_delete_version ON stream_state WHEN OLD.complete IS NOT NEW.complete OR OLD.last_delete_version IS NOT NEW.last_delete_version BEGIN
-  INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (NEW.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = NEW.connection_id), 0) + 1);
+    `CREATE TRIGGER view_streams_au AFTER UPDATE OF primary_key, profile_key, profile_version, complete, last_delete_version, head_version, head_generation, head_data_hash, head_blob ON stream_state
+WHEN OLD.primary_key IS NOT NEW.primary_key OR OLD.profile_key IS NOT NEW.profile_key OR OLD.profile_version IS NOT NEW.profile_version
+  OR OLD.complete IS NOT NEW.complete OR OLD.last_delete_version IS NOT NEW.last_delete_version
+  OR OLD.head_version IS NOT NEW.head_version OR OLD.head_generation IS NOT NEW.head_generation
+  OR OLD.head_data_hash IS NOT NEW.head_data_hash OR OLD.head_blob IS NOT NEW.head_blob BEGIN
+  ${bumpView("NEW")}
+END`,
+    // `INSERT OR REPLACE` removes a replaced row without firing a delete
+    // trigger (recursive triggers are off), and an AFTER trigger cannot tell
+    // the row it replaced. A BEFORE trigger sees the stored row, so it bumps
+    // unless an identical row is already there.
+    `CREATE TRIGGER view_versions_bi BEFORE INSERT ON stream_versions
+WHEN NOT EXISTS (SELECT 1 FROM stream_versions o WHERE o.connection_id = NEW.connection_id AND o.stream = NEW.stream AND o.version = NEW.version
+  AND o.generation IS NEW.generation AND o.head_blob IS NEW.head_blob AND o.complete IS NEW.complete AND o.observed_at IS NEW.observed_at AND o.kind IS NEW.kind) BEGIN
+  ${bumpView("NEW")}
+END`,
+    `CREATE TRIGGER view_versions_au AFTER UPDATE OF generation, head_blob, complete, observed_at, kind ON stream_versions
+WHEN OLD.generation IS NOT NEW.generation OR OLD.head_blob IS NOT NEW.head_blob OR OLD.complete IS NOT NEW.complete
+  OR OLD.observed_at IS NOT NEW.observed_at OR OLD.kind IS NOT NEW.kind BEGIN
+  ${bumpView("NEW")}
+END`,
+    `CREATE TRIGGER view_versions_ad AFTER DELETE ON stream_versions BEGIN
+  ${bumpView("OLD")}
 END`,
   ],
 ];
