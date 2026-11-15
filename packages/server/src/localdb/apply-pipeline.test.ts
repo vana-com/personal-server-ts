@@ -10,6 +10,7 @@ import {
   applyStream,
 } from "../../../core/src/localdb/apply.js";
 import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import { syncBeforeBegin } from "../../../core/src/localdb/bootstrap.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.js";
 
@@ -549,4 +550,37 @@ it("five callers asking at once for unchanged streams share one flight: one cont
   expect(
     f.read.mock.calls.filter(([s]) => s === a.scope || s === b.scope),
   ).toHaveLength(0);
+});
+it("bootstrap's apply sees a stream that advanced after bootstrap listed the registry", async () => {
+  const f = await bothApplied();
+  const inner = f.deps.registry.listStreamRows;
+  let entered!: () => void, release!: () => void;
+  const hasEntered = new Promise<void>((r) => {
+    entered = r;
+  });
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  let first = true;
+  f.deps.registry = {
+    ...f.deps.registry,
+    listStreamRows: async (key) => {
+      const rows = await inner(key);
+      if (first) {
+        first = false;
+        entered();
+        await gate;
+      }
+      return rows;
+    },
+  };
+  const running = syncBeforeBegin(f.deps, "fixture-source");
+  await hasEntered;
+  // The listing is taken (b v1) and held; the remote advances before apply.
+  await f.head("b", [{ id: "b2" }], { version: 2 });
+  release();
+  await running;
+  expect(
+    await f.db.query("SELECT head_version FROM stream_state WHERE stream='b'"),
+  ).toEqual([{ head_version: 2 }]);
 });
