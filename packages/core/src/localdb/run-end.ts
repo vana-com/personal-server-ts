@@ -13,7 +13,11 @@ import {
   planStreamStep,
 } from "../stream-sync/publish-plan.js";
 import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
-import { compactTombstones, tombstoneRunDeletes } from "./admit.js";
+import {
+  compactTombstones,
+  replaceOwnRunRows,
+  tombstoneRunDeletes,
+} from "./admit.js";
 import type { SqlStatement } from "./driver.js";
 import { checkRunFence } from "./fence.js";
 import { planInputs } from "./plan-inputs.js";
@@ -69,6 +73,7 @@ type Stream = {
   row_count: number;
   /** Set by batch admission: the connector is below the head's version or key. */
   marked_reason: string | null;
+  unadmitted: number;
 };
 
 export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
@@ -103,7 +108,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           // This run no longer holds back older tombstones. Last, so the
           // compaction sees the run as ended.
           ...(deps.publishWhileCollecting === true
-            ? [compactTombstones(run.connection_id)]
+            ? compactTombstones(run.connection_id)
             : []),
         ];
         if (req.outcome === "failed" || req.outcome === "cancelled") {
@@ -164,7 +169,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
                 s.profile_version AS local_profile_version, s.complete,
                 s.head_version, s.head_generation, s.floor_version, s.floor_o, s.floor_r,
                 (SELECT COUNT(*) FROM run_rows rr WHERE rr.run_id = rs.run_id AND rr.stream = rs.stream) AS row_count,
-                rs.reason AS marked_reason
+                rs.reason AS marked_reason, rs.unadmitted
            FROM run_streams rs LEFT JOIN stream_state s
              ON s.connection_id = ? AND s.stream = rs.stream
           WHERE rs.run_id = ? ORDER BY rs.stream`,
@@ -177,6 +182,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         const statements: SqlStatement[] = [];
         const results: Record<string, StreamRunResult> = Object.create(null);
         let merged = false;
+        let lateAdmission = false;
         let updateRequired = false;
         const retry = req.outcome === "retry_pending";
         for (const stream of streams) {
@@ -255,8 +261,11 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             results[stream.stream] = { state: "discarded" };
             continue;
           }
-          // A run that admitted its batches has its upserts in `records` already.
-          if (run.admitting !== 1)
+          // A run that admitted its batches has its upserts in `records` already,
+          // except a stream with rows staged and not admitted.
+          if (run.admitting === 1 && stream.unadmitted === 1)
+            lateAdmission = true;
+          if (run.admitting !== 1 || stream.unadmitted === 1)
             statements.push({
               sql: `INSERT INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
               SELECT ?, stream, pk_hash, record_key, ?, ?, body, body_sha256, ?
@@ -330,6 +339,11 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
                   };
           }
         }
+        // A later batch of the run wins over an earlier one admitted before.
+        if (lateAdmission)
+          statements.push(
+            replaceOwnRunRows(op, run.connection_id, runId, run.o),
+          );
         statements.push(...mergeIncoming(op, run.connection_id));
         const candidate = req.checkpointCandidate;
         const refused = Object.keys(results).filter(

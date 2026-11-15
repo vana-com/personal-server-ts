@@ -460,6 +460,145 @@ it("a batch from a connector older than the version floor is not admitted and ma
   expect(await a.keys()).toEqual(["admitted-early", "from-v2"]);
 });
 
+/**
+ * Run `effect` once, right before the next batch that admits rows reaches the
+ * database: after the connector check read the stream state, before the
+ * transaction writes. That is the window a concurrent commit can use.
+ */
+function raceOnce(
+  db: { batch: (...args: never[]) => Promise<unknown> },
+  effect: () => Promise<void>,
+) {
+  const original = db.batch.bind(db) as (
+    statements: Array<{ sql: string }>,
+  ) => Promise<unknown>;
+  let fired = false;
+  (db as { batch: unknown }).batch = async (
+    statements: Array<{ sql: string }>,
+  ) => {
+    if (!fired && statements.some((s) => s.sql.includes("INTO incoming"))) {
+      fired = true;
+      await effect();
+    }
+    return original(statements);
+  };
+}
+
+it("a newer connector committing between the check and the write leaves the batch staged, not admitted", async () => {
+  const { a } = await world(true, "checkpoint_window");
+  await a.begin("old-run", { digest: "v1", observedAt: 1100 });
+  await a.batch("old-run", 0, ["early"]);
+  raceOnce(a.db as never, async () => {
+    // A v2 commit lands: the floor rises and the head version moves.
+    await a.db.batch([
+      {
+        sql: "UPDATE stream_state SET floor_version='2', head_version=head_version+1 WHERE stream='items'",
+      },
+    ]);
+  });
+  const result = await a.batch("old-run", 1, ["raced"]);
+  expect(result).toMatchObject({ applied: true, accepted: 1, tombstoned: 0 });
+  expect(await a.keys()).toEqual(["early"]);
+  expect(
+    await a.query(
+      "SELECT record_key FROM run_rows WHERE record_key='raced' UNION ALL SELECT record_key FROM records WHERE record_key='raced'",
+    ),
+  ).toHaveLength(1);
+  const ended = await a.end("old-run", 1);
+  expect(ended.updateRequired).toBe(true);
+  expect(await a.keys()).toEqual(["early"]);
+});
+
+it("a change of stream state that does not refuse the run leaves the batch staged, and run end merges it", async () => {
+  const { a } = await world(true, "checkpoint_window");
+  await a.begin("run", { observedAt: 1100 });
+  await a.batch("run", 0, ["early"]);
+  raceOnce(a.db as never, async () => {
+    await a.db.batch([
+      {
+        sql: "UPDATE stream_state SET head_version=head_version+1 WHERE stream='items'",
+      },
+    ]);
+  });
+  await a.batch("run", 1, ["raced"]);
+  expect(await a.keys()).toEqual(["early"]);
+  expect(
+    await a.query(
+      "SELECT unadmitted FROM run_streams WHERE run_id='run' AND stream='items'",
+    ),
+  ).toEqual([{ unadmitted: 1 }]);
+  await a.batch("run", 2, ["after"]);
+  expect(await a.keys()).toEqual(["after", "early"]);
+  await a.end("run", 2);
+  expect(await a.keys()).toEqual(["after", "early", "raced"]);
+});
+
+it("a run that begins with an old observedAt after a delete's tombstone was compacted is stamped above it", async () => {
+  const { a, b } = await world(true, "checkpoint_window");
+  await a.run("seed", ["gone"], { observedAt: 1100 });
+  await a.begin("deleter", { observedAt: 3000 });
+  await a.batch("deleter", 0, [{ id: "gone", remove: true }]);
+  await a.end("deleter", 0);
+  // No run is open: the tombstone is compacted, its stamp is the watermark.
+  expect(await a.tombstones()).toBe(0);
+  expect(
+    await a.query(
+      "SELECT tombstone_wm_o AS o, tombstone_wm_r AS r FROM connections",
+    ),
+  ).toEqual([{ o: 3000, r: "deleter" }]);
+
+  // Ahead of the watermark by run id: the stamp is already above, o is kept
+  // only when it is.
+  await a.begin("late", { observedAt: 1200 });
+  await a.begin("alpha", { observedAt: 1300 });
+  const stamps = await a.query(
+    "SELECT run_id, o FROM runs WHERE run_id IN ('late','alpha') ORDER BY run_id",
+  );
+  // 'late' sorts after 'deleter': o is raised to the watermark's o.
+  // 'alpha' sorts before it: o goes one above.
+  expect(stamps).toEqual([
+    { run_id: "alpha", o: 3001 },
+    { run_id: "late", o: 3000 },
+  ]);
+
+  // The row it brings back carries a stamp above the delete's, so every
+  // device orders the delete before it.
+  await a.batch("late", 0, ["gone"]);
+  const [row] = await a.query(
+    "SELECT stamp_o, stamp_r FROM records WHERE record_key='gone'",
+  );
+  expect(
+    row!.stamp_o! > 3000 ||
+      (row!.stamp_o === 3000 && row!.stamp_r! > "deleter"),
+  ).toBe(true);
+  await a.end("late", 0);
+  await a.end("alpha", -1, { outcome: "failed" });
+  await a.publish();
+  await b.sync.apply();
+  expect(await b.keys()).toEqual(await a.keys());
+});
+
+it("compaction at run begin drops a tombstone whose older run ended without compacting", async () => {
+  const { a } = await world(true, "checkpoint_window");
+  await a.run("seed", ["gone"], { observedAt: 1100 });
+  await a.begin("older", { observedAt: 1200 });
+  await a.begin("deleter", { observedAt: 3000 });
+  await a.batch("deleter", 0, [{ id: "gone", remove: true }]);
+  await a.end("deleter", 0);
+  expect(await a.tombstones()).toBe(1);
+  // The older run ends by a path that does not compact (a discard, a crash
+  // recovery). The next begin must still drop the tombstone.
+  await a.db.batch([
+    { sql: "UPDATE runs SET state='ended' WHERE run_id='older'" },
+  ]);
+  expect(await a.tombstones()).toBe(1);
+  await a.begin("next", { observedAt: 4000 });
+  expect(await a.tombstones()).toBe(0);
+  expect(await a.query("SELECT tombstone_wm_o AS o FROM connections")).toEqual([
+    { o: 3000 },
+  ]);
+});
+
 // GAP, not fixed here: a head commit that changes the primary key does not move
 // the connection generation (only delete + reconnect does, bootstrap.ts), so
 // the fence never trips an older connector's run that is already collecting,

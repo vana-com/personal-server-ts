@@ -33,8 +33,10 @@ import { checkRunFence } from "./fence.js";
 import {
   ADMIT_ROW_OFFSET,
   admitUpserts,
+  clampRunStart,
   compactTombstones,
   connectorBlockedStreams,
+  guardFailureMarks,
   type AdmitRow,
 } from "./admit.js";
 
@@ -446,7 +448,9 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
               sql: "UPDATE runs SET admitting=1 WHERE run_id=?",
               params: [runId],
             },
-            compactTombstones(id),
+            // Stamp above every compacted tombstone, then count this run.
+            clampRunStart(runId),
+            ...compactTombstones(id),
           );
         }
         statements.push({ sql: "DROP TRIGGER temp.intake_begin_check" });
@@ -570,10 +574,11 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
         const admitting = run.admitting === 1;
         // A stream whose connector the head refuses (version floor or key) has
         // its upserts staged, not admitted: run end refuses it the same way.
-        const blocked = admitting
+        const { blocked, facts } = admitting
           ? await connectorBlockedStreams(deps, runId, run)
-          : new Set<string>();
+          : { blocked: new Set<string>(), facts: new Map() };
         const admitted = upserts.filter((u) => !blocked.has(u.stream));
+        const admittedStreams = [...new Set(admitted.map((u) => u.stream))];
         const admission =
           admitting && admitted.length > 0
             ? admitUpserts({
@@ -582,20 +587,33 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
                 runId,
                 o: run.o,
                 rows: admitted,
+                facts,
                 guard: {
                   sql: "EXISTS (SELECT 1 FROM runs WHERE run_id=? AND state='collecting' AND last_batch=?)",
                   params: [runId, run.last_batch],
                 },
               })
             : [];
+        // A stream whose facts changed since the check is staged, not admitted:
+        // run end merges it.
+        const guardMarks =
+          admission.length > 0
+            ? guardFailureMarks(
+                run.connection_id,
+                runId,
+                facts,
+                admittedStreams,
+              )
+            : [];
         // The mark outlives the batch: run end reports `updateRequired` for it
         // even when another refusal (commit order) comes first there.
-        const marks: SqlStatement[] = [
+        const blockedStreams = [
           ...new Set(
             upserts.filter((u) => blocked.has(u.stream)).map((u) => u.stream),
           ),
-        ].map((stream) => ({
-          sql: "UPDATE run_streams SET reason='connector_update_required' WHERE run_id=? AND stream=?",
+        ];
+        const marks: SqlStatement[] = blockedStreams.map((stream) => ({
+          sql: "UPDATE run_streams SET reason='connector_update_required', unadmitted=1 WHERE run_id=? AND stream=?",
           params: [runId, stream],
         }));
         let outcome: Awaited<ReturnType<typeof db.batch>>;
@@ -605,6 +623,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             { sql: BATCH_CHECK },
             ...rows,
             ...admission,
+            ...guardMarks,
             {
               sql: "UPDATE runs SET last_batch=? WHERE run_id=? AND state='collecting' AND last_batch=?",
               params: [req.batch, runId, run.last_batch],
@@ -613,7 +632,11 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             { sql: "DROP TRIGGER temp.intake_rows_check" },
             { sql: "DROP TRIGGER temp.intake_batch_check" },
           ]);
-          if (outcome.changes[rows.length + admission.length + 2] === 0) {
+          if (
+            outcome.changes[
+              rows.length + admission.length + guardMarks.length + 2
+            ] === 0
+          ) {
             await live(runId);
             return replay;
           }
@@ -628,10 +651,20 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
         }
         if (!admitting) return { applied: true, accepted, deletesSkipped: 0 };
         const base = 2 + rows.length + ADMIT_ROW_OFFSET;
+        const markBase = 2 + rows.length + admission.length;
+        const notAdmitted = new Set(
+          admittedStreams.filter((_, i) => outcome.changes[markBase + i] === 1),
+        );
+        // A row skipped for a remembered delete; rows of a stream whose facts
+        // changed are counted as staged, not as skipped.
         const tombstoned = admitted.filter(
-          (_, i) => outcome.changes[base + i] === 0,
+          (u, i) =>
+            outcome.changes[base + i] === 0 && !notAdmitted.has(u.stream),
         ).length;
-        if (admitted.length > tombstoned) announceRecordsCommitted(deps);
+        const landed = admitted.filter(
+          (_, i) => outcome.changes[base + i] !== 0,
+        ).length;
+        if (landed > 0) announceRecordsCommitted(deps);
         return {
           applied: true,
           accepted,

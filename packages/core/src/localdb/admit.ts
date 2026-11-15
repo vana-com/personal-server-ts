@@ -32,6 +32,64 @@ export interface AdmitRow {
 export const ADMIT_ROW_OFFSET = 1;
 
 /**
+ * What the connector check read of a stream's local state. The batch's
+ * transaction admits the stream's rows only while the state still shows these
+ * values, so a commit that lands between the read and the write (a newer
+ * connector raising the floor, a head with another key) cannot slip past.
+ */
+export interface StreamFacts {
+  readonly head_version: number;
+  readonly head_generation: number | null;
+  readonly floor_version: string | null;
+  readonly floor_o: number | null;
+  readonly local_primary_key: string;
+}
+
+function factsGuard(
+  connectionId: string,
+  stream: string,
+  facts: StreamFacts,
+): { sql: string; params: SqlStatement["params"] } {
+  return {
+    sql: `EXISTS (SELECT 1 FROM stream_state s WHERE s.connection_id = ? AND s.stream = ?
+        AND s.head_version = ? AND s.head_generation IS ? AND s.floor_version IS ?
+        AND s.floor_o IS ? AND s.primary_key = ?)`,
+    params: [
+      connectionId,
+      stream,
+      facts.head_version,
+      facts.head_generation,
+      facts.floor_version,
+      facts.floor_o,
+      facts.local_primary_key,
+    ],
+  };
+}
+
+/**
+ * One statement per stream, after the admission statements: marks the stream
+ * `unadmitted` when its facts no longer hold. `changes` is 1 for a stream whose
+ * rows were not admitted for that reason.
+ */
+export function guardFailureMarks(
+  connectionId: string,
+  runId: string,
+  facts: ReadonlyMap<string, StreamFacts>,
+  streams: readonly string[],
+): SqlStatement[] {
+  return streams.map((stream) => {
+    const known = facts.get(stream);
+    const guard = known ? factsGuard(connectionId, stream, known) : null;
+    return {
+      sql: `UPDATE run_streams SET unadmitted = 1 WHERE run_id = ? AND stream = ?${
+        guard ? ` AND NOT ${guard.sql}` : ""
+      }`,
+      params: [runId, stream, ...(guard?.params ?? [])],
+    };
+  });
+}
+
+/**
  * Statements for one batch's admitted upserts. The per-row inserts come right
  * after the origin update, in row order: the caller reads `changes[offset + i]`
  * (0 = skipped because a newer delete is remembered for the key).
@@ -45,12 +103,13 @@ export function admitUpserts(input: {
   readonly runId: string;
   readonly o: number;
   readonly rows: readonly AdmitRow[];
+  readonly facts: ReadonlyMap<string, StreamFacts>;
   readonly guard: {
     readonly sql: string;
     readonly params: SqlStatement["params"];
   };
 }): SqlStatement[] {
-  const { op, connectionId, runId, o, rows, guard } = input;
+  const { op, connectionId, runId, o, rows, facts, guard } = input;
   const guardParams = guard.params ?? [];
   const statements: SqlStatement[] = [
     // The logging triggers read the origin; run end writes under `local` too.
@@ -60,10 +119,15 @@ export function admitUpserts(input: {
     },
   ];
   for (const row of rows) {
+    const known = facts.get(row.stream);
+    // No facts for the stream: nothing to check the row against, so it stays staged.
+    const stream = known
+      ? factsGuard(connectionId, row.stream, known)
+      : { sql: "0", params: [] };
     statements.push({
       // A later row for the same key in this batch replaces the earlier one.
       sql: `INSERT OR REPLACE INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${guard.sql}
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${guard.sql} AND ${stream.sql}
           AND NOT EXISTS (SELECT 1 FROM record_tombstones t
             WHERE t.connection_id = ? AND t.stream = ? AND t.pk_hash = ?
               AND (t.stamp_o, t.stamp_r) > (?, ?))`,
@@ -78,6 +142,7 @@ export function admitUpserts(input: {
         row.bodySha256,
         o,
         ...guardParams,
+        ...(stream.params ?? []),
         connectionId,
         row.stream,
         row.pkHash,
@@ -87,26 +152,37 @@ export function admitUpserts(input: {
     });
   }
   statements.push(
-    {
-      // Within a run the later batch wins. A row this run already holds, as its
-      // stamp or as its newest sighting, has the same stamp as the incoming
-      // row, so mergeIncoming's strict stamp rule would keep the earlier batch.
-      // Replace it here, and only for the run's own rows: another writer at the
-      // same stamp is still never replaced.
-      sql: `UPDATE records SET
-          body = (SELECT i.body FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash),
-          body_sha256 = (SELECT i.body_sha256 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash),
-          body_bytes = (SELECT LENGTH(CAST(i.body AS BLOB)) FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash),
-          stamp_o = ?, stamp_r = ?, seen_o = NULL, seen_r = NULL
-        WHERE (connection_id, stream, pk_hash) IN (SELECT ?, stream, pk_hash FROM incoming WHERE op = ?)
-          AND COALESCE(seen_o, stamp_o) = ? AND COALESCE(seen_r, stamp_r) = ?
-          AND EXISTS (SELECT 1 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash
-                      AND NOT (i.body_sha256 = records.body_sha256 AND i.body = records.body))`,
-      params: [op, op, op, o, runId, connectionId, op, o, runId, op],
-    },
+    replaceOwnRunRows(op, connectionId, runId, o),
     ...mergeIncoming(op, connectionId),
   );
   return statements;
+}
+
+/**
+ * Within a run the later batch wins. A row this run already holds, as its
+ * stamp or as its newest sighting, has the same stamp as the incoming row, so
+ * mergeIncoming's strict stamp rule would keep the earlier batch. Replace it
+ * here, and only for the run's own rows: another writer at the same stamp is
+ * still never replaced. Runs on `incoming` rows of `op`, before the merge.
+ */
+export function replaceOwnRunRows(
+  op: string,
+  connectionId: string,
+  runId: string,
+  o: number,
+): SqlStatement {
+  return {
+    sql: `UPDATE records SET
+        body = (SELECT i.body FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash),
+        body_sha256 = (SELECT i.body_sha256 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash),
+        body_bytes = (SELECT LENGTH(CAST(i.body AS BLOB)) FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash),
+        stamp_o = ?, stamp_r = ?, seen_o = NULL, seen_r = NULL
+      WHERE (connection_id, stream, pk_hash) IN (SELECT ?, stream, pk_hash FROM incoming WHERE op = ?)
+        AND COALESCE(seen_o, stamp_o) = ? AND COALESCE(seen_r, stamp_r) = ?
+        AND EXISTS (SELECT 1 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash
+                    AND NOT (i.body_sha256 = records.body_sha256 AND i.body = records.body))`,
+    params: [op, op, op, o, runId, connectionId, op, o, runId, op],
+  };
 }
 
 /** Remember a run's explicit deletes by the deleting run's stamp. */
@@ -161,18 +237,61 @@ export function tombstoneOmissions(
   };
 }
 
+// A tombstone no collecting run can still need: no collecting run of the
+// connection started before it (by stamp). With none, every later run starts
+// later and carries a newer stamp.
+const DROPPABLE = (t: string) => `NOT EXISTS (SELECT 1 FROM runs r
+    WHERE r.connection_id = ? AND r.state = 'collecting'
+      AND (r.o, r.run_id) < (${t}.stamp_o, ${t}.stamp_r))`;
+
 /**
- * Drop the tombstones no collecting run can still need. A tombstone matters to
- * a run only if the run started before it. With no collecting run older than a
- * tombstone, every later run starts later and carries a newer stamp, so the
- * row can go. Call after a run ends and after a run begins (its row counts).
+ * Drop the tombstones no collecting run can still need, and keep the highest
+ * stamp dropped as the connection's watermark. Call after a run ends and after
+ * a run begins (its row counts).
  */
-export function compactTombstones(connectionId: string): SqlStatement {
+export function compactTombstones(connectionId: string): SqlStatement[] {
+  return [
+    {
+      // The watermark moves first, from the rows the delete below removes.
+      sql: `UPDATE connections SET
+          tombstone_wm_o = (SELECT t.stamp_o FROM record_tombstones t
+            WHERE t.connection_id = connections.connection_id AND ${DROPPABLE("t")}
+            ORDER BY t.stamp_o DESC, t.stamp_r DESC LIMIT 1),
+          tombstone_wm_r = (SELECT t.stamp_r FROM record_tombstones t
+            WHERE t.connection_id = connections.connection_id AND ${DROPPABLE("t")}
+            ORDER BY t.stamp_o DESC, t.stamp_r DESC LIMIT 1)
+        WHERE connection_id = ?
+          AND EXISTS (SELECT 1 FROM record_tombstones t
+            WHERE t.connection_id = connections.connection_id AND ${DROPPABLE("t")}
+              AND (connections.tombstone_wm_o IS NULL
+                   OR (t.stamp_o, t.stamp_r) > (connections.tombstone_wm_o, connections.tombstone_wm_r)))`,
+      params: [connectionId, connectionId, connectionId, connectionId],
+    },
+    {
+      sql: `DELETE FROM record_tombstones WHERE connection_id = ?
+        AND ${DROPPABLE("record_tombstones")}`,
+      params: [connectionId, connectionId],
+    },
+  ];
+}
+
+/**
+ * Raise a new run's `o` until its stamp `(o, run_id)` is above the connection's
+ * watermark. A tombstone below the watermark is gone, so a run that stamped
+ * below it (a caller-supplied old `observedAt`) could admit a row back that a
+ * newer run deleted. Runs in the begin batch, after the run row is inserted
+ * and before compaction counts it.
+ */
+export function clampRunStart(runId: string): SqlStatement {
   return {
-    sql: `DELETE FROM record_tombstones WHERE connection_id = ?
-      AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.connection_id = ? AND r.state = 'collecting'
-        AND (r.o, r.run_id) < (record_tombstones.stamp_o, record_tombstones.stamp_r))`,
-    params: [connectionId, connectionId],
+    sql: `UPDATE runs SET o = (SELECT CASE
+          WHEN c.tombstone_wm_o IS NULL THEN runs.o
+          WHEN (runs.o, runs.run_id) > (c.tombstone_wm_o, c.tombstone_wm_r) THEN runs.o
+          WHEN runs.run_id > c.tombstone_wm_r THEN c.tombstone_wm_o
+          ELSE c.tombstone_wm_o + 1 END
+        FROM connections c WHERE c.connection_id = runs.connection_id)
+      WHERE run_id = ?`,
+    params: [runId],
   };
 }
 
@@ -192,12 +311,15 @@ export async function connectorBlockedStreams(
     readonly generation: number | null;
     readonly artifact_version: string;
   },
-): Promise<Set<string>> {
+): Promise<{
+  readonly blocked: Set<string>;
+  readonly facts: Map<string, StreamFacts>;
+}> {
   const [connection] = await deps.db.query<{ connector: string }>(
     "SELECT connector FROM connections WHERE connection_id = ?",
     [run.connection_id],
   );
-  if (!connection) return new Set();
+  if (!connection) return { blocked: new Set(), facts: new Map() };
   const rows = await deps.db.query<StreamPlanRow & { stream: string }>(
     `SELECT rs.stream, rs.primary_key, rs.profile_key, rs.profile_version,
             s.primary_key AS local_primary_key, s.profile_key AS local_profile_key,
@@ -209,7 +331,15 @@ export async function connectorBlockedStreams(
     [run.connection_id, runId],
   );
   const blocked = new Set<string>();
+  const facts = new Map<string, StreamFacts>();
   for (const row of rows) {
+    facts.set(row.stream, {
+      head_version: row.head_version,
+      head_generation: row.head_generation,
+      floor_version: row.floor_version,
+      floor_o: row.floor_o,
+      local_primary_key: row.local_primary_key,
+    });
     const { primaryKey, profile, head } = planInputs(
       row,
       run,
@@ -238,5 +368,5 @@ export async function connectorBlockedStreams(
     )
       blocked.add(row.stream);
   }
-  return blocked;
+  return { blocked, facts };
 }

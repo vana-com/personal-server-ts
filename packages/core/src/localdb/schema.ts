@@ -321,5 +321,15 @@ END`,
     // 1 = the run's batches were admitted into `records` as they arrived, so
     // run end does not merge its upserts again. Fixed at begin from the flag.
     `ALTER TABLE runs ADD COLUMN admitting INTEGER NOT NULL DEFAULT 0`,
+    // The highest tombstone stamp compaction ever dropped for the connection.
+    // A run that begins later takes an `o` that puts its stamp above it
+    // (`clampRunStart` in admit.ts), so "a later run has a newer stamp" holds
+    // even when the caller passes an old `observedAt`.
+    `ALTER TABLE connections ADD COLUMN tombstone_wm_o INTEGER`,
+    `ALTER TABLE connections ADD COLUMN tombstone_wm_r TEXT`,
+    // 1 = some upserts of this stream were staged in `run_rows` and not
+    // admitted (the connector check blocked them, or the stream's head or floor
+    // changed between that check and the batch commit). Run end merges them.
+    `ALTER TABLE run_streams ADD COLUMN unadmitted INTEGER NOT NULL DEFAULT 0`,
   ],
 ];
