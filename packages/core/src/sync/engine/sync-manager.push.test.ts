@@ -262,7 +262,7 @@ describe("a pushed change does not wait for the optional probe", () => {
     await manager.stop();
   });
 
-  it("records the marker a forced cycle covered, so the next probe does not repeat it", async () => {
+  it("publishes no marker of its own: the next probe runs one conservative follow-up, then settles", async () => {
     const { push, state } = fakePush();
     let marker = "m1";
     const cycle = vi.fn(async () => {});
@@ -279,8 +279,62 @@ describe("a pushed change does not wait for the optional probe", () => {
     state.handlers!.onChange();
     await vi.advanceTimersByTimeAsync(0);
     expect(cycle).toHaveBeenCalledTimes(1);
-    await manager.requestPull(); // m2 was applied by the forced cycle
+    await manager.requestPull(); // the probe's own read of m2, then its cycle
+    expect(cycle).toHaveBeenCalledTimes(2);
+    await manager.requestPull(); // m2 is now applied by a cycle that followed its read
+    expect(cycle).toHaveBeenCalledTimes(2);
+    await manager.stop();
+  });
+
+  it("does not mark a change applied that the forced cycle never read", async () => {
+    // pulledMarker only holds a marker that was read BEFORE the cycle that
+    // applied it started. A marker answered while a forced cycle is running may
+    // describe a commit made after the cycle's registry snapshot.
+    const { push, state } = fakePush();
+    const answers: Array<(m: string) => void> = [];
+    let immediate = true;
+    const read = vi.fn(() =>
+      immediate
+        ? Promise.resolve("m1")
+        : new Promise<string>((resolve) => answers.push(resolve)),
+    );
+    let snapshot = "";
+    let registry = "m1";
+    let release: () => void = () => {};
+    let hold = false;
+    const cycle = vi.fn(async () => {
+      snapshot = registry; // the cycle's registry read
+      if (hold) await new Promise<void>((resolve) => (release = resolve)); // applying it
+    });
+    const manager = build({
+      localSync: { cycle },
+      changeProbe: { read, intervalMs: 5_000, push },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await manager.requestPull(); // m1 is applied
+    cycle.mockClear();
+    immediate = false;
+    hold = true;
+
+    state.handlers!.onChange(); // the forced cycle starts and takes its snapshot
+    await vi.advanceTimersByTimeAsync(0);
     expect(cycle).toHaveBeenCalledTimes(1);
+    expect(snapshot).toBe("m1");
+    registry = "m2"; // a later commit, after the snapshot
+    answers.splice(0).forEach((answer) => answer("m2")); // a probe read sees it
+    await vi.advanceTimersByTimeAsync(0);
+    release(); // the forced cycle finishes with snapshot m1
+    await vi.advanceTimersByTimeAsync(0);
+
+    const next = manager.requestPull();
+    await vi.advanceTimersByTimeAsync(0);
+    answers.splice(0).forEach((answer) => answer("m2"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cycle).toHaveBeenCalledTimes(2); // m2 was never applied: a follow-up runs
+    expect(snapshot).toBe("m2");
+    release();
+    await next;
     await manager.stop();
   });
 });

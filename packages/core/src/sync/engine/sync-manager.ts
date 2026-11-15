@@ -250,8 +250,10 @@ export function createSyncManager(
   let lastProbeAt = 0;
   let stopPush: (() => void) | null = null;
   // The registry marker as of the last cycle a pull ran and finished cleanly.
-  // Only a pull moves it, and only to a marker read BEFORE its cycle started,
-  // so every change up to it was in the registry when that cycle read.
+  // Only `pullIfChanged` moves it, and only to a marker read BEFORE its cycle
+  // started, so every change up to it was in the registry when that cycle read.
+  // A cycle that does not read its own marker first (a pushed change) leaves it
+  // alone: the next probe then runs one conservative follow-up.
   let pulledMarker: string | null | undefined;
   let errorSeq = 0;
   let probeIntervalId: ReturnType<typeof setInterval> | null = null;
@@ -633,53 +635,6 @@ export function createSyncManager(
     }
   }
 
-  /**
-   * A cycle for a verified change (a push answer). The change is already
-   * proven, so the cycle neither waits for the optional probe nor depends on
-   * its marker, and it does not join a timed probe read that is in flight: a
-   * probe that never answers must not hold up the push. `runCycle` still
-   * serializes it with every other cycle.
-   *
-   * The marker read starts first and is not awaited. When it has answered by
-   * the time the cycle ends it is recorded as applied, so the next timed probe
-   * does not repeat this cycle. A read that is late, or that fails, only costs
-   * that repeat.
-   */
-  async function pullForcedNow(probe: ChangeProbe, run: number): Promise<void> {
-    const errorsBefore = errorSeq;
-    lastProbeAt = Date.now();
-    let marker: string | null | undefined;
-    let answered = false;
-    void probe.read().then(
-      (value) => {
-        if (run !== lifecycle) return;
-        marker = value;
-        answered = true;
-        probeFailures = 0;
-        nextTimedProbeAt = 0;
-      },
-      (err: Error) => {
-        if (run === lifecycle) noteProbeFailure(probe);
-        uploadDeps.logger.debug(
-          { error: err.message },
-          "Registry change probe failed; the pushed change cycles without it",
-        );
-      },
-    );
-    await runCycle();
-    // Only a read that answered before the cycle ended counts (`answered`).
-    if (
-      run === lifecycle &&
-      isRunning &&
-      answered &&
-      marker !== undefined &&
-      blocked === null &&
-      errorSeq === errorsBefore
-    ) {
-      pulledMarker = marker;
-    }
-  }
-
   function pull(fromSignal: boolean): Promise<void> {
     if (!isRunning) return Promise.resolve();
     // No probe: a pull is a cycle request, and `runCycle` coalesces those.
@@ -785,9 +740,11 @@ export function createSyncManager(
     stopPush = push.subscribe({
       onChange() {
         if (run !== lifecycle || !isRunning) return;
-        const probe = options?.changeProbe;
-        if (!probe) return;
-        pullForcedNow(probe, run).catch(() => {
+        // A verified change cycles at once. It does not wait for the optional
+        // probe or join a timed probe read in flight, so a probe that never
+        // answers cannot hold it up; `runCycle` still runs one cycle at a time.
+        // It reads no marker and publishes none: see `pulledMarker`.
+        runCycle().catch(() => {
           // Errors already captured in ring buffer
         });
       },

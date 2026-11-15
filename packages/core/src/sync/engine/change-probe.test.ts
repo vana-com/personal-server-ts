@@ -44,6 +44,39 @@ describe("createRegistryChangeProbe", () => {
     }
   });
 
+  it("stays rejected when the read answers after the deadline, and a later pull trusts only a fresh read", async () => {
+    vi.useFakeTimers();
+    try {
+      const late: Array<(marker: string) => void> = [];
+      let reads = 0;
+      const probeChange = vi.fn(async () => {
+        reads += 1;
+        if (reads === 1) return "m1";
+        return new Promise<string>((resolve) => late.push(resolve));
+      });
+      const probe = createRegistryChangeProbe(
+        registry(probeChange as StreamSyncRegistry["probeChange"]),
+      )!;
+      expect(await probe.read()).toBe("m1");
+
+      const outcome = probe.read().then(
+        (m) => `answered ${m}`,
+        (e: Error) => e.message,
+      );
+      await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS);
+      expect(await outcome).toMatch(/probe/i);
+      late.splice(0).forEach((resolve) => resolve("m2")); // too late
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await outcome).toMatch(/probe/i); // the rejection stands
+      // Next read is its own request, not the late one.
+      const next = probe.read();
+      late.splice(0).forEach((resolve) => resolve("m3"));
+      expect(await next).toBe("m3");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not delay or abort an answer that arrives in time", async () => {
     const probe = createRegistryChangeProbe(registry(async () => "m"))!;
     expect(await probe.read()).toBe("m");
