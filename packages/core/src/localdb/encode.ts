@@ -325,15 +325,13 @@ async function* readFrozen(
   // freeze of the next prefixes.
   const reader: SqlReader = source.view?.view ?? readerOf(deps.db);
   const frozen = source.view;
-  // The two sources differ only in the table, its scope and the size column.
+  // The two sources differ only in the table and its scope.
   let from: string;
   let scope: string;
-  let size: string;
   let scopeParams: SqlValue[];
   if (frozen) {
     from = "records";
     scope = "connection_id = ? AND stream = ?";
-    size = BODY_BYTES;
     scopeParams = [frozen.connectionId, frozen.stream];
     if (frozen.replaceBelow) {
       // Rows below the replacing run are left out, as the copy leaves them.
@@ -343,10 +341,9 @@ async function* readFrozen(
   } else {
     from = "publish_spool";
     scope = "attempt = ?";
-    size = "body_bytes";
     scopeParams = [source.attempt];
   }
-  let meta: { pk_hash: string; body_bytes: number }[] = [];
+  let meta: { pk_hash: string; body_bytes: number | null }[] = [];
   let at = 0;
   let more = true;
   for (;;) {
@@ -354,7 +351,7 @@ async function* readFrozen(
       if (!more) return;
       const after: string | undefined = meta[meta.length - 1]?.pk_hash;
       meta = await reader.query(
-        `SELECT pk_hash, ${size} AS body_bytes FROM ${from}
+        `SELECT pk_hash, body_bytes FROM ${from}
           WHERE ${scope}${range.sql}${after === undefined ? "" : " AND pk_hash > ?"}
           ORDER BY pk_hash LIMIT ${META_ROWS}`,
         [
@@ -366,6 +363,26 @@ async function* readFrozen(
       at = 0;
       more = meta.length === META_ROWS;
       if (meta.length === 0) return;
+      // A row from before `body_bytes` existed has no stored size: measure
+      // the span of rows that holds them in one range read of the bodies.
+      const unsized = meta.filter((row) => row.body_bytes === null);
+      if (frozen && unsized.length > 0) {
+        const measured = new Map(
+          (
+            await reader.query<{ pk_hash: string; n: number }>(
+              `SELECT pk_hash, ${BODY_BYTES} AS n FROM records
+                WHERE ${scope} AND pk_hash >= ? AND pk_hash <= ?`,
+              [
+                ...scopeParams,
+                unsized[0]!.pk_hash,
+                unsized[unsized.length - 1]!.pk_hash,
+              ],
+            )
+          ).map((row) => [row.pk_hash, Number(row.n)]),
+        );
+        for (const row of unsized)
+          row.body_bytes = measured.get(row.pk_hash) ?? 0;
+      }
     }
     let take = 0;
     let bytes = 0;
