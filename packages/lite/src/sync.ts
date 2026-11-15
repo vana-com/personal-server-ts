@@ -579,9 +579,10 @@ export async function createPsLiteSyncManager(
       gatewayUrl: options.config.gateway.url,
       ownerAddress: serverOwner,
     });
-  // A hidden tab has no one to show a change to: it skips the timed probe and
-  // probes once when shown again (`startPullSignals`). Where the document says
-  // nothing (a worker), the probe runs.
+  // A hidden tab has no one to show a change to: the runtime pauses the
+  // manager (`startVisibilityPause`), which holds no request and no timer
+  // until it is shown again. Where the document says nothing (a worker), the
+  // probe runs.
   const changeProbe = options.localDb
     ? createRegistryChangeProbe(streamSyncRegistry, {
         intervalMs: options.config.streamSync.changeProbeMs,
@@ -589,9 +590,6 @@ export async function createPsLiteSyncManager(
           enabled: options.config.streamSync.changePush,
           healthyProbeMs: options.config.streamSync.changeProbeHealthyMs,
         },
-        active: () =>
-          (globalThis as { document?: { visibilityState?: string } }).document
-            ?.visibilityState !== "hidden",
       })
     : undefined;
 
