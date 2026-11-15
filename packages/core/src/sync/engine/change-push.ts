@@ -60,7 +60,9 @@ export interface RegistryChangePushOptions {
  *
  *  - an answer that says `changed` is a poke (`onChange`): the manager pulls;
  *  - the first answer after any failure is a poke too, whether or not the
- *    sequence moved, so a poke lost with the connection costs one pull;
+ *    sequence moved, so a poke lost with the connection costs one pull. A
+ *    failed attempt is not a poke: with every answer lost, only the manager's
+ *    timer cycle (and its probe) finds the change;
  *  - `onHealth(false)` on any failure or silence, `onHealth(true)` on the next
  *    answer: only while healthy does the manager stretch its probe.
  */

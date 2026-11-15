@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { StreamSyncRegistry } from "../../stream-sync/ports.js";
 import {
   DEFAULT_CHANGE_PROBE_MS,
+  PROBE_TIMEOUT_MS,
   createRegistryChangeProbe,
 } from "./change-probe.js";
 import { DEFAULT_CHANGE_PUSH_HEALTHY_PROBE_MS } from "./change-push.js";
@@ -16,6 +17,36 @@ describe("createRegistryChangeProbe", () => {
     expect(probe.intervalMs).toBe(DEFAULT_CHANGE_PROBE_MS);
     expect(await probe.read()).toBe("m");
     expect(probeChange).toHaveBeenCalledTimes(1);
+  });
+
+  it("ends a read that never answers: aborts it and rejects at the deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      let seen: AbortSignal | undefined;
+      const probeChange = vi.fn(
+        (signal?: AbortSignal) =>
+          new Promise<string>(() => {
+            seen = signal;
+          }),
+      );
+      const probe = createRegistryChangeProbe(
+        registry(probeChange as StreamSyncRegistry["probeChange"]),
+      )!;
+      const outcome = probe.read().then(
+        () => "answered",
+        (e: Error) => e.message,
+      );
+      await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS);
+      expect(await outcome).toMatch(/probe/i);
+      expect(seen?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not delay or abort an answer that arrives in time", async () => {
+    const probe = createRegistryChangeProbe(registry(async () => "m"))!;
+    expect(await probe.read()).toBe("m");
   });
 
   it("is absent when the registry cannot probe or the period is 0", () => {

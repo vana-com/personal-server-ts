@@ -386,13 +386,15 @@ export function createGatewayStreamSyncRegistry(
         return parsed?.kind === "stream" && parsed.connector === connector;
       }),
 
-    async probeChange() {
+    async probeChange(signal) {
       const params = new URLSearchParams({
         user: options.ownerAddress,
         includeDeleted: "true",
         limit: "1",
       });
-      const res = await fetchImpl(`${base}/v1/data?${params.toString()}`);
+      const res = await fetchImpl(`${base}/v1/data?${params.toString()}`, {
+        ...(signal && { signal }),
+      });
       if (!res.ok) {
         throw new Error(`registry change probe failed: ${res.status}`);
       }

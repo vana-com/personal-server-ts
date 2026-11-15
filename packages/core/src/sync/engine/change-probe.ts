@@ -25,6 +25,14 @@ import type { ChangeProbe } from "./sync-manager.js";
  */
 export const DEFAULT_CHANGE_PROBE_MS = 5_000;
 
+/**
+ * A probe read that has not answered after this long failed. A probe is
+ * optional: a read that never settles must not hold a pull in flight, so the
+ * ordinary timed path and every later poke stay free. It matches the push
+ * request's grace (`REQUEST_GRACE_MS`), the same "this connection is dead" bar.
+ */
+export const PROBE_TIMEOUT_MS = 10_000;
+
 export interface RegistryChangeProbeOptions {
   /** Default {@link DEFAULT_CHANGE_PROBE_MS}; 0 or less: no probe. */
   intervalMs?: number;
@@ -50,9 +58,33 @@ export function createRegistryChangeProbe(
     ...(options.active && { active: options.active }),
   });
   return {
-    read: probeChange,
+    read: () => readWithDeadline(probeChange),
     intervalMs,
     ...(push && { push }),
     ...(options.active && { active: options.active }),
   };
+}
+
+/**
+ * One probe read that ends: it is aborted at the deadline (so the request frees
+ * its connection) and rejects at the deadline even when the registry ignores
+ * the signal.
+ */
+async function readWithDeadline(
+  probeChange: (signal?: AbortSignal) => Promise<string | null | undefined>,
+): Promise<string | null | undefined> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error("registry change probe got no answer");
+      controller.abort(error);
+      reject(error);
+    }, PROBE_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([probeChange(controller.signal), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }

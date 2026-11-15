@@ -485,6 +485,23 @@ describe("probeChange", () => {
     expect(await registry.probeChange!()).toBeUndefined();
   });
 
+  it("hands the caller's abort signal to the request, so a stalled read can be ended", async () => {
+    const seen: Array<AbortSignal | null | undefined> = [];
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test",
+      ownerAddress: "0x" + "11".repeat(20),
+      fetch: (async (_url: string, init?: RequestInit) => {
+        seen.push(init?.signal);
+        return new Response(JSON.stringify({ data: { dataPoints: [] } }));
+      }) as typeof fetch,
+    });
+    const controller = new AbortController();
+    await registry.probeChange!(controller.signal);
+    expect(seen).toHaveLength(1);
+    controller.abort();
+    expect(seen[0]?.aborted).toBe(true);
+  });
+
   it("throws on a failed read: a failure is not 'nothing changed'", async () => {
     const { registry } = probing([new Response("no", { status: 503 })]);
     await expect(registry.probeChange!()).rejects.toThrow(/503/);

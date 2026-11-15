@@ -65,10 +65,12 @@ export interface ChangeProbe {
  * A poke runs a cycle. It does not go through the marker comparison that a
  * focus or a probe tick uses, because the marker is the lossy part (it
  * fingerprints one row, and another row stamped in the same millisecond leaves
- * it equal) while a poke is the gateway's exact sequence changing, or a
- * reconnect after a failure. The unconditional timer cycle stays the
- * completeness guarantee. The push only shortens the wait, and it says when it
- * cannot be trusted so the short probe returns.
+ * it equal) while a poke is the gateway's exact sequence changing, or the
+ * first answer after a failure. It does not wait for the probe either: a probe
+ * that never answers cannot hold it up. A failed attempt is not a poke. The
+ * unconditional timer cycle stays the completeness guarantee. The push only
+ * shortens the wait, and it says when it cannot be trusted so the short probe
+ * returns.
  */
 export interface ChangePush {
   /**
@@ -78,8 +80,10 @@ export interface ChangePush {
   healthyProbeMs: number;
   /**
    * Start a subscription; the returned function ends it. `onChange` means the
-   * registry's sequence moved since the last poke, or the channel came back
-   * after a failure: run a cycle. `onHealth(true)`:
+   * registry's sequence moved since the last answer, or the first answer after
+   * a failure came back: run a cycle. It is called on a successful answer
+   * only; a failed attempt calls nothing, so with every answer lost the timer
+   * cycle is the bound. `onHealth(true)`:
    * the channel answered lately, so pokes can be expected; `onHealth(false)`:
    * it failed or went quiet, so do not rely on one.
    */
@@ -232,9 +236,6 @@ export function createSyncManager(
   let pullRequested = false;
   // True when a person-driven signal (focus, online) joined the pull in flight.
   let pullSignalled = false;
-  // A pull from a verified change (a push answer): its cycle does not depend on
-  // the probe marker. Sticky across joiners like `pullSignalled`.
-  let pullForced = false;
   // One value per start() and per stop(). A pull remembers the value it began
   // under and does nothing once it differs: a probe answering after stop(), or
   // from before a stop and start, can start no cycle and set no baseline.
@@ -599,35 +600,25 @@ export function createSyncManager(
     probe: ChangeProbe,
     run: number,
     fromSignal: boolean,
-    forced: boolean,
   ): Promise<void> {
     let marker: string | null | undefined;
-    let readFailed = false;
     lastProbeAt = Date.now();
     try {
       marker = await probe.read();
     } catch (err) {
-      readFailed = true;
       if (run === lifecycle) noteProbeFailure(probe);
       uploadDeps.logger.debug(
         { error: (err as Error).message },
-        forced
-          ? "Registry change probe failed; the pushed change cycles without it"
-          : "Registry change probe failed; the timer cycle is the fallback",
+        "Registry change probe failed; the timer cycle is the fallback",
       );
-      // A verified change needs no marker: the cycle reads the registry itself.
-      if (!forced) return;
+      return;
     }
     // stop() does not wait for a probe; an answer from an earlier run is void.
     if (run !== lifecycle || !isRunning) return;
-    if (!readFailed) {
-      probeFailures = 0;
-      nextTimedProbeAt = 0;
-    }
-    if (!forced) {
-      if (marker === undefined && !fromSignal) return; // cannot tell: the timer decides
-      if (marker !== undefined && marker === pulledMarker) return;
-    }
+    probeFailures = 0;
+    nextTimedProbeAt = 0;
+    if (marker === undefined && !fromSignal) return; // cannot tell: the timer decides
+    if (marker !== undefined && marker === pulledMarker) return;
     const errorsBefore = errorSeq;
     // A cycle already running may have read the registry before the change:
     // `runCycle` makes a joiner wait for a follow-up that starts after this call.
@@ -642,7 +633,54 @@ export function createSyncManager(
     }
   }
 
-  function pull(fromSignal: boolean, forced = false): Promise<void> {
+  /**
+   * A cycle for a verified change (a push answer). The change is already
+   * proven, so the cycle neither waits for the optional probe nor depends on
+   * its marker, and it does not join a timed probe read that is in flight: a
+   * probe that never answers must not hold up the push. `runCycle` still
+   * serializes it with every other cycle.
+   *
+   * The marker read starts first and is not awaited. When it has answered by
+   * the time the cycle ends it is recorded as applied, so the next timed probe
+   * does not repeat this cycle. A read that is late, or that fails, only costs
+   * that repeat.
+   */
+  async function pullForcedNow(probe: ChangeProbe, run: number): Promise<void> {
+    const errorsBefore = errorSeq;
+    lastProbeAt = Date.now();
+    let marker: string | null | undefined;
+    let answered = false;
+    void probe.read().then(
+      (value) => {
+        if (run !== lifecycle) return;
+        marker = value;
+        answered = true;
+        probeFailures = 0;
+        nextTimedProbeAt = 0;
+      },
+      (err: Error) => {
+        if (run === lifecycle) noteProbeFailure(probe);
+        uploadDeps.logger.debug(
+          { error: err.message },
+          "Registry change probe failed; the pushed change cycles without it",
+        );
+      },
+    );
+    await runCycle();
+    // Only a read that answered before the cycle ended counts (`answered`).
+    if (
+      run === lifecycle &&
+      isRunning &&
+      answered &&
+      marker !== undefined &&
+      blocked === null &&
+      errorSeq === errorsBefore
+    ) {
+      pulledMarker = marker;
+    }
+  }
+
+  function pull(fromSignal: boolean): Promise<void> {
     if (!isRunning) return Promise.resolve();
     // No probe: a pull is a cycle request, and `runCycle` coalesces those.
     const probe = options?.changeProbe;
@@ -651,21 +689,17 @@ export function createSyncManager(
     if (pullInFlight && pullInFlightRun === run) {
       pullRequested = true;
       pullSignalled ||= fromSignal;
-      pullForced ||= forced;
       return pullInFlight;
     }
     pullSignalled = fromSignal;
-    pullForced = forced;
     const seq = ++pullSeq;
     const current = (async () => {
       try {
         do {
           pullRequested = false;
           const signalled = pullSignalled;
-          const wasForced = pullForced;
           pullSignalled = false;
-          pullForced = false;
-          await pullIfChanged(probe, run, signalled, wasForced);
+          await pullIfChanged(probe, run, signalled);
           // A tick that joined a read that then failed waits out the back-off;
           // only a signal (focus, online) is read again at once.
         } while (
@@ -751,7 +785,9 @@ export function createSyncManager(
     stopPush = push.subscribe({
       onChange() {
         if (run !== lifecycle || !isRunning) return;
-        pull(true, true).catch(() => {
+        const probe = options?.changeProbe;
+        if (!probe) return;
+        pullForcedNow(probe, run).catch(() => {
           // Errors already captured in ring buffer
         });
       },

@@ -232,9 +232,10 @@ export interface StreamSyncRegistry {
    * rows. `undefined`: this gateway sends no change time, so the caller cannot
    * tell. Throws when the read fails. A hint to start a pull early, never an
    * authority: the unconditional timer cycle is what guarantees completeness,
-   * and a pull still reads the rows it applies.
+   * and a pull still reads the rows it applies. `signal` ends a read that
+   * stalls: a probe is optional work, so no caller may wait on it unbounded.
    */
-  probeChange?(): Promise<string | null | undefined>;
+  probeChange?(signal?: AbortSignal): Promise<string | null | undefined>;
   /**
    * One held request: answers when the owner's registry sequence differs from
    * `after` (a cursor from an earlier answer; none asks for the current one),

@@ -175,6 +175,116 @@ describe("a poke", () => {
   });
 });
 
+describe("a pushed change does not wait for the optional probe", () => {
+  const never = () => new Promise<string>(() => {});
+
+  /** A probe whose reads answer "m1" until the test makes them hang. */
+  function hangingProbe() {
+    let hang = false;
+    const read = vi.fn(async () => (hang ? never() : "m1"));
+    return { read, hang: () => (hang = true) };
+  }
+
+  it("starts a cycle at once although the probe read never settles", async () => {
+    const { push, state } = fakePush();
+    const cycle = vi.fn(async () => {});
+    const probe = hangingProbe();
+    const manager = build({
+      localSync: { cycle },
+      changeProbe: { read: probe.read, intervalMs: 5_000, push },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await manager.requestPull(); // the marker is established
+    cycle.mockClear();
+    probe.hang();
+
+    state.handlers!.onChange();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cycle).toHaveBeenCalledTimes(1); // long before the next 60 s tick
+    await manager.stop();
+  });
+
+  it("does not join a timed probe read that is already pending", async () => {
+    const { push, state } = fakePush();
+    const cycle = vi.fn(async () => {});
+    const probe = hangingProbe();
+    const manager = build({
+      localSync: { cycle },
+      changeProbe: { read: probe.read, intervalMs: 5_000, push },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await manager.requestPull();
+    cycle.mockClear();
+    probe.hang();
+    probe.read.mockClear();
+    await vi.advanceTimersByTimeAsync(5_000); // the timed probe starts and hangs
+    expect(probe.read).toHaveBeenCalledTimes(1);
+    expect(cycle).not.toHaveBeenCalled();
+
+    state.handlers!.onChange();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cycle).toHaveBeenCalledTimes(1);
+    await manager.stop();
+  });
+
+  it("keeps cycles one at a time: a forced request during a running cycle waits for a follow-up", async () => {
+    const { push, state } = fakePush();
+    let running = 0;
+    let overlap = 0;
+    let release: () => void = () => {};
+    const cycle = vi.fn(async () => {
+      running += 1;
+      overlap = Math.max(overlap, running);
+      await new Promise<void>((r) => (release = r));
+      running -= 1;
+    });
+    const probe = hangingProbe();
+    const manager = build({
+      localSync: { cycle },
+      changeProbe: { read: probe.read, intervalMs: 5_000, push },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    probe.hang();
+    state.handlers!.onChange();
+    await vi.advanceTimersByTimeAsync(0);
+    state.handlers!.onChange(); // arrives while the first cycle runs
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cycle).toHaveBeenCalledTimes(1);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cycle).toHaveBeenCalledTimes(2);
+    expect(overlap).toBe(1);
+    await manager.stop();
+  });
+
+  it("records the marker a forced cycle covered, so the next probe does not repeat it", async () => {
+    const { push, state } = fakePush();
+    let marker = "m1";
+    const cycle = vi.fn(async () => {});
+    const manager = build({
+      localSync: { cycle },
+      changeProbe: { read: async () => marker, intervalMs: 5_000, push },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await manager.requestPull();
+    cycle.mockClear();
+
+    marker = "m2";
+    state.handlers!.onChange();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cycle).toHaveBeenCalledTimes(1);
+    await manager.requestPull(); // m2 was applied by the forced cycle
+    expect(cycle).toHaveBeenCalledTimes(1);
+    await manager.stop();
+  });
+});
+
 describe("the timed probe while the subscription is healthy", () => {
   async function probesIn(ms: number, healthy: boolean | null) {
     const { push, state } = fakePush();
@@ -333,6 +443,21 @@ describe("the real subscription driving the manager", () => {
     pending[1].answer({ seq: "2", changed: true });
     await vi.advanceTimersByTimeAsync(0);
     expect(cycle).toHaveBeenCalledTimes(1);
+    await manager.stop();
+  });
+
+  it("a failed or timed-out attempt starts no cycle: with every answer lost only the 60 s timer applies the change", async () => {
+    const { manager, pending, cycle } = await started();
+    // Fail every held request the subscription sends, for a minute.
+    let failed = 1;
+    for (let waited = 0; waited < 55_000; waited += 1_000) {
+      while (failed < pending.length) pending[failed++].fail(new Error("lost"));
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(failed).toBeGreaterThanOrEqual(3); // it did reconnect, repeatedly
+    expect(cycle).not.toHaveBeenCalled(); // and no reconnect started a cycle
+    await vi.advanceTimersByTimeAsync(5_000); // the 60 s timer
+    expect(cycle).toHaveBeenCalled();
     await manager.stop();
   });
 
