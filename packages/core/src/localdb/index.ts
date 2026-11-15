@@ -39,6 +39,13 @@ export {
   type PublishResult,
   type PublicationReceipt,
 } from "./publish.js";
+export {
+  applyLog,
+  LogDivergedError,
+  applySegmentOperations,
+  applySnapshotPart,
+} from "./log-apply.js";
+export { publishLog } from "./log-publish.js";
 export { encodePrefixes, type EncodedPart } from "./encode.js";
 export { unwriteRefusedRun } from "./unwrite.js";
 export { runCycle, syncConnection, type CycleReport } from "./cycle.js";

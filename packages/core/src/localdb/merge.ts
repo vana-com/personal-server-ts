@@ -89,7 +89,11 @@ const STORED_BYTES = "LENGTH(CAST(i.body AS BLOB))";
  * row's SEEN stamp: the newest observation wins, whether or not this device
  * had pulled the other write first. An equal or older one changes nothing.
  * Independently, first_o is the minimum checkpoint with NULL as the bottom;
- * imported rows have an unknown checkpoint.
+ * imported rows have an unknown checkpoint. With `firstSeenOfWinner` (the log's
+ * apply) first_o is not a minimum: it is the first-seen the winning
+ * observation carries, replaced when a newer observation wins and left alone
+ * otherwise, NULL included. See `foldLog`: a snapshot keeps the winner, so
+ * this is the one rule a snapshot reader and a segment-by-segment reader share.
  *
  * With `promoteSeen` (apply only, origin `remote`): a different body that is
  * newer than the row's stamp but not than its SEEN stamp loses to the local
@@ -103,7 +107,10 @@ const STORED_BYTES = "LENGTH(CAST(i.body AS BLOB))";
 export function mergeIncoming(
   op: string,
   connectionId: string,
-  options: { readonly promoteSeen?: boolean } = {},
+  options: {
+    readonly promoteSeen?: boolean;
+    readonly firstSeenOfWinner?: boolean;
+  } = {},
 ): SqlStatement[] {
   const pick = (f: string) =>
     `(SELECT i.${f} FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash)`;
@@ -123,17 +130,21 @@ export function mergeIncoming(
             (ch.stamp_o=incoming.stamp_o AND ch.stamp_r>=incoming.stamp_r)))`,
       params: [op, connectionId, connectionId],
     },
-    {
-      // This statement must not assign a column watched by records_au.
-      sql: `UPDATE records SET first_o = CASE
+    ...(options.firstSeenOfWinner
+      ? []
+      : [
+          {
+            // This statement must not assign a column watched by records_au.
+            sql: `UPDATE records SET first_o = CASE
    WHEN (SELECT origin FROM write_ctx WHERE id = 1) = 'import'
      OR first_o IS NULL OR ${pick("first_o")} IS NULL THEN NULL
    WHEN ${pick("first_o")} < first_o THEN ${pick("first_o")}
    ELSE first_o END
  WHERE (connection_id, stream, pk_hash) IN
    (SELECT ?, stream, pk_hash FROM incoming WHERE op = ?)`,
-      params: [op, op, op, connectionId, op],
-    },
+            params: [op, op, op, connectionId, op],
+          },
+        ]),
     {
       // A run saw a body the row already holds. Neither assigned column is
       // watched by records_au, so nothing is logged.
@@ -148,7 +159,7 @@ export function mergeIncoming(
     {
       // A seen stamp newer than the incoming one survives; an older one is
       // the incoming row's own observation.
-      sql: `UPDATE records SET ${FIELDS.map((f) => `${f} = ${pick(f)}`).join(", ")},
+      sql: `UPDATE records SET ${[...FIELDS, ...(options.firstSeenOfWinner ? ["first_o"] : [])].map((f) => `${f} = ${pick(f)}`).join(", ")},
    body_bytes = (SELECT ${STORED_BYTES} FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash),
    seen_o = CASE WHEN (seen_o, seen_r) > (${pick("stamp_o")}, ${pick("stamp_r")}) THEN seen_o END,
    seen_r = CASE WHEN (seen_o, seen_r) > (${pick("stamp_o")}, ${pick("stamp_r")}) THEN seen_r END
@@ -160,6 +171,7 @@ export function mergeIncoming(
                         ELSE (i.stamp_o, i.stamp_r) > ${seenPair("records.")} END)`,
       params: [
         ...FIELDS.map(() => op),
+        ...(options.firstSeenOfWinner ? [op] : []),
         op,
         op,
         op,
