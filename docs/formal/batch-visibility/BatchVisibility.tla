@@ -32,7 +32,7 @@ Init ==
   /\ source \in [K -> (Values \cup {"absent"})]
   /\ d=Empty /\ r=Empty /\ best=Empty
   /\ del=[k \in K |-> 0] /\ rdel=del
-  /\ log=<<>> /\ cursor=0
+  /\ log = <<>> /\ cursor=0
   /\ active=FALSE /\ cutoff=0 /\ seen={}
   /\ staged=Empty /\ merged={} /\ checkpoint={} /\ proof=FALSE
   /\ clock=0 /\ steps=0
