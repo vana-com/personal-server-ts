@@ -13,6 +13,7 @@ import {
   sameControl,
   streamScope,
   verifyHead,
+  type ControlRead,
   type ControlState,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { manifestStreamLister } from "../stream-sync/artifacts.js";
@@ -22,6 +23,7 @@ import {
   endedGenerationDeleteMetadataHash,
 } from "../stream-sync/delete-metadata.js";
 import { RegistryRefusedError } from "../stream-sync/ports.js";
+import { createDeleteBatcher, type DeleteBatcher } from "./delete-batch.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { purgeConnection } from "./purge.js";
 
@@ -41,6 +43,8 @@ export class ConnectorNotVerifiedError extends Error {
     this.name = "ConnectorNotVerifiedError";
   }
 }
+/** The batch request did not write this stream's row; the per-stream path must. */
+class BatchFellBack extends Error {}
 export class ConnectionDeleteSuperseded extends Error {
   constructor(readonly connector: string) {
     super(`delete of ${connector} was superseded before it landed`);
@@ -133,6 +137,15 @@ export function createConnectionDeleter(
   },
 ): ConnectionDeleter {
   const flights = new Map<string, Landing>();
+  /**
+   * The stream rows the plan listed, by delete id. Only a delete this process
+   * just planned has one; the landing takes it. The rows are a hint for the
+   * first cleanup attempt: every write is a compare-and-set, so a row that has
+   * moved since the listing costs one rejected write and a re-read.
+   */
+  const listings = new Map<string, Map<string, ControlRead>>();
+  /** Set once the registry answers that it has no usable batch route. */
+  let batchOff = false;
   const keyInfo = async () => {
     const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
     return { keyCheck, hashes: await controlHashes(keccak, keyCheck) };
@@ -178,9 +191,11 @@ export function createConnectionDeleter(
         params: [connector, id],
       },
     ]);
-  async function plan(
-    connector: string,
-  ): Promise<{ intent: DeleteIntent; empty: boolean }> {
+  async function plan(connector: string): Promise<{
+    intent: DeleteIntent;
+    empty: boolean;
+    listing: Map<string, ControlRead>;
+  }> {
     const { hashes } = await keyInfo();
     const controls = new Map<string, ControlState>();
     const pins: { ns: string; version: number }[] = [];
@@ -201,14 +216,17 @@ export function createConnectionDeleter(
         });
     }
     const streams: StreamPin[] = [];
+    const listing = new Map<string, ControlRead>();
     for (const entry of await deps.registry.listStreamRows(connector)) {
       const parsed = parseScope(entry.scope);
-      if (parsed?.kind === "stream" && parsed.connector === connector)
+      if (parsed?.kind === "stream" && parsed.connector === connector) {
+        listing.set(entry.scope, { ...entry.read });
         streams.push({
           ns: parsed.ns,
           stream: parsed.stream,
           control: controls.get(parsed.ns) ?? { kind: "absent" },
         });
+      }
     }
     const empty = pins.length === 0 && streams.length === 0;
     if (!empty) {
@@ -226,7 +244,7 @@ export function createConnectionDeleter(
             control: controls.get("") ?? { kind: "absent" },
           });
     }
-    return { intent: { id: deps.newOp(), pins, streams }, empty };
+    return { intent: { id: deps.newOp(), pins, streams }, empty, listing };
   }
   function samePlan(a: DeleteIntent, b: DeleteIntent) {
     return (
@@ -289,19 +307,26 @@ export function createConnectionDeleter(
       });
     }
   }
-  async function signPost(
+  const sign = (
     scope: string,
     dataHash: `0x${string}`,
     metadataHash: `0x${string}`,
     version: number,
-  ) {
-    const signature = await deps.signer.signAddData({
+  ) =>
+    deps.signer.signAddData({
       ownerAddress: deps.ownerAddress,
       scope,
       dataHash,
       metadataHash,
       expectedVersion: BigInt(version),
     });
+  async function signPost(
+    scope: string,
+    dataHash: `0x${string}`,
+    metadataHash: `0x${string}`,
+    version: number,
+  ) {
+    const signature = await sign(scope, dataHash, metadataHash, version);
     return deps.registry.post({
       ownerAddress: deps.ownerAddress,
       scope,
@@ -382,6 +407,23 @@ export function createConnectionDeleter(
     }
     let intent: DeleteIntent = stored;
     const { keyCheck, hashes } = await keyInfo();
+    const listed = listings.get(stored.id!);
+    listings.delete(stored.id!);
+    // One observation of a namespace's control row serves every stream of the
+    // landing that is not fenced. A rejected write drops it: the next attempt
+    // looks again.
+    const controlSeen = new Map<string, Promise<ControlState>>();
+    const observeControl = (ns: string) => {
+      let seen = controlSeen.get(ns);
+      if (!seen) {
+        seen = deps.registry
+          .read(controlScope(connector, ns))
+          .then((read) => classifyControl(read, hashes));
+        seen.catch(() => controlSeen.delete(ns));
+        controlSeen.set(ns, seen);
+      }
+      return seen;
+    };
     // Streams are cleaned in parallel and each saves its own pin, so saves
     // run in the order the intent changed.
     let saved: Promise<unknown> = Promise.resolve();
@@ -408,8 +450,19 @@ export function createConnectionDeleter(
       target: StreamPin,
       hashes: Awaited<ReturnType<typeof keyInfo>>["hashes"],
       keyCheck: string,
+      /**
+       * The first tombstone goes through the landing's batch request, with the
+       * fence of `ended` in the same commit or an earlier one (see
+       * delete-batch.ts). It then needs no lifetime proof of its own: the
+       * request's condition holds the control row at that fence.
+       */
+      batched?: { readonly batcher: DeleteBatcher; readonly ended: number },
     ) {
       const scope = streamScope(connector, target.ns, target.stream);
+      // The listed row serves the first attempt of this stream only: a retry,
+      // or the per-stream path after a batch, reads the registry.
+      let hint = listed?.get(scope);
+      listed?.delete(scope);
       let finished = false;
       let signedPin = target.pin;
       // A rejected CAS spends one of ATTEMPTS, and so does a landed CAS that
@@ -418,17 +471,15 @@ export function createConnectionDeleter(
       let spent = 0;
       let landed = false;
       for (;;) {
-        const row = await deps.registry.read(scope);
-        const ended = fencedAt(target.ns);
+        const row = hint ?? (await deps.registry.read(scope));
+        hint = undefined;
+        const ended = batched ? batched.ended : fencedAt(target.ns);
         // Fenced: the lifetime this delete ended, as the control row said
         // before the fence. Otherwise the control row now.
         const now: ControlState =
           ended !== undefined
             ? { kind: "active", generation: ended }
-            : classifyControl(
-                await deps.registry.read(controlScope(connector, target.ns)),
-                hashes,
-              );
+            : await observeControl(target.ns);
         if (ended === undefined) {
           const pin = intent.pins.find((p) => p.ns === target.ns);
           const holds = target.control
@@ -548,6 +599,7 @@ export function createConnectionDeleter(
         // upload (a head blob is content-addressed and harmless if unused).
         const oldDataOnly =
           ended !== undefined &&
+          !batched &&
           row.found &&
           classifyStreamRow(row, hashes) !== "tombstoned"
             ? holdsEndedLifetimeOnly(
@@ -581,28 +633,50 @@ export function createConnectionDeleter(
           ),
         }));
         let conflict = false;
-        try {
-          conflict =
-            (
-              await signPost(
+        const metadataHash =
+          endedGeneration === undefined
+            ? deleteMetadataHash(scope, version)
+            : endedGenerationDeleteMetadataHash(
+                scope,
+                version,
+                endedGeneration,
+              );
+        if (batched) {
+          // One shot: a lost compare-and-set, a failed condition or a missing
+          // batch route all end it, and the per-stream path takes over.
+          const turn = await batched.batcher.submit(
+            {
+              scope,
+              dataHash: digest.dataHash,
+              metadataHash,
+              expectedVersion: String(version),
+              signature: await sign(
                 scope,
                 digest.dataHash,
-                endedGeneration === undefined
-                  ? deleteMetadataHash(scope, version)
-                  : endedGenerationDeleteMetadataHash(
-                      scope,
-                      version,
-                      endedGeneration,
-                    ),
+                metadataHash,
                 version,
-              )
-            ).kind === "conflict";
+              ),
+              ...(row.found && {
+                expectedHeadDataHash: row.dataHash as `0x${string}`,
+              }),
+            },
+            { ns: target.ns, fence: false },
+          );
+          if (turn === "fallback") throw new BatchFellBack();
+          finished = true;
+          break;
+        }
+        try {
+          conflict =
+            (await signPost(scope, digest.dataHash, metadataHash, version))
+              .kind === "conflict";
         } catch (error) {
           if (!(error instanceof RegistryRefusedError && error.status === 409))
             throw error;
           conflict = true;
         }
         if (conflict) {
+          controlSeen.delete(target.ns);
           await new Promise<void>((resolve) =>
             setTimeout(resolve, Math.min(10 * 2 ** spent, 1000)),
           );
@@ -676,6 +750,106 @@ export function createConnectionDeleter(
           .filter((s) => s.control?.kind === "foreign")
           .map((s) => s.ns),
       );
+      const settledByBatch = new Set<string>();
+      const unfencedPins = intent.pins.filter(
+        (p) => fencedAt(p.ns) === undefined && !foreign.has(p.ns),
+      );
+      if (
+        unfencedPins.length > 0 &&
+        !batchOff &&
+        deps.registry.postBatch !== undefined
+      ) {
+        // The first landing: each unfenced namespace's fence and its streams'
+        // tombstones in one batch request. Whatever it does not write is left
+        // for the per-stream path below, which re-reads before it writes.
+        const pins = new Map(unfencedPins.map((p) => [p.ns, p.version]));
+        const streams = (intent.streams ?? []).filter(
+          (s) => !intent.streamsLanded && pins.has(s.ns),
+        );
+        const batcher = createDeleteBatcher({
+          registry: deps.registry,
+          ownerAddress: deps.ownerAddress,
+          controlScopeOf: (ns) => controlScope(connector, ns),
+          pins,
+          hashes,
+          participants: unfencedPins.length + streams.length,
+          onUnusable: () => {
+            batchOff = true;
+          },
+        });
+        /** Each participant sends one row or leaves, whatever else happens. */
+        const participate = async (
+          work: (submit: DeleteBatcher) => Promise<void>,
+        ) => {
+          let sent = false;
+          try {
+            await work({
+              submit: (row, part) => {
+                sent = true;
+                return batcher.submit(row, part);
+              },
+              leave: () => {
+                sent = true;
+                batcher.leave();
+              },
+            });
+          } catch (error) {
+            if (!(error instanceof BatchFellBack)) throw error;
+          } finally {
+            if (!sent) batcher.leave();
+          }
+        };
+        const fences = Promise.all(
+          unfencedPins.map((pin) =>
+            participate(async (own) => {
+              const scope = controlScope(connector, pin.ns);
+              const turn = await own.submit(
+                {
+                  scope,
+                  dataHash: hashes.tombstoneData,
+                  metadataHash: hashes.tombstoneMetadata,
+                  expectedVersion: String(pin.version + 1),
+                  signature: await sign(
+                    scope,
+                    hashes.tombstoneData,
+                    hashes.tombstoneMetadata,
+                    pin.version + 1,
+                  ),
+                },
+                { ns: pin.ns, fence: true },
+              );
+              if (turn === "fallback") return;
+              await persist((current) => ({
+                ...current,
+                fences: [
+                  ...(current.fences ?? []),
+                  { ns: pin.ns, version: pin.version + 1 },
+                ],
+              }));
+            }),
+          ),
+        );
+        // The request waits for the fences, not for the rest.
+        void fences.then(
+          () => {
+            if (intent.pins.every((p) => fencedAt(p.ns) !== undefined))
+              fencePhaseEnded(true);
+          },
+          () => undefined,
+        );
+        await settleAll([
+          fences,
+          ...streams.map((target) =>
+            participate(async (own) => {
+              await cleanStream(connector, target, hashes, keyCheck, {
+                batcher: own,
+                ended: pins.get(target.ns)!,
+              });
+              settledByBatch.add(`${target.ns}\0${target.stream}`);
+            }),
+          ),
+        ]);
+      }
       await settleAll(
         intent.pins
           .filter((p) => fencedAt(p.ns) === undefined && !foreign.has(p.ns))
@@ -697,9 +871,9 @@ export function createConnectionDeleter(
       // streams do not wait for one another.
       if (!intent.streamsLanded) {
         await settleAll(
-          (intent.streams ?? []).map((target) =>
-            cleanStream(connector, target, hashes, keyCheck),
-          ),
+          (intent.streams ?? [])
+            .filter((t) => !settledByBatch.has(`${t.ns}\0${t.stream}`))
+            .map((target) => cleanStream(connector, target, hashes, keyCheck)),
         );
         await persist((current) => ({ ...current, streamsLanded: true }));
       }
@@ -782,6 +956,7 @@ export function createConnectionDeleter(
             return null;
           }
           await save(connector, planned.intent);
+          listings.set(planned.intent.id!, planned.listing);
           await purgeLocal(connector, planned.intent);
           return planned.intent;
         },
