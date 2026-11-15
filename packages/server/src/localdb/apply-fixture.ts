@@ -121,7 +121,6 @@ export async function remoteFixture(
         const hash = toHex(sha256(bytes));
         parts.push({
           prefix: prefixOf(frame.k),
-
           hash,
           bytes: bytes.length,
           count: at === 0 ? 1 : 0,
