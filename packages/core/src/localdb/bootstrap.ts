@@ -162,11 +162,10 @@ export async function syncBeforeBegin(
     }
     const connection = await saveControl(locked, connector, ns, read, control);
     await purgeDeleted(locked, connection);
-    let streams: Awaited<
-      ReturnType<LocalSyncDeps["registry"]["listStreamRows"]>
-    >;
     try {
-      streams = await deps.registry.listStreamRows(connector);
+      // Availability only. The rows are not handed on: apply lists for
+      // itself, so its answer reflects reads taken after this call began.
+      await deps.registry.listStreamRows(connector);
     } catch {
       return {
         connection: await cachedConnection(locked, id),
@@ -174,23 +173,8 @@ export async function syncBeforeBegin(
       };
     }
     if (connection.controlState === "active") {
-      // applyConnection owns version/empty-head-parts selection. Reuse this
-      // listing, so its registry availability matches the snapshot above.
-      await applyConnection(
-        {
-          ...locked,
-          registry: {
-            read: (scope) => deps.registry.read(scope),
-            post: (request) => deps.registry.post(request),
-            listControlRows: () => deps.registry.listControlRows(),
-            listStreamRows: (key) =>
-              key === connector
-                ? Promise.resolve(streams)
-                : deps.registry.listStreamRows(key),
-          },
-        },
-        id,
-      );
+      // applyConnection owns version/empty-head-parts selection.
+      await applyConnection(locked, id);
     }
     return {
       connection: await cachedConnection(locked, id),
