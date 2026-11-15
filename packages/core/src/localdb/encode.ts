@@ -11,6 +11,7 @@ import {
 import { readerOf, type SqlReader, type SqlValue } from "./driver.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { nobleStreamCrypto } from "../stream-sync/crypto-port.js";
+import { readAhead } from "./read-ahead.js";
 import { meteredBlobs, type PublishMeter } from "./publish-meter.js";
 import { newUploadWave, type UploadWave } from "./upload-wave.js";
 import { holdMemory } from "./transfer-memory.js";
@@ -562,7 +563,10 @@ async function encodeFrozenParts(
       }
     };
     let seen = 0;
-    const pages = readFrozen(deps, input, prefix, pageBytes);
+    // One page is read ahead while the one in hand is encoded. It starts only
+    // after the builder holds its reservation (below), and `pageBytes` keeps the
+    // two pages inside the `2 * target` that reservation counts.
+    const pages = readAhead(readFrozen(deps, input, prefix, pageBytes));
     try {
       for (;;) {
         await memory.hold();
