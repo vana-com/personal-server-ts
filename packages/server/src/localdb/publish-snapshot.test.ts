@@ -36,11 +36,17 @@ type Hooks = {
 };
 const PAGE = /SELECT pk_hash, stamp_o/;
 
-async function world(options: { view: boolean; journal?: string } & Hooks) {
+async function world(
+  options: {
+    view: boolean;
+    journal?: string;
+    partTargetBytes?: number;
+  } & Hooks,
+) {
   const dir = mkdtempSync(join(process.cwd(), ".localdb-snapshot-"));
   dirs.push(dir);
   const inner = openBetterSqlite3(join(dir, "db.sqlite"));
-  const counts = { opened: 0, released: 0 };
+  const counts = { opened: 0, released: 0, metadataRows: [] as number[] };
   let paged = false;
   const beforePage = async (sql: string) => {
     if (paged || !PAGE.test(sql)) return;
@@ -64,9 +70,15 @@ async function world(options: { view: boolean; journal?: string } & Hooks) {
       const view = await inner.snapshot!();
       counts.opened += 1;
       return {
-        query: async (sql, params) => {
+        query: async <T>(
+          sql: string,
+          params?: Parameters<SqlSnapshot["query"]>[1],
+        ) => {
           await beforePage(sql);
-          return view.query(sql, params);
+          const rows = await view.query<T>(sql, params);
+          if (/SELECT pk_hash, body_bytes FROM records/.test(sql))
+            counts.metadataRows.push(rows.length);
+          return rows;
         },
         release: async () => {
           counts.released += 1;
@@ -111,7 +123,7 @@ async function world(options: { view: boolean; journal?: string } & Hooks) {
     logger: { info: vi.fn(), warn: vi.fn() },
     now: () => ++clock,
     newOp: () => `op-${++op}`,
-    partTargetBytes: 4096, // many prefixes and parts
+    partTargetBytes: options.partTargetBytes ?? 4096, // many prefixes and parts
   };
   const sync = createLocalSync(deps, {
     resolveArtifact: () => ({
@@ -424,3 +436,63 @@ it("publishes the same blobs for rows with no stored size", async () => {
   for (const [key, bytes] of sized.puts)
     expect(Buffer.from(old.puts.get(key)!)).toEqual(Buffer.from(bytes));
 });
+
+for (const mode of ["null", "mixed"] as const) {
+  it(`publishes byte-identical UTF-8 blobs across metadata windows and a large frame with ${mode} sizes`, async () => {
+    // One planned bucket makes 2051 keys cross the 2048-key metadata window.
+    const sized = await world({ view: true, partTargetBytes: 8 * 1024 * 1024 });
+    const fallback = await world({
+      view: true,
+      partTargetBytes: 8 * 1024 * 1024,
+    });
+    const records = [
+      ...ids(2050).map((id) => ({
+        stream: "items",
+        data: { id, text: "é".repeat(32) },
+      })),
+      { stream: "items", data: { id: "large", text: "é".repeat(1200000) } },
+    ];
+    const largeBody = JSON.stringify(records[records.length - 1]!.data);
+    expect(largeBody.length).toBeLessThan(2 * 1024 * 1024);
+    expect(new TextEncoder().encode(largeBody).length).toBeGreaterThan(
+      2 * 1024 * 1024,
+    );
+    for (const w of [sized, fallback]) {
+      await w.sync.intake.begin("utf8", {
+        connector: "fixture",
+        artifactDigest: "fixture",
+        owner: { address: owner, leaseId: null },
+      });
+      await w.sync.intake.batch("utf8", { batch: 0, records });
+      await w.sync.intake.end("utf8", {
+        outcome: "succeeded",
+        coveredStreams: ["items"],
+        lastBatch: 0,
+      });
+      expect(await sizes(w)).toHaveLength(2051);
+    }
+    await fallback.db.query(
+      mode === "null"
+        ? "UPDATE records SET body_bytes = NULL"
+        : "UPDATE records SET body_bytes = NULL WHERE record_key = 'large' OR CAST(SUBSTR(record_key, 5) AS INTEGER) % 2 = 0",
+      [],
+    );
+    const metadata = await sizes(fallback);
+    expect(metadata.some(({ stored }) => stored === null)).toBe(true);
+    expect(metadata.some(({ stored }) => stored !== null)).toBe(
+      mode === "mixed",
+    );
+    await sized.sync.cycle();
+    await fallback.sync.cycle();
+    expect(sized.counts.metadataRows).toEqual([2048, 3]);
+    expect(fallback.counts.metadataRows).toEqual([2048, 3]);
+    expect(sized.puts.size).toBeGreaterThan(0);
+    expect([...fallback.puts.keys()].sort()).toEqual(
+      [...sized.puts.keys()].sort(),
+    );
+    for (const [key, bytes] of sized.puts)
+      expect(Buffer.from(fallback.puts.get(key)!)).toEqual(Buffer.from(bytes));
+    expect(fallback.counts.released).toBe(fallback.counts.opened);
+    expect(sized.counts.released).toBe(sized.counts.opened);
+  });
+}

@@ -668,6 +668,72 @@ describe("encodePrefixes under writes and large bodies", () => {
       }
     });
 
+    it("uses UTF-8 bytes across the planner threshold for NULL and mixed sizes", async () => {
+      const planOf = async (
+        mode: "stored" | "null" | "mixed" | "characters",
+      ) => {
+        const f = await fresh();
+        const rows = ["0", "8"].map((prefix, i) => {
+          const k = keyHash(prefix);
+          const value = "é".repeat(1000);
+          const body = JSON.stringify({ id: k, value });
+          // Two character-count frames fit 3500; two byte-count frames do not.
+          expect(2 * (body.length + 160)).toBeLessThan(3500);
+          expect(
+            2 * (new TextEncoder().encode(body).length + 160),
+          ).toBeGreaterThan(3500);
+          return {
+            k,
+            value,
+            ...(mode === "characters"
+              ? { size: body.length }
+              : mode === "stored" || (mode === "mixed" && i === 0)
+                ? { size: "stored" as const }
+                : {}),
+          };
+        });
+        await f.insert(rows);
+        return planChangedPrefixes(readerOf(f.db), {
+          connectionId: input.connectionId,
+          stream: input.stream,
+          changedKeys: rows.map(({ k }) => k),
+          baseParts: [],
+          targetBytes: 3500,
+          rewriteAll: false,
+        });
+      };
+      const stored = await planOf("stored");
+      expect(stored).not.toEqual(await planOf("characters"));
+      expect(await planOf("null")).toEqual(stored);
+      expect(await planOf("mixed")).toEqual(stored);
+    });
+
+    for (const mode of ["null", "mixed"] as const) {
+      it(`cuts UTF-8 ${mode} pages by bytes rather than characters`, async () => {
+        const f = await fresh();
+        const rows = Array.from({ length: 3 }, (_, i) => {
+          const k = key(i);
+          const overhead = JSON.stringify({ id: k, value: "" }).length;
+          const payloadBytes = MIB + 100 - overhead;
+          const value =
+            "é".repeat(Math.floor(payloadBytes / 2)) +
+            "x".repeat(payloadBytes % 2);
+          const body = JSON.stringify({ id: k, value });
+          expect(new TextEncoder().encode(body).length).toBe(MIB + 100);
+          expect(3 * body.length).toBeLessThan(2 * MIB);
+          return {
+            k,
+            value,
+            ...(mode === "mixed" && i === 0 ? { size: "stored" as const } : {}),
+          };
+        });
+        await f.insert(rows);
+        const result = await pages(f);
+        expect(result.seen.pageRows).toEqual([1, 1, 1]);
+        expect(result.rows.map(({ k }) => k)).toEqual(rows.map(({ k }) => k));
+      });
+    }
+
     it("plans the same prefixes from stored sizes, from bodies, and from a mix", async () => {
       const planOf = async (size: (i: number) => "stored" | undefined) => {
         const f = await fresh();
