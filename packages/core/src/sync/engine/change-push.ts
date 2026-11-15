@@ -86,17 +86,19 @@ export function createRegistryChangePush(
         handlers.onHealth(next);
       };
 
+      // The abort listener goes away on both ways out. A hidden tab sleeps
+      // every PARK_CHECK_MS for as long as the subscription lives, and an
+      // outage sleeps once per attempt; a listener left behind by each sleep
+      // is a leak that grows with the subscription's age.
       const sleep = (ms: number) =>
         new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, ms);
-          lifetime.signal.addEventListener(
-            "abort",
-            () => {
-              clearTimeout(timer);
-              resolve();
-            },
-            { once: true },
-          );
+          const done = () => {
+            clearTimeout(timer);
+            lifetime.signal.removeEventListener("abort", done);
+            resolve();
+          };
+          const timer = setTimeout(done, ms);
+          lifetime.signal.addEventListener("abort", done, { once: true });
         });
 
       async function once(): Promise<"answer" | "failed" | "absent"> {

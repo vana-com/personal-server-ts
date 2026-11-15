@@ -1,15 +1,16 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 127 and seed 1957793549001127285 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 1646789] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
-Parsing file /home/tnunamak/.tmp/stream-sync-plan/formal/registry-poke/RegistryPoke.tla
+Running breadth-first search Model-Checking with fp 67 and seed -886747382854864162 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 3894690] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/tnunamak/.tmp/gap-push-1115-ps/docs/formal/registry-poke/RegistryPoke.tla
 Parsing file /tmp/Naturals.tla
 Semantic processing of module Naturals
 Semantic processing of module RegistryPoke
-Starting... (2026-11-14 16:51:11)
+Starting... (2026-11-14 17:49:57)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-11-14 16:51:11.
+Finished computing initial states: 1 distinct state generated at 2026-11-14 17:49:57.
 Error: Invariant StaleBound is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
+/\ nextTimer = (d1 :> 13)
 /\ age = (d1 :> 0)
 /\ applied = (d1 :> 0)
 /\ healthy = (d1 :> FALSE)
@@ -22,7 +23,8 @@ State 1: <Initial predicate>
 /\ lastSeen = (d1 :> 0)
 /\ clock = 0
 
-State 2: <Subscribe line 77, col 3 to line 88, col 67 of module RegistryPoke>
+State 2: <Subscribe line 102, col 3 to line 112, col 78 of module RegistryPoke>
+/\ nextTimer = (d1 :> 13)
 /\ age = (d1 :> 0)
 /\ applied = (d1 :> 0)
 /\ healthy = (d1 :> FALSE)
@@ -35,21 +37,23 @@ State 2: <Subscribe line 77, col 3 to line 88, col 67 of module RegistryPoke>
 /\ lastSeen = (d1 :> 0)
 /\ clock = 0
 
-State 3: <Tick line 165, col 3 to line 170, col 38 of module RegistryPoke>
+State 3: <Commit line 94, col 3 to line 97, col 44 of module RegistryPoke>
+/\ nextTimer = (d1 :> 13)
 /\ age = (d1 :> 0)
 /\ applied = (d1 :> 0)
 /\ healthy = (d1 :> FALSE)
 /\ needPull = (d1 :> FALSE)
 /\ reply = (d1 :> -1)
 /\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 0, held |-> TRUE])
-/\ seq = 0
+/\ seq = 1
 /\ nextProbe = (d1 :> 1)
-/\ writes = 0
+/\ writes = 1
 /\ lastSeen = (d1 :> 0)
-/\ clock = 1
+/\ clock = 0
 
-State 4: <Commit line 69, col 3 to line 72, col 33 of module RegistryPoke>
-/\ age = (d1 :> 0)
+State 4: <Tick line 203, col 3 to line 208, col 49 of module RegistryPoke>
+/\ nextTimer = (d1 :> 13)
+/\ age = (d1 :> 1)
 /\ applied = (d1 :> 0)
 /\ healthy = (d1 :> FALSE)
 /\ needPull = (d1 :> FALSE)
@@ -61,8 +65,9 @@ State 4: <Commit line 69, col 3 to line 72, col 33 of module RegistryPoke>
 /\ lastSeen = (d1 :> 0)
 /\ clock = 1
 
-State 5: <Wake line 92, col 3 to line 97, col 33 of module RegistryPoke>
-/\ age = (d1 :> 0)
+State 5: <Wake line 116, col 3 to line 121, col 44 of module RegistryPoke>
+/\ nextTimer = (d1 :> 13)
+/\ age = (d1 :> 1)
 /\ applied = (d1 :> 0)
 /\ healthy = (d1 :> FALSE)
 /\ needPull = (d1 :> FALSE)
@@ -74,7 +79,8 @@ State 5: <Wake line 92, col 3 to line 97, col 33 of module RegistryPoke>
 /\ lastSeen = (d1 :> 0)
 /\ clock = 1
 
-State 6: <Deliver line 111, col 3 to line 122, col 58 of module RegistryPoke>
+State 6: <Deliver line 137, col 3 to line 147, col 69 of module RegistryPoke>
+/\ nextTimer = (d1 :> 13)
 /\ age = (d1 :> 0)
 /\ applied = (d1 :> 1)
 /\ healthy = (d1 :> TRUE)
@@ -87,7 +93,8 @@ State 6: <Deliver line 111, col 3 to line 122, col 58 of module RegistryPoke>
 /\ lastSeen = (d1 :> 1)
 /\ clock = 1
 
-State 7: <Probe line 150, col 3 to line 154, col 78 of module RegistryPoke>
+State 7: <Probe line 178, col 3 to line 182, col 28 of module RegistryPoke>
+/\ nextTimer = (d1 :> 13)
 /\ age = (d1 :> 0)
 /\ applied = (d1 :> 1)
 /\ healthy = (d1 :> TRUE)
@@ -100,7 +107,8 @@ State 7: <Probe line 150, col 3 to line 154, col 78 of module RegistryPoke>
 /\ lastSeen = (d1 :> 1)
 /\ clock = 1
 
-State 8: <Commit line 69, col 3 to line 72, col 33 of module RegistryPoke>
+State 8: <Commit line 94, col 3 to line 97, col 44 of module RegistryPoke>
+/\ nextTimer = (d1 :> 13)
 /\ age = (d1 :> 0)
 /\ applied = (d1 :> 1)
 /\ healthy = (d1 :> TRUE)
@@ -113,7 +121,8 @@ State 8: <Commit line 69, col 3 to line 72, col 33 of module RegistryPoke>
 /\ lastSeen = (d1 :> 1)
 /\ clock = 1
 
-State 9: <Subscribe line 77, col 3 to line 88, col 67 of module RegistryPoke>
+State 9: <Subscribe line 102, col 3 to line 112, col 78 of module RegistryPoke>
+/\ nextTimer = (d1 :> 13)
 /\ age = (d1 :> 0)
 /\ applied = (d1 :> 1)
 /\ healthy = (d1 :> TRUE)
@@ -126,7 +135,8 @@ State 9: <Subscribe line 77, col 3 to line 88, col 67 of module RegistryPoke>
 /\ lastSeen = (d1 :> 1)
 /\ clock = 1
 
-State 10: <Lose line 126, col 3 to line 129, col 43 of module RegistryPoke>
+State 10: <Lose line 151, col 3 to line 154, col 54 of module RegistryPoke>
+/\ nextTimer = (d1 :> 13)
 /\ age = (d1 :> 0)
 /\ applied = (d1 :> 1)
 /\ healthy = (d1 :> TRUE)
@@ -139,7 +149,8 @@ State 10: <Lose line 126, col 3 to line 129, col 43 of module RegistryPoke>
 /\ lastSeen = (d1 :> 1)
 /\ clock = 1
 
-State 11: <Tick line 165, col 3 to line 170, col 38 of module RegistryPoke>
+State 11: <Tick line 203, col 3 to line 208, col 49 of module RegistryPoke>
+/\ nextTimer = (d1 :> 13)
 /\ age = (d1 :> 1)
 /\ applied = (d1 :> 1)
 /\ healthy = (d1 :> TRUE)
@@ -152,7 +163,8 @@ State 11: <Tick line 165, col 3 to line 170, col 38 of module RegistryPoke>
 /\ lastSeen = (d1 :> 1)
 /\ clock = 2
 
-State 12: <Tick line 165, col 3 to line 170, col 38 of module RegistryPoke>
+State 12: <Tick line 203, col 3 to line 208, col 49 of module RegistryPoke>
+/\ nextTimer = (d1 :> 13)
 /\ age = (d1 :> 2)
 /\ applied = (d1 :> 1)
 /\ healthy = (d1 :> TRUE)
@@ -165,7 +177,8 @@ State 12: <Tick line 165, col 3 to line 170, col 38 of module RegistryPoke>
 /\ lastSeen = (d1 :> 1)
 /\ clock = 3
 
-State 13: <Tick line 165, col 3 to line 170, col 38 of module RegistryPoke>
+State 13: <Tick line 203, col 3 to line 208, col 49 of module RegistryPoke>
+/\ nextTimer = (d1 :> 13)
 /\ age = (d1 :> 3)
 /\ applied = (d1 :> 1)
 /\ healthy = (d1 :> TRUE)
@@ -178,8 +191,8 @@ State 13: <Tick line 165, col 3 to line 170, col 38 of module RegistryPoke>
 /\ lastSeen = (d1 :> 1)
 /\ clock = 4
 
-2593 states generated, 1282 distinct states found, 264 states left on queue.
-The depth of the complete state graph search is 16.
+2025 states generated, 1010 distinct states found, 218 states left on queue.
+The depth of the complete state graph search is 15.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 4 and the 95th percentile is 3).
-Finished in 00s at (2026-11-14 16:51:11)
+Finished in 00s at (2026-11-14 17:49:57)
 exit 12

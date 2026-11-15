@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Logger } from "../../logger/index.js";
 import type { DownloadWorkerDeps } from "../workers/download.js";
 import type { UploadWorkerDeps } from "../workers/upload.js";
+import type { StreamSyncRegistry } from "../../stream-sync/ports.js";
+import { createRegistryChangePush } from "./change-push.js";
 import {
   createSyncManager,
   type ChangePush,
@@ -93,7 +95,27 @@ describe("a poke", () => {
     await manager.stop();
   });
 
-  it("costs no cycle when the registry did not actually move (a doubled poke)", async () => {
+  it("a plain probe poke (focus, online) still skips a marker that did not move", async () => {
+    const { push } = fakePush();
+    const cycle = vi.fn(async () => {});
+    const manager = build({
+      localSync: { cycle },
+      changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await manager.requestPull(); // applies m1
+    cycle.mockClear();
+    await manager.requestPull();
+    await manager.requestPull();
+    expect(cycle).not.toHaveBeenCalled();
+    await manager.stop();
+  });
+
+  it("a push answer that says the sequence moved cycles even when the probe marker is equal", async () => {
+    // The marker fingerprints one row: a second row stamped in the same
+    // millisecond leaves it unchanged. The gateway's sequence is exact, so a
+    // verified change must not be judged by the lossy marker.
     const { push, state } = fakePush();
     const cycle = vi.fn(async () => {});
     const manager = build({
@@ -102,13 +124,34 @@ describe("a poke", () => {
     });
     manager.start();
     await vi.advanceTimersByTimeAsync(0);
+    await manager.requestPull(); // m1 is applied
+    cycle.mockClear();
+
     state.handlers!.onChange();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cycle).toHaveBeenCalledTimes(1);
+    await manager.stop();
+  });
+
+  it("still cycles when the marker probe itself fails: a verified change does not need it", async () => {
+    const { push, state } = fakePush();
+    const cycle = vi.fn(async () => {});
+    const manager = build({
+      localSync: { cycle },
+      changeProbe: {
+        read: async () => {
+          throw new Error("probe down");
+        },
+        intervalMs: 5_000,
+        push,
+      },
+    });
+    manager.start();
     await vi.advanceTimersByTimeAsync(0);
     cycle.mockClear();
     state.handlers!.onChange();
-    state.handlers!.onChange();
     await vi.advanceTimersByTimeAsync(0);
-    expect(cycle).not.toHaveBeenCalled();
+    expect(cycle).toHaveBeenCalledTimes(1);
     await manager.stop();
   });
 
@@ -239,6 +282,72 @@ describe("the subscription's lifecycle", () => {
     read.mockClear();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(read.mock.calls.length).toBe(12);
+    await manager.stop();
+  });
+});
+
+describe("the real subscription driving the manager", () => {
+  /** A registry whose held requests the test answers or fails by hand. */
+  function heldRegistry() {
+    const pending: Array<{
+      after: string | undefined;
+      answer: (a: { seq: string; changed: boolean }) => void;
+      fail: (e: Error) => void;
+    }> = [];
+    const registry = {
+      waitForChange: (
+        after: string | undefined,
+        _waitMs: number,
+        signal: AbortSignal,
+      ) =>
+        new Promise<{ seq: string; changed: boolean }>((resolve, reject) => {
+          pending.push({ after, answer: resolve, fail: reject });
+          signal.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+        }),
+    } as unknown as StreamSyncRegistry;
+    return { registry, pending };
+  }
+
+  async function started() {
+    const { registry, pending } = heldRegistry();
+    const push = createRegistryChangePush(registry)!;
+    const cycle = vi.fn(async () => {});
+    // The probe marker never moves: every cycle that follows is the push's doing.
+    const manager = build({
+      localSync: { cycle },
+      changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    pending[0].answer({ seq: "1", changed: true }); // learns the cursor
+    await vi.advanceTimersByTimeAsync(0);
+    await manager.requestPull(); // m1 applied
+    cycle.mockClear();
+    return { manager, pending, cycle };
+  }
+
+  it("a changed sequence cycles although the probe marker is unchanged", async () => {
+    const { manager, pending, cycle } = await started();
+    pending[1].answer({ seq: "2", changed: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cycle).toHaveBeenCalledTimes(1);
+    await manager.stop();
+  });
+
+  it("the first answer after a failure cycles although neither the sequence nor the marker moved", async () => {
+    const { manager, pending, cycle } = await started();
+    pending[1].fail(new Error("socket reset"));
+    await vi.advanceTimersByTimeAsync(2_000); // back-off, then the next request
+    expect(pending.length).toBeGreaterThanOrEqual(3);
+    pending[2].answer({ seq: "1", changed: false });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cycle).toHaveBeenCalledTimes(1);
+    // Later empty answers do not cycle.
+    pending[3].answer({ seq: "1", changed: false });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cycle).toHaveBeenCalledTimes(1);
     await manager.stop();
   });
 });

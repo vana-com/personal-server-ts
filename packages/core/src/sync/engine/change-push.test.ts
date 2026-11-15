@@ -5,6 +5,7 @@
 // poke is lossy by design (a lost answer, a dropped socket, a restart), so the
 // loop repairs itself by comparing sequences when it reconnects, and says when
 // it is NOT healthy so the manager can fall back to its short timed probe.
+import { getEventListeners } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { StreamSyncRegistry } from "../../stream-sync/ports.js";
 import {
@@ -259,5 +260,52 @@ describe("stopping and parking", () => {
     await vi.advanceTimersByTimeAsync(2_000);
     expect(t.calls).toHaveLength(1);
     t.stop();
+  });
+});
+
+describe("listeners on the subscription's lifetime signal", () => {
+  /** The subscription's own AbortController: the first one it creates. */
+  function captureLifetime() {
+    const created: AbortController[] = [];
+    const Real = globalThis.AbortController;
+    vi.stubGlobal(
+      "AbortController",
+      class extends Real {
+        constructor() {
+          super();
+          created.push(this);
+        }
+      },
+    );
+    return created;
+  }
+  const abortListeners = (c: AbortController) =>
+    getEventListeners(c.signal, "abort").length;
+
+  it("a hidden tab that parks every 2 s keeps one listener, not one per park", async () => {
+    const created = captureLifetime();
+    const { stop } = subscribed({ active: () => false });
+    await flush();
+    const lifetime = created[0];
+    await vi.advanceTimersByTimeAsync(2_000 * 50); // 50 parked intervals
+    expect(abortListeners(lifetime)).toBeLessThanOrEqual(1);
+    stop();
+    expect(abortListeners(lifetime)).toBe(0);
+    vi.unstubAllGlobals();
+  });
+
+  it("a gateway outage that backs off repeatedly keeps one listener, not one per back-off", async () => {
+    const created = captureLifetime();
+    const { calls, stop } = subscribed();
+    await flush();
+    const lifetime = created[0];
+    for (let i = 0; i < 12; i++) {
+      calls[calls.length - 1].fail(new Error("down"));
+      await vi.advanceTimersByTimeAsync(40_000); // past the longest back-off
+    }
+    expect(abortListeners(lifetime)).toBeLessThanOrEqual(2);
+    stop();
+    expect(abortListeners(lifetime)).toBe(0);
+    vi.unstubAllGlobals();
   });
 });
