@@ -278,22 +278,24 @@ describe("requestPull with a change probe", () => {
     await manager.stop();
   });
 
-  it("skips the timed probe while the host says it is not worth probing, but not a signal", async () => {
-    let active = false;
+  it("holds no timed probe or signal probe while paused, and probes again once resumed", async () => {
     const read = vi.fn(async () => "m1");
     const manager = build(async () => {}, {
-      changeProbe: { read, intervalMs: 5_000, active: () => active },
+      changeProbe: { read, intervalMs: 5_000 },
     });
     manager.start();
     await vi.advanceTimersByTimeAsync(0);
+    manager.pause();
     await vi.advanceTimersByTimeAsync(20_000);
     expect(read).not.toHaveBeenCalled();
 
-    await manager.requestPull();
-    expect(read).toHaveBeenCalledTimes(1);
+    await manager.requestPull(); // a signal while hidden does nothing
+    expect(read).not.toHaveBeenCalled();
 
-    active = true;
+    manager.resume();
     await vi.advanceTimersByTimeAsync(5_000);
+    expect(read).toHaveBeenCalledTimes(1);
+    await manager.requestPull();
     expect(read).toHaveBeenCalledTimes(2);
     await manager.stop();
   });

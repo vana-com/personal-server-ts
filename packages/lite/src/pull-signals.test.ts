@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { startPullSignals } from "./pull-signals.js";
+import { startPullSignals, startVisibilityPause } from "./pull-signals.js";
 
 function target(visibilityState?: string) {
   const et = new EventTarget() as EventTarget & { visibilityState?: string };
@@ -60,5 +60,54 @@ describe("startPullSignals", () => {
       { window: win },
     );
     expect(() => win.dispatchEvent(new Event("focus"))).not.toThrow();
+  });
+});
+
+describe("startVisibilityPause", () => {
+  it("pauses on hide, resumes on show, and ignores a repeat of the same state", () => {
+    const doc = target("visible");
+    const manager = { pause: vi.fn(), resume: vi.fn() };
+    startVisibilityPause(manager, { document: doc });
+    expect(manager.pause).not.toHaveBeenCalled();
+
+    doc.visibilityState = "hidden";
+    doc.dispatchEvent(new Event("visibilitychange"));
+    expect(manager.pause).toHaveBeenCalledTimes(1);
+    doc.visibilityState = "visible";
+    doc.dispatchEvent(new Event("visibilitychange"));
+    expect(manager.resume).toHaveBeenCalledTimes(1);
+  });
+
+  it("a page that starts hidden pauses at once", () => {
+    const manager = { pause: vi.fn(), resume: vi.fn() };
+    startVisibilityPause(manager, { document: target("hidden") });
+    expect(manager.pause).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes before a pull signal registered after it reads the manager", () => {
+    const doc = target("hidden");
+    const order: string[] = [];
+    startVisibilityPause(
+      { pause: () => order.push("pause"), resume: () => order.push("resume") },
+      { document: doc },
+    );
+    startPullSignals(() => order.push("pull"), {
+      document: doc,
+      window: target(),
+    });
+    doc.visibilityState = "visible";
+    doc.dispatchEvent(new Event("visibilitychange"));
+    expect(order).toEqual(["pause", "resume", "pull"]);
+  });
+
+  it("stops listening when stopped, and does nothing without a page", () => {
+    const doc = target("visible");
+    const manager = { pause: vi.fn(), resume: vi.fn() };
+    const stop = startVisibilityPause(manager, { document: doc });
+    stop();
+    doc.visibilityState = "hidden";
+    doc.dispatchEvent(new Event("visibilitychange"));
+    expect(manager.pause).not.toHaveBeenCalled();
+    expect(() => startVisibilityPause(manager, {})()).not.toThrow();
   });
 });

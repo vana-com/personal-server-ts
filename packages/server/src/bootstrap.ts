@@ -1741,36 +1741,47 @@ async function bootstrapServer(
 
   const cleanup = async () => {
     backgroundClosed = true;
-    try {
-      // The importer writes through the stores that close below.
-      await importWaker?.stop();
-      clearRegistrationPoll();
-      // Before the database closes: abort the running step and let it settle.
+    // Every stop runs, whatever an earlier one did: a stop that rejects must
+    // not leave the sync manager's push request and timers live while the
+    // index closes. The first error is rethrown once all have run.
+    const errors: unknown[] = [];
+    const attempt = async (stop: () => unknown) => {
+      try {
+        await stop();
+      } catch (error) {
+        errors.push(error);
+      }
+    };
+    // The importer writes through the stores that close below.
+    await attempt(() => importWaker?.stop());
+    await attempt(() => clearRegistrationPoll());
+    // Before the database closes: abort the running step and let it settle.
+    await attempt(async () => {
       if (
         replicaHost &&
         !(await replicaHost.driver.stop(NODE_REPLICATION_STOP_GRACE_MS))
       )
         logger.warn("Replication step did not settle before shutdown");
-      derivativeScheduler.stop();
-      if (tunnelManager) {
-        await tunnelManager.stop();
-      }
-      if (syncManager) {
-        await syncManager.stop();
-      }
+    });
+    await attempt(() => derivativeScheduler.stop());
+    await attempt(() => tunnelManager?.stop());
+    await attempt(() => syncManager?.stop());
+    await attempt(async () => {
       // Finish an outstanding open before releasing the database lock.
       await openingLocalSync?.catch(() => undefined);
       await localSync?.close();
-    } finally {
-      // However the steps above ended, the authority drains the legacy writes
-      // it already admitted (they still need the index, which stays open until
-      // they are done).
+    });
+    // However the steps above ended, the authority drains the legacy writes
+    // it already admitted (they still need the index, which stays open until
+    // they are done).
+    await attempt(async () => {
       try {
         await accountModeAuthority.close();
       } finally {
         indexManager.close();
       }
-    }
+    });
+    if (errors.length > 0) throw errors[0];
   };
 
   const context: ServerContext = {

@@ -39,8 +39,6 @@ export function changePushBackoffMs(
   const base = BACKOFF_MIN_MS * 2 ** Math.min(failures, 5);
   return Math.min(BACKOFF_MAX_MS, base * (0.5 + random()));
 }
-/** How often a parked subscription (no one is looking) re-checks the host. */
-const PARK_CHECK_MS = 2_000;
 
 /**
  * The timed probe's period while the push is healthy. The unconditional timer
@@ -56,11 +54,6 @@ export interface RegistryChangePushOptions {
   healthyProbeMs?: number;
   /** Default {@link CHANGE_PUSH_WAIT_MS}. */
   waitMs?: number;
-  /**
-   * Whether anyone is looking now. A hidden Web tab holds no request and
-   * pulls once when it is shown again (the host's own signal).
-   */
-  active?: () => boolean;
 }
 
 /**
@@ -103,10 +96,9 @@ export function createRegistryChangePush(
         handlers.onHealth(next);
       };
 
-      // The abort listener goes away on both ways out. A hidden tab sleeps
-      // every PARK_CHECK_MS for as long as the subscription lives, and an
-      // outage sleeps once per attempt; a listener left behind by each sleep
-      // is a leak that grows with the subscription's age.
+      // The abort listener goes away on both ways out. An outage sleeps once
+      // per attempt; a listener left behind by each sleep is a leak that grows
+      // with the subscription's age.
       const sleep = (ms: number) =>
         new Promise<void>((resolve) => {
           const done = () => {
@@ -120,14 +112,29 @@ export function createRegistryChangePush(
 
       async function once(): Promise<"answer" | "failed" | "absent"> {
         const request = new AbortController();
-        const onStop = () => request.abort(lifetime.signal.reason);
-        lifetime.signal.addEventListener("abort", onStop, { once: true });
-        const deadline = setTimeout(
-          () => request.abort(new Error("change request got no answer")),
-          waitMs + REQUEST_GRACE_MS,
-        );
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let onStop: (() => void) | undefined;
+        // The request ends on the first of: the registry's answer, the
+        // deadline, or the subscription's end. The last two settle it at once
+        // and clear the deadline timer in the same turn, even when the
+        // registry ignores the abort; a late answer then finds nobody waiting.
+        const ended = new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            const error = new Error("change request got no answer");
+            request.abort(error);
+            reject(error);
+          }, waitMs + REQUEST_GRACE_MS);
+          onStop = () => {
+            clearTimeout(timer);
+            request.abort(lifetime.signal.reason);
+            reject(lifetime.signal.reason);
+          };
+          lifetime.signal.addEventListener("abort", onStop, { once: true });
+        });
         try {
-          const answer = await waitForChange!(cursor, waitMs, request.signal);
+          const wait = waitForChange!(cursor, waitMs, request.signal);
+          wait.catch(() => {}); // a late failure after the race is not ours
+          const answer = await Promise.race([wait, ended]);
           if (lifetime.signal.aborted) return "failed";
           cursor = answer.seq;
           failures = 0;
@@ -141,18 +148,13 @@ export function createRegistryChangePush(
           if (error instanceof ChangeFeedAbsentError) return "absent";
           return "failed";
         } finally {
-          clearTimeout(deadline);
-          lifetime.signal.removeEventListener("abort", onStop);
+          clearTimeout(timer);
+          lifetime.signal.removeEventListener("abort", onStop!);
         }
       }
 
       void (async () => {
         while (!lifetime.signal.aborted) {
-          if (options.active && !options.active()) {
-            setHealth(false);
-            await sleep(PARK_CHECK_MS);
-            continue;
-          }
           const outcome = await once();
           if (lifetime.signal.aborted) return;
           if (outcome === "absent") {
