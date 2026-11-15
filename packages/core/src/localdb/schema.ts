@@ -306,6 +306,13 @@ END`,
 END`,
   ],
   [
+    // Apply has no rollback. Set before an apply's first write to a
+    // connection, cleared when an apply of the whole connection completes. A
+    // begin never goes on offline while it is set: the registry cannot say
+    // what the half-applied local data lacks.
+    `ALTER TABLE connections ADD COLUMN apply_partial INTEGER NOT NULL DEFAULT 0`,
+  ],
+  [
     // Publish while collecting (flag `publishWhileCollecting`). A run's batch
     // is admitted into `records` as it arrives, so an older run can admit a row
     // after a newer run deleted it. This remembers each delete by the stamp of
