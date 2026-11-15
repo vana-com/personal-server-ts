@@ -16,6 +16,8 @@ import {
   pkHash,
   shouldCompact,
   streamScope,
+  foldLog,
+  partitionFold,
   type LogEntry,
   type Segment,
   type SnapshotPart,
@@ -785,14 +787,12 @@ type OracleKey = {
   upsert: { stamp: Stamp; value: unknown; firstSeen: number | null } | null;
   /** The greatest deletion: an explicit delete, or a completion's cutoff. */
   deletion: { stamp: Stamp; explicit: boolean } | null;
-  seen: { stamp: Stamp; firstSeen: number }[];
 };
 
 /**
  * The fold of a prefix, written independently of `foldLog`, as a map from key
- * to what a snapshot must say about it: the winning upsert (with the least
- * first-seen over the upserts that outlive the deletion) and the deletion
- * frontier when it erased something. Order of ranks, as the model has it: an
+ * to what a snapshot must say about it: the winning upsert (with the first-seen
+ * it carries) and the deletion frontier when it erased something. Order of ranks, as the model has it: an
  * omission at a stamp ranks below an observation at that stamp; an explicit
  * delete at that stamp ranks above it.
  */
@@ -802,8 +802,7 @@ function oracleFold(segments: readonly Segment[]) {
   const keys = new Map<string, OracleKey>();
   const at = (stream: string, pk: string) => {
     const key = `${stream}/${pk}`;
-    if (!keys.has(key))
-      keys.set(key, { upsert: null, deletion: null, seen: [] });
+    if (!keys.has(key)) keys.set(key, { upsert: null, deletion: null });
     return keys.get(key)!;
   };
   const deleted = (c: OracleKey, stamp: Stamp, explicit: boolean) => {
@@ -825,8 +824,6 @@ function oracleFold(segments: readonly Segment[]) {
             value: op.value,
             firstSeen: op.firstSeen,
           };
-        if (op.firstSeen !== null)
-          c.seen.push({ stamp: op.stamp, firstSeen: op.firstSeen });
       } else if (op.kind === "delete")
         deleted(at(op.stream, op.pkHash), op.stamp, true);
       else
@@ -849,18 +846,7 @@ function oracleFold(segments: readonly Segment[]) {
         (same(c.upsert.stamp, d.stamp) && !d.explicit));
     const entry: typeof out extends Map<string, infer V> ? V : never = {};
     if (survives) {
-      const live = c.seen.filter(
-        (s) =>
-          !d ||
-          after(s.stamp, d.stamp) ||
-          (same(s.stamp, d.stamp) && !d.explicit),
-      );
-      entry.upsert = {
-        ...c.upsert!,
-        firstSeen: live.length
-          ? Math.min(...live.map((s) => s.firstSeen))
-          : null,
-      };
+      entry.upsert = c.upsert!;
       // Only a deletion the winner is strictly after has erased anything older.
       if (d && after(c.upsert!.stamp, d.stamp))
         entry.tombstone = {
@@ -1508,4 +1494,182 @@ describe("log protocol: a resurrection after a deletion (P2-3)", () => {
     expect(await firstSeen(separate)).toBe(7000);
     expect(await firstSeen(together)).toBe(7000);
   });
+});
+
+describe("log protocol: first-seen travels with the winning observation (P2-a, P2-b)", () => {
+  // `first_o` is read by `/additions` (the day a record arrived) and by nothing
+  // else: no merge, delete or publish decision depends on it. The rule that
+  // every reader can compute from the log is that a record's first-seen is the
+  // one its winning observation carries (NULL when that observation's is
+  // unknown). A late delete never touches a row that outlives it, and a
+  // snapshot, which keeps the winner, keeps its first-seen.
+  type Obs =
+    { kind: "u"; o: number; f: number | null } | { kind: "d"; o: number };
+  const U = (o: number, f: number | null): Obs => ({ kind: "u", o, f });
+  const D = (o: number): Obs => ({ kind: "d", o });
+
+  const K = () => idHash("k");
+  const operation = async (obs: Obs): Promise<Segment["operations"][number]> =>
+    obs.kind === "u"
+      ? {
+          kind: "upsert",
+          stream: sName(0),
+          pkHash: await K(),
+          stamp: { o: obs.o, r: `run-${obs.o}` },
+          firstSeen: obs.f,
+          value: { id: "k", v: obs.o },
+        }
+      : {
+          kind: "delete",
+          stream: sName(0),
+          pkHash: await K(),
+          stamp: { o: obs.o, r: `run-${obs.o}` },
+        };
+  const context = {
+    connector: CONNECTOR,
+    ns: "",
+    generation: 1,
+    keyCheck: "0123456789abcdef",
+  };
+
+  /** What the winning-observation rule says, written from the rule alone. */
+  const expected = (log: readonly Obs[]) => {
+    const upserts = log.filter((x): x is Obs & { kind: "u" } => x.kind === "u");
+    const deletes = log.filter((x) => x.kind === "d");
+    const winner = upserts.reduce<(typeof upserts)[number] | null>(
+      (best, x) => (best === null || x.o > best.o ? x : best),
+      null,
+    );
+    const frontier = Math.max(-1, ...deletes.map((x) => x.o));
+    // An explicit delete at the winner's stamp outranks it.
+    return winner !== null && winner.o > frontier ? winner : null;
+  };
+
+  const seeded = async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    const a = await w.device("a");
+    await a.run("run-1", [{ stream: sName(0), id: "seed" }], {
+      observedAt: 1100,
+    });
+    await a.cycle();
+    return w;
+  };
+  const kRow = async (d: Device) =>
+    (await d.rows())
+      .map(
+        (r) => JSON.parse(r) as { record_key: string; first_o: number | null },
+      )
+      .filter((r) => r.record_key === "k");
+
+  /** A reader that applies the log one segment at a time, in position order. */
+  const sequential = async (
+    w: Awaited<ReturnType<typeof world>>,
+    id: string,
+    log: readonly Obs[],
+  ) => {
+    const d = await joined(w, id);
+    for (const [i, obs] of log.entries())
+      await applySegmentOperations(
+        d.deps,
+        CONNECTION_ID,
+        await crafted(i + 2, [await operation(obs)]),
+      );
+    return d;
+  };
+  /** A reader that installs the fold of `prefix`, then applies the rest. */
+  const throughSnapshot = async (
+    w: Awaited<ReturnType<typeof world>>,
+    id: string,
+    log: readonly Obs[],
+    split: number,
+  ) => {
+    const d = await joined(w, id);
+    const prefix = await Promise.all(
+      log
+        .slice(0, split)
+        .map(async (obs, i) => await crafted(i + 2, [await operation(obs)])),
+    );
+    const fold = foldLog({ snapshot: [], segments: prefix });
+    for (const part of partitionFold(fold, { ...context, position: split + 1 }))
+      await applySnapshotPart(d.deps, CONNECTION_ID, part);
+    for (const [i, obs] of log.slice(split).entries())
+      await applySegmentOperations(
+        d.deps,
+        CONNECTION_ID,
+        await crafted(split + i + 2, [await operation(obs)]),
+      );
+    return d;
+  };
+
+  it("P2-a: an unknown first-seen at the lower stamp does not outlast a later known one, in either order", async () => {
+    const w = await seeded();
+    for (const [name, log] of [
+      ["unknown first", [U(10, null), U(30, 30)]],
+      ["known first", [U(30, 30), U(10, null)]],
+    ] as const) {
+      const online = await sequential(w, `online-${name}`, log);
+      const fresh = await throughSnapshot(w, `fresh-${name}`, log, log.length);
+      expect(await kRow(online)).toMatchObject([{ first_o: 30 }]);
+      expect(await online.rows()).toEqual(await fresh.rows());
+    }
+  });
+
+  it("P2-a: a later observation whose first-seen is unknown makes it unknown for every reader", async () => {
+    const w = await seeded();
+    const log = [U(10, 10), U(30, null)];
+    const online = await sequential(w, "online", log);
+    const fresh = await throughSnapshot(w, "fresh", log, 2);
+    expect(await kRow(online)).toMatchObject([{ first_o: null }]);
+    expect(await online.rows()).toEqual(await fresh.rows());
+  });
+
+  it("P2-b: a late delete below a surviving row leaves its first-seen alone, for the online and the fresh reader", async () => {
+    const w = await seeded();
+    const log = [U(10, 10), U(30, 30), D(20)];
+    const online = await sequential(w, "online", log);
+    const prefixThenTail = await throughSnapshot(w, "prefix", log, 2);
+    const fresh = await throughSnapshot(w, "fresh", log, 3);
+    expect(await kRow(online)).toMatchObject([{ first_o: 30 }]);
+    expect(await prefixThenTail.rows()).toEqual(await online.rows());
+    expect(await fresh.rows()).toEqual(await online.rows());
+  });
+
+  it("every short history gives every reader the winning observation's first-seen", async () => {
+    const w = await seeded();
+    const alphabet = [
+      U(10, null),
+      U(10, 10),
+      U(30, null),
+      U(30, 30),
+      D(15),
+      D(25),
+    ];
+    // Every pair, and every triple over the three observations that matter
+    // most: an old unknown, a later known, and a delete between them.
+    const triple = [U(10, null), U(30, 30), D(20)];
+    const logs: Obs[][] = [];
+    for (const x of alphabet) {
+      logs.push([x]);
+      for (const y of alphabet) logs.push([x, y]);
+    }
+    for (const x of triple)
+      for (const y of triple) for (const z of triple) logs.push([x, y, z]);
+    let n = 0;
+    for (const log of logs) {
+      const tag = `h${n++}`;
+      const online = await sequential(w, `${tag}-online`, log);
+      const want = expected(log);
+      expect(
+        (await kRow(online)).map((r) => r.first_o),
+        JSON.stringify(log),
+      ).toEqual(want === null ? [] : [want.f]);
+      for (let split = 0; split <= log.length; split++) {
+        const reader = await throughSnapshot(w, `${tag}-${split}`, log, split);
+        expect(
+          await reader.rows(),
+          `${JSON.stringify(log)} split ${split}`,
+        ).toEqual(await online.rows());
+      }
+    }
+  }, 120_000);
 });

@@ -132,7 +132,9 @@ export function stampAfter(a: LogStamp, b: LogStamp): boolean {
 
 /**
  * The record's current body at its observation stamp. `firstSeen` is the
- * record's first-seen checkpoint (`first_o`), `null` when unknown.
+ * record's first-seen checkpoint (`first_o`) as the observing device knew it,
+ * `null` when unknown. It belongs to this observation: a reader keeps it while
+ * this upsert is the winner and replaces it when a newer one wins.
  */
 export interface LogUpsert {
   readonly kind: "upsert";
@@ -331,8 +333,11 @@ const entryKey = (stream: string, pk: string) => `${stream}\u0000${pk}`;
  * before it merges the resurrection. A deletion the upsert only ties (an
  * omission at the observation's stamp) erased nothing and is left out.
  *
- * The first-seen checkpoint is the least known one over the upserts that
- * outlive the deletion; an older one went with the row it described.
+ * A record's first-seen checkpoint is the one its winning upsert carries, NULL
+ * included. Nothing takes a minimum over upserts: a reader that applied them
+ * one segment at a time has already folded the older ones into a row it cannot
+ * take apart again when a late delete or an unknown value arrives, so only the
+ * winner's own value is something every reader can compute.
  *
  * Applying the fold gives the same records as applying the prefix in order.
  */
@@ -343,22 +348,18 @@ export function foldLog(input: {
   type Deletion = { stamp: LogStamp; explicit: boolean };
   type Cell = {
     upsert: LogUpsert | null;
-    /** Every upsert's stamp and first-seen checkpoint, to settle after the deletion is known. */
-    seen: { stamp: LogStamp; firstSeen: number }[];
     deletion: Deletion | null;
   };
   const cells = new Map<string, Cell>();
   const cell = (stream: string, pk: string): Cell => {
     const key = entryKey(stream, pk);
     let c = cells.get(key);
-    if (!c) cells.set(key, (c = { upsert: null, seen: [], deletion: null }));
+    if (!c) cells.set(key, (c = { upsert: null, deletion: null }));
     return c;
   };
   const upsert = (op: LogUpsert) => {
     const c = cell(op.stream, op.pkHash);
     if (!c.upsert || stampAfter(op.stamp, c.upsert.stamp)) c.upsert = op;
-    if (op.firstSeen !== null)
-      c.seen.push({ stamp: op.stamp, firstSeen: op.firstSeen });
   };
   const deletion = (
     stream: string,
@@ -416,14 +417,7 @@ export function foldLog(input: {
     if (c.upsert && outlives(c.upsert.stamp, d)) {
       // Only a deletion the winner is strictly after has erased anything.
       if (d && stampAfter(c.upsert.stamp, d.stamp)) entries.push(tombstone());
-      let firstSeen: number | null = null;
-      for (const s of c.seen)
-        if (
-          outlives(s.stamp, d) &&
-          (firstSeen === null || s.firstSeen < firstSeen)
-        )
-          firstSeen = s.firstSeen;
-      entries.push({ ...c.upsert, stream, pkHash, firstSeen });
+      entries.push({ ...c.upsert, stream, pkHash });
     } else if (d) {
       entries.push(tombstone());
     }

@@ -374,7 +374,10 @@ async function applyBatch(
                    AND (t.stamp_o, t.stamp_r, t.rank) > (incoming.stamp_o, incoming.stamp_r, ${UPSERT_RANK}))`,
         params: [op, connectionId],
       },
-      ...mergeIncoming(op, connectionId, { promoteSeen: true }),
+      ...mergeIncoming(op, connectionId, {
+        promoteSeen: true,
+        firstSeenOfWinner: true,
+      }),
     );
 
   // 4. Each stream the segment touched now reads from it: a local version

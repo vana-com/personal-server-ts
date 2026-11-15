@@ -542,6 +542,42 @@ describe("fold: the deletion frontier (P2-3)", () => {
     ]);
   });
 
+  it("the fold carries the winner's first-seen: an unknown one stays unknown, a late delete changes nothing (P2-a, P2-b)", () => {
+    const firstSeenOf = (segments: Segment[]) =>
+      foldLog({ snapshot: [], segments }).entries.find(
+        (e) => e.kind === "upsert",
+      );
+    // An unknown first-seen at the lower stamp, a known one at the higher.
+    expect(
+      firstSeenOf([
+        seg(1, [{ ...up("a", 1, 10), firstSeen: null }]),
+        seg(2, [up("a", 1, 30)]),
+      ]),
+    ).toMatchObject({ firstSeen: 30 });
+    // The same two upserts the other way round.
+    expect(
+      firstSeenOf([
+        seg(1, [up("a", 1, 30)]),
+        seg(2, [{ ...up("a", 1, 10), firstSeen: null }]),
+      ]),
+    ).toMatchObject({ firstSeen: 30 });
+    // The winner's own unknown first-seen is not replaced by an older known one.
+    expect(
+      firstSeenOf([
+        seg(1, [up("a", 1, 10)]),
+        seg(2, [{ ...up("a", 1, 30), firstSeen: null }]),
+      ]),
+    ).toMatchObject({ firstSeen: null });
+    // A delete between the two upserts, applied last, leaves the winner alone.
+    expect(
+      firstSeenOf([
+        seg(1, [up("a", 1, 10)]),
+        seg(2, [up("a", 1, 30)]),
+        seg(3, [del("a", 1, 20)]),
+      ]),
+    ).toMatchObject({ firstSeen: 30, stamp: { o: 30, r: "r" } });
+  });
+
   it("folding in two steps keeps the frontier", () => {
     const all = [
       seg(1, [up("a", 1, 10)]),
