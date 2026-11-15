@@ -194,6 +194,17 @@ export interface SyncManager {
    * `running: false`), so a manager that starts again is heard again. With no
    * subscriber the manager reads nothing extra; the first subscriber's value is
    * the baseline and is not delivered. Returns the unsubscribe.
+   *
+   * Do not call `trigger` on every event. Each cycle changes `lastSync`, so
+   * each cycle ends with an event that would start the next one, and nothing
+   * here bounds that loop: delivery is never nested and coalesces events, but
+   * it does not stop a listener that always triggers. Trigger only on a change
+   * the listener acts on, such as the first `lastSync`.
+   *
+   * Disposal: the manager does not close with its host. Unsubscribe before the
+   * storage or the stream database the status reads is closed (in Lite,
+   * before `closeStreamSync`), because a stop, or a cycle that is still ending,
+   * can deliver one more event after the host has begun to close.
    */
   subscribeStatus(listener: (status: SyncStatus) => void): () => void;
 
@@ -526,6 +537,7 @@ export function createSyncManager(
         }
 
         lastSync = new Date().toISOString();
+        statusMayHaveChanged(); // the cursor and lastSync, at the pass boundary
       } while (rerunRequested && isRunning && !paused);
     };
 
@@ -655,12 +667,16 @@ export function createSyncManager(
       const uploadResults = await uploadAll(workerUploadDeps, {
         batchSize: uploadBatchSize,
         onError(entry, error) {
-          pushError({
-            fileId: entry.fileId,
-            scope: entry.scope,
-            message: `Upload failed for ${entry.path}: ${error.message}`,
-            timestamp: new Date().toISOString(),
-          });
+          // One notification for the whole upload cycle, from the caller.
+          pushError(
+            {
+              fileId: entry.fileId,
+              scope: entry.scope,
+              message: `Upload failed for ${entry.path}: ${error.message}`,
+              timestamp: new Date().toISOString(),
+            },
+            false,
+          );
         },
       });
       uploadDeps.logger.debug(
@@ -810,13 +826,35 @@ export function createSyncManager(
     }, notifyDebounceMs);
   }
 
-  function pushError(error: SyncError): void {
+  /**
+   * Record an error for the status. `notify: false` leaves the notification to
+   * the caller, which owes one at the end of its batch: the upload worker
+   * reports one error per failed file, and a status read per file would cost
+   * a count each.
+   */
+  function pushError(error: SyncError, notify = true): void {
     errorSeq += 1;
     errors.push(error);
     if (errors.length > MAX_ERRORS) {
       errors = errors.slice(-MAX_ERRORS);
     }
-    statusMayHaveChanged();
+    if (notify) statusMayHaveChanged();
+  }
+
+  /**
+   * Log a failure of delivery. Anything can be thrown (`null`, a string), and
+   * the logger can throw too; neither may leave delivery, or a caller such as
+   * `start` would stop before its first cycle.
+   */
+  function reportQuietly(message: string, thrown: unknown): void {
+    try {
+      uploadDeps.logger.warn(
+        { error: thrown instanceof Error ? thrown.message : String(thrown) },
+        message,
+      );
+    } catch {
+      // A failing logger has no one left to tell.
+    }
   }
 
   /**
@@ -840,10 +878,7 @@ export function createSyncManager(
           status = manager.getStatus();
           seen = JSON.stringify(status);
         } catch (error) {
-          uploadDeps.logger.warn(
-            { error: (error as Error).message },
-            "sync status could not be read for subscribers",
-          );
+          reportQuietly("sync status could not be read for subscribers", error);
           return;
         }
         if (seen === statusSeen) return;
@@ -854,10 +889,7 @@ export function createSyncManager(
           try {
             listener(status);
           } catch (error) {
-            uploadDeps.logger.warn(
-              { error: (error as Error).message },
-              "a sync status listener threw",
-            );
+            reportQuietly("a sync status listener threw", error);
           }
         }
       }
@@ -1072,7 +1104,8 @@ export function createSyncManager(
         options?.accountStorageMode &&
         options.accountStorageMode.read() !== "unswitched"
           ? 0
-          : uploadDeps.storage.findUnsynced().length;
+          : (uploadDeps.storage.countUnsynced?.() ??
+            uploadDeps.storage.findUnsynced().length);
 
       return {
         enabled: true,
@@ -1138,8 +1171,14 @@ export function createSyncManager(
 
     async retryQuarantinedUploads(scope) {
       if (!(await uploadAttempts.recover())) return;
-      for (const path of await uploadAttempts.release(scope))
-        uploadState.clear(path);
+      try {
+        for (const path of await uploadAttempts.release(scope))
+          uploadState.clear(path);
+      } finally {
+        // The tracker's snapshot is part of the status, and a release that
+        // fails part way has still cleared the paths before it.
+        statusMayHaveChanged();
+      }
     },
 
     async deleteScope(scope: string, within?: LegacyWriteSeal["commit"]) {

@@ -211,6 +211,13 @@ export interface IndexedDbPsLiteRuntime {
    * host that shows sync state needs no timer. Works before the manager
    * starts; the subscription stays when the manager stops and starts again.
    * Returns the unsubscribe; with no sync manager it hears nothing.
+   *
+   * Do not call `syncManager.trigger()` on every event: each cycle changes
+   * `lastSync`, so each ends with an event that would start the next, and
+   * nothing bounds that loop. Trigger only on a change the listener acts on.
+   *
+   * Unsubscribe before `closeStreamSync`. As a fence, no listener is called
+   * once `closeStreamSync` has begun, even if the caller forgot.
    */
   subscribeSyncStatus(listener: (status: SyncStatus) => void): () => void;
   /** Database facade when a host driver is supplied and available. */
@@ -383,6 +390,8 @@ export async function createIndexedDbPsLiteRuntime(
   let syncRuntime:
     Awaited<ReturnType<typeof createPsLiteSyncManager>> | undefined;
   let closeStreamSync = async () => {};
+  // Set when closeStreamSync begins: sync status listeners hear nothing after.
+  let streamSyncClosing = false;
   let runtimeRef: PsLiteRuntime | null = null;
   // Derivative compute: built before sync so downloads can mark questions
   // stale; it reaches the sync manager lazily to upload its results.
@@ -615,12 +624,17 @@ export async function createIndexedDbPsLiteRuntime(
     subscribeViewChanges: (listener) =>
       (syncRuntime?.viewChanges ?? NO_VIEW_CHANGES).subscribe(listener),
     subscribeSyncStatus: (listener) =>
-      syncManager?.subscribeStatus?.(listener) ?? (() => {}),
+      syncManager?.subscribeStatus?.((status) => {
+        if (!streamSyncClosing) listener(status);
+      }) ?? (() => {}),
     get localSync() {
       return syncRuntime?.localSync ?? null;
     },
     getLocalSync: syncRuntime?.getLocalSync,
-    closeStreamSync,
+    closeStreamSync: async () => {
+      streamSyncClosing = true;
+      await closeStreamSync();
+    },
     streamSyncIntake,
     streamSyncSeed,
     derivatives,

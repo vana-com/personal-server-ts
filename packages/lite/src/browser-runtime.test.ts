@@ -387,6 +387,31 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
     await context.closeStreamSync?.();
   });
 
+  it("subscribeSyncStatus delivers nothing once closeStreamSync has begun", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const context = await createSwitchedIndexedDbPsLiteRuntime(
+      options({
+        localDb: { openDriver: async () => openBetterSqlite3(":memory:") },
+        configDefaults: {
+          gateway: { url: "https://gateway.local" },
+          sync: { enabled: false },
+          streamSync: { write: true },
+        },
+      }),
+    );
+    const listener = vi.fn();
+    context.subscribeSyncStatus(listener); // never unsubscribed, on purpose
+    await context.syncManager?.trigger();
+    const before = listener.mock.calls.length;
+    expect(before).toBeGreaterThan(0);
+
+    await context.closeStreamSync?.();
+    await context.syncManager?.trigger(); // a late cycle after the close began
+
+    expect(listener).toHaveBeenCalledTimes(before);
+    await context.syncManager?.stop();
+  });
+
   it("refuses intake while Account is Off regardless of the old write flag", async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());
     const { streamSyncIntake } = await createUnswitchedIndexedDbPsLiteRuntime(
