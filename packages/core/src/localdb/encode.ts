@@ -145,12 +145,24 @@ export class FrozenRowsChanged extends Error {
 }
 
 /**
- * A transfer page holds at most this many rows and, when two or more rows
- * fit, at most `PAGE_BYTES` of bodies. A row larger than that is a page of
- * its own: one body is the floor, because a body is encoded whole.
+ * The most bytes of bodies a transfer page aims at, whatever the part target.
+ * A page is also at most a quarter of the part target (`pageBytesOf`).
  */
-const PAGE_ROWS = 64;
 const PAGE_BYTES = 2 * 1024 * 1024;
+/** The most rows one page query asks for, however small the rows are. */
+const PAGE_ROWS_MAX = 1024;
+/** A page's row count follows the largest row of this many recent pages. */
+const PAGE_HISTORY = 4;
+
+/**
+ * Bytes of bodies one transfer page aims at: a quarter of the part target, so
+ * the part being built (at most `target`) plus the page in hand and the page
+ * read ahead (at most `target / 2` together) fit the `2 * target` the builder
+ * reserves (see `startFrozenParts`).
+ */
+export function pageBytesOf(target: number): number {
+  return Math.max(1, Math.min(PAGE_BYTES, Math.floor(target / 4)));
+}
 
 /** The byte target a part is cut at: `deps.partTargetBytes`, default 4 MiB. */
 export function partTargetOf(deps: LocalSyncDeps): number {
@@ -303,20 +315,26 @@ export async function freezePrefixRows(
   return frozen;
 }
 
-type SpoolRow = Omit<FrozenRow, "body"> & { readonly body: string };
+type SpoolRow = FrozenRow & { readonly body_bytes: number };
 
 /**
  * Read one prefix of the frozen rows in key order, from the attempt's spool or
- * from a frozen view of `records`. A page is found by metadata first (key and
- * body size, no body), cut at `PAGE_ROWS` rows or `PAGE_BYTES` of bodies (at
- * least one row), and only then are its bodies read. Neither source changes
- * while the attempt runs, so a range read returns exactly the rows the
- * metadata named; fewer means the spool was emptied under the transfer.
+ * from a frozen view of `records`, one query per page. A page asks for `rows`
+ * rows after the last key read; the rows come with their body size, and the
+ * next page asks for as many rows as fit `pageBytes` at the largest row of the
+ * last `PAGE_HISTORY` pages. The first page is one row and each page at most
+ * doubles, so a stream of large rows is never read in a wide page to learn its
+ * size. A page can pass `pageBytes` only when it holds rows larger than any of
+ * those pages' rows; a single row larger than `pageBytes` is a page of its own,
+ * because a body is encoded whole. Neither source changes while the attempt
+ * runs, so a read after a key returns exactly the rows that follow it; the
+ * caller's row count check catches a spool emptied under the transfer.
  */
 async function* readFrozen(
   deps: LocalSyncDeps,
   source: { readonly attempt: string; readonly view?: FrozenView },
   prefix: string,
+  pageBytes: number,
 ): AsyncGenerator<readonly SpoolRow[]> {
   const range = keyRange(prefix);
   // A prefix is read after its batch committed, and nothing writes it again,
@@ -346,36 +364,25 @@ async function* readFrozen(
     scopeParams = [source.attempt];
   }
   let after: string | null = null;
+  let rows = 1;
+  const recentMax: number[] = [];
   for (;;) {
-    const meta: { pk_hash: string; body_bytes: number }[] = await reader.query(
-      `SELECT pk_hash, ${size} AS body_bytes FROM ${from}
-          WHERE ${scope}${range.sql}${after === null ? "" : " AND pk_hash > ?"}
-          ORDER BY pk_hash LIMIT ${PAGE_ROWS}`,
+    const page: SpoolRow[] = await reader.query(
+      `SELECT pk_hash, stamp_o, stamp_r, first_o, body_sha256,
+              ${size} AS body_bytes, body
+         FROM ${from}
+        WHERE ${scope}${range.sql}${after === null ? "" : " AND pk_hash > ?"}
+        ORDER BY pk_hash LIMIT ${rows}`,
       [...scopeParams, ...range.params, ...(after === null ? [] : [after])],
     );
-    if (meta.length === 0) return;
-    let take = 0;
-    let bytes = 0;
-    while (
-      take < meta.length &&
-      (take === 0 || bytes + Number(meta[take]!.body_bytes) <= PAGE_BYTES)
-    ) {
-      bytes += Number(meta[take]!.body_bytes);
-      take += 1;
-    }
-    const first = meta[0]!.pk_hash;
-    const last = meta[take - 1]!.pk_hash;
-    const page: SpoolRow[] = await reader.query(
-      `SELECT pk_hash, stamp_o, stamp_r, first_o, body_sha256, body
-         FROM ${from}
-        WHERE ${scope} AND pk_hash >= ? AND pk_hash <= ?
-        ORDER BY pk_hash`,
-      [...scopeParams, first, last],
-    );
-    if (page.length !== take) throw new FrozenRowsChanged(prefix);
+    if (page.length === 0) return;
     yield page;
-    if (take === meta.length && meta.length < PAGE_ROWS) return;
-    after = last;
+    if (page.length < rows) return;
+    after = page[page.length - 1]!.pk_hash;
+    recentMax.push(Math.max(...page.map((row) => Number(row.body_bytes))));
+    if (recentMax.length > PAGE_HISTORY) recentMax.shift();
+    const fit = Math.floor(pageBytes / Math.max(1, ...recentMax));
+    rows = Math.max(1, Math.min(PAGE_ROWS_MAX, rows * 2, fit));
   }
 }
 
@@ -503,6 +510,7 @@ async function encodeFrozenParts(
   },
 ): Promise<readonly EncodedPart[]> {
   const result: EncodedPart[] = [];
+  const pageBytes = pageBytesOf(target);
   const port = deps.streamCrypto ?? nobleStreamCrypto;
   const hash = async (bytes: Uint8Array): Promise<Uint8Array> =>
     port.sha256(bytes);
@@ -554,51 +562,55 @@ async function encodeFrozenParts(
       }
     };
     let seen = 0;
-    const pages = readFrozen(deps, input, prefix);
-    for (;;) {
-      await memory.hold();
-      const next = await pages.next();
-      if (next.done) break;
-      for (const row of next.value) {
-        seen += 1;
-        const body = new TextEncoder().encode(row.body);
-        const frame = frameOfBody(
-          {
-            h: row.body_sha256,
-            k: row.pk_hash,
-            n: body.length,
-            o: row.stamp_o,
-            r: row.stamp_r,
-            f: row.first_o ?? null,
-          },
-          body,
-        );
-        if (frame.length > target) {
-          await flush();
-          // A reader must see the entire envelope in the first piece.
-          if (frame.indexOf(0x0a) + 1 > target) {
-            throw new Error(
-              "partTargetBytes is too small for a frame envelope",
-            );
-          }
-          for (let at = 0; at < frame.length; at += target) {
+    const pages = readFrozen(deps, input, prefix, pageBytes);
+    try {
+      for (;;) {
+        await memory.hold();
+        const next = await pages.next();
+        if (next.done) break;
+        for (const row of next.value) {
+          seen += 1;
+          const body = new TextEncoder().encode(row.body);
+          const frame = frameOfBody(
+            {
+              h: row.body_sha256,
+              k: row.pk_hash,
+              n: body.length,
+              o: row.stamp_o,
+              r: row.stamp_r,
+              f: row.first_o ?? null,
+            },
+            body,
+          );
+          if (frame.length > target) {
+            await flush();
+            // A reader must see the entire envelope in the first piece.
+            if (frame.indexOf(0x0a) + 1 > target) {
+              throw new Error(
+                "partTargetBytes is too small for a frame envelope",
+              );
+            }
+            for (let at = 0; at < frame.length; at += target) {
+              await memory.hold();
+              await upload(
+                await encodePiece(
+                  hash,
+                  prefix,
+                  frame.subarray(at, at + target),
+                  at === 0,
+                ),
+              );
+            }
+          } else {
+            if (bytes + frame.length > target) await flush();
             await memory.hold();
-            await upload(
-              await encodePiece(
-                hash,
-                prefix,
-                frame.subarray(at, at + target),
-                at === 0,
-              ),
-            );
+            frames.push({ k: row.pk_hash, bytes: frame });
+            bytes += frame.length;
           }
-        } else {
-          if (bytes + frame.length > target) await flush();
-          await memory.hold();
-          frames.push({ k: row.pk_hash, bytes: frame });
-          bytes += frame.length;
         }
       }
+    } finally {
+      await pages.return(undefined);
     }
     if (frozen.rows !== null && seen !== frozen.rows)
       throw new FrozenRowsChanged(prefix);

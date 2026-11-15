@@ -199,16 +199,16 @@ describe("encodePrefixes", () => {
     expect(second).toEqual(first);
     expect(f.put).not.toHaveBeenCalled();
     expect(f.encryptPart).not.toHaveBeenCalled();
-    // Per call and prefix: one query for a page's keys and sizes, one for its
-    // bodies (the copy into the spool is a batch, not a query).
+    // Per call and prefix: one query for the one-row page, one that finds no
+    // more rows (the copy into the spool is a batch, not a query). A page is
+    // one query: its rows, their sizes and their bodies together.
     expect(query).toHaveBeenCalledTimes(8);
     expect(
-      query.mock.calls.every(([sql]) => sql.includes("ORDER BY pk_hash")),
+      query.mock.calls.every(
+        ([sql]) =>
+          sql.includes("ORDER BY pk_hash") && sql.includes("body_bytes"),
+      ),
     ).toBe(true);
-    // The first of the two never reads a body.
-    expect(
-      query.mock.calls.filter(([sql]) => sql.includes("body_bytes")),
-    ).toHaveLength(4);
     expect(request.headExtras).toBe(headExtras);
   });
 
@@ -312,7 +312,8 @@ describe("encodePrefixes", () => {
       { k: keyHash("ae"), o: 10, r: "z", f: null },
       { k: keyHash("bf"), o: 11, r: "a", f: null },
     ]);
-    expect(query).toHaveBeenCalledTimes(2);
+    // Pages of one and two rows, then a read that finds no more.
+    expect(query).toHaveBeenCalledTimes(3);
     expect(
       await f.db.query<{ n: number }>("SELECT count(*) AS n FROM records"),
     ).toEqual([{ n: 8 }]);
@@ -499,9 +500,10 @@ describe("encodePrefixes under writes and large bodies", () => {
     const parts = await encodePrefixes(f.deps, input);
     expect(parts.reduce((n, part) => n + part.count, 0)).toBeGreaterThan(0);
     expect((await f.read(parts)).map((row) => row.k)).toHaveLength(12);
-    // Twelve rows are 7 MiB; a page holds what fits in 2 MiB (three rows).
-    expect(seen.maxBodyChars).toBeLessThanOrEqual(2 * 1024 * 1024);
-    expect(seen.bodyPages).toBeGreaterThanOrEqual(4);
+    // Twelve rows are 7 MiB; a page aims at a quarter of the 4 MiB part target
+    // (1 MiB), so a 600 KiB row is a page of its own.
+    expect(seen.maxBodyChars).toBeLessThanOrEqual(1024 * 1024);
+    expect(seen.bodyPages).toBe(12);
   });
 
   it("reads a body larger than the cap as a page of its own", async () => {
