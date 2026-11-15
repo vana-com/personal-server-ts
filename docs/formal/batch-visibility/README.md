@@ -109,3 +109,43 @@ writer and collector actions; Publish may drain after the bound. This is finite
 bounded exploration, not an unbounded proof. Increase the bound separately and
 report cost/results. Deadlock checking is disabled because exhaustion intentionally
 stutters; no liveness property is asserted.
+
+## TLC results (host, 2026-11-15)
+Command: `java -XX:+UseParallelGC -Xmx2g -cp tla2tools.jar tlc2.TLC -workers 2 -deadlock`
+(tla2tools 1.7.4, `nice -n 19 ionice -c3`, 900 s timeout per run). Each run ran
+alone. Depth for completed runs is TLC's "complete state graph search" depth. For
+unfinished runs it is the last `Progress(n)` level. Counts for unfinished runs are
+the last Progress line before the timeout. Logs are in `~/.tmp/tla-brief-meta/`
+(not committed); state dirs were deleted after each run.
+
+| Config | K | MaxSteps | Result | States generated | Distinct states | Depth | Runtime |
+|---|---|---|---|---|---|---|---|
+| TODAY-full_inventory | k1,k2,k3 | 8 | unfinished (not run at K=3; 74.7M distinct per brief) | n/a | n/a | n/a | n/a |
+| TODAY-full_inventory-K2 | k1,k2 | 8 | unfinished | 205,638,194 (last Progress) | 97,515,271 (last Progress) | >=10 (last Progress(10)) | 900 s timeout |
+| TODAY-full_inventory-K2-S6 | k1,k2 | 6 | No error | 24,217,061 | 9,823,939 | 13 | 1m 12s |
+| TODAY-checkpoint_window-K2 | k1,k2 | 8 | unfinished | 208,949,589 (last Progress) | 99,681,765 (last Progress) | >=10 (last Progress(10)) | 900 s timeout |
+| TODAY-checkpoint_window-K2-S6 | k1,k2 | 6 | No error | 23,943,077 | 9,717,346 | 13 | 1m 08s |
+| PROPOSED-full_inventory-K2 | k1,k2 | 8 | unfinished | 153,418,766 (last Progress) | 78,257,208 (last Progress) | >=9 (last Progress(9)) | 900 s timeout |
+| PROPOSED-full_inventory-K2-S6 | k1,k2 | 6 | No error | 27,911,023 | 11,703,559 | 13 | 1m 48s |
+| PROPOSED-checkpoint_window-K2 | k1,k2 | 8 | unfinished | 152,716,748 (last Progress) | 79,146,279 (last Progress) | >=9 (last Progress(9)) | 900 s timeout |
+| PROPOSED-checkpoint_window-K2-S6 | k1,k2 | 6 | No error | 28,787,923 | 12,191,646 | 13 | 1m 38s |
+
+Mutants (earlier runs, not rerun):
+
+| Config | K | MaxSteps | Result | States generated | Distinct states | Depth | Runtime |
+|---|---|---|---|---|---|---|---|
+| m1 | k1,k2,k3 | 8 | Invariant NoOmissionBeforeProof violated | 7,742 | 4,324 | not printed | 1 s |
+| m2 | k1,k2,k3 | 8 | Invariant NoOmissionBeforeProof violated | 770,626 | 396,488 | not printed | 4 s |
+| m3 | k1,k2,k3 | 8 | Invariant LaterWriteKept violated | 815,117 | 419,263 | not printed | 4 s |
+| m4 | k1,k2,k3 | 8 | Invariant NoResurrection violated | 11,627 | 6,357 | not printed | <1 s |
+
+Notes:
+- No baseline reported an invariant violation, so there is no counterexample trace.
+- Every K=2 run at MaxSteps=8 hit the 900 s timeout. Dropping from 3 keys to 2 did
+  not make MaxSteps=8 tractable: distinct states were still growing at about
+  6M per minute when the timeout hit.
+- MaxSteps=6 completed for all four baselines (0 states left on queue, no error).
+  Depth 13 is larger than MaxSteps because `Publish` may drain after the bound
+  (see Host gate).
+- The MaxSteps=6, K=2 result is a bounded check only. It does not cover K=3 or
+  MaxSteps=8.
