@@ -19,6 +19,7 @@ import {
   toHex,
   verifyHead,
   type ControlHashes,
+  type ControlRead,
   type Head,
   type HeadPart,
   type JsonObject,
@@ -149,6 +150,11 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
         );
       }
       const answers = new Map<string, ApplyResult>();
+      const listedReads = new Map<string, ControlRead>();
+      // Reuse the last serial download fence; early returns consume it.
+      const controlRead: { value?: Awaited<ReturnType<typeof control>> } = {
+        value: initial,
+      };
       let listed = false;
       while (true) {
         if (flight.all && !listed) {
@@ -160,8 +166,10 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
               scope?.kind === "stream" &&
               scope.connector === connection.connector &&
               scope.ns === connection.ns
-            )
+            ) {
               flight.streams.add(scope.stream);
+              listedReads.set(scope.stream, row.read);
+            }
           }
           listed = true;
         }
@@ -169,7 +177,16 @@ function request(deps: LocalSyncDeps, id: string, stream?: string) {
         if (next === undefined) break;
         answers.set(
           next,
-          await applyOne(locked, id, connection, next, keyCheck, hashes),
+          await applyOne(
+            locked,
+            id,
+            connection,
+            next,
+            keyCheck,
+            hashes,
+            controlRead,
+            listedReads.get(next),
+          ),
         );
       }
       return [...answers.values()];
@@ -283,12 +300,16 @@ async function applyOne(
   stream: string,
   keyCheck: string,
   hashes: ControlHashes,
+  controlRead: { value?: Awaited<ReturnType<typeof control>> },
+  listedRead?: ControlRead,
 ): Promise<ApplyResult> {
-  const active = await control(deps, id, connection, hashes);
+  const active =
+    controlRead.value ?? (await control(deps, id, connection, hashes));
+  delete controlRead.value;
   if (active.kind !== "active")
     return result(stream, active.kind === "deleted" ? "purged" : "gone");
   const scope = streamScope(connection.connector, connection.ns, stream);
-  const read = await deps.registry.read(scope);
+  const read = listedRead ?? (await deps.registry.read(scope));
   const classification = classifyStreamRow(read, hashes);
   if (!read.found || classification === "absent") return result(stream, "gone");
   const [state] = await deps.db.query<State>(
@@ -499,6 +520,7 @@ async function applyOne(
       }
     }
     const stillActive = await control(deps, id, connection, hashes);
+    controlRead.value = stillActive;
     if (
       stillActive.kind !== "active" ||
       stillActive.generation !== active.generation
