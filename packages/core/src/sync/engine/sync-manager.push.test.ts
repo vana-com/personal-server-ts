@@ -26,12 +26,15 @@ const logger = {
   fatal: vi.fn(),
 } as unknown as Logger;
 
-function build(options: Partial<SyncManagerOptions>) {
+function build(
+  options: Partial<SyncManagerOptions>,
+  storage: object = { findUnsynced: () => [] },
+) {
   return createSyncManager(
     {
       logger,
       serverOwner: "0x1111111111111111111111111111111111111111",
-      storage: { findUnsynced: () => [] },
+      storage,
     } as unknown as UploadWorkerDeps,
     { logger } as unknown as DownloadWorkerDeps,
     {
@@ -262,86 +265,173 @@ describe("a pushed change does not wait for the optional probe", () => {
     await manager.stop();
   });
 
-  it("runs the follow-up a pushed change requested even when the cycle it waited on rejects", async () => {
-    // A request that was accepted while a cycle ran is owed one more cycle,
-    // whether or not the running one succeeds.
-    const { push, state } = fakePush();
-    let running = 0;
-    let overlap = 0;
-    let failFirst: (e: Error) => void = () => {};
-    let calls = 0;
-    const cycle = vi.fn(async () => {
-      calls += 1;
-      running += 1;
-      overlap = Math.max(overlap, running);
-      try {
-        if (calls === 1) {
-          await new Promise<void>((_, reject) => (failFirst = reject));
+  describe("a failing cycle", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    // Each attempt holds until the test rejects it. Back-off jitter is fixed at
+    // its middle (x1.0), so the cooldowns are 1 s, 2 s, 4 s, ...
+    function failingCycles() {
+      vi.spyOn(Math, "random").mockReturnValue(0.5);
+      const rejects: Array<(e: Error) => void> = [];
+      let running = 0;
+      let overlap = 0;
+      const cycle = vi.fn(async () => {
+        running += 1;
+        overlap = Math.max(overlap, running);
+        try {
+          await new Promise<void>((_, reject) => rejects.push(reject));
+        } finally {
+          running -= 1;
         }
-      } finally {
-        running -= 1;
-      }
-    });
-    const manager = build({
-      localSync: { cycle },
-      changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
-    });
-    manager.start();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(cycle).toHaveBeenCalledTimes(1); // the startup cycle, held
-    state.handlers!.onChange(); // accepted while it runs
-    await vi.advanceTimersByTimeAsync(0);
-    expect(cycle).toHaveBeenCalledTimes(1);
-    failFirst(new Error("storage unreachable"));
-    await vi.advanceTimersByTimeAsync(0); // no timer advance: nothing else fires
-    expect(cycle).toHaveBeenCalledTimes(2); // the owed follow-up, exactly one
-    await vi.advanceTimersByTimeAsync(4_000); // below the probe period
-    expect(cycle).toHaveBeenCalledTimes(2);
-    expect(overlap).toBe(1);
-    await manager.stop();
-  });
+      });
+      return { cycle, rejects, overlap: () => overlap };
+    }
 
-  it("retries nothing when no follow-up was requested", async () => {
-    const { push } = fakePush();
-    const cycle = vi.fn(async () => {
-      throw new Error("storage unreachable");
-    });
-    const manager = build({
-      localSync: { cycle },
-      changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
-    });
-    manager.start();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(cycle).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(4_000);
-    expect(cycle).toHaveBeenCalledTimes(1);
-    await manager.stop();
-  });
+    function quietProbe(push: ChangePush) {
+      return { read: async () => "m1", intervalMs: 3_600_000, push };
+    }
 
-  it("still reports the failure to the caller that asked for the failed cycle", async () => {
-    const { push, state } = fakePush();
-    let reject: (e: Error) => void = () => {};
-    let calls = 0;
-    const cycle = vi.fn(async () => {
-      calls += 1;
-      if (calls === 1) await new Promise<void>((_, r) => (reject = r));
+    it("runs the follow-up a queued request is owed after a cooldown, not at once", async () => {
+      const { push, state } = fakePush();
+      const { cycle, rejects, overlap } = failingCycles();
+      const manager = build({
+        localSync: { cycle },
+        changeProbe: quietProbe(push),
+      });
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cycle).toHaveBeenCalledTimes(1); // the startup cycle, held
+      state.handlers!.onChange(); // accepted while it runs
+      rejects[0]!(new Error("storage unreachable"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cycle).toHaveBeenCalledTimes(1); // no immediate retry
+      await vi.advanceTimersByTimeAsync(999);
+      expect(cycle).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1); // the first back-off step
+      expect(cycle).toHaveBeenCalledTimes(2); // the owed follow-up, exactly one
+      expect(overlap()).toBe(1);
+      rejects[1]!(new Error("storage unreachable")); // let stop() drain it
+      await manager.stop().catch(() => {});
     });
-    const manager = build({
-      localSync: { cycle },
-      changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
+
+    it("retries nothing when no follow-up was requested", async () => {
+      const { push } = fakePush();
+      const { cycle, rejects } = failingCycles();
+      const manager = build({
+        localSync: { cycle },
+        changeProbe: quietProbe(push),
+      });
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      rejects[0]!(new Error("storage unreachable"));
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(cycle).toHaveBeenCalledTimes(1);
+      await manager.stop();
     });
-    manager.start();
-    await vi.advanceTimersByTimeAsync(0);
-    const asked = manager.requestPull().then(
-      () => "resolved",
-      (e: Error) => e.message,
-    );
-    state.handlers!.onChange();
-    reject(new Error("storage unreachable"));
-    await vi.advanceTimersByTimeAsync(0);
-    expect(await asked).toBe("storage unreachable");
-    expect(cycle).toHaveBeenCalledTimes(2);
-    await manager.stop();
+
+    it("under pushes during every failing attempt: finite immediate attempts, backed-off retries, queued work progresses, first error delivered", async () => {
+      const { push, state } = fakePush();
+      const { cycle, rejects, overlap } = failingCycles();
+      const deleted = vi.fn(async () => 1);
+      const manager = build(
+        { localSync: { cycle }, changeProbe: quietProbe(push) },
+        {
+          findUnsynced: () => [],
+          deleteScope: deleted,
+          listVersions: () => [],
+        },
+      );
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cycle).toHaveBeenCalledTimes(1);
+
+      state.handlers!.onChange(); // during attempt 1
+      const waiter = manager.trigger().then(
+        () => "resolved",
+        (e: Error) => e.message,
+      ); // a caller waiting on attempt 1
+      const queued = manager.deleteScope("instagram.profile");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deleted).not.toHaveBeenCalled(); // behind the running attempt
+
+      rejects[0]!(new Error("first failure"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await waiter).toBe("first failure"); // not held back by retries
+      await queued; // the slot was released: the delete ran between attempts
+      expect(deleted).toHaveBeenCalledTimes(1);
+      expect(cycle).toHaveBeenCalledTimes(1); // finite: one attempt, then cooldown
+
+      // Pushes keep arriving, including during the cooldown; none shortens it.
+      state.handlers!.onChange();
+      await vi.advanceTimersByTimeAsync(500);
+      state.handlers!.onChange();
+      await vi.advanceTimersByTimeAsync(499);
+      expect(cycle).toHaveBeenCalledTimes(1); // 999 ms in
+      await vi.advanceTimersByTimeAsync(1);
+      expect(cycle).toHaveBeenCalledTimes(2); // 1 s: attempt 2
+
+      state.handlers!.onChange(); // during attempt 2
+      rejects[1]!(new Error("second failure"));
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(cycle).toHaveBeenCalledTimes(2); // the step doubled: 2 s
+      await vi.advanceTimersByTimeAsync(1);
+      expect(cycle).toHaveBeenCalledTimes(3);
+
+      state.handlers!.onChange(); // during attempt 3
+      rejects[2]!(new Error("third failure"));
+      await vi.advanceTimersByTimeAsync(3_999);
+      expect(cycle).toHaveBeenCalledTimes(3); // 4 s
+      expect(overlap()).toBe(1);
+
+      // Stopping ends the obligation: no retry fires after stop.
+      await manager.stop();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(cycle).toHaveBeenCalledTimes(3);
+    });
+
+    it("keeps the dirty request while cooling down and runs it once the cooldown ends", async () => {
+      const { push, state } = fakePush();
+      const { cycle, rejects } = failingCycles();
+      const manager = build({
+        localSync: { cycle },
+        changeProbe: quietProbe(push),
+      });
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      state.handlers!.onChange();
+      rejects[0]!(new Error("down"));
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(cycle).toHaveBeenCalledTimes(2);
+      rejects[1]!(new Error("down")); // no push during this attempt: nothing owed
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(cycle).toHaveBeenCalledTimes(2);
+      await manager.stop();
+    });
+
+    it("still reports the failure to the caller that asked for the failed cycle", async () => {
+      const { push, state } = fakePush();
+      const { cycle, rejects } = failingCycles();
+      const manager = build({
+        localSync: { cycle },
+        changeProbe: quietProbe(push),
+      });
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      const asked = manager.requestPull().then(
+        () => "resolved",
+        (e: Error) => e.message,
+      );
+      state.handlers!.onChange();
+      rejects[0]!(new Error("storage unreachable"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await asked).toBe("storage unreachable");
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(cycle).toHaveBeenCalledTimes(2);
+      rejects[1]!(new Error("storage unreachable")); // let stop() drain it
+      await manager.stop().catch(() => {});
+    });
   });
 
   it("publishes no marker of its own: the next probe runs one conservative follow-up, then settles", async () => {

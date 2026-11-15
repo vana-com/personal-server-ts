@@ -18,6 +18,7 @@ import {
 } from "../workers/delete.js";
 import { createDownloadRetryMemory } from "../retry-memory.js";
 import { createTombstoneResubmitTracker } from "../tombstone-resubmits.js";
+import { changePushBackoffMs } from "./change-push.js";
 import type {
   DeleteDataPort,
   PendingBlobDeletionStore,
@@ -228,7 +229,14 @@ export function createSyncManager(
   let blocked: SyncBlockedReason | null = null;
   let errors: SyncError[] = [];
   let cycleInFlight: Promise<void> | null = null;
+  // The dirty follow-up flag: a request arrived that the running cycle may not
+  // have seen. It is owed one more cycle and is dropped only by running one (or
+  // by a stop). A pass clears it on entry, so it never re-arms itself.
   let rerunRequested = false;
+  // Failed cycles in a row, and the pending retry of the follow-up they owe.
+  // `retryTimer` set means cooling down: a pushed change only marks the flag.
+  let cycleFailures = 0;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
   // Pulls: one probe-and-cycle in flight; `pullRequested` is its dirty flag.
   let pullInFlight: Promise<void> | null = null;
   let pullInFlightRun = 0;
@@ -452,28 +460,46 @@ export function createSyncManager(
       } while (rerunRequested && isRunning);
     };
 
-    // A request accepted while a cycle ran is owed one more cycle whether or
-    // not that cycle succeeds: a failing pass leaves `passes` before its own
-    // check, so the check is repeated here. The next pass resets the request,
-    // so a failure with no new request ends the loop and nothing retries on
-    // its own. Callers still get the first failure.
-    cycleInFlight = exclusive(async () => {
-      let failure: { error: unknown } | null = null;
-      do {
-        try {
-          await passes();
-        } catch (error) {
-          failure ??= { error };
-        }
-      } while (rerunRequested && isRunning);
-      if (failure) throw failure.error;
-    });
+    // A failed cycle ends its exclusive operation at once: callers get its
+    // error and queued mutations run. A follow-up it still owes (the dirty
+    // flag) waits out a cooldown first: see `scheduleRetry`.
+    cycleInFlight = exclusive(passes);
 
     try {
       await cycleInFlight;
+      cycleFailures = 0;
+    } catch (error) {
+      cycleFailed();
+      throw error;
     } finally {
       cycleInFlight = null;
     }
+  }
+
+  /**
+   * A cycle failed. If a request arrived while it ran, one follow-up is owed:
+   * run it after a cooldown from the push's back-off schedule (1 s doubling to
+   * 30 s over consecutive failures), never at once. Pushes cannot shorten or
+   * restart the cooldown: while it runs they only mark the dirty flag, and the
+   * one timer runs the follow-up. Without a request nothing retries; the timed
+   * cycle is the fallback.
+   */
+  function cycleFailed(): void {
+    const failures = cycleFailures;
+    cycleFailures += 1;
+    if (!rerunRequested || !isRunning || retryTimer !== null) return;
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      if (!isRunning || !rerunRequested) return;
+      runCycle().catch(() => {
+        // Errors already captured in ring buffer
+      });
+    }, changePushBackoffMs(failures));
+  }
+
+  function clearRetryTimer(): void {
+    if (retryTimer !== null) clearTimeout(retryTimer);
+    retryTimer = null;
   }
 
   function deleteScopeDeps() {
@@ -762,6 +788,12 @@ export function createSyncManager(
         // probe or join a timed probe read in flight, so a probe that never
         // answers cannot hold it up; `runCycle` still runs one cycle at a time.
         // It reads no marker and publishes none: see `pulledMarker`.
+        if (retryTimer !== null) {
+          // Cooling down after a failed cycle: the request is owed, and the
+          // retry timer runs it. A push neither skips nor restarts the wait.
+          rerunRequested = true;
+          return;
+        }
         runCycle().catch(() => {
           // Errors already captured in ring buffer
         });
@@ -803,6 +835,7 @@ export function createSyncManager(
       isRunning = true;
       lifecycle += 1;
       pulledMarker = undefined;
+      cycleFailures = 0;
       probeFailures = 0;
       nextTimedProbeAt = 0;
       lastProbeAt = Date.now();
@@ -827,6 +860,8 @@ export function createSyncManager(
       clearProbeInterval();
       stopChangePush();
       clearNotifyTimer();
+      clearRetryTimer();
+      rerunRequested = false;
       isRunning = false;
       // Cancel pulls: a probe that answers later finds a new lifecycle value.
       lifecycle += 1;

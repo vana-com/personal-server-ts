@@ -24,6 +24,21 @@ const REQUEST_GRACE_MS = 10_000;
 
 const BACKOFF_MIN_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
+
+/**
+ * The wait before retry number `failures` + 1 (0 for the first retry): 1 s
+ * doubling to 30 s, spread over half to one and a half of the step so a fleet
+ * that lost the same dependency together does not return together. The push
+ * uses it for its transport; the manager uses it to space retries of a failing
+ * cycle, so a failure has one back-off schedule.
+ */
+export function changePushBackoffMs(
+  failures: number,
+  random: () => number = Math.random,
+): number {
+  const base = BACKOFF_MIN_MS * 2 ** Math.min(failures, 5);
+  return Math.min(BACKOFF_MAX_MS, base * (0.5 + random()));
+}
 /** How often a parked subscription (no one is looking) re-checks the host. */
 const PARK_CHECK_MS = 2_000;
 
@@ -147,11 +162,9 @@ export function createRegistryChangePush(
           if (outcome === "failed") {
             setHealth(false);
             afterFailure = true;
-            const base = BACKOFF_MIN_MS * 2 ** Math.min(failures, 5);
+            const wait = changePushBackoffMs(failures);
             failures += 1;
-            // Spread over half to one and a half of the back-off, so a fleet
-            // that lost the gateway together does not return together.
-            await sleep(Math.min(BACKOFF_MAX_MS, base * (0.5 + Math.random())));
+            await sleep(wait);
           }
         }
       })();
