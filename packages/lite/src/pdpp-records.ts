@@ -1,7 +1,7 @@
 import {
   assertSupportedPdppVersion,
-  connectorOfSourceId,
   listPdppRecords,
+  resolveOwnerSource,
   type OwnedAccountStorageMode,
   type PdppRecordListPorts,
 } from "@opendatalabs/personal-server-ts-core/api";
@@ -73,16 +73,16 @@ export async function handleLitePdppRecordList(
       accountMode: deps.accountStorageMode,
       recordQuery: linked,
       declarations: liteDeclarations(local.declarations, connectors),
-      // `source` names a connector or its canonical source id. An id the
-      // store has no connection for stays as given and matches nothing, so
-      // it answers like a source the caller may not read.
+      // Lite holds connector ids only, not canonical source ids. `source`
+      // names a held connector exactly; any other string names no source here
+      // and is refused as a source the caller may not read.
       ownerInstances: (_context, source) => {
         if (source === undefined || source === "") return [];
-        if (connectors.includes(source)) return [source];
-        const connector = connectorOfSourceId(source);
-        return connector !== undefined && connectors.includes(connector)
-          ? [connector]
-          : [source];
+        const resolved = resolveOwnerSource(source, {
+          sourceIdForConnector: (connector) =>
+            connectors.includes(connector) ? connector : undefined,
+        });
+        return connectors.includes(resolved) ? [resolved] : [];
       },
     };
     const result = await listPdppRecords(ports, {

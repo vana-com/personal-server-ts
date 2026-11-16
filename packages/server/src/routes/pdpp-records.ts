@@ -2,6 +2,7 @@ import { grantIsCandidate } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
   assertSupportedPdppVersion,
   listPdppRecords,
+  resolveOwnerSource,
   localRecord,
   localRecordJson,
   projectFields,
@@ -902,7 +903,10 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     const requested =
       source === undefined
         ? undefined
-        : (deps.sourceIdForConnector?.(source) ?? source);
+        : resolveOwnerSource(source, {
+            sourceIdForConnector: (connector) =>
+              deps.sourceIdForConnector?.(connector),
+          });
     if (context.sourceId) {
       if (requested !== undefined && requested !== context.sourceId) {
         throw new PdppError(

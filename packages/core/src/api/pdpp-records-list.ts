@@ -532,7 +532,26 @@ export function assertSupportedPdppVersion(
   }
 }
 
-/** The connector a source id names: its last path segment. */
+/** The connector a registered source id names: its last path segment. */
 export function connectorOfSourceId(sourceId: string): string | undefined {
   return sourceId.split("/").filter(Boolean).at(-1);
+}
+
+/** What a host knows about the sources it serves. */
+export interface SourceLookup {
+  /** The source id a connector id stands for; absent when none is held. */
+  sourceIdForConnector(connector: string): string | undefined;
+}
+
+/**
+ * The source a request's `source` names: a connector id the host maps to its
+ * source id, or any other string as given. A source id is never derived from
+ * another string by its shape, so a string no host mapping accepts names no
+ * source and the read refuses it like a source the caller may not read.
+ */
+export function resolveOwnerSource(
+  source: string,
+  lookup: SourceLookup,
+): string {
+  return lookup.sourceIdForConnector(source) ?? source;
 }
