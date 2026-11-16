@@ -8,7 +8,7 @@ import {
 } from "./replace.js";
 
 const bytes = readFileSync(
-  new URL("./replace-conformance.json", import.meta.url),
+  new URL("../../contracts/replace-conformance.json", import.meta.url),
 );
 const fixture = JSON.parse(bytes.toString()) as {
   cases: {

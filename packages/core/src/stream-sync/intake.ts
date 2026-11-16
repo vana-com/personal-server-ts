@@ -6,36 +6,24 @@ import type {
   KeyFieldType,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 
-/** What `end` can answer (V2 §2.3). */
-export type EndResult =
-  "queued" | "checkpoint_only" | "no_checkpoint" | "discarded" | "aborted";
+import type { EndOutcome, EndResult } from "./host-contract.js";
 
-export type RunIntakeErrorName =
-  | "invalid_request"
-  | "owner_mismatch"
-  | "lease_lost"
-  | "connection_busy"
-  /** The connection is stopped: deleted, and an explicit connect is required. */
-  | "connection_stopped"
-  /**
-   * A delete of this connection is not finished on this device and the last
-   * resume failed. The device keeps retrying; no run may write until it lands.
-   */
-  | "delete_pending"
-  | "gone"
-  | "run_conflict"
-  | "unknown_artifact"
-  | "batch_gap"
-  | "restricted_scope_unsupported"
-  | "control_basis_mismatch"
-  | "control_basis_unavailable";
-
-const STATUS: Record<RunIntakeErrorName, number> = {
+/**
+ * The run-intake refusals and the HTTP status each carries. Hosts that run a
+ * writer of their own read this list from the
+ * generated host contract, never from a copy.
+ */
+export const RUN_INTAKE_ERROR_STATUS = {
   invalid_request: 400,
   owner_mismatch: 409,
   lease_lost: 409,
   connection_busy: 409,
+  /** The connection is stopped: deleted, and an explicit connect is required. */
   connection_stopped: 409,
+  /**
+   * A delete of this connection is not finished on this device and the last
+   * resume failed. The device keeps retrying; no run may write until it lands.
+   */
   delete_pending: 409,
   gone: 410,
   run_conflict: 409,
@@ -44,7 +32,9 @@ const STATUS: Record<RunIntakeErrorName, number> = {
   restricted_scope_unsupported: 422,
   control_basis_mismatch: 409,
   control_basis_unavailable: 503,
-};
+} as const;
+
+export type RunIntakeErrorName = keyof typeof RUN_INTAKE_ERROR_STATUS;
 
 export class RunIntakeError extends Error {
   readonly status: number;
@@ -57,7 +47,7 @@ export class RunIntakeError extends Error {
   ) {
     super(message);
     this.name = "RunIntakeError";
-    this.status = STATUS[code];
+    this.status = RUN_INTAKE_ERROR_STATUS[code];
   }
 }
 
@@ -184,8 +174,7 @@ export interface BatchResponse {
 }
 
 export interface EndRequest {
-  readonly outcome:
-    "succeeded" | "partial" | "retry_pending" | "failed" | "cancelled";
+  readonly outcome: EndOutcome;
   readonly coveredStreams: readonly string[];
   readonly checkpointCandidate?: Readonly<Record<string, JsonValue>> | null;
   readonly lastBatch: number;
