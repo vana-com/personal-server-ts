@@ -62,6 +62,7 @@ import {
   type SnapshotPointer,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { type StreamSyncRegistry } from "../stream-sync/ports.js";
+import { StorageDeferredError } from "../stream-sync/storage-retry.js";
 import { sameHead, type PlanHead } from "../stream-sync/publish-plan.js";
 import { keccakOf } from "../stream-sync/crypto-port.js";
 import { applyConnection } from "./apply.js";
@@ -271,21 +272,34 @@ async function publishRounds(
     // at once and the commit waits for all of them. The commit's one
     // dependency is the objects it names.
     const scope = await logScopeOf(deps, connectionId);
-    await Promise.all([
-      candidate.attachments.length > 0
-        ? clock.time("attachments", () =>
-            uploadBlobs(deps, candidate.attachments),
-          )
-        : undefined,
-      clock.time("segment-put", () =>
-        Promise.all([
-          ...candidate.snapshotParts.map((part) =>
-            deps.blobs.put(`${scope}/${part.name}`, part.cipher),
-          ),
-          deps.blobs.put(`${scope}/${candidate.blobName}`, candidate.cipher),
-        ]),
-      ),
-    ]);
+    try {
+      await Promise.all([
+        candidate.attachments.length > 0
+          ? clock.time("attachments", () =>
+              uploadBlobs(deps, candidate.attachments),
+            )
+          : undefined,
+        clock.time("segment-put", () =>
+          Promise.all([
+            ...candidate.snapshotParts.map((part) =>
+              deps.blobs.put(`${scope}/${part.name}`, part.cipher),
+            ),
+            deps.blobs.put(`${scope}/${candidate.blobName}`, candidate.cipher),
+          ]),
+        ),
+      ]);
+    } catch (error) {
+      // Storage kept refusing past its retry budget. Nothing is wrong with the
+      // data: nothing was committed, so the changes stay queued and the next
+      // cycle sends them again.
+      if (!(error instanceof StorageDeferredError)) throw error;
+      deps.logger.info(
+        { connectionId, error: error.message },
+        "stream sync: storage unavailable, publish left in the queue",
+      );
+      keep(await backoff(deps, connectionId));
+      break;
+    }
 
     const committed = await clock.time("commit", () =>
       deps.queue.run(connectionId, "publish", () =>
