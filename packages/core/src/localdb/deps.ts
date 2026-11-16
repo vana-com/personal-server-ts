@@ -60,7 +60,9 @@ export interface LocalSyncDeps {
    * Default off. On: a stream with no complete head is readable by its owner
    * from its first applied part, in an explicit partial state, and fills in
    * as parts apply (`stream_partial`). Off: a stream is readable only when
-   * its head is complete, as before.
+   * its head is complete, as before. A first load that loads key by key
+   * (`keyedFirstLoad`) does so with this on too, and its streams are
+   * readable when it ends (see `planKeyedLoad`).
    */
   readonly progressiveFirstLoad?: boolean;
   /**
