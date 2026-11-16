@@ -938,7 +938,7 @@ async function bootstrapServer(
           logger,
           now: Date.now,
           newOp: randomUUID,
-          recordsCommitted: () => syncManager?.notifyNewData(),
+          recordsCommitted: () => syncManager?.notifyRecordsCommitted(),
           progressiveFirstLoad:
             options?.streamSyncProgressiveFirstLoad ??
             (process.env.PS_STREAM_SYNC_PROGRESSIVE_FIRST_LOAD === "true" ||

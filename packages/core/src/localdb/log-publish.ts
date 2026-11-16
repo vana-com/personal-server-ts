@@ -446,10 +446,9 @@ async function snapshotRound(
           },
           complete: row.complete === 1,
         }));
-    const hasWork =
-      groups.length > 0 ||
-      replace !== null ||
-      (metaChanged && plan.steps.some((s) => s.decision.kind === "publish"));
+    const metaPublishes =
+      metaChanged && plan.steps.some((s) => s.decision.kind === "publish");
+    const hasWork = groups.length > 0 || replace !== null || metaPublishes;
     if (!hasWork || head === null) {
       planned.push({ ...base, runIds: base.runIds });
       continue;
@@ -534,6 +533,14 @@ async function snapshotRound(
         planned.push({ ...base, ack: row.publish_watermark, rest: true });
         continue;
       }
+    }
+    // Changes that carry no operation are nothing to publish: the rows a
+    // replacing run dropped are deleted locally in the commit that publishes
+    // its completion, and those deletions are changes above that commit's
+    // watermark. Counted as work they would cost a segment that says nothing.
+    if (!atomic && !rest && taken.length === 0 && !metaPublishes) {
+      planned.push({ ...base });
+      continue;
     }
     budget += bytes;
     first = false;

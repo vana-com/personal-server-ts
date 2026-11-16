@@ -183,9 +183,13 @@ describe("Lite database intake", () => {
   });
   it("a run that ends wakes the sync manager so publish does not wait for the poll", async () => {
     const { lite } = await fixture();
-    const wake = vi.spyOn(lite.syncManager, "notifyNewData");
+    // Not `notifyNewData`: its trailing timer would hold a run's changes back
+    // by the debounce after the run has ended.
+    const wake = vi.spyOn(lite.syncManager, "notifyRecordsCommitted");
+    const debounced = vi.spyOn(lite.syncManager, "notifyNewData");
     await collect(lite.streamSyncIntake!, "lite-wake", "item", 1000);
-    expect(wake).toHaveBeenCalledTimes(1);
+    expect(wake).toHaveBeenCalled();
+    expect(debounced).not.toHaveBeenCalled();
   });
   it("a subscriber taken before the database opens hears the first local run, with no sync manager running", async () => {
     let mode: "unknown" | "unswitched" | "switched" = "unknown";
