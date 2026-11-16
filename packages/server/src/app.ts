@@ -408,11 +408,14 @@ export function createApp(deps: AppDeps): Hono {
           lineage: async (input) => (await localSync()).history.lineage(input),
         }
       : undefined);
+  // Absence is a missing host capability, not an unresolved connection.
+  // Leave the query absent so switched routes use their typed refusal.
+  const connectionLink = deps.pdpp?.connectionLink;
   const linkedQuery = async () => {
     const local = await localSync!();
-    return local.recordsFor(deps.pdpp?.connectionLink ?? (() => null));
+    return local.recordsFor(connectionLink!);
   };
-  const recordQuery: RecordQuery | undefined = localSync
+  const recordQuery: RecordQuery | undefined = localSync && connectionLink
     ? {
         listRecords: async (input) => (await linkedQuery()).listRecords(input),
         getRecord: async (input) => (await linkedQuery()).getRecord(input),
@@ -559,10 +562,10 @@ export function createApp(deps: AppDeps): Hono {
         store: deps.pdpp.store,
         accountStorageMode,
         recordQuery,
-        recordHistory: localSync
+        recordHistory: localSync && connectionLink
           ? async (stream, options) =>
               (await localSync()).changesFor(
-                deps.pdpp?.connectionLink ?? (() => null),
+                connectionLink,
               )(stream, options)
           : undefined,
         reads: deps.pdpp.reads,

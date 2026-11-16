@@ -1,7 +1,8 @@
 import { fixedModeAuthority as explicitLegacyAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createHash } from "node:crypto";
 import pino from "pino";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ConnectionLink, LocalSync, RecordQuery } from "@opendatalabs/personal-server-ts-core/localdb";
 import { createFixtureAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
 import {
   binding,
@@ -42,7 +43,12 @@ afterEach(() => {
 function host({
   epoch,
   conflictFacts = true,
-}: { epoch?: () => number; conflictFacts?: boolean } = {}) {
+  local,
+}: {
+  epoch?: () => number;
+  conflictFacts?: boolean;
+  local?: "missing-link" | "linked" | "unresolved";
+} = {}) {
   const db = initializeDatabase(":memory:");
   const store = createReplicaRecordStore(db);
   store.registerConnection({ instance, sourceId, method, label: "A" });
@@ -97,7 +103,40 @@ function host({
       },
     },
   });
+  // A populated host-local read port, separate from the real legacy store.
+  // The test targets app composition, not the SQL implementation.
+  const localRows = [{
+    recordKey: "local-key",
+    pkHash: "local-hash",
+    body: JSON.stringify({ id: "local-key", day: "2026-08-02", score: 90 }),
+    emittedAt: Date.parse("2026-08-02T00:00:00Z"),
+  } as NonNullable<Awaited<ReturnType<RecordQuery["getRecord"]>>>];
+  const connectionLink: ConnectionLink | undefined =
+    local === "missing-link" || local === undefined
+      ? undefined
+      : (id, name) => local === "linked" && id === instance && name === stream
+        ? { connector: method, namespace: "" }
+        : null;
+  const recordsFor = vi.fn((link: ConnectionLink): RecordQuery => {
+    const selected = (id: string, name: string) => {
+      const target = link(id, name);
+      return target?.connector === method && target.namespace === "" ? localRows : [];
+    };
+    return {
+      listRecords: async (input) => ({
+        records: selected(input.connectionId, input.stream),
+        nextCursor: null,
+      }),
+      getRecord: async (input) =>
+        selected(input.connectionId, input.stream).find((row) => row.recordKey === input.recordKey) ?? null,
+      changesSince: async () => "gone",
+      async *streamRecords(id, name) { yield* selected(id, name); },
+    };
+  });
+  const localSync = vi.fn(async () => ({ recordsFor } as unknown as LocalSync));
+  const legacyReads = vi.fn((reader: "owner" | "grant") => receiver.readStore({ reader }));
   const pdpp = {
+    ...(connectionLink && { connectionLink }),
     store,
     bindingStore: store,
     configuredMethods: new Map([[sourceId, [method]]]),
@@ -115,11 +154,12 @@ function host({
     readBlobBytes: async (id: string) => store.getBlobBytes(id),
     resource: "http://localhost:8080",
     // The host-owned reader capability, selected per authenticated token.
-    reads: (reader: "owner" | "grant") => receiver.readStore({ reader }),
+    reads: legacyReads,
   };
   const indexManager = createIndexManager(db);
   const app = createApp({
-    accountModeAuthority: explicitLegacyAuthority("unswitched"),
+    accountModeAuthority: explicitLegacyAuthority(local ? "switched" : "unswitched"),
+    ...(local && { localSync }),
     logger: pino({ level: "silent" }),
     version: "test",
     startedAt: new Date(),
@@ -197,6 +237,10 @@ function host({
     db,
     store,
     receiver,
+    localRows,
+    recordsFor,
+    localSync,
+    legacyReads,
     get,
     envelope,
     row,
@@ -561,6 +605,51 @@ describe("createApp with an enabled replica receiver", () => {
         expect((await h.get(token, "/v1/streams")).body.data).toEqual([]);
         expect((await h.get(token, `/v1/blobs/${h.blobId}`)).status).toBe(404);
       }
+    },
+  );
+});
+
+describe("createApp switched records require the host connection-link capability", () => {
+  it.each(["missing-link", "linked", "unresolved"] as const)(
+    "keeps populated legacy rows out of %s reads",
+    async (local) => {
+      const h = host({ local });
+      h.receiver.import({
+        credential: "x",
+        envelope: h.envelope("legacy", [
+          h.registration,
+          h.claim("legacy-claim", 2),
+          h.row("legacy-row", 3, "legacy-key"),
+        ]),
+        blobs: [{ blobId: h.blobId, bytes: h.bytes }],
+      });
+      // Prove the forbidden fallback has data, then count only HTTP read calls.
+      expect(h.receiver.readStore({ reader: "owner" }).getRecord(instance, stream, "legacy-key")).toBeDefined();
+      expect(h.localRows).toHaveLength(1);
+      h.legacyReads.mockClear();
+
+      const page = await h.get("owner", `/v1/streams/${stream}/records`);
+      const point = await h.get("owner", `/v1/streams/${stream}/records/local-key`);
+      if (local === "missing-link") {
+        for (const response of [page, point]) {
+          expect(response.status).toBe(503);
+          expect(JSON.stringify(response.body)).toContain("STREAM_READ_UNAVAILABLE");
+        }
+        expect(h.recordsFor).not.toHaveBeenCalled();
+      } else if (local === "linked") {
+        expect(page.status).toBe(200);
+        expect(page.body.data.map((row: { id: string }) => row.id)).toEqual(["local-key"]);
+        expect(point.status).toBe(200);
+        expect(point.body.id).toBe("local-key");
+        expect(h.recordsFor).toHaveBeenCalled();
+      } else {
+        expect(page.status).toBe(200);
+        expect(page.body.data).toEqual([]);
+        expect(point.status).toBe(404);
+        expect(h.recordsFor).toHaveBeenCalled();
+      }
+      expect(h.legacyReads).not.toHaveBeenCalled();
+      expect(JSON.stringify([page.body, point.body])).not.toContain("legacy-key");
     },
   );
 });
