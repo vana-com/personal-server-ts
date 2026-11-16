@@ -1083,7 +1083,7 @@ describe("startPersonalServer publication receipts", () => {
     const server = await startPersonalServer(options);
     try {
       await write(server, "acme", "run-a");
-      vi.spyOn(options.streamSyncRegistry, "post").mockRejectedValue(
+      vi.spyOn(options.streamSyncRegistry, "postBatch").mockRejectedValue(
         new Error("registry unavailable"),
       );
       await expect(server.publish()).rejects.toThrow("registry unavailable");
@@ -1102,7 +1102,7 @@ describe("startPersonalServer publication receipts", () => {
         streams: [{ name: "items", state: "pending" }],
       });
       const post = vi
-        .spyOn(options.streamSyncRegistry, "post")
+        .spyOn(options.streamSyncRegistry, "postBatch")
         .mockRejectedValueOnce(new Error("registry unavailable"));
       await expect(server.publish()).rejects.toThrow("registry unavailable");
       post.mockRestore();
@@ -1147,14 +1147,14 @@ describe("startPersonalServer publication receipts", () => {
     const blocked = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const post = options.streamSyncRegistry.post.bind(
+    const postBatch = options.streamSyncRegistry.postBatch!.bind(
       options.streamSyncRegistry,
     );
-    vi.spyOn(options.streamSyncRegistry, "post").mockImplementation(
+    vi.spyOn(options.streamSyncRegistry, "postBatch").mockImplementation(
       async (request) => {
         entered();
         await blocked;
-        return post(request);
+        return postBatch(request);
       },
     );
     const publication = server.publish();

@@ -8,7 +8,6 @@ import {
   createMemoryStreamSyncBlobs,
   createMemoryStreamSyncRegistry,
   type MemoryStreamSyncRegistry,
-  type StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { RegistryRefusedError } from "../../../core/src/stream-sync/ports.js";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
@@ -38,8 +37,6 @@ async function stuckDelete(
   };
   const fixture = await remoteFixture(keys);
   const registry = createMemoryStreamSyncRegistry() as MemoryStreamSyncRegistry;
-  // A gateway without the batch route: the delete takes the per-stream path.
-  (registry as StreamSyncRegistry).postBatch = undefined;
   const blobs = createMemoryStreamSyncBlobs();
   await legacyHeadRow({
     ...fixture,
@@ -96,6 +93,18 @@ async function stuckDelete(
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
   if (controlReply) {
+    // The fence's batch request gets no answer, so the per-row pass posts it
+    // alone, and the reply below is that post's. A hang holds the request.
+    const realBatch = registry.postBatch.bind(registry);
+    vi.spyOn(registry, "postBatch").mockImplementation(async (req) => {
+      if (!req.rows.some((row) => row.scope === fixture.control))
+        return realBatch(req);
+      if (controlReply === "hang") {
+        await gate;
+        return realBatch(req);
+      }
+      throw new Error("connection reset fixture");
+    });
     const real = registry.post.bind(registry);
     vi.spyOn(registry, "post").mockImplementation(async (req) => {
       if (req.scope !== fixture.control) return real(req);

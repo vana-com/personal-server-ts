@@ -1,6 +1,9 @@
 import { expect, it } from "vitest";
 import { gatewayBatchRefusal } from "../../../core/src/localdb/batch-contract.js";
-import type { SignedRegistryBatch } from "../../../core/src/stream-sync/ports.js";
+import type {
+  RegistryBatchPolicy,
+  SignedRegistryBatch,
+} from "../../../core/src/stream-sync/ports.js";
 
 const row = (scope: string) => ({
   scope,
@@ -23,21 +26,35 @@ const request = (
   requires: requires.map(need),
 });
 
+const POLICY: RegistryBatchPolicy = {
+  rows: 16,
+  requires: 16,
+  bytes: 65_536,
+};
+
 it("accepts a condition on a row the request does not write", () => {
-  expect(gatewayBatchRefusal(request(["a", "b"], ["control"]))).toBeNull();
+  expect(
+    gatewayBatchRefusal(request(["a", "b"], ["control"]), POLICY),
+  ).toBeNull();
 });
 
-it("refuses a condition on a row the same request writes", () => {
-  expect(gatewayBatchRefusal(request(["control", "a"], ["control"]))).toBe(
-    "requires[0].scope: must be a different data point than the one written",
-  );
+// Conditions are judged on the state the request commits, so a condition may
+// name a row the same request writes (a first save: control v1 and the log
+// row that needs it).
+it("accepts a condition on a row the same request writes", () => {
+  expect(
+    gatewayBatchRefusal(request(["control", "a"], ["control"]), POLICY),
+  ).toBeNull();
 });
 
 it("refuses a repeated condition scope and an oversize request", () => {
-  expect(gatewayBatchRefusal(request(["a"], ["c", "c"]))).toBe(
+  expect(gatewayBatchRefusal(request(["a"], ["c", "c"]), POLICY)).toBe(
     "requires[1].scope: repeated",
   );
   expect(
-    gatewayBatchRefusal(request(Array.from({ length: 17 }, (_, i) => `r${i}`))),
-  ).toBe("rows: at most 16 rows (got 17)");
+    gatewayBatchRefusal(request(Array.from({ length: 5 }, (_, i) => `r${i}`)), {
+      ...POLICY,
+      rows: 4,
+    }),
+  ).toBe("rows: at most 4 rows (got 5)");
 });

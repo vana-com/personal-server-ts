@@ -5,7 +5,6 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { ConnectorNotVerifiedError } from "@opendatalabs/personal-server-ts-core/localdb";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
 import {
   createMemoryPsLiteAccessLogStore,
@@ -236,23 +235,5 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
         error: { code: status, errorCode, message: expect.any(String) },
       });
     }
-  });
-
-  it("answers 503 CONNECTOR_NOT_VERIFIED when the writer cannot name the streams", async () => {
-    const response = await del(
-      await runtimeWith({
-        switched: true,
-        connectionDelete: {
-          requestConnectionDelete: async (connector) => {
-            throw new ConnectorNotVerifiedError(connector);
-          },
-        },
-      }),
-      "/v1/owner/connectors/github",
-    );
-    expect(response.status).toBe(503);
-    expect((await response.json()).error.errorCode).toBe(
-      "CONNECTOR_NOT_VERIFIED",
-    );
   });
 });

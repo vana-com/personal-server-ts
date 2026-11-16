@@ -77,7 +77,6 @@ export function createLocalSync(
     readonly aliasTargets?: AliasTargets;
     readonly resolveArtifact: ResolveArtifact;
     readonly declaredStreams: (connector: string) => readonly string[];
-    readonly retainedManifests?: () => readonly string[];
     readonly eraseLegacy?: (connector: string) => Promise<void>;
     readonly olderVersionReads: () => boolean;
     readonly deleting?: (connector: string) => boolean | Promise<boolean>;
@@ -214,10 +213,6 @@ export function createLocalSync(
   });
   const makeDeleter = () =>
     createConnectionDeleter(deps, {
-      declaredStreams: options.declaredStreams,
-      ...(options.retainedManifests && {
-        retainedManifests: options.retainedManifests,
-      }),
       ...(options.eraseLegacy && { eraseLegacy: options.eraseLegacy }),
       // A request waits for the fence no longer than the loop waits to look
       // at a delete that has not landed.

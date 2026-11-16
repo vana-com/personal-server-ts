@@ -13,8 +13,13 @@
 //     connection's control row is not yet known to be active here.
 //   TRANSFER (no slot)  Upload the attachments, then the segment.
 //   COMMIT (slot)     Re-read the basis. Post one row for the log scope at
-//     version position+1 with a condition on the control row, in one request.
-//     A 409 applies the winner and starts the round over; a failed control
+//     version position+1 with a condition on the control row, in one
+//     all-or-nothing request. A new connection's first save also carries the
+//     control row's creation (version 1): the segment's PUT needs no control
+//     row (objects are content addressed and authorize nothing until a commit
+//     names them), so the creation waits for the commit and costs no round
+//     trip of its own. A lost log row applies the winner and starts the round
+//     over; a lost control row reads the control row; a failed control
 //     condition purges or defers. On success one local batch: replace
 //     deletes, each touched stream's local head, watermarks, run evidence, the
 //     log position, and compaction of `record_changes`.
@@ -61,7 +66,11 @@ import {
   type SegmentRef,
   type SnapshotPointer,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { type StreamSyncRegistry } from "../stream-sync/ports.js";
+import {
+  RegistryBatchRouteMissingError,
+  type RegistryRequirementFailure,
+  type SignedBatchRow,
+} from "../stream-sync/ports.js";
 import { sameHead, type PlanHead } from "../stream-sync/publish-plan.js";
 import { keccakOf } from "../stream-sync/crypto-port.js";
 import { applyConnection } from "./apply.js";
@@ -116,9 +125,6 @@ export const PAGE_BYTES = 2 * 1024 * 1024;
 const MAX_ATTEMPTS = 5;
 /** Keys a query binds: the delete lookup binds a connection, a stream and two positions beside them. */
 const KEYS_PER_QUERY = rowsPerStatement(1, 4);
-
-/** Registries that answered the batch route with 404 or 405: the log needs it. */
-const withoutBatchRoute = new WeakSet<StreamSyncRegistry>();
 
 type StreamRow = LocalStream & {
   stream: string;
@@ -187,6 +193,8 @@ type Candidate = {
   readonly attachments: readonly BlobDescriptor[];
   readonly controlDataHash: `0x${string}`;
   readonly prevHash: `0x${string}` | null;
+  /** The first save of a new connection: the commit creates the control row. */
+  readonly createControl: boolean;
 };
 
 type Snapshot =
@@ -205,19 +213,18 @@ type Committed =
       readonly results: PublishResult[];
       readonly more: boolean;
     }
-  | { readonly kind: "retry"; readonly conflict: boolean }
-  | { readonly kind: "unsupported" };
+  | { readonly kind: "retry"; readonly conflict: boolean };
 
 /**
- * Publish a connection through the log. `null`: this registry has no batch
- * route, so the caller publishes per stream.
+ * Publish a connection through the log. Every commit is a batch request:
+ * throws `RegistryBatchRouteMissingError` when the registry serves none.
  */
 export async function publishLog(
   deps: LocalSyncDeps,
   connectionId: string,
-): Promise<readonly PublishResult[] | null> {
-  if (!deps.registry.postBatch || withoutBatchRoute.has(deps.registry))
-    return null;
+): Promise<readonly PublishResult[]> {
+  if (!deps.registry.postBatch)
+    throw new RegistryBatchRouteMissingError("this registry has no batch port");
   const clock = openPhases(deps);
   try {
     return await publishRounds(deps, connectionId, clock);
@@ -230,7 +237,7 @@ async function publishRounds(
   deps: LocalSyncDeps,
   connectionId: string,
   clock: PhaseClock,
-): Promise<readonly PublishResult[] | null> {
+): Promise<readonly PublishResult[]> {
   const results = new Map<string, PublishResult>();
   const keep = (list: readonly PublishResult[]) => {
     for (const result of list) {
@@ -297,10 +304,6 @@ async function publishRounds(
         ),
       ),
     );
-    if (committed.kind === "unsupported") {
-      withoutBatchRoute.add(deps.registry);
-      return results.size > 0 ? [...results.values()] : null;
-    }
     if (committed.kind === "retry") {
       if (++attempts >= MAX_ATTEMPTS) {
         keep(await backoff(deps, connectionId));
@@ -404,14 +407,16 @@ async function snapshotRound(
   const hashes = await controlHashes(keccakOf(held.streamCrypto), keyCheck);
 
   // Control. A connection this device already holds as active is confirmed by
-  // the commit's own condition; only an unknown one is read here.
+  // the commit's own condition; only an unknown one is read here. A first
+  // save creates the row with its commit.
   const controlDataHash = hashes.activeData;
+  let createControl = false;
   if (connection.control_state !== "active") {
     const settled = await clock.time("control", () =>
       establishControl(held, connectionId, connection, hashes),
     );
-    if (settled === "retry") return { kind: "retry" };
-    if (settled !== "active") return all(settled);
+    if (settled === "create") createControl = true;
+    else if (settled !== "active") return all(settled);
   }
   if (
     await discardForeignLifetimeRuns(held, connectionId, connection.generation)
@@ -420,10 +425,7 @@ async function snapshotRound(
     return { kind: "retry" };
   }
   await held.db.batch([
-    {
-      sql: "UPDATE connections SET control_state='active',control_version=? WHERE connection_id=?",
-      params: [connection.generation, connectionId],
-    },
+    ...(createControl ? [] : [markControlActive(connectionId, connection)]),
     {
       sql: "UPDATE runs SET generation=? WHERE connection_id=? AND generation IS NULL AND state='ended'",
       params: [connection.generation, connectionId],
@@ -714,8 +716,16 @@ async function snapshotRound(
         })),
       );
   if (included.length === 0) {
-    // Nothing to publish. Record that every covered run was already saved by
-    // what the log holds, move the watermarks, and compact.
+    // Nothing to publish. A new connection's control row is still created, as
+    // a request of its own. Record that every covered run was already saved
+    // by what the log holds, move the watermarks, and compact.
+    if (createControl) {
+      const created = await clock.time("control", () =>
+        commitControl(held, connectionId, connection, hashes),
+      );
+      if (created === "retry") return { kind: "retry" };
+      if (created !== "active") return all(created);
+    }
     await commitIdle(held, connectionId, planned, log);
     return {
       kind: "done",
@@ -813,6 +823,7 @@ async function snapshotRound(
       planned,
       attachments,
       controlDataHash,
+      createControl,
       prevHash: log.refs.at(-1)?.dataHash ?? null,
     },
   };
@@ -832,54 +843,38 @@ function omittedSize(omitted: readonly LogOmission[]): number {
 }
 
 /**
- * Make sure the connection's control row is active here, for a connection this
+ * Whether the connection's control row is active here, for a connection this
  * device does not already hold as active.
  *
  * A connection this device has only ever seen absent, at its first generation,
- * is the first save of a new connection: the row is created with the one
- * request that creates it. A read first would learn what the post's own answer
- * says (created, or a row is there), and a read after would re-learn the row
- * this device just wrote. Both are skipped. The post is the compare-and-set at
- * version 1, so a row another device wrote answers 409 and the row is read and
- * classified as for any other connection. Nothing rests on the skipped read:
- * the commit names the control row as a condition (version, hash, not
- * deleted), so a row that is not the one assumed fails the commit, not a write.
+ * is the first save of a new connection: `create`, with no read. The commit
+ * creates the row in its own request, as a compare-and-set at version 1, and
+ * the request's control condition is judged on what it commits. A row another
+ * device wrote makes the creation lose, and the row is then read and
+ * classified as for any other connection (`readControl`).
  */
 async function establishControl(
   held: LocalSyncDeps,
   connectionId: string,
   connection: ConnectionRow & { control_state: string },
   hashes: ControlHashes,
-): Promise<"active" | "retry" | PublishResult["outcome"]> {
+): Promise<"active" | "create" | PublishResult["outcome"]> {
+  if (connection.control_state === "absent" && connection.generation === 1)
+    return "create";
+  return readControl(held, connectionId, connection, hashes);
+}
+
+/** Read the control row and say what it means for this connection. */
+async function readControl(
+  held: LocalSyncDeps,
+  connectionId: string,
+  connection: ConnectionRow,
+  hashes: ControlHashes,
+): Promise<"active" | "create" | PublishResult["outcome"]> {
   const control = controlScope(connection.connector, connection.ns);
-  const create = async () => {
-    const signature = await held.signer.signAddData({
-      ownerAddress: held.ownerAddress,
-      scope: control,
-      dataHash: hashes.activeData,
-      metadataHash: hashes.activeMetadata,
-      expectedVersion: 1n,
-    });
-    return held.registry.post({
-      ownerAddress: held.ownerAddress,
-      scope: control,
-      dataHash: hashes.activeData,
-      metadataHash: hashes.activeMetadata,
-      expectedVersion: "1",
-      signature,
-    });
-  };
-  if (connection.control_state === "absent" && connection.generation === 1) {
-    if ((await create()).kind === "committed") return "active";
-  }
-  let read = await held.registry.read(control);
-  let state = classifyControl(read, hashes);
-  if (state.kind === "absent") {
-    if (connection.generation !== 1) return "deferred";
-    await create();
-    read = await held.registry.read(control);
-    state = classifyControl(read, hashes);
-  }
+  const state = classifyControl(await held.registry.read(control), hashes);
+  if (state.kind === "absent")
+    return connection.generation === 1 ? "create" : "deferred";
   if (state.kind === "deleted") {
     await purgeConnection(held, connectionId, {
       controlVersion: state.version,
@@ -892,6 +887,99 @@ async function establishControl(
     return "deferred";
   }
   return "active";
+}
+
+function markControlActive(
+  connectionId: string,
+  connection: ConnectionRow,
+): SqlStatement {
+  return {
+    sql: "UPDATE connections SET control_state='active',control_version=? WHERE connection_id=?",
+    params: [connection.generation, connectionId],
+  };
+}
+
+/** The control row of a new connection: active, version 1. */
+async function controlCreation(
+  held: LocalSyncDeps,
+  control: string,
+  hashes: ControlHashes,
+): Promise<SignedBatchRow> {
+  return {
+    scope: control,
+    dataHash: hashes.activeData,
+    metadataHash: hashes.activeMetadata,
+    expectedVersion: "1",
+    signature: await held.signer.signAddData({
+      ownerAddress: held.ownerAddress,
+      scope: control,
+      dataHash: hashes.activeData,
+      metadataHash: hashes.activeMetadata,
+      expectedVersion: 1n,
+    }),
+  };
+}
+
+/**
+ * The condition every commit carries: the control row is this connection's
+ * lifetime, active. Judged on what the request commits, so it also holds a
+ * control row the same request creates, and refuses a stored one (a replay)
+ * that a delete has since tombstoned.
+ */
+function controlCondition(
+  control: string,
+  connection: ConnectionRow,
+  hashes: ControlHashes,
+) {
+  return {
+    scope: control,
+    expectedVersion: String(connection.generation),
+    notDeleted: true,
+    expectedDataHash: hashes.activeData,
+  };
+}
+
+/** What a failed control condition means for the connection. */
+async function controlFailed(
+  held: LocalSyncDeps,
+  connectionId: string,
+  control: string,
+  failure: RegistryRequirementFailure | null,
+): Promise<"purged" | "deferred"> {
+  const verdict = failure ? settleRequirementFailure(failure, control) : null;
+  if (verdict?.kind !== "purge") return "deferred";
+  await purgeConnection(held, connectionId, {
+    controlVersion: verdict.controlVersion,
+  });
+  return "purged";
+}
+
+/**
+ * Create a new connection's control row in a request of its own: the first
+ * save of a connection with nothing to publish yet.
+ */
+async function commitControl(
+  held: LocalSyncDeps,
+  connectionId: string,
+  connection: ConnectionRow,
+  hashes: ControlHashes,
+): Promise<"active" | "retry" | PublishResult["outcome"]> {
+  const control = controlScope(connection.connector, connection.ns);
+  const answer = await postBatchOnce(held.registry, {
+    ownerAddress: held.ownerAddress,
+    rows: [await controlCreation(held, control, hashes)],
+    requires: [controlCondition(control, connection, hashes)],
+  });
+  if (answer.kind === "precondition_failed")
+    return controlFailed(held, connectionId, control, answer.failure);
+  const state =
+    answer.kind === "committed"
+      ? "active"
+      : await readControl(held, connectionId, connection, hashes);
+  if (state === "create") return "retry";
+  if (state === "active")
+    await held.db.batch([markControlActive(connectionId, connection)]);
+  return state;
 }
 
 /**
@@ -1330,43 +1418,50 @@ async function commitRound(
       expectedHeadDataHash: candidate.prevHash,
     }),
   };
+  // A first save creates the control row in the same request: one commit.
+  const creation = candidate.createControl
+    ? await controlCreation(held, control, hashes)
+    : null;
   const answer = await clock.time("registry-commit", () =>
     postBatchOnce(held.registry, {
       ownerAddress: held.ownerAddress,
-      rows: [row],
-      requires: [
-        {
-          scope: control,
-          expectedVersion: String(connection.generation),
-          notDeleted: true,
-          expectedDataHash: hashes.activeData,
-        },
-      ],
+      rows: creation ? [creation, row] : [row],
+      requires: [controlCondition(control, connection, hashes)],
     }),
   );
-  if (answer.kind === "unsupported") return { kind: "unsupported" };
-  if (answer.kind === "precondition_failed") {
-    const verdict = answer.failure
-      ? settleRequirementFailure(answer.failure, control)
-      : null;
-    if (verdict?.kind === "purge") {
-      await purgeConnection(held, connectionId, {
-        controlVersion: verdict.controlVersion,
-      });
-      return results("purged");
-    }
-    return results("deferred");
-  }
+  if (answer.kind === "precondition_failed")
+    return results(
+      await controlFailed(held, connectionId, control, answer.failure),
+    );
   if (!(await lifetimeHolds(held, connectionId, connection.generation)))
     return results("deferred");
-  const settlement = settleRow(answer.rows[0]!, {
-    expectedVersion: row.expectedVersion,
-    dataHash: row.dataHash,
-  });
-  if (settlement === "conflict") {
-    // Another writer holds this position. Take its segments, then plan again.
-    await applyConnection(held, connectionId);
-    return { kind: "retry", conflict: true };
+  if (answer.kind === "refused") {
+    // Nothing was written. The row that lost says why.
+    const [created, logged] = creation
+      ? answer.rows
+      : [undefined, answer.rows[0]!];
+    if (created?.kind === "conflict") {
+      // Another device's row holds the control scope: read it.
+      const state = await readControl(held, connectionId, connection, hashes);
+      if (state === "active") {
+        await held.db.batch([markControlActive(connectionId, connection)]);
+        return { kind: "retry", conflict: false };
+      }
+      if (state === "create") return { kind: "retry", conflict: false };
+      return results(state);
+    }
+    const settlement = settleRow(logged!, {
+      expectedVersion: row.expectedVersion,
+      dataHash: row.dataHash,
+    });
+    if (settlement === "conflict") {
+      // Another writer holds this position. Take its segments, then plan again.
+      await applyConnection(held, connectionId);
+      return { kind: "retry", conflict: true };
+    }
+    // A copy of this very row landed earlier, with the whole request that
+    // held it: published.
+    if (settlement !== "committed") return { kind: "retry", conflict: false };
   }
   if (await hasDeleteIntent(held, connection.connector))
     return results("deferred");
@@ -1377,7 +1472,9 @@ async function commitRound(
     dataHash: candidate.dataHash,
     bytes: candidate.clearBytes,
   };
-  const statements: SqlStatement[] = [];
+  const statements: SqlStatement[] = candidate.createControl
+    ? [markControlActive(connectionId, connection)]
+    : [];
   const touched = candidate.planned.filter((p) => p.included);
   for (const p of touched) {
     if (p.replace)

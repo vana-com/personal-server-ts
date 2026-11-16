@@ -320,14 +320,6 @@ export interface CreateServerOptions {
   profile?: "standard" | "enclave";
   serverAccount?: ServerAccount;
   /**
-   * Stream names a connection delete fences for a connector, beside the
-   * streams of the manifests this server retained. A host that no longer
-   * verifies a connector (uninstalled, manifest not retained) names its
-   * streams here; without it such a connector's delete refuses
-   * (CONNECTOR_NOT_VERIFIED). Read at delete time.
-   */
-  declaredStreams?: (connector: string) => readonly string[];
-  /**
    * The stream-sync registry. Default: the gateway client at `gateway.url`. A
    * test with no gateway passes its own (for example
    * `createMemoryStreamSyncRegistry()`).
@@ -966,8 +958,9 @@ async function bootstrapServer(
         const facade = createServerLocalSync(deps, {
           resolveArtifact: (digest) =>
             manifestArtifactResolver(pdppAuth?.retainedManifests ?? [])(digest),
-          declaredStreams: options?.declaredStreams ?? (() => []),
-          retainedManifests: () => pdppAuth?.retainedManifests ?? [],
+          // A connection delete names no streams; this host reads no
+          // stream declarations.
+          declaredStreams: () => [],
           eraseLegacy: (connector) =>
             eraseConnectorLeftovers(connector, {
               storage: rawDataStorage,

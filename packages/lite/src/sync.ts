@@ -144,19 +144,12 @@ export interface PsLiteSyncOptions {
   /**
    * The stream names a connector declares, from the manifests the host
    * verified (`manifestStreamLister` over the same documents the host passes
-   * to `streamSyncDeclarations`). A connection delete posts a delete head on
-   * each declared stream that has no registry row. Required: a host that omits
-   * it lets a stale record of a rowless stream publish after a delete.
-   * A connector with registry rows and no declared names is not deleted
-   * (`ConnectorNotVerifiedError`).
+   * to `streamSyncDeclarations`).
    */
   streamSyncDeclaredStreams: (connector: string) => readonly string[];
   /**
-   * Verified manifests retained for seed-descriptor admission and deletion.
-   * Seed profiles and primary keys must match one of these documents. A connection
-   * delete also fences the streams these declare, so a host that passes no
-   * `streamSyncDeclaredStreams` names for a connector with rows still deletes
-   * it. Default: none.
+   * Verified manifests retained for seed-descriptor admission. Seed profiles
+   * and primary keys must match one of these documents. Default: none.
    */
   streamSyncRetainedManifests?: () => readonly string[];
   /**
@@ -655,7 +648,6 @@ export async function createPsLiteSyncManager(
           aliasTargets: legacyAliasScopes,
           resolveArtifact: options.streamSyncDeclarations ?? (() => null),
           declaredStreams: options.streamSyncDeclaredStreams,
-          retainedManifests: options.streamSyncRetainedManifests,
           eraseLegacy: (connector) =>
             eraseLegacyScopesOf(connector, options.storage),
           olderVersionReads:
