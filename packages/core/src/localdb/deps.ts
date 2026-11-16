@@ -73,17 +73,6 @@ export interface LocalSyncDeps {
    */
   readonly keyedFirstLoad?: boolean;
   /**
-   * Default off. A key-ordered first load stages every row of the log in
-   * scratch tables before it writes `records`. Off: they are ordinary tables,
-   * so each page is journaled and later copied into the database file, and the
-   * store holds them until they are dropped. On: they are TEMP tables, which a
-   * store whose temp tables spill to a file (SQLite's default) never journals.
-   * A host turns it on only when that holds: a store that keeps temp tables in
-   * memory would hold the whole log there. Nothing reads the stage after the
-   * load stops (a retry stages again), so it needs no durability.
-   */
-  readonly stageInTempStore?: boolean;
-  /**
    * Publish and apply through the stream-sync log (one segment and one
    * registry commit per batch, across streams) instead of per-stream heads.
    * Default off. The flag lets this device START a log on a connection that has

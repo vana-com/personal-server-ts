@@ -109,7 +109,6 @@ import {
   rowsPerStatement,
   commitStaged,
   mergeStaged,
-  mergeStagedIntoEmpty,
   operationStatements,
   prepareOperations,
   streamHeadStatements,
@@ -404,30 +403,17 @@ const complexKeys = (table: string) =>
   `SELECT stream, pk_hash FROM ${table} GROUP BY stream, pk_hash
      HAVING COUNT(*) > 1 OR MAX(kind <> 'u')`;
 
-/**
- * Drop what a load of this connection staged. A stage in the database file
- * is found by name; a TEMP stage is on the writer's connection only, so the
- * tables of the buckets this load uses are named. A temp stage of an earlier
- * load of another size cannot outlive the connection that made it.
- */
 async function dropStages(
-  deps: Pick<LocalSyncDeps, "db" | "stageInTempStore">,
+  deps: Pick<LocalSyncDeps, "db">,
   tag: string,
-  buckets: number,
 ): Promise<void> {
   const stale = await deps.db.query<{ name: string }>(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE ? ESCAPE '\\'",
     [`log\\_stage\\_${tag}\\_%`],
   );
-  const names = new Set([
-    ...stale.map(({ name }) => name),
-    ...(deps.stageInTempStore
-      ? Array.from({ length: buckets }, (_, bucket) => stageTable(tag, bucket))
-      : []),
-  ]);
-  if (names.size > 0)
+  if (stale.length > 0)
     await deps.db.batch(
-      [...names].map((name) => ({
+      stale.map(({ name }) => ({
         sql: `DROP TABLE IF EXISTS ${name}`,
         params: [],
       })),
@@ -572,7 +558,7 @@ export async function loadKeyed(
   buckets: number,
 ): Promise<void> {
   const tag = tagOf(connectionId);
-  await dropStages(deps, tag, buckets);
+  await dropStages(deps, tag);
   try {
     await deps.db.batch([
       {
@@ -581,7 +567,7 @@ export async function loadKeyed(
         params: [],
       },
       ...Array.from({ length: buckets }, (_, bucket) => ({
-        sql: `CREATE ${deps.stageInTempStore ? "TEMP " : ""}TABLE ${stageTable(tag, bucket)} (position INTEGER NOT NULL, kind TEXT NOT NULL,
+        sql: `CREATE TABLE ${stageTable(tag, bucket)} (position INTEGER NOT NULL, kind TEXT NOT NULL,
                 stream TEXT NOT NULL, pk_hash TEXT NOT NULL, record_key TEXT NOT NULL,
                 stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL, body TEXT, body_sha256 TEXT, first_o INTEGER,
                 stamp_n INTEGER NOT NULL DEFAULT 0)`,
@@ -639,19 +625,14 @@ export async function loadKeyed(
     const last = sources[staged - 1]!.state;
     // What an unfinished load of this connection wrote must lie inside the
     // prefix this one publishes; if it does not, write nothing.
-    const pending = await readKeyedPending(deps, connectionId);
-    if (!pendingAdmits(pending, last)) {
+    if (!pendingAdmits(await readKeyedPending(deps, connectionId), last)) {
       if (stopped) throw stopped.error;
       throw new LogDivergedError(
         "apply: the log is not the one an earlier key-ordered load of this connection wrote rows from",
       );
     }
-    // A load that begins (no marker) on a connection that holds no row of it:
-    // the ranges hold disjoint keys, so none of them meets a row, a tombstone
-    // or an unpublished delete, and no key needs a merge to be written.
-    const empty = pending === null && (await holdsNothing(deps, connectionId));
     for (let bucket = 0; bucket < buckets; bucket++)
-      await applyBucket(deps, connectionId, tag, bucket, empty, {
+      await applyBucket(deps, connectionId, tag, bucket, {
         // The first range creates the streams' rows and names the position
         // the rows it and the later ranges write belong to.
         first:
@@ -665,28 +646,8 @@ export async function loadKeyed(
       });
     if (stopped) throw stopped.error;
   } finally {
-    await dropStages(deps, tag, buckets).catch(() => undefined);
+    await dropStages(deps, tag).catch(() => undefined);
   }
-}
-
-/**
- * Whether the connection holds nothing a staged key could meet: no row in
- * `records`, no tombstone in `log_tombstones`, and no change in `record_changes`
- * (an unpublished explicit delete there refuses an older upsert of its key).
- * A device that began collecting before its first load, or imported, holds
- * some of these and merges every key.
- */
-async function holdsNothing(
-  deps: Pick<LocalSyncDeps, "db">,
-  connectionId: string,
-): Promise<boolean> {
-  const [held] = await deps.db.query<{ n: number }>(
-    `SELECT EXISTS (SELECT 1 FROM records WHERE connection_id = ?)
-          + EXISTS (SELECT 1 FROM log_tombstones WHERE connection_id = ?)
-          + EXISTS (SELECT 1 FROM record_changes WHERE connection_id = ?) AS n`,
-    [connectionId, connectionId, connectionId],
-  );
-  return held?.n === 0;
 }
 
 /**
@@ -814,7 +775,6 @@ async function applyBucket(
   connectionId: string,
   tag: string,
   bucket: number,
-  empty: boolean,
   edges: {
     /** The first range creates the streams' rows and names the position the rows written from here on belong to. */
     readonly first?: {
@@ -857,9 +817,7 @@ async function applyBucket(
                SELECT 1 FROM temp.log_complex c WHERE c.stream = s.stream AND c.pk_hash = s.pk_hash)`,
       params: [simpleOp],
     },
-    ...(empty
-      ? mergeStagedIntoEmpty(connectionId, simpleOp)
-      : mergeStaged(connectionId, simpleOp)),
+    ...mergeStaged(connectionId, simpleOp),
     { sql: "DELETE FROM temp.log_complex", params: [] },
   ];
   const closing: SqlStatement[] = [{ sql: `DROP TABLE ${table}`, params: [] }];

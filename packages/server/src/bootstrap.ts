@@ -953,8 +953,6 @@ async function bootstrapServer(
             options?.streamSyncBlobs ?? createStorageStreamSyncBlobs(storage),
           keys: createStreamSyncKeyPorts(masterKeySignature!, nodeStreamCrypto),
           streamCrypto: nodeStreamCrypto,
-          // SQLite on Node keeps temp tables in a file, in the temp directory.
-          stageInTempStore: true,
           signer: serverSigner!,
           logger,
           now: Date.now,

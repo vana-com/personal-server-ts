@@ -237,35 +237,18 @@ export function mergeIncoming(
       },
     );
   }
-  statements.push(...insertIncoming(op, connectionId, { onlyNew: true }));
-  return statements;
-}
-
-/**
- * The statements that write the rows staged in `incoming` under `op` as new
- * rows of `records`, and clear them. With `onlyNew` a key the connection
- * already holds is left to the merge above. Without it the caller says the
- * keys are new (`mergeStagedIntoEmpty`): a key that is not would fail the
- * insert, not be merged.
- */
-export function insertIncoming(
-  op: string,
-  connectionId: string,
-  options: { readonly onlyNew: boolean },
-): SqlStatement[] {
-  return [
+  statements.push(
     {
       sql: `INSERT INTO records (connection_id, stream, pk_hash, ${FIELDS.join(", ")}, body_bytes, first_o)
 SELECT ?, i.stream, i.pk_hash, ${FIELDS.map((f) => `i.${f}`).join(", ")}, ${STORED_BYTES},
        CASE WHEN (SELECT origin FROM write_ctx WHERE id = 1) = 'import' THEN NULL ELSE i.first_o END
  FROM incoming i
- WHERE i.op = ?${options.onlyNew ? " AND NOT EXISTS (SELECT 1 FROM records r WHERE r.connection_id = ? AND r.stream = i.stream AND r.pk_hash = i.pk_hash)" : ""}`,
-      params: options.onlyNew
-        ? [connectionId, op, connectionId]
-        : [connectionId, op],
+ WHERE i.op = ? AND NOT EXISTS (SELECT 1 FROM records r WHERE r.connection_id = ? AND r.stream = i.stream AND r.pk_hash = i.pk_hash)`,
+      params: [connectionId, op, connectionId],
     },
     { sql: "DELETE FROM incoming WHERE op = ?", params: [op] },
-  ];
+  );
+  return statements;
 }
 
 /**
