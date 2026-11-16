@@ -19,6 +19,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { TokenStore } from "../token-store.js";
 import { createServerApiAuth } from "../api-auth.js";
+import { createFeedWriter } from "./sync-event-writer.js";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 
 export interface SyncRouteDeps {
@@ -111,21 +112,42 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
   app.get("/events", async (c) => {
     await auth.authorizeOwner(c.req.raw);
     return streamSSE(c, async (stream) => {
-      const send = (event: string, data: unknown) =>
-        stream.writeSSE({ event, data: JSON.stringify(data) }).catch(() => {});
-      const release = [
-        deps.viewChanges?.subscribe(({ connectionIds }) => {
-          void send("view", { connectionIds });
-        }),
-        deps.syncManager?.subscribeStatus((status) => {
-          void send("status", status);
-        }),
-      ];
+      // One writer per connection folds what arrives while a frame is being
+      // written, so a reader that stops reading holds bounded memory.
+      const feed = createFeedWriter((event, data) =>
+        stream.writeSSE({ event, data: JSON.stringify(data) }),
+      );
       const left = new Promise<void>((resolve) => stream.onAbort(resolve));
-      await send("ready", {});
-      if (deps.syncManager) await send("status", deps.syncManager.getStatus());
-      await left;
-      for (const stop of release) stop?.();
+      // A subscription joins this list when it is acquired, so whatever
+      // happens next releases exactly what was acquired.
+      const release: Array<() => void> = [];
+      try {
+        if (deps.viewChanges)
+          release.push(
+            deps.viewChanges.subscribe(({ connectionIds }) =>
+              feed.views(connectionIds),
+            ),
+          );
+        if (deps.syncManager) {
+          release.push(
+            deps.syncManager.subscribeStatus((status) => feed.status(status)),
+          );
+        }
+        feed.ready();
+        if (deps.syncManager) feed.status(deps.syncManager.getStatus());
+        await left;
+      } catch (err) {
+        deps.logger.warn({ err }, "sync event feed failed; closing it");
+      } finally {
+        feed.close();
+        for (const stop of release.reverse()) {
+          try {
+            stop();
+          } catch (err) {
+            deps.logger.warn({ err }, "sync event feed release failed");
+          }
+        }
+      }
     });
   });
   app.post("/file/:id", async (c, next) => {

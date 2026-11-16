@@ -15,7 +15,9 @@ import {
   openLocalDb,
   type LocalSync,
   type SqlDriver,
+  type ViewChangeListener,
   type ViewChangeRecorder,
+  type ViewChanges,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   createMemoryStreamSyncBlobs,
@@ -252,4 +254,185 @@ describe("GET /v1/sync/events", () => {
     expect(await feed.next()).toEqual({ event: "status", data: current });
     await feed.close();
   });
+
+  it("holds bounded work for a reader that stops reading, and still serves one that reads", async () => {
+    const { views, emit, listeners } = fakeViews();
+    const status = fakeStatus({ syncing: false, lastSync: null });
+    const app = syncRoutes({
+      ...auth,
+      syncManager: status.manager,
+      viewChanges: views,
+    });
+    const stalled = await app.request("/events", { headers });
+    const healthy = await app.request("/events", { headers });
+    const healthyFeed = frames(healthy);
+    expect((await healthyFeed.next()).event).toBe("ready");
+    expect((await healthyFeed.next()).event).toBe("status");
+
+    // The stalled reader never reads. A flood of changes arrives meanwhile.
+    const flood = 1000;
+    for (let n = 0; n < flood; n++) {
+      emit([`c${n % 3}`]);
+      status.set({ syncing: n % 2 === 0, lastSync: n });
+    }
+    const last = { syncing: false, lastSync: flood };
+    status.set(last);
+
+    // The healthy reader receives every change: the union of the ids it was
+    // told about, and the last status.
+    const seen = new Set<string>();
+    let lastSeen: unknown;
+    while (
+      lastSeen === undefined ||
+      (lastSeen as { lastSync: number }).lastSync !== flood
+    ) {
+      const frame = await healthyFeed.next();
+      if (frame.event === "view")
+        for (const id of (frame.data as { connectionIds: string[] })
+          .connectionIds)
+          seen.add(id);
+      if (frame.event === "status") lastSeen = frame.data;
+    }
+    expect(lastSeen).toEqual(last);
+
+    // When the stalled reader reads at last, the flood has collapsed: the
+    // frames it receives are bounded by the kinds of change, not their count.
+    const late = frames(stalled);
+    const counts: Record<string, number> = {};
+    let latest: unknown;
+    for (;;) {
+      const frame = await late.next();
+      counts[frame.event] = (counts[frame.event] ?? 0) + 1;
+      if (frame.event === "status") latest = frame.data;
+      if (
+        frame.event === "status" &&
+        (frame.data as { lastSync: number }).lastSync === flood
+      )
+        break;
+    }
+    expect(latest).toEqual(last);
+    // One frame of a kind may already be in flight when the flood starts; the
+    // rest of that kind collapse into one more.
+    expect(counts.view ?? 0).toBeLessThanOrEqual(2);
+    expect(counts.status).toBeLessThanOrEqual(3);
+
+    await late.close();
+    await healthyFeed.close();
+    await vi.waitFor(() => expect(listeners()).toBe(0));
+    await vi.waitFor(() => expect(status.listeners.size).toBe(0));
+  });
+
+  it.each([
+    ["the status subscription throws", { subscribeStatus: true }],
+    ["the opening status read throws", { getStatus: true }],
+  ])("releases both subscriptions when %s", async (_name, fault) => {
+    const { views, listeners } = fakeViews();
+    const status = fakeStatus({ syncing: false, lastSync: null }, fault);
+    const app = syncRoutes({
+      ...auth,
+      syncManager: status.manager,
+      viewChanges: views,
+    });
+    const response = await app.request("/events", { headers });
+    // The feed ends instead of staying open on a dead subscription.
+    const reader = response.body!.getReader();
+    for (;;) if ((await reader.read()).done) break;
+    expect(listeners()).toBe(0);
+    expect(status.listeners.size).toBe(0);
+  });
+
+  it("opens no status subscription when the view subscription throws", async () => {
+    const status = fakeStatus({ syncing: false, lastSync: null });
+    const app = syncRoutes({
+      ...auth,
+      syncManager: status.manager,
+      viewChanges: {
+        subscribe: () => {
+          throw new Error("subscribe failed");
+        },
+      },
+    });
+    const response = await app.request("/events", { headers });
+    const reader = response.body!.getReader();
+    for (;;) if ((await reader.read()).done) break;
+    expect(status.listeners.size).toBe(0);
+  });
+
+  it("releases the rest when one release throws", async () => {
+    const status = fakeStatus({ syncing: false, lastSync: null });
+    const app = syncRoutes({
+      ...auth,
+      syncManager: status.manager,
+      viewChanges: {
+        subscribe: () => () => {
+          throw new Error("release failed");
+        },
+      },
+    });
+    const feed = frames(await app.request("/events", { headers }));
+    expect((await feed.next()).event).toBe("ready");
+    await feed.close();
+    await vi.waitFor(() => expect(status.listeners.size).toBe(0));
+  });
+
+  it("releases both subscriptions when the client leaves before reading anything", async () => {
+    const { views, listeners } = fakeViews();
+    const status = fakeStatus({ syncing: false, lastSync: null });
+    const app = syncRoutes({
+      ...auth,
+      syncManager: status.manager,
+      viewChanges: views,
+    });
+    const response = await app.request("/events", { headers });
+    expect(listeners()).toBe(1);
+    await response.body!.cancel();
+    await vi.waitFor(() => expect(listeners()).toBe(0));
+    await vi.waitFor(() => expect(status.listeners.size).toBe(0));
+  });
 });
+
+/** A view feed that counts its subscribers and lets a test emit a change. */
+function fakeViews() {
+  const set = new Set<ViewChangeListener>();
+  const views: ViewChanges = {
+    subscribe: (listener) => {
+      set.add(listener);
+      return () => void set.delete(listener);
+    },
+  };
+  return {
+    views,
+    listeners: () => set.size,
+    emit: (connectionIds: string[]) => {
+      for (const listener of [...set]) listener({ connectionIds });
+    },
+  };
+}
+
+/** A manager whose status a test sets; faults throw where named. */
+function fakeStatus(
+  initial: unknown,
+  fault: { subscribeStatus?: boolean; getStatus?: boolean } = {},
+) {
+  let current = initial;
+  const listeners = new Set<(status: unknown) => void>();
+  const manager = {
+    subscribeStatus: (listener: (status: unknown) => void) => {
+      if (fault.subscribeStatus) throw new Error("subscribeStatus failed");
+      listeners.add(listener);
+      return () => void listeners.delete(listener);
+    },
+    getStatus: () => {
+      if (fault.getStatus) throw new Error("getStatus failed");
+      return current;
+    },
+  } as unknown as SyncManager;
+  return {
+    manager,
+    listeners,
+    set: (status: unknown) => {
+      current = status;
+      for (const listener of [...listeners]) listener(status);
+    },
+  };
+}
