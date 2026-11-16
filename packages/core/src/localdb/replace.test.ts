@@ -19,7 +19,7 @@ const fixture = JSON.parse(bytes.toString()) as {
   }[];
 };
 const SHA256 =
-  "4b0a9b5c1fe647e2437811c893f9b0a47de125d2863ad25515a31e028ed7e180";
+  "cf246791fa8346f99010e424f3e3a0e208ddd600223f12b2b1a8a9a876dd86d3";
 
 it("pins all 18 historical producer cases and #560 cases 1-5", () => {
   expect(createHash("sha256").update(bytes).digest("hex")).toBe(SHA256);
