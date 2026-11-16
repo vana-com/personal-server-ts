@@ -1106,7 +1106,7 @@ export function createSyncManager(
   }
 
   /**
-   * True when a full cycle or a marker probe would only repeat what the last
+   * True when a full timer cycle would only repeat what the last
    * clean cycle read: the push answers (healthy), nothing runs now, and its
    * position is the one that cycle started under. Each answer of the held
    * request carries the current position, so a change whose wake was lost
@@ -1119,6 +1119,23 @@ export function createSyncManager(
       cycleInFlight === null &&
       knownPosition !== undefined &&
       knownPosition === syncedPosition
+    );
+  }
+
+  /**
+   * True when the push alone announces every registry change: it is healthy and
+   * its answers carry a position. The gateway wakes the held request on every
+   * write, so a marker read finds nothing the held request does not announce
+   * sooner. This holds whether or not the last pass settled: owed work (a
+   * deferred publish, a deletion waiting on finality) is retried by the timer
+   * cycle, and no marker read speeds that up. Without a position (a gateway
+   * that sends none) the push cannot vouch and the probe keeps running.
+   */
+  function pushAnnouncesChanges(): boolean {
+    return (
+      options?.changeProbe?.push !== undefined &&
+      pushHealthy &&
+      knownPosition !== undefined
     );
   }
 
@@ -1144,9 +1161,9 @@ export function createSyncManager(
     if (!probe || probeIntervalId !== null) return;
     probeIntervalId = setInterval(() => {
       if (Date.now() < nextTimedProbeAt) return; // backing off after failures
-      // The position says nothing moved since the last clean cycle: a marker
-      // read would repeat the answer.
-      if (pushCovers()) return;
+      // The held request announces every change: a marker read adds requests
+      // and no news (see `pushAnnouncesChanges`).
+      if (pushAnnouncesChanges()) return;
       pull(false).catch(() => {
         // Errors already captured in ring buffer
       });

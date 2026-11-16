@@ -1290,8 +1290,9 @@ async function bootstrapServer(
       pdppImporter,
     };
 
-    // The Desktop PS runs in the tray with no window of its own: the timed
-    // probe is what reaches a change made while the app is in the background.
+    // The Desktop PS runs in the tray with no window of its own: the held
+    // change request (or, when it is down, the timed probe) is what reaches a
+    // change made while the app is in the background.
     const changeProbe =
       localSyncSource &&
       createRegistryChangeProbe(streamSyncRegistry(), {
