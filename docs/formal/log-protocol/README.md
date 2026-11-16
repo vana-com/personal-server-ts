@@ -345,7 +345,9 @@ Rules the passing model fixes, and the code that carries them:
   the row by the same function. The stream-sync fold uses `upsertAfter`, the
   same order in TypeScript. `equal-stamp-order.test.ts` runs the SQL and the
   fold on the same operations: every sequence of up to three observations and
-  150 random sequences of eight.
+  200 random sequences of eight, drawn from a 32-bit generator. The test also
+  counts the shapes in that corpus (every kind of step, an identical body at a
+  higher ordinal, mixed alternation), so a degenerate generator fails it.
 - A database's own batch with a body the row already holds is a sighting, not a
   change. It moves no ordinal and publishes nothing. So the ordinal a row holds
   is always one that is in the log or waiting to be published. Two writers that
@@ -363,3 +365,29 @@ run's. They act between different stamps. The older-stamp case of
 stamp ranks below the run's batch whatever its ordinal. The `LogProtocol.tla`
 rank packing is exact only for ordinal below 3 and body below 100; an `ASSUME`
 checks the corpus. A larger domain needs the tuple compare.
+
+## Per-stream heads beside the log (`apply.ts`)
+
+A head's parts carry no ordinal, and the server does not serialize `stamp_n` in
+a head (`stamp_n` is read only by `log-publish.ts` and written by intake,
+admission, the merge and the log's apply). `apply.ts` stages a part's row with
+`stamp_n = 0`, so in the merge it is a legacy log entry: one `Pull` of
+`SqlRank.tla` with ordinal 0. A log-on device applies the registry's heads
+before the log (`applyConnection`), then the log, so a first load meets both. The
+order is one total order, so a part and a log entry arriving in either order
+give one row. `equal-stamp-order.test.ts` has a `part` step (same SQL options as
+`applyOneOnce`) in its exhaustive and random sequences, and
+`log-protocol.test.ts` loads a head and a log naming one key at one stamp
+through a first load, a progressive first load and a compacted snapshot.
+
+Not covered, and not an ordering matter: a log-on device that already follows
+the log does not read a head whose registry version is not above its own
+(`applyOneOnce`, the `head_version > read.version` answer), at any stamp. So a
+head that a log-off writer publishes beside a log reaches first loads and not
+devices that follow it. The tests show the same split at a later stamp.
+
+With the log off and admission on (`publishWhileCollecting`) a device stores
+`stamp_n` in its own rows and orders its own bodies by it. No log segment is
+written and a head holds no ordinal. A device that turns the log on after it
+published a head publishes its changes then, and a first load reads one row.
+

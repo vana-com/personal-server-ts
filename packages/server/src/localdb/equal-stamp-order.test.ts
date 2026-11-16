@@ -31,6 +31,10 @@ const bodyOf = (v: number) => canonicalJson({ id: "K", v });
 
 type Step =
   | { readonly kind: "pull"; readonly ord: number; readonly v: number }
+  // A row of a per-stream head's part, applied as `applyOneOnce` does: no
+  // ordinal (so ordinal 0, as a legacy log entry), `promoteSeen`, no
+  // first-seen of the winner. Its fold entry is an upsert at ordinal 0.
+  | { readonly kind: "part"; readonly v: number }
   | { readonly kind: "intake"; readonly v: number };
 
 const drivers: SqlDriver[] = [];
@@ -89,7 +93,25 @@ async function run(db: SqlDriver, steps: readonly Step[]) {
     value: { id: "K", v },
   });
   for (const [i, step] of steps.entries()) {
-    if (step.kind === "pull") {
+    if (step.kind === "part") {
+      await db.batch(
+        withOrigin("remote", [
+          // `apply.ts` stages a part's row with the column default: no stamp_n.
+          {
+            sql: "INSERT INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256) VALUES (?, 's', 'aa01', 'K', ?, ?, ?, ?)",
+            params: [
+              op(i),
+              STAMP.o,
+              STAMP.r,
+              bodyOf(step.v),
+              toHex(sha256(new TextEncoder().encode(bodyOf(step.v)))),
+            ],
+          },
+          ...mergeIncoming(op(i), CONNECTION, { promoteSeen: true }),
+        ]),
+      );
+      log.push(entry(0, step.v));
+    } else if (step.kind === "pull") {
       await db.batch(
         withOrigin("remote", [
           stage(op(i), step.ord, step.v),
@@ -127,7 +149,11 @@ function folded(log: readonly LogUpsert[]) {
 function describeSteps(steps: readonly Step[]) {
   return steps
     .map((s) =>
-      s.kind === "pull" ? `pull(n${s.ord},v${s.v})` : `intake(v${s.v})`,
+      s.kind === "pull"
+        ? `pull(n${s.ord},v${s.v})`
+        : s.kind === "part"
+          ? `part(v${s.v})`
+          : `intake(v${s.v})`,
     )
     .join(" ");
 }
@@ -178,6 +204,7 @@ describe("equal-stamp order: the stored row is the fold of the log", () => {
     for (const ord of [0, 1, 2])
       for (const v of [1, 2, 3]) actions.push({ kind: "pull", ord, v });
     for (const v of [1, 2, 3]) actions.push({ kind: "intake", v });
+    for (const v of [1, 2, 3]) actions.push({ kind: "part", v });
     const sequences: Step[][] = [[]];
     let layer: Step[][] = [[]];
     for (let depth = 0; depth < 3; depth++) {
@@ -198,20 +225,91 @@ describe("equal-stamp order: the stored row is the fold of the log", () => {
     expect(failures).toHaveLength(0);
   }, 120_000);
 
-  it("random longer sequences end on the fold", async () => {
+  it("a head's part, with no ordinal, lands in the same order as a logged entry at ordinal 0, before or after any ordinal", async () => {
     const db = await database();
-    let seed = 20261116;
-    const next = (n: number) => {
-      seed = (seed * 1103515245 + 12345) % 2147483648;
-      return seed % n;
+    const hash = (v: number) =>
+      toHex(sha256(new TextEncoder().encode(bodyOf(v))));
+    const [low, high] = hash(1) < hash(2) ? [1, 2] : [2, 1];
+    // The part's body has the greater hash: it beats an ordinal-0 entry, and
+    // loses to any ordinal above 0, whichever arrives first.
+    for (const steps of [
+      [
+        { kind: "part", v: high },
+        { kind: "pull", ord: 0, v: low },
+      ],
+      [
+        { kind: "pull", ord: 0, v: low },
+        { kind: "part", v: high },
+      ],
+    ] as Step[][]) {
+      await db.batch([{ sql: "DELETE FROM records", params: [] }]);
+      const { log, row } = await run(db, steps);
+      expect(row).toEqual({ body: bodyOf(high), stamp_n: 0 });
+      expect(row).toEqual(folded(log));
+    }
+    for (const steps of [
+      [
+        { kind: "part", v: high },
+        { kind: "pull", ord: 1, v: low },
+      ],
+      [
+        { kind: "pull", ord: 1, v: low },
+        { kind: "part", v: high },
+      ],
+    ] as Step[][]) {
+      await db.batch([{ sql: "DELETE FROM records", params: [] }]);
+      const { log, row } = await run(db, steps);
+      expect(row).toEqual({ body: bodyOf(low), stamp_n: 1 });
+      expect(row).toEqual(folded(log));
+    }
+  });
+
+  /** mulberry32: a 32-bit generator whose bits are all usable. */
+  const generator = (seed: number) => {
+    let state = seed >>> 0;
+    return () => {
+      state = (state + 0x6d2b79f5) >>> 0;
+      let t = state;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
+  };
+
+  it("random longer sequences end on the fold, and the corpus has the shapes the claim needs", async () => {
+    const db = await database();
+    const random = generator(20261116);
+    const next = (n: number) => Math.floor(random() * n);
     const failures: string[] = [];
-    for (let i = 0; i < 150; i++) {
-      const steps: Step[] = Array.from({ length: 8 }, () =>
-        next(4) === 0
+    let intakes = 0;
+    let parts = 0;
+    let pulls = 0;
+    let repeatedBodyHigherOrdinal = 0;
+    let mixedAlternation = 0;
+    for (let i = 0; i < 200; i++) {
+      const steps: Step[] = Array.from({ length: 8 }, () => {
+        const kind = next(6);
+        return kind === 0
           ? { kind: "intake", v: 1 + next(3) }
-          : { kind: "pull", ord: next(4), v: 1 + next(3) },
+          : kind === 1
+            ? { kind: "part", v: 1 + next(3) }
+            : { kind: "pull", ord: next(4), v: 1 + next(3) };
+      });
+      for (const step of steps)
+        if (step.kind === "intake") intakes++;
+        else if (step.kind === "part") parts++;
+        else pulls++;
+      const pulled = steps.filter(
+        (s): s is Extract<Step, { kind: "pull" }> => s.kind === "pull",
       );
+      if (
+        pulled.some((p, j) =>
+          pulled.slice(j + 1).some((q) => q.v === p.v && q.ord > p.ord),
+        )
+      )
+        repeatedBodyHigherOrdinal++;
+      if (steps.some((s, j) => j > 0 && s.kind !== steps[j - 1]!.kind))
+        mixedAlternation++;
       await db.batch([
         { sql: "DELETE FROM records", params: [] },
         { sql: "DELETE FROM incoming", params: [] },
@@ -221,5 +319,12 @@ describe("equal-stamp order: the stored row is the fold of the log", () => {
         failures.push(describeSteps(steps));
     }
     expect(failures.slice(0, 3)).toEqual([]);
+    // A degenerate generator would leave one kind out. Every kind must be
+    // common, and the shapes behind the old shortcuts must occur.
+    expect(intakes).toBeGreaterThan(150);
+    expect(parts).toBeGreaterThan(150);
+    expect(pulls).toBeGreaterThan(600);
+    expect(repeatedBodyHigherOrdinal).toBeGreaterThan(50);
+    expect(mixedAlternation).toBeGreaterThan(150);
   }, 120_000);
 });
