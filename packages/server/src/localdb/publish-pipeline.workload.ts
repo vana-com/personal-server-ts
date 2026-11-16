@@ -20,6 +20,10 @@ import { existsSync } from "node:fs";
 import { createStorageStreamSyncBlobs } from "../../../core/src/stream-sync/blobs.js";
 import { createMemoryStreamSyncRegistry } from "../../../core/src/stream-sync/memory-registry.js";
 import { DEFAULT_STORAGE_ACCESS_POLICY } from "../../../core/src/stream-sync/storage-retry.js";
+import {
+  parseRateLimitPolicy,
+  type QuotaPolicies,
+} from "../../../core/src/storage/adapters/rate-limit-policy.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
@@ -111,13 +115,26 @@ export interface PipelineBenchOptions {
   readonly width: number;
   /** Use the store's default policy as it is, and ignore `width`. */
   readonly production?: boolean;
-  /** The storage guard: PUTs allowed per 60 s (vana-storage: 600). None when absent. */
+  /** The storage guard: PUTs allowed per 60 s. None when absent. */
   readonly putsPerMinute?: number;
   readonly profile?: boolean;
   /** With `profile`: time a commit batch's statements one by one. */
   readonly profileStatements?: boolean;
   /** Queue a write to `records` as soon as the first PUT starts. */
   readonly writeDuringPublish?: boolean;
+  /**
+   * The `RateLimit-Policy` header the fake storage puts on every response
+   * (for example `"put";q=600;w=60`). The gate learns it from the first
+   * response, as it does from a real store.
+   */
+  readonly publishedQuota?: string;
+  /**
+   * The fake storage's uplink in bytes per second, shared evenly by the PUTs in
+   * flight, plus `rttMs` of fixed latency per PUT. Without it every PUT takes
+   * `putMs`.
+   */
+  readonly uplinkBytesPerSec?: number;
+  readonly rttMs?: number;
 }
 
 export interface PipelineBenchResult {
@@ -129,6 +146,10 @@ export interface PipelineBenchResult {
   readonly lastPutEndAtMs: number | null;
   readonly puts: number;
   readonly peakOnWire: number;
+  /** PUT-seconds on the wire divided by the span from the first PUT's start to the last one's end. */
+  readonly meanOnWire: number;
+  /** Each PUT: start and end in ms from the publish's start. */
+  readonly putSpans?: readonly (readonly [number, number])[];
   /** The most resident memory the process had while the publish ran, in MiB. */
   readonly peakRssMiB: number;
   /** The most buffer memory outside the JS heap, in MiB. */
@@ -148,6 +169,60 @@ export interface PipelineBenchResult {
     readonly runMs: number;
     readonly startAtMs: number;
   }[];
+}
+
+/**
+ * A PUT's time in the fake storage. Without an uplink every PUT takes
+ * `putMs`. With one, the PUTs in flight share it evenly (processor sharing):
+ * each takes `rttMs` and then moves its bytes at its share of the uplink.
+ */
+function createSharedUplink(
+  uplinkBytesPerSec: number | undefined,
+  rttMs: number,
+  putMs: number,
+): { send(bytes: number): Promise<void> } {
+  if (uplinkBytesPerSec === undefined)
+    return { send: () => new Promise((r) => setTimeout(r, putMs)) };
+  interface Flow {
+    left: number;
+    done: () => void;
+  }
+  const flows = new Set<Flow>();
+  let at = performance.now();
+  let timer: NodeJS.Timeout | undefined;
+  const advance = () => {
+    const now = performance.now();
+    if (flows.size > 0) {
+      const each = (uplinkBytesPerSec * (now - at)) / 1000 / flows.size;
+      for (const flow of flows) flow.left -= each;
+    }
+    at = now;
+  };
+  const schedule = () => {
+    clearTimeout(timer);
+    if (flows.size === 0) return;
+    const least = Math.min(...[...flows].map((f) => f.left));
+    const ms = (Math.max(0, least) * flows.size * 1000) / uplinkBytesPerSec;
+    timer = setTimeout(() => {
+      advance();
+      for (const flow of [...flows])
+        if (flow.left <= 1) {
+          flows.delete(flow);
+          flow.done();
+        }
+      schedule();
+    }, ms);
+  };
+  return {
+    send: (bytes) =>
+      new Promise<void>((resolve) => {
+        setTimeout(() => {
+          advance();
+          flows.add({ left: bytes, done: resolve });
+          schedule();
+        }, rttMs);
+      }),
+  };
 }
 
 const shapeOf = (sql: string) => sql.replace(/\s+/g, " ").trim().slice(0, 90);
@@ -251,7 +326,16 @@ export async function benchPublish(
     peakOnWire: 0,
     firstPutAtMs: null as number | null,
     lastPutEndAtMs: null as number | null,
+    putSeconds: 0,
+    spans: [] as [number, number][],
   };
+  const listeners = new Set<(quota: QuotaPolicies) => void>();
+  const published = parseRateLimitPolicy(options.publishedQuota);
+  const sharing = createSharedUplink(
+    options.uplinkBytesPerSec,
+    options.rttMs ?? 0,
+    options.putMs,
+  );
   let wrote = false;
   const stored: string[] = [];
   const key = randomBytes(32);
@@ -262,19 +346,27 @@ export async function benchPublish(
       exists: async () => false,
       download: async () => new Uint8Array(),
       delete: async () => true,
-      upload: async (objectKey: string) => {
+      onRateLimitPolicy: (listener: (quota: QuotaPolicies) => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      upload: async (objectKey: string, bytes: Uint8Array) => {
         stored.push(objectKey);
         stats.puts += 1;
         stats.onWire += 1;
         stats.peakOnWire = Math.max(stats.peakOnWire, stats.onWire);
-        stats.firstPutAtMs ??= at();
+        const startedAt = at();
+        stats.firstPutAtMs ??= startedAt;
         if (options.writeDuringPublish && !wrote) {
           wrote = true;
           void writeRecord(db);
         }
-        await new Promise((resolve) => setTimeout(resolve, options.putMs));
+        await sharing.send(bytes.byteLength);
         stats.onWire -= 1;
         stats.lastPutEndAtMs = at();
+        stats.putSeconds += (at() - startedAt) / 1000;
+        stats.spans.push([startedAt, at()]);
+        if (published) for (const listener of listeners) listener(published);
         return "";
       },
     } as never,
@@ -361,6 +453,12 @@ export async function benchPublish(
       lastPutEndAtMs: stats.lastPutEndAtMs,
       puts: stats.puts,
       peakOnWire: stats.peakOnWire,
+      meanOnWire:
+        stats.firstPutAtMs === null || stats.lastPutEndAtMs === null
+          ? 0
+          : stats.putSeconds /
+            ((stats.lastPutEndAtMs - stats.firstPutAtMs) / 1000),
+      ...(options.profile ? { putSpans: stats.spans } : {}),
       peakRssMiB: Math.round(peakRss / 1048576),
       peakExternalMiB: Math.round(peakExternal / 1048576),
       objectsDigest: createHash("sha256")
@@ -418,6 +516,15 @@ async function main(): Promise<void> {
     putMs: Number(arg("put-ms", "1200")),
     width: Number(arg("width", "16")),
     production: process.argv.includes("--production"),
+    ...(process.argv.includes("--published-quota")
+      ? { publishedQuota: arg("published-quota") }
+      : {}),
+    ...(process.argv.includes("--uplink-mb-s")
+      ? {
+          uplinkBytesPerSec: Number(arg("uplink-mb-s")) * 1_000_000,
+          rttMs: Number(arg("rtt-ms", "0")),
+        }
+      : {}),
     ...(process.argv.includes("--puts-per-minute")
       ? { putsPerMinute: Number(arg("puts-per-minute")) }
       : {}),

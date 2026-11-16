@@ -15,9 +15,21 @@ import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
 import type { ImportLedger } from "./import-ledger.js";
 import type { ImportReceipt, ImportSource } from "./legacy-import-types.js";
 
-/** A merge batch ends at this many rows or body characters, whichever is first. */
-export const IMPORT_CHUNK_ROWS = 64;
-const IMPORT_CHUNK_BYTES = 256 * 1024;
+/**
+ * A merge batch ends at this many rows or body characters, whichever is first.
+ *
+ * Each batch pays a fixed cost: a transaction, the snapshot lookup and the
+ * writer's checkpoint pass. At 64 rows and 256 KiB a 198,000-row seed made
+ * 3,900 batches and spent 60 of its 129 s in checkpoint passes. The byte bound
+ * is the span of one checkpoint mark (1,000 frames of 4 KiB pages, see the
+ * SQLite worker): a larger batch writes more than one mark and checkpoints
+ * the same way, and a smaller one pays the fixed cost for less than a mark.
+ * The row bound keeps the statements of a batch of tiny rows bounded; a batch
+ * is one worker message, and the memory test holds that its size, not the row
+ * count of the import, sets the peak.
+ */
+export const IMPORT_CHUNK_ROWS = 2048;
+const IMPORT_CHUNK_BYTES = 4 * 1024 * 1024;
 
 /** Import refusals are diagnostics; copy removal has its own exact-byte fence. */
 export type LegacyImportResult =

@@ -202,6 +202,27 @@ it("import-makes-fewer-driver-calls-than-rows", async () => {
     { n: rows },
   ]);
 });
+it("a seed of about three MiB merges in one batch, not one per 64 rows", async () => {
+  // Every merge batch pays a transaction, a snapshot lookup and the writer's
+  // checkpoint pass: a seed split at 64 rows paid them 24 times for these rows.
+  const f = await fixture();
+  const rows = 1500;
+  const text = "x".repeat(2000);
+  f.setValues(Array.from({ length: rows }, (_, i) => ({ id: `r${i}`, text })));
+  const batch = f.db.batch.bind(f.db);
+  let merges = 0;
+  f.db.batch = async (statements) => {
+    if (statements.some((s) => s.sql.startsWith("INSERT INTO records")))
+      merges++;
+    return batch(statements);
+  };
+  expect((await f.run()).kind).toBe("imported");
+  // One batch for the rows and the closing merge that carries the receipt.
+  expect(merges).toBeLessThanOrEqual(2);
+  expect(await f.db.query("SELECT count(*) AS n FROM records")).toEqual([
+    { n: rows },
+  ]);
+});
 it("import-crash-resume-idempotent", async () => {
   const f = await fixture();
   f.setValues(twoChunks);
