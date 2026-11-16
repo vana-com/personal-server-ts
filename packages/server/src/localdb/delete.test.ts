@@ -1299,3 +1299,21 @@ it("a request the gateway refuses (400) is reported, the per-stream path ends th
   expect(await f.a.deleter.resumeDeletes()).toEqual([]);
   expect(batches).toHaveLength(1);
 });
+
+it("a delete that cannot land logs the cause, with its message and stack", async () => {
+  const f = await world();
+  f.registry.beforePost = async () => {
+    throw new Error("registry write failed: fixture detail");
+  };
+  await f.a.deleter.requestConnectionDelete("fixture-source").catch(() => {});
+  expect(await f.a.deleter.resumeDeletes()).toHaveLength(1);
+  expect(f.a.deps.logger.warn).toHaveBeenCalledWith(
+    expect.objectContaining({
+      connector: "fixture-source",
+      reason: "Error",
+      message: "registry write failed: fixture detail",
+      stack: expect.stringContaining("fixture detail"),
+    }),
+    "connection delete pending",
+  );
+});

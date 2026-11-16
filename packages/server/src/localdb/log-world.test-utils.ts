@@ -51,6 +51,8 @@ export async function world(options: {
   streams: number;
   logProtocol: boolean;
   publishWhileCollecting?: boolean;
+  /** The registry's rule that refuses a stream row write beside a log row (default on). */
+  connectionLogFence?: boolean;
   partTargetBytes?: number;
   /** The key types every stream's schema declares (none: undeclared). */
   keyTypes?: readonly ("string" | "number" | "integer" | "boolean" | null)[];
@@ -59,7 +61,7 @@ export async function world(options: {
   const hashes = await controlHashes(async (b) => keccak_256(b), keyCheck);
   const gateway = createFakeGateway({
     owner: OWNER,
-    connectionLogFence: true,
+    connectionLogFence: options.connectionLogFence ?? true,
     isTombstone: (v) =>
       v.dataHash === hashes.tombstoneData &&
       v.metadataHash === hashes.tombstoneMetadata,
