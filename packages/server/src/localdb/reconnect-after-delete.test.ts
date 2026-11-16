@@ -43,7 +43,6 @@ describe.each([
   it("lands the delete, leaves the log row alone and begins the reconnect run", async () => {
     const w = await world({
       streams: 3,
-      logProtocol: true,
       connectionLogFence: fence,
     });
     const a = await w.device("a");
@@ -70,7 +69,6 @@ describe.each([
   it("publishes the new lifetime and a second device sees only it", async () => {
     const w = await world({
       streams: 3,
-      logProtocol: true,
       connectionLogFence: fence,
     });
     const a = await w.device("a");
@@ -101,7 +99,7 @@ describe.each([
 });
 
 it("a log row that appears after the delete was planned ends the stream cleanup", async () => {
-  const w = await world({ streams: 3, logProtocol: true });
+  const w = await world({ streams: 3 });
   const a = await w.device("a");
   await a.run("run-1", [{ stream: sName(0), id: "1" }]);
   await a.cycle();
@@ -117,7 +115,7 @@ it("a log row that appears after the delete was planned ends the stream cleanup"
 });
 
 it("planning excludes the log and every listed or declared stream in its namespace", async () => {
-  const w = await world({ streams: 3, logProtocol: true });
+  const w = await world({ streams: 3 });
   const a = await w.device("plan-guard");
   await a.run("run-plan", [{ stream: sName(0), id: "old" }]);
   await a.cycle();
@@ -165,7 +163,6 @@ it("resumes an older saved log pin without planning or advancing the log version
   // successful destructive write, not an incidental conflict-based exit.
   const w = await world({
     streams: 3,
-    logProtocol: true,
     connectionLogFence: false,
   });
   const a = await w.device("legacy-intent");

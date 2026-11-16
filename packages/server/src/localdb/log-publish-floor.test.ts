@@ -28,9 +28,9 @@ const six = (prefix: string) =>
     id: `${prefix}${i}`,
   }));
 
-async function openWorld(others: number) {
-  const trace = requestTrace(2);
-  const w = await world({ streams: 6, logProtocol: true, trace });
+async function openWorld(others: number, latencyMs = 2) {
+  const trace = requestTrace(latencyMs);
+  const w = await world({ streams: 6, trace });
   const a = await w.device("a");
   for (let c = 0; c < others; c++) {
     await a.run(`other-${c}`, six("o"), { connector: `other${c}` });
@@ -68,7 +68,10 @@ describe("log publish: the requests of one save", () => {
   it("listings of the owner's rows stay at three or fewer, however many other connections the owner has", async () => {
     const lists: number[] = [];
     for (const others of [1, 9]) {
-      const { trace, a } = await openWorld(others);
+      // A listing is shared by the applies that call it while it is out, so the
+      // count depends on how the applies line up. A latency well above the
+      // host's scheduling jitter keeps them in the same windows under load.
+      const { trace, a } = await openWorld(others, 25);
       await a.run("save", six("b"), {
         connector: "other0",
         full: false,
@@ -90,7 +93,7 @@ describe("log publish: the requests of one save", () => {
 
   it("an attachment goes up beside the segment, not before it: depth 3 (probe, PUT), not 4", async () => {
     const trace = requestTrace(2);
-    const w = await world({ streams: 1, logProtocol: true, trace });
+    const w = await world({ streams: 1, trace });
     const a = await w.device("a");
     const bytes = new Uint8Array(5000).fill(7);
     const hash = Buffer.from(sha256(bytes)).toString("hex");

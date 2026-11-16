@@ -2,8 +2,8 @@
 //
 // One round publishes one batch: the changes of every stream that has work,
 // as ONE immutable segment object (one PUT) and ONE registry commit that
-// advances the connection's log position. The per-stream path writes a head
-// and parts per stream; here request count does not grow with stream count.
+// advances the connection's log position, so request count does not grow with
+// stream count. It is the only way a connection publishes.
 //
 //   SNAPSHOT (slot)   Decide, for each stream, what its publish is: apply the
 //     retained runs' plan (`planStream`), select the changes since the stream's
@@ -25,10 +25,9 @@
 // completion and its changes are one unit). A single record larger than the
 // target still goes, alone.
 //
-// What this writer leaves to the per-stream path: nothing is published through
-// it. Runs it cannot place (refused, fenced, from another lifetime) are
-// cleaned up with the same helpers publish uses, and the round starts over;
-// runs it cannot order yet (deferred) hold only their own stream.
+// Runs it cannot place (refused, fenced, from another lifetime) are cleaned up
+// and the round starts over; runs it cannot order yet (deferred) hold only
+// their own stream.
 //
 // Compaction rides the batch's own commit (log-compact.ts): when the cost rule
 // or the head's bound says so, the segment carries a snapshot pointer, a new
@@ -100,11 +99,19 @@ import {
   type PublishResult,
   type StreamPlan,
 } from "./publish.js";
-import { META_ROWS, PAGE_BYTES } from "./encode.js";
 import { BODY_BYTES } from "./part-layout.js";
 import { purgeConnection } from "./purge.js";
 import { insideQueue } from "./slot.js";
 import { unwriteRefusedRun } from "./unwrite.js";
+
+/**
+ * A transfer page holds at most `PAGE_BYTES` of bodies when two or more rows
+ * fit; a row larger than that is a page of its own (a body is encoded whole).
+ * Row sizes are read `META_ROWS` at a time and cut into pages; a page also
+ * holds at most `META_ROWS` rows.
+ */
+const META_ROWS = 2048;
+export const PAGE_BYTES = 2 * 1024 * 1024;
 
 const MAX_ATTEMPTS = 5;
 /** Keys a query binds: the delete lookup binds a connection, a stream and two positions beside them. */
@@ -113,7 +120,15 @@ const KEYS_PER_QUERY = rowsPerStatement(1, 4);
 /** Registries that answered the batch route with 404 or 405: the log needs it. */
 const withoutBatchRoute = new WeakSet<StreamSyncRegistry>();
 
-type StreamRow = LocalStream & { stream: string };
+type StreamRow = LocalStream & {
+  stream: string;
+  /**
+   * `complete` of the version this stream's head stands for, 0 when it has
+   * none. The stream's own `complete` is written when a run ends, before its
+   * publish, so it is not what the log last said.
+   */
+  published_complete: number;
+};
 
 type Planned = {
   readonly stream: string;
@@ -349,7 +364,12 @@ async function snapshotRound(
   const streams = await held.db.query<StreamRow>(
     `SELECT stream, primary_key, profile_key, profile_version, complete,
             floor_version, floor_o, floor_r, last_delete_version,
-            head_version, head_generation, head_data_hash, publish_watermark
+            head_version, head_generation, head_data_hash, publish_watermark,
+            coalesce((SELECT v.complete FROM stream_versions v
+                       WHERE v.connection_id = stream_state.connection_id
+                         AND v.stream = stream_state.stream
+                         AND v.version = stream_state.head_version), 0)
+              AS published_complete
        FROM stream_state WHERE connection_id = ? ORDER BY stream`,
     [connectionId],
   );
@@ -395,6 +415,11 @@ async function snapshotRound(
 
   const planStart = clock.now();
   const log = await readLogState(held, connectionId);
+  // A connection with no log yet starts it with everything this device holds.
+  const seeded =
+    log.position === 0
+      ? await seedFromRecords(held, connectionId)
+      : new Set<string>();
   const planned: Planned[] = [];
   const target = held.partTargetBytes ?? DEFAULT_PART_TARGET_BYTES;
   let budget = 0;
@@ -415,7 +440,8 @@ async function snapshotRound(
       connectionId,
       connection,
       stream,
-      row,
+      // The plan's base is what the log last said, not what the run's end wrote.
+      { ...row, complete: row.published_complete },
       null,
       row.head_version,
       row.head_data_hash,
@@ -476,7 +502,7 @@ async function snapshotRound(
       watermark,
     );
     // A stream with no head yet (a first collection that publishes while it
-    // collects) is described by its local state, as the per-stream path does.
+    // collects) is described by its local state.
     const head: PlanHead | null =
       plan.finalHead ??
       (groups.length > 0
@@ -487,7 +513,10 @@ async function snapshotRound(
               key: row.profile_key ?? connection.connector,
               version: row.profile_version ?? row.floor_version ?? "0",
             },
-            complete: false,
+            // A seeded stream is what this device holds, head and all: its
+            // completeness is its own. Other changes with no run to describe
+            // them belong to a first collection that is still filling.
+            complete: seeded.has(stream) && row.complete === 1,
           }
         : null);
     const metaChanged =
@@ -500,7 +529,7 @@ async function snapshotRound(
             key: row.profile_key ?? connection.connector,
             version: row.profile_version ?? "0",
           },
-          complete: row.complete === 1,
+          complete: row.published_complete === 1,
         }));
     const metaPublishes =
       metaChanged && plan.steps.some((s) => s.decision.kind === "publish");
@@ -854,8 +883,7 @@ async function establishControl(
  * the run deletes it: the row's data holds them with their types, and a
  * deletion's key is exactly what its hash was computed from.
  *
- * The bodies are read a page at a time, as the spool is (`PAGE_BYTES` of
- * bodies, or one row), after reading the rows' sizes alone (`META_ROWS` at a
+ * The bodies are read a page at a time (`PAGE_BYTES` of bodies, or one row), after reading the rows' sizes alone (`META_ROWS` at a
  * time): the shared SQL cannot return just the key fields of a body (a phone's
  * SQLite 3.22 has no JSON1), and a pass that drops many large records must not
  * hold them all at once. Only the small keys are kept.
@@ -925,6 +953,44 @@ async function omittedHashes(
 }
 
 /** Changed keys since the watermark, oldest change first. */
+/**
+ * The first write of a log carries every record this device holds, not only
+ * the changes made since its last publish: nothing below the log's first
+ * segment is read from anywhere else, so a record that is not in the log is
+ * not there for a reader that has only the log. A record with no change
+ * pending gets one (`import`, at the stamp it already holds), so the usual
+ * rounds carry it: bounded by the part target, in order, acknowledged one
+ * round at a time. A key that already has a pending change is left alone, so a
+ * round that lost its commit seeds nothing twice. Returns the streams seeded.
+ */
+async function seedFromRecords(
+  deps: LocalSyncDeps,
+  connectionId: string,
+): Promise<Set<string>> {
+  const [mark] = await deps.db.query<{ seq: number | null }>(
+    "SELECT MAX(seq) AS seq FROM record_changes",
+  );
+  const from = mark?.seq ?? 0;
+  await deps.db.batch([
+    {
+      sql: `INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin)
+        SELECT r.connection_id,r.stream,r.pk_hash,r.record_key,'upsert',r.stamp_o,r.stamp_r,'import'
+          FROM records r
+          JOIN stream_state s ON s.connection_id=r.connection_id AND s.stream=r.stream
+         WHERE r.connection_id=?
+           AND NOT EXISTS (SELECT 1 FROM record_changes c
+                            WHERE c.connection_id=r.connection_id AND c.stream=r.stream
+                              AND c.pk_hash=r.pk_hash AND c.seq > s.publish_watermark)`,
+      params: [connectionId],
+    },
+  ]);
+  const rows = await deps.db.query<{ stream: string }>(
+    "SELECT DISTINCT stream FROM record_changes WHERE connection_id=? AND seq > ?",
+    [connectionId, from],
+  );
+  return new Set(rows.map((r) => r.stream));
+}
+
 async function changedKeys(
   deps: LocalSyncDeps,
   connectionId: string,

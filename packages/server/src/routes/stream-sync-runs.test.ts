@@ -175,11 +175,12 @@ describe("stream-sync run intake route", () => {
     });
     expect(ended.status).toBe(200);
     expect(await ended.json()).toMatchObject({ result: "queued" });
+    // The early publish writes the log; the cycle's own pass finds nothing left.
     expect(
       (await sync.cycle()).connections
         .flatMap((c) => c.published)
         .map((r) => r.outcome),
-    ).toEqual(["published"]);
+    ).toEqual(["published", "noop"]);
     expect([...(await read(body.connector)).keys()]).toEqual(["a"]);
   });
 
@@ -275,17 +276,17 @@ describe("stream-sync run intake route", () => {
     expect(await res.json()).toMatchObject({ error: "connection_stopped" });
   });
 
-  it("takes a 30 MiB record through the batch route and reads it back byte-exact", async () => {
-    const { sync, call, read } = await build("route-30mib");
+  it("takes an 8 MiB record through the batch route and reads it back byte-exact", async () => {
+    const { sync, call, read } = await build("route-8mib");
     const body = beginBody();
     await call("PUT", "big1", body);
-    const huge = { id: "huge", pad: 'é"\\}{'.repeat(5 * 1024 * 1024) };
-    expect(JSON.stringify(huge).length).toBeGreaterThan(30 * 1024 * 1024);
+    const big = { id: "big", pad: 'é"\\}{'.repeat(1_300_000) };
+    expect(JSON.stringify(big).length).toBeGreaterThan(8 * 1024 * 1024);
     const sent = await call("POST", "big1/batches", {
       batch: 0,
       records: [
         { stream: "items", data: { id: "small", n: 1 } },
-        { stream: "items", data: huge },
+        { stream: "items", data: big },
         { stream: "items", data: { id: "tail", n: 2 } },
       ],
     });
@@ -299,13 +300,37 @@ describe("stream-sync run intake route", () => {
     });
     expect(ended.status).toBe(200);
     expect(
-      (await sync.cycle()).connections
-        .flatMap((c) => c.published)
-        .map((r) => r.outcome),
-    ).toEqual(["published"]);
+      (await sync.cycle()).connections.flatMap((c) => c.error ?? []),
+    ).toEqual([]);
     const view = await read(body.connector);
-    expect([...view.keys()].sort()).toEqual(["huge", "small", "tail"]);
-    expect(canonicalJson(view.get("huge"))).toBe(canonicalJson(huge));
+    expect([...view.keys()].sort()).toEqual(["big", "small", "tail"]);
+    expect(canonicalJson(view.get("big"))).toBe(canonicalJson(big));
+  }, 120_000);
+
+  it("takes a 30 MiB record through the batch route; the log cannot carry it, and the cycle says so", async () => {
+    const { sync, call } = await build("route-30mib");
+    const body = beginBody();
+    await call("PUT", "big2", body);
+    const huge = { id: "huge", pad: 'é"\\}{'.repeat(5 * 1024 * 1024) };
+    expect(JSON.stringify(huge).length).toBeGreaterThan(30 * 1024 * 1024);
+    const sent = await call("POST", "big2/batches", {
+      batch: 0,
+      records: [{ stream: "items", data: huge }],
+    });
+    expect(sent.status).toBe(200);
+    expect(await sent.json()).toMatchObject({ accepted: 1, applied: true });
+    const ended = await call("POST", "big2/end", {
+      outcome: "succeeded",
+      coveredStreams: ["items"],
+      checkpointCandidate: { items: "c1" },
+      lastBatch: 0,
+    });
+    expect(ended.status).toBe(200);
+    // One segment holds at most 16 MiB (stream-sync log.ts), and a record is
+    // never split across segments, so this connection publishes nothing.
+    expect(
+      (await sync.cycle()).connections.map((c) => [c.published, c.error]),
+    ).toEqual([[[], "segment exceeds the 16 MiB segment limit"]]);
   }, 120_000);
 
   it("refuses a request that declares a body over the ceiling", async () => {

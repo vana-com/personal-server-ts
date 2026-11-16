@@ -1,30 +1,42 @@
-/** Encrypted registry fixtures shared by apply and Node composition tests. */
-import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/memory-registry.js";
-import { sha256 } from "@noble/hashes/sha2";
+/**
+ * A registry, a blob store and an author for Node composition and read tests.
+ *
+ * `head` is the other device of the owner: it collects the values as a full
+ * run and publishes them through the connection log, with the real publisher
+ * (a real database, the real intake, the real batch commit), so what the
+ * device under test reads is what a real remote device wrote.
+ */
+import { afterEach } from "vitest";
 import { keccak_256 } from "@noble/hashes/sha3";
 import {
-  canonicalJson,
   controlHashes,
   controlScope,
   deriveKeyCheck,
-  digestHead,
-  encodeHead,
-  frameOfBody,
-  partBlobName,
-  pkHash,
   streamScope,
-  toHex,
   type ControlRead,
-  type Head,
-  type HeadPart,
   type JsonObject,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  connectionQueue,
+  createLocalSync,
+  openLocalDb,
+  type SqlDriver,
+} from "../../../core/src/localdb/index.js";
+import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/index.js";
 import type {
+  RegistryBatchResult,
+  RegistryBatchRow,
+  SignedRegistryBatch,
   StreamSyncKeyPorts,
   StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
-const SHA = async (bytes: Uint8Array) => sha256(bytes);
+const authorDrivers: SqlDriver[] = [];
+afterEach(async () => {
+  for (const db of authorDrivers.splice(0)) await db.close();
+});
+
 export async function remoteFixture(
   keys: StreamSyncKeyPorts,
   connector = "fixture-source",
@@ -44,6 +56,10 @@ export async function remoteFixture(
       deleted,
     });
   setControl(1);
+  const versionOf = (scope: string) => {
+    const row = reads.get(scope);
+    return row?.found ? row.version : 0;
+  };
   const registry: StreamSyncRegistry = {
     read: async (scope) => reads.get(scope) ?? { found: false },
     listControlRows: async () =>
@@ -54,8 +70,72 @@ export async function remoteFixture(
       [...reads]
         .filter(([scope]) => key === connector && scope !== control)
         .map(([scope, read]) => ({ scope, read })),
-    post: async () => {
-      throw new Error("unexpected fixture post");
+    post: async (post) => {
+      if (String(versionOf(post.scope) + 1) !== post.expectedVersion)
+        return {
+          kind: "conflict",
+          latestVersion: String(versionOf(post.scope)),
+        };
+      reads.set(post.scope, {
+        found: true,
+        version: versionOf(post.scope) + 1,
+        dataHash: post.dataHash,
+        metadataHash: post.metadataHash,
+        deleted: false,
+      });
+      return { kind: "committed" };
+    },
+    /** The gateway's batch route: every condition first, then each row on its own. */
+    postBatch: async (request: SignedRegistryBatch) => {
+      for (const need of request.requires) {
+        const row = reads.get(need.scope);
+        const reason = !row?.found
+          ? ("absent" as const)
+          : String(row.version) !== need.expectedVersion
+            ? ("version-mismatch" as const)
+            : need.expectedDataHash !== undefined &&
+                row.dataHash.toLowerCase() !==
+                  need.expectedDataHash.toLowerCase()
+              ? ("data-hash-mismatch" as const)
+              : undefined;
+        if (reason !== undefined)
+          return {
+            kind: "precondition_failed",
+            failure: {
+              scope: need.scope,
+              reason,
+              latestVersion: row?.found ? String(row.version) : null,
+              deleted: false,
+            },
+          } satisfies RegistryBatchResult;
+      }
+      const results: RegistryBatchRow[] = [];
+      for (const row of request.rows) {
+        const prior = reads.get(row.scope);
+        const fence = row.expectedHeadDataHash;
+        if (
+          String(versionOf(row.scope) + 1) !== row.expectedVersion ||
+          (fence !== undefined &&
+            (!prior?.found ||
+              prior.dataHash.toLowerCase() !== fence.toLowerCase()))
+        ) {
+          results.push({
+            kind: "conflict",
+            latestVersion: String(versionOf(row.scope)),
+            latestDataHash: prior?.found ? prior.dataHash : null,
+          });
+          continue;
+        }
+        reads.set(row.scope, {
+          found: true,
+          version: versionOf(row.scope) + 1,
+          dataHash: row.dataHash,
+          metadataHash: row.metadataHash,
+          deleted: false,
+        });
+        results.push({ kind: "committed" });
+      }
+      return { kind: "rows", rows: results } satisfies RegistryBatchResult;
     },
   };
   const storage = {
@@ -66,106 +146,84 @@ export async function remoteFixture(
       blobs.set(key, bytes);
     },
   };
+
+  // The author: another device of the owner, made on the first `head`.
+  const declared = new Map<string, readonly string[]>();
+  let author: Awaited<ReturnType<typeof createAuthor>> | undefined;
+  async function createAuthor() {
+    const db = await openLocalDb(openBetterSqlite3(":memory:"), {
+      owner: `0x${"22".repeat(20)}`,
+      network: "test",
+      deviceId: "remote-author",
+    });
+    authorDrivers.push(db);
+    let op = 0;
+    const sync = createLocalSync(
+      {
+        db,
+        queue: connectionQueue(),
+        registry,
+        blobs: storage,
+        keys,
+        ownerAddress: `0x${"22".repeat(20)}`,
+        signer: { signAddData: async () => "0x00" },
+        logger: { info() {}, warn() {} },
+        now: () => 100,
+        newOp: () => `author-${++op}`,
+      },
+      {
+        resolveArtifact: () => ({
+          connector,
+          version: "1",
+          streams: [...declared].map(([name, primaryKey]) => ({
+            name,
+            primaryKey: [...primaryKey],
+            coverageStrategy: "full_inventory" as const,
+            semantics: "mutable_state" as const,
+          })),
+        }),
+        declaredStreams: () => [...declared.keys()],
+        olderVersionReads: () => true,
+      },
+    );
+    return { sync, runs: 0 };
+  }
+
+  /**
+   * Publish `values` as the whole of `stream`, observed at `options.o`: one
+   * full run, then one cycle that writes the log.
+   */
   async function head(
     stream: string,
     values: readonly JsonObject[],
-    options: {
-      version?: number;
-      generation?: number;
-      o?: number;
-      /** Format 5: when the replacing run dropped what the source no longer lists. */
-      replacedAt?: number;
-      f?: number | null;
-      format?: Head["format"];
-      pieceBytes?: number;
-      /** Group parts by the first bits of the key hash: `1` makes prefixes `0` and `1`. */
-      prefixBits?: number;
-      complete?: boolean;
-      primaryKey?: string[];
-      profile?: { key: string | null; version: string };
-      /** Rewrites the head's entry for a part (not the part's bytes), to make a head whose metadata is wrong. */
-      entry?: (part: HeadPart, index: number, total: number) => HeadPart;
-    } = {},
+    options: { o?: number; primaryKey?: string[] } = {},
   ) {
-    const scope = streamScope(connector, ns, stream);
-    const generation = options.generation ?? 1;
-    const format = options.format ?? 4;
-    const prefixOf = (k: string) =>
-      (options.prefixBits ?? 0) === 0
-        ? ""
-        : [...k.slice(0, Math.ceil((options.prefixBits ?? 0) / 4))]
-            .map((c) => parseInt(c, 16).toString(2).padStart(4, "0"))
-            .join("")
-            .slice(0, options.prefixBits);
-    const frames = await Promise.all(
-      values.map(async (v) => {
-        const body = new TextEncoder().encode(canonicalJson(v));
-        const k = await pkHash(SHA, v, options.primaryKey ?? ["id"]);
-        const envelope = {
-          h: toHex(sha256(body)),
-          k,
-          n: body.length,
-          o: options.o ?? 100,
-          r: "remote-run",
-          ...(format >= 4
-            ? { f: options.f === undefined ? 50 : options.f }
-            : {}),
-        };
-        return { k, bytes: frameOfBody(envelope, body) };
-      }),
-    );
-    frames.sort((a, b) => a.k.localeCompare(b.k));
-    const parts: HeadPart[] = [];
-    for (const frame of frames) {
-      const size = options.pieceBytes ?? frame.bytes.length;
-      for (let at = 0; at < frame.bytes.length; at += size) {
-        const bytes = frame.bytes.slice(at, at + size);
-        const hash = toHex(sha256(bytes));
-        parts.push({
-          prefix: prefixOf(frame.k),
-          hash,
-          bytes: bytes.length,
-          count: at === 0 ? 1 : 0,
-        });
-        blobs.set(
-          `${scope}/${partBlobName(generation, hash)}`,
-          await keys.encryptPart(scope, bytes),
-        );
-      }
-    }
-    const clear = encodeHead({
+    declared.set(stream, options.primaryKey ?? ["id"]);
+    author ??= await createAuthor();
+    const runId = `author-run-${++author.runs}`;
+    const { sync } = author;
+    await sync.intake.begin(runId, {
       connector,
-      ns,
-      stream,
-      generation,
-      format,
-      ...(format >= 3 ? { lastDeleteVersion: 0 } : {}),
-      keyCheck,
-      primaryKey: options.primaryKey ?? ["id"],
-      profile: options.profile ?? { key: null, version: "1" },
-      complete: options.complete ?? true,
+      artifactDigest: connector,
+      wantFull: true,
       observedAt: options.o ?? 100,
-      ...(format >= 5
-        ? { replacedAt: options.replacedAt ?? options.o ?? 100 }
-        : {}),
-      recordCount: values.length,
-      parts: options.entry
-        ? parts.map((p, i) => options.entry!(p, i, parts.length))
-        : parts,
+      owner: { address: `0x${"22".repeat(20)}`, leaseId: null },
     });
-    const { dataHash, blobName } = await digestHead(
-      async (b) => keccak_256(b),
-      clear,
-    );
-    blobs.set(`${scope}/${blobName}`, await keys.encrypt(scope, clear));
-    reads.set(scope, {
-      found: true,
-      version: options.version ?? 1,
-      dataHash,
-      metadataHash: hashes.activeMetadata,
-      deleted: false,
+    if (values.length > 0)
+      await sync.intake.batch(runId, {
+        batch: 0,
+        records: values.map((data) => ({ stream, data })),
+      });
+    await sync.intake.end(runId, {
+      outcome: "succeeded",
+      coveredStreams: [stream],
+      provenFullStreams: [stream],
+      lastBatch: values.length > 0 ? 0 : -1,
     });
-    return { scope, parts, blobName, dataHash };
+    const report = await sync.cycle();
+    const failed = report.connections.find((c) => c.error !== null);
+    if (failed) throw new Error(`fixture author cycle failed: ${failed.error}`);
+    return { scope: streamScope(connector, ns, stream) };
   }
   return { registry, storage, reads, blobs, head, setControl, hashes, control };
 }

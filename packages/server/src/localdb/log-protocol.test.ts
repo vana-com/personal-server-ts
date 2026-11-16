@@ -30,11 +30,9 @@ import {
   fetchSegment,
   recordKeyOfKey,
 } from "../../../core/src/localdb/log-apply.js";
-import { PAGE_BYTES } from "../../../core/src/localdb/encode.js";
+import { PAGE_BYTES } from "../../../core/src/localdb/log-publish.js";
 import { computeRecordKeyFromData } from "../../../core/src/storage/pdpp-records/record-key.js";
 import {
-  applyConnection,
-  applyStream,
   applySegmentOperations,
   applySnapshotPart,
 } from "../../../core/src/localdb/index.js";
@@ -58,9 +56,9 @@ const six = (prefix = "a") =>
     { stream: sName(i), id: `${prefix}${i}-2` },
   ]).flat();
 
-describe("log protocol, flag on", () => {
+describe("log protocol", () => {
   it("a 6-stream batch is one segment PUT and one registry commit", async () => {
-    const w = await world({ streams: 6, logProtocol: true });
+    const w = await world({ streams: 6 });
     const a = await w.device("a");
     await a.run("run-1", six());
     await a.cycle();
@@ -83,7 +81,7 @@ describe("log protocol, flag on", () => {
   });
 
   it("P2: a receiver at position n fetches and applies only n+1..m", async () => {
-    const w = await world({ streams: 6, logProtocol: true });
+    const w = await world({ streams: 6 });
     const a = await w.device("a");
     const b = await w.device("b");
     await a.run("run-1", six());
@@ -113,7 +111,7 @@ describe("log protocol, flag on", () => {
   });
 
   it("P1: out-of-order and duplicated segments converge to the same records", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const a = await w.device("a");
     await a.run("run-1", [
       { stream: sName(0), id: "x", v: 1 },
@@ -162,7 +160,7 @@ describe("log protocol, flag on", () => {
   });
 
   it("P2: a gap triggers a full check, and a missing segment never lets n+1 apply before n", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const a = await w.device("a");
     const b = await w.device("b");
     await a.run("run-1", [{ stream: sName(0), id: "one" }]);
@@ -221,7 +219,7 @@ describe("log protocol, flag on", () => {
   });
 
   it("P1: caught-up readers equal the greatest-stamp fold of the whole log", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const a = await w.device("a");
     const b = await w.device("b");
     await a.run(
@@ -305,7 +303,7 @@ describe("log protocol, flag on", () => {
   });
 
   it("P5: after a reset a reader adopts the new lifetime and clears the old view", async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     const b = await w.device("b");
     await a.run("run-1", [
@@ -346,7 +344,7 @@ describe("log protocol, flag on", () => {
   });
 
   it("P3: an omission completion deletes only records not observed at or after the cutoff", async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     const b = await w.device("b");
     await a.run(
@@ -425,95 +423,26 @@ describe("log protocol, flag on", () => {
       "s0/2",
     ]);
   });
-
-  it("upgrades a connection whose streams were published in the old format", async () => {
-    const w = await world({ streams: 3, logProtocol: false });
-    const legacy = await w.device("legacy", false);
-    await legacy.run("run-1", [
-      { stream: sName(0), id: "old-1" },
-      { stream: sName(1), id: "old-2" },
-    ]);
-    await legacy.cycle();
-    expect(
-      [...w.gateway.versions.keys()].filter((s) => s !== CONTROL).sort(),
-    ).toEqual(
-      [
-        streamScope(CONNECTOR, "", sName(0)),
-        streamScope(CONNECTOR, "", sName(1)),
-        streamScope(CONNECTOR, "", sName(2)),
-      ]
-        .filter((s) => w.gateway.versions.has(s))
-        .sort(),
-    );
-
-    const upgraded = await w.device("upgraded", true);
-    await upgraded.cycle();
-    // Old heads read; no position yet.
-    expect(await upgraded.records()).toEqual(await legacy.records());
-    expect(await upgraded.position()).toBe(0);
-
-    await upgraded.run("run-2", [{ stream: sName(2), id: "new-1" }], {
-      full: false,
-      covered: [sName(2)],
-    });
-    await upgraded.cycle();
-    expect(await upgraded.position()).toBe(1);
-
-    const fresh = await w.device("fresh", true);
-    await fresh.cycle();
-    expect((await fresh.records()).map((r) => r.split("=")[0])).toEqual([
-      "s0/old-1",
-      "s1/old-2",
-      "s2/new-1",
-    ]);
-    expect(await fresh.position()).toBe(1);
-  });
-});
-
-describe("flag off", () => {
-  it("publishes per-stream heads and writes no log row", async () => {
-    const w = await world({ streams: 6, logProtocol: false });
-    const a = await w.device("a");
-    await a.run("run-1", six());
-    await a.cycle();
-    expect(w.gateway.versions.has(LOG)).toBe(false);
-    expect(a.puts.length).toBeGreaterThan(6);
-  });
 });
 
 describe("request counts", () => {
   for (const streams of [6, 20]) {
-    it(`${streams} streams: log writes 1 PUT and 1 commit; per-stream writes more`, async () => {
+    it(`${streams} streams: one segment PUT and one registry commit`, async () => {
       const records = Array.from({ length: streams }, (_, i) => [
         { stream: sName(i), id: `r${i}-1` },
         { stream: sName(i), id: `r${i}-2` },
       ]).flat();
-      const counts: Record<
-        string,
-        { puts: number; batches: number; posts: number }
-      > = {};
-      for (const logProtocol of [false, true]) {
-        const w = await world({ streams, logProtocol });
-        const a = await w.device("a");
-        await a.run("run-1", records);
-        await a.cycle();
-        counts[logProtocol ? "log" : "legacy"] = {
-          puts: a.puts.length,
-          ...w.writes(),
-        };
-      }
-      console.info(
-        `request counts, ${streams} streams`,
-        JSON.stringify(counts),
-      );
-      expect(counts.log!.puts).toBe(1);
-      expect(counts.log!.batches).toBe(1);
-      expect(counts.legacy!.puts).toBeGreaterThan(counts.log!.puts);
+      const w = await world({ streams });
+      const a = await w.device("a");
+      await a.run("run-1", records);
+      await a.cycle();
+      expect(a.puts.length).toBe(1);
+      expect(w.writes().batches).toBe(1);
     });
   }
 
   it("a full run that drops rows is one segment: the drop it applies locally is not published again", async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run(
       "run-1",
@@ -532,7 +461,7 @@ describe("request counts", () => {
   });
 
   it("a connection the device knows publishes before the cycle reads the registry", async () => {
-    const w = await world({ streams: 6, logProtocol: true });
+    const w = await world({ streams: 6 });
     const a = await w.device("a");
     await a.run("run-1", [{ stream: sName(0), id: "r1" }]);
     await a.cycle();
@@ -715,7 +644,7 @@ const entriesOf = (parts: readonly SnapshotPart[]) => {
 
 /** A log with an early deletion, grown until it has compacted once. */
 async function compactedWorld() {
-  const w = await world({ streams: 2, logProtocol: true });
+  const w = await world({ streams: 2 });
   const a = await w.device("a");
   const b = await w.device("b");
   const m = await w.device("m");
@@ -818,11 +747,11 @@ describe("log protocol: compaction", () => {
   });
 
   it("a compaction races a writer's commit: the compare-and-set on the head decides, and every device converges", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     let armed = false;
     let raced = 0;
     const b = await w.device("b");
-    const a = await w.device("a", true, {
+    const a = await w.device("a", {
       beforePut: async (key) => {
         if (!armed || !key.includes(`${LOG}/q-`)) return;
         armed = false;
@@ -892,14 +821,13 @@ describe("log protocol: size splitting", () => {
     const target = 3000;
     const w = await world({
       streams: 6,
-      logProtocol: true,
       partTargetBytes: target,
     });
     const reader = await w.device("reader");
     let segmentPuts = 0;
     let midway: string[] | null = null;
     let midwayPosition = -1;
-    const a = await w.device("a", true, {
+    const a = await w.device("a", {
       beforePut: async (key) => {
         if (!key.includes(`${LOG}/s-`) || ++segmentPuts !== 2) return;
         // Segment 1 is committed and segment 2 is not: a reader here sees
@@ -969,11 +897,11 @@ describe("log protocol: attachments", () => {
   const hash = Buffer.from(sha256(bytes)).toString("hex");
 
   it("a blob uploaded with a log-mode publish is readable on another device", async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     // The registry commit that names the blob's record comes after the blob and
     // the segment are both in storage; their own order is free.
     const batchesAtPut: number[] = [];
-    const a = await w.device("a", true, {
+    const a = await w.device("a", {
       beforePut: async () => {
         batchesAtPut.push(w.gateway.batches().length);
       },
@@ -999,7 +927,7 @@ describe("log protocol: attachments", () => {
   });
 
   it("bytes that arrive after their records were published are uploaded by the next pass", async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     const b = await w.device("b");
     await a.run("run-1", [
@@ -1072,7 +1000,7 @@ describe("log protocol: boundary kinds at equal stamps (P2-1)", () => {
     d.records().then((rs) => rs.some((r) => r.includes('"id":"k"')));
 
   const seeded = async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run("run-1", [{ stream: sName(0), id: "seed" }], {
       observedAt: 1100,
@@ -1156,7 +1084,7 @@ describe("log protocol: boundary kinds at equal stamps (P2-1)", () => {
 describe("log protocol: a registry that is behind or on another history fails closed (P2-2)", () => {
   /** a writes an insert (position 1) and a delete (position 2); b applies both. */
   const history = async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     const b = await w.device("b");
     await a.run(
@@ -1210,7 +1138,7 @@ describe("log protocol: a registry that is behind or on another history fails cl
 
 describe("log protocol: a resurrection after a deletion (P2-3)", () => {
   it("a lagging, a fresh and an uninterrupted reader agree on every column, first-seen included", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const a = await w.device("a");
     const lagging = await w.device("lagging");
     const uninterrupted = await w.device("uninterrupted");
@@ -1272,7 +1200,7 @@ describe("log protocol: a resurrection after a deletion (P2-3)", () => {
   });
 
   it("a deletion and its resurrection in one segment give the resurrection's first-seen, as two segments do", async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run("run-1", [{ stream: sName(0), id: "seed" }], {
       observedAt: 1100,
@@ -1379,7 +1307,7 @@ describe("log protocol: first-seen travels with the winning observation (P2-a, P
   };
 
   const seeded = async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run("run-1", [{ stream: sName(0), id: "seed" }], {
       observedAt: 1100,
@@ -1507,108 +1435,6 @@ describe("log protocol: first-seen travels with the winning observation (P2-a, P
   }, 120_000);
 });
 
-describe("log protocol: the log noop shortcut and unresolved partial state", () => {
-  // With the log on, a stream the log wrote reads from a local version above the
-  // registry's own stream row, and the apply of that stream answers noop without
-  // reading it. That answer says nothing about rows an earlier failed apply of a
-  // newer per-stream head merged: neither the per-stream head nor the log holds
-  // them. So it must not count as proof that the stream is repaired.
-  it("a partial per-stream apply, the per-stream registry back at an older version, and an unchanged log: the mark stays and nothing claims a repair", async () => {
-    const w = await world({
-      streams: 1,
-      logProtocol: false,
-      partTargetBytes: 400,
-    });
-    const s0 = streamScope(CONNECTOR, "", sName(0));
-    const rowsLocal = async (d: Device) =>
-      (
-        await d.db.query<{ record_key: string }>(
-          "SELECT record_key FROM records WHERE stream = ?",
-          [sName(0)],
-        )
-      ).map((r) => r.record_key);
-    const state = async (d: Device) =>
-      (
-        await d.db.query<{ head_version: number; apply_partial: number }>(
-          `SELECT s.head_version, c.apply_partial FROM stream_state s
-             JOIN connections c ON c.connection_id = s.connection_id
-            WHERE s.stream = ?`,
-          [sName(0)],
-        )
-      )[0]!;
-
-    // The per-stream registry holds version 1, then a device without the log
-    // grows it to version 4 with many rows in many parts. The log does not
-    // exist yet, so this device's cycles write per-stream heads. The registry
-    // is put back to version 1 for the device that joins next, and grown again
-    // below, which is the order the log's own device saw it.
-    const legacy = await w.device("legacy", false);
-    await legacy.run("run-1", [{ stream: sName(0), id: "a" }]);
-    await legacy.cycle();
-    for (let i = 0; i < 3; i++) {
-      await legacy.run(
-        `run-L${i}`,
-        Array.from({ length: 12 }, (_, j) => ({
-          stream: sName(0),
-          id: `x${i}-${j}`,
-          pad: 60,
-        })),
-        { full: false, covered: [sName(0)] },
-      );
-      await legacy.cycle();
-    }
-    expect(w.gateway.rowsOf(s0)).toBe(4);
-    const grown = w.gateway.versions.get(s0)!.splice(1);
-
-    // This device reads version 1, then the log carries it to local version 3.
-    const b = await w.device("b", true);
-    await b.cycle();
-    for (const id of ["b1", "b2"]) {
-      await b.run(`run-${id}`, [{ stream: sName(0), id }], {
-        full: false,
-        covered: [sName(0)],
-      });
-      await b.cycle();
-    }
-    expect((await state(b)).head_version).toBe(3);
-    const logRows = await rowsLocal(b);
-    expect(logRows).toEqual(expect.arrayContaining(["a", "b1", "b2"]));
-
-    // The per-stream registry is at version 4 again, beside the log.
-    w.gateway.versions.get(s0)!.push(...grown);
-    expect(w.gateway.rowsOf(s0)).toBe(4);
-
-    // Applying it merges some parts and then a part download fails.
-    const get = b.deps.blobs.get.bind(b.deps.blobs);
-    let parts = 0;
-    b.deps.blobs.get = async (key) => {
-      if (key.startsWith(`${s0}/`) && key.includes("-p-") && ++parts === 3)
-        throw new Error("part blob transfer failed");
-      return get(key);
-    };
-    await expect(applyConnection(b.deps, CONNECTION_ID)).rejects.toThrow(
-      "part blob transfer failed",
-    );
-    b.deps.blobs.get = get;
-    expect(await state(b)).toEqual({ head_version: 3, apply_partial: 1 });
-    const merged = (await rowsLocal(b)).filter((k) => k.startsWith("x"));
-    expect(merged.length).toBeGreaterThan(0);
-
-    // The per-stream registry goes back to version 1; the log has not moved.
-    const rows = w.gateway.versions.get(s0)!;
-    while (rows.length > 1) rows.pop();
-    await applyConnection(b.deps, CONNECTION_ID);
-
-    // Rows the version-4 head merged are in neither source, and the mark says so.
-    expect(await state(b)).toEqual({ head_version: 3, apply_partial: 1 });
-    expect((await rowsLocal(b)).filter((k) => k.startsWith("x"))).toEqual(
-      merged,
-    );
-    // The log's own state is intact.
-    expect(await rowsLocal(b)).toEqual(expect.arrayContaining(logRows));
-  }, 60_000);
-});
-
 // ---------------------------------------------------------------------------
 // The canonical record key travels with every deletion (log format 2).
 // ---------------------------------------------------------------------------
@@ -1617,7 +1443,7 @@ describe("log protocol: deletions carry the canonical record key", () => {
   const SEEN = sName(0);
   /** Records 1, 2, 3; 2 deleted and a never-held `ghost` deleted; a full pass then omits 3. */
   async function omissionWorld(compact: boolean) {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run(
       "run-1",
@@ -1744,7 +1570,7 @@ describe("log protocol: deletions carry the canonical record key", () => {
   });
 
   it("a hash-only segment (format 1) is refused, not applied as keyless", async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run("run-1", [{ stream: SEEN, id: "seed" }], { observedAt: 1100 });
     await a.cycle();
@@ -1786,7 +1612,7 @@ describe("log protocol: deletions carry the canonical record key", () => {
 describe("log protocol: a deletion's key must be the key its hash names", () => {
   const S = { o: 5000, r: "run-k" };
   const seeded = async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run("run-1", [{ stream: sName(0), id: "A" }], { observedAt: 1100 });
     await a.cycle();
@@ -1914,7 +1740,7 @@ describe("log protocol: a deletion's key must be the key its hash names", () => 
   });
 
   it("an explicit delete made before the typed key was kept is not acknowledged: the stream is held, nothing is lost, and once the key is known every reader converges", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const a = await w.device("a");
     const warnings: unknown[] = [];
     (a.deps as { logger: unknown }).logger = {
@@ -2005,7 +1831,7 @@ describe("log protocol: a deletion's key must be the key its hash names", () => 
   });
 
   it("a delete and an omission of a numeric key carry the number, and a reader derives the same record key", async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run(
       "run-1",
@@ -2055,7 +1881,7 @@ describe("log protocol: an omission reads a bounded page of bodies", () => {
     const SEEN = sName(0);
     const count = 60;
     const pad = 100_000; // 6 MB of bodies, three times a page
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run(
       "run-1",
@@ -2108,7 +1934,7 @@ describe("log protocol: adversarial key values converge", () => {
   const ONE = sName(0);
 
   it("an explicit delete of each removes it for a reader that held it, and for a fresh one", async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run(
       "run-1",
@@ -2144,7 +1970,7 @@ describe("log protocol: adversarial key values converge", () => {
   });
 
   it("an omission of each drops it for a reader that held it, and for a fresh one", async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run(
       "run-1",
@@ -2175,7 +2001,6 @@ describe("log protocol: the declared key types release an untyped delete", () =>
   ) => {
     const w = await world({
       streams: 1,
-      logProtocol: true,
       ...(keyTypes ? { keyTypes } : {}),
     });
     const a = await w.device("a");
@@ -2287,7 +2112,6 @@ describe("log protocol: a run emits a key again after an interim publish", () =>
   it("converges to the later batch on the writer, a fresh reader and a reader that applied the first body", async () => {
     const w = await world({
       streams: 1,
-      logProtocol: true,
       publishWhileCollecting: true,
     });
     const a = await w.device("a");
@@ -2332,7 +2156,6 @@ describe("log protocol: a run emits a key again after an interim publish", () =>
   it("converges for a reader that installs a compacted snapshot", async () => {
     const w = await world({
       streams: 1,
-      logProtocol: true,
       publishWhileCollecting: true,
     });
     const a = await w.device("a");
@@ -2363,7 +2186,6 @@ describe("log protocol: a run emits a key again after an interim publish", () =>
   it("a delete at the run's end beats the interim body whatever its ordinal", async () => {
     const w = await world({
       streams: 1,
-      logProtocol: true,
       publishWhileCollecting: true,
     });
     const a = await w.device("a");
@@ -2407,7 +2229,6 @@ describe("log protocol: a run emits a key again after an interim publish", () =>
   it("an identical body at a higher ordinal advances a reader that holds it, so a lower ordinal of another body loses everywhere", async () => {
     const w = await world({
       streams: 1,
-      logProtocol: true,
       publishWhileCollecting: true,
     });
     const a = await w.device("a");
@@ -2440,7 +2261,6 @@ describe("log protocol: a run emits a key again after an interim publish", () =>
   it("the same trace converges for a reader that installs a compacted snapshot", async () => {
     const w = await world({
       streams: 1,
-      logProtocol: true,
       publishWhileCollecting: true,
     });
     const a = await w.device("a");
@@ -2468,7 +2288,6 @@ describe("log protocol: a run emits a key again after an interim publish", () =>
   it("a run that has pulled a clone's higher ordinal does not replace it with its own lower ordinal", async () => {
     const w = await world({
       streams: 1,
-      logProtocol: true,
       publishWhileCollecting: true,
     });
     const a = await w.device("a");
@@ -2489,25 +2308,9 @@ describe("log protocol: a run emits a key again after an interim publish", () =>
     expect(await keyOf(a)).toEqual(expected);
   });
 
-  it("with the log protocol off and no admission while collecting, no ordinal is stored or published: no log segment is written and a reader gets the final body", async () => {
-    const w = await world({ streams: 1, logProtocol: false });
-    const a = await w.device("a");
-    await begin(a);
-    await batch(a, 0, [{ id: "K", v: 1 }]);
-    await batch(a, 1, [{ id: "K", v: 2 }]);
-    await end(a, 1);
-    await a.cycle();
-    expect(await keyOf(a)).toMatchObject([{ stamp_n: 0 }]);
-    expect((await w.segments()).size).toBe(0);
-    const fresh = await w.device("fresh");
-    await fresh.cycle();
-    expect(await fresh.records()).toEqual([body(2)]);
-  });
-
   it("writers that share a run id and emit different bodies at one batch converge on the greater body hash", async () => {
     const w = await world({
       streams: 1,
-      logProtocol: true,
       publishWhileCollecting: true,
     });
     const a = await w.device("a");
@@ -2532,543 +2335,4 @@ describe("log protocol: a run emits a key again after an interim publish", () =>
     for (const d of [a, c, fresh])
       expect(await d.records()).toEqual([body(winner)]);
   });
-});
-
-// ---------------------------------------------------------------------------
-// Rows that reach a log-on device as a per-stream head's part carry no ordinal:
-// a head is applied before the log (`applyConnection`), its rows enter the
-// merge as ordinal 0 (`apply.ts` stages them without `stamp_n`), the same as a
-// legacy log entry. They meet the log's ordinals at a stamp only when a writer
-// that does not publish a log shares a run id with one that does (a clone, or a
-// device whose flag differs). The order is one total order, so arrival order
-// does not matter.
-// ---------------------------------------------------------------------------
-
-describe("log protocol: first loads of a per-stream head and a log that name one key at one stamp", () => {
-  const RUN = "shared-run";
-  const stream = sName(0);
-  const bodyV = (v: number) => `{"id":"K","v":${v}}`;
-  const hashOf = (v: number) =>
-    Buffer.from(sha256(new TextEncoder().encode(bodyV(v)))).toString("hex");
-  /** Distinct values ordered by body hash, lowest first. */
-  const byHash = [1, 2, 3, 4, 5, 6].sort((x, y) =>
-    hashOf(x) < hashOf(y) ? -1 : 1,
-  );
-  /** The run of the writer; a clone shares it, a later run of another device does not. */
-  type RunAt = { readonly runId: string; readonly observedAt: number };
-  const WRITER_RUN: RunAt = { runId: RUN, observedAt: 1500 };
-  const begin = (d: Device, run: RunAt = WRITER_RUN) =>
-    d.sync.intake.begin(run.runId, {
-      connector: CONNECTOR,
-      artifactDigest: CONNECTOR,
-      wantFull: true,
-      observedAt: run.observedAt,
-      owner: { address: OWNER, leaseId: null },
-    });
-  const batch = (d: Device, n: number, v: number, run: RunAt = WRITER_RUN) =>
-    d.sync.intake.batch(run.runId, {
-      batch: n,
-      records: [{ stream, data: { id: "K", v } }],
-    });
-  const end = (d: Device, lastBatch: number, run: RunAt = WRITER_RUN) =>
-    d.sync.intake.end(run.runId, {
-      outcome: "succeeded",
-      coveredStreams: [stream],
-      provenFullStreams: [stream],
-      lastBatch,
-    });
-  const keyOf = async (d: Device) =>
-    (await d.rows())
-      .map(
-        (r) =>
-          JSON.parse(r) as {
-            record_key: string;
-            body: string;
-            stamp_n: number;
-          },
-      )
-      .filter((r) => r.record_key === "K");
-
-  /**
-   * `writer` (log on) publishes `logged` as batches 0, 1, ...; `clone` (log
-   * off; by default the same run id and stamp) publishes `head` as a
-   * per-stream head. `fresh` and `progressive` are first loads: they read the
-   * heads and then the log, so they must end on one row (the tests below).
-   * `writer` and `early` already follow the log; what they do with the head is
-   * the boundary test at the end.
-   */
-  async function mixed(
-    logged: readonly number[],
-    head: number,
-    cloneRun: RunAt = WRITER_RUN,
-  ) {
-    const w = await world({
-      streams: 1,
-      logProtocol: true,
-      publishWhileCollecting: true,
-    });
-    // The clone is a device that writes a per-stream head beside a log: an
-    // older build, or a device that read the registry just before the log's
-    // first write. A current build follows a log it finds and never does
-    // that, so the head is written first and put in the registry after the
-    // log exists (the registry shows the order a later reader sees).
-    const clone = await w.device("clone", false);
-    await begin(clone, cloneRun);
-    await batch(clone, 0, head, cloneRun);
-    await end(clone, 0, cloneRun);
-    await clone.cycle();
-    expect(
-      (await w.segments()).size,
-      "the clone publishes a head and no segment",
-    ).toBe(0);
-    const headScope = streamScope(CONNECTOR, "", stream);
-    const headRows = w.gateway.versions.get(headScope)!;
-    w.gateway.versions.clear();
-    const writer = await w.device("writer");
-    await begin(writer);
-    for (const [n, v] of logged.entries()) {
-      await batch(writer, n, v);
-      await writer.cycle();
-    }
-    await end(writer, logged.length - 1);
-    await writer.cycle();
-    // a log-on reader that has the log before the head exists
-    const early = await w.device("early");
-    await early.cycle();
-    w.gateway.versions.set(headScope, headRows);
-    await writer.cycle();
-    await early.cycle();
-    const fresh = await w.device("fresh");
-    await fresh.cycle();
-    const progressive = await w.device("progressive", true, {
-      progressiveFirstLoad: true,
-    });
-    await progressive.cycle();
-    return { w, writer, early, fresh, progressive, clone };
-  }
-
-  const firstLoads = (m: Awaited<ReturnType<typeof mixed>>) => [
-    m.fresh,
-    m.progressive,
-  ];
-
-  it("the head's body has the greater hash at ordinal 0: every first-load device holds it", async () => {
-    const [low, high] = [byHash[0]!, byHash[5]!];
-    const m = await mixed([low], high);
-    for (const d of firstLoads(m))
-      expect(await keyOf(d)).toMatchObject([{ body: bodyV(high), stamp_n: 0 }]);
-  });
-
-  it("the head's body has the lesser hash at ordinal 0: every first-load device holds the logged one", async () => {
-    const [low, high] = [byHash[0]!, byHash[5]!];
-    const m = await mixed([high], low);
-    for (const d of firstLoads(m))
-      expect(await keyOf(d)).toMatchObject([{ body: bodyV(high), stamp_n: 0 }]);
-  });
-
-  it("a logged ordinal above 0 beats a head's body whatever the hashes: every first-load device holds the logged one", async () => {
-    // the head's body has the greatest hash; the log's batch 1 still wins
-    const m = await mixed([byHash[1]!, byHash[2]!], byHash[5]!);
-    for (const d of firstLoads(m))
-      expect(await keyOf(d)).toMatchObject([
-        { body: bodyV(byHash[2]!), stamp_n: 1 },
-      ]);
-  });
-
-  it("a reader that installs a compacted snapshot, in one pass or progressively, agrees with one that applied the segments, the head included", async () => {
-    const m = await mixed([byHash[1]!, byHash[2]!], byHash[5]!);
-    await growUntilCompacted(m.writer, m.w);
-    const segments = await m.w.segments();
-    expect(segments.get(Math.max(...segments.keys()))!.snapshot).not.toBeNull();
-    const late = await m.w.device("late");
-    await late.cycle();
-    const lateProgressive = await m.w.device("lateProgressive", true, {
-      progressiveFirstLoad: true,
-    });
-    await lateProgressive.cycle();
-    await m.early.cycle();
-    const expected = await keyOf(m.fresh);
-    expect(expected).toMatchObject([{ body: bodyV(byHash[2]!), stamp_n: 1 }]);
-    for (const d of [late, lateProgressive, m.progressive])
-      expect(await keyOf(d)).toEqual(expected);
-  });
-
-  // A head published outside the followed log (a log-off device, or a writer
-  // that fell back to the per-stream path), read by a device that already
-  // follows the log. Such a device reads a head it has not consumed, whatever
-  // the head's registry version is beside its own local version (`consumed_*`,
-  // `applyOneOnce`), and then reads the log over it. So every device, a first
-  // load or not, ends on the head's row at an equal stamp and at a later one.
-  for (const [label, cloneRun] of [
-    ["an equal stamp", WRITER_RUN],
-    ["a later stamp", { runId: "later-run", observedAt: 1600 }],
-  ] as const)
-    it(`a device that follows the log reads a head it has not consumed, as a first load does, at ${label}`, async () => {
-      const [low, high] = [byHash[0]!, byHash[5]!];
-      // The log holds `low`; the head holds `high`, which beats it at an equal
-      // stamp (ordinal 0, greater hash) and at a later one (the stamp).
-      // The writer's run end makes a second segment, so its local version is
-      // above the head's.
-      const m = await mixed([low], high, cloneRun);
-      // Cycles repeat after the writes stop: nothing moves again.
-      for (let i = 0; i < 2; i++)
-        for (const d of [m.writer, m.early, m.fresh, m.progressive])
-          await d.cycle();
-      for (const d of [m.writer, m.early, ...firstLoads(m)])
-        expect(await keyOf(d)).toMatchObject([{ body: bodyV(high) }]);
-    });
-});
-
-describe("log protocol: the ordinal with the log off", () => {
-  const RUN = "off-run";
-  const stream = sName(0);
-  const begin = (d: Device) =>
-    d.sync.intake.begin(RUN, {
-      connector: CONNECTOR,
-      artifactDigest: CONNECTOR,
-      wantFull: true,
-      observedAt: 1500,
-      owner: { address: OWNER, leaseId: null },
-    });
-  const batch = (d: Device, n: number, v: number) =>
-    d.sync.intake.batch(RUN, {
-      batch: n,
-      records: [{ stream, data: { id: "K", v } }],
-    });
-  const end = (d: Device, lastBatch: number) =>
-    d.sync.intake.end(RUN, {
-      outcome: "succeeded",
-      coveredStreams: [stream],
-      provenFullStreams: [stream],
-      lastBatch,
-    });
-  const keyOf = async (d: Device) =>
-    (await d.rows())
-      .map(
-        (r) =>
-          JSON.parse(r) as {
-            record_key: string;
-            body: string;
-            stamp_n: number;
-          },
-      )
-      .filter((r) => r.record_key === "K");
-
-  it("a log-off device that admits while it collects keeps the ordinal in its own rows only: nothing is published but a head with the final body", async () => {
-    const w = await world({
-      streams: 1,
-      logProtocol: false,
-      publishWhileCollecting: true,
-    });
-    const a = await w.device("a");
-    await begin(a);
-    await batch(a, 0, 1);
-    await batch(a, 1, 2);
-    await end(a, 1);
-    await a.cycle();
-    // the writer orders its own two bodies by the ordinal ...
-    expect(await keyOf(a)).toMatchObject([{ stamp_n: 1 }]);
-    // ... and publishes no log: the ordinal is not serialized anywhere
-    expect((await w.segments()).size).toBe(0);
-    expect(w.innerBlobs.keys().filter((k) => k.startsWith(`${LOG}/`))).toEqual(
-      [],
-    );
-    const readerOff = await w.device("readerOff", false);
-    await readerOff.cycle();
-    const readerOn = await w.device("readerOn");
-    await readerOn.cycle();
-    for (const d of [readerOff, readerOn])
-      expect(await keyOf(d)).toMatchObject([
-        { body: '{"id":"K","v":2}', stamp_n: 0 },
-      ]);
-  });
-
-  it("a device that turns the log on after it published a head ends on one row with a device that never had the log off", async () => {
-    const w = await world({
-      streams: 1,
-      logProtocol: false,
-      publishWhileCollecting: true,
-    });
-    const a = await w.device("a");
-    await begin(a);
-    await batch(a, 0, 1);
-    await batch(a, 1, 2);
-    await end(a, 1);
-    await a.cycle();
-    (a.deps as { logProtocol?: boolean }).logProtocol = true;
-    await a.cycle();
-    const fresh = await w.device("fresh", true);
-    await fresh.cycle();
-    const row = await keyOf(fresh);
-    expect(row).toMatchObject([{ body: '{"id":"K","v":2}' }]);
-    expect(await keyOf(a)).toMatchObject([{ body: '{"id":"K","v":2}' }]);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// A per-stream head committed before the log exists (docs/formal/log-protocol/
-// HeadCursor.tla). The device's local `head_version` counts the log's own
-// rounds, so it cannot also say which registry head the device consumed.
-// ---------------------------------------------------------------------------
-describe("log protocol: a per-stream head that predates the log is consumed once, by identity", () => {
-  const S = sName(0);
-  const s0 = streamScope(CONNECTOR, "", S);
-  const rowIds = async (d: Device) =>
-    (
-      await d.db.query<{ record_key: string }>(
-        "SELECT record_key FROM records WHERE stream = ? ORDER BY record_key",
-        [S],
-      )
-    ).map((r) => r.record_key);
-  const localVersion = async (d: Device) =>
-    (
-      await d.db.query<{ head_version: number }>(
-        "SELECT head_version FROM stream_state WHERE stream = ?",
-        [S],
-      )
-    )[0]!.head_version;
-
-  /**
-   * The head of a device that has not seen the log: a current build follows a
-   * log it finds, so the registry hides the log row while the device writes.
-   */
-  async function headWithoutLog(
-    w: Awaited<ReturnType<typeof world>>,
-    legacy: Device,
-    runId: string,
-    id: string,
-  ) {
-    const log = w.gateway.versions.get(LOG);
-    w.gateway.versions.delete(LOG);
-    try {
-      await legacy.run(runId, [{ stream: S, id }], {
-        full: false,
-        covered: [S],
-      });
-      await legacy.cycle();
-    } finally {
-      if (log) w.gateway.versions.set(LOG, log);
-    }
-  }
-
-  /**
-   * Registry head 1 holds `a0`. Device `a` and `caught` consume it. Before any
-   * log exists another device commits head 2 with a new key `z`. Device `a` had
-   * ended runs with many large rows, so its first publish takes several rounds.
-   */
-  async function beforeTheLog() {
-    const w = await world({
-      streams: 1,
-      logProtocol: false,
-      partTargetBytes: 3000,
-    });
-    const legacy = await w.device("legacy", false);
-    await legacy.run("run-1", [{ stream: S, id: "a0" }]);
-    await legacy.cycle();
-    const a = await w.device("a", true);
-    await a.cycle();
-    const caught = await w.device("caught", true);
-    await caught.cycle();
-    // Local changes on `a`: they stay unpublished until its next cycle.
-    await a.run(
-      "run-a",
-      Array.from({ length: 12 }, (_, i) => ({
-        stream: S,
-        id: `l${String(i).padStart(2, "0")}`,
-        pad: 500,
-      })),
-      { full: false, covered: [S] },
-    );
-    // The other device's head 2: a new key, before any log row.
-    await legacy.run("run-2", [{ stream: S, id: "z" }], {
-      full: false,
-      covered: [S],
-    });
-    await legacy.cycle();
-    expect(w.gateway.rowsOf(s0)).toBe(2);
-    return { w, legacy, a, caught };
-  }
-
-  it("the registry head 2 reaches the log writer, a caught-up reader and a fresh reader alike", async () => {
-    const { w, a, caught } = await beforeTheLog();
-    await a.cycle();
-    // The writer published several rounds, so its local version passed the
-    // registry's head version. That is the state that hid head 2.
-    expect(await a.position()).toBeGreaterThan(1);
-    expect(await localVersion(a)).toBeGreaterThan(2);
-    const fresh = await w.device("fresh", true);
-    for (const d of [caught, fresh, a, caught, fresh, a]) await d.cycle();
-
-    const want = await rowIds(fresh);
-    expect(want).toEqual(expect.arrayContaining(["a0", "z", "l00", "l11"]));
-    expect(await rowIds(a)).toEqual(want);
-    expect(await rowIds(caught)).toEqual(want);
-    expect(await a.rows()).toEqual(await fresh.rows());
-    expect(await caught.rows()).toEqual(await fresh.rows());
-  }, 60_000);
-
-  it("control: a head already consumed is not read again, however far the log moved the local version", async () => {
-    const { w, a, caught } = await beforeTheLog();
-    const fresh = await w.device("fresh", true);
-    for (const d of [a, caught, fresh, a]) await d.cycle();
-    const headReads = (d: Device) =>
-      d.gets.filter((k) => k.startsWith(`${s0}/`)).length;
-    const before = headReads(a);
-    await a.cycle();
-    await a.cycle();
-    expect(headReads(a)).toBe(before);
-    expect(await rowIds(a)).toEqual(await rowIds(fresh));
-  }, 60_000);
-
-  it("control: a head older than the one consumed is not applied over newer rows", async () => {
-    const { w, a, caught } = await beforeTheLog();
-    const fresh = await w.device("fresh", true);
-    for (const d of [a, caught, fresh, a]) await d.cycle();
-    const settled = await rowIds(a);
-    // The per-stream registry reads back at head 1.
-    const rows = w.gateway.versions.get(s0)!;
-    while (rows.length > 1) rows.pop();
-    await a.cycle();
-    expect(await rowIds(a)).toEqual(settled);
-  }, 60_000);
-  it("a single-stream apply that admits the head also reads the log over it, before it returns", async () => {
-    const w = await world({ streams: 1, logProtocol: false });
-    const legacy = await w.device("legacy", false);
-    await legacy.run("run-1", [{ stream: S, id: "a0" }]);
-    await legacy.cycle();
-    const a = await w.device("a", true);
-    await a.cycle();
-    // The writer publishes rows that head 2 will not hold, then head 2 arrives
-    // unread (its cutoff is above the rows' stamps).
-    await a.run(
-      "run-a",
-      [
-        { stream: S, id: "l0" },
-        { stream: S, id: "l1" },
-      ],
-      {
-        full: false,
-        covered: [S],
-      },
-    );
-    await a.cycle();
-    const published = await a.position();
-    expect(published).toBeGreaterThan(0);
-    await headWithoutLog(w, legacy, "run-2", "z");
-    const fresh = await w.device("fresh", true);
-    await fresh.cycle();
-    const want = await rowIds(fresh);
-    expect(want).toEqual(expect.arrayContaining(["a0", "z", "l0", "l1"]));
-
-    // One stream's apply: the head is admitted and the log is read before the
-    // call returns, and again on a repeat.
-    expect((await applyStream(a.deps, CONNECTION_ID, S)).outcome).toBe(
-      "applied",
-    );
-    expect(await rowIds(a)).toEqual(want);
-    expect(await a.position()).toBe(published);
-    await applyStream(a.deps, CONNECTION_ID, S);
-    expect(await rowIds(a)).toEqual(want);
-    expect(await a.position()).toBe(published);
-  }, 60_000);
-
-  it("pending local changes survive the head's omission, and every device ends equal after they publish", async () => {
-    const w = await world({ streams: 1, logProtocol: false });
-    const legacy = await w.device("legacy", false);
-    await legacy.run("run-1", [{ stream: S, id: "a0" }]);
-    await legacy.cycle();
-    const a = await w.device("a", true);
-    await a.cycle();
-    // Published rows, and pending ones: a new key and an update of a held key.
-    await a.run("run-p", [{ stream: S, id: "l0" }], {
-      full: false,
-      covered: [S],
-    });
-    await a.cycle();
-    await a.run(
-      "run-q",
-      [
-        { stream: S, id: "p1" },
-        { stream: S, id: "a0", v: 9 },
-      ],
-      { full: false, covered: [S] },
-    );
-    await headWithoutLog(w, legacy, "run-2", "z");
-    // The head is admitted and the log read, with nothing published yet.
-    await applyConnection(a.deps, CONNECTION_ID);
-    expect(await rowIds(a)).toEqual(
-      expect.arrayContaining(["a0", "l0", "p1", "z"]),
-    );
-    const fresh = await w.device("fresh", true);
-    for (const d of [a, fresh, a, fresh]) await d.cycle();
-    expect(await rowIds(a)).toEqual(await rowIds(fresh));
-    expect(await rowIds(fresh)).toEqual(
-      expect.arrayContaining(["a0", "l0", "p1", "z"]),
-    );
-    expect(await a.rows()).toEqual(await fresh.rows());
-  }, 60_000);
-
-  it("a head admitted over a compacted log: the log is read again from its snapshot and every device ends equal", async () => {
-    const w = await world({ streams: 1, logProtocol: false });
-    const legacy = await w.device("legacy", false);
-    await legacy.run("run-1", [{ stream: S, id: "a0" }]);
-    await legacy.cycle();
-    const a = await w.device("a", true);
-    await a.cycle();
-    await grow(a, 40);
-    const segments = await w.segments();
-    const head = segments.get(Math.max(...segments.keys()))!;
-    expect(head.snapshot).toBeTruthy();
-    await headWithoutLog(w, legacy, "run-2", "z");
-    const fresh = await w.device("fresh", true);
-    await fresh.cycle();
-    const want = await rowIds(fresh);
-    expect(want).toEqual(expect.arrayContaining(["a0", "x", "z"]));
-    const position = await a.position();
-    await applyStream(a.deps, CONNECTION_ID, S);
-    expect(await rowIds(a)).toEqual(want);
-    expect(await a.position()).toBe(position);
-    expect(await a.rows()).toEqual(await fresh.rows());
-  }, 120_000);
-
-  it("a registry log that is behind this device still fails closed when an unseen head arrives: nothing is written", async () => {
-    const w = await world({ streams: 1, logProtocol: false });
-    const legacy = await w.device("legacy", false);
-    await legacy.run("run-1", [{ stream: S, id: "a0" }]);
-    await legacy.cycle();
-    const a = await w.device("a", true);
-    await a.cycle();
-    for (const id of ["l0", "l1"]) {
-      await a.run(`run-${id}`, [{ stream: S, id }], {
-        full: false,
-        covered: [S],
-      });
-      await a.cycle();
-    }
-    expect(await a.position()).toBe(2);
-    await headWithoutLog(w, legacy, "run-2", "z");
-    const before = { rows: await a.rows(), position: await a.position() };
-    w.gateway.versions.get(LOG)!.pop(); // the log registry is at position 1 again
-    await expect(applyStream(a.deps, CONNECTION_ID, S)).rejects.toThrow(
-      /behind this device/,
-    );
-    expect(await a.position()).toBe(before.position);
-    expect(await a.rows()).toEqual(before.rows);
-  }, 60_000);
-
-  it("control: the same registry version under another hash is not the consumed head", async () => {
-    const { w, a, caught } = await beforeTheLog();
-    const fresh = await w.device("fresh", true);
-    for (const d of [a, caught, fresh, a]) await d.cycle();
-    const rows = w.gateway.versions.get(s0)!;
-    const last = rows[rows.length - 1]!;
-    rows[rows.length - 1] = {
-      ...last,
-      dataHash: `0x${"ab".repeat(32)}`,
-    };
-    // The device goes to read that head: its blob is not there.
-    await expect(applyConnection(a.deps, CONNECTION_ID)).rejects.toThrow(
-      "missing head blob",
-    );
-  }, 60_000);
 });

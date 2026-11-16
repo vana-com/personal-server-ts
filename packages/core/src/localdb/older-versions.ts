@@ -1,20 +1,6 @@
-import { sha256 } from "@noble/hashes/sha2";
-import { keccakOf } from "../stream-sync/crypto-port.js";
-import {
-  canonicalJson,
-  deriveKeyCheck,
-  linesOfParts,
-  parseBlobName,
-  parseScope,
-  streamScope,
-  partBlobName,
-  verifyHead,
-} from "@opendatalabs/personal-server-ts-stream-sync";
-import { logicalStreamScopeParts } from "../stream-sync-read/routing.js";
 import type { LocalSyncDeps } from "./deps.js";
-import type { SqlValue } from "./driver.js";
 
-/** A version a read can fetch now. */
+/** A version `list` shows. A read of it answers `"gone"`: no body is kept. */
 export interface VersionInfo {
   readonly version: number;
   /** `stream_versions.head_blob`; the `?fileId=` value. */
@@ -40,12 +26,12 @@ export interface OlderVersionCounts {
  * The `/additions`, `/versions` and `/lineage` routes on the database live in
  * `history.ts` (r5.2 1.4), not here; this interface is unchanged by them.
  *
- * Flag on: versions come from `stream_versions` of the connection's CURRENT
- * generation; head and parts are fetched on demand, decrypted, projected, and
- * nothing is stored. A missing part = `"gone"` and that `stream_versions` row
- * is removed. Flag off: `read` = `"gone"` and `list` = the current version
- * only. Each `read` logs `older-version read outcome=<served|gone|off>` with
- * no scope or owner, and bumps `counts()`.
+ * `list` reads `stream_versions` of the connection's CURRENT generation (flag
+ * off: the current version only). `read` serves nothing: a version's body was a
+ * per-stream head and its parts, and the connection log does not keep one, so
+ * every read is `"gone"` (`"off"` when the flag is off). Each `read` logs
+ * `older-version read outcome=<gone|off>` with no scope or owner, and bumps
+ * `counts()`.
  */
 export interface OlderVersions {
   list(connectionId: string, stream: string): Promise<readonly VersionInfo[]>;
@@ -88,9 +74,6 @@ const currentVersions = `SELECT v.*, c.connector, c.ns FROM stream_versions v
   WHERE c.control_state = 'active' AND v.generation = c.generation
   AND NOT EXISTS (SELECT 1 FROM delete_intents d WHERE d.connector=c.connector)`;
 const newestFirst = " ORDER BY v.observed_at DESC, v.version DESC";
-const sha = async (bytes: Uint8Array) => sha256(bytes);
-
-class MissingVersionBlob extends Error {}
 
 export function createOlderVersions(
   deps: LocalSyncDeps,
@@ -118,144 +101,17 @@ export function createOlderVersions(
       return rows.map(versionInfo);
     },
 
-    async read(scope, select, selected) {
+    async read() {
       let outcome: keyof OlderVersionCounts = "gone";
       try {
         if (!options.enabled()) {
           outcome = "off";
           return "gone";
         }
-        const physical = parseScope(scope);
-        const logical = logicalStreamScopeParts(scope);
-        const name = physical?.kind === "stream" ? physical : logical;
-        if (!name) return "gone";
-        // Current reads belong to the resolver, not this history interface.
-        if (!select.fileId && !select.at) return "gone";
-        const params: SqlValue[] = [name.connector, name.stream];
-        const namespace = physical?.kind === "stream" ? " AND c.ns = ?" : "";
-        if (physical?.kind === "stream") params.push(physical.ns);
-        let selection: string;
-        if (select.fileId) {
-          selection = " AND v.head_blob = ?";
-          params.push(select.fileId);
-        } else {
-          const text = select.at!;
-          const at = /^[0-9]+$/.test(text) ? Number(text) : Date.parse(text);
-          if (!Number.isSafeInteger(at) || at < 0) return "gone";
-          selection = " AND v.observed_at <= ?";
-          params.push(at);
-        }
-        const [version] = await deps.db.query<VersionRow>(
-          currentVersions +
-            " AND c.connector = ? AND v.stream = ?" +
-            namespace +
-            selection +
-            newestFirst +
-            " LIMIT 1",
-          params,
-        );
-        if (!version) return "gone";
-        const physicalScope = streamScope(
-          version.connector,
-          version.ns,
-          version.stream,
-        );
-        const blob = parseBlobName(version.head_blob);
-        if (blob?.kind !== "head") return "gone";
-        const evict = () =>
-          deps.db.batch([
-            {
-              sql: `DELETE FROM stream_versions
-            WHERE connection_id = ? AND stream = ? AND version = ?
-              AND generation = ? AND head_blob = ?`,
-              params: [
-                version.connection_id,
-                version.stream,
-                version.version,
-                version.generation,
-                version.head_blob,
-              ],
-            },
-          ]);
-        try {
-          const encrypted = await deps.blobs.get(
-            `${physicalScope}/${version.head_blob}`,
-          );
-          if (encrypted === null) throw new MissingVersionBlob();
-          const verified = await verifyHead(
-            keccakOf(deps.streamCrypto),
-            await deps.keys.decrypt(physicalScope, encrypted),
-            {
-              dataHash: `0x${blob.keccak}`,
-              connector: name.connector,
-              ns: version.ns,
-              stream: name.stream,
-              keyCheck: await deriveKeyCheck((message) =>
-                deps.keys.namespaceHmac(message),
-              ),
-            },
-          );
-          if (verified.kind !== "ok") return "gone";
-          const { head } = verified;
-          if (
-            head.generation !== version.generation ||
-            head.format !== version.head_format
-          )
-            return "gone";
-
-          // Finish loading before returning a response: a missing later part
-          // must become "gone", not a failure after response headers were sent.
-          // These response chunks are ephemeral; no record or blob is persisted.
-          const encoder = new TextEncoder();
-          const chunks: Uint8Array[] = [encoder.encode("[")];
-          let count = 0;
-          for await (const line of linesOfParts(sha, head, async (part) => {
-            const key = `${physicalScope}/${partBlobName(head.generation, part.hash)}`;
-            const cipher = await deps.blobs.get(key);
-            if (cipher === null) throw new MissingVersionBlob();
-            return deps.keys.decrypt(physicalScope, cipher);
-          })) {
-            chunks.push(
-              encoder.encode(
-                (count++ === 0 ? "" : ",") + canonicalJson(line.v),
-              ),
-            );
-          }
-          chunks.push(encoder.encode("]"));
-          if (count !== head.recordCount) return "gone";
-
-          // A delete or generation change during network I/O must not revive data.
-          const stillCurrent = await deps.db.query<VersionRow>(
-            currentVersions +
-              " AND v.connection_id = ? AND v.stream = ?" +
-              " AND v.version = ? AND v.generation = ? AND v.head_blob = ?",
-            [
-              version.connection_id,
-              version.stream,
-              version.version,
-              version.generation,
-              version.head_blob,
-            ],
-          );
-          if (stillCurrent.length === 0) return "gone";
-          const body = new ReadableStream<Uint8Array>({
-            start(controller) {
-              for (const chunk of chunks) controller.enqueue(chunk);
-              controller.close();
-            },
-          });
-          outcome = "served";
-          selected?.({
-            scope: physicalScope,
-            version: version.version,
-            observedAt: version.observed_at,
-          });
-          return body;
-        } catch (error) {
-          if (!(error instanceof MissingVersionBlob)) throw error;
-          await evict();
-          return "gone";
-        }
+        // A version's body is a per-stream head and its parts, which nothing
+        // writes any more: the connection log holds versions as segments, and
+        // no log version has a body to read back. Every read is a 410.
+        return "gone";
       } finally {
         totals[outcome] += 1;
         deps.logger.info({}, `older-version read outcome=${outcome}`);

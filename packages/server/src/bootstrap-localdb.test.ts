@@ -94,7 +94,6 @@ describe("Node database composition", () => {
       "streamSyncPublishWhileCollecting",
       "PS_PUBLISH_WHILE_COLLECTING",
     ],
-    ["logProtocol", "streamSyncLogProtocol", "PS_STREAM_SYNC_LOG_PROTOCOL"],
     [
       "progressiveFirstLoad",
       "streamSyncProgressiveFirstLoad",
@@ -169,11 +168,7 @@ describe("Node database composition", () => {
     const remote = await remoteFixture(
       createStreamSyncKeyPorts(await signature()),
     );
-    const head = await remote.head(
-      "items",
-      [{ id: "item", value: "database" }],
-      { f: 42 },
-    );
+    await remote.head("items", [{ id: "item", value: "database" }]);
     const get = vi.spyOn(remote.storage, "get");
     let context = await boot(root, store, remote);
     await context.accountModeAuthority.submitEvidence({
@@ -199,9 +194,10 @@ describe("Node database composition", () => {
       contexts.splice(contexts.indexOf(context), 1);
       if (attempt === 0) context = await boot(root, store, remote);
     }
+    // The log's one segment is fetched once; the restart reads the retained image.
     expect(
-      get.mock.calls.filter(([key]) => key.includes("/g1-p-")),
-    ).toHaveLength(head.parts.length);
+      get.mock.calls.filter(([key]) => /\/s-[0-9a-f]+$/.test(key)),
+    ).toHaveLength(1);
   });
   it("accepts real HTTP intake from a pinned artifact and stores retry progress in SQLite", async () => {
     const root = await directory();
@@ -355,20 +351,6 @@ describe("Node database composition", () => {
         })
       ).status,
     ).toBe(200);
-    remote.registry.post = async (post) => {
-      const prior = remote.reads.get(post.scope);
-      const version = prior?.found ? prior.version + 1 : 1;
-      if (String(version) !== post.expectedVersion)
-        return { kind: "conflict", latestVersion: String(version - 1) };
-      remote.reads.set(post.scope, {
-        found: true,
-        version,
-        dataHash: post.dataHash,
-        metadataHash: post.metadataHash,
-        deleted: false,
-      });
-      return { kind: "committed" };
-    };
     const report = await (await context.getLocalSync!()).cycle();
     expect(report.connections.map((c) => c.error)).toEqual([null]);
     const read = await context.app.request(

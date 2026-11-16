@@ -165,7 +165,6 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   streamSyncRetainedManifests?: PsLiteSyncOptions["streamSyncRetainedManifests"];
   /** Stream-sync design flags, default off; see `PsLiteSyncOptions`. */
   streamSyncPublishWhileCollecting?: PsLiteSyncOptions["streamSyncPublishWhileCollecting"];
-  streamSyncLogProtocol?: PsLiteSyncOptions["streamSyncLogProtocol"];
   streamSyncProgressiveFirstLoad?: PsLiteSyncOptions["streamSyncProgressiveFirstLoad"];
   streamSyncFlags?: PsLiteSyncOptions["streamSyncFlags"];
   /**
@@ -469,7 +468,6 @@ export async function createIndexedDbPsLiteRuntime(
       streamSyncRetainedManifests: options.streamSyncRetainedManifests,
       streamSyncPublishWhileCollecting:
         options.streamSyncPublishWhileCollecting,
-      streamSyncLogProtocol: options.streamSyncLogProtocol,
       streamSyncProgressiveFirstLoad: options.streamSyncProgressiveFirstLoad,
       streamSyncFlags: options.streamSyncFlags,
       diagnostics,

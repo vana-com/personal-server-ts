@@ -340,8 +340,8 @@ export interface CreateServerOptions {
    */
   streamSyncBlobs?: StreamSyncBlobs;
   /**
-   * Part size, in bytes, for published stream heads. Default: 4 MiB. A test
-   * lowers it to get a head of many parts from a small fixture.
+   * Target size, in bytes, of one published log segment. Default: 4 MiB. A test
+   * lowers it to get a log of many segments from a small fixture.
    */
   streamSyncPartTargetBytes?: number;
   /**
@@ -350,13 +350,6 @@ export interface CreateServerOptions {
    * publish starts during collection. See `LocalSyncDeps.publishWhileCollecting`.
    */
   streamSyncPublishWhileCollecting?: boolean;
-  /**
-   * Publish and apply through the stream-sync log (default off; env
-   * `PS_STREAM_SYNC_LOG_PROTOCOL=true`). The flag lets this device start a log
-   * on a connection that has none; a connection that has a log is followed by
-   * every device of this build whatever its flag. See `LocalSyncDeps.logProtocol`.
-   */
-  streamSyncLogProtocol?: boolean;
   /**
    * Serve a first load's applied parts while it fills (default off; env
    * `PS_STREAM_SYNC_PROGRESSIVE_FIRST_LOAD=true` turns it on; the config key
@@ -968,9 +961,6 @@ async function bootstrapServer(
           ...((options?.streamSyncPublishWhileCollecting ??
           designFlags.publishWhileCollecting)
             ? { publishWhileCollecting: true }
-            : {}),
-          ...((options?.streamSyncLogProtocol ?? designFlags.logProtocol)
-            ? { logProtocol: true }
             : {}),
         };
         const facade = createServerLocalSync(deps, {

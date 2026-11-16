@@ -170,12 +170,6 @@ export interface PsLiteSyncOptions {
   /** Publish while collecting, default off. See `LocalSyncDeps.publishWhileCollecting`. */
   streamSyncPublishWhileCollecting?: boolean;
   /**
-   * Publish and apply through the stream-sync log, default off. The flag lets
-   * this device start a log on a connection that has none; a connection that
-   * has a log is followed whatever the flag. See `LocalSyncDeps.logProtocol`.
-   */
-  streamSyncLogProtocol?: boolean;
-  /**
    * Serve a first load's applied parts while it fills. Default: the config key
    * `streamSync.progressiveFirstLoad`, off. An explicit option wins. See
    * `LocalSyncDeps.progressiveFirstLoad`.
@@ -654,9 +648,6 @@ export async function createPsLiteSyncManager(
           ...((options.streamSyncPublishWhileCollecting ??
           designFlags.publishWhileCollecting)
             ? { publishWhileCollecting: true }
-            : {}),
-          ...((options.streamSyncLogProtocol ?? designFlags.logProtocol)
-            ? { logProtocol: true }
             : {}),
         };
         localSync = createLocalSync(localSyncDeps, {

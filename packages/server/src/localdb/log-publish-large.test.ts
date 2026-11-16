@@ -15,7 +15,7 @@ const KEYS = 125_000;
 
 describe("log publish of a very large stream", () => {
   it("publishes a stream with more keys than a call can take as arguments", async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run(
       "r1",

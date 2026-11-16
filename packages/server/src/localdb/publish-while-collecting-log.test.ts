@@ -82,7 +82,6 @@ async function world(options: {
       logger: { info: () => {}, warn: () => {} },
       now: () => clock,
       newOp: () => `${deviceId}-${++op}`,
-      logProtocol: true,
       ...(options.admit ? { publishWhileCollecting: true } : {}),
     };
     const sync = createLocalSync(deps, {

@@ -593,21 +593,10 @@ describe("view changes", () => {
     expect(ids(seen).flat()).toEqual([id]);
   });
 
-  /**
-   * What a version listing and a historical read answer for c0/s0: the
-   * record count each version reports, and the body of the newest version
-   * (or `gone`, as the read gives when the stored head format does not match
-   * the head it fetched).
-   */
+  /** What a version listing answers for c0/s0: the record count each version reports. */
   async function versionReads(d: Device) {
     const listed = await d.olderVersions.list("pdpp.c0~", "s0");
-    const read = await d.olderVersions.read("pdpp.c0.s0", {
-      at: "9999999999999",
-    });
-    return {
-      counts: listed.map((v) => v.recordCount),
-      read: read === "gone" ? read : await new Response(read).text(),
-    };
+    return { counts: listed.map((v) => v.recordCount) };
   }
 
   async function versioned() {
@@ -616,16 +605,18 @@ describe("view changes", () => {
     await a.cycle();
     const before = await versionReads(a);
     await a.views.settled();
-    expect(before.read).not.toBe("gone"); // the read serves before the change
+    expect(before.counts.length).toBeGreaterThan(0);
     return { a, before, ...listen(a) };
   }
 
+  // `head_format` is read by nothing a reader sees any more (it named how a
+  // per-stream head was encoded), so a change of it only has to emit.
   const versionColumns = {
     record_count: "record_count + 7",
     head_format: "head_format + 7",
   };
   for (const [column, next] of Object.entries(versionColumns)) {
-    it(`(p) a change of ${column} on a version row changes what a reader sees, and emits`, async () => {
+    it(`(p) a change of ${column} on a version row ${column === "record_count" ? "changes what a reader sees, and " : ""}emits`, async () => {
       for (const how of ["an update", "a replacement"]) {
         const { a, before, seen } = await versioned();
         await a.db.batch([
@@ -639,7 +630,8 @@ describe("view changes", () => {
         ]);
         await a.views.settled();
         onlyConnection(seen, "pdpp.c0~");
-        expect(await versionReads(a)).not.toEqual(before);
+        if (column === "record_count")
+          expect(await versionReads(a)).not.toEqual(before);
       }
     });
   }
@@ -923,7 +915,7 @@ describe("view changes", () => {
       ...MIGRATIONS.slice(viewMigration + 1)
         .flat()
         .flatMap((sql) => /^CREATE TABLE (\w+)/.exec(sql)?.[1] ?? [])
-        .map((table) => ({ sql: `DROP TABLE ${table}` })),
+        .map((table) => ({ sql: `DROP TABLE IF EXISTS ${table}` })),
       // Publish while collecting adds columns after the view counters too.
       { sql: "ALTER TABLE runs DROP COLUMN admitting" },
       { sql: "ALTER TABLE run_streams DROP COLUMN unadmitted" },
@@ -935,11 +927,6 @@ describe("view changes", () => {
       { sql: "ALTER TABLE stream_state DROP COLUMN key_types" },
       // The batch ordinal that orders two bodies of a key at one stamp.
       { sql: "ALTER TABLE records DROP COLUMN stamp_n" },
-
-      // The consumed registry head is columns on a table that stays.
-      { sql: "ALTER TABLE stream_state DROP COLUMN consumed_version" },
-      { sql: "ALTER TABLE stream_state DROP COLUMN consumed_generation" },
-      { sql: "ALTER TABLE stream_state DROP COLUMN consumed_data_hash" },
       { sql: `PRAGMA user_version = ${viewMigration}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");
@@ -951,6 +938,11 @@ describe("view changes", () => {
       await upgraded.db.query("SELECT count(*) AS n FROM records"),
     ).toEqual(records);
     expect(seen).toEqual([]); // the upgrade is not a change
+    // The previous build kept no log state, so the first cycle reads the
+    // registry's log again: that is a sync, and it is heard. The next one is idle.
+    await upgraded.cycle();
+    await upgraded.views.settled();
+    seen.length = 0;
     await upgraded.cycle(); // idle
     await upgraded.views.settled();
     expect(seen).toEqual([]);

@@ -441,9 +441,8 @@ export function mergeStaged(
 }
 
 /**
- * Each stream a batch touched now reads from it: a local version above
- * anything the registry's own stream row holds, so the per-stream path never
- * replaces what the log wrote (see `applyOneOnce`).
+ * Each stream a batch touched now reads from it: a local version and its
+ * head columns, which hold the batch's segment name.
  */
 export function streamHeadStatements(
   connectionId: string,

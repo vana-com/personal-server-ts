@@ -479,4 +479,17 @@ END`,
   connection_id TEXT PRIMARY KEY, position INTEGER NOT NULL, base INTEGER NOT NULL,
   refs TEXT NOT NULL) WITHOUT ROWID`,
   ],
+  [
+    // The connection log is the only protocol, so the state the per-stream
+    // head path kept beside it is gone: the parts a head was built from
+    // (`head_parts`), the replay a head admission owed (`log_replay`) and the
+    // registry head a device had consumed (`consumed_*`). Local only.
+    `DROP TABLE IF EXISTS head_parts`,
+    `DROP TABLE IF EXISTS log_replay`,
+    `ALTER TABLE stream_state DROP COLUMN consumed_version`,
+    `ALTER TABLE stream_state DROP COLUMN consumed_generation`,
+    `ALTER TABLE stream_state DROP COLUMN consumed_data_hash`,
+    // The copy a head publish attempt sent from (`publish_spool`) went with it.
+    `DROP TABLE IF EXISTS publish_spool`,
+  ],
 ];

@@ -1,17 +1,6 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { sha256 } from "@noble/hashes/sha2";
-import { keccak_256 } from "@noble/hashes/sha3";
-import {
-  canonicalJson,
-  digestHead,
-  encodeFramePart,
-  encodeHead,
-  frameOfLine,
-  partBlobName,
-  pkHash,
-  streamScope,
-} from "@opendatalabs/personal-server-ts-stream-sync";
+import { pkHash } from "@opendatalabs/personal-server-ts-stream-sync";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
@@ -362,47 +351,10 @@ describe("local resolve", () => {
     expect(f.visited).not.toHaveBeenCalled();
   });
 
-  it("retains the complete head after a partial image replaces records, with history disabled and a fresh resolver", async () => {
+  it("answers no_data when a partial image replaces records, because no body of the retained complete version is kept", async () => {
     const f = await fixture();
     await f.connection();
     await f.head("items", { version: 1 });
-    const scope = streamScope(CONNECTOR, "", "items");
-    const sha = async (bytes: Uint8Array) => sha256(bytes);
-    const value = { id: "original", value: "retained" };
-    const k = await pkHash(sha, value, ["id"]);
-    const frame = await frameOfLine(
-      sha,
-      k,
-      canonicalJson({ o: 1000, r: "run", v: value }),
-    );
-    const part = (await encodeFramePart(sha, "", [{ k, bytes: frame.bytes }]))!;
-    const head = encodeHead({
-      connector: CONNECTOR,
-      ns: "",
-      stream: "items",
-      generation: 2,
-      complete: true,
-      format: 4,
-      lastDeleteVersion: 0,
-      keyCheck: "0000000000000000",
-      observedAt: 1000,
-      parts: [part.entry],
-      primaryKey: ["id"],
-      profile: { key: null, version: "1" },
-      recordCount: 1,
-    });
-    const { blobName } = await digestHead(
-      async (bytes) => keccak_256(bytes),
-      head,
-    );
-    f.blobs.set(`${scope}/${blobName}`, head);
-    f.blobs.set(`${scope}/${partBlobName(2, part.entry.hash)}`, part.data);
-    await f.db.batch([
-      {
-        sql: "UPDATE stream_versions SET head_blob = ?, head_format = 4 WHERE version = 1",
-        params: [blobName],
-      },
-    ]);
     await f.head("items", { version: 2, complete: false });
     await f.record("items", "partial");
     const historyOff = {
@@ -413,15 +365,6 @@ describe("local resolve", () => {
       query: f.query,
       olderVersions: historyOff,
     });
-    const result = await fresh.resolve(input());
-    expect(result.kind).toBe("view");
-    if (result.kind !== "view") throw new Error("missing retained view");
-    expect(result.served?.version).toBe(1);
-    expect((await drain(result)).data.records).toEqual([value]);
-    expect(historyOff.read).not.toHaveBeenCalled();
-    await f.db.batch([
-      { sql: "UPDATE stream_state SET last_delete_version = 1" },
-    ]);
     expect(verdict(await fresh.resolve(input()))).toBe("no_data");
   });
 

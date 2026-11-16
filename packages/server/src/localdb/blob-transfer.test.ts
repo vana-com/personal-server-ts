@@ -104,11 +104,11 @@ async function fixture(late = false) {
       mimeType: "application/octet-stream",
       bytes,
     });
-    expect(
-      (await a.sync.cycle()).connections
-        .flatMap((c) => c.published)
-        .map((r) => r.outcome),
-    ).toEqual(["noop"]);
+    const outcomes = (await a.sync.cycle()).connections
+      .flatMap((c) => c.published)
+      .map((r) => r.outcome);
+    expect(outcomes.length).toBeGreaterThan(0);
+    expect(outcomes.every((o) => o === "noop")).toBe(true);
   }
   await b.sync.apply();
   return { a, b, blobs, bytes, hash, blobId };

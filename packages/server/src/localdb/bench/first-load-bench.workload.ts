@@ -2,7 +2,7 @@
 // readers (own file DB each) over the same published blobs. Generic synthetic
 // stream, no connector knowledge. Usage:
 //   npx tsx packages/server/src/localdb/bench/first-load-bench.workload.ts \
-//     --rows 198001 --log on --progressive off --readers 3 --get-ms 250 --node-crypto on
+//     --rows 198001 --progressive off --readers 3 --get-ms 250 --node-crypto on
 // Run it under `nice -n 19 ionice -c3`. `--dir` holds the databases and is
 // removed afterwards; the default is on disk, since /tmp may be memory.
 import { keccak_256 } from "@noble/hashes/sha3";
@@ -36,7 +36,6 @@ const arg = (name: string, d: string) => {
   return i < 0 ? d : process.argv[i + 1]!;
 };
 const ROWS = Number(arg("rows", "20000"));
-const LOG = arg("log", "off") === "on";
 const PROGRESSIVE = arg("progressive", "on") === "on";
 const READERS = Number(arg("readers", "1"));
 const ROW_BYTES = Number(arg("rowbytes", "2200"));
@@ -149,7 +148,6 @@ function makeDeps(
     now: () => Date.now(),
     newOp: () => `${deviceId}-${++op}`,
     ...(NODE_CRYPTO ? { streamCrypto: nodeStreamCrypto } : {}),
-    ...(LOG ? { logProtocol: true } : {}),
     ...(PROGRESSIVE && timing ? { progressiveFirstLoad: true } : {}),
   } as LocalSyncDeps;
 }
@@ -295,7 +293,7 @@ mkdirSync(DIR, { recursive: true });
   let bytes = 0;
   for (const v of store.values()) bytes += v.byteLength;
   console.log(
-    `[publisher] rows=${ROWS} intake=${((t1 - t0) / 1000).toFixed(1)}s publish-cycle=${((t2 - t1) / 1000).toFixed(1)}s blobs=${store.size} bytes=${(bytes / 1e6).toFixed(1)}MB log=${LOG}`,
+    `[publisher] rows=${ROWS} intake=${((t1 - t0) / 1000).toFixed(1)}s publish-cycle=${((t2 - t1) / 1000).toFixed(1)}s blobs=${store.size} bytes=${(bytes / 1e6).toFixed(1)}MB`,
   );
   await db.close();
 }
@@ -379,7 +377,7 @@ for (let r = 0; r < READERS; r++) {
   );
   results.push(wall);
   console.log(
-    `[reader ${r}] wall=${wall.toFixed(1)}s records=${n} log=${LOG} progressive=${PROGRESSIVE}`,
+    `[reader ${r}] wall=${wall.toFixed(1)}s records=${n} progressive=${PROGRESSIVE}`,
     timing.report(),
   );
   await db.close();

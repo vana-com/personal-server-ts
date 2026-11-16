@@ -51,7 +51,6 @@ export async function closeWorldDrivers(): Promise<void> {
 
 export async function world(options: {
   streams: number;
-  logProtocol: boolean;
   publishWhileCollecting?: boolean;
   /** The registry's rule that refuses a stream row write beside a log row (default on). */
   connectionLogFence?: boolean;
@@ -87,7 +86,6 @@ export async function world(options: {
 
   async function device(
     deviceId: string,
-    logProtocol = options.logProtocol,
     hooks: {
       beforePut?: (key: string) => Promise<void>;
       /** Awaited before a blob is returned: stops an apply where it fetches. */
@@ -177,7 +175,6 @@ export async function world(options: {
       logger: { info: () => {}, warn: () => {} },
       now: () => clock,
       newOp: () => `${deviceId}-${++op}`,
-      ...(logProtocol ? { logProtocol: true } : {}),
       ...(options.publishWhileCollecting
         ? { publishWhileCollecting: true }
         : {}),

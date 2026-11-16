@@ -14,6 +14,7 @@ import {
   MemoryStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
 } from "../../../core/src/stream-sync/index.js";
+import { logScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}` as const;
@@ -45,7 +46,6 @@ async function world() {
     encryptPart: async (_s: string, b: Uint8Array) => b,
     decrypt: async (_s: string, b: Uint8Array) => b,
   };
-  const publishLines: Record<string, unknown>[] = [];
   const surfaces = [];
   for (const name of ["desktop", "web", "phone"]) {
     const db = await openLocalDb(openBetterSqlite3(":memory:"), {
@@ -64,12 +64,7 @@ async function world() {
       blobs,
       ownerAddress: owner,
       signer: { signAddData: async () => "0x00" },
-      logger: {
-        info: (line: Record<string, unknown>) => {
-          if (typeof line.partsUploaded === "number") publishLines.push(line);
-        },
-        warn() {},
-      },
+      logger: { info() {}, warn() {} },
       now: () => now,
       newOp: () => `${name}-${++op}`,
       partTargetBytes: 2048,
@@ -151,16 +146,16 @@ async function world() {
     };
     surfaces.push({ db, sync, refresh, cycle, values, emittedAt });
   }
-  const streamPosts = () =>
-    registry.log.filter((post) => post.scope.includes("A")).length;
+  const logPosts = () =>
+    registry.log.filter((post) => post.scope === logScope("fixture-source", ""))
+      .length;
   return {
     desktop: surfaces[0]!,
     web: surfaces[1]!,
     phone: surfaces[2]!,
     registry,
     puts,
-    publishLines,
-    streamPosts,
+    logPosts,
   };
 }
 
@@ -171,24 +166,20 @@ const rows = (count: number, v = "1"): Row[] =>
   }));
 
 describe("an unchanged refresh", () => {
-  it("uploads no part, puts nothing, and makes no new stream version", async () => {
+  it("writes one coverage-only segment: no record and no part go up again", async () => {
     const w = await world();
     await w.desktop.refresh("r1", 1000, rows(120));
-    expect(w.publishLines.at(-1)).toMatchObject({ outcome: "published" });
-    const posts = w.streamPosts();
+    const posts = w.logPosts();
+    expect(posts).toBeGreaterThan(0);
     const puts = w.puts.length;
-    const lines = w.publishLines.length;
 
     await w.desktop.refresh("r2", 2000, rows(120));
 
-    expect(w.streamPosts()).toBe(posts);
-    expect(w.puts).toHaveLength(puts);
-    // A stream with nothing to publish logs no publish line, so no part went up.
-    expect(
-      w.publishLines
-        .slice(lines)
-        .reduce((n, l) => n + Number(l.partsUploaded), 0),
-    ).toBe(0);
+    // The full refresh's coverage marker is the only operation of the new
+    // position; no row changed, so no row is in it.
+    expect(w.logPosts()).toBe(posts + 1);
+    expect(w.puts).toHaveLength(puts + 1);
+    expect(w.puts.at(-1)).toContain(".~log/s-");
   });
 
   it("still reads as freshly collected on the device that collected it", async () => {
@@ -205,28 +196,27 @@ describe("an unchanged refresh", () => {
     await w.desktop.refresh("r1", 1000, rows(30));
     await w.web.sync.apply();
     await w.desktop.refresh("r2", 2000, rows(30));
-    const posts = w.streamPosts();
+    const posts = w.logPosts();
     await w.web.cycle();
-    expect(w.streamPosts()).toBe(posts);
+    expect(w.logPosts()).toBe(posts);
     expect(await w.web.values()).toEqual(await w.desktop.values());
   });
 });
 
 describe("a change in the source", () => {
-  it("re-uploads only the part that holds the changed record", async () => {
+  it("writes one segment for the one changed record", async () => {
     const w = await world();
     await w.desktop.refresh("r1", 1000, rows(200));
-    const first = w.publishLines.at(-1)!;
-    expect(Number(first.partsUploaded)).toBeGreaterThan(2);
-    const lines = w.publishLines.length;
+    const putsBefore = w.puts.length;
+    const postsBefore = w.logPosts();
 
     const next = rows(200);
     next[77] = { ...next[77]!, v: "changed" };
     await w.desktop.refresh("r2", 2000, next);
 
-    const second = w.publishLines.slice(lines);
-    expect(second).toHaveLength(1);
-    expect(second[0]).toMatchObject({ outcome: "published", partsUploaded: 1 });
+    // One segment carries the one changed record; no stream part goes up again.
+    expect(w.puts.length - putsBefore).toBe(1);
+    expect(w.logPosts() - postsBefore).toBe(1);
     await w.web.sync.apply();
     expect((await w.web.values())["row-0077"]).toBe("changed");
     expect((await w.web.values())["row-0076"]).toBe("1");
