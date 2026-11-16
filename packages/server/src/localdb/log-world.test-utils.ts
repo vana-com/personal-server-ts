@@ -186,9 +186,11 @@ export async function world(options: {
         : {}),
     };
     const sync = createLocalSync(deps, {
+      // A digest `<connector>@<version>` names a connector version; a bare
+      // connector name is version 1.
       resolveArtifact: (digest) => ({
-        connector: digest,
-        version: "1",
+        connector: digest.split("@")[0]!,
+        version: digest.split("@")[1] ?? "1",
         streams: names.map((name) => ({
           name,
           semantics: "mutable_state" as const,
@@ -219,13 +221,18 @@ export async function world(options: {
         blob?: { hash: string; bytes: Uint8Array };
         /** The connector the run collects for (default: the world's one connector). */
         connector?: string;
+        /** The connector version the run's artifact declares (default "1"). */
+        version?: string;
       } = {},
     ) => {
       clock++;
       const connector = opts.connector ?? CONNECTOR;
       await sync.intake.begin(runId, {
         connector,
-        artifactDigest: connector,
+        artifactDigest:
+          opts.version === undefined
+            ? connector
+            : `${connector}@${opts.version}`,
         wantFull: opts.full ?? true,
         observedAt: opts.observedAt,
         owner: { address: OWNER, leaseId: null },

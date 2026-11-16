@@ -927,6 +927,10 @@ describe("view changes", () => {
       { sql: "ALTER TABLE stream_state DROP COLUMN key_types" },
       // The batch ordinal that orders two bodies of a key at one stamp.
       { sql: "ALTER TABLE records DROP COLUMN stamp_n" },
+      // The stream meta the log said at each local version.
+      { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
+      { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
+      { sql: "ALTER TABLE stream_versions DROP COLUMN profile_version" },
       { sql: `PRAGMA user_version = ${viewMigration}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");

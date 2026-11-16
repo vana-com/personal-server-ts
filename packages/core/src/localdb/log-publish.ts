@@ -123,12 +123,26 @@ const withoutBatchRoute = new WeakSet<StreamSyncRegistry>();
 type StreamRow = LocalStream & {
   stream: string;
   /**
-   * `complete` of the version this stream's head stands for, 0 when it has
-   * none. The stream's own `complete` is written when a run ends, before its
-   * publish, so it is not what the log last said.
+   * The meta of the version this stream's head stands for: what the log last
+   * said. A run's end writes the stream's own meta before its publish, so the
+   * stream's columns are not it. `complete` is 0 when the stream has no head.
    */
   published_complete: number;
+  published_primary_key: string;
+  published_profile_key: string | null;
+  published_profile_version: string | null;
 };
+
+/** The stream as the log last described it: the base a plan starts from. */
+function asPublished(row: StreamRow): LocalStream {
+  return {
+    ...row,
+    primary_key: row.published_primary_key,
+    profile_key: row.published_profile_key,
+    profile_version: row.published_profile_version,
+    complete: row.published_complete,
+  };
+}
 
 type Planned = {
   readonly stream: string;
@@ -362,15 +376,18 @@ async function snapshotRound(
   if (!connection)
     throw new Error(`publish: unknown connection ${connectionId}`);
   const streams = await held.db.query<StreamRow>(
-    `SELECT stream, primary_key, profile_key, profile_version, complete,
-            floor_version, floor_o, floor_r, last_delete_version,
-            head_version, head_generation, head_data_hash, publish_watermark,
-            coalesce((SELECT v.complete FROM stream_versions v
-                       WHERE v.connection_id = stream_state.connection_id
-                         AND v.stream = stream_state.stream
-                         AND v.version = stream_state.head_version), 0)
-              AS published_complete
-       FROM stream_state WHERE connection_id = ? ORDER BY stream`,
+    `SELECT s.stream, s.primary_key, s.profile_key, s.profile_version, s.complete,
+            s.floor_version, s.floor_o, s.floor_r, s.last_delete_version,
+            s.head_version, s.head_generation, s.head_data_hash, s.publish_watermark,
+            coalesce(v.complete, 0) AS published_complete,
+            coalesce(v.primary_key, s.primary_key) AS published_primary_key,
+            coalesce(v.profile_key, s.profile_key) AS published_profile_key,
+            coalesce(v.profile_version, s.profile_version) AS published_profile_version
+       FROM stream_state s
+       LEFT JOIN stream_versions v
+         ON v.connection_id = s.connection_id AND v.stream = s.stream
+        AND v.version = s.head_version
+      WHERE s.connection_id = ? ORDER BY s.stream`,
     [connectionId],
   );
   const all = (outcome: PublishResult["outcome"]): Snapshot => ({
@@ -441,7 +458,7 @@ async function snapshotRound(
       connection,
       stream,
       // The plan's base is what the log last said, not what the run's end wrote.
-      { ...row, complete: row.published_complete },
+      asPublished(row),
       null,
       row.head_version,
       row.head_data_hash,
@@ -524,10 +541,10 @@ async function snapshotRound(
       (row.head_version === 0 ||
         !sameHead(head, {
           generation: row.head_generation ?? head.generation,
-          primaryKey: JSON.parse(row.primary_key),
+          primaryKey: JSON.parse(row.published_primary_key),
           profile: {
-            key: row.profile_key ?? connection.connector,
-            version: row.profile_version ?? "0",
+            key: row.published_profile_key ?? connection.connector,
+            version: row.published_profile_version ?? "0",
           },
           complete: row.published_complete === 1,
         }));
@@ -1382,10 +1399,11 @@ async function commitRound(
     statements.push(
       {
         sql: `INSERT OR REPLACE INTO stream_versions (connection_id, stream, version, generation,
-                head_blob, head_format, record_count, observed_at, complete, kind)
+                head_blob, head_format, record_count, observed_at, complete, kind,
+                primary_key, profile_key, profile_version)
               SELECT ?, ?, MAX(s.head_version, s.last_delete_version) + 1, ?, ?, ?,
                      (SELECT COUNT(*) FROM records r WHERE r.connection_id = ? AND r.stream = ?),
-                     ?, ?, 'published'
+                     ?, ?, 'published', ?, ?, ?
                 FROM stream_state s WHERE s.connection_id = ? AND s.stream = ?`,
         params: [
           connectionId,
@@ -1397,6 +1415,9 @@ async function commitRound(
           p.stream,
           candidate.observedAt,
           meta.complete ? 1 : 0,
+          JSON.stringify(meta.primaryKey),
+          meta.profile.key,
+          meta.profile.version,
           connectionId,
           p.stream,
         ],

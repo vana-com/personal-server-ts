@@ -150,7 +150,12 @@ export async function hasDeleteIntent(
   return rows.length > 0;
 }
 
-/** The ended runs whose decision still awaits publication, oldest first. */
+/**
+ * The ended runs whose decision still awaits publication, oldest first. A run
+ * a publication already covered is not planned again: the end planned it
+ * against the floor of its time, and a later, higher floor must not refuse it
+ * and unwrite rows a newer run only re-observed.
+ */
 async function retainedRuns(
   deps: LocalSyncDeps,
   connectionId: string,
@@ -166,6 +171,7 @@ async function retainedRuns(
        FROM runs r JOIN run_streams rs ON rs.run_id = r.run_id
       WHERE r.connection_id = ? AND rs.stream = ? AND r.state = 'ended'
         AND rs.decision IN ('publish', 'noop', 'deferred')
+        AND rs.publication_state = 'pending'
       ORDER BY r.o, r.run_id`,
     [connectionId, stream],
   );

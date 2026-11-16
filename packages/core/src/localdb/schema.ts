@@ -492,4 +492,13 @@ END`,
     // The copy a head publish attempt sent from (`publish_spool`) went with it.
     `DROP TABLE IF EXISTS publish_spool`,
   ],
+  [
+    // The stream meta the log said at each local version, beside its
+    // `complete`. A run's end writes its own meta into `stream_state` before
+    // its publish, so the publish compares the run with these. NULL on a row
+    // written before this column: the stream's own meta stands in.
+    `ALTER TABLE stream_versions ADD COLUMN primary_key TEXT`,
+    `ALTER TABLE stream_versions ADD COLUMN profile_key TEXT`,
+    `ALTER TABLE stream_versions ADD COLUMN profile_version TEXT`,
+  ],
 ];

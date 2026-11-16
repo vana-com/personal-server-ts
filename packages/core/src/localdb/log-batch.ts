@@ -456,10 +456,11 @@ export function streamHeadStatements(
     statements.push(
       {
         sql: `INSERT OR REPLACE INTO stream_versions (connection_id, stream, version, generation,
-                head_blob, head_format, record_count, observed_at, complete, kind)
+                head_blob, head_format, record_count, observed_at, complete, kind,
+                primary_key, profile_key, profile_version)
               SELECT ?, ?, MAX(s.head_version, s.last_delete_version) + 1, ?, ?, ?,
                      (SELECT COUNT(*) FROM records r WHERE r.connection_id = ? AND r.stream = ?),
-                     ?, ?, 'applied'
+                     ?, ?, 'applied', ?, ?, ?
                 FROM stream_state s WHERE s.connection_id = ? AND s.stream = ?`,
         params: [
           connectionId,
@@ -471,6 +472,9 @@ export function streamHeadStatements(
           meta.stream,
           batch.observedAt,
           meta.complete ? 1 : 0,
+          JSON.stringify(meta.primaryKey),
+          meta.profile.key,
+          meta.profile.version,
           connectionId,
           meta.stream,
         ],
