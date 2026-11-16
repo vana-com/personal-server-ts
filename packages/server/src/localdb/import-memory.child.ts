@@ -45,6 +45,11 @@ export interface ImportMemoryResult {
   payloadBytes: number;
   retainedRows: number;
   retainedPayloadBytes: number;
+  /**
+   * Main-isolate heap plus external bytes after two full collections, with the
+   * retained rows still reachable: what the process holds, not what it touched.
+   */
+  liveBytes: number;
   memory: Record<string, NodeJS.MemoryUsage>;
   rssSnapshots: Record<string, NodeJS.MemoryUsage>;
   /** Driver calls the import made; only filled by an attribution run. */
@@ -336,6 +341,11 @@ export async function importMemoryWorkload(input: {
         : await acceptLegacyImportUpload(deps, source);
     if (imported.kind === "refused") throw new Error(imported.reason);
     memory.afterImport = process.memoryUsage();
+    const collect = (globalThis as { gc?: () => void }).gc;
+    if (!collect) throw new Error("memory_child_needs_gc");
+    collect();
+    collect();
+    const settled = process.memoryUsage();
     const [stored] = await db.query<{ rows: number; payloadBytes: number }>(
       "SELECT count(*) AS rows, sum(length(CAST(json_extract(body, '$.text') AS BLOB))) AS payloadBytes FROM records",
     );
@@ -344,6 +354,7 @@ export async function importMemoryWorkload(input: {
       receiptRows: imported.receipt.rows,
       rows: stored!.rows,
       payloadBytes: stored!.payloadBytes,
+      liveBytes: settled.heapUsed + settled.external,
       retainedRows: retained.length,
       retainedPayloadBytes: retained.reduce(
         (sum, record) => sum + Buffer.byteLength(record.text as string),
