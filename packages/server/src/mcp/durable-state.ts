@@ -218,6 +218,17 @@ export async function openMcpDurableState(options: {
   let closed = false;
   let closing: Promise<void> | undefined;
   const admitted = new AsyncLocalStorage<{ active: boolean }>();
+  // Runs a caller-supplied callback, or an operation that awaits one, under a
+  // fresh token that is revoked once it settles. Its own writes stay admitted
+  // after close begins, and a close made from inside it is rejected.
+  const scoped = async <T>(run: () => Promise<T>): Promise<T> => {
+    const token = { active: true };
+    try {
+      return await admitted.run(token, run);
+    } finally {
+      token.active = false;
+    }
+  };
   const refused = <T>(): Promise<T> =>
     Promise.reject(new Error("MCP state is closed"));
   const mutate = <T>(change: (draft: State) => T): Promise<T> => {
@@ -248,67 +259,69 @@ export async function openMcpDurableState(options: {
     },
     prepareRollback(migrationId, resolve) {
       if (closed) return refused();
-      const operation = operations.then(() => {
-        const prepared = writes.then(async () => {
-          assertActive();
-          if (
-            !migrationId ||
-            state.writer?.importedId !== migrationId ||
-            !state.writer.importedDigest
-          )
-            throw new Error("Rollback requires the exact imported migration");
-          // A failed refresh must not leave an earlier receipt usable at boot.
-          const pending = structuredClone(state);
-          delete pending.writer!.rollback;
-          delete pending.writer!.rollbackActivated;
-          await persist(options.path, key, pending);
-          state = pending;
-          const required = rollbackOwners(state);
-          const draft = structuredClone(state);
-          const identities: RollbackPreparation["identities"] = {};
-          // Resolve one owner at a time on the small source TEE, without writing
-          // a partial cache or exposing owner bindings to the operator.
-          for (const binding of required.bindings) {
-            const resolved = await resolve(binding);
-            const id = userPsId(binding.chainId, binding.owner);
+      const operation = operations.then(() =>
+        scoped(() => {
+          const prepared = writes.then(async () => {
+            assertActive();
             if (
-              resolved.identity.userPsId !== id ||
-              !Number.isSafeInteger(resolved.identity.epoch) ||
-              resolved.identity.epoch < 1 ||
-              !Number.isSafeInteger(resolved.generation) ||
-              resolved.generation < 0
+              !migrationId ||
+              state.writer?.importedId !== migrationId ||
+              !state.writer.importedDigest
             )
-              throw new Error("Rollback identity does not match its owner");
-            draft.identities[id] = structuredClone(resolved.identity);
-            identities[id] = {
-              digest: rollbackDigest(resolved.identity),
-              generation: resolved.generation,
-            };
-          }
-          const receipt = {
-            migrationId,
-            digest: rollbackDigest({
+              throw new Error("Rollback requires the exact imported migration");
+            // A failed refresh must not leave an earlier receipt usable at boot.
+            const pending = structuredClone(state);
+            delete pending.writer!.rollback;
+            delete pending.writer!.rollbackActivated;
+            await persist(options.path, key, pending);
+            state = pending;
+            const required = rollbackOwners(state);
+            const draft = structuredClone(state);
+            const identities: RollbackPreparation["identities"] = {};
+            // Resolve one owner at a time on the small source TEE, without writing
+            // a partial cache or exposing owner bindings to the operator.
+            for (const binding of required.bindings) {
+              const resolved = await resolve(binding);
+              const id = userPsId(binding.chainId, binding.owner);
+              if (
+                resolved.identity.userPsId !== id ||
+                !Number.isSafeInteger(resolved.identity.epoch) ||
+                resolved.identity.epoch < 1 ||
+                !Number.isSafeInteger(resolved.generation) ||
+                resolved.generation < 0
+              )
+                throw new Error("Rollback identity does not match its owner");
+              draft.identities[id] = structuredClone(resolved.identity);
+              identities[id] = {
+                digest: rollbackDigest(resolved.identity),
+                generation: resolved.generation,
+              };
+            }
+            const receipt = {
               migrationId,
-              importedDigest: state.writer!.importedDigest,
+              digest: rollbackDigest({
+                migrationId,
+                importedDigest: state.writer!.importedDigest,
+                ownersDigest: required.digest,
+                identities,
+              }),
+              owners: required.bindings.length,
+              connections: required.connections,
+            };
+            draft.writer!.rollback = {
+              importedDigest: state.writer!.importedDigest!,
               ownersDigest: required.digest,
               identities,
-            }),
-            owners: required.bindings.length,
-            connections: required.connections,
-          };
-          draft.writer!.rollback = {
-            importedDigest: state.writer!.importedDigest!,
-            ownersDigest: required.digest,
-            identities,
-            receipt,
-          };
-          await persist(options.path, key, draft);
-          state = draft;
-          return structuredClone(receipt);
-        });
-        writes = prepared.catch(() => undefined);
-        return prepared;
-      });
+              receipt,
+            };
+            await persist(options.path, key, draft);
+            state = draft;
+            return structuredClone(receipt);
+          });
+          writes = prepared.catch(() => undefined);
+          return prepared;
+        }),
+      );
       operations = operation.catch(() => undefined);
       return operation;
     },
@@ -606,14 +619,7 @@ export async function openMcpDurableState(options: {
     getIdentity: (id) => read((current) => current.identities[id] ?? null),
     exclusive<T>(operation: () => Promise<T>): Promise<T> {
       if (closed) return refused();
-      const result = operations.then(async () => {
-        const token = { active: true };
-        try {
-          return await admitted.run(token, operation);
-        } finally {
-          token.active = false;
-        }
-      });
+      const result = operations.then(() => scoped(operation));
       operations = result.catch(() => undefined);
       return result;
     },
