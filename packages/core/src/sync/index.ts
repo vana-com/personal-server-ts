@@ -25,7 +25,6 @@ export {
 } from "./engine/change-probe.js";
 export {
   CHANGE_PUSH_WAIT_MS,
-  DEFAULT_CHANGE_PUSH_HEALTHY_PROBE_MS,
   createRegistryChangePush,
   type RegistryChangePushOptions,
 } from "./engine/change-push.js";

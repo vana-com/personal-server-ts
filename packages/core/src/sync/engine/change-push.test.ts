@@ -53,11 +53,20 @@ function subscribed(
   const push = createRegistryChangePush(s.registry, options)!;
   const pokes = vi.fn();
   const health: boolean[] = [];
+  const positions: string[] = [];
+  const order: string[] = [];
   const stop = push.subscribe({
-    onChange: pokes,
+    onChange: () => {
+      order.push("change");
+      pokes();
+    },
     onHealth: (h) => health.push(h),
+    onPosition: (p) => {
+      order.push(`position:${p}`);
+      positions.push(p);
+    },
   });
-  return { ...s, push, pokes, health, stop };
+  return { ...s, push, pokes, health, positions, order, stop };
 }
 
 const flush = () => vi.advanceTimersByTimeAsync(0);
@@ -83,13 +92,14 @@ describe("createRegistryChangePush", () => {
     ).toBeUndefined();
   });
 
-  it("carries the healthy probe period", () => {
+  it("carries the period of its held request: one request per period while idle", () => {
     const s = scripted();
     expect(
-      createRegistryChangePush(s.registry, { healthyProbeMs: 90_000 })!
-        .healthyProbeMs,
-    ).toBe(90_000);
-    expect(createRegistryChangePush(s.registry)!.healthyProbeMs).toBe(60_000);
+      createRegistryChangePush(s.registry, { waitMs: 9_000 })!.requestPeriodMs,
+    ).toBe(9_000);
+    expect(createRegistryChangePush(s.registry)!.requestPeriodMs).toBe(
+      CHANGE_PUSH_WAIT_MS,
+    );
   });
 });
 
@@ -104,6 +114,28 @@ describe("a subscription", () => {
     await flush();
     expect(t.pokes).toHaveBeenCalledTimes(1);
     expect(t.health).toEqual([true]);
+    t.stop();
+  });
+
+  it("reports each answer's sequence as the position, before it pokes", async () => {
+    // The manager compares this position with the one its last clean cycle
+    // read at, so the position must be set before the cycle the poke starts.
+    const t = subscribed();
+    await flush();
+    t.calls[0]!.answer({ seq: "7", changed: true });
+    await flush();
+    t.calls[1]!.answer({ seq: "7", changed: false });
+    await flush();
+    t.calls[2]!.answer({ seq: "9", changed: true });
+    await flush();
+    expect(t.positions).toEqual(["7", "7", "9"]);
+    expect(t.order).toEqual([
+      "position:7",
+      "change",
+      "position:7",
+      "position:9",
+      "change",
+    ]);
     t.stop();
   });
 

@@ -4,9 +4,9 @@
 
 The gateway keeps one counter, `seq`, that rises on every committed registry write. A device keeps `applied`: the `seq` its last pull read. Only a pull moves `applied`. A held request's reply and a probe are hints that start a pull. A reply may be lost; a request may break; the gateway may fail to wake a waiter.
 
-The probe compares a marker that fingerprints one registry row. Another row stamped in the same millisecond leaves it equal, so a probe, or any pull that the marker gates, can find "nothing new" after a change (`ProbeBlind`). The model keeps that fault: the probe is not exact. What the device can rely on is the gateway's sequence: an answer whose sequence is above the device's cursor, and the first answer after a failure, start a cycle that does not look at the marker and does not wait for the probe (`ForcedPull`). Only a successful answer starts that cycle (`PullAfterFailure`); a failed or lost request and the re-subscription that follows call nothing, as in `change-push.ts`. After a failed request the device waits `BO` ticks before the next one (`BO` = 3, the 30 s cap of the shipped back-off, in every configuration except the ones marked `BO` = 0). The manager's own timer cycle (`TimerOn`, every `PT` = 6 ticks, 60 s) reads the registry exactly whatever else happened.
+The probe compares a marker that fingerprints one registry row. Another row stamped in the same millisecond leaves it equal, so a probe, or any pull that the marker gates, can find "nothing new" after a change (`ProbeBlind`). The model keeps that fault: the probe is not exact. What the device can rely on is the gateway's sequence: an answer whose sequence is above the device's cursor, and the first answer after a failure, start a cycle that does not look at the marker and does not wait for the probe (`ForcedPull`). Only a successful answer starts that cycle (`PullAfterFailure`); a failed or lost request and the re-subscription that follows call nothing, as in `change-push.ts`. After a failed request the device waits `BO` ticks before the next one (`BO` = 3, the 30 s cap of the shipped back-off, in every configuration except the ones marked `BO` = 0). The manager's own timer cycle (`TimerOn`, every `PT` = 6 ticks, 60 s) reads the registry exactly. With `Gate` it is skipped while the push covers it (see "The position gate").
 
-`StaleBound` says `age[d] <= Bound` for every device, where `age` counts ticks since the oldest commit the device has not yet applied. One tick is about 10 s in the shipped settings: the held request waits `W` = 2 ticks (25 s) and is declared dead after `Slack` = 1 more (10 s); the probe period is `PL` = 1 (5 s, unhealthy) or `PH` = 6 (60 s, healthy), re-read at every probe tick so that a push that just failed returns to the short period at once; the timer cycle is `PT` = 6.
+`StaleBound` says `age[d] <= Bound` for every device, where `age` counts ticks since the oldest commit the device has not yet applied. One tick is about 10 s in the shipped settings: the held request waits `W` = 2 ticks (25 s) and is declared dead after `Slack` = 1 more (10 s); the probe period is `PL` = 1 (5 s), or in the older configurations `PH` = 6 (60 s) while the push is healthy, re-read at every probe tick so that a push that just failed returns to the short period at once; the timer cycle is `PT` = 6.
 
 Run one configuration (one TLC job, 4 workers, `nice 19`):
 
@@ -14,32 +14,40 @@ Run one configuration (one TLC job, 4 workers, `nice 19`):
 
 TLC 1.7.4, one device, two writes, 12 ticks. Raw output is in `out/`. P0 to P3 model an exact probe (`ProbeBlind=FALSE`) and no timer (`TimerOn=FALSE`); P4 onward use the shipped combination: a blind probe is possible and the timer runs.
 
+## The position gate
+
+The shipped manager no longer stretches the probe while the push is healthy. Each push answer reports the gateway's sequence as a position. A cycle started under position P reads the registry after P, so while the push is healthy and its position is still the one the last cycle started under, the timer's cycle and the probe would only repeat that read, and the manager skips both (`Gate`). Net ticks after that cycle started, one full cycle runs anyway, as a check on the push itself; the net is derived from what an idle cycle costs and is not modelled here; the probe tick that finds it due runs that cycle itself instead of reading the marker first, so it is never later than the timer's (it stands for faults the model leaves out, such as a commit that does not raise `seq`). A push that goes from healthy to not healthy starts a cycle at once (`PullOnUnhealthy`): while it was silent its position could not vouch for the registry. Without that cycle the gate is not safe: V9 is violated at 6 ticks, because a reply lost on the wire is noticed only at the request deadline (3 ticks), and the timer tick that follows may have been skipped just before. With it, the bound is the one the timer gave before: 6 holds (G1) and 5 does not (G1b); with every reply lost the push is never healthy, the gate never applies, and the result is P6's (G2). Every older configuration runs with `Gate = FALSE` and `PullOnUnhealthy = FALSE` and returns the verdict in the table above; only the state counts changed, because of the two new variables.
+
 ## Results
 
 The second column names what differs from the shipped model: a blind probe possible, the timer on, every fault, `BO` = 3.
 
-| config                                     | what it checks                                                        | Bound (ticks) | result   | states                    |
-| ------------------------------------------ | --------------------------------------------------------------------- | ------------- | -------- | ------------------------- |
-| P0-healthy-bound0                          | exact probe, no timer, no faults                                      | 0             | pass     | 1772 gen, 1125 distinct   |
-| P1-full-bound3                             | exact probe, no timer, every fault                                    | 3             | pass     | 34306 gen, 14106 distinct |
-| P1b-full-bound2-tight                      | same                                                                  | 2             | VIOLATED | 638 gen, 396 distinct     |
-| P2-alllost-bound1                          | exact probe, no timer, every reply lost                               | 1             | pass     | 5062 gen, 2190 distinct   |
-| P3-nopull-noresume-probeonly-bound3        | exact probe alone: no cursor resume, no pull after failure            | 3             | pass     | 41462 gen, 17038 distinct |
-| P4-noprobe-timer-bound6                    | no probe: push and timer only                                         | 6             | pass     | 18842 gen, 7444 distinct  |
-| P4b-noprobe-timer-bound5-tight             | same                                                                  | 5             | VIOLATED | 754 gen, 510 distinct     |
-| P5-blindprobe-forced-bound6                | blind probe, any reply may be lost                                    | 6             | pass     | 59952 gen, 20608 distinct |
-| P6-blindprobe-alllost-forced-bound6        | blind probe, every reply lost                                         | 6             | pass     | 13360 gen, 4582 distinct  |
-| P6b-blindprobe-alllost-forced-bound5-tight | same                                                                  | 5             | VIOLATED | 2233 gen, 1045 distinct   |
-| P7-blindprobe-noloss-backoff-bound5        | blind probe, no reply lost, connections break, wakes missed, `BO` = 3 | 5             | pass     | 35497 gen, 13723 distinct |
-| P7b-blindprobe-noloss-backoff-bound4-tight | same                                                                  | 4             | VIOLATED | 2011 gen, 1113 distinct   |
-| P8-blindprobe-nofaults-forced-bound0       | blind probe, no loss, no breaks, no missed wakes (`BO` = 0)           | 0             | pass     | 2887 gen, 1493 distinct   |
-| V1-nothing-bound7                          | no cursor resume, no pull after failure, no probe                     | 7             | VIOLATED | 1960 gen, 1216 distinct   |
-| V2-edge-pullafterfailure-noprobe-bound7    | no cursor resume, no final read at the deadline, no probe             | 7             | VIOLATED | 2098 gen, 1303 distinct   |
-| V4-stretch-always-alllost-bound1           | exact probe stretched to 60 s even when unhealthy, every reply lost   | 1             | VIOLATED | 43 gen, 33 distinct       |
-| V6-resume-only-noprobe-bound3              | no pull after failure, no probe                                       | 3             | VIOLATED | 331 gen, 232 distinct     |
-| V7-unforced-nofaults-bound0                | answers go through the marker gate, no faults except the blind marker | 0             | VIOLATED | 69 gen, 55 distinct       |
-| V7b-unforced-nofaults-bound6               | same                                                                  | 6             | pass     | 5915 gen, 2948 distinct   |
-| V8-pushonly-noprobe-notimer-bound7         | push alone: no probe, no timer, replies may be lost                   | 7             | VIOLATED | 1906 gen, 1179 distinct   |
+| config                                     | what it checks                                                        | Bound (ticks) | result   | states                     |
+| ------------------------------------------ | --------------------------------------------------------------------- | ------------- | -------- | -------------------------- |
+| P0-healthy-bound0                          | exact probe, no timer, no faults                                      | 0             | pass     | 2543 gen, 1619 distinct    |
+| P1-full-bound3                             | exact probe, no timer, every fault                                    | 3             | pass     | 42170 gen, 17759 distinct  |
+| P1b-full-bound2-tight                      | same                                                                  | 2             | VIOLATED | 811 gen, 509 distinct      |
+| P2-alllost-bound1                          | exact probe, no timer, every reply lost                               | 1             | pass     | 5062 gen, 2190 distinct    |
+| P3-nopull-noresume-probeonly-bound3        | exact probe alone: no cursor resume, no pull after failure            | 3             | pass     | 50941 gen, 21325 distinct  |
+| P4-noprobe-timer-bound6                    | no probe: push and timer only                                         | 6             | pass     | 28020 gen, 11248 distinct  |
+| P4b-noprobe-timer-bound5-tight             | same                                                                  | 5             | VIOLATED | 777 gen, 551 distinct      |
+| P5-blindprobe-forced-bound6                | blind probe, any reply may be lost                                    | 6             | pass     | 120526 gen, 40260 distinct |
+| P6-blindprobe-alllost-forced-bound6        | blind probe, every reply lost                                         | 6             | pass     | 40207 gen, 13404 distinct  |
+| P6b-blindprobe-alllost-forced-bound5-tight | same                                                                  | 5             | VIOLATED | 4169 gen, 2101 distinct    |
+| P7-blindprobe-noloss-backoff-bound5        | blind probe, no reply lost, connections break, wakes missed, `BO` = 3 | 5             | pass     | 71853 gen, 26804 distinct  |
+| P7b-blindprobe-noloss-backoff-bound4-tight | same                                                                  | 4             | VIOLATED | 2971 gen, 1759 distinct    |
+| P8-blindprobe-nofaults-forced-bound0       | blind probe, no loss, no breaks, no missed wakes (`BO` = 0)           | 0             | pass     | 4886 gen, 2534 distinct    |
+| V1-nothing-bound7                          | no cursor resume, no pull after failure, no probe                     | 7             | VIOLATED | 1836 gen, 1237 distinct    |
+| V2-edge-pullafterfailure-noprobe-bound7    | no cursor resume, no final read at the deadline, no probe             | 7             | VIOLATED | 2260 gen, 1471 distinct    |
+| V4-stretch-always-alllost-bound1           | exact probe stretched to 60 s even when unhealthy, every reply lost   | 1             | VIOLATED | 48 gen, 38 distinct        |
+| V6-resume-only-noprobe-bound3              | no pull after failure, no probe                                       | 3             | VIOLATED | 250 gen, 174 distinct      |
+| V7-unforced-nofaults-bound0                | answers go through the marker gate, no faults except the blind marker | 0             | VIOLATED | 96 gen, 79 distinct        |
+| V7b-unforced-nofaults-bound6               | same                                                                  | 6             | pass     | 11687 gen, 6116 distinct   |
+| V8-pushonly-noprobe-notimer-bound7         | push alone: no probe, no timer, replies may be lost                   | 7             | VIOLATED | 2536 gen, 1665 distinct    |
+| G1-gate-blindprobe-bound6                  | position gate + unhealthy cycle, blind probe, every fault             | 6             | pass     | 123125 gen, 39442 distinct |
+| G1b-gate-blindprobe-bound5-tight           | same                                                                  | 5             | VIOLATED | 6425 gen, 3149 distinct    |
+| G2-gate-blindprobe-alllost-bound6          | position gate, every reply lost                                       | 6             | pass     | 40207 gen, 13404 distinct  |
+| V9-gate-nopullonunhealthy-bound6           | position gate without the cycle when the push turns unhealthy         | 6             | VIOLATED | 65498 gen, 25507 distinct  |
 
 ## Reading the table
 

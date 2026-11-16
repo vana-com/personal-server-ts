@@ -40,18 +40,9 @@ export function changePushBackoffMs(
   return Math.min(BACKOFF_MAX_MS, base * (0.5 + random()));
 }
 
-/**
- * The timed probe's period while the push is healthy. The unconditional timer
- * cycle already runs every 60 s and is what guarantees completeness, so a
- * probe that fires less often than that adds nothing.
- */
-export const DEFAULT_CHANGE_PUSH_HEALTHY_PROBE_MS = 60_000;
-
 export interface RegistryChangePushOptions {
   /** Default true; false: no push, the timed probe alone (as before). */
   enabled?: boolean;
-  /** Default {@link DEFAULT_CHANGE_PUSH_HEALTHY_PROBE_MS}. */
-  healthyProbeMs?: number;
   /** Default {@link CHANGE_PUSH_WAIT_MS}. */
   waitMs?: number;
 }
@@ -59,20 +50,24 @@ export interface RegistryChangePushOptions {
 /**
  * A subscription to the gateway's "the registry moved" signal.
  *
- * The signal is a hint over a lossy channel. Correctness stays in the pull and
- * the manager's timer; this loop only makes the common case fast and says
- * honestly when it cannot be trusted. It keeps one held request open. Each
- * answer carries the registry's sequence; the next request sends it back, so
- * the gateway compares two numbers and a poke that was lost on the wire is
- * found by the next request. It does three things:
+ * It keeps one held request open. Each answer carries the registry's
+ * sequence, the registry's position; the next request sends it back, so the
+ * gateway compares two numbers and a poke that was lost on the wire is found
+ * by the next request. The position is not data: the manager reads the
+ * registry itself and trusts the position only to say that nothing moved since
+ * a cycle that started under it (a check it repeats at a derived interval, the
+ * safety net). It does four things:
  *
+ *  - every answer reports its sequence as the position (`onPosition`), before
+ *    anything else, so the cycle a poke starts samples the position it follows;
  *  - an answer that says `changed` is a poke (`onChange`): the manager pulls;
  *  - the first answer after any failure is a poke too, whether or not the
  *    sequence moved, so a poke lost with the connection costs one pull. A
  *    failed attempt is not a poke: with every answer lost, only the manager's
  *    timer cycle (and its probe) finds the change;
  *  - `onHealth(false)` on any failure or silence, `onHealth(true)` on the next
- *    answer: only while healthy does the manager stretch its probe.
+ *    answer: only while healthy does the manager skip its timer cycle and
+ *    probe.
  */
 export function createRegistryChangePush(
   registry: Pick<StreamSyncRegistry, "waitForChange">,
@@ -82,8 +77,7 @@ export function createRegistryChangePush(
   if (!waitForChange || options.enabled === false) return undefined;
   const waitMs = options.waitMs ?? CHANGE_PUSH_WAIT_MS;
   return {
-    healthyProbeMs:
-      options.healthyProbeMs ?? DEFAULT_CHANGE_PUSH_HEALTHY_PROBE_MS,
+    requestPeriodMs: waitMs,
     subscribe(handlers) {
       const lifetime = new AbortController();
       let cursor: string | undefined;
@@ -139,6 +133,8 @@ export function createRegistryChangePush(
           cursor = answer.seq;
           failures = 0;
           setHealth(true);
+          // The position first: the cycle a poke starts samples it.
+          handlers.onPosition(answer.seq);
           if (answer.changed || afterFailure) {
             afterFailure = false;
             handlers.onChange();

@@ -199,6 +199,24 @@ describe("PS Lite persistence bundle — injected state + data continuity", () =
     });
   });
 
+  it("hands the host the built runtime's view-change and sync-status subscriptions", async () => {
+    // A host (Web) learns that data changed from these. A handle that drops
+    // them leaves the host re-listing on a timer, which is a wait of up to a
+    // whole timer period after the data already arrived.
+    const server = await startServerOverBundle(memoryBundle(), {
+      relay: false,
+    });
+    try {
+      expect(typeof server.subscribeViewChanges).toBe("function");
+      expect(typeof server.subscribeSyncStatus).toBe("function");
+      const stop = server.subscribeViewChanges!(() => {});
+      expect(typeof stop).toBe("function");
+      stop();
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("persists data + access logs through injected stores across a runtime restart", async () => {
     const bundle = memoryBundle();
 

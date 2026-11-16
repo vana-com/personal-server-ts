@@ -36,9 +36,9 @@ import type { LegacyWriteSeal } from "../../storage/legacy-write-seal.js";
  * row, so a change that leaves that row alone (two rows stamped in the same
  * millisecond, a lower row changed under an unchanged top row) is invisible to
  * it. A manager therefore uses it only to start a cycle early. It never uses
- * it to skip the timer's cycle, and the unconditional timer cycle is what
- * guarantees every change is applied. A failed or "cannot tell" probe never
- * starts a cycle by itself (see `requestPull`).
+ * it to skip a cycle. A failed or "cannot tell" probe never starts a cycle by
+ * itself (see `requestPull`). What may skip the timer's cycle is the push's
+ * position, which the gateway makes exact (see {@link ChangePush}).
  */
 export interface ChangeProbe {
   /**
@@ -54,43 +54,58 @@ export interface ChangeProbe {
    */
   intervalMs: number;
   /**
-   * A server push that tells the manager when to pull. While it is healthy the
-   * timed probe stretches to `push.healthyProbeMs`; otherwise nothing differs.
+   * A server push that tells the manager when to pull. While it is healthy and
+   * its position is the one the last clean cycle started under, the timer's
+   * cycle and the timed probe are skipped; otherwise nothing differs.
    */
   push?: ChangePush;
+  /**
+   * Registry requests made so far by the cycle, not counting the change feed.
+   * The manager reads it around a clean cycle to learn what an idle one costs,
+   * which sets the push's safety net. Without it the net is the poll interval:
+   * the timer then skips nothing.
+   */
+  requestCount?: () => number;
 }
 
 /**
- * A server-pushed hint that the registry changed. It is lossy by design: a
- * poke can be lost, doubled or late, and nothing here depends on one arriving.
- * A poke runs a cycle. It does not go through the marker comparison that a
- * focus or a probe tick uses, because the marker is the lossy part (it
- * fingerprints one row, and another row stamped in the same millisecond leaves
- * it equal) while a poke is the gateway's exact sequence changing, or the
- * first answer after a failure. It does not wait for the probe either: a probe
- * that never answers cannot hold it up. A failed attempt is not a poke. The
- * unconditional timer cycle stays the completeness guarantee. The push only
- * shortens the wait, and it says when it cannot be trusted so the short probe
- * returns.
+ * A server push that says where the registry is. Its position is the gateway's
+ * exact sequence for the owner: it changes whenever anything a client can see
+ * changed. A poke can still be lost, doubled or late, and the marker the probe
+ * compares fingerprints one row, so neither decides alone.
+ *
+ * A poke runs a cycle at once. It does not go through the marker comparison,
+ * and it does not wait for the probe: a probe that never answers cannot hold
+ * it up. A failed attempt is not a poke.
+ *
+ * The position lets the manager skip work. A cycle reads the registry after
+ * the position it started under, so when the push is healthy and its position
+ * is still the one the last clean cycle started under, that cycle already
+ * holds everything the registry has, and the timer's cycle and the probe would
+ * only repeat it. Both resume the moment the push is not healthy, the position
+ * moved, or the last cycle was not clean. A full cycle still runs once the
+ * safety net elapses, a check on the push itself: see `safetyNetMs`.
  */
 export interface ChangePush {
   /**
-   * The timed probe's period while the push is healthy. Longer than the
-   * probe's own `intervalMs`; the unconditional timer cycle bounds it.
+   * How often the push makes a request while idle (one held request per this
+   * long). The safety net is priced in these: it costs no more requests than
+   * the push does.
    */
-  healthyProbeMs: number;
+  requestPeriodMs: number;
   /**
-   * Start a subscription; the returned function ends it. `onChange` means the
-   * registry's sequence moved since the last answer, or the first answer after
-   * a failure came back: run a cycle. It is called on a successful answer
-   * only; a failed attempt calls nothing, so with every answer lost the timer
-   * cycle is the bound. `onHealth(true)`:
-   * the channel answered lately, so pokes can be expected; `onHealth(false)`:
-   * it failed or went quiet, so do not rely on one.
+   * Start a subscription; the returned function ends it. `onPosition(p)` is
+   * the registry's position as of an answer; it comes before the `onChange` of
+   * the same answer. `onChange` means the registry's sequence moved since the
+   * last answer, or the first answer after a failure came back: run a cycle.
+   * Both are called on a successful answer only; a failed attempt calls
+   * nothing. `onHealth(true)`: the channel answered lately, so positions can be
+   * trusted; `onHealth(false)`: it failed or went quiet, so do not rely on one.
    */
   subscribe(handlers: {
     onChange(): void;
     onHealth(healthy: boolean): void;
+    onPosition(position: string): void;
   }): () => void;
 }
 
@@ -103,9 +118,10 @@ export interface SyncManagerOptions {
   pollInterval?: number;
   /**
    * Starts a cycle when the registry changed, between the timer's cycles. The
-   * timer stays unconditional and is the completeness guarantee: a probe that
-   * fails or misses a change (see {@link ChangeProbe}) costs at most one poll
-   * interval, and the timer's cycle is never gated on the marker.
+   * timer's cycle is never gated on the marker: a probe that fails or misses a
+   * change (see {@link ChangeProbe}) costs at most one poll interval. Only a
+   * healthy push whose position has not moved lets the timer skip, and then
+   * for at most the safety net.
    */
   changeProbe?: ChangeProbe;
   /** Max upload batch size per cycle (default: 50) */
@@ -320,12 +336,23 @@ export function createSyncManager(
   // Failed probes in a row, and the earliest time the timed probe tries again.
   let probeFailures = 0;
   let nextTimedProbeAt = 0;
-  // The change push (`ChangeProbe.push`): whether it can be trusted now, when
-  // the registry was last probed (a tick within the healthy period of one is
-  // skipped), and how to end the subscription of this run.
+  // The change push (`ChangeProbe.push`): whether it can be trusted now, and
+  // how to end the subscription of this run.
   let pushHealthy = false;
-  let lastProbeAt = 0;
   let stopPush: (() => void) | null = null;
+  // Positions (see `ChangePush`). `knownPosition` is the push's latest answer.
+  // `syncedPosition` is the position the last cleanly finished pass started
+  // under, and `syncedAt` when it started; both are undefined while a pass
+  // runs or when the last one did not finish clean. `idleCycleRequests` is the
+  // price of an idle pass, in registry requests: the latest clean pass that
+  // started and ended under the position the clean pass before it started
+  // under. Nothing was committed anywhere across that pass, so it only checked.
+  // A pass that found news (or uploaded some) cost more and never sets it.
+  let knownPosition: string | undefined;
+  let syncedPosition: string | undefined;
+  let priorCleanPosition: string | undefined;
+  let syncedAt = 0;
+  let idleCycleRequests: number | undefined;
   // The host paused the manager (no one is looking): no request, no timer.
   // `owedWhilePaused` remembers a local ingest that arrived meanwhile.
   let paused = false;
@@ -440,6 +467,28 @@ export function createSyncManager(
         if (!first) cycleFailures = 0;
         first = false;
         rerunRequested = false;
+        // Sample before anything is read: every change up to this position is
+        // in the registry when the pass reads. Nothing is settled until it
+        // ends clean.
+        const startedUnder = knownPosition;
+        const startedAt = Date.now();
+        const errorsBefore = errorSeq;
+        const requestsBefore = options?.changeProbe?.requestCount?.();
+        syncedPosition = undefined;
+        const settle = () => {
+          if (blocked !== null || errorSeq !== errorsBefore) return;
+          syncedPosition = startedUnder;
+          syncedAt = startedAt;
+          const count = options?.changeProbe?.requestCount;
+          const idle =
+            startedUnder !== undefined &&
+            startedUnder === priorCleanPosition &&
+            knownPosition === startedUnder;
+          if (idle && count && requestsBefore !== undefined) {
+            idleCycleRequests = Math.max(count() - requestsBefore, 1);
+          }
+          priorCleanPosition = startedUnder;
+        };
         const canRun = await (options?.canSync?.() ?? { ok: true });
         if (!canRun.ok) {
           blocked = { reason: canRun.reason, message: canRun.message };
@@ -456,6 +505,7 @@ export function createSyncManager(
               await options.localSync.cycle();
               lastSync = new Date().toISOString();
               statusMayHaveChanged();
+              settle();
             } else {
               blocked = {
                 reason:
@@ -546,6 +596,7 @@ export function createSyncManager(
 
         lastSync = new Date().toISOString();
         statusMayHaveChanged(); // the cursor and lastSync, at the pass boundary
+        settle();
       } while (rerunRequested && isRunning && !paused);
     };
 
@@ -744,7 +795,6 @@ export function createSyncManager(
     ended: AbortSignal,
   ): Promise<void> {
     let marker: string | null | undefined;
-    lastProbeAt = Date.now();
     try {
       marker = await probe.read(ended);
     } catch (err) {
@@ -913,9 +963,53 @@ export function createSyncManager(
     }
   }
 
+  /**
+   * How long a healthy push with an unmoved position may stand in for a full
+   * cycle. The net is a check on the push, and it is priced like the push: one
+   * idle cycle's requests, spread over as many held requests' periods, so it
+   * costs this device no more than the push does. Never under the poll
+   * interval, which is the timer's own cadence; without a request count the
+   * price is unknown and the net is the poll interval (nothing is skipped).
+   */
+  function safetyNetMs(push: ChangePush): number {
+    return Math.max(
+      pollInterval,
+      (idleCycleRequests ?? 0) * push.requestPeriodMs,
+    );
+  }
+
+  /**
+   * True when the push vouches for the registry: it answers (healthy), nothing
+   * runs now, and its position is the one the last clean cycle started under.
+   * That cycle read everything the registry held after that position.
+   */
+  function pushVouches(): boolean {
+    return (
+      options?.changeProbe?.push !== undefined &&
+      pushHealthy &&
+      cycleInFlight === null &&
+      knownPosition !== undefined &&
+      knownPosition === syncedPosition
+    );
+  }
+
+  /**
+   * True when a full cycle or a marker probe would only repeat what the last
+   * clean cycle read: the push vouches and the safety net has not elapsed.
+   */
+  function pushCovers(): boolean {
+    const push = options?.changeProbe?.push;
+    return (
+      push !== undefined &&
+      pushVouches() &&
+      Date.now() - syncedAt < safetyNetMs(push)
+    );
+  }
+
   function startInterval(): void {
     if (intervalId !== null) return;
     intervalId = setInterval(() => {
+      if (pushCovers()) return;
       runCycle().catch(() => {
         // Errors already captured in ring buffer
       });
@@ -934,13 +1028,15 @@ export function createSyncManager(
     if (!probe || probeIntervalId !== null) return;
     probeIntervalId = setInterval(() => {
       if (Date.now() < nextTimedProbeAt) return; // backing off after failures
-      // A healthy push pokes on a change; the timer cycle still runs every
-      // poll interval, so this probe only has to back it up now and then.
-      if (
-        pushHealthy &&
-        probe.push &&
-        Date.now() - lastProbeAt < probe.push.healthyProbeMs
-      ) {
+      // The position says nothing moved since the last clean cycle: a marker
+      // read would repeat the answer.
+      if (pushCovers()) return;
+      // The net has elapsed: the check it stands for is a full cycle, and a
+      // marker read would only delay it until the timer's next tick.
+      if (pushVouches()) {
+        runCycle().catch(() => {
+          // Errors already captured in ring buffer
+        });
         return;
       }
       pull(false).catch(() => {
@@ -953,26 +1049,39 @@ export function createSyncManager(
     const push = options?.changeProbe?.push;
     if (!push || stopPush !== null) return;
     const run = lifecycle;
+    // A cycle the push asks for. It does not wait for the optional probe or
+    // join a timed probe read in flight, so a probe that never answers cannot
+    // hold it up; `runCycle` still runs one cycle at a time. It reads no marker
+    // and publishes none: see `pulledMarker`.
+    const cycleNow = () => {
+      if (retryTimer !== null) {
+        // Cooling down after a failed cycle: the request is owed, and the
+        // retry timer runs it. A push neither skips nor restarts the wait.
+        rerunRequested = true;
+        return;
+      }
+      runCycle().catch(() => {
+        // Errors already captured in ring buffer
+      });
+    };
     stopPush = push.subscribe({
       onChange() {
         if (run !== lifecycle || !isRunning) return;
-        // A verified change cycles at once. It does not wait for the optional
-        // probe or join a timed probe read in flight, so a probe that never
-        // answers cannot hold it up; `runCycle` still runs one cycle at a time.
-        // It reads no marker and publishes none: see `pulledMarker`.
-        if (retryTimer !== null) {
-          // Cooling down after a failed cycle: the request is owed, and the
-          // retry timer runs it. A push neither skips nor restarts the wait.
-          rerunRequested = true;
-          return;
-        }
-        runCycle().catch(() => {
-          // Errors already captured in ring buffer
-        });
+        cycleNow();
       },
       onHealth(healthy) {
         if (run !== lifecycle) return;
+        const wasHealthy = pushHealthy;
         pushHealthy = healthy;
+        // While the push was silent its position could not vouch for the
+        // registry, and a change committed in that time is not in any
+        // position. Read once now rather than wait for the timer, which may
+        // have skipped its last tick on the strength of that position.
+        if (wasHealthy && !healthy && isRunning) cycleNow();
+      },
+      onPosition(position) {
+        if (run !== lifecycle || !isRunning) return;
+        knownPosition = position;
       },
     });
   }
@@ -981,6 +1090,7 @@ export function createSyncManager(
     stopPush?.();
     stopPush = null;
     pushHealthy = false;
+    knownPosition = undefined;
   }
 
   function clearProbeInterval(): void {
@@ -1012,7 +1122,10 @@ export function createSyncManager(
       cycleFailures = 0;
       probeFailures = 0;
       nextTimedProbeAt = 0;
-      lastProbeAt = Date.now();
+      knownPosition = undefined;
+      syncedPosition = undefined;
+      idleCycleRequests = undefined;
+      priorCleanPosition = undefined;
       statusMayHaveChanged(); // running: true
 
       // Crash recovery: run one cycle immediately on start

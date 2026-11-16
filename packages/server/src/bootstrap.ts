@@ -160,6 +160,7 @@ import {
   type RunIntake,
   type StreamSyncBlobs,
   type StreamSyncRegistry,
+  countRegistryRequests,
   createGatewayStreamSyncRegistry,
   manifestArtifactResolver,
   createStorageStreamSyncBlobs,
@@ -893,15 +894,22 @@ async function bootstrapServer(
         "Stream sync is unavailable on this server",
       );
   }
-  // One registry client for the cycle's reads and the change probe.
-  let streamSyncRegistryClient: StreamSyncRegistry | undefined;
-  function streamSyncRegistry(): StreamSyncRegistry {
+  // One registry client for the cycle's reads and the change probe. The cycle's
+  // calls are counted: the manager prices an idle cycle from the count.
+  let streamSyncRegistryClient:
+    ReturnType<typeof countRegistryRequests<StreamSyncRegistry>> | undefined;
+  function countedStreamSyncRegistry() {
     return (streamSyncRegistryClient ??=
-      options?.streamSyncRegistry ??
-      createGatewayStreamSyncRegistry({
-        gatewayUrl: config.gateway.url,
-        ownerAddress: serverOwner!,
-      }));
+      countRegistryRequests<StreamSyncRegistry>(
+        options?.streamSyncRegistry ??
+          createGatewayStreamSyncRegistry({
+            gatewayUrl: config.gateway.url,
+            ownerAddress: serverOwner!,
+          }),
+      ));
+  }
+  function streamSyncRegistry(): StreamSyncRegistry {
+    return countedStreamSyncRegistry().registry;
   }
   async function getLocalSync(): Promise<LocalSync> {
     requireStreamMode();
@@ -1283,10 +1291,8 @@ async function bootstrapServer(
       localSyncSource &&
       createRegistryChangeProbe(streamSyncRegistry(), {
         intervalMs: config.streamSync.changeProbeMs,
-        push: {
-          enabled: config.streamSync.changePush,
-          healthyProbeMs: config.streamSync.changeProbeHealthyMs,
-        },
+        push: { enabled: config.streamSync.changePush },
+        requestCount: countedStreamSyncRegistry().count,
       });
 
     syncManager = createSyncManager(uploadDeps, downloadDeps, {

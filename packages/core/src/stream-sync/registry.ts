@@ -269,6 +269,19 @@ export function createGatewayStreamSyncRegistry(
   let batchRoute: "absent" | undefined;
   let batchPolicy: RegistryBatchPolicy | undefined;
 
+  /**
+   * `"absent"` once the gateway has said it has no change route. The answer is
+   * learned once per client: a later subscription (a resume, a restart of the
+   * push) asks nothing, where each ask is a request that cannot succeed.
+   */
+  let changeFeed: "absent" | undefined;
+  const absentFeed = (status?: number) =>
+    new ChangeFeedAbsentError(
+      status === undefined
+        ? "registry has no change route"
+        : `registry has no change route: ${status}`,
+    );
+
   /** One `POST /v1/data`, with `requires` when the caller has conditions. */
   async function sendPost(
     request: SignedRegistryPost,
@@ -455,7 +468,7 @@ export function createGatewayStreamSyncRegistry(
       // every write, tombstone and revive of a row. The marker fingerprints
       // this one row. Another row stamped in the same millisecond leaves it
       // unchanged, so equal markers are not proof of "nothing changed": the
-      // caller's unconditional timer cycle is the completeness guarantee.
+      // caller's timer cycle, or the push's position, is the completeness guarantee.
       const newest = rows[0] as RegistryRow & { id?: unknown };
       if (typeof newest.changedAt !== "string" || newest.changedAt === "") {
         return undefined;
@@ -464,6 +477,7 @@ export function createGatewayStreamSyncRegistry(
     },
 
     async waitForChange(after, waitMs, signal) {
+      if (changeFeed === "absent") throw absentFeed();
       const params = new URLSearchParams({ user: options.ownerAddress });
       if (after !== undefined) {
         params.set("after", after);
@@ -473,10 +487,19 @@ export function createGatewayStreamSyncRegistry(
         `${base}/v1/data/changes?${params.toString()}`,
         { signal },
       );
-      if (res.status === 404 || res.status === 405) {
-        throw new ChangeFeedAbsentError(
-          `registry has no change route: ${res.status}`,
-        );
+      // The first request (no cursor) is the capability probe, and this client
+      // always builds it well formed. A gateway without the route hands the
+      // path to its `/v1/data/:id` handler, which refuses the id `changes`
+      // with a 400; so 404, 405 and a 400 with no cursor all mean "no such
+      // route". A 400 on a request that carries a cursor is the route refusing
+      // that cursor: a failure, not an absence.
+      if (
+        res.status === 404 ||
+        res.status === 405 ||
+        (res.status === 400 && after === undefined)
+      ) {
+        changeFeed = "absent";
+        throw absentFeed(res.status);
       }
       if (!res.ok) {
         throw new Error(`registry change wait failed: ${res.status}`);

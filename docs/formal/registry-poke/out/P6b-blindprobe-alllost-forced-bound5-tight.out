@@ -1,21 +1,23 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 129 and seed 5839787512986201862 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 1718372] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
-Parsing file /home/tnunamak/.tmp/gap-push-1115-ps/docs/formal/registry-poke/RegistryPoke.tla
+Running breadth-first search Model-Checking with fp 86 and seed 3424287889228121136 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 2612860] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/tnunamak/.tmp/floors-gap-1116/idle-push-root/ps/docs/formal/registry-poke/RegistryPoke.tla
 Parsing file /tmp/Naturals.tla
 Semantic processing of module Naturals
 Semantic processing of module RegistryPoke
-Starting... (2026-11-14 18:32:41)
+Starting... (2026-11-15 19:42:39)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-11-14 18:32:41.
+Finished computing initial states: 1 distinct state generated at 2026-11-15 19:42:39.
 Error: Invariant StaleBound is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
 /\ seq = 0
 /\ healthy = (d1 :> FALSE)
 /\ writes = 0
+/\ syncedAt = (d1 :> 0)
 /\ clock = 0
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> FALSE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> FALSE)
@@ -24,13 +26,15 @@ State 1: <Initial predicate>
 /\ lastProbe = (d1 :> 0)
 /\ age = (d1 :> 0)
 
-State 2: <Commit line 103, col 3 to line 106, col 44 of module RegistryPoke>
+State 2: <Commit line 135, col 3 to line 138, col 50 of module RegistryPoke>
 /\ seq = 1
 /\ healthy = (d1 :> FALSE)
 /\ writes = 1
+/\ syncedAt = (d1 :> 0)
 /\ clock = 0
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> FALSE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> FALSE)
@@ -39,13 +43,15 @@ State 2: <Commit line 103, col 3 to line 106, col 44 of module RegistryPoke>
 /\ lastProbe = (d1 :> 0)
 /\ age = (d1 :> 0)
 
-State 3: <Commit line 103, col 3 to line 106, col 44 of module RegistryPoke>
+State 3: <Commit line 135, col 3 to line 138, col 50 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 0
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> FALSE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> FALSE)
@@ -54,13 +60,15 @@ State 3: <Commit line 103, col 3 to line 106, col 44 of module RegistryPoke>
 /\ lastProbe = (d1 :> 0)
 /\ age = (d1 :> 0)
 
-State 4: <Subscribe line 112, col 3 to line 119, col 53 of module RegistryPoke>
+State 4: <Subscribe line 144, col 3 to line 151, col 59 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 0
 /\ reply = (d1 :> 2)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> FALSE)
@@ -69,13 +77,15 @@ State 4: <Subscribe line 112, col 3 to line 119, col 53 of module RegistryPoke>
 /\ lastProbe = (d1 :> 0)
 /\ age = (d1 :> 0)
 
-State 5: <Lose line 160, col 3 to line 163, col 63 of module RegistryPoke>
+State 5: <Lose line 192, col 3 to line 195, col 69 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 0
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> FALSE)
@@ -84,13 +94,15 @@ State 5: <Lose line 160, col 3 to line 163, col 63 of module RegistryPoke>
 /\ lastProbe = (d1 :> 0)
 /\ age = (d1 :> 0)
 
-State 6: <Tick line 216, col 3 to line 221, col 58 of module RegistryPoke>
+State 6: <Tick line 248, col 3 to line 253, col 64 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 1
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> FALSE)
@@ -99,13 +111,15 @@ State 6: <Tick line 216, col 3 to line 221, col 58 of module RegistryPoke>
 /\ lastProbe = (d1 :> 0)
 /\ age = (d1 :> 1)
 
-State 7: <Probe line 191, col 3 to line 195, col 28 of module RegistryPoke>
+State 7: <Probe line 223, col 3 to line 227, col 28 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 1
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> FALSE)
@@ -114,13 +128,15 @@ State 7: <Probe line 191, col 3 to line 195, col 28 of module RegistryPoke>
 /\ lastProbe = (d1 :> 1)
 /\ age = (d1 :> 1)
 
-State 8: <Tick line 216, col 3 to line 221, col 58 of module RegistryPoke>
+State 8: <Tick line 248, col 3 to line 253, col 64 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 2
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> FALSE)
@@ -129,13 +145,15 @@ State 8: <Tick line 216, col 3 to line 221, col 58 of module RegistryPoke>
 /\ lastProbe = (d1 :> 1)
 /\ age = (d1 :> 2)
 
-State 9: <Probe line 191, col 3 to line 195, col 28 of module RegistryPoke>
+State 9: <Probe line 223, col 3 to line 227, col 28 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 2
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> FALSE)
@@ -144,13 +162,15 @@ State 9: <Probe line 191, col 3 to line 195, col 28 of module RegistryPoke>
 /\ lastProbe = (d1 :> 2)
 /\ age = (d1 :> 2)
 
-State 10: <Tick line 216, col 3 to line 221, col 58 of module RegistryPoke>
+State 10: <Tick line 248, col 3 to line 253, col 64 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 3
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> TRUE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> FALSE)
@@ -159,13 +179,15 @@ State 10: <Tick line 216, col 3 to line 221, col 58 of module RegistryPoke>
 /\ lastProbe = (d1 :> 2)
 /\ age = (d1 :> 3)
 
-State 11: <Drop line 167, col 3 to line 173, col 33 of module RegistryPoke>
+State 11: <Drop line 199, col 3 to line 205, col 76 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 3
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> FALSE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> TRUE)
@@ -174,13 +196,15 @@ State 11: <Drop line 167, col 3 to line 173, col 33 of module RegistryPoke>
 /\ lastProbe = (d1 :> 2)
 /\ age = (d1 :> 3)
 
-State 12: <Probe line 191, col 3 to line 195, col 28 of module RegistryPoke>
+State 12: <Probe line 223, col 3 to line 227, col 28 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 3
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> FALSE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> TRUE)
@@ -189,13 +213,15 @@ State 12: <Probe line 191, col 3 to line 195, col 28 of module RegistryPoke>
 /\ lastProbe = (d1 :> 3)
 /\ age = (d1 :> 3)
 
-State 13: <Tick line 216, col 3 to line 221, col 58 of module RegistryPoke>
+State 13: <Tick line 248, col 3 to line 253, col 64 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 4
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> FALSE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> TRUE)
@@ -204,13 +230,15 @@ State 13: <Tick line 216, col 3 to line 221, col 58 of module RegistryPoke>
 /\ lastProbe = (d1 :> 3)
 /\ age = (d1 :> 4)
 
-State 14: <Probe line 191, col 3 to line 195, col 28 of module RegistryPoke>
+State 14: <Probe line 223, col 3 to line 227, col 28 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 4
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> FALSE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> TRUE)
@@ -219,13 +247,15 @@ State 14: <Probe line 191, col 3 to line 195, col 28 of module RegistryPoke>
 /\ lastProbe = (d1 :> 4)
 /\ age = (d1 :> 4)
 
-State 15: <Tick line 216, col 3 to line 221, col 58 of module RegistryPoke>
+State 15: <Tick line 248, col 3 to line 253, col 64 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 5
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> FALSE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> TRUE)
@@ -234,13 +264,15 @@ State 15: <Tick line 216, col 3 to line 221, col 58 of module RegistryPoke>
 /\ lastProbe = (d1 :> 4)
 /\ age = (d1 :> 5)
 
-State 16: <Probe line 191, col 3 to line 195, col 28 of module RegistryPoke>
+State 16: <Probe line 223, col 3 to line 227, col 28 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 5
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> FALSE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> TRUE)
@@ -249,13 +281,15 @@ State 16: <Probe line 191, col 3 to line 195, col 28 of module RegistryPoke>
 /\ lastProbe = (d1 :> 5)
 /\ age = (d1 :> 5)
 
-State 17: <Tick line 216, col 3 to line 221, col 58 of module RegistryPoke>
+State 17: <Tick line 248, col 3 to line 253, col 64 of module RegistryPoke>
 /\ seq = 2
 /\ healthy = (d1 :> FALSE)
 /\ writes = 2
+/\ syncedAt = (d1 :> 0)
 /\ clock = 6
 /\ reply = (d1 :> -1)
 /\ applied = (d1 :> 0)
+/\ synced = (d1 :> -1)
 /\ nextTimer = (d1 :> 6)
 /\ req = (d1 :> [on |-> FALSE, base |-> 0, since |-> 0, held |-> FALSE])
 /\ needPull = (d1 :> TRUE)
@@ -264,8 +298,8 @@ State 17: <Tick line 216, col 3 to line 221, col 58 of module RegistryPoke>
 /\ lastProbe = (d1 :> 5)
 /\ age = (d1 :> 6)
 
-2233 states generated, 1045 distinct states found, 171 states left on queue.
-The depth of the complete state graph search is 19.
+4169 states generated, 2101 distinct states found, 454 states left on queue.
+The depth of the complete state graph search is 17.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 5 and the 95th percentile is 3).
-Finished in 00s at (2026-11-14 18:32:41)
+Finished in 00s at (2026-11-15 19:42:39)
 exit 12

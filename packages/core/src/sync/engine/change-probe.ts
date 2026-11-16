@@ -42,6 +42,12 @@ export interface RegistryChangeProbeOptions {
    * is the host's `SyncManager.pause`, not an option here.
    */
   push?: RegistryChangePushOptions;
+  /**
+   * Registry requests made so far by the cycle (see `countRegistryRequests`).
+   * The manager prices an idle cycle with it and derives the push's safety
+   * net from the price.
+   */
+  requestCount?: () => number;
 }
 
 /** The manager's probe over a registry that can answer one; none otherwise. */
@@ -57,6 +63,7 @@ export function createRegistryChangeProbe(
     read: (lifecycle) => readWithDeadline(probeChange, lifecycle),
     intervalMs,
     ...(push && { push }),
+    ...(options.requestCount && { requestCount: options.requestCount }),
   };
 }
 

@@ -125,6 +125,13 @@ export type PersonalServerLiteHandle = PersonalServerHandle & {
    * Errors as `streamSyncIntake.publicationStatus` does.
    */
   publicationStatus(runId: string): Promise<RunPublicationStatus>;
+  /**
+   * The built runtime's change announcements, for a host that shows the data
+   * (see `IndexedDbPsLiteRuntime`). Absent over a supplied runtime: its
+   * storage is the caller's. A host without them can only re-read on a timer.
+   */
+  readonly subscribeViewChanges?: IndexedDbPsLiteRuntime["subscribeViewChanges"];
+  readonly subscribeSyncStatus?: IndexedDbPsLiteRuntime["subscribeSyncStatus"];
 };
 
 export async function startPersonalServer(
@@ -252,6 +259,17 @@ export async function startPersonalServer(
     return lastInfo;
   }
 
+  /**
+   * Where API calls go: the relay URL once there is one, else the local
+   * runtime. It is the `urls.apiOrigin` that `info()` reports, without the
+   * `/health` request behind `info()`, which looks this server up at the
+   * gateway. A call that needs only the origin must not pay that lookup: the
+   * handle's calls each did, twice.
+   */
+  function apiOrigin(): string {
+    return publicUrl ?? localOrigin;
+  }
+
   async function prepareRegistration(
     prepareOptions: PersonalServerPrepareRegistrationOptions = {},
   ): Promise<PersonalServerRegistrationRequest> {
@@ -298,8 +316,7 @@ export async function startPersonalServer(
     input: string | URL | Request,
     init?: RequestInit,
   ): Promise<Response> {
-    const origin = (await info()).urls.apiOrigin ?? localOrigin;
-    return runtime.fetch(await toRuntimeRequest(input, origin, init));
+    return runtime.fetch(await toRuntimeRequest(input, apiOrigin(), init));
   }
 
   async function postData(
@@ -307,8 +324,7 @@ export async function startPersonalServer(
     body: unknown,
     postOptions: PersonalServerPostDataOptions,
   ): Promise<{ scope: string; collectedAt: string; status: string }> {
-    const current = await info();
-    const origin = requiredApiOrigin(current);
+    const origin = apiOrigin();
     const path = `/v1/data/${encodeURIComponent(scope)}`;
     const request = await createOwnerRequest({
       origin,
@@ -331,7 +347,7 @@ export async function startPersonalServer(
     scope: string,
     uploadOptions: PersonalServerOpenScopeUploadOptions,
   ): Promise<PersonalServerScopeUpload> {
-    const origin = requiredApiOrigin(await info());
+    const origin = apiOrigin();
     const base = `/v1/data/${encodeURIComponent(scope)}/uploads`;
     // Every request below is already addressed to `origin`, so each goes
     // straight to the runtime. `callFetch` would ask `info()` for the origin
@@ -501,9 +517,8 @@ export async function startPersonalServer(
   async function listData(
     listOptions: PersonalServerListDataOptions = {},
   ): Promise<PersonalServerListDataResult> {
-    const current = await info();
     const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
+      origin: apiOrigin(),
       path: dataListPath(listOptions),
       method: "GET",
       authOptions: listOptions,
@@ -518,9 +533,8 @@ export async function startPersonalServer(
   async function listAccessLogs(
     accessLogOptions: PersonalServerListAccessLogsOptions = {},
   ): Promise<PersonalServerListAccessLogsResult> {
-    const current = await info();
     const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
+      origin: apiOrigin(),
       path: accessLogsListPath(accessLogOptions),
       method: "GET",
       authOptions: accessLogOptions,
@@ -536,9 +550,8 @@ export async function startPersonalServer(
     scope: string,
     versionOptions: PersonalServerListVersionsOptions = {},
   ): Promise<PersonalServerListVersionsResult> {
-    const current = await info();
     const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
+      origin: apiOrigin(),
       path: dataVersionsPath(scope, versionOptions),
       method: "GET",
       authOptions: versionOptions,
@@ -554,9 +567,8 @@ export async function startPersonalServer(
     scope: string,
     readOptions: PersonalServerReadDataOptions = {},
   ): Promise<DataFileEnvelope> {
-    const current = await info();
     const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
+      origin: apiOrigin(),
       path: dataReadPath(scope, readOptions),
       method: "GET",
       authOptions: readOptions,
@@ -571,9 +583,8 @@ export async function startPersonalServer(
   async function syncStatus(
     syncOptions: PersonalServerAuthRequestOptions = {},
   ): Promise<SyncStatus> {
-    const current = await info();
     const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
+      origin: apiOrigin(),
       path: "/v1/sync/status",
       method: "GET",
       authOptions: syncOptions,
@@ -588,9 +599,8 @@ export async function startPersonalServer(
   async function createGrant(
     grantOptions: PersonalServerCreateGrantOptions,
   ): Promise<PersonalServerCreateGrantResult> {
-    const current = await info();
     const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
+      origin: apiOrigin(),
       path: "/v1/grants",
       method: "POST",
       body: {
@@ -618,9 +628,8 @@ export async function startPersonalServer(
   async function listGrants(
     grantOptions: PersonalServerAuthRequestOptions = {},
   ): Promise<PersonalServerListGrantsResult> {
-    const current = await info();
     const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
+      origin: apiOrigin(),
       path: "/v1/grants",
       method: "GET",
       authOptions: grantOptions,
@@ -636,9 +645,8 @@ export async function startPersonalServer(
     grantId: string,
     grantOptions: PersonalServerAuthRequestOptions = {},
   ): Promise<PersonalServerRevokeGrantResult> {
-    const current = await info();
     const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
+      origin: apiOrigin(),
       path: grantRevokePath(grantId),
       method: "DELETE",
       authOptions: grantOptions,
@@ -653,9 +661,8 @@ export async function startPersonalServer(
   async function syncNow(
     syncOptions: PersonalServerAuthRequestOptions = {},
   ): Promise<PersonalServerSyncTriggerResult> {
-    const current = await info();
     const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
+      origin: apiOrigin(),
       path: "/v1/sync/trigger",
       method: "POST",
       authOptions: syncOptions,
@@ -802,6 +809,10 @@ export async function startPersonalServer(
     revokeGrant,
     syncStatus,
     syncNow,
+    ...(runtimeBundle && {
+      subscribeViewChanges: runtimeBundle.subscribeViewChanges,
+      subscribeSyncStatus: runtimeBundle.subscribeSyncStatus,
+    }),
     streamSyncIntake: runtimeBundle?.streamSyncIntake ?? null,
     streamSyncSeed,
     publish,
@@ -866,13 +877,6 @@ function requiredGatewayUrl(info: PersonalServerInfo): string {
     throw new Error("Personal Server gateway URL is required");
   }
   return info.gatewayUrl;
-}
-
-function requiredApiOrigin(info: PersonalServerInfo): string {
-  if (!info.urls.apiOrigin) {
-    throw new Error("Personal Server API origin is required");
-  }
-  return info.urls.apiOrigin;
 }
 
 async function toRuntimeRequest(

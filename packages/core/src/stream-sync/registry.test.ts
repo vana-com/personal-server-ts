@@ -569,6 +569,56 @@ describe("waitForChange", () => {
     }
   });
 
+  it("reads a 400 on the cursorless first request as 'no change route'", async () => {
+    // A gateway without the route hands the path to its `/v1/data/:id` handler,
+    // which refuses the id `changes` with a 400. The first request is the
+    // capability probe and is always well formed, so a 400 there says the path
+    // is not the change route.
+    const { registry } = waiting(() => new Response("bad id", { status: 400 }));
+    await expect(
+      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+    ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
+  });
+
+  it("does not read a 400 on a request that carries a cursor as an absent route", async () => {
+    const { registry } = waiting(() => new Response("bad", { status: 400 }));
+    const failure = await registry.waitForChange!(
+      "9",
+      25_000,
+      new AbortController().signal,
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).name).not.toBe("ChangeFeedAbsentError");
+  });
+
+  it("asks for the change route once: after 'absent' it sends nothing", async () => {
+    const { registry, urls } = waiting(
+      () => new Response("no", { status: 404 }),
+    );
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await expect(
+        registry.waitForChange!(
+          undefined,
+          25_000,
+          new AbortController().signal,
+        ),
+      ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
+    }
+    expect(urls).toHaveLength(1);
+  });
+
+  it("keeps asking after a failure that does not say the route is absent", async () => {
+    const { registry, urls } = waiting(
+      () => new Response("down", { status: 503 }),
+    );
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await expect(
+        registry.waitForChange!("1", 25_000, new AbortController().signal),
+      ).rejects.toThrow(/503/);
+    }
+    expect(urls).toHaveLength(3);
+  });
+
   it("throws on any other failure, and on an answer that is not a sequence", async () => {
     const down = waiting(() => new Response("no", { status: 503 }));
     await expect(

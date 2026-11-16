@@ -324,6 +324,73 @@ describe("PS Lite sync", () => {
     );
   });
 
+  describe("the registration check before a cycle", () => {
+    async function managerOver(getServer: ReturnType<typeof vi.fn>) {
+      const stateStore = createMemoryPsLiteStateStore();
+      const accountStorageMode = {
+        owner: await recoverServerOwner(OWNER_SIGNATURE),
+        read: () => "unswitched" as const,
+      };
+      const identity = await loadOrCreatePsLiteServerIdentity({
+        store: stateStore,
+        ownerSignature: OWNER_SIGNATURE,
+        accountStorageMode,
+      });
+      const { syncManager } = await createPsLiteSyncManager({
+        config: ServerConfigSchema.parse({ sync: { enabled: true } }),
+        stateStore,
+        storage: createMemoryPsLiteStorage(),
+        ownerSignature: OWNER_SIGNATURE,
+        accountStorageMode,
+        serverAccount: identity.account,
+        gateway: { getServer, registerServer: vi.fn() } as never,
+        dataPointFeed: {
+          getDataPoint: async () => null,
+          listDataPointsByOwner: async () => ({
+            dataPoints: [],
+            cursor: null,
+          }),
+        },
+        autoStartSync: false,
+      });
+      return syncManager;
+    }
+
+    it("asks the gateway once for a registered server, not at every cycle", async () => {
+      // Registration does not lapse while the manager lives. Each ask is a
+      // gateway request that a device repeats at every cycle it ever runs.
+      const getServer = vi.fn().mockResolvedValue({ id: "server-1" });
+      const manager = await managerOver(getServer);
+      try {
+        await manager.trigger();
+        await manager.trigger();
+        await manager.trigger();
+      } finally {
+        await manager.stop();
+      }
+      expect(getServer).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps asking while the server is unregistered, so registering unblocks sync", async () => {
+      const getServer = vi
+        .fn()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue({ id: "server-1" });
+      const manager = await managerOver(getServer);
+      try {
+        await manager.trigger();
+        expect(manager.getStatus().blocked).toMatchObject({
+          reason: "unregistered",
+        });
+        await manager.trigger();
+        expect(manager.getStatus().blocked).toBeNull();
+      } finally {
+        await manager.stop();
+      }
+      expect(getServer).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it("uses the caller-provided logger for sync lifecycle logs", async () => {
     const stateStore = createMemoryPsLiteStateStore();
     const storage = createMemoryPsLiteStorage();

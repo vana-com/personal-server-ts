@@ -2,6 +2,7 @@ export * from "./ports.js";
 export * from "./crypto.js";
 export * from "./crypto-port.js";
 export * from "./registry.js";
+export * from "./request-counter.js";
 export * from "./blobs.js";
 export * from "./scope-routing.js";
 export * from "./intake.js";
