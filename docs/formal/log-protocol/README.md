@@ -583,3 +583,40 @@ Run on 2026-11-16, TLC 2.19 (`tla2tools.jar` 1.7.4, Java 17), `-workers 4`.
 Traces: `traces/head-cursor-*.txt`. The two mutants show that both halves of the
 fix are needed: the cursor (skip by consumption) and the replay (a head applied
 over log rows can drop them).
+
+## Key-ordered load beside local writers (host run, 2026-11-16)
+
+Question: a local write (a run's rows, an explicit delete) can land between the key
+ranges of a key-ordered first load. Does the load lose it, or bring back a row it
+deleted? The load of a connection that holds nothing used to decide that once, at the
+start, and write every key as a plain insert. The code now decides per key inside the
+transaction that writes the key (`stageSimpleUpserts` in `log-keyed.ts`): a key that
+meets a row, a tombstone or an unpublished change is merged, the rest are inserted.
+
+Model: modes `keyedLocal` (the code) and `keyedStale` (mutant: the emptiness read at
+the start of the load is reused, so a bucket replaces what a local write put there).
+`LocalWrite(d,k,op)` is a local upsert or delete of a key at stamp 2 or 6, enabled at
+any point before the load publishes. `own` is the fold of a device's local writes;
+`empt` is the stale decision. `Rebaseline` keeps `own`: the code keeps the rows that
+are the latest unpublished change of their key. `P8`: after a publish, every key holds
+the winner (body and rank) of the log's prefix and `own`. A new lifetime drops `own`
+(`FullCheck`): what survives a lifetime change is outside this model.
+
+Run: TLC 2.19 (`tla2tools.jar` 1.7.4), Java 17, `-workers 4`, `nice -n 19`, one job at a
+time. One device (the devices are independent), two keys, at most six commits.
+
+| Config               | Mode       | Result                                                                                                                     |
+|----------------------|------------|----------------------------------------------------------------------------------------------------------------------------|
+| KeyedLocal.cfg       | keyedLocal | PASS, complete for `ShortLog` (at most 3 log segments): 187,742 distinct states                                             |
+| KeyedLocalFull.cfg   | keyedLocal | BOUNDED: stopped at 500 s with no error; 17.1M distinct states, 3.7M left on the queue                                      |
+| KeyedLocalRebase.cfg | keyedLocal | BOUNDED: stopped at 500 s with no error; 19.5M distinct states, 3.9M left on the queue (resets, rebaseline)                  |
+| KeyedStale.cfg       | keyedStale | FAIL P8 at depth 9, 18,083 distinct states (`traces/KeyedStale.txt`): a local delete of key 1 is replaced by the log's row   |
+
+The first `KeyedLocalRebase.cfg` run failed P8 because a lifetime change kept `own`
+while `FullCheck` emptied the rows; that was the model's gap, fixed as stated above.
+The other keyed configs still end as before the change (checked: `KeyedSkip` fails P1;
+`KeyedBypass`, `KeyedEarly` and `KeyedLeak` fail P5; `KeyedShort` ran 240 s, about 5M
+distinct states, no error: bounded).
+The model does not cover the SQL failure the stale decision also had (a plain insert
+into a key a local write already holds fails on the primary key); the interleaving
+tests in `log-keyed-first-load.test.ts` cover it.

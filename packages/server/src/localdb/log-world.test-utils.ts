@@ -45,7 +45,12 @@ export const idHash = (id: string | number) =>
 const drivers: SqlDriver[] = [];
 /** Closes the databases of the devices a test opened; call it from `afterEach`. */
 export async function closeWorldDrivers(): Promise<void> {
-  for (const db of drivers.splice(0)) await db.close();
+  for (const db of drivers.splice(0))
+    await db.close().catch((error: unknown) => {
+      // A test that closed its device itself has nothing left to close.
+      if (!(error instanceof Error) || error.message !== "sqlite_driver_closed")
+        throw error;
+    });
 }
 
 export async function world(options: {
@@ -102,9 +107,11 @@ export async function world(options: {
       maxBytesInFlight?: number;
       /** The host's hash and cipher port (`LocalSyncDeps.streamCrypto`). */
       streamCrypto?: StreamCryptoPort;
+      /** A database file, so a test can close the device and open it again. Default: in memory. */
+      file?: string;
     } = {},
   ) {
-    const db = await openLocalDb(openBetterSqlite3(":memory:"), {
+    const db = await openLocalDb(openBetterSqlite3(hooks.file ?? ":memory:"), {
       owner: OWNER,
       network: "test",
       deviceId,

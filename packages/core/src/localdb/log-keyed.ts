@@ -103,13 +103,12 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement, SqlValue } from "./driver.js";
-import { withOrigin } from "./merge.js";
+import { insertIncoming, withOrigin } from "./merge.js";
 import {
   applyInGroups,
   rowsPerStatement,
   commitStaged,
   mergeStaged,
-  mergeStagedIntoEmpty,
   operationStatements,
   prepareOperations,
   streamHeadStatements,
@@ -646,12 +645,8 @@ export async function loadKeyed(
         "apply: the log is not the one an earlier key-ordered load of this connection wrote rows from",
       );
     }
-    // A load that begins (no marker) on a connection that holds no row of it:
-    // the ranges hold disjoint keys, so none of them meets a row, a tombstone
-    // or an unpublished delete, and no key needs a merge to be written.
-    const empty = pending === null && (await holdsNothing(deps, connectionId));
     for (let bucket = 0; bucket < buckets; bucket++)
-      await applyBucket(deps, connectionId, tag, bucket, empty, {
+      await applyBucket(deps, connectionId, tag, bucket, {
         // The first range creates the streams' rows and names the position
         // the rows it and the later ranges write belong to.
         first:
@@ -667,26 +662,6 @@ export async function loadKeyed(
   } finally {
     await dropStages(deps, tag, buckets).catch(() => undefined);
   }
-}
-
-/**
- * Whether the connection holds nothing a staged key could meet: no row in
- * `records`, no tombstone in `log_tombstones`, and no change in `record_changes`
- * (an unpublished explicit delete there refuses an older upsert of its key).
- * A device that began collecting before its first load, or imported, holds
- * some of these and merges every key.
- */
-async function holdsNothing(
-  deps: Pick<LocalSyncDeps, "db">,
-  connectionId: string,
-): Promise<boolean> {
-  const [held] = await deps.db.query<{ n: number }>(
-    `SELECT EXISTS (SELECT 1 FROM records WHERE connection_id = ?)
-          + EXISTS (SELECT 1 FROM log_tombstones WHERE connection_id = ?)
-          + EXISTS (SELECT 1 FROM record_changes WHERE connection_id = ?) AS n`,
-    [connectionId, connectionId, connectionId],
-  );
-  return held?.n === 0;
 }
 
 /**
@@ -801,6 +776,33 @@ export async function complexPages(
 }
 
 /**
+ * The rows of a stage table's one-upsert keys, copied into `temp.incoming`
+ * under `op`: the keys the connection holds nothing of (`clean`: no row, no
+ * tombstone, no change, so nothing refuses or merges with them) or the keys
+ * it holds something of. Run inside the transaction that writes them, the
+ * test sees the state those writes land on.
+ */
+function stageSimpleUpserts(
+  table: string,
+  connectionId: string,
+  op: string,
+  clean: boolean,
+): SqlStatement {
+  return {
+    sql: `INSERT INTO temp.incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, stamp_n)
+          SELECT ?, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, stamp_n
+            FROM ${table} s
+           WHERE s.kind = 'u' AND NOT EXISTS (
+             SELECT 1 FROM temp.log_complex c WHERE c.stream = s.stream AND c.pk_hash = s.pk_hash)
+             AND ${clean ? "NOT " : ""}(
+               EXISTS (SELECT 1 FROM records r WHERE r.connection_id = ? AND r.stream = s.stream AND r.pk_hash = s.pk_hash)
+               OR EXISTS (SELECT 1 FROM log_tombstones t WHERE t.connection_id = ? AND t.stream = s.stream AND t.pk_hash = s.pk_hash)
+               OR EXISTS (SELECT 1 FROM record_changes ch WHERE ch.connection_id = ? AND ch.stream = s.stream AND ch.pk_hash = s.pk_hash))`,
+    params: [op, connectionId, connectionId, connectionId],
+  };
+}
+
+/**
  * One key range. A bucket whose complex rows fit the memory budget commits in
  * one transaction. The single-upsert keys merge in one batch from the stage
  * table; the others (see `complexKeys`) apply as the segments they came from,
@@ -814,7 +816,6 @@ async function applyBucket(
   connectionId: string,
   tag: string,
   bucket: number,
-  empty: boolean,
   edges: {
     /** The first range creates the streams' rows and names the position the rows written from here on belong to. */
     readonly first?: {
@@ -833,7 +834,8 @@ async function applyBucket(
 ): Promise<void> {
   const table = stageTable(tag, bucket);
   const pages = await complexPages(deps, table, deps.blobs.governor.limitBytes);
-  const simpleOp = deps.newOp();
+  const cleanOp = deps.newOp();
+  const mergeOp = deps.newOp();
   const simple: SqlStatement[] = [
     ...(edges.first
       ? [
@@ -849,18 +851,23 @@ async function applyBucket(
         ]
       : []),
     { sql: `INSERT INTO temp.log_complex ${complexKeys(table)}`, params: [] },
+    // One upsert keys split by what this transaction finds: a key the
+    // connection holds nothing of (no row, no tombstone, no change) is written
+    // as it is; the rest merge. The test and the writes are in one transaction,
+    // so a write of another path lands before it or after it, never between.
+    stageSimpleUpserts(table, connectionId, cleanOp, true),
+    stageSimpleUpserts(table, connectionId, mergeOp, false),
+    ...insertIncoming(cleanOp, connectionId, { onlyNew: false }),
+  ];
+  const simpleBatches: StagedBatch[] = [
+    { op: cleanOp, statements: simple },
     {
-      sql: `INSERT INTO temp.incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, stamp_n)
-            SELECT ?, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, stamp_n
-              FROM ${table} s
-             WHERE s.kind = 'u' AND NOT EXISTS (
-               SELECT 1 FROM temp.log_complex c WHERE c.stream = s.stream AND c.pk_hash = s.pk_hash)`,
-      params: [simpleOp],
+      op: mergeOp,
+      statements: [
+        ...mergeStaged(connectionId, mergeOp),
+        { sql: "DELETE FROM temp.log_complex", params: [] },
+      ],
     },
-    ...(empty
-      ? mergeStagedIntoEmpty(connectionId, simpleOp)
-      : mergeStaged(connectionId, simpleOp)),
-    { sql: "DELETE FROM temp.log_complex", params: [] },
   ];
   const closing: SqlStatement[] = [{ sql: `DROP TABLE ${table}`, params: [] }];
   if (edges.last) {
@@ -903,7 +910,7 @@ async function applyBucket(
     const release = pages[0] ? await hold(pages[0]) : undefined;
     try {
       await commitStaged(deps, [
-        { op: simpleOp, statements: simple },
+        ...simpleBatches,
         ...(pages[0] ? await batchesOf(pages[0]) : []),
         { op: deps.newOp(), statements: closing },
       ]);
@@ -912,7 +919,7 @@ async function applyBucket(
     }
     return;
   }
-  await commitStaged(deps, [{ op: simpleOp, statements: simple }]);
+  await commitStaged(deps, simpleBatches);
   for (const page of pages) {
     const release = await hold(page);
     try {

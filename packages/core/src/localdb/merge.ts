@@ -245,7 +245,7 @@ export function mergeIncoming(
  * The statements that write the rows staged in `incoming` under `op` as new
  * rows of `records`, and clear them. With `onlyNew` a key the connection
  * already holds is left to the merge above. Without it the caller says the
- * keys are new (`mergeStagedIntoEmpty`): a key that is not would fail the
+ * keys are new (`applyBucket` tests each key in the same transaction): a key that is not would fail the
  * insert, not be merged.
  */
 export function insertIncoming(

@@ -446,21 +446,6 @@ export function mergeStaged(
 }
 
 /**
- * `mergeStaged` for rows whose keys the connection holds nowhere: it has no
- * row of them to merge with, no tombstone to refuse them, and no unpublished
- * delete to honour. Then every statement of the merge but the insert changes
- * nothing, and each one still scans the rows (about a third of a key-ordered
- * first load's time in SQLite). The caller owns the claim
- * (`holdsNothing` in log-keyed.ts).
- */
-export function mergeStagedIntoEmpty(
-  connectionId: string,
-  op: string,
-): SqlStatement[] {
-  return insertIncoming(op, connectionId, { onlyNew: false });
-}
-
-/**
  * Each stream a batch touched now reads from it: a local version above
  * anything the registry's own stream row holds, so the per-stream path never
  * replaces what the log wrote (see `applyOneOnce`).

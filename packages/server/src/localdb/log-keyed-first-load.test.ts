@@ -5,6 +5,9 @@
 // stops (a crash, a segment it cannot fetch) leaves nothing a reader trusts and
 // ends right when it runs again. Real publisher, real gateway adapter, real
 // SQLite (log-world.test-utils.ts).
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { keccak_256 } from "@noble/hashes/sha3";
 import {
@@ -19,6 +22,7 @@ import {
   publishConnection,
   LogDivergedError,
 } from "../../../core/src/localdb/index.js";
+import { readerOf } from "../../../core/src/localdb/driver.js";
 import {
   complexPages,
   keyedLoadBlocked,
@@ -1302,9 +1306,7 @@ describe("log first load, key by key: a per-stream head admitted while a load is
   });
 });
 
-describe("log first load, key by key: the merge a load into an empty connection skips", () => {
-  const RECORD_MERGES = /^(UPDATE|DELETE FROM) (records|log_tombstones)\b/;
-
+describe("log first load, key by key: keys the connection holds nothing of are written without a merge", () => {
   /** The statements a keyed load of this log runs in one device. */
   async function loadRecording(w: World, id: string) {
     const d = await connected(w, id, { maxBytesInFlight: await splitting(w) });
@@ -1316,7 +1318,7 @@ describe("log first load, key by key: the merge a load into an empty connection 
     return { d, sql };
   }
 
-  it("writes each key range with one insert and no merge, to the rows a segment-by-segment load writes", async () => {
+  it("writes each key range's clean keys with one insert, to the rows a segment-by-segment load writes", async () => {
     const w = await world({ streams: 2, logProtocol: true });
     // Keys written once: none is complex, so every key takes the simple path.
     const a = await w.device("a");
@@ -1333,9 +1335,12 @@ describe("log first load, key by key: the merge a load into an empty connection 
     const { d, sql } = await loadRecording(w, "empty");
     const ranges = sql.filter((s) => s.startsWith("DROP TABLE log_stage_"));
     expect(ranges.length).toBeGreaterThan(1);
-    // None of the statements that merge a staged key with a row the
-    // connection holds ran: it held none.
-    expect(sql.filter((s) => RECORD_MERGES.test(s.trim()))).toEqual([]);
+    // Every range inserted its clean keys without the anti-join a merge needs.
+    expect(
+      sql.filter(
+        (s) => s.startsWith("INSERT INTO records") && !s.includes("NOT EXISTS"),
+      ).length,
+    ).toBe(ranges.length);
     const got = await tables(d);
     const expected = await tables(reference);
     expect(got.records).toEqual(expected.records);
@@ -1386,7 +1391,7 @@ describe("log first load, key by key: the merge a load into an empty connection 
   ];
 
   for (const { name, seed } of held)
-    it(`merges every key when the connection holds ${name}`, async () => {
+    it(`merges the keys the connection holds ${name} of`, async () => {
       const w = await world({ streams: 2, logProtocol: true });
       await history(w);
       // A key the log writes (taken from a load that holds nothing).
@@ -1415,8 +1420,6 @@ describe("log first load, key by key: the merge a load into an empty connection 
       expect(
         sql.filter((s) => s.startsWith("DROP TABLE log_stage_")).length,
       ).toBeGreaterThan(1);
-      // It took the merge, which this device's load needs.
-      expect(sql.some((s) => RECORD_MERGES.test(s.trim()))).toBe(true);
       const got = await tables(d);
       const expected = await tables(reference);
       expect(got.records).toEqual(expected.records);
@@ -1424,4 +1427,166 @@ describe("log first load, key by key: the merge a load into an empty connection 
       expect(got.state).toEqual(expected.state);
       expect(got.changes).toEqual(expected.changes);
     });
+  // A write that lands between two key ranges reaches keys the load has not
+  // written. Whatever it is, the load ends where it ends when the write came
+  // first: the test of what a key meets runs in the transaction that writes it.
+  for (const { name, seed } of held)
+    it(`ends as if the write came first when ${name} lands between two key ranges`, async () => {
+      const w = await world({ streams: 2, logProtocol: true });
+      await history(w);
+      const probe = await connected(w, "probe", { keyedFirstLoad: false });
+      await applyConnection(probe.deps, CONNECTION_ID);
+      const rows = (await tables(probe)).records as Record<string, unknown>[];
+
+      const d = await connected(w, "late", {
+        maxBytesInFlight: await splitting(w),
+      });
+      let buckets = 0;
+      let firstRangeCommitted = false;
+      let late: Record<string, unknown>[] = [];
+      let seeding = false;
+      onCommit(d, async (statements) => {
+        if (seeding) return;
+        const creates = statements.filter((s) =>
+          /^CREATE (TEMP )?TABLE log_stage_/.test(s.sql),
+        );
+        if (creates.length > 0) buckets = creates.length;
+        if (firstRangeCommitted && late.length === 0) {
+          // The next call after the first range's commit: the others have not run.
+          late = rows.filter(
+            (r) =>
+              Math.floor(
+                (Number.parseInt(String(r.pk_hash).slice(0, 4), 16) * buckets) /
+                  16 ** 4,
+              ) >= 1,
+          );
+          seeding = true;
+          // A local write names its origin, as every write batch does.
+          await d.db.batch(withOrigin("local", []));
+          for (const row of late) await seed(d, row);
+          seeding = false;
+        }
+        if (statements.some((s) => /^DROP TABLE log_stage_\w+_0$/.test(s.sql)))
+          firstRangeCommitted = true;
+      });
+      await applyConnection(d.deps, CONNECTION_ID);
+      expect(buckets).toBeGreaterThan(1);
+      expect(late.length).toBeGreaterThan(0);
+
+      const reference = await connected(w, "reference", {
+        keyedFirstLoad: false,
+      });
+      for (const row of late) await seed(reference, row);
+      await applyConnection(reference.deps, CONNECTION_ID);
+      const got = await tables(d);
+      const expected = await tables(reference);
+      expect(got.records).toEqual(expected.records);
+      expect(got.tombstones).toEqual(expected.tombstones);
+      expect(got.state).toEqual(expected.state);
+      expect(got.changes).toEqual(expected.changes);
+    });
+});
+
+describe("log first load, key by key: a database that closes in the middle of a load", () => {
+  for (const stageInTempStore of [false, true])
+    it(`${stageInTempStore ? "keeps nothing of a TEMP stage and" : "leaves a stage in the file that the next load drops, and"} ends right when the file is opened again`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "keyed-reopen-"));
+      const file = join(dir, "db.sqlite");
+      try {
+        const w = await world({ streams: 2, logProtocol: true });
+        await history(w);
+        const reference = await connected(w, "reference", {
+          keyedFirstLoad: false,
+        });
+        await applyConnection(reference.deps, CONNECTION_ID);
+
+        // The first key range commits, the second never does; the file closes.
+        // Nothing reaches the file after that commit, not even a clean-up: the process is gone.
+        const first = await connected(w, "first", {
+          file,
+          stageInTempStore,
+          maxBytesInFlight: await splitting(w),
+        });
+        let committed = false;
+        onCommit(first, async (statements) => {
+          if (committed) throw new Error("process gone");
+          if (dropsStage(statements)) committed = true;
+        });
+        await expect(
+          applyConnection(first.deps, CONNECTION_ID),
+        ).rejects.toThrow();
+        const left = await tables(first);
+        expect(left.records.length).toBeGreaterThan(0);
+        expect(left.state).toEqual([]);
+        expect(
+          (await first.db.query("SELECT * FROM log_keyed_pending")).length,
+        ).toBe(1);
+        // Rows of the first range are on disk; where the others are staged depends on the host.
+        expect((await stageTables(first)).length > 0).toBe(!stageInTempStore);
+        await first.db.close();
+
+        // Opened again: the durable state is what the first device committed, and no TEMP stage survived.
+        const second = await w.device("first", true, {
+          file,
+          stageInTempStore,
+          maxBytesInFlight: await splitting(w),
+        });
+        expect((await tables(second)).records).toEqual(left.records);
+        expect((await tempStageTables(second)).length).toBe(0);
+        expect((await stageTables(second)).length > 0).toBe(!stageInTempStore);
+        expect(await second.position()).toBe(0);
+
+        // It loads again, from the log, to what a segment-by-segment load ends in.
+        await applyConnection(second.deps, CONNECTION_ID);
+        const got = await tables(second);
+        const expected = await tables(reference);
+        expect(got.records).toEqual(expected.records);
+        expect(got.tombstones).toEqual(expected.tombstones);
+        expect(got.streams).toEqual(expected.streams);
+        expect(got.state).toEqual(expected.state);
+        expect(await stageTables(second)).toEqual([]);
+        expect(
+          await second.db.query("SELECT * FROM log_keyed_pending"),
+        ).toEqual([]);
+        await second.db.close();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+});
+
+describe("log first load, key by key: one connection reads what it stages", () => {
+  // A stage is written by `db.batch` and read by `db.query`; the load stays
+  // correct on a host only if both reach the connection that holds the TEMP
+  // tables. The driver's `reads` is another connection and cannot see them.
+  it("the Node driver's batch and query are one connection, and `reads` is another", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keyed-affinity-"));
+    try {
+      const w = await world({ streams: 1, logProtocol: true });
+      const d = await w.device("affinity", true, {
+        file: join(dir, "db.sqlite"),
+      });
+      await d.db.batch([
+        { sql: "CREATE TEMP TABLE affinity_probe (n INTEGER)", params: [] },
+        { sql: "INSERT INTO affinity_probe VALUES (1)", params: [] },
+      ]);
+      expect(
+        await d.db.query("SELECT COUNT(*) AS n FROM temp.affinity_probe"),
+      ).toEqual([{ n: 1 }]);
+      expect(readerOf(d.db)).not.toBe(d.db);
+      await expect(
+        readerOf(d.db).query("SELECT COUNT(*) AS n FROM temp.affinity_probe"),
+      ).rejects.toThrow(/no such table/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("the key-ordered load reads and writes its stage through `db` alone", () => {
+    const here = new URL("../../../core/src/localdb/", import.meta.url);
+    for (const name of ["log-keyed.ts", "log-batch.ts", "merge.ts"]) {
+      const source = readFileSync(new URL(name, here), "utf8");
+      expect(source, name).not.toMatch(/\breaderOf\b|\.reads\b/);
+    }
+  });
 });
