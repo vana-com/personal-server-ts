@@ -1,4 +1,5 @@
 import {
+  createViewChanges,
   localDatabaseName,
   openLocalDb,
   connectionQueue,
@@ -851,6 +852,9 @@ async function bootstrapServer(
   let backgroundClosed = false;
   let localSync: LocalSync | undefined;
   let localDb: SqlDriver | undefined;
+  // One recorder for the process, built before the database opens so the
+  // owner's change feed can subscribe at once (`GET /v1/sync/events`).
+  const viewChanges = createViewChanges();
   let openingLocalSync: Promise<LocalSync> | undefined;
   const accountStorageMode = accountStorageModeFor(
     accountStorageModeOf(accountModeAuthority),
@@ -914,11 +918,17 @@ async function bootstrapServer(
         ),
       );
       try {
-        await openLocalDb(driver, {
-          owner: serverOwner!,
-          network,
-          deviceId: serverAccount!.address,
-        });
+        // Every write the sync engine makes goes through the driver this
+        // returns, so the recorder sees each commit.
+        const db = await openLocalDb(
+          driver,
+          {
+            owner: serverOwner!,
+            network,
+            deviceId: serverAccount!.address,
+          },
+          { viewChanges: { recorder: viewChanges, logger } },
+        );
         const storage = createVanaSyncStorageAdapter({
           config,
           serverOwner: serverOwner!,
@@ -926,7 +936,7 @@ async function bootstrapServer(
           reads: "signed",
         });
         const deps: LocalSyncDeps = {
-          db: driver,
+          db,
           ownerAddress: serverOwner!,
           queue: connectionQueue(),
           registry: streamSyncRegistry(),
@@ -968,7 +978,7 @@ async function bootstrapServer(
           olderVersionReads: () => config.olderVersionReads,
         });
         localSyncDeps = deps;
-        localDb = driver;
+        localDb = db;
         localSync = facade;
         return facade;
       } catch (error) {
@@ -1657,6 +1667,7 @@ async function bootstrapServer(
     dataStorage,
     additions,
     localSync: localSyncSource,
+    viewChanges,
     localFile: localSyncSource
       ? async (id) => {
           const local = await localSyncSource();

@@ -1,6 +1,7 @@
 import {
   localDatabaseName,
   openLocalDb,
+  type OpenLocalDbOptions,
   type SqlDriver,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 
@@ -34,6 +35,7 @@ export async function openLiteLocalDb(
     readonly network: string;
     readonly deviceId: string;
   },
+  open: OpenLocalDbOptions = {},
 ): Promise<SqlDriver | null> {
   const owner = identity.owner.toLowerCase();
   const driver = await options.openDriver({
@@ -43,7 +45,7 @@ export async function openLiteLocalDb(
   });
   if (driver === null) return null;
   try {
-    return await openLocalDb(driver, { ...identity, owner });
+    return await openLocalDb(driver, { ...identity, owner }, open);
   } catch (error) {
     // Release the host lock even when migration or identity checks fail.
     try {
