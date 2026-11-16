@@ -103,7 +103,7 @@ adopting a newer epoch, so monotonicity means the pair (epoch, position).
   of the ones before it). The `groupedSkip` mutant leaves out the middle
   segments and must fail P5.
 - KeyedLoad / KeyedBucket / KeyedPublish / StageLost (`Mode` keyed, keyedSkip,
-  keyedEarly, keyedLeak): a device with position 0 and no rows, over a log that
+  keyedEarly, keyedLeak, keyedBypass): a device with position 0 and no rows, over a log that
   has never compacted, folds the log key by key into a staging area
   (`KeyedLoad(d,k,q)`: key k's operations from segments 1..q), in any key order,
   any number of times. `KeyedBucket(d,k)` makes one key's staged fold durable
@@ -123,6 +123,15 @@ adopting a newer epoch, so monotonicity means the pair (epoch, position).
   not yet folded and must fail P5. The `keyedLeak` mutant is the earlier rule,
   with no `PendingAdmits`: a retry that can fold only a shorter prefix publishes
   over durable rows of a longer one, and must fail P5.
+  Durable rows are also a state of the device, so every other way the device
+  moves its position is gated on `NoPending(d)` (no durable rows): Install,
+  Apply, SkipGap, ApplyRun and a lifetime change (FullCheck). A device that
+  holds durable rows may only finish them by `KeyedPublish` (`LiveRows(d)` is
+  what the rows of such a device are: the durable rows merged over its data).
+  `KeyedPage(d,k,j)` makes a key's fold durable in slices of its operations,
+  `j` at a time, in any order and any number of times (a key whose history is
+  over the budget). The `keyedBypass` mutant drops the `NoPending` gate, so the
+  position may move past durable rows by another action, and must fail P5.
 
 ## Properties and expected host results
 
@@ -144,6 +153,8 @@ adopting a newer epoch, so monotonicity means the pair (epoch, position).
 | KeyedEarly.cfg            | FAIL P5                             | the position written while a key is not yet folded                                                       |
 | KeyedLeak.cfg             | FAIL P5                             | no `PendingAdmits`: a shorter retry publishes durable rows of a longer, stopped load                     |
 | KeyedShort.cfg            | BOUNDED, no violation               | Keyed with `Len(log) <= 3`: TypeOK, P1–P5, OrderOK                                                       |
+| KeyedBypass.cfg           | FAIL P5                             | no `NoPending` gate: another action moves the position past durable rows of an unfinished load           |
+| KeyedLife.cfg             | BOUNDED, no violation               | Keyed with `AllowReset` and `Len(log) <= 3`: a lifetime change while durable rows exist                  |
 
 Corpus (batch 6): an equal-cutoff omission (key 1, stamp 5) meets the live
 stamp-5 row, and an older omission (key 2, stamp 1) sits below the live delete.
@@ -239,30 +250,35 @@ to the implementation.
 
 TLC 1.7.4 (`tla2tools.jar`, 2.19 engine), `-workers 4 -Xmx10g`, `nice -n 19`, one job at
 a time, metadirs deleted after each run. Expected results were stated before the
-run: `Keyed.cfg` and `KeyedShort.cfg` hold, `KeyedSkip.cfg` fails P1,
-`KeyedEarly.cfg` and `KeyedLeak.cfg` fail P5.
+run: `Keyed.cfg`, `KeyedShort.cfg` and `KeyedLife.cfg` hold; `KeyedSkip.cfg`
+fails P1; `KeyedEarly.cfg`, `KeyedLeak.cfg` and `KeyedBypass.cfg` fail P5.
 
 The first model of the keyed load had one crash outcome: the staging area is
 lost. A bucket's commit also makes rows durable, with no stream version and no
-position, so the model gained `dur`, `durAt`, `durEp`, the `KeyedBucket` action
-and the `PendingAdmits` rule, and `KeyedLeak` keeps the earlier rule
-(no `PendingAdmits`). Results below are for the model with durable buckets.
+position, so the model has `dur`, `durAt`, `durEp`, the `KeyedBucket` and
+`KeyedPage` actions, the `PendingAdmits` rule and the `NoPending` gate on every
+other way to move the position. Results below are for that model.
 
-| Configuration  | Expected | Actual                                                                                                                                 | Distinct states     | Depth | Wall time       |
-| -------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------- | ----- | --------------- |
-| KeyedLeak.cfg  | FAIL P5  | FAIL P5 as expected: 3 commits, FullCheck, a bucket made durable for q=3, the staging area lost, a retry that folds only q=2 publishes | 818,988 at failure  | 11    | 17 s            |
-| KeyedSkip.cfg  | FAIL P1  | FAIL P1 as expected: a key's fold omits a segment, then the keyed publish installs rows that differ from the reference                 | 7,327 at failure    | 9     | 1 s             |
-| KeyedEarly.cfg | FAIL P5  | FAIL P5 as expected: the position is written while a key is not folded, so a device claims a prefix it does not hold                   | 499 at failure      | 7     | <1 s            |
-| KeyedShort.cfg | PASS     | BOUNDED: stopped at the 28 min limit; no invariant error in the explored states (676,040,051 generated, 25,213,550 left on queue)      | at least 59,763,423 | 18    | 28 min, stopped |
-| Keyed.cfg      | PASS     | BOUNDED: stopped at the 10 min limit; no invariant error in the explored states (173,792,458 generated, 20,131,485 left on queue)      | at least 25,583,041 | 14    | 10 min, stopped |
+| Configuration   | Expected | Actual                                                                                                                                       | Distinct states     | Depth | Wall time       |
+| --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- | ----- | --------------- |
+| KeyedLeak.cfg   | FAIL P5  | FAIL P5 as expected: 3 commits, FullCheck, a bucket made durable for q=3, the staging area lost, a retry that folds only q=2 publishes       | see `traces/`       | 11    | 24 s            |
+| KeyedBypass.cfg | FAIL P5  | FAIL P5 as expected: 2 commits, FullCheck, a bucket made durable, then another action moves the position past the durable rows               | 4,119 at failure    | 8     | 1 s             |
+| KeyedSkip.cfg   | FAIL P1  | FAIL P1 as expected: a key's fold omits a segment, then the keyed publish installs rows that differ from the reference                       | 6,578 at failure    | 8     | 1 s             |
+| KeyedEarly.cfg  | FAIL P5  | FAIL P5 as expected: the position is written while a key is not folded, so a device claims a prefix it does not hold                         | 598 at failure      | 7     | <1 s            |
+| KeyedShort.cfg  | PASS     | BOUNDED: stopped at the 9 min limit; no invariant error in the explored states (132,349,328 generated, 5,418,158 left on queue)              | at least 11,740,986 | 17    | 9 min, stopped  |
+| KeyedLife.cfg   | PASS     | BOUNDED: stopped at the 9 min limit; no invariant error in the explored states (152,565,182 generated, 7,529,445 left on queue)              | at least 14,425,007 | 16    | 9 min, stopped  |
+| Keyed.cfg       | PASS     | BOUNDED, earlier model (before `KeyedPage` and the `NoPending` gate): stopped at the 10 min limit; no invariant error in the explored states | at least 25,583,041 | 14    | 10 min, stopped |
 
-Neither passing run finished, so their PASS is not established: they are
-bounded evidence, the same status as `Good.cfg`. `KeyedShort.cfg` restricts the
-log to three segments (`ShortLog`), which holds the `KeyedLeak` scenario (a
-target of 3 and a retry of 2); it also did not exhaust the space with the
-durable-bucket variables. The failing runs stop at the first violation, so
-their state counts are what TLC had reached, not a space size. Traces:
-`traces/KeyedLeak.txt`, `traces/KeyedSkip.txt`, `traces/KeyedEarly.txt`.
+No passing run finished, so their PASS is not established: they are bounded
+evidence, the same status as `Good.cfg`. `KeyedShort.cfg` restricts the log to
+three segments (`ShortLog`), which holds the `KeyedLeak` scenario (a target of 3
+and a retry of 2). `KeyedLife.cfg` adds `AllowReset`, so a lifetime change meets
+durable rows. The `Keyed.cfg` row is from before the model had `KeyedPage` and
+the `NoPending` gate and was not rerun to the same limit, so it is not evidence
+for the current model. The failing runs stop at the first violation, so their
+state counts are what TLC had reached, not a space size. Traces:
+`traces/KeyedLeak.txt`, `traces/KeyedBypass.txt`, `traces/KeyedSkip.txt`,
+`traces/KeyedEarly.txt`.
 
 ## #705 r3 extension (host run, 2026-11-15)
 

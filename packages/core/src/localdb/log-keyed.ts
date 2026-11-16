@@ -51,7 +51,20 @@
 // this path whatever the flags say, and fails closed (`LogDivergedError`) if it
 // cannot: a snapshot, a compaction or a different log has no key-ordered load
 // that could finish what was written, and the rows left cannot be told apart
-// from rows of the live log. The model: `KeyedBucket`, `PendingAdmits`.
+// from rows of the live log. The marker holds back every other way to move the
+// position, not only the load plan: the lifetime branches of `applyLog` (a log
+// read as ended, a log of an earlier lifetime) write a cursor without applying
+// anything, and a device that holds a cursor above 0 beside the marker is not
+// one this load made, so each of them raises with the marker kept. The model:
+// `KeyedBucket`, `KeyedPage`, `PendingAdmits`, `NoPending`.
+//
+// The way out of a refused retry. A log that compacted, or was rewritten, after
+// a stopped load has nothing a key-ordered load can finish, and the rows the
+// stopped load left are not told apart from rows of the live log (no per-key
+// record says which position wrote a row). Such a connection stays refused
+// until its local data is purged, which deletes the marker with the rows. A
+// journal of positions per key, or a key-ordered load that also reads a
+// snapshot, would remove that wait; neither is built.
 //
 // A segment that cannot be fetched ends staging there: if no bucket has
 // committed yet, the segments before it load, the cursor stands at the last of
@@ -63,7 +76,10 @@
 // counts every row by what it holds (key, hash and body in UTF-8 bytes, NULL
 // bodies and tombstone rows included), and a bucket whose complex rows exceed
 // the room is applied a page at a time (`complexPages`: a hash range, or a
-// position slice of one key), each page in its own commit.
+// position slice of one key), each page in its own commit. This is weighted
+// in-flight accounting against the governor's budget, not a hard memory bound:
+// the SQLite driver and the statements a page builds are not counted, and a
+// page is held at twice its row bytes to cover them.
 
 import { sha256 } from "@noble/hashes/sha2";
 import {
@@ -157,8 +173,13 @@ export async function planKeyedLoad(
     // gate (a flag, the size of the log) decided how the first attempt began;
     // it does not decide how to end it.
     if (snapshotPresent || tail.length === 0 || deps.keyedFirstLoad === false)
-      throw new LogDivergedError(
-        `apply: an earlier key-ordered load of this connection wrote rows up to position ${pending.position} and did not finish; only a key-ordered load of the same log can finish it`,
+      throw unfinishedKeyedLoad(
+        pending,
+        snapshotPresent
+          ? "the log has a snapshot now"
+          : tail.length === 0
+            ? "the log holds no segment past it"
+            : "the key-ordered first load is off",
       );
     return buckets;
   }
@@ -176,6 +197,21 @@ export async function planKeyedLoad(
     [connectionId],
   );
   return held?.n === 0 ? buckets : null;
+}
+
+/**
+ * The refusal of every path that cannot finish an unfinished key-ordered load
+ * of this connection. Its rows are in `records` and `log_tombstones` and
+ * belong to no published position; the way out is a key-ordered load of the
+ * same log, or purging the connection's rows.
+ */
+export function unfinishedKeyedLoad(
+  pending: LogState,
+  why: string,
+): LogDivergedError {
+  return new LogDivergedError(
+    `apply: an earlier key-ordered load of this connection wrote rows up to position ${pending.position} and did not finish; only a key-ordered load of the same log can finish it (${why})`,
+  );
 }
 
 /**
@@ -203,7 +239,7 @@ export function pendingAdmits(
 
 /** The stage tables of one connection: its id hashed, so any id is a name. */
 const tagOf = (connectionId: string) =>
-  toHex(sha256(new TextEncoder().encode(connectionId))).slice(0, 16);
+  toHex(sha256(new TextEncoder().encode(connectionId)));
 const stageTable = (tag: string, bucket: number) =>
   `log_stage_${tag}_${bucket}`;
 

@@ -52,7 +52,12 @@ import {
   type OperationBatch,
   type PassItem,
 } from "./log-batch.js";
-import { loadKeyed, planKeyedLoad, type KeyedSource } from "./log-keyed.js";
+import {
+  loadKeyed,
+  planKeyedLoad,
+  unfinishedKeyedLoad,
+  type KeyedSource,
+} from "./log-keyed.js";
 import { heldKeys, planLogLoad, type PlannedBatch } from "./log-progressive.js";
 import {
   LogDivergedError,
@@ -148,8 +153,18 @@ export async function applyLog(
   const classification = classifyStreamRow(read, context.hashes);
   if (!read.found || classification === "absent") return { applied: 0 };
   const local = await readLogState(deps, connectionId);
+  // Rows an unfinished key-ordered load left (see `log-keyed.ts`) lie beyond
+  // this device's position, and only a key-ordered load that covers them may
+  // move it. So while the marker stands, no branch below may write a cursor:
+  // not the lifetime branches, which write `log_state` without applying
+  // anything, and not a device that somehow holds both a cursor and the marker.
+  const pending = await readKeyedPending(deps, connectionId);
+  if (pending !== null && local.position !== 0)
+    throw unfinishedKeyedLoad(pending, "this device holds a cursor above 0");
 
   if (classification === "tombstoned") {
+    if (pending !== null)
+      throw unfinishedKeyedLoad(pending, "the log is of an ended lifetime");
     // The log of an ended lifetime. A new one begins after its version.
     if (read.version > local.position)
       await deps.db.batch([
@@ -189,6 +204,8 @@ export async function applyLog(
   );
   const head = newest.segment;
   if (head.generation < context.generation) {
+    if (pending !== null)
+      throw unfinishedKeyedLoad(pending, "the log is of an earlier lifetime");
     // A log of an earlier lifetime holds none of this one.
     await deps.db.batch([
       writeLogState(connectionId, {
@@ -221,10 +238,6 @@ export async function applyLog(
         `apply: the log names a different segment at position ${lastRef.position} than this device applied`,
       );
   }
-  // Rows an unfinished key-ordered load left (see `log-keyed.ts`) lie beyond
-  // this device's position; only a key-ordered load that covers them goes on.
-  const pending =
-    local.position === 0 ? await readKeyedPending(deps, connectionId) : null;
   let since = local.position;
   let plan = planOpsSince(head, headRef, since);
   let snapshot: SnapshotPointer | null = null;

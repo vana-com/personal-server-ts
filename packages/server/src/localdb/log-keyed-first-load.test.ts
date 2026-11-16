@@ -6,13 +6,21 @@
 // ends right when it runs again. Real publisher, real gateway adapter, real
 // SQLite (log-world.test-utils.ts).
 import { afterEach, describe, expect, it } from "vitest";
+import { keccak_256 } from "@noble/hashes/sha3";
+import {
+  controlHashes,
+  deriveKeyCheck,
+  logScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   applyConnection,
+  applyLog,
   LogDivergedError,
 } from "../../../core/src/localdb/index.js";
 import { complexPages } from "../../../core/src/localdb/log-keyed.js";
 import {
   CONNECTION_ID,
+  OWNER,
   closeWorldDrivers,
   sName,
   world,
@@ -373,25 +381,90 @@ const dropsStage = (statements: { sql: string }[]) =>
 const stagesRows = (statements: { sql: string }[]) =>
   statements.some((s) => s.sql.startsWith("INSERT INTO log_stage_"));
 
-describe("log first load, key by key: what an unfinished load leaves", () => {
-  /**
-   * A load that stopped after its first key range committed: rows of the whole
-   * log are in `records` (those of that range), and the position is 0.
-   */
-  async function stoppedAfterFirstRange(w: World, id: string) {
-    const d = await connected(w, id, { maxBytesInFlight: await splitting(w) });
-    let ranges = 0;
-    let armed = true;
-    onCommit(d, async (statements) => {
-      if (armed && ranges >= 1 && (dropsStage(statements) || ranges > 1))
-        throw new Error("stopped");
-      if (dropsStage(statements)) ranges++;
+describe("log first load, key by key: a run that emits a key again at its stamp", () => {
+  it("keeps the batch ordinal of a key, and the body the order picks, as a segment-by-segment load does", async () => {
+    const w = await world({
+      streams: 2,
+      logProtocol: true,
+      publishWhileCollecting: true,
     });
-    await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toThrow();
-    armed = false;
-    return d;
-  }
+    const a = await w.device("a");
+    for (let n = 1; n <= 8; n++)
+      await step(a, n, [{ stream: S0, id: `fill-${n}`, pad: 4_000 }]);
+    const run = "ordinal-run";
+    await a.sync.intake.begin(run, {
+      connector: "fixture",
+      artifactDigest: "fixture",
+      wantFull: false,
+      observedAt: 2000,
+      owner: { address: OWNER, leaseId: null },
+    });
+    const send = (batch: number, records: object[]) =>
+      a.sync.intake.batch(run, {
+        batch,
+        records: records.map((data) => ({ stream: S0, data })),
+      });
+    // Key "twice" has two bodies at the run's one stamp; "later" first appears
+    // in batch 1 (a single upsert that carries ordinal 1).
+    await send(0, [
+      { id: "twice", v: 1 },
+      { id: "once-0", pad: 4_000 },
+    ]);
+    await a.cycle();
+    await send(1, [
+      { id: "twice", v: 2 },
+      { id: "later", v: 1, pad: 4_000 },
+    ]);
+    await a.sync.intake.end(run, {
+      outcome: "succeeded",
+      coveredStreams: [S0],
+      provenFullStreams: [],
+      lastBatch: 1,
+    });
+    await a.cycle();
 
+    const plain = await connected(w, "plain", { keyedFirstLoad: false });
+    await applyConnection(plain.deps, CONNECTION_ID);
+    const keyed = await connected(w, "keyed", {
+      maxBytesInFlight: await splitting(w),
+    });
+    await applyConnection(keyed.deps, CONNECTION_ID);
+
+    const expected = await tables(plain);
+    const got = await tables(keyed);
+    expect(got.records).toEqual(expected.records);
+    expect(got.tombstones).toEqual(expected.tombstones);
+    expect(got.heads).toEqual(expected.heads);
+    expect(got.state).toEqual(expected.state);
+    // The ordinal is in the rows, not only equal by chance.
+    const row = (key: string) =>
+      expected.records
+        .map((r) => JSON.stringify(r))
+        .find((r) => r.includes(`${key}`)) ?? "";
+    expect(row("later")).toContain('"stamp_n":1');
+    expect(row("twice")).toContain('\\"v\\":2');
+  });
+});
+
+/**
+ * A load that stopped after its first key range committed: rows of the whole
+ * log are in `records` (those of that range), and the position is 0.
+ */
+async function stoppedAfterFirstRange(w: World, id: string) {
+  const d = await connected(w, id, { maxBytesInFlight: await splitting(w) });
+  let ranges = 0;
+  let armed = true;
+  onCommit(d, async (statements) => {
+    if (armed && ranges >= 1 && (dropsStage(statements) || ranges > 1))
+      throw new Error("stopped");
+    if (dropsStage(statements)) ranges++;
+  });
+  await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toThrow();
+  armed = false;
+  return d;
+}
+
+describe("log first load, key by key: what an unfinished load leaves", () => {
   it("publishes nothing from a retry that holds a shorter prefix than the rows it left", async () => {
     const w = await world({ streams: 2, logProtocol: true });
     await history(w);
@@ -521,6 +594,95 @@ describe("log first load, key by key: what an unfinished load leaves", () => {
       applyConnection(off.deps, CONNECTION_ID),
     ).rejects.toBeInstanceOf(LogDivergedError);
     expect(await off.position()).toBe(0);
+  });
+});
+
+describe("log first load, key by key: the marker stops every other way to move the position", () => {
+  /** `applyLog` as the connection's apply calls it, with the read overridden. */
+  async function direct(
+    d: Awaited<ReturnType<typeof stoppedAfterFirstRange>>,
+    generation: number,
+    override: (read: {
+      version: number;
+      dataHash: string;
+      metadataHash: string;
+    }) => object,
+  ) {
+    const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
+    const hashes = await controlHashes(async (b) => keccak_256(b), keyCheck);
+    const real = await d.deps.registry.read(logScope("fixture", ""));
+    if (!real.found) throw new Error("the log has no registry row");
+    return applyLog(d.deps, CONNECTION_ID, {
+      connector: "fixture",
+      ns: "",
+      generation,
+      keyCheck,
+      hashes,
+      read: { ...real, ...override(real) } as typeof real,
+    });
+  }
+  async function stopped(id: string) {
+    const w = await world({ streams: 2, logProtocol: true });
+    await history(w);
+    const d = await stoppedAfterFirstRange(w, id);
+    expect(await d.position()).toBe(0);
+    return d;
+  }
+  async function untouched(d: Awaited<ReturnType<typeof stopped>>) {
+    expect(await d.position()).toBe(0);
+    expect(
+      (
+        await d.db.query<{ n: number }>(
+          "SELECT COUNT(*) AS n FROM log_keyed_pending",
+        )
+      )[0]!.n,
+    ).toBe(1);
+    expect(
+      (
+        await d.db.query<{ n: number }>(
+          "SELECT COUNT(*) AS n FROM stream_versions",
+        )
+      )[0]!.n,
+    ).toBe(0);
+  }
+
+  it("does not move the position past rows it left when the log reads as ended", async () => {
+    const d = await stopped("ended");
+    await expect(
+      direct(d, 1, (real) => ({ deleted: true, version: real.version + 50 })),
+    ).rejects.toBeInstanceOf(LogDivergedError);
+    await untouched(d);
+  });
+
+  it("does not move the position past rows it left when the log is of an earlier lifetime", async () => {
+    const d = await stopped("earlier");
+    // The connection is at generation 2; the log's newest segment is of 1.
+    await expect(direct(d, 2, () => ({}))).rejects.toBeInstanceOf(
+      LogDivergedError,
+    );
+    await untouched(d);
+  });
+
+  it("does not apply on a device that holds a cursor and the marker", async () => {
+    const d = await stopped("both");
+    await d.db.batch([
+      {
+        sql: "INSERT OR REPLACE INTO log_state (connection_id, position, base, refs, snapshot) VALUES (?, 1, 0, '[]', NULL)",
+        params: [CONNECTION_ID],
+      },
+    ]);
+    const before = await d.db.query("SELECT * FROM log_state");
+    await expect(direct(d, 1, () => ({}))).rejects.toBeInstanceOf(
+      LogDivergedError,
+    );
+    expect(await d.db.query("SELECT * FROM log_state")).toEqual(before);
+    expect(
+      (
+        await d.db.query<{ n: number }>(
+          "SELECT COUNT(*) AS n FROM log_keyed_pending",
+        )
+      )[0]!.n,
+    ).toBe(1);
   });
 });
 

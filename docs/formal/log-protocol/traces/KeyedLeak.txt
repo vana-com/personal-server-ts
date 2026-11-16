@@ -38,7 +38,7 @@ State 1: <Initial predicate>
    [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
 /\ budget = 0
 
-State 2: <Commit line 134, col 2 to line 142, col 78 of module LogProtocol>
+State 2: <Commit line 167, col 2 to line 174, col 78 of module LogProtocol>
 /\ omissionOK = TRUE
 /\ epoch = 1
 /\ monotoneOK = TRUE
@@ -50,13 +50,15 @@ State 2: <Commit line 134, col 2 to line 142, col 78 of module LogProtocol>
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 1 ],
+        counter |-> 1,
+        ord |-> 0 ],
       [ stamp |-> 1,
         body |-> 21,
         kind |-> "upsert",
         key |-> 2,
         writer |-> 1,
-        counter |-> 1 ] >> >>
+        counter |-> 1,
+        ord |-> 0 ] >> >>
 /\ hints = {[generation |-> 1, at |-> 1]}
 /\ stage = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
@@ -87,7 +89,7 @@ State 2: <Commit line 134, col 2 to line 142, col 78 of module LogProtocol>
    [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
 /\ budget = 1
 
-State 3: <Commit line 134, col 2 to line 142, col 78 of module LogProtocol>
+State 3: <Commit line 167, col 2 to line 174, col 78 of module LogProtocol>
 /\ omissionOK = TRUE
 /\ epoch = 1
 /\ monotoneOK = TRUE
@@ -99,25 +101,29 @@ State 3: <Commit line 134, col 2 to line 142, col 78 of module LogProtocol>
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 1 ],
+        counter |-> 1,
+        ord |-> 0 ],
       [ stamp |-> 1,
         body |-> 21,
         kind |-> "upsert",
         key |-> 2,
         writer |-> 1,
-        counter |-> 1 ] >>,
+        counter |-> 1,
+        ord |-> 0 ] >>,
    << [ stamp |-> 2,
         body |-> 12,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 2,
-        counter |-> 2 ],
+        counter |-> 2,
+        ord |-> 0 ],
       [ stamp |-> 2,
         body |-> 0,
         kind |-> "delete",
         key |-> 2,
         writer |-> 2,
-        counter |-> 2 ] >> >>
+        counter |-> 2,
+        ord |-> 0 ] >> >>
 /\ hints = {[generation |-> 1, at |-> 1], [generation |-> 1, at |-> 2]}
 /\ stage = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
@@ -148,7 +154,7 @@ State 3: <Commit line 134, col 2 to line 142, col 78 of module LogProtocol>
    [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
 /\ budget = 2
 
-State 4: <Commit line 134, col 2 to line 142, col 78 of module LogProtocol>
+State 4: <Commit line 167, col 2 to line 174, col 78 of module LogProtocol>
 /\ omissionOK = TRUE
 /\ epoch = 1
 /\ monotoneOK = TRUE
@@ -160,31 +166,36 @@ State 4: <Commit line 134, col 2 to line 142, col 78 of module LogProtocol>
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 1 ],
+        counter |-> 1,
+        ord |-> 0 ],
       [ stamp |-> 1,
         body |-> 21,
         kind |-> "upsert",
         key |-> 2,
         writer |-> 1,
-        counter |-> 1 ] >>,
+        counter |-> 1,
+        ord |-> 0 ] >>,
    << [ stamp |-> 2,
         body |-> 12,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 2,
-        counter |-> 2 ],
+        counter |-> 2,
+        ord |-> 0 ],
       [ stamp |-> 2,
         body |-> 0,
         kind |-> "delete",
         key |-> 2,
         writer |-> 2,
-        counter |-> 2 ] >>,
+        counter |-> 2,
+        ord |-> 0 ] >>,
    << [ stamp |-> 5,
         body |-> 13,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 3 ] >> >>
+        counter |-> 3,
+        ord |-> 0 ] >> >>
 /\ hints = { [generation |-> 1, at |-> 1],
   [generation |-> 1, at |-> 2],
   [generation |-> 1, at |-> 3] }
@@ -217,7 +228,7 @@ State 4: <Commit line 134, col 2 to line 142, col 78 of module LogProtocol>
    [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
 /\ budget = 3
 
-State 5: <FullCheck line 177, col 2 to line 187, col 106 of module LogProtocol>
+State 5: <FullCheck line 219, col 2 to line 230, col 106 of module LogProtocol>
 /\ omissionOK = TRUE
 /\ epoch = 1
 /\ monotoneOK = TRUE
@@ -229,31 +240,36 @@ State 5: <FullCheck line 177, col 2 to line 187, col 106 of module LogProtocol>
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 1 ],
+        counter |-> 1,
+        ord |-> 0 ],
       [ stamp |-> 1,
         body |-> 21,
         kind |-> "upsert",
         key |-> 2,
         writer |-> 1,
-        counter |-> 1 ] >>,
+        counter |-> 1,
+        ord |-> 0 ] >>,
    << [ stamp |-> 2,
         body |-> 12,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 2,
-        counter |-> 2 ],
+        counter |-> 2,
+        ord |-> 0 ],
       [ stamp |-> 2,
         body |-> 0,
         kind |-> "delete",
         key |-> 2,
         writer |-> 2,
-        counter |-> 2 ] >>,
+        counter |-> 2,
+        ord |-> 0 ] >>,
    << [ stamp |-> 5,
         body |-> 13,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 3 ] >> >>
+        counter |-> 3,
+        ord |-> 0 ] >> >>
 /\ hints = { [generation |-> 1, at |-> 1],
   [generation |-> 1, at |-> 2],
   [generation |-> 1, at |-> 3] }
@@ -286,7 +302,7 @@ State 5: <FullCheck line 177, col 2 to line 187, col 106 of module LogProtocol>
    [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
 /\ budget = 3
 
-State 6: <Recover line 358, col 19 to line 358, col 66 of module LogProtocol>
+State 6: <Recover line 419, col 19 to line 419, col 66 of module LogProtocol>
 /\ omissionOK = TRUE
 /\ epoch = 1
 /\ monotoneOK = TRUE
@@ -298,35 +314,40 @@ State 6: <Recover line 358, col 19 to line 358, col 66 of module LogProtocol>
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 1 ],
+        counter |-> 1,
+        ord |-> 0 ],
       [ stamp |-> 1,
         body |-> 21,
         kind |-> "upsert",
         key |-> 2,
         writer |-> 1,
-        counter |-> 1 ] >>,
+        counter |-> 1,
+        ord |-> 0 ] >>,
    << [ stamp |-> 2,
         body |-> 12,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 2,
-        counter |-> 2 ],
+        counter |-> 2,
+        ord |-> 0 ],
       [ stamp |-> 2,
         body |-> 0,
         kind |-> "delete",
         key |-> 2,
         writer |-> 2,
-        counter |-> 2 ] >>,
+        counter |-> 2,
+        ord |-> 0 ] >>,
    << [ stamp |-> 5,
         body |-> 13,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 3 ] >> >>
+        counter |-> 3,
+        ord |-> 0 ] >> >>
 /\ hints = { [generation |-> 1, at |-> 1],
   [generation |-> 1, at |-> 2],
   [generation |-> 1, at |-> 3] }
-/\ stage = << << [stamp |-> 5, rank |-> 10, body |-> 13, first |-> 3],
+/\ stage = << << [stamp |-> 5, rank |-> 381, body |-> 13, first |-> 3],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
    << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
@@ -355,7 +376,7 @@ State 6: <Recover line 358, col 19 to line 358, col 66 of module LogProtocol>
    [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
 /\ budget = 3
 
-State 7: <KeyedBucket line 319, col 2 to line 327, col 31 of module LogProtocol>
+State 7: <KeyedBucket line 366, col 2 to line 374, col 31 of module LogProtocol>
 /\ omissionOK = TRUE
 /\ epoch = 1
 /\ monotoneOK = TRUE
@@ -367,35 +388,40 @@ State 7: <KeyedBucket line 319, col 2 to line 327, col 31 of module LogProtocol>
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 1 ],
+        counter |-> 1,
+        ord |-> 0 ],
       [ stamp |-> 1,
         body |-> 21,
         kind |-> "upsert",
         key |-> 2,
         writer |-> 1,
-        counter |-> 1 ] >>,
+        counter |-> 1,
+        ord |-> 0 ] >>,
    << [ stamp |-> 2,
         body |-> 12,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 2,
-        counter |-> 2 ],
+        counter |-> 2,
+        ord |-> 0 ],
       [ stamp |-> 2,
         body |-> 0,
         kind |-> "delete",
         key |-> 2,
         writer |-> 2,
-        counter |-> 2 ] >>,
+        counter |-> 2,
+        ord |-> 0 ] >>,
    << [ stamp |-> 5,
         body |-> 13,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 3 ] >> >>
+        counter |-> 3,
+        ord |-> 0 ] >> >>
 /\ hints = { [generation |-> 1, at |-> 1],
   [generation |-> 1, at |-> 2],
   [generation |-> 1, at |-> 3] }
-/\ stage = << << [stamp |-> 5, rank |-> 10, body |-> 13, first |-> 3],
+/\ stage = << << [stamp |-> 5, rank |-> 381, body |-> 13, first |-> 3],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
    << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
@@ -411,7 +437,7 @@ State 7: <KeyedBucket line 319, col 2 to line 327, col 31 of module LogProtocol>
 /\ deviceEpoch = <<1, 1, 1>>
 /\ durAt = <<3, 0, 0>>
 /\ prefixOK = TRUE
-/\ dur = << << [stamp |-> 5, rank |-> 10, body |-> 13, first |-> 3],
+/\ dur = << << [stamp |-> 5, rank |-> 381, body |-> 13, first |-> 3],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
    << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
@@ -424,7 +450,7 @@ State 7: <KeyedBucket line 319, col 2 to line 327, col 31 of module LogProtocol>
    [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
 /\ budget = 3
 
-State 8: <StageLost line 349, col 2 to line 355, col 33 of module LogProtocol>
+State 8: <StageLost line 410, col 2 to line 416, col 33 of module LogProtocol>
 /\ omissionOK = TRUE
 /\ epoch = 1
 /\ monotoneOK = TRUE
@@ -436,31 +462,36 @@ State 8: <StageLost line 349, col 2 to line 355, col 33 of module LogProtocol>
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 1 ],
+        counter |-> 1,
+        ord |-> 0 ],
       [ stamp |-> 1,
         body |-> 21,
         kind |-> "upsert",
         key |-> 2,
         writer |-> 1,
-        counter |-> 1 ] >>,
+        counter |-> 1,
+        ord |-> 0 ] >>,
    << [ stamp |-> 2,
         body |-> 12,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 2,
-        counter |-> 2 ],
+        counter |-> 2,
+        ord |-> 0 ],
       [ stamp |-> 2,
         body |-> 0,
         kind |-> "delete",
         key |-> 2,
         writer |-> 2,
-        counter |-> 2 ] >>,
+        counter |-> 2,
+        ord |-> 0 ] >>,
    << [ stamp |-> 5,
         body |-> 13,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 3 ] >> >>
+        counter |-> 3,
+        ord |-> 0 ] >> >>
 /\ hints = { [generation |-> 1, at |-> 1],
   [generation |-> 1, at |-> 2],
   [generation |-> 1, at |-> 3] }
@@ -480,7 +511,7 @@ State 8: <StageLost line 349, col 2 to line 355, col 33 of module LogProtocol>
 /\ deviceEpoch = <<1, 1, 1>>
 /\ durAt = <<3, 0, 0>>
 /\ prefixOK = TRUE
-/\ dur = << << [stamp |-> 5, rank |-> 10, body |-> 13, first |-> 3],
+/\ dur = << << [stamp |-> 5, rank |-> 381, body |-> 13, first |-> 3],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
    << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
@@ -493,7 +524,7 @@ State 8: <StageLost line 349, col 2 to line 355, col 33 of module LogProtocol>
    [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
 /\ budget = 3
 
-State 9: <Recover line 358, col 19 to line 358, col 66 of module LogProtocol>
+State 9: <Recover line 419, col 19 to line 419, col 66 of module LogProtocol>
 /\ omissionOK = TRUE
 /\ epoch = 1
 /\ monotoneOK = TRUE
@@ -505,35 +536,40 @@ State 9: <Recover line 358, col 19 to line 358, col 66 of module LogProtocol>
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 1 ],
+        counter |-> 1,
+        ord |-> 0 ],
       [ stamp |-> 1,
         body |-> 21,
         kind |-> "upsert",
         key |-> 2,
         writer |-> 1,
-        counter |-> 1 ] >>,
+        counter |-> 1,
+        ord |-> 0 ] >>,
    << [ stamp |-> 2,
         body |-> 12,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 2,
-        counter |-> 2 ],
+        counter |-> 2,
+        ord |-> 0 ],
       [ stamp |-> 2,
         body |-> 0,
         kind |-> "delete",
         key |-> 2,
         writer |-> 2,
-        counter |-> 2 ] >>,
+        counter |-> 2,
+        ord |-> 0 ] >>,
    << [ stamp |-> 5,
         body |-> 13,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 3 ] >> >>
+        counter |-> 3,
+        ord |-> 0 ] >> >>
 /\ hints = { [generation |-> 1, at |-> 1],
   [generation |-> 1, at |-> 2],
   [generation |-> 1, at |-> 3] }
-/\ stage = << << [stamp |-> 3, rank |-> 6, body |-> 11, first |-> 1],
+/\ stage = << << [stamp |-> 3, rank |-> 241, body |-> 11, first |-> 1],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
    << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
@@ -549,7 +585,7 @@ State 9: <Recover line 358, col 19 to line 358, col 66 of module LogProtocol>
 /\ deviceEpoch = <<1, 1, 1>>
 /\ durAt = <<3, 0, 0>>
 /\ prefixOK = TRUE
-/\ dur = << << [stamp |-> 5, rank |-> 10, body |-> 13, first |-> 3],
+/\ dur = << << [stamp |-> 5, rank |-> 381, body |-> 13, first |-> 3],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
    << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
@@ -562,7 +598,7 @@ State 9: <Recover line 358, col 19 to line 358, col 66 of module LogProtocol>
    [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
 /\ budget = 3
 
-State 10: <Recover line 358, col 19 to line 358, col 66 of module LogProtocol>
+State 10: <Recover line 419, col 19 to line 419, col 66 of module LogProtocol>
 /\ omissionOK = TRUE
 /\ epoch = 1
 /\ monotoneOK = TRUE
@@ -574,36 +610,41 @@ State 10: <Recover line 358, col 19 to line 358, col 66 of module LogProtocol>
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 1 ],
+        counter |-> 1,
+        ord |-> 0 ],
       [ stamp |-> 1,
         body |-> 21,
         kind |-> "upsert",
         key |-> 2,
         writer |-> 1,
-        counter |-> 1 ] >>,
+        counter |-> 1,
+        ord |-> 0 ] >>,
    << [ stamp |-> 2,
         body |-> 12,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 2,
-        counter |-> 2 ],
+        counter |-> 2,
+        ord |-> 0 ],
       [ stamp |-> 2,
         body |-> 0,
         kind |-> "delete",
         key |-> 2,
         writer |-> 2,
-        counter |-> 2 ] >>,
+        counter |-> 2,
+        ord |-> 0 ] >>,
    << [ stamp |-> 5,
         body |-> 13,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 3 ] >> >>
+        counter |-> 3,
+        ord |-> 0 ] >> >>
 /\ hints = { [generation |-> 1, at |-> 1],
   [generation |-> 1, at |-> 2],
   [generation |-> 1, at |-> 3] }
-/\ stage = << << [stamp |-> 3, rank |-> 6, body |-> 11, first |-> 1],
-      [stamp |-> 2, rank |-> 5, body |-> 0, first |-> 2] >>,
+/\ stage = << << [stamp |-> 3, rank |-> 241, body |-> 11, first |-> 1],
+      [stamp |-> 2, rank |-> 184, body |-> 0, first |-> 2] >>,
    << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
    << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
@@ -618,7 +659,7 @@ State 10: <Recover line 358, col 19 to line 358, col 66 of module LogProtocol>
 /\ deviceEpoch = <<1, 1, 1>>
 /\ durAt = <<3, 0, 0>>
 /\ prefixOK = TRUE
-/\ dur = << << [stamp |-> 5, rank |-> 10, body |-> 13, first |-> 3],
+/\ dur = << << [stamp |-> 5, rank |-> 381, body |-> 13, first |-> 3],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
    << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
@@ -631,7 +672,7 @@ State 10: <Recover line 358, col 19 to line 358, col 66 of module LogProtocol>
    [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
 /\ budget = 3
 
-State 11: <Recover line 360, col 19 to line 360, col 55 of module LogProtocol>
+State 11: <Recover line 422, col 19 to line 422, col 55 of module LogProtocol>
 /\ omissionOK = TRUE
 /\ epoch = 1
 /\ monotoneOK = TRUE
@@ -643,31 +684,36 @@ State 11: <Recover line 360, col 19 to line 360, col 55 of module LogProtocol>
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 1 ],
+        counter |-> 1,
+        ord |-> 0 ],
       [ stamp |-> 1,
         body |-> 21,
         kind |-> "upsert",
         key |-> 2,
         writer |-> 1,
-        counter |-> 1 ] >>,
+        counter |-> 1,
+        ord |-> 0 ] >>,
    << [ stamp |-> 2,
         body |-> 12,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 2,
-        counter |-> 2 ],
+        counter |-> 2,
+        ord |-> 0 ],
       [ stamp |-> 2,
         body |-> 0,
         kind |-> "delete",
         key |-> 2,
         writer |-> 2,
-        counter |-> 2 ] >>,
+        counter |-> 2,
+        ord |-> 0 ] >>,
    << [ stamp |-> 5,
         body |-> 13,
         kind |-> "upsert",
         key |-> 1,
         writer |-> 1,
-        counter |-> 3 ] >> >>
+        counter |-> 3,
+        ord |-> 0 ] >> >>
 /\ hints = { [generation |-> 1, at |-> 1],
   [generation |-> 1, at |-> 2],
   [generation |-> 1, at |-> 3] }
@@ -677,8 +723,8 @@ State 11: <Recover line 360, col 19 to line 360, col 55 of module LogProtocol>
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
    << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
-/\ data = << << [stamp |-> 5, rank |-> 10, body |-> 13, first |-> 3],
-      [stamp |-> 2, rank |-> 5, body |-> 0, first |-> 2] >>,
+/\ data = << << [stamp |-> 5, rank |-> 381, body |-> 13, first |-> 3],
+      [stamp |-> 2, rank |-> 184, body |-> 0, first |-> 2] >>,
    << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
       [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
    << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],

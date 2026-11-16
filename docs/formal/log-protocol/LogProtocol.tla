@@ -6,7 +6,7 @@ ASSUME /\ MaxSteps \in 6..8
        /\ Mode \in {"good","gap","outOfOrder","droppedDeleteEffect","forgetTombstone",
                     "omitNoCutoff","omitInclusive","dropKind","replayFromBase",
                     "grouped","groupedSkip","equalStamp","equalStampToday",
-                    "keyed","keyedSkip","keyedEarly","keyedLeak"}
+                    "keyed","keyedSkip","keyedEarly","keyedLeak","keyedBypass"}
 Devices == {1,2,3}
 Keys == {1,2}
 Writers == {1,2}
@@ -203,10 +203,21 @@ Rollback ==
  /\ stageAt' = [d \in Devices |-> [k \in Keys |-> 0]]
  /\ UNCHANGED <<stopped,deviceEpoch,position,known,data,hints,
                 prefixOK,monotoneOK,omissionOK,dur,durAt,durEp>>
+\* A device that holds durable unpublished rows (`durAt[d] # 0`: the code's `log_keyed_pending`
+\* marker) takes no other way to move its position or its rows: not a segment, a group, a
+\* snapshot, a lifetime change. Each of those would publish a cursor over rows it did not
+\* write or cannot account for, so the code refuses them (`LogDivergedError`) until a
+\* key-ordered load that covers the rows publishes. keyedBypass mutant: no such refusal.
+NoPending(d) == Mode = "keyedBypass" \/ durAt[d] = 0
+\* The rows a device physically holds: the durable unpublished rows are in the live table, so
+\* a segment applied over them merges with them (the code's `records`). With the refusal
+\* above `dur` is Empty whenever one applies, and this equals `data[d]`.
+LiveRows(d) == [k \in Keys |-> MergeRow(data[d][k], dur[d][k])]
 \* A full check adopts the current lifetime and resets a device that was on another one.
 \* replayFromBase mutant: the device keeps its rows and position and replays from there.
 FullCheck(d) ==
  /\ (deviceEpoch[d] # epoch \/ known[d] # Len(log))
+ /\ (deviceEpoch[d] # epoch => NoPending(d))
  /\ deviceEpoch' = [deviceEpoch EXCEPT ![d]=epoch]
  /\ known' = [known EXCEPT ![d]=Len(log)]
  /\ LET relabel == deviceEpoch[d] # epoch /\ Mode # "replayFromBase"
@@ -242,8 +253,9 @@ Compact ==
                 prefixOK,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp>>
 \* A reader behind the snapshot merges it into the rows it already has.
 Install(d) ==
+ /\ NoPending(d)
  /\ deviceEpoch[d]=epoch /\ position[d]<cut /\ known[d]>=cut
- /\ data'=[data EXCEPT ![d]=[k \in Keys |-> MergeRow(data[d][k],snapshot[k])]]
+ /\ data'=[data EXCEPT ![d]=[k \in Keys |-> MergeRow(LiveRows(d)[k],snapshot[k])]]
  /\ position'=[position EXCEPT ![d]=cut]
  /\ monotoneOK'=(monotoneOK /\ cut>=position[d])
  /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
@@ -256,10 +268,11 @@ OmissionSafeFor(state,ops) ==
    IN (op.kind="omit" /\ before[op.key].stamp>=op.stamp /\ before[op.key].body#0)
       => after[op.key]=before[op.key]
 Apply(d,p) ==
+ /\ NoPending(d)
  /\ deviceEpoch[d]=epoch /\ position[d]>=cut
  /\ p \in retained /\ p<=known[d] /\ p>position[d]
  /\ (Mode="outOfOrder" \/ p=position[d]+1)
- /\ data'=[data EXCEPT ![d]=FoldOps(data[d],log[p],Mode="omitNoCutoff",p)]
+ /\ data'=[data EXCEPT ![d]=FoldOps(LiveRows(d),log[p],Mode="omitNoCutoff",p)]
  /\ position'=[position EXCEPT ![d]=p]
  /\ prefixOK'=(prefixOK /\ p=position[d]+1)
  /\ monotoneOK'=(monotoneOK /\ p>=position[d])
@@ -269,6 +282,7 @@ Apply(d,p) ==
 \* Mutant: treating a later position hint as an applied checkpoint without
 \* detecting/fetching its missing predecessors.
 SkipGap(d) ==
+ /\ NoPending(d)
  /\ Mode="gap" /\ deviceEpoch[d]=epoch /\ known[d]>position[d]+1
  /\ position'=[position EXCEPT ![d]=known[d]]
  /\ prefixOK'=FALSE
@@ -286,14 +300,15 @@ FoldRun(state,from,to) ==
  IF from > to THEN state
  ELSE FoldRun(FoldOps(state,log[from],FALSE,from),from+1,to)
 ApplyRun(d,q) ==
- /\ Mode \in {"grouped","groupedSkip","keyed","keyedSkip","keyedEarly","keyedLeak"}
+ /\ Mode \in {"grouped","groupedSkip","keyed","keyedSkip","keyedEarly","keyedLeak","keyedBypass"}
+ /\ NoPending(d)
  /\ deviceEpoch[d]=epoch /\ position[d]>=cut
  /\ q \in retained /\ q<=known[d] /\ q>position[d]+1
  /\ \A p \in (position[d]+1)..q : p \in retained
  /\ data'=[data EXCEPT ![d]=
       IF Mode="groupedSkip"
       THEN FoldOps(FoldOps(data[d],log[position[d]+1],FALSE,position[d]+1),log[q],FALSE,q)
-      ELSE FoldRun(data[d],position[d]+1,q)]
+      ELSE FoldRun(LiveRows(d),position[d]+1,q)]
  /\ position'=[position EXCEPT ![d]=q]
  \* Each constituent segment is the next position, so the prefix rule holds step by step.
  /\ prefixOK'=prefixOK
@@ -320,7 +335,7 @@ ApplyRun(d,q) ==
 \* keyedSkip mutant: a key's fold leaves out the segment before the last (as a stage that
 \* lost rows would). keyedEarly mutant: the position is written while a key is not yet folded.
 KeyedGate(d) ==
- /\ Mode \in {"keyed","keyedSkip","keyedEarly","keyedLeak"}
+ /\ Mode \in {"keyed","keyedSkip","keyedEarly","keyedLeak","keyedBypass"}
  /\ deviceEpoch[d]=epoch /\ cut=0 /\ position[d]=0 /\ data[d]=Empty
 \* The pending target admits a stage that ends at q.
 PendingAdmits(d,q) ==
@@ -357,6 +372,20 @@ KeyedBucket(d,k) ==
  /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
                 deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK,
                 stage,stageAt>>
+\* A page of a bucket's complex rows (the code's `complexPages`): a run of one key's
+\* operations, committed alone, so the durable row holds a PARTIAL fold of the key (segments
+\* 1..j of the stage's 1..q, j < q), with the same pending target. Folding the rest at
+\* publish gives the whole fold, whatever page was or was not written before a crash.
+KeyedPage(d,k,j) ==
+ /\ KeyedGate(d)
+ /\ stageAt[d][k] # 0 /\ j \in 1..(stageAt[d][k]-1) /\ PendingAdmits(d,stageAt[d][k])
+ /\ dur' = [dur EXCEPT ![d] = [dur[d] EXCEPT ![k] = MergeRow(dur[d][k], FoldKeyRun(Empty,k,1,j)[k])]]
+ /\ durAt' = [durAt EXCEPT ![d] = IF durAt[d] > stageAt[d][k] /\ durEp[d] = epoch
+                                  THEN durAt[d] ELSE stageAt[d][k]]
+ /\ durEp' = [durEp EXCEPT ![d] = epoch]
+ /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
+                deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK,
+                stage,stageAt>>
 KeyedPublish(d,q) ==
  /\ KeyedGate(d)
  /\ q \in retained /\ q<=known[d]
@@ -378,7 +407,7 @@ KeyedPublish(d,q) ==
                 deviceEpoch,known,hints>>
 \* A crash, or the next start: the stage goes, the durable rows and the pending target stay.
 StageLost(d) ==
- /\ Mode \in {"keyed","keyedSkip","keyedEarly","keyedLeak"}
+ /\ Mode \in {"keyed","keyedSkip","keyedEarly","keyedLeak","keyedBypass"}
  /\ \E k \in Keys : stageAt[d][k] # 0
  /\ stage' = [stage EXCEPT ![d]=Empty]
  /\ stageAt' = [stageAt EXCEPT ![d]=[k \in Keys |-> 0]]
@@ -389,6 +418,7 @@ Recover(d) == Install(d) \/ (\E p \in retained : Apply(d,p)) \/ SkipGap(d)
               \/ (\E q \in retained : ApplyRun(d,q))
               \/ (\E k \in Keys, q \in retained : KeyedLoad(d,k,q))
               \/ (\E k \in Keys : KeyedBucket(d,k))
+              \/ (\E k \in Keys, j \in 1..MaxSteps : KeyedPage(d,k,j))
               \/ (\E q \in retained : KeyedPublish(d,q))
               \/ StageLost(d)
 Next ==
