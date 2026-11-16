@@ -1,10 +1,23 @@
-import type { HeadPart } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { StreamSyncBlobs } from "../stream-sync/ports.js";
 import type { Reservation } from "../stream-sync/send-gate.js";
 import { holdMemory } from "./transfer-memory.js";
 
 /**
- * The parts of a head, fetched ahead of the one the apply is on.
+ * What read-ahead needs of an item: the bytes it holds in memory, and, for a
+ * head's part, whether it continues the frame before it (`count` is 0). A log's
+ * segment and a snapshot part have only `bytes`: each is a unit of its own.
+ */
+export interface SizedPart {
+  readonly bytes: number;
+  readonly count?: number;
+}
+
+/**
+ * The parts of a head, or the segments and snapshot parts of a log, fetched
+ * ahead of the one the apply is on. `fetch` is whatever turns an item into what
+ * the apply needs: the GET and decrypt of a head's part, or the GET, decrypt,
+ * verify and staging of a log's segment. It runs ahead of the commits in the
+ * same way.
  *
  * Apply reads a head's parts in order and commits what it has read before it
  * waits for storage. Without read-ahead the part's GET, its decrypt and its
@@ -48,8 +61,8 @@ import { holdMemory } from "./transfer-memory.js";
  * `load` has the signature `framesOfParts` calls and is asked for parts in
  * order. A part is read once.
  */
-export interface PartReader {
-  readonly load: (part: HeadPart, index: number) => Promise<Uint8Array>;
+export interface PartReader<P extends SizedPart = SizedPart, T = Uint8Array> {
+  readonly load: (part: P, index: number) => Promise<T>;
   /**
    * Whether the unit of the part at `index` has been fetched, so reading it
    * waits for nothing and cannot fail. A part whose fetch failed is not
@@ -88,20 +101,20 @@ interface Unit {
   released: boolean;
 }
 
-interface Slot {
+interface Slot<T> {
   /** Cleared once the apply has read the part, so the bytes are not kept.
    * `resolve` and `reject` stay until the fetch ends, then go too. */
-  promise?: Promise<Uint8Array>;
-  resolve?: (bytes: Uint8Array) => void;
+  promise?: Promise<T>;
+  resolve?: (value: T) => void;
   reject?: (error: unknown) => void;
   unit: Unit;
 }
 
-export function readPartsAhead(
+export function readPartsAhead<P extends SizedPart, T = Uint8Array>(
   blobs: Pick<StreamSyncBlobs, "governor">,
-  parts: readonly HeadPart[],
-  fetch: (part: HeadPart) => Promise<Uint8Array>,
-): PartReader {
+  parts: readonly P[],
+  fetch: (part: P) => Promise<T>,
+): PartReader<P, T> {
   const units: Unit[] = [];
   for (let i = 0; i < parts.length; i++) {
     const open = units[units.length - 1];
@@ -118,10 +131,10 @@ export function readPartsAhead(
       });
     }
   }
-  const slots: Slot[] = [];
+  const slots: Slot<T>[] = [];
   for (const unit of units) {
     for (let i = unit.first; i <= unit.last; i++) {
-      const slot: Slot = { unit };
+      const slot: Slot<T> = { unit };
       slot.promise = new Promise((resolve, reject) => {
         slot.resolve = resolve;
         slot.reject = reject;
@@ -140,7 +153,7 @@ export function readPartsAhead(
    * The slot's settle functions, once. They refer to the slot's promise, and
    * with it to the bytes, so the slot keeps none after the part settles.
    */
-  const end = (slot: Slot) => {
+  const end = (slot: Slot<T>) => {
     const { resolve, reject } = slot;
     slot.resolve = slot.reject = undefined;
     return resolve === undefined || reject === undefined
@@ -183,9 +196,9 @@ export function readPartsAhead(
         const slot = slots[i]!;
         fetch(parts[i]!)
           .then(
-            (data) => {
+            (value) => {
               unit.fetched++;
-              end(slot)?.resolve(data);
+              end(slot)?.resolve(value);
             },
             (error) => end(slot)?.reject(error),
           )

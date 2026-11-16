@@ -25,6 +25,10 @@ import {
   createGatewayStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
 } from "../../../core/src/stream-sync/index.js";
+import {
+  createStorageAccess,
+  DEFAULT_STORAGE_ACCESS_POLICY,
+} from "../../../core/src/stream-sync/storage-retry.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { createFakeGateway } from "./fake-gateway.js";
 
@@ -81,6 +85,11 @@ export async function world(options: {
       beforeGet?: (key: string) => Promise<void>;
       /** A host that serves a first load's applied parts while it fills. */
       progressiveFirstLoad?: boolean;
+      /**
+       * The byte budget of this device's transfers. A budget below one
+       * segment makes an apply fetch and commit one segment at a time.
+       */
+      maxBytesInFlight?: number;
     } = {},
   ) {
     const db = await openLocalDb(openBetterSqlite3(":memory:"), {
@@ -101,7 +110,13 @@ export async function world(options: {
         fetch: gateway.fetch,
       }),
       blobs: {
-        governor: innerBlobs.governor,
+        governor:
+          hooks.maxBytesInFlight === undefined
+            ? innerBlobs.governor
+            : createStorageAccess({
+                ...DEFAULT_STORAGE_ACCESS_POLICY,
+                maxBytesInFlight: hooks.maxBytesInFlight,
+              }),
         async get(key) {
           gets.push(key);
           await hooks.beforeGet?.(key);

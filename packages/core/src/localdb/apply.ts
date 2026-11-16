@@ -769,7 +769,7 @@ async function applyOneOnce(
     if (progressive) announceApplied(deps, id);
     committing = false;
   };
-  let reader: PartReader | undefined;
+  let reader: PartReader<HeadPart> | undefined;
   // Rows of applied parts that wait for their commit, and the position in the
   // read list of the last part they hold.
   let pending: SqlStatement[] = [];
@@ -897,7 +897,9 @@ async function applyOneOnce(
             const last = frame.parts[frame.parts.length - 1]!;
             applied = groupStart + parts.indexOf(last) + 1;
             lastApplied = groupOffset + parts.indexOf(last);
-            pending.push(...rows);
+            // One by one: a part of small rows can hold more statements than a
+            // call takes as arguments.
+            for (const row of rows) pending.push(row);
             rows = [];
             records = 0;
             end = parts[parts.indexOf(last) + 1];

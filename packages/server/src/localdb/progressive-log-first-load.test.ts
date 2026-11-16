@@ -43,6 +43,11 @@ const SCOPE = `pdpp.${CONNECTOR}.${sName(0)}`;
 const STREAM = sName(0);
 const LOG = logScope(CONNECTOR, "");
 const BLOCKED = "blocked" as const;
+/**
+ * A budget under one segment: an apply holds one segment at a time, so each
+ * commits by itself and a gate on a position sees the state before it.
+ */
+const ONE_AT_A_TIME = 1;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** One run of `a` that publishes as its own segment. */
@@ -74,7 +79,8 @@ function gate(d: Device) {
   const batch = db.batch.bind(db);
   const gates = new Map<number, { reached: () => void; open: Promise<void> }>();
   db.batch = async (statements) => {
-    const write = statements.find((s) =>
+    // The last position a batch writes is where the log is after it.
+    const write = statements.findLast((s) =>
       s.sql.includes("INSERT OR REPLACE INTO log_state"),
     );
     const position = write?.params?.[1];
@@ -205,7 +211,10 @@ describe("progressive first load, log protocol on", () => {
   it("a stream over many segments is readable before the last segment applies, and complete after", async () => {
     const w = await world({ streams: 1, logProtocol: true });
     await sevenSegments(w);
-    const b = await w.device("b", true, { progressiveFirstLoad: true });
+    const b = await w.device("b", true, {
+      progressiveFirstLoad: true,
+      maxBytesInFlight: ONE_AT_A_TIME,
+    });
     await connect(b);
     const reads = reader(b);
     const held = gate(b).before(7);
@@ -231,7 +240,10 @@ describe("progressive first load, log protocol on", () => {
   it("a key a later fetched segment deletes or omits is never readable, at any point", async () => {
     const w = await world({ streams: 1, logProtocol: true });
     await sevenSegments(w);
-    const b = await w.device("b", true, { progressiveFirstLoad: true });
+    const b = await w.device("b", true, {
+      progressiveFirstLoad: true,
+      maxBytesInFlight: ONE_AT_A_TIME,
+    });
     await connect(b);
     const reads = reader(b);
     const gates = gate(b);
@@ -271,7 +283,10 @@ describe("progressive first load, log protocol on", () => {
     await publish(a, "run-3", ["C"], { observedAt: 1300 });
     await publish(a, "run-4", ["A"], { observedAt: 1400 });
     await publish(a, "run-5", ["D"], { observedAt: 1500 });
-    const b = await w.device("b", true, { progressiveFirstLoad: true });
+    const b = await w.device("b", true, {
+      progressiveFirstLoad: true,
+      maxBytesInFlight: ONE_AT_A_TIME,
+    });
     await connect(b);
     const reads = reader(b);
     const gates = gate(b);
@@ -295,7 +310,10 @@ describe("progressive first load, log protocol on", () => {
   it("the finished stream is the one a device with the flag off gets, and the view clears its mark", async () => {
     const w = await world({ streams: 1, logProtocol: true });
     await sevenSegments(w);
-    const b = await w.device("b", true, { progressiveFirstLoad: true });
+    const b = await w.device("b", true, {
+      progressiveFirstLoad: true,
+      maxBytesInFlight: ONE_AT_A_TIME,
+    });
     await connect(b);
     const held = gate(b).before(7);
     const { applying } = await stopAt(b, held);
@@ -327,7 +345,10 @@ describe("progressive first load, log protocol on", () => {
     await publish(a, "run-1", ids, { full: true, observedAt: 1100 });
     await publish(a, "run-2", ["tail"], { observedAt: 1200 });
     await publish(a, "run-3", ["tail2"], { observedAt: 1300 });
-    const b = await w.device("b", true, { progressiveFirstLoad: true });
+    const b = await w.device("b", true, {
+      progressiveFirstLoad: true,
+      maxBytesInFlight: ONE_AT_A_TIME,
+    });
     await connect(b);
     const held = gate(b).before(3);
     const { applying } = await stopAt(b, held);
@@ -361,7 +382,10 @@ describe("progressive first load, log protocol on", () => {
     await publish(a, "run-1", ids, { full: true, observedAt: 1100 });
     await publish(a, "run-2", ["tail"], { observedAt: 1200 });
     await publish(a, "run-3", ["tail2"], { observedAt: 1300 });
-    const b = await w.device("b", true, { progressiveFirstLoad: true });
+    const b = await w.device("b", true, {
+      progressiveFirstLoad: true,
+      maxBytesInFlight: ONE_AT_A_TIME,
+    });
     await connect(b);
     const held = gate(b).before(3);
     const { applying } = await stopAt(b, held);
@@ -508,7 +532,10 @@ describe(
       const key = partKey(head, 2);
       const bytes = (await w.innerBlobs.get(key))!;
       w.innerBlobs.delete(key);
-      const b = await w.device("b", true, { progressiveFirstLoad: true });
+      const b = await w.device("b", true, {
+        progressiveFirstLoad: true,
+        maxBytesInFlight: ONE_AT_A_TIME,
+      });
       await connect(b);
       const reads = reader(b);
       await expect(applyConnection(b.deps, CONNECTION_ID)).rejects.toThrow(
