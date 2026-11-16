@@ -673,6 +673,14 @@ interface ReleaseDecision {
    * rollback): their delete converged even if keys above it stay held.
    */
   converged: Set<string>;
+  /** Per scope, the highest finalized tombstone read; null when none. */
+  finalizedThrough: Map<string, bigint | null>;
+}
+
+/** The lowest registry version a marker still covers; null if unexpanded. */
+function lowestKeyOf(marker: PendingBlobDeletion): bigint | null {
+  if (marker.version !== null) return BigInt(marker.version);
+  return marker.range ? BigInt(marker.range.from) : null;
 }
 
 /**
@@ -695,6 +703,7 @@ async function releasableMarkers(
       released: markers.map((marker) => ({ marker, through: null })),
       rolledBack,
       converged,
+      finalizedThrough: new Map(),
     };
   }
   const lowestGate = new Map<string, bigint>();
@@ -755,7 +764,7 @@ async function releasableMarkers(
       "Blob deletions wait until the covering tombstone is finalized",
     );
   }
-  return { released, rolledBack, converged };
+  return { released, rolledBack, converged, finalizedThrough: finalized };
 }
 
 /**
@@ -996,6 +1005,24 @@ export interface RetryPendingBlobDeletionsResult {
   failed: Array<{ scope: string; version: string | null; error: string }>;
   /** Markers still queued after this pass (a range counts once). */
   remaining: number;
+  /**
+   * Queued markers a later pass can still finish: those waiting on a
+   * tombstone's finality, or whose delete failed. `remaining` minus the
+   * markers of `parked` scopes.
+   */
+  waiting: number;
+  /**
+   * Scopes whose tombstone rolled back and that this pass cannot re-submit
+   * (no `resubmitDeletion`). Their markers stay queued, since the data is
+   * live; nothing a pass can do advances them. A new delete of the scope, or
+   * a later final tombstone, frees them.
+   */
+  parked: string[];
+  /**
+   * Set when the pass could not look at finality or send deletes because a
+   * port is missing. The markers stay queued and are counted in `remaining`.
+   */
+  unavailable: "delete-port" | "finality-port" | null;
 }
 
 /**
@@ -1024,6 +1051,12 @@ export type RetryPendingBlobDeletionsDeps = Pick<
   | "tombstoneFinality"
   | "logger"
 > & {
+  /**
+   * Refuse to release any marker without a finality port. The permissive
+   * default (no port: release at once) is for the legacy upload path; a
+   * caller that cannot tell whether a tombstone may still roll back sets this.
+   */
+  requireFinality?: boolean;
   /** Local index, for expanding unexpanded markers into exact keys. */
   storage?: Pick<DataStoragePort, "listVersions" | "legacyWriteSeal">;
   /**
@@ -1050,11 +1083,30 @@ export async function retryPendingBlobDeletions(
     superseded: [],
     failed: [],
     remaining: 0,
+    waiting: 0,
+    parked: [],
+    unavailable: null,
   };
-  if (!deleteData || !pendingBlobDeletions) return result;
+  if (!pendingBlobDeletions) return result;
 
   let markers = await pendingBlobDeletions.list();
   if (markers.length === 0) return result;
+
+  // Debt is what the store holds, whatever the transport can do about it.
+  const unavailable = !deleteData
+    ? "delete-port"
+    : deps.requireFinality && !deps.tombstoneFinality
+      ? "finality-port"
+      : null;
+  if (unavailable || !deleteData) {
+    result.remaining = markers.length;
+    result.unavailable = unavailable;
+    logger.debug(
+      { markers: markers.length, missing: unavailable },
+      "Blob deletions are queued but cannot run: a port they need is missing",
+    );
+    return result;
+  }
 
   // Expand markers whose tombstone version was unknown at delete time.
   for (const marker of markers.filter(
@@ -1149,7 +1201,9 @@ export async function retryPendingBlobDeletions(
       );
     }
   }
+  const parked = new Set<string>();
   for (const [scope, rollback] of decision.rolledBack) {
+    if (!deps.resubmitDeletion || !deps.tombstoneResubmits) parked.add(scope);
     await resubmitRolledBackDeletion(
       deps,
       scope,
@@ -1169,6 +1223,18 @@ export async function retryPendingBlobDeletions(
     }
   }
   result.remaining = left.length;
+  result.parked = [...parked].filter((scope) =>
+    left.some((marker) => marker.scope === scope),
+  );
+  // A parked scope holds only the keys above its finalized frontier. Keys at
+  // or below it are free, and a pass that sends one batch at a time may not
+  // have reached them yet: that is work a later pass finishes.
+  result.waiting = left.filter((marker) => {
+    if (!parked.has(marker.scope)) return true;
+    const through = decision.finalizedThrough.get(marker.scope) ?? null;
+    const lowest = lowestKeyOf(marker);
+    return through !== null && lowest !== null && lowest <= through;
+  }).length;
   return result;
 }
 
@@ -1200,6 +1266,13 @@ async function resubmitRolledBackDeletion(
   const { logger, tombstoneResubmits: tracker } = deps;
   const failedVersion = rollback.tombstoneVersion;
   if (!deps.resubmitDeletion || !tracker) {
+    // Nothing here may send a new tombstone (the stream-sync pass has no
+    // legacy path to send it through). With a tracker, park the scope: one
+    // visible failure, no more work for the timer. Without one, only log.
+    if (tracker && !tracker.exhausted(scope)) {
+      const state = tracker.giveUp(scope, failedVersion, "no-reissue-path");
+      deps.onDeletionAbandoned?.(state);
+    }
     logger.warn(
       { scope, tombstoneVersion: failedVersion },
       "Scope tombstone failed and the scope is live again; its storage copies stay until the scope is deleted again",

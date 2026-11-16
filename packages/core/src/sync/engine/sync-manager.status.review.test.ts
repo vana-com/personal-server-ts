@@ -18,7 +18,15 @@ vi.mock("../workers/lost-data-points.js", () => ({
 }));
 vi.mock("../workers/delete.js", () => ({
   deleteScope: vi.fn(),
-  retryPendingBlobDeletions: vi.fn(async () => {}),
+  retryPendingBlobDeletions: vi.fn(async () => ({
+    completed: [],
+    superseded: [],
+    failed: [],
+    remaining: 0,
+    waiting: 0,
+    parked: [],
+    unavailable: null,
+  })),
 }));
 
 import { uploadAll } from "../workers/upload.js";
