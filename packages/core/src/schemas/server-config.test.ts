@@ -378,3 +378,25 @@ describe("pdpp.protocolProfile", () => {
     ).toBe(false);
   });
 });
+
+describe("ServerConfigSchema — server.port", () => {
+  it.each([-1, 1.5, 65536, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects invalid configured port %s",
+    (port) => {
+      expect(ServerConfigSchema.safeParse({ server: { port } }).success).toBe(
+        false,
+      );
+    },
+  );
+
+  it("keeps configured ports concrete; ephemeral binding is a node handle option", () => {
+    expect(ServerConfigSchema.safeParse({ server: { port: 0 } }).success).toBe(
+      false,
+    );
+    for (const port of [1, 65535]) {
+      expect(ServerConfigSchema.parse({ server: { port } }).server.port).toBe(
+        port,
+      );
+    }
+  });
+});

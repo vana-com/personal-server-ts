@@ -199,15 +199,30 @@ async function declareOff(ps: PersonalServerHandle) {
 describe("startPersonalServer node handle", () => {
   it("starts on port 0 and derives its URLs from the bound address", async () => {
     const { ps, port } = await startTestServer();
+    expect(Number.isInteger(port)).toBe(true);
     expect(port).toBeGreaterThan(0);
+    expect(port).toBeLessThanOrEqual(65535);
     const info = await ps.ready();
+    expect(info.status).toBe("ready");
     expect(info.urls).toMatchObject({
       local: `http://127.0.0.1:${port}`,
       apiOrigin: `http://localhost:${port}`,
       registration: `http://localhost:${port}`,
     });
-    const health = await fetch(`http://127.0.0.1:${port}/health`);
+    const registration = await ps.prepareRegistration();
+    expect(registration.candidate.serverUrl).toBe(info.urls.registration);
+    const health = await fetch(`${info.urls.local}/health`);
     expect(health.status).toBe(200);
+    await health.json();
+    const handledHealth = await ps.fetch("/health");
+    expect(handledHealth.status).toBe(200);
+    await handledHealth.json();
+
+    const stopped = ps.stop();
+    expect(ps.stop()).toBe(stopped);
+    await stopped;
+    await expect(ps.stop()).resolves.toBeUndefined();
+    await expect(ps.info()).resolves.toMatchObject({ status: "stopped" });
   });
 
   it.each([-1, 1.5, 65536, Number.NaN, Number.POSITIVE_INFINITY])(
