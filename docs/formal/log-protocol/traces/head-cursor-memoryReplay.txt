@@ -1,0 +1,143 @@
+Error: Invariant InvReplayedOrOwed is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ lver = [A |-> 0, C |-> 0, R |-> 0]
+/\ hwId = [A |-> "-", C |-> "-", R |-> "-"]
+/\ stopped = FALSE
+/\ log = <<>>
+/\ cons = [A |-> 0, C |-> 0, R |-> 0]
+/\ regV = 0
+/\ pos = [A |-> 0, C |-> 0, R |-> 0]
+/\ data = [ A |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ evId = [A |-> "-", C |-> "-", R |-> "-"]
+/\ hwPos = [A |-> 0, C |-> 0, R |-> 0]
+/\ logIds = <<>>
+/\ pid = [A |-> "-", C |-> "-", R |-> "-"]
+/\ evPos = [A |-> 0, C |-> 0, R |-> 0]
+/\ rolled = FALSE
+/\ owed = [A |-> FALSE, C |-> FALSE, R |-> FALSE]
+
+State 2: <CommitHead line 92, col 3 to line 94, col 94 of module HeadCursor>
+/\ lver = [A |-> 0, C |-> 0, R |-> 0]
+/\ hwId = [A |-> "-", C |-> "-", R |-> "-"]
+/\ stopped = FALSE
+/\ log = <<>>
+/\ cons = [A |-> 0, C |-> 0, R |-> 0]
+/\ regV = 1
+/\ pos = [A |-> 0, C |-> 0, R |-> 0]
+/\ data = [ A |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ evId = [A |-> "-", C |-> "-", R |-> "-"]
+/\ hwPos = [A |-> 0, C |-> 0, R |-> 0]
+/\ logIds = <<>>
+/\ pid = [A |-> "-", C |-> "-", R |-> "-"]
+/\ evPos = [A |-> 0, C |-> 0, R |-> 0]
+/\ rolled = FALSE
+/\ owed = [A |-> FALSE, C |-> FALSE, R |-> FALSE]
+
+State 3: <LogRound line 99, col 3 to line 108, col 59 of module HeadCursor>
+/\ lver = [A |-> 1, C |-> 0, R |-> 0]
+/\ hwId = [A |-> "m", C |-> "-", R |-> "-"]
+/\ stopped = FALSE
+/\ log = <<(3 :> [rank |-> 2, live |-> TRUE])>>
+/\ cons = [A |-> 0, C |-> 0, R |-> 0]
+/\ regV = 1
+/\ pos = [A |-> 1, C |-> 0, R |-> 0]
+/\ data = [ A |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 2, live |-> TRUE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ evId = [A |-> "-", C |-> "-", R |-> "-"]
+/\ hwPos = [A |-> 1, C |-> 0, R |-> 0]
+/\ logIds = <<"m">>
+/\ pid = [A |-> "m", C |-> "-", R |-> "-"]
+/\ evPos = [A |-> 0, C |-> 0, R |-> 0]
+/\ rolled = FALSE
+/\ owed = [A |-> FALSE, C |-> FALSE, R |-> FALSE]
+
+State 4: <AdmitHead line 166, col 6 to line 178, col 63 of module HeadCursor>
+/\ lver = [A |-> 2, C |-> 0, R |-> 0]
+/\ hwId = [A |-> "m", C |-> "-", R |-> "-"]
+/\ stopped = FALSE
+/\ log = <<(3 :> [rank |-> 2, live |-> TRUE])>>
+/\ cons = [A |-> 1, C |-> 0, R |-> 0]
+/\ regV = 1
+/\ pos = [A |-> 0, C |-> 0, R |-> 0]
+/\ data = [ A |->
+      << [rank |-> 1, live |-> TRUE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 2, live |-> TRUE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ evId = [A |-> "-", C |-> "-", R |-> "-"]
+/\ hwPos = [A |-> 1, C |-> 0, R |-> 0]
+/\ logIds = <<"m">>
+/\ pid = [A |-> "-", C |-> "-", R |-> "-"]
+/\ evPos = [A |-> 0, C |-> 0, R |-> 0]
+/\ rolled = FALSE
+/\ owed = [A |-> TRUE, C |-> FALSE, R |-> FALSE]
+
+State 5: <MemCrash line 198, col 3 to line 200, col 94 of module HeadCursor>
+/\ lver = [A |-> 2, C |-> 0, R |-> 0]
+/\ hwId = [A |-> "m", C |-> "-", R |-> "-"]
+/\ stopped = FALSE
+/\ log = <<(3 :> [rank |-> 2, live |-> TRUE])>>
+/\ cons = [A |-> 1, C |-> 0, R |-> 0]
+/\ regV = 1
+/\ pos = [A |-> 0, C |-> 0, R |-> 0]
+/\ data = [ A |->
+      << [rank |-> 1, live |-> TRUE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 2, live |-> TRUE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ evId = [A |-> "-", C |-> "-", R |-> "-"]
+/\ hwPos = [A |-> 1, C |-> 0, R |-> 0]
+/\ logIds = <<"m">>
+/\ pid = [A |-> "-", C |-> "-", R |-> "-"]
+/\ evPos = [A |-> 0, C |-> 0, R |-> 0]
+/\ rolled = FALSE
+/\ owed = [A |-> FALSE, C |-> FALSE, R |-> FALSE]
+
+165 states generated, 98 distinct states found, 69 states left on queue.

@@ -36,6 +36,7 @@ import {
   verifySegment,
   verifySnapshotPart,
   type ControlHashes,
+  type ControlRead,
   type Segment,
   type SegmentRef,
   type SnapshotPart,
@@ -140,10 +141,116 @@ export interface LogApplyContext {
 }
 
 /**
+ * What a head admission left to the next log pass: the replay it owes and
+ * the cursor it replaced (see `log_replay` in schema.ts).
+ */
+export interface ReplayObligation {
+  readonly position: number;
+  readonly lastRef: SegmentRef | null;
+}
+
+export async function readReplayObligation(
+  deps: Pick<LocalSyncDeps, "db">,
+  connectionId: string,
+): Promise<ReplayObligation | undefined> {
+  const [row] = await deps.db.query<{
+    position: number;
+    last_ref: string | null;
+  }>("SELECT position, last_ref FROM log_replay WHERE connection_id = ?", [
+    connectionId,
+  ]);
+  return row
+    ? {
+        position: row.position,
+        lastRef: row.last_ref ? (JSON.parse(row.last_ref) as SegmentRef) : null,
+      }
+    : undefined;
+}
+
+/**
+ * The evidence a head admission keeps: the cursor it replaces, or the evidence
+ * an earlier admission kept when that is further along (a second head before
+ * the replay finished).
+ */
+export function replayEvidence(
+  cursor: LogState,
+  owed: ReplayObligation | undefined,
+): ReplayObligation {
+  if (owed && owed.position >= cursor.position) return owed;
+  return { position: cursor.position, lastRef: cursor.refs.at(-1) ?? null };
+}
+
+export function writeReplayObligation(
+  connectionId: string,
+  evidence: ReplayObligation,
+): SqlStatement {
+  return {
+    sql: "INSERT OR REPLACE INTO log_replay (connection_id, position, last_ref) VALUES (?, ?, ?)",
+    params: [
+      connectionId,
+      evidence.position,
+      evidence.lastRef ? JSON.stringify(evidence.lastRef) : null,
+    ],
+  };
+}
+
+/**
+ * Why a registry log row is not a continuation of the history a device held
+ * (the position and the segment at it), or null when it is. A registry behind
+ * the position is a rollback; one that names another segment at the position
+ * is another history. A row that is absent, or of another lifetime, says
+ * nothing about it.
+ */
+export function logContinuationFault(
+  read: ControlRead,
+  hashes: ControlHashes,
+  held: { readonly position: number; readonly lastRef: SegmentRef | null },
+): string | null {
+  if (held.position <= 0 || !read.found) return null;
+  if (classifyStreamRow(read, hashes) !== "present") return null;
+  if (read.version < held.position)
+    return `apply: the log registry is at position ${read.version}, behind this device at ${held.position}`;
+  if (
+    read.version === held.position &&
+    held.lastRef &&
+    held.lastRef.dataHash.toLowerCase() !== read.dataHash.toLowerCase()
+  )
+    return `apply: the log names a different segment at position ${held.position} than this device applied`;
+  return null;
+}
+
+/**
  * Bring this device to the log's position. One registry read, one GET for the
  * newest segment, one GET for each older segment this device lacks.
+ *
+ * When a head admission owes a replay, the registry row is first
+ * checked against the cursor that admission replaced, and the obligation is
+ * cleared only after the pass finishes on a log that fit it.
  */
 export async function applyLog(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  context: LogApplyContext,
+): Promise<{ readonly applied: number }> {
+  const owed = await readReplayObligation(deps, connectionId);
+  if (!owed) return applyLogPass(deps, connectionId, context);
+  const scope = logScope(context.connector, context.ns);
+  const read = context.read ?? (await deps.registry.read(scope));
+  const fault = logContinuationFault(read, context.hashes, owed);
+  if (fault !== null) throw new LogDivergedError(fault);
+  const out = await applyLogPass(deps, connectionId, { ...context, read });
+  // A pass on a log that is absent proved nothing: the obligation stays.
+  if (read.found && classifyStreamRow(read, context.hashes) !== "absent")
+    await deps.db.batch([
+      {
+        sql: "DELETE FROM log_replay WHERE connection_id = ?",
+        params: [connectionId],
+      },
+    ]);
+  return out;
+}
+
+async function applyLogPass(
   deps: LocalSyncDeps,
   connectionId: string,
   context: LogApplyContext,

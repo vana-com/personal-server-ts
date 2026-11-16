@@ -935,6 +935,11 @@ describe("view changes", () => {
       { sql: "ALTER TABLE stream_state DROP COLUMN key_types" },
       // The batch ordinal that orders two bodies of a key at one stamp.
       { sql: "ALTER TABLE records DROP COLUMN stamp_n" },
+
+      // The consumed registry head is columns on a table that stays.
+      { sql: "ALTER TABLE stream_state DROP COLUMN consumed_version" },
+      { sql: "ALTER TABLE stream_state DROP COLUMN consumed_generation" },
+      { sql: "ALTER TABLE stream_state DROP COLUMN consumed_data_hash" },
       { sql: `PRAGMA user_version = ${viewMigration}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");

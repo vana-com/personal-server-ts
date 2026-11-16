@@ -439,6 +439,33 @@ END`,
     // with a changed body, at the same stamp; the later batch is the fresher
     // observation. 0 for a row from before the column and for a run's first batch.
     `ALTER TABLE records ADD COLUMN stamp_n INTEGER NOT NULL DEFAULT 0`,
+
+    // The last registry per-stream head this device consumed completely:
+    // `head_version` cannot say it, because the log's own rounds also advance
+    // `head_version` (a local number above anything the registry holds). A row
+    // is written only when a head's apply (or this device's own publish of a
+    // head) finishes; the log never touches it. A row of a connection with no
+    // log took its head as consumed. A connection that followed a log did not:
+    // its `head_version` may be a log's local number, so its heads are read
+    // once more.
+    `ALTER TABLE stream_state ADD COLUMN consumed_version INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE stream_state ADD COLUMN consumed_generation INTEGER`,
+    `ALTER TABLE stream_state ADD COLUMN consumed_data_hash TEXT`,
+    `UPDATE stream_state SET consumed_version = head_version, consumed_generation = head_generation,
+        consumed_data_hash = head_data_hash
+      WHERE head_version > 0 AND head_data_hash IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM log_state l WHERE l.connection_id = stream_state.connection_id)`,
+
+    // The log replay a head admission owes. A per-stream head merged beside a
+    // log can drop rows the log holds, so the head batch resets the log
+    // cursor (`log_state`) and writes this row in the same batch: one row
+    // per connection, present until a replay of the log has been validated
+    // and finished. `position` and `last_ref` are the cursor the batch
+    // replaced (0 and null for a device that held none): the evidence that a
+    // registry log behind that position, or naming another segment there, is
+    // not a continuation. Local only.
+    `CREATE TABLE log_replay (
+  connection_id TEXT PRIMARY KEY, position INTEGER NOT NULL, last_ref TEXT) WITHOUT ROWID;`,
   ],
   [
     // A key-ordered first load of the log (log-keyed.ts) writes its rows one

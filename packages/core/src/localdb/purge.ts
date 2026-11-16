@@ -50,7 +50,8 @@ export async function purgeConnection(
    WHERE NOT EXISTS (SELECT 1 FROM blob_refs r WHERE r.blob_id = blobs.blob_id)`,
         },
         {
-          sql: `UPDATE stream_state SET last_delete_version = ?
+          sql: `UPDATE stream_state SET last_delete_version = ?, consumed_version = 0,
+   consumed_generation = NULL, consumed_data_hash = NULL
    WHERE connection_id = ?`,
           params: [deleted.controlVersion, connectionId],
         },
@@ -66,6 +67,10 @@ export async function purgeConnection(
         },
         {
           sql: "DELETE FROM log_keyed_pending WHERE connection_id = ?",
+          params: [connectionId],
+        },
+        {
+          sql: "DELETE FROM log_replay WHERE connection_id = ?",
           params: [connectionId],
         },
         {

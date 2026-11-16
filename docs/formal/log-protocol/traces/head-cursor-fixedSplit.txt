@@ -1,0 +1,85 @@
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ pos = [A |-> 0, C |-> 0, R |-> 0]
+/\ cons = [A |-> 0, C |-> 0, R |-> 0]
+/\ regV = 0
+/\ data = [ A |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ lver = [A |-> 0, C |-> 0, R |-> 0]
+/\ stopped = FALSE
+/\ log = <<>>
+
+State 2: <CommitHead line 65, col 3 to line 67, col 49 of module HeadCursor>
+/\ pos = [A |-> 0, C |-> 0, R |-> 0]
+/\ cons = [A |-> 0, C |-> 0, R |-> 0]
+/\ regV = 1
+/\ data = [ A |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ lver = [A |-> 0, C |-> 0, R |-> 0]
+/\ stopped = FALSE
+/\ log = <<>>
+
+State 3: <LogRound line 72, col 3 to line 77, col 36 of module HeadCursor>
+/\ pos = [A |-> 1, C |-> 0, R |-> 0]
+/\ cons = [A |-> 0, C |-> 0, R |-> 0]
+/\ regV = 1
+/\ data = [ A |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 2, live |-> TRUE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ lver = [A |-> 1, C |-> 0, R |-> 0]
+/\ stopped = FALSE
+/\ log = <<(3 :> [rank |-> 2, live |-> TRUE])>>
+
+State 4: <ApplyHead line 107, col 6 to line 113, col 38 of module HeadCursor>
+/\ pos = [A |-> 0, C |-> 0, R |-> 0]
+/\ cons = [A |-> 1, C |-> 0, R |-> 0]
+/\ regV = 1
+/\ data = [ A |->
+      << [rank |-> 1, live |-> TRUE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 2, live |-> TRUE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ lver = [A |-> 2, C |-> 0, R |-> 0]
+/\ stopped = FALSE
+/\ log = <<(3 :> [rank |-> 2, live |-> TRUE])>>
+
+48 states generated, 30 distinct states found, 20 states left on queue.
+The depth of the complete state graph search is 4.
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 6 and the 95th percentile is 6).
+Finished in 00s at (2026-11-16 05:37:33)

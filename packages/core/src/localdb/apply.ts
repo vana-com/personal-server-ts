@@ -12,6 +12,7 @@ import {
   headBlobName,
   isPlainObject,
   isLogStream,
+  logScope,
   omissionCutoff,
   parseScope,
   partBlobName,
@@ -24,7 +25,6 @@ import {
   type Head,
   type HeadPart,
   type JsonObject,
-  logScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { ConnectionQueue, LocalSyncDeps } from "./deps.js";
@@ -43,7 +43,15 @@ import {
   hydrateLifetimeBoundary,
   olderLifetimeFence,
 } from "./lifetime-boundary.js";
-import { applyLog } from "./log-apply.js";
+import {
+  applyLog,
+  LogDivergedError,
+  logContinuationFault,
+  readLogState,
+  readReplayObligation,
+  replayEvidence,
+  writeReplayObligation,
+} from "./log-apply.js";
 import { readPartsAhead, type PartReader } from "./part-readahead.js";
 import { purgeConnection } from "./purge.js";
 import {
@@ -73,6 +81,9 @@ type State = {
   head_generation: number | null;
   head_data_hash: string | null;
   head_format: number | null;
+  consumed_version: number;
+  consumed_generation: number | null;
+  consumed_data_hash: string | null;
 };
 type SavedPart = {
   prefix: string;
@@ -296,7 +307,9 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
       if (row.found) reuse.log = row;
     }
     if (await logFollowed(deps, id, reuse)) {
-      // Streams published before the log, then the log on top of them.
+      // Streams published before the log, then the log on top of them. A job
+      // for one stream that admitted a head reads the log too: the head's
+      // omission can drop rows the log holds, and its position was dropped.
       const [now] = await deps.db.query<{
         generation: number;
         control_state: string;
@@ -341,9 +354,10 @@ export async function connectionHasLog(
   if (reuse?.log !== undefined) return true;
   return (
     (
-      await deps.db.query("SELECT 1 FROM log_state WHERE connection_id = ?", [
-        connectionId,
-      ])
+      await deps.db.query(
+        "SELECT 1 FROM log_state WHERE connection_id = ? UNION ALL SELECT 1 FROM log_replay WHERE connection_id = ?",
+        [connectionId, connectionId],
+      )
     ).length > 0
   );
 }
@@ -440,7 +454,7 @@ async function control(
       await purgeConnection(deps, id, { controlVersion: state.generation - 1 });
       await deps.db.batch([
         {
-          sql: `UPDATE stream_state SET head_version=0, head_generation=NULL, head_data_hash=NULL, head_blob=NULL, complete=0, last_delete_version=0, floor_version=NULL, floor_o=NULL, floor_r=NULL WHERE connection_id=?`,
+          sql: `UPDATE stream_state SET head_version=0, head_generation=NULL, head_data_hash=NULL, head_blob=NULL, consumed_version=0, consumed_generation=NULL, consumed_data_hash=NULL, complete=0, last_delete_version=0, floor_version=NULL, floor_o=NULL, floor_r=NULL WHERE connection_id=?`,
           params: [id],
         },
       ]);
@@ -570,7 +584,7 @@ async function applyOneOnce(
   if (!read.found || classification === "absent")
     return early(result(stream, "gone"));
   const [state] = await deps.db.query<State>(
-    `SELECT s.primary_key,s.complete,s.last_delete_version,s.head_version,s.head_generation,s.head_data_hash,v.head_format FROM stream_state s LEFT JOIN stream_versions v ON v.connection_id=s.connection_id AND v.stream=s.stream AND v.version=s.head_version AND v.generation=s.head_generation WHERE s.connection_id=? AND s.stream=?`,
+    `SELECT s.primary_key,s.complete,s.last_delete_version,s.head_version,s.head_generation,s.head_data_hash,s.consumed_version,s.consumed_generation,s.consumed_data_hash,v.head_format FROM stream_state s LEFT JOIN stream_versions v ON v.connection_id=s.connection_id AND v.stream=s.stream AND v.version=s.head_version AND v.generation=s.head_generation WHERE s.connection_id=? AND s.stream=?`,
     [id, stream],
   );
   if (classification === "tombstoned") {
@@ -601,7 +615,7 @@ async function applyOneOnce(
           params: [id, stream],
         },
         {
-          sql: "UPDATE stream_state SET complete=0, head_version=0, head_blob=NULL, head_data_hash=NULL, last_delete_version=? WHERE connection_id=? AND stream=?",
+          sql: "UPDATE stream_state SET complete=0, head_version=0, head_blob=NULL, head_data_hash=NULL, consumed_version=0, consumed_generation=NULL, consumed_data_hash=NULL, last_delete_version=? WHERE connection_id=? AND stream=?",
           params: [read.version, id, stream],
         },
         {
@@ -615,23 +629,54 @@ async function applyOneOnce(
   }
   if (state && read.version <= state.last_delete_version)
     return settled(result(stream, "gone"));
-  // With the log on, a stream the log wrote reads from a local version above
-  // the registry's own stream row (see `applySegmentOperations`): that row is
-  // older than what this device holds and replaces nothing. The answer is a
-  // version comparison and reads no data, so it proves nothing about rows an
-  // earlier failed apply of a newer per-stream head merged: neither this row
-  // nor the log holds them. While the connection is marked partial it is not
-  // `settled`, the mark stays, and only a read of a head that replaces the
-  // stream (or a rebuild) clears it. Dropping the shortcut instead would replay
-  // an older head over valid log state.
+  // With the log on, `head_version` is a local number: the log's own rounds
+  // advance it above anything the registry's stream row holds (see
+  // `applySegmentOperations`), so it cannot say which registry head this
+  // device consumed. `consumed_*` says that, and only a finished apply of a
+  // head (or this device's own publish of one) writes it. A registry head is
+  // skipped when that exact head, or a later one of this lifetime, is
+  // consumed: replaying it would put older rows over what this device holds.
+  // A head not consumed is never skipped for a number below the local one: it
+  // is applied (below) and the log is read again over it.
+  //
+  // The answer reads no data, so it proves nothing about rows an earlier failed
+  // apply of a newer per-stream head merged: neither this row nor the log holds
+  // them. While the connection is marked partial it is not `settled`, the mark
+  // stays, and only a read of a head that replaces the stream (or a rebuild)
+  // clears it.
   if (
     state &&
-    state.head_version > read.version &&
+    state.consumed_generation === active.generation &&
+    (read.version < state.consumed_version ||
+      (read.version === state.consumed_version &&
+        read.dataHash === state.consumed_data_hash)) &&
     (await logFollowed(deps, id, reuse))
   ) {
     const answer = result(stream, "noop");
-    return reuse.partial ? early(answer) : settled(answer);
+    // The head is consumed, which only a finished batch writes, and that batch
+    // rewrites `head_parts`. The first commit of a merge of any other head
+    // drops them (`commit` below), so a stream that still has them has merged
+    // nothing since: no interrupted merge is behind the partial mark for this
+    // stream, and a committed head that waits for its log replay settles. A
+    // stream without them may hold a newer head's merged parts, and the mark
+    // stays.
+    if (
+      reuse.partial &&
+      (
+        await deps.db.query(
+          "SELECT 1 FROM head_parts WHERE connection_id=? AND stream=? LIMIT 1",
+          [id, stream],
+        )
+      ).length === 0
+    )
+      return early(answer);
+    return settled(answer);
   }
+  // Admitting this head resets the log cursor (see the final batch), which
+  // keeps the position and segment it held as stored evidence. A registry log
+  // that already fails it is refused here, before the download, and again just
+  // before the batch.
+  await assertLogContinues(deps, id, connection, hashes, reuse, false);
   const saved = await deps.db.query<SavedPart>(
     "SELECT prefix,seq,part_hash,bytes,count FROM head_parts WHERE connection_id=? AND stream=? ORDER BY prefix,seq",
     [id, stream],
@@ -641,8 +686,24 @@ async function applyOneOnce(
     state.head_data_hash === read.dataHash &&
     state.head_generation === active.generation &&
     saved.length > 0
-  )
+  ) {
+    // Rows built from these very parts: this head is consumed.
+    if (
+      state.consumed_version !== read.version ||
+      state.consumed_data_hash !== read.dataHash ||
+      state.consumed_generation !== active.generation
+    )
+      await deps.db.batch([
+        consumedStatement(
+          id,
+          stream,
+          read.version,
+          active.generation,
+          read.dataHash,
+        ),
+      ]);
     return settled(result(stream, "noop"));
+  }
   const blob = headBlobName(read.dataHash);
   const cipher = await deps.blobs.get(`${scope}/${blob}`);
   if (cipher === null) {
@@ -984,6 +1045,29 @@ async function applyOneOnce(
       classifyStreamRow(latest, hashes) !== "present"
     )
       throw new Error("apply: stream changed during download");
+    await assertLogContinues(deps, id, connection, hashes, reuse, true);
+    // The local number of the head this device now holds. A registry number
+    // above the local one is used as it is. When the log's rounds already took
+    // the number, the next local one is: it cannot collide with the version
+    // rows the log wrote, and `consumed_*` names the registry head.
+    const logAhead =
+      state !== undefined &&
+      state.head_version >= read.version &&
+      (await logFollowed(deps, id, reuse));
+    const localVersion = logAhead
+      ? Math.max(state.head_version, state.last_delete_version) + 1
+      : read.version;
+    // A device that follows the log owes it a replay over this head. The
+    // cursor is reset and the obligation, with the cursor it replaces as
+    // continuity evidence, is stored in the same batch (`log_replay`). A device
+    // that held no cursor owes the replay too.
+    const owesReplay = await logFollowed(deps, id, reuse);
+    const evidence = owesReplay
+      ? replayEvidence(
+          await readLogState(deps, id),
+          await readReplayObligation(deps, id),
+        )
+      : undefined;
     const statements: SqlStatement[] = [
       {
         sql: `INSERT OR IGNORE INTO stream_state (connection_id,stream,primary_key,semantics,incremental) VALUES (?,?,?,'mutable_state',1)`,
@@ -991,13 +1075,13 @@ async function applyOneOnce(
       },
       ...applyDelete(op, id, stream, omissionCutoff(head)),
       {
-        sql: `UPDATE stream_state SET primary_key=?,profile_key=?,profile_version=?,complete=?,head_version=?,head_generation=?,head_data_hash=?,head_blob=?,last_delete_version=? WHERE connection_id=? AND stream=?`,
+        sql: `UPDATE stream_state SET primary_key=?,profile_key=?,profile_version=?,complete=?,head_version=?,head_generation=?,head_data_hash=?,head_blob=?,last_delete_version=?,consumed_version=?,consumed_generation=?,consumed_data_hash=? WHERE connection_id=? AND stream=?`,
         params: [
           JSON.stringify(head.primaryKey),
           head.profile.key,
           head.profile.version,
           head.complete ? 1 : 0,
-          read.version,
+          localVersion,
           head.generation,
           read.dataHash,
           blob,
@@ -1005,6 +1089,9 @@ async function applyOneOnce(
             state?.last_delete_version ?? 0,
             head.lastDeleteVersion ?? 0,
           ),
+          read.version,
+          head.generation,
+          read.dataHash,
           id,
           stream,
         ],
@@ -1023,7 +1110,7 @@ async function applyOneOnce(
         params: [
           id,
           stream,
-          read.version,
+          localVersion,
           head.generation,
           blob,
           head.format,
@@ -1033,6 +1120,21 @@ async function applyOneOnce(
         ],
       },
     ];
+    // The log is read again over this head: it was written for the stream
+    // before this head merged, and this head may drop rows the log holds. The
+    // cursor goes back to the start (a reader with none reads the log from its
+    // snapshot or its first segment, and the merge keeps whatever is newer),
+    // and the obligation stays until a replay has been validated against the
+    // evidence. Other log bookkeeping, such as a keyed first load's pending
+    // rows, is not reset here: it belongs to the log pass, not to the head.
+    if (evidence !== undefined)
+      statements.push(
+        {
+          sql: "DELETE FROM log_state WHERE connection_id=?",
+          params: [id],
+        },
+        writeReplayObligation(id, evidence),
+      );
     for (const [prefix, parts] of grouped)
       parts.forEach((part, seq) =>
         statements.push({
@@ -1096,6 +1198,46 @@ async function applyOneOnce(
       })),
     );
   }
+}
+
+/**
+ * Throws `LogDivergedError` when the registry's log is not a continuation of
+ * the history this device holds: the cursor it applied, or the one a head
+ * admission replaced and has not yet replayed.
+ */
+async function assertLogContinues(
+  deps: LocalSyncDeps,
+  id: string,
+  connection: Connection,
+  hashes: ControlHashes,
+  reuse: Reuse,
+  fresh: boolean,
+): Promise<void> {
+  const held = replayEvidence(
+    await readLogState(deps, id),
+    await readReplayObligation(deps, id),
+  );
+  if (held.position <= 0) return;
+  const scope = logScope(connection.connector, connection.ns);
+  const read =
+    fresh || reuse.stale
+      ? await deps.registry.read(scope)
+      : (reuse.log ?? (await deps.registry.read(scope)));
+  const fault = logContinuationFault(read, hashes, held);
+  if (fault !== null) throw new LogDivergedError(fault);
+}
+
+function consumedStatement(
+  connectionId: string,
+  stream: string,
+  version: number,
+  generation: number,
+  dataHash: string,
+): SqlStatement {
+  return {
+    sql: "UPDATE stream_state SET consumed_version=?,consumed_generation=?,consumed_data_hash=? WHERE connection_id=? AND stream=?",
+    params: [version, generation, dataHash, connectionId, stream],
+  };
 }
 
 async function stage(

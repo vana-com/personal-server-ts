@@ -1,0 +1,186 @@
+Error: The following behavior constitutes a counter-example:
+
+State 1: <Initial predicate>
+/\ pos = [A |-> 0, C |-> 0, R |-> 0]
+/\ cons = [A |-> 0, C |-> 0, R |-> 0]
+/\ regV = 0
+/\ data = [ A |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ lver = [A |-> 0, C |-> 0, R |-> 0]
+/\ stopped = FALSE
+/\ log = <<>>
+
+State 2: <CommitHead line 61, col 3 to line 63, col 49 of module HeadCursor>
+/\ pos = [A |-> 0, C |-> 0, R |-> 0]
+/\ cons = [A |-> 0, C |-> 0, R |-> 0]
+/\ regV = 1
+/\ data = [ A |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ lver = [A |-> 0, C |-> 0, R |-> 0]
+/\ stopped = FALSE
+/\ log = <<>>
+
+State 3: <Apply line 87, col 6 to line 92, col 38 of module HeadCursor>
+/\ pos = [A |-> 0, C |-> 0, R |-> 0]
+/\ cons = [A |-> 1, C |-> 0, R |-> 0]
+/\ regV = 1
+/\ data = [ A |->
+      << [rank |-> 1, live |-> TRUE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ lver = [A |-> 1, C |-> 0, R |-> 0]
+/\ stopped = FALSE
+/\ log = <<>>
+
+State 4: <CommitHead line 61, col 3 to line 63, col 49 of module HeadCursor>
+/\ pos = [A |-> 0, C |-> 0, R |-> 0]
+/\ cons = [A |-> 1, C |-> 0, R |-> 0]
+/\ regV = 2
+/\ data = [ A |->
+      << [rank |-> 1, live |-> TRUE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ lver = [A |-> 1, C |-> 0, R |-> 0]
+/\ stopped = FALSE
+/\ log = <<>>
+
+State 5: <LogRound line 68, col 3 to line 73, col 36 of module HeadCursor>
+/\ pos = [A |-> 1, C |-> 0, R |-> 0]
+/\ cons = [A |-> 1, C |-> 0, R |-> 0]
+/\ regV = 2
+/\ data = [ A |->
+      << [rank |-> 1, live |-> TRUE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 2, live |-> TRUE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ lver = [A |-> 2, C |-> 0, R |-> 0]
+/\ stopped = FALSE
+/\ log = <<(3 :> [rank |-> 2, live |-> TRUE])>>
+
+State 6: <LogRound line 68, col 3 to line 73, col 36 of module HeadCursor>
+/\ pos = [A |-> 2, C |-> 0, R |-> 0]
+/\ cons = [A |-> 1, C |-> 0, R |-> 0]
+/\ regV = 2
+/\ data = [ A |->
+      << [rank |-> 5, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 2, live |-> TRUE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ lver = [A |-> 3, C |-> 0, R |-> 0]
+/\ stopped = FALSE
+/\ log = <<(3 :> [rank |-> 2, live |-> TRUE]), <<[rank |-> 5, live |-> FALSE]>>>>
+
+State 7: <Stop line 94, col 9 to line 94, col 80 of module HeadCursor>
+/\ pos = [A |-> 2, C |-> 0, R |-> 0]
+/\ cons = [A |-> 1, C |-> 0, R |-> 0]
+/\ regV = 2
+/\ data = [ A |->
+      << [rank |-> 5, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 2, live |-> TRUE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >> ]
+/\ lver = [A |-> 3, C |-> 0, R |-> 0]
+/\ stopped = TRUE
+/\ log = <<(3 :> [rank |-> 2, live |-> TRUE]), <<[rank |-> 5, live |-> FALSE]>>>>
+
+State 8: <Apply line 87, col 6 to line 92, col 38 of module HeadCursor>
+/\ pos = [A |-> 2, C |-> 0, R |-> 2]
+/\ cons = [A |-> 1, C |-> 0, R |-> 2]
+/\ regV = 2
+/\ data = [ A |->
+      << [rank |-> 5, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 2, live |-> TRUE] >>,
+  C |->
+      << [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE] >>,
+  R |->
+      << [rank |-> 5, live |-> FALSE],
+         [rank |-> 4, live |-> TRUE],
+         [rank |-> 2, live |-> TRUE] >> ]
+/\ lver = [A |-> 3, C |-> 0, R |-> 4]
+/\ stopped = TRUE
+/\ log = <<(3 :> [rank |-> 2, live |-> TRUE]), <<[rank |-> 5, live |-> FALSE]>>>>
+
+State 9: <Apply line 87, col 6 to line 92, col 38 of module HeadCursor>
+/\ pos = [A |-> 2, C |-> 2, R |-> 2]
+/\ cons = [A |-> 1, C |-> 2, R |-> 2]
+/\ regV = 2
+/\ data = [ A |->
+      << [rank |-> 5, live |-> FALSE],
+         [rank |-> 0, live |-> FALSE],
+         [rank |-> 2, live |-> TRUE] >>,
+  C |->
+      << [rank |-> 5, live |-> FALSE],
+         [rank |-> 4, live |-> TRUE],
+         [rank |-> 2, live |-> TRUE] >>,
+  R |->
+      << [rank |-> 5, live |-> FALSE],
+         [rank |-> 4, live |-> TRUE],
+         [rank |-> 2, live |-> TRUE] >> ]
+/\ lver = [A |-> 3, C |-> 4, R |-> 4]
+/\ stopped = TRUE
+/\ log = <<(3 :> [rank |-> 2, live |-> TRUE]), <<[rank |-> 5, live |-> FALSE]>>>>
+
+State 10: Stuttering
+Finished checking temporal properties in 00s at 2026-11-16 05:09:39
+3082 states generated, 444 distinct states found, 0 states left on queue.
+Finished in 00s at (2026-11-16 05:09:39)
