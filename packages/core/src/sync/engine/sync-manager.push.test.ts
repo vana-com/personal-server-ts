@@ -763,10 +763,28 @@ describe("the push position", () => {
       })),
     });
 
-    async function run(result: unknown) {
+    // A settled device at position "7", poked at that position into a cycle
+    // whose report is `result`. The report stays the same from then on, so the
+    // work it names is never resolved: the device must retry it on the clock
+    // and must not retry it in a loop.
+    async function pokedInto(result: unknown, passMs = 0) {
       const { push, state } = fakePush();
       let next: unknown = report({});
-      const cycle = vi.fn(async () => next);
+      const passes = { starts: [] as number[], ends: [] as number[] };
+      let running = 0;
+      let maxRunning = 0;
+      let slow = false; // only the passes after the poke take `passMs`
+      const cycle = vi.fn(async () => {
+        passes.starts.push(Date.now());
+        running += 1;
+        maxRunning = Math.max(maxRunning, running);
+        if (slow && passMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, passMs));
+        }
+        running -= 1;
+        passes.ends.push(Date.now());
+        return next;
+      });
       const manager = build({
         localSync: { cycle },
         changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
@@ -777,35 +795,86 @@ describe("the push position", () => {
       state.handlers!.onPosition("7");
       await vi.advanceTimersByTimeAsync(60_000); // settles on "7"
       cycle.mockClear();
+      passes.starts.length = 0;
+      passes.ends.length = 0;
       next = result;
+      slow = true;
       state.handlers!.onChange(); // a poke at the same position runs the cycle
       await vi.advanceTimersByTimeAsync(0);
-      expect(cycle).toHaveBeenCalledTimes(1);
-      cycle.mockClear();
-      next = report({});
-      await vi.advanceTimersByTimeAsync(5 * 60_000);
-      const timerCycles = cycle.mock.calls.length;
-      await manager.stop();
-      return timerCycles;
+      return { manager, cycle, passes, maxRunning: () => maxRunning };
     }
 
-    it.each([
+    const unresolved = [
       ["a connection that failed", report({ error: "boom" })],
       ["a stream whose publish backs off", report({ outcomes: ["backoff"] })],
       [
         "a stream deferred on a condition",
         report({ outcomes: ["noop", "deferred"] }),
       ],
-    ])("%s: the timer cycle still runs", async (_name, result) => {
-      expect(await run(result)).toBeGreaterThanOrEqual(1);
-    });
+    ] as const;
+
+    it.each(unresolved)(
+      "%s: one retry per poll interval, none sooner, none after stop",
+      async (_name, result) => {
+        const { manager, cycle } = await pokedInto(result);
+        expect(cycle).toHaveBeenCalledTimes(1); // the poke
+
+        await vi.advanceTimersByTimeAsync(59_999);
+        expect(cycle).toHaveBeenCalledTimes(1); // no rerun of its own
+        await vi.advanceTimersByTimeAsync(1);
+        expect(cycle).toHaveBeenCalledTimes(2);
+        // The same report every time: one cycle each interval over five more.
+        for (let interval = 3; interval <= 6; interval++) {
+          await vi.advanceTimersByTimeAsync(60_000);
+          expect(cycle).toHaveBeenCalledTimes(interval);
+        }
+
+        await manager.stop();
+        expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+        expect(cycle).toHaveBeenCalledTimes(6);
+      },
+    );
+
+    it.each(unresolved)(
+      "%s: when a pass outlasts the timer ticks, passes follow one at a time and never start faster than they end",
+      async (_name, result) => {
+        const passMs = 150_000; // two and a half poll intervals
+        const { manager, cycle, passes, maxRunning } = await pokedInto(
+          result,
+          passMs,
+        );
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+        // Stop waits for the pass under way; let it end.
+        const stopping = manager.stop();
+        await vi.advanceTimersByTimeAsync(passMs);
+        await stopping;
+        const startedAtStop = cycle.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+        expect(cycle.mock.calls.length).toBe(startedAtStop);
+        expect(vi.getTimerCount()).toBe(0);
+
+        expect(maxRunning()).toBe(1);
+        // Each pass starts only after the one before it ended: a tick during a
+        // pass costs one follow-up, not one per tick.
+        for (let i = 1; i < passes.starts.length; i++) {
+          expect(passes.starts[i]).toBeGreaterThanOrEqual(passes.ends[i - 1]!);
+        }
+        // Ticks in the window: ten. Ten minutes of 150 s passes: at most
+        // four finished, plus the one under way when the window closed.
+        expect(cycle.mock.calls.length).toBeLessThanOrEqual(5);
+        expect(cycle.mock.calls.length).toBeGreaterThanOrEqual(2);
+      },
+    );
 
     it("every connection done: quiet again", async () => {
-      expect(
-        await run(
-          report({ outcomes: ["published", "noop", "refused", "purged"] }),
-        ),
-      ).toBe(0);
+      const { manager, cycle } = await pokedInto(
+        report({ outcomes: ["published", "noop", "refused", "purged"] }),
+      );
+      cycle.mockClear();
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(cycle).not.toHaveBeenCalled();
+      await manager.stop();
     });
   });
 

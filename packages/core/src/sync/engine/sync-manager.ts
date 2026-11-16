@@ -287,6 +287,31 @@ const MAX_ERRORS = 10;
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
 
 /**
+ * The longest delay a host timer holds: it keeps the delay in a signed 32-bit
+ * integer of milliseconds, and runs a longer one after 1 ms.
+ */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
+/**
+ * A repeating period the host timer runs as written. The timer counts whole
+ * milliseconds and runs a delay below 1 after 1 ms, so a period that is not
+ * finite or is below 1 would turn the fallback into a busy loop or never run;
+ * it takes the default. A period beyond the timer's limit is the longest
+ * period the timer holds: the caller asked for a long wait, not a short one.
+ */
+function timerPeriod(requested: number | undefined): number {
+  if (
+    typeof requested !== "number" ||
+    Number.isNaN(requested) ||
+    requested < 1 ||
+    requested === Number.POSITIVE_INFINITY
+  ) {
+    return DEFAULT_POLL_INTERVAL_MS;
+  }
+  return Math.min(Math.floor(requested), MAX_TIMER_DELAY_MS);
+}
+
+/**
  * True when a stream-sync cycle's report says it left work that nothing in the
  * registry announces. The cycle reports per connection and does not throw: a
  * connection that failed, or a stream whose publish backs off or waits on a
@@ -319,14 +344,7 @@ export function createSyncManager(
   downloadDeps: DownloadWorkerDeps,
   options?: SyncManagerOptions,
 ): SyncManager {
-  // A period that is not a positive finite number would arm a timer that fires
-  // at once or never, so it takes the default.
-  const pollInterval =
-    typeof options?.pollInterval === "number" &&
-    Number.isFinite(options.pollInterval) &&
-    options.pollInterval > 0
-      ? options.pollInterval
-      : DEFAULT_POLL_INTERVAL_MS;
+  const pollInterval = timerPeriod(options?.pollInterval);
   const uploadBatchSize = options?.uploadBatchSize ?? 50;
   const notifyDebounceMs = options?.notifyDebounceMs ?? 500;
   const transferMode = options?.transferMode ?? "upload-download";
