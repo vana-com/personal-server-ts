@@ -1070,7 +1070,10 @@ async function stage(
   const key = await pkHash(sha, value, head.primaryKey);
   return [
     {
-      sql: `INSERT INTO temp.incoming (op,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256,first_o) VALUES (?,?,?,?,?,?,?,?,?)`,
+      // A head's part carries no batch ordinal, so its row ranks as a legacy
+      // log entry does: ordinal 0 (`rankAfter`). Said here, not left to the
+      // column default, so a part cannot take another rank by accident.
+      sql: `INSERT INTO temp.incoming (op,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256,first_o,stamp_n) VALUES (?,?,?,?,?,?,?,?,?,0)`,
       params: [
         op,
         stream,

@@ -5,7 +5,7 @@ ASSUME /\ MaxSteps \in 6..8
        /\ KeepTail = 1
        /\ Mode \in {"good","gap","outOfOrder","droppedDeleteEffect","forgetTombstone",
                     "omitNoCutoff","omitInclusive","dropKind","replayFromBase",
-                    "grouped","groupedSkip"}
+                    "grouped","groupedSkip","equalStamp","equalStampToday"}
 Devices == {1,2,3}
 Keys == {1,2}
 Writers == {1,2}
@@ -14,12 +14,15 @@ Writers == {1,2}
 \* which an observation with this row's rank was applied (0 for the empty row).
 EmptyRow == [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0]
 Empty == [k \in Keys |-> EmptyRow]
-Op(k,s,b,w,c,kind) ==
+\* ord is the intake batch ordinal of the run that observed the body (0 when the entry
+\* carries none). It is the third component of the observation order: (stamp, ord, kind).
+OpN(k,s,b,w,c,kind,n) ==
   [key |-> k, stamp |-> s, body |-> b, writer |-> w, counter |-> c,
-   kind |-> kind]
+   kind |-> kind, ord |-> n]
+Op(k,s,b,w,c,kind) == OpN(k,s,b,w,c,kind,0)
 \* Finite independent writers; stamps encode ordered (o,r) pairs as s=2*o+r, r in {0,1}. The stamp
 \* order is deliberately different from the Lamport counter order.
-Batches ==
+BaseBatches ==
  << <<Op(1,3,11,1,1,"upsert"), Op(2,1,21,1,1,"upsert")>>,
     <<Op(1,2,12,2,2,"upsert"), Op(2,2,0,2,2,"delete")>>,
     <<Op(1,5,13,1,3,"upsert")>>,
@@ -31,14 +34,48 @@ Batches ==
     \* Equal stamp, same key, same batch: an upsert and an explicit delete at stamp 4.
     \* Only the kind rank decides the outcome (delete > upsert), in either order.
     <<Op(2,4,22,1,7,"upsert"), Op(2,4,0,2,7,"delete")>> >>
-\* Rank at a stamp: omission < upsert < explicit delete (the registry's tombstone kinds).
+\* One run (stamp 3, writer 1) re-emits keys in later intake batches, each published as soon
+\* as it commits (publish while collecting). Ordinal = the intake batch index, carried by
+\* upserts only. Key 1: body 11 at ordinal 0, replaced by body 12 at ordinal 1 (same stamp).
+\* Key 2: body 21 at ordinal 0, body 22 at ordinal 1, then the run's end deletes it. An
+\* explicit delete exists only at run end (intake admits upserts only), so it carries no
+\* ordinal and its kind rank puts it above every upsert of its run; the omission at the run's
+\* own cutoff (also a run-end entry) erases nothing the run observed. Batch 4: a later run
+\* (stamp 5, ordinal 0) beats every ordinal of the earlier run. Batch 5: a clone (another
+\* writer with the same run id, so the same stamp and ordinal) emits a different body.
+EqualStampBatches ==
+ << <<OpN(1,3,11,1,1,"upsert",0), OpN(2,3,21,1,1,"upsert",0)>>,
+    <<OpN(1,3,12,1,2,"upsert",1), OpN(2,3,22,1,2,"upsert",1)>>,
+    <<OpN(2,3,0,1,3,"delete",0), OpN(1,3,0,2,3,"omit",0)>>,
+    <<OpN(1,5,13,2,4,"upsert",0)>>,
+    <<OpN(1,5,14,1,5,"upsert",0)>> >>
+Batches == IF Mode \in {"equalStamp","equalStampToday"} THEN EqualStampBatches ELSE BaseBatches
+\* Rank: the observation order (stamp, kind, ord, body) as one number; absent is rank 0 and
+\* every real operation ranks above it. Kind: omission < upsert < explicit delete (the
+\* registry's tombstone kinds). Deletes and omissions are run-end entries and carry no ordinal. The body
+\* is the last tie-break (the real comparator uses the canonical body's hash, a total order
+\* on bodies), so two entries with equal stamp, ordinal and kind but different bodies
+\* (writers that share a run id) still have one winner at every reader.
 \* omitInclusive mutant: an omission at a cutoff also beats an observation AT that cutoff.
-\* dropKind mutant: an explicit delete ranks with an upsert, so equal-stamp order matters.
-Rank(op) == IF op.kind = "omit"
-            THEN (IF Mode = "omitInclusive" THEN 2 * op.stamp + 1 ELSE 2 * op.stamp - 1)
-            ELSE IF op.kind = "delete"
-            THEN (IF Mode = "dropKind" THEN 2 * op.stamp ELSE 2 * op.stamp + 1)
-            ELSE 2 * op.stamp
+\* dropKind mutant: an explicit delete ranks with an upsert and the body tie-break is
+\* absent, so equal-stamp order matters.
+\* equalStampToday mutant: the comparator of the code before the ordinal: ord and body are
+\* ignored, so a later batch's body at the same stamp ties the earlier one and the first
+\* applied wins.
+OrdOf(op) == IF Mode = "equalStampToday" THEN 0 ELSE op.ord
+TieOf(op) == IF Mode \in {"equalStampToday","dropKind"} THEN 0 ELSE op.body
+KindRank(op) == IF op.kind = "omit" THEN (IF Mode = "omitInclusive" THEN 2 ELSE 0)
+                ELSE IF op.kind = "delete" THEN (IF Mode = "dropKind" THEN 1 ELSE 2)
+                ELSE 1
+\* The packing into one number is exact by construction: each radix is one more than the
+\* largest value the corpus uses in that field (kinds have three ranks), so no field can
+\* carry into the next. SqlRank.tla compares the tuple instead and needs no packing.
+CorpusOps == UNION {{Batches[i][j] : j \in 1..Len(Batches[i])} : i \in 1..Len(Batches)}
+MaxOf(S) == CHOOSE m \in S : \A x \in S : x <= m
+KindBase == 3
+OrdBase == MaxOf({o.ord : o \in CorpusOps}) + 1
+BodyBase == MaxOf({o.body : o \in CorpusOps}) + 1
+Rank(op) == BodyBase * (OrdBase * (KindBase * op.stamp + KindRank(op)) + OrdOf(op)) + TieOf(op)
 Min2(a,b) == IF a < b THEN a ELSE b
 \* An omission cutoff is a strict boundary: an observation AT cutoff wins.
 Merge(state,op,bad,fs) ==
@@ -119,15 +156,9 @@ Init ==
 
 AllOps(history) == UNION { {history[i][j] : j \in 1..Len(history[i])} :
                            i \in 1..Len(history) }
-Admissible(batch) ==
- \A incoming \in {batch[i] : i \in 1..Len(batch)}, old \in AllOps(log) :
-  (incoming.key=old.key /\ incoming.stamp=old.stamp /\
-   incoming.kind#"omit" /\ old.kind#"omit") => incoming.body=old.body
-
 Commit ==
  /\ ~stopped /\ budget < MaxSteps /\ Len(log) < Len(Batches)
  /\ LET p == Len(log)+1 IN
-    /\ Admissible(Batches[p])
     /\ log' = Append(log,Batches[p])
     /\ retained' = retained \cup {p}
     /\ hints' = hints \cup {[generation |-> epoch, at |-> p]}
@@ -152,7 +183,7 @@ Reset ==
 \* Empty (cut 0), so no snapshot of the rolled-back history survives.
 Rollback ==
  /\ AllowRollback /\ ~stopped /\ epoch=1 /\ Len(log)>=2 /\ budget<MaxSteps
- /\ \E alt \in {0} \cup {p \in 1..Len(Batches) : Admissible(Batches[p])} :
+ /\ \E alt \in 0..Len(Batches) :
      LET kept == SubSeq(log,1,Len(log)-1)
          newLog == IF alt = 0 THEN kept ELSE Append(kept,Batches[alt])
      IN /\ log' = newLog
@@ -294,6 +325,19 @@ P5 == \A d \in Devices :
          IF position[d] > Len(log) THEN FALSE
          ELSE data[d]=FoldLog(Empty,Prefix(log,position[d]))
 CaughtUp == \A d \in Devices : deviceEpoch[d]=epoch /\ position[d]=Len(log)
+\* The intended winner of a key, from the log alone and independent of apply order: the
+\* operation greatest in (stamp, ord, kind). Computed with the ordinal in every mode, so the
+\* equalStampToday mutant is judged against the intended order and not its own.
+IntendedRank(op) == BodyBase * (OrdBase * (KindBase * op.stamp + KindRank(op)) + op.ord) + op.body
+IntendedBody(k) ==
+  LET ops == {o \in AllOps(log) : o.key = k}
+  IN IF ops = {} THEN 0
+     ELSE LET top == CHOOSE o \in ops : \A q \in ops : IntendedRank(q) <= IntendedRank(o)
+          IN top.body
+\* P7: a caught-up replica of the current lifetime shows the intended winner of every key.
+P7 == \A d \in Devices :
+       (deviceEpoch[d]=epoch /\ position[d]=Len(log))
+       => \A k \in Keys : data[d][k].body = IntendedBody(k)
 EventuallyConverged == <>[](stopped /\ CaughtUp /\ P1)
 \* Expected FALSE: evidence that the two conflict orders are not equivalent.
 StampEqualsLamport ==

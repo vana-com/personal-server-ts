@@ -1,0 +1,20 @@
+Error: Invariant RowIsFold is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ row = [body |-> 0, ord |-> 0]
+/\ steps = 0
+/\ nextOrd = 0
+/\ log = <<>>
+
+State 2: <Pull line 50, col 3 to line 54, col 44 of module SqlRank>
+/\ row = [body |-> 1, ord |-> 0]
+/\ steps = 1
+/\ nextOrd = 0
+/\ log = <<[body |-> 1, ord |-> 0]>>
+
+State 3: <Pull line 50, col 3 to line 54, col 44 of module SqlRank>
+/\ row = [body |-> 1, ord |-> 0]
+/\ steps = 2
+/\ nextOrd = 0
+/\ log = <<[body |-> 1, ord |-> 0], [body |-> 1, ord |-> 1]>>
+

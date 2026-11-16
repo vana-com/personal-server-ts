@@ -571,6 +571,23 @@ async function grow(d: Device, count: number, from = 0) {
   }
 }
 
+/**
+ * Grow until the log's head carries a snapshot. How many segments that takes is
+ * the library's compaction rule (`shouldCompact`) applied to the segments'
+ * real sizes, so it is observed, not set here; a rule that never fires ends
+ * the test by its timeout.
+ */
+async function growUntilCompacted(
+  d: Device,
+  w: Awaited<ReturnType<typeof world>>,
+) {
+  for (let i = 0; ; i++) {
+    const segments = await w.segments();
+    if (segments.get(Math.max(...segments.keys()))!.snapshot !== null) return;
+    await grow(d, 1, i);
+  }
+}
+
 /** Whether this device's next publish would compact: the library's own rule. */
 async function compactionDue(d: Device): Promise<boolean> {
   const [row] = await d.db.query<{ refs: string; snapshot: string | null }>(
@@ -2219,5 +2236,550 @@ describe("log protocol: the declared key types release an untyped delete", () =>
     expect(await a.db.query("SELECT 1 FROM record_changes")).not.toHaveLength(
       0,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A run that publishes while it collects can emit a key again in a later batch
+// with a changed body, at the run's one stamp. The log's order between the two
+// is the intake batch ordinal, then the body hash (stream-sync `upsertAfter`).
+// ---------------------------------------------------------------------------
+
+describe("log protocol: a run emits a key again after an interim publish", () => {
+  const RUN = "same-run";
+  const stream = sName(0);
+  const begin = (d: Device, runId = RUN) =>
+    d.sync.intake.begin(runId, {
+      connector: CONNECTOR,
+      artifactDigest: CONNECTOR,
+      wantFull: true,
+      observedAt: 1500,
+      owner: { address: OWNER, leaseId: null },
+    });
+  const batch = (d: Device, n: number, records: object[], runId = RUN) =>
+    d.sync.intake.batch(runId, {
+      batch: n,
+      records: records.map((data) => ({ stream, data })),
+    });
+  const end = (d: Device, lastBatch: number, runId = RUN) =>
+    d.sync.intake.end(runId, {
+      outcome: "succeeded",
+      coveredStreams: [stream],
+      provenFullStreams: [stream],
+      lastBatch,
+    });
+  const body = (v: number) => `s0/K={"id":"K","v":${v}}`;
+
+  it("converges to the later batch on the writer, a fresh reader and a reader that applied the first body", async () => {
+    const w = await world({
+      streams: 1,
+      logProtocol: true,
+      publishWhileCollecting: true,
+    });
+    const a = await w.device("a");
+    await begin(a);
+    await batch(a, 0, [{ id: "K", v: 1 }]);
+    expect(await a.records()).toEqual([body(1)]);
+    await a.cycle();
+    expect(await a.position()).toBe(1);
+    // a reader that holds the first body before the replacement exists
+    const early = await w.device("early");
+    await early.cycle();
+    expect(await early.records()).toEqual([body(1)]);
+
+    await batch(a, 1, [{ id: "K", v: 2 }]);
+    await end(a, 1);
+    await a.cycle();
+    expect(await a.position()).toBe(2);
+    expect(await a.records()).toEqual([body(2)]);
+
+    // the second segment names the same stamp and the batch ordinal
+    const segments = await w.segments();
+    const stamps = [1, 2].map((p) => {
+      const op = segments
+        .get(p)!
+        .operations.find((o) => o.kind === "upsert" && o.stream === stream);
+      if (op?.kind !== "upsert") throw new Error("no upsert");
+      return op;
+    });
+    expect(stamps[1]!.stamp).toEqual(stamps[0]!.stamp);
+    expect(stamps[0]!.ordinal).toBeUndefined();
+    expect(stamps[1]!.ordinal).toBe(1);
+
+    await early.cycle();
+    expect(await early.records()).toEqual([body(2)]);
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    expect(await fresh.position()).toBe(2);
+    expect(await fresh.rows()).toEqual(await a.rows());
+    expect(await early.rows()).toEqual(await a.rows());
+  });
+
+  it("converges for a reader that installs a compacted snapshot", async () => {
+    const w = await world({
+      streams: 1,
+      logProtocol: true,
+      publishWhileCollecting: true,
+    });
+    const a = await w.device("a");
+    await begin(a);
+    await batch(a, 0, [{ id: "K", v: 1 }]);
+    await a.cycle();
+    // a reader that holds the first body while the log grows and compacts
+    const early = await w.device("early");
+    await early.cycle();
+    expect(await early.records()).toEqual([body(1)]);
+    await batch(a, 1, [{ id: "K", v: 2 }]);
+    await end(a, 1);
+    await a.cycle();
+    await growUntilCompacted(a, w);
+    const segments = await w.segments();
+    const head = segments.get(Math.max(...segments.keys()))!;
+    expect(head.snapshot).not.toBeNull();
+    expect(head.base).toBeGreaterThan(2);
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    await early.cycle();
+    for (const reader of [fresh, early])
+      expect(
+        (await reader.records()).filter((r) => r.startsWith("s0/K=")),
+      ).toEqual([body(2)]);
+  });
+
+  it("a delete at the run's end beats the interim body whatever its ordinal", async () => {
+    const w = await world({
+      streams: 1,
+      logProtocol: true,
+      publishWhileCollecting: true,
+    });
+    const a = await w.device("a");
+    await begin(a);
+    await batch(a, 0, [{ id: "K", v: 1 }]);
+    await a.cycle();
+    await batch(a, 1, [{ id: "K", v: 2 }]);
+    await a.cycle();
+    await a.sync.intake.batch(RUN, {
+      batch: 2,
+      records: [{ stream, op: "delete", data: { id: "K" } }],
+    });
+    await end(a, 2);
+    await a.cycle();
+    expect(await a.records()).toEqual([]);
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    expect(await fresh.records()).toEqual([]);
+  });
+
+  // Three writers share one run id, so one stamp. Each emits the key at its own
+  // batch ordinal; the filler keys only move the writer's batch counter.
+  const filler = (i: number) => ({ id: `F${i}`, v: 0 });
+  const emitAt = async (d: Device, n: number, v: number) => {
+    await begin(d);
+    for (let i = 0; i < n; i++) await batch(d, i, [filler(i)]);
+    await batch(d, n, [{ id: "K", v }]);
+  };
+  const keyOf = async (d: Device) =>
+    (await d.rows())
+      .map(
+        (r) =>
+          JSON.parse(r) as {
+            record_key: string;
+            body: string;
+            stamp_n: number;
+          },
+      )
+      .filter((r) => r.record_key === "K");
+
+  it("an identical body at a higher ordinal advances a reader that holds it, so a lower ordinal of another body loses everywhere", async () => {
+    const w = await world({
+      streams: 1,
+      logProtocol: true,
+      publishWhileCollecting: true,
+    });
+    const a = await w.device("a");
+    const c = await w.device("c");
+    const d = await w.device("d");
+    // A at n0 (a), A at n2 (c), B at n1 (d). Each writer emits before it pulls, so
+    // each writes its own observation; they publish in that order.
+    await emitAt(a, 0, 1);
+    await emitAt(c, 2, 1);
+    await emitAt(d, 1, 2);
+    await a.cycle();
+    const early = await w.device("early");
+    await early.cycle();
+    await c.cycle();
+    await early.cycle();
+    await d.cycle();
+    await early.cycle();
+    await a.cycle();
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    const expected = await keyOf(fresh);
+    expect(expected).toMatchObject([
+      { body: expect.stringContaining('"v":1') },
+    ]);
+    expect(expected[0]!.stamp_n).toBe(2);
+    for (const reader of [early, a])
+      expect(await keyOf(reader)).toEqual(expected);
+  });
+
+  it("the same trace converges for a reader that installs a compacted snapshot", async () => {
+    const w = await world({
+      streams: 1,
+      logProtocol: true,
+      publishWhileCollecting: true,
+    });
+    const a = await w.device("a");
+    const c = await w.device("c");
+    const d = await w.device("d");
+    await emitAt(a, 0, 1);
+    await emitAt(c, 2, 1);
+    await emitAt(d, 1, 2);
+    await a.cycle();
+    const early = await w.device("early");
+    await early.cycle();
+    await c.cycle();
+    await d.cycle();
+    await growUntilCompacted(d, w);
+    const segments = await w.segments();
+    expect(segments.get(Math.max(...segments.keys()))!.snapshot).not.toBeNull();
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    await early.cycle();
+    const expected = await keyOf(fresh);
+    expect(expected[0]!.stamp_n).toBe(2);
+    expect(await keyOf(early)).toEqual(expected);
+  });
+
+  it("a run that has pulled a clone's higher ordinal does not replace it with its own lower ordinal", async () => {
+    const w = await world({
+      streams: 1,
+      logProtocol: true,
+      publishWhileCollecting: true,
+    });
+    const a = await w.device("a");
+    const c = await w.device("c");
+    await begin(a);
+    // the clone publishes B at n1 while a is still collecting
+    await emitAt(c, 1, 2);
+    await c.cycle();
+    await a.cycle();
+    expect(await keyOf(a)).toMatchObject([{ stamp_n: 1 }]);
+    // a's own first batch: another body at n0
+    await batch(a, 0, [{ id: "K", v: 1 }]);
+    await a.cycle();
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    const expected = await keyOf(fresh);
+    expect(expected).toMatchObject([{ stamp_n: 1 }]);
+    expect(await keyOf(a)).toEqual(expected);
+  });
+
+  it("with the log protocol off and no admission while collecting, no ordinal is stored or published: no log segment is written and a reader gets the final body", async () => {
+    const w = await world({ streams: 1, logProtocol: false });
+    const a = await w.device("a");
+    await begin(a);
+    await batch(a, 0, [{ id: "K", v: 1 }]);
+    await batch(a, 1, [{ id: "K", v: 2 }]);
+    await end(a, 1);
+    await a.cycle();
+    expect(await keyOf(a)).toMatchObject([{ stamp_n: 0 }]);
+    expect((await w.segments()).size).toBe(0);
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    expect(await fresh.records()).toEqual([body(2)]);
+  });
+
+  it("writers that share a run id and emit different bodies at one batch converge on the greater body hash", async () => {
+    const w = await world({
+      streams: 1,
+      logProtocol: true,
+      publishWhileCollecting: true,
+    });
+    const a = await w.device("a");
+    const c = await w.device("c");
+    await begin(a);
+    await begin(c);
+    await batch(a, 0, [{ id: "K", v: 1 }]);
+    await batch(c, 0, [{ id: "K", v: 2 }]);
+    await end(a, 0);
+    await end(c, 0);
+    const hashOf = (v: number) =>
+      Buffer.from(
+        sha256(new TextEncoder().encode(`{"id":"K","v":${v}}`)),
+      ).toString("hex");
+    const winner = hashOf(1) > hashOf(2) ? 1 : 2;
+    // each publishes its own body first, then reads the other's
+    await a.cycle();
+    await c.cycle();
+    await a.cycle();
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    for (const d of [a, c, fresh])
+      expect(await d.records()).toEqual([body(winner)]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rows that reach a log-on device as a per-stream head's part carry no ordinal:
+// a head is applied before the log (`applyConnection`), its rows enter the
+// merge as ordinal 0 (`apply.ts` stages them without `stamp_n`), the same as a
+// legacy log entry. They meet the log's ordinals at a stamp only when a writer
+// that does not publish a log shares a run id with one that does (a clone, or a
+// device whose flag differs). The order is one total order, so arrival order
+// does not matter.
+// ---------------------------------------------------------------------------
+
+describe("log protocol: first loads of a per-stream head and a log that name one key at one stamp", () => {
+  const RUN = "shared-run";
+  const stream = sName(0);
+  const bodyV = (v: number) => `{"id":"K","v":${v}}`;
+  const hashOf = (v: number) =>
+    Buffer.from(sha256(new TextEncoder().encode(bodyV(v)))).toString("hex");
+  /** Distinct values ordered by body hash, lowest first. */
+  const byHash = [1, 2, 3, 4, 5, 6].sort((x, y) =>
+    hashOf(x) < hashOf(y) ? -1 : 1,
+  );
+  /** The run of the writer; a clone shares it, a later run of another device does not. */
+  type RunAt = { readonly runId: string; readonly observedAt: number };
+  const WRITER_RUN: RunAt = { runId: RUN, observedAt: 1500 };
+  const begin = (d: Device, run: RunAt = WRITER_RUN) =>
+    d.sync.intake.begin(run.runId, {
+      connector: CONNECTOR,
+      artifactDigest: CONNECTOR,
+      wantFull: true,
+      observedAt: run.observedAt,
+      owner: { address: OWNER, leaseId: null },
+    });
+  const batch = (d: Device, n: number, v: number, run: RunAt = WRITER_RUN) =>
+    d.sync.intake.batch(run.runId, {
+      batch: n,
+      records: [{ stream, data: { id: "K", v } }],
+    });
+  const end = (d: Device, lastBatch: number, run: RunAt = WRITER_RUN) =>
+    d.sync.intake.end(run.runId, {
+      outcome: "succeeded",
+      coveredStreams: [stream],
+      provenFullStreams: [stream],
+      lastBatch,
+    });
+  const keyOf = async (d: Device) =>
+    (await d.rows())
+      .map(
+        (r) =>
+          JSON.parse(r) as {
+            record_key: string;
+            body: string;
+            stamp_n: number;
+          },
+      )
+      .filter((r) => r.record_key === "K");
+
+  /**
+   * `writer` (log on) publishes `logged` as batches 0, 1, ...; `clone` (log
+   * off; by default the same run id and stamp) publishes `head` as a
+   * per-stream head. `fresh` and `progressive` are first loads: they read the
+   * heads and then the log, so they must end on one row (the tests below).
+   * `writer` and `early` already follow the log; what they do with the head is
+   * the boundary test at the end.
+   */
+  async function mixed(
+    logged: readonly number[],
+    head: number,
+    cloneRun: RunAt = WRITER_RUN,
+  ) {
+    const w = await world({
+      streams: 1,
+      logProtocol: true,
+      publishWhileCollecting: true,
+    });
+    const writer = await w.device("writer");
+    await begin(writer);
+    for (const [n, v] of logged.entries()) {
+      await batch(writer, n, v);
+      await writer.cycle();
+    }
+    await end(writer, logged.length - 1);
+    await writer.cycle();
+    // a log-on reader that has the log before the head exists
+    const early = await w.device("early");
+    await early.cycle();
+    const segmentsBefore = (await w.segments()).size;
+    const clone = await w.device("clone", false);
+    await begin(clone, cloneRun);
+    await batch(clone, 0, head, cloneRun);
+    await end(clone, 0, cloneRun);
+    await clone.cycle();
+    expect(
+      (await w.segments()).size,
+      "the clone publishes a head and no segment",
+    ).toBe(segmentsBefore);
+    await writer.cycle();
+    await early.cycle();
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    const progressive = await w.device("progressive", true, {
+      progressiveFirstLoad: true,
+    });
+    await progressive.cycle();
+    return { w, writer, early, fresh, progressive, clone };
+  }
+
+  const firstLoads = (m: Awaited<ReturnType<typeof mixed>>) => [
+    m.fresh,
+    m.progressive,
+  ];
+
+  it("the head's body has the greater hash at ordinal 0: every first-load device holds it", async () => {
+    const [low, high] = [byHash[0]!, byHash[5]!];
+    const m = await mixed([low], high);
+    for (const d of firstLoads(m))
+      expect(await keyOf(d)).toMatchObject([{ body: bodyV(high), stamp_n: 0 }]);
+  });
+
+  it("the head's body has the lesser hash at ordinal 0: every first-load device holds the logged one", async () => {
+    const [low, high] = [byHash[0]!, byHash[5]!];
+    const m = await mixed([high], low);
+    for (const d of firstLoads(m))
+      expect(await keyOf(d)).toMatchObject([{ body: bodyV(high), stamp_n: 0 }]);
+  });
+
+  it("a logged ordinal above 0 beats a head's body whatever the hashes: every first-load device holds the logged one", async () => {
+    // the head's body has the greatest hash; the log's batch 1 still wins
+    const m = await mixed([byHash[1]!, byHash[2]!], byHash[5]!);
+    for (const d of firstLoads(m))
+      expect(await keyOf(d)).toMatchObject([
+        { body: bodyV(byHash[2]!), stamp_n: 1 },
+      ]);
+  });
+
+  it("a reader that installs a compacted snapshot, in one pass or progressively, agrees with one that applied the segments, the head included", async () => {
+    const m = await mixed([byHash[1]!, byHash[2]!], byHash[5]!);
+    await growUntilCompacted(m.writer, m.w);
+    const segments = await m.w.segments();
+    expect(segments.get(Math.max(...segments.keys()))!.snapshot).not.toBeNull();
+    const late = await m.w.device("late");
+    await late.cycle();
+    const lateProgressive = await m.w.device("lateProgressive", true, {
+      progressiveFirstLoad: true,
+    });
+    await lateProgressive.cycle();
+    await m.early.cycle();
+    const expected = await keyOf(m.fresh);
+    expect(expected).toMatchObject([{ body: bodyV(byHash[2]!), stamp_n: 1 }]);
+    for (const d of [late, lateProgressive, m.progressive])
+      expect(await keyOf(d)).toEqual(expected);
+  });
+
+  // A boundary, pinned as it is. A device that already follows the log keeps
+  // its row: it does not read a head whose registry version is not above its
+  // own (`applyOneOnce`, the `head_version > read.version` answer), whatever the
+  // head's stamp. A first load reads the head, so the two differ at an equal
+  // stamp and at a later one. It is not an ordering matter (the same split with
+  // a later stamp, where the stamp rule alone decides), and it needs a head
+  // published outside the followed log (a log-off device, or a writer that
+  // fell back to the per-stream path). This test says so; closing the boundary
+  // changes its expected values.
+  for (const [label, cloneRun] of [
+    ["an equal stamp", WRITER_RUN],
+    ["a later stamp", { runId: "later-run", observedAt: 1600 }],
+  ] as const)
+    it(`a device that follows the log keeps its row where a first load reads the head, at ${label}`, async () => {
+      const [low, high] = [byHash[0]!, byHash[5]!];
+      // The log holds `low`; the head holds `high`, which beats it at an equal
+      // stamp (ordinal 0, greater hash) and at a later one (the stamp).
+      // The writer's run end makes a second segment, so its local version is
+      // above the head's.
+      const m = await mixed([low], high, cloneRun);
+      for (const d of [m.writer, m.early])
+        expect(await keyOf(d)).toMatchObject([{ body: bodyV(low) }]);
+      for (const d of firstLoads(m))
+        expect(await keyOf(d)).toMatchObject([{ body: bodyV(high) }]);
+    });
+});
+
+describe("log protocol: the ordinal with the log off", () => {
+  const RUN = "off-run";
+  const stream = sName(0);
+  const begin = (d: Device) =>
+    d.sync.intake.begin(RUN, {
+      connector: CONNECTOR,
+      artifactDigest: CONNECTOR,
+      wantFull: true,
+      observedAt: 1500,
+      owner: { address: OWNER, leaseId: null },
+    });
+  const batch = (d: Device, n: number, v: number) =>
+    d.sync.intake.batch(RUN, {
+      batch: n,
+      records: [{ stream, data: { id: "K", v } }],
+    });
+  const end = (d: Device, lastBatch: number) =>
+    d.sync.intake.end(RUN, {
+      outcome: "succeeded",
+      coveredStreams: [stream],
+      provenFullStreams: [stream],
+      lastBatch,
+    });
+  const keyOf = async (d: Device) =>
+    (await d.rows())
+      .map(
+        (r) =>
+          JSON.parse(r) as {
+            record_key: string;
+            body: string;
+            stamp_n: number;
+          },
+      )
+      .filter((r) => r.record_key === "K");
+
+  it("a log-off device that admits while it collects keeps the ordinal in its own rows only: nothing is published but a head with the final body", async () => {
+    const w = await world({
+      streams: 1,
+      logProtocol: false,
+      publishWhileCollecting: true,
+    });
+    const a = await w.device("a");
+    await begin(a);
+    await batch(a, 0, 1);
+    await batch(a, 1, 2);
+    await end(a, 1);
+    await a.cycle();
+    // the writer orders its own two bodies by the ordinal ...
+    expect(await keyOf(a)).toMatchObject([{ stamp_n: 1 }]);
+    // ... and publishes no log: the ordinal is not serialized anywhere
+    expect((await w.segments()).size).toBe(0);
+    expect(w.innerBlobs.keys().filter((k) => k.startsWith(`${LOG}/`))).toEqual(
+      [],
+    );
+    const readerOff = await w.device("readerOff", false);
+    await readerOff.cycle();
+    const readerOn = await w.device("readerOn");
+    await readerOn.cycle();
+    for (const d of [readerOff, readerOn])
+      expect(await keyOf(d)).toMatchObject([
+        { body: '{"id":"K","v":2}', stamp_n: 0 },
+      ]);
+  });
+
+  it("a device that turns the log on after it published a head ends on one row with a device that never had the log off", async () => {
+    const w = await world({
+      streams: 1,
+      logProtocol: false,
+      publishWhileCollecting: true,
+    });
+    const a = await w.device("a");
+    await begin(a);
+    await batch(a, 0, 1);
+    await batch(a, 1, 2);
+    await end(a, 1);
+    await a.cycle();
+    (a.deps as { logProtocol?: boolean }).logProtocol = true;
+    await a.cycle();
+    const fresh = await w.device("fresh", true);
+    await fresh.cycle();
+    const row = await keyOf(fresh);
+    expect(row).toMatchObject([{ body: '{"id":"K","v":2}' }]);
+    expect(await keyOf(a)).toMatchObject([{ body: '{"id":"K","v":2}' }]);
   });
 });

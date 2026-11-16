@@ -120,7 +120,7 @@ describe("P06 database apply", () => {
     await f.head("events", [{ id: "b" }]);
     await f.db.batch([
       {
-        sql: "INSERT INTO temp.incoming VALUES ('other','items',?,'other',0,'other','{}','hash',NULL)",
+        sql: "INSERT INTO temp.incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o) VALUES ('other','items',?,'other',0,'other','{}','hash',NULL)",
         params: ["f".repeat(64)],
       },
       {

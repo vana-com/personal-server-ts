@@ -373,7 +373,7 @@ async function stageBatch(
           params: [],
         },
         {
-          sql: `UPDATE records SET stamp_o = seen_o, stamp_r = seen_r
+          sql: `UPDATE records SET stamp_o = seen_o, stamp_r = seen_r, stamp_n = 0
                  WHERE connection_id = ? AND stream = ? AND pk_hash IN (${marks})
                    AND seen_o IS NOT NULL AND NOT (${seenPair()} ${cmp} (?, ?))`,
           params: [connectionId, stream, ...group, o, r],
@@ -435,8 +435,8 @@ async function stageBatch(
     if ((await pkHash(sha, operation.value, primaryKey)) !== operation.pkHash)
       throw new Error("apply: invalid log record key");
     statements.push({
-      sql: `INSERT OR REPLACE INTO temp.incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      sql: `INSERT OR REPLACE INTO temp.incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, stamp_n)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       params: [
         op,
         operation.stream,
@@ -447,6 +447,7 @@ async function stageBatch(
         canonical,
         toHex(sha256(new TextEncoder().encode(canonical))),
         operation.firstSeen,
+        operation.ordinal ?? 0,
       ],
     });
     staged++;
