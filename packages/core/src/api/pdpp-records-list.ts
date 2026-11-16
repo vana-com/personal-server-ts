@@ -1,3 +1,4 @@
+import { PDPP_VERSION } from "../pdpp-version.js";
 import { grantIsCandidate } from "../pdpp/types.js";
 import type { OwnedAccountStorageMode } from "./account-storage-mode.js";
 import { PdppError } from "../errors/pdpp-catalog.js";
@@ -513,4 +514,25 @@ function readDeclaration(
       ? ports.declarations.forInstance(ownerInstanceIds[0]!, stream)
       : ports.declarations.get(stream);
   return { declaration, ownerInstanceIds };
+}
+
+/**
+ * Version negotiation for every PDPP request: only `PDPP_VERSION` is
+ * supported. Both hosts call it before authentication or any query. An
+ * absent or empty header is accepted.
+ */
+export function assertSupportedPdppVersion(
+  requested: string | null | undefined,
+): void {
+  if (requested && requested !== PDPP_VERSION) {
+    throw new PdppError(
+      "unsupported_version",
+      `Unsupported PDPP-Version '${requested}'`,
+    );
+  }
+}
+
+/** The connector a source id names: its last path segment. */
+export function connectorOfSourceId(sourceId: string): string | undefined {
+  return sourceId.split("/").filter(Boolean).at(-1);
 }

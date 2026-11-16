@@ -1,5 +1,6 @@
 import { grantIsCandidate } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
+  assertSupportedPdppVersion,
   listPdppRecords,
   localRecord,
   localRecordJson,
@@ -847,14 +848,10 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
   // PDPP-Version negotiation: only PDPP_VERSION is supported in v0.1.
   app.use("*", async (c, next) => {
-    const requested = c.req.header("PDPP-Version");
-    if (requested && requested !== PDPP_VERSION) {
-      const reqId = requestId();
-      const err = new PdppError(
-        "unsupported_version",
-        `Unsupported PDPP-Version '${requested}'`,
-      );
-      return sendError(c, err, reqId);
+    try {
+      assertSupportedPdppVersion(c.req.header("PDPP-Version"));
+    } catch (error) {
+      return sendError(c, error as PdppError, requestId());
     }
     await next();
   });
