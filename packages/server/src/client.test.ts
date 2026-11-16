@@ -36,20 +36,23 @@ const heldWrite = vi.hoisted(() => {
     reached: Promise<void>;
     release: () => void;
     reachedNow: () => void;
-    closeEntered: Promise<void>;
-    closeEnteredNow: () => void;
+    closeAwaited: Promise<void>;
+    closeAwaitedNow: () => void;
+    closeSettled: boolean;
   } = {
     armed: false,
     reached: Promise.resolve(),
     release: () => undefined,
     reachedNow: () => undefined,
-    closeEntered: Promise.resolve(),
-    closeEnteredNow: () => undefined,
+    closeAwaited: Promise.resolve(),
+    closeAwaitedNow: () => undefined,
+    closeSettled: false,
   };
   return gate;
 });
-// A pass-through around the real MCP state's close(): it reports entry and
-// then runs the real drain, so a test can observe the server reaching it.
+// A pass-through around the real MCP state's close(). It runs the real drain
+// and hands back a thenable that reports when a caller awaits it, so a test
+// can tell a stop that waits for the drain from one that only calls it.
 vi.mock("./mcp/local-state.js", async (importOriginal) => {
   const actual = await importOriginal<typeof localState>();
   return {
@@ -60,8 +63,20 @@ vi.mock("./mcp/local-state.js", async (importOriginal) => {
       const state = await actual.openLocalMcpState(...args);
       const close = state.close.bind(state);
       state.close = () => {
-        heldWrite.closeEnteredNow();
-        return close();
+        const drained = close();
+        const settled = () => {
+          heldWrite.closeSettled = true;
+        };
+        drained.then(settled, settled);
+        return {
+          then: (
+            onFulfilled?: (value: void) => unknown,
+            onRejected?: (reason: unknown) => unknown,
+          ) => {
+            heldWrite.closeAwaitedNow();
+            return drained.then(onFulfilled, onRejected);
+          },
+        } as Promise<void>;
       };
       return state;
     },
@@ -746,9 +761,10 @@ describe("startPersonalServer node handle", () => {
     heldWrite.reached = new Promise<void>((resolve) => {
       heldWrite.reachedNow = resolve;
     });
-    heldWrite.closeEntered = new Promise<void>((resolve) => {
-      heldWrite.closeEnteredNow = resolve;
+    heldWrite.closeAwaited = new Promise<void>((resolve) => {
+      heldWrite.closeAwaitedNow = resolve;
     });
+    heldWrite.closeSettled = false;
     heldWrite.armed = true;
     let stopping: Promise<void> | undefined;
     try {
@@ -765,16 +781,18 @@ describe("startPersonalServer node handle", () => {
       const directory = dirname(heldWrite.target ?? "");
 
       stopping = ps.stop();
-      // Stop reaches the MCP state's close while the write is still held. If
-      // stop skipped the drain it would settle first, without ever entering it.
+      // Stop awaits the MCP state's drain while the write is still held. A
+      // stop that dropped the drain's promise would settle without awaiting it.
       const first = await Promise.race([
-        heldWrite.closeEntered.then(() => "close"),
+        heldWrite.closeAwaited.then(() => "awaited"),
         stopping.then(() => "stop"),
       ]);
-      expect(first).toBe("close");
+      expect(first).toBe("awaited");
+      expect(heldWrite.closeSettled).toBe(false);
 
       heldWrite.release();
       await stopping;
+      expect(heldWrite.closeSettled).toBe(true);
       // The write landed before stop resolved, and no temp file is left.
       const after = await readdir(directory);
       expect(after).toContain("mcp-state.json");
