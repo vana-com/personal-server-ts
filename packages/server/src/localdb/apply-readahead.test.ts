@@ -318,6 +318,7 @@ it("commits the parts it has verified before it raises the error of the next one
   const secondSubmitted = acknowledgement();
   const releaseSecond = acknowledgement();
   const validationFailed = acknowledgement<unknown>();
+  const events: string[] = [];
   const realAhead = partReadahead.readPartsAhead;
   const aheadSpy = vi
     .spyOn(partReadahead, "readPartsAhead")
@@ -329,25 +330,19 @@ it("commits the parts it has verified before it raises the error of the next one
       parts: readonly P[],
       fetch: (part: P) => Promise<T>,
     ): partReadahead.PartReader<P, T> {
-      const reader = realAhead(blobs, parts, (part) => {
-        const pending = fetch(part);
-        // Register after readPartsAhead has attached its own fulfillment
-        // handler: that handler increments fetched before our observation.
-        // This is promise ordering, not a GET acknowledgement or timer.
-        queueMicrotask(() => {
-          void pending.then(
-            () => {
-              if (parts.indexOf(part) === 2)
-                thirdReady.resolve(reader.ready(2));
-            },
-            () => {
-              if (parts.indexOf(part) === 2) thirdReady.resolve(false);
-            },
-          );
-        });
-        return pending;
+      const reader = realAhead(blobs, parts, fetch, (_first, last) => {
+        if (last === 2) thirdReady.resolve(reader.ready(2));
       });
-      return reader;
+      return {
+        ...reader,
+        ready(index) {
+          const ready = reader.ready(index);
+          // apply.ts asks about part 3 only after validating/staging part 2.
+          // A true result keeps that verified part pending instead of submitting it.
+          if (index === 2 && ready) events.push("second pending");
+          return ready;
+        },
+      };
     });
   const realFrames = streamSync.framesOfParts;
   const framesSpy = vi
@@ -358,6 +353,7 @@ it("commits the parts it has verified before it raises the error of the next one
       try {
         yield* realFrames(...args);
       } catch (error) {
+        events.push("third validation failed");
         validationFailed.resolve(error);
         throw error;
       }
@@ -368,11 +364,17 @@ it("commits the parts it has verified before it raises the error of the next one
     .spyOn(f.db, "batch")
     .mockImplementation(async (statements) => {
       if (statements.some((s) => s.sql.includes("INSERT INTO temp.incoming"))) {
+        const rows = statements.filter((s) =>
+          s.sql.includes("INSERT INTO temp.incoming"),
+        );
+        expect(rows).toHaveLength(1);
         submissions++;
         if (submissions === 1) {
+          events.push("first submitted");
           firstSubmitted.resolve();
           await releaseFirst.promise;
         } else if (submissions === 2) {
+          events.push("second submitted");
           secondSubmitted.resolve();
           await releaseSecond.promise;
         }
@@ -394,6 +396,11 @@ it("commits the parts it has verified before it raises the error of the next one
         expect((failure as Error).message).toMatch(
           /part SHA-256 does not match/,
         );
+        expect(events.slice(0, 3)).toEqual([
+          "first submitted",
+          "second pending",
+          "third validation failed",
+        ]);
         // If the catch flush is removed, outcome settles without a second
         // submission; do not hang waiting for an event the mutant cannot emit.
         await wait(
@@ -412,6 +419,17 @@ it("commits the parts it has verified before it raises the error of the next one
           { parts_applied: 2, failed: 1 },
         ]);
         expect(submissions).toBe(2);
+        expect(events).toEqual([
+          "first submitted",
+          "second pending",
+          "third validation failed",
+          "second submitted",
+        ]);
+        await wait(
+          f.deps.blobs.governor
+            .reserve(DEFAULT_STORAGE_ACCESS_POLICY.maxBytesInFlight)
+            .then((release) => release()),
+        );
         expect(
           await wait(
             f.db.query("SELECT 1 FROM stream_state WHERE complete = 1"),
@@ -446,42 +464,80 @@ it("gives a fetch that is still running its memory when it ends, after the apply
     `${h.scope}/g1-p-${h.parts[2]!.hash}`,
     new Uint8Array(h.parts[2]!.bytes).fill(7),
   );
-  // The fourth part's GET does not return until released.
-  let release!: () => void;
-  const stuck = new Promise<void>((r) => (release = r));
+  const releaseFourth = acknowledgement();
+  const fourthStarted = acknowledgement();
+  const fourthReturned = acknowledgement();
+  const thirdReady = acknowledgement();
   const get = f.deps.blobs.get.bind(f.deps.blobs);
-  let fetched = 0;
   f.deps.blobs.get = async (key) => {
-    if (key.includes(h.parts[3]!.hash)) await stuck;
-    const bytes = await get(key);
-    if (key.includes("/g1-p-")) fetched++;
-    return bytes;
+    if (!key.endsWith(h.parts[3]!.hash)) return get(key);
+    fourthStarted.resolve();
+    await releaseFourth.promise;
+    try {
+      return await get(key);
+    } finally {
+      fourthReturned.resolve();
+    }
   };
+  const realAhead = partReadahead.readPartsAhead;
+  const aheadSpy = vi
+    .spyOn(partReadahead, "readPartsAhead")
+    .mockImplementation(function <
+      P extends partReadahead.SizedPart,
+      T = Uint8Array,
+    >(
+      blobs: Parameters<typeof realAhead>[0],
+      parts: readonly P[],
+      fetch: (part: P) => Promise<T>,
+    ): partReadahead.PartReader<P, T> {
+      return realAhead(blobs, parts, fetch, (_first, last) => {
+        if (last === 2) thirdReady.resolve();
+      });
+    });
   const batch = f.db.batch.bind(f.db);
   let held = false;
-  vi.spyOn(f.db, "batch").mockImplementation(async (statements) => {
-    if (!held && statements.some((s) => s.sql.includes("temp.incoming"))) {
-      held = true;
-      while (fetched < 3) await new Promise((r) => setTimeout(r, 5));
-    }
-    return batch(statements);
-  });
-  await expect(deadline(applyConnection(progressive(f), f.id))).rejects.toThrow(
-    /part SHA-256 does not match/,
+  const batchSpy = vi
+    .spyOn(f.db, "batch")
+    .mockImplementation(async (statements) => {
+      if (
+        !held &&
+        statements.some((s) => s.sql.includes("INSERT INTO temp.incoming"))
+      ) {
+        held = true;
+        await thirdReady.promise;
+        await fourthStarted.promise;
+      }
+      return batch(statements);
+    });
+  const outcome = applyConnection(progressive(f), f.id).then(
+    () => undefined,
+    (error: unknown) => error,
   );
-  const whole = DEFAULT_STORAGE_ACCESS_POLICY.maxBytesInFlight;
-  const waiting = await Promise.race([
-    f.deps.blobs.governor.reserve(whole).then((r) => (r(), "granted")),
-    new Promise((resolve) => setTimeout(() => resolve("waiting"), 100)),
-  ]);
-  expect(waiting).toBe("waiting");
-  release();
-  // The fetch ends and the reader gives its part's memory back, exactly once.
-  const after = await Promise.race([
-    f.deps.blobs.governor.reserve(whole).then((r) => (r(), "granted")),
-    new Promise((resolve) => setTimeout(() => resolve("waiting"), 2000)),
-  ]);
-  expect(after).toBe("granted");
+  try {
+    await acknowledgedScenario(async (wait) => {
+      try {
+        const error = await wait(outcome);
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toMatch(/part SHA-256 does not match/);
+        // One reservation, started while the fourth fetch is still held.
+        // It must eventually succeed after that fetch returns and releases its unit.
+        const whole = f.deps.blobs.governor
+          .reserve(DEFAULT_STORAGE_ACCESS_POLICY.maxBytesInFlight)
+          .then((release) => release());
+        releaseFourth.resolve();
+        await wait(fourthReturned.promise);
+        await wait(whole);
+      } finally {
+        releaseFourth.resolve();
+        await wait(outcome).catch(() => undefined);
+      }
+    });
+  } finally {
+    releaseFourth.resolve();
+    f.deps.blobs.get = get;
+    aheadSpy.mockRestore();
+    batchSpy.mockRestore();
+  }
 });
 
 it("leaves a committed first group durable when a later group fails before it is submitted, and a fresh apply finishes exactly", async () => {
