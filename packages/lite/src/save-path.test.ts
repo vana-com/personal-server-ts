@@ -1,0 +1,190 @@
+// The save path of a Web write: begin, batch and end a run on a Personal Server
+// that has the log protocol and publish-while-collecting on, a sync manager
+// running, then `handle.publish()`: what a connect-sheet save awaits.
+//
+// Real Lite runtime, real SQLite, the real gateway adapter over a fake gateway.
+// Only the wire is simulated: every registry request and every blob PUT takes
+// a fixed delay, so what overlaps and what waits for what shows in the times.
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { privateKeyToAccount } from "viem/accounts";
+import { signOwnerMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
+import {
+  createGatewayStreamSyncRegistry,
+  createMemoryStreamSyncBlobs,
+  type StreamSyncBlobs,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { logScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import { openBetterSqlite3 } from "../../server/src/localdb/better-sqlite3-driver.js";
+import { createFakeGateway } from "../../server/src/localdb/fake-gateway.js";
+import { startPersonalServer } from "./client.js";
+import { createMockPsLiteGateway } from "./test-support/gateway.js";
+import {
+  createMemoryModeRecordStore,
+  type ModeRecordStore,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import type { PsLitePersistenceBundle } from "./persistence.js";
+import {
+  createMemoryPsLiteAccessLogStore,
+  createMemoryPsLiteStateStore,
+  createMemoryPsLiteStorage,
+  createMemoryPsLiteTokenStore,
+} from "./test-support/memory.js";
+import {
+  createInMemoryMcpConnectionStore,
+  createInMemoryMcpOAuthAuthorizationStore,
+} from "@opendatalabs/personal-server-ts-core/mcp";
+
+function memoryBundle(): PsLitePersistenceBundle {
+  return {
+    storage: createMemoryPsLiteStorage(),
+    state: createMemoryPsLiteStateStore(),
+    tokens: createMemoryPsLiteTokenStore(),
+    accessLog: createMemoryPsLiteAccessLogStore(),
+    mcpConnections: createInMemoryMcpConnectionStore(),
+    mcpOAuthAuthorizations: createInMemoryMcpOAuthAuthorizationStore(),
+    relayTlsIdentity: { read: () => null, write: () => {} },
+  };
+}
+
+const WIRE_MS = 40;
+const CONNECTOR = "acme";
+const LOG = logScope(CONNECTOR, "");
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+let ownerAddress: `0x${string}`;
+let ownerSignature: `0x${string}`;
+beforeAll(async () => {
+  const account = privateKeyToAccount(`0x${"11".repeat(32)}`);
+  ownerAddress = account.address;
+  ownerSignature = await signOwnerMasterKey(account);
+});
+
+const servers: Awaited<ReturnType<typeof startPersonalServer>>[] = [];
+afterEach(async () => {
+  for (const server of servers.splice(0)) await server.stop();
+  vi.unstubAllGlobals();
+});
+
+/** One Personal Server over a timed wire, and what the wire saw. */
+async function savePathWorld() {
+  const gateway = createFakeGateway({
+    owner: ownerAddress,
+    isTombstone: () => false,
+  });
+  const at = (t: number) => Math.round(t);
+  /** When each registry commit of the connection's log answered, and its scope. */
+  const commits: { readonly at: number; readonly landed: boolean }[] = [];
+  const timedFetch = (async (input: string, init?: RequestInit) => {
+    await sleep(WIRE_MS);
+    const response = await gateway.fetch(input, init);
+    if (new URL(input).pathname === "/v1/data/batch") {
+      const body = JSON.parse(String(init?.body)) as {
+        rows: { scope: string }[];
+      };
+      if (body.rows.some((row) => row.scope === LOG))
+        commits.push({ at: at(performance.now()), landed: response.ok });
+    }
+    return response;
+  }) as unknown as typeof fetch;
+  const inner = createMemoryStreamSyncBlobs();
+  const segmentPuts: string[] = [];
+  const blobs: StreamSyncBlobs = {
+    ...inner,
+    governor: inner.governor,
+    async put(key, bytes) {
+      await sleep(WIRE_MS);
+      if (key.startsWith(`${LOG}/s-`)) segmentPuts.push(key);
+      return inner.put(key, bytes);
+    },
+    get: inner.get,
+    exists: inner.exists,
+  };
+  const modes: ModeRecordStore = createMemoryModeRecordStore();
+  await modes.save(ownerAddress.toLowerCase(), {
+    answer: "on",
+    generation: 0,
+    receivedAt: 1,
+  });
+  const logger = {
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+    debug: () => {},
+  } as never;
+  const server = await startPersonalServer({
+    ownerAddress,
+    ownerSignature,
+    persistence: memoryBundle(),
+    accountModeStore: modes,
+    gateway: {
+      ...createMockPsLiteGateway(),
+      // Registered, so the sync manager's cycles run (`canSync`).
+      getServer: async () => ({ id: "server-1" }) as never,
+    },
+    relay: false as const,
+    logger,
+    localDb: { openDriver: async () => openBetterSqlite3(":memory:") },
+    streamSyncRegistry: createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test",
+      ownerAddress,
+      fetch: timedFetch,
+    }),
+    streamSyncBlobs: blobs,
+    streamSyncLogProtocol: true,
+    streamSyncPublishWhileCollecting: true,
+    streamSyncDeclaredStreams: () => ["items"],
+    streamSyncDeclarations: (connector: string) => ({
+      connector,
+      version: "1",
+      streams: [
+        {
+          name: "items",
+          semantics: "mutable_state" as const,
+          primaryKey: ["id"],
+        },
+      ],
+    }),
+    configDefaults: {
+      gateway: { url: "https://gateway.local" },
+      sync: { enabled: true },
+    },
+  } as never);
+  servers.push(server);
+  /** What a connect-sheet save does before it awaits `publish()`. */
+  const collect = async (runId: string) => {
+    await server.streamSyncIntake!.begin(runId, {
+      connector: CONNECTOR,
+      artifactDigest: CONNECTOR,
+      owner: { address: ownerAddress, leaseId: null },
+      observedAt: Date.now(),
+      connect: true,
+    });
+    await server.streamSyncIntake!.batch(runId, {
+      batch: 0,
+      records: [
+        { stream: "items", data: { id: "1" } },
+        { stream: "items", data: { id: "2" } },
+      ],
+    });
+    await server.streamSyncIntake!.end(runId, {
+      outcome: "succeeded",
+      coveredStreams: ["items"],
+      provenFullStreams: ["items"],
+      lastBatch: 0,
+    });
+  };
+  return { server, collect, commits, segmentPuts, gateway };
+}
+
+describe("the save path of a Web write", () => {
+  it("publishes a save's records once: one segment PUT and one registry commit", async () => {
+    const { server, collect, commits, segmentPuts } = await savePathWorld();
+    await collect("run-1");
+    const receipt = await server.publish();
+    expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-1"]]);
+    // Let any second publish that the save started finish its own PUT and commit.
+    await sleep(WIRE_MS * 12);
+    expect(segmentPuts).toHaveLength(1);
+    expect(commits).toHaveLength(1);
+  });
+});

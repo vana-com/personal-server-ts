@@ -189,12 +189,65 @@ export async function publishLog(
 ): Promise<readonly PublishResult[] | null> {
   if (!deps.registry.postBatch || withoutBatchRoute.has(deps.registry))
     return null;
-  const clock = openPhases(deps);
+  // One publish of a connection at a time. A publish releases the queue slot
+  // while it uploads, and what it sends is chosen at its snapshot and leaves
+  // the pending set only at its local commit. A second publish that took its
+  // snapshot in between would choose the same changes: it would encode and
+  // upload the same segment again and commit nothing. It waits for the first
+  // instead, then publishes what is left, which is usually nothing; the
+  // results of both come back, so a caller that asked while a wake's publish
+  // was running still receives the receipt for the rows that publish sent.
+  const earlier = inFlight.get(deps.db)?.get(connectionId);
+  const own = (async () => {
+    // The earlier publish's own failure is its caller's; this one starts over.
+    const before = earlier ? await earlier.catch(() => null) : null;
+    const clock = openPhases(deps);
+    try {
+      const results = await publishRounds(deps, connectionId, clock);
+      return results === null || before === null
+        ? (results ?? before)
+        : mergeResults(before, results);
+    } finally {
+      logPublishPhases(deps, connectionId, clock);
+    }
+  })();
+  const chain = inFlightOf(deps.db);
+  chain.set(connectionId, own);
   try {
-    return await publishRounds(deps, connectionId, clock);
+    return await own;
   } finally {
-    logPublishPhases(deps, connectionId, clock);
+    if (chain.get(connectionId) === own) chain.delete(connectionId);
   }
+}
+
+/** Publishes in flight, by database and connection (see `publishLog`). */
+const inFlight = new WeakMap<
+  object,
+  Map<string, Promise<readonly PublishResult[] | null>>
+>();
+function inFlightOf(
+  db: object,
+): Map<string, Promise<readonly PublishResult[] | null>> {
+  let chain = inFlight.get(db);
+  if (!chain) inFlight.set(db, (chain = new Map()));
+  return chain;
+}
+
+/** A published result outranks a later one that found nothing to send. */
+function mergeResults(
+  earlier: readonly PublishResult[],
+  later: readonly PublishResult[],
+): readonly PublishResult[] {
+  const byStream = new Map<string, PublishResult>();
+  for (const result of [...earlier, ...later]) {
+    const held = byStream.get(result.stream);
+    if (held?.outcome === "published" && result.outcome !== "published")
+      continue;
+    byStream.set(result.stream, result);
+  }
+  return [...byStream.values()].sort((a, b) =>
+    a.stream.localeCompare(b.stream),
+  );
 }
 
 async function publishRounds(
