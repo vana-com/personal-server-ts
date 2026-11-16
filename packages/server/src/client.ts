@@ -443,18 +443,21 @@ export async function startPersonalServer(
     });
   }
 
-  async function stop(): Promise<void> {
-    if (stopped) return;
-    if (!lastInfo) {
-      lastInfo = await info();
-    }
-    stopped = true;
-    setStatus("stopped");
-    await Promise.all([
-      closeServer(mainServer),
-      localAuthServer ? closeServer(localAuthServer) : Promise.resolve(),
-    ]);
-    await context.cleanup();
+  let stopping: Promise<void> | undefined;
+  function stop(): Promise<void> {
+    // Publish before any await or status callback, including reentrant stop.
+    return (stopping ??= Promise.resolve().then(async () => {
+      if (!lastInfo) {
+        lastInfo = await info();
+      }
+      stopped = true;
+      setStatus("stopped");
+      await Promise.all([
+        closeServer(mainServer),
+        localAuthServer ? closeServer(localAuthServer) : Promise.resolve(),
+      ]);
+      await context.cleanup();
+    }));
   }
 
   const { replicationStatus, replicaWriterRotation } = context;

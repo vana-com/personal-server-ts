@@ -1806,6 +1806,8 @@ async function bootstrapServer(
     await attempt(() => derivativeScheduler.stop());
     await attempt(() => tunnelManager?.stop());
     await attempt(() => syncManager?.stop());
+    // A request may have started an MCP state write it did not await.
+    await attempt(() => mcpState?.close());
     await attempt(async () => {
       // Finish an outstanding open before releasing the database lock.
       await openingLocalSync?.catch(() => undefined);

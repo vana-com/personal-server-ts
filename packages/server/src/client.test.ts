@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import type * as fsPromises from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { dirname } from "node:path";
 import { createServer as createNetServer } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -24,6 +26,42 @@ import {
   currentReplicaWriterIdentity,
   enableReplicaWriterIdentity,
 } from "./storage/pdpp-replica-writer-identity.js";
+
+// Holds one MCP state write at its rename so a test can stop the server while
+// the write is in flight. Unarmed, every rename passes straight through.
+const heldWrite = vi.hoisted(() => {
+  const gate: {
+    armed: boolean;
+    target?: string;
+    reached: Promise<void>;
+    release: () => void;
+    reachedNow: () => void;
+  } = {
+    armed: false,
+    reached: Promise.resolve(),
+    release: () => undefined,
+    reachedNow: () => undefined,
+  };
+  return gate;
+});
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof fsPromises>();
+  return {
+    ...actual,
+    rename: async (from: string, to: string) => {
+      if (heldWrite.armed && to.endsWith("mcp-state.json")) {
+        heldWrite.armed = false;
+        heldWrite.target = to;
+        const released = new Promise<void>((resolve) => {
+          heldWrite.release = resolve;
+        });
+        heldWrite.reachedNow();
+        await released;
+      }
+      return actual.rename(from, to);
+    },
+  };
+});
 
 const ownerWallet = createTestWallet(8);
 let cleanupFns: Array<() => Promise<void>> = [];
@@ -643,6 +681,78 @@ describe("startPersonalServer node handle", () => {
     expect(await boot(false, true)).toBe("replication_off");
     expect(await boot(true, true)).toBe("replication_off");
     expect(identities()).toEqual({ rows: 2, current: rotated });
+  }, 30_000);
+
+  it("shares one stop promise across concurrent and repeated calls", async () => {
+    const { ps } = await startTestServer();
+    const first = ps.stop();
+    expect(ps.stop()).toBe(first);
+    await first;
+    expect(ps.stop()).toBe(first);
+  });
+
+  it("stop waits for an MCP lastUsedAt write that is still in flight", async () => {
+    const { ps, port } = await startTestServer();
+    const ownerPost = async (path: string, body: unknown) => {
+      const bytes = new TextEncoder().encode(JSON.stringify(body));
+      const auth = await buildWeb3SignedHeader({
+        wallet: ownerWallet,
+        aud: `http://localhost:${port}`,
+        method: "POST",
+        uri: path,
+        body: bytes,
+      });
+      return ps.fetch(path, {
+        method: "POST",
+        headers: { Authorization: auth, "Content-Type": "application/json" },
+        body: bytes,
+      });
+    };
+    const created = await ownerPost("/v1/mcp/connections", {
+      displayName: "Test client",
+    });
+    const { connectionId, connectionToken } = await created.json();
+    const approved = await ownerPost(
+      `/v1/mcp/connections/${connectionId}/approve`,
+      { grants: [{ grantId: "grant-1", scopes: ["instagram.profile"] }] },
+    );
+    expect(approved.status).toBe(200);
+
+    // The next state write is the request's lastUsedAt update.
+    heldWrite.reached = new Promise<void>((resolve) => {
+      heldWrite.reachedNow = resolve;
+    });
+    heldWrite.armed = true;
+    const response = await ps.fetch(`/mcp/${connectionToken}`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json, text/event-stream",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    expect(response.status).toBe(200);
+    await heldWrite.reached;
+    const directory = dirname(heldWrite.target ?? "");
+
+    let stopped = false;
+    const stopping = ps.stop().then(() => {
+      stopped = true;
+    });
+    // Stop must stay pending while the write is held. Count event-loop turns,
+    // not time: the held write cannot finish, so a stop that does not wait for
+    // it resolves within these turns.
+    for (let turn = 0; turn < 500 && !stopped; turn++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(stopped).toBe(false);
+
+    heldWrite.release();
+    await stopping;
+    // The write landed before stop resolved, and nothing is left or follows.
+    const after = await readdir(directory);
+    expect(after.filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(await readdir(directory)).toEqual(after);
   }, 30_000);
 
   it("stops idempotently", async () => {

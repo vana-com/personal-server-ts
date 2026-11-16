@@ -135,6 +135,12 @@ export interface McpDurableState {
   getIdentity(userPsId: string): Promise<McpWakeupIdentity | null>;
   /** Serializes multi-step OAuth mutations in the single ingress process. */
   exclusive<T>(operation: () => Promise<T>): Promise<T>;
+  /**
+   * Refuses every later write and resolves once the writes already admitted
+   * have reached disk. The request path may start a write without awaiting it;
+   * the server awaits this on shutdown so none outlives its storage directory.
+   */
+  close(): Promise<void>;
 }
 
 /**
@@ -202,7 +208,9 @@ export async function openMcpDurableState(options: {
     if (state.writer?.fenced)
       throw new Error("MCP writer fenced for migration");
   };
+  let closed = false;
   const mutate = <T>(change: (draft: State) => T): Promise<T> => {
+    if (closed) return Promise.reject(new Error("MCP state is closed"));
     const result = writes.then(async () => {
       assertActive();
       const draft = structuredClone(state);
@@ -586,6 +594,12 @@ export async function openMcpDurableState(options: {
       const result = operations.then(operation);
       operations = result.catch(() => undefined);
       return result;
+    },
+    async close() {
+      closed = true;
+      // Operations queue their own writes, so settle them before the writes.
+      await operations;
+      await writes;
     },
   };
 }
