@@ -15,11 +15,10 @@ already implements immutable operation segments.
   their run stamp and records tombstones even for missing keys. The model treats
   promoted effective observations as already emitted operations. It does not
   confuse immutable content stamps with local SEEN stamps.
-- The accepted operation corpus rejects equal-stamp/different-body conflicts
-  through `Admissible`; this is an admission assumption of the requested
-  design. The scoped merge SQL alone is not proof of an exception-throwing
-  rejection path: it simply does not let an equal-stamp different body replace
-  the row. Identical retransmitted bodies are idempotent.
+- Two bodies of one key at one stamp are admitted: a collection run that
+  publishes while it collects can emit a key again in a later intake batch.
+  The model no longer assumes they agree (the old `Admissible` assumption is
+  removed). The order that settles them is in "Equal-stamp order" below.
 - `localdb/replace.ts#decideReplace` requires declared full inventory,
   mutable state, successful covered/proven full streams; `replaceMayApply`
   requires the recorded basis. Model omission operations assume those admission
@@ -260,3 +259,48 @@ Traces for the failing r3 runs are in `traces/r3-*.txt`. The earlier traces
 are from the pre-r3 model. The earlier table above is also from the pre-r3 model:
 the delete rank changed, rows carry `first`, and Install merges, so its state
 counts and depths do not apply to this file.
+
+## Equal-stamp order (host run, 2026-11-15)
+
+Defect: with publish-while-collecting on, one run can emit two different
+bodies for one key at the same stamp `(o, r)`. The writer kept the later body
+(`INSERT OR REPLACE` in run intake, `replaceOwnRunRows` in admission). A
+reader kept the first (the strict newer-stamp rule in `merge.ts`, the first
+equal-stamp upsert in the `log.ts` fold). The old `Admissible` assumption said
+equal key and stamp imply equal body, so the model never explored the case.
+
+Model change: operations carry `ord`, the intake batch ordinal (`OpN`; `Op` is
+`OpN` with ord 0). Mode `equalStamp` adds a corpus where one run emits a key
+again at one stamp, with a delete, an omission and a clone (same run id, other
+writer) at neighbouring stamps. `Rank` is the one total order:
+
+    (stamp, kind rank, ordinal, body hash)    omission < upsert < delete
+
+Equal rank implies equal body. A writer incarnation field, when the log
+provenance design adds one, goes between kind rank and ordinal; it is equal
+for all non-clone data, so no outcome changes. `P7` compares every reader with
+an oracle that does not depend on apply order (greatest rank, then its body).
+Mode `equalStampToday` is the mutant that ignores ordinal and body hash.
+
+| Configuration          | Expected                                     | Actual                                                                                                                                          | Distinct states               | Depth | Wall time |
+| ---------------------- | -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- | ----- | --------- |
+| EqualStampToday.cfg    | FAIL P7                                      | FAIL P7 (`traces/EqualStampToday.txt`): a reader applies batch 2 (bodies 12, 22) after batch 1 (11, 21) at one stamp and keeps the first bodies | 730 at failure                | 6     | <1 s      |
+| EqualStamp.cfg         | PASS (P1–P5, P7, EventuallyConverged)        | PASS, state space complete, no error found                                                                                                      | 3,447,086                     | 31    | 11 min    |
+| EqualStampLifetime.cfg | no violation (same, with Reset and Rollback) | BOUNDED: stopped at 40 min (exit 124), no invariant error in explored states; 9.5M states left on queue; liveness not checked                   | at least 81,930,672 (partial) | n/a   | 40 min    |
+
+Each run used `-workers 4`, `nice -n 19`, one job at a time, and its own
+metadir, deleted after the run. An earlier 6-batch corpus did not finish in 30
+minutes with no violation; the corpus was cut to five batches, which is the
+one the table covers. Reset and Rollback are checked only in the Lifetime
+config, because together with the equal-stamp corpus they grew the space
+without bound.
+
+The other configs still fail where expected (DropGap P2, OmissionInclusive P3,
+DropKind OrderOK). Good.cfg and LostPush.cfg were not rerun: the base corpus
+has ord 0 throughout and `Rank` reduces to the old order there, so their
+results are unchanged by construction, not by a new run.
+
+Clone and legacy rules the model fixes: two writers with one run id and one
+ordinal go to the greater body hash, never to first seen; a legacy entry with
+no ordinal counts as 0; an explicit delete beats every ordinal; an omission
+loses to every upsert at its stamp.

@@ -102,6 +102,8 @@ export function admitUpserts(input: {
   readonly connectionId: string;
   readonly runId: string;
   readonly o: number;
+  /** The run's intake batch index: the order between two bodies of a key at the run's stamp. */
+  readonly batch: number;
   readonly rows: readonly AdmitRow[];
   readonly facts: ReadonlyMap<string, StreamFacts>;
   readonly guard: {
@@ -109,7 +111,7 @@ export function admitUpserts(input: {
     readonly params: SqlStatement["params"];
   };
 }): SqlStatement[] {
-  const { op, connectionId, runId, o, rows, facts, guard } = input;
+  const { op, connectionId, runId, o, batch, rows, facts, guard } = input;
   const guardParams = guard.params ?? [];
   const statements: SqlStatement[] = [
     // The logging triggers read the origin; run end writes under `local` too.
@@ -126,8 +128,8 @@ export function admitUpserts(input: {
       : { sql: "0", params: [] };
     statements.push({
       // A later row for the same key in this batch replaces the earlier one.
-      sql: `INSERT OR REPLACE INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${guard.sql} AND ${stream.sql}
+      sql: `INSERT OR REPLACE INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, stamp_n)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${guard.sql} AND ${stream.sql}
           AND NOT EXISTS (SELECT 1 FROM record_tombstones t
             WHERE t.connection_id = ? AND t.stream = ? AND t.pk_hash = ?
               AND (t.stamp_o, t.stamp_r) > (?, ?))`,
@@ -141,6 +143,7 @@ export function admitUpserts(input: {
         row.body,
         row.bodySha256,
         o,
+        batch,
         ...guardParams,
         ...(stream.params ?? []),
         connectionId,
@@ -160,10 +163,14 @@ export function admitUpserts(input: {
 
 /**
  * Within a run the later batch wins. A row this run already holds, as its
- * stamp or as its newest sighting, has the same stamp as the incoming row, so
- * mergeIncoming's strict stamp rule would keep the earlier batch. Replace it
- * here, and only for the run's own rows: another writer at the same stamp is
- * still never replaced. Runs on `incoming` rows of `op`, before the merge.
+ * stamp or as its newest sighting, has the same stamp as the incoming row, or
+ * the sighting's older stamp, so mergeIncoming's stamp rule alone would keep
+ * the earlier batch. Replace it here, and only for the run's own rows: another
+ * writer at the same stamp is still never replaced here. The row takes the
+ * batch's ordinal (`stamp_n`), which is what orders it against the body a
+ * reader already holds from an earlier publication of this run
+ * (`mergeIncoming` applies the same ordinal at a reader). Runs on `incoming`
+ * rows of `op`, before the merge.
  */
 export function replaceOwnRunRows(
   op: string,
@@ -176,12 +183,13 @@ export function replaceOwnRunRows(
         body = (SELECT i.body FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash),
         body_sha256 = (SELECT i.body_sha256 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash),
         body_bytes = (SELECT LENGTH(CAST(i.body AS BLOB)) FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash),
-        stamp_o = ?, stamp_r = ?, seen_o = NULL, seen_r = NULL
+        stamp_o = ?, stamp_r = ?, stamp_n = (SELECT i.stamp_n FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash),
+        seen_o = NULL, seen_r = NULL
       WHERE (connection_id, stream, pk_hash) IN (SELECT ?, stream, pk_hash FROM incoming WHERE op = ?)
         AND COALESCE(seen_o, stamp_o) = ? AND COALESCE(seen_r, stamp_r) = ?
         AND EXISTS (SELECT 1 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash
                     AND NOT (i.body_sha256 = records.body_sha256 AND i.body = records.body))`,
-    params: [op, op, op, o, runId, connectionId, op, o, runId, op],
+    params: [op, op, op, o, runId, op, connectionId, op, o, runId, op],
   };
 }
 

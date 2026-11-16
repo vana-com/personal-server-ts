@@ -598,6 +598,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
                 connectionId: run.connection_id,
                 runId,
                 o: run.o,
+                batch: req.batch,
                 rows: admitted,
                 facts,
                 guard: {

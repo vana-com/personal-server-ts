@@ -432,4 +432,12 @@ END`,
     // key they give a delete made before `pk_values` its typed key back.
     `ALTER TABLE stream_state ADD COLUMN key_types TEXT`,
   ],
+  [
+    // The intake batch ordinal of the run that observed a record's body: the
+    // order between two bodies of one key at one stamp (`mergeIncoming`). A run
+    // that publishes while collecting can admit a key again in a later batch
+    // with a changed body, at the same stamp; the later batch is the fresher
+    // observation. 0 for a row from before the column and for a run's first batch.
+    `ALTER TABLE records ADD COLUMN stamp_n INTEGER NOT NULL DEFAULT 0`,
+  ],
 ];

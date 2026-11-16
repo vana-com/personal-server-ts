@@ -912,9 +912,10 @@ async function operationsFor(
       stamp_o: number;
       stamp_r: string;
       first_o: number | null;
+      stamp_n: number;
       body: string;
     }>(
-      `SELECT pk_hash, stamp_o, stamp_r, first_o, body FROM records
+      `SELECT pk_hash, stamp_o, stamp_r, stamp_n, first_o, body FROM records
         WHERE connection_id = ? AND stream = ? AND pk_hash IN (${marks})`,
       [connectionId, stream, ...group],
     );
@@ -925,6 +926,8 @@ async function operationsFor(
         stream,
         pkHash: row.pk_hash,
         stamp: { o: row.stamp_o, r: row.stamp_r },
+        // Absent for the run's first batch and for rows from before the column.
+        ...(row.stamp_n > 0 ? { ordinal: row.stamp_n } : {}),
         firstSeen: row.first_o,
         value: JSON.parse(row.body),
       });

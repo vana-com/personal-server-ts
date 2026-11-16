@@ -30,9 +30,10 @@
  *    `(o, r)`, as in `localdb/merge.ts`: not a Lamport counter, and not the
  *    log position. Position orders delivery and gap detection only. A delete
  *    wins a tie with an upsert of the same stamp (`deleteRunRecords` uses
- *    `<=`). Applying the same operations in any order, any number of times,
- *    gives the same records, once the reader keeps a tombstone per deleted key
- *    (see `LogDelete`).
+ *    `<=`). Between two upserts at one stamp, the greater ORDINAL wins, then
+ *    the greater body hash (`upsertAfter`). Applying the same operations in
+ *    any order, any number of times, gives the same records, once the reader
+ *    keeps a tombstone per deleted key (see `LogDelete`).
  * 2. OMISSION. A full pass that dropped records is a completion operation that
  *    names the dropped keys. A cutoff alone is unsound: a record the pass saw
  *    again unchanged moves only its local SEEN stamp (`merge.ts`), publishes
@@ -69,6 +70,7 @@
  * measured primitives, with the hard backstop above.
  */
 
+import { sha256 as sha256Sync } from "@noble/hashes/sha2";
 import {
   DEFAULT_PART_TARGET_BYTES,
   HEAD_LIMIT_BYTES,
@@ -153,6 +155,41 @@ export function stampAfter(a: LogStamp, b: LogStamp): boolean {
 }
 
 /**
+ * Between two upserts of one key at one stamp `(o, r)`: the later intake batch
+ * of that run wins, then the greater body hash. A run's batches are one writer's
+ * observations in order, and a connector may emit a key again with a changed
+ * body, so the later batch is the fresher observation. The upsert's `ordinal`
+ * is the intake batch index of the run that observed the body; absent is 0
+ * (an entry from before the field, or the run's first batch).
+ *
+ * The full order of two entries of a key is `(o, r, kind, [writer], ordinal,
+ * body hash)`: the kind rank (omission < upsert < explicit delete) comes before
+ * the ordinal because deletes and omissions are written at run end, so they
+ * carry no ordinal and must beat or lose to every upsert of the run by kind
+ * alone. A later writer-incarnation field goes between kind and ordinal; for
+ * entries of one run and one writer it is equal, so no outcome for such
+ * entries changes. The body hash is the last tie: writers that share a run id
+ * (a cloned device) can emit one stamp and ordinal with different bodies, and
+ * the hash gives every reader the same winner, whatever order it applies them.
+ */
+export function upsertAfter(a: LogUpsert, b: LogUpsert): boolean {
+  if (stampAfter(a.stamp, b.stamp)) return true;
+  if (stampAfter(b.stamp, a.stamp)) return false;
+  const an = a.ordinal ?? 0;
+  const bn = b.ordinal ?? 0;
+  if (an !== bn) return an > bn;
+  return bodyHash(a.value) > bodyHash(b.value);
+}
+
+/** The hash `records.body_sha256` holds for the same body: SHA-256 of its canonical JSON. */
+function bodyHash(value: JsonObject): string {
+  let hex = "";
+  for (const byte of sha256Sync(utf8(canonicalJson(value))))
+    hex += byte.toString(16).padStart(2, "0");
+  return hex;
+}
+
+/**
  * The record's current body at its observation stamp. `firstSeen` is the
  * record's first-seen checkpoint (`first_o`) as the observing device knew it,
  * `null` when unknown. It belongs to this observation: a reader keeps it while
@@ -163,6 +200,8 @@ export interface LogUpsert {
   readonly stream: string;
   readonly pkHash: string;
   readonly stamp: LogStamp;
+  /** Intake batch index of the observing run; absent means 0. See `upsertAfter`. */
+  readonly ordinal?: number;
   readonly firstSeen: number | null;
   readonly value: JsonObject;
 }
@@ -431,7 +470,7 @@ export function foldLog(input: {
   };
   const upsert = (op: LogUpsert) => {
     const c = cell(op.stream, op.pkHash);
-    if (!c.upsert || stampAfter(op.stamp, c.upsert.stamp)) c.upsert = op;
+    if (!c.upsert || upsertAfter(op, c.upsert)) c.upsert = op;
   };
   const deletion = (
     stream: string,
@@ -703,6 +742,8 @@ const SEGMENT_FIELDS = [
 const REF_FIELDS = ["bytes", "dataHash", "position"];
 const META_FIELDS = ["complete", "primaryKey", "profile", "stream"];
 const UPSERT_FIELDS = ["f", "k", "o", "p", "r", "s", "v"];
+/** An upsert of a run's later intake batch also carries its ordinal `n` (>= 1). */
+const UPSERT_ORDINAL_FIELDS = ["f", "k", "n", "o", "p", "r", "s", "v"];
 const DELETE_FIELDS = ["k", "o", "p", "r", "rk", "s"];
 const COMPLETE_FIELDS = ["k", "o", "omit", "r", "s"];
 const OMISSION_FIELDS = ["p", "rk"];
@@ -767,7 +808,10 @@ function operationProblem(op: unknown, at: string): string | null {
   if (!isPlainObject(op)) return `${at} must be an object`;
   const kind = op["k"];
   if (kind === "u") {
-    if (!exactKeys(op, UPSERT_FIELDS)) return `${at} upsert fields`;
+    if (!exactKeys(op, UPSERT_FIELDS) && !exactKeys(op, UPSERT_ORDINAL_FIELDS))
+      return `${at} upsert fields`;
+    if (hasOwn(op, "n") && !isCount(op["n"], 1))
+      return `${at} ordinal must be a count of at least 1`;
     if (!isPlainObject(op["v"])) return `${at} value must be an object`;
     if (op["f"] !== null && !isCount(op["f"], 0))
       return `${at} first-seen must be null or a count`;
@@ -921,6 +965,7 @@ function opToWire(op: LogOperation | LogOmitted): Record<string, unknown> {
       return {
         f: op.firstSeen,
         k: "u",
+        ...(op.ordinal ? { n: op.ordinal } : {}),
         o: op.stamp.o,
         p: op.pkHash,
         r: op.stamp.r,
@@ -1031,6 +1076,7 @@ function opFromWire(op: Record<string, unknown>): LogOperation | LogOmitted {
       stream,
       pkHash: op["p"] as string,
       stamp,
+      ...(hasOwn(op, "n") ? { ordinal: op["n"] as number } : {}),
       firstSeen: op["f"] as number | null,
       value: op["v"] as JsonObject,
     };

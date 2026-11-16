@@ -933,6 +933,8 @@ describe("view changes", () => {
       { sql: "ALTER TABLE run_rows DROP COLUMN pk_values" },
       { sql: "ALTER TABLE record_changes DROP COLUMN pk_values" },
       { sql: "ALTER TABLE stream_state DROP COLUMN key_types" },
+      // The batch ordinal that orders two bodies of a key at one stamp.
+      { sql: "ALTER TABLE records DROP COLUMN stamp_n" },
       { sql: `PRAGMA user_version = ${viewMigration}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");

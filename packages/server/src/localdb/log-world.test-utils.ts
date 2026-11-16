@@ -50,6 +50,7 @@ export async function closeWorldDrivers(): Promise<void> {
 export async function world(options: {
   streams: number;
   logProtocol: boolean;
+  publishWhileCollecting?: boolean;
   partTargetBytes?: number;
   /** The key types every stream's schema declares (none: undeclared). */
   keyTypes?: readonly ("string" | "number" | "integer" | "boolean" | null)[];
@@ -141,6 +142,9 @@ export async function world(options: {
       now: () => clock,
       newOp: () => `${deviceId}-${++op}`,
       ...(logProtocol ? { logProtocol: true } : {}),
+      ...(options.publishWhileCollecting
+        ? { publishWhileCollecting: true }
+        : {}),
       ...(hooks.progressiveFirstLoad ? { progressiveFirstLoad: true } : {}),
       ...(options.partTargetBytes !== undefined
         ? { partTargetBytes: options.partTargetBytes }

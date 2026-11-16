@@ -221,6 +221,30 @@ export function runDriverConformance(
   });
 
   describe("merge pair", () => {
+    it("orders two bodies at one stamp by batch ordinal, then body hash", async () => {
+      const { db } = await fresh();
+      await seedConnection(db);
+      const at = (body: string, n: number) => ({
+        sql: "INSERT INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, stamp_n, body, body_sha256) VALUES ('m', 's', 'aa01', '1', 1000, 'run-a', ?, ?, ?)",
+        params: [n, body, `sha-${body}`],
+      });
+      const body = async () =>
+        (await db.query("SELECT body FROM records"))[0]?.body;
+      await merge(db, "local", "m", at('{"v":"b"}', 0));
+      // The lower hash at the same ordinal loses.
+      await merge(db, "local", "m", at('{"v":"a"}', 0));
+      expect(await body()).toBe('{"v":"b"}');
+      // A later batch of the run wins whatever the hashes.
+      await merge(db, "local", "m", at('{"v":"a"}', 1));
+      expect(await body()).toBe('{"v":"a"}');
+      // The earlier batch no longer replaces it.
+      await merge(db, "local", "m", at('{"v":"z"}', 0));
+      expect(await body()).toBe('{"v":"a"}');
+      // At the same ordinal the greater hash wins (a clone of the run).
+      await merge(db, "local", "m", at('{"v":"c"}', 1));
+      expect(await body()).toBe('{"v":"c"}');
+    });
+
     it("lets a strictly newer stamp win and ignores equal, older and replayed rows without logging", async () => {
       const { db } = await fresh();
       await seedConnection(db);
@@ -235,7 +259,7 @@ export function runDriverConformance(
         db,
         "local",
         "m",
-        stage("m", "aa01", "1", 1000, "run-a", '{"v":"x"}'),
+        stage("m", "aa01", "1", 1000, "run-a", '{"v":"a"}'),
       );
       await merge(
         db,

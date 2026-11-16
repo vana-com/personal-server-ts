@@ -25,6 +25,7 @@ import {
   planOpsSince,
   segmentBlobName,
   stampAfter,
+  upsertAfter,
   verifySegment,
   type Segment,
   type SegmentRef,
@@ -869,5 +870,138 @@ describe("a deletion's key is bound to its hash", () => {
     expect(
       await firstDeletionKeyMismatch(sha256, metas, [asString]),
     ).not.toBeNull();
+  });
+});
+
+describe("fold: bodies of one key at one stamp (equal-stamp order)", () => {
+  /** A body of key 1 at stamp (5, "run") from intake batch `ordinal`. */
+  const body = (v: number, ordinal?: number) => ({
+    ...up("a", 1, 5, "run"),
+    ...(ordinal === undefined ? {} : { ordinal }),
+    value: { id: "1", v },
+  });
+  const winner = (ops: Segment["operations"][number][][]) => {
+    const fold = foldLog({
+      snapshot: [],
+      segments: ops.map((o, i) => seg(i + 1, o)),
+    });
+    expect(fold.entries).toHaveLength(1);
+    return (fold.entries[0] as { value: { v: number } }).value.v;
+  };
+  const permutations = <T>(items: T[]): T[][] =>
+    items.length <= 1
+      ? [items]
+      : items.flatMap((item, i) =>
+          permutations([...items.slice(0, i), ...items.slice(i + 1)]).map(
+            (rest) => [item, ...rest],
+          ),
+        );
+
+  it("the later intake batch wins, in every order of the entries and in one segment or several", () => {
+    const entries = [body(1), body(2, 1), body(3, 2)];
+    for (const order of permutations(entries)) {
+      expect(winner(order.map((e) => [e]))).toBe(3);
+      expect(winner([order])).toBe(3);
+    }
+  });
+
+  it("an entry with no ordinal counts as ordinal 0, and a changed body is not an older one", () => {
+    expect(upsertAfter(body(2, 1), body(1))).toBe(true);
+    expect(upsertAfter(body(1), body(2, 1))).toBe(false);
+    expect(upsertAfter(body(1), body(2, 0))).toBe(
+      upsertAfter(body(1), body(2)),
+    );
+  });
+
+  it("a later stamp beats any ordinal of an earlier one", () => {
+    const newerRun = { ...up("a", 1, 6, "run"), value: { id: "1", v: 9 } };
+    for (const order of permutations([body(1, 7), newerRun]))
+      expect(winner(order.map((e) => [e]))).toBe(9);
+  });
+
+  it("equal stamp and ordinal with different bodies (a clone) go to the greater body hash, in every order", () => {
+    const a = body(1, 1);
+    const b = body(2, 1);
+    const expectedWinner = upsertAfter(a, b) ? 1 : 2;
+    expect(upsertAfter(a, b)).not.toBe(upsertAfter(b, a));
+    for (const order of permutations([a, b]))
+      expect(winner(order.map((e) => [e]))).toBe(expectedWinner);
+  });
+
+  it("is idempotent: an entry applied again changes nothing", () => {
+    const once = foldLog({
+      snapshot: [],
+      segments: [seg(1, [body(1)]), seg(2, [body(2, 1)])],
+    });
+    const twice = foldLog({
+      snapshot: [],
+      segments: [
+        seg(1, [body(1)]),
+        seg(2, [body(2, 1)]),
+        seg(3, [body(2, 1), body(1)]),
+      ],
+    });
+    expect(twice).toEqual(once);
+  });
+
+  it("a snapshot of the earlier batch plus the later segment equals folding both", () => {
+    const context = {
+      connector: "c",
+      ns: "fedcba9876543210",
+      generation: 1,
+      keyCheck: "0123456789abcdef",
+      position: 1,
+    };
+    const first = seg(1, [body(1)]);
+    const second = seg(2, [body(2, 1)]);
+    const snapshot = partitionFold(
+      foldLog({ snapshot: [], segments: [first] }),
+      context,
+      10,
+    );
+    expect(foldLog({ snapshot, segments: [second] })).toEqual(
+      foldLog({ snapshot: [], segments: [first, second] }),
+    );
+    // the other way round: the snapshot holds the later batch, the tail the earlier
+    const later = partitionFold(
+      foldLog({ snapshot: [], segments: [second] }),
+      { ...context, position: 2 },
+      10,
+    );
+    expect(foldLog({ snapshot: later, segments: [first] })).toEqual(
+      foldLog({ snapshot: [], segments: [first, second] }),
+    );
+  });
+
+  it("a delete at the stamp beats every ordinal, and an omission at it loses to every one", () => {
+    const withDelete = foldLog({
+      snapshot: [],
+      segments: [seg(1, [body(1, 3), del("a", 1, 5, "run")])],
+    });
+    expect(kindsOf(withDelete.entries, 1)).toEqual(["delete"]);
+    const withOmission = foldLog({
+      snapshot: [],
+      segments: [seg(1, [body(1, 0), complete("a", [1], 5, "run")])],
+    });
+    expect(kindsOf(withOmission.entries, 1)).toEqual(["upsert"]);
+  });
+
+  it("the ordinal rides the wire only when it is set, and survives a snapshot part", async () => {
+    const plain = encodeSegment(seg(1, [body(1)]));
+    expect(new TextDecoder().decode(plain)).not.toContain('"n":');
+    const ordered = seg(1, [body(2, 3)]);
+    const decoded = decodeSegment(encodeSegment(ordered));
+    expect(decoded).toEqual({ kind: "ok", segment: ordered });
+    const fold = foldLog({ snapshot: [], segments: [ordered] });
+    expect(fold.entries[0]).toMatchObject({ ordinal: 3 });
+  });
+
+  it("refuses an ordinal that is not a count of at least 1", () => {
+    for (const bad of ["0", "-1", "1.5", '"1"', "null"]) {
+      const text = new TextDecoder()
+        .decode(encodeSegment(seg(1, [body(2, 3)])))
+        .replace('"n":3', `"n":${bad}`);
+      expect(decodeSegment(utf8(text)).kind).toBe("malformed");
+    }
   });
 });
