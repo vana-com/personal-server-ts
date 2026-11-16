@@ -5,6 +5,7 @@ import type {
   LocalHistory,
   RecordQuery,
   ConnectionLink,
+  ViewChanges,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import { ouraRoutes } from "./routes/oura.js";
 import {
@@ -182,6 +183,8 @@ export interface AppDeps {
   /** Run intake (V2 §2); absent when stream sync writing is off. */
   streamSyncIntake?: RunIntake;
   localSync?: () => Promise<LocalSync>;
+  /** The recorder the database is opened with (`GET /v1/sync/events`). */
+  viewChanges?: ViewChanges;
   localFile?: SyncRouteDeps["localFile"];
   history?: LocalHistory;
   /** The stream-sync writer's connection delete (`DELETE /v1/owner/connectors/:id`). */
@@ -925,6 +928,7 @@ export function createApp(deps: AppDeps): Hono {
       tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
       localSync,
+      ...(deps.viewChanges ? { viewChanges: deps.viewChanges } : {}),
       localFile: deps.localFile,
       accountStorageMode,
       mountPath: "/v1/sync",

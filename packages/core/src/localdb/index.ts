@@ -21,6 +21,7 @@ export {
   LocalDbIdentityMismatch,
   openLocalDb,
   type LocalDbIdentity,
+  type OpenLocalDbOptions,
 } from "./open.js";
 export { connectionQueue, type OperationKind } from "./queue.js";
 export type { ConnectionQueue, ConnectionRow, LocalSyncDeps } from "./deps.js";

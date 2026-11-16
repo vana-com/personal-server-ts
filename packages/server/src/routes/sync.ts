@@ -4,8 +4,12 @@ import type { OwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-c
  * All endpoints require owner authentication.
  */
 
-import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
+import type {
+  LocalSync,
+  ViewChanges,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { Logger } from "pino";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
@@ -15,6 +19,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { TokenStore } from "../token-store.js";
 import { createServerApiAuth } from "../api-auth.js";
+import { createFeedWriter } from "./sync-event-writer.js";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 
 export interface SyncRouteDeps {
@@ -28,6 +33,8 @@ export interface SyncRouteDeps {
   syncManager: SyncManager | null; // null when sync disabled
   localSync?: LocalSync | (() => Promise<LocalSync>);
   accountStorageMode?: OwnedAccountStorageMode;
+  /** The recorder the database was opened with; absent when there is none. */
+  viewChanges?: ViewChanges;
   /** Resolve a file selector without reading its body until its connection synced. */
   localFile?: (
     id: string,
@@ -90,6 +97,57 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
     return c.json({
       ...status,
       changeProbeMs: deps.syncManager?.getStatus().changeProbeMs ?? 0,
+    });
+  });
+  // The owner's change feed, so a screen follows the local store instead of
+  // polling it. Standard server-sent events:
+  //   `ready`  {}                  the feed is live; read now to catch up
+  //   `view`   {connectionIds}     what a reader sees of these connections moved
+  //   `status` <SyncStatus>        the sync manager's status changed
+  // No event carries record data. Both sources are subscribed before `ready`
+  // is sent, so a change after `ready` is never missed; a client reads once
+  // after every `ready` to cover the change before it. The manager's current
+  // status follows `ready`, so a client that listens only for status learns
+  // what it missed while it was away without a read.
+  app.get("/events", async (c) => {
+    await auth.authorizeOwner(c.req.raw);
+    return streamSSE(c, async (stream) => {
+      // One writer per connection folds what arrives while a frame is being
+      // written, so a reader that stops reading holds bounded memory.
+      const feed = createFeedWriter((event, data) =>
+        stream.writeSSE({ event, data: JSON.stringify(data) }),
+      );
+      const left = new Promise<void>((resolve) => stream.onAbort(resolve));
+      // A subscription joins this list when it is acquired, so whatever
+      // happens next releases exactly what was acquired.
+      const release: Array<() => void> = [];
+      try {
+        if (deps.viewChanges)
+          release.push(
+            deps.viewChanges.subscribe(({ connectionIds }) =>
+              feed.views(connectionIds),
+            ),
+          );
+        if (deps.syncManager) {
+          release.push(
+            deps.syncManager.subscribeStatus((status) => feed.status(status)),
+          );
+        }
+        feed.ready();
+        if (deps.syncManager) feed.status(deps.syncManager.getStatus());
+        await left;
+      } catch (err) {
+        deps.logger.warn({ err }, "sync event feed failed; closing it");
+      } finally {
+        feed.close();
+        for (const stop of release.reverse()) {
+          try {
+            stop();
+          } catch (err) {
+            deps.logger.warn({ err }, "sync event feed release failed");
+          }
+        }
+      }
     });
   });
   app.post("/file/:id", async (c, next) => {

@@ -24,6 +24,7 @@ vi.mock(
     };
   },
 );
+import { createViewChanges } from "@opendatalabs/personal-server-ts-core/localdb";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { uploadAttemptKey } from "@opendatalabs/personal-server-ts-core/sync";
 import {
@@ -409,11 +410,25 @@ describe("PS Lite local database composition", () => {
       network: identity.network,
     });
     expect(openLocalDb).toHaveBeenCalledTimes(1);
-    expect(openLocalDb).toHaveBeenCalledWith(db, {
-      ...identity,
-      owner: identity.owner.toLowerCase(),
-    });
+    expect(openLocalDb).toHaveBeenCalledWith(
+      db,
+      { ...identity, owner: identity.owner.toLowerCase() },
+      {},
+    );
     expect(db.close).not.toHaveBeenCalled();
+
+    // The recorder rides the shared open path, so a host that serves a reader
+    // does not attach it itself.
+    const viewChanges = {
+      recorder: createViewChanges(),
+      logger: { warn() {} },
+    };
+    await openLiteLocalDb({ openDriver }, identity, { viewChanges });
+    expect(openLocalDb).toHaveBeenLastCalledWith(
+      db,
+      { ...identity, owner: identity.owner.toLowerCase() },
+      { viewChanges },
+    );
 
     const failure = new Error("database identity mismatch");
     vi.mocked(openLocalDb).mockRejectedValueOnce(failure);

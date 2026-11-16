@@ -612,14 +612,18 @@ export async function createPsLiteSyncManager(
     let opening: Promise<LocalSync | null> | undefined;
     async function openDatabase(): Promise<LocalSync | null> {
       if (!options.localDb) return null;
-      const opened = await openLiteLocalDb(options.localDb, {
-        owner: serverOwner,
-        network: streamSyncNet,
-        deviceId: options.localDbDeviceId ?? options.serverAccount.address,
-      });
-      // Every write the sync engine makes goes through this driver, so the
-      // recorder sees each commit (and starts a new baseline per open).
-      localDb = opened ? viewChanges.attach(opened, logger) : null;
+      // Every write the sync engine makes goes through the driver this
+      // returns, so the recorder sees each commit (and starts a new baseline
+      // per open). The shared open path attaches it.
+      localDb = await openLiteLocalDb(
+        options.localDb,
+        {
+          owner: serverOwner,
+          network: streamSyncNet,
+          deviceId: options.localDbDeviceId ?? options.serverAccount.address,
+        },
+        { viewChanges: { recorder: viewChanges, logger } },
+      );
       if (localDb) {
         localSyncDeps = {
           db: localDb,
