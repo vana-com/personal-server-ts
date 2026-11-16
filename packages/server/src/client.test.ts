@@ -786,7 +786,9 @@ describe("startPersonalServer node handle", () => {
       await heldWrite.reached;
       const directory = dirname(heldWrite.target ?? "");
       expect(heldWrite.temporaryOpens).toBe(opensBefore);
-      expect((await readdir(directory)).filter(name => name.endsWith(".tmp"))).toEqual([]);
+      expect(
+        (await readdir(directory)).filter((name) => name.endsWith(".tmp")),
+      ).toEqual([]);
 
       stopping = ps.stop();
       // Stop awaits the MCP state's drain while the write is still held. A
@@ -808,10 +810,10 @@ describe("startPersonalServer node handle", () => {
       expect(after).toContain("mcp-state.json");
       expect(after.filter((name) => name.endsWith(".tmp"))).toEqual([]);
       expect(heldWrite.temporaryOpens).toBe(opensBefore + 1);
-      await rm(rootPath, {recursive:true, force:true});
+      await rm(rootPath, { recursive: true, force: true });
       await ps.stop();
       expect(heldWrite.temporaryOpens).toBe(opensBefore + 1);
-      await expect(access(rootPath)).rejects.toMatchObject({code:"ENOENT"});
+      await expect(access(rootPath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       heldWrite.armed = false;
       heldWrite.release();
