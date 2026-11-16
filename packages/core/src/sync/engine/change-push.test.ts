@@ -91,16 +91,6 @@ describe("createRegistryChangePush", () => {
       createRegistryChangePush(s.registry, { enabled: false }),
     ).toBeUndefined();
   });
-
-  it("carries the period of its held request: one request per period while idle", () => {
-    const s = scripted();
-    expect(
-      createRegistryChangePush(s.registry, { waitMs: 9_000 })!.requestPeriodMs,
-    ).toBe(9_000);
-    expect(createRegistryChangePush(s.registry)!.requestPeriodMs).toBe(
-      CHANGE_PUSH_WAIT_MS,
-    );
-  });
 });
 
 describe("a subscription", () => {
@@ -258,15 +248,56 @@ describe("a failing gateway", () => {
     t.stop();
   });
 
-  it("gives up and stays unhealthy when the gateway has no change route", async () => {
+  it("stays unhealthy without a route and asks again after one held period, not sooner", async () => {
     const t = subscribed();
     await flush();
     t.calls[0]!.fail(new ChangeFeedAbsentError("no route"));
     await flush();
-    await vi.advanceTimersByTimeAsync(10 * 60_000);
-    expect(t.calls).toHaveLength(1);
-    expect(t.pokes).not.toHaveBeenCalled();
     expect(t.health.at(-1) ?? false).toBe(false);
+    await vi.advanceTimersByTimeAsync(CHANGE_PUSH_WAIT_MS - 1);
+    expect(t.calls).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(t.calls).toHaveLength(2);
+    t.calls[1]!.fail(new ChangeFeedAbsentError("no route"));
+    await flush();
+    // One request per held period, the most a present route would cost.
+    await vi.advanceTimersByTimeAsync(CHANGE_PUSH_WAIT_MS - 1);
+    expect(t.calls).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(t.calls).toHaveLength(3);
+    expect(t.pokes).not.toHaveBeenCalled();
+    t.stop();
+  });
+
+  it("picks up a route the gateway gains later: the first answer is healthy and pokes", async () => {
+    const t = subscribed();
+    await flush();
+    t.calls[0]!.fail(new ChangeFeedAbsentError("no route"));
+    await flush();
+    await vi.advanceTimersByTimeAsync(CHANGE_PUSH_WAIT_MS);
+    t.calls[1]!.answer({ seq: "3", changed: true });
+    await flush();
+    expect(t.health.at(-1)).toBe(true);
+    expect(t.pokes).toHaveBeenCalledTimes(1);
+    t.stop();
+  });
+});
+
+describe("the held period", () => {
+  it.each([NaN, Infinity, -Infinity, 0, -5])(
+    "uses the default when the host gives %s",
+    async (waitMs) => {
+      const t = subscribed({ waitMs });
+      await flush();
+      expect(t.calls[0]!.waitMs).toBe(CHANGE_PUSH_WAIT_MS);
+      t.stop();
+    },
+  );
+
+  it("keeps a finite positive period the host gives", async () => {
+    const t = subscribed({ waitMs: 9_000 });
+    await flush();
+    expect(t.calls[0]!.waitMs).toBe(9_000);
     t.stop();
   });
 });

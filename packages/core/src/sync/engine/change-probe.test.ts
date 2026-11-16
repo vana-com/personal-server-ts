@@ -146,6 +146,17 @@ describe("createRegistryChangeProbe", () => {
     expect(probe.intervalMs).toBe(9_000);
   });
 
+  it.each([NaN, Infinity, -Infinity])(
+    "takes the default period when the host gives %s",
+    (intervalMs) => {
+      const probe = createRegistryChangeProbe(
+        registry(async () => "m"),
+        { intervalMs },
+      )!;
+      expect(probe.intervalMs).toBe(DEFAULT_CHANGE_PROBE_MS);
+    },
+  );
+
   it("keeps the period above the cost-parity floor of the smallest idle cycle", () => {
     // 29 registry requests per idle cycle for one connection of six streams,
     // one cycle per 60 s: a probe may not out-spend that.
@@ -163,21 +174,7 @@ describe("createRegistryChangeProbe", () => {
       } as unknown as StreamSyncRegistry,
       { push: { waitMs: 9_000 } },
     )!;
-    expect(probe.push?.requestPeriodMs).toBe(9_000);
-  });
-
-  it("hands the host's request counter to the manager, which derives the safety net from it", () => {
-    const requestCount = () => 3;
-    const probe = createRegistryChangeProbe(
-      registry(async () => "m"),
-      {
-        requestCount,
-      },
-    )!;
-    expect(probe.requestCount).toBe(requestCount);
-    expect(
-      createRegistryChangeProbe(registry(async () => "m"))!.requestCount,
-    ).toBeUndefined();
+    expect(probe.push).toBeDefined();
   });
 
   it("has no push when the registry cannot hold a request or the host turns it off", () => {

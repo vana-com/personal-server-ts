@@ -1,19 +1,18 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 105 and seed 3167663672436619803 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 2612471] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 80 and seed 3295484320620982471 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 2394185] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/tnunamak/.tmp/floors-gap-1116/idle-push-root/ps/docs/formal/registry-poke/RegistryPoke.tla
 Parsing file /tmp/Naturals.tla
 Semantic processing of module Naturals
 Semantic processing of module RegistryPoke
-Starting... (2026-11-15 19:42:38)
+Starting... (2026-11-15 22:39:07)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-11-15 19:42:38.
+Finished computing initial states: 1 distinct state generated at 2026-11-15 22:39:07.
 Model checking completed. No error has been found.
   Estimates of the probability that TLC did not check all reachable states
   because two distinct states had the same fingerprint:
-  calculated (optimistic):  val = 1.8E-10
-  based on the actual fingerprints:  val = 2.5E-11
-120526 states generated, 40260 distinct states found, 0 states left on queue.
+  calculated (optimistic):  val = 4.9E-11
+63614 states generated, 21803 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 42.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 6 and the 95th percentile is 3).
-Finished in 00s at (2026-11-15 19:42:38)
+Finished in 00s at (2026-11-15 22:39:08)
 exit 0

@@ -43,7 +43,10 @@ export function changePushBackoffMs(
 export interface RegistryChangePushOptions {
   /** Default true; false: no push, the timed probe alone (as before). */
   enabled?: boolean;
-  /** Default {@link CHANGE_PUSH_WAIT_MS}. */
+  /**
+   * Default {@link CHANGE_PUSH_WAIT_MS}, also for a value that is not a finite
+   * positive number: a held request of NaN or Infinity seconds is no period.
+   */
   waitMs?: number;
 }
 
@@ -53,10 +56,11 @@ export interface RegistryChangePushOptions {
  * It keeps one held request open. Each answer carries the registry's
  * sequence, the registry's position; the next request sends it back, so the
  * gateway compares two numbers and a poke that was lost on the wire is found
- * by the next request. The position is not data: the manager reads the
- * registry itself and trusts the position only to say that nothing moved since
- * a cycle that started under it (a check it repeats at a derived interval, the
- * safety net). It does four things:
+ * by the next request. An answer that ends the wait with nothing new carries
+ * the gateway's current sequence too, read when the wait ended. The position is
+ * not data: the manager reads the registry itself and trusts the position only
+ * to say that nothing moved since a cycle that started under it, so a wake that
+ * was lost is found at the next answer. It does four things:
  *
  *  - every answer reports its sequence as the position (`onPosition`), before
  *    anything else, so the cycle a poke starts samples the position it follows;
@@ -75,9 +79,11 @@ export function createRegistryChangePush(
 ): ChangePush | undefined {
   const waitForChange = registry.waitForChange?.bind(registry);
   if (!waitForChange || options.enabled === false) return undefined;
-  const waitMs = options.waitMs ?? CHANGE_PUSH_WAIT_MS;
+  const waitMs =
+    Number.isFinite(options.waitMs) && (options.waitMs as number) > 0
+      ? (options.waitMs as number)
+      : CHANGE_PUSH_WAIT_MS;
   return {
-    requestPeriodMs: waitMs,
     subscribe(handlers) {
       const lifetime = new AbortController();
       let cursor: string | undefined;
@@ -154,8 +160,14 @@ export function createRegistryChangePush(
           const outcome = await once();
           if (lifetime.signal.aborted) return;
           if (outcome === "absent") {
+            // No route: stay unhealthy, so the manager's timer and probe keep
+            // watching, and ask again after one held period. An absent route
+            // then costs at most the one request per period a present route
+            // costs, and a gateway that gains the route is found within a
+            // period, with no restart.
             setHealth(false);
-            return;
+            await sleep(waitMs);
+            continue;
           }
           if (outcome === "failed") {
             setHealth(false);

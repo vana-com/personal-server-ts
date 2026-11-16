@@ -560,7 +560,7 @@ describe("waitForChange", () => {
     expect(new URL(urls[0]!).searchParams.has("after")).toBe(false);
   });
 
-  it("says the gateway has no change route on 404 or 405, so the caller stops asking", async () => {
+  it("says the gateway has no change route on 404 or 405", async () => {
     for (const status of [404, 405]) {
       const { registry } = waiting(() => new Response("no", { status }));
       await expect(
@@ -569,21 +569,37 @@ describe("waitForChange", () => {
     }
   });
 
-  it("reads a 400 on the cursorless first request as 'no change route'", async () => {
-    // A gateway without the route hands the path to its `/v1/data/:id` handler,
-    // which refuses the id `changes` with a 400. The first request is the
-    // capability probe and is always well formed, so a 400 there says the path
-    // is not the change route.
-    const { registry } = waiting(() => new Response("bad id", { status: 400 }));
-    await expect(
-      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
-    ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
+  it("reads the legacy handler's 400 for the id `changes` as 'no change route'", async () => {
+    // A gateway without the route hands the path to its `/v1/data/:dataPointId`
+    // handler, which refuses the id `changes` with a 400 that names dataPointId.
+    for (const after of [undefined, "9"]) {
+      const { registry } = waiting(
+        () =>
+          new Response(
+            JSON.stringify({
+              error:
+                "Invalid dataPointId: must be a valid bytes32 hex string (0x-prefixed, 64 hex chars)",
+            }),
+            { status: 400 },
+          ),
+      );
+      await expect(
+        registry.waitForChange!(after, 25_000, new AbortController().signal),
+      ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
+    }
   });
 
-  it("does not read a 400 on a request that carries a cursor as an absent route", async () => {
-    const { registry } = waiting(() => new Response("bad", { status: 400 }));
+  it.each([
+    [
+      "the change route's own refusal",
+      JSON.stringify({ error: "Invalid user: expected an 0x address" }),
+    ],
+    ["a body that is not JSON", "bad request"],
+    ["an empty body", ""],
+  ])("does not read a 400 with %s as an absent route", async (_name, body) => {
+    const { registry } = waiting(() => new Response(body, { status: 400 }));
     const failure = await registry.waitForChange!(
-      "9",
+      undefined,
       25_000,
       new AbortController().signal,
     ).catch((error: unknown) => error);
@@ -591,20 +607,43 @@ describe("waitForChange", () => {
     expect((failure as Error).name).not.toBe("ChangeFeedAbsentError");
   });
 
-  it("asks for the change route once: after 'absent' it sends nothing", async () => {
-    const { registry, urls } = waiting(
-      () => new Response("no", { status: 404 }),
+  it("asks again after a first 400 that was not an absence, and uses the answer", async () => {
+    let calls = 0;
+    const { registry, urls } = waiting(() => {
+      calls += 1;
+      return calls === 1
+        ? new Response(
+            JSON.stringify({ error: "Invalid user: expected an 0x address" }),
+            {
+              status: 400,
+            },
+          )
+        : new Response(JSON.stringify({ seq: "4", changed: true }));
+    });
+    await expect(
+      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+    ).rejects.toThrow(/400/);
+    await expect(
+      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+    ).resolves.toEqual({ seq: "4", changed: true });
+    expect(urls).toHaveLength(2);
+  });
+
+  it("remembers no absence: a gateway upgraded to have the route is found by the next ask", async () => {
+    let upgraded = false;
+    const { registry, urls } = waiting(() =>
+      upgraded
+        ? new Response(JSON.stringify({ seq: "1", changed: true }))
+        : new Response("no", { status: 404 }),
     );
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      await expect(
-        registry.waitForChange!(
-          undefined,
-          25_000,
-          new AbortController().signal,
-        ),
-      ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
-    }
-    expect(urls).toHaveLength(1);
+    await expect(
+      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+    ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
+    upgraded = true;
+    await expect(
+      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+    ).resolves.toEqual({ seq: "1", changed: true });
+    expect(urls).toHaveLength(2);
   });
 
   it("keeps asking after a failure that does not say the route is absent", async () => {

@@ -26,7 +26,6 @@ import {
   type RunIntake,
   type StreamSyncRegistry,
   type StreamSyncBlobs,
-  countRegistryRequests,
   createGatewayStreamSyncRegistry,
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
@@ -586,16 +585,13 @@ export async function createPsLiteSyncManager(
     else await localDb?.close();
   }
 
-  // One registry client for the cycle's reads and the change probe. The cycle's
-  // calls are counted: the manager prices an idle cycle from the count.
-  const counted = countRegistryRequests<StreamSyncRegistry>(
+  // One registry client for the cycle's reads and the change probe.
+  const streamSyncRegistry: StreamSyncRegistry =
     options.streamSyncRegistry ??
-      createGatewayStreamSyncRegistry({
-        gatewayUrl: options.config.gateway.url,
-        ownerAddress: serverOwner,
-      }),
-  );
-  const streamSyncRegistry = counted.registry;
+    createGatewayStreamSyncRegistry({
+      gatewayUrl: options.config.gateway.url,
+      ownerAddress: serverOwner,
+    });
   // A hidden tab has no one to show a change to: the runtime pauses the
   // manager (`startVisibilityPause`), which holds no request and no timer
   // until it is shown again. Where the document says nothing (a worker), the
@@ -604,12 +600,10 @@ export async function createPsLiteSyncManager(
     ? createRegistryChangeProbe(streamSyncRegistry, {
         intervalMs: options.config.streamSync.changeProbeMs,
         push: { enabled: options.config.streamSync.changePush },
-        requestCount: counted.count,
       })
     : undefined;
 
   let syncManager!: ReturnType<typeof createSyncManager>;
-  let serverRegistered = false;
   try {
     let closed = false;
     let opening: Promise<LocalSync | null> | undefined;
@@ -769,18 +763,12 @@ export async function createPsLiteSyncManager(
           : undefined,
         tombstoneFinality,
         async canSync() {
-          if (options.ownerSyncSigner || serverRegistered) return { ok: true };
+          if (options.ownerSyncSigner) return { ok: true };
           try {
             const serverInfo = await gateway.getServer(
               options.serverAccount.address,
             );
-            if (serverInfo?.id) {
-              // Registration is a fact about this device's identity, and it
-              // does not lapse while the manager lives: ask once, not on
-              // every cycle. An unregistered or failed answer is asked again.
-              serverRegistered = true;
-              return { ok: true };
-            }
+            if (serverInfo?.id) return { ok: true };
             return {
               ok: false,
               reason: "unregistered",

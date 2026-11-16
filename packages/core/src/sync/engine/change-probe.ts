@@ -34,7 +34,11 @@ export const DEFAULT_CHANGE_PROBE_MS = 5_000;
 export const PROBE_TIMEOUT_MS = 10_000;
 
 export interface RegistryChangeProbeOptions {
-  /** Default {@link DEFAULT_CHANGE_PROBE_MS}; 0 or less: no probe. */
+  /**
+   * Default {@link DEFAULT_CHANGE_PROBE_MS}, also for a value that is not a
+   * finite number (a timer given NaN or Infinity fires at once); 0 or less:
+   * no probe.
+   */
   intervalMs?: number;
   /**
    * The server push that relieves the probe, when the registry can hold a
@@ -42,12 +46,6 @@ export interface RegistryChangeProbeOptions {
    * is the host's `SyncManager.pause`, not an option here.
    */
   push?: RegistryChangePushOptions;
-  /**
-   * Registry requests made so far by the cycle (see `countRegistryRequests`).
-   * The manager prices an idle cycle with it and derives the push's safety
-   * net from the price.
-   */
-  requestCount?: () => number;
 }
 
 /** The manager's probe over a registry that can answer one; none otherwise. */
@@ -55,7 +53,9 @@ export function createRegistryChangeProbe(
   registry: Pick<StreamSyncRegistry, "probeChange" | "waitForChange">,
   options: RegistryChangeProbeOptions = {},
 ): ChangeProbe | undefined {
-  const intervalMs = options.intervalMs ?? DEFAULT_CHANGE_PROBE_MS;
+  const intervalMs = Number.isFinite(options.intervalMs)
+    ? (options.intervalMs as number)
+    : DEFAULT_CHANGE_PROBE_MS;
   const probeChange = registry.probeChange?.bind(registry);
   if (!probeChange || !(intervalMs > 0)) return undefined;
   const push = createRegistryChangePush(registry, options.push);
@@ -63,7 +63,6 @@ export function createRegistryChangeProbe(
     read: (lifecycle) => readWithDeadline(probeChange, lifecycle),
     intervalMs,
     ...(push && { push }),
-    ...(options.requestCount && { requestCount: options.requestCount }),
   };
 }
 

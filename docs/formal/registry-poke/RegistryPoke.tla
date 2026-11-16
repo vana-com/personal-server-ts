@@ -44,11 +44,19 @@
     Gate              the push's position stands in for the timer and the
                       probe: while the push is healthy and `lastSeen[d]` is
                       the position the last cycle started under, the timer and
-                      the probe pull nothing, until Net ticks have passed since
-                      that cycle started. Any pull that ran (a push answer, a
-                      probe, the timer) settles the position. The probe's
-                      period is PL whenever it runs: a healthy push no longer
-                      stretches it, it skips it.
+                      the probe pull nothing, however long that lasts: there is
+                      no periodic check on the push. Any pull that ran (a push
+                      answer, a probe, the timer) settles the position. The
+                      probe's period is PL whenever it runs: a healthy push no
+                      longer stretches it, it skips it.
+    CycleFails        a cycle may fail, at most MaxFails times in a run: it
+                      applies nothing and the position it started under is not
+                      settled (the manager settles a position only when a
+                      cycle ends clean).
+    PositionCompare   the gate compares `lastSeen[d]` with the position the last
+                      cycle started under (the shipped rule). FALSE: the gate
+                      skips the timer and the probe whenever the push is
+                      healthy, whatever the positions say.
   Retry back-off: after a failed request the device sends the next one BO ticks
   later (the shipped back-off is 1 s doubling to 30 s, jittered; BO = 3 is the
   30 s cap, BO = 0 the first retry).
@@ -65,23 +73,23 @@
 *)
 EXTENDS Naturals
 
-CONSTANTS Devices, MaxWrites, MaxClock, W, Slack, PL, PH, PT, BO, Bound, Net,
-          Resume, FinalCheck, PullAfterFailure, ProbeOn, StretchOnlyWhenHealthy,
-          ProbeBlind, ForcedPull, TimerOn, Gate, PullOnUnhealthy,
+CONSTANTS Devices, MaxWrites, MaxClock, W, Slack, PL, PH, PT, BO, Bound,
+          MaxFails, Resume, FinalCheck, PullAfterFailure, ProbeOn, StretchOnlyWhenHealthy,
+          ProbeBlind, ForcedPull, TimerOn, Gate, PositionCompare, CycleFails, PullOnUnhealthy,
           PokesLost, AllLost, HubMiss, Disconnects
 
 NoReq == [on |-> FALSE, base |-> 0, since |-> 0, held |-> FALSE]
 NoReply == 0 - 1  \* sentinel: no reply in flight (sequences are naturals)
 
 VARIABLES seq, writes, clock, applied, lastSeen, req, reply, healthy,
-          needPull, retryAt, lastProbe, nextTimer, age, synced, syncedAt
+          needPull, retryAt, lastProbe, nextTimer, age, synced, fails
 
 \* `synced[d]`: the position (a `lastSeen`) the last pull that ran started
-\* under; NoReply when none has, or while it is unknown. `syncedAt[d]`: when.
-sync == <<synced, syncedAt>>
+\* under; NoReply when none has, or while it is unknown.
+sync == <<synced, fails>>
 
 vars == <<seq, writes, clock, applied, lastSeen, req, reply, healthy,
-          needPull, retryAt, lastProbe, nextTimer, age, synced, syncedAt>>
+          needPull, retryAt, lastProbe, nextTimer, age, synced, fails>>
 
 \* A pull that starts a cycle: the cycle reads the registry as it is now, and
 \* started under position `ls`.
@@ -89,27 +97,38 @@ Applied(d, ls) ==
   /\ applied' = [applied EXCEPT ![d] = seq]
   /\ age' = [age EXCEPT ![d] = 0]
   /\ synced' = [synced EXCEPT ![d] = ls]
-  /\ syncedAt' = [syncedAt EXCEPT ![d] = clock]
+  /\ UNCHANGED fails
+
+\* A cycle that fails (CycleFails, at most MaxFails times): it applies nothing and
+\* settles nothing, and the position it started under is no longer vouched for.
+\* The manager retries a failed cycle after a back-off; the model leaves that
+\* retry out, so the only repair is what the timer and the probe do.
+Cycle(d, ls) ==
+  \/ Applied(d, ls)
+  \/ /\ CycleFails /\ fails < MaxFails
+     /\ fails' = fails + 1
+     /\ synced' = [synced EXCEPT ![d] = NoReply]
+     /\ UNCHANGED <<applied, age>>
 
 \* A pull that the marker gates. With a blind marker the gate may find "equal"
 \* and start no cycle; the device does not apply, and does not know it missed.
 Gated(d, ls) ==
-  \/ Applied(d, ls)
+  \/ Cycle(d, ls)
   \/ ProbeBlind /\ UNCHANGED <<applied, age, sync>>
 
 \* A pull started by a push answer or a reconnect.
-PokePull(d, ls) == IF ForcedPull THEN Applied(d, ls) ELSE Gated(d, ls)
+PokePull(d, ls) == IF ForcedPull THEN Cycle(d, ls) ELSE Gated(d, ls)
 
 \* A request failed. A push that was healthy and is not any more starts a cycle
 \* (PullOnUnhealthy); otherwise nothing is pulled.
 Failed(d) ==
-  IF PullOnUnhealthy /\ healthy[d] THEN Applied(d, lastSeen[d])
+  IF PullOnUnhealthy /\ healthy[d] THEN Cycle(d, lastSeen[d])
   ELSE UNCHANGED <<applied, age, sync>>
 
 \* The push's position says nothing moved since the last cycle that ran.
 Covered(d) ==
-  /\ Gate /\ healthy[d] /\ synced[d] = lastSeen[d]
-  /\ clock < syncedAt[d] + Net
+  /\ Gate /\ healthy[d]
+  /\ (PositionCompare => synced[d] = lastSeen[d])
 
 Period(d) ==
   IF Gate THEN PL
@@ -128,7 +147,7 @@ Init ==
   /\ nextTimer = [d \in Devices |-> IF TimerOn THEN PT ELSE MaxClock + 1]
   /\ age = [d \in Devices |-> 0]
   /\ synced = [d \in Devices |-> NoReply]
-  /\ syncedAt = [d \in Devices |-> 0]
+  /\ fails = 0
 
 \* The gateway commits a registry write.
 Commit ==
@@ -230,7 +249,7 @@ Probe(d) ==
 \* does not look at any marker. With Gate it is skipped while the push covers it.
 Timer(d) ==
   /\ TimerOn /\ clock >= nextTimer[d]
-  /\ IF Covered(d) THEN UNCHANGED <<applied, age, sync>> ELSE Applied(d, lastSeen[d])
+  /\ IF Covered(d) THEN UNCHANGED <<applied, age, sync>> ELSE Cycle(d, lastSeen[d])
   /\ nextTimer' = [nextTimer EXCEPT ![d] = clock + PT]
   /\ UNCHANGED <<seq, writes, clock, lastSeen, req, reply, healthy, needPull, retryAt,
                  lastProbe>>

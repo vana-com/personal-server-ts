@@ -46,7 +46,7 @@ function build(
 }
 
 /** A push the test drives by hand. */
-function fakePush(requestPeriodMs = 25_000) {
+function fakePush() {
   const state = {
     subscribed: 0,
     stopped: 0,
@@ -57,7 +57,6 @@ function fakePush(requestPeriodMs = 25_000) {
     },
   };
   const push: ChangePush = {
-    requestPeriodMs,
     subscribe(handlers) {
       state.subscribed += 1;
       state.handlers = handlers;
@@ -549,50 +548,39 @@ describe("a pushed change does not wait for the optional probe", () => {
 });
 
 describe("the push position", () => {
-  // The push answers with the registry's sequence. A cycle reads the registry
-  // after the position it started under, so when the push is healthy and the
-  // position is the one the last clean cycle started under, that cycle already
-  // holds everything the registry has: the timer cycle and the probe add
-  // requests and no news. A full cycle still runs once the safety net elapses,
-  // as a check on the push itself. The net costs no more requests than the
-  // held request does: idle cycle requests x the held request's period.
-  const IDLE_CYCLE_REQUESTS = 29;
-  const NET_MS = IDLE_CYCLE_REQUESTS * 25_000; // 725 s
+  // Every answer of the held request, an empty one at the end of its wait
+  // included, carries the registry's current sequence. A cycle reads the
+  // registry after the position it started under, so when the push is healthy
+  // and the position is the one the last clean cycle started under, that cycle
+  // already holds everything the registry has: the timer cycle and the probe
+  // add requests and no news. A wake that was lost on the way is found by the
+  // next answer, whose position differs. Nothing else is owed.
 
-  /** A manager whose cycle costs IDLE_CYCLE_REQUESTS registry calls. */
+  /** A manager whose push the test drives by hand. */
   function setup(opts: { cycle?: () => Promise<void> } = {}) {
     const { push, state } = fakePush();
-    let requests = 0;
     const cycle = vi.fn(async () => {
-      requests += IDLE_CYCLE_REQUESTS;
       await opts.cycle?.();
     });
     const read = vi.fn(async () => "m1");
     const manager = build({
       localSync: { cycle },
-      changeProbe: {
-        read,
-        intervalMs: 5_000,
-        push,
-        requestCount: () => requests,
-      },
+      changeProbe: { read, intervalMs: 5_000, push },
     });
     return { manager, state, cycle, read };
   }
 
   /**
-   * Start, answer the first position, and let two timer cycles settle on it.
+   * Start, answer the first position, and let one timer cycle settle on it.
    * The start cycle began before any position was known: it proves nothing.
-   * The first timer cycle starts under the position and settles on it, but it
-   * cannot tell an idle cycle from one that found news; the second, which
-   * starts and ends under the position the first started under, prices the net.
+   * The first timer cycle starts under the position and settles on it.
    */
   async function settled(t: ReturnType<typeof setup>, position = "7") {
     t.manager.start();
     await vi.advanceTimersByTimeAsync(0);
     t.state.handlers!.onHealth(true);
     t.state.handlers!.onPosition(position);
-    await vi.advanceTimersByTimeAsync(2 * 60_000);
+    await vi.advanceTimersByTimeAsync(60_000);
     t.cycle.mockClear();
     t.read.mockClear();
   }
@@ -600,95 +588,37 @@ describe("the push position", () => {
   it("runs no timer cycle and no probe while the push is healthy and the position has not moved", async () => {
     const t = setup();
     await settled(t);
-    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
     expect(t.cycle).not.toHaveBeenCalled();
     expect(t.read).not.toHaveBeenCalled();
     await t.manager.stop();
   });
 
-  it("runs one full cycle when the safety net elapses: idle cycle requests x the held request's period", async () => {
+  it("a renewal that answers with an unmoved position owes nothing", async () => {
     const t = setup();
     await settled(t);
-    await vi.advanceTimersByTimeAsync(NET_MS - 61_000);
+    for (let i = 0; i < 100; i++) {
+      t.state.handlers!.onPosition("7"); // an empty answer at the end of the wait
+      await vi.advanceTimersByTimeAsync(25_000);
+    }
     expect(t.cycle).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(2 * 60_000);
-    expect(t.cycle).toHaveBeenCalledTimes(1);
-    await t.manager.stop();
-  });
-
-  it("runs the net's cycle at the probe tick that finds it due, without a marker read first", async () => {
-    const t = setup();
-    await settled(t);
-    // The timer's next tick is up to 60 s away; the probe ticks every 5 s.
-    await vi.advanceTimersByTimeAsync(NET_MS + 10_000);
-    expect(t.cycle).toHaveBeenCalledTimes(1);
     expect(t.read).not.toHaveBeenCalled();
     await t.manager.stop();
   });
 
-  it("prices the net on an idle cycle, not on one that found news", async () => {
-    let requests = 0;
-    let news = false;
-    const { push, state } = fakePush();
-    const cycle = vi.fn(async () => {
-      requests += news ? 5_000 : IDLE_CYCLE_REQUESTS;
-    });
-    const manager = build({
-      localSync: { cycle },
-      changeProbe: {
-        read: async () => "m1",
-        intervalMs: 5_000,
-        push,
-        requestCount: () => requests,
-      },
-    });
-    manager.start();
+  it("a wake lost on the way is found by the next answer: its position differs from the last clean one", async () => {
+    const t = setup();
+    await settled(t);
+    // The poke never arrived; the renewal's answer carries the position.
+    t.state.handlers!.onPosition("8");
+    t.state.handlers!.onChange();
     await vi.advanceTimersByTimeAsync(0);
-    state.handlers!.onHealth(true);
-    state.handlers!.onPosition("7");
-    await vi.advanceTimersByTimeAsync(2 * 60_000); // priced: 29 requests
-    // A pass under a new position finds news and costs far more.
-    news = true;
-    state.handlers!.onPosition("8");
-    await vi.advanceTimersByTimeAsync(60_000);
-    news = false;
-    cycle.mockClear();
-    // Still the idle price: one cycle after 725 s, not after 5 000 x 25 s.
-    await vi.advanceTimersByTimeAsync(NET_MS + 60_000);
-    expect(cycle).toHaveBeenCalledTimes(1);
-    await manager.stop();
-  });
-
-  it("follows the idle price as it changes", async () => {
-    let requests = 0;
-    let cost = IDLE_CYCLE_REQUESTS;
-    const { push, state } = fakePush();
-    const cycle = vi.fn(async () => {
-      requests += cost;
-    });
-    const manager = build({
-      localSync: { cycle },
-      changeProbe: {
-        read: async () => "m1",
-        intervalMs: 5_000,
-        push,
-        requestCount: () => requests,
-      },
-    });
-    manager.start();
-    await vi.advanceTimersByTimeAsync(0);
-    state.handlers!.onHealth(true);
-    state.handlers!.onPosition("7");
-    await vi.advanceTimersByTimeAsync(2 * 60_000);
-    // The net ends: the next idle cycle costs twice as much (more streams).
-    cost = 2 * IDLE_CYCLE_REQUESTS;
-    await vi.advanceTimersByTimeAsync(NET_MS + 60_000);
-    cycle.mockClear();
-    await vi.advanceTimersByTimeAsync(NET_MS + 60_000);
-    expect(cycle).not.toHaveBeenCalled(); // the net is now 1 450 s
-    await vi.advanceTimersByTimeAsync(NET_MS + 60_000);
-    expect(cycle).toHaveBeenCalledTimes(1);
-    await manager.stop();
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    // That cycle started under "8": quiet again.
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(t.cycle).not.toHaveBeenCalled();
+    await t.manager.stop();
   });
 
   it("runs a cycle when the position moved, even if no poke arrived", async () => {
@@ -797,7 +727,6 @@ describe("the push position", () => {
         read: async () => "m1",
         intervalMs: 5_000,
         push,
-        requestCount: () => 0,
       },
     });
     manager.start();
@@ -810,24 +739,6 @@ describe("the push position", () => {
     cycle.mockClear();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(cycle).toHaveBeenCalledTimes(1);
-    await manager.stop();
-  });
-
-  it("without a request counter the net is the poll interval: no saving, no risk", async () => {
-    const { push, state } = fakePush();
-    const cycle = vi.fn(async () => {});
-    const manager = build({
-      localSync: { cycle },
-      changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
-    });
-    manager.start();
-    await vi.advanceTimersByTimeAsync(0);
-    state.handlers!.onHealth(true);
-    state.handlers!.onPosition("7");
-    await vi.advanceTimersByTimeAsync(60_000);
-    cycle.mockClear();
-    await vi.advanceTimersByTimeAsync(5 * 60_000);
-    expect(cycle.mock.calls.length).toBeGreaterThanOrEqual(4);
     await manager.stop();
   });
 

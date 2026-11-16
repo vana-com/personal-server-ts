@@ -326,6 +326,10 @@ describe("PS Lite sync", () => {
 
   describe("the registration check before a cycle", () => {
     async function managerOver(getServer: ReturnType<typeof vi.fn>) {
+      const listDataPointsByOwner = vi.fn(async () => ({
+        dataPoints: [],
+        cursor: null,
+      }));
       const stateStore = createMemoryPsLiteStateStore();
       const accountStorageMode = {
         owner: await recoverServerOwner(OWNER_SIGNATURE),
@@ -346,29 +350,40 @@ describe("PS Lite sync", () => {
         gateway: { getServer, registerServer: vi.fn() } as never,
         dataPointFeed: {
           getDataPoint: async () => null,
-          listDataPointsByOwner: async () => ({
-            dataPoints: [],
-            cursor: null,
-          }),
+          listDataPointsByOwner,
         },
         autoStartSync: false,
       });
-      return syncManager;
+      return Object.assign(syncManager, { listDataPointsByOwner });
     }
 
-    it("asks the gateway once for a registered server, not at every cycle", async () => {
-      // Registration does not lapse while the manager lives. Each ask is a
-      // gateway request that a device repeats at every cycle it ever runs.
-      const getServer = vi.fn().mockResolvedValue({ id: "server-1" });
+    it("asks at every cycle, so a server deregistered after a good answer is blocked and transfers nothing", async () => {
+      // Registration can lapse while the manager lives. A cycle is the unit of
+      // work the ask rides on: a device with a healthy change push runs one
+      // only when the registry moved, so the ask costs one request next to the
+      // cycle's reads.
+      const getServer = vi
+        .fn()
+        .mockResolvedValueOnce({ id: "server-1" })
+        .mockResolvedValue(null);
       const manager = await managerOver(getServer);
       try {
         await manager.trigger();
+        expect(manager.getStatus().blocked).toBeNull();
+        const readsWhileRegistered =
+          manager.listDataPointsByOwner.mock.calls.length;
+        expect(readsWhileRegistered).toBeGreaterThan(0);
         await manager.trigger();
-        await manager.trigger();
+        expect(manager.getStatus().blocked).toMatchObject({
+          reason: "unregistered",
+        });
+        expect(manager.listDataPointsByOwner.mock.calls.length).toBe(
+          readsWhileRegistered,
+        );
       } finally {
         await manager.stop();
       }
-      expect(getServer).toHaveBeenCalledTimes(1);
+      expect(getServer).toHaveBeenCalledTimes(2);
     });
 
     it("keeps asking while the server is unregistered, so registering unblocks sync", async () => {
