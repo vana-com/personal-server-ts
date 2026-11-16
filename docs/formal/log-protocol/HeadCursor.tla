@@ -15,6 +15,10 @@
 (*                 sets cons and restarts the log replay from position 0.  *)
 (* Mode "fixedNoRebase": the same skip rule, no replay after admission.    *)
 (*                                                                         *)
+(* Mode "fixedSplit": the fixed rule, but the head step and the log step are *)
+(*                 two operations (a single-stream apply returns after the  *)
+(*                 head step). InvReplayed refuses the state between them.  *)
+(*                                                                         *)
 (* A row is [rank, live]. The larger rank wins; live=FALSE is a tombstone. *)
 (* A head apply merges the head's rows, then drops the rows the head does  *)
 (* not hold whose rank is <= the head's cutoff (applyDelete/omission).     *)
@@ -22,7 +26,7 @@
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 CONSTANTS Mode
-ASSUME Mode \in {"today","todayRebase","fixed","fixedNoRebase"}
+ASSUME Mode \in {"today","todayRebase","fixed","fixedNoRebase","fixedSplit"}
 
 Devices == {"A","C","R"}   \* A: log writer. C: reader. R: reader that starts late.
 Keys == {1,2,3}            \* 1 = x (in both heads), 2 = z (only in head 2), 3 = a (A's own)
@@ -75,32 +79,61 @@ LogRound ==
 Skip(d) == IF Mode \in {"today","todayRebase"} THEN lver[d] > regV ELSE regV <= cons[d]
 
 \* One apply job: the registry head first, then the log from the device's position.
-Apply(d) ==
+HeadStep(d) ==
   LET h == Heads[regV]
       admit == regV > 0 /\ ~Skip(d)
       d1 == IF admit THEN MergeRows(Omit(data[d], h), h.rows) ELSE data[d]
       lver1 == IF admit THEN (IF Mode \in {"today","todayRebase"} \/ lver[d] < regV THEN regV ELSE lver[d] + 1)
                ELSE lver[d]
       cons1 == IF admit THEN regV ELSE cons[d]
-      pos1 == IF admit /\ Mode \in {"fixed","todayRebase"} THEN 0 ELSE pos[d]
-      d2 == FoldLog(d1, log, pos1 + 1, Len(log))
-  IN /\ data' = [data EXCEPT ![d] = d2]
-     /\ lver' = [lver EXCEPT ![d] = lver1 + (Len(log) - pos1)]
-     /\ cons' = [cons EXCEPT ![d] = cons1]
+      pos1 == IF admit /\ Mode \in {"fixed","fixedSplit","todayRebase"} THEN 0 ELSE pos[d]
+  IN [d1 |-> d1, lver1 |-> lver1, cons1 |-> cons1, pos1 |-> pos1]
+LogStep(d, hs) ==
+  [d2 |-> FoldLog(hs.d1, log, hs.pos1 + 1, Len(log)),
+   lver2 |-> hs.lver1 + (Len(log) - hs.pos1)]
+Apply(d) ==
+  LET hs == HeadStep(d)
+      ls == LogStep(d, hs)
+  IN /\ Mode # "fixedSplit"
+     /\ data' = [data EXCEPT ![d] = ls.d2]
+     /\ lver' = [lver EXCEPT ![d] = ls.lver2]
+     /\ cons' = [cons EXCEPT ![d] = hs.cons1]
      /\ pos' = [pos EXCEPT ![d] = Len(log)]
      /\ data' # data \/ lver' # lver \/ cons' # cons \/ pos' # pos
      /\ UNCHANGED <<regV,log,stopped>>
+\* fixedSplit: a single-stream apply admits the head and returns.
+ApplyHead(d) ==
+  LET hs == HeadStep(d)
+  IN /\ Mode = "fixedSplit"
+     /\ data' = [data EXCEPT ![d] = hs.d1]
+     /\ lver' = [lver EXCEPT ![d] = hs.lver1]
+     /\ cons' = [cons EXCEPT ![d] = hs.cons1]
+     /\ pos' = [pos EXCEPT ![d] = hs.pos1]
+     /\ data' # data \/ lver' # lver \/ cons' # cons \/ pos' # pos
+     /\ UNCHANGED <<regV,log,stopped>>
+ApplyLogOnly(d) ==
+  LET ls == LogStep(d, [d1 |-> data[d], lver1 |-> lver[d], pos1 |-> pos[d]])
+  IN /\ Mode = "fixedSplit" /\ pos[d] < Len(log)
+     /\ data' = [data EXCEPT ![d] = ls.d2]
+     /\ lver' = [lver EXCEPT ![d] = ls.lver2]
+     /\ pos' = [pos EXCEPT ![d] = Len(log)]
+     /\ UNCHANGED <<regV,log,stopped,cons>>
 
 Stop == ~stopped /\ stopped' = TRUE /\ UNCHANGED <<regV,log,data,lver,cons,pos>>
 
-Next == CommitHead \/ LogRound \/ Stop \/ \E d \in Devices : Apply(d)
-Spec == Init /\ [][Next]_vars /\ WF_vars(Stop) /\ \A d \in Devices : WF_vars(Apply(d))
+Next == CommitHead \/ LogRound \/ Stop \/ \E d \in Devices : Apply(d) \/ ApplyHead(d) \/ ApplyLogOnly(d)
+Spec == Init /\ [][Next]_vars /\ WF_vars(Stop) /\ \A d \in Devices : WF_vars(Apply(d)) /\ WF_vars(ApplyHead(d)) /\ WF_vars(ApplyLogOnly(d))
 
 \* What a device that reads head and log from nothing holds.
 Truth == IF regV = 0 THEN FoldLog(Empty, log, 1, Len(log))
          ELSE FoldLog(MergeRows(Omit(Empty, Heads[regV]), Heads[regV].rows), log, 1, Len(log))
 \* After the writers stop and every device has read, all hold the same rows.
 EventuallyConverged == <>[](stopped /\ \A d \in Devices : data[d] = Truth)
+\* A device that holds the current head holds the head's rows with the log's rows
+\* of its position over them: no state keeps the head and lacks the replay.
+InvReplayed ==
+  \A d \in Devices : (regV > 0 /\ cons[d] = regV) =>
+     data[d] = FoldLog(MergeRows(Omit(Empty, Heads[regV]), Heads[regV].rows), log, 1, pos[d])
 TypeOK == /\ regV \in 0..Len(Heads) /\ Len(log) <= Len(Rounds)
           /\ \A d \in Devices : lver[d] \in Nat /\ cons[d] \in 0..Len(Heads)
 =============================================================================

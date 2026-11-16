@@ -12,6 +12,7 @@ import {
   headBlobName,
   isPlainObject,
   isLogStream,
+  logScope,
   omissionCutoff,
   parseScope,
   partBlobName,
@@ -43,7 +44,7 @@ import {
   hydrateLifetimeBoundary,
   olderLifetimeFence,
 } from "./lifetime-boundary.js";
-import { applyLog } from "./log-apply.js";
+import { applyLog, LogDivergedError, readLogState } from "./log-apply.js";
 import { readPartsAhead, type PartReader } from "./part-readahead.js";
 import { purgeConnection } from "./purge.js";
 import {
@@ -299,7 +300,9 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
       if (row.found) reuse.log = row;
     }
     if (await logFollowed(deps, id, reuse)) {
-      // Streams published before the log, then the log on top of them.
+      // Streams published before the log, then the log on top of them. A job
+      // for one stream that admitted a head reads the log too: the head's
+      // omission can drop rows the log holds, and its position was dropped.
       const [now] = await deps.db.query<{
         generation: number;
         control_state: string;
@@ -643,6 +646,37 @@ async function applyOneOnce(
   ) {
     const answer = result(stream, "noop");
     return reuse.partial ? early(answer) : settled(answer);
+  }
+  // Admitting this head drops the log position (see the final batch), and with
+  // it the evidence that a registry log behind this device, or on another
+  // history, is not a continuation. Read it first: nothing is written for a
+  // head that `applyLog` would refuse after it.
+  {
+    const held = await readLogState(deps, id);
+    const lastRef = held.refs.at(-1);
+    if (held.position > 0) {
+      const logRead = reuse.stale
+        ? await deps.registry.read(
+            logScope(connection.connector, connection.ns),
+          )
+        : (reuse.log ??
+          (await deps.registry.read(
+            logScope(connection.connector, connection.ns),
+          )));
+      if (
+        logRead.found &&
+        classifyStreamRow(logRead, hashes) === "present" &&
+        (logRead.version < held.position ||
+          (logRead.version === held.position &&
+            lastRef !== undefined &&
+            lastRef.dataHash.toLowerCase() !== logRead.dataHash.toLowerCase()))
+      )
+        throw new LogDivergedError(
+          logRead.version < held.position
+            ? `apply: the log registry is at position ${logRead.version}, behind this device at ${held.position}`
+            : `apply: the log names a different segment at position ${held.position} than this device applied`,
+        );
+    }
   }
   const saved = await deps.db.query<SavedPart>(
     "SELECT prefix,seq,part_hash,bytes,count FROM head_parts WHERE connection_id=? AND stream=? ORDER BY prefix,seq",

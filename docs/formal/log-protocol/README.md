@@ -452,22 +452,20 @@ give one row. `equal-stamp-order.test.ts` has a `part` step (same SQL options as
 `log-protocol.test.ts` loads a head and a log naming one key at one stamp
 through a first load, a progressive first load and a compacted snapshot. Those
 tests assert first-load devices only. The writer and a reader that already
-followed the log are cycled and asserted in the boundary tests (below).
+followed the log are cycled and asserted in the head-beside-the-log tests (below).
 
-Boundary, not an ordering matter: a log-on device that already follows the log
-does not read a head whose registry version is not above its own
-(`applyOneOnce`, the `head_version > read.version` answer), at any stamp. A first
-load reads it. So a head published outside the followed log reaches first loads
-and not the devices that follow it. `log-protocol.test.ts` pins this at an equal
-stamp and at a later one (the second case is decided by the stamp alone, so the
-ordinal plays no part). The test expects today's split; closing the boundary
-changes its expected values.
+A log-on device that already follows the log reads a registry head it has not
+consumed, as a first load does, whatever the head's registry version is beside
+its own local version (`applyOneOnce`, `stream_state.consumed_*`; see HeadCursor
+below). It then reads the log over the head. `log-protocol.test.ts` asserts all
+four devices (writer, early reader, fresh, progressive) end on the head's row,
+at an equal stamp and at a later one, and stay there over repeated cycles.
 
 What publishes a head beside a log is not only the flag. A log-off device does.
 So does a log-on device whose registry has no batch route, or that cached "no
 batch route" earlier: `publishLog` returns `null` and the caller publishes per
 stream (`log-publish.ts:184-185`, `232-234`). A fleet whose flags are all on is
-not by that fact free of this boundary, for example during a gateway rollout.
+not by that fact free of this case, for example during a gateway rollout.
 No test here drives that fallback. A device that flips from log on to log off on
 one database also fails its per-stream publish with a `UNIQUE` error on
 `stream_versions` (the log's apply allocates versions there); that refusal
@@ -492,12 +490,15 @@ head's rows and then drops rows the head lacks whose rank is at or below its
 cutoff. Pending unpublished local changes, compaction and snapshots are not
 modelled. The corpus (two heads, two rounds) is a model limit, not a claim.
 
-| Configuration                | Skip rule              | After admitting a head | TLC result (EventuallyConverged)                                                                 |
-| ---------------------------- | ---------------------- | ---------------------- | ------------------------------------------------------------------------------------------------ |
-| HeadCursor-today.cfg         | `lver > head version`  | log not replayed       | FAIL                                                                                             |
-| HeadCursor-todayRebase.cfg   | `lver > head version`  | log replayed from 0    | FAIL: the writer keeps `cons=1`, `lver=3`, never reads head 2                                    |
-| HeadCursor-fixedNoRebase.cfg | `head version <= cons` | log not replayed       | FAIL: the head's cutoff drops the writer's own row `a`; position stays, replay never restores it |
-| HeadCursor-fixed.cfg         | `head version <= cons` | log replayed from 0    | PASS: 4568 states generated, 658 distinct, depth complete                                        |
+| Configuration                | Skip rule              | After admitting a head                    | TLC result (EventuallyConverged)                                                                                        |
+| ---------------------------- | ---------------------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| HeadCursor-today.cfg         | `lver > head version`  | log not replayed                          | FAIL                                                                                                                    |
+| HeadCursor-todayRebase.cfg   | `lver > head version`  | log replayed from 0                       | FAIL: the writer keeps `cons=1`, `lver=3`, never reads head 2                                                           |
+| HeadCursor-fixedNoRebase.cfg | `head version <= cons` | log not replayed                          | FAIL: the head's cutoff drops the writer's own row `a`; position stays, replay never restores it                        |
+| HeadCursor-fixed.cfg         | `head version <= cons` | log replayed from 0                       | PASS: 4568 states generated, 658 distinct, depth complete                                                               |
+| HeadCursor-fixedSplit.cfg    | `head version <= cons` | head step and log step are two operations | FAIL InvReplayed: a device holds the head and lacks the replay (a single-stream apply that returns after the head step) |
+
+`InvReplayed` (a device holding the current head holds the head's rows with the log's rows over them) is checked in `fixed` and `fixedSplit`. The code keeps head and replay one operation: a job for one stream that admits a head also reads the log before it returns.
 
 Run on 2026-11-16, TLC 2.19 (`tla2tools.jar` 1.7.4, Java 17), `-workers 4`.
 Traces: `traces/head-cursor-*.txt`. The two mutants show that both halves of the
