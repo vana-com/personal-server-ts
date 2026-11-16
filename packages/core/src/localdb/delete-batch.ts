@@ -1,11 +1,17 @@
 /**
  * The first landing of a connection delete as batch requests: the control
  * fences of its namespaces in one `POST /v1/data/batch`, then every stream
- * tombstone in the next (each split above the gateway's row limit).
+ * tombstone in the next (each split at the bounds the gateway advertised, or
+ * at the fixed caps every gateway accepts before it has).
  *
  * Each participant (a fence, or a stream) submits at most one signed row, or
- * leaves without one. When every participant has done one or the other the
- * rows go out. No timer: a participant is never waited for past its own work.
+ * leaves without one. The fence rows go out as soon as every fence participant
+ * has done one or the other, without waiting for the streams: a stream's work
+ * before its row (its head upload) runs beside the fence request, so the two
+ * round trips are the fence and the stream rows, not those and an upload in
+ * front of them. The stream rows go out once every stream participant has
+ * arrived and the fences have landed. No timer: a participant is never waited
+ * for past its own work.
  *
  * Why two requests and not one:
  * - A stream row of namespace N must land only if N's fence landed. The only
@@ -34,7 +40,7 @@ import {
   type SignedBatchRow,
   type StreamSyncRegistry,
 } from "../stream-sync/ports.js";
-import { GATEWAY_MAX_BATCH_ROWS } from "./batch-commit.js";
+import { batchBounds } from "./batch-commit.js";
 
 /** `committed`: the row is written. `fallback`: it is not; use the per-stream path. */
 export type BatchTurn = "committed" | "fallback";
@@ -46,7 +52,7 @@ export interface DeleteBatcher {
     part: { readonly ns: string; readonly fence: boolean },
   ): Promise<BatchTurn>;
   /** This participant has no row to send. */
-  leave(): void;
+  leave(part: { readonly fence: boolean }): void;
 }
 
 interface Parked {
@@ -64,15 +70,23 @@ export function createDeleteBatcher(options: {
   /** The version each namespace's control row held when the delete was planned. */
   readonly pins: ReadonlyMap<string, number>;
   readonly hashes: Pick<ControlHashes, "activeData" | "tombstoneData">;
-  /** Fences plus streams: each calls `submit` or `leave` once. */
-  readonly participants: number;
+  /** Each calls `submit` or `leave` once: one per fence, one per stream. */
+  readonly fenceParticipants: number;
+  readonly streamParticipants: number;
   /** The registry answered that it has no batch route. */
   readonly onUnusable: () => void;
   /** The registry refused the request (HTTP 4xx other than 409): a defect to surface. */
   readonly onRefused: (error: RegistryRefusedError) => void;
 }): DeleteBatcher {
-  let outstanding = options.participants;
-  const parked: Parked[] = [];
+  let fencesOutstanding = options.fenceParticipants;
+  let streamsOutstanding = options.streamParticipants;
+  const fenceRows: Parked[] = [];
+  const streamRows: Parked[] = [];
+  /** Whether every fence row is written: the stream rows rest on it. */
+  let fencesDone!: (healthy: boolean) => void;
+  const fencesLanded = new Promise<boolean>((resolve) => {
+    fencesDone = resolve;
+  });
 
   /**
    * The fence rows carry their own compare-and-set. The stream rows of a
@@ -143,43 +157,74 @@ export function createDeleteBatcher(options: {
     }
   }
 
-  async function flush() {
-    const byScope = (a: Parked, b: Parked) =>
-      a.row.scope < b.row.scope ? -1 : a.row.scope > b.row.scope ? 1 : 0;
-    const rows = parked.splice(0);
-    const split = (list: Parked[]) => {
-      const chunks: Parked[][] = [];
-      for (let i = 0; i < list.length; i += GATEWAY_MAX_BATCH_ROWS)
-        chunks.push(list.slice(i, i + GATEWAY_MAX_BATCH_ROWS));
-      return chunks;
-    };
-    const fences = split(rows.filter((p) => p.fence).sort(byScope));
-    const streams = split(rows.filter((p) => !p.fence).sort(byScope));
-    let healthy = true;
-    for (const chunk of fences) {
-      if (!healthy) {
-        for (const p of chunk) p.settle("fallback");
-        continue;
+  const byScope = (a: Parked, b: Parked) =>
+    a.row.scope < b.row.scope ? -1 : a.row.scope > b.row.scope ? 1 : 0;
+
+  /**
+   * Chunks of at most the gateway's rows and conditions: a stream chunk names
+   * one condition per namespace it holds, a fence chunk none.
+   */
+  function split(list: readonly Parked[]): Parked[][] {
+    const bounds = batchBounds(options.registry);
+    const chunks: Parked[][] = [];
+    let chunk: Parked[] = [];
+    let namespaces = new Set<string>();
+    for (const part of list) {
+      const needs = part.fence || namespaces.has(part.ns) ? 0 : 1;
+      if (
+        chunk.length > 0 &&
+        (chunk.length >= bounds.rows ||
+          namespaces.size + needs > bounds.requires)
+      ) {
+        chunks.push(chunk);
+        chunk = [];
+        namespaces = new Set();
       }
-      healthy = await send(chunk);
+      chunk.push(part);
+      if (!part.fence) namespaces.add(part.ns);
     }
-    if (!healthy) {
-      for (const chunk of streams) for (const p of chunk) p.settle("fallback");
-      return;
-    }
-    await Promise.all(streams.map(send));
+    if (chunk.length > 0) chunks.push(chunk);
+    return chunks;
   }
 
-  const arrived = () => {
-    outstanding--;
-    if (outstanding === 0 && parked.length > 0) void flush();
+  async function flushFences() {
+    const rows = fenceRows.splice(0).sort(byScope);
+    // Each fence is its own compare-and-set on its own row: chunks do not
+    // depend on one another, so they go out together.
+    const results = await Promise.all(split(rows).map(send));
+    fencesDone(results.every(Boolean));
+  }
+
+  async function flushStreams() {
+    const rows = streamRows.splice(0).sort(byScope);
+    if (!(await fencesLanded)) {
+      for (const p of rows) p.settle("fallback");
+      return;
+    }
+    await Promise.all(split(rows).map(send));
+  }
+
+  const fenceArrived = () => {
+    fencesOutstanding--;
+    if (fencesOutstanding === 0) void flushFences();
   };
+  const streamArrived = () => {
+    streamsOutstanding--;
+    if (streamsOutstanding === 0) void flushStreams();
+  };
+  // Nothing to fence: the stream rows rest on no fence of this request.
+  if (fencesOutstanding === 0) fencesDone(true);
   return {
     submit: (row, part) =>
       new Promise<BatchTurn>((settle, fail) => {
-        parked.push({ row, ...part, settle, fail });
-        arrived();
+        (part.fence ? fenceRows : streamRows).push({
+          row,
+          ...part,
+          settle,
+          fail,
+        });
+        (part.fence ? fenceArrived : streamArrived)();
       }),
-    leave: arrived,
+    leave: (part) => (part.fence ? fenceArrived : streamArrived)(),
   };
 }

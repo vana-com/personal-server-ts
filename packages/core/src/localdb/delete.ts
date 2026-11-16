@@ -199,25 +199,40 @@ export function createConnectionDeleter(
     const { hashes } = await keyInfo();
     const controls = new Map<string, ControlState>();
     const pins: { ns: string; version: number }[] = [];
-    for (const entry of await deps.registry.listControlRows()) {
-      const parsed = parseScope(entry.scope);
-      if (parsed?.kind !== "control" || parsed.connector !== connector)
-        continue;
-      const current = classifyControl(
-        await deps.registry.read(entry.scope),
-        hashes,
-      );
-      controls.set(parsed.ns, current);
+    const streams: StreamPin[] = [];
+    const listing = new Map<string, ControlRead>();
+    // The two listings and the control rereads depend on nothing of one
+    // another, so they are in flight together. The listed control rows are a
+    // hint that can lag, so each control row is read again for its pin; the
+    // stream rows are a hint too, and every write on them is a compare-and-set.
+    const [observed, listedStreams] = await Promise.all([
+      deps.registry.listControlRows().then((entries) =>
+        Promise.all(
+          entries.flatMap((entry) => {
+            const parsed = parseScope(entry.scope);
+            return parsed?.kind === "control" && parsed.connector === connector
+              ? [
+                  deps.registry
+                    .read(entry.scope)
+                    .then((read) => ({ ns: parsed.ns, read })),
+                ]
+              : [];
+          }),
+        ),
+      ),
+      deps.registry.listStreamRows(connector),
+    ]);
+    for (const { ns, read } of observed) {
+      const current = classifyControl(read, hashes);
+      controls.set(ns, current);
       if (current.kind === "active" || current.kind === "foreign")
         pins.push({
-          ns: parsed.ns,
+          ns,
           version:
             current.kind === "active" ? current.generation : current.version,
         });
     }
-    const streams: StreamPin[] = [];
-    const listing = new Map<string, ControlRead>();
-    for (const entry of await deps.registry.listStreamRows(connector)) {
+    for (const entry of listedStreams) {
       const parsed = parseScope(entry.scope);
       if (parsed?.kind === "stream" && parsed.connector === connector) {
         listing.set(entry.scope, { ...entry.read });
@@ -774,7 +789,8 @@ export function createConnectionDeleter(
           controlScopeOf: (ns) => controlScope(connector, ns),
           pins,
           hashes,
-          participants: unfencedPins.length + streams.length,
+          fenceParticipants: unfencedPins.length,
+          streamParticipants: streams.length,
           onUnusable: () => {
             batchOff = true;
           },
@@ -790,6 +806,7 @@ export function createConnectionDeleter(
         });
         /** Each participant sends one row or leaves, whatever else happens. */
         const participate = async (
+          fence: boolean,
           work: (submit: DeleteBatcher) => Promise<void>,
         ) => {
           let sent = false;
@@ -801,18 +818,18 @@ export function createConnectionDeleter(
               },
               leave: () => {
                 sent = true;
-                batcher.leave();
+                batcher.leave({ fence });
               },
             });
           } catch (error) {
             if (!(error instanceof BatchFellBack)) throw error;
           } finally {
-            if (!sent) batcher.leave();
+            if (!sent) batcher.leave({ fence });
           }
         };
         const fences = Promise.all(
           unfencedPins.map((pin) =>
-            participate(async (own) => {
+            participate(true, async (own) => {
               const scope = controlScope(connector, pin.ns);
               const turn = await own.submit(
                 {
@@ -851,7 +868,7 @@ export function createConnectionDeleter(
         await settleAll([
           fences,
           ...streams.map((target) =>
-            participate(async (own) => {
+            participate(false, async (own) => {
               await cleanStream(connector, target, hashes, keyCheck, {
                 batcher: own,
                 ended: pins.get(target.ns)!,
