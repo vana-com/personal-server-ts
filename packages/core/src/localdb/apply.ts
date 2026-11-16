@@ -1,5 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2";
-import { keccak_256 } from "@noble/hashes/sha3";
+import { keccakOf } from "../stream-sync/crypto-port.js";
 import {
   canonicalJson,
   classifyControl,
@@ -122,7 +122,6 @@ async function clearPartial(deps: LocalSyncDeps, id: string, job: Reuse) {
 }
 
 const sha = async (bytes: Uint8Array) => sha256(bytes);
-const keccak = async (bytes: Uint8Array) => keccak_256(bytes);
 const result = (
   stream: string,
   outcome: ApplyResult["outcome"],
@@ -250,7 +249,7 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
       return [...flight.streams].map((s) => result(s, "gone"));
     }
     const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
-    const hashes = await controlHashes(keccak, keyCheck);
+    const hashes = await controlHashes(keccakOf(deps.streamCrypto), keyCheck);
     const initial = await control(locked, id, connection, hashes, reuse);
     if (initial.kind !== "active") {
       if (flight.all)
@@ -711,7 +710,7 @@ async function applyOneOnce(
     throw new Error("apply: missing head blob");
   }
   const verified = await verifyHead(
-    keccak,
+    keccakOf(deps.streamCrypto),
     await deps.keys.decrypt(scope, cipher),
     {
       dataHash: read.dataHash,

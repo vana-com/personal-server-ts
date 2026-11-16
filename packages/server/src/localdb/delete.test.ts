@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { afterEach, expect, it, vi } from "vitest";
 import {
   connectionQueue,
@@ -16,6 +17,7 @@ import {
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import { createConnectionDeleter } from "../../../core/src/localdb/delete.js";
+import { batchBounds } from "../../../core/src/localdb/batch-commit.js";
 import { gatewayBatchRefusal } from "../../../core/src/localdb/batch-contract.js";
 import {
   RegistryRefusedError,
@@ -1073,7 +1075,7 @@ function withBatchRoute(f: World, route: "present" | 405 = "present") {
     batches.push(request);
     if (route === 405) return { kind: "unsupported" };
     // The real route answers 400 to a request of a shape it refuses.
-    const refusal = gatewayBatchRefusal(request);
+    const refusal = gatewayBatchRefusal(request, batchBounds(f.registry));
     if (refusal !== null)
       throw new RegistryRefusedError(`batch POST refused: ${refusal}`, 400);
     for (const need of request.requires) {
@@ -1316,4 +1318,163 @@ it("a delete that cannot land logs the cause, with its message and stack", async
     }),
     "connection delete pending",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Serial depth: every request a delete makes, with the requests that had
+// already finished when it started. The depth is the longest chain.
+// ---------------------------------------------------------------------------
+
+/**
+ * Gives every registry and blob request a fixed latency and records when it
+ * started and ended. `depth` is the number of requests on the longest chain
+ * where each started after the last ended: the time a delete takes, in
+ * round trips, when every request costs the same.
+ */
+function withRequestClock(f: World, latencyMs: number) {
+  type Call = {
+    name: string;
+    scope: string;
+    start: number;
+    end: number;
+    depth: number;
+  };
+  const calls: Call[] = [];
+  const inside = new AsyncLocalStorage<boolean>();
+  const clock = () => performance.now();
+  const timed = <A extends unknown[], R>(
+    name: string,
+    scopeOf: (...args: A) => string,
+    send: (...args: A) => Promise<R>,
+  ) => {
+    return async (...args: A): Promise<R> => {
+      // A request a registry makes of itself is part of the outer request.
+      if (inside.getStore()) return send(...args);
+      const call: Call = {
+        name,
+        scope: scopeOf(...args),
+        start: clock(),
+        end: 0,
+        depth: 0,
+      };
+      // Requests that ended before this one began are what it waited for.
+      // A little slack keeps timer jitter from ordering parallel requests.
+      call.depth =
+        1 +
+        Math.max(
+          0,
+          ...calls
+            .filter((c) => c.end > 0 && c.end <= call.start + 1)
+            .map((c) => c.depth),
+        );
+      calls.push(call);
+      await new Promise((resolve) => setTimeout(resolve, latencyMs));
+      try {
+        return await inside.run(true, () => send(...args));
+      } finally {
+        call.end = clock();
+      }
+    };
+  };
+  const registry = f.registry as StreamSyncRegistry & {
+    listControlRows: StreamSyncRegistry["listControlRows"];
+  };
+  const bind = <K extends keyof StreamSyncRegistry>(key: K) =>
+    (registry[key] as (...args: never[]) => Promise<unknown>).bind(registry);
+  const read = bind("read");
+  registry.read = timed("read", (scope: string) => scope, read as never);
+  const post = f.registry.post.bind(f.registry);
+  f.registry.post = timed("post", (r) => r.scope, post);
+  const postBatch = registry.postBatch!.bind(registry);
+  registry.postBatch = timed(
+    "batch",
+    (r: SignedRegistryBatch) => r.rows.map((row) => row.scope).join(","),
+    postBatch,
+  );
+  const listControlRows = bind("listControlRows");
+  registry.listControlRows = timed(
+    "listControlRows",
+    () => "",
+    listControlRows as never,
+  );
+  const listStreamRows = bind("listStreamRows");
+  registry.listStreamRows = timed(
+    "listStreamRows",
+    (c: string) => c,
+    listStreamRows as never,
+  );
+  const put = f.blobs.put.bind(f.blobs);
+  f.blobs.put = timed("blob.put", (k: string) => k, put);
+  const get = f.blobs.get.bind(f.blobs);
+  f.blobs.get = timed("blob.get", (k: string) => k, get);
+  return {
+    calls,
+    get depth() {
+      return Math.max(0, ...calls.map((c) => c.depth));
+    },
+    summary: () =>
+      calls
+        .map((c) => `${c.depth} ${c.name}`)
+        .sort()
+        .join("\n"),
+  };
+}
+
+const countOf = (clock: ReturnType<typeof withRequestClock>, name: string) =>
+  clock.calls.filter((c) => c.name === name).length;
+
+for (const count of [1, 6, 20]) {
+  it(`a ${count}-stream delete is four round trips: list, reread the control row, fence beside the head uploads, stream rows`, async () => {
+    const f = await world(undefined, names(count));
+    withBatchRoute(f);
+    const clock = withRequestClock(f, 60);
+    const started = await f.a.deleter.requestConnectionDelete("fixture-source");
+    expect(started.fenced).toBe(true);
+    // The request answers when the fence is confirmed: the third round trip.
+    const fence = clock.calls.find(
+      (c) => c.name === "batch" && c.scope === f.control,
+    )!;
+    expect(fence.depth).toBe(3);
+    expect(fence.end).toBeGreaterThan(0);
+    expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+    expect(clock.depth).toBe(4);
+    // Nothing is read or written one row at a time, and no old head is read.
+    expect(countOf(clock, "post")).toBe(0);
+    expect(countOf(clock, "blob.get")).toBe(0);
+    expect(countOf(clock, "listControlRows")).toBe(1);
+    expect(countOf(clock, "listStreamRows")).toBe(1);
+    expect(countOf(clock, "read")).toBe(1);
+    expect(countOf(clock, "blob.put")).toBe(count);
+    // The head uploads and the fence request are in flight together.
+    for (const put of clock.calls.filter((c) => c.name === "blob.put"))
+      expect(put.start).toBeLessThan(fence.end);
+    // Fence first, then the stream rows in as many requests as the bound needs.
+    expect(countOf(clock, "batch")).toBe(1 + Math.ceil(count / 16));
+  });
+}
+
+it("a batch bound the gateway advertised sets the size of the stream requests", async () => {
+  const f = await world(undefined, names(20));
+  const { batches } = withBatchRoute(f);
+  (f.registry as StreamSyncRegistry).batchPolicy = () => ({
+    rows: 32,
+    requires: 4,
+    bytes: 1 << 20,
+  });
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  // More than the fixed 16: the advertised bound, not a constant, sets it.
+  expect(batches.map((b) => b.rows.length)).toEqual([1, 20]);
+  // Fewer: every request stays within it.
+  const g = await world(undefined, names(20));
+  const again = withBatchRoute(g);
+  (g.registry as StreamSyncRegistry).batchPolicy = () => ({
+    rows: 6,
+    requires: 1,
+    bytes: 1 << 20,
+  });
+  await g.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await g.a.deleter.resumeDeletes()).toEqual([]);
+  expect(again.batches.map((b) => b.rows.length)).toEqual([1, 6, 6, 6, 2]);
+  expect(again.singles).toEqual([]);
 });

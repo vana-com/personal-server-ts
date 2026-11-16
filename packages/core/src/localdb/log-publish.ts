@@ -35,7 +35,6 @@
 // `base`, and no refs at or below it.
 
 import { sha256 } from "@noble/hashes/sha2";
-import { keccak_256 } from "@noble/hashes/sha3";
 import {
   LOG_FORMAT,
   DEFAULT_PART_TARGET_BYTES,
@@ -65,6 +64,7 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { type StreamSyncRegistry } from "../stream-sync/ports.js";
 import { sameHead, type PlanHead } from "../stream-sync/publish-plan.js";
+import { keccakOf } from "../stream-sync/crypto-port.js";
 import { applyConnection } from "./apply.js";
 import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 import { settleRequirementFailure, settleRow } from "./batch-commit.js";
@@ -101,7 +101,6 @@ import { purgeConnection } from "./purge.js";
 import { insideQueue } from "./slot.js";
 import { unwriteRefusedRun } from "./unwrite.js";
 
-const keccak = async (bytes: Uint8Array) => keccak_256(bytes);
 const MAX_ATTEMPTS = 5;
 /** Keys a query binds: the delete lookup binds a connection, a stream and two positions beside them. */
 const KEYS_PER_QUERY = rowsPerStatement(1, 4);
@@ -326,7 +325,7 @@ async function snapshotRound(
   if (await hasDeleteIntent(held, connection.connector)) return all("deferred");
   if (streams.length === 0) return { kind: "done", results: [] };
   const keyCheck = await deriveKeyCheck(held.keys.namespaceHmac);
-  const hashes = await controlHashes(keccak, keyCheck);
+  const hashes = await controlHashes(keccakOf(held.streamCrypto), keyCheck);
 
   // Control. A connection this device already holds as active is confirmed by
   // the commit's own condition; only an unknown one is read here.
@@ -692,9 +691,12 @@ async function snapshotRound(
       `publish: a deletion's key does not match its hash (${mismatch.stream}/${mismatch.pkHash})`,
     );
   const clear = encodeSegment(segment);
-  const { dataHash, blobName } = await digestSegment(keccak, clear);
+  const { dataHash, blobName } = await digestSegment(
+    keccakOf(held.streamCrypto),
+    clear,
+  );
   // A segment that would not verify is never uploaded or posted.
-  const verified = await verifySegment(keccak, clear, {
+  const verified = await verifySegment(keccakOf(held.streamCrypto), clear, {
     dataHash,
     connector: connection.connector,
     ns: connection.ns,
@@ -1161,7 +1163,7 @@ async function commitRound(
   const scope = logScope(connection.connector, connection.ns);
   const control = controlScope(connection.connector, connection.ns);
   const keyCheck = await deriveKeyCheck(held.keys.namespaceHmac);
-  const hashes = await controlHashes(keccak, keyCheck);
+  const hashes = await controlHashes(keccakOf(held.streamCrypto), keyCheck);
   const metadataHash = metadataHashFor(
     scope,
     new Date(candidate.observedAt).toISOString(),

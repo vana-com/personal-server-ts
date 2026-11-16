@@ -24,7 +24,6 @@
 // through the old lineage may still fetch them. Collecting them is a later
 // slice.
 
-import { keccak_256 } from "@noble/hashes/sha3";
 import {
   DEFAULT_PART_TARGET_BYTES,
   compactionRequired,
@@ -37,9 +36,8 @@ import {
   type SnapshotPointer,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { LocalSyncDeps } from "./deps.js";
+import { keccakOf } from "../stream-sync/crypto-port.js";
 import { fetchSegment, fetchSnapshotPart, type LogState } from "./log-apply.js";
-
-const keccak = async (bytes: Uint8Array) => keccak_256(bytes);
 
 export interface CompactionPlan {
   /** What the next segment's `snapshot` is. Its position is the next `base`. */
@@ -130,7 +128,10 @@ export async function planCompaction(
   const pointer: { dataHash: `0x${string}`; bytes: number }[] = [];
   for (const part of folded) {
     const clear = encodeSnapshotPart(part);
-    const { dataHash } = await digestSnapshotPart(keccak, clear);
+    const { dataHash } = await digestSnapshotPart(
+      keccakOf(deps.streamCrypto),
+      clear,
+    );
     pointer.push({ dataHash, bytes: clear.length });
     built.push({
       name: snapshotPartBlobName(dataHash),

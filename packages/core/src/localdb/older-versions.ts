@@ -1,5 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2";
-import { keccak_256 } from "@noble/hashes/sha3";
+import { keccakOf } from "../stream-sync/crypto-port.js";
 import {
   canonicalJson,
   deriveKeyCheck,
@@ -89,7 +89,6 @@ const currentVersions = `SELECT v.*, c.connector, c.ns FROM stream_versions v
   AND NOT EXISTS (SELECT 1 FROM delete_intents d WHERE d.connector=c.connector)`;
 const newestFirst = " ORDER BY v.observed_at DESC, v.version DESC";
 const sha = async (bytes: Uint8Array) => sha256(bytes);
-const keccak = async (bytes: Uint8Array) => keccak_256(bytes);
 
 class MissingVersionBlob extends Error {}
 
@@ -184,7 +183,7 @@ export function createOlderVersions(
           );
           if (encrypted === null) throw new MissingVersionBlob();
           const verified = await verifyHead(
-            keccak,
+            keccakOf(deps.streamCrypto),
             await deps.keys.decrypt(physicalScope, encrypted),
             {
               dataHash: `0x${blob.keccak}`,

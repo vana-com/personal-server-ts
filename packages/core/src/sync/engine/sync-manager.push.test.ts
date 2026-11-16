@@ -594,6 +594,29 @@ describe("the push position", () => {
     await t.manager.stop();
   });
 
+  it("issues no probe read in an idle minute while the push is healthy, even when the last pass left work owed", async () => {
+    // A pass that leaves work (a connection error, a deferred publish) settles
+    // nothing, so the timer cycle keeps its clock. The held request still
+    // announces every change, so the marker probe has nothing to add.
+    const { push, state } = fakePush();
+    const cycle = vi.fn(async () => ({
+      connections: [{ error: "owed", published: [] }],
+    }));
+    const read = vi.fn(async () => "m1");
+    const manager = build({
+      localSync: { cycle },
+      changeProbe: { read, intervalMs: 5_000, push },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    state.handlers!.onHealth(true);
+    state.handlers!.onPosition("7");
+    read.mockClear();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(read).not.toHaveBeenCalled();
+    await manager.stop();
+  });
+
   it("a renewal that answers with an unmoved position owes nothing", async () => {
     const t = setup();
     await settled(t);
