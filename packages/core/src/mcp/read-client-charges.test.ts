@@ -77,6 +77,8 @@ interface HarnessOptions {
   stream?: boolean;
   /** Write the legacy file for SCOPE. Defaults to on for the legacy harness. */
   legacy?: boolean;
+  /** Overrides on the gateway's grant, such as a revocation or an expiry. */
+  grant?: { revokedAt?: string | null; expiresAt?: string | null };
   /** Tombstone the stream connector, so its name is deleted. */
   deleteStream?: boolean;
   /** Scope the legacy file is stored under. Defaults to SCOPE. */
@@ -105,6 +107,7 @@ async function harness(options: HarnessOptions = {}) {
     expiresAt: null,
     paymentStatus: "paid",
     fee,
+    ...options.grant,
   };
   const gateway = {
     getBuilder: async () => ({ id: builder.address }),
@@ -1200,6 +1203,27 @@ describe("mcp scope metadata on a switched source never reads the body", () => {
     expect(await s.h.client.getScopeMetadata(STREAM_SCOPE)).toBeNull();
     expect(s.resolve).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["revoked", { revokedAt: "2026-06-01T00:00:00Z" }],
+    ["expired", { expiresAt: "2026-01-01T00:00:00Z" }],
+  ])(
+    "refuses metadata for a %s grant, reading and charging nothing",
+    async (_name, grant) => {
+      const h = await harness({ stream: true, grant });
+      const resolve = vi.spyOn(
+        h.deps.streamSyncRead as { resolve: () => Promise<unknown> },
+        "resolve",
+      );
+      resolve.mockImplementation(forbidden);
+      const s = { h, resolve, bodyReads: [] };
+
+      await expect(
+        h.client.getScopeMetadata(STREAM_SCOPE, GRANT_ID),
+      ).rejects.toMatchObject({ status: expect.any(Number) });
+      expectNoBodyRead(s);
+    },
+  );
 
   it("lists a granted switched scope as unknown, without size or time", async () => {
     const s = await switchedWithoutBodyReads();

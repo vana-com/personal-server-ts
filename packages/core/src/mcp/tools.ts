@@ -1290,7 +1290,7 @@ const readScope: McpToolDefinition = {
 
     // In-band steer: the model may call read_scope on a large scope without
     // first consulting list_granted_scopes. Fetch lightweight planning metadata
-    // (storage-index only, no network/auth) opportunistically so we can attach a
+    // (body-free: the storage index, or a grant check for a switched source) opportunistically so we can attach a
     // `guidance` hint when it is already available. This is advisory only: it
     // must never delay the read or consume the read timeout budget.
     let guidance:
