@@ -114,6 +114,11 @@ export function resolveReplication(
   }
 }
 
+/** The connector a source id names: its last path segment. */
+function connectorOf(sourceId: string): string | undefined {
+  return sourceId.split("/").filter(Boolean).at(-1);
+}
+
 export interface PdppRecordsDeps {
   connectionLink?: ConnectionLink;
   store: PdppRecordStore;
@@ -125,6 +130,8 @@ export interface PdppRecordsDeps {
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
   instancesForSource?: (subjectId: string, sourceId: string) => string[];
+  /** The registered source a connector id names, if any. */
+  sourceIdForConnector?: (connector: string) => string | undefined;
   readBlobBytes?: (
     blobId: string,
   ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
@@ -406,9 +413,12 @@ export function createPdppRecordsDeps(
         (candidate) => candidate.sourceId === binding.sourceId,
       );
       if (!source || !sourceRegistry.get(stream, source.sourceId)) return null;
-      const connector = source.sourceId.split("/").filter(Boolean).at(-1);
+      const connector = connectorOf(source.sourceId);
       return connector ? { connector, namespace: "" } : null;
     },
+    sourceIdForConnector: (connector) =>
+      sources.find((source) => connectorOf(source.sourceId) === connector)
+        ?.sourceId,
     store,
     // Without a replica receiver every reader reads the canonical store.
     reads: options.replica?.reads ?? (() => store),

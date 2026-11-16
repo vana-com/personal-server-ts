@@ -4354,3 +4354,5 @@ export {
   prepareScopeUploadBatches,
   type PreparedScopeUploadBatch,
 } from "./scope-upload-batches.js";
+export * from "./pdpp-records-list.js";
+export { parseRecordQuery } from "./pdpp-record-query.js";

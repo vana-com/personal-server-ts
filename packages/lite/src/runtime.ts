@@ -147,6 +147,7 @@ import {
   createDefaultPsLiteSaveConfig,
   createDefaultPsLiteTokenStore,
 } from "./state.js";
+import { handleLitePdppRecordList } from "./pdpp-records.js";
 import {
   collectDiagnosticsWithTimeout,
   DiagnosticsRecorder,
@@ -171,6 +172,13 @@ export interface PsLiteAuthAdapter extends PersonalServerApiAuthPort {
 
 export interface PsLiteRuntimeOptions {
   localSync?: () => Promise<LocalSync>;
+  /**
+   * The streams a connector declares, as the sync engine is given them. With
+   * it, `GET /v1/streams/:stream/records` refuses an undeclared stream or
+   * unknown source as the Node host does; without it, any stream of an active
+   * connection reads and an undeclared one lists empty.
+   */
+  streamSyncDeclaredStreams?: (connector: string) => readonly string[];
   streamSyncSeed?: SeedIntake | null;
   history?: LocalHistory;
 
@@ -1546,6 +1554,29 @@ export function createPsLiteRuntime(
             if (error instanceof LegacyWriteRefusedError) return error.response;
             throw error;
           }
+        }
+
+        const pdppRecords = /^\/v1\/streams\/([^/]+)\/records$/.exec(
+          url.pathname,
+        );
+        if (pdppRecords && options.localSync) {
+          if (request.method !== "GET")
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          return handleLitePdppRecordList(
+            request,
+            decodeURIComponent(pdppRecords[1]!),
+            {
+              localSync: options.localSync,
+              accountStorageMode,
+              authorizeOwner: (req) => auth.authorizeOwner(req),
+              ownerAddress,
+              declaredStreams: options.streamSyncDeclaredStreams,
+            },
+          );
         }
 
         const dataPrefix = "/v1/data";
