@@ -9,6 +9,7 @@ import {
   vi,
   type Mock,
 } from "vitest";
+import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import { createSourceStreamDeclarationRegistry } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createFixtureAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
 import type {
@@ -140,6 +141,7 @@ describe("POST /records/completions", () => {
       auth: createFixtureAuthorizationService(tokens),
       declarations,
       ownerSubjectId: "sub_1",
+      accountStorageMode: { owner: "sub_1", read: () => "unswitched" },
       instancesForSubject: () => ["inst_1"],
       instancesForSource: (_subject, source) =>
         source === SRC ? ["inst_1"] : [],
@@ -206,6 +208,69 @@ describe("POST /records/completions", () => {
     );
     expect(result.rejected).toEqual([]);
   }
+
+  describe("account storage mode", () => {
+    const mountMode = (mode: "switched" | "unswitched") => {
+      completeStreams = vi.fn(store.completeStreams);
+      const getInstanceBinding = vi.fn(store.getInstanceBinding);
+      const modeApp = pdppRecordsRoutes({
+        store,
+        bindingStore: { ...store, completeStreams, getInstanceBinding },
+        configuredMethods: new Map([["inst_1", ["m1"]]]),
+        auth: createFixtureAuthorizationService(tokens),
+        declarations,
+        ownerSubjectId: "sub_1",
+        instancesForSubject: () => ["inst_1"],
+        accountStorageMode: { owner: "sub_1", read: () => mode },
+      });
+      return { modeApp, getInstanceBinding };
+    };
+    const send = (modeApp: ReturnType<typeof mount>, token?: string) =>
+      modeApp.request(`/records/completions${QUERY}`, {
+        method: "POST",
+        headers: {
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(wire()),
+      });
+
+    it("refuses a switched owner's valid legacy proof like a record write, touching nothing", async () => {
+      // The legacy table holds set B (no messages); a switched owner's
+      // authoritative set A lives in the stream-sync store. A valid proof of B
+      // must not be certified.
+      const { modeApp, getInstanceBinding } = mountMode("switched");
+      const before = state();
+      const response = await send(modeApp, "owner-tok");
+      const write = await modeApp.request("/streams/messages/records/ingest", {
+        method: "POST",
+        headers: { Authorization: "Bearer owner-tok" },
+        body: "not json",
+      });
+      expect(write.status).toBe(426);
+      expect(response.status).toBe(426);
+      expect(await response.json()).toEqual(await write.json());
+      expect(response.headers.get("Request-Id")).toMatch(/^req_/);
+      expect(response.headers.get("PDPP-Version")).toBe(PDPP_VERSION);
+      expect(completeStreams).not.toHaveBeenCalled();
+      expect(getInstanceBinding).not.toHaveBeenCalled();
+      expect(state()).toEqual(before);
+    });
+
+    it("still authenticates before refusing a switched account", async () => {
+      const { modeApp } = mountMode("switched");
+      expect((await send(modeApp, "client-tok")).status).toBe(401);
+      expect((await send(modeApp)).status).toBe(401);
+    });
+
+    it("keeps unswitched completion unchanged", async () => {
+      const { modeApp } = mountMode("unswitched");
+      const response = await send(modeApp, "owner-tok");
+      expect(response.status).toBe(200);
+      expect(completeStreams).toHaveBeenCalledOnce();
+      expect(state().receipts).toHaveLength(1);
+    });
+  });
 
   describe("authority", () => {
     it.each([
