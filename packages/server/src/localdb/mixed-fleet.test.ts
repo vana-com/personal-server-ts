@@ -87,31 +87,83 @@ describe("a device with the log flag off, on a connection that has a log", () =>
   });
 });
 
-describe("a per-stream head written beside the log by a build without the gate", () => {
-  // Known gap, closed only by a registry rule (docs/formal/mixed-fleet): a
-  // client has no condition on a row being absent, so it cannot stop another
-  // build's commit. `publishConnection` is what every build without the gate
-  // does with the flag off; the gate lives in the cycle. A device that follows
-  // the log meets that head and either throws or replaces rows the log holds.
-  // `it.fails` keeps the gap visible: it turns red when the gap is closed.
-  it.fails(
-    "does not erase the rows the log holds on a device that follows the log",
-    async () => {
-      const w = await world({ streams: 2, logProtocol: true });
-      const a = await w.device("a", true);
-      const old = await w.device("old", false);
-      await a.run("run-a1", [{ stream: sName(0), id: "a-1" }]);
+describe("a per-stream head written beside the log", () => {
+  // A client has no condition on a row being absent, so it cannot stop another
+  // build's commit; the registry can, and refuses it (docs/formal/mixed-fleet,
+  // `Fence`). The fake registry of these tests has the rule the gateway has: a
+  // per-stream commit of a connection loses while the connection's log row
+  // exists.
+
+  it("is refused: a build without the gate cannot erase the rows the log holds", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    const a = await w.device("a", true);
+    const old = await w.device("old", false);
+    await a.run("run-a1", [{ stream: sName(0), id: "a-1" }]);
+    await a.cycle();
+    await old.run("run-b1", [{ stream: sName(0), id: "b-1" }], {
+      full: false,
+      covered: [sName(0)],
+    });
+    // `publishConnection` is what every build without the gate does with the
+    // flag off; the gate lives in the cycle.
+    await publishConnection(old.deps, CONNECTION_ID);
+    expect(streamRows(w)).toEqual([]);
+    await a.cycle();
+    expect(ids(await a.records())).toContain("s0/a-1");
+    expect(w.gateway.rowsOf(LOG)).toBe(1);
+  });
+
+  it("is refused on a registry without the batch route too", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    const a = await w.device("a", true);
+    const old = await w.device("old", false);
+    await a.run("run-a1", [{ stream: sName(0), id: "a-1" }]);
+    await a.cycle();
+    w.gateway.setBatchRoute(404);
+    await old.run("run-b1", [{ stream: sName(0), id: "b-1" }], {
+      full: false,
+      covered: [sName(0)],
+    });
+    await publishConnection(old.deps, CONNECTION_ID);
+    expect(w.gateway.calls.some((c) => c.kind === "post")).toBe(true);
+    expect(streamRows(w)).toEqual([]);
+    await a.cycle();
+    expect(ids(await a.records())).toContain("s0/a-1");
+  });
+
+  it("is refused when it races the first log write, and the write follows the log on the next cycle", async () => {
+    // Device b read the registry while the connection had no log, then device
+    // a wrote the first log row, then b committed its per-stream head.
+    const w = await world({ streams: 2, logProtocol: true });
+    const a = await w.device("a", true);
+    const b = await w.device("b", false);
+    await a.run("run-a1", [{ stream: sName(0), id: "a-1" }]);
+    await b.run("run-b1", [{ stream: sName(1), id: "b-1" }]);
+
+    let armed = true;
+    w.gateway.beforeBatch = async (call) => {
+      const writesStream = call.body.rows.some(
+        (row) => row.scope !== LOG && row.scope !== CONTROL,
+      );
+      if (!armed || !writesStream) return;
+      armed = false;
       await a.cycle();
-      await old.run("run-b1", [{ stream: sName(0), id: "b-1" }], {
-        full: false,
-        covered: [sName(0)],
-      });
-      await publishConnection(old.deps, CONNECTION_ID);
-      expect(streamRows(w)).toHaveLength(1);
-      await a.cycle();
-      expect(ids(await a.records())).toContain("s0/a-1");
-    },
-  );
+    };
+    await b.sync.cycle();
+    expect(armed).toBe(false);
+    // The log exists and b's head did not land beside it.
+    expect(w.gateway.rowsOf(LOG)).toBe(1);
+    expect(streamRows(w)).toEqual([]);
+
+    await b.cycle();
+    await a.cycle();
+    await b.cycle();
+    expect(streamRows(w)).toEqual([]);
+    expect(w.gateway.rowsOf(LOG)).toBe(2);
+    const both = ["s0/a-1", "s1/b-1"];
+    expect(ids(await a.records())).toEqual(both);
+    expect(ids(await b.records())).toEqual(both);
+  });
 });
 
 /**
