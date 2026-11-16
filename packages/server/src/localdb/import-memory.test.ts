@@ -114,24 +114,28 @@ async function measure(
 }
 
 // What the test protects: the import holds a batch, not the input. Two
-// readings carry that claim, and each bound is derived from it.
+// readings test that claim with different allowances, not exact heap bounds.
 //
 // 1. Live bytes (main-isolate heap plus external after two full collections,
-//    rows still reachable). This is retention, and it does not depend on
-//    timing: across repeated children it was identical to the byte, and the
-//    clean import held 0.1 MiB more at 4x than at 1x (upload) or 1.1 MiB less
-//    (node). A correct import may hold at most one batch more at the larger
-//    size, so the margin is one batch, IMPORT_CHUNK_BYTES (4 MiB). Retaining
-//    every 10th row adds 10 MiB between 1x and 4x, every 4th 26 MiB, the whole
-//    input 106 MiB.
+//    rows still reachable). This measures retention. Byte-identical readings
+//    across repeated children were observed on the tested runtime, not
+//    guaranteed by two collections or independent of timing. The clean import
+//    held 0.1 MiB more at 4x than at 1x (upload) or 1.1 MiB less (node).
+//    The allowance reuses the real import batch threshold, IMPORT_CHUNK_BYTES
+//    (4 MiB). A batch's character budget is not an exact bound on retained
+//    heap: objects and statements add overhead, and a row can cross the
+//    threshold. Detection floor: retention growth of 4 MiB or less from 1x to
+//    4x input passes by design. Retaining every 10th row adds 10 MiB between
+//    1x and 4x, every 4th 26 MiB, the whole input 106 MiB.
 // 2. Peak resident size, a high-water mark. It is a maximum over the run, so it
 //    rises with run length and with when the 25 ms collector timer fires: the
 //    clean upload peak rose 70, 78, 84, 90, 91 MiB at 1x, 4x, 16x, 32x, 64x
 //    and stopped (a per-row leak would keep climbing), and CI saw 2 to 12 MiB of
 //    4x-minus-1x on code that never touched the import. A margin tighter than
-//    that noise cannot tell a clean import from one that keeps every 10th row,
-//    so this reading only guards against materializing the input: the peak may
-//    not grow by more than half the bytes the larger input adds.
+//    that noise cannot tell a clean import from one that keeps every 10th row.
+//    The guard against materializing the input allows peak growth of half the
+//    bytes the larger input adds. This is a calibrated tolerance backed by the
+//    load-whole control below, not a consequence of batching.
 const LIVE_MARGIN = IMPORT_CHUNK_BYTES;
 interface Growth {
   addedBytes: number;
