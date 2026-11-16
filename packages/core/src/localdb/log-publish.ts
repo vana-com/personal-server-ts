@@ -280,6 +280,20 @@ const chunked = <T>(items: readonly T[], size: number): T[][] => {
   return out;
 };
 
+/**
+ * What this process already warned about, by database and connection: a held
+ * stream's warned state, so one held state warns once however many publish
+ * passes meet it.
+ */
+const heldWarnings = new WeakMap<object, Map<string, Map<string, string>>>();
+function warnedHolds(db: object, connectionId: string): Map<string, string> {
+  let byConnection = heldWarnings.get(db);
+  if (!byConnection) heldWarnings.set(db, (byConnection = new Map()));
+  let streams = byConnection.get(connectionId);
+  if (!streams) byConnection.set(connectionId, (streams = new Map()));
+  return streams;
+}
+
 async function snapshotRound(
   held: LocalSyncDeps,
   connectionId: string,
@@ -347,6 +361,9 @@ async function snapshotRound(
   const target = held.partTargetBytes ?? DEFAULT_PART_TARGET_BYTES;
   let budget = 0;
   let first = true;
+  // Streams this pass holds back, and streams it did not examine for it.
+  const heldNow = new Set<string>();
+  const unexamined = new Set<string>();
   eachStream: for (const row of streams) {
     const { stream } = row;
     if (await discardFencedRuns(held, connectionId, stream)) {
@@ -396,6 +413,7 @@ async function snapshotRound(
       bytes: 0,
     };
     if (plan.deferred) {
+      unexamined.add(stream);
       planned.push({ ...base, ack: row.publish_watermark });
       continue;
     }
@@ -470,10 +488,19 @@ async function snapshotRound(
     const wasFirst = first;
     const stop = (untyped: readonly string[]) => {
       first = wasFirst;
-      held.logger.warn(
-        { connectionId, stream, pkHashes: untyped.slice(0, 5) },
-        `stream sync: the log holds back stream "${stream}": an explicit delete made before typed keys were kept cannot be written to it, and the stream's declared key types do not give its key back`,
-      );
+      heldNow.add(stream);
+      // One warning per held state, not per pass: a cycle publishes more than
+      // once and a held stream is met again on every poll until its keys are
+      // known. The state is the set of changes held; a different set warns.
+      const state = [...untyped].sort().join(",");
+      const warned = warnedHolds(held.db, connectionId);
+      if (warned.get(stream) !== state) {
+        warned.set(stream, state);
+        held.logger.warn(
+          { connectionId, stream, pkHashes: untyped.slice(0, 5) },
+          `stream sync: the log holds back stream "${stream}": an explicit delete made before typed keys were kept cannot be written to it, and the stream's declared key types do not give its key back`,
+        );
+      }
       planned.push({
         ...base,
         plan: { ...plan, deferred: true },
@@ -575,6 +602,10 @@ async function snapshotRound(
     });
   }
 
+  // A stream that is no longer held warns again if it is held again.
+  const warned = warnedHolds(held.db, connectionId);
+  for (const stream of [...warned.keys()])
+    if (!heldNow.has(stream) && !unexamined.has(stream)) warned.delete(stream);
   const included = planned.filter((p) => p.included);
   const settle = (outcomeFor: (p: Planned) => PublishResult["outcome"]) =>
     planned.map((p): PublishResult => ({

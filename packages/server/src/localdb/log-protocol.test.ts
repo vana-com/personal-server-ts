@@ -1939,6 +1939,9 @@ describe("log protocol: a deletion's key must be the key its hash names", () => 
     expect(warnings).toHaveLength(1);
     expect(JSON.stringify(warnings)).toContain("explicit delete");
     expect(JSON.stringify(warnings)).toContain(`stream \\"${s0}\\"`);
+    // The same held state does not warn again on the next cycle.
+    await a.cycle();
+    expect(warnings).toHaveLength(1);
     // The other stream is not held by it.
     await reader.cycle();
     expect(await reader.records()).toEqual(
