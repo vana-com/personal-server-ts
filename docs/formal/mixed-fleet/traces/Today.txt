@@ -1,0 +1,72 @@
+Error: Invariant NoSilentStale is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ nextK = <<1, 1, 1>>
+/\ seen = <<-1, -1, -1>>
+/\ view = <<{}, {}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{}, {}, {}>>
+/\ log1 = {}
+/\ log2 = {}
+/\ stale = <<FALSE, FALSE, FALSE>>
+/\ heads = {}
+/\ logFmt = 0
+
+State 2: <Collect line 81, col 3 to line 85, col 71 of module MixedFleet>
+/\ nextK = <<2, 1, 1>>
+/\ seen = <<-1, -1, -1>>
+/\ view = <<{1}, {}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{1}, {}, {}>>
+/\ log1 = {}
+/\ log2 = {}
+/\ stale = <<FALSE, FALSE, FALSE>>
+/\ heads = {}
+/\ logFmt = 0
+
+State 3: <PubRead line 114, col 3 to line 121, col 76 of module MixedFleet>
+/\ nextK = <<2, 1, 1>>
+/\ seen = <<0, -1, -1>>
+/\ view = <<{1}, {}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{1}, {}, {}>>
+/\ log1 = {}
+/\ log2 = {}
+/\ stale = <<FALSE, FALSE, FALSE>>
+/\ heads = {}
+/\ logFmt = 0
+
+State 4: <PubCommit line 128, col 3 to line 152, col 30 of module MixedFleet>
+/\ nextK = <<2, 1, 1>>
+/\ seen = <<-1, -1, -1>>
+/\ view = <<{1}, {}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{}, {}, {}>>
+/\ log1 = {}
+/\ log2 = {1}
+/\ stale = <<FALSE, TRUE, TRUE>>
+/\ heads = {}
+/\ logFmt = 2
+
+State 5: <Read line 92, col 3 to line 104, col 69 of module MixedFleet>
+/\ nextK = <<2, 1, 1>>
+/\ seen = <<-1, -1, -1>>
+/\ view = <<{1}, {}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{}, {}, {}>>
+/\ log1 = {}
+/\ log2 = {1}
+/\ stale = <<FALSE, FALSE, TRUE>>
+/\ heads = {}
+/\ logFmt = 2
+
+101 states generated, 39 distinct states found, 17 states left on queue.
+The depth of the complete state graph search is 6.
+The average outdegree of the complete state graph is 2 (minimum is 1, the maximum 4 and the 95th percentile is 4).
+Finished in 00s at (2026-11-15 23:10:24)
+EXIT=12

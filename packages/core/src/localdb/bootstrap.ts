@@ -17,6 +17,7 @@ import { applyConnection } from "./apply.js";
 import type { ConnectionRow, LocalSyncDeps } from "./deps.js";
 import { purgeConnection } from "./purge.js";
 import { insideQueue } from "./slot.js";
+import { UpdateRequiredError } from "./update-required.js";
 
 // A connection id is its canonical control scope: pdpp.<connector>~<ns>.
 function connectionId(connector: string, ns: string): string {
@@ -203,6 +204,14 @@ export async function syncBeforeBegin(
         // integrity, key and database failures.
         await applyConnection(locked, id);
       } catch (error) {
+        // A log this build cannot read stops this connection's apply, not the
+        // join: the cycle's pass for the connection applies again and reports
+        // `update_required` for it (`syncConnection`).
+        if (error instanceof UpdateRequiredError)
+          return {
+            connection: await cachedConnection(locked, id),
+            unreachable: false,
+          };
         if (!(error instanceof RegistryUnavailableBeforeWriteError))
           throw error;
         return {

@@ -57,6 +57,7 @@ import type { SqlStatement } from "./driver.js";
 import { heldKeys, planLogLoad, type PlannedBatch } from "./log-progressive.js";
 import { mergeIncoming, seenPair, withOrigin } from "./merge.js";
 import { readPartsAhead } from "./part-readahead.js";
+import { UpdateRequiredError } from "./update-required.js";
 import {
   failedRowStatement,
   failureCode,
@@ -940,6 +941,11 @@ export async function fetchSegment(
       position,
     },
   );
+  if (verified.kind === "unsupported_format")
+    throw new UpdateRequiredError(
+      `apply: invalid log segment ${position} (unsupported_format)`,
+      verified.format,
+    );
   if (verified.kind !== "ok")
     throw new Error(
       `apply: invalid log segment ${position} (${verified.kind})`,
@@ -970,6 +976,11 @@ export async function fetchSnapshotPart(
       position,
     },
   );
+  if (verified.kind === "unsupported_format")
+    throw new UpdateRequiredError(
+      "apply: invalid log snapshot part (unsupported_format)",
+      verified.format,
+    );
   if (verified.kind !== "ok")
     throw new Error(`apply: invalid log snapshot part (${verified.kind})`);
   return verified.part;

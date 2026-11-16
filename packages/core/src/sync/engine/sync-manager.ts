@@ -495,6 +495,37 @@ export function createSyncManager(
     }
   }
 
+  /**
+   * One cycle of the local stream database. A connection whose log this
+   * build cannot read is reported by the cycle as `update_required`: it is
+   * shown as the sync status's `blocked` reason, so every host that reads the
+   * status shows it without code of its own. It ends with a cycle that does
+   * not report one.
+   */
+  async function runLocalCycle(
+    localSync: NonNullable<SyncManagerOptions["localSync"]>,
+  ): Promise<unknown> {
+    const report = (await localSync.cycle()) as {
+      connections?: readonly { connectionId: string; status?: string }[];
+    } | null;
+    const waiting = (report?.connections ?? []).filter(
+      (c) => c.status === "update_required",
+    );
+    if (waiting.length > 0) {
+      blocked = {
+        reason: "update_required",
+        message:
+          "A connection's log is in a format this version cannot read. Update to sync it.",
+      };
+      uploadDeps.logger.warn(
+        { connections: waiting.map((c) => c.connectionId) },
+        "Sync blocked: update required",
+      );
+    } else if (blocked?.reason === "update_required") blocked = null;
+    statusMayHaveChanged();
+    return report;
+  }
+
   async function runCycle(): Promise<void> {
     // Prevent concurrent cycles
     if (cycleInFlight) {
@@ -535,7 +566,7 @@ export function createSyncManager(
           const mode = options.accountStorageMode.read();
           if (mode !== "unswitched") {
             if (mode === "switched" && options.localSync) {
-              const report = await options.localSync.cycle();
+              const report = await runLocalCycle(options.localSync);
               lastSync = new Date().toISOString();
               statusMayHaveChanged();
               if (!reportLeavesWork(report)) settle();
@@ -1275,7 +1306,7 @@ export function createSyncManager(
           const mode = options.accountStorageMode.read();
           if (mode !== "unswitched") {
             if (mode === "switched" && options.localSync)
-              await options.localSync.cycle();
+              await runLocalCycle(options.localSync);
             else {
               blocked = {
                 reason: "account_mode_unknown",

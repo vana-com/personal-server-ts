@@ -1530,10 +1530,28 @@ describe("log protocol: the log noop shortcut and unresolved partial state", () 
         )
       )[0]!;
 
-    // The per-stream registry holds version 1.
+    // The per-stream registry holds version 1, then a device without the log
+    // grows it to version 4 with many rows in many parts. The log does not
+    // exist yet, so this device's cycles write per-stream heads. The registry
+    // is put back to version 1 for the device that joins next, and grown again
+    // below, which is the order the log's own device saw it.
     const legacy = await w.device("legacy", false);
     await legacy.run("run-1", [{ stream: sName(0), id: "a" }]);
     await legacy.cycle();
+    for (let i = 0; i < 3; i++) {
+      await legacy.run(
+        `run-L${i}`,
+        Array.from({ length: 12 }, (_, j) => ({
+          stream: sName(0),
+          id: `x${i}-${j}`,
+          pad: 60,
+        })),
+        { full: false, covered: [sName(0)] },
+      );
+      await legacy.cycle();
+    }
+    expect(w.gateway.rowsOf(s0)).toBe(4);
+    const grown = w.gateway.versions.get(s0)!.splice(1);
 
     // This device reads version 1, then the log carries it to local version 3.
     const b = await w.device("b", true);
@@ -1549,19 +1567,8 @@ describe("log protocol: the log noop shortcut and unresolved partial state", () 
     const logRows = await rowsLocal(b);
     expect(logRows).toEqual(expect.arrayContaining(["a", "b1", "b2"]));
 
-    // The per-stream registry grows to version 4 with many rows in many parts.
-    for (let i = 0; i < 3; i++) {
-      await legacy.run(
-        `run-L${i}`,
-        Array.from({ length: 12 }, (_, j) => ({
-          stream: sName(0),
-          id: `x${i}-${j}`,
-          pad: 60,
-        })),
-        { full: false, covered: [sName(0)] },
-      );
-      await legacy.cycle();
-    }
+    // The per-stream registry is at version 4 again, beside the log.
+    w.gateway.versions.get(s0)!.push(...grown);
     expect(w.gateway.rowsOf(s0)).toBe(4);
 
     // Applying it merges some parts and then a part download fails.

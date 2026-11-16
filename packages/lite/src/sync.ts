@@ -169,8 +169,9 @@ export interface PsLiteSyncOptions {
   /** Publish while collecting, default off. See `LocalSyncDeps.publishWhileCollecting`. */
   streamSyncPublishWhileCollecting?: boolean;
   /**
-   * Publish and apply through the stream-sync log, default off. Turn it on for
-   * all devices of an owner together. See `LocalSyncDeps.logProtocol`.
+   * Publish and apply through the stream-sync log, default off. The flag lets
+   * this device start a log on a connection that has none; a connection that
+   * has a log is followed whatever the flag. See `LocalSyncDeps.logProtocol`.
    */
   streamSyncLogProtocol?: boolean;
   /**

@@ -351,9 +351,9 @@ export interface CreateServerOptions {
   streamSyncPublishWhileCollecting?: boolean;
   /**
    * Publish and apply through the stream-sync log (default off; env
-   * `PS_STREAM_SYNC_LOG_PROTOCOL=true`). A connection that has published to
-   * the log is read through it by every device, so turn it on for all devices
-   * of an owner together. See `LocalSyncDeps.logProtocol`.
+   * `PS_STREAM_SYNC_LOG_PROTOCOL=true`). The flag lets this device start a log
+   * on a connection that has none; a connection that has a log is followed by
+   * every device of this build whatever its flag. See `LocalSyncDeps.logProtocol`.
    */
   streamSyncLogProtocol?: boolean;
   /**

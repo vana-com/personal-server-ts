@@ -64,6 +64,36 @@ describe("database sync hooks", () => {
     await manager.stop();
   });
 
+  it("shows a connection whose log this build cannot read as the blocked reason, until a cycle reports none", async () => {
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const reports = [
+      {
+        connections: [{ connectionId: "c", status: "update_required" }],
+      },
+      { connections: [{ connectionId: "c" }] },
+    ];
+    const cycle = vi.fn(async () => reports.shift());
+    const manager = createSyncManager(
+      {
+        storage: new Proxy({}, { get: () => () => {} }),
+        logger,
+        serverOwner: "0x1234",
+      } as never,
+      { logger } as never,
+      { accountStorageMode: { read: () => "switched" }, localSync: { cycle } },
+    );
+    await manager.trigger();
+    expect(manager.getStatus().blocked?.reason).toBe("update_required");
+    await manager.trigger();
+    expect(manager.getStatus().blocked ?? null).toBeNull();
+    await manager.stop();
+  });
+
   it("the download hooks apply database heads before any legacy sidecar, feed or cursor operation", async () => {
     const apply = vi.fn(async () => {});
     const deps = { localSync: { apply } } as never;
