@@ -141,11 +141,8 @@ export interface PsLiteSyncOptions {
    */
   streamSyncDeclarations?: ResolveArtifact;
   /**
-   * Verified manifests retained for seed-descriptor admission and deletion.
-   * Seed profiles and primary keys must match one of these documents. A connection
-   * delete also fences the streams these declare that have no registry row.
-   * A connector with registry rows and no retained manifest still deletes.
-   * Default: none.
+   * Verified manifests retained for seed-descriptor admission. Seed profiles
+   * and primary keys must match one of these documents. Default: none.
    */
   streamSyncRetainedManifests?: () => readonly string[];
   /**
@@ -646,7 +643,6 @@ export async function createPsLiteSyncManager(
           aliasScopes: () => LEGACY_SCOPE_BINDINGS.keys(),
           aliasTargets: legacyAliasScopes,
           resolveArtifact: options.streamSyncDeclarations ?? (() => null),
-          retainedManifests: options.streamSyncRetainedManifests,
           eraseLegacy: (connector) =>
             eraseLegacyScopesOf(connector, options.storage),
         });

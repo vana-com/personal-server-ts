@@ -107,12 +107,13 @@ export async function recommitApplied(
         },
       ],
     });
-    if (answer.kind === "unsupported")
-      throw new Error("apply: the registry has no batch route for the log");
     // The connection changed (deleted, another lifetime): the next apply
     // reads that first.
     if (answer.kind === "precondition_failed") return;
-    if (settleRow(answer.rows[0]!, row) === "conflict") return;
+    // A refused one-row request: the row lost, unless the winner is this very
+    // row (a resend).
+    if (answer.kind === "refused" && settleRow(answer.rows[0]!, row) !== "committed")
+      return;
     head = ref.dataHash;
   }
 }

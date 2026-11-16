@@ -1,246 +1,92 @@
 /**
- * The first landing of a connection delete as batch requests: the control
- * fences of its namespaces in one `POST /v1/data/batch`, then every stream
- * tombstone in the next (each split at the bounds the gateway advertised, or
- * at the fixed caps every gateway accepts before it has).
+ * The fences of a connection delete (one control tombstone per namespace) as
+ * batch requests on `POST /v1/data/batch`, within the bounds the gateway
+ * advertises. Each request is one all-or-nothing transaction: every row lands,
+ * or none does. A gateway that serves no batch contract fails the delete
+ * (`RegistryBatchRouteMissingError`): there is no per-row path for it.
  *
- * Each participant (a fence, or a stream) submits at most one signed row, or
- * leaves without one. The fence rows go out as soon as every fence participant
- * has done one or the other, without waiting for the streams: a stream's work
- * before its row (its head upload) runs beside the fence request, so the two
- * round trips are the fence and the stream rows, not those and an upload in
- * front of them. The stream rows go out once every stream participant has
- * arrived and the fences have landed. No timer: a participant is never waited
- * for past its own work.
- *
- * Why two requests and not one:
- * - A stream row of namespace N must land only if N's fence landed. The only
- *   way to say so is a condition on N's control row, and the gateway refuses a
- *   condition on a row the same request writes (HTTP 400). Rows of one request
- *   also commit independently, so a fence that lost its compare-and-set would
- *   not hold back the stream rows beside it.
- * - So the fences go first, alone, each guarded by its own compare-and-set on
- *   the version: it lands only over the version the delete pinned (pin + 1).
- *   The pin is a version number, not a hash, so the fence does not bind the
- *   control row's data hash; that would need the hash stored with the pin.
- *   The stream rows go next, each namespace's rows resting on the condition
- *   "control is the tombstone at pin + 1". No stream row lands unless its
- *   fence is already committed.
- * - A fence that does not land, a failed condition, a missing batch route, or a
- *   request the gateway refuses, all answer `fallback`: nothing is guessed and
- *   the caller runs the per-stream path, which re-reads and re-checks
- *   everything itself. A refusal of the request's shape is a defect of this
- *   code, so it is reported through `onRefused`, never as a quiet limit.
+ * - A request the gateway refuses writes nothing. A row the gateway already
+ *   held (a replay: the same tombstone, written by this delete before or by
+ *   another device's delete) answers `committed`. A row that lost its
+ *   compare-and-set answers `not_written`, and the other rows go again at once
+ *   without it: each refusal drops at least one row, since the gateway names
+ *   the row that lost.
+ * - A request with no answer (no reply twice, or a failure that says nothing
+ *   of the rows) answers `not_written` for its rows: they may have landed.
+ * - The caller reads each row that is not `committed` again and writes it
+ *   alone (delete.ts `landFence`), as a resumed delete does.
+ * - A refusal of the request itself (no batch contract, a request the gateway
+ *   judged malformed) throws: it is not a race to recover from.
  */
 import {
-  countFencedLogScopes,
-  type ControlHashes,
-} from "@opendatalabs/personal-server-ts-stream-sync";
-import {
   AmbiguousRegistryReplyError,
+  RegistryBatchRouteMissingError,
   RegistryRefusedError,
-  type RegistryRequirement,
   type SignedBatchRow,
   type StreamSyncRegistry,
 } from "../stream-sync/ports.js";
-import { batchBounds } from "./batch-commit.js";
+import { requireBatchPolicy } from "./batch-commit.js";
 
-/** `committed`: the row is written. `fallback`: it is not; use the per-stream path. */
-export type BatchTurn = "committed" | "fallback";
+export type FenceTurn = "committed" | "not_written";
 
-export interface DeleteBatcher {
-  /** Park a signed row of namespace `ns` (a fence, or a stream under it) for the request. */
-  submit(
-    row: SignedBatchRow,
-    part: { readonly ns: string; readonly fence: boolean },
-  ): Promise<BatchTurn>;
-  /** This participant has no row to send. */
-  leave(part: { readonly fence: boolean }): void;
-}
-
-interface Parked {
-  readonly row: SignedBatchRow;
-  readonly ns: string;
-  readonly fence: boolean;
-  readonly settle: (turn: BatchTurn) => void;
-  readonly fail: (error: unknown) => void;
-}
-
-export function createDeleteBatcher(options: {
+/** One turn per row, in the order of `rows`. */
+export async function commitFences(options: {
   readonly registry: StreamSyncRegistry;
   readonly ownerAddress: string;
-  readonly controlScopeOf: (ns: string) => string;
-  /** The version each namespace's control row held when the delete was planned. */
-  readonly pins: ReadonlyMap<string, number>;
-  readonly hashes: Pick<
-    ControlHashes,
-    "activeData" | "tombstoneData" | "tombstoneMetadata"
-  >;
-  /** Each calls `submit` or `leave` once: one per fence, one per stream. */
-  readonly fenceParticipants: number;
-  readonly streamParticipants: number;
-  /** The registry answered that it has no batch route. */
-  readonly onUnusable: () => void;
-  /** The registry refused the request (HTTP 4xx other than 409): a defect to surface. */
-  readonly onRefused: (error: RegistryRefusedError) => void;
-}): DeleteBatcher {
-  let fencesOutstanding = options.fenceParticipants;
-  let streamsOutstanding = options.streamParticipants;
-  const fenceRows: Parked[] = [];
-  const streamRows: Parked[] = [];
-  /** Whether every fence row is written: the stream rows rest on it. */
-  let fencesDone!: (healthy: boolean) => void;
-  const fencesLanded = new Promise<boolean>((resolve) => {
-    fencesDone = resolve;
-  });
+  readonly rows: readonly SignedBatchRow[];
+}): Promise<readonly FenceTurn[]> {
+  const { rows: bound } = await requireBatchPolicy(options.registry);
+  const turns: FenceTurn[] = options.rows.map(() => "not_written");
+  const indexes = options.rows.map((_, i) => i);
+  const chunks: number[][] = [];
+  for (let at = 0; at < indexes.length; at += bound)
+    chunks.push(indexes.slice(at, at + bound));
+  // Each fence is a compare-and-set on its own row, so the requests go
+  // together.
+  await Promise.all(chunks.map((chunk) => send(chunk)));
+  return turns;
 
-  /**
-   * The fence rows carry their own compare-and-set. The stream rows of a
-   * namespace rest on that namespace's fence having landed.
-   */
-  const requiresFor = (chunk: readonly Parked[]): RegistryRequirement[] => {
-    const requires: RegistryRequirement[] = [];
-    const seen = new Set<string>();
-    for (const part of chunk) {
-      if (part.fence || seen.has(part.ns)) continue;
-      seen.add(part.ns);
-      requires.push({
-        scope: options.controlScopeOf(part.ns),
-        expectedVersion: String(options.pins.get(part.ns)! + 1),
-        notDeleted: false,
-        expectedDataHash: options.hashes.tombstoneData,
-      });
-    }
-    return requires;
-  };
-
-  /** True when the request went through and every fence row of the chunk is written. */
-  async function send(chunk: readonly Parked[]): Promise<boolean> {
-    const request = {
-      ownerAddress: options.ownerAddress,
-      rows: chunk.map((p) => p.row),
-      requires: requiresFor(chunk),
-    };
-    const fallbackAll = () => {
-      for (const p of chunk) p.settle("fallback");
-      return false;
-    };
+  async function send(chunk: readonly number[]) {
+    let pending = chunk;
     try {
-      let answer;
-      try {
-        answer = await options.registry.postBatch!(request);
-      } catch (error) {
-        if (!(error instanceof AmbiguousRegistryReplyError)) throw error;
-        // The first send may have landed. The same request again answers a
-        // row it holds as a conflict and fails its conditions: both fall back.
-        answer = await options.registry.postBatch!(request);
-      }
-      if (answer.kind === "unsupported") {
-        options.onUnusable();
-        return fallbackAll();
-      }
-      if (answer.kind === "precondition_failed") return fallbackAll();
-      let all = true;
-      for (const [i, p] of chunk.entries()) {
-        if (answer.rows[i]!.kind === "committed") {
-          p.settle("committed");
-        } else {
-          p.settle("fallback");
-          if (p.fence) all = false;
+      while (pending.length > 0) {
+        const request = {
+          ownerAddress: options.ownerAddress,
+          rows: pending.map((i) => options.rows[i]!),
+          requires: [],
+        };
+        let answer;
+        try {
+          answer = await options.registry.postBatch!(request);
+        } catch (error) {
+          if (!(error instanceof AmbiguousRegistryReplyError)) throw error;
+          // The first send may have landed. The same request again answers
+          // the rows it holds as replays.
+          answer = await options.registry.postBatch!(request);
         }
+        if (answer.kind === "committed") {
+          for (const i of pending) turns[i] = "committed";
+          return;
+        }
+        // A request with no conditions fails none; the per-row pass decides.
+        if (answer.kind === "precondition_failed") return;
+        // Refused: nothing of the request was written. A replay is stored all
+        // the same; the rows that lost leave; the rest go again.
+        const rest: number[] = [];
+        for (const [at, i] of pending.entries()) {
+          const row = answer.rows[at]!;
+          if (row.kind === "committed") turns[i] = "committed";
+          else if (row.kind === "not_written") rest.push(i);
+        }
+        pending = rest;
       }
-      return all;
     } catch (error) {
-      if (error instanceof RegistryRefusedError && error.status !== 409) {
-        // The delete still ends, by the per-stream path. The refusal is
-        // reported: the gateway judged the request wrong, and a caller that
-        // swallowed that would never be fixed.
-        options.onRefused(error);
-        return fallbackAll();
-      }
-      for (const p of chunk) p.fail(error);
-      return false;
-    }
-  }
-
-  const byScope = (a: Parked, b: Parked) =>
-    a.row.scope < b.row.scope ? -1 : a.row.scope > b.row.scope ? 1 : 0;
-
-  /** Split at the advertised row, condition and connection-log lock bounds. */
-  function split(list: readonly Parked[]): Parked[][] {
-    const bounds = batchBounds(options.registry);
-    const fits = (chunk: readonly Parked[]): boolean => {
       if (
-        chunk.length > bounds.rows ||
-        requiresFor(chunk).length > bounds.requires
+        error instanceof RegistryBatchRouteMissingError ||
+        error instanceof RegistryRefusedError
       )
-        return false;
-      if (bounds.lockedScopes === undefined) return true;
-      const fences = countFencedLogScopes(
-        chunk.map((part) => part.row),
-        (row) =>
-          row.dataHash.toLowerCase() === options.hashes.tombstoneData &&
-          row.metadataHash.toLowerCase() === options.hashes.tombstoneMetadata,
-      );
-      return fences === 0 || chunk.length + fences <= bounds.lockedScopes;
-    };
-    const chunks: Parked[][] = [];
-    let chunk: Parked[] = [];
-    for (const part of list) {
-      if (!fits([...chunk, part])) {
-        if (chunk.length > 0) chunks.push(chunk);
-        chunk = [];
-        // Even one row can exceed the lock budget. Settle it once through the
-        // per-stream path; never send an empty or oversized batch or retry it here.
-        if (!fits([part])) {
-          part.settle("fallback");
-          continue;
-        }
-      }
-      chunk.push(part);
+        throw error;
+      // No answer: the per-row pass reads each row.
     }
-    if (chunk.length > 0) chunks.push(chunk);
-    return chunks;
   }
-
-  async function flushFences() {
-    const rows = fenceRows.splice(0).sort(byScope);
-    // Each fence is its own compare-and-set on its own row: chunks do not
-    // depend on one another, so they go out together.
-    const results = await Promise.all(split(rows).map(send));
-    fencesDone(results.every(Boolean));
-  }
-
-  async function flushStreams() {
-    const rows = streamRows.splice(0).sort(byScope);
-    if (!(await fencesLanded)) {
-      for (const p of rows) p.settle("fallback");
-      return;
-    }
-    await Promise.all(split(rows).map(send));
-  }
-
-  const fenceArrived = () => {
-    fencesOutstanding--;
-    if (fencesOutstanding === 0) void flushFences();
-  };
-  const streamArrived = () => {
-    streamsOutstanding--;
-    if (streamsOutstanding === 0) void flushStreams();
-  };
-  // Nothing to fence: the stream rows rest on no fence of this request.
-  if (fencesOutstanding === 0) fencesDone(true);
-  return {
-    submit: (row, part) =>
-      new Promise<BatchTurn>((settle, fail) => {
-        (part.fence ? fenceRows : streamRows).push({
-          row,
-          ...part,
-          settle,
-          fail,
-        });
-        (part.fence ? fenceArrived : streamArrived)();
-      }),
-    leave: (part) => (part.fence ? fenceArrived : streamArrived)(),
-  };
 }

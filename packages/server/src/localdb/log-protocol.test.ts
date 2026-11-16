@@ -59,7 +59,7 @@ const six = (prefix = "a") =>
   ]).flat();
 
 describe("log protocol", () => {
-  it("a 6-stream batch is one segment PUT and one registry commit", async () => {
+  it("a 6-stream batch is one segment PUT and one registry commit, which also creates the control row", async () => {
     const w = await world({ streams: 6 });
     const a = await w.device("a");
     await a.run("run-1", six());
@@ -68,8 +68,9 @@ describe("log protocol", () => {
     expect(a.puts[0]).toMatch(/\.~log\/s-[0-9a-f]{64}$/);
     expect(w.writes().batches).toBe(1);
     const [batch] = w.gateway.batches();
-    expect(batch!.body.rows.map((r) => r.scope)).toEqual([LOG]);
-    expect(batch!.body.rows[0]!.expectedVersion).toBe("1");
+    // A first save: the control row and the log row that needs it.
+    expect(batch!.body.rows.map((r) => r.scope)).toEqual([CONTROL, LOG]);
+    expect(batch!.body.rows.map((r) => r.expectedVersion)).toEqual(["1", "1"]);
     // No stream row exists: the log row is the only data row besides control.
     expect([...w.gateway.versions.keys()].filter((s) => s !== CONTROL)).toEqual(
       [LOG],
@@ -843,10 +844,18 @@ describe("log protocol: size splitting", () => {
     expect(positions).toEqual(positions.map((_, i) => i + 1));
     expect(await a.position()).toBe(positions.length);
     expect(w.writes().batches).toBe(positions.length);
-    // One commit per segment, at consecutive versions.
+    // One commit per segment, at consecutive versions; the first also
+    // creates the control row.
     expect(
-      w.gateway.batches().map((b) => b.body.rows.map((r) => r.expectedVersion)),
+      w.gateway
+        .batches()
+        .map((b) =>
+          b.body.rows
+            .filter((r) => r.scope === LOG)
+            .map((r) => r.expectedVersion),
+        ),
     ).toEqual(positions.map((p) => [String(p)]));
+    expect(w.gateway.batches()[0]!.body.rows[0]!.scope).toBe(CONTROL);
 
     // Streams go in order, each in exactly one segment, none split.
     const order = positions.flatMap((p) =>

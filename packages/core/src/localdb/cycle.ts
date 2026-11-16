@@ -159,8 +159,7 @@ async function publishEarly(
     ...active.map(async ({ connectionId }) => {
       try {
         const published = await publishLog(deps, connectionId);
-        if (published !== null)
-          early.set(connectionId, { published, error: null });
+        early.set(connectionId, { published, error: null });
       } catch (cause) {
         early.set(connectionId, { published: [], error: cause });
       }
@@ -173,11 +172,10 @@ async function publishEarly(
     ...fresh.map(async ({ connectionId }) => {
       try {
         const published = await publishLog(deps, connectionId);
-        if (published !== null)
-          early.set(connectionId, {
-            published: published.filter((r) => r.outcome !== "deferred"),
-            error: null,
-          });
+        early.set(connectionId, {
+          published: published.filter((r) => r.outcome !== "deferred"),
+          error: null,
+        });
       } catch (cause) {
         early.set(connectionId, { published: [], error: cause });
       }
@@ -212,14 +210,11 @@ export async function syncConnection(
       applyConnection(insideQueue(deps, connectionId), connectionId, listed),
     );
     if (early && early.error !== null) throw early.error;
-    // One segment and one commit per batch; `null` means this registry has no
-    // batch route, so nothing can be published until it has. What apply left
-    // to publish goes after what the early publish already sent.
+    // One segment and one commit per batch. A registry without the batch
+    // route fails it (`RegistryBatchRouteMissingError`): nothing is published
+    // until it has one. What apply left to publish goes after what the early
+    // publish already sent.
     const through = await publishLog(deps, connectionId);
-    if (through === null)
-      throw new Error(
-        "stream sync: this registry has no batch route; nothing is published until it has",
-      );
     published = [...(early?.published ?? []), ...through];
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause);

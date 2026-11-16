@@ -25,6 +25,7 @@ import {
 } from "../../../core/src/localdb/index.js";
 import { createMemoryStreamSyncBlobs } from "../../../core/src/stream-sync/index.js";
 import type {
+  RegistryBatchPolicy,
   RegistryBatchResult,
   RegistryBatchRow,
   SignedRegistryBatch,
@@ -61,7 +62,15 @@ export async function remoteFixture(
     const row = reads.get(scope);
     return row?.found ? row.version : 0;
   };
+  // The bounds the gateway derives and advertises in `Batch-Policy`.
+  const policy: RegistryBatchPolicy = {
+    rows: 36,
+    requires: 2152,
+    bytes: 3_979_801,
+  };
   const registry: StreamSyncRegistry = {
+    batchPolicy: () => policy,
+    readBatchPolicy: async () => policy,
     read: async (scope) => reads.get(scope) ?? { found: false },
     listControlRows: async () =>
       [...reads]
@@ -88,8 +97,43 @@ export async function remoteFixture(
       });
       return { kind: "committed" };
     },
-    /** The gateway's batch route: every condition first, then each row on its own. */
+    /**
+     * The gateway's batch route: one all-or-nothing transaction. A row that
+     * loses refuses the request; the conditions are judged after the writes.
+     */
     postBatch: async (request: SignedRegistryBatch) => {
+      const lost = request.rows.map((row) => {
+        const prior = reads.get(row.scope);
+        const fence = row.expectedHeadDataHash;
+        return (
+          String(versionOf(row.scope) + 1) !== row.expectedVersion ||
+          (fence !== undefined &&
+            (!prior?.found ||
+              prior.dataHash.toLowerCase() !== fence.toLowerCase()))
+        );
+      });
+      if (lost.some(Boolean))
+        return {
+          kind: "refused",
+          rows: request.rows.map((row, at): RegistryBatchRow => {
+            if (!lost[at]) return { kind: "not_written" };
+            const prior = reads.get(row.scope);
+            return {
+              kind: "conflict",
+              latestVersion: String(versionOf(row.scope)),
+              latestDataHash: prior?.found ? prior.dataHash : null,
+            };
+          }),
+        } satisfies RegistryBatchResult;
+      const before = new Map(reads);
+      for (const row of request.rows)
+        reads.set(row.scope, {
+          found: true,
+          version: versionOf(row.scope) + 1,
+          dataHash: row.dataHash,
+          metadataHash: row.metadataHash,
+          deleted: row.dataHash.toLowerCase() === hashes.tombstoneData,
+        });
       for (const need of request.requires) {
         const row = reads.get(need.scope);
         const reason = !row?.found
@@ -101,44 +145,20 @@ export async function remoteFixture(
                   need.expectedDataHash.toLowerCase()
               ? ("data-hash-mismatch" as const)
               : undefined;
-        if (reason !== undefined)
-          return {
-            kind: "precondition_failed",
-            failure: {
-              scope: need.scope,
-              reason,
-              latestVersion: row?.found ? String(row.version) : null,
-              deleted: false,
-            },
-          } satisfies RegistryBatchResult;
+        if (reason === undefined) continue;
+        reads.clear();
+        for (const [scope, read] of before) reads.set(scope, read);
+        return {
+          kind: "precondition_failed",
+          failure: {
+            scope: need.scope,
+            reason,
+            latestVersion: row?.found ? String(row.version) : null,
+            deleted: false,
+          },
+        } satisfies RegistryBatchResult;
       }
-      const results: RegistryBatchRow[] = [];
-      for (const row of request.rows) {
-        const prior = reads.get(row.scope);
-        const fence = row.expectedHeadDataHash;
-        if (
-          String(versionOf(row.scope) + 1) !== row.expectedVersion ||
-          (fence !== undefined &&
-            (!prior?.found ||
-              prior.dataHash.toLowerCase() !== fence.toLowerCase()))
-        ) {
-          results.push({
-            kind: "conflict",
-            latestVersion: String(versionOf(row.scope)),
-            latestDataHash: prior?.found ? prior.dataHash : null,
-          });
-          continue;
-        }
-        reads.set(row.scope, {
-          found: true,
-          version: versionOf(row.scope) + 1,
-          dataHash: row.dataHash,
-          metadataHash: row.metadataHash,
-          deleted: false,
-        });
-        results.push({ kind: "committed" });
-      }
-      return { kind: "rows", rows: results } satisfies RegistryBatchResult;
+      return { kind: "committed" } satisfies RegistryBatchResult;
     },
   };
   const storage = {

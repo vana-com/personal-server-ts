@@ -122,7 +122,11 @@ it("a listing that says it is complete ends", async () => {
 
 // --- batch commit and `requires` ---
 
-import { AmbiguousRegistryReplyError, RegistryRefusedError } from "./ports.js";
+import {
+  AmbiguousRegistryReplyError,
+  RegistryBatchRouteMissingError,
+  RegistryRefusedError,
+} from "./ports.js";
 
 const OWNER = "0x" + "11".repeat(20);
 const batchRequest = {
@@ -164,16 +168,11 @@ const results200 = (statuses: Record<string, object>) =>
     }),
   );
 
-it("sends every row and every condition in one request and reads one result per row", async () => {
+it("sends every row and every condition in one request; a 200 is a commit of every row", async () => {
   const { registry, sent } = gatewayAnswering(() =>
     results200({
-      "pdpp.x~.b": {
-        status: 409,
-        reason: "stale",
-        latestVersion: "2",
-        latestDataHash: hash("aa"),
-      },
       "pdpp.x~.a": { status: 201, version: "2" },
+      "pdpp.x~.b": { status: 201, version: "2" },
     }),
   );
   const result = await registry.postBatch!(batchRequest);
@@ -184,9 +183,59 @@ it("sends every row and every condition in one request and reads one result per 
     rows: batchRequest.rows,
     requires: batchRequest.requires,
   });
-  // Results come back in request order, whatever order the gateway lists them.
-  expect(result).toEqual({
-    kind: "rows",
+  expect(result).toEqual({ kind: "committed" });
+});
+
+it("a 409 conflict wrote nothing: one answer per row in request order, the loser with its winner, a replay stored, the rest not written", async () => {
+  const { registry } = gatewayAnswering(
+    () =>
+      new Response(
+        JSON.stringify({
+          success: false,
+          error: "conflict",
+          results: [
+            {
+              scope: "pdpp.x~.b",
+              status: 409,
+              reason: "stale",
+              latestVersion: "2",
+              latestDataHash: hash("aa"),
+            },
+            { scope: "pdpp.x~.a", status: 424 },
+          ],
+        }),
+        { status: 409 },
+      ),
+  );
+  expect(await registry.postBatch!(batchRequest)).toEqual({
+    kind: "refused",
+    rows: [
+      { kind: "not_written" },
+      { kind: "conflict", latestVersion: "2", latestDataHash: hash("aa") },
+    ],
+  });
+  const replay = gatewayAnswering(
+    () =>
+      new Response(
+        JSON.stringify({
+          success: false,
+          error: "conflict",
+          results: [
+            { scope: "pdpp.x~.a", status: 201, version: "2" },
+            {
+              scope: "pdpp.x~.b",
+              status: 409,
+              reason: "stale",
+              latestVersion: "2",
+              latestDataHash: hash("aa"),
+            },
+          ],
+        }),
+        { status: 409 },
+      ),
+  );
+  expect(await replay.registry.postBatch!(batchRequest)).toEqual({
+    kind: "refused",
     rows: [
       { kind: "committed" },
       { kind: "conflict", latestVersion: "2", latestDataHash: hash("aa") },
@@ -268,18 +317,12 @@ it.each([
 );
 
 it.each([404, 405])(
-  "a %s on the batch route is remembered: later calls send nothing",
+  "a %s on the batch route is a gateway without the batch contract: the call fails closed",
   async (status) => {
-    const { registry, sent } = gatewayAnswering(
-      () => new Response("{}", { status }),
+    const { registry } = gatewayAnswering(() => new Response("{}", { status }));
+    await expect(registry.postBatch!(batchRequest)).rejects.toBeInstanceOf(
+      RegistryBatchRouteMissingError,
     );
-    expect(await registry.postBatch!(batchRequest)).toEqual({
-      kind: "unsupported",
-    });
-    expect(await registry.postBatch!(batchRequest)).toEqual({
-      kind: "unsupported",
-    });
-    expect(sent).toHaveLength(1);
   },
 );
 
@@ -350,13 +393,7 @@ it("a reply that did not say whether the rows landed is ambiguous, a refusal is 
   await expect(dropped.postBatch!(batchRequest)).rejects.toBeInstanceOf(
     AmbiguousRegistryReplyError,
   );
-  // A 200 that does not answer every row cannot be read as published.
-  const partial = gatewayAnswering(() =>
-    results200({ "pdpp.x~.a": { status: 201 } }),
-  );
-  await expect(
-    partial.registry.postBatch!(batchRequest),
-  ).rejects.toBeInstanceOf(AmbiguousRegistryReplyError);
+  // A 2xx that does not say it committed (a proxy's page) is no commit.
   const notJson = gatewayAnswering(() => new Response("<html>"));
   await expect(
     notJson.registry.postBatch!(batchRequest),
@@ -916,6 +953,7 @@ describe("listings of concurrent callers", () => {
     const { begun, fetch, started } = held();
     const registry = registryOver(fetch);
     const first = registry.listControlRows();
+    await new Promise((resolve) => setTimeout(resolve, 0));
     const second = registry.listControlRows();
     const third = registry.listStreamRows("acme");
     await started(0);
@@ -983,6 +1021,7 @@ describe("listings of concurrent callers", () => {
     }) as unknown as typeof globalThis.fetch;
     const registry = registryOver(fetch);
     const first = registry.listControlRows();
+    await Promise.resolve();
     const second = registry.listControlRows();
     await expect(first).rejects.toBeInstanceOf(RegistryUnavailableError);
     await expect(second).resolves.toEqual([]);

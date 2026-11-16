@@ -3,6 +3,7 @@ import { afterEach, expect, it } from "vitest";
 import {
   controlHashes,
   deriveKeyCheck,
+  LOG_STREAM,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   connectionQueue,
@@ -190,7 +191,16 @@ async function world(options: {
   return {
     a: await device("a"),
     b: await device("b"),
-    commits: () => gateway.batches().length,
+    // Log commits. A new connection's control row is created on its own
+    // batch when a round has nothing to publish; that is not a log commit.
+    commits: () =>
+      gateway
+        .batches()
+        .filter((call) =>
+          call.body.rows.some((row: { scope: string }) =>
+            row.scope.endsWith(`.${LOG_STREAM}`),
+          ),
+        ).length,
     segmentPuts: () =>
       [...store.keys()].filter((k) => k.includes("/s-")).length,
   };

@@ -23,6 +23,7 @@ import {
   RegistryUnavailableError,
   ChangeFeedAbsentError,
   RegistryRefusedError,
+  RegistryBatchRouteMissingError,
   type ConditionalPostResult,
   type ConditionalRegistryPost,
   type RegistryBatchPolicy,
@@ -158,11 +159,12 @@ function ambiguousOrRefused(
   );
 }
 
-/** One row of a batch reply. Anything else than 2xx or 409 is not a result. */
+/** One row of a refused batch's reply: 201 (a replay), 409 (it lost) or 424 (not written). */
 function batchRowOf(raw: unknown, scope: string): RegistryBatchRow {
   const row = asRecord(raw);
   const status = typeof row?.status === "number" ? row.status : 0;
   if (status >= 200 && status < 300) return { kind: "committed" };
+  if (status === 424) return { kind: "not_written" };
   if (status === 409) {
     const hash = row?.latestDataHash;
     return {
@@ -305,9 +307,9 @@ export function createGatewayStreamSyncRegistry(
     return (await ownerRows()).filter((row) => keep(row.scope));
   }
 
-  /** `undefined` until the gateway answers the batch route once. */
-  let batchRoute: "absent" | undefined;
   let batchPolicy: RegistryBatchPolicy | undefined;
+  /** The one policy read of this process; cleared when it got no answer. */
+  let policyRead: Promise<RegistryBatchPolicy | undefined> | undefined;
 
   const absentFeed = (status?: number) =>
     new ChangeFeedAbsentError(
@@ -359,8 +361,8 @@ export function createGatewayStreamSyncRegistry(
     );
   }
 
-  /** The 2xx reply of a batch: one result per row, in request order. */
-  function batchRowsOf(
+  /** A refused batch (409 `conflict`): one result per row, in request order. */
+  function refusedRowsOf(
     request: SignedRegistryBatch,
     body: unknown,
   ): RegistryBatchResult {
@@ -383,7 +385,12 @@ export function createGatewayStreamSyncRegistry(
       }
       return batchRowOf(byScope.get(row.scope), row.scope);
     });
-    return { kind: "rows", rows };
+    if (!rows.some((row) => row.kind === "conflict")) {
+      throw new AmbiguousRegistryReplyError(
+        "registry refused a batch without naming the row that lost",
+      );
+    }
+    return { kind: "refused", rows };
   }
 
   return {
@@ -417,11 +424,9 @@ export function createGatewayStreamSyncRegistry(
       return sendPost(request, request.requires);
     },
 
-    async postBatch(request: SignedRegistryBatch) {
-      // A 404 or 405 is the gateway's answer for the process's lifetime: ask
-      // again only after a restart. Nothing is written by a request the
-      // gateway has no route for.
-      if (batchRoute === "absent") return { kind: "unsupported" as const };
+    async postBatch(
+      request: SignedRegistryBatch,
+    ): Promise<RegistryBatchResult> {
       let res: Response;
       try {
         res = await fetchImpl(`${base}/v1/data/batch`, {
@@ -447,30 +452,62 @@ export function createGatewayStreamSyncRegistry(
           `registry batch POST got no reply: ${(cause as Error).message}`,
         );
       }
+      // Nothing is written by a request the gateway has no route for.
       if (res.status === 404 || res.status === 405) {
-        batchRoute = "absent";
-        return { kind: "unsupported" as const };
+        throw new RegistryBatchRouteMissingError(`HTTP ${res.status}`);
       }
       // Every answer of the route, errors included, carries the bounds.
       batchPolicy =
         parseBatchPolicy(res.headers.get("batch-policy")) ?? batchPolicy;
       const what = `batch POST of ${request.rows.length} rows`;
       if (res.status === 409) {
-        // The batch route answers 409 only when a condition failed (a row that
-        // lost answers inside a 2xx). A body without the detail is still that:
-        // the caller reads the row.
+        // Nothing was written: a row lost (`conflict`), or a condition failed.
+        // A body without the detail is a failed condition: the caller reads
+        // the row.
+        const body = await jsonOf(res);
+        if (asRecord(body)?.error === "conflict") {
+          return refusedRowsOf(request, body);
+        }
         return {
-          kind: "precondition_failed" as const,
-          failure: requirementFailure(await jsonOf(res)),
+          kind: "precondition_failed",
+          failure: requirementFailure(body),
         };
       }
       if (res.status < 200 || res.status >= 300) {
         throw ambiguousOrRefused(what, res, await res.text().catch(() => ""));
       }
-      return batchRowsOf(request, await jsonOf(res));
+      // A commit says so. A 2xx body that does not (a proxy's page) may come
+      // from something other than the route.
+      if (asRecord(await jsonOf(res))?.success !== true) {
+        throw new AmbiguousRegistryReplyError(
+          `${what} answered ${res.status} without a commit`,
+        );
+      }
+      return { kind: "committed" };
     },
 
     batchPolicy: () => batchPolicy,
+
+    readBatchPolicy() {
+      if (batchPolicy !== undefined) return Promise.resolve(batchPolicy);
+      // The route sets `Batch-Policy` before it answers a preflight, so an
+      // OPTIONS request reads it without writing. A gateway whose answer has
+      // no header has no policy for this process's lifetime, as a 404 to the
+      // batch route has no route.
+      policyRead ??= fetchImpl(`${base}/v1/data/batch`, { method: "OPTIONS" })
+        .then((res) => {
+          batchPolicy =
+            parseBatchPolicy(res.headers.get("batch-policy")) ?? batchPolicy;
+          return batchPolicy;
+        })
+        .catch((cause: unknown) => {
+          policyRead = undefined;
+          throw new AmbiguousRegistryReplyError(
+            `registry batch policy read got no reply: ${(cause as Error).message}`,
+          );
+        });
+      return policyRead;
+    },
 
     listControlRows: () =>
       listRows((scope) => parseScope(scope)?.kind === "control"),
@@ -635,9 +672,10 @@ async function isLegacyRouteRefusal(res: Response): Promise<boolean> {
 }
 
 /**
- * `Batch-Policy: rows=<R>;bytes=<B>;requires=<Q>[;lockedScopes=<L>]`. `undefined` when the header
- * is absent or any field is not a positive integer: a client that cannot read
- * the bounds keeps the ones it had.
+ * `Batch-Policy: rows=<R>;bytes=<B>;requires=<Q>[;lockedScopes=<L>]`.
+ * `undefined` when the header is absent or any field is not a positive
+ * integer: a client that cannot read the bounds keeps the ones it had. A field
+ * this client does not know is ignored.
  */
 export function parseBatchPolicy(
   header: string | null,

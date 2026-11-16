@@ -14,38 +14,31 @@
  * Answers:
  *   202 { deleteId, fenced }    the delete intent is durable; the landing runs
  *                               in the writer and retries until it lands. The
- *                               control tombstone lands first and the request
- *                               waits for it: `fenced: true` means the
- *                               registry confirmed it, so every other surface
- *                               already sees the source as deleted and its
- *                               streams are being cleaned in the background.
- *                               `fenced: false` means the registry has not
- *                               confirmed it (unreachable, refused, or slower
- *                               than the writer's first resume wait, 5 s by
- *                               default): the
- *                               delete is only saved here, other surfaces
- *                               still see the source, and what they publish
- *                               before the fence lands is deleted with it.
- *                               When the registry lists nothing of the
+ *                               delete is the control tombstone (the fence),
+ *                               and the request waits for it: `fenced: true`
+ *                               means the registry confirmed it, so every
+ *                               other surface already sees the source as
+ *                               deleted. `fenced: false` means the registry
+ *                               has not confirmed it (unreachable, refused,
+ *                               or slower than the writer's first resume
+ *                               wait, 5 s by default): the delete is only
+ *                               saved here, other surfaces still see the
+ *                               source, and what they publish before the
+ *                               fence lands ends with its lifetime. When the
+ *                               registry lists no control row of the
  *                               connector, the writer purges this device's
  *                               local state and the delete is already done
- *                               (`fenced: true`). A reconnect that lands
- *                               before the cleanup keeps its data: cleanup
- *                               removes only the lifetime the fence ended
+ *                               (`fenced: true`)
  *   400 INVALID_CONNECTOR       the id is not a connector key
  *   409 NOT_SWITCHED            the account has not moved to stream sync
  *   503 ACCOUNT_MODE_UNKNOWN    the storage mode cannot be read yet; retry
  *   503 STREAM_SYNC_UNAVAILABLE no stream-sync writer is wired on this host
- *   503 CONNECTOR_NOT_VERIFIED  the registry holds a pin of the connector, no
- *                               stream row, and this host verified no manifest
- *                               naming its streams; retry once it has
- *
+ * *
  * Every refusal has the one error shape of the API, the `ProtocolError`
  * envelope: `{ error: { code, errorCode, message } }`.
  */
 
 import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
-import { ConnectorNotVerifiedError } from "../localdb/delete.js";
 
 /**
  * What the route needs of the account's storage mode: the read shape of
@@ -152,18 +145,7 @@ export async function handleOwnerConnectorDelete(
       "Stream sync is not running on this server.",
     );
   }
-  try {
-    const started =
-      await deps.connectionDelete.requestConnectionDelete(connectorId);
-    return accepted(started.deleteId, started.fenced);
-  } catch (error) {
-    if (error instanceof ConnectorNotVerifiedError) {
-      return ownerConnectorRefusal(
-        503,
-        "CONNECTOR_NOT_VERIFIED",
-        "This server has not verified the source's streams yet, so it cannot delete the source safely. Retry shortly.",
-      );
-    }
-    throw error;
-  }
+  const started =
+    await deps.connectionDelete.requestConnectionDelete(connectorId);
+  return accepted(started.deleteId, started.fenced);
 }
