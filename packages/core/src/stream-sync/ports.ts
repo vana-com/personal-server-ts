@@ -261,17 +261,17 @@ export interface StreamSyncRegistry {
     connector: string,
   ): Promise<readonly { readonly scope: string; readonly read: ControlRead }[]>;
   /**
-   * The control row of one connection and every stream row in its namespace,
-   * deleted or not, in one pass over the owner's rows. A publish takes its
-   * snapshot's starting point from it instead of reading each row. The rows
-   * are a hint: the commit still re-checks the control row and posts with
-   * compare-and-set. A registry that cannot list in one pass leaves this out,
-   * and publish reads each row itself.
+   * Every row of the owner, control and stream, deleted or not, in one
+   * listing. A sync cycle takes it once and reads each connection's control
+   * and log rows from it, so the cycle's listings do not depend on when its
+   * applies run. The rows are a hint taken before the applies: an apply that
+   * holds a newer log position than the listing reads the row again. A
+   * registry that cannot list in one pass leaves this out, and each apply
+   * lists for itself.
    */
-  listConnectionRows?(
-    connector: string,
-    ns: string,
-  ): Promise<readonly { readonly scope: string; readonly read: ControlRead }[]>;
+  listOwnerRows?(): Promise<
+    readonly { readonly scope: string; readonly read: ControlRead }[]
+  >;
   /**
    * One request: a marker of the owner's newest registry change, whatever the
    * number of rows (the gateway's change feed, newest first, one row). A

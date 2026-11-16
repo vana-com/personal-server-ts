@@ -9,6 +9,7 @@ import {
   type ControlRead,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { keccakOf } from "../stream-sync/crypto-port.js";
+import type { OwnerRows } from "./bootstrap.js";
 import type { ConnectionQueue, LocalSyncDeps } from "./deps.js";
 import { applyLog } from "./log-apply.js";
 import { purgeConnection } from "./purge.js";
@@ -64,20 +65,34 @@ type Flight = {
   /** Closed at the start of the job; later callers join the next flight. */
   closed: boolean;
   promise: Promise<void>;
+  /**
+   * The listing the flight reads its log row from, when every caller of the
+   * flight brought this same one (`applyConnection`). A caller with another
+   * listing, or none, joins and clears it: the flight then lists for itself.
+   */
+  listed?: OwnerRows;
 };
 type Slot = { running: Flight; next?: Flight };
 const slots = new WeakMap<ConnectionQueue, Map<string, Slot>>();
-function request(deps: LocalSyncDeps, id: string): Promise<void> {
+function request(
+  deps: LocalSyncDeps,
+  id: string,
+  listed: OwnerRows | undefined,
+): Promise<void> {
   let byId = slots.get(deps.queue);
   if (!byId) {
     byId = new Map();
     slots.set(deps.queue, byId);
   }
+  const join = (flight: Flight) => {
+    if (flight.listed !== listed) flight.listed = undefined;
+    return flight.promise;
+  };
   const slot = byId.get(id);
   if (slot) {
-    if (!slot.running.closed) return slot.running.promise;
-    if (slot.next) return slot.next.promise;
-    const next = newFlight();
+    if (!slot.running.closed) return join(slot.running);
+    if (slot.next) return join(slot.next);
+    const next = newFlight(listed);
     slot.next = next;
     next.promise = slot.running.promise
       .then(
@@ -87,15 +102,16 @@ function request(deps: LocalSyncDeps, id: string): Promise<void> {
       .then(() => launch(deps, id, next, byId, slot));
     return next.promise;
   }
-  const flight = newFlight();
+  const flight = newFlight(listed);
   const created: Slot = { running: flight };
   byId.set(id, created);
   flight.promise = launch(deps, id, flight, byId, created);
   return flight.promise;
 }
-const newFlight = (): Flight => ({
+const newFlight = (listed: OwnerRows | undefined): Flight => ({
   closed: false,
   promise: Promise.resolve(),
+  ...(listed ? { listed } : {}),
 });
 function launch(
   deps: LocalSyncDeps,
@@ -163,15 +179,20 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
       return;
     }
     // The connection's data is its log. The owner's listing says where the log
-    // stands; concurrent applies share one listing, where a read of each log
-    // row would be one request per connection.
+    // stands: the cycle's one listing when every caller of this flight came
+    // with it, else one this flight takes (concurrent applies share it). A
+    // read of each log row would be one request per connection.
     await applyLog(locked, id, {
       connector: connection.connector,
       ns: connection.ns,
       generation: initial.generation,
       keyCheck,
       hashes,
-      read: await listedLog(deps, connection),
+      read: logRowOf(
+        flight.listed ??
+          (await deps.registry.listStreamRows(connection.connector)),
+        connection,
+      ),
     });
     // A pass that ran to its end has applied the log through the position it
     // read, which is what the mark waits for.
@@ -180,14 +201,14 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
 }
 
 /**
- * The connection's log row from the registry listing, or `undefined` when the
+ * The connection's log row in a registry listing, or `undefined` when the
  * listing holds none (`applyLog` then reads it itself).
  */
-async function listedLog(
-  deps: LocalSyncDeps,
+function logRowOf(
+  listed: OwnerRows,
   connection: Connection,
-): Promise<ControlRead | undefined> {
-  for (const row of await deps.registry.listStreamRows(connection.connector)) {
+): ControlRead | undefined {
+  for (const row of listed) {
     const scope = parseScope(row.scope);
     if (
       scope?.kind === "stream" &&
@@ -200,12 +221,17 @@ async function listedLog(
   return undefined;
 }
 
-/** Apply the connection's log; concurrent requests share one flight. */
+/**
+ * Apply the connection's log; concurrent requests share one flight. `listed`
+ * is a listing of the owner's rows the caller took for this apply (a sync
+ * cycle's); without it the apply lists for itself.
+ */
 export function applyConnection(
   deps: LocalSyncDeps,
   connectionId: string,
+  listed?: OwnerRows,
 ): Promise<void> {
-  return request(deps, connectionId);
+  return request(deps, connectionId, listed);
 }
 
 async function control(

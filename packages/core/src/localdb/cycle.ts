@@ -3,6 +3,7 @@ import {
   bootstrapConnections,
   knownActiveConnections,
   newConnectionsWithStreams,
+  type OwnerRows,
 } from "./bootstrap.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { publishLog } from "./log-publish.js";
@@ -43,11 +44,16 @@ export interface EarlyPublish {
  */
 export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
   const early = await publishEarly(deps);
-  const connections = await bootstrapConnections(deps);
+  // One listing for the whole cycle, taken after the early publish: the
+  // bootstrap reads the control rows from it and every apply its log row. Each
+  // apply's own listing would be shared only by the applies that reach it while
+  // it is out, so the count would follow how their control reads line up.
+  const listed = await deps.registry.listOwnerRows?.();
+  const connections = await bootstrapConnections(deps, listed);
   return {
     connections: await Promise.all(
       connections.map(({ connectionId }) =>
-        syncConnection(deps, connectionId, early.get(connectionId)),
+        syncConnection(deps, connectionId, early.get(connectionId), listed),
       ),
     ),
   };
@@ -117,6 +123,8 @@ export async function syncConnection(
   deps: LocalSyncDeps,
   connectionId: string,
   early?: EarlyPublish,
+  /** The cycle's listing of the owner's rows, taken before this call. */
+  listed?: OwnerRows,
 ): Promise<CycleReport["connections"][number]> {
   let published: readonly PublishResult[] = [];
   let error: string | null = null;
@@ -124,7 +132,7 @@ export async function syncConnection(
   try {
     // A pass includes publish, so it must not join an apply-only operation.
     await deps.queue.run(connectionId, "publish", () =>
-      applyConnection(insideQueue(deps, connectionId), connectionId),
+      applyConnection(insideQueue(deps, connectionId), connectionId, listed),
     );
     if (early && early.error !== null) throw early.error;
     // One segment and one commit per batch; `null` means this registry has no

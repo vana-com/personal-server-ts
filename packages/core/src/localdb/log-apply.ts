@@ -137,7 +137,10 @@ export interface LogApplyContext {
   readonly generation: number;
   readonly keyCheck: string;
   readonly hashes: ControlHashes;
-  /** The registry's row for the log, if the caller already holds a fresh one. */
+  /**
+   * The registry's row for the log from a listing the caller holds. A row
+   * behind this device's position is read again (see `applyLog`).
+   */
   readonly read?: Awaited<ReturnType<LocalSyncDeps["registry"]["read"]>>;
 }
 
@@ -152,10 +155,17 @@ export async function applyLog(
   context: LogApplyContext,
 ): Promise<{ readonly applied: number }> {
   const scope = logScope(context.connector, context.ns);
-  const read = context.read ?? (await deps.registry.read(scope));
+  const local = await readLogState(deps, connectionId);
+  // A listed row is a hint taken before this apply. One behind this device can
+  // be a listing taken before this device's own later commit, so it is read
+  // again before it is believed.
+  const listed = context.read;
+  const read =
+    listed === undefined || (listed.found && listed.version < local.position)
+      ? await deps.registry.read(scope)
+      : listed;
   const classification = classifyStreamRow(read, context.hashes);
   if (!read.found || classification === "absent") return { applied: 0 };
-  const local = await readLogState(deps, connectionId);
   // Rows an unfinished key-ordered load left (see `log-keyed.ts`) lie beyond
   // this device's position, and only a key-ordered load that covers them may
   // move it. So while the marker stands, no branch below may write a cursor:

@@ -753,8 +753,7 @@ describe("an unreachable registry is told apart from a refusing one", () => {
   const listings = {
     listStreamRows: (r: ReturnType<typeof over>) => r.listStreamRows("acme"),
     listControlRows: (r: ReturnType<typeof over>) => r.listControlRows(),
-    listConnectionRows: (r: ReturnType<typeof over>) =>
-      r.listConnectionRows("acme", ""),
+    listOwnerRows: (r: ReturnType<typeof over>) => r.listOwnerRows!(),
   };
   it.each([
     ["a network error", new TypeError("terminated")],

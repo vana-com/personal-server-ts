@@ -111,6 +111,12 @@ async function purgeDeleted(deps: LocalSyncDeps, row: ConnectionRow) {
   }
 }
 
+/** Rows of one owner listing (`StreamSyncRegistry.listOwnerRows`). */
+export type OwnerRows = readonly {
+  readonly scope: string;
+  readonly read: ControlRead;
+}[];
+
 /**
  * C.0 step 1: list the registry's control rows and upsert one `connections`
  * row per control scope (classification is `classifyControl`). A deleted
@@ -119,9 +125,11 @@ async function purgeDeleted(deps: LocalSyncDeps, row: ConnectionRow) {
  */
 export async function bootstrapConnections(
   deps: LocalSyncDeps,
+  /** The owner's rows, when the caller already listed them (`listOwnerRows`). */
+  listed?: OwnerRows,
 ): Promise<readonly ConnectionRow[]> {
   const control = await hashes(deps);
-  const rows = await deps.registry.listControlRows();
+  const rows = listed ?? (await deps.registry.listControlRows());
   for (const row of rows) {
     const parsed = parseScope(row.scope);
     if (parsed?.kind !== "control") continue;

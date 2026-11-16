@@ -53,9 +53,9 @@ async function world(connectors: number, streamsPer: number) {
       calls.push("registry.list");
       return inner.listStreamRows(connector);
     },
-    async listConnectionRows(connector, ns) {
+    async listOwnerRows() {
       calls.push("registry.list");
-      return inner.listConnectionRows(connector, ns);
+      return inner.listOwnerRows!();
     },
     async probeChange() {
       calls.push("registry.probe");
