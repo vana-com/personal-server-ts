@@ -21,10 +21,13 @@
  *   slow save cannot undo a failed read that finished first.
  * - An answer that has arrived and is not applied yet suspends the permission
  *   from its arrival: `legacyWriteDecision` is `unknown` for that owner, and a
- *   `commitLegacy` that has not started waits for the answer to settle, then
- *   judges again. So no write starts on a permission that an arrived answer
- *   may contradict, and an Off poll that applies unchanged only delays a
- *   write. Only a write already running keeps its hold; the On waits for it.
+ *   `commitLegacy` that has not started waits once for the answers pending
+ *   when it was asked for, then judges inside the lock. Evidence that arrives
+ *   after that is not waited for (a steady stream could renew the wait
+ *   forever): the write gets the retryable `unknown`, never a pass. So no
+ *   write starts on a permission that an arrived answer may contradict, and
+ *   an Off poll that applies unchanged only delays a write. Only a write
+ *   already running keeps its hold; the On waits for it.
  *   When the answer settles, the permission is back only if the answer was
  *   applied, is the latest, and is current (its generation is not below the
  *   record's). An answer that fails to apply, or is older than the record,
@@ -130,11 +133,15 @@ export function createModeAuthority(
   const latest = new Map<string, number>();
   let submissions = 0;
   /**
-   * Answers (on or off) that have arrived and not settled, per owner, and the
-   * waiters for the count to reach zero. Counted before the first await.
+   * Answers (on or off) that have arrived and not settled, per owner, by
+   * their evidence number; and the writes waiting for the answers that were
+   * pending when they were asked for. Added before the first await.
    */
-  const unsettled = new Map<string, number>();
-  const settledWaiters = new Map<string, Array<() => void>>();
+  const unsettled = new Map<string, Set<number>>();
+  const cohortWaiters = new Map<
+    string,
+    Array<{ through: number; resolve: () => void }>
+  >();
   let loaded = false;
   let loadFailed = false;
   let closed = false;
@@ -188,25 +195,31 @@ export function createModeAuthority(
       : UNKNOWN_DECISION;
   }
 
-  function settledOf(key: string): Promise<void> {
-    if (!unsettled.has(key)) return Promise.resolve();
+  /**
+   * Resolves once every answer pending now has settled. Answers that arrive
+   * later are not waited for: that wait could be renewed forever.
+   */
+  function cohortSettled(key: string): Promise<void> {
+    const pending = unsettled.get(key);
+    if (!pending || pending.size === 0) return Promise.resolve();
     return new Promise((resolve) => {
-      const waiters = settledWaiters.get(key) ?? [];
-      waiters.push(resolve);
-      settledWaiters.set(key, waiters);
+      const waiters = cohortWaiters.get(key) ?? [];
+      waiters.push({ through: Math.max(...pending), resolve });
+      cohortWaiters.set(key, waiters);
     });
   }
 
-  function settle(key: string): void {
-    const left = (unsettled.get(key) ?? 1) - 1;
-    if (left > 0) {
-      unsettled.set(key, left);
-      return;
-    }
-    unsettled.delete(key);
-    const waiters = settledWaiters.get(key) ?? [];
-    settledWaiters.delete(key);
-    for (const resolve of waiters) resolve();
+  function settle(key: string, ticket: number): void {
+    const pending = unsettled.get(key);
+    pending?.delete(ticket);
+    const oldest =
+      pending && pending.size > 0 ? Math.min(...pending) : Infinity;
+    if (pending?.size === 0) unsettled.delete(key);
+    const waiters = cohortWaiters.get(key) ?? [];
+    const waiting = waiters.filter((w) => w.through >= oldest);
+    if (waiting.length > 0) cohortWaiters.set(key, waiting);
+    else cohortWaiters.delete(key);
+    for (const w of waiters) if (w.through < oldest) w.resolve();
   }
 
   return {
@@ -221,7 +234,11 @@ export function createModeAuthority(
       latest.set(owner, ticket);
       const answered = input.state === "on" || input.state === "off";
       if (!answered) verified.delete(owner);
-      else unsettled.set(owner, (unsettled.get(owner) ?? 0) + 1);
+      else {
+        const pending = unsettled.get(owner) ?? new Set<number>();
+        pending.add(ticket);
+        unsettled.set(owner, pending);
+      }
       if (answered) {
         // Settled in the `finally`, under the lock, whatever happens.
         let release: (() => void) | undefined;
@@ -257,7 +274,7 @@ export function createModeAuthority(
         } finally {
           if (eligible) verified.add(owner);
           else verified.delete(owner);
-          settle(owner);
+          settle(owner, ticket);
           release?.();
         }
       } else {
@@ -278,37 +295,35 @@ export function createModeAuthority(
       return decision;
     },
     async commitLegacy(owner, write) {
+      // An answer that has arrived and is not applied yet may contradict the
+      // permission. Wait once, outside the lock (its exclusive request may be
+      // queued behind other shared holders), for the answers pending at this
+      // call: captured before the first await. Evidence that arrives after
+      // that is not waited for: inside the lock, `legacyWriteDecision` is
+      // `unknown` while any answer is unsettled, so the write is refused
+      // (retryable) and never admitted past it.
+      const cohort =
+        typeof owner === "string"
+          ? cohortSettled(normalizeOwner(owner))
+          : Promise.resolve();
       await ready;
-      const key = typeof owner === "string" ? normalizeOwner(owner) : null;
-      for (;;) {
-        // An answer that has arrived and is not applied yet may contradict the
-        // permission: wait for it, outside the lock (its exclusive request
-        // may be queued behind other shared holders), then judge again.
-        if (key !== null) await settledOf(key);
-        const release = await lock.shared();
-        if (key !== null && unsettled.has(key)) {
-          // An answer arrived while this write waited for the lock.
-          release();
-          continue;
+      await cohort;
+      const release = await lock.shared();
+      try {
+        // No await between this read and the start of the write.
+        const decision = closed ? UNKNOWN_DECISION : legacyWriteDecision(owner);
+        if (decision.kind === "legacy") {
+          return { ok: true, value: await write() };
         }
-        try {
-          // No await between the checks above and the start of the write.
-          const decision = closed
-            ? UNKNOWN_DECISION
-            : legacyWriteDecision(owner);
-          if (decision.kind === "legacy") {
-            return { ok: true, value: await write() };
-          }
-          return {
-            ok: false,
-            decision:
-              decision.kind === "streams"
-                ? SWITCHED_REFUSAL
-                : (decision as RefuseDecision),
-          };
-        } finally {
-          release();
-        }
+        return {
+          ok: false,
+          decision:
+            decision.kind === "streams"
+              ? SWITCHED_REFUSAL
+              : (decision as RefuseDecision),
+        };
+      } finally {
+        release();
       }
     },
     async commitRemoval(work) {

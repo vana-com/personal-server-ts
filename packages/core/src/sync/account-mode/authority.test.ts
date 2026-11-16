@@ -503,6 +503,85 @@ describe("the account-mode record", () => {
       expect(await write).toEqual({ ok: true, value: "wrote" });
     });
 
+    it("refuses a waiting write once the answers pending at its entry settle, without draining answers that keep arriving", async () => {
+      // Off 3 is in flight when the write is asked for. Off 4 arrives before
+      // 3 is released, and each later save entry enqueues the next answer
+      // before its own is released, so the owner never has zero unsettled
+      // answers until the test stops enqueuing.
+      const memory = createMemoryModeRecordStore();
+      const SAVES = 4;
+      const entered = Array.from({ length: SAVES }, deferred);
+      const gates = Array.from({ length: SAVES }, deferred);
+      const submitted: Array<Promise<unknown>> = [];
+      const released = [false, false, false, false];
+      let saves = 0;
+      let counting = false;
+      const holder: {
+        authority?: Awaited<ReturnType<typeof authorityWith>>["authority"];
+      } = {};
+      const store: ModeRecordStore = {
+        load: () => memory.load(),
+        save: async (owner, record) => {
+          if (counting && saves < SAVES) {
+            const i = saves++;
+            // From the second save on, the next answer arrives before this
+            // one is released.
+            if (i >= 1 && i + 1 < SAVES) {
+              submitted.push(
+                holder.authority!.submitEvidence({
+                  owner: OWNER,
+                  state: "off",
+                  generation: 4 + i,
+                }),
+              );
+            }
+            entered[i]!.resolve();
+            await gates[i]!.promise;
+          }
+          await memory.save(owner, record);
+        },
+      };
+      const { authority } = await verifiedOff(store);
+      holder.authority = authority;
+      counting = true;
+      submitted.push(
+        authority.submitEvidence({ owner: OWNER, state: "off", generation: 3 }),
+      );
+      await entered[0]!.promise;
+      let ran = false;
+      const write = authority.commitLegacy(OWNER, () => {
+        ran = true;
+      });
+      // Off 4 arrives after the write was asked for, before Off 3 is released.
+      submitted.push(
+        authority.submitEvidence({ owner: OWNER, state: "off", generation: 4 }),
+      );
+      released[0] = true;
+      gates[0]!.resolve();
+      // Off 3 settles, so the write's cohort has. Off 4 was queued for the
+      // lock before the write asked for it, so it saves first, and enqueues
+      // Off 5 while it does.
+      await entered[1]!.promise;
+      released[1] = true;
+      gates[1]!.resolve();
+      // The write is refused while Off 5 is still unsettled, and Off 5's save
+      // is not released: it was not waited for.
+      expect(await write).toEqual({ ok: false, decision: UNKNOWN });
+      expect(ran).toBe(false);
+      expect(released).toEqual([true, true, false, false]);
+      for (let i = 2; i < SAVES; i += 1) {
+        await entered[i]!.promise;
+        released[i] = true;
+        gates[i]!.resolve();
+      }
+      await Promise.all(submitted);
+      // Once the evidence has drained, a write is admitted on the last Off.
+      expect(await authority.commitLegacy(OWNER, () => "wrote")).toEqual({
+        ok: true,
+        value: "wrote",
+      });
+    });
+
     it("takes back a live permission for an answer older than the record: Off 2, then a stale On 1 or a stale Off 1", async () => {
       for (const state of ["on", "off"] as const) {
         const { authority } = await verifiedOff();
