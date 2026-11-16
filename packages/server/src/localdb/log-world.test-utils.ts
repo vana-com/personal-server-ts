@@ -2,6 +2,7 @@
 // and any number of devices of one owner, each with its own real SQLite and the
 // real publish and apply drivers (see log-protocol.test.ts).
 import { keccak_256 } from "@noble/hashes/sha3";
+import type { StreamCryptoPort } from "../../../core/src/stream-sync/crypto-port.js";
 import {
   controlHashes,
   controlScope,
@@ -97,6 +98,8 @@ export async function world(options: {
        * segment makes an apply fetch and commit one segment at a time.
        */
       maxBytesInFlight?: number;
+      /** The host's hash and cipher port (`LocalSyncDeps.streamCrypto`). */
+      streamCrypto?: StreamCryptoPort;
     } = {},
   ) {
     const db = await openLocalDb(openBetterSqlite3(":memory:"), {
@@ -153,6 +156,7 @@ export async function world(options: {
         : {}),
       ...(hooks.progressiveFirstLoad ? { progressiveFirstLoad: true } : {}),
       ...(hooks.keyedFirstLoad === false ? { keyedFirstLoad: false } : {}),
+      ...(hooks.streamCrypto ? { streamCrypto: hooks.streamCrypto } : {}),
       ...(options.partTargetBytes !== undefined
         ? { partTargetBytes: options.partTargetBytes }
         : {}),

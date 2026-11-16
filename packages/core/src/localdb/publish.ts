@@ -79,7 +79,7 @@ import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 // snapshot and the commit. The caller must not hold it. applyConnection and
 // purgeConnection, called inside a turn, run inline in that turn.
 
-import { keccak_256 } from "@noble/hashes/sha3";
+import { keccakOf, nobleStreamCrypto } from "../stream-sync/crypto-port.js";
 import {
   HEAD_FORMAT,
   classifyControl,
@@ -100,7 +100,6 @@ import {
   type ControlRead,
   type Head,
   type HeadPart,
-  type Keccak256,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   planStreamStep,
@@ -222,7 +221,7 @@ export async function publishConnection(
       throw new Error(`publish: unknown connection ${connectionId}`);
     }
     const keyCheck = await deriveKeyCheck(held.keys.namespaceHmac);
-    const hashes = await controlHashes(keccak, keyCheck);
+    const hashes = await controlHashes(keccakOf(deps.streamCrypto), keyCheck);
     const streams = await held.db.query<{ stream: string }>(
       `SELECT stream FROM stream_state WHERE connection_id = ? ORDER BY stream`,
       [connectionId],
@@ -361,15 +360,13 @@ function logSendGate(
   );
 }
 
-const keccak: Keccak256 = async (data) => keccak_256(data);
-
 /** metadataHash for a head: keccak over the UTF-8 JSON of the envelope facts. */
 export function metadataHashFor(
   scope: string,
   collectedAt: string,
   sizeBytes: number,
 ): `0x${string}` {
-  return `0x${toHex(keccak_256(utf8(JSON.stringify({ scope, collectedAt, sizeBytes }))))}`;
+  return `0x${toHex(nobleStreamCrypto.keccak256(utf8(JSON.stringify({ scope, collectedAt, sizeBytes }))))}`;
 }
 
 export type ConnectionRow = {
@@ -1496,7 +1493,10 @@ async function transferOnWave(
   let handedOver = false;
   try {
     const headBytes = encodeHead({ ...plan.head, parts, recordCount });
-    const { dataHash, blobName } = await digestHead(keccak, headBytes);
+    const { dataHash, blobName } = await digestHead(
+      keccakOf(deps.streamCrypto),
+      headBytes,
+    );
     // The same data hash as the registry head: nothing to upload or post.
     if (
       plan.registryDataHash !== null &&
@@ -1513,7 +1513,7 @@ async function transferOnWave(
     }
     // The reader's own check, on the bytes about to be uploaded: a head that
     // would not verify is never uploaded, posted or remembered.
-    const verified = await verifyHead(keccak, headBytes, {
+    const verified = await verifyHead(keccakOf(deps.streamCrypto), headBytes, {
       dataHash,
       connector: context.connection.connector,
       ns: context.connection.ns,
@@ -2598,7 +2598,7 @@ async function readRegistryHead(
     );
   }
   const clear = await deps.keys.decrypt(scope, cipher);
-  const verified = await verifyHead(keccak, clear, {
+  const verified = await verifyHead(keccakOf(deps.streamCrypto), clear, {
     dataHash,
     connector: connection.connector,
     ns: connection.ns,
