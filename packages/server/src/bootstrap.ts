@@ -1283,10 +1283,7 @@ async function bootstrapServer(
       localSyncSource &&
       createRegistryChangeProbe(streamSyncRegistry(), {
         intervalMs: config.streamSync.changeProbeMs,
-        push: {
-          enabled: config.streamSync.changePush,
-          healthyProbeMs: config.streamSync.changeProbeHealthyMs,
-        },
+        push: { enabled: config.streamSync.changePush },
       });
 
     syncManager = createSyncManager(uploadDeps, downloadDeps, {

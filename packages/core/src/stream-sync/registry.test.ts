@@ -560,13 +560,106 @@ describe("waitForChange", () => {
     expect(new URL(urls[0]!).searchParams.has("after")).toBe(false);
   });
 
-  it("says the gateway has no change route on 404 or 405, so the caller stops asking", async () => {
+  it("says the gateway has no change route on 404 or 405", async () => {
     for (const status of [404, 405]) {
       const { registry } = waiting(() => new Response("no", { status }));
       await expect(
         registry.waitForChange!("1", 25_000, new AbortController().signal),
       ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
     }
+  });
+
+  it("reads the legacy handler's 400 for the id `changes` as 'no change route'", async () => {
+    // A gateway without the route hands the path to its `/v1/data/:dataPointId`
+    // handler, which refuses the id `changes` with a 400 that names dataPointId.
+    for (const after of [undefined, "9"]) {
+      const { registry } = waiting(
+        () =>
+          new Response(
+            JSON.stringify({
+              error:
+                "Invalid dataPointId: must be a valid bytes32 hex string (0x-prefixed, 64 hex chars)",
+            }),
+            { status: 400 },
+          ),
+      );
+      await expect(
+        registry.waitForChange!(after, 25_000, new AbortController().signal),
+      ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
+    }
+  });
+
+  it.each([
+    [
+      "the change route's own refusal",
+      JSON.stringify({ error: "Invalid user: expected an 0x address" }),
+    ],
+    [
+      "a message that only mentions dataPointId",
+      JSON.stringify({ error: "dataPointId lookup temporarily unavailable" }),
+    ],
+    ["a body that is not JSON", "bad request"],
+    ["an empty body", ""],
+  ])("does not read a 400 with %s as an absent route", async (_name, body) => {
+    const { registry } = waiting(() => new Response(body, { status: 400 }));
+    const failure = await registry.waitForChange!(
+      undefined,
+      25_000,
+      new AbortController().signal,
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).name).not.toBe("ChangeFeedAbsentError");
+  });
+
+  it("asks again after a first 400 that was not an absence, and uses the answer", async () => {
+    let calls = 0;
+    const { registry, urls } = waiting(() => {
+      calls += 1;
+      return calls === 1
+        ? new Response(
+            JSON.stringify({ error: "Invalid user: expected an 0x address" }),
+            {
+              status: 400,
+            },
+          )
+        : new Response(JSON.stringify({ seq: "4", changed: true }));
+    });
+    await expect(
+      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+    ).rejects.toThrow(/400/);
+    await expect(
+      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+    ).resolves.toEqual({ seq: "4", changed: true });
+    expect(urls).toHaveLength(2);
+  });
+
+  it("remembers no absence: a gateway upgraded to have the route is found by the next ask", async () => {
+    let upgraded = false;
+    const { registry, urls } = waiting(() =>
+      upgraded
+        ? new Response(JSON.stringify({ seq: "1", changed: true }))
+        : new Response("no", { status: 404 }),
+    );
+    await expect(
+      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+    ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
+    upgraded = true;
+    await expect(
+      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+    ).resolves.toEqual({ seq: "1", changed: true });
+    expect(urls).toHaveLength(2);
+  });
+
+  it("keeps asking after a failure that does not say the route is absent", async () => {
+    const { registry, urls } = waiting(
+      () => new Response("down", { status: 503 }),
+    );
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await expect(
+        registry.waitForChange!("1", 25_000, new AbortController().signal),
+      ).rejects.toThrow(/503/);
+    }
+    expect(urls).toHaveLength(3);
   });
 
   it("throws on any other failure, and on an answer that is not a sequence", async () => {

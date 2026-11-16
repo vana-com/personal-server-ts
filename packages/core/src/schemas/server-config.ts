@@ -69,10 +69,9 @@ export const DEFAULTS = {
     changeProbeMs: 5_000,
     // The gateway tells this server when the registry changed (a held request
     // answered on a write), so a save on another device is pulled at once.
-    // The probe above stays as the fallback and stretches to
-    // `changeProbeHealthyMs` while that push is healthy. false: probe only.
+    // The probe above stays as the fallback and rests while that push is
+    // healthy and its position has not moved. false: probe only.
     changePush: true,
-    changeProbeHealthyMs: 60_000,
     // Off by default. When true, an owner read of a stream that has no complete
     // head yet serves the parts applied so far, marked partial, and a reader
     // fills in as parts apply. When false, a stream is readable only when its
@@ -267,11 +266,6 @@ export const ServerConfigSchema = z.object({
         .min(0)
         .default(DEFAULTS.streamSync.changeProbeMs),
       changePush: z.boolean().default(DEFAULTS.streamSync.changePush),
-      changeProbeHealthyMs: z
-        .number()
-        .int()
-        .min(0)
-        .default(DEFAULTS.streamSync.changeProbeHealthyMs),
       progressiveFirstLoad: z
         .boolean()
         .default(DEFAULTS.streamSync.progressiveFirstLoad),

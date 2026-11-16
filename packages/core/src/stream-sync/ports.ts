@@ -183,8 +183,9 @@ export class RegistryUnavailableBeforeWriteError extends RegistryUnavailableErro
 
 /** The registry refused the request for good (4xx other than 409). */
 /**
- * The gateway has no change route (404 or 405): it predates the change push.
- * The caller stops asking and keeps its timed probe; asking again cannot help.
+ * The gateway has no change route: it predates the change push. The caller
+ * keeps its timed probe and asks again after a bounded wait, since a gateway
+ * that is upgraded gains the route. The client does not remember the answer.
  */
 export class ChangeFeedAbsentError extends Error {
   constructor(message: string) {
@@ -280,18 +281,21 @@ export interface StreamSyncRegistry {
    * stamped in the same millisecond) is invisible. `null`: the owner has no
    * rows. `undefined`: this gateway sends no change time, so the caller cannot
    * tell. Throws when the read fails. A hint to start a pull early, never an
-   * authority: the unconditional timer cycle is what guarantees completeness,
-   * and a pull still reads the rows it applies. `signal` ends a read that
+   * authority: the timer's cycle (or the push's position, see
+   * `waitForChange`) is what guarantees completeness, and a pull still reads
+   * the rows it applies. `signal` ends a read that
    * stalls: a probe is optional work, so no caller may wait on it unbounded.
    */
   probeChange?(signal?: AbortSignal): Promise<string | null | undefined>;
   /**
    * One held request: answers when the owner's registry sequence differs from
    * `after` (a cursor from an earlier answer; none asks for the current one),
-   * or after about `waitMs` with `changed: false`. It carries no registry data
-   * and is never an authority: a caller that gets `changed` pulls with its
-   * ordinary reads, and one that gets nothing (a lost answer, a dropped
-   * connection) is repaired by the next pull. Throws `ChangeFeedAbsentError`
+   * or after about `waitMs` with `changed: false`. It carries no registry
+   * data, only the owner's sequence, which is a position: it changes whenever
+   * anything a client can see changed. A caller that gets `changed` pulls with
+   * its ordinary reads, and one that gets nothing (a lost answer, a dropped
+   * connection) is repaired by the next pull. A caller may skip pulls while
+   * the same position stands (see `ChangePush`). Throws `ChangeFeedAbsentError`
    * when the gateway has no such route, and any other error on a failed read.
    * `signal` ends the request.
    */

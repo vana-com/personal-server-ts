@@ -599,10 +599,7 @@ export async function createPsLiteSyncManager(
   const changeProbe = options.localDb
     ? createRegistryChangeProbe(streamSyncRegistry, {
         intervalMs: options.config.streamSync.changeProbeMs,
-        push: {
-          enabled: options.config.streamSync.changePush,
-          healthyProbeMs: options.config.streamSync.changeProbeHealthyMs,
-        },
+        push: { enabled: options.config.streamSync.changePush },
       })
     : undefined;
 

@@ -129,6 +129,102 @@ describe("a requested cycle", () => {
     expect(calls).toBe(3);
     await manager.stop();
   });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, 0, -5])(
+    "takes the 60 s default for a poll interval of %s",
+    async (pollInterval) => {
+      let calls = 0;
+      const manager = build(
+        async () => {
+          calls += 1;
+        },
+        { pollInterval },
+      );
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls).toBe(1);
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(calls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(calls).toBe(2);
+      await manager.stop();
+    },
+  );
+
+  // A host timer reads its delay as an integer of milliseconds and runs a
+  // delay below 1 or above its 32-bit limit after 1 ms. Both would turn the
+  // fallback into a busy loop, so a period outside that range is not passed on
+  // as is.
+  it.each([0.5, 1e-9])(
+    "takes the 60 s default for a period of %s ms, below what a timer can count",
+    async (pollInterval) => {
+      let calls = 0;
+      const manager = build(
+        async () => {
+          calls += 1;
+        },
+        { pollInterval },
+      );
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(calls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(calls).toBe(2);
+      await manager.stop();
+    },
+  );
+
+  it.each([2 ** 31, 2 ** 40, 1e300])(
+    "runs a period of %s ms, beyond the timer's limit, as the longest period the timer holds",
+    async (pollInterval) => {
+      let calls = 0;
+      const manager = build(
+        async () => {
+          calls += 1;
+        },
+        { pollInterval },
+      );
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(calls).toBe(1); // no 1 ms ticking
+      await manager.stop();
+    },
+  );
+});
+
+// The same bounds against the host's own scheduler: a fake clock models the
+// limit, the real one is what ships.
+describe("the poll period on the real scheduler", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
+  it.each([2 ** 31, 0.5])(
+    "does not tick every millisecond for a period of %s ms",
+    async (pollInterval) => {
+      let calls = 0;
+      const manager = build(
+        async () => {
+          calls += 1;
+        },
+        { pollInterval },
+      );
+      const warn = vi
+        .spyOn(process, "emitWarning")
+        .mockImplementation(() => {});
+      try {
+        manager.start();
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        expect(calls).toBe(1);
+        expect(warn).not.toHaveBeenCalled(); // no TimeoutOverflowWarning
+      } finally {
+        warn.mockRestore();
+        await manager.stop();
+      }
+    },
+  );
 });
 
 describe("requestPull without a change probe", () => {

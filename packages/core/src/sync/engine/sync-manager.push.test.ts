@@ -46,17 +46,17 @@ function build(
 }
 
 /** A push the test drives by hand. */
-function fakePush(healthyProbeMs = 60_000) {
+function fakePush() {
   const state = {
     subscribed: 0,
     stopped: 0,
     handlers: null as null | {
       onChange(): void;
       onHealth(healthy: boolean): void;
+      onPosition(position: string): void;
     },
   };
   const push: ChangePush = {
-    healthyProbeMs,
     subscribe(handlers) {
       state.subscribed += 1;
       state.handlers = handlers;
@@ -547,54 +547,145 @@ describe("a pushed change does not wait for the optional probe", () => {
   });
 });
 
-describe("the timed probe while the subscription is healthy", () => {
-  async function probesIn(ms: number, healthy: boolean | null) {
+describe("the push position", () => {
+  // Every answer of the held request, an empty one at the end of its wait
+  // included, carries the registry's current sequence. A cycle reads the
+  // registry after the position it started under, so when the push is healthy
+  // and the position is the one the last clean cycle started under, that cycle
+  // already holds everything the registry has: the timer cycle and the probe
+  // add requests and no news. A wake that was lost on the way is found by the
+  // next answer, which says it changed. Nothing else is owed.
+
+  /** A manager whose push the test drives by hand. */
+  function setup(opts: { cycle?: () => Promise<void> } = {}) {
     const { push, state } = fakePush();
-    const read = vi.fn(async () => "m1");
-    const manager = build({
-      localSync: { cycle: async () => {} },
-      changeProbe: { read, intervalMs: 5_000, push },
+    const cycle = vi.fn(async () => {
+      await opts.cycle?.();
     });
-    manager.start();
-    await vi.advanceTimersByTimeAsync(0);
-    if (healthy !== null) state.handlers!.onHealth(healthy);
-    read.mockClear();
-    await vi.advanceTimersByTimeAsync(ms);
-    await manager.stop();
-    return read.mock.calls.length;
-  }
-
-  it("stretches to the healthy period: one probe a minute instead of twelve", async () => {
-    expect(await probesIn(60_000, null)).toBe(12); // never subscribed healthy: unchanged
-    expect(await probesIn(60_000, true)).toBe(1);
-  });
-
-  it("returns to the short period as soon as the subscription is not healthy", async () => {
-    const { push, state } = fakePush();
     const read = vi.fn(async () => "m1");
-    const manager = build({
-      localSync: { cycle: async () => {} },
-      changeProbe: { read, intervalMs: 5_000, push },
-    });
-    manager.start();
-    await vi.advanceTimersByTimeAsync(0);
-    state.handlers!.onHealth(true);
-    await vi.advanceTimersByTimeAsync(30_000);
-    read.mockClear();
-    state.handlers!.onHealth(false);
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(read.mock.calls.length).toBeGreaterThanOrEqual(1);
-    await vi.advanceTimersByTimeAsync(20_000);
-    expect(read.mock.calls.length).toBeGreaterThanOrEqual(5);
-    await manager.stop();
-  });
-
-  it("keeps the 60 s timer cycle unconditional, whatever the subscription says", async () => {
-    const { push, state } = fakePush();
-    const cycle = vi.fn(async () => {});
     const manager = build({
       localSync: { cycle },
-      changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
+      changeProbe: { read, intervalMs: 5_000, push },
+    });
+    return { manager, state, cycle, read };
+  }
+
+  /**
+   * Start, answer the first position, and let one timer cycle settle on it.
+   * The start cycle began before any position was known: it proves nothing.
+   * The first timer cycle starts under the position and settles on it.
+   */
+  async function settled(t: ReturnType<typeof setup>, position = "7") {
+    t.manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    t.state.handlers!.onHealth(true);
+    t.state.handlers!.onPosition(position);
+    await vi.advanceTimersByTimeAsync(60_000);
+    t.cycle.mockClear();
+    t.read.mockClear();
+  }
+
+  it("runs no timer cycle and no probe while the push is healthy and the position has not moved", async () => {
+    const t = setup();
+    await settled(t);
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+    expect(t.cycle).not.toHaveBeenCalled();
+    expect(t.read).not.toHaveBeenCalled();
+    await t.manager.stop();
+  });
+
+  it("a renewal that answers with an unmoved position owes nothing", async () => {
+    const t = setup();
+    await settled(t);
+    for (let i = 0; i < 100; i++) {
+      t.state.handlers!.onPosition("7"); // an empty answer at the end of the wait
+      await vi.advanceTimersByTimeAsync(25_000);
+    }
+    expect(t.cycle).not.toHaveBeenCalled();
+    expect(t.read).not.toHaveBeenCalled();
+    await t.manager.stop();
+  });
+
+  it("a renewal that answers moved runs a cycle at once: the position, then the change", async () => {
+    const t = setup();
+    await settled(t);
+    // The poke never arrived; the renewal's answer carries the position and
+    // says it changed.
+    t.state.handlers!.onPosition("8");
+    t.state.handlers!.onChange();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    // That cycle started under "8": quiet again.
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(t.cycle).not.toHaveBeenCalled();
+    await t.manager.stop();
+  });
+
+  it("a position that moved without a change callback ends the skip: the timer repairs it, not an immediate cycle", async () => {
+    const t = setup();
+    await settled(t);
+    t.state.handlers!.onPosition("8");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    // That cycle started under "8" and settled on it: quiet again.
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(t.cycle).not.toHaveBeenCalled();
+    await t.manager.stop();
+  });
+
+  it("a position that moves during a cycle owes another cycle", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    let block = false;
+    const t = setup({ cycle: () => (block ? hold : Promise.resolve()) });
+    await settled(t);
+    block = true;
+    t.state.handlers!.onPosition("8");
+    t.state.handlers!.onChange(); // cycle starts under "8"
+    await vi.advanceTimersByTimeAsync(0);
+    t.state.handlers!.onPosition("9"); // moves while that cycle runs
+    block = false;
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.cycle).toHaveBeenCalledTimes(1); // "9" was never read
+    await t.manager.stop();
+  });
+
+  it("runs one cycle at once when the push turns from healthy to not healthy: while it was silent its position could not vouch for the registry", async () => {
+    const t = setup();
+    await settled(t);
+    t.state.handlers!.onHealth(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    // A push that was never healthy has no silence to answer for.
+    t.cycle.mockClear();
+    t.state.handlers!.onHealth(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.cycle).not.toHaveBeenCalled();
+    await t.manager.stop();
+  });
+
+  it("falls back to the 60 s timer and the 5 s probe as soon as the push is not healthy", async () => {
+    const t = setup();
+    await settled(t);
+    t.state.handlers!.onHealth(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.cycle.mock.calls.length).toBeGreaterThanOrEqual(2); // the turn, then the timer
+    expect(t.read.mock.calls.length).toBeGreaterThanOrEqual(10);
+    await t.manager.stop();
+  });
+
+  it("never skips while no position is known (a gateway or push that sends none)", async () => {
+    const { push, state } = fakePush();
+    const cycle = vi.fn(async () => {});
+    const read = vi.fn(async () => "m1");
+    const manager = build({
+      localSync: { cycle },
+      changeProbe: { read, intervalMs: 5_000, push },
     });
     manager.start();
     await vi.advanceTimersByTimeAsync(0);
@@ -602,7 +693,250 @@ describe("the timed probe while the subscription is healthy", () => {
     cycle.mockClear();
     await vi.advanceTimersByTimeAsync(120_000);
     expect(cycle.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(read.mock.calls.length).toBeGreaterThanOrEqual(10);
     await manager.stop();
+  });
+
+  it("a cycle that failed under the current position settles nothing: the next timer tick cycles again", async () => {
+    let fail = false;
+    const t = setup({
+      cycle: async () => {
+        if (fail) throw new Error("boom");
+      },
+    });
+    await settled(t);
+    fail = true;
+    t.state.handlers!.onChange(); // a poke at the same position: the cycle fails
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    fail = false;
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    await t.manager.stop();
+  });
+
+  it("a blocked cycle settles nothing", async () => {
+    const { push, state } = fakePush();
+    let ok = true;
+    const cycle = vi.fn(async () => {});
+    const manager = build({
+      localSync: { cycle },
+      canSync: () =>
+        ok ? { ok: true } : { ok: false, reason: "paused", message: "m" },
+      changeProbe: {
+        read: async () => "m1",
+        intervalMs: 5_000,
+        push,
+      },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    state.handlers!.onHealth(true);
+    state.handlers!.onPosition("7");
+    ok = false;
+    await vi.advanceTimersByTimeAsync(60_000); // blocked under "7"
+    ok = true;
+    cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(cycle).toHaveBeenCalledTimes(1);
+    await manager.stop();
+  });
+
+  describe("a cycle that finished but left work no position announces", () => {
+    // The stream-sync cycle reports per connection instead of throwing. A
+    // connection that failed, or whose publish backs off or waits on a
+    // condition, retries only when another cycle runs; the registry does not
+    // move for it. Such a cycle settles nothing, so the timer keeps running.
+    const report = (
+      ...streams: Array<{ error?: string; outcomes?: string[] }>
+    ) => ({
+      connections: streams.map((s, i) => ({
+        connectionId: `c${i}`,
+        applied: [],
+        published: (s.outcomes ?? ["noop"]).map((outcome) => ({
+          stream: "s",
+          outcome,
+          watermark: null,
+        })),
+        error: s.error ?? null,
+      })),
+    });
+
+    // A settled device at position "7", poked at that position into a cycle
+    // whose report is `result`. The report stays the same from then on, so the
+    // work it names is never resolved: the device must retry it on the clock
+    // and must not retry it in a loop.
+    async function pokedInto(result: unknown, passMs = 0) {
+      const { push, state } = fakePush();
+      let next: unknown = report({});
+      const passes = { starts: [] as number[], ends: [] as number[] };
+      let running = 0;
+      let maxRunning = 0;
+      let slow = false; // only the passes after the poke take `passMs`
+      const cycle = vi.fn(async () => {
+        passes.starts.push(Date.now());
+        running += 1;
+        maxRunning = Math.max(maxRunning, running);
+        if (slow && passMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, passMs));
+        }
+        running -= 1;
+        passes.ends.push(Date.now());
+        return next;
+      });
+      const manager = build({
+        localSync: { cycle },
+        changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
+      });
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      state.handlers!.onHealth(true);
+      state.handlers!.onPosition("7");
+      await vi.advanceTimersByTimeAsync(60_000); // settles on "7"
+      cycle.mockClear();
+      passes.starts.length = 0;
+      passes.ends.length = 0;
+      next = result;
+      slow = true;
+      state.handlers!.onChange(); // a poke at the same position runs the cycle
+      await vi.advanceTimersByTimeAsync(0);
+      return { manager, cycle, passes, maxRunning: () => maxRunning };
+    }
+
+    const unresolved = [
+      ["a connection that failed", report({ error: "boom" })],
+      ["a stream whose publish backs off", report({ outcomes: ["backoff"] })],
+      [
+        "a stream deferred on a condition",
+        report({ outcomes: ["noop", "deferred"] }),
+      ],
+    ] as const;
+
+    it.each(unresolved)(
+      "%s: one retry per poll interval, none sooner, none after stop",
+      async (_name, result) => {
+        const { manager, cycle } = await pokedInto(result);
+        expect(cycle).toHaveBeenCalledTimes(1); // the poke
+
+        await vi.advanceTimersByTimeAsync(59_999);
+        expect(cycle).toHaveBeenCalledTimes(1); // no rerun of its own
+        await vi.advanceTimersByTimeAsync(1);
+        expect(cycle).toHaveBeenCalledTimes(2);
+        // The same report every time: one cycle each interval over five more.
+        for (let interval = 3; interval <= 6; interval++) {
+          await vi.advanceTimersByTimeAsync(60_000);
+          expect(cycle).toHaveBeenCalledTimes(interval);
+        }
+
+        await manager.stop();
+        expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+        expect(cycle).toHaveBeenCalledTimes(6);
+      },
+    );
+
+    it.each(unresolved)(
+      "%s: when a pass outlasts the timer ticks, passes follow one at a time and never start faster than they end",
+      async (_name, result) => {
+        const passMs = 150_000; // two and a half poll intervals
+        const { manager, cycle, passes, maxRunning } = await pokedInto(
+          result,
+          passMs,
+        );
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+        // Stop waits for the pass under way; let it end.
+        const stopping = manager.stop();
+        await vi.advanceTimersByTimeAsync(passMs);
+        await stopping;
+        const startedAtStop = cycle.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+        expect(cycle.mock.calls.length).toBe(startedAtStop);
+        expect(vi.getTimerCount()).toBe(0);
+
+        expect(maxRunning()).toBe(1);
+        // Each pass starts only after the one before it ended: a tick during a
+        // pass costs one follow-up, not one per tick.
+        for (let i = 1; i < passes.starts.length; i++) {
+          expect(passes.starts[i]).toBeGreaterThanOrEqual(passes.ends[i - 1]!);
+        }
+        // Ticks in the window: ten. Ten minutes of 150 s passes: at most
+        // four finished, plus the one under way when the window closed.
+        expect(cycle.mock.calls.length).toBeLessThanOrEqual(5);
+        expect(cycle.mock.calls.length).toBeGreaterThanOrEqual(2);
+      },
+    );
+
+    it("every connection done: quiet again", async () => {
+      const { manager, cycle } = await pokedInto(
+        report({ outcomes: ["published", "noop", "refused", "purged"] }),
+      );
+      cycle.mockClear();
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(cycle).not.toHaveBeenCalled();
+      await manager.stop();
+    });
+  });
+
+  it("a registration revoked with no data write is found when the gateway moves the position, and not before", async () => {
+    // The sync gate (`canSync`) reads server registration, which is not a data
+    // write. The gateway raises the owner's position for it; the manager's
+    // part is to run the gate on the cycle that position starts.
+    const { push, state } = fakePush();
+    let registered = true;
+    const canSync = vi.fn(() =>
+      registered
+        ? { ok: true as const }
+        : {
+            ok: false as const,
+            reason: "unregistered" as const,
+            message: "Register this Personal Server before syncing.",
+          },
+    );
+    const cycle = vi.fn(async () => ({ connections: [] }));
+    const manager = build({
+      localSync: { cycle },
+      canSync,
+      changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    state.handlers!.onHealth(true);
+    state.handlers!.onPosition("7");
+    await vi.advanceTimersByTimeAsync(60_000); // settled on "7"
+    canSync.mockClear();
+    cycle.mockClear();
+
+    registered = false; // revoked: no data point written
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(canSync).not.toHaveBeenCalled(); // nothing announced it yet
+
+    state.handlers!.onPosition("8"); // the gateway raised the position
+    state.handlers!.onChange();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(canSync).toHaveBeenCalledTimes(1);
+    expect(cycle).not.toHaveBeenCalled(); // blocked: nothing transferred
+    expect(manager.getStatus().blocked?.reason).toBe("unregistered");
+
+    // A blocked device is never quiet: it finds the registration by timer.
+    registered = true;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(cycle).toHaveBeenCalledTimes(1);
+    expect(manager.getStatus().blocked).toBeNull();
+    await manager.stop();
+  });
+
+  it("forgets the position when stopped and restarted", async () => {
+    const t = setup();
+    await settled(t);
+    await t.manager.stop();
+    t.manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    t.cycle.mockClear();
+    // New subscription, nothing known yet: the timer cycle runs.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.cycle.mock.calls.length).toBeGreaterThanOrEqual(1);
+    await t.manager.stop();
   });
 });
 
@@ -708,7 +1042,7 @@ describe("the real subscription driving the manager", () => {
     await manager.stop();
   });
 
-  it("a failed or timed-out attempt starts no cycle: with every answer lost only the 60 s timer applies the change", async () => {
+  it("a failed or timed-out attempt starts one cycle, when the push turns unhealthy: the reconnects that follow start none, and the timer applies the rest", async () => {
     const { manager, pending, cycle } = await started();
     // Fail every held request the subscription sends, for a minute.
     let failed = 1;
@@ -717,9 +1051,10 @@ describe("the real subscription driving the manager", () => {
       await vi.advanceTimersByTimeAsync(1_000);
     }
     expect(failed).toBeGreaterThanOrEqual(3); // it did reconnect, repeatedly
-    expect(cycle).not.toHaveBeenCalled(); // and no reconnect started a cycle
+    // The push turning unhealthy read once; no reconnect after it read again.
+    expect(cycle).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(5_000); // the 60 s timer
-    expect(cycle).toHaveBeenCalled();
+    expect(cycle).toHaveBeenCalledTimes(2);
     await manager.stop();
   });
 
@@ -728,13 +1063,14 @@ describe("the real subscription driving the manager", () => {
     pending[1].fail(new Error("socket reset"));
     await vi.advanceTimersByTimeAsync(2_000); // back-off, then the next request
     expect(pending.length).toBeGreaterThanOrEqual(3);
+    const atFailure = cycle.mock.calls.length; // the push turning unhealthy read
     pending[2].answer({ seq: "1", changed: false });
     await vi.advanceTimersByTimeAsync(0);
-    expect(cycle).toHaveBeenCalledTimes(1);
+    expect(cycle).toHaveBeenCalledTimes(atFailure + 1);
     // Later empty answers do not cycle.
     pending[3].answer({ seq: "1", changed: false });
     await vi.advanceTimersByTimeAsync(0);
-    expect(cycle).toHaveBeenCalledTimes(1);
+    expect(cycle).toHaveBeenCalledTimes(atFailure + 1);
     await manager.stop();
   });
 });

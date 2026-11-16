@@ -269,6 +269,13 @@ export function createGatewayStreamSyncRegistry(
   let batchRoute: "absent" | undefined;
   let batchPolicy: RegistryBatchPolicy | undefined;
 
+  const absentFeed = (status?: number) =>
+    new ChangeFeedAbsentError(
+      status === undefined
+        ? "registry has no change route"
+        : `registry has no change route: ${status}`,
+    );
+
   /** One `POST /v1/data`, with `requires` when the caller has conditions. */
   async function sendPost(
     request: SignedRegistryPost,
@@ -455,7 +462,7 @@ export function createGatewayStreamSyncRegistry(
       // every write, tombstone and revive of a row. The marker fingerprints
       // this one row. Another row stamped in the same millisecond leaves it
       // unchanged, so equal markers are not proof of "nothing changed": the
-      // caller's unconditional timer cycle is the completeness guarantee.
+      // caller's timer cycle, or the push's position, is the completeness guarantee.
       const newest = rows[0] as RegistryRow & { id?: unknown };
       if (typeof newest.changedAt !== "string" || newest.changedAt === "") {
         return undefined;
@@ -473,10 +480,20 @@ export function createGatewayStreamSyncRegistry(
         `${base}/v1/data/changes?${params.toString()}`,
         { signal },
       );
-      if (res.status === 404 || res.status === 405) {
-        throw new ChangeFeedAbsentError(
-          `registry has no change route: ${res.status}`,
-        );
+      // "No such route" is learned from the response, never remembered here:
+      // the caller decides when to ask again (the push waits one held period),
+      // so a gateway upgrade is found without a restart. A gateway without the
+      // route is told apart by what it answers: 404 or 405, or the 400 its
+      // `/v1/data/:dataPointId` handler gives the id `changes` ("Invalid
+      // dataPointId..."). Any other 400 is the change route refusing this
+      // request (the route's own errors name `user`, `after` or `wait`): a
+      // failure that may pass, not an absence.
+      if (
+        res.status === 404 ||
+        res.status === 405 ||
+        (res.status === 400 && (await isLegacyRouteRefusal(res)))
+      ) {
+        throw absentFeed(res.status);
       }
       if (!res.ok) {
         throw new Error(`registry change wait failed: ${res.status}`);
@@ -500,6 +517,25 @@ export function createGatewayStreamSyncRegistry(
         );
       }),
   };
+}
+
+const LEGACY_REFUSAL = "Invalid dataPointId";
+
+/**
+ * True when a 400 is the gateway's `/v1/data/:dataPointId` handler refusing the
+ * path segment `changes`, which is what a gateway without the change route
+ * answers. That handler's refusals say "Invalid dataPointId"; the change
+ * route's own 400s say "Invalid user", "Invalid after" or "Invalid wait".
+ */
+async function isLegacyRouteRefusal(res: Response): Promise<boolean> {
+  try {
+    const body = (await res.json()) as { error?: unknown };
+    return (
+      typeof body.error === "string" && body.error.startsWith(LEGACY_REFUSAL)
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**

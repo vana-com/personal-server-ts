@@ -36,8 +36,27 @@
                       marker (and does not wait for the probe). FALSE: they go
                       through the marker gate like a probe, and a blind marker
                       discards them.
-    TimerOn           the manager's own cycle runs every PT ticks whatever
-                      else happens, and reads the registry exactly.
+    PullOnUnhealthy   the push going from healthy to not healthy (a break, a
+                      deadline) starts a cycle at once: while it was silent
+                      the position could not vouch for the registry.
+    TimerOn           the manager's own cycle runs every PT ticks and reads
+                      the registry exactly.
+    Gate              the push's position stands in for the timer and the
+                      probe: while the push is healthy and `lastSeen[d]` is
+                      the position the last cycle started under, the timer and
+                      the probe pull nothing, however long that lasts: there is
+                      no periodic check on the push. Any pull that ran (a push
+                      answer, a probe, the timer) settles the position. The
+                      probe's period is PL whenever it runs: a healthy push no
+                      longer stretches it, it skips it.
+    CycleFails        a cycle may fail, at most MaxFails times in a run: it
+                      applies nothing and the position it started under is not
+                      settled (the manager settles a position only when a
+                      cycle ends clean).
+    PositionCompare   the gate compares `lastSeen[d]` with the position the last
+                      cycle started under (the shipped rule). FALSE: the gate
+                      skips the timer and the probe whenever the push is
+                      healthy, whatever the positions say.
   Retry back-off: after a failed request the device sends the next one BO ticks
   later (the shipped back-off is 1 s doubling to 30 s, jittered; BO = 3 is the
   30 s cap, BO = 0 the first retry).
@@ -55,35 +74,65 @@
 EXTENDS Naturals
 
 CONSTANTS Devices, MaxWrites, MaxClock, W, Slack, PL, PH, PT, BO, Bound,
-          Resume, FinalCheck, PullAfterFailure, ProbeOn, StretchOnlyWhenHealthy,
-          ProbeBlind, ForcedPull, TimerOn,
+          MaxFails, Resume, FinalCheck, PullAfterFailure, ProbeOn, StretchOnlyWhenHealthy,
+          ProbeBlind, ForcedPull, TimerOn, Gate, PositionCompare, CycleFails, PullOnUnhealthy,
           PokesLost, AllLost, HubMiss, Disconnects
 
 NoReq == [on |-> FALSE, base |-> 0, since |-> 0, held |-> FALSE]
 NoReply == 0 - 1  \* sentinel: no reply in flight (sequences are naturals)
 
 VARIABLES seq, writes, clock, applied, lastSeen, req, reply, healthy,
-          needPull, retryAt, lastProbe, nextTimer, age
+          needPull, retryAt, lastProbe, nextTimer, age, synced, fails
+
+\* `synced[d]`: the position (a `lastSeen`) the last pull that ran started
+\* under; NoReply when none has, or while it is unknown.
+sync == <<synced, fails>>
 
 vars == <<seq, writes, clock, applied, lastSeen, req, reply, healthy,
-          needPull, retryAt, lastProbe, nextTimer, age>>
+          needPull, retryAt, lastProbe, nextTimer, age, synced, fails>>
 
-\* A pull that starts a cycle: the cycle reads the registry as it is now.
-Applied(d) ==
+\* A pull that starts a cycle: the cycle reads the registry as it is now, and
+\* started under position `ls`.
+Applied(d, ls) ==
   /\ applied' = [applied EXCEPT ![d] = seq]
   /\ age' = [age EXCEPT ![d] = 0]
+  /\ synced' = [synced EXCEPT ![d] = ls]
+  /\ UNCHANGED fails
+
+\* A cycle that fails (CycleFails, at most MaxFails times): it applies nothing and
+\* settles nothing, and the position it started under is no longer vouched for.
+\* The manager retries a failed cycle after a back-off; the model leaves that
+\* retry out, so the only repair is what the timer and the probe do.
+Cycle(d, ls) ==
+  \/ Applied(d, ls)
+  \/ /\ CycleFails /\ fails < MaxFails
+     /\ fails' = fails + 1
+     /\ synced' = [synced EXCEPT ![d] = NoReply]
+     /\ UNCHANGED <<applied, age>>
 
 \* A pull that the marker gates. With a blind marker the gate may find "equal"
 \* and start no cycle; the device does not apply, and does not know it missed.
-Gated(d) ==
-  \/ Applied(d)
-  \/ ProbeBlind /\ UNCHANGED <<applied, age>>
+Gated(d, ls) ==
+  \/ Cycle(d, ls)
+  \/ ProbeBlind /\ UNCHANGED <<applied, age, sync>>
 
 \* A pull started by a push answer or a reconnect.
-PokePull(d) == IF ForcedPull THEN Applied(d) ELSE Gated(d)
+PokePull(d, ls) == IF ForcedPull THEN Cycle(d, ls) ELSE Gated(d, ls)
+
+\* A request failed. A push that was healthy and is not any more starts a cycle
+\* (PullOnUnhealthy); otherwise nothing is pulled.
+Failed(d) ==
+  IF PullOnUnhealthy /\ healthy[d] THEN Cycle(d, lastSeen[d])
+  ELSE UNCHANGED <<applied, age, sync>>
+
+\* The push's position says nothing moved since the last cycle that ran.
+Covered(d) ==
+  /\ Gate /\ healthy[d]
+  /\ (PositionCompare => synced[d] = lastSeen[d])
 
 Period(d) ==
-  IF StretchOnlyWhenHealthy THEN (IF healthy[d] THEN PH ELSE PL) ELSE PH
+  IF Gate THEN PL
+  ELSE IF StretchOnlyWhenHealthy THEN (IF healthy[d] THEN PH ELSE PL) ELSE PH
 
 Init ==
   /\ seq = 0 /\ writes = 0 /\ clock = 0
@@ -97,13 +146,15 @@ Init ==
   /\ lastProbe = [d \in Devices |-> 0]
   /\ nextTimer = [d \in Devices |-> IF TimerOn THEN PT ELSE MaxClock + 1]
   /\ age = [d \in Devices |-> 0]
+  /\ synced = [d \in Devices |-> NoReply]
+  /\ fails = 0
 
 \* The gateway commits a registry write.
 Commit ==
   /\ writes < MaxWrites
   /\ seq' = seq + 1 /\ writes' = writes + 1
   /\ UNCHANGED <<clock, applied, lastSeen, req, reply, healthy, needPull, retryAt,
-                 lastProbe, nextTimer, age>>
+                 lastProbe, nextTimer, age, sync>>
 
 \* A device sends a request, BO ticks after the failure that ended the last
 \* one. Sending pulls nothing: only an answer does (see Deliver). With Resume
@@ -116,7 +167,7 @@ Subscribe(d) ==
                        since |-> clock, held |-> ~now]]
         /\ reply' = [reply EXCEPT ![d] = IF now THEN seq ELSE NoReply]
   /\ UNCHANGED <<seq, writes, clock, applied, lastSeen, healthy, needPull,
-                 retryAt, lastProbe, nextTimer, age>>
+                 retryAt, lastProbe, nextTimer, age, sync>>
 
 \* The gateway answers a held request because a commit passed its base.
 Wake(d) ==
@@ -125,7 +176,7 @@ Wake(d) ==
   /\ reply' = [reply EXCEPT ![d] = seq]
   /\ req' = [req EXCEPT ![d].held = FALSE]
   /\ UNCHANGED <<seq, writes, clock, applied, lastSeen, healthy, needPull, retryAt,
-                 lastProbe, nextTimer, age>>
+                 lastProbe, nextTimer, age, sync>>
 
 \* The gateway answers after W ticks. It reads `seq` first, so this answer is exact.
 ServerTimeout(d) ==
@@ -134,7 +185,7 @@ ServerTimeout(d) ==
   /\ reply' = [reply EXCEPT ![d] = IF FinalCheck THEN seq ELSE lastSeen[d]]
   /\ req' = [req EXCEPT ![d].held = FALSE]
   /\ UNCHANGED <<seq, writes, clock, applied, lastSeen, healthy, needPull, retryAt,
-                 lastProbe, nextTimer, age>>
+                 lastProbe, nextTimer, age, sync>>
 
 \* The device receives a reply: it is now healthy, and pulls when the reply
 \* is above its cursor (the answer says "changed") or when it is the first answer
@@ -151,8 +202,8 @@ Deliver(d) ==
   /\ reply' = [reply EXCEPT ![d] = NoReply]
   /\ needPull' = [needPull EXCEPT ![d] = FALSE]
   /\ IF reply[d] > lastSeen[d] \/ (PullAfterFailure /\ needPull[d])
-       THEN PokePull(d)
-       ELSE UNCHANGED <<applied, age>>
+       THEN PokePull(d, IF reply[d] > lastSeen[d] THEN reply[d] ELSE lastSeen[d])
+       ELSE UNCHANGED <<applied, age, sync>>
   /\ UNCHANGED <<seq, writes, clock, retryAt, lastProbe, nextTimer>>
 
 \* The network drops a reply. The device learns only at its deadline.
@@ -160,28 +211,28 @@ Lose(d) ==
   /\ PokesLost /\ reply[d] /= NoReply
   /\ reply' = [reply EXCEPT ![d] = NoReply]
   /\ UNCHANGED <<seq, writes, clock, applied, lastSeen, req, healthy,
-                 needPull, retryAt, lastProbe, nextTimer, age>>
+                 needPull, retryAt, lastProbe, nextTimer, age, sync>>
 
 \* A request breaks. The device sees it at once.
 Drop(d) ==
   /\ Disconnects /\ req[d].on /\ reply[d] = NoReply
+  /\ Failed(d)
   /\ req' = [req EXCEPT ![d] = NoReq]
   /\ healthy' = [healthy EXCEPT ![d] = FALSE]
   /\ needPull' = [needPull EXCEPT ![d] = TRUE]
   /\ retryAt' = [retryAt EXCEPT ![d] = clock + BO]
-  /\ UNCHANGED <<seq, writes, clock, applied, lastSeen, reply, lastProbe,
-                 nextTimer, age>>
+  /\ UNCHANGED <<seq, writes, clock, lastSeen, reply, lastProbe, nextTimer>>
 
 \* The device gives up on a request that got no reply.
 ClientTimeout(d) ==
   /\ req[d].on /\ reply[d] = NoReply
   /\ clock - req[d].since >= W + Slack
+  /\ Failed(d)
   /\ req' = [req EXCEPT ![d] = NoReq]
   /\ healthy' = [healthy EXCEPT ![d] = FALSE]
   /\ needPull' = [needPull EXCEPT ![d] = TRUE]
   /\ retryAt' = [retryAt EXCEPT ![d] = clock + BO]
-  /\ UNCHANGED <<seq, writes, clock, applied, lastSeen, reply, lastProbe,
-                 nextTimer, age>>
+  /\ UNCHANGED <<seq, writes, clock, lastSeen, reply, lastProbe, nextTimer>>
 
 \* The timed probe: the manager checks every PL ticks whether the period has run
 \* out since the last probe, using the push's health at that moment (so a
@@ -189,16 +240,16 @@ ClientTimeout(d) ==
 \* the marker and pulls when it differs. A blind marker may miss a change.
 Probe(d) ==
   /\ ProbeOn /\ clock >= lastProbe[d] + Period(d)
-  /\ Gated(d)
+  /\ IF Covered(d) THEN UNCHANGED <<applied, age, sync>> ELSE Gated(d, lastSeen[d])
   /\ lastProbe' = [lastProbe EXCEPT ![d] = clock]
   /\ UNCHANGED <<seq, writes, clock, lastSeen, req, reply, healthy, needPull, retryAt,
                  nextTimer>>
 
-\* The manager's own cycle, every PT ticks, unconditional: it reads the
-\* registry exactly and does not look at any marker or hint.
+\* The manager's own cycle, every PT ticks: it reads the registry exactly and
+\* does not look at any marker. With Gate it is skipped while the push covers it.
 Timer(d) ==
   /\ TimerOn /\ clock >= nextTimer[d]
-  /\ Applied(d)
+  /\ IF Covered(d) THEN UNCHANGED <<applied, age, sync>> ELSE Cycle(d, lastSeen[d])
   /\ nextTimer' = [nextTimer EXCEPT ![d] = clock + PT]
   /\ UNCHANGED <<seq, writes, clock, lastSeen, req, reply, healthy, needPull, retryAt,
                  lastProbe>>
@@ -218,7 +269,7 @@ Tick ==
   /\ clock' = clock + 1
   /\ age' = [d \in Devices |-> IF applied[d] < seq THEN age[d] + 1 ELSE 0]
   /\ UNCHANGED <<seq, writes, applied, lastSeen, req, reply, healthy,
-                 needPull, retryAt, lastProbe, nextTimer>>
+                 needPull, retryAt, lastProbe, nextTimer, sync>>
 
 Next ==
   \/ Commit

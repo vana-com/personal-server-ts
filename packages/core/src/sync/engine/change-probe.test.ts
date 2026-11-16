@@ -6,7 +6,6 @@ import {
   PROBE_TIMEOUT_MS,
   createRegistryChangeProbe,
 } from "./change-probe.js";
-import { DEFAULT_CHANGE_PUSH_HEALTHY_PROBE_MS } from "./change-push.js";
 
 const registry = (probeChange?: StreamSyncRegistry["probeChange"]) =>
   ({ ...(probeChange && { probeChange }) }) as unknown as StreamSyncRegistry;
@@ -147,6 +146,17 @@ describe("createRegistryChangeProbe", () => {
     expect(probe.intervalMs).toBe(9_000);
   });
 
+  it.each([NaN, Infinity, -Infinity])(
+    "takes the default period when the host gives %s",
+    (intervalMs) => {
+      const probe = createRegistryChangeProbe(
+        registry(async () => "m"),
+        { intervalMs },
+      )!;
+      expect(probe.intervalMs).toBe(DEFAULT_CHANGE_PROBE_MS);
+    },
+  );
+
   it("keeps the period above the cost-parity floor of the smallest idle cycle", () => {
     // 29 registry requests per idle cycle for one connection of six streams,
     // one cycle per 60 s: a probe may not out-spend that.
@@ -162,9 +172,9 @@ describe("createRegistryChangeProbe", () => {
         probeChange: async () => "m",
         waitForChange,
       } as unknown as StreamSyncRegistry,
-      { push: { healthyProbeMs: 90_000 } },
+      { push: { waitMs: 9_000 } },
     )!;
-    expect(probe.push?.healthyProbeMs).toBe(90_000);
+    expect(probe.push).toBeDefined();
   });
 
   it("has no push when the registry cannot hold a request or the host turns it off", () => {
@@ -179,12 +189,5 @@ describe("createRegistryChangeProbe", () => {
       createRegistryChangeProbe(withWait, { push: { enabled: false } })!.push,
     ).toBeUndefined();
     expect(createRegistryChangeProbe(withWait)!.push).toBeDefined();
-  });
-
-  it("stretches the healthy period well above the short probe and below the timer's 60 s guarantee", () => {
-    expect(DEFAULT_CHANGE_PUSH_HEALTHY_PROBE_MS).toBeGreaterThan(
-      DEFAULT_CHANGE_PROBE_MS,
-    );
-    expect(DEFAULT_CHANGE_PUSH_HEALTHY_PROBE_MS).toBeLessThanOrEqual(60_000);
   });
 });

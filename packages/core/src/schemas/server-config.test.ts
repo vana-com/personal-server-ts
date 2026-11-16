@@ -32,7 +32,6 @@ describe("ServerConfigSchema — streamSync.retireLegacy", () => {
       progressiveFirstLoad: false,
       changeProbeMs: 5_000,
       changePush: true,
-      changeProbeHealthyMs: 60_000,
     });
   });
 
@@ -81,7 +80,6 @@ describe("ServerConfigSchema — streamSync.refuseLegacyWrites (removed)", () =>
       progressiveFirstLoad: false,
       changeProbeMs: 5_000,
       changePush: true,
-      changeProbeHealthyMs: 60_000,
     });
     expect("refuseLegacyWrites" in DEFAULTS.streamSync).toBe(false);
   });
@@ -110,10 +108,9 @@ describe("ServerConfigSchema — streamSync.changeProbeMs", () => {
 });
 
 describe("ServerConfigSchema — streamSync registry change push", () => {
-  it("is on by default, with a 60 s timed probe while the push is healthy", () => {
+  it("is on by default", () => {
     const parsed = ServerConfigSchema.parse({});
     expect(parsed.streamSync.changePush).toBe(true);
-    expect(parsed.streamSync.changeProbeHealthyMs).toBe(60_000);
   });
 
   it("can be switched off, which keeps the 5 s probe alone", () => {
@@ -123,11 +120,7 @@ describe("ServerConfigSchema — streamSync registry change push", () => {
     ).toBe(false);
   });
 
-  it("refuses a negative, fractional or non-boolean setting", () => {
-    expect(
-      ServerConfigSchema.safeParse({ streamSync: { changeProbeHealthyMs: -1 } })
-        .success,
-    ).toBe(false);
+  it("refuses a non-boolean setting", () => {
     expect(
       ServerConfigSchema.safeParse({ streamSync: { changePush: "yes" } })
         .success,
