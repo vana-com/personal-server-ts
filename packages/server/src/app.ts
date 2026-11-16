@@ -408,21 +408,26 @@ export function createApp(deps: AppDeps): Hono {
           lineage: async (input) => (await localSync()).history.lineage(input),
         }
       : undefined);
+  // Absence is a missing host capability, not an unresolved connection.
+  // Leave the query absent so switched routes use their typed refusal.
+  const connectionLink = deps.pdpp?.connectionLink;
   const linkedQuery = async () => {
     const local = await localSync!();
-    return local.recordsFor(deps.pdpp?.connectionLink ?? (() => null));
+    return local.recordsFor(connectionLink!);
   };
-  const recordQuery: RecordQuery | undefined = localSync
-    ? {
-        listRecords: async (input) => (await linkedQuery()).listRecords(input),
-        getRecord: async (input) => (await linkedQuery()).getRecord(input),
-        changesSince: async (input) =>
-          (await linkedQuery()).changesSince(input),
-        async *streamRecords(connection, stream) {
-          yield* (await linkedQuery()).streamRecords(connection, stream);
-        },
-      }
-    : undefined;
+  const recordQuery: RecordQuery | undefined =
+    localSync && connectionLink
+      ? {
+          listRecords: async (input) =>
+            (await linkedQuery()).listRecords(input),
+          getRecord: async (input) => (await linkedQuery()).getRecord(input),
+          changesSince: async (input) =>
+            (await linkedQuery()).changesSince(input),
+          async *streamRecords(connection, stream) {
+            yield* (await linkedQuery()).streamRecords(connection, stream);
+          },
+        }
+      : undefined;
   const streamSyncRead: StreamSyncReadPort | undefined = localSync
     ? {
         resolve: async (input) => (await localSync()).resolver.resolve(input),
@@ -559,12 +564,11 @@ export function createApp(deps: AppDeps): Hono {
         store: deps.pdpp.store,
         accountStorageMode,
         recordQuery,
-        recordHistory: localSync
-          ? async (stream, options) =>
-              (await localSync()).changesFor(
-                deps.pdpp?.connectionLink ?? (() => null),
-              )(stream, options)
-          : undefined,
+        recordHistory:
+          localSync && connectionLink
+            ? async (stream, options) =>
+                (await localSync()).changesFor(connectionLink)(stream, options)
+            : undefined,
         reads: deps.pdpp.reads,
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
@@ -620,7 +624,7 @@ export function createApp(deps: AppDeps): Hono {
             return deps.pdpp!.reads(
               context.tokenKind === "owner" ? "owner" : "grant",
             );
-          if (!localSync)
+          if (!localSync || !connectionLink)
             throw new PdppError(
               "STREAM_READ_UNAVAILABLE",
               "Database is unavailable",
@@ -628,7 +632,7 @@ export function createApp(deps: AppDeps): Hono {
           const subject = context.subjectId ?? "";
           return grantBlobStore({
             local: await localSync(),
-            link: deps.pdpp!.connectionLink ?? (() => null),
+            link: connectionLink,
             context,
             blobId,
             declarations: deps.pdpp!.declarations,
