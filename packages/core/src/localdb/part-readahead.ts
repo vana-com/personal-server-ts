@@ -65,7 +65,13 @@ export interface PartReader {
    * until then.
    */
   readonly committed: (index: number) => void;
-  /** Stop fetching and give back every reservation. Safe to call twice. */
+  /**
+   * Stop fetching and give back every reservation. Safe to call twice. A unit
+   * whose fetch is still running keeps its reservation until that fetch ends;
+   * the reader cancels nothing. A store's GET always ends: the storage
+   * governor aborts an operation at its deadline (`retryBudgetMs`), so a
+   * stuck request holds its memory for that long and no longer.
+   */
   readonly close: () => void;
 }
 

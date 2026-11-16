@@ -708,6 +708,7 @@ async function applyOneOnce(
   // keep and noop shortcuts to trust; the next one reads the stream whole.
   let cached = true;
   const commit = async (rows: SqlStatement[]) => {
+    committing = true;
     const begin: SqlStatement[] = cached
       ? [
           {
@@ -766,8 +767,16 @@ async function applyOneOnce(
       ]),
     );
     if (progressive) announceApplied(deps, id);
+    committing = false;
   };
   let reader: PartReader | undefined;
+  // Rows of applied parts that wait for their commit, and the position in the
+  // read list of the last part they hold.
+  let pending: SqlStatement[] = [];
+  let lastApplied = -1;
+  // Set while a commit runs and left set if it throws: a commit that failed is
+  // not tried again.
+  let committing = false;
   try {
     // A prefix whose parts all match the saved ones is kept as it is. Decide
     // every prefix first: a first load's drop of other heads' rows spares
@@ -811,10 +820,6 @@ async function applyOneOnce(
     );
     reader = ahead;
     let offset = 0;
-    // Rows of applied parts that wait for their commit, and the position in
-    // the read list of the last part they hold.
-    let pending: SqlStatement[] = [];
-    let lastApplied = -1;
     for (const [prefix, parts] of grouped) {
       if (keptPrefixes.has(prefix)) continue;
       const groupStart = applied;
@@ -1002,6 +1007,19 @@ async function applyOneOnce(
       partsKept: kept,
     };
   } catch (error) {
+    // Parts that were read and checked are not lost to the one that was not:
+    // a load that commits each part as it reads it keeps them, and a group
+    // that waits for the next fetched part commits them here. A commit that
+    // failed is not tried again, and a failure here must not hide the one
+    // being thrown.
+    if (pending.length > 0 && !committing) {
+      const rows = pending;
+      pending = [];
+      await commit(rows).then(
+        () => reader?.committed(lastApplied),
+        () => undefined,
+      );
+    }
     // The load stopped short of its last part: say so on its row, for a
     // reader to tell this from a load that is still going. The next part
     // clears it. A failure here must not hide the one being thrown.
