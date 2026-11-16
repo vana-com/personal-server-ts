@@ -3,7 +3,11 @@ import {
   connectionHasLog,
   type ApplyResult,
 } from "./apply.js";
-import { bootstrapConnections, knownActiveConnections } from "./bootstrap.js";
+import {
+  bootstrapConnections,
+  knownActiveConnections,
+  newConnectionsWithStreams,
+} from "./bootstrap.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { publishLog } from "./log-publish.js";
 import { publishConnection, type PublishResult } from "./publish.js";
@@ -76,8 +80,10 @@ async function publishEarly(
   deps: LocalSyncDeps,
 ): Promise<Map<string, EarlyPublish>> {
   const early = new Map<string, EarlyPublish>();
-  await Promise.all(
-    (await knownActiveConnections(deps)).map(async ({ connectionId }) => {
+  const active = await knownActiveConnections(deps);
+  const fresh = await newConnectionsWithStreams(deps);
+  await Promise.all([
+    ...active.map(async ({ connectionId }) => {
       try {
         const published = await publishLog(deps, connectionId);
         if (published !== null)
@@ -86,7 +92,24 @@ async function publishEarly(
         early.set(connectionId, { published: [], error: cause });
       }
     }),
-  );
+    // A new connection's first publish creates its control row, so it does not
+    // wait for the cycle's listing and apply, which would find nothing for it.
+    // The device's view of it can still be old (another device made the row
+    // since): the publish then defers or loses its commit and applies, and the
+    // cycle's own pass below publishes it, so a deferral is not reported here.
+    ...fresh.map(async ({ connectionId }) => {
+      try {
+        const published = await publishLog(deps, connectionId);
+        if (published !== null)
+          early.set(connectionId, {
+            published: published.filter((r) => r.outcome !== "deferred"),
+            error: null,
+          });
+      } catch (cause) {
+        early.set(connectionId, { published: [], error: cause });
+      }
+    }),
+  ]);
   return early;
 }
 

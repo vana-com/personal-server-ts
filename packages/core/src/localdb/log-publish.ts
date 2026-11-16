@@ -72,6 +72,11 @@ import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { tombstoneOmissions } from "./admit.js";
 import { planCompaction } from "./log-compact.js";
+import {
+  logPublishPhases,
+  openPhases,
+  type PhaseClock,
+} from "./log-publish-phases.js";
 import { readLogState, writeLogState, type LogState } from "./log-apply.js";
 import { rowsPerStatement } from "./log-batch.js";
 import {
@@ -184,6 +189,19 @@ export async function publishLog(
 ): Promise<readonly PublishResult[] | null> {
   if (!deps.registry.postBatch || withoutBatchRoute.has(deps.registry))
     return null;
+  const clock = openPhases(deps);
+  try {
+    return await publishRounds(deps, connectionId, clock);
+  } finally {
+    logPublishPhases(deps, connectionId, clock);
+  }
+}
+
+async function publishRounds(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  clock: PhaseClock,
+): Promise<readonly PublishResult[] | null> {
   const results = new Map<string, PublishResult>();
   const keep = (list: readonly PublishResult[]) => {
     for (const result of list) {
@@ -195,14 +213,18 @@ export async function publishLog(
   };
   let attempts = 0;
   for (;;) {
-    const turn = await deps.queue.run(connectionId, "publish", async () => {
-      const held = insideQueue(deps, connectionId);
-      return snapshotRound(held, connectionId);
-    });
+    const turn = await clock.time("snapshot", () =>
+      deps.queue.run(connectionId, "publish", async () => {
+        const held = insideQueue(deps, connectionId);
+        return snapshotRound(held, connectionId, clock);
+      }),
+    );
     if (turn.kind === "done") {
       // Bytes that arrived after their records were published still go up.
-      if (turn.attachments && turn.attachments.length > 0)
-        await uploadBlobs(deps, turn.attachments);
+      if (turn.attachments && turn.attachments.length > 0) {
+        const attachments = turn.attachments;
+        await clock.time("attachments", () => uploadBlobs(deps, attachments));
+      }
       keep(turn.results);
       break;
     }
@@ -215,20 +237,36 @@ export async function publishLog(
     }
     const { candidate } = turn;
     // TRANSFER: no slot. Objects are content addressed and authorize nothing
-    // until the registry commit.
-    if (candidate.attachments.length > 0)
-      await uploadBlobs(deps, candidate.attachments);
+    // until the registry commit, so nothing orders one PUT before another:
+    // the attachments, the snapshot parts and the segment that names them go
+    // at once and the commit waits for all of them. The commit's one
+    // dependency is the objects it names.
     const scope = await logScopeOf(deps, connectionId);
-    // Snapshot parts, then the segment that names them.
-    await Promise.all(
-      candidate.snapshotParts.map((part) =>
-        deps.blobs.put(`${scope}/${part.name}`, part.cipher),
+    await Promise.all([
+      candidate.attachments.length > 0
+        ? clock.time("attachments", () =>
+            uploadBlobs(deps, candidate.attachments),
+          )
+        : undefined,
+      clock.time("segment-put", () =>
+        Promise.all([
+          ...candidate.snapshotParts.map((part) =>
+            deps.blobs.put(`${scope}/${part.name}`, part.cipher),
+          ),
+          deps.blobs.put(`${scope}/${candidate.blobName}`, candidate.cipher),
+        ]),
       ),
-    );
-    await deps.blobs.put(`${scope}/${candidate.blobName}`, candidate.cipher);
+    ]);
 
-    const committed = await deps.queue.run(connectionId, "publish", () =>
-      commitRound(insideQueue(deps, connectionId), connectionId, candidate),
+    const committed = await clock.time("commit", () =>
+      deps.queue.run(connectionId, "publish", () =>
+        commitRound(
+          insideQueue(deps, connectionId),
+          connectionId,
+          candidate,
+          clock,
+        ),
+      ),
     );
     if (committed.kind === "unsupported") {
       withoutBatchRoute.add(deps.registry);
@@ -298,6 +336,7 @@ function warnedHolds(db: object, connectionId: string): Map<string, string> {
 async function snapshotRound(
   held: LocalSyncDeps,
   connectionId: string,
+  clock: PhaseClock,
 ): Promise<Snapshot> {
   const [connection] = await held.db.query<
     ConnectionRow & { control_state: string }
@@ -331,11 +370,8 @@ async function snapshotRound(
   // the commit's own condition; only an unknown one is read here.
   const controlDataHash = hashes.activeData;
   if (connection.control_state !== "active") {
-    const settled = await establishControl(
-      held,
-      connectionId,
-      connection,
-      hashes,
+    const settled = await clock.time("control", () =>
+      establishControl(held, connectionId, connection, hashes),
     );
     if (settled === "retry") return { kind: "retry" };
     if (settled !== "active") return all(settled);
@@ -357,6 +393,7 @@ async function snapshotRound(
     },
   ]);
 
+  const planStart = clock.now();
   const log = await readLogState(held, connectionId);
   const planned: Planned[] = [];
   const target = held.partTargetBytes ?? DEFAULT_PART_TARGET_BYTES;
@@ -618,6 +655,7 @@ async function snapshotRound(
     }));
   // Attachments named by any stream's records, published or not yet: bytes can
   // arrive after the records that name them were published.
+  clock.record("plan", planStart);
   const attachments: BlobDescriptor[] = [];
   for (const p of planned)
     if (!p.plan.deferred)
@@ -690,6 +728,7 @@ async function snapshotRound(
     throw new Error(
       `publish: a deletion's key does not match its hash (${mismatch.stream}/${mismatch.pkHash})`,
     );
+  const encodeStart = clock.now();
   const clear = encodeSegment(segment);
   const { dataHash, blobName } = await digestSegment(
     keccakOf(held.streamCrypto),
@@ -708,6 +747,7 @@ async function snapshotRound(
       `publish: the log segment failed verification: ${verified.kind}`,
     );
   const cipher = await held.keys.encrypt(scope, clear);
+  clock.record("encode", encodeStart);
   return {
     kind: "candidate",
     candidate: {
@@ -745,18 +785,28 @@ function omittedSize(omitted: readonly LogOmission[]): number {
   return omitted.reduce((n, o) => n + 70 + JSON.stringify(o.key).length, 0);
 }
 
-/** A stream that has not been published has its own scope for blobs only. */
+/**
+ * Make sure the connection's control row is active here, for a connection this
+ * device does not already hold as active.
+ *
+ * A connection this device has only ever seen absent, at its first generation,
+ * is the first save of a new connection: the row is created with the one
+ * request that creates it. A read first would learn what the post's own answer
+ * says (created, or a row is there), and a read after would re-learn the row
+ * this device just wrote. Both are skipped. The post is the compare-and-set at
+ * version 1, so a row another device wrote answers 409 and the row is read and
+ * classified as for any other connection. Nothing rests on the skipped read:
+ * the commit names the control row as a condition (version, hash, not
+ * deleted), so a row that is not the one assumed fails the commit, not a write.
+ */
 async function establishControl(
   held: LocalSyncDeps,
   connectionId: string,
-  connection: ConnectionRow,
+  connection: ConnectionRow & { control_state: string },
   hashes: ControlHashes,
 ): Promise<"active" | "retry" | PublishResult["outcome"]> {
   const control = controlScope(connection.connector, connection.ns);
-  let read = await held.registry.read(control);
-  let state = classifyControl(read, hashes);
-  if (state.kind === "absent") {
-    if (connection.generation !== 1) return "deferred";
+  const create = async () => {
     const signature = await held.signer.signAddData({
       ownerAddress: held.ownerAddress,
       scope: control,
@@ -764,7 +814,7 @@ async function establishControl(
       metadataHash: hashes.activeMetadata,
       expectedVersion: 1n,
     });
-    await held.registry.post({
+    return held.registry.post({
       ownerAddress: held.ownerAddress,
       scope: control,
       dataHash: hashes.activeData,
@@ -772,6 +822,15 @@ async function establishControl(
       expectedVersion: "1",
       signature,
     });
+  };
+  if (connection.control_state === "absent" && connection.generation === 1) {
+    if ((await create()).kind === "committed") return "active";
+  }
+  let read = await held.registry.read(control);
+  let state = classifyControl(read, hashes);
+  if (state.kind === "absent") {
+    if (connection.generation !== 1) return "deferred";
+    await create();
     read = await held.registry.read(control);
     state = classifyControl(read, hashes);
   }
@@ -1135,6 +1194,7 @@ async function commitRound(
   held: LocalSyncDeps,
   connectionId: string,
   candidate: Candidate,
+  clock: PhaseClock,
 ): Promise<Committed> {
   const [connection] = await held.db.query<ConnectionRow>(
     "SELECT connector, ns, generation FROM connections WHERE connection_id = ?",
@@ -1186,18 +1246,20 @@ async function commitRound(
       expectedHeadDataHash: candidate.prevHash,
     }),
   };
-  const answer = await postBatchOnce(held.registry, {
-    ownerAddress: held.ownerAddress,
-    rows: [row],
-    requires: [
-      {
-        scope: control,
-        expectedVersion: String(connection.generation),
-        notDeleted: true,
-        expectedDataHash: hashes.activeData,
-      },
-    ],
-  });
+  const answer = await clock.time("registry-commit", () =>
+    postBatchOnce(held.registry, {
+      ownerAddress: held.ownerAddress,
+      rows: [row],
+      requires: [
+        {
+          scope: control,
+          expectedVersion: String(connection.generation),
+          notDeleted: true,
+          expectedDataHash: hashes.activeData,
+        },
+      ],
+    }),
+  );
   if (answer.kind === "unsupported") return { kind: "unsupported" };
   if (answer.kind === "precondition_failed") {
     const verdict = answer.failure
@@ -1321,7 +1383,9 @@ async function commitRound(
     }),
     ...(await compaction(held, connectionId, candidate.planned)),
   );
-  await held.db.batch(withOrigin("refresh", statements));
+  await clock.time("local-commit", () =>
+    held.db.batch(withOrigin("refresh", statements)),
+  );
 
   const more = candidate.planned.some((p) => p.rest);
   return {

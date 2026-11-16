@@ -816,3 +816,81 @@ describe("an unreachable registry is told apart from a refusing one", () => {
     expect(error).not.toBeInstanceOf(RegistryUnavailableError);
   });
 });
+
+describe("listings of concurrent callers", () => {
+  const owner = `0x${"11".repeat(20)}` as const;
+  /** A fetch whose listings answer only when released, in the order begun. */
+  function held() {
+    const begun: { release: (rows: string[]) => void }[] = [];
+    const fetch = (() =>
+      new Promise<Response>((resolve) => {
+        begun.push({
+          release: (scopes) =>
+            resolve(
+              new Response(
+                JSON.stringify({
+                  data: {
+                    dataPoints: scopes.map((scope) => ({
+                      scope,
+                      expectedVersion: "1",
+                      dataHash: `0x${"aa".repeat(32)}`,
+                      metadataHash: `0x${"bb".repeat(32)}`,
+                      deleted: false,
+                    })),
+                  },
+                  pagination: { hasMore: false },
+                }),
+                { status: 200 },
+              ),
+            ),
+        });
+      })) as unknown as typeof fetch;
+    return { begun, fetch };
+  }
+  const registryOver = (fetch: typeof globalThis.fetch) =>
+    createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test",
+      ownerAddress: owner,
+      fetch,
+    });
+
+  it("a call made while a listing is out waits for a listing that begins after it, and callers that arrive meanwhile share that one", async () => {
+    const { begun, fetch } = held();
+    const registry = registryOver(fetch);
+    const first = registry.listControlRows();
+    const second = registry.listControlRows();
+    const third = registry.listStreamRows("acme");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // One request is out: the later calls did not take it, and began none.
+    expect(begun).toHaveLength(1);
+    begun[0]!.release(["pdpp.acme~"]);
+    expect((await first).map((r) => r.scope)).toEqual(["pdpp.acme~"]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // The later calls share one listing, begun after the first one ended.
+    expect(begun).toHaveLength(2);
+    begun[1]!.release(["pdpp.acme~", streamScope("acme", "", "s1")]);
+    expect((await second).map((r) => r.scope)).toEqual(["pdpp.acme~"]);
+    expect((await third).length).toBe(1);
+    expect(begun).toHaveLength(2);
+  });
+
+  it("a failed listing fails its own callers and not the ones waiting for the next", async () => {
+    let calls = 0;
+    const fetch = (async () => {
+      if (++calls === 1) throw new TypeError("terminated");
+      return new Response(
+        JSON.stringify({
+          data: { dataPoints: [] },
+          pagination: { hasMore: false },
+        }),
+        { status: 200 },
+      );
+    }) as unknown as typeof globalThis.fetch;
+    const registry = registryOver(fetch);
+    const first = registry.listControlRows();
+    const second = registry.listControlRows();
+    await expect(first).rejects.toBeInstanceOf(RegistryUnavailableError);
+    await expect(second).resolves.toEqual([]);
+    expect(calls).toBe(2);
+  });
+});

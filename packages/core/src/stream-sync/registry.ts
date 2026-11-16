@@ -220,9 +220,11 @@ export function createGatewayStreamSyncRegistry(
   }
   const pageSize = options.listPageSize ?? 500;
 
-  /** Page through every owner row and keep the scopes `keep` accepts. */
-  async function listRows(keep: (scope: string) => boolean) {
-    const out: { scope: string; read: ControlRead }[] = [];
+  type OwnerRow = { scope: string; read: ControlRead };
+
+  /** Page through every owner row. */
+  async function fetchOwnerRows(): Promise<OwnerRow[]> {
+    const out: OwnerRow[] = [];
     let cursor: string | null = null;
     do {
       const params = new URLSearchParams({
@@ -240,7 +242,7 @@ export function createGatewayStreamSyncRegistry(
         pagination?: { hasMore?: boolean; nextCursor?: string | null };
       };
       for (const row of envelope.data?.dataPoints ?? []) {
-        if (typeof row.scope !== "string" || !keep(row.scope)) continue;
+        if (typeof row.scope !== "string") continue;
         out.push({ scope: row.scope, read: toControlRead(row) });
       }
       // A delete depends on the whole listing: a missing or inconsistent page
@@ -263,6 +265,43 @@ export function createGatewayStreamSyncRegistry(
       }
     } while (cursor !== null);
     return out;
+  }
+
+  // Callers that list at the same moment (a cycle applies every connection at
+  // once, and each lists the owner's rows) share listings. A listing that is
+  // already out began before a later caller's call, so that caller cannot take
+  // it: it would not reflect what was written since. Such callers wait for the
+  // next listing, and every caller that arrives while it is out takes that
+  // same one. The listings of N concurrent callers are at most two requests,
+  // each taken after the call of every caller that uses it.
+  let listingOut: Promise<OwnerRow[]> | undefined;
+  let listingNext: Promise<OwnerRow[]> | undefined;
+  function startListing(): Promise<OwnerRow[]> {
+    const listing = fetchOwnerRows();
+    listingOut = listing;
+    const done = () => {
+      if (listingOut === listing) listingOut = undefined;
+    };
+    listing.then(done, done);
+    return listing;
+  }
+  function ownerRows(): Promise<OwnerRow[]> {
+    if (listingOut === undefined) return startListing();
+    listingNext ??= listingOut
+      .then(
+        () => undefined,
+        () => undefined,
+      )
+      .then(() => {
+        listingNext = undefined;
+        return startListing();
+      });
+    return listingNext;
+  }
+
+  /** Every owner row whose scope `keep` accepts. */
+  async function listRows(keep: (scope: string) => boolean) {
+    return (await ownerRows()).filter((row) => keep(row.scope));
   }
 
   /** `undefined` until the gateway answers the batch route once. */

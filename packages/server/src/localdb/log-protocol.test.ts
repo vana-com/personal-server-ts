@@ -970,7 +970,14 @@ describe("log protocol: attachments", () => {
 
   it("a blob uploaded with a log-mode publish is readable on another device", async () => {
     const w = await world({ streams: 1, logProtocol: true });
-    const a = await w.device("a");
+    // The registry commit that names the blob's record comes after the blob and
+    // the segment are both in storage; their own order is free.
+    const batchesAtPut: number[] = [];
+    const a = await w.device("a", true, {
+      beforePut: async () => {
+        batchesAtPut.push(w.gateway.batches().length);
+      },
+    });
     const b = await w.device("b");
     await a.run(
       "run-1",
@@ -982,10 +989,9 @@ describe("log protocol: attachments", () => {
     await a.cycle();
     const key = `${streamScope(CONNECTOR, "", sName(0))}/g1-b-${hash}`;
     expect(a.puts).toContain(key);
-    // The blob went up before the segment that names its record.
-    expect(a.puts.indexOf(key)).toBeLessThan(
-      a.puts.findIndex((k) => k.includes(`${LOG}/s-`)),
-    );
+    expect(a.puts.some((k) => k.includes(`${LOG}/s-`))).toBe(true);
+    expect(batchesAtPut).toEqual([0, 0]);
+    expect(w.writes().batches).toBe(1);
     await b.cycle();
     expect(new Uint8Array((await b.sync.blobs.get(hash))!.bytes)).toEqual(
       bytes,
