@@ -1,4 +1,4 @@
-import { keccak_256 } from "@noble/hashes/sha3";
+import { keccakOf } from "../stream-sync/crypto-port.js";
 import {
   classifyControl,
   classifyStreamRow,
@@ -105,7 +105,6 @@ interface Landing {
   readonly fenced: Promise<boolean>;
   readonly done: Promise<void>;
 }
-const keccak = async (bytes: Uint8Array) => keccak_256(bytes);
 const ATTEMPTS = 8;
 
 /** `work`'s answer, or `false` once `ms` has passed (never: wait for `work`). */
@@ -136,6 +135,7 @@ export function createConnectionDeleter(
     readonly fenceWaitMs?: number;
   },
 ): ConnectionDeleter {
+  const keccak = keccakOf(deps.streamCrypto);
   const flights = new Map<string, Landing>();
   /**
    * The stream rows the plan listed, by delete id. Only a delete this process

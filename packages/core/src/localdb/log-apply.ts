@@ -22,7 +22,6 @@
 // work. What the log does not hold below `base` (a log that began after the
 // streams were published) is read by the per-stream path.
 
-import { keccak_256 } from "@noble/hashes/sha3";
 import {
   classifyStreamRow,
   digestSegment,
@@ -42,6 +41,7 @@ import {
   type SnapshotPart,
   type SnapshotPointer,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { keccakOf } from "../stream-sync/crypto-port.js";
 import { announceApplied } from "./apply-progress.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
@@ -84,8 +84,6 @@ export {
   type LogState,
 } from "./log-state.js";
 
-const keccak = async (bytes: Uint8Array) => keccak_256(bytes);
-
 /**
  * Apply one segment's operations to local state, in one batch (origin
  * `remote`). Safe to repeat and to run in any order against other segments:
@@ -100,7 +98,7 @@ export async function applySegmentOperations(
   state?: LogState,
 ): Promise<void> {
   const { dataHash, blobName } = await digestSegment(
-    keccak,
+    keccakOf(deps.streamCrypto),
     encodeSegment(segment),
   );
   await applyBatch(deps, connectionId, segment, { dataHash, blobName }, state);
@@ -117,7 +115,10 @@ export async function applySnapshotPart(
   state?: LogState,
 ): Promise<void> {
   const bytes = encodeSnapshotPart(part);
-  const { dataHash, blobName } = await digestSnapshotPart(keccak, bytes);
+  const { dataHash, blobName } = await digestSnapshotPart(
+    keccakOf(deps.streamCrypto),
+    bytes,
+  );
   await applyBatch(
     deps,
     connectionId,
@@ -608,7 +609,7 @@ export async function fetchSegment(
   if (cipher === null)
     throw new Error(`apply: missing log segment ${position}`);
   const verified = await verifySegment(
-    keccak,
+    keccakOf(deps.streamCrypto),
     await deps.keys.decrypt(scope, cipher),
     {
       dataHash,
@@ -643,7 +644,7 @@ export async function fetchSnapshotPart(
   );
   if (cipher === null) throw new Error("apply: missing log snapshot part");
   const verified = await verifySnapshotPart(
-    keccak,
+    keccakOf(deps.streamCrypto),
     await deps.keys.decrypt(scope, cipher),
     {
       dataHash,

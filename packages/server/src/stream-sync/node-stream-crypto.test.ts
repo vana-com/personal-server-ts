@@ -1,5 +1,6 @@
-import { randomBytes } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { createHash, randomBytes } from "node:crypto";
+import type * as NodeCrypto from "node:crypto";
+import { describe, expect, it, vi } from "vitest";
 import { nobleStreamCrypto } from "../../../core/src/stream-sync/crypto-port.js";
 import { createStreamSyncKeyPorts } from "../../../core/src/stream-sync/crypto.js";
 import {
@@ -38,6 +39,58 @@ describe("the node stream-crypto port", () => {
       expect(Buffer.from(nodeStreamCrypto.sha256(data)).toString("hex")).toBe(
         Buffer.from(nobleStreamCrypto.sha256(data)).toString("hex"),
       );
+    }
+  });
+
+  it("hashes Keccak-256 the same as noble, and not as SHA3-256", () => {
+    for (const size of [0, 1, 135, 136, 137, 100_000, 3 * 1024 * 1024 + 5]) {
+      const data = bytesOf(size);
+      expect(
+        Buffer.from(nodeStreamCrypto.keccak256(data)).toString("hex"),
+      ).toBe(Buffer.from(nobleStreamCrypto.keccak256(data)).toString("hex"));
+    }
+    // Ethereum's digest of "abc"; SHA3-256 of the same bytes is 3a985da7…
+    expect(
+      Buffer.from(
+        nodeStreamCrypto.keccak256(new TextEncoder().encode("abc")),
+      ).toString("hex"),
+    ).toBe("4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45");
+  });
+
+  it.each([
+    [
+      "has no keccak-256",
+      () => {
+        throw new Error("Digest method not supported");
+      },
+    ],
+    [
+      "answers keccak-256 with SHA3-256",
+      (algorithm: string) =>
+        createHash(algorithm === "keccak-256" ? "sha3-256" : algorithm),
+    ],
+  ])("keeps noble's Keccak-256 when OpenSSL %s", async (_name, replacement) => {
+    vi.resetModules();
+    vi.doMock("node:crypto", async (importOriginal) => {
+      const real = await importOriginal<typeof NodeCrypto>();
+      return {
+        ...real,
+        createHash: (algorithm: string) =>
+          algorithm === "keccak-256"
+            ? replacement(algorithm)
+            : real.createHash(algorithm),
+      };
+    });
+    try {
+      const { nodeStreamCrypto: port } =
+        await import("./node-stream-crypto.js");
+      const data = bytesOf(5_000);
+      expect(Buffer.from(port.keccak256(data)).toString("hex")).toBe(
+        Buffer.from(nobleStreamCrypto.keccak256(data)).toString("hex"),
+      );
+    } finally {
+      vi.doUnmock("node:crypto");
+      vi.resetModules();
     }
   });
 

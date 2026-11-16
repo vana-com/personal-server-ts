@@ -1,7 +1,7 @@
+import { keccakOf } from "../stream-sync/crypto-port.js";
 import { readBeginReceipt } from "./run-receipts.js";
 import { RegistryRefusedError } from "../stream-sync/ports.js";
 import { sha256 } from "@noble/hashes/sha2";
-import { keccak_256 } from "@noble/hashes/sha3";
 import {
   canonicalJson,
   controlHashes,
@@ -288,7 +288,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           !synced.unreachable
         ) {
           const hashes = await controlHashes(
-            async (b) => keccak_256(b),
+            keccakOf(deps.streamCrypto),
             await deriveKeyCheck((m) => deps.keys.namespaceHmac(m)),
           );
           const version = synced.connection.controlVersion + 1;
