@@ -80,7 +80,6 @@ async function build(device: string) {
       {
         resolveArtifact: (d) => declarations.get(d) ?? null,
         declaredStreams: () => ["items"],
-        olderVersionReads: () => true,
       },
     );
   };

@@ -107,7 +107,6 @@ async function world(connectors: number, streamsPer: number) {
       })),
     }),
     declaredStreams: () => names,
-    olderVersionReads: () => true,
   });
   let runs = 0;
   for (let c = 0; c < connectors; c++) {

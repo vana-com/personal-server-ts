@@ -25,7 +25,6 @@ describe("server alias ports", () => {
     createServerLocalSync({} as never, {
       resolveArtifact: () => null,
       declaredStreams: () => [],
-      olderVersionReads: () => false,
     });
     const { aliasScopes, aliasTargets } = build.mock.calls[0][1];
     expect([...aliasScopes()]).toEqual([...LEGACY_SCOPE_BINDINGS.keys()]);

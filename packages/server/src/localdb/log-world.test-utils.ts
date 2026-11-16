@@ -200,7 +200,6 @@ export async function world(options: {
         })),
       }),
       declaredStreams: () => names,
-      olderVersionReads: () => true,
     });
     /** One run that writes `records` and ends covering `covered`. */
     const run = async (

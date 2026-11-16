@@ -89,7 +89,6 @@ async function stuckDelete(
       ],
     }),
     declaredStreams: () => ["items"],
-    olderVersionReads: () => true,
     deleteRetryMs: { first: 5, max: 20 },
   });
   syncs.push(sync);

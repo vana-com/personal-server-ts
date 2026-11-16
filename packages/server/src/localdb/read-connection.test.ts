@@ -88,7 +88,6 @@ describe("read connection", () => {
     createServerLocalSync(depsFor(db), {
       resolveArtifact: () => undefined,
       declaredStreams: () => [],
-      olderVersionReads: () => true,
     });
 
   /**

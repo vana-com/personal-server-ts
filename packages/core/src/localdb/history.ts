@@ -25,10 +25,14 @@ export type HistoryResult<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly reason: "not_found" | "deleted" };
 
-/** One `/versions` item: the six fields of the legacy contract. */
+/**
+ * One `/versions` item: the six fields of the legacy contract. The list holds
+ * the one version a read serves, the stream's log position: the connection log
+ * keeps no body of an older one.
+ */
 export interface HistoryVersionItem {
-  /** `stream_versions.head_blob`. */
-  readonly fileId: string | null;
+  /** Always null: no version is read by `?fileId=`; read without a selector. */
+  readonly fileId: null;
   readonly schemaId: null;
   /** ISO string of the writer's `observed_at`, never import or registry time. */
   readonly collectedAt: string;
@@ -116,8 +120,6 @@ const trackedSince = (counts: Counts): string | null =>
 export function createLocalHistory(
   deps: LocalSyncDeps,
   options: {
-    /** The `olderVersionReads` server config value, read at each call (default true). */
-    readonly olderVersionReads: () => boolean;
     /** Registry freshness is not persisted by the current local database schema. */
     readonly behind?: (connectionId: string) => boolean;
     /** The host's legacy alias ports; the ones the read route resolves with. */
@@ -318,7 +320,6 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
         control_state: string;
         head_version: number | null;
         total: number;
-        head_blob: string | null;
         observed_at: number | null;
         version: number | null;
       }>(
@@ -330,20 +331,20 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
            LEFT JOIN stream_state s ON s.connection_id = c.connection_id
              AND s.stream = ?
          ), visible AS (
-           SELECT v.head_blob, v.observed_at, v.version
+           SELECT v.observed_at, v.version
            FROM context c JOIN stream_versions v
              ON v.connection_id = c.connection_id AND v.stream = ?
            WHERE c.control_state = 'active' AND v.generation = c.generation
              AND v.version > c.last_delete_version
              AND v.kind IN ('published', 'applied')
-             AND (? = 1 OR v.version = c.head_version)
+             AND v.version = c.head_version
          ), page AS (
            SELECT * FROM visible WHERE (? IS NULL OR version < ?)
            ORDER BY version DESC LIMIT ?
          )
          SELECT c.control_state, c.head_version,
                 (SELECT COUNT(*) FROM visible) AS total,
-                p.head_blob, p.observed_at, p.version
+                p.observed_at, p.version
          FROM context c LEFT JOIN page p ON 1 = 1
          ORDER BY p.version DESC`,
         [
@@ -351,7 +352,6 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
           ns,
           stream,
           stream,
-          options.olderVersionReads() ? 1 : 0,
           cursor ?? null,
           cursor ?? null,
           limit + 1,
@@ -374,7 +374,7 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
         value: {
           scope,
           versions: page.map((row) => ({
-            fileId: row.head_blob,
+            fileId: null,
             schemaId: null,
             collectedAt: new Date(row.observed_at!).toISOString(),
             version: row.version!,

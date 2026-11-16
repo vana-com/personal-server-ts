@@ -152,7 +152,6 @@ async function world() {
     {
       resolveArtifact: () => declaration,
       declaredStreams: () => ["items"],
-      olderVersionReads: () => true,
     },
   );
   const readerKeys = async () => {

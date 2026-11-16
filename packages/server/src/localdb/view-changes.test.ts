@@ -115,7 +115,6 @@ async function device(
       })),
     }),
     declaredStreams: () => streams,
-    olderVersionReads: () => true,
   });
   return Object.assign(sync, {
     db,
@@ -593,32 +592,26 @@ describe("view changes", () => {
     expect(ids(seen).flat()).toEqual([id]);
   });
 
-  /** What a version listing answers for c0/s0: the record count each version reports. */
-  async function versionReads(d: Device) {
-    const listed = await d.olderVersions.list("pdpp.c0~", "s0");
-    return { counts: listed.map((v) => v.recordCount) };
-  }
-
   async function versioned() {
     const a = await device(shared(), "a");
     await collect(a, "c0");
     await a.cycle();
-    const before = await versionReads(a);
+    const before = await visible(a);
     await a.views.settled();
-    expect(before.counts.length).toBeGreaterThan(0);
     return { a, before, ...listen(a) };
   }
 
-  // `head_format` is read by nothing a reader sees any more (it named how a
-  // per-stream head was encoded), so a change of it only has to emit.
+  // Neither column reaches a reader any more: `head_format` named how a
+  // per-stream head was encoded, and `record_count` was reported only by the
+  // older-version listing. A change of either only has to emit.
   const versionColumns = {
     record_count: "record_count + 7",
     head_format: "head_format + 7",
   };
   for (const [column, next] of Object.entries(versionColumns)) {
-    it(`(p) a change of ${column} on a version row ${column === "record_count" ? "changes what a reader sees, and " : ""}emits`, async () => {
+    it(`(p) a change of ${column} on a version row emits`, async () => {
       for (const how of ["an update", "a replacement"]) {
-        const { a, before, seen } = await versioned();
+        const { a, seen } = await versioned();
         await a.db.batch([
           {
             sql:
@@ -630,8 +623,6 @@ describe("view changes", () => {
         ]);
         await a.views.settled();
         onlyConnection(seen, "pdpp.c0~");
-        if (column === "record_count")
-          expect(await versionReads(a)).not.toEqual(before);
       }
     });
   }
@@ -648,20 +639,27 @@ describe("view changes", () => {
     ]);
     await a.views.settled();
     expect(seen).toEqual([]);
-    expect(await versionReads(a)).toEqual(before);
+    expect(await visible(a)).toEqual(before);
   });
 
   const intent = (id: string) =>
     `INSERT OR REPLACE INTO delete_intents(connector, delete_id, intent) VALUES ('c0', '${id}', '{}')`;
 
   /**
-   * The versions a reader can list per connection. A connection under a
-   * delete intent lists none, as it serves no record or version.
+   * The records a grant read sees per connection. A connection under a delete
+   * intent serves none.
    */
-  const listed = async (d: Device) => ({
-    c0: (await d.olderVersions.list("pdpp.c0~", "s0")).length,
-    c1: (await d.olderVersions.list("pdpp.c1~", "s0")).length,
-  });
+  const listed = async (d: Device) => {
+    const seen = async (connector: string) => {
+      const records = d.recordsFor(() => ({ connector, namespace: "" }));
+      const page = await records.listRecords({
+        connectionId: connector,
+        stream: "s0",
+      });
+      return page.records.length;
+    };
+    return { c0: await seen("c0"), c1: await seen("c1") };
+  };
 
   it("(q) a delete intent that starts to exist hides the connection, and emits; replacing it is silent; clearing it restores the connection, and emits", async () => {
     const a = await device(shared(), "a");

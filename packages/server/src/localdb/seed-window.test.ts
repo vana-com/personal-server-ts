@@ -89,7 +89,6 @@ async function openDevice(
       })),
     }),
     declaredStreams: () => streams,
-    olderVersionReads: () => true,
   });
   const keys = async (stream = "items") =>
     (await sync.query.listRecords({ connectionId, stream, limit: 100 })).records

@@ -85,7 +85,6 @@ async function switchedStore(): Promise<LocalSync> {
       resolveArtifact: () => undefined,
       declaredStreams: (connector) =>
         connector === CONNECTOR ? ["posts"] : [],
-      olderVersionReads: () => true,
     },
   );
   await local.apply();

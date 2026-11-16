@@ -4,7 +4,6 @@ import { logicalStreamScopeParts } from "../stream-sync-read/routing.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
 import { SEEN_O } from "./merge.js";
-import type { OlderVersionCounts } from "./older-versions.js";
 import { createRecordQuery } from "./query.js";
 import {
   chooseCandidate,
@@ -66,9 +65,7 @@ export interface LocalListing {
   listScopes(input: {
     readonly canRead: (scope: string) => boolean | Promise<boolean>;
   }): Promise<readonly ListedScope[]>;
-  status(): Promise<
-    StreamSyncReadStatus & { readonly olderVersionReads: OlderVersionCounts }
-  >;
+  status(): Promise<StreamSyncReadStatus>;
   /** Changes whenever any control row or stream head changes. */
   cacheKey(): Promise<string>;
 }
@@ -108,7 +105,6 @@ export function createLocalListing(
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
   },
-  counts: () => OlderVersionCounts,
 ): LocalListing {
   // Listing and status only read: they take the read connection, so they do
   // not wait for a long import or publish batch on the writer.
@@ -400,7 +396,6 @@ export function createLocalListing(
         listed: true,
         connections: result,
         issues: [],
-        olderVersionReads: counts(),
       };
     },
 

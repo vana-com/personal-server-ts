@@ -133,8 +133,6 @@ export interface PsLiteSyncOptions {
   localDb?: LiteLocalDbOptions;
   /** Stable host device identity; defaults to this server account. */
   localDbDeviceId?: string;
-  /** Whether the local database may fetch historical versions. */
-  olderVersionReads?: () => boolean;
   /**
    * Resolves a run's `artifactDigest` to declarations the host verified
    * (run-intake contract v2 §6). Without it every run answers
@@ -658,9 +656,6 @@ export async function createPsLiteSyncManager(
           retainedManifests: options.streamSyncRetainedManifests,
           eraseLegacy: (connector) =>
             eraseLegacyScopesOf(connector, options.storage),
-          olderVersionReads:
-            options.olderVersionReads ??
-            (() => options.config.olderVersionReads),
         });
       }
       return localSync;
@@ -815,18 +810,6 @@ export async function createPsLiteSyncManager(
           (await getLocalSync()).resolver.resolve(input),
         listScopes: async (input) =>
           (await getLocalSync()).listing.listScopes(input),
-        olderVersions: {
-          read: async (...args) =>
-            (await getLocalSync()).olderVersions.read(...args),
-          list: async (...args) =>
-            (await getLocalSync()).olderVersions.list(...args),
-          counts: () =>
-            localSync?.olderVersions.counts() ?? {
-              served: 0,
-              gone: 0,
-              off: 0,
-            },
-        },
       },
     };
   } catch (error) {

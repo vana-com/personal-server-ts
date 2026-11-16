@@ -35,13 +35,6 @@ vi.mock("../../../core/src/localdb/delete.js", () => ({
     resumeDeletes: vi.fn(async () => []),
   }),
 }));
-vi.mock("../../../core/src/localdb/older-versions.js", () => ({
-  createOlderVersions: () => ({
-    list: vi.fn(),
-    read: vi.fn(),
-    counts: () => ({ served: 0, gone: 0, off: 0 }),
-  }),
-}));
 vi.mock("../../../core/src/localdb/listing.js", () => ({
   createLocalListing: (...args: unknown[]) => {
     ports.listing(...args);
@@ -121,7 +114,6 @@ describe("local sync intake adapter", () => {
     const sync = createLocalSync(deps, {
       resolveArtifact: () => declaration,
       declaredStreams: () => ["items"],
-      olderVersionReads: () => true,
       ...aliases,
     });
     return { db, deps, sync };

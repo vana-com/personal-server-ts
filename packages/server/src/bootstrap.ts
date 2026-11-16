@@ -973,7 +973,6 @@ async function bootstrapServer(
               storage: rawDataStorage,
               pdpp: pdppConnections,
             }),
-          olderVersionReads: () => config.olderVersionReads,
         });
         localSyncDeps = deps;
         localDb = db;

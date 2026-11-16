@@ -64,7 +64,6 @@ async function world(seed = true) {
         })),
       }),
       declaredStreams: () => ["A", "B"],
-      olderVersionReads: () => true,
     });
     const collect = async (
       id: string,

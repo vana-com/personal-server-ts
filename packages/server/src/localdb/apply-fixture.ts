@@ -183,7 +183,6 @@ export async function remoteFixture(
           })),
         }),
         declaredStreams: () => [...declared.keys()],
-        olderVersionReads: () => true,
       },
     );
     return { sync, runs: 0 };

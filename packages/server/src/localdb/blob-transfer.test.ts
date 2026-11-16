@@ -57,7 +57,6 @@ async function fixture(late = false) {
           ],
         }),
         declaredStreams: () => ["media"],
-        olderVersionReads: () => true,
       }),
     };
   };

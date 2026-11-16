@@ -60,7 +60,6 @@ async function world() {
       ],
     }),
     declaredStreams: () => ["items"],
-    olderVersionReads: () => true,
   });
   const request = {
     connector: "fixture",

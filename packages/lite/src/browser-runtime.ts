@@ -115,7 +115,6 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   /** Host-owned local database, shared by stream intake and reads. */
   localDb?: PsLiteSyncOptions["localDb"];
   localDbDeviceId?: PsLiteSyncOptions["localDbDeviceId"];
-  olderVersionReads?: PsLiteSyncOptions["olderVersionReads"];
   /**
    * Where the account-mode module keeps its per-owner records. Default: its
    * own IndexedDB database next to the data store's. A host with another
@@ -446,7 +445,6 @@ export async function createIndexedDbPsLiteRuntime(
       autoStartSync: config.sync.enabled,
       localDb: options.localDb,
       localDbDeviceId: options.localDbDeviceId,
-      olderVersionReads: options.olderVersionReads,
       stateStore,
       storage,
       ownerSignature: options.ownerSignature,

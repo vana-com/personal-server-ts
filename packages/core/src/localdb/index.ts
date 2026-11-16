@@ -61,12 +61,6 @@ export {
   type StoredRecord,
 } from "./query.js";
 export {
-  createOlderVersions,
-  type OlderVersionCounts,
-  type OlderVersions,
-  type VersionInfo,
-} from "./older-versions.js";
-export {
   createLocalResolver,
   type LocalResolver,
   type LocalAliasTarget,

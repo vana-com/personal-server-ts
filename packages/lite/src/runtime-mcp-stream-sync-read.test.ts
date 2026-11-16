@@ -166,14 +166,12 @@ async function streamView(): Promise<StreamSyncReadPort> {
     {
       resolveArtifact: () => undefined,
       declaredStreams: () => ["posts", "post_likes"],
-      olderVersionReads: () => true,
     },
   );
   await local.apply();
   return {
     resolve: (input) => local.resolver.resolve(input),
     listScopes: (input) => local.listing.listScopes(input),
-    olderVersions: local.olderVersions,
   };
 }
 
