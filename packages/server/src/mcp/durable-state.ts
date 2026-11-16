@@ -4,6 +4,7 @@ import {
   createHash,
   randomBytes,
 } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
@@ -208,9 +209,18 @@ export async function openMcpDurableState(options: {
     if (state.writer?.fenced)
       throw new Error("MCP writer fenced for migration");
   };
+  // One admission gate for every operation that can write. Once close()
+  // begins, each entry point refuses new work synchronously. An operation
+  // admitted earlier runs to completion, and its own writes stay admitted
+  // through `admitted`, so a multi-step exclusive operation is never refused
+  // halfway.
   let closed = false;
+  let closing: Promise<void> | undefined;
+  const admitted = new AsyncLocalStorage<true>();
+  const refused = <T>(): Promise<T> =>
+    Promise.reject(new Error("MCP state is closed"));
   const mutate = <T>(change: (draft: State) => T): Promise<T> => {
-    if (closed) return Promise.reject(new Error("MCP state is closed"));
+    if (closed && !admitted.getStore()) return refused();
     const result = writes.then(async () => {
       assertActive();
       const draft = structuredClone(state);
@@ -236,6 +246,7 @@ export async function openMcpDurableState(options: {
       return structuredClone(rollbackOwners(state).bindings);
     },
     prepareRollback(migrationId, resolve) {
+      if (closed) return refused();
       const operation = operations.then(() => {
         const prepared = writes.then(async () => {
           assertActive();
@@ -372,6 +383,7 @@ export async function openMcpDurableState(options: {
       };
     },
     fenceAndExport(migrationId, target): Promise<Uint8Array> {
+      if (closed) return refused();
       if (!migrationId || !target)
         return Promise.reject(new Error("Migration identity required"));
       const result = operations.then(async () => {
@@ -400,6 +412,7 @@ export async function openMcpDurableState(options: {
       snapshot,
       migrationId,
     ): Promise<{ connections: number; digest: string }> {
+      if (closed) return refused();
       const result = operations.then(async () => {
         const imported = writes.then(async () => {
           const digest = createHash("sha256").update(snapshot).digest("hex");
@@ -591,15 +604,19 @@ export async function openMcpDurableState(options: {
       }),
     getIdentity: (id) => read((current) => current.identities[id] ?? null),
     exclusive<T>(operation: () => Promise<T>): Promise<T> {
-      const result = operations.then(operation);
+      if (closed) return refused();
+      const result = operations.then(() => admitted.run(true, operation));
       operations = result.catch(() => undefined);
       return result;
     },
-    async close() {
+    close() {
       closed = true;
-      // Operations queue their own writes, so settle them before the writes.
-      await operations;
-      await writes;
+      // Admitted operations queue their own writes, so settle them before the
+      // writes. Nothing new is admitted now, so both tails are final.
+      return (closing ??= (async () => {
+        await operations;
+        await writes;
+      })());
     },
   };
 }
