@@ -1,0 +1,129 @@
+/**
+ * The Node host's outbound `fetch` reuses a connection across a gap longer
+ * than Node's own 4 s idle limit, against a peer that sends no `Keep-Alive`
+ * hint (the data gateway and storage send none). Real sockets, real `fetch`.
+ */
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
+import type { AddressInfo, Socket } from "node:net";
+import { afterEach, describe, expect, it } from "vitest";
+import { createKeepAliveFetch } from "./outbound-fetch.js";
+
+const servers: Server[] = [];
+afterEach(async () => {
+  for (const server of servers.splice(0)) {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+/** A peer like the gateway: keeps a connection open and sends no hint. */
+async function peer(
+  onRequest: (
+    request: IncomingMessage,
+    response: ServerResponse,
+    sockets: Socket[],
+  ) => void = (_request, response) => response.end("ok"),
+) {
+  const sockets: Socket[] = [];
+  const server = createServer((request, response) => {
+    // An explicit `Connection` header leaves out the `Keep-Alive: timeout=`
+    // hint Node would add, so the client has only its own idle limit.
+    response.setHeader("connection", "keep-alive");
+    onRequest(request, response, sockets);
+  });
+  server.keepAliveTimeout = 60_000;
+  server.on("connection", (socket) => sockets.push(socket));
+  servers.push(server);
+  await new Promise<void>((resolve) =>
+    server.listen(0, "127.0.0.1", () => resolve()),
+  );
+  const { port } = server.address() as AddressInfo;
+  return { url: `http://127.0.0.1:${port}/`, sockets };
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+describe("createKeepAliveFetch", () => {
+  it("reuses the socket for a request sent 6 s after the last one", async () => {
+    const { url, sockets } = await peer();
+    const send = createKeepAliveFetch();
+
+    expect(await (await send(url)).text()).toBe("ok");
+    await sleep(6_000);
+    expect(await (await send(url)).text()).toBe("ok");
+
+    expect(sockets).toHaveLength(1);
+  }, 15_000);
+
+  it("is needed: Node's default fetch opens a second connection after the same gap", async () => {
+    const { url, sockets } = await peer();
+
+    await (await fetch(url)).text();
+    await sleep(6_000);
+    await (await fetch(url)).text();
+
+    expect(sockets).toHaveLength(2);
+  }, 15_000);
+
+  it("sends a PUT body over the reused socket", async () => {
+    const received: string[] = [];
+    const { url, sockets } = await peer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        received.push(`${request.method} ${Buffer.concat(chunks).length}`);
+        response.statusCode = 201;
+        response.end();
+      });
+    });
+    const send = createKeepAliveFetch();
+
+    for (const size of [1024 * 1024, 2048]) {
+      await (
+        await send(url, { method: "PUT", body: new Uint8Array(size) })
+      ).text();
+      // Right after a body is read the pool may not yet count its connection
+      // as idle, and then opens a second one beside it. That is not a failure
+      // to reuse, so the test lets the connection settle.
+      await sleep(50);
+    }
+
+    expect(received).toEqual(["PUT 1048576", "PUT 2048"]);
+    expect(sockets).toHaveLength(1);
+  });
+
+  it("still succeeds when the peer closed the idle socket before the next request", async () => {
+    const { url, sockets } = await peer();
+    const send = createKeepAliveFetch();
+
+    expect(await (await send(url)).text()).toBe("ok");
+    for (const socket of sockets) socket.destroy();
+    await sleep(100);
+    expect(await (await send(url)).text()).toBe("ok");
+
+    expect(sockets).toHaveLength(2);
+  });
+
+  it("wraps the globalThis.fetch of its creation, so a wrapper installed on it applies", async () => {
+    const original = globalThis.fetch;
+    const seen: string[] = [];
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      seen.push(String(input));
+      return original(input, init);
+    }) as typeof fetch;
+    try {
+      const { url } = await peer();
+      const send = createKeepAliveFetch();
+      globalThis.fetch = original;
+      await (await send(url)).text();
+      expect(seen).toEqual([url]);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
