@@ -1421,6 +1421,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           "Delete requires an owner token",
         );
       }
+      const refusal = refuseRecordWrite(reqId);
+      if (refusal) return refusal;
       const stream = c.req.param("stream");
       const recordKey = decodeURIComponent(c.req.param("id"));
       if (!deps.declarations.declares(stream)) {
