@@ -15,11 +15,14 @@ import {
 import {
   applyConnection,
   applyLog,
+  applyStream,
+  publishConnection,
   LogDivergedError,
 } from "../../../core/src/localdb/index.js";
 import { complexPages } from "../../../core/src/localdb/log-keyed.js";
 import {
   CONNECTION_ID,
+  LOG,
   OWNER,
   closeWorldDrivers,
   sName,
@@ -844,5 +847,109 @@ describe("log first load, key by key: what it holds", () => {
       covered += rows!.n;
     }
     expect(covered).toBe(total!.n);
+  });
+});
+
+describe("log first load, key by key: a per-stream head admitted while a load is unfinished", () => {
+  const rowKeys = async (d: Device) =>
+    (
+      await d.db.query<{ record_key: string }>(
+        "SELECT record_key FROM records ORDER BY record_key",
+      )
+    ).map((r) => r.record_key);
+
+  /**
+   * A build that does not follow the log (one without the gate in the cycle)
+   * publishes a head of each stream after a keyed load stopped: with `full` it
+   * omits the keys of the log it did not carry. `publishConnection` is what such
+   * a build does (see mixed-fleet.test.ts).
+   */
+  async function lateHeads(w: World, full: boolean) {
+    const legacy = await w.device("legacy", false);
+    // The gateway refuses a per-stream head once the log row exists, so the
+    // build writes while it cannot see the row: it read the registry just
+    // before the log's first write.
+    const log = w.gateway.versions.get(LOG);
+    w.gateway.versions.delete(LOG);
+    try {
+      for (const [n, stream] of [S0, S1].entries()) {
+        await legacy.run(`run-L${n}`, [{ stream, id: `late-${n}`, v: 1 }], {
+          full,
+          covered: [stream],
+          observedAt: 5000 + n,
+        });
+        await publishConnection(legacy.deps, CONNECTION_ID);
+      }
+    } finally {
+      if (log) w.gateway.versions.set(LOG, log);
+    }
+  }
+
+  for (const full of [true, false]) {
+    it(`ends in the rows a device that read the head and then the log ends in (head run full: ${full})`, async () => {
+      const w = await world({ streams: 2, logProtocol: true });
+      await history(w);
+      const d = await stoppedAfterFirstRange(w, "late");
+      const written = await rowKeys(d);
+      expect(written.length).toBeGreaterThan(0);
+      await lateHeads(w, full);
+
+      // Each stream's head is admitted on its own, as a stream's apply does,
+      // and the apply reads the log over it before it returns: the stopped
+      // load's rows beyond the cursor are the head's to drop, and the log's
+      // to bring back.
+      for (const stream of [S0, S1])
+        expect((await applyStream(d.deps, CONNECTION_ID, stream)).outcome).toBe(
+          "applied",
+        );
+      await applyConnection(d.deps, CONNECTION_ID);
+
+      const reference = await connected(w, "reference", {
+        keyedFirstLoad: false,
+      });
+      await applyConnection(reference.deps, CONNECTION_ID);
+      const want = await tables(reference);
+      const got = await tables(d);
+      expect(got.records).toEqual(want.records);
+      expect(got.tombstones).toEqual(want.tombstones);
+      expect(await d.db.query("SELECT * FROM log_keyed_pending")).toEqual([]);
+      expect(await d.position()).toBe(await reference.position());
+    });
+  }
+
+  it("a log pass that cannot finish after a head is admitted publishes no position, and the obligation stays", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    await history(w);
+    const keys = await w.segmentKeys();
+    const missing = keys.get(6)!;
+    const bytes = (await w.innerBlobs.get(missing))!;
+    const d = await stoppedAfterFirstRange(w, "short");
+    await lateHeads(w, false);
+
+    // The apply of a stream admits its head and reads the log over it. It
+    // cannot fetch segment 6. Rows from beyond 5 are in `records` whatever the
+    // head dropped, so the marker must still refuse position 5.
+    await w.innerBlobs.delete(missing);
+    await expect(applyStream(d.deps, CONNECTION_ID, S0)).rejects.toThrow();
+    expect(await d.position()).toBe(0);
+    expect(await d.db.query("SELECT * FROM log_state")).toEqual([]);
+    expect((await d.db.query("SELECT * FROM log_keyed_pending")).length).toBe(
+      1,
+    );
+    // The head batch left the marker alone and stored the replay it owes.
+    expect((await d.db.query("SELECT * FROM log_replay")).length).toBe(1);
+
+    await w.innerBlobs.put(missing, bytes);
+    await applyStream(d.deps, CONNECTION_ID, S1);
+    await applyConnection(d.deps, CONNECTION_ID);
+    const reference = await connected(w, "reference", {
+      keyedFirstLoad: false,
+    });
+    await applyConnection(reference.deps, CONNECTION_ID);
+    expect((await tables(d)).records).toEqual(
+      (await tables(reference)).records,
+    );
+    expect(await d.db.query("SELECT * FROM log_keyed_pending")).toEqual([]);
+    expect(await d.db.query("SELECT * FROM log_replay")).toEqual([]);
   });
 });

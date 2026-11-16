@@ -32,10 +32,15 @@ it("a populated no-log head is consumed after the upgrade; a head of a connectio
   const dir = mkdtempSync(join(process.cwd(), ".consumed-head-test-"));
   dirs.push(dir);
   const path = join(dir, "db.sqlite");
-  // The database as the build before the last migration left it.
+  // The database as the build before the migration that adds `consumed_*`
+  // left it.
   const old = openBetterSqlite3(path);
   open.add(old);
-  for (let i = 0; i < MIGRATIONS.length - 1; i++)
+  const at = MIGRATIONS.findIndex((group) =>
+    group.some((sql) => sql.includes("consumed_version")),
+  );
+  expect(at).toBeGreaterThan(0);
+  for (let i = 0; i < at; i++)
     await old.batch([
       ...MIGRATIONS[i]!.map((sql) => ({ sql })),
       { sql: `PRAGMA user_version = ${i + 1}` },
