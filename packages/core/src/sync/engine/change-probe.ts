@@ -22,6 +22,9 @@ import type { ChangeProbe } from "./sync-manager.js";
  *    waiting P/2 = 2.5 s keeps the added wait below the work it follows.
  *
  * 5 s sits inside both bounds. Hosts may change it; 0 switches the probe off.
+ * The probe runs only while the held push request cannot announce changes
+ * (absent, failing, or answering without a position); a healthy push makes it
+ * redundant and the manager skips it.
  */
 export const DEFAULT_CHANGE_PROBE_MS = 5_000;
 
