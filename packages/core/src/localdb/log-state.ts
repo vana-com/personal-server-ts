@@ -17,6 +17,20 @@ export interface LogState {
   readonly snapshot: SnapshotPointer | null;
 }
 
+/**
+ * The registry's log is not a continuation of the one this device applied: it
+ * is behind this device, or names another segment at a position this device
+ * holds. A real rebaseline (rows, tombstones and checkpoints rebuilt from the
+ * log, the local overlay kept apart) is not built; until it is, the device
+ * refuses to read on top of state the log no longer vouches for.
+ */
+export class LogDivergedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LogDivergedError";
+  }
+}
+
 const NO_LOG: LogState = { position: 0, base: 0, refs: [], snapshot: null };
 
 export async function readLogState(
@@ -58,5 +72,57 @@ export function writeLogState(
       JSON.stringify(state.refs),
       state.snapshot ? JSON.stringify(state.snapshot) : null,
     ],
+  };
+}
+
+/**
+ * The position a key-ordered first load (log-keyed.ts) means to publish, kept
+ * (`log_keyed_pending`) from the commit that first writes its rows until the
+ * commit that publishes. Those rows are in `records` and `log_tombstones`
+ * before the cursor moves, so a later load must name a prefix that holds
+ * every one of them: `null` when no key-ordered load is unfinished.
+ */
+export async function readKeyedPending(
+  deps: Pick<LocalSyncDeps, "db">,
+  connectionId: string,
+): Promise<LogState | null> {
+  const [row] = await deps.db.query<{
+    position: number;
+    base: number;
+    refs: string;
+  }>(
+    "SELECT position, base, refs FROM log_keyed_pending WHERE connection_id = ?",
+    [connectionId],
+  );
+  return row
+    ? {
+        position: row.position,
+        base: row.base,
+        refs: JSON.parse(row.refs) as SegmentRef[],
+        snapshot: null,
+      }
+    : null;
+}
+
+export function writeKeyedPending(
+  connectionId: string,
+  target: LogState,
+): SqlStatement {
+  return {
+    sql: `INSERT OR REPLACE INTO log_keyed_pending (connection_id, position, base, refs)
+          VALUES (?, ?, ?, ?)`,
+    params: [
+      connectionId,
+      target.position,
+      target.base,
+      JSON.stringify(target.refs),
+    ],
+  };
+}
+
+export function clearKeyedPending(connectionId: string): SqlStatement {
+  return {
+    sql: "DELETE FROM log_keyed_pending WHERE connection_id = ?",
+    params: [connectionId],
   };
 }

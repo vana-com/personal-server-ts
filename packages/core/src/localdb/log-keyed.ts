@@ -38,14 +38,32 @@
 // A log that fits in the budget has one commit's worth of rows and gains
 // nothing from this: it takes the pass of `applyInGroups`.
 //
-// What a stopped load leaves. Before the last commit the streams have no
-// version row, so no reader serves their rows, and the cursor is where it was.
-// The next pass finds no version row (the gate below) and loads again; the
-// stage tables of the stopped load are dropped first, and the rows it merged
-// merge again to the same rows (a segment applies any number of times). A
-// segment that cannot be fetched ends staging there: the segments before it
-// load, the cursor stands at the last of them, and the error is raised, as it
-// is when they apply one by one.
+// What a stopped load leaves. Each bucket's commit makes its rows and
+// tombstones durable in `records` and `log_tombstones`, but the streams have no
+// version row, so no reader serves them, and the cursor is where it was. Those
+// rows are bound to the position the load meant to publish: bucket 0's commit
+// also writes `log_keyed_pending` (that position, the base and the segment
+// refs), and the commit that publishes deletes it. A retry may publish only a
+// target that `pendingAdmits` accepts (same base, no shorter, same data hashes
+// at the pending refs): a retry that can fetch fewer segments than the stopped
+// load wrote would otherwise publish rows from beyond its cursor. A refused
+// retry writes nothing and raises. While the marker exists `applyLog` takes
+// this path whatever the flags say, and fails closed (`LogDivergedError`) if it
+// cannot: a snapshot, a compaction or a different log has no key-ordered load
+// that could finish what was written, and the rows left cannot be told apart
+// from rows of the live log. The model: `KeyedBucket`, `PendingAdmits`.
+//
+// A segment that cannot be fetched ends staging there: if no bucket has
+// committed yet, the segments before it load, the cursor stands at the last of
+// them, and the error is raised, as it is when they apply one by one.
+//
+// What a bucket holds. Its simple keys (one upsert) merge from the stage table
+// in SQL, so they hold nothing in memory. Its complex keys (several operations,
+// deletes, omissions) are read into memory to build statements. `STAGE_ROW_BYTES`
+// counts every row by what it holds (key, hash and body in UTF-8 bytes, NULL
+// bodies and tombstone rows included), and a bucket whose complex rows exceed
+// the room is applied a page at a time (`complexPages`: a hash range, or a
+// position slice of one key), each page in its own commit.
 
 import { sha256 } from "@noble/hashes/sha2";
 import {
@@ -69,7 +87,14 @@ import {
   type PreparedOperation,
   type StagedBatch,
 } from "./log-batch.js";
-import { writeLogState, type LogState } from "./log-state.js";
+import {
+  clearKeyedPending,
+  LogDivergedError,
+  readKeyedPending,
+  writeKeyedPending,
+  writeLogState,
+  type LogState,
+} from "./log-state.js";
 import { holdMemory } from "./transfer-memory.js";
 
 /** Hex digits of a key's hash that place it in a bucket: the key space is 16^4. */
@@ -120,7 +145,23 @@ export async function planKeyedLoad(
   local: LogState,
   snapshotPresent: boolean,
   tail: readonly { readonly bytes: number }[],
+  pending: LogState | null = null,
 ): Promise<number | null> {
+  const buckets = keyedBuckets(
+    tail.map((ref) => ref.bytes),
+    deps.blobs.governor.limitBytes,
+  );
+  if (pending !== null) {
+    // An unfinished key-ordered load left rows in `records` that only a
+    // key-ordered load that covers them may publish over. The rest of the
+    // gate (a flag, the size of the log) decided how the first attempt began;
+    // it does not decide how to end it.
+    if (snapshotPresent || tail.length === 0 || deps.keyedFirstLoad === false)
+      throw new LogDivergedError(
+        `apply: an earlier key-ordered load of this connection wrote rows up to position ${pending.position} and did not finish; only a key-ordered load of the same log can finish it`,
+      );
+    return buckets;
+  }
   if (
     deps.keyedFirstLoad === false ||
     deps.progressiveFirstLoad === true ||
@@ -129,16 +170,35 @@ export async function planKeyedLoad(
     tail.length < 2
   )
     return null;
-  const buckets = keyedBuckets(
-    tail.map((ref) => ref.bytes),
-    deps.blobs.governor.limitBytes,
-  );
   if (buckets < 2) return null;
   const [held] = await deps.db.query<{ n: number }>(
     "SELECT COUNT(*) AS n FROM (SELECT 1 FROM stream_versions WHERE connection_id = ? LIMIT 1)",
     [connectionId],
   );
   return held?.n === 0 ? buckets : null;
+}
+
+/**
+ * Whether the rows an unfinished key-ordered load left (`pending`) lie inside
+ * the prefix that a load ending at `target` publishes: the same log (the same
+ * segment at every position they name) and no shorter. A load that holds less
+ * (a segment it cannot fetch now) must leave the cursor where it is, because
+ * the rows beyond it would become visible, or hide a row of the prefix, under
+ * a cursor that does not cover them.
+ */
+export function pendingAdmits(
+  pending: LogState | null,
+  target: LogState,
+): boolean {
+  if (pending === null) return true;
+  if (pending.base !== target.base || pending.position > target.position)
+    return false;
+  const hashes = new Map(
+    target.refs.map((ref) => [ref.position, ref.dataHash.toLowerCase()]),
+  );
+  return pending.refs.every(
+    (ref) => hashes.get(ref.position) === ref.dataHash.toLowerCase(),
+  );
 }
 
 /** The stage tables of one connection: its id hashed, so any id is a name. */
@@ -405,9 +465,22 @@ export async function loadKeyed(
         heads.set(meta.stream, { ...info!, meta });
       }
     const last = sources[staged - 1]!.state;
+    // What an unfinished load of this connection wrote must lie inside the
+    // prefix this one publishes; if it does not, write nothing.
+    if (!pendingAdmits(await readKeyedPending(deps, connectionId), last)) {
+      if (stopped) throw stopped.error;
+      throw new LogDivergedError(
+        "apply: the log is not the one an earlier key-ordered load of this connection wrote rows from",
+      );
+    }
     for (let bucket = 0; bucket < buckets; bucket++)
       await applyBucket(deps, connectionId, tag, bucket, {
-        first: bucket === 0 ? [...primaryKeys.values()] : [],
+        // The first range creates the streams' rows and names the position
+        // the rows it and the later ranges write belong to.
+        first:
+          bucket === 0
+            ? { primaryKeys: [...primaryKeys.values()], target: last }
+            : undefined,
         last:
           bucket === buckets - 1
             ? { heads: [...heads.values()], state: last }
@@ -420,9 +493,124 @@ export async function loadKeyed(
 }
 
 /**
- * One key range, in one transaction. The single-upsert keys merge in one batch
- * from the stage table; the others (see `complexKeys`) apply as the segments
- * they came from, in position order, restricted to these keys.
+ * What a stage row holds in memory, in bytes: every text field as UTF-8 (a
+ * body or a key of non-ASCII text is more bytes than characters) and each
+ * number as 8. A deletion or an omission has no body and still holds its keys.
+ */
+const STAGE_ROW_BYTES = `(
+  LENGTH(CAST(kind AS BLOB)) + LENGTH(CAST(stream AS BLOB)) + LENGTH(CAST(pk_hash AS BLOB))
+  + LENGTH(CAST(record_key AS BLOB)) + LENGTH(CAST(stamp_r AS BLOB))
+  + COALESCE(LENGTH(CAST(body AS BLOB)), 0) + COALESCE(LENGTH(CAST(body_sha256 AS BLOB)), 0)
+  + 4 * 8)`;
+
+/** A slice of one bucket's complex rows: a range of key hashes, and of positions. */
+interface ComplexPage {
+  readonly from: string;
+  /** Exclusive: above every hex digit, so `prefix + "g"` ends a prefix's range. */
+  readonly to: string;
+  readonly firstPosition: number;
+  readonly lastPosition: number;
+  /** What `weighPage` counts for the rows of the slice. */
+  readonly bytes: number;
+}
+
+const PAGE_FILTER = "pk_hash >= ? AND pk_hash < ? AND position BETWEEN ? AND ?";
+const pageParams = (page: ComplexPage): SqlValue[] => [
+  page.from,
+  page.to,
+  page.firstPosition,
+  page.lastPosition,
+];
+
+async function weighPage(
+  deps: Pick<LocalSyncDeps, "db">,
+  table: string,
+  page: ComplexPage,
+): Promise<{ n: number; bytes: number }> {
+  const [weight] = await deps.db.query<{ n: number; bytes: number }>(
+    `SELECT COUNT(*) AS n, COALESCE(SUM(${STAGE_ROW_BYTES}), 0) AS bytes
+       FROM ${table} WHERE ${PAGE_FILTER}
+        AND (stream, pk_hash) IN (${complexKeys(table)})`,
+    pageParams(page),
+  );
+  return weight!;
+}
+
+/**
+ * The slices the complex rows of a bucket are applied in, each holding at most
+ * `room` bytes (as `weighPage` counts them, twice: the rows and the statements
+ * made from them). One slice for a bucket that fits, which is nearly always: the
+ * bucket count already divides the log's bytes by the budget. A bucket whose
+ * keys cluster (their hashes share a prefix) splits by the next hex digit of
+ * the hash until each piece fits. A single key whose operations are over the
+ * room splits by position: its operations apply in position order, and a slice
+ * is a run of them.
+ */
+export async function complexPages(
+  deps: Pick<LocalSyncDeps, "db">,
+  table: string,
+  room: number,
+): Promise<ComplexPage[]> {
+  const all: ComplexPage = {
+    from: "",
+    to: "g",
+    firstPosition: 0,
+    lastPosition: Number.MAX_SAFE_INTEGER,
+    bytes: 0,
+  };
+  const split = async (prefix: string): Promise<ComplexPage[]> => {
+    const page = { ...all, from: prefix, to: `${prefix}g` };
+    const weight = await weighPage(deps, table, page);
+    if (weight.n === 0) return [];
+    if (2 * weight.bytes <= room) return [{ ...page, bytes: weight.bytes }];
+    if (prefix.length < 64) {
+      const pieces: ComplexPage[] = [];
+      for (const digit of "0123456789abcdef")
+        pieces.push(...(await split(prefix + digit)));
+      return pieces;
+    }
+    // One key: slice its positions.
+    const byPosition = await deps.db.query<{ position: number; bytes: number }>(
+      `SELECT position, SUM(${STAGE_ROW_BYTES}) AS bytes FROM ${table}
+        WHERE pk_hash = ? AND (stream, pk_hash) IN (${complexKeys(table)})
+        GROUP BY position ORDER BY position`,
+      [prefix],
+    );
+    const slices: ComplexPage[] = [];
+    let start = byPosition[0]!.position;
+    let held = 0;
+    for (const { position, bytes } of byPosition) {
+      if (held > 0 && 2 * (held + bytes) > room) {
+        slices.push({
+          ...page,
+          firstPosition: start,
+          lastPosition: position - 1,
+          bytes: held,
+        });
+        start = position;
+        held = 0;
+      }
+      held += bytes;
+    }
+    slices.push({
+      ...page,
+      firstPosition: start,
+      lastPosition: Number.MAX_SAFE_INTEGER,
+      bytes: held,
+    });
+    return slices;
+  };
+  return split("");
+}
+
+/**
+ * One key range. A bucket whose complex rows fit the memory budget commits in
+ * one transaction. The single-upsert keys merge in one batch from the stage
+ * table; the others (see `complexKeys`) apply as the segments they came from,
+ * in position order, restricted to these keys. A bucket whose complex rows do
+ * not fit commits the single-upsert keys first, then the complex rows a page
+ * at a time (`complexPages`), then the clean-up: the rows are held in memory
+ * for a page, not for the bucket.
  */
 async function applyBucket(
   deps: LocalSyncDeps,
@@ -430,8 +618,14 @@ async function applyBucket(
   tag: string,
   bucket: number,
   edges: {
-    /** The first range creates the streams' rows. */
-    readonly first: readonly Pick<LogStreamMeta, "stream" | "primaryKey">[];
+    /** The first range creates the streams' rows and names the position the rows written from here on belong to. */
+    readonly first?: {
+      readonly primaryKeys: readonly Pick<
+        LogStreamMeta,
+        "stream" | "primaryKey"
+      >[];
+      readonly target: LogState;
+    };
     /** The last range writes the streams' heads and the cursor. */
     readonly last?: {
       readonly heads: readonly HeadInfo[];
@@ -440,84 +634,92 @@ async function applyBucket(
   },
 ): Promise<void> {
   const table = stageTable(tag, bucket);
-  const [weight] = await deps.db.query<{ n: number; bytes: number }>(
-    `SELECT COUNT(*) AS n,
-            COALESCE(SUM(LENGTH(body) + LENGTH(pk_hash) + LENGTH(record_key) + LENGTH(stream)), 0) AS bytes
-       FROM ${table} WHERE (stream, pk_hash) IN (${complexKeys(table)})`,
-  );
-  // The rows of the keys that need their own statements are in memory while
-  // the bucket commits: they come out of the same budget the staging used.
-  const hold =
-    weight!.n > 0
-      ? await holdMemory(deps.blobs, 2 * weight!.bytes, 0)
-      : undefined;
-  try {
-    const rows =
-      weight!.n > 0
-        ? await deps.db.query<StageRow>(
-            `SELECT ${STAGE_COLUMNS} FROM ${table}
-              WHERE (stream, pk_hash) IN (${complexKeys(table)}) ORDER BY rowid`,
-          )
-        : [];
+  const pages = await complexPages(deps, table, deps.blobs.governor.limitBytes);
+  const simpleOp = deps.newOp();
+  const simple: SqlStatement[] = [
+    ...(edges.first
+      ? [
+          // In the commit of the first rows the load writes, or before it: the
+          // position those rows lie within. A load that is one commit has no
+          // rows to fence.
+          ...(edges.last && pages.length <= 1
+            ? []
+            : [writeKeyedPending(connectionId, edges.first.target)]),
+          ...edges.first.primaryKeys.map((meta) =>
+            streamStateStatement(connectionId, meta),
+          ),
+        ]
+      : []),
+    { sql: `INSERT INTO temp.log_complex ${complexKeys(table)}`, params: [] },
+    {
+      sql: `INSERT INTO temp.incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, stamp_n)
+            SELECT ?, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, stamp_n
+              FROM ${table} s
+             WHERE s.kind = 'u' AND NOT EXISTS (
+               SELECT 1 FROM temp.log_complex c WHERE c.stream = s.stream AND c.pk_hash = s.pk_hash)`,
+      params: [simpleOp],
+    },
+    ...mergeStaged(connectionId, simpleOp),
+    { sql: "DELETE FROM temp.log_complex", params: [] },
+  ];
+  const closing: SqlStatement[] = [{ sql: `DROP TABLE ${table}`, params: [] }];
+  if (edges.last) {
+    for (const head of edges.last.heads)
+      closing.push(
+        ...streamHeadStatements(connectionId, [head.meta], head, head.identity),
+      );
+    closing.push(
+      writeLogState(connectionId, edges.last.state),
+      clearKeyedPending(connectionId),
+    );
+  }
+
+  // The complex rows of a page, as the batches that apply them: one per
+  // position, in position order (the rows came out in the order they were staged).
+  const batchesOf = async (page: ComplexPage): Promise<StagedBatch[]> => {
+    const rows = await deps.db.query<StageRow>(
+      `SELECT ${STAGE_COLUMNS} FROM ${table}
+        WHERE ${PAGE_FILTER} AND (stream, pk_hash) IN (${complexKeys(table)}) ORDER BY rowid`,
+      pageParams(page),
+    );
     const byPosition = new Map<number, PreparedOperation[]>();
     for (const row of rows) {
       const operations = byPosition.get(row.position);
       if (operations) operations.push(operationOf(row));
       else byPosition.set(row.position, [operationOf(row)]);
     }
-
-    const simpleOp = deps.newOp();
-    const batches: StagedBatch[] = [
-      {
-        op: simpleOp,
-        statements: [
-          ...edges.first.map((meta) =>
-            streamStateStatement(connectionId, meta),
-          ),
-          {
-            sql: `INSERT INTO temp.log_complex ${complexKeys(table)}`,
-            params: [],
-          },
-          {
-            sql: `INSERT INTO temp.incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, stamp_n)
-                  SELECT ?, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, stamp_n
-                    FROM ${table} s
-                   WHERE s.kind = 'u' AND NOT EXISTS (
-                     SELECT 1 FROM temp.log_complex c WHERE c.stream = s.stream AND c.pk_hash = s.pk_hash)`,
-            params: [simpleOp],
-          },
-          ...mergeStaged(connectionId, simpleOp),
-          { sql: "DELETE FROM temp.log_complex", params: [] },
-        ],
-      },
-    ];
-    // Positions ascend (a Map keeps the order its keys were set in, and the
-    // rows came out in the order they were staged).
-    for (const [, operations] of byPosition) {
+    return [...byPosition.values()].map((operations) => {
       const op = deps.newOp();
-      batches.push({
+      return {
         op,
         statements: operationStatements(connectionId, op, operations),
-      });
+      };
+    });
+  };
+  // The rows of a page and the statements made from them: twice its bytes.
+  const hold = (page: ComplexPage) => holdMemory(deps.blobs, 2 * page.bytes, 0);
+
+  if (pages.length <= 1) {
+    const release = pages[0] ? await hold(pages[0]) : undefined;
+    try {
+      await commitStaged(deps, [
+        { op: simpleOp, statements: simple },
+        ...(pages[0] ? await batchesOf(pages[0]) : []),
+        { op: deps.newOp(), statements: closing },
+      ]);
+    } finally {
+      release?.();
     }
-    const closing: SqlStatement[] = [
-      { sql: `DROP TABLE ${table}`, params: [] },
-    ];
-    if (edges.last) {
-      for (const head of edges.last.heads)
-        closing.push(
-          ...streamHeadStatements(
-            connectionId,
-            [head.meta],
-            head,
-            head.identity,
-          ),
-        );
-      closing.push(writeLogState(connectionId, edges.last.state));
-    }
-    batches.push({ op: deps.newOp(), statements: closing });
-    await commitStaged(deps, batches);
-  } finally {
-    hold?.();
+    return;
   }
+  await commitStaged(deps, [{ op: simpleOp, statements: simple }]);
+  for (const page of pages) {
+    const release = await hold(page);
+    try {
+      await commitStaged(deps, await batchesOf(page));
+    } finally {
+      release();
+    }
+  }
+  await commitStaged(deps, [{ op: deps.newOp(), statements: closing }]);
 }

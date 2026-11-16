@@ -102,35 +102,48 @@ adopting a newer epoch, so monotonicity means the pair (epoch, position).
   steps with no committed state between them (each segment folds over the rows
   of the ones before it). The `groupedSkip` mutant leaves out the middle
   segments and must fail P5.
-- KeyedLoad / KeyedPublish / StageLost (`Mode` keyed, keyedSkip, keyedEarly): a
-  device with position 0 and no rows, over a log that has never compacted,
-  folds the log key by key into a staging area (`KeyedLoad(d,k,q)`: key k's
-  operations from segments 1..q), in any key order, any number of times.
-  `KeyedPublish(d,q)` writes the rows and the position q in ONE transaction,
-  and only when every key is folded to q. `StageLost` drops the staging area
-  (a crash, or the next start). Reset, Rollback and FullCheck clear it. The
-  `keyedSkip` mutant leaves a key's fold without the segment before its last
-  (a stage that lost rows) and must fail P1. The `keyedEarly` mutant publishes
-  while a key is not yet folded and must fail P5.
+- KeyedLoad / KeyedBucket / KeyedPublish / StageLost (`Mode` keyed, keyedSkip,
+  keyedEarly, keyedLeak): a device with position 0 and no rows, over a log that
+  has never compacted, folds the log key by key into a staging area
+  (`KeyedLoad(d,k,q)`: key k's operations from segments 1..q), in any key order,
+  any number of times. `KeyedBucket(d,k)` makes one key's staged fold durable
+  in the live rows (`dur`) with no position: a bucket's commit. Durable rows
+  carry the target they were written for (`durAt`, in the epoch `durEp`; it is
+  the `log_keyed_pending` row in the code). `PendingAdmits(d,q)` is the rule:
+  a load may fold, make durable or publish a target q only if no durable rows
+  exist, or they are of this epoch and q is not shorter than their target.
+  `KeyedPublish(d,q)` writes the rows (durable rows merged with the staging
+  area) and the position q in ONE transaction, only when every key is folded to
+  q, and clears the durable rows and the target. `StageLost` drops the staging
+  area (a crash, or the next start) and leaves the durable rows. Reset,
+  Rollback and FullCheck clear the staging area; a rollback of the epoch makes
+  the durable rows foreign, so `PendingAdmits` refuses them. The `keyedSkip`
+  mutant leaves a key's fold without the segment before its last (a stage that
+  lost rows) and must fail P1. The `keyedEarly` mutant publishes while a key is
+  not yet folded and must fail P5. The `keyedLeak` mutant is the earlier rule,
+  with no `PendingAdmits`: a retry that can fold only a shorter prefix publishes
+  over durable rows of a longer one, and must fail P5.
 
 ## Properties and expected host results
 
-| Configuration             | Expected result                     | Target                                                                                          |
-| ------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------- |
-| Good.cfg                  | PASS within this finite abstraction | TypeOK, P1–P5; eventual convergence                                                             |
-| LostPush.cfg              | PASS, even with no Deliver action   | P2 full-check recovery and eventual convergence                                                 |
-| DropGap.cfg               | FAIL P2                             | skipped missing predecessors                                                                    |
-| OutOfOrder.cfg            | FAIL P2                             | later segment applied first                                                                     |
-| DroppedDeleteEffect.cfg   | FAIL P1 after snapshot+tail         | snapshot built without delete operations                                                        |
-| ForgetTombstone.cfg       | FAIL P1 via replay                  | correct delete, then snapshot forgets its tombstone; a later replayed upsert resurrects the key |
-| OmissionWithoutCutoff.cfg | FAIL P3                             | newer observed row erased by old omission                                                       |
-| OmissionInclusive.cfg     | FAIL P3                             | omission at equal stamp erases an observation AT the cutoff (`<=` boundary)                     |
-| LamportDifference.cfg     | FAIL StampEqualsLamport             | P6 orders choose different winners                                                              |
-| Grouped.cfg               | PASS within this finite abstraction | group commit (`ApplyRun`): TypeOK, P1–P5, OrderOK                                               |
-| GroupedSkip.cfg           | FAIL P5                             | a group commit that leaves out the segments between its first and last                          |
-| Keyed.cfg                 | PASS within this finite abstraction | key-ordered first load (`KeyedLoad`, `KeyedPublish`, `StageLost`): TypeOK, P1–P5, OrderOK       |
-| KeyedSkip.cfg             | FAIL P1                             | a key's fold that leaves out a segment                                                          |
-| KeyedEarly.cfg            | FAIL P5                             | the position written while a key is not yet folded                                              |
+| Configuration             | Expected result                     | Target                                                                                                   |
+| ------------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Good.cfg                  | PASS within this finite abstraction | TypeOK, P1–P5; eventual convergence                                                                      |
+| LostPush.cfg              | PASS, even with no Deliver action   | P2 full-check recovery and eventual convergence                                                          |
+| DropGap.cfg               | FAIL P2                             | skipped missing predecessors                                                                             |
+| OutOfOrder.cfg            | FAIL P2                             | later segment applied first                                                                              |
+| DroppedDeleteEffect.cfg   | FAIL P1 after snapshot+tail         | snapshot built without delete operations                                                                 |
+| ForgetTombstone.cfg       | FAIL P1 via replay                  | correct delete, then snapshot forgets its tombstone; a later replayed upsert resurrects the key          |
+| OmissionWithoutCutoff.cfg | FAIL P3                             | newer observed row erased by old omission                                                                |
+| OmissionInclusive.cfg     | FAIL P3                             | omission at equal stamp erases an observation AT the cutoff (`<=` boundary)                              |
+| LamportDifference.cfg     | FAIL StampEqualsLamport             | P6 orders choose different winners                                                                       |
+| Grouped.cfg               | PASS within this finite abstraction | group commit (`ApplyRun`): TypeOK, P1–P5, OrderOK                                                        |
+| GroupedSkip.cfg           | FAIL P5                             | a group commit that leaves out the segments between its first and last                                   |
+| Keyed.cfg                 | BOUNDED, no violation               | key-ordered first load (`KeyedLoad`, `KeyedBucket`, `KeyedPublish`, `StageLost`): TypeOK, P1–P5, OrderOK |
+| KeyedSkip.cfg             | FAIL P1                             | a key's fold that leaves out a segment                                                                   |
+| KeyedEarly.cfg            | FAIL P5                             | the position written while a key is not yet folded                                                       |
+| KeyedLeak.cfg             | FAIL P5                             | no `PendingAdmits`: a shorter retry publishes durable rows of a longer, stopped load                     |
+| KeyedShort.cfg            | BOUNDED, no violation               | Keyed with `Len(log) <= 3`: TypeOK, P1–P5, OrderOK                                                       |
 
 Corpus (batch 6): an equal-cutoff omission (key 1, stamp 5) meets the live
 stamp-5 row, and an older omission (key 2, stamp 1) sits below the live delete.
@@ -224,20 +237,32 @@ to the implementation.
 
 ## Key-ordered first load (host run, 2026-11-16)
 
-TLC 2.19, `-workers 4`, `nice -n 19`, one job at a time, metadirs deleted after
-each run. Expected results were stated before the run: `Keyed.cfg` holds,
-`KeyedSkip.cfg` fails P1, `KeyedEarly.cfg` fails P5.
+TLC 1.7.4 (`tla2tools.jar`, 2.19 engine), `-workers 4 -Xmx10g`, `nice -n 19`, one job at
+a time, metadirs deleted after each run. Expected results were stated before the
+run: `Keyed.cfg` and `KeyedShort.cfg` hold, `KeyedSkip.cfg` fails P1,
+`KeyedEarly.cfg` and `KeyedLeak.cfg` fail P5.
 
-| Configuration  | Expected | Actual                                                                                                                            | Distinct states     | Depth | Wall time       |
-| -------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------- | ----- | --------------- |
-| Keyed.cfg      | PASS     | BOUNDED: stopped at the 25 min limit; no invariant error in the explored states (462,751,607 generated, 41,591,212 left on queue) | at least 56,493,699 | n/a   | 25 min, stopped |
-| KeyedSkip.cfg  | FAIL P1  | FAIL P1 as expected: a key's fold omits a segment, then the keyed publish installs rows that differ from the reference            | 5,922 at failure    | 8     | 1 s             |
-| KeyedEarly.cfg | FAIL P5  | FAIL P5 as expected: the position is written while a key is not folded, so a device claims a prefix it does not hold              | 791 at failure      | 6     | <1 s            |
+The first model of the keyed load had one crash outcome: the staging area is
+lost. A bucket's commit also makes rows durable, with no stream version and no
+position, so the model gained `dur`, `durAt`, `durEp`, the `KeyedBucket` action
+and the `PendingAdmits` rule, and `KeyedLeak` keeps the earlier rule
+(no `PendingAdmits`). Results below are for the model with durable buckets.
 
-`Keyed.cfg` did not finish, so its PASS is not established: the model is bounded
-evidence, the same status as `Good.cfg`. Its space is larger than `Grouped.cfg`'s
-because fold progress per key adds state. Traces: `traces/KeyedSkip.txt`,
-`traces/KeyedEarly.txt`.
+| Configuration  | Expected | Actual                                                                                                                                 | Distinct states     | Depth | Wall time       |
+| -------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------- | ----- | --------------- |
+| KeyedLeak.cfg  | FAIL P5  | FAIL P5 as expected: 3 commits, FullCheck, a bucket made durable for q=3, the staging area lost, a retry that folds only q=2 publishes | 818,988 at failure  | 11    | 17 s            |
+| KeyedSkip.cfg  | FAIL P1  | FAIL P1 as expected: a key's fold omits a segment, then the keyed publish installs rows that differ from the reference                 | 7,327 at failure    | 9     | 1 s             |
+| KeyedEarly.cfg | FAIL P5  | FAIL P5 as expected: the position is written while a key is not folded, so a device claims a prefix it does not hold                   | 499 at failure      | 7     | <1 s            |
+| KeyedShort.cfg | PASS     | BOUNDED: stopped at the 28 min limit; no invariant error in the explored states (676,040,051 generated, 25,213,550 left on queue)      | at least 59,763,423 | 18    | 28 min, stopped |
+| Keyed.cfg      | PASS     | BOUNDED: stopped at the 10 min limit; no invariant error in the explored states (173,792,458 generated, 20,131,485 left on queue)      | at least 25,583,041 | 14    | 10 min, stopped |
+
+Neither passing run finished, so their PASS is not established: they are
+bounded evidence, the same status as `Good.cfg`. `KeyedShort.cfg` restricts the
+log to three segments (`ShortLog`), which holds the `KeyedLeak` scenario (a
+target of 3 and a retry of 2); it also did not exhaust the space with the
+durable-bucket variables. The failing runs stop at the first violation, so
+their state counts are what TLC had reached, not a space size. Traces:
+`traces/KeyedLeak.txt`, `traces/KeyedSkip.txt`, `traces/KeyedEarly.txt`.
 
 ## #705 r3 extension (host run, 2026-11-15)
 

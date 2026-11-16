@@ -6,7 +6,11 @@
 // ends right when it runs again. Real publisher, real gateway adapter, real
 // SQLite (log-world.test-utils.ts).
 import { afterEach, describe, expect, it } from "vitest";
-import { applyConnection } from "../../../core/src/localdb/index.js";
+import {
+  applyConnection,
+  LogDivergedError,
+} from "../../../core/src/localdb/index.js";
+import { complexPages } from "../../../core/src/localdb/log-keyed.js";
 import {
   CONNECTION_ID,
   closeWorldDrivers,
@@ -360,5 +364,323 @@ describe("log first load, key by key", () => {
     await applyConnection(holds.deps, CONNECTION_ID);
     expect(heldStages).toEqual([]);
     expect(await holds.position()).toBeGreaterThan(0);
+  });
+});
+
+/** Count the commits that apply a key range (each drops its stage table). */
+const dropsStage = (statements: { sql: string }[]) =>
+  statements.some((s) => s.sql.startsWith("DROP TABLE log_stage_"));
+const stagesRows = (statements: { sql: string }[]) =>
+  statements.some((s) => s.sql.startsWith("INSERT INTO log_stage_"));
+
+describe("log first load, key by key: what an unfinished load leaves", () => {
+  /**
+   * A load that stopped after its first key range committed: rows of the whole
+   * log are in `records` (those of that range), and the position is 0.
+   */
+  async function stoppedAfterFirstRange(w: World, id: string) {
+    const d = await connected(w, id, { maxBytesInFlight: await splitting(w) });
+    let ranges = 0;
+    let armed = true;
+    onCommit(d, async (statements) => {
+      if (armed && ranges >= 1 && (dropsStage(statements) || ranges > 1))
+        throw new Error("stopped");
+      if (dropsStage(statements)) ranges++;
+    });
+    await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toThrow();
+    armed = false;
+    return d;
+  }
+
+  it("publishes nothing from a retry that holds a shorter prefix than the rows it left", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    await history(w);
+    const keys = await w.segmentKeys();
+    const missing = keys.get(6)!;
+    const bytes = (await w.innerBlobs.get(missing))!;
+
+    // What a load of the first five segments ends in.
+    await w.innerBlobs.delete(missing);
+    const reference = await connected(w, "reference", {
+      keyedFirstLoad: false,
+    });
+    await expect(
+      applyConnection(reference.deps, CONNECTION_ID),
+    ).rejects.toThrow();
+    const prefix = await tables(reference);
+    await w.innerBlobs.put(missing, bytes);
+
+    // A load that wrote its first key range and stopped: rows from beyond
+    // position 5 are in `records`, and the position is 0.
+    const d = await stoppedAfterFirstRange(w, "retry");
+    expect(await d.position()).toBe(0);
+    const left = (await tables(d)).records;
+    expect(left.length).toBeGreaterThan(0);
+    const pending = await d.db.query<{ position: number }>(
+      "SELECT position FROM log_keyed_pending",
+    );
+    expect(pending[0]!.position).toBeGreaterThan(5);
+
+    // The retry cannot fetch segment 6: the log it holds is 1..5.
+    await w.innerBlobs.delete(missing);
+    await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toThrow();
+    // It publishes no prefix: the rows beyond 5 would show under position 5.
+    expect(await d.position()).toBe(0);
+    expect(
+      (
+        await d.db.query<{ n: number }>(
+          "SELECT COUNT(*) AS n FROM stream_versions",
+        )
+      )[0]!.n,
+    ).toBe(0);
+    // Rows the stopped load wrote are not the plain prefix, which is the point.
+    expect(left).not.toEqual(prefix.records);
+
+    // With the segment back, the retry covers them and ends in the whole log.
+    await w.innerBlobs.put(missing, bytes);
+    await applyConnection(d.deps, CONNECTION_ID);
+    const whole = await connected(w, "whole", { keyedFirstLoad: false });
+    await applyConnection(whole.deps, CONNECTION_ID);
+    const expected = await tables(whole);
+    const got = await tables(d);
+    expect(got.records).toEqual(expected.records);
+    expect(got.tombstones).toEqual(expected.tombstones);
+    expect(got.heads).toEqual(expected.heads);
+    expect(got.state).toEqual(expected.state);
+    expect(await d.db.query("SELECT * FROM log_keyed_pending")).toEqual([]);
+  });
+
+  it("keeps the position it means to publish from its first key range to its last", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    await history(w);
+    const d = await connected(w, "keyed", {
+      maxBytesInFlight: await splitting(w),
+    });
+    const seen: number[] = [];
+    onCommit(d, async (statements) => {
+      if (dropsStage(statements))
+        seen.push(
+          (
+            await d.db.query<{ n: number }>(
+              "SELECT COUNT(*) AS n FROM log_keyed_pending",
+            )
+          )[0]!.n,
+        );
+    });
+    await applyConnection(d.deps, CONNECTION_ID);
+    // Before the first range commits it is not written yet; before every
+    // later one it is; after the last it is gone.
+    expect(seen.length).toBeGreaterThan(2);
+    expect(seen[0]).toBe(0);
+    for (const n of seen.slice(1)) expect(n).toBe(1);
+    expect(await d.db.query("SELECT * FROM log_keyed_pending")).toEqual([]);
+    expect(await d.position()).toBeGreaterThan(0);
+  });
+
+  it("refuses to publish over rows of another log", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    await history(w);
+    const d = await stoppedAfterFirstRange(w, "other");
+    // The same position, named by a segment this log does not have.
+    const [row] = await d.db.query<{ refs: string }>(
+      "SELECT refs FROM log_keyed_pending",
+    );
+    const refs = (JSON.parse(row!.refs) as { dataHash: string }[]).map(
+      (ref, i) =>
+        i === 0 ? { ...ref, dataHash: `0x${"ab".repeat(32)}` } : ref,
+    );
+    await d.db.batch([
+      {
+        sql: "UPDATE log_keyed_pending SET refs = ?",
+        params: [JSON.stringify(refs)],
+      },
+    ]);
+    await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toBeInstanceOf(
+      LogDivergedError,
+    );
+    expect(await d.position()).toBe(0);
+  });
+
+  it("does not finish an unfinished key-ordered load any other way", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    await history(w);
+    const d = await stoppedAfterFirstRange(w, "switched");
+    // The segment-by-segment load, as a host that turned the flag off asks for.
+    const off = await connected(w, "off", { keyedFirstLoad: false });
+    await off.db.batch(
+      (
+        await d.db.query<{ position: number; base: number; refs: string }>(
+          "SELECT position, base, refs FROM log_keyed_pending",
+        )
+      ).map((r) => ({
+        sql: "INSERT INTO log_keyed_pending (connection_id, position, base, refs) VALUES (?, ?, ?, ?)",
+        params: [CONNECTION_ID, r.position, r.base, r.refs],
+      })),
+    );
+    await expect(
+      applyConnection(off.deps, CONNECTION_ID),
+    ).rejects.toBeInstanceOf(LogDivergedError);
+    expect(await off.position()).toBe(0);
+  });
+});
+
+describe("log first load, key by key: what it holds", () => {
+  /** What the load asks the governor for after it has staged the whole log. */
+  async function holds(w: World, id: string, budget: number) {
+    const d = await connected(w, id, { maxBytesInFlight: budget });
+    const events: (number | "commit")[] = [];
+    const { governor } = d.deps.blobs;
+    const reserve = governor.reserve.bind(governor);
+    governor.reserve = (bytes, objectBytes) => {
+      events.push(bytes);
+      return reserve(bytes, objectBytes);
+    };
+    onCommit(d, async (statements) => {
+      if (stagesRows(statements)) events.push("commit");
+    });
+    await applyConnection(d.deps, CONNECTION_ID);
+    const lastStaged = events.lastIndexOf("commit");
+    return {
+      d,
+      asked: events
+        .slice(lastStaged + 1)
+        .filter((e): e is number => e !== "commit"),
+    };
+  }
+
+  /** A log that only deletes: keys the log never held, `n` of them, each `id`. */
+  async function deletes(w: World, ids: string[]) {
+    const a = await w.device("a");
+    // Padding segments so the log is big enough to split into key ranges.
+    for (let n = 1; n <= 6; n++)
+      await step(a, n, [{ stream: S0, id: `fill-${n}`, pad: 4_000 }]);
+    await step(
+      a,
+      7,
+      ids.map((id) => ({ stream: S0, id, remove: true })),
+    );
+    await step(a, 8, [{ stream: S0, id: "last", v: 1 }]);
+  }
+
+  it("counts the rows of keys that are only deleted", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    const ids = Array.from({ length: 60 }, (_, i) => `gone-${i}`);
+    await deletes(w, ids);
+    const { asked } = await holds(w, "keyed", await splitting(w));
+    // Each deletion is a row that holds at least its key hash (64 bytes).
+    expect(asked.reduce((sum, n) => sum + n, 0)).toBeGreaterThanOrEqual(
+      2 * ids.length * 64,
+    );
+  });
+
+  it("weighs a row by its UTF-8 bytes, and a deletion by its keys", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    const d = await connected(w, "weigh");
+    const utf8 = (text: string | null) =>
+      text === null ? 0 : new TextEncoder().encode(text).length;
+    const rows = [
+      // A deletion: no body, a key of non-ASCII text.
+      { hash: "1".repeat(64), key: "ключ", kind: "d", body: null, sha: null },
+      // Two upserts of one key (so it is complex), a non-ASCII body.
+      { hash: "2".repeat(64), key: "k", kind: "u", body: "жжжж", sha: "abc" },
+      { hash: "2".repeat(64), key: "k", kind: "u", body: "{}", sha: "def" },
+    ];
+    await d.db.batch([
+      {
+        sql: `CREATE TABLE t (position INTEGER NOT NULL, kind TEXT NOT NULL, stream TEXT NOT NULL,
+                pk_hash TEXT NOT NULL, record_key TEXT NOT NULL, stamp_o INTEGER NOT NULL,
+                stamp_r TEXT NOT NULL, body TEXT, body_sha256 TEXT, first_o INTEGER, stamp_n INTEGER NOT NULL DEFAULT 0)`,
+      },
+      ...rows.map((r, i) => ({
+        sql: `INSERT INTO t (position, kind, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
+              VALUES (?, ?, 's', ?, ?, 1, 'r', ?, ?, 1)`,
+        params: [i + 1, r.kind, r.hash, r.key, r.body, r.sha],
+      })),
+    ]);
+    const expected = rows.reduce(
+      (sum, r) =>
+        sum +
+        utf8(r.kind) +
+        utf8("s") +
+        utf8(r.hash) +
+        utf8(r.key) +
+        utf8("r") +
+        utf8(r.body) +
+        utf8(r.sha) +
+        4 * 8,
+      0,
+    );
+    const pages = await complexPages(d.deps, "t", 2 * expected);
+    expect(pages.length).toBe(1);
+    expect(pages[0]!.bytes).toBe(expected);
+  });
+
+  it("applies a key whose history is over the budget a slice at a time, to the same rows", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    const a = await w.device("a");
+    // One key rewritten in every segment, each rewrite as big as a segment's rest.
+    for (let n = 1; n <= 14; n++)
+      await step(a, n, [
+        { stream: S0, id: "hot", v: n, pad: 6_000 },
+        { stream: S1, id: `once-${n}`, pad: 2_000 },
+      ]);
+    await step(a, 15, [{ stream: S0, id: "hot", remove: true }]);
+    const reference = await connected(w, "reference", {
+      keyedFirstLoad: false,
+    });
+    await applyConnection(reference.deps, CONNECTION_ID);
+
+    const budget = await splitting(w);
+    const { d, asked } = await holds(w, "keyed", budget);
+    const got = await tables(d);
+    const expected = await tables(reference);
+    expect(got.records).toEqual(expected.records);
+    expect(got.tombstones).toEqual(expected.tombstones);
+    expect(got.heads).toEqual(expected.heads);
+    expect(got.state).toEqual(expected.state);
+    // The hot key's rows are 14 x 6 KB at least: held whole, they would be
+    // asked for at once; a slice holds a part and stays in the room.
+    const room = Math.max(budget, 2 * Math.max(...(await segmentWeights(w))));
+    expect(Math.max(...asked)).toBeLessThanOrEqual(room);
+    expect(asked.length).toBeGreaterThan(1);
+  });
+
+  it("splits a range whose keys share a hash prefix by the next digits", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    const d = await connected(w, "pages");
+    const row = (hash: string, position: number, body: string) => ({
+      sql: `INSERT INTO t (position, kind, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
+            VALUES (?, 'u', 's', ?, 'k', 1, 'r', ?, 'h', 1)`,
+      params: [position, hash, body],
+    });
+    const hash = (tail: string) => `00000000${tail.padEnd(56, "0")}`;
+    await d.db.batch([
+      {
+        sql: `CREATE TABLE t (position INTEGER NOT NULL, kind TEXT NOT NULL, stream TEXT NOT NULL,
+                pk_hash TEXT NOT NULL, record_key TEXT NOT NULL, stamp_o INTEGER NOT NULL,
+                stamp_r TEXT NOT NULL, body TEXT, body_sha256 TEXT, first_o INTEGER)`,
+      },
+      // Three keys under one 8-digit prefix, each written twice (so each is complex).
+      ...["1", "5", "9"].flatMap((digit) => [
+        row(hash(digit), 1, "x".repeat(1_000)),
+        row(hash(digit), 2, "y".repeat(1_000)),
+      ]),
+    ]);
+    // A room for one key at a time (two rows of about 1,100 bytes, twice).
+    const pages = await complexPages(d.deps, "t", 5_000);
+    expect(pages.length).toBe(3);
+    const [total] = await d.db.query<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM t",
+    );
+    let covered = 0;
+    for (const page of pages) {
+      expect(2 * page.bytes).toBeLessThanOrEqual(5_000);
+      const [rows] = await d.db.query<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM t WHERE pk_hash >= ? AND pk_hash < ? AND position BETWEEN ? AND ?",
+        [page.from, page.to, page.firstPosition, page.lastPosition],
+      );
+      covered += rows!.n;
+    }
+    expect(covered).toBe(total!.n);
   });
 });

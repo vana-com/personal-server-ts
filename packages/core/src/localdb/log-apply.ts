@@ -54,7 +54,13 @@ import {
 } from "./log-batch.js";
 import { loadKeyed, planKeyedLoad, type KeyedSource } from "./log-keyed.js";
 import { heldKeys, planLogLoad, type PlannedBatch } from "./log-progressive.js";
-import { readLogState, writeLogState, type LogState } from "./log-state.js";
+import {
+  LogDivergedError,
+  readKeyedPending,
+  readLogState,
+  writeLogState,
+  type LogState,
+} from "./log-state.js";
 import { UpdateRequiredError } from "./update-required.js";
 import {
   failedRowStatement,
@@ -63,7 +69,12 @@ import {
 } from "./partial-load.js";
 
 export { recordKeyOfKey } from "./log-batch.js";
-export { readLogState, writeLogState, type LogState } from "./log-state.js";
+export {
+  LogDivergedError,
+  readLogState,
+  writeLogState,
+  type LogState,
+} from "./log-state.js";
 
 const keccak = async (bytes: Uint8Array) => keccak_256(bytes);
 
@@ -111,20 +122,6 @@ export async function applySnapshotPart(
     { dataHash, blobName },
     state,
   );
-}
-
-/**
- * The registry's log is not a continuation of the one this device applied: it
- * is behind this device, or names another segment at a position this device
- * holds. A real rebaseline (rows, tombstones and checkpoints rebuilt from the
- * log, the local overlay kept apart) is not built; until it is, the device
- * refuses to read on top of state the log no longer vouches for.
- */
-export class LogDivergedError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "LogDivergedError";
-  }
 }
 
 export interface LogApplyContext {
@@ -224,6 +221,10 @@ export async function applyLog(
         `apply: the log names a different segment at position ${lastRef.position} than this device applied`,
       );
   }
+  // Rows an unfinished key-ordered load left (see `log-keyed.ts`) lie beyond
+  // this device's position; only a key-ordered load that covers them goes on.
+  const pending =
+    local.position === 0 ? await readKeyedPending(deps, connectionId) : null;
   let since = local.position;
   let plan = planOpsSince(head, headRef, since);
   let snapshot: SnapshotPointer | null = null;
@@ -235,7 +236,7 @@ export async function applyLog(
     // A full check. Behind `base` the log no longer holds the prefix: a
     // snapshot does, and it is installed first. Without one (a log that began
     // after the streams were published) the per-stream path holds it.
-    if (deps.progressiveFirstLoad === true) {
+    if (deps.progressiveFirstLoad === true && pending === null) {
       const after = planOpsSince(head, headRef, head.base);
       return {
         applied: await loadProgressively(
@@ -256,8 +257,9 @@ export async function applyLog(
     snapshot = head.snapshot ?? null;
   }
   const tail = plan.kind === "segments" ? plan.refs : [];
-  if (tail.length === 0 && snapshot === null) return { applied: 0 };
-  if (deps.progressiveFirstLoad === true)
+  if (tail.length === 0 && snapshot === null && pending === null)
+    return { applied: 0 };
+  if (deps.progressiveFirstLoad === true && pending === null)
     return {
       applied: await loadProgressively(
         deps,
@@ -279,6 +281,7 @@ export async function applyLog(
     local,
     snapshot !== null,
     tail,
+    pending,
   );
   if (buckets !== null) {
     await loadKeyed(
