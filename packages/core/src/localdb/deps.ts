@@ -64,6 +64,13 @@ export interface LocalSyncDeps {
    */
   readonly progressiveFirstLoad?: boolean;
   /**
+   * Default on. A first load of a log that does not fit one commit's memory
+   * budget loads key by key (`log-keyed.ts`). Off: it applies segment by
+   * segment in position order, as it does for every other pass. A test that
+   * wants the segment-by-segment result to compare against turns it off.
+   */
+  readonly keyedFirstLoad?: boolean;
+  /**
    * Publish and apply through the stream-sync log (one segment and one
    * registry commit per batch, across streams) instead of per-stream heads.
    * Default off. The flag lets this device START a log on a connection that has

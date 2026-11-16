@@ -440,4 +440,16 @@ END`,
     // observation. 0 for a row from before the column and for a run's first batch.
     `ALTER TABLE records ADD COLUMN stamp_n INTEGER NOT NULL DEFAULT 0`,
   ],
+  [
+    // A key-ordered first load of the log (log-keyed.ts) writes its rows one
+    // key range at a time and moves `log_state` in the last commit. Between
+    // them the rows are in `records` and `log_tombstones` with no stream
+    // version. This keeps, per connection, the position and refs that load
+    // means to publish, written with its first range and deleted with its
+    // last, so a retry that holds a shorter prefix cannot publish over those
+    // rows. Local only.
+    `CREATE TABLE log_keyed_pending (
+  connection_id TEXT PRIMARY KEY, position INTEGER NOT NULL, base INTEGER NOT NULL,
+  refs TEXT NOT NULL) WITHOUT ROWID`,
+  ],
 ];

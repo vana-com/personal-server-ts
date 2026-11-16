@@ -315,7 +315,7 @@ export interface StreamSyncBlobs {
    * a stream holds in memory while their PUTs are pending. An in-memory test
    * store gets one too (`createMemoryStreamSyncBlobs`).
    */
-  readonly governor: Pick<SendGovernor, "reserve" | "window">;
+  readonly governor: Pick<SendGovernor, "reserve" | "window" | "limitBytes">;
   /**
    * `beforeAttempt` runs immediately before each request that sends the bytes,
    * after every wait for a turn or a retry delay; a throw stops the upload and

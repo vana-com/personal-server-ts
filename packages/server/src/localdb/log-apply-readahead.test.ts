@@ -88,7 +88,8 @@ function holdFirstCommit(d: Device) {
 }
 
 async function connected(w: World, id: string, hooks = {}) {
-  const d = await w.device(id, true, hooks);
+  // These test the segment-by-segment pass; the keyed load has its own tests.
+  const d = await w.device(id, true, { keyedFirstLoad: false, ...hooks });
   await d.db.batch([
     {
       sql: "INSERT INTO connections(connection_id,connector,ns,generation,control_state,control_version) VALUES (?,?,'',1,'active',1)",

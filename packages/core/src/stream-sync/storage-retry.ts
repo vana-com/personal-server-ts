@@ -304,6 +304,12 @@ export interface SendGovernor {
    * store's limit.
    */
   reserve(bytes: number, objectBytes?: number): Promise<Reservation>;
+  /**
+   * The most `reserve` holds at once (`maxBytesInFlight`). A reader that sizes
+   * its working set to the budget (the keyed first load, `log-keyed.ts`) needs
+   * the whole of it; a request above it waits to run alone.
+   */
+  readonly limitBytes: number;
   /** Watch the governor; `end()` reports what happened since this call. */
   window(): { end(): SendWindowStats };
   /** Follow the quota a service publishes. Returns a function that stops it. */
@@ -394,6 +400,7 @@ export function createStorageAccess(policy: StorageAccessPolicy): SendGovernor {
     for (const open of windows) open.peak = Math.max(open.peak, inUse);
   });
   return {
+    limitBytes: policy.maxBytesInFlight,
     reserve(bytes, objectBytes = bytes) {
       if (objectBytes > policy.maxObjectBytes) {
         return Promise.reject(

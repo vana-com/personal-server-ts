@@ -65,6 +65,10 @@ export async function purgeConnection(
           params: [connectionId],
         },
         {
+          sql: "DELETE FROM log_keyed_pending WHERE connection_id = ?",
+          params: [connectionId],
+        },
+        {
           sql: "DELETE FROM log_tombstones WHERE connection_id = ?",
           params: [connectionId],
         },
