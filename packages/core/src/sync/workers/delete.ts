@@ -673,6 +673,14 @@ interface ReleaseDecision {
    * rollback): their delete converged even if keys above it stay held.
    */
   converged: Set<string>;
+  /** Per scope, the highest finalized tombstone read; null when none. */
+  finalizedThrough: Map<string, bigint | null>;
+}
+
+/** The lowest registry version a marker still covers; null if unexpanded. */
+function lowestKeyOf(marker: PendingBlobDeletion): bigint | null {
+  if (marker.version !== null) return BigInt(marker.version);
+  return marker.range ? BigInt(marker.range.from) : null;
 }
 
 /**
@@ -695,6 +703,7 @@ async function releasableMarkers(
       released: markers.map((marker) => ({ marker, through: null })),
       rolledBack,
       converged,
+      finalizedThrough: new Map(),
     };
   }
   const lowestGate = new Map<string, bigint>();
@@ -755,7 +764,7 @@ async function releasableMarkers(
       "Blob deletions wait until the covering tombstone is finalized",
     );
   }
-  return { released, rolledBack, converged };
+  return { released, rolledBack, converged, finalizedThrough: finalized };
 }
 
 /**
@@ -1217,7 +1226,15 @@ export async function retryPendingBlobDeletions(
   result.parked = [...parked].filter((scope) =>
     left.some((marker) => marker.scope === scope),
   );
-  result.waiting = left.filter((marker) => !parked.has(marker.scope)).length;
+  // A parked scope holds only the keys above its finalized frontier. Keys at
+  // or below it are free, and a pass that sends one batch at a time may not
+  // have reached them yet: that is work a later pass finishes.
+  result.waiting = left.filter((marker) => {
+    if (!parked.has(marker.scope)) return true;
+    const through = decision.finalizedThrough.get(marker.scope) ?? null;
+    const lowest = lowestKeyOf(marker);
+    return through !== null && lowest !== null && lowest <= through;
+  }).length;
   return result;
 }
 

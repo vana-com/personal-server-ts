@@ -726,11 +726,12 @@ export function createSyncManager(
    *
    * `legacy` may re-send a rolled-back tombstone through `deleteScope`, which
    * writes to legacy storage and is sealed once the account has switched.
-   * `switched` never does: it fails closed without a finality port (the
-   * worker's permissive no-port release would free a slot a rolled-back
-   * tombstone can still hand to another writer), only waits for finality and
-   * then deletes the blob, and parks a rolled-back scope as a visible failure
-   * until the user deletes it again.
+   * `switched` never does: it only waits for finality and then deletes the
+   * blob, and parks a rolled-back scope as a visible failure until the user
+   * deletes it again. Either way, a manager that knows the account mode fails
+   * closed without a finality port: the worker's permissive no-port release
+   * would free a slot a rolled-back tombstone can still hand to another
+   * writer, and the mode can change while the drain awaits.
    *
    * Returns whether work is owed that a later pass can do: markers waiting on
    * finality, a failed key, or a retry that threw. Parked and unavailable
@@ -748,7 +749,11 @@ export function createSyncManager(
         serverOwner: uploadDeps.serverOwner,
         storage: uploadDeps.storage,
         logger: uploadDeps.logger,
-        ...(mode === "switched" ? { requireFinality: true } : {}),
+        // The account can switch at any await below, and the legacy write seal
+        // does not guard a blob delete. Only a manager that has no account
+        // mode at all is fixed to legacy, so only it may release without
+        // finality.
+        requireFinality: options?.accountStorageMode !== undefined,
         ...(options?.tombstoneFinality && options.deleteData
           ? {
               tombstoneResubmits,

@@ -45,6 +45,16 @@ const FINAL: TombstoneFinalityState = {
   rolledBack: null,
 };
 
+// The legacy pass transfers nothing here: only the delete worker is real.
+vi.mock("../workers/upload.js", () => ({ uploadAll: vi.fn(async () => []) }));
+vi.mock("../workers/download.js", () => ({
+  downloadAll: vi.fn(async () => []),
+  downloadScopes: vi.fn(async () => undefined),
+}));
+vi.mock("../workers/lost-data-points.js", () => ({
+  requeueLostDataPoints: vi.fn(async () => ({ requeued: [], failed: [] })),
+}));
+
 beforeEach(() => {
   vi.useFakeTimers();
 });
@@ -57,14 +67,22 @@ function setup(
     finality?: TombstoneFinalityState;
     withFinality?: boolean;
     withDeleteData?: boolean;
+    marker?: PendingBlobDeletion;
+    mode?: { current: "unswitched" | "switched" };
+    listGate?: { entered: () => void; release: Promise<void> };
   } = {},
 ) {
   let finality = options.finality ?? PENDING;
   const store = createMemoryPendingBlobDeletionStore();
-  const ready = store.add([MARKER]);
+  const ready = store.add([options.marker ?? MARKER]);
   const pending = {
     list: vi.fn(async () => {
       await ready;
+      const gate = options.listGate;
+      if (gate) {
+        gate.entered();
+        await gate.release;
+      }
       return store.list();
     }),
     add: vi.fn((keys: PendingBlobDeletion[]) => store.add(keys)),
@@ -100,7 +118,7 @@ function setup(
     } as unknown as UploadWorkerDeps,
     { logger, storage: { download } } as unknown as DownloadWorkerDeps,
     {
-      accountStorageMode: { read: () => "switched" },
+      accountStorageMode: { read: () => options.mode?.current ?? "switched" },
       pollInterval: 60_000,
       localSync: { cycle },
       changeProbe: { read, intervalMs: 5_000, push },
@@ -224,6 +242,82 @@ describe("a switched device owes storage deletes whose tombstone is not final", 
       waiting: 0,
       unavailable: "delete-port",
     });
+    await t.manager.stop();
+  });
+
+  it("an unswitched pass that is overtaken by the switch frees nothing without a finality port", async () => {
+    // The mode is sampled before the pass awaits. The marker list is read
+    // after, so the switch can land between them. Release must not depend on
+    // the mode sampled earlier.
+    const mode = { current: "unswitched" as "unswitched" | "switched" };
+    let entered!: () => void;
+    const reachedList = new Promise<void>((resolve) => (entered = resolve));
+    let release!: () => void;
+    const open = new Promise<void>((resolve) => (release = resolve));
+    const t = setup({
+      withFinality: false,
+      mode,
+      listGate: { entered, release: open },
+    });
+    const pass = t.manager.trigger();
+    await reachedList; // the drain is inside the store read
+    mode.current = "switched";
+    release();
+    await pass;
+    expect(t.deleteData.deleteBlobVersions).not.toHaveBeenCalled();
+    expect(await t.store.list()).toEqual([MARKER]);
+    expect(t.manager.getStatus().blobDeletions?.unavailable).toBe(
+      "finality-port",
+    );
+  });
+
+  it("keeps draining a finalized prefix of a parked scope, then parks only the rest", async () => {
+    // One range 1..60. The finalized frontier is 45, and a newer tombstone
+    // rolled back. Each pass sends one batch, so the prefix takes several
+    // passes. The keys above 45 stay: the data may be live.
+    const marker: PendingBlobDeletion = {
+      scope: MARKER.scope,
+      version: null,
+      range: { from: "1", to: "60" },
+      tombstoneVersion: "60",
+    };
+    const t = setup({
+      marker,
+      finality: {
+        finalized: "45",
+        settling: false,
+        rolledBack: {
+          tombstoneVersion: "60",
+          head: {
+            dataPointId: "0xdp",
+            expectedVersion: "2",
+            dataHash: "0x" + "11".repeat(32),
+            metadataHash: "0x" + "22".repeat(32),
+          },
+        },
+      } as never,
+    });
+    await t.start();
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    const sent = t.deleteData.deleteBlobVersions.mock.calls.flatMap(
+      (call) => call[1] as string[],
+    );
+    expect(sent.map(Number).sort((a, b) => a - b)).toEqual(
+      Array.from({ length: 45 }, (_, i) => i + 1),
+    );
+    expect(await t.store.list()).toEqual([
+      expect.objectContaining({ range: { from: "46", to: "60" } }),
+    ]);
+    expect(t.deleteData.tombstone).not.toHaveBeenCalled();
+    expect(t.manager.getStatus().blobDeletions).toEqual({
+      remaining: 1,
+      waiting: 0,
+      unavailable: null,
+    });
+    // Nothing owed: the device goes quiet.
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+    expect(t.cycle).not.toHaveBeenCalled();
     await t.manager.stop();
   });
 
