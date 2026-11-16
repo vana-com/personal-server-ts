@@ -43,6 +43,7 @@ import {
   olderLifetimeFence,
 } from "./lifetime-boundary.js";
 import { applyLog } from "./log-apply.js";
+import { readPartsAhead, type PartReader } from "./part-readahead.js";
 import { purgeConnection } from "./purge.js";
 import {
   RegistryUnavailableBeforeWriteError,
@@ -766,6 +767,7 @@ async function applyOneOnce(
     );
     if (progressive) announceApplied(deps, id);
   };
+  let reader: PartReader | undefined;
   try {
     // A prefix whose parts all match the saved ones is kept as it is. Decide
     // every prefix first: a first load's drop of other heads' rows spares
@@ -798,14 +800,33 @@ async function applyOneOnce(
       }
     }
     applied = kept;
+    // The parts to read, in apply order, are fetched ahead of the apply (see
+    // `readPartsAhead`). A group reads its parts at its offset in this list.
+    const ahead = readPartsAhead(
+      deps.blobs,
+      [...grouped].flatMap(([prefix, parts]) =>
+        keptPrefixes.has(prefix) ? [] : parts,
+      ),
+      load,
+    );
+    reader = ahead;
+    let offset = 0;
+    // Rows of applied parts that wait for their commit, and the position in
+    // the read list of the last part they hold.
+    let pending: SqlStatement[] = [];
+    let lastApplied = -1;
     for (const [prefix, parts] of grouped) {
       if (keptPrefixes.has(prefix)) continue;
       const groupStart = applied;
+      const groupOffset = offset;
+      offset += parts.length;
+      const loadPart = (part: HeadPart, index: number) =>
+        ahead.load(part, groupOffset + index);
       if (head.format === 1) {
-        for (const part of parts) {
+        for (const [index, part] of parts.entries()) {
           const lines = await decodePart(
             sha,
-            await load(part),
+            await loadPart(part, index),
             part,
             head.primaryKey,
           );
@@ -816,14 +837,16 @@ async function applyOneOnce(
             );
           applied++;
           await commit(rows);
+          ahead.committed(groupOffset + index);
         }
       } else {
         // framesOfParts verifies hashes, counts, key order, prefix membership and
-        // continuations. Only one part and one SQL record body are held at a time.
+        // continuations. Only one part and one SQL record body are held at a
+        // time, besides the rows of the parts waiting for their commit.
         let rows: SqlStatement[] = [];
         let records = 0;
         let end = parts[0];
-        for await (const frame of framesOfParts(sha, parts, load, {
+        for await (const frame of framesOfParts(sha, parts, loadPart, {
           generation: head.format >= 4 ? "v3" : "v2",
         })) {
           const digest = sha256.create();
@@ -860,23 +883,41 @@ async function applyOneOnce(
             )),
           );
           records++;
-          // A long frame is its own part run; otherwise commit at the end of
-          // the part, before the reader loads another part.
+          // A long frame is its own part run; otherwise a part ends the
+          // records it counts.
           if (frame.parts[0] !== end) {
             end = frame.parts[0];
           }
           if (records === end!.count || frame.parts.length > 1) {
             const last = frame.parts[frame.parts.length - 1]!;
             applied = groupStart + parts.indexOf(last) + 1;
-            await commit(rows);
+            lastApplied = groupOffset + parts.indexOf(last);
+            pending.push(...rows);
             rows = [];
             records = 0;
             end = parts[parts.indexOf(last) + 1];
+            // Group commit: a commit costs the pages it dirties, and parts
+            // whose rows are in hand share them. The first part commits at
+            // once, for the first screen. After that the commit waits while
+            // the next part is already fetched, and goes when the apply would
+            // otherwise wait for storage. The parts that wait are the ones the
+            // memory budget lets the reader fetch ahead, so the budget is the
+            // bound on a commit.
+            if (began && ahead.ready(lastApplied + 1)) continue;
+            await commit(pending);
+            pending = [];
+            ahead.committed(lastApplied);
           }
         }
         if (rows.length > 0) throw new Error("apply: incomplete part");
       }
     }
+    if (pending.length > 0) {
+      await commit(pending);
+      pending = [];
+      ahead.committed(lastApplied);
+    }
+    ahead.close();
     const stillActive = await control(deps, id, connection, hashes, reuse);
     reuse.control = stillActive;
     if (
@@ -986,6 +1027,7 @@ async function applyOneOnce(
         );
     throw error;
   } finally {
+    reader?.close();
     await deps.db.batch(
       ["incoming", "apply_keys", "keep_ranges"].map((table) => ({
         sql: `DELETE FROM temp.${table} WHERE op=?`,

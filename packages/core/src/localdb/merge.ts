@@ -241,9 +241,18 @@ export function applyDelete(
   droppedAt: number = Number.MAX_SAFE_INTEGER,
 ): SqlStatement[] {
   const keys: SqlValue[] = [connectionId, stream];
+  // The omitted keys come from a read of the stream's keys alone, which an
+  // index holds (`records_size`, in key order). A test of the row itself would
+  // read every row of the stream, and a row's `seen_o` and the columns after
+  // `body` sit behind the body's overflow pages: on a host whose every page
+  // read is a call (the Web's OPFS), a stream with no omitted row would still
+  // cost a read of its whole body. The statements then reach only the rows
+  // this finds, by key.
   const omitted = `connection_id = ? AND stream = ?
-   AND pk_hash NOT IN (SELECT pk_hash FROM temp.apply_keys WHERE op = ?)
-   AND NOT EXISTS (SELECT 1 FROM temp.keep_ranges k WHERE k.op = ? AND records.pk_hash >= k.lo AND records.pk_hash < k.hi)`;
+   AND pk_hash IN (SELECT pk_hash FROM records WHERE connection_id = ? AND stream = ?
+     AND pk_hash NOT IN (SELECT pk_hash FROM temp.apply_keys WHERE op = ?)
+     AND NOT EXISTS (SELECT 1 FROM temp.keep_ranges k WHERE k.op = ? AND records.pk_hash >= k.lo AND records.pk_hash < k.hi))`;
+  const omittedParams: SqlValue[] = [...keys, ...keys, op, op];
   return [
     {
       sql: "UPDATE write_ctx SET origin = 'local' WHERE id = 1 AND origin = 'remote'",
@@ -253,7 +262,7 @@ export function applyDelete(
       sql: `UPDATE records SET stamp_o = seen_o, stamp_r = seen_r
  WHERE ${omitted}
    AND seen_o > ?`,
-      params: [...keys, op, op, droppedAt],
+      params: [...omittedParams, droppedAt],
     },
     {
       sql: "UPDATE write_ctx SET origin = 'remote' WHERE id = 1 AND origin = 'local'",
@@ -266,7 +275,7 @@ export function applyDelete(
                     WHERE ch.connection_id = records.connection_id AND ch.stream = records.stream
                       AND ch.pk_hash = records.pk_hash AND ch.origin IN ('local','import','refresh')
                       AND ch.seq > (SELECT publish_watermark FROM stream_state WHERE connection_id = ? AND stream = ?))`,
-      params: [...keys, op, op, ...keys],
+      params: [...omittedParams, ...keys],
     },
     { sql: "DELETE FROM temp.apply_keys WHERE op = ?", params: [op] },
     { sql: "DELETE FROM temp.keep_ranges WHERE op = ?", params: [op] },
