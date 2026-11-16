@@ -510,6 +510,47 @@ describe("request counts", () => {
       expect(counts.legacy!.puts).toBeGreaterThan(counts.log!.puts);
     });
   }
+
+  it("a full run that drops rows is one segment: the drop it applies locally is not published again", async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    const a = await w.device("a");
+    await a.run(
+      "run-1",
+      ["x", "y", "z"].map((id) => ({ stream: sName(0), id })),
+    );
+    await a.cycle();
+    // The second full run lists only x: y and z leave as the run's completion.
+    // Applying that completion locally deletes y and z, and those deletions are
+    // changes the log has nothing to say about: the completion already says them.
+    await a.run("run-2", [{ stream: sName(0), id: "x" }]);
+    await a.cycle();
+    expect(w.gateway.batches()).toHaveLength(2);
+    expect(await a.position()).toBe(2);
+    await a.cycle();
+    expect(w.gateway.batches()).toHaveLength(2);
+  });
+
+  it("a connection the device knows publishes before the cycle reads the registry", async () => {
+    const w = await world({ streams: 6, logProtocol: true });
+    const a = await w.device("a");
+    await a.run("run-1", [{ stream: sName(0), id: "r1" }]);
+    await a.cycle();
+    // The connection is now known and its control row is cached. A second
+    // run's changes reach the registry before anything is read from it: the
+    // log's writer needs no reading, and each read before the commit is a round
+    // trip between the run's end and the new head.
+    await a.run("run-2", [{ stream: sName(0), id: "r2" }], {
+      full: false,
+      covered: [sName(0)],
+    });
+    w.gateway.calls.length = 0;
+    await a.cycle();
+    const kinds = w.gateway.calls.map((call) => call.kind);
+    expect(kinds).toContain("batch");
+    expect(kinds.slice(0, kinds.indexOf("batch"))).toEqual([]);
+    // What the cycle then reads is the same as before: nothing is published twice.
+    expect(w.gateway.batches()).toHaveLength(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1898,6 +1939,9 @@ describe("log protocol: a deletion's key must be the key its hash names", () => 
     expect(warnings).toHaveLength(1);
     expect(JSON.stringify(warnings)).toContain("explicit delete");
     expect(JSON.stringify(warnings)).toContain(`stream \\"${s0}\\"`);
+    // The same held state does not warn again on the next cycle.
+    await a.cycle();
+    expect(warnings).toHaveLength(1);
     // The other stream is not held by it.
     await reader.cycle();
     expect(await reader.records()).toEqual(

@@ -634,7 +634,7 @@ export async function createPsLiteSyncManager(
           logger,
           now: Date.now,
           newOp: () => globalThis.crypto.randomUUID(),
-          recordsCommitted: () => syncManager?.notifyNewData(),
+          recordsCommitted: () => syncManager?.notifyRecordsCommitted(),
           progressiveFirstLoad:
             options.streamSyncProgressiveFirstLoad ??
             options.config.streamSync.progressiveFirstLoad,

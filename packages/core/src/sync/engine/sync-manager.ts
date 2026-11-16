@@ -221,6 +221,14 @@ export interface SyncManager {
   notifyNewData(): void;
 
   /**
+   * A run or an import committed its rows: the data is complete, and nothing
+   * more is coming that a wait could gather. Starts the cycle now; a cycle in
+   * flight runs once more after it. `notifyNewData` instead waits out the
+   * debounce, for callers that signal one record at a time.
+   */
+  notifyRecordsCommitted(): void;
+
+  /**
    * The host says no one is looking (a hidden Web tab). The manager holds no
    * request and no timer until `resume`: it aborts the held push request and
    * clears the push's cooldown, the failure retry, the poll, the probe and the
@@ -810,20 +818,27 @@ export function createSyncManager(
     return pull(true);
   }
 
-  function scheduleNotifiedCycle(): void {
+  function scheduleNotifiedCycle(delayMs: number = notifyDebounceMs): void {
     if (!isRunning) return;
     if (paused) {
       owedWhilePaused = true;
       return;
     }
-    if (notifyTimerId !== null) return;
-    notifyTimerId = setTimeout(() => {
+    const start = () => {
       notifyTimerId = null;
       if (!isRunning) return;
       runCycle().catch(() => {
         // Errors already captured in ring buffer
       });
-    }, notifyDebounceMs);
+    };
+    if (delayMs === 0) {
+      // The cycle starts now and takes whatever a pending timer was waiting for.
+      if (notifyTimerId !== null) clearTimeout(notifyTimerId);
+      start();
+      return;
+    }
+    if (notifyTimerId !== null) return;
+    notifyTimerId = setTimeout(start, delayMs);
   }
 
   /**
@@ -1167,6 +1182,12 @@ export function createSyncManager(
       uploadDeps.logger.debug("New data notification received");
       statusMayHaveChanged(); // the new data is pending until a cycle takes it
       scheduleNotifiedCycle();
+    },
+
+    notifyRecordsCommitted() {
+      uploadDeps.logger.debug("Records committed notification received");
+      statusMayHaveChanged();
+      scheduleNotifiedCycle(0);
     },
 
     async retryQuarantinedUploads(scope) {

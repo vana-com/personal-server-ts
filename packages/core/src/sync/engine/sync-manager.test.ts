@@ -430,6 +430,45 @@ describe("SyncManager", () => {
     await manager.stop();
   });
 
+  it("notifyRecordsCommitted() starts the cycle now and absorbs a pending debounce", async () => {
+    const uploadDeps = makeMockUploadDeps();
+    const downloadDeps = makeMockDownloadDeps();
+    const manager = createSyncManager(uploadDeps, downloadDeps, {
+      pollInterval: 60_000,
+      notifyDebounceMs: 500,
+    });
+
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    vi.clearAllMocks();
+
+    manager.notifyNewData();
+    manager.notifyRecordsCommitted();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(uploadAll).toHaveBeenCalledTimes(1);
+    expect(downloadAll).toHaveBeenCalledTimes(1);
+
+    // The debounce the first call set is gone: no second cycle at 500 ms.
+    await vi.advanceTimersByTimeAsync(600);
+    expect(uploadAll).toHaveBeenCalledTimes(1);
+
+    await manager.stop();
+  });
+
+  it("notifyRecordsCommitted() does not sync while stopped", async () => {
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+      { pollInterval: 60_000, notifyDebounceMs: 500 },
+    );
+
+    manager.notifyRecordsCommitted();
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(uploadAll).not.toHaveBeenCalled();
+  });
+
   it("notifyNewData() does not sync while stopped", async () => {
     const uploadDeps = makeMockUploadDeps();
     const downloadDeps = makeMockDownloadDeps();

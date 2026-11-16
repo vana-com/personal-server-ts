@@ -144,6 +144,19 @@ export async function bootstrapConnections(
 }
 
 /**
+ * The connections this device already knows to be active, from its own table.
+ * Reads nothing from the registry: a host that wants to publish before it
+ * learns anything uses it to name what to publish.
+ */
+export async function knownActiveConnections(
+  deps: LocalSyncDeps,
+): Promise<readonly ConnectionRow[]> {
+  return deps.db.query<SqlConnection>(
+    `${SELECT_CONNECTIONS} WHERE control_state = 'active' ORDER BY connection_id`,
+  );
+}
+
+/**
  * C.0 step 2, inside the connection queue and before any row is staged:
  * read the control row and the stream rows, then apply every stream whose
  * registry version differs from `head_version` or whose `head_parts` is empty

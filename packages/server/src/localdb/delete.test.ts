@@ -16,7 +16,11 @@ import {
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import { createConnectionDeleter } from "../../../core/src/localdb/delete.js";
-import { RegistryUnavailableError } from "../../../core/src/stream-sync/ports.js";
+import { gatewayBatchRefusal } from "../../../core/src/localdb/batch-contract.js";
+import {
+  RegistryRefusedError,
+  RegistryUnavailableError,
+} from "../../../core/src/stream-sync/ports.js";
 import { remoteFixture } from "./apply-fixture.js";
 import { postStreamDeleteOnly } from "./legacy-delete-fixture.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
@@ -1043,8 +1047,9 @@ it("a stale listed row costs one rejected write, one refresh read of the row and
 });
 
 // ---------------------------------------------------------------------------
-// One commit: with a batch route the fence and every stream row of the
-// connection go in one POST /v1/data/batch (split at the gateway's 16 rows).
+// Two commits: with a batch route the fence goes in one POST /v1/data/batch and
+// every stream row of the connection in the next (split at the gateway's 16
+// rows). A fence and a condition on it cannot share a request.
 // ---------------------------------------------------------------------------
 
 const names = (n: number) => Array.from({ length: n }, (_, i) => `s${i + 1}`);
@@ -1058,15 +1063,19 @@ function withBatchRoute(f: World, route: "present" | 405 = "present") {
   const registry: StreamSyncRegistry = f.registry;
   const batches: SignedRegistryBatch[] = [];
   const singles: string[] = [];
-  let inBatch = false;
+  let inBatch = 0;
   const post = f.registry.post.bind(f.registry);
   f.registry.post = async (request) => {
-    if (!inBatch) singles.push(request.scope);
+    if (inBatch === 0) singles.push(request.scope);
     return post(request);
   };
   registry.postBatch = async (request): Promise<RegistryBatchResult> => {
     batches.push(request);
     if (route === 405) return { kind: "unsupported" };
+    // The real route answers 400 to a request of a shape it refuses.
+    const refusal = gatewayBatchRefusal(request);
+    if (refusal !== null)
+      throw new RegistryRefusedError(`batch POST refused: ${refusal}`, 400);
     for (const need of request.requires) {
       const row = await f.registry.read(need.scope);
       const tombstoned = row.found && row.dataHash === f.hashes.tombstoneData;
@@ -1083,7 +1092,7 @@ function withBatchRoute(f: World, route: "present" | 405 = "present") {
       RegistryBatchResult,
       { kind: "rows" }
     >["rows"][number][] = [];
-    inBatch = true;
+    inBatch++;
     try {
       for (const row of request.rows) {
         const head = await f.registry.read(row.scope);
@@ -1109,33 +1118,35 @@ function withBatchRoute(f: World, route: "present" | 405 = "present") {
         );
       }
     } finally {
-      inBatch = false;
+      inBatch--;
     }
     return { kind: "rows", rows };
   };
   return { batches, singles };
 }
 
-it("a six-stream delete is one POST that carries the fence and every stream row", async () => {
+it("a six-stream delete is two POSTs: the fence alone, then every stream row resting on it", async () => {
   const f = await world(undefined, names(6));
   const { batches, singles } = withBatchRoute(f);
   const started = await f.a.deleter.requestConnectionDelete("fixture-source");
   expect(started.fenced).toBe(true);
   expect(await f.a.deleter.resumeDeletes()).toEqual([]);
-  expect(batches).toHaveLength(1);
+  expect(batches).toHaveLength(2);
   expect(singles).toEqual([]);
-  const [batch] = batches;
-  expect(batch!.rows.map((r) => r.scope)).toEqual([
-    f.control,
-    ...f.heads.map((h) => h.scope).sort(),
-  ]);
-  // The stream rows rest on the control row still being the one planned over.
-  expect(batch!.requires).toEqual([
+  const [fence, streams] = batches;
+  // The fence row is its own compare-and-set, so it names no condition.
+  expect(fence!.rows.map((r) => r.scope)).toEqual([f.control]);
+  expect(fence!.requires).toEqual([]);
+  expect(streams!.rows.map((r) => r.scope)).toEqual(
+    f.heads.map((h) => h.scope).sort(),
+  );
+  // The stream rows rest on the fence having landed.
+  expect(streams!.requires).toEqual([
     {
       scope: f.control,
-      expectedVersion: "1",
-      notDeleted: true,
-      expectedDataHash: f.hashes.activeData,
+      expectedVersion: "2",
+      notDeleted: false,
+      expectedDataHash: f.hashes.tombstoneData,
     },
   ]);
   expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
@@ -1152,31 +1163,31 @@ it("without a batch route the same delete is a fence post and one post per strea
   expect(f.registry.log.length - before).toBe(7);
 });
 
-it("above sixteen rows the first request holds every fence and the rest follow it", async () => {
+it("above sixteen stream rows the fence goes first and the stream requests follow it, each resting on it", async () => {
   const f = await world(undefined, names(20));
   const { batches, singles } = withBatchRoute(f);
   await f.a.deleter.requestConnectionDelete("fixture-source");
   expect(await f.a.deleter.resumeDeletes()).toEqual([]);
   expect(singles).toEqual([]);
-  expect(batches.map((b) => b.rows.length)).toEqual([16, 5]);
+  expect(batches.map((b) => b.rows.length)).toEqual([1, 16, 4]);
   expect(batches[0]!.rows[0]!.scope).toBe(f.control);
-  expect(batches[1]!.rows.some((r) => r.scope === f.control)).toBe(false);
-  // The second request has no fence of its own: it rests on the fence that
-  // the first one wrote.
-  expect(batches[1]!.requires).toEqual([
-    {
-      scope: f.control,
-      expectedVersion: "2",
-      notDeleted: false,
-      expectedDataHash: f.hashes.tombstoneData,
-    },
-  ]);
+  for (const streams of batches.slice(1)) {
+    expect(streams.rows.some((r) => r.scope === f.control)).toBe(false);
+    expect(streams.requires).toEqual([
+      {
+        scope: f.control,
+        expectedVersion: "2",
+        notDeleted: false,
+        expectedDataHash: f.hashes.tombstoneData,
+      },
+    ]);
+  }
   expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
   for (const head of f.heads)
     expect(await f.registry.read(head.scope)).toMatchObject({ version: 2 });
 });
 
-it("a stream row that loses its compare-and-set is retried alone; the rest stay in the one commit", async () => {
+it("a stream row that loses its compare-and-set is retried alone; the rest stay in the stream commit", async () => {
   const f = await world(undefined, names(6));
   const { batches, singles } = withBatchRoute(f);
   const loser = f.heads[2]!.scope;
@@ -1188,7 +1199,7 @@ it("a stream row that loses its compare-and-set is retried alone; the rest stay 
   };
   await f.a.deleter.requestConnectionDelete("fixture-source");
   expect(await f.a.deleter.resumeDeletes()).toEqual([]);
-  expect(batches).toHaveLength(1);
+  expect(batches).toHaveLength(2);
   expect(singles).toEqual([loser]);
   expect(await f.registry.read(loser)).toMatchObject({ version: 3 });
   for (const head of f.heads.filter((h) => h.scope !== loser))
@@ -1196,7 +1207,7 @@ it("a stream row that loses its compare-and-set is retried alone; the rest stay 
   expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
 });
 
-it("a reconnect before the request writes nothing in it, and the per-stream path ends the delete", async () => {
+it("a reconnect before the fence request: the fence loses, no stream row is sent, and the per-stream path ends the delete", async () => {
   const f = await world(undefined, names(3));
   const { batches, singles } = withBatchRoute(f);
   const send = f.registry.postBatch!.bind(f.registry);
@@ -1218,10 +1229,11 @@ it("a reconnect before the request writes nothing in it, and the per-stream path
   };
   await f.a.deleter.requestConnectionDelete("fixture-source");
   expect(await f.a.deleter.resumeDeletes()).toEqual([]);
-  // The condition (control active at version 1) failed: the request wrote
-  // nothing, the per-stream path cleaned each stream of the ended lifetime,
-  // and the reconnected lifetime was never tombstoned.
+  // The fence lost its compare-and-set (control moved on from version 1), so
+  // no stream row was sent: the per-stream path cleaned each stream of the
+  // ended lifetime, and the reconnected lifetime was never tombstoned.
   expect(batches).toHaveLength(1);
+  expect(batches[0]!.rows.map((r) => r.scope)).toEqual([f.control]);
   expect(singles.filter((scope) => scope !== f.control)).toHaveLength(3);
   expect(await f.registry.read(f.control)).toMatchObject({
     version: 3,
@@ -1240,6 +1252,40 @@ it("a gateway without the batch route (405) is asked once; the old path ends the
   expect(singles).toHaveLength(7);
   expect(singles[0]).toBe(f.control);
   expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
+  // A reconnect, then a second delete in the same session.
+  await f.registry.post({
+    ownerAddress: owner,
+    scope: f.control,
+    dataHash: f.hashes.activeData,
+    metadataHash: f.hashes.activeMetadata,
+    expectedVersion: "3",
+    signature: "0x00",
+  });
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(batches).toHaveLength(1);
+});
+
+it("a request the gateway refuses (400) is reported, the per-stream path ends the delete, and later deletes do not ask again", async () => {
+  const f = await world(undefined, names(6));
+  const { batches, singles } = withBatchRoute(f);
+  (f.registry as StreamSyncRegistry).postBatch = async (request) => {
+    batches.push(request);
+    throw new RegistryRefusedError("batch POST refused: shape", 400);
+  };
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  // The delete is complete, written one row at a time.
+  expect(batches).toHaveLength(1);
+  expect(singles).toHaveLength(7);
+  expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
+  for (const head of f.heads)
+    expect(await f.registry.read(head.scope)).toMatchObject({ version: 2 });
+  // The refusal is a defect to fix, so it is logged with its status.
+  expect(f.a.deps.logger.warn).toHaveBeenCalledWith(
+    expect.objectContaining({ status: 400 }),
+    "registry refused the delete batch; deleting stream by stream",
+  );
   // A reconnect, then a second delete in the same session.
   await f.registry.post({
     ownerAddress: owner,

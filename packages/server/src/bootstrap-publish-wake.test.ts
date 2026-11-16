@@ -1,6 +1,6 @@
 /**
- * A run that ends with rows wakes the sync manager, so publish starts within
- * the notify debounce and does not wait for the 60 s poll.
+ * A run that ends with rows wakes the sync manager, so publish starts at once
+ * and does not wait for the notify debounce or the 60 s poll.
  *
  * Real Node composition: HTTP intake, real SQLite, the real sync manager. Only
  * the registration check is stubbed (it asks the gateway) and the registry post
@@ -171,7 +171,7 @@ async function world() {
   return { context, post, intake };
 }
 
-it("publishes within the notify debounce after a run ends, not at the next poll", async () => {
+it("publishes as the run ends, not after the notify debounce or the next poll", async () => {
   const { context, post, intake } = await world();
   const local = await context.getLocalSync!();
   const cycle = vi.spyOn(local, "cycle");
@@ -180,12 +180,17 @@ it("publishes within the notify debounce after a run ends, not at the next poll"
   const end = await intake("wake", "item-1", "succeeded").finish();
   expect(end.status).toBe(200);
   expect(await end.json()).toMatchObject({ result: "queued" });
-  expect(cycle).not.toHaveBeenCalled();
 
-  // Past the 500 ms debounce, far short of the 60 s poll.
+  // The cycle starts when the run commits: well inside the 500 ms debounce
+  // (the wait steps the faked clock by 50 ms, so a debounce would show).
+  await vi.waitFor(() => expect(cycle).toHaveBeenCalledTimes(1), {
+    timeout: 300,
+    interval: 50,
+  });
+  await cycle.mock.results[0]!.value;
+  expect(post).toHaveBeenCalledTimes(1);
+  // The 500 ms debounce is not owed afterwards either.
   await vi.advanceTimersByTimeAsync(600);
   expect(POLL_MS).toBeGreaterThan(600);
   expect(cycle).toHaveBeenCalledTimes(1);
-  await cycle.mock.results[0]!.value;
-  expect(post).toHaveBeenCalledTimes(1);
 });
