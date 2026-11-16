@@ -44,7 +44,7 @@ async function hashes(deps: LocalSyncDeps): Promise<ControlHashes> {
   return controlHashes(streamSyncHashes.keccak256, keyCheck);
 }
 
-async function saveControl(
+export async function saveControl(
   deps: LocalSyncDeps,
   connector: string,
   ns: string,

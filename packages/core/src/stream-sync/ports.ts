@@ -206,9 +206,9 @@ export interface RegistryChangeAnswer {
   readonly changed: boolean;
   /**
    * What changed after the request's `since`, read in one snapshot at `seq`.
-   * Present only on a changed answer to a request that sent `since`, from a
-   * gateway that serves it; a gateway that does not, or whose delta read
-   * failed, leaves it out, and the caller reads the registry as before.
+   * Present on, and only on, a changed answer to a request that sent `since`
+   * (a gateway that cannot read the delta answers `reset`). A changed answer
+   * to such a request without a readable delta fails the request.
    */
   readonly delta?: RegistryChangeDelta;
 }
@@ -245,9 +245,10 @@ export type RegistryChangeDelta =
 
 /**
  * What applying a change delta did. `cycle`: the delta holds something only a
- * full cycle handles (a control row, a stream head, a row of a connection this
- * device does not hold, a removed row, a server change, a reset), or the apply
- * did not reach the delta's position; nothing is settled and the caller runs a
+ * full cycle handles (a new or reconnected lifetime, a stream head or a
+ * deleted log row of a live connection, a row of a connection this device
+ * does not hold, a removed row, a server change, a reset), or the apply did
+ * not reach the delta's position; nothing is settled and the caller runs a
  * cycle. `applied`: the device holds what the registry held at the delta's
  * `seq`, for everything a switched cycle reads.
  */
@@ -256,6 +257,8 @@ export type DeltaApplyResult =
       readonly outcome: "applied";
       /** Connections whose log moved (a row of this device's own commit does not). */
       readonly connections: number;
+      /** Connections the delta's control tombstones deleted here. */
+      readonly deleted: number;
       /** Segment and snapshot GETs, and the time spent in them. */
       readonly blobGets: number;
       readonly blobMs: number;

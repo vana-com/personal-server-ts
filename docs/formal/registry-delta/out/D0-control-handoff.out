@@ -1,0 +1,32 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 113 and seed -8169403539746426823 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 1793971] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file RegistryDelta.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module RegistryDelta
+Starting... (2026-11-16 16:53:47)
+Implied-temporal checking--satisfiability problem has 1 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-16 16:53:47.
+Checking temporal properties for the current state space with 116579 total distinct states at (2026-11-16 16:53:50)
+Finished checking temporal properties in 01s at 2026-11-16 16:53:51
+Progress(13) at 2026-11-16 16:53:51: 786,171 states generated (786,171 s/min), 238,287 distinct states found (238,287 ds/min), 121,706 states left on queue.
+Progress(19) at 2026-11-16 16:54:09: 5,307,452 states generated, 2,022,284 distinct states found, 0 states left on queue.
+Checking temporal properties for the complete state space with 2022284 total distinct states at (2026-11-16 16:54:09)
+Finished checking temporal properties in 22s at 2026-11-16 16:54:31
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 3.6E-7
+  based on the actual fingerprints:  val = 2.4E-6
+5307452 states generated, 2022284 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 19.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 12 and the 95th percentile is 3).
+Finished in 44s at (2026-11-16 16:54:31)
+exit 0

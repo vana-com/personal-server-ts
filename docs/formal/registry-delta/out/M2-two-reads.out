@@ -1,5 +1,5 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 72 and seed 1351618700151277348 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 2837998] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 36 and seed 3597742209938140545 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 1810259] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file RegistryDelta.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/FiniteSets.tla
@@ -10,122 +10,134 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module RegistryDelta
-Starting... (2026-11-16 15:12:17)
+Starting... (2026-11-16 16:54:33)
 Implied-temporal checking--satisfiability problem has 1 branches.
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-11-16 15:12:17.
+Finished computing initial states: 1 distinct state generated at 2026-11-16 16:54:33.
 Error: Invariant NoSkip is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
-/\ nextSeq = 1
-/\ counter = 0
+/\ txn = ( w1 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] @@
+  w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
+/\ chg = [ctl |-> 0, log |-> 0]
+/\ floor = 0
 /\ txns = 0
 /\ rcursor = 0
-/\ view = (a :> 0 @@ b :> 0)
-/\ lock = NoWriter
-/\ floor = 0
-/\ chg = (a :> 0 @@ b :> 0)
-/\ rbuf = (a :> 0 @@ b :> 0)
-/\ txn = ( w1 :> [phase |-> "idle", scope |-> a, del |-> FALSE, seq |-> 0] @@
-  w2 :> [phase |-> "idle", scope |-> a, del |-> FALSE, seq |-> 0] )
-/\ ver = (a :> 0 @@ b :> 0)
-/\ rphase = "idle"
-/\ hist = {}
 /\ floored = FALSE
+/\ counter = 0
+/\ view = [ctl |-> 0, log |-> 0]
+/\ lock = NoWriter
+/\ kind = [ctl |-> "act", log |-> "app"]
+/\ hist = {}
+/\ ver = [ctl |-> 0, log |-> 0]
+/\ rkind = "act"
+/\ rphase = "idle"
+/\ nextSeq = 1
+/\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
 
-State 2: <Begin line 72, col 3 to line 77, col 53 of module RegistryDelta>
-/\ nextSeq = 1
-/\ counter = 0
+State 2: <Begin line 96, col 3 to line 101, col 60 of module RegistryDelta>
+/\ txn = ( w1 :> [phase |-> "open", scope |-> "ctl", op |-> "tomb", seq |-> 0] @@
+  w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
+/\ chg = [ctl |-> 0, log |-> 0]
+/\ floor = 0
 /\ txns = 1
 /\ rcursor = 0
-/\ view = (a :> 0 @@ b :> 0)
-/\ lock = NoWriter
-/\ floor = 0
-/\ chg = (a :> 0 @@ b :> 0)
-/\ rbuf = (a :> 0 @@ b :> 0)
-/\ txn = ( w1 :> [phase |-> "open", scope |-> a, del |-> FALSE, seq |-> 0] @@
-  w2 :> [phase |-> "idle", scope |-> a, del |-> FALSE, seq |-> 0] )
-/\ ver = (a :> 0 @@ b :> 0)
-/\ rphase = "idle"
-/\ hist = {}
 /\ floored = FALSE
+/\ counter = 0
+/\ view = [ctl |-> 0, log |-> 0]
+/\ lock = NoWriter
+/\ kind = [ctl |-> "act", log |-> "app"]
+/\ hist = {}
+/\ ver = [ctl |-> 0, log |-> 0]
+/\ rkind = "act"
+/\ rphase = "idle"
+/\ nextSeq = 1
+/\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
 
-State 3: <Number line 82, col 3 to line 90, col 53 of module RegistryDelta>
-/\ nextSeq = 1
-/\ counter = 0
+State 3: <Number line 106, col 3 to line 114, col 60 of module RegistryDelta>
+/\ txn = ( w1 :> [phase |-> "numbered", scope |-> "ctl", op |-> "tomb", seq |-> 1] @@
+  w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
+/\ chg = [ctl |-> 0, log |-> 0]
+/\ floor = 0
 /\ txns = 1
 /\ rcursor = 0
-/\ view = (a :> 0 @@ b :> 0)
+/\ floored = FALSE
+/\ counter = 0
+/\ view = [ctl |-> 0, log |-> 0]
 /\ lock = w1
-/\ floor = 0
-/\ chg = (a :> 0 @@ b :> 0)
-/\ rbuf = (a :> 0 @@ b :> 0)
-/\ txn = ( w1 :> [phase |-> "numbered", scope |-> a, del |-> FALSE, seq |-> 1] @@
-  w2 :> [phase |-> "idle", scope |-> a, del |-> FALSE, seq |-> 0] )
-/\ ver = (a :> 0 @@ b :> 0)
-/\ rphase = "idle"
+/\ kind = [ctl |-> "act", log |-> "app"]
 /\ hist = {}
-/\ floored = FALSE
+/\ ver = [ctl |-> 0, log |-> 0]
+/\ rkind = "act"
+/\ rphase = "idle"
+/\ nextSeq = 1
+/\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
 
-State 4: <DeltaRows line 141, col 3 to line 145, col 39 of module RegistryDelta>
-/\ nextSeq = 1
+State 4: <DeltaRows line 193, col 3 to line 197, col 46 of module RegistryDelta>
+/\ txn = ( w1 :> [phase |-> "numbered", scope |-> "ctl", op |-> "tomb", seq |-> 1] @@
+  w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
+/\ chg = [ctl |-> 0, log |-> 0]
+/\ floor = 0
+/\ txns = 1
+/\ rcursor = 0
+/\ floored = FALSE
 /\ counter = 0
-/\ txns = 1
-/\ rcursor = 0
-/\ view = (a :> 0 @@ b :> 0)
+/\ view = [ctl |-> 0, log |-> 0]
 /\ lock = w1
-/\ floor = 0
-/\ chg = (a :> 0 @@ b :> 0)
-/\ rbuf = (a :> 0 @@ b :> 0)
-/\ txn = ( w1 :> [phase |-> "numbered", scope |-> a, del |-> FALSE, seq |-> 1] @@
-  w2 :> [phase |-> "idle", scope |-> a, del |-> FALSE, seq |-> 0] )
-/\ ver = (a :> 0 @@ b :> 0)
-/\ rphase = "rows"
+/\ kind = [ctl |-> "act", log |-> "app"]
 /\ hist = {}
-/\ floored = FALSE
-/\ since = 0
-
-State 5: <Commit line 93, col 3 to line 102, col 84 of module RegistryDelta>
-/\ nextSeq = 1
-/\ counter = 1
-/\ txns = 1
-/\ rcursor = 0
-/\ view = (a :> 0 @@ b :> 0)
-/\ lock = NoWriter
-/\ floor = 0
-/\ chg = (a :> 1 @@ b :> 0)
-/\ rbuf = (a :> 0 @@ b :> 0)
-/\ txn = ( w1 :> [phase |-> "idle", scope |-> a, del |-> FALSE, seq |-> 1] @@
-  w2 :> [phase |-> "idle", scope |-> a, del |-> FALSE, seq |-> 0] )
-/\ ver = (a :> 1 @@ b :> 0)
+/\ ver = [ctl |-> 0, log |-> 0]
+/\ rkind = "act"
 /\ rphase = "rows"
-/\ hist = {<<1, a, 1>>}
-/\ floored = FALSE
+/\ nextSeq = 1
+/\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
 
-State 6: <DeltaCounter line 148, col 3 to line 151, col 32 of module RegistryDelta>
-/\ nextSeq = 1
-/\ counter = 1
+State 5: <Commit line 117, col 3 to line 127, col 91 of module RegistryDelta>
+/\ txn = ( w1 :> [phase |-> "idle", scope |-> "ctl", op |-> "tomb", seq |-> 1] @@
+  w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
+/\ chg = [ctl |-> 1, log |-> 0]
+/\ floor = 0
 /\ txns = 1
 /\ rcursor = 0
-/\ view = (a :> 0 @@ b :> 0)
-/\ lock = NoWriter
-/\ floor = 0
-/\ chg = (a :> 1 @@ b :> 0)
-/\ rbuf = (a :> 0 @@ b :> 0)
-/\ txn = ( w1 :> [phase |-> "idle", scope |-> a, del |-> FALSE, seq |-> 1] @@
-  w2 :> [phase |-> "idle", scope |-> a, del |-> FALSE, seq |-> 0] )
-/\ ver = (a :> 1 @@ b :> 0)
-/\ rphase = "idle"
-/\ hist = {<<1, a, 1>>}
 /\ floored = FALSE
+/\ counter = 1
+/\ view = [ctl |-> 0, log |-> 0]
+/\ lock = NoWriter
+/\ kind = [ctl |-> "tomb", log |-> "app"]
+/\ hist = {<<1, "ctl", 1>>}
+/\ ver = [ctl |-> 1, log |-> 0]
+/\ rkind = "act"
+/\ rphase = "rows"
+/\ nextSeq = 1
+/\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
+/\ since = 0
+
+State 6: <DeltaCounter line 200, col 3 to line 207, col 23 of module RegistryDelta>
+/\ txn = ( w1 :> [phase |-> "idle", scope |-> "ctl", op |-> "tomb", seq |-> 1] @@
+  w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
+/\ chg = [ctl |-> 1, log |-> 0]
+/\ floor = 0
+/\ txns = 1
+/\ rcursor = 0
+/\ floored = FALSE
+/\ counter = 1
+/\ view = [ctl |-> 0, log |-> 0]
+/\ lock = NoWriter
+/\ kind = [ctl |-> "tomb", log |-> "app"]
+/\ hist = {<<1, "ctl", 1>>}
+/\ ver = [ctl |-> 1, log |-> 0]
+/\ rkind = "act"
+/\ rphase = "idle"
+/\ nextSeq = 1
+/\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 1
 
-1224 states generated, 552 distinct states found, 378 states left on queue.
+1429 states generated, 629 distinct states found, 444 states left on queue.
 The depth of the complete state graph search is 6.
-The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 10 and the 95th percentile is 8).
-Finished in 00s at (2026-11-16 15:12:17)
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 12 and the 95th percentile is 9).
+Finished in 00s at (2026-11-16 16:54:33)
 exit 12
