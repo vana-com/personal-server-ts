@@ -47,6 +47,8 @@ export async function world(options: {
   streams: number;
   logProtocol: boolean;
   partTargetBytes?: number;
+  /** The key types every stream's schema declares (none: undeclared). */
+  keyTypes?: readonly ("string" | "number" | "integer" | "boolean" | null)[];
 }) {
   const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
   const hashes = await controlHashes(async (b) => keccak_256(b), keyCheck);
@@ -138,6 +140,7 @@ export async function world(options: {
           semantics: "mutable_state" as const,
           primaryKey: ["id"],
           coverageStrategy: "full_inventory" as const,
+          ...(options.keyTypes ? { keyTypes: options.keyTypes } : {}),
         })),
       }),
       declaredStreams: () => names,

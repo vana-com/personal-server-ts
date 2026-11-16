@@ -46,12 +46,15 @@ import {
   deriveKeyCheck,
   digestSegment,
   encodeSegment,
+  deletionKeyMatchesHash,
   firstDeletionKeyMismatch,
+  keyFromRecordKey,
   logScope,
   primaryKeyValues,
   streamScope,
   verifySegment,
   type ControlHashes,
+  type KeyFieldType,
   type LogKey,
   type LogOmission,
   type LogOperation,
@@ -91,6 +94,8 @@ import {
   type PublishResult,
   type StreamPlan,
 } from "./publish.js";
+import { META_ROWS, PAGE_BYTES } from "./encode.js";
+import { BODY_BYTES } from "./part-layout.js";
 import { purgeConnection } from "./purge.js";
 import { insideQueue } from "./slot.js";
 import { unwriteRefusedRun } from "./unwrite.js";
@@ -342,7 +347,7 @@ async function snapshotRound(
   const target = held.partTargetBytes ?? DEFAULT_PART_TARGET_BYTES;
   let budget = 0;
   let first = true;
-  for (const row of streams) {
+  eachStream: for (const row of streams) {
     const { stream } = row;
     if (await discardFencedRuns(held, connectionId, stream)) {
       await applyConnection(held, connectionId);
@@ -460,8 +465,24 @@ async function snapshotRound(
     const taken: LogOperation[] = [];
     let bytes = omittedSize(omitted) + 100;
     let rest = false;
+    // A stream with a change the log cannot say stops here: nothing of it is
+    // published or acknowledged this round (`plan.deferred`, as for a stream
+    // that waits on its runs), so no change is lost without a trace.
+    const wasFirst = first;
+    const stop = (untyped: readonly string[]) => {
+      first = wasFirst;
+      held.logger.warn(
+        { connectionId, stream, pkHashes: untyped.slice(0, 5) },
+        `stream sync: the log holds back stream "${stream}": an explicit delete made before typed keys were kept cannot be written to it, and the stream's declared key types do not give its key back`,
+      );
+      planned.push({
+        ...base,
+        plan: { ...plan, deferred: true },
+        ack: row.publish_watermark,
+      });
+    };
     if (atomic) {
-      const found = await operationsFor(
+      const { ops: found, untyped } = await operationsFor(
         held,
         connectionId,
         stream,
@@ -469,6 +490,10 @@ async function snapshotRound(
         row.publish_watermark,
         watermark,
       );
+      if (untyped.length > 0) {
+        stop(untyped);
+        continue;
+      }
       const size =
         bytes + [...found.values()].reduce((n, op) => n + opSize(op), 0);
       if (!room(size)) {
@@ -480,7 +505,7 @@ async function snapshotRound(
       bytes = size;
     } else {
       scan: for (const batch of chunked(groups, KEYS_PER_QUERY)) {
-        const found = await operationsFor(
+        const { ops: found, untyped } = await operationsFor(
           held,
           connectionId,
           stream,
@@ -488,6 +513,10 @@ async function snapshotRound(
           row.publish_watermark,
           watermark,
         );
+        if (untyped.length > 0) {
+          stop(untyped);
+          continue eachStream;
+        }
         for (const group of batch) {
           const op = found.get(group.pk);
           const size = op ? opSize(op) : 0;
@@ -721,6 +750,12 @@ async function establishControl(
  * names its typed primary-key values from the row it drops, which is held until
  * the run deletes it: the row's data holds them with their types, and a
  * deletion's key is exactly what its hash was computed from.
+ *
+ * The bodies are read a page at a time, as the spool is (`PAGE_BYTES` of
+ * bodies, or one row), after reading the rows' sizes alone (`META_ROWS` at a
+ * time): the shared SQL cannot return just the key fields of a body (a phone's
+ * SQLite 3.22 has no JSON1), and a pass that drops many large records must not
+ * hold them all at once. Only the small keys are kept.
  */
 async function omittedBy(
   deps: LocalSyncDeps,
@@ -729,15 +764,46 @@ async function omittedBy(
   primaryKey: readonly string[],
   replace: { o: number; r: string },
 ): Promise<LogOmission[]> {
-  const rows = await deps.db.query<{ pk_hash: string; body: string }>(
-    `SELECT pk_hash, body FROM records WHERE connection_id = ? AND stream = ?
-        AND ${SEEN_BEFORE} ORDER BY pk_hash`,
-    [connectionId, stream, ...seenBeforeParams(replace.o, replace.r)],
-  );
-  return rows.map((row) => ({
-    pkHash: row.pk_hash,
-    key: primaryKeyValues(JSON.parse(row.body), primaryKey) as LogKey,
-  }));
+  const scope = `connection_id = ? AND stream = ? AND ${SEEN_BEFORE}`;
+  const scopeParams = [
+    connectionId,
+    stream,
+    ...seenBeforeParams(replace.o, replace.r),
+  ];
+  const omitted: LogOmission[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const meta = await deps.db.query<{ pk_hash: string; n: number }>(
+      `SELECT pk_hash, COALESCE(body_bytes, ${BODY_BYTES}) AS n FROM records
+        WHERE ${scope}${after === undefined ? "" : " AND pk_hash > ?"}
+        ORDER BY pk_hash LIMIT ${META_ROWS}`,
+      after === undefined ? scopeParams : [...scopeParams, after],
+    );
+    for (let at = 0; at < meta.length;) {
+      let take = 0;
+      let bytes = 0;
+      while (
+        at + take < meta.length &&
+        (take === 0 || bytes + Number(meta[at + take]!.n) <= PAGE_BYTES)
+      ) {
+        bytes += Number(meta[at + take]!.n);
+        take += 1;
+      }
+      const page = await deps.db.query<{ pk_hash: string; body: string }>(
+        `SELECT pk_hash, body FROM records
+          WHERE ${scope} AND pk_hash >= ? AND pk_hash <= ? ORDER BY pk_hash`,
+        [...scopeParams, meta[at]!.pk_hash, meta[at + take - 1]!.pk_hash],
+      );
+      for (const row of page)
+        omitted.push({
+          pkHash: row.pk_hash,
+          key: primaryKeyValues(JSON.parse(row.body), primaryKey) as LogKey,
+        });
+      at += take;
+    }
+    if (meta.length < META_ROWS) return omitted;
+    after = meta[meta.length - 1]!.pk_hash;
+  }
 }
 
 /** The hashes `omittedBy` names, for a comparison that needs no key. */
@@ -792,8 +858,13 @@ async function operationsFor(
   keys: readonly string[],
   from: number,
   to: number,
-): Promise<Map<string, LogOperation>> {
+): Promise<{
+  readonly ops: Map<string, LogOperation>;
+  /** Explicit deletes of these keys have no typed key and cannot be published. */
+  readonly untyped: string[];
+}> {
   const ops = new Map<string, LogOperation>();
+  const untyped: string[] = [];
   for (const group of chunked(keys, KEYS_PER_QUERY)) {
     const marks = group.map(() => "?").join(",");
     const rows = await deps.db.query<{
@@ -823,10 +894,11 @@ async function operationsFor(
     const deletes = await deps.db.query<{
       pk_hash: string;
       pk_values: string | null;
+      record_key: string;
       stamp_o: number;
       stamp_r: string;
     }>(
-      `SELECT pk_hash, pk_values, stamp_o, stamp_r, MAX(seq) FROM record_changes
+      `SELECT pk_hash, pk_values, record_key, stamp_o, stamp_r, MAX(seq) FROM record_changes
         WHERE connection_id = ? AND stream = ? AND seq > ? AND seq <= ?
           AND op = 'remove' AND explicit_delete = 1 AND pk_hash IN (${goneMarks})
         GROUP BY pk_hash`,
@@ -834,24 +906,65 @@ async function operationsFor(
     );
     for (const row of deletes) {
       // A delete made before `pk_values` existed has only the lossy string
-      // key; the log never carried it, so there is nothing to say.
-      if (row.pk_values === null) {
-        deps.logger.warn(
-          { connectionId, stream, pkHash: row.pk_hash },
-          "stream sync: an explicit delete has no typed key and is not published",
-        );
+      // key. The stream's declared key types give the typed key back from it,
+      // if the rebuilt tuple hashes to the record's hash; otherwise the log
+      // cannot name the deletion, and the caller must not acknowledge it.
+      const key =
+        row.pk_values !== null
+          ? (JSON.parse(row.pk_values) as LogKey)
+          : await declaredKey(deps, connectionId, stream, row);
+      if (key === null) {
+        untyped.push(row.pk_hash);
         continue;
       }
       ops.set(row.pk_hash, {
         kind: "delete",
         stream,
         pkHash: row.pk_hash,
-        key: JSON.parse(row.pk_values) as LogKey,
+        key,
         stamp: { o: row.stamp_o, r: row.stamp_r },
       });
     }
   }
-  return ops;
+  return { ops, untyped };
+}
+
+/**
+ * The typed key of a delete made before typed keys were kept: its record key
+ * read with the types the stream's schema declares for its key fields, and
+ * accepted only if it hashes to the delete's hash. `null` when the schema does
+ * not determine it (no declared types yet, a union, or data that disagrees
+ * with the schema).
+ */
+async function declaredKey(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  stream: string,
+  row: { pk_hash: string; record_key: string },
+): Promise<LogKey | null> {
+  const [state] = await deps.db.query<{
+    primary_key: string;
+    key_types: string | null;
+  }>(
+    "SELECT primary_key, key_types FROM stream_state WHERE connection_id = ? AND stream = ?",
+    [connectionId, stream],
+  );
+  if (!state || state.key_types === null) return null;
+  const primaryKey = JSON.parse(state.primary_key) as string[];
+  const key = keyFromRecordKey(
+    primaryKey,
+    JSON.parse(state.key_types) as (KeyFieldType | null)[],
+    row.record_key,
+  );
+  return key !== null &&
+    (await deletionKeyMatchesHash(
+      async (bytes) => sha256(bytes),
+      primaryKey,
+      key,
+      row.pk_hash,
+    ))
+    ? (key as LogKey)
+    : null;
 }
 
 /** Upserts, then deletes, each by key: one order for every writer. */

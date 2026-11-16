@@ -30,6 +30,7 @@ import {
   fetchSegment,
   recordKeyOfKey,
 } from "../../../core/src/localdb/log-apply.js";
+import { PAGE_BYTES } from "../../../core/src/localdb/encode.js";
 import { computeRecordKeyFromData } from "../../../core/src/storage/pdpp-records/record-key.js";
 import {
   applyConnection,
@@ -1840,20 +1841,92 @@ describe("log protocol: a deletion's key must be the key its hash names", () => 
     }
   });
 
-  it("an explicit delete made before the typed key was kept (a change with no pk_values) is not published", async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+  it("an explicit delete made before the typed key was kept is not acknowledged: the stream is held, nothing is lost, and once the key is known every reader converges", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
     const a = await w.device("a");
-    await a.run("run-1", [{ stream: sName(0), id: 7 }], { observedAt: 1100 });
+    const warnings: unknown[] = [];
+    (a.deps as { logger: unknown }).logger = {
+      info: () => {},
+      warn: (...args: unknown[]) => warnings.push(args),
+    };
+    const [s0, s1] = [sName(0), sName(1)];
+    await a.run(
+      "run-1",
+      [
+        { stream: s0, id: 7 },
+        { stream: s1, id: "x" },
+      ],
+      { observedAt: 1100 },
+    );
     await a.cycle();
-    await a.run("run-2", [{ stream: sName(0), id: 7, remove: true }], {
-      full: false,
-      covered: [sName(0)],
-      observedAt: 1200,
-    });
-    await a.db.query("UPDATE record_changes SET pk_values = NULL");
+    const reader = await joined(w, "r");
+    expect(await reader.records()).toHaveLength(2);
+
+    await a.run(
+      "run-2",
+      [
+        { stream: s0, id: 7, remove: true },
+        { stream: s1, id: "y" },
+      ],
+      { full: false, covered: [s0, s1], observedAt: 1200 },
+    );
+    // The delete was made before typed keys were kept.
+    await a.db.query(
+      "UPDATE record_changes SET pk_values = NULL WHERE op = 'remove'",
+    );
+    const watermark = async () =>
+      a.db.query<{ stream: string; publish_watermark: number }>(
+        "SELECT stream, publish_watermark FROM stream_state ORDER BY stream",
+      );
+    const before = await watermark();
     await a.cycle();
-    const ops = [...(await w.segments()).values()].flatMap((g) => g.operations);
-    expect(ops.filter((o) => o.kind === "delete")).toEqual([]);
+
+    // Not published, not acknowledged: the change is still owed to the log.
+    const ops = () =>
+      w.segments().then((m) => [...m.values()].flatMap((g) => g.operations));
+    expect((await ops()).filter((o) => o.kind === "delete")).toEqual([]);
+    const held = await watermark();
+    expect(held.find((r) => r.stream === s0)).toEqual(
+      before.find((r) => r.stream === s0),
+    );
+    expect(
+      await a.db.query(
+        "SELECT 1 FROM record_changes WHERE stream = ? AND op = 'remove' AND explicit_delete = 1",
+        [s0],
+      ),
+    ).toHaveLength(1);
+    expect(warnings).toHaveLength(1);
+    expect(JSON.stringify(warnings)).toContain("explicit delete");
+    expect(JSON.stringify(warnings)).toContain(`stream \\"${s0}\\"`);
+    // The other stream is not held by it.
+    await reader.cycle();
+    expect(await reader.records()).toEqual(
+      expect.arrayContaining([expect.stringContaining(`${s1}/y=`)]),
+    );
+    // The reader still holds the record the delete would remove, and says so
+    // by the log having nothing for it: this is why the change is kept owed.
+    expect(await reader.records()).toEqual(
+      expect.arrayContaining([expect.stringContaining(`${s0}/7=`)]),
+    );
+
+    // Once its typed key is known the delete is published and acknowledged,
+    // and a fresh reader that replays the whole log lacks the record.
+    await a.db.query(
+      "UPDATE record_changes SET pk_values = '[7]' WHERE op = 'remove' AND pk_values IS NULL",
+    );
+    await a.cycle();
+    expect((await ops()).filter((o) => o.kind === "delete")).toMatchObject([
+      { stream: s0, pkHash: await idHash(7), key: [7] },
+    ]);
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    await reader.cycle();
+    for (const d of [fresh, reader]) {
+      expect(await d.records()).toEqual(await a.records());
+      expect(await d.records()).not.toEqual(
+        expect.arrayContaining([expect.stringContaining(`${s0}/7=`)]),
+      );
+    }
   });
 
   it("a delete and an omission of a numeric key carry the number, and a reader derives the same record key", async () => {
@@ -1899,5 +1972,208 @@ describe("log protocol: a deletion's key must be the key its hash names", () => 
       ["7", 2],
       ["8", 0],
     ]);
+  });
+});
+
+describe("log protocol: an omission reads a bounded page of bodies", () => {
+  it("many omitted rows with large bodies are read a page at a time, and only their keys are kept", async () => {
+    const SEEN = sName(0);
+    const count = 60;
+    const pad = 100_000; // 6 MB of bodies, three times a page
+    const w = await world({ streams: 1, logProtocol: true });
+    const a = await w.device("a");
+    await a.run(
+      "run-1",
+      Array.from({ length: count }, (_, i) => ({
+        stream: SEEN,
+        id: `k${i}`,
+        pad,
+      })),
+      { observedAt: 1100 },
+    );
+    await a.cycle();
+    await a.run("run-2", [{ stream: SEEN, id: "k0", pad }], {
+      observedAt: 1200,
+    });
+
+    const bodyReads: number[] = [];
+    const real = a.db.query.bind(a.db);
+    (a.db as { query: unknown }).query = async (
+      sql: string,
+      params?: unknown[],
+    ) => {
+      const rows = await real(sql, params as never);
+      if (/SELECT pk_hash, body FROM records/.test(sql))
+        bodyReads.push(
+          (rows as { body: string }[]).reduce((n, r) => n + r.body.length, 0),
+        );
+      return rows;
+    };
+    await a.cycle();
+
+    const completion = [...(await w.segments()).values()]
+      .flatMap((g) => g.operations)
+      .find((o) => o.kind === "complete" && o.omitted.length > 0) as
+      { omitted: { pkHash: string; key: unknown[] }[] } | undefined;
+    expect(completion!.omitted.map((o) => o.key[0]).sort()).toEqual(
+      Array.from({ length: count - 1 }, (_, i) => `k${i + 1}`).sort(),
+    );
+    const total = bodyReads.reduce((n, b) => n + b, 0);
+    expect(total).toBeGreaterThan(2 * PAGE_BYTES);
+    expect(bodyReads.length).toBeGreaterThanOrEqual(3);
+    expect(Math.max(...bodyReads)).toBeLessThanOrEqual(PAGE_BYTES);
+  });
+});
+
+// A key the log must carry the same at the writer and at the reader, or
+// refuse at both: through the real writer, the segment and the real reader.
+describe("log protocol: adversarial key values converge", () => {
+  const accents = ["\u00e9", "e\u0301"]; // precomposed, decomposed
+  const ids: (string | number)[] = [-0, 1, 9007199254740992, ...accents];
+  const ONE = sName(0);
+
+  it("an explicit delete of each removes it for a reader that held it, and for a fresh one", async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    const a = await w.device("a");
+    await a.run(
+      "run-1",
+      ids.map((id) => ({ stream: ONE, id })),
+      { observedAt: 1100 },
+    );
+    await a.cycle();
+    const held = await joined(w, "held");
+    expect(await held.records()).toHaveLength(ids.length);
+    await a.run(
+      "run-2",
+      ids.map((id) => ({ stream: ONE, id, remove: true })),
+      { full: false, covered: [ONE], observedAt: 1200 },
+    );
+    await a.cycle();
+    await held.cycle();
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    expect(await a.records()).toEqual([]);
+    expect(await held.records()).toEqual([]);
+    expect(await fresh.records()).toEqual([]);
+    // Each delete named the key its hash was computed from.
+    const deletes = [...(await w.segments()).values()]
+      .flatMap((g) => g.operations)
+      .filter((o) => o.kind === "delete") as {
+      pkHash: string;
+      key: (string | number)[];
+    }[];
+    expect(deletes.map((d) => d.key[0]).sort()).toEqual(
+      [0, 1, 9007199254740992, ...accents].sort(),
+    );
+    for (const d of deletes) expect(d.pkHash).toBe(await idHash(d.key[0]!));
+  });
+
+  it("an omission of each drops it for a reader that held it, and for a fresh one", async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    const a = await w.device("a");
+    await a.run(
+      "run-1",
+      [...ids, "keep"].map((id) => ({ stream: ONE, id })),
+      { observedAt: 1100 },
+    );
+    await a.cycle();
+    const held = await joined(w, "held");
+    expect(await held.records()).toHaveLength(ids.length + 1);
+    await a.run("run-2", [{ stream: ONE, id: "keep" }], { observedAt: 1200 });
+    await a.cycle();
+    await held.cycle();
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    for (const d of [a, held, fresh])
+      expect(await d.records()).toEqual([`${ONE}/keep={"id":"keep"}`]);
+  });
+});
+
+// A delete made before typed keys were kept is held back unless the stream's
+// declared key types give its key back, and then only if that key hashes to the
+// delete's hash.
+describe("log protocol: the declared key types release an untyped delete", () => {
+  const ONE = sName(0);
+  /** Key 7 published, deleted, and the delete's typed key lost, as before the column. */
+  const legacyDelete = async (
+    keyTypes?: ("string" | "number" | "integer" | "boolean" | null)[],
+  ) => {
+    const w = await world({
+      streams: 1,
+      logProtocol: true,
+      ...(keyTypes ? { keyTypes } : {}),
+    });
+    const a = await w.device("a");
+    const warnings: string[] = [];
+    (a.deps as { logger: unknown }).logger = {
+      info: () => {},
+      warn: (_fields: unknown, message: string) => warnings.push(message),
+    };
+    await a.run("run-1", [{ stream: ONE, id: 7 }], { observedAt: 1100 });
+    await a.cycle();
+    const reader = await joined(w, "r");
+    await a.run("run-2", [{ stream: ONE, id: 7, remove: true }], {
+      full: false,
+      covered: [ONE],
+      observedAt: 1200,
+    });
+    await a.db.query("UPDATE record_changes SET pk_values = NULL");
+    await a.cycle();
+    const deletes = async () =>
+      [...(await w.segments()).values()]
+        .flatMap((g) => g.operations)
+        .filter((o) => o.kind === "delete");
+    return { w, a, reader, warnings, deletes };
+  };
+  const converged = async (
+    w: Awaited<ReturnType<typeof world>>,
+    a: Device,
+    reader: Device,
+  ) => {
+    await reader.cycle();
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    for (const d of [reader, fresh])
+      expect(await d.records()).toEqual(await a.records());
+    expect(await a.records()).toEqual([]);
+  };
+
+  it("an integer key declared by the schema is rebuilt from the record key, published, and every reader converges", async () => {
+    const { w, a, reader, warnings, deletes } = await legacyDelete(["integer"]);
+    expect(
+      (
+        await a.db.query<{ key_types: string }>(
+          "SELECT key_types FROM stream_state",
+        )
+      )[0]!.key_types,
+    ).toBe('["integer"]');
+    expect(await deletes()).toMatchObject([
+      { stream: ONE, pkHash: await idHash(7), key: [7] },
+    ]);
+    expect(warnings).toEqual([]);
+    await converged(w, a, reader);
+  });
+
+  it("the same delete is held when the schema declares no type for the key", async () => {
+    const { w, a, reader, warnings, deletes } = await legacyDelete();
+    expect(await deletes()).toEqual([]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(`stream "${ONE}"`);
+    expect(await reader.cycle().then(() => reader.records())).toHaveLength(1);
+    // The next run that declares the types releases it.
+    await a.db.query("UPDATE stream_state SET key_types = '[\"integer\"]'");
+    await a.cycle();
+    expect(await deletes()).toMatchObject([{ key: [7] }]);
+    await converged(w, a, reader);
+  });
+
+  it("is held when the data disagrees with the declared type: the rebuilt key does not hash to the delete's hash", async () => {
+    const { a, reader, warnings, deletes } = await legacyDelete(["string"]);
+    expect(await deletes()).toEqual([]);
+    expect(warnings).toHaveLength(1);
+    expect(await reader.cycle().then(() => reader.records())).toHaveLength(1);
+    expect(await a.db.query("SELECT 1 FROM record_changes")).not.toHaveLength(
+      0,
+    );
   });
 });

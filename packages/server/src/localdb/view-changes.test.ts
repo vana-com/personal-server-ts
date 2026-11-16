@@ -932,6 +932,7 @@ describe("view changes", () => {
       // The log's typed deletion keys are columns on tables that stay.
       { sql: "ALTER TABLE run_rows DROP COLUMN pk_values" },
       { sql: "ALTER TABLE record_changes DROP COLUMN pk_values" },
+      { sql: "ALTER TABLE stream_state DROP COLUMN key_types" },
       { sql: `PRAGMA user_version = ${viewMigration}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");

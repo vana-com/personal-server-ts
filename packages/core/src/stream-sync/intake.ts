@@ -1,7 +1,10 @@
 /** Shared run-intake contract for Node, Lite and native hosts.
  * P03/P04 own persistence and lifecycle; hosts compose the database facade.
  */
-import type { JsonValue } from "@opendatalabs/personal-server-ts-stream-sync";
+import type {
+  JsonValue,
+  KeyFieldType,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 
 /** What `end` can answer (V2 §2.3). */
 export type EndResult =
@@ -75,6 +78,12 @@ export interface IntakeStreamDeclaration {
   readonly consentTimeField?: string;
   /** Collection profile §3.5. Missing declarations never authorize deletion. */
   readonly coverageStrategy?: CoverageStrategy;
+  /**
+   * The type the stream's schema declares for each primary-key field, in key
+   * order; `null` where it declares none (or several). Lets a delete made
+   * before typed keys were kept name its typed key (see `keyFromRecordKey`).
+   */
+  readonly keyTypes?: readonly (KeyFieldType | null)[];
 }
 
 export interface IntakeDeclarations {

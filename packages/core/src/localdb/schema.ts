@@ -427,5 +427,9 @@ END`,
     // before the column: its typed key is gone, and the log never carried it.
     `ALTER TABLE run_rows ADD COLUMN pk_values TEXT`,
     `ALTER TABLE record_changes ADD COLUMN pk_values TEXT`,
+    // The types the stream's schema declares for its key fields (JSON array of
+    // type names or null), from the latest run's declarations. With the record
+    // key they give a delete made before `pk_values` its typed key back.
+    `ALTER TABLE stream_state ADD COLUMN key_types TEXT`,
   ],
 ];

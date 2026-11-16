@@ -416,6 +416,14 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
                 d.incremental === false ? 0 : 1,
               ],
             },
+            ...(d.keyTypes
+              ? [
+                  {
+                    sql: "UPDATE stream_state SET key_types=? WHERE connection_id=? AND stream=?",
+                    params: [JSON.stringify(d.keyTypes), id, d.name],
+                  },
+                ]
+              : []),
             {
               sql: `INSERT INTO run_streams(run_id,stream,delete_snapshot,basis_version,basis_generation,basis_data_hash,primary_key,profile_key,profile_version,full_read,coverage_strategy,semantics)
             SELECT ?,stream,last_delete_version,CASE WHEN head_version>0 THEN head_version ELSE NULL END,CASE WHEN head_version>0 THEN head_generation ELSE ? END,head_data_hash,?,NULL,?,?,?,?

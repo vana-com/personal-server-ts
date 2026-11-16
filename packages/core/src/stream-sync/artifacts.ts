@@ -14,6 +14,7 @@
 
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex } from "@noble/hashes/utils";
+import type { KeyFieldType } from "@opendatalabs/personal-server-ts-stream-sync";
 import type {
   CoverageStrategy,
   IntakeDeclarations,
@@ -62,6 +63,7 @@ interface DeclaredStreamShape {
   readonly incremental?: unknown;
   readonly coverage_strategy?: CoverageStrategy;
   readonly consent_time_field?: unknown;
+  readonly key_types?: readonly (KeyFieldType | null)[];
 }
 
 function streamDeclaration(
@@ -76,6 +78,9 @@ function streamDeclaration(
       ? { coverageStrategy: stream.coverage_strategy }
       : {}),
     ...(stream.incremental === false ? { incremental: false } : {}),
+    ...(stream.key_types?.some((t) => t !== null)
+      ? { keyTypes: stream.key_types }
+      : {}),
     ...(typeof stream.consent_time_field === "string" &&
     stream.consent_time_field !== ""
       ? { consentTimeField: stream.consent_time_field }
@@ -93,6 +98,33 @@ function nonEmptyStrings(value: unknown): value is string[] {
     value.length > 0 &&
     value.every((part) => typeof part === "string" && part !== "")
   );
+}
+
+const KEY_FIELD_TYPES: readonly string[] = [
+  "string",
+  "number",
+  "integer",
+  "boolean",
+];
+
+/**
+ * The type a stream's embedded schema declares for each primary-key field:
+ * one plain type name, else `null` (no schema, no property, a union, or a type
+ * the key cannot be).
+ */
+function keyTypesOf(
+  schema: unknown,
+  primaryKey: readonly string[],
+): (KeyFieldType | null)[] {
+  const properties =
+    isRecord(schema) && isRecord(schema.properties) ? schema.properties : {};
+  return primaryKey.map((field) => {
+    const property = properties[field];
+    const type = isRecord(property) ? property.type : undefined;
+    return typeof type === "string" && KEY_FIELD_TYPES.includes(type)
+      ? (type as KeyFieldType)
+      : null;
+  });
 }
 
 /**
@@ -147,6 +179,7 @@ export function manifestArtifact(document: string): VerifiedArtifact | null {
         coverage_strategy: stream.coverage_strategy as
           CoverageStrategy | undefined,
         consent_time_field: stream.consent_time_field,
+        key_types: keyTypesOf(stream.schema, stream.primary_key),
       }),
     );
   }
