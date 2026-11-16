@@ -1,0 +1,197 @@
+{
+  "format": 1,
+  "routes": [
+    {
+      "path": "/.well-known/oauth-authorization-server",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/.well-known/oauth-authorization-server/pdpp/v1",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/.well-known/oauth-protected-resource/mcp",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/auth/device",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/auth/device/approve",
+      "hosts": ["lite"]
+    },
+    {
+      "path": "/auth/device/poll",
+      "hosts": ["lite"]
+    },
+    {
+      "path": "/auth/device/token",
+      "hosts": ["lite"]
+    },
+    {
+      "path": "/enclave/v1/fleet",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/enclave/v1/jobs",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/enclave/v1/mcp",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/health",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/mcp",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/mcp/oauth/authorize",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/mcp/oauth/register",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/mcp/oauth/token",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/mcp/session",
+      "hosts": ["lite"]
+    },
+    {
+      "path": "/oauth/token",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/pdpp",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/pdpp/capabilities",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/pdpp/connections",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/pdpp/v1",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/pdpp/v1/blobs",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/ui",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/ui/api",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/ui/api/config",
+      "hosts": ["lite"]
+    },
+    {
+      "path": "/v1/access-logs",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/v1/account-mode",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/v1/account-mode/evidence",
+      "hosts": ["lite"]
+    },
+    {
+      "path": "/v1/blobs",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/v1/data",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/v1/derivatives",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/v1/diagnostics",
+      "hosts": ["lite"]
+    },
+    {
+      "path": "/v1/grants",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/v1/import/oura-browser",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/v1/import/oura-browser/requirements",
+      "hosts": ["lite"]
+    },
+    {
+      "path": "/v1/mcp/activity",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/v1/mcp/connections",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/v1/mcp/oauth/authorizations",
+      "hosts": ["lite"]
+    },
+    {
+      "path": "/v1/owner/connectors",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/v1/replication/status",
+      "hosts": ["lite"]
+    },
+    {
+      "path": "/v1/replication/sync",
+      "hosts": ["lite"]
+    },
+    {
+      "path": "/v1/stream-sync",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/v1/stream-sync/read-status",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/v1/stream-sync/runs",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/v1/stream-sync/seed",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/v1/sync",
+      "hosts": ["lite", "server"]
+    },
+    {
+      "path": "/v1/write",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/v1/write/session",
+      "hosts": ["lite"]
+    }
+  ]
+}
