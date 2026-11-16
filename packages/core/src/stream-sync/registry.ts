@@ -516,8 +516,9 @@ export function createGatewayStreamSyncRegistry(
         params.set("after", after);
         params.set("wait", String(Math.max(0, Math.round(waitMs / 1000))));
       }
-      if (since !== undefined && DECIMAL.test(since))
-        params.set("since", since);
+      const sent =
+        since !== undefined && DECIMAL.test(since) ? since : undefined;
+      if (sent !== undefined) params.set("since", sent);
       const res = await fetchImpl(
         `${base}/v1/data/changes?${params.toString()}`,
         { signal },
@@ -552,17 +553,18 @@ export function createGatewayStreamSyncRegistry(
       ) {
         throw new Error("registry change answer is not {seq, changed}");
       }
-      // The delta is an optimisation: one this client cannot read is left
-      // out, and the caller reads the registry as it would without one.
-      const delta =
-        body.changed && since !== undefined
-          ? parseDelta(body.delta, since, body.seq)
-          : undefined;
-      return {
-        seq: body.seq,
-        changed: body.changed,
-        ...(delta && { delta }),
-      };
+      // A changed answer to a request that sent `since` carries its delta
+      // (rows or reset). One that does not, or carries another request's, or
+      // one this client cannot read, fails the request: the push then pokes a
+      // full pull on its next answer.
+      if (!body.changed || sent === undefined)
+        return { seq: body.seq, changed: body.changed };
+      const delta = parseDelta(body.delta, sent, body.seq);
+      if (delta === undefined)
+        throw new Error(
+          `registry change answer has no readable delta for since=${sent}`,
+        );
+      return { seq: body.seq, changed: true, delta };
     },
 
     listConnectionRows: (connector, ns) =>
@@ -579,7 +581,8 @@ const DECIMAL = /^(0|[1-9]\d*)$/;
 
 /**
  * The `delta` of a changed answer, or `undefined` when there is none or it is
- * not the delta of this request (another `since`) or not well formed. Rows are
+ * not the delta of this request (another `since`) or not well formed (the
+ * caller refuses the answer). Rows are
  * read as the listing's rows are: a row whose version or hashes are not valid
  * makes the whole delta unreadable, never a partial one.
  */

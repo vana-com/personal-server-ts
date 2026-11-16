@@ -1004,10 +1004,14 @@ describe("waitForChange with since", () => {
       { since: "3", reset: false, rows: [], serversChanged: false },
     ],
     ["not an object", "delta"],
-  ])("a delta %s is left out, never half read", async (_name, delta) => {
-    const { wait } = answering({ seq: "5", changed: true, delta });
-    expect(await wait("3")).toEqual({ seq: "5", changed: true });
-  });
+    ["missing (mutation: a missing delta read as none)", undefined],
+  ])(
+    "a changed answer to a since with a delta %s fails the request, never half read",
+    async (_name, delta) => {
+      const { wait } = answering({ seq: "5", changed: true, delta });
+      await expect(wait("3")).rejects.toThrow(/delta/);
+    },
+  );
 
   it("an unchanged answer carries no delta", async () => {
     const { wait } = answering({

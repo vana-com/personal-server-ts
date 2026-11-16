@@ -244,7 +244,7 @@ describe("a change delta", () => {
     await t.manager.stop();
   });
 
-  it("an answer without a delta runs the cycle, as before", async () => {
+  it("a poke without a delta (the first answer after a failure) runs the cycle", async () => {
     const t = setup();
     await settled(t);
     await answer(t, undefined, "8");
