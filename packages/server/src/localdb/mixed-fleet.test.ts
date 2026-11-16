@@ -247,3 +247,79 @@ describe("applying one stream of a connection that keeps its data in a log", () 
     });
   }
 });
+
+describe("a device with the flag off, on a connection whose log is on", () => {
+  // The cycle is the only publisher a build runs. A connection that has a log
+  // is never published as a per-stream head: not by a device that has never
+  // read the log, and not by one that switched its flag off after writing it.
+  const headVersions = (w: Awaited<ReturnType<typeof world>>) =>
+    new Map(
+      streamRows(w).map((scope) => [scope, w.gateway.rowsOf(scope)] as const),
+    );
+
+  it("a device with an older per-stream head and the connection's data holds no newer head: it publishes through the log", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    // The device published a head of its own before any log existed.
+    const old = await w.device("old", false);
+    await old.run("run-b0", [{ stream: sName(1), id: "b-0" }], {
+      full: false,
+      covered: [sName(1)],
+    });
+    await old.cycle();
+    const headsBefore = headVersions(w);
+    expect([...headsBefore.values()]).toEqual([1]);
+    // Another device starts the log on the connection.
+    const a = await w.device("a", true);
+    await a.cycle();
+    await a.run("run-a1", [{ stream: sName(0), id: "a-1" }], {
+      full: false,
+      covered: [sName(0)],
+    });
+    await a.cycle();
+    expect(w.gateway.rowsOf(LOG)).toBe(1);
+    // The old device never read the log. It writes the stream it already
+    // published a head for, and cycles.
+    await old.run("run-b1", [{ stream: sName(1), id: "b-1" }], {
+      full: false,
+      covered: [sName(1)],
+    });
+    await old.cycle();
+    // No head moved; the write is in the log; a fresh device reads all of it.
+    expect(headVersions(w)).toEqual(headsBefore);
+    expect(w.gateway.rowsOf(LOG)).toBe(2);
+    await a.cycle();
+    const fresh = await w.device("fresh", false);
+    await fresh.cycle();
+    for (const device of [old, a, fresh])
+      expect(ids(await device.records())).toEqual([
+        "s0/a-1",
+        "s1/b-0",
+        "s1/b-1",
+      ]);
+  });
+
+  it("switching a device's flag from on to off keeps its writes in the log and fails nothing", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    const a = await w.device("a", true);
+    await a.run("run-a1", [{ stream: sName(0), id: "a-1" }]);
+    await a.cycle();
+    expect(w.gateway.rowsOf(LOG)).toBe(1);
+    (a.deps as { logProtocol?: boolean }).logProtocol = false;
+    await a.run("run-a2", [{ stream: sName(0), id: "a-2" }], {
+      full: false,
+      covered: [sName(0)],
+    });
+    const report = await a.sync.cycle();
+    expect(report.connections.map((c) => c.error)).toEqual([null]);
+    expect(streamRows(w)).toEqual([]);
+    expect(w.gateway.rowsOf(LOG)).toBe(2);
+    const stored = await a.db.query(
+      "SELECT COUNT(*) AS n FROM stream_versions WHERE connection_id = ?",
+      [CONNECTION_ID],
+    );
+    expect(stored).toBeDefined();
+    const fresh = await w.device("fresh", false);
+    await fresh.cycle();
+    expect(ids(await fresh.records())).toEqual(["s0/a-1", "s0/a-2"]);
+  });
+});
