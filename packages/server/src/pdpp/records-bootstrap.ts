@@ -1,3 +1,4 @@
+import { connectorOfSourceId } from "@opendatalabs/personal-server-ts-core/api";
 import type { ConnectionLink } from "@opendatalabs/personal-server-ts-core/localdb";
 /**
  * Boot the PDPP Resource Server for a real Personal Server.
@@ -112,11 +113,6 @@ export function resolveReplication(
       status: { state: "refused", refusal: error.reason },
     };
   }
-}
-
-/** The connector a source id names: its last path segment. */
-function connectorOf(sourceId: string): string | undefined {
-  return sourceId.split("/").filter(Boolean).at(-1);
 }
 
 export interface PdppRecordsDeps {
@@ -413,12 +409,13 @@ export function createPdppRecordsDeps(
         (candidate) => candidate.sourceId === binding.sourceId,
       );
       if (!source || !sourceRegistry.get(stream, source.sourceId)) return null;
-      const connector = connectorOf(source.sourceId);
+      const connector = connectorOfSourceId(source.sourceId);
       return connector ? { connector, namespace: "" } : null;
     },
     sourceIdForConnector: (connector) =>
-      sources.find((source) => connectorOf(source.sourceId) === connector)
-        ?.sourceId,
+      sources.find(
+        (source) => connectorOfSourceId(source.sourceId) === connector,
+      )?.sourceId,
     store,
     // Without a replica receiver every reader reads the canonical store.
     reads: options.replica?.reads ?? (() => store),

@@ -1,4 +1,6 @@
 import {
+  assertSupportedPdppVersion,
+  connectorOfSourceId,
   listPdppRecords,
   type OwnedAccountStorageMode,
   type PdppRecordListPorts,
@@ -35,6 +37,16 @@ export async function handleLitePdppRecordList(
     "PDPP-Version": PDPP_VERSION,
     "Cache-Control": "private, no-store",
   };
+  try {
+    // Negotiated before authentication and any query, as on Node.
+    assertSupportedPdppVersion(request.headers.get("PDPP-Version"));
+  } catch (error) {
+    if (!(error instanceof PdppError)) throw error;
+    return Response.json(error.toJSON(requestId), {
+      status: error.status,
+      headers,
+    });
+  }
   await deps.authorizeOwner(request);
   try {
     const subjectId = deps.ownerAddress();
@@ -56,15 +68,22 @@ export async function handleLitePdppRecordList(
       connector,
       namespace: "",
     }));
+    const connectors = await local.declarations.connectors();
     const ports: PdppRecordListPorts = {
       accountMode: deps.accountStorageMode,
       recordQuery: linked,
-      declarations: liteDeclarations(
-        local.declarations,
-        await local.declarations.connectors(),
-      ),
-      ownerInstances: (_context, source) =>
-        source === undefined || source === "" ? [] : [source],
+      declarations: liteDeclarations(local.declarations, connectors),
+      // `source` names a connector or its canonical source id. An id the
+      // store has no connection for stays as given and matches nothing, so
+      // it answers like a source the caller may not read.
+      ownerInstances: (_context, source) => {
+        if (source === undefined || source === "") return [];
+        if (connectors.includes(source)) return [source];
+        const connector = connectorOfSourceId(source);
+        return connector !== undefined && connectors.includes(connector)
+          ? [connector]
+          : [source];
+      },
     };
     const result = await listPdppRecords(ports, {
       url: request.url,

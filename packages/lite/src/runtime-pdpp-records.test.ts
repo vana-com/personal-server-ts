@@ -7,6 +7,7 @@
  * Stubbed: the PDPP token resolver on the Node side.
  */
 import { afterEach, describe, expect, it } from "vitest";
+import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import {
   createModeAuthority,
   createMemoryModeRecordStore,
@@ -263,5 +264,108 @@ describe("Node and Lite serve identical pages for one store", () => {
     expect(withoutRequestId(await lite.json())).toEqual(
       withoutRequestId(await node.json()),
     );
+  });
+
+  it("answers the canonical source id like its connector id", async () => {
+    const local = await switchedStore();
+    const runtime = await liteRuntime(local);
+    const app = nodeApp(local);
+    const path = `/v1/streams/posts/records?limit=3&source=${encodeURIComponent(SOURCE_ID)}`;
+    const [lite, node] = [
+      await liteGet(runtime, path),
+      await nodeGet(app, path),
+    ];
+    expect(lite.status).toBe(200);
+    expect(node.status).toBe(200);
+    const body = await lite.json();
+    expect(body).toEqual(await node.json());
+    expect(body.data.map((row: { id: string }) => row.id)).toEqual(
+      POSTS.slice(0, 3).map((post) => post.id),
+    );
+  });
+
+  it("answers an unknown canonical source id as a source the caller may not read", async () => {
+    const local = await switchedStore();
+    const path = `/v1/streams/posts/records?source=${encodeURIComponent("https://registry.test/connectors/other")}`;
+    const lite = await liteGet(await liteRuntime(local), path);
+    const node = await nodeGet(nodeApp(local), path);
+    expect(lite.status).toBe(403);
+    expect(lite.status).toBe(node.status);
+  });
+});
+
+describe("PDPP-Version negotiation on both hosts", () => {
+  /** A store whose record queries are counted. */
+  async function countedStore() {
+    const base = await switchedStore();
+    const calls = { queries: 0 };
+    const counted = Object.create(base) as LocalSync;
+    counted.recordsFor = ((link: Parameters<LocalSync["recordsFor"]>[0]) => {
+      const query = base.recordsFor(link);
+      return Object.create(query, {
+        listRecords: {
+          value: (...args: unknown[]) => {
+            calls.queries++;
+            return (query.listRecords as (...a: unknown[]) => unknown)(...args);
+          },
+        },
+      });
+    }) as LocalSync["recordsFor"];
+    return { local: counted, calls };
+  }
+
+  async function get(
+    host: "lite" | "node",
+    local: LocalSync,
+    version: string | undefined,
+  ) {
+    const path = `/v1/streams/posts/records?source=${CONNECTOR}`;
+    const headers: Record<string, string> =
+      version === undefined ? {} : { "PDPP-Version": version };
+    if (host === "node") {
+      return nodeApp(local).request(path.replace(/^\/v1/, ""), {
+        headers: { Authorization: "Bearer owner", ...headers },
+      });
+    }
+    const runtime = await liteRuntime(local);
+    const auth = await buildWeb3SignedHeader({
+      wallet: owner,
+      aud: ORIGIN,
+      method: "GET",
+      uri: path.split("?")[0]!,
+    });
+    return runtime.fetch(
+      new Request(`${ORIGIN}${path}`, {
+        headers: { Authorization: auth, ...headers },
+      }),
+    );
+  }
+
+  it.each(["lite", "node"] as const)(
+    "%s: serves a missing or supported version",
+    async (host) => {
+      for (const version of [undefined, PDPP_VERSION]) {
+        const { local, calls } = await countedStore();
+        const response = await get(host, local, version);
+        expect(response.status).toBe(200);
+        expect(calls.queries).toBeGreaterThan(0);
+      }
+    },
+  );
+
+  it("refuses an unsupported version with the same answer and no query", async () => {
+    const [lite, node] = [await countedStore(), await countedStore()];
+    const liteResponse = await get("lite", lite.local, "9999-01-01");
+    const nodeResponse = await get("node", node.local, "9999-01-01");
+    expect(liteResponse.status).toBe(400);
+    expect(liteResponse.status).toBe(nodeResponse.status);
+    const strip = (body: { error: Record<string, unknown> }) => ({
+      error: { ...body.error, request_id: undefined },
+    });
+    expect(strip(await liteResponse.json())).toEqual(
+      strip(await nodeResponse.json()),
+    );
+    expect(lite.calls.queries).toBe(0);
+    expect(node.calls.queries).toBe(0);
   });
 });
