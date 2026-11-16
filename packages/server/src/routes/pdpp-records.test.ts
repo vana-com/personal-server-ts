@@ -1017,32 +1017,44 @@ describe("pdpp records routes: tombstones", () => {
     async (mode) => {
       const store = createMemoryRecordStore();
       store.ingestBatch(
-        [{
-          instance: "inst_1", stream: "playlists", key: "pl_1",
-          data: { id: "pl_1", name: "v1" },
-          emitted_at: "2026-04-01T00:00:00.000Z",
-        }],
+        [
+          {
+            instance: "inst_1",
+            stream: "playlists",
+            key: "pl_1",
+            data: { id: "pl_1", name: "v1" },
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
         () => "mutable_state",
         () => ["id"],
       );
       const deleteRecord = vi.spyOn(store, "deleteRecord");
-      const { app } = buildApp({
-        "owner-tok": {
-          active: true, tokenKind: "owner", subjectId: "sub_1",
-          instanceIds: ["inst_1"],
+      const { app } = buildApp(
+        {
+          "owner-tok": {
+            active: true,
+            tokenKind: "owner",
+            subjectId: "sub_1",
+            instanceIds: ["inst_1"],
+          },
         },
-      }, {
-        store,
-        accountStorageMode: { owner: "sub_1", read: () => mode },
-      });
+        {
+          store,
+          accountStorageMode: { owner: "sub_1", read: () => mode },
+        },
+      );
       const headers = { Authorization: "Bearer owner-tok" };
       try {
         const removed = await app.request("/streams/playlists/records/pl_1", {
-          method: "DELETE", headers,
+          method: "DELETE",
+          headers,
         });
         if (mode === "switched") {
           const post = await app.request("/streams/playlists/records/ingest", {
-            method: "POST", headers, body: "not json",
+            method: "POST",
+            headers,
+            body: "not json",
           });
           expect(post.status).toBe(426);
           expect(removed.status).toBe(post.status);
@@ -1053,9 +1065,13 @@ describe("pdpp records routes: tombstones", () => {
         } else {
           expect(removed.status).toBe(204);
           expect(deleteRecord).toHaveBeenCalledTimes(1);
-          const missing = await app.request("/streams/playlists/records/missing", {
-            method: "DELETE", headers,
-          });
+          const missing = await app.request(
+            "/streams/playlists/records/missing",
+            {
+              method: "DELETE",
+              headers,
+            },
+          );
           expect(missing.status).toBe(404);
           expect(deleteRecord).toHaveBeenCalledTimes(2);
         }
