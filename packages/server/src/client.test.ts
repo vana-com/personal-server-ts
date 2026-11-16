@@ -40,6 +40,7 @@ const heldWrite = vi.hoisted(() => {
     closeAwaitedNow: () => void;
     closeSettled: boolean;
     temporaryOpens: number;
+    updateAfterClose?: (id: string) => Promise<unknown>;
   } = {
     armed: false,
     reached: Promise.resolve(),
@@ -64,6 +65,8 @@ vi.mock("./mcp/local-state.js", async (importOriginal) => {
     ) => {
       const state = await actual.openLocalMcpState(...args);
       const close = state.close.bind(state);
+      heldWrite.updateAfterClose = (id) =>
+        state.connections.update(id, { lastUsedAt: new Date().toISOString() });
       state.close = () => {
         const drained = close();
         const settled = () => {
@@ -802,9 +805,16 @@ describe("startPersonalServer node handle", () => {
       expect(ps.stop()).toBe(stopping);
       expect(heldWrite.temporaryOpens).toBe(opensBefore);
 
+      expect(heldWrite.updateAfterClose).toBeTypeOf("function");
+      await expect(heldWrite.updateAfterClose!(connectionId)).rejects.toThrow(
+        "MCP state is closed",
+      );
       heldWrite.release();
       await stopping;
       expect(heldWrite.closeSettled).toBe(true);
+      await expect(heldWrite.updateAfterClose!(connectionId)).rejects.toThrow(
+        "MCP state is closed",
+      );
       // The write landed before stop resolved, and no temp file is left.
       const after = await readdir(directory);
       expect(after).toContain("mcp-state.json");
