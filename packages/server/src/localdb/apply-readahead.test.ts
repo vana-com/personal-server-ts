@@ -152,14 +152,7 @@ it("gives its memory back when the apply fails", async () => {
     "apply: missing part blob",
   );
   // The budget is whole again: a reservation of all of it does not wait.
-  const whole = f.deps.blobs.governor.reserve(
-    DEFAULT_STORAGE_ACCESS_POLICY.maxBytesInFlight,
-  );
-  const outcome = await Promise.race([
-    whole.then((release) => (release(), "granted")),
-    new Promise((resolve) => setTimeout(() => resolve("waiting"), 100)),
-  ]);
-  expect(outcome).toBe("granted");
+  await reacquire(f, DEFAULT_STORAGE_ACCESS_POLICY.maxBytesInFlight);
 });
 
 it("commits the first part alone, then the parts it has already fetched together", async () => {
@@ -237,11 +230,7 @@ it("gives its memory back when a continuation part of a record is missing", asyn
   await expect(deadline(applyConnection(f.deps, f.id))).rejects.toThrow(
     "apply: missing part blob",
   );
-  const whole = await Promise.race([
-    f.deps.blobs.governor.reserve(2 * 3 * 300).then((r) => (r(), "granted")),
-    new Promise((resolve) => setTimeout(() => resolve("waiting"), 100)),
-  ]);
-  expect(whole).toBe("granted");
+  await reacquire(f, 2 * 3 * 300);
 });
 
 // A head loaded progressively: each commit also writes the stream's partial
@@ -294,6 +283,45 @@ async function acknowledgedScenario(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * The whole budget can be reserved again: the reservation is acknowledged, and
+ * no timing threshold decides it. A hang ends at the scenario deadline.
+ */
+async function reacquire(
+  f: Awaited<ReturnType<typeof fixture>>,
+  bytes: number,
+) {
+  await acknowledgedScenario(async (wait) => {
+    const release = await wait(f.deps.blobs.governor.reserve(bytes));
+    release();
+  });
+}
+
+/**
+ * Records every reservation and release at the governor, the boundary the
+ * reader reserves through. Reservation `n` is the n-th the governor granted.
+ */
+function watchGovernor(
+  governor: Awaited<ReturnType<typeof fixture>>["deps"]["blobs"]["governor"],
+) {
+  const events: string[] = [];
+  const released: ReturnType<typeof acknowledgement>[] = [];
+  const real = governor.reserve.bind(governor);
+  const spy = vi
+    .spyOn(governor, "reserve")
+    .mockImplementation(async (bytes, objectBytes) => {
+      const release = await real(bytes, objectBytes);
+      const n = released.push(acknowledgement()) - 1;
+      events.push(`reserved ${n}`);
+      return () => {
+        events.push(`released ${n}`);
+        released[n]!.resolve();
+        release();
+      };
+    });
+  return { events, released, restore: () => spy.mockRestore() };
 }
 
 function acknowledgement<T = void>() {
@@ -468,6 +496,7 @@ it("gives a fetch that is still running its memory when it ends, after the apply
   const fourthStarted = acknowledgement();
   const fourthReturned = acknowledgement();
   const thirdReady = acknowledgement();
+  const governor = watchGovernor(f.deps.blobs.governor);
   const get = f.deps.blobs.get.bind(f.deps.blobs);
   f.deps.blobs.get = async (key) => {
     if (!key.endsWith(h.parts[3]!.hash)) return get(key);
@@ -476,6 +505,7 @@ it("gives a fetch that is still running its memory when it ends, after the apply
     try {
       return await get(key);
     } finally {
+      governor.events.push("fourth fetch settled");
       fourthReturned.resolve();
     }
   };
@@ -519,14 +549,19 @@ it("gives a fetch that is still running its memory when it ends, after the apply
         const error = await wait(outcome);
         expect(error).toBeInstanceOf(Error);
         expect((error as Error).message).toMatch(/part SHA-256 does not match/);
-        // One reservation, started while the fourth fetch is still held.
-        // It must eventually succeed after that fetch returns and releases its unit.
-        const whole = f.deps.blobs.governor
-          .reserve(DEFAULT_STORAGE_ACCESS_POLICY.maxBytesInFlight)
-          .then((release) => release());
+        // The apply has failed and closed its reader while the fourth GET is
+        // still held: that unit's reservation must still be held.
+        expect(governor.events).toContain("reserved 3");
+        expect(governor.events).not.toContain("released 3");
         releaseFourth.resolve();
         await wait(fourthReturned.promise);
-        await wait(whole);
+        // It is released only after its fetch settles.
+        await wait(governor.released[3]!.promise);
+        expect(governor.events.indexOf("fourth fetch settled")).toBeLessThan(
+          governor.events.indexOf("released 3"),
+        );
+        // And the whole budget can then be reserved again.
+        await reacquire(f, DEFAULT_STORAGE_ACCESS_POLICY.maxBytesInFlight);
       } finally {
         releaseFourth.resolve();
         await wait(outcome).catch(() => undefined);
@@ -535,6 +570,7 @@ it("gives a fetch that is still running its memory when it ends, after the apply
   } finally {
     releaseFourth.resolve();
     f.deps.blobs.get = get;
+    governor.restore();
     aheadSpy.mockRestore();
     batchSpy.mockRestore();
   }
@@ -595,15 +631,6 @@ it("leaves a committed first group durable when a later group fails before it is
   expect(await partial(f)).toEqual([]);
 });
 
-const reacquires = async (
-  f: Awaited<ReturnType<typeof fixture>>,
-  bytes: number,
-) =>
-  Promise.race([
-    f.deps.blobs.governor.reserve(bytes).then((r) => (r(), "granted")),
-    new Promise((resolve) => setTimeout(() => resolve("waiting"), 1000)),
-  ]);
-
 it("rejects a head that splits a long record in its metadata, without waiting for another reservation", async () => {
   // Room for one part. The counts still add up to the record count, but the
   // second part is said to open a record while the first part's record runs on
@@ -637,7 +664,7 @@ it("rejects a head that splits a long record in its metadata, without waiting fo
   expect(gets).toBe(1);
   expect(await f.db.query("SELECT 1 FROM records")).toHaveLength(0);
   expect(await partial(f)).toEqual([]);
-  expect(await reacquires(f, 2 * 300)).toBe("granted");
+  await reacquire(f, 2 * 300);
 });
 
 it("rejects a head that joins the next record to this one in its metadata, without waiting for another reservation", async () => {
@@ -653,7 +680,7 @@ it("rejects a head that joins the next record to this one in its metadata, witho
     "part has 1 frames, head says 2",
   );
   expect(await partial(f)).toEqual([]);
-  expect(await reacquires(f, 2 * 150)).toBe("granted");
+  await reacquire(f, 2 * 150);
 });
 
 it("commits only what precedes a part that fails, when the parts after it arrive first", async () => {
@@ -739,7 +766,7 @@ it("commits no record of a head whose long record is missing a part, and finishe
     await f.db.query("SELECT 1 FROM stream_state WHERE complete = 1"),
   ).toHaveLength(0);
   expect(await f.db.query("SELECT 1 FROM head_parts")).toHaveLength(0);
-  expect(await reacquires(f, 2 * 3 * 300)).toBe("granted");
+  await reacquire(f, 2 * 3 * 300);
   // The part is back: a new apply finishes exactly.
   f.blobs.set(missing, blob);
   await deadline(applyConnection(progressive(f), f.id));
