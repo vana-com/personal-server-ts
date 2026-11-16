@@ -606,11 +606,11 @@ Run: TLC 2.19 (`tla2tools.jar` 1.7.4), Java 17, `-workers 4`, `nice -n 19`, one 
 time. One device (the devices are independent), two keys, at most six commits.
 
 | Config               | Mode       | Result                                                                                                                     |
-|----------------------|------------|----------------------------------------------------------------------------------------------------------------------------|
-| KeyedLocal.cfg       | keyedLocal | PASS, complete for `ShortLog` (at most 3 log segments): 187,742 distinct states                                             |
-| KeyedLocalFull.cfg   | keyedLocal | BOUNDED: stopped at 500 s with no error; 17.1M distinct states, 3.7M left on the queue                                      |
-| KeyedLocalRebase.cfg | keyedLocal | BOUNDED: stopped at 500 s with no error; 19.5M distinct states, 3.9M left on the queue (resets, rebaseline)                  |
-| KeyedStale.cfg       | keyedStale | FAIL P8 at depth 9, 18,083 distinct states (`traces/KeyedStale.txt`): a local delete of key 1 is replaced by the log's row   |
+| -------------------- | ---------- | -------------------------------------------------------------------------------------------------------------------------- |
+| KeyedLocal.cfg       | keyedLocal | PASS, complete for `ShortLog` (at most 3 log segments): 187,742 distinct states                                            |
+| KeyedLocalFull.cfg   | keyedLocal | BOUNDED: stopped at 500 s with no error; 17.1M distinct states, 3.7M left on the queue                                     |
+| KeyedLocalRebase.cfg | keyedLocal | BOUNDED: stopped at 500 s with no error; 19.5M distinct states, 3.9M left on the queue (resets, rebaseline)                |
+| KeyedStale.cfg       | keyedStale | FAIL P8 at depth 9, 18,083 distinct states (`traces/KeyedStale.txt`): a local delete of key 1 is replaced by the log's row |
 
 The first `KeyedLocalRebase.cfg` run failed P8 because a lifetime change kept `own`
 while `FullCheck` emptied the rows; that was the model's gap, fixed as stated above.
