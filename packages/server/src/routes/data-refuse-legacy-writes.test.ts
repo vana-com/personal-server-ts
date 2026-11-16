@@ -102,6 +102,8 @@ describe("refuse legacy writes after the stream-sync switch", () => {
       authority: {
         admit: (...args) => current().admit(...args),
         read: (...args) => current().read(...args),
+        legacyWriteDecision: (...args) =>
+          current().legacyWriteDecision(...args),
         commitLegacy: (...args) => current().commitLegacy(...args),
         commitRemoval: (...args) => current().commitRemoval(...args),
       },

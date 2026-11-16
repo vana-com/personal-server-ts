@@ -19,7 +19,7 @@ const UNKNOWN: RefuseDecision = {
  * the host always passes its authority's seal.
  */
 const NO_AUTHORITY: SealAuthority = {
-  read: () => UNKNOWN,
+  legacyWriteDecision: () => UNKNOWN,
   commitLegacy: async () => ({ ok: false, decision: UNKNOWN }),
   commitRemoval: async (work) => work(),
 };

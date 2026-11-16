@@ -29,8 +29,8 @@ export interface AccountAnswerSeen {
 
 /**
  * The one reading of the Account's `GET /api/v1/me/stream-sync` answer. Only a
- * 2xx answer with a boolean `streamSync` and a safe integer `generation` of 0
- * or more is on or off. Anything else (no response, another status, a missing
+ * 2xx answer (a whole-number HTTP status) with a boolean `streamSync` and a
+ * safe integer `generation` of 0 or more is on or off. Anything else (no response, another status, a missing
  * or malformed field, the Account's own failure body, which has no generation)
  * is `unknown`: a failed read is never an Off.
  */
@@ -38,7 +38,11 @@ export function parseAccountAnswer(
   seen: AccountAnswerSeen,
 ): Pick<ModeEvidenceInput, "state" | "generation"> {
   const status = seen.rawStatus;
-  const answered = typeof status === "number" && status >= 200 && status < 300;
+  const answered =
+    typeof status === "number" &&
+    Number.isInteger(status) &&
+    status >= 200 &&
+    status < 300;
   const generation = seen.generation;
   if (
     answered &&

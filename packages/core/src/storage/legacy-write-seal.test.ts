@@ -258,3 +258,30 @@ describe("verdict", () => {
     expect(seal.verdict()).toBe("switched");
   });
 });
+
+describe("a failed read of the Account after an Off", () => {
+  // UNKNOWN_AS_OFF: the seal, the early refusal and the workers' verdict
+  // answer from one place, so none of them keeps writing on the old Off.
+  it("is a retryable 503 at commit, admit and verdict, until the next verified answer", async () => {
+    const { authority, seal } = await sealOver("off");
+    await authority.submitEvidence({ owner: OWNER, state: "unknown" });
+    let ran = 0;
+    const refused = await seal
+      .commit(() => {
+        ran += 1;
+      })
+      .catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(LegacyWriteRefusedError);
+    expect((refused as LegacyWriteRefusedError).verdict).toBe("unknown");
+    expect(ran).toBe(0);
+    expect(seal.admit()?.status).toBe(503);
+    expect(seal.verdict()).toBe("unknown");
+    // A removal is admitted in every mode.
+    expect(await seal.remove(() => "removed")).toBe("removed");
+
+    await authority.submitEvidence(evidence("off"));
+    expect(seal.admit()).toBeNull();
+    expect(seal.verdict()).toBe("allow");
+    expect(await seal.commit(() => "stored")).toBe("stored");
+  });
+});

@@ -3,8 +3,17 @@
  * write seals share with the On latch.
  *
  * - `read` is synchronous and never waits: before the first answer it is
- *   `unknown` (reads stay legacy, legacy writes pause), after it `streams` or
- *   `legacy`.
+ *   `unknown` (reads and legacy writes pause), after it `streams` or `legacy`.
+ *   It follows the saved record only, so the person's data stays readable
+ *   while the Account cannot be reached.
+ * - `legacyWriteDecision` is what a legacy write gets. It is `read`, except
+ *   that an Off holds only while the owner's latest read of the Account
+ *   worked. A host that could not read the Account posts `unknown`; that
+ *   pauses legacy writes (retryable 503) until the next verified answer, and
+ *   erases nothing: the record, its generation and an On stay as they were.
+ *   A device that kept writing on a remembered Off could not tell that another
+ *   device had switched the Account. The pause lasts only until a read works,
+ *   and a restart starts from the saved record until its host reads.
  * - A load that fails leaves the authority unloaded: `read` stays `unknown`
  *   for every owner, `submitEvidence` saves nothing, and the next
  *   `submitEvidence` retries the load before judging the evidence.
@@ -36,7 +45,11 @@ export type CommitResult<T> =
 /** What a host says about one owner after asking the Account. */
 export interface ModeEvidenceInput {
   owner: string;
-  /** `unknown` (or anything else) changes nothing and returns the decision. */
+  /**
+   * `unknown` (or anything else): the host could not read the Account. It
+   * changes no record; it pauses legacy writes for an Off until a verified
+   * answer, and returns the decision.
+   */
   state: "on" | "off" | "unknown";
   /** Absent means 0. */
   generation?: number;
@@ -45,7 +58,14 @@ export interface ModeEvidenceInput {
 export interface ModeAuthority {
   /** Settles once the saved records are loaded. Never rejects; boot may skip it. */
   readonly ready: Promise<void>;
+  /** The mode that reads and listings follow: the saved record, nothing else. */
   read(owner: string): ModeDecision;
+  /**
+   * What a legacy write gets right now, with no lock: for an early refusal or
+   * a worker that wants to stop. The commit fence (`commitLegacy`) is the
+   * decision; this is never a permission.
+   */
+  legacyWriteDecision(owner: string): ModeDecision;
   submitEvidence(input: ModeEvidenceInput): Promise<ModeDecision>;
   /** Run `write` as a legacy write: only for an owner whose answer is Off. */
   commitLegacy<T>(
@@ -73,6 +93,12 @@ export function createModeAuthority(
   const warn = options.onWarning ?? (() => {});
   const records = new Map<string, AccountModeRecord>();
   const lock = createRwLock();
+  /**
+   * Owners whose latest read of the Account failed. In memory only: a record
+   * is history, this is what the host last saw, and a process that has seen
+   * nothing yet has nothing to report.
+   */
+  const unreadable = new Set<string>();
   let loaded = false;
   let loadFailed = false;
   let closed = false;
@@ -117,9 +143,19 @@ export function createModeAuthority(
     return record.answer === "on" ? { kind: "streams" } : { kind: "legacy" };
   }
 
+  function legacyWriteDecision(owner: string): ModeDecision {
+    const decision = read(owner);
+    return decision.kind === "legacy" &&
+      typeof owner === "string" &&
+      unreadable.has(normalizeOwner(owner))
+      ? UNKNOWN_DECISION
+      : decision;
+  }
+
   return {
     ready,
     read,
+    legacyWriteDecision,
     async submitEvidence(input) {
       await ready;
       const owner = normalizeOwner(input.owner);
@@ -145,13 +181,20 @@ export function createModeAuthority(
             await options.store.save(owner, next);
             records.set(owner, next);
           }
+          // A verified answer, at any generation, ends the pause. A save
+          // that threw above never reaches this line, so it ends nothing.
+          unreadable.delete(owner);
         } finally {
           release();
         }
       } else {
         await retryLoadIfFailed();
+        // Taking no lock is safe: a legacy write already running keeps its
+        // shared hold, and every write that starts later reads this inside
+        // its own hold.
+        unreadable.add(owner);
       }
-      const decision = read(owner);
+      const decision = legacyWriteDecision(owner);
       if (decision.kind === "streams") {
         try {
           options.onOn?.(owner);
@@ -166,7 +209,7 @@ export function createModeAuthority(
       const release = await lock.shared();
       try {
         // No await between this read and the start of the write.
-        const decision = closed ? UNKNOWN_DECISION : read(owner);
+        const decision = closed ? UNKNOWN_DECISION : legacyWriteDecision(owner);
         if (decision.kind === "legacy") {
           return { ok: true, value: await write() };
         }

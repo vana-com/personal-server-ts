@@ -18,6 +18,11 @@ describe("parseAccountAnswer: the one reading of the Account's stream-sync answe
     ["a redirect", { rawStatus: 302, streamSync: true, generation: 1 }],
     ["a 401", { rawStatus: 401, streamSync: true, generation: 1 }],
     ["a 500", { rawStatus: 500, streamSync: false, generation: 1 }],
+    // Not an HTTP status: the range holds, the integer does not.
+    [
+      "a fractional status",
+      { rawStatus: 200.5, streamSync: false, generation: 0 },
+    ],
     ["no switch", { rawStatus: 200, generation: 1 }],
     ["a string switch", { rawStatus: 200, streamSync: "true", generation: 1 }],
     // Account's own failure answer carries no generation.

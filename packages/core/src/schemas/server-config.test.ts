@@ -69,7 +69,7 @@ describe("ServerConfigSchema — streamSync.retireLegacy", () => {
 describe("ServerConfigSchema — streamSync.write, read, refuseLegacyWrites (removed)", () => {
   it("a saved config that still names them parses, and the keys are dropped", () => {
     const parsed = ServerConfigSchema.parse({
-      streamSync: { write: true, refuseLegacyWrites: true },
+      streamSync: { write: true, read: true, refuseLegacyWrites: true },
     });
     expect(parsed.streamSync).toEqual({
       retireLegacy: false,
