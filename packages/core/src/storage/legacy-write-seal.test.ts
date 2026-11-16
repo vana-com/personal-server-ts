@@ -320,4 +320,34 @@ describe("a failed read of the Account after an Off", () => {
     await authority.submitEvidence({ ...evidence("on"), generation: 2 });
     expect(seal.verdict()).toBe("switched");
   });
+
+  it("refuses at admit and verdict from the moment an On arrives, before its save has finished", async () => {
+    const memory = createMemoryModeRecordStore();
+    const saveGate = gate();
+    const saveEntered = gate();
+    const authority = createModeAuthority({
+      store: {
+        load: () => memory.load(),
+        save: async (owner, record) => {
+          if (record.answer === "on") {
+            saveEntered.open();
+            await saveGate.opened;
+          }
+          await memory.save(owner, record);
+        },
+      },
+    });
+    await authority.ready;
+    const seal = createLegacyWriteSeal({ authority, owner: OWNER });
+    await authority.submitEvidence({ ...evidence("off"), generation: 2 });
+    expect(seal.verdict()).toBe("allow");
+    const on = authority.submitEvidence({ ...evidence("on"), generation: 2 });
+    // No await since the On was submitted: it has arrived, nothing is applied.
+    expect(seal.admit()?.status).toBe(503);
+    expect(seal.verdict()).toBe("unknown");
+    await saveEntered.opened;
+    saveGate.open();
+    await on;
+    expect(seal.verdict()).toBe("switched");
+  });
 });

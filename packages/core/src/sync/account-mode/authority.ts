@@ -18,10 +18,19 @@
  *   Account.
  * - Evidence is numbered per owner when it arrives, before any await. A
  *   verified answer takes effect only if no later evidence was submitted, so a
- *   slow save cannot undo a failed read that finished first. An answer that
- *   arrives and cannot be applied (its save or the record load fails) takes
- *   the earlier permission back, under the lock: the latest evidence says the
- *   record is not what the permission was given for.
+ *   slow save cannot undo a failed read that finished first.
+ * - An answer that has arrived and is not applied yet suspends the permission
+ *   from its arrival: `legacyWriteDecision` is `unknown` for that owner, and a
+ *   `commitLegacy` that has not started waits for the answer to settle, then
+ *   judges again. So no write starts on a permission that an arrived answer
+ *   may contradict, and an Off poll that applies unchanged only delays a
+ *   write. Only a write already running keeps its hold; the On waits for it.
+ *   When the answer settles, the permission is back only if the answer was
+ *   applied, is the latest, and is current (its generation is not below the
+ *   record's). An answer that fails to apply, or is older than the record,
+ *   leaves the owner without permission until a later current answer. This
+ *   is a change to the in-memory write permission only: the saved record and
+ *   what reads follow stay as they were.
  * - This is a local guarantee. It cannot make a switch on another device
  *   atomic with this device's storage: a write between the last verified read
  *   and the next one is detected afterwards, not prevented. Preventing it needs
@@ -120,6 +129,12 @@ export function createModeAuthority(
    */
   const latest = new Map<string, number>();
   let submissions = 0;
+  /**
+   * Answers (on or off) that have arrived and not settled, per owner, and the
+   * waiters for the count to reach zero. Counted before the first await.
+   */
+  const unsettled = new Map<string, number>();
+  const settledWaiters = new Map<string, Array<() => void>>();
   let loaded = false;
   let loadFailed = false;
   let closed = false;
@@ -166,10 +181,32 @@ export function createModeAuthority(
 
   function legacyWriteDecision(owner: string): ModeDecision {
     const decision = read(owner);
-    return decision.kind === "legacy" &&
-      !(typeof owner === "string" && verified.has(normalizeOwner(owner)))
-      ? UNKNOWN_DECISION
-      : decision;
+    if (decision.kind !== "legacy") return decision;
+    const key = typeof owner === "string" ? normalizeOwner(owner) : null;
+    return key !== null && verified.has(key) && !unsettled.has(key)
+      ? decision
+      : UNKNOWN_DECISION;
+  }
+
+  function settledOf(key: string): Promise<void> {
+    if (!unsettled.has(key)) return Promise.resolve();
+    return new Promise((resolve) => {
+      const waiters = settledWaiters.get(key) ?? [];
+      waiters.push(resolve);
+      settledWaiters.set(key, waiters);
+    });
+  }
+
+  function settle(key: string): void {
+    const left = (unsettled.get(key) ?? 1) - 1;
+    if (left > 0) {
+      unsettled.set(key, left);
+      return;
+    }
+    unsettled.delete(key);
+    const waiters = settledWaiters.get(key) ?? [];
+    settledWaiters.delete(key);
+    for (const resolve of waiters) resolve();
   }
 
   return {
@@ -184,15 +221,14 @@ export function createModeAuthority(
       latest.set(owner, ticket);
       const answered = input.state === "on" || input.state === "off";
       if (!answered) verified.delete(owner);
-      await ready;
+      else unsettled.set(owner, (unsettled.get(owner) ?? 0) + 1);
       if (answered) {
-        const release = await lock.exclusive();
-        // An answer that arrived and was not applied (a failed save, a failed
-        // load) is the latest evidence, and it is not an Off. The permission
-        // an earlier verified answer gave is taken back under this lock, so no
-        // legacy write can start on it, and only an applied answer restores it.
-        let applied = false;
+        // Settled in the `finally`, under the lock, whatever happens.
+        let release: (() => void) | undefined;
+        let eligible = false;
         try {
+          await ready;
+          release = await lock.exclusive();
           // Retried under the lock, so the exclusive request is queued before
           // the load starts: an On still waits for legacy writes in flight,
           // and no legacy write starts after it.
@@ -213,17 +249,19 @@ export function createModeAuthority(
             await options.store.save(owner, next);
             records.set(owner, next);
           }
-          applied = true;
-          // Verified for this process only when nothing was submitted after
-          // it and it is not older than the record.
-          if (latest.get(owner) === ticket && generation >= next.generation) {
-            verified.add(owner);
-          }
+          // Permission for this process only when the answer was applied,
+          // nothing was submitted after it, and it is not older than the
+          // record. Any other end takes the earlier permission back.
+          eligible =
+            latest.get(owner) === ticket && generation >= next.generation;
         } finally {
-          if (!applied) verified.delete(owner);
-          release();
+          if (eligible) verified.add(owner);
+          else verified.delete(owner);
+          settle(owner);
+          release?.();
         }
       } else {
+        await ready;
         await retryLoadIfFailed();
         // Nothing to add: the pause was set above, with no lock. A legacy
         // write already running keeps its shared hold, and every write that
@@ -241,22 +279,36 @@ export function createModeAuthority(
     },
     async commitLegacy(owner, write) {
       await ready;
-      const release = await lock.shared();
-      try {
-        // No await between this read and the start of the write.
-        const decision = closed ? UNKNOWN_DECISION : legacyWriteDecision(owner);
-        if (decision.kind === "legacy") {
-          return { ok: true, value: await write() };
+      const key = typeof owner === "string" ? normalizeOwner(owner) : null;
+      for (;;) {
+        // An answer that has arrived and is not applied yet may contradict the
+        // permission: wait for it, outside the lock (its exclusive request
+        // may be queued behind other shared holders), then judge again.
+        if (key !== null) await settledOf(key);
+        const release = await lock.shared();
+        if (key !== null && unsettled.has(key)) {
+          // An answer arrived while this write waited for the lock.
+          release();
+          continue;
         }
-        return {
-          ok: false,
-          decision:
-            decision.kind === "streams"
-              ? SWITCHED_REFUSAL
-              : (decision as RefuseDecision),
-        };
-      } finally {
-        release();
+        try {
+          // No await between the checks above and the start of the write.
+          const decision = closed
+            ? UNKNOWN_DECISION
+            : legacyWriteDecision(owner);
+          if (decision.kind === "legacy") {
+            return { ok: true, value: await write() };
+          }
+          return {
+            ok: false,
+            decision:
+              decision.kind === "streams"
+                ? SWITCHED_REFUSAL
+                : (decision as RefuseDecision),
+          };
+        } finally {
+          release();
+        }
       }
     },
     async commitRemoval(work) {
