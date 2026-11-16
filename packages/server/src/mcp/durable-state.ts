@@ -4,6 +4,7 @@ import {
   createHash,
   randomBytes,
 } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
@@ -135,6 +136,12 @@ export interface McpDurableState {
   getIdentity(userPsId: string): Promise<McpWakeupIdentity | null>;
   /** Serializes multi-step OAuth mutations in the single ingress process. */
   exclusive<T>(operation: () => Promise<T>): Promise<T>;
+  /**
+   * Refuses every later write and resolves once the writes already admitted
+   * have reached disk. The request path may start a write without awaiting it;
+   * the server awaits this on shutdown so none outlives its storage directory.
+   */
+  close(): Promise<void>;
 }
 
 /**
@@ -202,7 +209,19 @@ export async function openMcpDurableState(options: {
     if (state.writer?.fenced)
       throw new Error("MCP writer fenced for migration");
   };
+  // One admission gate for every operation that can write. Once close()
+  // begins, each entry point refuses new work synchronously. An operation
+  // admitted earlier runs to completion, and writes made while it is active
+  // stay admitted through its token, so a multi-step exclusive operation is
+  // never refused halfway. The token is revoked when the operation settles, so
+  // work it leaves running afterwards is refused like any later call.
+  let closed = false;
+  let closing: Promise<void> | undefined;
+  const admitted = new AsyncLocalStorage<{ active: boolean }>();
+  const refused = <T>(): Promise<T> =>
+    Promise.reject(new Error("MCP state is closed"));
   const mutate = <T>(change: (draft: State) => T): Promise<T> => {
+    if (closed && !admitted.getStore()?.active) return refused();
     const result = writes.then(async () => {
       assertActive();
       const draft = structuredClone(state);
@@ -228,6 +247,7 @@ export async function openMcpDurableState(options: {
       return structuredClone(rollbackOwners(state).bindings);
     },
     prepareRollback(migrationId, resolve) {
+      if (closed) return refused();
       const operation = operations.then(() => {
         const prepared = writes.then(async () => {
           assertActive();
@@ -364,6 +384,7 @@ export async function openMcpDurableState(options: {
       };
     },
     fenceAndExport(migrationId, target): Promise<Uint8Array> {
+      if (closed) return refused();
       if (!migrationId || !target)
         return Promise.reject(new Error("Migration identity required"));
       const result = operations.then(async () => {
@@ -392,6 +413,7 @@ export async function openMcpDurableState(options: {
       snapshot,
       migrationId,
     ): Promise<{ connections: number; digest: string }> {
+      if (closed) return refused();
       const result = operations.then(async () => {
         const imported = writes.then(async () => {
           const digest = createHash("sha256").update(snapshot).digest("hex");
@@ -583,9 +605,35 @@ export async function openMcpDurableState(options: {
       }),
     getIdentity: (id) => read((current) => current.identities[id] ?? null),
     exclusive<T>(operation: () => Promise<T>): Promise<T> {
-      const result = operations.then(operation);
+      if (closed) return refused();
+      const result = operations.then(async () => {
+        const token = { active: true };
+        try {
+          return await admitted.run(token, operation);
+        } finally {
+          token.active = false;
+        }
+      });
       operations = result.catch(() => undefined);
       return result;
+    },
+    close() {
+      // Close waits for every admitted operation, so an operation that closed
+      // the state would wait for itself.
+      if (admitted.getStore()?.active)
+        return Promise.reject(
+          new Error(
+            "MCP state cannot be closed from inside one of its operations",
+          ),
+        );
+      closed = true;
+      // Admitted operations queue their own writes, so settle them before the
+      // writes. Nothing new is admitted once their tokens are revoked, so both
+      // tails are final.
+      return (closing ??= (async () => {
+        await operations;
+        await writes;
+      })());
     },
   };
 }

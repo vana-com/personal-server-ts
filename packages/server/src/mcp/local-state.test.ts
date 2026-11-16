@@ -54,6 +54,34 @@ describe("openLocalMcpState", () => {
     expect(await second.authorizations.getById("auth-1")).not.toBeNull();
   });
 
+  it("close lands the writes already started and refuses later ones", async () => {
+    const directory = await tempDir();
+    const path = join(directory, "mcp-state.json");
+    const masterKey = randomBytes(32);
+    const state = await openLocalMcpState({ path, masterKey });
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store: state.connections, publicOrigin: "https://ps.example" },
+    );
+
+    const started = state.connections.update(created.connectionId, {
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await state.close();
+    await expect(started).resolves.not.toBeNull();
+    await expect(
+      state.connections.update(created.connectionId, {
+        lastUsedAt: "2026-02-02T00:00:00.000Z",
+      }),
+    ).rejects.toThrow("MCP state is closed");
+
+    const reopened = await openLocalMcpState({ path, masterKey });
+    expect(
+      (await reopened.connections.getById(created.connectionId))?.lastUsedAt,
+    ).toBe("2026-01-01T00:00:00.000Z");
+    expect(await readdir(directory)).toEqual(["mcp-state.json"]);
+  });
+
   it("starts empty and moves the file aside when it no longer decrypts", async () => {
     const directory = await tempDir();
     const path = join(directory, "mcp-state.json");

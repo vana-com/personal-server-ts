@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
-import { createServer as createNetServer } from "node:net";
+import type * as fsPromises from "node:fs/promises";
+import type * as localState from "./mcp/local-state.js";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { dirname } from "node:path";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Builder, GatewayClient } from "@opendatalabs/vana-sdk/node";
@@ -24,6 +26,80 @@ import {
   currentReplicaWriterIdentity,
   enableReplicaWriterIdentity,
 } from "./storage/pdpp-replica-writer-identity.js";
+
+// Holds one MCP state write at its rename so a test can stop the server while
+// the write is in flight. Unarmed, every rename passes straight through.
+const heldWrite = vi.hoisted(() => {
+  const gate: {
+    armed: boolean;
+    target?: string;
+    reached: Promise<void>;
+    release: () => void;
+    reachedNow: () => void;
+    closeAwaited: Promise<void>;
+    closeAwaitedNow: () => void;
+    closeSettled: boolean;
+  } = {
+    armed: false,
+    reached: Promise.resolve(),
+    release: () => undefined,
+    reachedNow: () => undefined,
+    closeAwaited: Promise.resolve(),
+    closeAwaitedNow: () => undefined,
+    closeSettled: false,
+  };
+  return gate;
+});
+// A pass-through around the real MCP state's close(). It runs the real drain
+// and hands back a thenable that reports when a caller awaits it, so a test
+// can tell a stop that waits for the drain from one that only calls it.
+vi.mock("./mcp/local-state.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof localState>();
+  return {
+    ...actual,
+    openLocalMcpState: async (
+      ...args: Parameters<typeof actual.openLocalMcpState>
+    ) => {
+      const state = await actual.openLocalMcpState(...args);
+      const close = state.close.bind(state);
+      state.close = () => {
+        const drained = close();
+        const settled = () => {
+          heldWrite.closeSettled = true;
+        };
+        drained.then(settled, settled);
+        return {
+          then: (
+            onFulfilled?: (value: void) => unknown,
+            onRejected?: (reason: unknown) => unknown,
+          ) => {
+            heldWrite.closeAwaitedNow();
+            return drained.then(onFulfilled, onRejected);
+          },
+        } as Promise<void>;
+      };
+      return state;
+    },
+  };
+});
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof fsPromises>();
+  return {
+    ...actual,
+    rename: async (from: string, to: string) => {
+      if (heldWrite.armed && to.endsWith("mcp-state.json")) {
+        heldWrite.armed = false;
+        heldWrite.target = to;
+        const released = new Promise<void>((resolve) => {
+          heldWrite.release = resolve;
+        });
+        heldWrite.reachedNow();
+        await released;
+      }
+      return actual.rename(from, to);
+    },
+  };
+});
 
 const ownerWallet = createTestWallet(8);
 let cleanupFns: Array<() => Promise<void>> = [];
@@ -66,53 +142,40 @@ async function createOwnerSignature(): Promise<`0x${string}`> {
   return ownerWallet.signMessage("vana-master-key-v1");
 }
 
-async function getFreePort(): Promise<number> {
-  const server = createNetServer();
-  await new Promise<void>((resolve) => {
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  await new Promise<void>((resolve, reject) => {
-    server.close((err?: Error) => {
-      if (err) reject(err);
-      else resolve();
-    });
-  });
-  if (!address || typeof address === "string") {
-    throw new Error("Could not allocate a test port");
-  }
-  return address.port;
-}
-
 async function startTestServer(
   gateway = createGateway(),
   declareUnswitched = true,
   options: Partial<StartPersonalServerNodeOptions> = {},
 ) {
   const rootPath = await mkdtemp(join(tmpdir(), "ps-client-"));
-  const port = await getFreePort();
   const config = ServerConfigSchema.parse({
-    server: { port, origin: `http://localhost:${port}` },
     logging: { level: "fatal", pretty: false },
     devUi: { enabled: false },
     sync: { enabled: false, lastProcessedTimestamp: null },
     tunnel: { enabled: false },
   });
+  // The listener binds port 0 once; every URL below derives from its address.
   const ps = await startPersonalServer({
     rootPath,
     config,
+    port: 0,
     ownerSignature: await createOwnerSignature(),
     gatewayClient: gateway,
     localApproval: false,
     startBackgroundServices: false,
     ...options,
   });
+  const port = await boundPort(ps);
   cleanupFns.push(async () => {
     await ps.stop();
     await rm(rootPath, { recursive: true, force: true });
   });
   if (declareUnswitched) await declareOff(ps);
   return { ps, gateway, port };
+}
+
+async function boundPort(ps: PersonalServerHandle): Promise<number> {
+  return Number(new URL((await ps.info()).urls.local).port);
 }
 
 /** The Account's explicit Off for this server's owner, as a host forwards it. */
@@ -126,11 +189,27 @@ async function declareOff(ps: PersonalServerHandle) {
 }
 
 describe("startPersonalServer node handle", () => {
-  it("rejects port 0 because public handle URLs must be concrete", async () => {
-    await expect(startPersonalServer({ port: 0 })).rejects.toThrow(
-      "port: 0 is not supported",
-    );
+  it("starts on port 0 and derives its URLs from the bound address", async () => {
+    const { ps, port } = await startTestServer();
+    expect(port).toBeGreaterThan(0);
+    const info = await ps.ready();
+    expect(info.urls).toMatchObject({
+      local: `http://127.0.0.1:${port}`,
+      apiOrigin: `http://localhost:${port}`,
+      registration: `http://localhost:${port}`,
+    });
+    const health = await fetch(`http://127.0.0.1:${port}/health`);
+    expect(health.status).toBe(200);
   });
+
+  it.each([-1, 1.5, 65536, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects port %s, which cannot yield a concrete URL",
+    async (port) => {
+      await expect(startPersonalServer({ port })).rejects.toThrow(
+        "port must be an integer from 0 to 65535",
+      );
+    },
+  );
 
   it.each([
     "x".repeat(201),
@@ -219,9 +298,7 @@ describe("startPersonalServer node handle", () => {
   it("passes mcpGrantTtlSeconds to the server and rejects a bad one at startup", async () => {
     const rootPath = await mkdtemp(join(tmpdir(), "ps-client-"));
     cleanupFns.push(() => rm(rootPath, { recursive: true, force: true }));
-    const port = await getFreePort();
     const config = ServerConfigSchema.parse({
-      server: { port, origin: `http://localhost:${port}` },
       logging: { level: "fatal", pretty: false },
       devUi: { enabled: false },
       sync: { enabled: false, lastProcessedTimestamp: null },
@@ -230,6 +307,7 @@ describe("startPersonalServer node handle", () => {
     await expect(
       startPersonalServer({
         config,
+        port: 0,
         rootPath,
         ownerSignature: await createOwnerSignature(),
         gatewayClient: createGateway(),
@@ -514,11 +592,10 @@ describe("startPersonalServer node handle", () => {
     const rootPath = await mkdtemp(join(tmpdir(), "ps-client-"));
     cleanupFns.push(() => rm(rootPath, { recursive: true, force: true }));
     const boot = async (enabled: boolean) => {
-      const port = await getFreePort();
       const ps = await startPersonalServer({
         rootPath,
+        port: 0,
         config: ServerConfigSchema.parse({
-          server: { port, origin: `http://localhost:${port}` },
           logging: { level: "fatal", pretty: false },
           devUi: { enabled: false },
           sync: { enabled: false, lastProcessedTimestamp: null },
@@ -532,6 +609,7 @@ describe("startPersonalServer node handle", () => {
       });
       try {
         await expect(ps.ready()).resolves.toMatchObject({ status: "ready" });
+        const port = await boundPort(ps);
         expect((await fetch(`http://127.0.0.1:${port}/health`)).status).toBe(
           200,
         );
@@ -555,11 +633,10 @@ describe("startPersonalServer node handle", () => {
     const rootPath = await mkdtemp(join(tmpdir(), "ps-client-"));
     cleanupFns.push(() => rm(rootPath, { recursive: true, force: true }));
     const boot = async (enabled: boolean, rotate?: boolean) => {
-      const port = await getFreePort();
       const ps = await startPersonalServer({
         rootPath,
+        port: 0,
         config: ServerConfigSchema.parse({
-          server: { port, origin: `http://localhost:${port}` },
           logging: { level: "fatal", pretty: false },
           devUi: { enabled: false },
           sync: { enabled: false, lastProcessedTimestamp: null },
@@ -643,6 +720,88 @@ describe("startPersonalServer node handle", () => {
     expect(await boot(false, true)).toBe("replication_off");
     expect(await boot(true, true)).toBe("replication_off");
     expect(identities()).toEqual({ rows: 2, current: rotated });
+  }, 30_000);
+
+  it("shares one stop promise across concurrent and repeated calls", async () => {
+    const { ps } = await startTestServer();
+    const first = ps.stop();
+    expect(ps.stop()).toBe(first);
+    await first;
+    expect(ps.stop()).toBe(first);
+  });
+
+  it("stop waits for an MCP lastUsedAt write that is still in flight", async () => {
+    const { ps, port } = await startTestServer();
+    const ownerPost = async (path: string, body: unknown) => {
+      const bytes = new TextEncoder().encode(JSON.stringify(body));
+      const auth = await buildWeb3SignedHeader({
+        wallet: ownerWallet,
+        aud: `http://localhost:${port}`,
+        method: "POST",
+        uri: path,
+        body: bytes,
+      });
+      return ps.fetch(path, {
+        method: "POST",
+        headers: { Authorization: auth, "Content-Type": "application/json" },
+        body: bytes,
+      });
+    };
+    const created = await ownerPost("/v1/mcp/connections", {
+      displayName: "Test client",
+    });
+    const { connectionId, connectionToken } = await created.json();
+    const approved = await ownerPost(
+      `/v1/mcp/connections/${connectionId}/approve`,
+      { grants: [{ grantId: "grant-1", scopes: ["instagram.profile"] }] },
+    );
+    expect(approved.status).toBe(200);
+
+    // The next state write is the request's lastUsedAt update.
+    heldWrite.reached = new Promise<void>((resolve) => {
+      heldWrite.reachedNow = resolve;
+    });
+    heldWrite.closeAwaited = new Promise<void>((resolve) => {
+      heldWrite.closeAwaitedNow = resolve;
+    });
+    heldWrite.closeSettled = false;
+    heldWrite.armed = true;
+    let stopping: Promise<void> | undefined;
+    try {
+      const response = await ps.fetch(`/mcp/${connectionToken}`, {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+      expect(response.status).toBe(200);
+      await heldWrite.reached;
+      const directory = dirname(heldWrite.target ?? "");
+
+      stopping = ps.stop();
+      // Stop awaits the MCP state's drain while the write is still held. A
+      // stop that dropped the drain's promise would settle without awaiting it.
+      const first = await Promise.race([
+        heldWrite.closeAwaited.then(() => "awaited"),
+        stopping.then(() => "stop"),
+      ]);
+      expect(first).toBe("awaited");
+      expect(heldWrite.closeSettled).toBe(false);
+
+      heldWrite.release();
+      await stopping;
+      expect(heldWrite.closeSettled).toBe(true);
+      // The write landed before stop resolved, and no temp file is left.
+      const after = await readdir(directory);
+      expect(after).toContain("mcp-state.json");
+      expect(after.filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    } finally {
+      heldWrite.armed = false;
+      heldWrite.release();
+      await stopping;
+    }
   }, 30_000);
 
   it("stops idempotently", async () => {

@@ -80,8 +80,15 @@ export interface StartPersonalServerNodeOptions
 export async function startPersonalServer(
   options: StartPersonalServerNodeOptions = {},
 ): Promise<PersonalServerHandle> {
-  if (options.port === 0) {
-    throw new Error("port: 0 is not supported by the public Node handle");
+  if (
+    options.port !== undefined &&
+    !(
+      Number.isInteger(options.port) &&
+      options.port >= 0 &&
+      options.port <= 65535
+    )
+  ) {
+    throw new Error("port must be an integer from 0 to 65535");
   }
   const reviewHint = options.mcpScopeRequestReviewHint;
   if (reviewHint !== undefined) {
@@ -106,39 +113,62 @@ export async function startPersonalServer(
     options.onStatus?.(nextStatus);
   };
 
-  const config = prepareConfig(
-    options.config ?? (await loadConfig(options)),
-    options,
-  );
-  const context = await createServer(config, {
-    rootPath: options.rootPath,
-    dataDir: options.dataDir,
-    ownerSignature: options.ownerSignature,
-    gatewayClient: options.gatewayClient,
-    readFulfillmentReporter: options.readFulfillmentReporter,
-    mcpOAuthApprovalUrl: options.mcpOAuthApprovalUrl,
-    mcpScopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
-    mcpScopeRequestReviewHint: scopeRequestReviewHint,
-    mcpExposeUnsharedScopes: options.mcpExposeUnsharedScopes,
-    mcpOwnerAccessEdit: options.mcpOwnerAccessEdit,
-    mcpScopeRequestGuidance: options.mcpScopeRequestGuidance,
-    mcpRequestableScopes: options.mcpRequestableScopes,
-    mcpGrantTtlSeconds: options.mcpGrantTtlSeconds,
-    rotateReplicaWriterIdentity: options.rotateReplicaWriterIdentity,
-  });
-  const mainServer = await listenHttpServer({
-    fetch: context.app.fetch,
-    port: config.server.port,
-    hostname: options.hostname,
-  });
+  // Port 0 asks the OS for a free port. The listener binds it once, here,
+  // before the server is built, so the origin, the auth audience and the
+  // tunnel's local port all derive from the bound address. Probing for a free
+  // port and binding it later would leave a window for another process.
+  let appFetch: NodeFetchHandler | undefined;
+  const early =
+    options.port === 0
+      ? await listenHttpServer({
+          fetch: (...args) =>
+            appFetch
+              ? appFetch(...args)
+              : new Response("Personal Server is starting", { status: 503 }),
+          port: 0,
+          hostname: options.hostname,
+        })
+      : undefined;
+  const { config, context } = await (async () => {
+    try {
+      const config = prepareConfig(
+        options.config ?? (await loadConfig(options)),
+        early ? { ...options, port: portOfBound(early) } : options,
+      );
+      const context = await createServer(config, {
+        rootPath: options.rootPath,
+        dataDir: options.dataDir,
+        ownerSignature: options.ownerSignature,
+        gatewayClient: options.gatewayClient,
+        readFulfillmentReporter: options.readFulfillmentReporter,
+        mcpOAuthApprovalUrl: options.mcpOAuthApprovalUrl,
+        mcpScopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
+        mcpScopeRequestReviewHint: scopeRequestReviewHint,
+        mcpExposeUnsharedScopes: options.mcpExposeUnsharedScopes,
+        mcpOwnerAccessEdit: options.mcpOwnerAccessEdit,
+        mcpScopeRequestGuidance: options.mcpScopeRequestGuidance,
+        mcpRequestableScopes: options.mcpRequestableScopes,
+        mcpGrantTtlSeconds: options.mcpGrantTtlSeconds,
+        rotateReplicaWriterIdentity: options.rotateReplicaWriterIdentity,
+      });
+      appFetch = context.app.fetch;
+      return { config, context };
+    } catch (error) {
+      if (early) await closeServer(early);
+      throw error;
+    }
+  })();
+  const mainServer =
+    early ??
+    (await listenHttpServer({
+      fetch: context.app.fetch,
+      port: config.server.port,
+      hostname: options.hostname,
+    }));
   const localOrigin = originFromAddress(mainServer.address());
 
   let localAuthServer: NodeServer | undefined;
-  if (
-    options.localApproval !== false &&
-    context.localApprovalPort &&
-    config.server.port !== 0
-  ) {
+  if (options.localApproval !== false && context.localApprovalPort && !early) {
     try {
       localAuthServer = await listenHttpServer({
         fetch: context.app.fetch,
@@ -443,18 +473,21 @@ export async function startPersonalServer(
     });
   }
 
-  async function stop(): Promise<void> {
-    if (stopped) return;
-    if (!lastInfo) {
-      lastInfo = await info();
-    }
-    stopped = true;
-    setStatus("stopped");
-    await Promise.all([
-      closeServer(mainServer),
-      localAuthServer ? closeServer(localAuthServer) : Promise.resolve(),
-    ]);
-    await context.cleanup();
+  let stopping: Promise<void> | undefined;
+  function stop(): Promise<void> {
+    // Publish before any await or status callback, including reentrant stop.
+    return (stopping ??= Promise.resolve().then(async () => {
+      if (!lastInfo) {
+        lastInfo = await info();
+      }
+      stopped = true;
+      setStatus("stopped");
+      await Promise.all([
+        closeServer(mainServer),
+        localAuthServer ? closeServer(localAuthServer) : Promise.resolve(),
+      ]);
+      await context.cleanup();
+    }));
   }
 
   const { replicationStatus, replicaWriterRotation } = context;
@@ -568,6 +601,14 @@ function mergeConfig(
     sync: { ...input.sync, ...defaults.sync },
     tunnel: { ...input.tunnel, ...defaults.tunnel },
   };
+}
+
+function portOfBound(server: NodeServer): number {
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Could not resolve bound server address");
+  }
+  return address.port;
 }
 
 function originFromAddress(address: string | AddressInfo | null): string {
