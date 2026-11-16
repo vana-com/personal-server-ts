@@ -7,13 +7,22 @@
  *   It follows the saved record only, so the person's data stays readable
  *   while the Account cannot be reached.
  * - `legacyWriteDecision` is what a legacy write gets. It is `read`, except
- *   that an Off holds only while the owner's latest read of the Account
- *   worked. A host that could not read the Account posts `unknown`; that
- *   pauses legacy writes (retryable 503) until the next verified answer, and
- *   erases nothing: the record, its generation and an On stay as they were.
- *   A device that kept writing on a remembered Off could not tell that another
- *   device had switched the Account. The pause lasts only until a read works,
- *   and a restart starts from the saved record until its host reads.
+ *   that an Off authorizes a write only after a verified answer obtained in
+ *   this process, and only while that answer is still the latest evidence.
+ *   A saved Off is history, not permission: a restart starts with none, and a
+ *   failed read (the host posts `unknown`) takes it away. Either way legacy
+ *   writes get a retryable 503 until the next verified, current answer (its
+ *   generation not below the record's), and nothing is erased: the record, its
+ *   generation and an On stay as they were. A device that kept writing on a
+ *   remembered Off could not tell that another device had switched the
+ *   Account.
+ * - Evidence is numbered per owner when it arrives, before any await. A
+ *   verified answer takes effect only if no later evidence was submitted, so a
+ *   slow save cannot undo a failed read that finished first.
+ * - This is a local guarantee. It cannot make a switch on another device
+ *   atomic with this device's storage: a write between the last verified read
+ *   and the next one is detected afterwards, not prevented. Preventing it needs
+ *   the registry to refuse legacy-protocol writes.
  * - A load that fails leaves the authority unloaded: `read` stays `unknown`
  *   for every owner, `submitEvidence` saves nothing, and the next
  *   `submitEvidence` retries the load before judging the evidence.
@@ -47,8 +56,8 @@ export interface ModeEvidenceInput {
   owner: string;
   /**
    * `unknown` (or anything else): the host could not read the Account. It
-   * changes no record; it pauses legacy writes for an Off until a verified
-   * answer, and returns the decision.
+   * changes no record; it pauses legacy writes for an Off until a verified,
+   * current answer, and returns the decision.
    */
   state: "on" | "off" | "unknown";
   /** Absent means 0. */
@@ -94,11 +103,20 @@ export function createModeAuthority(
   const records = new Map<string, AccountModeRecord>();
   const lock = createRwLock();
   /**
-   * Owners whose latest read of the Account failed. In memory only: a record
-   * is history, this is what the host last saw, and a process that has seen
-   * nothing yet has nothing to report.
+   * Owners whose latest evidence in this process was a verified answer that
+   * is current (its generation is not older than the record's). In memory
+   * only: a record is history and survives a restart, this is what the host
+   * saw since this process started, so a restart starts empty.
    */
-  const unreadable = new Set<string>();
+  const verified = new Set<string>();
+  /**
+   * The number of the latest evidence submitted for each owner, taken before
+   * the first await. A verified answer ends a pause only while it is still the
+   * latest: one asked before a later submission cannot speak for the Account's
+   * state after it.
+   */
+  const latest = new Map<string, number>();
+  let submissions = 0;
   let loaded = false;
   let loadFailed = false;
   let closed = false;
@@ -146,8 +164,7 @@ export function createModeAuthority(
   function legacyWriteDecision(owner: string): ModeDecision {
     const decision = read(owner);
     return decision.kind === "legacy" &&
-      typeof owner === "string" &&
-      unreadable.has(normalizeOwner(owner))
+      !(typeof owner === "string" && verified.has(normalizeOwner(owner)))
       ? UNKNOWN_DECISION
       : decision;
   }
@@ -157,9 +174,15 @@ export function createModeAuthority(
     read,
     legacyWriteDecision,
     async submitEvidence(input) {
-      await ready;
+      // Before the first await, so a failed read takes effect at once and not
+      // behind an earlier answer that is still waiting on its save.
       const owner = normalizeOwner(input.owner);
-      if (input.state === "on" || input.state === "off") {
+      const ticket = (submissions += 1);
+      latest.set(owner, ticket);
+      const answered = input.state === "on" || input.state === "off";
+      if (!answered) verified.delete(owner);
+      await ready;
+      if (answered) {
         const release = await lock.exclusive();
         try {
           // Retried under the lock, so the exclusive request is queued before
@@ -171,28 +194,31 @@ export function createModeAuthority(
             return read(owner);
           }
           const prev = records.get(owner);
+          const generation = input.generation ?? 0;
           const next = applyAnswer(
             prev,
-            input.state,
-            input.generation ?? 0,
+            input.state as "on" | "off",
+            generation,
             now(),
           );
           if (next !== prev) {
             await options.store.save(owner, next);
             records.set(owner, next);
           }
-          // A verified answer, at any generation, ends the pause. A save
-          // that threw above never reaches this line, so it ends nothing.
-          unreadable.delete(owner);
+          // Verified for this process only when nothing was submitted after
+          // it and it is not older than the record. A save that threw above
+          // never reaches this line, so it verifies nothing.
+          if (latest.get(owner) === ticket && generation >= next.generation) {
+            verified.add(owner);
+          }
         } finally {
           release();
         }
       } else {
         await retryLoadIfFailed();
-        // Taking no lock is safe: a legacy write already running keeps its
-        // shared hold, and every write that starts later reads this inside
-        // its own hold.
-        unreadable.add(owner);
+        // Nothing to add: the pause was set above, with no lock. A legacy
+        // write already running keeps its shared hold, and every write that
+        // starts later reads it inside its own hold.
       }
       const decision = legacyWriteDecision(owner);
       if (decision.kind === "streams") {
