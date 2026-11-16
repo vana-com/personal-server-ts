@@ -415,17 +415,19 @@ export function createApp(deps: AppDeps): Hono {
     const local = await localSync!();
     return local.recordsFor(connectionLink!);
   };
-  const recordQuery: RecordQuery | undefined = localSync && connectionLink
-    ? {
-        listRecords: async (input) => (await linkedQuery()).listRecords(input),
-        getRecord: async (input) => (await linkedQuery()).getRecord(input),
-        changesSince: async (input) =>
-          (await linkedQuery()).changesSince(input),
-        async *streamRecords(connection, stream) {
-          yield* (await linkedQuery()).streamRecords(connection, stream);
-        },
-      }
-    : undefined;
+  const recordQuery: RecordQuery | undefined =
+    localSync && connectionLink
+      ? {
+          listRecords: async (input) =>
+            (await linkedQuery()).listRecords(input),
+          getRecord: async (input) => (await linkedQuery()).getRecord(input),
+          changesSince: async (input) =>
+            (await linkedQuery()).changesSince(input),
+          async *streamRecords(connection, stream) {
+            yield* (await linkedQuery()).streamRecords(connection, stream);
+          },
+        }
+      : undefined;
   const streamSyncRead: StreamSyncReadPort | undefined = localSync
     ? {
         resolve: async (input) => (await localSync()).resolver.resolve(input),
@@ -562,12 +564,11 @@ export function createApp(deps: AppDeps): Hono {
         store: deps.pdpp.store,
         accountStorageMode,
         recordQuery,
-        recordHistory: localSync && connectionLink
-          ? async (stream, options) =>
-              (await localSync()).changesFor(
-                connectionLink,
-              )(stream, options)
-          : undefined,
+        recordHistory:
+          localSync && connectionLink
+            ? async (stream, options) =>
+                (await localSync()).changesFor(connectionLink)(stream, options)
+            : undefined,
         reads: deps.pdpp.reads,
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,

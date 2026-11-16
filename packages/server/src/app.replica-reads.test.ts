@@ -2,7 +2,11 @@ import { fixedModeAuthority as explicitLegacyAuthority } from "@opendatalabs/per
 import { createHash } from "node:crypto";
 import pino from "pino";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ConnectionLink, LocalSync, RecordQuery } from "@opendatalabs/personal-server-ts-core/localdb";
+import type {
+  ConnectionLink,
+  LocalSync,
+  RecordQuery,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import { createFixtureAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
 import {
   binding,
@@ -105,22 +109,27 @@ function host({
   });
   // A populated host-local read port, separate from the real legacy store.
   // The test targets app composition, not the SQL implementation.
-  const localRows = [{
-    recordKey: "local-key",
-    pkHash: "local-hash",
-    body: JSON.stringify({ id: "local-key", day: "2026-08-02", score: 90 }),
-    emittedAt: Date.parse("2026-08-02T00:00:00Z"),
-  } as NonNullable<Awaited<ReturnType<RecordQuery["getRecord"]>>>];
+  const localRows = [
+    {
+      recordKey: "local-key",
+      pkHash: "local-hash",
+      body: JSON.stringify({ id: "local-key", day: "2026-08-02", score: 90 }),
+      emittedAt: Date.parse("2026-08-02T00:00:00Z"),
+    } as NonNullable<Awaited<ReturnType<RecordQuery["getRecord"]>>>,
+  ];
   const connectionLink: ConnectionLink | undefined =
     local === "missing-link" || local === undefined
       ? undefined
-      : (id, name) => local === "linked" && id === instance && name === stream
-        ? { connector: method, namespace: "" }
-        : null;
+      : (id, name) =>
+          local === "linked" && id === instance && name === stream
+            ? { connector: method, namespace: "" }
+            : null;
   const recordsFor = vi.fn((link: ConnectionLink): RecordQuery => {
     const selected = (id: string, name: string) => {
       const target = link(id, name);
-      return target?.connector === method && target.namespace === "" ? localRows : [];
+      return target?.connector === method && target.namespace === ""
+        ? localRows
+        : [];
     };
     return {
       listRecords: async (input) => ({
@@ -128,16 +137,24 @@ function host({
         nextCursor: null,
       }),
       getRecord: async (input) =>
-        selected(input.connectionId, input.stream).find((row) => row.recordKey === input.recordKey) ?? null,
+        selected(input.connectionId, input.stream).find(
+          (row) => row.recordKey === input.recordKey,
+        ) ?? null,
       changesSince: async () => "gone",
-      async *streamRecords(id, name) { yield* selected(id, name); },
+      async *streamRecords(id, name) {
+        yield* selected(id, name);
+      },
     };
   });
   const changesFor = vi.fn((_link: ConnectionLink) => {
     throw new Error("changesFor must not run without a connection link");
   });
-  const localSync = vi.fn(async () => ({ recordsFor, changesFor } as unknown as LocalSync));
-  const legacyReads = vi.fn((reader: "owner" | "grant") => receiver.readStore({ reader }));
+  const localSync = vi.fn(
+    async () => ({ recordsFor, changesFor }) as unknown as LocalSync,
+  );
+  const legacyReads = vi.fn((reader: "owner" | "grant") =>
+    receiver.readStore({ reader }),
+  );
   const pdpp = {
     ...(connectionLink && { connectionLink }),
     store,
@@ -161,7 +178,9 @@ function host({
   };
   const indexManager = createIndexManager(db);
   const app = createApp({
-    accountModeAuthority: explicitLegacyAuthority(local ? "switched" : "unswitched"),
+    accountModeAuthority: explicitLegacyAuthority(
+      local ? "switched" : "unswitched",
+    ),
     ...(local && { localSync }),
     logger: pino({ level: "silent" }),
     version: "test",
@@ -628,21 +647,32 @@ describe("createApp switched records require the host connection-link capability
         blobs: [{ blobId: h.blobId, bytes: h.bytes }],
       });
       // Prove the forbidden fallback has data, then count only HTTP read calls.
-      expect(h.receiver.readStore({ reader: "owner" }).getRecord(instance, stream, "legacy-key")).toBeDefined();
+      expect(
+        h.receiver
+          .readStore({ reader: "owner" })
+          .getRecord(instance, stream, "legacy-key"),
+      ).toBeDefined();
       expect(h.localRows).toHaveLength(1);
       h.legacyReads.mockClear();
 
       const page = await h.get("owner", `/v1/streams/${stream}/records`);
-      const point = await h.get("owner", `/v1/streams/${stream}/records/local-key`);
+      const point = await h.get(
+        "owner",
+        `/v1/streams/${stream}/records/local-key`,
+      );
       if (local === "missing-link") {
         for (const response of [page, point]) {
           expect(response.status).toBe(503);
-          expect(JSON.stringify(response.body)).toContain("STREAM_READ_UNAVAILABLE");
+          expect(JSON.stringify(response.body)).toContain(
+            "STREAM_READ_UNAVAILABLE",
+          );
         }
         expect(h.recordsFor).not.toHaveBeenCalled();
       } else if (local === "linked") {
         expect(page.status).toBe(200);
-        expect(page.body.data.map((row: { id: string }) => row.id)).toEqual(["local-key"]);
+        expect(page.body.data.map((row: { id: string }) => row.id)).toEqual([
+          "local-key",
+        ]);
         expect(point.status).toBe(200);
         expect(point.body.id).toBe("local-key");
         expect(h.recordsFor).toHaveBeenCalled();
@@ -653,7 +683,9 @@ describe("createApp switched records require the host connection-link capability
         expect(h.recordsFor).toHaveBeenCalled();
       }
       expect(h.legacyReads).not.toHaveBeenCalled();
-      expect(JSON.stringify([page.body, point.body])).not.toContain("legacy-key");
+      expect(JSON.stringify([page.body, point.body])).not.toContain(
+        "legacy-key",
+      );
     },
   );
 });
@@ -683,11 +715,17 @@ describe("createApp switched reads without the host connection-link capability",
         const response = await h.get(token, path);
         const label = `${token} ${path}`;
         expect(response.status, label).toBe(503);
-        expect(JSON.stringify(response.body), label).toContain("STREAM_READ_UNAVAILABLE");
-        expect(JSON.stringify(response.body), label).not.toContain("legacy-key");
+        expect(JSON.stringify(response.body), label).toContain(
+          "STREAM_READ_UNAVAILABLE",
+        );
+        expect(JSON.stringify(response.body), label).not.toContain(
+          "legacy-key",
+        );
       }
     }
-    expect((await h.get("owner", `/v1/blobs/${h.blobId}`, "HEAD")).status).toBe(503);
+    expect((await h.get("owner", `/v1/blobs/${h.blobId}`, "HEAD")).status).toBe(
+      503,
+    );
     // Per-stream metadata is the declaration alone: it reads no records, so
     // it stays available and exposes no row.
     for (const token of ["owner", "app"]) {
