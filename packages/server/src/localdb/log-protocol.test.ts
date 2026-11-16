@@ -2612,18 +2612,14 @@ describe("log protocol: a per-stream head and the log name one key at one stamp"
     const [low, high] = [byHash[0]!, byHash[5]!];
     const m = await mixed([low], high);
     for (const d of logOn(m))
-      expect(await keyOf(d)).toMatchObject([
-        { body: bodyV(high), stamp_n: 0 },
-      ]);
+      expect(await keyOf(d)).toMatchObject([{ body: bodyV(high), stamp_n: 0 }]);
   });
 
   it("the head's body has the lesser hash at ordinal 0: every log-on device holds the logged one", async () => {
     const [low, high] = [byHash[0]!, byHash[5]!];
     const m = await mixed([high], low);
     for (const d of logOn(m))
-      expect(await keyOf(d)).toMatchObject([
-        { body: bodyV(high), stamp_n: 0 },
-      ]);
+      expect(await keyOf(d)).toMatchObject([{ body: bodyV(high), stamp_n: 0 }]);
   });
 
   it("a logged ordinal above 0 beats a head's body whatever the hashes: every log-on device holds the logged one", async () => {
@@ -2648,9 +2644,7 @@ describe("log protocol: a per-stream head and the log name one key at one stamp"
     await lateProgressive.cycle();
     await m.early.cycle();
     const expected = await keyOf(m.fresh);
-    expect(expected).toMatchObject([
-      { body: bodyV(byHash[2]!), stamp_n: 1 },
-    ]);
+    expect(expected).toMatchObject([{ body: bodyV(byHash[2]!), stamp_n: 1 }]);
     for (const d of [late, lateProgressive, m.progressive])
       expect(await keyOf(d)).toEqual(expected);
   });

@@ -390,4 +390,3 @@ With the log off and admission on (`publishWhileCollecting`) a device stores
 `stamp_n` in its own rows and orders its own bodies by it. No log segment is
 written and a head holds no ordinal. A device that turns the log on after it
 published a head publishes its changes then, and a first load reads one row.
-
