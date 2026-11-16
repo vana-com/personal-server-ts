@@ -4,7 +4,8 @@ CONSTANTS MaxSteps, Mode, AllowReset, AllowRollback, KeepTail
 ASSUME /\ MaxSteps \in 6..8
        /\ KeepTail = 1
        /\ Mode \in {"good","gap","outOfOrder","droppedDeleteEffect","forgetTombstone",
-                    "omitNoCutoff","omitInclusive","dropKind","replayFromBase"}
+                    "omitNoCutoff","omitInclusive","dropKind","replayFromBase",
+                    "grouped","groupedSkip"}
 Devices == {1,2,3}
 Keys == {1,2}
 Writers == {1,2}
@@ -228,7 +229,36 @@ SkipGap(d) ==
  /\ prefixOK'=FALSE
  /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
                 deviceEpoch,known,data,hints,monotoneOK,omissionOK>>
+\* Group commit (a first load applies the segments it holds in few transactions): ONE
+\* transaction applies the retained segments position+1..q in order, and writes position q
+\* with the last of them (as `Apply` writes it with one). No state between them is committed,
+\* so no reader or crash sees one. Each segment still sees the rows of the ones before it,
+\* so the fold is the same as q-position separate `Apply` steps.
+\* groupedSkip mutant: the transaction omits the segments between the first and the last
+\* (it commits position q over rows that lack them), which P5 and P1 must refuse.
+RECURSIVE FoldRun(_,_,_)
+FoldRun(state,from,to) ==
+ IF from > to THEN state
+ ELSE FoldRun(FoldOps(state,log[from],FALSE,from),from+1,to)
+ApplyRun(d,q) ==
+ /\ Mode \in {"grouped","groupedSkip"}
+ /\ deviceEpoch[d]=epoch /\ position[d]>=cut
+ /\ q \in retained /\ q<=known[d] /\ q>position[d]+1
+ /\ \A p \in (position[d]+1)..q : p \in retained
+ /\ data'=[data EXCEPT ![d]=
+      IF Mode="groupedSkip"
+      THEN FoldOps(FoldOps(data[d],log[position[d]+1],FALSE,position[d]+1),log[q],FALSE,q)
+      ELSE FoldRun(data[d],position[d]+1,q)]
+ /\ position'=[position EXCEPT ![d]=q]
+ \* Each constituent segment is the next position, so the prefix rule holds step by step.
+ /\ prefixOK'=prefixOK
+ /\ monotoneOK'=(monotoneOK /\ q>=position[d])
+ /\ omissionOK'=(omissionOK /\ \A p \in (position[d]+1)..q :
+       OmissionSafeFor(FoldRun(data[d],position[d]+1,p-1),log[p]))
+ /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
+                deviceEpoch,known,hints>>
 Recover(d) == Install(d) \/ (\E p \in retained : Apply(d,p)) \/ SkipGap(d)
+              \/ (\E q \in retained : ApplyRun(d,q))
 Next ==
  \/ Commit \/ Stop \/ Reset \/ Compact \/ Rollback
  \/ \E d \in Devices : FullCheck(d) \/ Recover(d)

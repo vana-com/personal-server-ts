@@ -97,6 +97,12 @@ adopting a newer epoch, so monotonicity means the pair (epoch, position).
 - Reset: new authoritative lifetime, empty log/snapshot; offline views are not
   magically rewritten. All old hints remain eligible for transport, not authority.
 - SkipGap: mutant-only advancement of a checkpoint from a later hint.
+- ApplyRun (`Mode` grouped, groupedSkip): the segments `position+1..q` apply in
+  ONE transaction that writes position q with the last of them. It models the
+  host's group commit of a first load, and equals q-position separate `Apply`
+  steps with no committed state between them (each segment folds over the rows
+  of the ones before it). The `groupedSkip` mutant leaves out the middle
+  segments and must fail P5.
 
 ## Properties and expected host results
 
@@ -111,6 +117,8 @@ adopting a newer epoch, so monotonicity means the pair (epoch, position).
 | OmissionWithoutCutoff.cfg | FAIL P3                             | newer observed row erased by old omission                                                       |
 | OmissionInclusive.cfg     | FAIL P3                             | omission at equal stamp erases an observation AT the cutoff (`<=` boundary)                     |
 | LamportDifference.cfg     | FAIL StampEqualsLamport             | P6 orders choose different winners                                                              |
+| Grouped.cfg               | PASS within this finite abstraction | group commit (`ApplyRun`): TypeOK, P1–P5, OrderOK                                               |
+| GroupedSkip.cfg           | FAIL P5                             | a group commit that leaves out the segments between its first and last                          |
 
 Corpus (batch 6): an equal-cutoff omission (key 1, stamp 5) meets the live
 stamp-5 row, and an older omission (key 2, stamp 1) sits below the live delete.
@@ -172,17 +180,19 @@ Spec change for this run: one lexical edit, line 108 of `LogProtocol.tla`,
 did not lex. A grep for `=<<` found no other hit. No other spec or config
 change.
 
-| Configuration             | Expected                | Actual                                                                                                     | Distinct states               | Depth | Wall time                             |
-| ------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------- | ----------------------------- | ----- | ------------------------------------- |
-| Good.cfg                  | PASS                    | BOUNDED: stopped at 20.3M distinct, no invariant error in explored states; EventuallyConverged not checked | at least 20,309,206 (partial) | n/a   | 47 min 51 s, stopped                  |
-| LostPush.cfg              | PASS                    | BFS COMPLETE, no invariant error (23,019,334 distinct, 0 left on queue); temporal check cut at bound       | 23,019,334                    | n/a   | 46 min 7 s, stopped in temporal check |
-| DropGap.cfg               | FAIL P2                 | FAIL P2 as expected (`Invariant P2 is violated`)                                                           | 130 at failure                | 6     | <1 s                                  |
-| OutOfOrder.cfg            | FAIL P2                 | FAIL P2 as expected (`Invariant P2 is violated`)                                                           | 131 at failure                | 6     | <1 s                                  |
-| DroppedDeleteEffect.cfg   | FAIL P1                 | FAIL P1 as expected (`Invariant P1 is violated`)                                                           | 2,509 at failure              | 8     | <1 s                                  |
-| ForgetTombstone.cfg       | FAIL P1                 | FAIL P1 as expected; trace: Install, then replayed batch 5 resurrects key 2                                | 16,135 at failure             | 10    | 2 s                                   |
-| OmissionWithoutCutoff.cfg | FAIL P3                 | FAIL P3 as expected (`Invariant P3 is violated`)                                                           | 7,842 at failure              | 9     | <1 s                                  |
-| OmissionInclusive.cfg     | FAIL P3                 | FAIL P3 as expected; trace: stamp-5 omission erases the stamp-5 row                                        | 45,443 at failure             | 11    | <1 s                                  |
-| LamportDifference.cfg     | FAIL StampEqualsLamport | FAIL StampEqualsLamport as expected                                                                        | 4 at failure                  | 3     | <1 s                                  |
+| Configuration             | Expected                | Actual                                                                                                                | Distinct states               | Depth | Wall time                             |
+| ------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------- | ----- | ------------------------------------- |
+| Good.cfg                  | PASS                    | BOUNDED: stopped at 20.3M distinct, no invariant error in explored states; EventuallyConverged not checked            | at least 20,309,206 (partial) | n/a   | 47 min 51 s, stopped                  |
+| LostPush.cfg              | PASS                    | BFS COMPLETE, no invariant error (23,019,334 distinct, 0 left on queue); temporal check cut at bound                  | 23,019,334                    | n/a   | 46 min 7 s, stopped in temporal check |
+| DropGap.cfg               | FAIL P2                 | FAIL P2 as expected (`Invariant P2 is violated`)                                                                      | 130 at failure                | 6     | <1 s                                  |
+| OutOfOrder.cfg            | FAIL P2                 | FAIL P2 as expected (`Invariant P2 is violated`)                                                                      | 131 at failure                | 6     | <1 s                                  |
+| DroppedDeleteEffect.cfg   | FAIL P1                 | FAIL P1 as expected (`Invariant P1 is violated`)                                                                      | 2,509 at failure              | 8     | <1 s                                  |
+| ForgetTombstone.cfg       | FAIL P1                 | FAIL P1 as expected; trace: Install, then replayed batch 5 resurrects key 2                                           | 16,135 at failure             | 10    | 2 s                                   |
+| OmissionWithoutCutoff.cfg | FAIL P3                 | FAIL P3 as expected (`Invariant P3 is violated`)                                                                      | 7,842 at failure              | 9     | <1 s                                  |
+| OmissionInclusive.cfg     | FAIL P3                 | FAIL P3 as expected; trace: stamp-5 omission erases the stamp-5 row                                                   | 45,443 at failure             | 11    | <1 s                                  |
+| LamportDifference.cfg     | FAIL StampEqualsLamport | FAIL StampEqualsLamport as expected                                                                                   | 4 at failure                  | 3     | <1 s                                  |
+| Grouped.cfg               | PASS                    | BFS COMPLETE, no invariant error (372,262,911 generated, 0 left on queue); no temporal property                       | 20,306,222                    | 24    | 22 min 29 s (2 workers)               |
+| GroupedSkip.cfg           | FAIL P5                 | FAIL P5 as expected; trace: three commits, FullCheck, then a group that omits the segments between its first and last | 184 at failure                | 6     | <1 s                                  |
 
 Good and LostPush hit the bound before TLC finished (20M distinct states or 45
 min), so their PASS is not established. Good stopped with no invariant violation

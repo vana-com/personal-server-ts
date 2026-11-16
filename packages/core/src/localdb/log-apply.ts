@@ -56,6 +56,7 @@ import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { heldKeys, planLogLoad, type PlannedBatch } from "./log-progressive.js";
 import { mergeIncoming, seenPair, withOrigin } from "./merge.js";
+import { readPartsAhead } from "./part-readahead.js";
 import {
   failedRowStatement,
   failureCode,
@@ -228,14 +229,26 @@ export function recordKeyOfKey(
   );
 }
 
-async function applyBatch(
+/** A batch built (checked, canonicalized, hashed) and not yet written. */
+interface StagedBatch {
+  /** The id of its rows in `temp.incoming`. */
+  readonly op: string;
+  readonly statements: readonly SqlStatement[];
+}
+
+/**
+ * Staging is the JS half of an apply: it reads the batch's operations, checks
+ * and hashes them, and builds the statements. It does not touch the database,
+ * so it runs while an earlier commit is writing (see `applyInGroups`).
+ */
+async function stageBatch(
   deps: LocalSyncDeps,
   connectionId: string,
   segment: OperationBatch,
   identity: { readonly dataHash: string; readonly blobName: string },
   state?: LogState,
   steps: ReadonlyMap<string, BatchStep> = new Map(),
-): Promise<void> {
+): Promise<StagedBatch> {
   const { dataHash, blobName } = identity;
   const op = deps.newOp();
   const primaryKeyOf = new Map(
@@ -519,13 +532,111 @@ async function applyBatch(
         partialRowStatement(step.row.head, step.row.applied, step.row.total, 0),
       );
   if (state) statements.push(writeLogState(connectionId, state));
+  return { op, statements };
+}
 
+/**
+ * Write staged batches in one transaction, in order. Each batch's statements
+ * see the rows of the ones before it, as they do when the batches commit one
+ * by one, so the rows are the same; what differs is that no state between two
+ * of them is committed. A failure writes none of them.
+ */
+async function commitStaged(
+  deps: LocalSyncDeps,
+  batches: readonly StagedBatch[],
+): Promise<void> {
+  const statements: SqlStatement[] = [];
+  // One by one: a group's statements can outnumber what a call takes as arguments.
+  for (const batch of batches)
+    for (const statement of batch.statements) statements.push(statement);
   try {
     await deps.db.batch(withOrigin("remote", statements));
   } finally {
-    await deps.db.batch([
-      { sql: "DELETE FROM temp.incoming WHERE op = ?", params: [op] },
-    ]);
+    await deps.db.batch(
+      batches.map((batch) => ({
+        sql: "DELETE FROM temp.incoming WHERE op = ?",
+        params: [batch.op],
+      })),
+    );
+  }
+}
+
+async function applyBatch(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  segment: OperationBatch,
+  identity: { readonly dataHash: string; readonly blobName: string },
+  state?: LogState,
+  steps: ReadonlyMap<string, BatchStep> = new Map(),
+): Promise<void> {
+  await commitStaged(deps, [
+    await stageBatch(deps, connectionId, segment, identity, state, steps),
+  ]);
+}
+
+/** One batch of a pass: what it weighs, and how it is fetched and staged. */
+interface PassItem {
+  /** The clear length of the segment or snapshot part. */
+  readonly bytes: number;
+  /**
+   * It commits as the last of its group. A progressive load sets it on the
+   * batch that completes a stream, so the stream is complete when that batch
+   * commits and not when the group that holds it would.
+   */
+  readonly closesGroup?: boolean;
+  /** Fetch it (unless it is in hand), verify it and stage it. */
+  readonly stage: () => Promise<StagedBatch>;
+}
+
+/**
+ * Apply a pass's batches in order, fetching and staging the ones that follow
+ * while the commit of an earlier one writes (`readPartsAhead`, the reader a
+ * head's parts use), and committing the batches that are ready together.
+ *
+ * Why commit together: on a first load a batch's rows land across the whole of
+ * `records` and its indexes (the keys of a log are in publish order, not key
+ * order), so a commit writes about as many pages as it has rows, and a host
+ * whose every page write is a call (the Web's OPFS) pays for each. Batches
+ * committed together write a page once for all of them. Why it is safe: see
+ * `ApplyRun` in docs/formal/log-protocol/LogProtocol.tla. The batches apply in
+ * position order in one transaction, the position is written by the last of
+ * them, and the reader never sees a position whose rows are not all there.
+ *
+ * How many go together is not a number here: the commit goes when the next
+ * batch is not yet staged, so a group is the batches the reader staged during
+ * the commit before it, and the store's memory budget bounds that (each batch
+ * holds its bytes until its commit). With `firstAlone` the first batch commits
+ * by itself, for the first screen of a progressive load.
+ *
+ * A batch that cannot be fetched or staged is not ready, so the commit that
+ * holds the batches before it goes first, and then the error is raised.
+ */
+async function applyInGroups(
+  deps: LocalSyncDeps,
+  items: readonly PassItem[],
+  options: {
+    readonly firstAlone: boolean;
+    /** The batches `first..last` are committed. */
+    readonly onCommit?: (first: number, last: number) => void;
+  },
+): Promise<void> {
+  const ahead = readPartsAhead(deps.blobs, items, (item) => item.stage());
+  let pending: StagedBatch[] = [];
+  let first = 0;
+  let began = !options.firstAlone;
+  try {
+    for (const [index, item] of items.entries()) {
+      pending.push(await ahead.load(item, index));
+      if (began && !item.closesGroup && ahead.ready(index + 1)) continue;
+      await commitStaged(deps, pending);
+      pending = [];
+      began = true;
+      ahead.committed(index);
+      options.onCommit?.(first, index);
+      first = index + 1;
+    }
+  } finally {
+    ahead.close();
   }
 }
 
@@ -642,7 +753,7 @@ export async function applyLog(
   }
   let since = local.position;
   let plan = planOpsSince(head, headRef, since);
-  let applied = 0;
+  let snapshot: SnapshotPointer | null = null;
   if (plan.kind === "gap") {
     if (plan.reason === "ahead_of_head")
       throw new LogDivergedError(
@@ -666,14 +777,13 @@ export async function applyLog(
         ),
       };
     }
-    if (head.snapshot) {
-      await installSnapshot(deps, connectionId, scope, context, head, allRefs);
-      applied += head.snapshot.parts.length;
-    }
     since = head.base;
     plan = planOpsSince(head, headRef, since);
+    // Behind `base` the snapshot is installed first, then the tail: one pass.
+    snapshot = head.snapshot ?? null;
   }
-  if (plan.kind !== "segments") return { applied };
+  const tail = plan.kind === "segments" ? plan.refs : [];
+  if (tail.length === 0 && snapshot === null) return { applied: 0 };
   if (deps.progressiveFirstLoad === true)
     return {
       applied: await loadProgressively(
@@ -683,36 +793,128 @@ export async function applyLog(
         context,
         head,
         allRefs,
-        null,
-        plan.refs,
+        snapshot,
+        tail,
       ),
     };
 
-  // Older segments in parallel; they are applied strictly in position order.
-  const fetched = new Map<number, Segment>();
-  fetched.set(head.position, head);
-  await Promise.all(
-    plan.refs
-      .filter((ref) => ref.position !== head.position)
-      .map(async (ref) => {
-        fetched.set(
-          ref.position,
-          (await fetchSegment(deps, scope, context, ref.dataHash, ref.position))
-            .segment,
-        );
-      }),
-  );
-  for (const ref of plan.refs) {
-    const segment = fetched.get(ref.position)!;
-    await applySegmentOperations(deps, connectionId, segment, {
-      position: ref.position,
-      base: head.base,
-      refs: allRefs.filter((r) => r.position <= ref.position),
-      snapshot: head.snapshot,
-    });
-    applied++;
-  }
-  return { applied };
+  const items: PassItem[] = [
+    ...snapshotItems(
+      deps,
+      connectionId,
+      scope,
+      context,
+      head,
+      allRefs,
+      snapshot,
+    ),
+    ...tail.map((ref) =>
+      segmentItem(deps, connectionId, scope, context, head, allRefs, ref),
+    ),
+  ];
+  await applyInGroups(deps, items, { firstAlone: false });
+  return { applied: items.length };
+}
+
+/**
+ * One segment of the tail as a batch of the pass: fetched (the newest is
+ * already in hand), verified, staged, with the position it carries.
+ */
+function segmentItem(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  scope: string,
+  context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
+  head: Segment,
+  allRefs: readonly SegmentRef[],
+  ref: SegmentRef,
+): PassItem {
+  return {
+    bytes: ref.bytes,
+    stage: async () => {
+      const segment =
+        ref.position === head.position
+          ? head
+          : (
+              await fetchSegment(
+                deps,
+                scope,
+                context,
+                ref.dataHash,
+                ref.position,
+              )
+            ).segment;
+      return stageBatch(
+        deps,
+        connectionId,
+        segment,
+        {
+          dataHash: ref.dataHash.toLowerCase(),
+          blobName: segmentBlobName(ref.dataHash),
+        },
+        {
+          position: ref.position,
+          base: head.base,
+          refs: allRefs.filter((r) => r.position <= ref.position),
+          snapshot: head.snapshot,
+        },
+      );
+    },
+  };
+}
+
+/**
+ * The parts of the snapshot a reader behind `head.base` installs, as batches
+ * of the pass. The position moves to the snapshot's only with the last part,
+ * in the same batch, so an interrupted install is repeated, never half
+ * believed. Idempotent.
+ */
+function snapshotItems(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  scope: string,
+  context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
+  head: Segment,
+  allRefs: readonly SegmentRef[],
+  snapshot: SnapshotPointer | null,
+): PassItem[] {
+  if (snapshot === null) return [];
+  return snapshot.parts.map((ref, index) => ({
+    bytes: ref.bytes,
+    stage: async () => {
+      const part = await fetchSnapshotPart(
+        deps,
+        scope,
+        context,
+        ref.dataHash,
+        snapshot.position,
+      );
+      if (part.index !== index)
+        throw new Error("apply: invalid log snapshot part (inconsistent)");
+      return stageBatch(
+        deps,
+        connectionId,
+        {
+          generation: part.generation,
+          observedAt: 0,
+          streams: part.streams,
+          operations: part.entries,
+        },
+        {
+          dataHash: ref.dataHash.toLowerCase(),
+          blobName: snapshotPartBlobName(ref.dataHash),
+        },
+        index === snapshot.parts.length - 1
+          ? {
+              position: snapshot.position,
+              base: head.base,
+              refs: allRefs.filter((r) => r.position <= snapshot.position),
+              snapshot,
+            }
+          : undefined,
+      );
+    },
+  }));
 }
 
 /** One segment, fetched, decrypted and verified against the hash and position. */
@@ -773,46 +975,6 @@ export async function fetchSnapshotPart(
 }
 
 /**
- * Bring a reader that is behind `head.base` to the snapshot: fetch every part
- * (in parallel), then apply them in index order. The position moves to the
- * snapshot's only with the last part, in the same batch, so an interrupted
- * install is repeated, never half believed. Idempotent.
- */
-async function installSnapshot(
-  deps: LocalSyncDeps,
-  connectionId: string,
-  scope: string,
-  context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
-  head: Segment,
-  allRefs: readonly SegmentRef[],
-): Promise<void> {
-  const snapshot = head.snapshot!;
-  const parts = await Promise.all(
-    snapshot.parts.map((ref) =>
-      fetchSnapshotPart(deps, scope, context, ref.dataHash, snapshot.position),
-    ),
-  );
-  parts.sort((a, b) => a.index - b.index);
-  for (let i = 0; i < parts.length; i++)
-    await applySnapshotPart(
-      deps,
-      connectionId,
-      parts[i]!,
-      i === parts.length - 1
-        ? {
-            position: snapshot.position,
-            base: head.base,
-            refs: allRefs.filter((r) => r.position <= snapshot.position),
-            snapshot,
-          }
-        : undefined,
-    );
-}
-
-/** Snapshot parts fetched ahead of the one being applied. */
-const PART_WINDOW = 4;
-
-/**
  * The pass of `applyLog` for a device that serves a first load while it
  * applies (`progressiveFirstLoad`): the same batches in the same order, with
  * `stream_partial` rows between them. See `log-progressive.ts` for which
@@ -833,24 +995,28 @@ async function loadProgressively(
   tail: readonly SegmentRef[],
 ): Promise<number> {
   const partRefs = snapshot?.parts ?? [];
+  // A part is fetched once, whoever asks first: the plan asks for the first,
+  // the pass for the others as read-ahead reaches them.
   const parts: (Promise<SnapshotPart> | undefined)[] = [];
-  const startPart = (index: number) => {
-    if (index >= partRefs.length || parts[index]) return;
-    const fetching = fetchSnapshotPart(
-      deps,
-      scope,
-      context,
-      partRefs[index]!.dataHash,
-      snapshot!.position,
-    );
-    fetching.catch(() => undefined);
-    parts[index] = fetching;
+  const partAt = (index: number) => {
+    if (!parts[index]) {
+      const fetching = fetchSnapshotPart(
+        deps,
+        scope,
+        context,
+        partRefs[index]!.dataHash,
+        snapshot!.position,
+      );
+      fetching.catch(() => undefined);
+      parts[index] = fetching;
+    }
+    return parts[index]!;
   };
-  for (let i = 0; i < PART_WINDOW; i++) startPart(i);
+  if (partRefs.length > 0) void partAt(0);
 
   const fetched = new Map<number, Segment>([[head.position, head]]);
   const [firstPart] = await Promise.all([
-    parts[0] ?? Promise.resolve(undefined),
+    partRefs.length > 0 ? partAt(0) : Promise.resolve(undefined),
     Promise.all(
       tail
         .filter((ref) => ref.position !== head.position)
@@ -976,16 +1142,79 @@ async function loadProgressively(
   }
   if (ended.length > 0) await deps.db.batch(ended);
 
+  // What each batch does for the streams that load progressively: a function
+  // of its place in the pass and its own operations, so the batches can be
+  // staged in any order and are committed in this one. A part's operations
+  // are known once it is fetched, so its steps are made when it is staged.
   const seen = new Map<string, number>();
-  const begun = new Map<string, PartialIdentity>();
-  const finished = new Set<string>();
-  try {
-    for (let index = 0; index < planned.length; index++) {
+  const counts: ReadonlyMap<string, number>[] = planned.map((batch) => {
+    const here = new Map<string, number>();
+    for (const meta of batch.streams) {
+      const count = (seen.get(meta.stream) ?? 0) + 1;
+      seen.set(meta.stream, count);
+      here.set(meta.stream, count);
+    }
+    return here;
+  });
+  const stepsOf: ReadonlyMap<string, BatchStep>[] = [];
+  const stepsFor = (
+    index: number,
+    batch: OperationBatch,
+  ): ReadonlyMap<string, BatchStep> => {
+    const steps = new Map<string, BatchStep>();
+    for (const meta of batch.streams) {
+      const plan = plans.get(meta.stream);
+      if (!plan) continue;
+      const resume = resumed.get(meta.stream);
+      const count = counts[index]!.get(meta.stream)!;
+      const final = index === plan.last;
+      const total = resume?.total ?? plan.total;
+      steps.set(meta.stream, {
+        begin: index === plan.first && resume === undefined,
+        final,
+        held: final ? [] : heldKeys(plan, index, batch.operations),
+        row: final
+          ? undefined
+          : {
+              head: heads.get(meta.stream)!,
+              applied: Math.min((resume?.applied ?? 0) + count, total - 1),
+              total,
+            },
+      });
+    }
+    stepsOf[index] = steps;
+    return steps;
+  };
+  const stateOf = (index: number): LogState | undefined => {
+    const lastPart = index === partRefs.length - 1;
+    const position = index - partRefs.length;
+    return index < partRefs.length
+      ? lastPart
+        ? {
+            position: snapshot!.position,
+            base: head.base,
+            refs: allRefs.filter((r) => r.position <= snapshot!.position),
+            snapshot,
+          }
+        : undefined
+      : {
+          position: tail[position]!.position,
+          base: head.base,
+          refs: allRefs.filter((r) => r.position <= tail[position]!.position),
+          snapshot: head.snapshot,
+        };
+  };
+  const items: PassItem[] = planned.map((_, index) => ({
+    bytes:
+      index < partRefs.length
+        ? partRefs[index]!.bytes
+        : tail[index - partRefs.length]!.bytes,
+    // The batch that completes a stream commits that stream's last rows.
+    closesGroup: [...plans.values()].some((plan) => plan.last === index),
+    stage: async () => {
       let batch: OperationBatch;
-      const isPart = index < partRefs.length;
-      if (isPart) {
-        const part = await parts[index]!;
-        startPart(index + PART_WINDOW);
+      if (index < partRefs.length) {
+        const part = await partAt(index);
         if (
           part.index !== index ||
           JSON.stringify(part.streams) !== JSON.stringify(firstPart!.streams)
@@ -998,62 +1227,34 @@ async function loadProgressively(
           operations: part.entries,
         };
       } else batch = tailSegments[index - partRefs.length]!;
-
-      const steps = new Map<string, BatchStep>();
-      for (const meta of batch.streams) {
-        const plan = plans.get(meta.stream);
-        if (!plan) continue;
-        const resume = resumed.get(meta.stream);
-        const count = (seen.get(meta.stream) ?? 0) + 1;
-        seen.set(meta.stream, count);
-        const final = index === plan.last;
-        const total = resume?.total ?? plan.total;
-        steps.set(meta.stream, {
-          begin: index === plan.first && resume === undefined,
-          final,
-          held: final ? [] : heldKeys(plan, index, batch.operations),
-          row: final
-            ? undefined
-            : {
-                head: heads.get(meta.stream)!,
-                applied: Math.min((resume?.applied ?? 0) + count, total - 1),
-                total,
-              },
-        });
-      }
-
-      const lastPart = isPart && index === partRefs.length - 1;
-      const position = index - partRefs.length;
-      const state: LogState | undefined = lastPart
-        ? {
-            position: snapshot!.position,
-            base: head.base,
-            refs: allRefs.filter((r) => r.position <= snapshot!.position),
-            snapshot,
-          }
-        : !isPart
-          ? {
-              position: tail[position]!.position,
-              base: head.base,
-              refs: allRefs.filter(
-                (r) => r.position <= tail[position]!.position,
-              ),
-              snapshot: head.snapshot,
-            }
-          : undefined;
-      await applyBatch(
+      return stageBatch(
         deps,
         connectionId,
         batch,
         identities[index]!,
-        state,
-        steps,
+        stateOf(index),
+        stepsFor(index, batch),
       );
-      for (const [stream, step] of steps)
-        if (step.final) finished.add(stream);
-        else begun.set(stream, heads.get(stream)!);
-      if (steps.size > 0) announceApplied(deps, connectionId);
-    }
+    },
+  }));
+
+  const begun = new Map<string, PartialIdentity>();
+  const finished = new Set<string>();
+  try {
+    await applyInGroups(deps, items, {
+      // The first batch commits alone: it is the first screen.
+      firstAlone: true,
+      onCommit: (first, last) => {
+        let shown = false;
+        for (let index = first; index <= last; index++)
+          for (const [stream, step] of stepsOf[index]!) {
+            shown = true;
+            if (step.final) finished.add(stream);
+            else begun.set(stream, heads.get(stream)!);
+          }
+        if (shown) announceApplied(deps, connectionId);
+      },
+    });
   } catch (error) {
     // The load stopped short of its last batch: say so on its rows, for a
     // reader to tell this from a load that is still going. The next batch

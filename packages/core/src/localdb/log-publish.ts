@@ -526,8 +526,10 @@ async function snapshotRound(
         planned.push({ ...base, ack: row.publish_watermark, rest: true });
         continue;
       }
-      selected.push(...groups);
-      taken.push(...found.values());
+      // A stream can hold more keys than a call takes as arguments (a spread
+      // of ~125k overflows the stack), so these are appended one by one.
+      for (const group of groups) selected.push(group);
+      for (const op of found.values()) taken.push(op);
       bytes = size;
     } else {
       scan: for (const batch of chunked(groups, KEYS_PER_QUERY)) {
