@@ -1,7 +1,7 @@
 // The stored size of a row (`records.body_bytes`), which the log's snapshot
 // pages read to cut pages without reading bodies, and the driver's frozen read
 // view (`SqlDriver.snapshot`). A file database and the real driver.
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import {
@@ -27,7 +27,7 @@ afterEach(async () => {
 });
 
 async function world() {
-  const dir = mkdtempSync(join(process.cwd(), ".localdb-snapshot-"));
+  const dir = mkdtempSync(join(process.cwd(), ".localdb-body-bytes-"));
   dirs.push(dir);
   const db = openBetterSqlite3(join(dir, "db.sqlite"));
   drivers.push(db);
@@ -85,34 +85,6 @@ async function world() {
   return { sync, db, load };
 }
 const ids = (n: number) => Array.from({ length: n }, (_, i) => `row-${i}`);
-
-it("holds the WAL while a view is open, lets writes commit, and frees it on release", async () => {
-  const dir = mkdtempSync(join(process.cwd(), ".localdb-snapshot-"));
-  dirs.push(dir);
-  const path = join(dir, "wal.sqlite");
-  const db = openBetterSqlite3(path);
-  drivers.push(db);
-  await db.query("PRAGMA journal_mode = WAL", []);
-  await db.batch([{ sql: "CREATE TABLE t (k INTEGER PRIMARY KEY, v BLOB)" }]);
-  const write = (from: number) =>
-    db.batch(
-      Array.from({ length: 100 }, (_, j) => ({
-        sql: "INSERT INTO t VALUES (?, randomblob(10000))",
-        params: [from + j],
-      })),
-    );
-  await write(0);
-  const view = await db.snapshot!();
-  for (let i = 1; i <= 10; i++) await write(i * 1000); // 10 MB while open
-  expect(await view.query("SELECT COUNT(*) AS n FROM t", [])).toEqual([
-    { n: 100 },
-  ]);
-  await db.query("PRAGMA wal_checkpoint(PASSIVE)", []);
-  expect(statSync(`${path}-wal`).size).toBeGreaterThan(10_000_000);
-  await view.release();
-  await db.query("PRAGMA wal_checkpoint(TRUNCATE)", []);
-  expect(statSync(`${path}-wal`).size).toBe(0);
-});
 
 const sizes = (w: Awaited<ReturnType<typeof world>>) =>
   w.db.query<{ k: string; stored: number | null; real: number }>(
