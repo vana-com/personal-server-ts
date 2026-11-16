@@ -14,7 +14,11 @@ import {
   streamScope,
   type Segment,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { publishConnection } from "../../../core/src/localdb/index.js";
+import {
+  applyStream,
+  publishConnection,
+} from "../../../core/src/localdb/index.js";
+import { UpdateRequiredError } from "../../../core/src/localdb/update-required.js";
 import {
   CONNECTION_ID,
   CONNECTOR,
@@ -178,6 +182,68 @@ describe("a log in a format this core cannot read", () => {
       expect(w.gateway.rowsOf(LOG)).toBe(2);
       // The write is kept: the device still holds b-1 locally, unpublished.
       expect(ids(await b.records())).toContain("s0/b-1");
+    });
+  }
+});
+
+describe("applying one stream of a connection that keeps its data in a log", () => {
+  // The apply of a stream is the apply of its connection: the log is the
+  // connection's, and a stream asked for alone does not skip it.
+  it("flag off: finds a log no cycle has seen, and applies it", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    // The device has the connection, from a run of its own before any log.
+    const b = await w.device("b", false);
+    await b.run("run-b0", [{ stream: sName(1), id: "b-0" }], {
+      full: false,
+      covered: [sName(1)],
+    });
+    await b.cycle();
+    const a = await w.device("a", true);
+    await a.cycle();
+    await a.run("run-a1", [{ stream: sName(0), id: "a-1" }], {
+      full: false,
+      covered: [sName(0)],
+    });
+    await a.cycle();
+    expect(w.gateway.rowsOf(LOG)).toBe(1);
+    expect(ids(await b.records())).not.toContain("s0/a-1");
+
+    await applyStream(b.deps, CONNECTION_ID, sName(0));
+
+    expect(ids(await b.records())).toContain("s0/a-1");
+  });
+
+  for (const flag of [true, false]) {
+    it(`flag ${flag ? "on" : "off"}: advances a log it already knows`, async () => {
+      const w = await world({ streams: 2, logProtocol: true });
+      const a = await w.device("a", true);
+      const b = await w.device("b", flag);
+      await a.run("run-a1", [{ stream: sName(0), id: "a-1" }]);
+      await a.cycle();
+      await b.cycle();
+      await a.run("run-a2", [{ stream: sName(0), id: "a-2" }], {
+        full: false,
+        covered: [sName(0)],
+      });
+      await a.cycle();
+
+      await applyStream(b.deps, CONNECTION_ID, sName(0));
+
+      expect(ids(await b.records())).toEqual(["s0/a-1", "s0/a-2"]);
+    });
+
+    it(`flag ${flag ? "on" : "off"}: refuses a log in a format it cannot read`, async () => {
+      const w = await world({ streams: 2, logProtocol: true });
+      const a = await w.device("a", true);
+      await a.run("run-a1", [{ stream: sName(0), id: "a-1" }]);
+      await a.cycle();
+      const b = await w.device("b", flag);
+      await b.cycle();
+      await olderFormatLogRow(w, 2);
+
+      await expect(
+        applyStream(b.deps, CONNECTION_ID, sName(0)),
+      ).rejects.toBeInstanceOf(UpdateRequiredError);
     });
   }
 });

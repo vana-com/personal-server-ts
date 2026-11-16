@@ -24,6 +24,7 @@ import {
   type Head,
   type HeadPart,
   type JsonObject,
+  logScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { ConnectionQueue, LocalSyncDeps } from "./deps.js";
@@ -285,7 +286,16 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
         await applyOne(locked, id, connection, next, keyCheck, hashes, reuse),
       );
     }
-    if (flight.all && (await logFollowed(deps, id, reuse))) {
+    if (!flight.all && !(await connectionHasLog(deps, id, reuse))) {
+      // A flight for streams does not list the registry, but the log row is
+      // how a device learns the connection keeps its data in a log, and a
+      // connection in a log is followed whichever stream asked: one read.
+      const row = await deps.registry.read(
+        logScope(connection.connector, connection.ns),
+      );
+      if (row.found) reuse.log = row;
+    }
+    if (await logFollowed(deps, id, reuse)) {
       // Streams published before the log, then the log on top of them.
       const [now] = await deps.db.query<{
         generation: number;

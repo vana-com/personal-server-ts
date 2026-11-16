@@ -496,6 +496,18 @@ export function createSyncManager(
   }
 
   /**
+   * Clear the block a pass starts with. A connection that needs an update
+   * stays reported while the local cycle that can end it runs (and if that
+   * cycle throws): only a cycle that reports without it clears it
+   * (`runLocalCycle`). Any other block ends here.
+   */
+  function clearBlockBeforePass(mode: string | undefined): void {
+    const localCycleFollows = mode === "switched" && options?.localSync;
+    if (blocked?.reason === "update_required" && localCycleFollows) return;
+    blocked = null;
+  }
+
+  /**
    * One cycle of the local stream database. A connection whose log this
    * build cannot read is reported by the cycle as `update_required`: it is
    * shown as the sync status's `blocked` reason, so every host that reads the
@@ -559,11 +571,11 @@ export function createSyncManager(
           uploadDeps.logger.warn(blocked, "Sync cycle blocked");
           continue;
         }
-        blocked = null;
-        statusMayHaveChanged();
         // canSync can yield while Account changes. Sample only after it returns.
-        if (options?.accountStorageMode) {
-          const mode = options.accountStorageMode.read();
+        const mode = options?.accountStorageMode?.read();
+        clearBlockBeforePass(mode);
+        statusMayHaveChanged();
+        if (options?.accountStorageMode && mode !== undefined) {
           if (mode !== "unswitched") {
             if (mode === "switched" && options.localSync) {
               const report = await runLocalCycle(options.localSync);
@@ -1300,10 +1312,10 @@ export function createSyncManager(
           statusMayHaveChanged();
           return;
         }
-        blocked = null;
+        const mode = options?.accountStorageMode?.read();
+        clearBlockBeforePass(mode);
         statusMayHaveChanged();
-        if (options?.accountStorageMode) {
-          const mode = options.accountStorageMode.read();
+        if (options?.accountStorageMode && mode !== undefined) {
           if (mode !== "unswitched") {
             if (mode === "switched" && options.localSync)
               await runLocalCycle(options.localSync);

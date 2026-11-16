@@ -19,7 +19,10 @@ export interface CycleReport {
     readonly error: string | null;
     /**
      * Set when the connection's log is in a format this build cannot read:
-     * nothing was applied or published for it (see `UpdateRequiredError`).
+     * nothing was published for it and its pending changes stay pending. Rows
+     * applied before the log was read (older per-stream heads, a snapshot read
+     * before an unreadable segment) stay applied, and `applied` does not list
+     * them (see `UpdateRequiredError`).
      */
     readonly status?: "update_required";
   }[];

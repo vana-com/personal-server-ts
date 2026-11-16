@@ -6,9 +6,11 @@
 // snapshot is in a format this build does not know (an older build's format 1,
 // or a newer build's) is read by no part of this build, so this device cannot
 // show the connection's data as current and cannot write to it without
-// diverging from the devices that can. It refuses both and says so, typed: the
-// device's own rows stay as they are, its pending changes stay pending, and
-// the cycle reports `update_required` for the connection (`CycleReport`). The
+// diverging from the devices that can. It refuses both and says so, typed: it
+// publishes nothing for the connection, its pending changes stay pending, and
+// the cycle reports `update_required` for the connection (`CycleReport`). Rows
+// the device applied before it reached the unreadable object stay applied: the
+// refusal promises no publication, not an unchanged database. The
 // sync manager shows it as `blocked.reason` of the sync status.
 
 /** The log of a connection is in a format this build cannot read. */
