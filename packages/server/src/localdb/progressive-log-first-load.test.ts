@@ -50,6 +50,74 @@ const BLOCKED = "blocked" as const;
 const ONE_AT_A_TIME = 1;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+const WRITES_POSITION = "INSERT OR REPLACE INTO log_state";
+const TABLES: readonly [string, string][] = [
+  [
+    "records",
+    "connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o",
+  ],
+  [
+    "record_changes",
+    "connection_id, stream, pk_hash, record_key, op, stamp_o, stamp_r, origin",
+  ],
+  ["log_tombstones", "*"],
+  ["stream_state", "*"],
+  ["stream_versions", "*"],
+  ["stream_partial", "*"],
+  ["partial_hidden", "*"],
+  ["log_state", "*"],
+];
+
+/** Every table a load writes, as sorted rows of text (not the sequence numbers). */
+async function dump(d: Device) {
+  const out: Record<string, string[]> = {};
+  for (const [table, columns] of TABLES)
+    out[table] = (
+      await d.db.query<Record<string, unknown>>(
+        `SELECT ${columns} FROM ${table}`,
+      )
+    )
+      .map((r) => JSON.stringify(r))
+      .sort();
+  return out;
+}
+
+/** Runs `after` once each commit that writes a log position has landed. */
+function afterCommits(
+  d: Device,
+  after: (positions: number[]) => Promise<void>,
+  options: { failCommit?: number } = {},
+) {
+  const db = d.db as unknown as { batch: Device["db"]["batch"] };
+  const batch = db.batch.bind(db);
+  const commits: number[][] = [];
+  let writing = 0;
+  db.batch = async (statements) => {
+    const positions = statements
+      .filter((s) => s.sql.includes(WRITES_POSITION))
+      .map((s) => s.params?.[1] as number);
+    if (positions.length > 0 && ++writing === options.failCommit)
+      throw new Error("injected: the commit failed");
+    const out = await batch(statements);
+    if (positions.length > 0) {
+      commits.push(positions);
+      await after(positions);
+    }
+    return out;
+  };
+  return commits;
+}
+
+async function reference(w: World, hooks = {}) {
+  const d = await w.device("reference", true, {
+    progressiveFirstLoad: true,
+    maxBytesInFlight: ONE_AT_A_TIME,
+    ...hooks,
+  });
+  await connect(d);
+  return d;
+}
+
 /** One run of `a` that publishes as its own segment. */
 async function publish(
   a: Device,
@@ -561,6 +629,70 @@ describe(
       expect(await count(b, "stream_partial")).toBe(0);
       expect(await count(b, "partial_hidden")).toBe(0);
     });
+
+    it("with parts committed together, the snapshot's position is written only with its last part, and the tables end as a part-by-part load leaves them", async () => {
+      const { w, head } = await compacted();
+      const one = await reference(w);
+      await applyConnection(one.deps, CONNECTION_ID);
+
+      const b = await w.device("b", true, { progressiveFirstLoad: true });
+      await connect(b);
+      const db = b.db as unknown as { batch: Device["db"]["batch"] };
+      const batch = db.batch.bind(db);
+      const writes: { position: number | null; rows: number }[] = [];
+      let stated = false;
+      db.batch = async (statements) => {
+        const state = statements.find((s) => s.sql.includes(WRITES_POSITION));
+        const out = await batch(statements);
+        // Before the snapshot's last part there is no state to read.
+        writes.push({
+          position: state ? (state.params?.[1] as number) : null,
+          rows: await count(b, "records"),
+        });
+        if (!state && !stated) expect(await count(b, "log_state")).toBe(0);
+        if (state) stated = true;
+        return out;
+      };
+      await applyConnection(b.deps, CONNECTION_ID);
+
+      const firstState = writes.findIndex((x) => x.position !== null);
+      expect(writes[firstState]!.position).toBe(head.snapshot!.position);
+      // Earlier commits wrote rows without writing the state.
+      const before = writes.slice(0, firstState).filter((x) => x.rows > 0);
+      expect(before.length).toBeGreaterThan(0);
+      expect(await dump(b)).toEqual(await dump(one));
+    });
+
+    it("a last part that is missing leaves the committed parts' rows without a snapshot position, and the next apply finishes, with parts committed together", async () => {
+      const { w, head, victim } = await compacted();
+      const last = head.snapshot!.parts.length - 1;
+      const key = partKey(head, last);
+      const bytes = (await w.innerBlobs.get(key))!;
+      w.innerBlobs.delete(key);
+      const b = await w.device("b", true, { progressiveFirstLoad: true });
+      await connect(b);
+      await expect(applyConnection(b.deps, CONNECTION_ID)).rejects.toThrow(
+        "missing log snapshot part",
+      );
+      expect(await count(b, "log_state")).toBe(0);
+      expect(await count(b, "records")).toBeGreaterThan(0);
+      const marker = await b.db.query<{
+        failed: number;
+        parts_applied: number;
+      }>("SELECT failed, parts_applied FROM stream_partial");
+      expect(marker).toHaveLength(1);
+      expect(marker[0]!.failed).toBe(1);
+      expect(marker[0]!.parts_applied).toBe(last);
+
+      await w.innerBlobs.put(key, bytes);
+      await applyConnection(b.deps, CONNECTION_ID);
+      const plain = await w.device("plain", true);
+      await plain.cycle();
+      expect(await idsOf(b)).toEqual(await idsOf(plain));
+      expect(await idsOf(b)).not.toContain(victim);
+      expect(await b.position()).toBe(await plain.position());
+      expect(await count(b, "stream_partial")).toBe(0);
+    });
   },
 );
 
@@ -587,5 +719,247 @@ describe("progressive first load, log protocol on, flag off", () => {
     expect(done.partial).toBeUndefined();
     expect(await b.db.query("SELECT * FROM writes_seen")).toEqual([]);
     expect(await count(b, "stream_partial")).toBe(0);
+  });
+});
+
+// Commits that carry several batches (the default budget: a batch is
+// committed together with the ones fetched while it was written). The load's
+// rules do not depend on how many commit together. The tests below hold each
+// rule to the answer of a load that commits one batch at a time.
+describe("progressive first load, batches committed together", () => {
+  it("ends in every table a one-batch-at-a-time load ends in, and commits fewer times", async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    await sevenSegments(w);
+    const one = await reference(w);
+    await applyConnection(one.deps, CONNECTION_ID);
+
+    const grouped = await w.device("grouped", true, {
+      progressiveFirstLoad: true,
+    });
+    await connect(grouped);
+    const commits = afterCommits(grouped, async () => undefined);
+    await applyConnection(grouped.deps, CONNECTION_ID);
+
+    expect(commits.flat()).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(commits.length).toBeLessThan(7);
+    expect(await dump(grouped)).toEqual(await dump(one));
+  });
+
+  it("a key a later batch deletes or omits is in no view, at any commit, though the batches commit together", async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    await sevenSegments(w);
+    const b = await w.device("b", true, { progressiveFirstLoad: true });
+    await connect(b);
+    const reads = reader(b);
+    const views: string[][] = [];
+    const commits = afterCommits(b, async (positions) => {
+      // The last commit ends the load; a read then waits for the apply's end.
+      if (positions.at(-1) === 7) return;
+      const view = await reads.readNow();
+      expect(view).not.toBe(BLOCKED);
+      if (view !== BLOCKED && view.kind === "view") views.push(view.ids);
+    });
+    await applyConnection(b.deps, CONNECTION_ID);
+    expect(commits.length).toBeLessThan(7);
+    for (const ids of views) {
+      // A2 is deleted at position 4 and A3 omitted at 6: never shown.
+      expect(ids).not.toContain("A2");
+      expect(ids).not.toContain("A3");
+    }
+    expect(views.length).toBe(commits.length - 1);
+    expect((await reads.read()).ids).toEqual(["A1", "B", "C", "D", "E"]);
+  });
+
+  it("a key deleted and then written again is shown once written, with batches committed together", async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    const a = await w.device("a");
+    await publish(a, "run-1", ["A", "B"], { full: true, observedAt: 1100 });
+    await publish(a, "run-2", ["A"], { remove: true, observedAt: 1200 });
+    await publish(a, "run-3", ["C"], { observedAt: 1300 });
+    await publish(a, "run-4", ["A"], { observedAt: 1400 });
+    await publish(a, "run-5", ["D"], { observedAt: 1500 });
+    const one = await reference(w);
+    await applyConnection(one.deps, CONNECTION_ID);
+    const b = await w.device("b", true, { progressiveFirstLoad: true });
+    await connect(b);
+    const reads = reader(b);
+    const views: string[][] = [];
+    afterCommits(b, async () => {
+      const view = await reads.readNow();
+      if (view !== BLOCKED && view.kind === "view") views.push(view.ids);
+    });
+    await applyConnection(b.deps, CONNECTION_ID);
+    for (const ids of views)
+      if (!ids.includes("C")) expect(ids).not.toContain("A");
+    expect((await reads.read()).ids).toEqual(["A", "B", "C", "D"]);
+    expect(await dump(b)).toEqual(await dump(one));
+  });
+
+  /** Three streams: x over positions 1, 3; y over 2, 4, 5; z in position 2 only. */
+  async function threeStreams() {
+    const w = await world({ streams: 3, logProtocol: true });
+    const [x, y, z] = w.names as [string, string, string];
+    const a = await w.device("a");
+    let observedAt = 1100;
+    const run = async (
+      id: string,
+      records: { stream: string; id: string }[],
+    ) => {
+      await a.run(id, records, {
+        full: false,
+        covered: [...new Set(records.map((r) => r.stream))],
+        observedAt: (observedAt += 100),
+      });
+      await a.cycle();
+    };
+    await run("run-1", [{ stream: x, id: "x1" }]);
+    await run("run-2", [
+      { stream: y, id: "y1" },
+      { stream: z, id: "z1" },
+    ]);
+    await run("run-3", [{ stream: x, id: "x2" }]);
+    await run("run-4", [{ stream: y, id: "y2" }]);
+    await run("run-5", [{ stream: y, id: "y3" }]);
+    expect([...(await w.segments()).keys()]).toEqual([1, 2, 3, 4, 5]);
+    return { w, x, y, z };
+  }
+
+  it("a stream is complete when its own last batch commits, not when the group that holds it would", async () => {
+    const { w, x, y, z } = await threeStreams();
+    const b = await w.device("b", true, { progressiveFirstLoad: true });
+    await connect(b);
+    const states: { last: number; partial: string[]; complete: string[] }[] =
+      [];
+    const commits = afterCommits(b, async (positions) => {
+      states.push({
+        last: positions.at(-1)!,
+        partial: (
+          await b.db.query<{ stream: string }>(
+            "SELECT stream FROM stream_partial",
+          )
+        ).map((r) => r.stream),
+        complete: (
+          await b.db.query<{ stream: string }>(
+            "SELECT stream FROM stream_state WHERE complete = 1",
+          )
+        ).map((r) => r.stream),
+      });
+    });
+    await applyConnection(b.deps, CONNECTION_ID);
+    expect(commits.flat()).toEqual([1, 2, 3, 4, 5]);
+    // x's last batch is position 3: a commit ends there, and x is complete in
+    // it while y is still partial. z, one batch, is never partial.
+    const atThree = states.find((s) => s.last === 3);
+    expect(atThree, `commits ${JSON.stringify(commits)}`).toBeDefined();
+    expect(atThree!.complete).toContain(x);
+    expect(atThree!.partial).toEqual([y]);
+    for (const s of states) expect(s.partial).not.toContain(z);
+    expect(states.at(-1)!.partial).toEqual([]);
+  });
+
+  it("a batch that is missing anywhere in the tail stops the load before any batch is applied, as a one-batch-at-a-time load does", async () => {
+    const { w } = await threeStreams();
+    const keys = await w.segmentKeys();
+    const missing = keys.get(4)!;
+    const bytes = (await w.innerBlobs.get(missing))!;
+    await w.innerBlobs.delete(missing);
+
+    const one = await reference(w);
+    await expect(applyConnection(one.deps, CONNECTION_ID)).rejects.toThrow();
+    const grouped = await w.device("grouped", true, {
+      progressiveFirstLoad: true,
+    });
+    await connect(grouped);
+    await expect(
+      applyConnection(grouped.deps, CONNECTION_ID),
+    ).rejects.toThrow();
+    // Every tail segment is fetched before the first apply: no new prefix.
+    expect(await grouped.position()).toBe(0);
+    expect(await count(grouped, "records")).toBe(0);
+    expect(await dump(grouped)).toEqual(await dump(one));
+
+    await w.innerBlobs.put(missing, bytes);
+    await applyConnection(grouped.deps, CONNECTION_ID);
+    expect(await grouped.position()).toBe(5);
+    expect(await count(grouped, "stream_partial")).toBe(0);
+  });
+
+  it("a commit that fails after a stream finished leaves that stream finished and unmarked, and marks the one that stopped, as a one-batch-at-a-time load does", async () => {
+    const { w, x, y } = await threeStreams();
+    // One at a time, the fourth commit is position 4. Together, the third is
+    // positions 4 and 5: the second ended at position 3, where x finishes.
+    const one = await reference(w);
+    afterCommits(one, async () => undefined, { failCommit: 4 });
+    await expect(applyConnection(one.deps, CONNECTION_ID)).rejects.toThrow(
+      "injected",
+    );
+    const grouped = await w.device("grouped", true, {
+      progressiveFirstLoad: true,
+    });
+    await connect(grouped);
+    const commits = afterCommits(grouped, async () => undefined, {
+      failCommit: 3,
+    });
+    await expect(applyConnection(grouped.deps, CONNECTION_ID)).rejects.toThrow(
+      "injected",
+    );
+
+    expect(commits.at(-1)!.at(-1)).toBe(3);
+    expect(await grouped.position()).toBe(3);
+    expect(await dump(grouped)).toEqual(await dump(one));
+    // x finished and is not marked; y stopped short and is.
+    const rows = await grouped.db.query<{
+      stream: string;
+      failed: number;
+      parts_applied: number;
+      parts_total: number;
+    }>("SELECT stream, failed, parts_applied, parts_total FROM stream_partial");
+    expect(rows).toEqual([
+      { stream: y, failed: 1, parts_applied: 1, parts_total: 3 },
+    ]);
+    const complete = await grouped.db.query<{ stream: string }>(
+      "SELECT stream FROM stream_state WHERE complete = 1",
+    );
+    expect(complete.map((r) => r.stream)).toContain(x);
+
+    // Resumed, the load ends where an uninterrupted one ends.
+    await applyConnection(grouped.deps, CONNECTION_ID);
+    const whole = await reference(w);
+    await applyConnection(whole.deps, CONNECTION_ID);
+    expect(await dump(grouped)).toEqual(await dump(whole));
+    expect(await count(grouped, "stream_partial")).toBe(0);
+  });
+
+  it("a commit that fails writes none of its batches, keeps the commits before it, and a retry ends right", async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    await sevenSegments(w);
+    const one = await reference(w);
+    const oneCommits = afterCommits(one, async () => undefined);
+    await applyConnection(one.deps, CONNECTION_ID);
+    expect(oneCommits.length).toBe(7);
+
+    const b = await w.device("b", true, { progressiveFirstLoad: true });
+    await connect(b);
+    // The first commit is one batch; the second carries the ones fetched with it.
+    const commits = afterCommits(b, async () => undefined, { failCommit: 2 });
+    await expect(applyConnection(b.deps, CONNECTION_ID)).rejects.toThrow(
+      "injected",
+    );
+    expect(commits).toEqual([[1]]);
+    expect(await b.position()).toBe(1);
+    const stored = await b.db.query<{ n: number }>(
+      "SELECT count(*) AS n FROM records",
+    );
+    // Only the rows of position 1: A1, A2, A3.
+    expect(stored[0]!.n).toBe(3);
+    const marker = await b.db.query<{ parts_applied: number; failed: number }>(
+      "SELECT parts_applied, failed FROM stream_partial",
+    );
+    expect(marker).toEqual([{ parts_applied: 1, failed: 1 }]);
+
+    await applyConnection(b.deps, CONNECTION_ID);
+    const fresh = await reference(w);
+    await applyConnection(fresh.deps, CONNECTION_ID);
+    expect(await dump(b)).toEqual(await dump(fresh));
   });
 });

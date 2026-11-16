@@ -578,6 +578,12 @@ async function applyBatch(
 interface PassItem {
   /** The clear length of the segment or snapshot part. */
   readonly bytes: number;
+  /**
+   * It commits as the last of its group. A progressive load sets it on the
+   * batch that completes a stream, so the stream is complete when that batch
+   * commits and not when the group that holds it would.
+   */
+  readonly closesGroup?: boolean;
   /** Fetch it (unless it is in hand), verify it and stage it. */
   readonly stage: () => Promise<StagedBatch>;
 }
@@ -621,7 +627,7 @@ async function applyInGroups(
   try {
     for (const [index, item] of items.entries()) {
       pending.push(await ahead.load(item, index));
-      if (began && ahead.ready(index + 1)) continue;
+      if (began && !item.closesGroup && ahead.ready(index + 1)) continue;
       await commitStaged(deps, pending);
       pending = [];
       began = true;
@@ -1203,6 +1209,8 @@ async function loadProgressively(
       index < partRefs.length
         ? partRefs[index]!.bytes
         : tail[index - partRefs.length]!.bytes,
+    // The batch that completes a stream commits that stream's last rows.
+    closesGroup: [...plans.values()].some((plan) => plan.last === index),
     stage: async () => {
       let batch: OperationBatch;
       if (index < partRefs.length) {
