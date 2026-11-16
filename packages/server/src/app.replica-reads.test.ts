@@ -133,7 +133,10 @@ function host({
       async *streamRecords(id, name) { yield* selected(id, name); },
     };
   });
-  const localSync = vi.fn(async () => ({ recordsFor } as unknown as LocalSync));
+  const changesFor = vi.fn((_link: ConnectionLink) => {
+    throw new Error("changesFor must not run without a connection link");
+  });
+  const localSync = vi.fn(async () => ({ recordsFor, changesFor } as unknown as LocalSync));
   const legacyReads = vi.fn((reader: "owner" | "grant") => receiver.readStore({ reader }));
   const pdpp = {
     ...(connectionLink && { connectionLink }),
@@ -239,6 +242,7 @@ function host({
     receiver,
     localRows,
     recordsFor,
+    changesFor,
     localSync,
     legacyReads,
     get,
@@ -652,4 +656,48 @@ describe("createApp switched records require the host connection-link capability
       expect(JSON.stringify([page.body, point.body])).not.toContain("legacy-key");
     },
   );
+});
+
+describe("createApp switched reads without the host connection-link capability", () => {
+  it("refuses every read surface before any local reader or history factory runs", async () => {
+    const h = host({ local: "missing-link" });
+    h.receiver.import({
+      credential: "x",
+      envelope: h.envelope("legacy", [
+        h.registration,
+        h.claim("legacy-claim", 2),
+        h.row("legacy-row", 3, "legacy-key"),
+      ]),
+      blobs: [{ blobId: h.blobId, bytes: h.bytes }],
+    });
+    h.legacyReads.mockClear();
+
+    const paths = [
+      "/v1/streams",
+      `/v1/streams/${stream}/records`,
+      `/v1/streams/${stream}/records?changes_since=beginning`,
+      `/v1/blobs/${h.blobId}`,
+    ];
+    for (const token of ["owner", "app"]) {
+      for (const path of paths) {
+        const response = await h.get(token, path);
+        const label = `${token} ${path}`;
+        expect(response.status, label).toBe(503);
+        expect(JSON.stringify(response.body), label).toContain("STREAM_READ_UNAVAILABLE");
+        expect(JSON.stringify(response.body), label).not.toContain("legacy-key");
+      }
+    }
+    expect((await h.get("owner", `/v1/blobs/${h.blobId}`, "HEAD")).status).toBe(503);
+    // Per-stream metadata is the declaration alone: it reads no records, so
+    // it stays available and exposes no row.
+    for (const token of ["owner", "app"]) {
+      const meta = await h.get(token, `/v1/streams/${stream}`);
+      expect(meta.status, token).toBe(200);
+      expect(JSON.stringify(meta.body)).not.toContain("legacy-key");
+    }
+    expect(h.localSync).not.toHaveBeenCalled();
+    expect(h.recordsFor).not.toHaveBeenCalled();
+    expect(h.changesFor).not.toHaveBeenCalled();
+    expect(h.legacyReads).not.toHaveBeenCalled();
+  });
 });

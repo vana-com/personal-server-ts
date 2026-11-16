@@ -623,7 +623,7 @@ export function createApp(deps: AppDeps): Hono {
             return deps.pdpp!.reads(
               context.tokenKind === "owner" ? "owner" : "grant",
             );
-          if (!localSync)
+          if (!localSync || !connectionLink)
             throw new PdppError(
               "STREAM_READ_UNAVAILABLE",
               "Database is unavailable",
@@ -631,7 +631,7 @@ export function createApp(deps: AppDeps): Hono {
           const subject = context.subjectId ?? "";
           return grantBlobStore({
             local: await localSync(),
-            link: deps.pdpp!.connectionLink ?? (() => null),
+            link: connectionLink,
             context,
             blobId,
             declarations: deps.pdpp!.declarations,
