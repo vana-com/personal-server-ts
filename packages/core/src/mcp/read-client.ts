@@ -869,10 +869,18 @@ export function createMcpDataReadClient(
         // Discovery still checks the signed grantee and scope, but never settles
         // payment, logs a read or asks a resolver to construct a response body.
         await authorizeScopeRead({ scope, grantId, metadataOnly: true });
-        // The available read port exposes a body, not an applied-version
-        // metadata projection. Do not use the unrelated legacy index or invent
-        // a byte count, timestamp or readiness fact for the switched source.
-        return { scope };
+        // Use the host's local listing selection, never resolve() or a legacy
+        // index entry. A record count is not a byte size or block readiness.
+        const listed = await options.dataApiDeps.streamSyncRead.listScopes?.({
+          canRead: (candidate) => candidate === scope,
+        });
+        const entry = listed?.find((candidate) => candidate.scope === scope);
+        return {
+          scope,
+          ...(entry?.latestCollectedAt !== undefined
+            ? { collectedAt: entry.latestCollectedAt }
+            : {}),
+        };
       }
       const storage = options.dataApiDeps.storage;
       const entry = storage.findEntry({ scope });
