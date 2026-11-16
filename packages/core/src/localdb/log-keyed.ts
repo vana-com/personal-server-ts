@@ -58,6 +58,13 @@
 // one this load made, so each of them raises with the marker kept. The model:
 // `KeyedBucket`, `KeyedPage`, `PendingAdmits`, `NoPending`.
 //
+// A per-stream head admitted while the marker stands may drop rows the load
+// wrote (a full head omits the keys of its stream it did not carry). The marker
+// stays: rows beyond the cursor can remain, and a retry that holds a shorter
+// prefix must still not publish over them. The retry stages the whole log again
+// and the merge is order-insensitive per key, so it ends in the rows of a device
+// that read the head and then the log.
+//
 // The way out of a refused retry. A log that compacted, or was rewritten, after
 // a stopped load has nothing a key-ordered load can finish, and the rows the
 // stopped load left are not told apart from rows of the live log (no per-key
