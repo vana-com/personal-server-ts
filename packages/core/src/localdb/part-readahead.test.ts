@@ -123,3 +123,61 @@ it("raises a read of a part twice", async () => {
   await expect(reader.load(parts[0]!, 0)).rejects.toThrow("read twice");
   reader.close();
 });
+
+it("holds an oversized reader back while an ordinary reader holds its reservation, then admits it alone", async () => {
+  const governor = governorOf(2 * 3 * 100);
+  // The ordinary reader's one part waits at a barrier, holding 200 bytes.
+  const ordinary = [part(100, 1)];
+  let leave!: () => void;
+  const barrier = new Promise<void>((r) => (leave = r));
+  let ordinaryStarted = false;
+  const first = readPartsAhead({ governor }, ordinary, async (p) => {
+    ordinaryStarted = true;
+    await barrier;
+    return bytesOf(p);
+  });
+  while (!ordinaryStarted) await new Promise((r) => setImmediate(r));
+  // A record of ten parts needs 2,000 bytes, more than the budget.
+  const big = [part(100, 1), ...Array.from({ length: 9 }, () => part(100, 0))];
+  let bigStarted = 0;
+  const second = readPartsAhead({ governor }, big, async (p) => {
+    bigStarted++;
+    return bytesOf(p);
+  });
+  // It is not admitted while the other holds: nothing of it is fetched.
+  await new Promise((r) => setTimeout(r, 100));
+  expect(bigStarted).toBe(0);
+  // The ordinary reader commits and lets go; the record is admitted alone.
+  leave();
+  await within(drain(first, ordinary));
+  await within(drain(second, big));
+  expect(bigStarted).toBe(10);
+  const whole = await within(governor.reserve(2 * 3 * 100));
+  whole();
+});
+
+it("admits the oversized reader when the reader that held the budget fails", async () => {
+  const governor = governorOf(2 * 3 * 100);
+  const ordinary = [part(100, 1)];
+  let fail!: () => void;
+  const barrier = new Promise<void>(
+    (_, reject) => (fail = () => reject(new Error("transfer failed"))),
+  );
+  barrier.catch(() => undefined);
+  let started = false;
+  const first = readPartsAhead({ governor }, ordinary, async () => {
+    started = true;
+    return barrier.then(() => new Uint8Array());
+  });
+  while (!started) await new Promise((r) => setImmediate(r));
+  const big = [part(100, 1), ...Array.from({ length: 9 }, () => part(100, 0))];
+  const second = readPartsAhead({ governor }, big, async (p) => bytesOf(p));
+  fail();
+  await expect(within(drain(first, ordinary))).rejects.toThrow(
+    "transfer failed",
+  );
+  first.close();
+  await within(drain(second, big));
+  const whole = await within(governor.reserve(2 * 3 * 100));
+  whole();
+});

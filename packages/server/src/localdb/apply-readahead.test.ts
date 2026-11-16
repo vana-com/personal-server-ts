@@ -414,3 +414,139 @@ it("leaves a committed first group durable when a later group fails before it is
   ).toHaveLength(1);
   expect(await partial(f)).toEqual([]);
 });
+
+const reacquires = async (
+  f: Awaited<ReturnType<typeof fixture>>,
+  bytes: number,
+) =>
+  Promise.race([
+    f.deps.blobs.governor.reserve(bytes).then((r) => (r(), "granted")),
+    new Promise((resolve) => setTimeout(() => resolve("waiting"), 1000)),
+  ]);
+
+it("rejects a head that splits a long record in its metadata, without waiting for another reservation", async () => {
+  // Room for one part. The counts still add up to the record count, but the
+  // second part is said to open a record while the first part's record runs on
+  // into it, and the last part is said to continue one. Were the apply to read
+  // the second part, its reservation would wait for the first part's commit,
+  // which waits for the record: the old cycle.
+  const f = await fixture(2 * 300);
+  const bigKey = await pkHash(SHA, { id: "big" }, ["id"]);
+  let after = "after-0";
+  for (let i = 0; i < 64; i++) {
+    after = `after-${i}`;
+    if ((await pkHash(SHA, { id: after }, ["id"])) > bigKey) break;
+  }
+  const h = await f.head("a", [long("big"), { id: after }], {
+    pieceBytes: 300,
+    entry: (p, i, all) =>
+      i === 1 ? { ...p, count: 1 } : i === all - 1 ? { ...p, count: 0 } : p,
+  });
+  expect(h.parts[1]!.count).toBe(0);
+  let gets = 0;
+  const get = f.deps.blobs.get.bind(f.deps.blobs);
+  f.deps.blobs.get = async (key) => {
+    if (key.includes("/g1-p-")) gets++;
+    return get(key);
+  };
+  await expect(deadline(applyConnection(progressive(f), f.id))).rejects.toThrow(
+    "long frame runs past its parts",
+  );
+  // Only the first part ever held a reservation: the second waited behind it
+  // and the apply never waited for the second.
+  expect(gets).toBe(1);
+  expect(await f.db.query("SELECT 1 FROM records")).toHaveLength(0);
+  expect(await partial(f)).toEqual([]);
+  expect(await reacquires(f, 2 * 300)).toBe("granted");
+});
+
+it("rejects a head that joins the next record to this one in its metadata, without waiting for another reservation", async () => {
+  // The first part is said to hold two records and the second to continue
+  // them. It is read as one unit of two parts, larger than the budget and
+  // admitted alone; the decoder rejects the first part's count before it loads
+  // the second.
+  const f = await fixture(2 * 150);
+  await f.head("a", [{ id: "one" }, { id: "two" }], {
+    entry: (p, i) => ({ ...p, count: i === 0 ? 2 : 0 }),
+  });
+  await expect(deadline(applyConnection(progressive(f), f.id))).rejects.toThrow(
+    "part has 1 frames, head says 2",
+  );
+  expect(await partial(f)).toEqual([]);
+  expect(await reacquires(f, 2 * 150)).toBe("granted");
+});
+
+it("commits only what precedes a part that fails, when the parts after it arrive first", async () => {
+  const f = await fixture();
+  const records = Array.from({ length: 5 }, (_, i) => ({ id: `row-${i}` }));
+  const h = await f.head("a", records);
+  const order = await idsInPartOrder(records.map((r) => r.id));
+  // Every GET waits at a barrier. They end last part first, and the second
+  // part's fails.
+  const gates = h.parts.map(() => {
+    let open!: () => void;
+    const opened = new Promise<void>((r) => (open = r));
+    return { opened, open };
+  });
+  let started = 0;
+  const get = f.deps.blobs.get.bind(f.deps.blobs);
+  f.deps.blobs.get = async (key) => {
+    const at = h.parts.findIndex((p) => key.endsWith(p.hash));
+    if (at === -1) return get(key);
+    started++;
+    await gates[at]!.opened;
+    if (at === 1) throw new Error("storage failure on part 1");
+    return get(key);
+  };
+  const outcome = applyConnection(progressive(f), f.id).then(
+    () => "applied",
+    (error: Error) => error.message,
+  );
+  while (started < h.parts.length) await new Promise((r) => setTimeout(r, 5));
+  for (const at of [4, 3, 2, 1, 0]) {
+    gates[at]!.open();
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  expect(await deadline(outcome)).toBe("storage failure on part 1");
+  // Only the first part precedes the failure: the three that arrived early
+  // are not committed.
+  expect(await storedIds(f)).toEqual([order[0]]);
+  expect(await partial(f)).toEqual([{ parts_applied: 1, failed: 1 }]);
+  expect(
+    await reacquires(f, DEFAULT_STORAGE_ACCESS_POLICY.maxBytesInFlight),
+  ).toBe("granted");
+});
+
+it("commits no record of a head whose long record is missing a part, and finishes once the part is back", async () => {
+  const f = await fixture(2 * 3 * 300);
+  const bigKey = await pkHash(SHA, { id: "big" }, ["id"]);
+  // A record that sorts after the long one: it would follow it in the parts.
+  let after = "after-0";
+  for (let i = 0; i < 64; i++) {
+    after = `after-${i}`;
+    if ((await pkHash(SHA, { id: after }, ["id"])) > bigKey) break;
+  }
+  const h = await f.head("a", [long("big"), { id: after }], {
+    pieceBytes: 300,
+  });
+  const missing = `${h.scope}/g1-p-${h.parts[7]!.hash}`;
+  const blob = f.blobs.get(missing)!;
+  f.blobs.delete(missing);
+  await expect(deadline(applyConnection(progressive(f), f.id))).rejects.toThrow(
+    "apply: missing part blob",
+  );
+  // Neither the long record nor the one after it is committed, and no state
+  // says part of the head is applied or the head complete.
+  expect(await f.db.query("SELECT 1 FROM records")).toHaveLength(0);
+  expect(await partial(f)).toEqual([]);
+  expect(
+    await f.db.query("SELECT 1 FROM stream_state WHERE complete = 1"),
+  ).toHaveLength(0);
+  expect(await f.db.query("SELECT 1 FROM head_parts")).toHaveLength(0);
+  expect(await reacquires(f, 2 * 3 * 300)).toBe("granted");
+  // The part is back: a new apply finishes exactly.
+  f.blobs.set(missing, blob);
+  await deadline(applyConnection(progressive(f), f.id));
+  expect(await storedIds(f)).toEqual(["big", after].sort());
+  expect(await partial(f)).toEqual([]);
+});
