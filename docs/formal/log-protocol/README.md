@@ -300,7 +300,66 @@ DropKind OrderOK). Good.cfg and LostPush.cfg were not rerun: the base corpus
 has ord 0 throughout and `Rank` reduces to the old order there, so their
 results are unchanged by construction, not by a new run.
 
+These results cover the abstract max operator only. The incremental SQL step is
+checked separately, in "Incremental apply" below.
+
 Clone and legacy rules the model fixes: two writers with one run id and one
 ordinal go to the greater body hash, never to first seen; a legacy entry with
 no ordinal counts as 0; an explicit delete beats every ordinal; an omission
 loses to every upsert at its stamp.
+
+## Incremental apply (`SqlRank.tla`, host run, 2026-11-16)
+
+`LogProtocol.tla` folds a log with the max of one order. The local database
+does not fold. It applies one observation at a time to a stored row in SQL:
+`mergeIncoming` for a pulled operation and `replaceOwnRunRows` for the run's
+own batch. The `LogProtocol.tla` result therefore covers the abstract max
+operator only. The first version of the fix had two SQL shortcuts the model did
+not explore:
+
+- An identical body took the stored row only at a strictly greater stamp, so a
+  higher ordinal of a body the database held was dropped. Trace: A at ordinal
+  0, A at 2, then B at 1. The fold keeps A at 2 and rejects B; the incremental
+  database kept A at 0 and then took B.
+- `replaceOwnRunRows` replaced a different body at the run's stamp whatever the
+  row held. A run that had pulled a clone's higher-ranked body lost it to its
+  own lower batch.
+
+`SqlRank.tla` models the incremental step on one key at one stamp (order:
+ordinal, then body hash, as a tuple compare with no numeric packing). A
+database either pulls an operation from the log or admits its own next batch
+(strictly increasing ordinal). Its own batch is in the log only when it changed
+the row. `RowIsFold`: the stored row equals the fold of the log, in any order.
+
+| Configuration           | Expected | Actual                                                                                                                  | Distinct states | Depth |
+| ----------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------- | --------------- | ----- |
+| SqlRank.cfg             | PASS     | PASS, state space complete, no error found                                                                              | 1,029,883       | 6     |
+| SqlRankSameBodyKeep.cfg | FAIL     | FAIL `RowIsFold` in 3 states (`traces/SqlRankSameBodyKeep.txt`): a pulled identical body at a higher ordinal is dropped | 33 at failure   | 3     |
+| SqlRankOwnReplace.cfg   | FAIL     | FAIL `RowIsFold` in 3 states (`traces/SqlRankOwnReplace.txt`): the run's lower batch replaces a pulled higher one       | 80 at failure   | 3     |
+
+Rules the passing model fixes, and the code that carries them:
+
+- One order, `rankAfter` in `merge.ts` (stamp, ordinal, body hash). Pulled
+  operations, an identical body at a higher ordinal included, advance the stored
+  row. `replaceOwnRunRows` replaces only when the incoming batch ranks above
+  the row by the same function. The stream-sync fold uses `upsertAfter`, the
+  same order in TypeScript. `equal-stamp-order.test.ts` runs the SQL and the
+  fold on the same operations: every sequence of up to three observations and
+  150 random sequences of eight.
+- A database's own batch with a body the row already holds is a sighting, not a
+  change. It moves no ordinal and publishes nothing. So the ordinal a row holds
+  is always one that is in the log or waiting to be published. Two writers that
+  share a run id and both emit one body at different ordinals both publish, and
+  the log then orders them. The alternative (the own sighting advances the
+  ordinal and publishes the same body again) costs a log entry for each
+  re-emitted unchanged row and fixes nothing the fold can see.
+- Pulled operations apply to the row under origin `remote`. That already logged
+  nothing for publish, so advancing the ordinal on an identical body needs no
+  publish step.
+
+Not modelled: the SEEN stamp, `promoteSeen` and a stored stamp older than the
+run's. They act between different stamps. The older-stamp case of
+`replaceOwnRunRows` is covered by the same `rankAfter`: a row with an older
+stamp ranks below the run's batch whatever its ordinal. The `LogProtocol.tla`
+rank packing is exact only for ordinal below 3 and body below 100; an `ASSUME`
+checks the corpus. A larger domain needs the tuple compare.

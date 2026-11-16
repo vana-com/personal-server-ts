@@ -58,6 +58,18 @@ const SAME_BODY =
   "i.body_sha256 = records.body_sha256 AND i.body = records.body";
 
 /**
+ * The order of two observations of one key, as one row value:
+ * (stamp, batch ordinal, body hash). It is the SQL form of `upsertAfter` in
+ * stream-sync's log fold, and every place that compares two bodies of a key at
+ * equal stamps uses this (`mergeIncoming` here, `replaceOwnRunRows` in
+ * admit.ts), so a stored row and a fold of the log cannot disagree on a
+ * winner. `equal-stamp-order.test.ts` runs both on the same operations. Equal
+ * bodies have equal hashes, so for them it is an order on (stamp, ordinal).
+ */
+export const rankAfter = (a: string, b: string) =>
+  `(${a}stamp_o, ${a}stamp_r, ${a}stamp_n, ${a}body_sha256) > (${b}stamp_o, ${b}stamp_r, ${b}stamp_n, ${b}body_sha256)`;
+
+/**
  * TEMP tables for multi-batch operations. Every row carries the id of its
  * operation (`op`); an operation reads and clears only its own rows. A crash
  * or close drops them, and the operation re-runs from its durable inputs.
@@ -90,18 +102,19 @@ const STORED_BYTES = "LENGTH(CAST(i.body AS BLOB))";
  * Equal bodies are one fact. A run (origin `local`) that sees the body a row
  * already holds moves only the row's SEEN stamp: the stamp in the published
  * bytes stays, no change is logged, and the next publish has nothing to send.
- * Any other origin that brings an equal body under a newer stamp adopts the
- * newer stamp, as before, so every device ends on the same bytes.
+ * Any other origin that brings an equal body under a greater (stamp, batch
+ * ordinal) adopts it, as before, so every device ends on the same bytes and a
+ * higher ordinal of a body this device holds is not lost.
  *
  * A different body wins when its stamp (o, then r) is strictly newer than the
  * row's SEEN stamp: the newest observation wins, whether or not this device
  * had pulled the other write first. An older one changes nothing. At the same
- * stamp, with nothing newer seen, the later intake batch of the run wins
- * (`stamp_n`), then the greater body hash (not for origin `import`: an older
- * copy of the data never replaces what the database already holds): a run can emit a key again with a
- * changed body, and the log may already carry the earlier body. The stream-sync
- * `upsertAfter` is the same order for a fold, so a reader that folds and one that
- * applies in order agree.
+ * stamp, with nothing newer seen, the order is `rankAfter`: the later intake
+ * batch of the run (`stamp_n`), then the greater body hash (not for origin
+ * `import`: an older copy of the data never replaces what the database already
+ * holds). A run can emit a key again with a changed body, and the log may
+ * already carry the earlier body. The stream-sync `upsertAfter` is the same
+ * order for a fold, so a reader that folds and one that applies in order agree.
  * Independently, first_o is the minimum checkpoint with NULL as the bottom;
  * imported rows have an unknown checkpoint. With `firstSeenOfWinner` (the log's
  * apply) first_o is not a minimum: it is the first-seen the winning
@@ -181,12 +194,12 @@ export function mergeIncoming(
    AND EXISTS (SELECT 1 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash
                AND CASE WHEN ${SAME_BODY}
                         THEN (SELECT origin FROM write_ctx WHERE id = 1) <> 'local'
-                             AND (i.stamp_o, i.stamp_r) > (records.stamp_o, records.stamp_r)
+                             AND ${rankAfter("i.", "records.")}
                         ELSE (i.stamp_o, i.stamp_r) > ${seenPair("records.")}
                           OR ((SELECT origin FROM write_ctx WHERE id = 1) <> 'import'
                               AND (i.stamp_o, i.stamp_r) = (records.stamp_o, records.stamp_r)
                               AND (i.stamp_o, i.stamp_r) = ${seenPair("records.")}
-                              AND (i.stamp_n, i.body_sha256) > (records.stamp_n, records.body_sha256)) END)`,
+                              AND ${rankAfter("i.", "records.")}) END)`,
       params: [
         ...FIELDS.map(() => op),
         ...(options.firstSeenOfWinner ? [op] : []),

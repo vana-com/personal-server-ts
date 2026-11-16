@@ -67,7 +67,12 @@ TieOf(op) == IF Mode \in {"equalStampToday","dropKind"} THEN 0 ELSE op.body
 KindRank(op) == IF op.kind = "omit" THEN (IF Mode = "omitInclusive" THEN 2 ELSE 0)
                 ELSE IF op.kind = "delete" THEN (IF Mode = "dropKind" THEN 1 ELSE 2)
                 ELSE 1
+\* The packing into one number is exact only for ord < 3 and body < 100 (the multipliers 3
+\* and 100); the ASSUME below checks the corpus against it. A larger domain needs the tuple
+\* compare that SqlRank.tla uses.
 Rank(op) == 100 * (3 * (3 * op.stamp + KindRank(op)) + OrdOf(op)) + TieOf(op)
+ASSUME \A i \in 1..Len(Batches) : \A j \in 1..Len(Batches[i]) :
+         Batches[i][j].ord < 3 /\ Batches[i][j].body < 100
 Min2(a,b) == IF a < b THEN a ELSE b
 \* An omission cutoff is a strict boundary: an observation AT cutoff wins.
 Merge(state,op,bad,fs) ==

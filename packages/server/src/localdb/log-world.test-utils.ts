@@ -240,9 +240,10 @@ export async function world(options: {
           body: string;
           stamp_o: number;
           stamp_r: string;
+          stamp_n: number;
           first_o: number | null;
         }>(
-          "SELECT stream, record_key, body, stamp_o, stamp_r, first_o FROM records ORDER BY stream, record_key",
+          "SELECT stream, record_key, body, stamp_o, stamp_r, stamp_n, first_o FROM records ORDER BY stream, record_key",
         )
       ).map((r) => JSON.stringify(r));
     const position = async () =>

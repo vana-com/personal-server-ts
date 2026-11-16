@@ -2,7 +2,12 @@ import { planStreamStep } from "../stream-sync/publish-plan.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { planInputs, type StreamPlanRow } from "./plan-inputs.js";
-import { mergeIncoming, SEEN_BEFORE, seenBeforeParams } from "./merge.js";
+import {
+  mergeIncoming,
+  rankAfter,
+  SEEN_BEFORE,
+  seenBeforeParams,
+} from "./merge.js";
 
 /**
  * Publish while collecting: batch admission and the tombstones it relies on.
@@ -165,12 +170,16 @@ export function admitUpserts(input: {
  * Within a run the later batch wins. A row this run already holds, as its
  * stamp or as its newest sighting, has the same stamp as the incoming row, or
  * the sighting's older stamp, so mergeIncoming's stamp rule alone would keep
- * the earlier batch. Replace it here, and only for the run's own rows: another
- * writer at the same stamp is still never replaced here. The row takes the
- * batch's ordinal (`stamp_n`), which is what orders it against the body a
- * reader already holds from an earlier publication of this run
- * (`mergeIncoming` applies the same ordinal at a reader). Runs on `incoming`
- * rows of `op`, before the merge.
+ * the earlier batch. Replace it here, for a different body that ranks above
+ * the row by the same order as everywhere else (`rankAfter`: stamp, batch
+ * ordinal, body hash). The row takes the batch's ordinal (`stamp_n`), which is
+ * what orders it against the body a reader already holds from an earlier
+ * publication of this run (`mergeIncoming` applies the same order at a
+ * reader). Two writers can share a run id: one that has pulled the other's
+ * higher-ranked body keeps it, and its own lower batch is not stored. An
+ * identical body is a sighting, not a change: it keeps the row's ordinal, so
+ * the ordinal a row holds is always one that was published or is waiting to
+ * be. Runs on `incoming` rows of `op`, before the merge.
  */
 export function replaceOwnRunRows(
   op: string,
@@ -188,7 +197,8 @@ export function replaceOwnRunRows(
       WHERE (connection_id, stream, pk_hash) IN (SELECT ?, stream, pk_hash FROM incoming WHERE op = ?)
         AND COALESCE(seen_o, stamp_o) = ? AND COALESCE(seen_r, stamp_r) = ?
         AND EXISTS (SELECT 1 FROM incoming i WHERE i.op = ? AND i.stream = records.stream AND i.pk_hash = records.pk_hash
-                    AND NOT (i.body_sha256 = records.body_sha256 AND i.body = records.body))`,
+                    AND NOT (i.body_sha256 = records.body_sha256 AND i.body = records.body)
+                    AND ${rankAfter("i.", "records.")})`,
     params: [op, op, op, o, runId, op, connectionId, op, o, runId, op],
   };
 }
