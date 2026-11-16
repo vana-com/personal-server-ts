@@ -266,20 +266,12 @@ export function createLocalListing(
     return entries;
   }
 
-  /**
-   * Can a read build this alias body from the records installed now? A read
-   * whose installed head lags the newest complete head would fetch the
-   * retained head over the network; the listing does not, so it lists the
-   * scope without projecting.
-   */
+  /** Can a read build this alias body from the records installed now? */
   async function aliasBodyBuilds(
     target: Target,
     chosen: Candidate,
   ): Promise<boolean> {
     if (!target.alias) return true;
-    if (chosen.streams.some((s) => s.head_version !== s.installed_version)) {
-      return true;
-    }
     const projected = await projectAlias(
       target.alias,
       chosen,

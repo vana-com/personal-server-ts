@@ -10,7 +10,7 @@
 // The rule these tests hold to: a row is shown only if the finished log keeps
 // it. A segment is applied only after every later segment is fetched, so a key
 // that a later segment deletes or omits is never shown, at any point.
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   logScope,
   type Segment,
@@ -184,7 +184,6 @@ async function connect(d: Device) {
 function reader(d: Device) {
   const resolver = createLocalResolver(d.deps, {
     query: createRecordQuery(d.db),
-    olderVersions: { read: vi.fn(), list: vi.fn(), counts: vi.fn() } as never,
   });
   async function read() {
     const decision = await resolver.resolve({

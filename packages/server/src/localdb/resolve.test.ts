@@ -1,6 +1,5 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { pkHash } from "@opendatalabs/personal-server-ts-stream-sync";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
@@ -127,7 +126,6 @@ async function fixture() {
       yield* records;
     },
   };
-  const olderVersions = { read: vi.fn(), list: vi.fn(), counts: vi.fn() };
   const blobs = new Map<string, Uint8Array>();
   const deps = {
     db,
@@ -164,7 +162,6 @@ async function fixture() {
       );
   const resolver = createLocalResolver(deps, {
     query,
-    olderVersions,
     aliasScopes: () => ["fixture.alias", "fixture.unsupported"].values(),
     aliasTargets,
   });
@@ -278,7 +275,6 @@ async function fixture() {
     record,
     resolver,
     visited,
-    olderVersions,
     clear,
   };
 }
@@ -291,7 +287,6 @@ describe("local resolve", () => {
     await f.record();
     const isolated = createLocalResolver(f.deps, {
       query: f.query,
-      olderVersions: f.olderVersions,
       aliasTargets: () => {
         throw new Error("Unlisted alias target consulted");
       },
@@ -351,21 +346,34 @@ describe("local resolve", () => {
     expect(f.visited).not.toHaveBeenCalled();
   });
 
-  it("answers no_data when a partial image replaces records, because no body of the retained complete version is kept", async () => {
+  it("serves the local records when an incomplete version follows the retained complete one", async () => {
     const f = await fixture();
     await f.connection();
     await f.head("items", { version: 1 });
+    // The log merges per key: the rows of the complete version stay in
+    // `records` under the newer, incomplete one, beside the rows it adds.
+    const original = { id: "original", value: "retained" };
+    const added = { id: "added", value: "partial" };
+    await f.db.batch(
+      [original, added].map((value, i) => ({
+        sql: `INSERT INTO records
+        (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256)
+        VALUES ('c1', 'items', ?, ?, ?, 'run', ?, 'body-hash')`,
+        params: [`hash-${i}`, value.id, 1000 * (i + 1), JSON.stringify(value)],
+      })),
+    );
     await f.head("items", { version: 2, complete: false });
-    await f.record("items", "partial");
-    const historyOff = {
-      ...f.olderVersions,
-      read: vi.fn(async () => "gone" as const),
-    };
-    const fresh = createLocalResolver(f.deps, {
-      query: f.query,
-      olderVersions: historyOff,
-    });
-    expect(verdict(await fresh.resolve(input()))).toBe("no_data");
+    const result = await f.resolver.resolve(input());
+    expect(result.kind).toBe("view");
+    if (result.kind !== "view") throw new Error("missing retained view");
+    // The rows served are the installed version's.
+    expect(result.served?.version).toBe(2);
+    expect((await drain(result)).data.records).toEqual([original, added]);
+    // No complete version above the deletion floor: nothing is served.
+    await f.db.batch([
+      { sql: "UPDATE stream_state SET last_delete_version = 1" },
+    ]);
+    expect(verdict(await f.resolver.resolve(input()))).toBe("no_data");
   });
 
   it("#573 exercises the 3 x 5 x 2 JSON matrix; foreign and older images never win", async () => {
@@ -463,7 +471,6 @@ describe("local resolve", () => {
     expect((await drain(result)).data.records).toEqual([
       { id: "key", value: "installed" },
     ]);
-    expect(f.olderVersions.read).not.toHaveBeenCalled();
     const again = await f.resolver.resolve(
       input(undefined, { cursor: result.cursor }),
     );

@@ -270,7 +270,6 @@ export function createLocalSync(
     deleter,
     resolver: createLocalResolver(deps, {
       query,
-      olderVersions,
       aliasScopes: options.aliasScopes,
       aliasTargets: options.aliasTargets,
     }),
