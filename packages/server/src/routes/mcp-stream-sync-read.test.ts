@@ -322,13 +322,13 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
     expect(mcpCaptions).toEqual(httpCaptions);
   });
 
-  it("reports the view's size and readiness in list_granted_scopes", async () => {
+  it("lists the view in list_granted_scopes without reading it: no size, status unknown", async () => {
     const list = await mcpCall("list_granted_scopes", {});
     expect(list.isError).toBe(false);
     const entry = findScopeEntry(JSON.parse(list.text), SCOPE);
     expect(entry).toBeDefined();
-    expect(entry?.sizeBytes).toBeGreaterThan(0);
-    expect(entry?.dataStatus).not.toBe("needs_refresh");
+    expect(entry?.sizeBytes).toBeUndefined();
+    expect(entry?.dataStatus).toBe("unknown");
   });
 
   it("lists, pages and raw-reads a view-served name without legacy bytes", async () => {

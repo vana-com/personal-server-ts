@@ -312,10 +312,12 @@ function redactBlockPayloadsForGrantee<
 
 export interface McpScopeMetadata {
   scope: string;
-  collectedAt: string;
-  sizeBytes: number;
-  /** True when the bounded block read path is available for this scope. */
-  hasBlocks: boolean;
+  /** Omitted when no body-free version metadata is available. */
+  collectedAt?: string;
+  /** Exact serialized bytes, if known without reading the scope body. */
+  sizeBytes?: number;
+  /** Omitted when availability has not been established without a body read. */
+  hasBlocks?: boolean;
 }
 
 export interface McpDataReadClient {
@@ -350,10 +352,10 @@ export interface McpDataReadClient {
   listOwnerScopes?(): Promise<OwnerScopeSummary[]>;
 
   /**
-   * Return lightweight planning metadata for a scope using the storage index
-   * only — no network call, no block read, no auth. Used by list_granted_scopes
-   * to populate sizeBytes/sizeClass/recommendedAccess without reading data.
-   * Returns null when the scope has no local index entry.
+   * Return body-free planning metadata. Legacy scopes use their local index;
+   * stream-backed scopes authorize free metadata discovery but leave unavailable
+   * size, version and readiness facts unknown rather than materializing data.
+   * Returns null for a known missing legacy entry or absent stream grant.
    */
   getScopeMetadata(
     scope: string,
@@ -863,31 +865,14 @@ export function createMcpDataReadClient(
       grantId?: string,
     ): Promise<McpScopeMetadata | null> {
       if (options.dataApiDeps.streamSyncRead) {
-        // Same response a read serves: size and version come from the body
-        // the handler decided on, never from the legacy index.
         if (!grantId) return null;
-        try {
-          // Free discovery, as before: no charge, and no log or fulfilment.
-          const read = await readWholeScope({
-            scope,
-            grantId,
-            read: { metadataOnly: true, logAccess: false },
-          });
-          return {
-            scope,
-            collectedAt: read.collectedAt,
-            sizeBytes: read.sizeBytes,
-            hasBlocks: true,
-          };
-        } catch (err) {
-          if (
-            err instanceof McpDataReadError &&
-            (err.status === 404 || err.status === 410)
-          ) {
-            return null;
-          }
-          throw err;
-        }
+        // Discovery still checks the signed grantee and scope, but never settles
+        // payment, logs a read or asks a resolver to construct a response body.
+        await authorizeScopeRead({ scope, grantId, metadataOnly: true });
+        // The available read port exposes a body, not an applied-version
+        // metadata projection. Do not use the unrelated legacy index or invent
+        // a byte count, timestamp or readiness fact for the switched source.
+        return { scope };
       }
       const storage = options.dataApiDeps.storage;
       const entry = storage.findEntry({ scope });

@@ -672,9 +672,9 @@ type RecommendedAccess = "read" | "search" | "wait";
 // pages it must walk via nextCursor and tends to stall the agent loop.
 function recommendAccessForScope(
   sizeClass: SizeClass,
-  hasBlocks: boolean,
+  hasBlocks: boolean | undefined,
 ): { recommendedAccess: RecommendedAccess; reason: string } {
-  if (!hasBlocks) {
+  if (hasBlocks === false) {
     return {
       recommendedAccess: "wait",
       reason:
@@ -1015,9 +1015,12 @@ const listGrantedScopes: McpToolDefinition = {
           scope,
           source: scope.split(".")[0],
           collectedAt: meta.collectedAt,
-          dataStatus: meta.hasBlocks
-            ? ("ready" as const)
-            : ("indexing" as const),
+          dataStatus:
+            meta.hasBlocks === undefined
+              ? ("unknown" as const)
+              : meta.hasBlocks
+                ? ("ready" as const)
+                : ("indexing" as const),
           sizeBytes: meta.sizeBytes,
           sizeClass,
           recommendedAccess,
@@ -1287,7 +1290,7 @@ const readScope: McpToolDefinition = {
 
     // In-band steer: the model may call read_scope on a large scope without
     // first consulting list_granted_scopes. Fetch lightweight planning metadata
-    // (storage-index only, no network/auth) opportunistically so we can attach a
+    // (body-free: the storage index, or a grant check for a switched source) opportunistically so we can attach a
     // `guidance` hint when it is already available. This is advisory only: it
     // must never delay the read or consume the read timeout budget.
     let guidance:

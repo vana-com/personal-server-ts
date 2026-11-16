@@ -12,7 +12,8 @@ import {
 } from "@opendatalabs/vana-sdk/browser";
 import { handlePersonalServerDataRequest } from "../api/index.js";
 import { createMcpDataReadClient, McpDataReadError } from "./read-client.js";
-import type { McpToolContext } from "./tools.js";
+import { MCP_TOOLS, type McpToolContext } from "./tools.js";
+import type { McpConnectionRecord } from "./types.js";
 import { createMcpSessionAuthPort } from "./session.js";
 import { encodePaymentHeader, nextPaymentNonce } from "../payment/x402.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
@@ -76,6 +77,8 @@ interface HarnessOptions {
   stream?: boolean;
   /** Write the legacy file for SCOPE. Defaults to on for the legacy harness. */
   legacy?: boolean;
+  /** Overrides on the gateway's grant, such as a revocation or an expiry. */
+  grant?: { revokedAt?: string | null; expiresAt?: string | null };
   /** Tombstone the stream connector, so its name is deleted. */
   deleteStream?: boolean;
   /** Scope the legacy file is stored under. Defaults to SCOPE. */
@@ -104,6 +107,7 @@ async function harness(options: HarnessOptions = {}) {
     expiresAt: null,
     paymentStatus: "paid",
     fee,
+    ...options.grant,
   };
   const gateway = {
     getBuilder: async () => ({ id: builder.address }),
@@ -350,6 +354,11 @@ async function readAllPages(
   return pages;
 }
 
+/** An unswitched account has no stream port: the host wires one only when switched. */
+function withoutStreamPort(h: Awaited<ReturnType<typeof harness>>) {
+  delete (h.deps as { streamSyncRead?: unknown }).streamSyncRead;
+}
+
 describe("mcp/read-client charges", () => {
   it("settles each paged read call once and never reports a paged read as fulfilment", async () => {
     const h = await harness();
@@ -407,6 +416,7 @@ describe("mcp/read-client charges", () => {
 
   it("lists scope metadata on a paid session without a proof, unlogged and unreported", async () => {
     const h = await harness();
+    withoutStreamPort(h);
     const metadata = await h.client.getScopeMetadata(SCOPE, GRANT_ID);
 
     expect(metadata).toMatchObject({
@@ -1121,5 +1131,203 @@ describe("#599 MCP account-mode adapters", () => {
     }
     expect(h.legacyRead).not.toHaveBeenCalled();
     expect(h.legacyList).not.toHaveBeenCalled();
+  });
+});
+
+describe("mcp scope metadata on a switched source never reads the body", () => {
+  const connection = {
+    id: "conn-1",
+    displayName: "Test client",
+    granteeAddress: "0x1111111111111111111111111111111111111111",
+    granteePublicKey: "0x04deadbeef",
+    encryptedGranteePrivateKey: { kind: "plaintext", privateKey: "0x22" },
+    tokenHash: "token-hash",
+    status: "approved",
+    grants: [{ grantId: GRANT_ID, scopes: [STREAM_SCOPE, BINARY_SCOPE] }],
+    createdAt: "2026-06-05T00:00:00Z",
+    approvedAt: "2026-06-05T00:00:00Z",
+  } as McpConnectionRecord;
+  const tool = (name: string) => {
+    const found = MCP_TOOLS.find((candidate) => candidate.name === name);
+    if (!found) throw new Error(`missing tool ${name}`);
+    return found;
+  };
+  const forbidden = () => {
+    throw new Error("the scope body was read for metadata");
+  };
+
+  /** Every route to a switched source's body now throws. */
+  async function switchedWithoutBodyReads() {
+    const h = await harness({ stream: true });
+    const resolve = vi.spyOn(
+      h.deps.streamSyncRead as { resolve: () => Promise<unknown> },
+      "resolve",
+    );
+    resolve.mockImplementation(forbidden);
+    const storage = h.deps.storage as unknown as Record<string, unknown>;
+    const bodyReads = [
+      "readEnvelope",
+      "readScopeBlocks",
+      "readBlockManifest",
+      "findEntry",
+    ].map((name) =>
+      vi.spyOn(storage as never, name as never).mockImplementation(forbidden),
+    );
+    return { h, resolve, bodyReads };
+  }
+
+  function expectNoBodyRead(
+    s: Awaited<ReturnType<typeof switchedWithoutBodyReads>>,
+  ) {
+    expect(s.resolve).not.toHaveBeenCalled();
+    for (const spy of s.bodyReads) expect(spy).not.toHaveBeenCalled();
+    expect(s.h.paymentFetch).not.toHaveBeenCalled();
+    expect(s.h.accessLogWrite).not.toHaveBeenCalled();
+    expect(s.h.readFulfillmentReport).not.toHaveBeenCalled();
+  }
+
+  it("answers getScopeMetadata with the scope alone, no size, time or readiness", async () => {
+    const s = await switchedWithoutBodyReads();
+    const metadata = await s.h.client.getScopeMetadata(STREAM_SCOPE, GRANT_ID);
+
+    expect(metadata).toEqual({ scope: STREAM_SCOPE });
+    expectNoBodyRead(s);
+  });
+
+  it("still refuses metadata for an invalid grant", async () => {
+    const s = await switchedWithoutBodyReads();
+    // The session port checks the grant's scopes: a name it does not list.
+    await expect(
+      s.h.client.getScopeMetadata("pdpp.acme.not_granted", GRANT_ID),
+    ).rejects.toMatchObject({ status: expect.any(Number) });
+    expect(await s.h.client.getScopeMetadata(STREAM_SCOPE)).toBeNull();
+    expect(s.resolve).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["revoked", { revokedAt: "2026-06-01T00:00:00Z" }],
+    ["expired", { expiresAt: "2026-01-01T00:00:00Z" }],
+  ])(
+    "refuses metadata for a %s grant, reading and charging nothing",
+    async (_name, grant) => {
+      const h = await harness({ stream: true, grant });
+      const resolve = vi.spyOn(
+        h.deps.streamSyncRead as { resolve: () => Promise<unknown> },
+        "resolve",
+      );
+      resolve.mockImplementation(forbidden);
+      const s = { h, resolve, bodyReads: [] };
+
+      await expect(
+        h.client.getScopeMetadata(STREAM_SCOPE, GRANT_ID),
+      ).rejects.toMatchObject({ status: expect.any(Number) });
+      expectNoBodyRead(s);
+    },
+  );
+
+  it("lists a granted switched scope as unknown, without size or time", async () => {
+    const s = await switchedWithoutBodyReads();
+    const result = await tool("list_granted_scopes").handler(
+      {},
+      { connection, readClient: s.h.client },
+    );
+    const payload = JSON.parse(result.content[0].text);
+    const entry = payload.scopes.find(
+      (e: { scope: string }) => e.scope === STREAM_SCOPE,
+    );
+
+    expect(entry).toMatchObject({
+      scope: STREAM_SCOPE,
+      dataStatus: "unknown",
+      sizeClass: "unknown",
+    });
+    expect(entry.sizeBytes).toBeUndefined();
+    expect(entry.collectedAt).toBeUndefined();
+    expectNoBodyRead(s);
+  });
+
+  it("gives read_scope its advisory metadata without a body read", async () => {
+    const s = await switchedWithoutBodyReads();
+    let advisory: Promise<unknown> | undefined;
+    const readClient = {
+      ...s.h.client,
+      getScopeMetadata: (scope: string, grantId?: string) => {
+        advisory = s.h.client.getScopeMetadata(scope, grantId);
+        return advisory as ReturnType<typeof s.h.client.getScopeMetadata>;
+      },
+      readScopeBlocks: async () => ({
+        scope: STREAM_SCOPE,
+        collectedAt: COLLECTED_AT,
+        blocks: [],
+        nextCursor: undefined,
+      }),
+    };
+    const result = await tool("read_scope").handler(
+      { scope: STREAM_SCOPE },
+      { connection, readClient: readClient as never },
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(advisory).toBeDefined();
+    await expect(advisory).resolves.toEqual({ scope: STREAM_SCOPE });
+    expectNoBodyRead(s);
+  });
+
+  it("still returns the real 402 challenge on get_scope_file, with no size hint", async () => {
+    // A real challenge, as the payment-enforcing port issues it: an unpaid
+    // later page of a paid legacy read.
+    const legacy = await harness();
+    const first = await legacy.client.readScopeBlocks({
+      scope: SCOPE,
+      grantId: GRANT_ID,
+      maxBytes: PAGE_BYTES,
+      payment: await legacy.proof(),
+    });
+    const challenge = await legacy.client
+      .readScopeBlocks({
+        scope: SCOPE,
+        grantId: GRANT_ID,
+        cursor: first.nextCursor,
+        maxBytes: PAGE_BYTES,
+      })
+      .catch((error: unknown) => error);
+    expect(challenge).toMatchObject({
+      status: 402,
+      body: { error: { errorCode: "PAYMENT_REQUIRED" } },
+    });
+
+    // The switched source's raw read meets that challenge; the helper that
+    // adds size hints must not read the body to build one.
+    const s = await switchedWithoutBodyReads();
+    const readClient = {
+      ...s.h.client,
+      readRawScopeFile: async () => {
+        throw challenge;
+      },
+    };
+    const result = await tool("get_scope_file").handler(
+      { scope: STREAM_SCOPE, includeContent: true },
+      { connection, readClient: readClient as never },
+    );
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(payload.payment_required).toBe(true);
+    expect(payload.challenge).toBeDefined();
+    expect(payload.sizeBytes).toBeUndefined();
+    expect(payload.recommendedMaxBytes).toBeUndefined();
+    expectNoBodyRead(s);
+  });
+
+  it("leaves unswitched metadata as it was: size, time and readiness from the index", async () => {
+    const h = await harness();
+    withoutStreamPort(h);
+    const metadata = await h.client.getScopeMetadata(SCOPE, GRANT_ID);
+
+    expect(metadata).toEqual({
+      scope: SCOPE,
+      collectedAt: COLLECTED_AT,
+      sizeBytes: expect.any(Number),
+      hasBlocks: true,
+    });
   });
 });
