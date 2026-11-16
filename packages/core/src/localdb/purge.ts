@@ -70,6 +70,10 @@ export async function purgeConnection(
           params: [connectionId],
         },
         {
+          sql: "DELETE FROM log_replay WHERE connection_id = ?",
+          params: [connectionId],
+        },
+        {
           sql: "DELETE FROM log_tombstones WHERE connection_id = ?",
           params: [connectionId],
         },

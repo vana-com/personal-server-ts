@@ -498,7 +498,41 @@ modelled. The corpus (two heads, two rounds) is a model limit, not a claim.
 | HeadCursor-fixed.cfg         | `head version <= cons` | log replayed from 0                       | PASS: 4568 states generated, 658 distinct, depth complete                                                               |
 | HeadCursor-fixedSplit.cfg    | `head version <= cons` | head step and log step are two operations | FAIL InvReplayed: a device holds the head and lacks the replay (a single-stream apply that returns after the head step) |
 
-`InvReplayed` (a device holding the current head holds the head's rows with the log's rows over them) is checked in `fixed` and `fixedSplit`. The code keeps head and replay one operation: a job for one stream that admits a head also reads the log before it returns.
+`InvReplayed` (a device holding the current head holds the head's rows with the log's rows over them) is checked in `fixed` and `fixedSplit`. The code keeps them in one job: a job that admits a head also reads the log before it returns, and the batch stores the obligation for the case where it cannot (next section).
+
+### The stored replay obligation
+
+`fixed` makes head and replay one transition. The code cannot: the head batch
+commits, and the log pass is a later call that can fail, crash, or find a
+registry that moved. Modes `durable` and `memory` split them (`AdmitHead`,
+`Replay`) and add a registry rollback (`Rollback`, then a log of another history,
+`ForeignRound`) and a crash that loses memory (`MemCrash`).
+
+- `durable` (the code): the head batch also writes the obligation and the cursor
+  it replaces (`evPos`, `evId`; `log_replay`), for a device with a cursor and for
+  one without. `Replay` runs whenever the obligation exists or the log is ahead,
+  refuses a registry that does not fit the cursor and the evidence, and clears
+  both only after a validated replay. The registry log is also read just before
+  the batch.
+- `memory` (what the earlier head had): the obligation lived in the job and only
+  for a device that had a cursor row, and the cursor row, with its position, went
+  with the head.
+
+| Configuration                  | Result                                                                                                          |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| HeadCursor-durable.cfg         | PASS: InvReplayedOrOwed, InvKept, EventuallyConverged (44343 states generated, 10318 distinct)                  |
+| HeadCursor-durableRollback.cfg | PASS: InvReplayedOrOwed, InvKept with a rollback and a foreign log anywhere (357343 generated, 101618 distinct) |
+| HeadCursor-memory.cfg          | FAIL InvKept: the cursor is below the position it applied and the evidence is gone                              |
+| HeadCursor-memoryReplay.cfg    | FAIL InvReplayedOrOwed: a crash, or a device that held no cursor, holds the head and owes no replay             |
+| HeadCursor-memoryRollback.cfg  | FAIL InvKept: a rollback during the window passes unnoticed                                                     |
+
+`InvKept`: a cursor below the highest position the device applied keeps that
+position and its segment as evidence, with the obligation owed.
+`InvReplayedOrOwed`: a device that holds the current head owes the replay or
+holds the head's rows with the log's rows over them. Not modelled: pending local
+changes, compaction, and other log bookkeeping that the head batch must leave
+alone (a keyed first load's pending rows are the log pass's, not the head's; the
+head batch deletes none of them).
 
 Run on 2026-11-16, TLC 2.19 (`tla2tools.jar` 1.7.4, Java 17), `-workers 4`.
 Traces: `traces/head-cursor-*.txt`. The two mutants show that both halves of the

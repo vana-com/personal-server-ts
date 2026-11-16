@@ -455,6 +455,17 @@ END`,
         consumed_data_hash = head_data_hash
       WHERE head_version > 0 AND head_data_hash IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM log_state l WHERE l.connection_id = stream_state.connection_id)`,
+
+    // The log replay a head admission owes. A per-stream head merged beside a
+    // log can drop rows the log holds, so the head batch resets the log
+    // cursor (`log_state`) and writes this row in the same batch: one row
+    // per connection, present until a replay of the log has been validated
+    // and finished. `position` and `last_ref` are the cursor the batch
+    // replaced (0 and null for a device that held none): the evidence that a
+    // registry log behind that position, or naming another segment there, is
+    // not a continuation. Local only.
+    `CREATE TABLE log_replay (
+  connection_id TEXT PRIMARY KEY, position INTEGER NOT NULL, last_ref TEXT) WITHOUT ROWID;`,
   ],
   [
     // A key-ordered first load of the log (log-keyed.ts) writes its rows one
