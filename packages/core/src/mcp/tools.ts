@@ -672,9 +672,9 @@ type RecommendedAccess = "read" | "search" | "wait";
 // pages it must walk via nextCursor and tends to stall the agent loop.
 function recommendAccessForScope(
   sizeClass: SizeClass,
-  hasBlocks: boolean,
+  hasBlocks: boolean | undefined,
 ): { recommendedAccess: RecommendedAccess; reason: string } {
-  if (!hasBlocks) {
+  if (hasBlocks === false) {
     return {
       recommendedAccess: "wait",
       reason:
@@ -1015,9 +1015,12 @@ const listGrantedScopes: McpToolDefinition = {
           scope,
           source: scope.split(".")[0],
           collectedAt: meta.collectedAt,
-          dataStatus: meta.hasBlocks
-            ? ("ready" as const)
-            : ("indexing" as const),
+          dataStatus:
+            meta.hasBlocks === undefined
+              ? ("unknown" as const)
+              : meta.hasBlocks
+                ? ("ready" as const)
+                : ("indexing" as const),
           sizeBytes: meta.sizeBytes,
           sizeClass,
           recommendedAccess,
