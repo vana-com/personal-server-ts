@@ -245,8 +245,10 @@ it("checks a delete that arrives after preflight in the atomic write batch", asy
 it("replays a live begin, refuses a changed request and a replay after restart", async () => {
   const f = await fixture();
   const first = await f.store.begin("run", request, declaration);
+  // The control row is read once, by the begin that observed it.
+  const { control: _observed, ...stored } = first;
   expect(await f.store.begin("run", { ...request }, declaration)).toEqual(
-    first,
+    stored,
   );
   await expect(
     f.store.begin("run", { ...request, wantFull: true }, declaration),

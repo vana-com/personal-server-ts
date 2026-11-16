@@ -2,6 +2,7 @@
  * P03/P04 own persistence and lifecycle; hosts compose the database facade.
  */
 import type {
+  ControlState,
   JsonValue,
   KeyFieldType,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -32,6 +33,11 @@ export const RUN_INTAKE_ERROR_STATUS = {
   restricted_scope_unsupported: 422,
   control_basis_mismatch: 409,
   control_basis_unavailable: 503,
+  /**
+   * The registry's control row for this connector is under another key, so this
+   * owner key cannot publish a run. Refused before anything is written locally.
+   */
+  control_foreign: 409,
 } as const;
 
 export type RunIntakeErrorName = keyof typeof RUN_INTAKE_ERROR_STATUS;
@@ -129,6 +135,15 @@ export interface BeginResponse {
   readonly discardReason: "registry_unreachable" | null;
   readonly stuck: boolean;
   readonly binding: { readonly keyCheck: string };
+  /**
+   * The control row this `begin` first read from the registry, classified for
+   * the owner's key: what a caller that must know the connection's state
+   * before it collects (a save that reports the control version it observed)
+   * would otherwise read again. Absent from an answer that replays an earlier
+   * `begin` or an ended run, and `undefined` when the registry did not answer
+   * (the run begins offline).
+   */
+  readonly control?: ControlState;
   readonly start: {
     readonly collection_mode: "full_refresh" | "incremental";
     readonly state: JsonValue | null;

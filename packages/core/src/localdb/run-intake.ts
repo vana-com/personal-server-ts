@@ -272,6 +272,11 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
         )
           throw new RunIntakeError("connection_stopped");
         let synced = await syncBeforeBegin(deps, req.connector);
+        // Another key's control row: this owner cannot publish what a run
+        // would collect. Nothing is written for it (`syncBeforeBegin`).
+        if (synced.control?.kind === "foreign")
+          throw new RunIntakeError("control_foreign");
+        const observed = synced.control ?? undefined;
         if (req.expectedControlVersion !== undefined) {
           if (synced.unreachable)
             throw new RunIntakeError("control_basis_unavailable");
@@ -472,7 +477,11 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           throw error;
         }
         active.set(runId, { request: text, response });
-        return response;
+        // The control row is the caller's to read once: a replay or a stored
+        // receipt answers without it, and it is not saved with the run.
+        return observed === undefined
+          ? response
+          : { ...response, control: observed };
       }),
     batch: (runId, req) =>
       serial(runId, async () => {

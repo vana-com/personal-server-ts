@@ -7,6 +7,7 @@ import {
   parseScope,
   type ControlRead,
   type ControlHashes,
+  type ControlState,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { streamSyncHashes } from "../stream-sync/crypto.js";
 import {
@@ -179,12 +180,18 @@ export async function newConnectionsWithStreams(
  * registry version differs from `head_version` or whose `head_parts` is empty
  * while `head_version > 0`. `unreachable` = the registry did not answer (C.0
  * step 3); a caller with no connection stages `generation_unbound`.
+ *
+ * `control` is the control row as the registry answered, classified for this
+ * owner's key (`null` when the registry did not answer). A row under another
+ * key (`foreign`) is reported and not saved: nothing local is written for a
+ * connection this device cannot publish.
  */
 export async function syncBeforeBegin(
   deps: LocalSyncDeps,
   connector: string,
 ): Promise<{
   readonly connection: ConnectionRow | null;
+  readonly control: ControlState | null;
   readonly unreachable: boolean;
 }> {
   // The pinned intake contract has no account identity (R23).
@@ -205,9 +212,17 @@ export async function syncBeforeBegin(
       if (await partiallyApplied(locked, id)) throw error;
       return {
         connection: await cachedConnection(locked, id),
+        control: null,
         unreachable: true,
       };
     }
+    const state = classifyControl(read, control);
+    if (state.kind === "foreign")
+      return {
+        connection: await cachedConnection(locked, id),
+        control: state,
+        unreachable: false,
+      };
     const connection = await saveControl(locked, connector, ns, read, control);
     await purgeDeleted(locked, connection);
     if (connection.controlState === "active") {
@@ -226,18 +241,21 @@ export async function syncBeforeBegin(
         if (error instanceof UpdateRequiredError)
           return {
             connection: await cachedConnection(locked, id),
+            control: state,
             unreachable: false,
           };
         if (!(error instanceof RegistryUnavailableBeforeWriteError))
           throw error;
         return {
           connection: await cachedConnection(locked, id),
+          control: state,
           unreachable: true,
         };
       }
     }
     return {
       connection: await cachedConnection(locked, id),
+      control: state,
       unreachable: false,
     };
   });
