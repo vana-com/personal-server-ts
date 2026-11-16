@@ -40,9 +40,9 @@ import type { ImportReceipt, ImportSource } from "./legacy-import-types.js";
  * What the bytes count is limited: `body.length` is UTF-16 code units, not
  * UTF-8 bytes (a non-ASCII body takes up to three bytes per unit); keys, SQL
  * text, parameters and index overhead are not counted; and the bound is
- * checked after the row that crosses it is appended, so a batch overshoots by
- * up to one row, and a row larger than the bound goes alone. So this is not a
- * memory bound. The import memory test holds that peak memory does not grow
+ * checked only after the row that crosses it is appended, so a batch
+ * overshoots by up to one row, and an oversized row may share the batch with
+ * the rows before it. So this is not a memory bound. The import memory test holds that peak memory does not grow
  * with the row count of an import of rows this size; it does not bound the
  * worst batch.
  */
