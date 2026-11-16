@@ -1,13 +1,19 @@
 --------------------------- MODULE LogProtocol ---------------------------
 EXTENDS Naturals, Integers, Sequences, FiniteSets, TLC
 CONSTANTS MaxSteps, Mode, AllowReset, AllowRollback, KeepTail
+\* Every mode of the key-ordered first load. keyedRebase and keyedStuck are one device only
+\* (see Devices); keyedStuck is the load without the Rebaseline step.
+KeyedModes == {"keyed","keyedSkip","keyedEarly","keyedLeak","keyedBypass",
+               "keyedRebase","keyedStuck"}
 ASSUME /\ MaxSteps \in 6..8
        /\ KeepTail = 1
        /\ Mode \in {"good","gap","outOfOrder","droppedDeleteEffect","forgetTombstone",
                     "omitNoCutoff","omitInclusive","dropKind","replayFromBase",
                     "grouped","groupedSkip","equalStamp","equalStampToday",
-                    "keyed","keyedSkip","keyedEarly","keyedLeak","keyedBypass"}
-Devices == {1,2,3}
+                    "keyed","keyedSkip","keyedEarly","keyedLeak","keyedBypass",
+                    "keyedRebase","keyedStuck"}
+\* A device's recovery does not depend on another device's: the liveness runs use one.
+Devices == IF Mode \in {"keyedRebase","keyedStuck"} THEN {1} ELSE {1,2,3}
 Keys == {1,2}
 Writers == {1,2}
 \* Keys stand for (stream A,key a) and (stream B,key b).
@@ -300,7 +306,7 @@ FoldRun(state,from,to) ==
  IF from > to THEN state
  ELSE FoldRun(FoldOps(state,log[from],FALSE,from),from+1,to)
 ApplyRun(d,q) ==
- /\ Mode \in {"grouped","groupedSkip","keyed","keyedSkip","keyedEarly","keyedLeak","keyedBypass"}
+ /\ Mode \in ({"grouped","groupedSkip"} \cup KeyedModes)
  /\ NoPending(d)
  /\ deviceEpoch[d]=epoch /\ position[d]>=cut
  /\ q \in retained /\ q<=known[d] /\ q>position[d]+1
@@ -335,7 +341,7 @@ ApplyRun(d,q) ==
 \* keyedSkip mutant: a key's fold leaves out the segment before the last (as a stage that
 \* lost rows would). keyedEarly mutant: the position is written while a key is not yet folded.
 KeyedGate(d) ==
- /\ Mode \in {"keyed","keyedSkip","keyedEarly","keyedLeak","keyedBypass"}
+ /\ Mode \in KeyedModes
  /\ deviceEpoch[d]=epoch /\ cut=0 /\ position[d]=0 /\ data[d]=Empty
 \* The pending target admits a stage that ends at q.
 PendingAdmits(d,q) ==
@@ -407,14 +413,43 @@ KeyedPublish(d,q) ==
                 deviceEpoch,known,hints>>
 \* A crash, or the next start: the stage goes, the durable rows and the pending target stay.
 StageLost(d) ==
- /\ Mode \in {"keyed","keyedSkip","keyedEarly","keyedLeak","keyedBypass"}
+ /\ Mode \in KeyedModes
  /\ \E k \in Keys : stageAt[d][k] # 0
  /\ stage' = [stage EXCEPT ![d]=Empty]
  /\ stageAt' = [stageAt EXCEPT ![d]=[k \in Keys |-> 0]]
  /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
                 deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK,
                 dur,durAt,durEp>>
+\* A load of this log can no longer finish the durable rows (`durAt[d] # 0`) a stopped
+\* key-ordered load left: the log is of another lifetime (a reset or a rewrite) or it compacted,
+\* so a snapshot and a new base stand in for the prefix those rows came from. The code decides
+\* this from the marker alone (`keyedLoadBlocked` in log-keyed.ts: a snapshot, another base, a
+\* different segment at a position the marker names, the flag off, no segment past the marker).
+\* A log that is only shorter and agrees (`Len(log) < durAt[d]` with no reset or compaction:
+\* a segment that cannot be fetched now, a registry that lags) is NOT unfinishable: the device
+\* is refused by `PendingAdmits` with its rows kept, and finishes when the log is whole.
+Unfinishable(d) ==
+ /\ durAt[d] # 0
+ /\ (durEp[d] # epoch \/ cut > 0)
+\* The rebaseline: the durable rows, the pending target and the stage go together, in one
+\* transaction, and the load starts again from what the log now holds. The position is 0
+\* here already (a keyed device never published), so nothing a reader serves changes. What the
+\* device wrote itself and has not published is not in this model: the code keeps it (the
+\* rows that are the latest unpublished change of their key), and its tests state that.
+\* keyedStuck mutant: no such step, so a device that holds durable rows of a log that
+\* compacted or was rewritten can take no other step (EventuallyConverged fails).
+Rebaseline(d) ==
+ /\ Mode \in KeyedModes /\ Mode # "keyedStuck"
+ /\ Unfinishable(d)
+ /\ dur' = [dur EXCEPT ![d]=Empty]
+ /\ durAt' = [durAt EXCEPT ![d]=0]
+ /\ durEp' = [durEp EXCEPT ![d]=epoch]
+ /\ stage' = [stage EXCEPT ![d]=Empty]
+ /\ stageAt' = [stageAt EXCEPT ![d]=[k \in Keys |-> 0]]
+ /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
+                deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK>>
 Recover(d) == Install(d) \/ (\E p \in retained : Apply(d,p)) \/ SkipGap(d)
+              \/ Rebaseline(d)
               \/ (\E q \in retained : ApplyRun(d,q))
               \/ (\E k \in Keys, q \in retained : KeyedLoad(d,k,q))
               \/ (\E k \in Keys : KeyedBucket(d,k))
@@ -474,6 +509,12 @@ P7 == \A d \in Devices :
        (deviceEpoch[d]=epoch /\ position[d]=Len(log))
        => \A k \in Keys : data[d][k].body = IntendedBody(k)
 EventuallyConverged == <>[](stopped /\ CaughtUp /\ P1)
+\* The crash that drops a stage (`StageLost`) is the environment's, and a device that is
+\* crashed again before every step never finishes a load, in any design. The liveness claim for
+\* the key-ordered load is therefore made for the runs in which crashes end: the connection
+\* eventually serves (`EventuallyConverged`) once no further crash occurs.
+CrashesEnd == <>[][~(\E d \in Devices : StageLost(d))]_vars
+LiveWhenCrashesEnd == CrashesEnd => EventuallyConverged
 \* Expected FALSE: evidence that the two conflict orders are not equivalent.
 StampEqualsLamport ==
  (epoch=1 /\ Len(log)=2) =>

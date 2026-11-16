@@ -45,8 +45,21 @@ export const OMISSION_RANK = 0;
 export const UPSERT_RANK = 1;
 export const EXPLICIT_DELETE_RANK = 2;
 
-/** Variables a statement binds at most; a long key set goes in chunks. */
-export const KEYS_PER_STATEMENT = 400;
+/**
+ * The most variables any one statement of the log code binds. SQLite before
+ * 3.32 (the 3.22 this code supports) refuses a statement over 999, and the
+ * limit is a build option of the host, so a statement keeps well under it
+ * rather than at it. A statement that binds a set of keys or rows takes what
+ * is left after its fixed binds: `rowsPerStatement`.
+ */
+export const BIND_CEILING = 400;
+
+/** The rows (or keys) of `bindsPerRow` variables a statement can hold beside `fixedBinds` other variables. */
+export const rowsPerStatement = (bindsPerRow: number, fixedBinds = 0) =>
+  Math.max(1, Math.floor((BIND_CEILING - fixedBinds) / bindsPerRow));
+
+/** The survivors statement binds a connection, a stream and a cutoff pair beside its keys. */
+const SURVIVOR_FIXED_BINDS = 4;
 
 const chunks = <T>(items: readonly T[], size: number): T[][] => {
   const out: T[][] = [];
@@ -300,7 +313,10 @@ export function operationStatements(
   ): SqlStatement[] => {
     const out: SqlStatement[] = [];
     const cmp = inclusive ? "<=" : "<";
-    for (const group of chunks(keys, KEYS_PER_STATEMENT)) {
+    for (const group of chunks(
+      keys,
+      rowsPerStatement(1, SURVIVOR_FIXED_BINDS),
+    )) {
       const marks = group.map(() => "?").join(",");
       out.push(
         {

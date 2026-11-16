@@ -19,7 +19,12 @@ import {
   publishConnection,
   LogDivergedError,
 } from "../../../core/src/localdb/index.js";
-import { complexPages } from "../../../core/src/localdb/log-keyed.js";
+import {
+  complexPages,
+  keyedLoadBlocked,
+  pendingAdmits,
+} from "../../../core/src/localdb/log-keyed.js";
+import { withOrigin } from "../../../core/src/localdb/merge.js";
 import {
   CONNECTION_ID,
   LOG,
@@ -453,8 +458,11 @@ describe("log first load, key by key: a run that emits a key again at its stamp"
  * A load that stopped after its first key range committed: rows of the whole
  * log are in `records` (those of that range), and the position is 0.
  */
-async function stoppedAfterFirstRange(w: World, id: string) {
-  const d = await connected(w, id, { maxBytesInFlight: await splitting(w) });
+async function stoppedAfterFirstRange(w: World, id: string, hooks = {}) {
+  const d = await connected(w, id, {
+    maxBytesInFlight: await splitting(w),
+    ...hooks,
+  });
   let ranges = 0;
   let armed = true;
   onCommit(d, async (statements) => {
@@ -553,7 +561,7 @@ describe("log first load, key by key: what an unfinished load leaves", () => {
     expect(await d.position()).toBeGreaterThan(0);
   });
 
-  it("refuses to publish over rows of another log", async () => {
+  it("rebaselines over rows of another log, and ends in the log it reads", async () => {
     const w = await world({ streams: 2, logProtocol: true });
     await history(w);
     const d = await stoppedAfterFirstRange(w, "other");
@@ -571,17 +579,16 @@ describe("log first load, key by key: what an unfinished load leaves", () => {
         params: [JSON.stringify(refs)],
       },
     ]);
-    await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toBeInstanceOf(
-      LogDivergedError,
-    );
-    expect(await d.position()).toBe(0);
+    await applyConnection(d.deps, CONNECTION_ID);
+    await endsInTheLog(w, d);
   });
 
-  it("does not finish an unfinished key-ordered load any other way", async () => {
+  it("rebaselines when the flag is off, and loads segment by segment", async () => {
     const w = await world({ streams: 2, logProtocol: true });
     await history(w);
     const d = await stoppedAfterFirstRange(w, "switched");
-    // The segment-by-segment load, as a host that turned the flag off asks for.
+    // A host that turned the flag off now: the marker names rows no
+    // segment-by-segment load can tell from the log's own.
     const off = await connected(w, "off", { keyedFirstLoad: false });
     await off.db.batch(
       (
@@ -593,10 +600,288 @@ describe("log first load, key by key: what an unfinished load leaves", () => {
         params: [CONNECTION_ID, r.position, r.base, r.refs],
       })),
     );
-    await expect(
-      applyConnection(off.deps, CONNECTION_ID),
-    ).rejects.toBeInstanceOf(LogDivergedError);
-    expect(await off.position()).toBe(0);
+    await applyConnection(off.deps, CONNECTION_ID);
+    await endsInTheLog(w, off);
+  });
+});
+
+/**
+ * A device that holds nothing of the log's streams ends, whatever a stopped
+ * load left, in the rows, tombstones, heads and position of a device that read
+ * the log segment by segment: the marker is gone, so are the stage tables.
+ */
+async function endsInTheLog(w: World, d: Device) {
+  const reference = await connected(w, "reference-end", {
+    keyedFirstLoad: false,
+  });
+  await applyConnection(reference.deps, CONNECTION_ID);
+  const expected = await tables(reference);
+  const got = await tables(d);
+  expect(got.records).toEqual(expected.records);
+  expect(got.tombstones).toEqual(expected.tombstones);
+  expect(got.streams).toEqual(expected.streams);
+  expect(got.heads).toEqual(expected.heads);
+  expect(got.state).toEqual(expected.state);
+  expect(await d.db.query("SELECT * FROM log_keyed_pending")).toEqual([]);
+  expect(await stageTables(d)).toEqual([]);
+  expect(await d.position()).toBeGreaterThan(0);
+  expect(expected.records.length).toBeGreaterThan(5);
+}
+
+/** The writer publishes until the log's newest segment holds a snapshot. */
+async function compactLog(w: World, a: Device, from: number) {
+  for (let n = from; ; n++) {
+    const segments = await w.segments();
+    if (segments.get(Math.max(...segments.keys()))!.snapshot !== null) return;
+    await step(a, n, [{ stream: S0, id: `later-${n}`, pad: 4_000 }]);
+  }
+}
+
+describe("log first load, key by key: a log that can no longer finish it", () => {
+  it("serves the snapshot and the tail when the log compacts after a stopped load", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    const a = await history(w);
+    const d = await stoppedAfterFirstRange(w, "retry");
+    expect((await tables(d)).records.length).toBeGreaterThan(0);
+    expect(await d.db.query("SELECT * FROM log_keyed_pending")).toHaveLength(1);
+
+    await compactLog(w, a, 100);
+    const head = [...(await w.segments()).values()].at(-1)!;
+    expect(head.snapshot).not.toBeNull();
+    expect(head.base).toBeGreaterThan(0);
+
+    await applyConnection(d.deps, CONNECTION_ID);
+    await endsInTheLog(w, d);
+  });
+
+  it("serves a log whose base moved by a rewrite that holds the marker's positions under other segments", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    await history(w);
+    const d = await stoppedAfterFirstRange(w, "rewritten");
+    // The marker's base is not the log's.
+    await d.db.batch([
+      { sql: "UPDATE log_keyed_pending SET base = base + 1000", params: [] },
+    ]);
+    await applyConnection(d.deps, CONNECTION_ID);
+    await endsInTheLog(w, d);
+  });
+
+  it("keeps the writes the device has not published, and publishes them after", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    const a = await history(w);
+    const d = await stoppedAfterFirstRange(w, "local");
+    await compactLog(w, a, 100);
+
+    // What a device that read the log and then ran a local run holds, and the
+    // rows that run wrote: a key of its own, and one the log has.
+    const mine = [
+      { stream: S0, id: "mine", v: 1 },
+      { stream: S1, id: "mine-too", v: 2 },
+      { stream: S0, id: "shared", v: 777 },
+    ];
+    const when = { full: false, covered: [S0, S1], observedAt: 5000 };
+    const pure = await connected(w, "pure", { keyedFirstLoad: false });
+    await applyConnection(pure.deps, CONNECTION_ID);
+    const reference = await connected(w, "reference", {
+      keyedFirstLoad: false,
+    });
+    await applyConnection(reference.deps, CONNECTION_ID);
+    await reference.run("local-run", mine, when);
+    const logRows = new Set(await pure.rows());
+    const written = (
+      await reference.db.query<Record<string, string | number | null>>(
+        "SELECT * FROM records ORDER BY stream, record_key",
+      )
+    ).filter(
+      (r) =>
+        !logRows.has(
+          JSON.stringify({
+            stream: r.stream,
+            record_key: r.record_key,
+            body: r.body,
+            stamp_o: r.stamp_o,
+            stamp_r: r.stamp_r,
+            stamp_n: r.stamp_n,
+            first_o: r.first_o,
+          }),
+        ),
+    );
+    expect(written.length).toBeGreaterThanOrEqual(mine.length);
+
+    // The device wrote the same rows before it could reach the log again: a
+    // local write, as the run's own commit makes it (origin `local`).
+    const columns = Object.keys(written[0]!);
+    await d.db.batch(
+      withOrigin(
+        "local",
+        written.map((row) => ({
+          sql: `INSERT OR REPLACE INTO records (${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`,
+          params: columns.map((c) => row[c]!),
+        })),
+      ),
+    );
+    const unpublished = () =>
+      d.db.query<{ stream: string; pk_hash: string; op: string }>(
+        `SELECT ch.stream, ch.pk_hash, ch.op FROM record_changes ch
+          WHERE ch.origin IN ('local','import','refresh')
+            AND ch.seq > COALESCE((SELECT publish_watermark FROM stream_state s
+                                    WHERE s.connection_id = ch.connection_id AND s.stream = ch.stream), 0)
+          ORDER BY ch.seq`,
+      );
+    const before = await unpublished();
+    expect(before).toHaveLength(written.length);
+    expect(await d.db.query("SELECT * FROM log_keyed_pending")).toHaveLength(1);
+    expect(await d.position()).toBe(0);
+
+    await applyConnection(d.deps, CONNECTION_ID);
+    expect(await d.db.query("SELECT * FROM log_keyed_pending")).toEqual([]);
+    expect(await unpublished()).toEqual(before);
+    expect(await d.rows()).toEqual(await reference.rows());
+    expect((await d.records()).filter((r) => r.includes("/mine"))).toHaveLength(
+      2,
+    );
+
+    // They publish: another device reads them from the log.
+    await d.cycle();
+    expect(await unpublished()).toEqual([]);
+    const late = await connected(w, "late", { keyedFirstLoad: false });
+    await late.cycle();
+    expect(await late.rows()).toEqual(await d.rows());
+    expect(
+      (await late.records()).filter((r) => r.includes("/mine")),
+    ).toHaveLength(2);
+  });
+
+  it("drops a row of the stopped load that a local write does not stand behind", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    const a = await history(w);
+    const d = await stoppedAfterFirstRange(w, "all-remote");
+    const left = (await tables(d)).records.length;
+    expect(left).toBeGreaterThan(0);
+    await compactLog(w, a, 100);
+    // Nothing unpublished: the rebaseline leaves no row of the stopped load.
+    let rebaselined = -1;
+    onCommit(d, async (statements) => {
+      if (
+        statements.some((s) =>
+          s.sql.startsWith("DELETE FROM log_keyed_pending"),
+        ) &&
+        statements.some((s) => s.sql.startsWith("DELETE FROM records"))
+      )
+        rebaselined = (
+          await d.db.query<{ n: number }>("SELECT COUNT(*) AS n FROM records")
+        )[0]!.n;
+    });
+    await applyConnection(d.deps, CONNECTION_ID);
+    expect(rebaselined).toBe(left);
+    await endsInTheLog(w, d);
+  });
+
+  it("drops the rows, the tombstones and the marker together or not at all", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    const a = await history(w);
+    const d = await stoppedAfterFirstRange(w, "atomic");
+    await compactLog(w, a, 100);
+    const before = await tables(d);
+    const marker = await d.db.query("SELECT * FROM log_keyed_pending");
+    let armed = true;
+    onCommit(d, async (statements) => {
+      if (
+        armed &&
+        statements.some((s) =>
+          s.sql.startsWith("DELETE FROM log_keyed_pending"),
+        ) &&
+        statements.some((s) => s.sql.startsWith("DELETE FROM records"))
+      ) {
+        armed = false;
+        throw new Error("stopped in the rebaseline");
+      }
+    });
+    await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toThrow();
+    // The batch was refused as a whole: the stopped load is as it was.
+    expect(armed).toBe(false);
+    const after = await tables(d);
+    expect(after.records).toEqual(before.records);
+    expect(after.tombstones).toEqual(before.tombstones);
+    expect(await d.db.query("SELECT * FROM log_keyed_pending")).toEqual(marker);
+    // And the retry rebaselines and ends in the log.
+    await applyConnection(d.deps, CONNECTION_ID);
+    await endsInTheLog(w, d);
+  });
+
+  describe("keyedLoadBlocked", () => {
+    const ref = (position: number, hash: string) => ({
+      position,
+      dataHash: `0x${hash.repeat(32)}` as `0x${string}`,
+      bytes: 10,
+    });
+    const state = (
+      position: number,
+      base: number,
+      refs: ReturnType<typeof ref>[],
+    ) => ({ position, base, refs, snapshot: null });
+    const pending = state(3, 0, [ref(1, "aa"), ref(2, "bb"), ref(3, "cc")]);
+    const same = {
+      snapshotPresent: false,
+      target: state(5, 0, [
+        ref(1, "aa"),
+        ref(2, "bb"),
+        ref(3, "cc"),
+        ref(4, "dd"),
+        ref(5, "ee"),
+      ]),
+    };
+    const on = { keyedFirstLoad: true };
+
+    it("is not blocked by a log that holds the marker's segments, longer or equal", () => {
+      expect(keyedLoadBlocked(on, pending, same)).toBeNull();
+      expect(keyedLoadBlocked({}, pending, same)).toBeNull();
+      expect(
+        keyedLoadBlocked(on, pending, {
+          snapshotPresent: false,
+          target: state(3, 0, pending.refs),
+        }),
+      ).toBeNull();
+    });
+
+    it("is not blocked by a log that is shorter and agrees (a registry that lags)", () => {
+      const lagging = {
+        snapshotPresent: false,
+        target: state(2, 0, pending.refs.slice(0, 2)),
+      };
+      expect(keyedLoadBlocked(on, pending, lagging)).toBeNull();
+      // The load that cannot cover the marker is refused at publication.
+      expect(pendingAdmits(pending, lagging.target)).toBe(false);
+    });
+
+    it("is blocked by each thing no key-ordered load can finish", () => {
+      const reasons = [
+        keyedLoadBlocked({ keyedFirstLoad: false }, pending, same),
+        keyedLoadBlocked(on, pending, { ...same, snapshotPresent: true }),
+        keyedLoadBlocked(on, pending, { snapshotPresent: false, target: null }),
+        keyedLoadBlocked(on, pending, {
+          snapshotPresent: false,
+          target: state(5, 2, same.target.refs),
+        }),
+        keyedLoadBlocked(on, pending, {
+          snapshotPresent: false,
+          target: state(5, 0, [
+            ref(1, "aa"),
+            ref(2, "ff"),
+            ref(3, "cc"),
+            ref(4, "dd"),
+            ref(5, "ee"),
+          ]),
+        }),
+        // The log is at or past a position the marker names and does not name it.
+        keyedLoadBlocked(on, pending, {
+          snapshotPresent: false,
+          target: state(5, 0, [ref(1, "aa"), ref(3, "cc"), ref(5, "ee")]),
+        }),
+      ];
+      for (const reason of reasons) expect(reason).toEqual(expect.any(String));
+      expect(new Set(reasons).size).toBe(5);
+    });
   });
 });
 

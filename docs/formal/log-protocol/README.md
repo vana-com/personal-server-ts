@@ -132,29 +132,43 @@ adopting a newer epoch, so monotonicity means the pair (epoch, position).
   `j` at a time, in any order and any number of times (a key whose history is
   over the budget). The `keyedBypass` mutant drops the `NoPending` gate, so the
   position may move past durable rows by another action, and must fail P5.
+- Rebaseline (`Mode` keyedRebase, keyedStuck): a device that holds durable rows
+  (`durAt[d] # 0`) of a log that is now of another lifetime (`durEp[d] # epoch`) or
+  compacted (`cut > 0`) can never finish them: `PendingAdmits` and `KeyedGate` refuse
+  every load and `NoPending` refuses every other move. `Unfinishable(d)` names that
+  case and `Rebaseline(d)` ends it in one step: durable rows, pending target and
+  stage go together, the position stays 0, and the device starts again from the log
+  as it is. A log that is only shorter and agrees (`Len(log) < durAt[d]`) is not
+  `Unfinishable`: it stays refused, rows kept. The `keyedStuck` mutant has no
+  `Rebaseline` and must violate `LiveWhenCrashesEnd`. Both modes use one device and
+  `AllowReset`. What the device wrote itself and has not published is not in this
+  model: the code keeps it, and its tests state that (`log-keyed-first-load.test.ts`,
+  "keeps the writes the device has not published").
 
 ## Properties and expected host results
 
-| Configuration             | Expected result                     | Target                                                                                                   |
-| ------------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| Good.cfg                  | PASS within this finite abstraction | TypeOK, P1–P5; eventual convergence                                                                      |
-| LostPush.cfg              | PASS, even with no Deliver action   | P2 full-check recovery and eventual convergence                                                          |
-| DropGap.cfg               | FAIL P2                             | skipped missing predecessors                                                                             |
-| OutOfOrder.cfg            | FAIL P2                             | later segment applied first                                                                              |
-| DroppedDeleteEffect.cfg   | FAIL P1 after snapshot+tail         | snapshot built without delete operations                                                                 |
-| ForgetTombstone.cfg       | FAIL P1 via replay                  | correct delete, then snapshot forgets its tombstone; a later replayed upsert resurrects the key          |
-| OmissionWithoutCutoff.cfg | FAIL P3                             | newer observed row erased by old omission                                                                |
-| OmissionInclusive.cfg     | FAIL P3                             | omission at equal stamp erases an observation AT the cutoff (`<=` boundary)                              |
-| LamportDifference.cfg     | FAIL StampEqualsLamport             | P6 orders choose different winners                                                                       |
-| Grouped.cfg               | PASS within this finite abstraction | group commit (`ApplyRun`): TypeOK, P1–P5, OrderOK                                                        |
-| GroupedSkip.cfg           | FAIL P5                             | a group commit that leaves out the segments between its first and last                                   |
-| Keyed.cfg                 | BOUNDED, no violation               | key-ordered first load (`KeyedLoad`, `KeyedBucket`, `KeyedPublish`, `StageLost`): TypeOK, P1–P5, OrderOK |
-| KeyedSkip.cfg             | FAIL P1                             | a key's fold that leaves out a segment                                                                   |
-| KeyedEarly.cfg            | FAIL P5                             | the position written while a key is not yet folded                                                       |
-| KeyedLeak.cfg             | FAIL P5                             | no `PendingAdmits`: a shorter retry publishes durable rows of a longer, stopped load                     |
-| KeyedShort.cfg            | BOUNDED, no violation               | Keyed with `Len(log) <= 3`: TypeOK, P1–P5, OrderOK                                                       |
-| KeyedBypass.cfg           | FAIL P5                             | no `NoPending` gate: another action moves the position past durable rows of an unfinished load           |
-| KeyedLife.cfg             | BOUNDED, no violation               | Keyed with `AllowReset` and `Len(log) <= 3`: a lifetime change while durable rows exist                  |
+| Configuration             | Expected result                     | Target                                                                                                       |
+| ------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Good.cfg                  | PASS within this finite abstraction | TypeOK, P1–P5; eventual convergence                                                                          |
+| LostPush.cfg              | PASS, even with no Deliver action   | P2 full-check recovery and eventual convergence                                                              |
+| DropGap.cfg               | FAIL P2                             | skipped missing predecessors                                                                                 |
+| OutOfOrder.cfg            | FAIL P2                             | later segment applied first                                                                                  |
+| DroppedDeleteEffect.cfg   | FAIL P1 after snapshot+tail         | snapshot built without delete operations                                                                     |
+| ForgetTombstone.cfg       | FAIL P1 via replay                  | correct delete, then snapshot forgets its tombstone; a later replayed upsert resurrects the key              |
+| OmissionWithoutCutoff.cfg | FAIL P3                             | newer observed row erased by old omission                                                                    |
+| OmissionInclusive.cfg     | FAIL P3                             | omission at equal stamp erases an observation AT the cutoff (`<=` boundary)                                  |
+| LamportDifference.cfg     | FAIL StampEqualsLamport             | P6 orders choose different winners                                                                           |
+| Grouped.cfg               | PASS within this finite abstraction | group commit (`ApplyRun`): TypeOK, P1–P5, OrderOK                                                            |
+| GroupedSkip.cfg           | FAIL P5                             | a group commit that leaves out the segments between its first and last                                       |
+| Keyed.cfg                 | BOUNDED, no violation               | key-ordered first load (`KeyedLoad`, `KeyedBucket`, `KeyedPublish`, `StageLost`): TypeOK, P1–P5, OrderOK     |
+| KeyedSkip.cfg             | FAIL P1                             | a key's fold that leaves out a segment                                                                       |
+| KeyedEarly.cfg            | FAIL P5                             | the position written while a key is not yet folded                                                           |
+| KeyedLeak.cfg             | FAIL P5                             | no `PendingAdmits`: a shorter retry publishes durable rows of a longer, stopped load                         |
+| KeyedShort.cfg            | BOUNDED, no violation               | Keyed with `Len(log) <= 3`: TypeOK, P1–P5, OrderOK                                                           |
+| KeyedBypass.cfg           | FAIL P5                             | no `NoPending` gate: another action moves the position past durable rows of an unfinished load               |
+| KeyedLife.cfg             | BOUNDED, no violation               | Keyed with `AllowReset` and `Len(log) <= 3`: a lifetime change while durable rows exist                      |
+| KeyedRebase.cfg           | PASS (complete)                     | `Rebaseline`: LiveWhenCrashesEnd (the connection eventually serves once crashes end), TypeOK, P1–P5, OrderOK |
+| KeyedStuck.cfg            | FAIL LiveWhenCrashesEnd             | no `Rebaseline`: durable rows of a reset or compacted log leave the device stopped with position 0           |
 
 Corpus (batch 6): an equal-cutoff omission (key 1, stamp 5) meets the live
 stamp-5 row, and an older omission (key 2, stamp 1) sits below the live delete.
@@ -279,6 +293,37 @@ for the current model. The failing runs stop at the first violation, so their
 state counts are what TLC had reached, not a space size. Traces:
 `traces/KeyedLeak.txt`, `traces/KeyedBypass.txt`, `traces/KeyedSkip.txt`,
 `traces/KeyedEarly.txt`.
+
+## Rebaseline of an unfinishable key-ordered load (host run, 2026-11-16)
+
+Question. A key-ordered load that stopped leaves durable rows and a marker. If the
+log then compacts or is rewritten, no key-ordered load can finish them, and (before
+this change) the connection was refused for good. Does a rebaseline step restore the
+liveness property "the connection eventually serves"?
+
+Property. `EventuallyConverged` (`<>[](stopped /\ CaughtUp /\ P1)`) fails in any model in
+which a crash drops the stage again before every step (`StageLost` forever: the first
+run of `KeyedRebase.cfg` found that loop, a device that crashes in every attempt). So
+the property checked is `LiveWhenCrashesEnd == <>[][no StageLost] => EventuallyConverged`:
+the claim holds for runs in which crashes end.
+
+TLC 1.7.4, `-workers 4 -Xmx4g`, `nice -n 19`, one job at a time (the long `Keyed.cfg`
+run was paused with SIGSTOP while these ran and resumed after).
+
+| Configuration   | Expected                | Actual                                                                                                                                                                                                         | Distinct states     | Depth | Wall time      |
+| --------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- | ----- | -------------- |
+| KeyedStuck.cfg  | FAIL LiveWhenCrashesEnd | FAIL as expected: three commits, FullCheck, a key staged, a bucket made durable, then `Reset` (a new lifetime) and `Stop`; the device stutters with durable rows and no step enabled (`traces/KeyedStuck.txt`) | 24,485 at failure   | 9     | 3 s            |
+| KeyedRebase.cfg | PASS                    | PASS, complete: "Model checking completed. No error has been found." 8,860,053 states generated, 0 left on queue                                                                                               | 1,093,310           | 24    | 6 min 24 s     |
+| KeyedShort.cfg  | PASS (bounded)          | BOUNDED on the new model: stopped at the 9 min limit; no error in the explored states (about 166M states generated, 6.2M left on queue)                                                                        | at least 13,809,461 | 16    | 9 min, stopped |
+| KeyedLife.cfg   | PASS (bounded)          | BOUNDED on the new model: stopped at the 9 min limit; no error in the explored states (about 186M states generated, 8.6M left on queue)                                                                        | at least 16,957,565 | 16    | 9 min, stopped |
+
+`KeyedRebase.cfg` and `KeyedStuck.cfg` differ in one thing: `Mode`. Both use one
+device, `AllowReset = TRUE`, `AllowRollback = FALSE`, `MaxSteps = 6` and the `NoPushSpec`
+(no per-stream hints). `Rollback` is off because the code does not rebaseline a
+registry that is behind the marker: it stays refused (`KeyedLeak` covers that
+safety property). The complete run is complete for this finite abstraction only: one
+device, two keys, at most six commits, resets and compactions, and it does not model
+the rows a device wrote locally and has not published.
 
 ## #705 r3 extension (host run, 2026-11-15)
 

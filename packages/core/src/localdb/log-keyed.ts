@@ -47,11 +47,11 @@
 // target that `pendingAdmits` accepts (same base, no shorter, same data hashes
 // at the pending refs): a retry that can fetch fewer segments than the stopped
 // load wrote would otherwise publish rows from beyond its cursor. A refused
-// retry writes nothing and raises. While the marker exists `applyLog` takes
-// this path whatever the flags say, and fails closed (`LogDivergedError`) if it
-// cannot: a snapshot, a compaction or a different log has no key-ordered load
-// that could finish what was written, and the rows left cannot be told apart
-// from rows of the live log. The marker holds back every other way to move the
+// retry writes nothing and raises. While the marker exists and the log can
+// still finish it, `applyLog` takes this path whatever the flags say. A log
+// that cannot (a snapshot, a compaction, a different log) has no key-ordered
+// load that could finish what was written, and the rows left cannot be told
+// apart from rows of the live log: `applyLog` rebaselines (below). The marker holds back every other way to move the
 // position, not only the load plan: the lifetime branches of `applyLog` (a log
 // read as ended, a log of an earlier lifetime) write a cursor without applying
 // anything, and a device that holds a cursor above 0 beside the marker is not
@@ -65,13 +65,21 @@
 // and the merge is order-insensitive per key, so it ends in the rows of a device
 // that read the head and then the log.
 //
-// The way out of a refused retry. A log that compacted, or was rewritten, after
-// a stopped load has nothing a key-ordered load can finish, and the rows the
-// stopped load left are not told apart from rows of the live log (no per-key
-// record says which position wrote a row). Such a connection stays refused
-// until its local data is purged, which deletes the marker with the rows. A
-// journal of positions per key, or a key-ordered load that also reads a
-// snapshot, would remove that wait; neither is built.
+// The way out. A log that compacted, or was rewritten, after a stopped load has
+// nothing a key-ordered load can finish, and the rows the stopped load left are
+// not told apart from rows of the live log (no per-key record says which
+// position wrote a row). `keyedLoadBlocked` names that case (a snapshot, no
+// segment past the marker, the flag off, another base, another segment at a
+// position the marker names) and `rebaselineKeyedLoad` ends it: in one batch it
+// drops the rows the load wrote, the log's tombstones and the marker, and the
+// first load restarts from the log as it is now. A device that holds nothing
+// of the log's streams (no cursor, no stream version) loses nothing the log
+// does not hold; what is kept is the rows of a local write the device has not
+// published (below). A log that only reads short (a segment that cannot be
+// fetched now, a registry that lags) is not this case: the marker stands and
+// the retry is refused until the log is whole, as `pendingAdmits` says. The
+// model: `Rebaseline`, `Unfinishable`, and `EventuallyConverged` in
+// docs/formal/log-protocol.
 //
 // A segment that cannot be fetched ends staging there: if no bucket has
 // committed yet, the segments before it load, the cursor stands at the last of
@@ -95,9 +103,10 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement, SqlValue } from "./driver.js";
+import { withOrigin } from "./merge.js";
 import {
   applyInGroups,
-  KEYS_PER_STATEMENT,
+  rowsPerStatement,
   commitStaged,
   mergeStaged,
   operationStatements,
@@ -120,7 +129,17 @@ import {
 } from "./log-state.js";
 import { holdMemory } from "./transfer-memory.js";
 
-/** Hex digits of a key's hash that place it in a bucket: the key space is 16^4. */
+/**
+ * Hex digits of a key's hash that place it in a bucket. The count of buckets
+ * is the log's bytes over half the memory budget (`keyedBuckets`) and is capped
+ * by the key space, 16^PLACING_DIGITS, which is also the most stage tables a
+ * load can create. With 4 digits the cap is 65,536 tables, reached only by a
+ * log of `32,768 x budget` bytes, so the cap never decides the plan for a log
+ * a device can hold; a fifth digit would only raise a table-count ceiling that
+ * no log reaches, while 3 (4,096) would cap a log of `2,048 x budget`. A key's
+ * hash is uniform, so a range holds its share of the bytes within the variance
+ * of that many keys, not by construction.
+ */
 const PLACING_DIGITS = 4;
 const KEY_SPACE = 16 ** PLACING_DIGITS;
 
@@ -178,7 +197,9 @@ export async function planKeyedLoad(
     // An unfinished key-ordered load left rows in `records` that only a
     // key-ordered load that covers them may publish over. The rest of the
     // gate (a flag, the size of the log) decided how the first attempt began;
-    // it does not decide how to end it.
+    // it does not decide how to end it. `applyLog` rebaselines a connection
+    // whose log cannot finish it (`keyedLoadBlocked`) before it gets here, so
+    // this refusal holds the line for any other caller.
     if (snapshotPresent || tail.length === 0 || deps.keyedFirstLoad === false)
       throw unfinishedKeyedLoad(
         pending,
@@ -208,16 +229,17 @@ export async function planKeyedLoad(
 
 /**
  * The refusal of every path that cannot finish an unfinished key-ordered load
- * of this connection. Its rows are in `records` and `log_tombstones` and
- * belong to no published position; the way out is a key-ordered load of the
- * same log, or purging the connection's rows.
+ * of this connection and may not drop it. Its rows are in `records` and
+ * `log_tombstones` and belong to no published position; the way out is a
+ * key-ordered load of the same log, or `rebaselineKeyedLoad` when the log can
+ * no longer be one.
  */
 export function unfinishedKeyedLoad(
   pending: LogState,
   why: string,
 ): LogDivergedError {
   return new LogDivergedError(
-    `apply: an earlier key-ordered load of this connection wrote rows up to position ${pending.position} and did not finish; only a key-ordered load of the same log can finish it (${why})`,
+    `apply: an earlier key-ordered load of this connection wrote rows up to position ${pending.position} and did not finish; only a key-ordered load of the same log can finish it, or a rebaseline (${why})`,
   );
 }
 
@@ -241,6 +263,102 @@ export function pendingAdmits(
   );
   return pending.refs.every(
     (ref) => hashes.get(ref.position) === ref.dataHash.toLowerCase(),
+  );
+}
+
+/**
+ * Why no key-ordered load of this log can finish the one that stopped (the
+ * marker `pending`), or `null` when one still can. `target` is the state the
+ * load would publish: the last segment of the plan, or `null` when the plan
+ * holds none.
+ *
+ * Blocked: the load is off, the plan starts from a snapshot, the plan holds no
+ * segment, the log's base is not the one the rows were written under, or the
+ * log names another segment at a position the marker names. A log that holds
+ * the marker's prefix and is only shorter (a lagging registry) is not blocked:
+ * the load that cannot fetch the whole prefix is refused by `pendingAdmits`
+ * with the marker kept, and ends when the log is whole.
+ */
+export function keyedLoadBlocked(
+  deps: Pick<LocalSyncDeps, "keyedFirstLoad">,
+  pending: LogState,
+  plan: { readonly snapshotPresent: boolean; readonly target: LogState | null },
+): string | null {
+  if (deps.keyedFirstLoad === false) return "the key-ordered first load is off";
+  if (plan.snapshotPresent) return "the log has a snapshot now";
+  const { target } = plan;
+  if (target === null) return "the log holds no segment past the marker";
+  if (pending.base !== target.base) return "the log's base moved";
+  const named = new Map(
+    target.refs.map((ref) => [ref.position, ref.dataHash.toLowerCase()]),
+  );
+  for (const ref of pending.refs) {
+    const hash = named.get(ref.position);
+    if (
+      hash === undefined
+        ? target.position >= ref.position
+        : hash !== ref.dataHash.toLowerCase()
+    )
+      return "the log names another segment than the rows were written from";
+  }
+  return null;
+}
+
+/**
+ * End an unfinished key-ordered load that no load can finish (`keyedLoadBlocked`):
+ * in ONE batch (a failing statement rolls all back, so the marker never
+ * outlives the decision to drop its rows), delete the rows the load wrote, the
+ * log's tombstones and the marker, as `purgeConnection` does for the rows of a
+ * lifetime. The cursor is at 0 by the marker's invariant (the commit that
+ * writes it also clears the marker), so its row is deleted as well.
+ *
+ * What stays is every row that is the newest local write of its key the
+ * device has not published (a `record_changes` upsert of origin `local`,
+ * `import` or `refresh` past the stream's `publish_watermark`, at the row's own
+ * stamp: the test `mergeIncoming` uses to keep a key an omission names). Those
+ * writes exist nowhere else. The retry loads the log's rows under them, and
+ * the merge is order-insensitive per key, so the result is the one a device
+ * that held the write before the log would have. Streams' rows (`stream_state`,
+ * with the watermarks), `record_tombstones` and `record_changes` are not touched.
+ */
+export async function rebaselineKeyedLoad(
+  deps: Pick<LocalSyncDeps, "db" | "logger">,
+  connectionId: string,
+  why: string,
+): Promise<void> {
+  const { changes } = await deps.db.batch(
+    withOrigin("purge", [
+      {
+        sql: `DELETE FROM records
+               WHERE connection_id = ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM record_changes ch
+                    WHERE ch.connection_id = records.connection_id
+                      AND ch.stream = records.stream
+                      AND ch.pk_hash = records.pk_hash
+                      AND ch.origin IN ('local','import','refresh')
+                      AND ch.op = 'upsert'
+                      AND ch.stamp_o = records.stamp_o
+                      AND ch.stamp_r = records.stamp_r
+                      AND ch.seq > COALESCE(
+                            (SELECT s.publish_watermark FROM stream_state s
+                              WHERE s.connection_id = ch.connection_id AND s.stream = ch.stream), 0))`,
+        params: [connectionId],
+      },
+      {
+        sql: "DELETE FROM log_tombstones WHERE connection_id = ?",
+        params: [connectionId],
+      },
+      clearKeyedPending(connectionId),
+      {
+        sql: "DELETE FROM log_state WHERE connection_id = ?",
+        params: [connectionId],
+      },
+    ]),
+  );
+  deps.logger.info(
+    { connectionId, why, rowsDropped: changes[1] },
+    "rebaseline unfinished key-ordered load",
   );
 }
 
@@ -380,10 +498,7 @@ function stageStatements(
         operation.stampR,
       );
   }
-  const perStatement = Math.max(
-    1,
-    Math.floor(KEYS_PER_STATEMENT / STAGE_FIELDS),
-  );
+  const perStatement = rowsPerStatement(STAGE_FIELDS);
   const statements: SqlStatement[] = [];
   for (const [bucket, rows] of rowsOf)
     for (let i = 0; i < rows.length; i += perStatement) {
