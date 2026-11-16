@@ -1237,20 +1237,23 @@ async function bootstrapServer(
       pendingBlobDeletionsPath,
     );
     // Blob deletes wait for the covering tombstone to be finalized, read from
-    // the signed version inventory (owner or registered-server signer).
-    const tombstoneFinality =
-      deleteData && additionsInventorySigner
-        ? createInventoryTombstoneFinality(
-            createVersionInventoryClient({
-              gatewayUrl: config.gateway.url,
-              ownerAddress: serverOwner,
-              ownerSigner: additionsInventorySigner,
-            }),
-          )
-        : undefined;
-    if (deleteData && !tombstoneFinality) {
-      logger.warn(
-        "No version-inventory signer: storage blobs are deleted when a tombstone is queued, before it is final",
+    // the signed version inventory. `deleteData` exists only outside an
+    // enclave, where `requestSigner` (and so the inventory signer) always
+    // exists, so a deleting server cannot be built without finality.
+    let tombstoneFinality:
+      ReturnType<typeof createInventoryTombstoneFinality> | undefined;
+    if (deleteData) {
+      if (!additionsInventorySigner) {
+        throw new Error(
+          "A server that deletes data needs a version-inventory signer",
+        );
+      }
+      tombstoneFinality = createInventoryTombstoneFinality(
+        createVersionInventoryClient({
+          gatewayUrl: config.gateway.url,
+          ownerAddress: serverOwner,
+          ownerSigner: additionsInventorySigner,
+        }),
       );
     }
 
