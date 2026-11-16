@@ -1,6 +1,6 @@
 # Provenance that stream-sync log format 2 must carry
 
-Design only. No code. Revision 3, after two independent reviews.
+Design only. No code. Revision 4, after three independent reviews.
 
 Source pin: `vana-com/personal-server-ts` at
 `85b3a8578fc66ba81834f5a5f4ac14e3fc6ef95d` (`feat/stream-sync`, after #715).
@@ -8,6 +8,11 @@ Every `file:line` is at that SHA. At this SHA `LOG_FORMAT = 2`
 (`packages/stream-sync/src/log.ts:109`). If no released client has written
 format 2, the fields below extend format 2 in place. If one has, they need
 format 3. I did not verify which.
+
+The base branch has moved since this pin (to `0576a772`), and `log-publish.ts`
+changed by about 54 lines. I did not re-pin. Line numbers in that file may be
+off; the two scheduling facts that revision 4 cites (`run-intake.ts:109-122`,
+`log-publish.ts:1142-1153` and `:1268-1277`) I re-read on the new base.
 
 Goal, unchanged: store enough evidence before format 2's first real write that
 a later ordering rule (counter-style, or bounded observation time) is a
@@ -20,7 +25,19 @@ proves by argument, what it requires tests to show, and what stays unverified.
 
 ## 1. What changed, and why
 
-### Revision 3 (this revision)
+### Revision 4 (this revision)
+
+Each fix below is the reviewer's smallest one.
+
+| Review finding | Decision | Why | Cost |
+|---|---|---|---|
+| P2: `P` is a preorder, not a strict total order: with a forked writer `s'` is 0, so two distinct observations (same run, same body, equal `c`, `s` 5 and 7) get one tuple | **Fix.** The last component of `P` and of `W` is the observation's canonical identity (8.2). It is arbitrary and has no causal meaning. | A tuple that drops `s` cannot tell two events apart. | No bytes. Sections 9.1, 9.2. |
+| P2: identity aliases same-body context forks (same `(w, s)`, same body, different `r`, `c`, `t`, `u` or `a`) | **Fix.** The identity includes `ctxKey`, the context row's canonical text. `q` is never merged across different `ctxKey`. `ctx` sorts by `(w, s, ctxKey)`. | The entry points to one context, so the identity must name it. No hash and no random id needed. | No wire bytes. Sections 6, 8.2. |
+| P2: fork detection is not associative through a lossy fold | **Qualify, as the reviewer allows.** Fold and split properties hold for entries, `ctx` and `q`. `f` and `P` are equal only when no fork's first side was dropped before its second side was seen. A detected fork is never lost. | Retaining witnesses for every dropped context is unbounded. Option B already accepts bounded loss. | None. Sections 8.4, 8.5, 15. |
+| P2: `u = 0` does not give `q <= c` for the device's own unacknowledged publications | **Qualify and cover.** The `q <= c` claim covers the applied prefix only. Own rows that committed but are not acknowledged are ordered by `s` of the same writer. Rotation waits for in-flight publishes. A barrier is rejected. | A barrier stalls collection by a registry round trip. Section 4.3. | None |
+| P2: legacy seen sightings break the `seen_obs` invariant | **Fix.** `seen_obs = 0` means "sighting of unknown provenance". Migration sets it where `seen_o` is set. Promotion of `0` gives `obs = NULL`. Section 10. | Do not invent a context, and do not clear a real sighting. | None |
+
+### Revision 3 (kept)
 
 | Review finding | Decision | Why | Cost |
 |---|---|---|---|
@@ -54,7 +71,7 @@ applied position during a progressive load (section 4.4).
 Add now, as three structures and one rule:
 
 1. **Observation contexts.** Each segment and each snapshot part carries
-   `ctx: [{a, c, r, s, t, u, w}, ...]`, sorted by `(w, s, r)`. One row names
+   `ctx: [{a, c, r, s, t, u, w}, ...]`, sorted by `(w, s, ctxKey)`, where `ctxKey` is the row's canonical JSON text (the fixed field order the codec writes). One row names
    one *observation event*: a batch that a run admitted into `records`, or the
    run-end step that applies deletes, omissions and staged rows. Fields:
    - `w`: writer incarnation id (32 lowercase hex, random). Section 7.
@@ -99,7 +116,7 @@ field lists. None of it was measured on a device.
 | `d` entry reference | **Add now** | (a) not rebuildable. An entry's event cannot be inferred from its run, because one run has many events. | New field on `UPSERT_FIELDS` (`log.ts:705`), `DELETE_FIELDS` (`:706`), `COMPLETE_FIELDS` (`:707`). | 6-9 per entry |
 | `q` origin commit | **Add now** | (a) not rebuildable: `foldLog` (`log.ts:416`) drops the segment position of each winner. | Section 6. | 11 per snapshot entry; 0 in a segment unless a copy |
 | `f` fork set | **Add now** | (a) not rebuildable: a fork seen only as two live rows is forgotten when fold keeps one. | New field on the segment and part field lists. | 7 per container; 36 per forked writer |
-| Per-op id | **Never** | Derivable: `(w, s, stream, pk, kind, bodyHash)` (section 8). | None | 0 |
+| Per-op id | **Never** | Derivable: `(w, s, stream, pk, kind, bodyHash, ctxKey)` (section 8). | None | 0 |
 | HLC logical counter | **Never** | `c` is already a Lamport clock (section 4); `P` breaks every tie (section 9). | None | 0 |
 | Frontier vector | **Never** | `c` names a full applied prefix. | None | 0 |
 | Raw (unclamped) start time | **Never** | `clampRunStart` (`admit.ts:316`) raises `o` so a run cannot bring back a row that a newer run deleted. A rule that used the raw claim would reopen that bug. | None | 0 |
@@ -174,12 +191,36 @@ precedes Y by the recorded edge, and `(c, w, s)` gives X `(0, w_A, 1)` and Y
   not have. An under-report is the safe direction for a rule that treats
   unknown order as concurrent.
 
-**Claim, for events with `u = 0`:** every observation that was visible on the
-device when the event happened, and that reached the log before it, has
-`q <= c` of the event. A linear extension such as `(c, w, s)` respects every
-recorded edge. This is the property an Automerge-style rule needs. Automerge's
+**Claim, for events with `u = 0`:** every observation that the device had
+*applied* when the event happened (through `log_state.position`, which includes
+its own publications once acknowledged) has `q <= c` of the event. A linear
+extension such as `(c, w, s)` respects every recorded edge. This is the property an Automerge-style rule needs. Automerge's
 own per-op counter is not reproduced, and a causality-consistent order is not
 a freshness rule.
+
+**The second under-report window: own publications awaiting acknowledgement.**
+Read on the current base: `run-intake.ts:109-122` lets other runs collect while
+a publish holds its connection queue for network I/O; `log-publish.ts:1142-1153`
+awaits the registry's commit; the local position moves only when the
+acknowledgement is applied (`log-publish.ts:1268-1277`). So a row X that this
+writer published can have committed at `q_X = 1` while the device still has
+`c = 0`, and a second run can admit Y, with `u = 0` and `c = 0`, having read X.
+`q_X > c_Y`, so the claim above does not cover this edge. It is covered another
+way:
+- X and Y are events of **one writer incarnation**, because all runs of a
+  database share one `w` and the sequence `s` is allocated per database. X is
+  earlier, so `s_X < s_Y` and `c_X <= c_Y`, and `(c, w, s)` orders X before Y;
+- a **different incarnation** cannot reach an unacknowledged row of the old
+  one, because **rotation is deferred until no publish of the connection is in
+  flight**. A host-request rotation happens at boot, where none is. The in-log
+  rollback rotation waits for the queue;
+- `A(c)` stays a valid lower bound, because `c` is only a lower bound here.
+
+The literal universal claim would need a barrier: admission waits for every
+earlier publish acknowledgement. That stalls collection by a registry round
+trip for every batch. I reject it: the `s` cover loses nothing. This is a
+scheduling argument read from source, not an executed race. A CAS retry keeps
+event contexts immutable. It cannot fix an event's capture position.
 
 **Not claimed.** The position says nothing about local observations that were
 never published (they are ordered by `s` for one writer), nor about a record a
@@ -331,13 +372,13 @@ How `q` is set and kept.
   recorded origin: **`q = 0`**, which means unknown.
 - **Which entries are "equal".** The same observation can appear many times
   (segment, part, copy). Its identity is
-  `(w, s, stream, pk, kind, bodyHash)` (section 8): **the body hash is part of
-  it.** The merged `q` is the **minimum over occurrences of one identity with
+  `(w, s, stream, pk, kind, bodyHash, ctxKey)` (section 8): **the body hash
+  and the context's canonical text are part of it.** The merged `q` is the **minimum over occurrences of one identity with
   `q > 0`**; `0` loses to any known value. The minimum is commutative,
   associative and idempotent, so fold order and repeat folds give the same
-  bytes. Two entries that share `(w, s, stream, pk, kind)` but differ in body
-  are **two identities**, kept apart; they never merge their `q`. They are a
-  fork (section 8).
+  bytes. Two entries that share `(w, s, stream, pk, kind)` but differ in body or
+  in `ctxKey` are **two identities**, kept apart; they never merge their `q`,
+  even when their bodies match. They are a fork (section 8).
 - **Generations.** Positions are comparable only inside one generation. A part
   and its segments share a generation, so the minimum never mixes
   generations. When apply meets a generation different from a row's
@@ -468,19 +509,34 @@ Revision 2 said an observation is "unique by construction" as
 database file. A clone can keep `w`, reuse `s`, and write a different body, and
 a clone can keep a run id.
 
-**An observation is `(w, s, stream, pkHash, kind, bodyHash)`**, with `bodyHash`
-null for a delete or an omission. The body hash is already in the row
-(`body_sha256`). Consequences:
+**An observation is `(w, s, stream, pkHash, kind, bodyHash, ctxKey)`**, with
+`bodyHash` null for a delete or an omission. `ctxKey` is the canonical JSON text
+of the observation's context row `{a, c, r, s, t, u, w}`, fields in the fixed
+order the codec writes. A context row is **immutable**, so `ctxKey` never
+changes after the event. The body hash is already in the row (`body_sha256`).
+Nothing is hashed or minted for `ctxKey`: it is a string compare. An
+observation with no context has `ctxKey` empty, and its identity is its stamp,
+kind and body. Consequences:
 - two entries with equal `(w, s, stream, pkHash, kind)` and different bodies
-  are two observations. They are never merged, and their `q` never mixes;
-- a context row is identified by `(w, s)` and compared on `(r, c, t, u, a)`.
+  are two observations;
+- two entries with the same body and different `ctxKey` (a clone that reused
+  `(w, s)` with a different `r`, `c`, `t`, `u` or `a`) are **also two
+  observations**. They are never merged, and their `q` never mixes. Taking one
+  side's earliest `q` with the other side's `c` could invert the window of
+  section 5, so no field of one is ever mixed with a field of the other;
+- the winner of a key under `W` (9.1) is one identity, and its `d` points at
+  its own context row. Which identity wins is decided by the last components
+  of `W`, so the retained context is deterministic and the same on every
+  replica;
+- a context row is identified by `(w, s, ctxKey)`; rows with equal `(w, s)`
+  and different `ctxKey` coexist.
 
 ### 8.3 What counts as a fork
 
 A writer `w` is **forked** when a log, in one generation, holds any of:
-1. two context rows with the same `(w, s)` and a different `(r, c, t, u, a)`;
+1. two context rows with the same `(w, s)` and different `ctxKey` (a different `r`, `c`, `t`, `u` or `a`);
 2. two observations with the same `(w, s, stream, pkHash, kind)` and different
-   body hashes;
+   body hashes, or different `ctxKey`;
 3. one run id `r` carried by contexts of two different writer ids, or the same
    `(r, stream, pkHash, kind)` with different body hashes under different `w`.
    A run has one `w` (section 7.3), so this is a clone that kept running a run.
@@ -496,15 +552,28 @@ A writer `w` is **forked** when a log, in one generation, holds any of:
   the inputs`. Detection runs at apply (stored locally in a `log_forks`
   table), at publish (the segment carries the local set), and in the pure fold
   over *all* candidates before it keeps one per key. Union is commutative,
-  associative and idempotent, so repeat folds and split folds give the same
-  `f`.
+  associative and idempotent, and a detected fork is never removed. That does
+  **not** make *detection* associative: see the next bullet.
+- **Bounded loss, stated.** Fold drops the contexts of losing candidates.
+  Let A be the first side of a `(w, s)` fork, and C a higher-winning
+  observation that makes fold drop A's context. `fold(A, C)` has `f` empty. If
+  conflicting B then arrives and also loses to C, A is gone and nothing is
+  detected. A one-shot `fold(A, C, B)` sees A and B together and gives
+  `f = {w}`. The winners, `ctx`, entries and `q` are equal. **`f` differs, and
+  so can `P` for rows of that writer.** I do not retain witnesses for dropped
+  contexts: that is unbounded, and Option B already accepts bounded loss. The
+  fold and split properties of section 15 therefore hold for entries, `ctx`
+  and `q` unconditionally, and for `f` and `P` only for inputs whose
+  detection witnesses are all still present. `f(incremental)` is a subset of
+  `f(one-shot)`.
 - **It does not depend on winners.** The losing branch's context row may be
   dropped by fold, because contexts are kept per surviving entry. The writer's
   id stays in `f`.
 - **A generation bump empties it**, with the observations it described.
 - **What a forked writer's rows mean.** `s` order among a forked writer's rows
   is unknown. The projection order `P` (section 9) uses `(c, w)` and then
-  `(r, kind, bodyHash)` for those rows and ignores `s`. Every edge `c` records
+  `(r, rank, bodyHash)` for those rows, ignores `s` for causal order, and ends
+  with the canonical identity as an arbitrary tie-break (9.2). Every edge `c` records
   remains valid.
 
 ### 8.5 What the fork set cannot do
@@ -519,12 +588,14 @@ detected.** What still holds for it:
 - the order `P` respects every recorded edge in each branch (`c` does not
   decrease along `s` in a branch, so `(c, w, s)` orders each branch's own
   events correctly);
-- identities are kept apart by the body hash, so no `q` merges wrongly;
+- identities are kept apart by the body hash and `ctxKey`, so no `q` merges
+  wrongly;
 - the winner is still the same on every replica, because `W` reads no fork
   state (section 9.1).
 
-What is lost: the flag. A rule that wants to distrust `s` for that writer
-cannot know to.
+What is lost: the flag, and with it any `P` difference that depends on the flag.
+A rule that wants to distrust `s` for that writer cannot know to, and two
+replicas with different compaction histories can hold different `f`.
 
 ### 8.6 Tests, all new
 
@@ -543,8 +614,15 @@ operations:
 5. Same body under same `(w, s)` and same `r`, different body under same
    `r` and different `w`, and different `a`: each is classified as in 8.3.
 6. A generation bump empties `f`.
-7. The undetectable case (8.5): the first side alone compacted, the second
-   arrives: no flag, `P` order unchanged for each branch, identities distinct.
+7. The undetectable case (8.5): A, then C that drops A's context, then
+   conflicting B. Incremental fold: `f` empty. One-shot `fold(A, C, B)`:
+   `f = {w}`. Assert equal winners, entries, `ctx` and `q`; `f(incremental)` a
+   subset of `f(one-shot)`; `P` differs only among rows of `w`; identities
+   distinct.
+8. Same-body forks: same `(w, s)`, same body, **different `r`**; and same
+   `(w, s, r)`, same body, **different `c` and `t`** (for instance `c = 0,
+   t = 100` against `c = 4, t = 500`). Assert: two identities, `q` not merged,
+   the same winner context on every delivery order, `w` in `f`.
 
 ## 9. Comparators
 
@@ -557,7 +635,7 @@ order the later ordering rule projects over. `P` changes no winner.
 Compare two observations of one key in one generation. The greater wins.
 `W` is the lexicographic order on this tuple:
 
-`(o, r, rank, w', s', bodyHash)`
+`(o, r, rank, w', s', bodyHash, ctxKey)`
 
 1. **`(o, r)`**: the stamp. Greater wins. Unchanged.
 2. **`rank`**: the existing rank. An explicit delete beats an upsert, and an
@@ -575,7 +653,12 @@ Compare two observations of one key in one generation. The greater wins.
    and the same on every replica.
 4. **`bodyHash`**: the greater lowercase-hex hash wins; null (a delete or
    omission) is the same as any other null. Equal hashes mean equal bytes. The
-   code compares body bytes after the hash today; that stays as the last guard.
+   code compares body bytes after the hash today; that stays as a guard.
+5. **`ctxKey`**: the greater canonical context text wins; empty (no context)
+   is the least. It decides only between two observations that have the same
+   stamp, rank, writer, `s` and body: two context rows of a fork. It is
+   arbitrary, makes the retained context deterministic, and has no meaning in
+   time.
 
 `W` reads no part of the fork set `f`: a winner must not change when a fork is
 learned later.
@@ -589,12 +672,14 @@ How each case lands:
 | Same run, one writer, two batches | Step 3: the later `s` wins. This equals today's "later batch wins" on the writer (`replaceOwnRunRows`, `admit.ts:168`), so the writer and the readers agree |
 | Different writer incarnations, same run id (a clone) | Step 3: the greater `w` wins (deterministic, not temporal) |
 | Same `(w, s)`, different bodies (a fork) | Step 4 |
+| Same `(w, s)`, same body, different context (a fork) | Step 5 |
 | Equal hash and body | Same observation: no conflict |
 | Delete against upsert at equal stamp | Step 2: the delete wins, whatever `s` is. `s` never overrides kind |
 | Omission against observation | Step 2, unchanged |
 
-**`W` is a strict total order.** It is a lexicographic order on a tuple of
-totally ordered components, so it is transitive. (A version that compared `s`
+**`W` is a strict total order on observation identities.** It is a
+lexicographic order on a tuple of totally ordered components that ends with the
+full context text, so equal tuples mean equal identities. It is transitive. (A version that compared `s`
 only inside one writer and used the hash across writers is **not** transitive:
 three observations from writers `w1`, `w2`, `w1` with `s` 5, 1, 3 and hashes
 rising can form a cycle. That is the same flaw as the review's mixed-provenance
@@ -617,7 +702,11 @@ implementation. A property test compares them (section 9.2 and slice 6).
 Records and tombstones need `w` and `s` at comparison time, so `records` joins
 its context row on the equal-stamp path only.
 
-**Agreement with any other fix of the equal-stamp divergence.** A change that
+**Agreement with the equal-stamp change (#721).** It is being reworked to one
+comparator `(stamp, kind, ordinal n, hash)` shared by admit, merge and fold.
+`W` is that comparator with `(w', s')` in place of `n` and `ctxKey` after the
+hash: `s'` can replace `n`. If it ships first with `n`, `(w', s')` replaces
+`n` later with no storage change, and the two must not both be live. A change that
 uses a per-run batch ordinal `b` (later batch wins) gives the same answer as
 steps 3 and 4 on every pair of one writer's rows, because `s` is allocated in
 the same transaction as the batch that carries `b` and both grow with intake
@@ -640,18 +729,26 @@ B < C < A, and C unknown, the pairs give A < B, B < C and C < A, a cycle.
 observation maps to one tuple, and tuples compare lexicographically.
 
 - **Class N: no context.** The observation has no `d`, or a `d` whose context
-  was never stored. Tuple: `(0, o, r, rank, bodyHash)`.
-- **Class C: has a context.** Tuple: `(1, c, w, s', r, rank, bodyHash)`, where
-  `s' = s` if `w` is not in `f` and `s' = 0` if `w` is in `f`.
-  Events flagged `u = 1` are class C.
+  was never stored. Tuple: `(0, o, r, rank, bodyHash)`. For these the tuple is
+  the identity (8.2), so equal tuples mean the same observation.
+- **Class C: has a context.** Tuple:
+  `(1, c, w, s', r, rank, bodyHash, ctxKey)`, where `s' = s` if `w` is not in
+  `f` and `s' = 0` if `w` is in `f`. Events flagged `u = 1` are class C. The
+  last component is the **canonical identity tie-break**: `ctxKey` contains
+  `w`, `s`, `r`, `c`, `t`, `u` and `a`, so it keeps the original `s` even when
+  `s'` has dropped it. It is arbitrary. It does **not** restore the causal
+  order of a forked writer's events.
 
 So **every observation of class N sorts below every observation of class C**,
 whatever the stamps are, and the order inside each class is fixed and total.
 
 **It is a strict total order.** Each tuple is a function of stored fields and
 of `f` only. Each component has a total order. A lexicographic order on tuples
-of totally ordered components is a total order. The last components make equal
-tuples mean the same observation. It is therefore transitive, with no cycle.
+of totally ordered components is a total order, and the last component makes
+equal tuples mean the same identity. (Without it, two events of a forked
+writer with equal `c`, the same run and the same body but `s` 5 and 7 would
+share one tuple, and a sort would keep arrival order: a preorder only.) It is
+therefore transitive, with no cycle.
 Run on the review's counterexample: A and B are class C, so A < B. C is class
 N, so C < A < B. The stamp order B < C < A is **not consulted** across classes.
 
@@ -671,12 +768,14 @@ classes the stamp is ignored. So:
 - the order of events of a forked writer by `s` is lost (8.4);
 - a flagged event can sort before a partial row it read (4.4);
 - `P` is a function of `f`. Two replicas that hold the same containers agree.
-  Replicas with different `f` can disagree until they converge, and `f`
-  only grows.
+  Replicas with different `f` can disagree, and `f` only grows. Replicas with
+  different compaction histories can keep different `f` for good (8.4, bounded
+  loss), and `P` then differs only among rows of the writers in the difference.
 
 **Mixed folds.** Fold and snapshot do not store `P`. They store the fields
 `P` reads. So a population that is partly class N and partly class C folds,
-splits and re-folds without changing any field.
+splits and re-folds without changing any field. `f` is the one field that
+fold can change by history (8.4).
 
 **Tests, all new.**
 - *Six-permutation.* Three observations of one key: A and B in class C with
@@ -686,15 +785,19 @@ splits and re-folds without changing any field.
   C, A, B, the same `W` winner, and byte-equal folded output.
 - *Property: strict total order.* Random populations over class N, class C,
   flagged, forked, equal `c`, equal `(c, w, s)`, equal stamp: for every pair,
-  exactly one of `<`, `=`, `>`; for every triple, transitivity; sorting any
-  shuffle gives one result.
+  exactly one of `<`, `=`, `>`, and `=` only for the same identity; for every
+  triple, transitivity; sorting any shuffle gives one result. The population
+  includes **this exact pair**: a forked writer, same key, kind, body and run,
+  equal `c`, `s` 5 and `s` 7. Sorting must give one result under every
+  arrival order.
 - *Property: `W` parity.* The SQL form and the TypeScript form of `W` agree on
   random pairs and triples that include legacy rows, clone pairs (different `w`,
   same run), equal `s`, equal hash, delete/upsert and omission ties, including
   the three-writer cycle shape of 9.1.
 - *Snapshot split.* A snapshot written at every possible split of a segment
-  list, then applied on a fresh replica, gives the same `P` order and the same
-  winners as the segments alone.
+  list, then applied on a fresh replica, gives the same winners, entries,
+  `ctx` and `q` as the segments alone, and the same `P` order when the input
+  holds no fork or every fork witness is still present.
 
 ## 10. Seen sightings and promotion (review finding 4)
 
@@ -716,11 +819,13 @@ with the *old* observation's context. That is a wrong attribution.
 
 **The design.**
 - `seen_obs` is a nullable local column beside `seen_o/seen_r`. It holds the
-  context id of the event that produced the sighting. That event already wrote
+  context id (ids start at 1) of the event that produced the sighting, or `0`:
+  **a sighting of unknown provenance.** That event already wrote
   a context row (every admitted event does), so there is nothing new to
   capture.
-- **Invariant.** `seen_obs IS NULL` exactly when `seen_o IS NULL`, and
-  `seen_obs` names the event of the stamp `(seen_o, seen_r)`. Every statement
+- **Invariant.** `seen_obs IS NULL` exactly when `seen_o IS NULL`. When it is
+  not null, it is `0` (unknown) or names the event of the stamp
+  `(seen_o, seen_r)`. Every statement
   that sets, keeps or clears the seen stamp changes `seen_obs` in the same
   expression:
 
@@ -728,7 +833,7 @@ with the *old* observation's context. That is a wrong attribution.
 |---|---|---|
 | `merge.ts:151` | sets it from the incoming row | `seen_obs` = the incoming row's context id |
 | `merge.ts:164-165` | keeps it if it outranks the incoming stamp, else clears it | the same `CASE`; and `obs`, `origin_q` come from the incoming row |
-| `merge.ts:186-205` (promote) | copies it into the stamp | in the same `UPDATE`: `obs = seen_obs`, `origin_q = NULL`, `origin_g = NULL` |
+| `merge.ts:186-205` (promote) | copies it into the stamp | in the same `UPDATE`: `obs = NULLIF(seen_obs, 0)`, `origin_q = NULL`, `origin_g = NULL` |
 | `merge.ts:253` (`applyDelete`) | copies it into the stamp | the same three assignments |
 | `log-apply.ts:363` (`survivors`) | copies it into the stamp | the same three assignments |
 | `merge.ts:349` | clears it for a retired run | `seen_obs = NULL` |
@@ -746,9 +851,11 @@ with the *old* observation's context. That is a wrong attribution.
   statement that forgets cannot ship silently. I did not check which SQLite
   forms `ALTER TABLE ADD COLUMN` allows for such a constraint, so the build
   chooses between a trigger and a test over every writer of `seen_o`.
-- **Legacy.** A row whose `seen_o` was set before the upgrade has
-  `seen_obs = NULL`. Promoting it gives `obs = NULL`: unknown provenance,
-  class N. That is the honest result.
+- **Legacy.** The migration sets `seen_obs = 0` on every row whose `seen_o` is
+  set, and leaves it `NULL` where `seen_o` is `NULL`. It invents no context and
+  clears no real sighting. Promoting a `0` sighting gives `obs = NULL`:
+  unknown provenance, class N, and `origin_q` stays `NULL` until publication.
+  That is the honest result, and the constraint holds for every row.
 - **Local context rows** are kept while any of `obs`, `seen_obs`, an
   unpublished `record_changes` row or a tombstone refers to them, and may be
   dropped after the last reference goes. A sighting that is never promoted
@@ -769,7 +876,13 @@ delete older than the sighting (`survivors`). Each time:
 5. a remote conflict at the same stamp and a remote delete after the promotion
    do not change attribution except through `W`;
 6. the invariant holds after every statement (a property test over all
-   writers of `seen_o`).
+   writers of `seen_o`);
+7. **migration:** a database with a pre-upgrade sighting (`seen_o` set) opens
+   with `seen_obs = 0`; promoting it in each of the three variants gives
+   `obs = NULL`, and the published entry has no `d`;
+8. **identity preservation, not only parity:** after each promotion `obs`
+   equals the sighting event's context id, never the old winner's, and a
+   later statement that keeps the seen stamp leaves `seen_obs` unchanged.
 
 ## 11. Retention
 
@@ -876,9 +989,9 @@ PASS** for `Good`. It models the protocol, not a refinement of the code.
 
 **What changes in the model, and what does not.**
 - **`W` (slice 6) changes semantics, so the model changes first.** Extend the
-  stamp comparison in `LogProtocol.tla` with the writer's `s` and the body hash
-  (`OrderOK`, line 85); replace `Admissible` (line 121) with "an equal key and
-  stamp and `s` has the same body, or the tie rule decides"; re-run `Good` and
+  stamp comparison in `LogProtocol.tla` with the writer id, the writer's `s`, the body hash and the context key
+  (`OrderOK`, line 85); replace `Admissible` (line 121) with "an equal key,
+  stamp, writer and `s` has the same body and context, or the tie rule decides"; re-run `Good` and
   every mutant, and add a mutant that keeps first-equal-wins to show the model
   catches the divergence.
 - **`P` is not in the model.** It reads fields the model does not carry. Its
@@ -923,7 +1036,7 @@ Each slice names its files and its tests. Tests marked **new** do not exist.
    rotation input, rotation at run boundary), `server/src/bootstrap.ts` and
    `lite/src/sync.ts` (pass the rotation request), the Desktop and phone hosts
    (they already compute the request). Tests, **new**: rotation on request and
-   only at a run boundary; first mint; `s` never repeats across a crash inside
+   only at a run boundary; rotation waits for an in-flight publish; first mint; `s` never repeats across a crash inside
    one batch; a cloned file's rotation after the log shows its own `w`; the
    fork tests of 8.6.
 2. **Context capture and the open-load marker.** Files: `run-intake.ts`
@@ -936,11 +1049,15 @@ Each slice names its files and its tests. Tests marked **new** do not exist.
    for `u = 0` events; the progressive tests of 4.4 (early-completed stream X
    then local Y; marker cleared atomically; crash leaves it set); a CAS retry
    leaves a published event's context unchanged; one run, many events;
-   unreferenced local contexts are dropped.
+   unreferenced local contexts are dropped; **delayed acknowledgement**: a
+   publish has committed at the registry and its acknowledgement is held, a
+   second run admits Y, and Y has `c` below `q_X`, `s_Y > s_X` and `P` orders X
+   before Y.
 3. **Wire format.** Files: `stream-sync/src/log.ts` (field lists at `:689`,
-   `:705-711`; encode and decode; `foldLog`: `ctx` with `u`, `d`, `q`, `f`;
-   identity with the body hash), `log.test.ts`. Tests, **new**: the
-   idempotence suite below, and the fork-set union.
+   `:705-711`; encode and decode; `foldLog`: `ctx` with `u`, `d`, `q`, `f`, sorted by
+   `(w, s, ctxKey)`; identity with the body hash and `ctxKey`), `log.test.ts`. Tests, **new**: the
+   idempotence suite below, the fork-set union, and the same-body fork tests
+   of 8.6.
 4. **Apply, republish and promotion.** Files: `log-apply.ts` (`:346`,
    `:363`), `log-publish.ts` (`operationsFor`, `changedKeys`), `merge.ts`
    (`:151`, `:164-165`, `:186-205`, `:253`, `:349`), `admit.ts` (`:179`).
@@ -949,7 +1066,8 @@ Each slice names its files and its tests. Tests marked **new** do not exist.
    `obs ← seen_obs` and clears `origin_q`. Tests, **new**: a remote
    observation republished keeps its `w`, `s`, `c`, `t`, `u` and `q`; the
    promotion test of section 10 in all three variants; the `seen_obs`
-   invariant property test.
+   invariant property test; the legacy migration and identity-preservation
+   tests of section 10.
 5. **Origin `q`.** Files: `log.ts` (fold minimum rule), `log-publish.ts` (set
    `origin_q` at commit only for the planned identity; bootstrap), `log-apply.ts`
    (generation reset). Tests, **new**: the idempotence suite; a lost
@@ -960,10 +1078,11 @@ Each slice names its files and its tests. Tests marked **new** do not exist.
    (first). Tests, **new**: a run publishes while collecting and replaces the
    body of a published key, and the writer and a fresh reader end on the same
    body; the `W` parity property test (SQL against TypeScript); all rows of the
-   table in 9.1.
+   table in 9.1, including two context forks of one body.
 7. **Projection order `P` (a test-only reference implementation).** Files: a
    pure function and its tests under `stream-sync`. No production path reads
-   it yet. Tests, **new**: the four tests of 9.2.
+   it yet. Tests, **new**: the four tests of 9.2, with the forked same-run pair
+   (`s` 5 and `s` 7).
 8. **Window helper (tests only, no host call).** A pure function from
    `(t, c, q, A)` to `{estimate, trusted}`. Tests, **new**: `c = 0`; missing
    inventory; an expired version; `A(c) > A(q)`; one-sided window; a valid
@@ -973,15 +1092,17 @@ Each slice names its files and its tests. Tests marked **new** do not exist.
 - `fold(fold(x))` equals `fold(x)` byte for byte, including `ctx` order, `d`,
   `q` and `f`.
 - Splitting the same input at every point (snapshot plus segments, segments
-  alone, fold then more segments) gives equal entries, `ctx`, `q` and `f`.
+  alone, fold then more segments) gives equal entries, `ctx` and `q`. It gives
+  equal `f` only for inputs that hold no fork, or whose fork witnesses are all
+  still present; otherwise `f(split)` is a subset of `f(one-shot)` (8.4).
 - Republishing a copy does not change its `q`. Publishing the same entry
   twice (a lost acknowledgement) converges to the minimum `q`.
 - Applying a segment twice, or a snapshot then its own segments, leaves
   `origin_q` unchanged.
 - A bootstrap row without a context has no `d` and `q = 0`, and a later copy
   with `q > 0` of the same identity wins by the minimum rule.
-- Two entries with one `(w, s, stream, pk, kind)` and different bodies stay
-  two identities and keep their own `q`.
+- Two entries with one `(w, s, stream, pk, kind)` and different bodies, or the
+  same body and different `ctxKey`, stay two identities and keep their own `q`.
 - Identical `ctx` rows collapse; conflicting rows coexist and the fork is
   reported in `f`.
 - After any sequence of publish, apply and compact, the winner's `(w, s, c, t,
@@ -994,14 +1115,17 @@ Each slice names its files and its tests. Tests marked **new** do not exist.
 
 **What this design proves, by argument.** These are arguments from the code
 and the definitions, not machine-checked results.
-1. `P` is a strict total order on any mixed population (9.2): a lexicographic
-   order on a total tuple. The counterexample of the review lands as
-   C < A < B.
+1. `P` is a strict total order on observation identities in any mixed
+   population (9.2): a lexicographic order on a tuple that ends with the
+   canonical identity. The tuple, not causal meaning, breaks the last ties. The
+   counterexample of the review lands as C < A < B.
 2. For every event with `u = 0`, the stored `c` is at or above `q` of every
-   observation visible to the device at the event (4.3). `P` respects every
-   edge recorded this way, including the edges a flagged event does record.
-3. An identity includes the body hash, so no `q` is ever merged across bodies
-   (8.2). The `q` minimum is idempotent, commutative and associative over true
+   observation in the device's applied prefix (4.3). Dependencies on the
+   device's own unacknowledged publications are covered by `s` of the same
+   writer (4.3). `P` respects every edge recorded either way, including the
+   edges a flagged event does record.
+3. An identity includes the body hash and the context text, so no `q` is ever
+   merged across bodies or across contexts (8.2). The `q` minimum is idempotent, commutative and associative over true
    duplicates in one generation (6).
 4. `W` is a total order, so a fold that keeps its maximum does not depend on
    delivery order (9.1). That closes the equal-stamp divergence of 8.1: every
@@ -1010,13 +1134,18 @@ and the definitions, not machine-checked results.
    (10), if every writer of `seen_o` also writes `seen_obs`, which a trigger or
    test enforces.
 6. A fork detected while both sides were together stays in `f` through
-   compaction and reaches a fresh install (8.4).
+   compaction and reaches a fresh install (8.4). A fork whose first side was
+   dropped before detection may not be in `f`, and `f` and `P` can then differ
+   by compaction history.
 
 **What it does not prove.**
 - It does **not** record the exact causal edges of events admitted during a
   progressive first load (`u = 1`, 4.4). The record is a lower bound.
 - It does **not** detect a fork whose first side was compacted away alone
-  (8.5).
+  (8.5), and it does **not** give equal `f` or `P` across different
+  compaction histories of such input.
+- It does **not** give `q <= c` for the device's own acknowledged-late
+  publications. It orders them by `s` instead (4.3).
 - It does **not** order class N against class C by the stamp (9.2), and it
   does not recover real time for rows with no window (5).
 - It does **not** support choosing a different historical winner from discarded
@@ -1044,18 +1173,21 @@ and the definitions, not machine-checked results.
    surviving entry's minimum `q`, and the union `f`.
 6. The journal starts at an atomic checkpoint and records events by `(w, s)`.
 
-**The riskiest assumption.** That the one remaining gap, the open-load window,
-is as rare as I believe and that a lower bound is enough there. Evidence for
+**The riskiest assumption.** That the open-load window is as rare as I believe and that a lower bound is enough there. Evidence for
 rarity: it needs a first load of a connection and a local observation of the
 same connection at the same time, and the design marks every such event.
 Evidence that the loss is bounded: `c` is a valid lower bound, so no recorded
 edge is wrong. What I did not measure: how often a device collects while it
 loads. If it is often, the exact per-key choice of 4.4 is the upgrade, and it
-cannot be applied to events already written. A second risk: the writer
-incarnation protects against copies and rollbacks the host or the log can see.
+cannot be applied to events already written. A second risk, new in this
+revision: the own-publication cover (4.3) relies on every run of a database
+sharing one writer and on rotation waiting for in-flight publishes. A host that
+runs two writers in one database, or rotates during a publish, breaks it. A
+third risk: the writer incarnation
+protects against copies and rollbacks the host or the log can see.
 A clone that has not published yet is not seen, and two copies can reuse `s`
 until one publishes. The effect is bounded: identities stay apart, `P` stays
-total, and the fork is flagged once both sides meet. A third: the latent
+total, and the fork is flagged once both sides meet. A fourth: the latent
 equal-stamp divergence is read from the code, not reproduced.
 
 ## 17. What I could not verify
@@ -1065,6 +1197,10 @@ equal-stamp divergence is read from the code, not reproduced.
   window, so the marker can reuse it.
 - Whether a row written by an import gets a context, and the SQLite forms
   allowed for the `seen_obs` constraint.
+- The delayed-acknowledgement race of 4.3: a scheduling argument from source,
+  not an executed test, read on the current base and not at the pin.
+- Whether `ctxKey` text compare is cheap enough in the SQL form of `W`; it is
+  used only on equal-stamp ties.
 - The host rows in section 7 come from a read-only survey of another
   repository, not re-read here. Browser database naming and the runtime's use
   of `device_id` next to the bindings are unverified.
