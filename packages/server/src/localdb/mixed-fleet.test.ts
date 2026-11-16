@@ -129,6 +129,9 @@ describe("a per-stream head written beside the log", () => {
     expect(streamRows(w)).toEqual([]);
     await a.cycle();
     expect(ids(await a.records())).toContain("s0/a-1");
+    // The refused write is kept on the device that made it, unpublished
+    // (the race test below shows it following the log on the next cycle).
+    expect(ids(await old.records())).toContain("s0/b-1");
   });
 
   it("is refused when it races the first log write, and the write follows the log on the next cycle", async () => {

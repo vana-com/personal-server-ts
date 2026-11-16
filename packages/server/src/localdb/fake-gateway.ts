@@ -70,7 +70,11 @@ export interface FakeGatewayOptions {
   readonly policy?: { rows: number; requires: number; bytes: number };
   /**
    * The registry's connection-log fence: a write that is not a tombstone, to a
-   * stream row of a connection whose log row exists, loses with a 409. The
+   * stream row of a connection whose log row exists, loses with a 409. So does
+   * one whose log row the same batch names, whatever becomes of that log row
+   * (it is no committed log write). Every write the registry would apply is
+   * fenced, an append and a refresh of a pending row alike; a replay and a
+   * sequence conflict are answered as before. The
    * scope grammar below is the registry's own, written out here and not taken
    * from the client's parser, so a drift between the two shows in a test.
    */
@@ -160,16 +164,20 @@ export function createFakeGateway(options: FakeGatewayOptions) {
           ...(options.isTombstone(head) && { deletedAt: "2026-01-01" }),
         };
       };
-      /** The log row that makes this write lose, when the fence is on. */
+      /**
+       * The log row that makes this write lose, when the fence is on: the log
+       * row exists, or the request names it (`named`), whatever the request
+       * makes of it.
+       */
       const fencedBy = (
         scope: string,
         version: Version,
-        written: ReadonlySet<string>,
+        named: ReadonlySet<string>,
       ): string | null => {
         if (!options.connectionLogFence || options.isTombstone(version))
           return null;
         const log = fencingLogScope(scope);
-        return log !== null && !written.has(log) && versions.has(log)
+        return log !== null && (named.has(log) || versions.has(log))
           ? log
           : null;
       };
@@ -306,7 +314,7 @@ export function createFakeGateway(options: FakeGatewayOptions) {
       }
       const bad = requirementFails(body.requires ?? []);
       if (bad) return json(409, failure(bad));
-      const writtenScopes = new Set<string>(
+      const requestScopes = new Set<string>(
         body.rows.map((row: BatchRow) => row.scope),
       );
       const results = body.rows.map((row: BatchRow) => {
@@ -331,6 +339,21 @@ export function createFakeGateway(options: FakeGatewayOptions) {
             version: row.expectedVersion,
           };
         }
+        // What the registry would apply (an append, or a refresh of the
+        // pending head) is judged by the connection-log fence first.
+        const applies =
+          !isReplay &&
+          (Number(row.expectedVersion) === rows.length + 1 ||
+            (options.refresh && Number(row.expectedVersion) === rows.length));
+        if (applies && fencedBy(row.scope, row, requestScopes) !== null) {
+          return {
+            scope: row.scope,
+            status: 409,
+            reason: "log-exists",
+            latestVersion: String(rows.length),
+            latestDataHash: null,
+          };
+        }
         const fence = row.expectedHeadDataHash;
         if (
           !isReplay &&
@@ -344,18 +367,6 @@ export function createFakeGateway(options: FakeGatewayOptions) {
             reason: "head-mismatch",
             latestVersion: String(rows.length),
             latestDataHash: head?.dataHash ?? null,
-          };
-        }
-        if (
-          Number(row.expectedVersion) === rows.length + 1 &&
-          fencedBy(row.scope, row, writtenScopes) !== null
-        ) {
-          return {
-            scope: row.scope,
-            status: 409,
-            reason: "log-exists",
-            latestVersion: String(rows.length),
-            latestDataHash: null,
           };
         }
         if (Number(row.expectedVersion) === rows.length + 1) {
