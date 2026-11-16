@@ -894,3 +894,127 @@ describe("listings of concurrent callers", () => {
     expect(calls).toBe(2);
   });
 });
+
+describe("waitForChange with since", () => {
+  const owner = "0x" + "11".repeat(20);
+  const LOG = "pdpp.fixture~.~log";
+  const ROW = {
+    scope: LOG,
+    expectedVersion: "4",
+    dataHash: "0x" + "aa".repeat(32),
+    metadataHash: "0x" + "bb".repeat(32),
+    deletedAt: null,
+  };
+
+  function answering(body: unknown) {
+    const urls: string[] = [];
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test/",
+      ownerAddress: owner,
+      fetch: (async (url: string) => {
+        urls.push(url);
+        return new Response(JSON.stringify(body));
+      }) as typeof fetch,
+    });
+    const wait = (since?: string) =>
+      registry.waitForChange!("3", 25_000, new AbortController().signal, since);
+    return { wait, urls };
+  }
+
+  it("sends since, and reads the delta's rows as the listing's rows (mutation: since not sent)", async () => {
+    const { wait, urls } = answering({
+      seq: "5",
+      changed: true,
+      delta: {
+        since: "3",
+        reset: false,
+        rows: [ROW],
+        gone: ["0x01"],
+        serversChanged: true,
+      },
+    });
+    const answer = await wait("3");
+    expect(new URL(urls[0]!).searchParams.get("since")).toBe("3");
+    expect(answer).toEqual({
+      seq: "5",
+      changed: true,
+      delta: {
+        since: "3",
+        seq: "5",
+        reset: false,
+        rows: [
+          {
+            scope: LOG,
+            read: {
+              found: true,
+              version: 4,
+              dataHash: ROW.dataHash,
+              metadataHash: ROW.metadataHash,
+              deleted: false,
+            },
+          },
+        ],
+        gone: ["0x01"],
+        serversChanged: true,
+      },
+    });
+  });
+
+  it("a reset carries no rows", async () => {
+    const { wait } = answering({
+      seq: "5",
+      changed: true,
+      delta: { since: "3", reset: true },
+    });
+    expect((await wait("3")).delta).toEqual({
+      since: "3",
+      seq: "5",
+      reset: true,
+    });
+  });
+
+  it("without since, nothing is sent and a delta in the answer is not read", async () => {
+    const { wait, urls } = answering({
+      seq: "5",
+      changed: true,
+      delta: { since: "3", reset: true },
+    });
+    const answer = await wait(undefined);
+    expect(new URL(urls[0]!).searchParams.has("since")).toBe(false);
+    expect(answer).toEqual({ seq: "5", changed: true });
+  });
+
+  it.each([
+    [
+      "for another since (mutation: since not matched)",
+      { since: "2", reset: true },
+    ],
+    [
+      "with a row whose version is not valid (mutation: rows read loosely)",
+      {
+        since: "3",
+        reset: false,
+        rows: [{ ...ROW, expectedVersion: "x" }],
+        gone: [],
+        serversChanged: false,
+      },
+    ],
+    [
+      "without gone",
+      { since: "3", reset: false, rows: [], serversChanged: false },
+    ],
+    ["not an object", "delta"],
+  ])("a delta %s is left out, never half read", async (_name, delta) => {
+    const { wait } = answering({ seq: "5", changed: true, delta });
+    expect(await wait("3")).toEqual({ seq: "5", changed: true });
+  });
+
+  it("an unchanged answer carries no delta", async () => {
+    const { wait } = answering({
+      seq: "3",
+      changed: false,
+      delta: { since: "3", reset: true },
+    });
+    expect(await wait("3")).toEqual({ seq: "3", changed: false });
+  });
+});
