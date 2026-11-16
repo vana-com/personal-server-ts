@@ -129,6 +129,27 @@ describe("a requested cycle", () => {
     expect(calls).toBe(3);
     await manager.stop();
   });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, 0, -5])(
+    "takes the 60 s default for a poll interval of %s",
+    async (pollInterval) => {
+      let calls = 0;
+      const manager = build(
+        async () => {
+          calls += 1;
+        },
+        { pollInterval },
+      );
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls).toBe(1);
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(calls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(calls).toBe(2);
+      await manager.stop();
+    },
+  );
 });
 
 describe("requestPull without a change probe", () => {

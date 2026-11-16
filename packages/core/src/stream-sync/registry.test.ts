@@ -594,6 +594,10 @@ describe("waitForChange", () => {
       "the change route's own refusal",
       JSON.stringify({ error: "Invalid user: expected an 0x address" }),
     ],
+    [
+      "a message that only mentions dataPointId",
+      JSON.stringify({ error: "dataPointId lookup temporarily unavailable" }),
+    ],
     ["a body that is not JSON", "bad request"],
     ["an empty body", ""],
   ])("does not read a 400 with %s as an absent route", async (_name, body) => {

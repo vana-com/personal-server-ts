@@ -77,11 +77,19 @@ export interface ChangeProbe {
  * holds everything the registry has, and the timer's cycle and the probe would
  * only repeat it. Both resume the moment the push is not healthy, the position
  * moved, or the last cycle was not clean. Every answer of the held request,
- * an empty one at the end of its wait included, carries the current position,
- * so a wake that was lost on the way is found by the next answer: its position
- * differs from the one the last clean cycle started under, and a cycle runs.
- * Nothing else is owed while the push is healthy, so an idle device costs one
- * held request per period.
+ * an empty one at the end of its wait included, carries the current position.
+ * An answer whose position moved also says `changed`, so a wake that was lost
+ * on the way is found by the next answer: `onChange` runs a cycle at once.
+ * `onPosition` only records the position. A moved position that arrives
+ * without `onChange` ends the skip, and the next timer tick or probe runs the
+ * cycle.
+ *
+ * A clean cycle threw nothing, was not blocked and left no work behind (see
+ * `reportLeavesWork`). A legacy (unswitched) cycle is never clean: its retries
+ * run on the clock, and no position announces them. While the push is healthy
+ * and the last cycle was clean, an idle device costs one held request per
+ * period. That holds only for what the gateway's position covers: the data
+ * rows and the server registration the cycle reads.
  */
 export interface ChangePush {
   /**
@@ -276,13 +284,49 @@ export interface SyncManager {
 }
 
 const MAX_ERRORS = 10;
+const DEFAULT_POLL_INTERVAL_MS = 60_000;
+
+/**
+ * True when a stream-sync cycle's report says it left work that nothing in the
+ * registry announces. The cycle reports per connection and does not throw: a
+ * connection that failed, or a stream whose publish backs off or waits on a
+ * condition, is tried again only by a later cycle. A position cannot stand in
+ * for that cycle, so the pass is not settled and the timer keeps running. A
+ * report of another shape says nothing and leaves nothing owed.
+ */
+function reportLeavesWork(report: unknown): boolean {
+  const connections = (report as { connections?: unknown } | null | undefined)
+    ?.connections;
+  if (!Array.isArray(connections)) return false;
+  return connections.some((connection: unknown) => {
+    const { error, published } = (connection ?? {}) as {
+      error?: unknown;
+      published?: unknown;
+    };
+    if (error !== null && error !== undefined) return true;
+    return (
+      Array.isArray(published) &&
+      published.some((result: { outcome?: unknown } | null) => {
+        const outcome = result?.outcome;
+        return outcome === "backoff" || outcome === "deferred";
+      })
+    );
+  });
+}
 
 export function createSyncManager(
   uploadDeps: UploadWorkerDeps,
   downloadDeps: DownloadWorkerDeps,
   options?: SyncManagerOptions,
 ): SyncManager {
-  const pollInterval = options?.pollInterval ?? 60_000;
+  // A period that is not a positive finite number would arm a timer that fires
+  // at once or never, so it takes the default.
+  const pollInterval =
+    typeof options?.pollInterval === "number" &&
+    Number.isFinite(options.pollInterval) &&
+    options.pollInterval > 0
+      ? options.pollInterval
+      : DEFAULT_POLL_INTERVAL_MS;
   const uploadBatchSize = options?.uploadBatchSize ?? 50;
   const notifyDebounceMs = options?.notifyDebounceMs ?? 500;
   const transferMode = options?.transferMode ?? "upload-download";
@@ -473,10 +517,10 @@ export function createSyncManager(
           const mode = options.accountStorageMode.read();
           if (mode !== "unswitched") {
             if (mode === "switched" && options.localSync) {
-              await options.localSync.cycle();
+              const report = await options.localSync.cycle();
               lastSync = new Date().toISOString();
               statusMayHaveChanged();
-              settle();
+              if (!reportLeavesWork(report)) settle();
             } else {
               blocked = {
                 reason:
@@ -567,7 +611,9 @@ export function createSyncManager(
 
         lastSync = new Date().toISOString();
         statusMayHaveChanged(); // the cursor and lastSync, at the pass boundary
-        settle();
+        // No `settle()`: this pass retries on the clock (a deletion waiting on
+        // chain finality, a download in backoff, an upload cap) and no
+        // registry position announces that, so the timer keeps running.
       } while (rerunRequested && isRunning && !paused);
     };
 

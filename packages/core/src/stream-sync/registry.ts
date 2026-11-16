@@ -519,6 +519,8 @@ export function createGatewayStreamSyncRegistry(
   };
 }
 
+const LEGACY_REFUSAL = "Invalid dataPointId";
+
 /**
  * True when a 400 is the gateway's `/v1/data/:dataPointId` handler refusing the
  * path segment `changes`, which is what a gateway without the change route
@@ -528,7 +530,9 @@ export function createGatewayStreamSyncRegistry(
 async function isLegacyRouteRefusal(res: Response): Promise<boolean> {
   try {
     const body = (await res.json()) as { error?: unknown };
-    return typeof body.error === "string" && body.error.includes("dataPointId");
+    return (
+      typeof body.error === "string" && body.error.startsWith(LEGACY_REFUSAL)
+    );
   } catch {
     return false;
   }

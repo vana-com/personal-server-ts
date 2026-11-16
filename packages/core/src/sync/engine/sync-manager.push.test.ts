@@ -554,7 +554,7 @@ describe("the push position", () => {
   // and the position is the one the last clean cycle started under, that cycle
   // already holds everything the registry has: the timer cycle and the probe
   // add requests and no news. A wake that was lost on the way is found by the
-  // next answer, whose position differs. Nothing else is owed.
+  // next answer, which says it changed. Nothing else is owed.
 
   /** A manager whose push the test drives by hand. */
   function setup(opts: { cycle?: () => Promise<void> } = {}) {
@@ -606,10 +606,11 @@ describe("the push position", () => {
     await t.manager.stop();
   });
 
-  it("a wake lost on the way is found by the next answer: its position differs from the last clean one", async () => {
+  it("a renewal that answers moved runs a cycle at once: the position, then the change", async () => {
     const t = setup();
     await settled(t);
-    // The poke never arrived; the renewal's answer carries the position.
+    // The poke never arrived; the renewal's answer carries the position and
+    // says it changed.
     t.state.handlers!.onPosition("8");
     t.state.handlers!.onChange();
     await vi.advanceTimersByTimeAsync(0);
@@ -621,7 +622,7 @@ describe("the push position", () => {
     await t.manager.stop();
   });
 
-  it("runs a cycle when the position moved, even if no poke arrived", async () => {
+  it("a position that moved without a change callback ends the skip: the timer repairs it, not an immediate cycle", async () => {
     const t = setup();
     await settled(t);
     t.state.handlers!.onPosition("8");
@@ -739,6 +740,120 @@ describe("the push position", () => {
     cycle.mockClear();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(cycle).toHaveBeenCalledTimes(1);
+    await manager.stop();
+  });
+
+  describe("a cycle that finished but left work no position announces", () => {
+    // The stream-sync cycle reports per connection instead of throwing. A
+    // connection that failed, or whose publish backs off or waits on a
+    // condition, retries only when another cycle runs; the registry does not
+    // move for it. Such a cycle settles nothing, so the timer keeps running.
+    const report = (
+      ...streams: Array<{ error?: string; outcomes?: string[] }>
+    ) => ({
+      connections: streams.map((s, i) => ({
+        connectionId: `c${i}`,
+        applied: [],
+        published: (s.outcomes ?? ["noop"]).map((outcome) => ({
+          stream: "s",
+          outcome,
+          watermark: null,
+        })),
+        error: s.error ?? null,
+      })),
+    });
+
+    async function run(result: unknown) {
+      const { push, state } = fakePush();
+      let next: unknown = report({});
+      const cycle = vi.fn(async () => next);
+      const manager = build({
+        localSync: { cycle },
+        changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
+      });
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      state.handlers!.onHealth(true);
+      state.handlers!.onPosition("7");
+      await vi.advanceTimersByTimeAsync(60_000); // settles on "7"
+      cycle.mockClear();
+      next = result;
+      state.handlers!.onChange(); // a poke at the same position runs the cycle
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cycle).toHaveBeenCalledTimes(1);
+      cycle.mockClear();
+      next = report({});
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      const timerCycles = cycle.mock.calls.length;
+      await manager.stop();
+      return timerCycles;
+    }
+
+    it.each([
+      ["a connection that failed", report({ error: "boom" })],
+      ["a stream whose publish backs off", report({ outcomes: ["backoff"] })],
+      [
+        "a stream deferred on a condition",
+        report({ outcomes: ["noop", "deferred"] }),
+      ],
+    ])("%s: the timer cycle still runs", async (_name, result) => {
+      expect(await run(result)).toBeGreaterThanOrEqual(1);
+    });
+
+    it("every connection done: quiet again", async () => {
+      expect(
+        await run(
+          report({ outcomes: ["published", "noop", "refused", "purged"] }),
+        ),
+      ).toBe(0);
+    });
+  });
+
+  it("a registration revoked with no data write is found when the gateway moves the position, and not before", async () => {
+    // The sync gate (`canSync`) reads server registration, which is not a data
+    // write. The gateway raises the owner's position for it; the manager's
+    // part is to run the gate on the cycle that position starts.
+    const { push, state } = fakePush();
+    let registered = true;
+    const canSync = vi.fn(() =>
+      registered
+        ? { ok: true as const }
+        : {
+            ok: false as const,
+            reason: "unregistered" as const,
+            message: "Register this Personal Server before syncing.",
+          },
+    );
+    const cycle = vi.fn(async () => ({ connections: [] }));
+    const manager = build({
+      localSync: { cycle },
+      canSync,
+      changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
+    });
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    state.handlers!.onHealth(true);
+    state.handlers!.onPosition("7");
+    await vi.advanceTimersByTimeAsync(60_000); // settled on "7"
+    canSync.mockClear();
+    cycle.mockClear();
+
+    registered = false; // revoked: no data point written
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(canSync).not.toHaveBeenCalled(); // nothing announced it yet
+
+    state.handlers!.onPosition("8"); // the gateway raised the position
+    state.handlers!.onChange();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(canSync).toHaveBeenCalledTimes(1);
+    expect(cycle).not.toHaveBeenCalled(); // blocked: nothing transferred
+    expect(manager.getStatus().blocked?.reason).toBe("unregistered");
+
+    // A blocked device is never quiet: it finds the registration by timer.
+    registered = true;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(cycle).toHaveBeenCalledTimes(1);
+    expect(manager.getStatus().blocked).toBeNull();
     await manager.stop();
   });
 
