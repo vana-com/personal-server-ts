@@ -759,9 +759,11 @@ export function createConnectionDeleter(
         !batchOff &&
         deps.registry.postBatch !== undefined
       ) {
-        // The first landing: each unfenced namespace's fence and its streams'
-        // tombstones in one batch request. Whatever it does not write is left
-        // for the per-stream path below, which re-reads before it writes.
+        // The first landing, as batch requests: the fences of the unfenced
+        // namespaces (a version compare-and-set on each pin), then the streams'
+        // tombstones resting on those fences (see delete-batch.ts). Whatever
+        // they do not write is left for the per-stream path below, which
+        // re-reads before it writes.
         const pins = new Map(unfencedPins.map((p) => [p.ns, p.version]));
         const streams = (intent.streams ?? []).filter(
           (s) => !intent.streamsLanded && pins.has(s.ns),

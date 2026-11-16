@@ -13,10 +13,13 @@
  *   condition on a row the same request writes (HTTP 400). Rows of one request
  *   also commit independently, so a fence that lost its compare-and-set would
  *   not hold back the stream rows beside it.
- * - So the fences go first, alone, each guarded by its own compare-and-set (the
- *   next version, and the active head's data hash). The stream rows go next,
- *   each namespace's rows resting on the condition "control is the tombstone at
- *   pin + 1". No stream row lands unless its fence is already committed.
+ * - So the fences go first, alone, each guarded by its own compare-and-set on
+ *   the version: it lands only over the version the delete pinned (pin + 1).
+ *   The pin is a version number, not a hash, so the fence does not bind the
+ *   control row's data hash; that would need the hash stored with the pin.
+ *   The stream rows go next, each namespace's rows resting on the condition
+ *   "control is the tombstone at pin + 1". No stream row lands unless its
+ *   fence is already committed.
  * - A fence that does not land, a failed condition, a missing batch route, or a
  *   request the gateway refuses, all answer `fallback`: nothing is guessed and
  *   the caller runs the per-stream path, which re-reads and re-checks

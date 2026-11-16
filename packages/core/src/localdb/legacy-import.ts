@@ -16,17 +16,35 @@ import type { ImportLedger } from "./import-ledger.js";
 import type { ImportReceipt, ImportSource } from "./legacy-import-types.js";
 
 /**
- * A merge batch ends at this many rows or body characters, whichever is first.
+ * A merge batch ends once it holds 2,048 rows or 4,194,304 body characters,
+ * whichever comes first. Both are measured batching bounds, not derived
+ * limits.
  *
- * Each batch pays a fixed cost: a transaction, the snapshot lookup and the
- * writer's checkpoint pass. At 64 rows and 256 KiB a 198,000-row seed made
- * 3,900 batches and spent 60 of its 129 s in checkpoint passes. The byte bound
- * is the span of one checkpoint mark (1,000 frames of 4 KiB pages, see the
- * SQLite worker): a larger batch writes more than one mark and checkpoints
- * the same way, and a smaller one pays the fixed cost for less than a mark.
- * The row bound keeps the statements of a batch of tiny rows bounded; a batch
- * is one worker message, and the memory test holds that its size, not the row
- * count of the import, sets the peak.
+ * Each batch pays a fixed cost: a transaction, the snapshot lookup and, after
+ * the write, the SQLite worker's checkpoint pass (it runs once the WAL holds
+ * 1,000 frames, about 4 MB at 4 KiB pages). What was measured, on filler rows
+ * of 2,150 bytes (`seed-handoff.workload.ts`):
+ * - 198,000 rows (405 MiB), the import after staging: 64 rows / 256 KiB, the
+ *   earlier bounds, made 3,900 batches and took 112-117 s (n=2); with these
+ *   bounds it takes 63-67 s (n=3). In an instrumented run of the earlier
+ *   bounds 60 of 129 s went to 1,496 checkpoint passes; with 2,048 rows
+ *   and 8 MiB there were 80.
+ * - 20,000 rows: 64 rows / 256 KiB 10.5 s, 512 rows / 2 MiB 6.1 s, 2,048 rows /
+ *   8 MiB 4.2 s.
+ * Bigger batches kept winning up to the largest tried. 2,048 is that largest
+ * row count, not an optimum, and nothing above it was tried. At this row size
+ * the byte bound ends a batch at about 1,950 rows, so the two bounds act as
+ * one here. The row bound keeps the statements of a batch of tiny rows
+ * bounded.
+ *
+ * What the bytes count is limited: `body.length` is UTF-16 code units, not
+ * UTF-8 bytes (a non-ASCII body takes up to three bytes per unit); keys, SQL
+ * text, parameters and index overhead are not counted; and the bound is
+ * checked after the row that crosses it is appended, so a batch overshoots by
+ * up to one row, and a row larger than the bound goes alone. So this is not a
+ * memory bound. The import memory test holds that peak memory does not grow
+ * with the row count of an import of rows this size; it does not bound the
+ * worst batch.
  */
 export const IMPORT_CHUNK_ROWS = 2048;
 const IMPORT_CHUNK_BYTES = 4 * 1024 * 1024;
@@ -219,6 +237,8 @@ async function importSource(
         const row = await canonicalImportRow(record, source.target.primaryKey);
         chunk.push(row);
         chunkBytes += row.body.length;
+        // Checked after the append: the batch ends with the row that crosses a
+        // bound, so it can exceed the byte bound by up to one row.
         if (
           chunk.length >= IMPORT_CHUNK_ROWS ||
           chunkBytes >= IMPORT_CHUNK_BYTES
