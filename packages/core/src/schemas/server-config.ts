@@ -67,7 +67,7 @@ export const DEFAULTS = {
     // The gateway tells this server when the registry changed (a held request
     // answered on a write), so a save on another device is pulled at once.
     // The probe above stays as the fallback and rests while that push is
-    // healthy and its position has not moved. false: probe only.
+    // healthy and its answers carry a position. false: probe only.
     changePush: true,
     // Off by default. When true, an owner read of a stream that has no complete
     // head yet serves the parts applied so far, marked partial, and a reader
