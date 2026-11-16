@@ -20,7 +20,10 @@ afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
 });
 
-async function fixture(maxBytesInFlight?: number) {
+async function fixture(
+  maxBytesInFlight?: number,
+  shared?: ReturnType<typeof createStorageAccess>,
+) {
   const db = await openLocalDb(openBetterSqlite3(":memory:"), {
     owner: "0xabc",
     network: "test",
@@ -35,15 +38,17 @@ async function fixture(maxBytesInFlight?: number) {
   };
   const remote = await remoteFixture(keys);
   const blobs =
-    maxBytesInFlight === undefined
-      ? remote.storage
-      : {
-          ...remote.storage,
-          governor: createStorageAccess({
-            ...DEFAULT_STORAGE_ACCESS_POLICY,
-            maxBytesInFlight,
-          }),
-        };
+    shared !== undefined
+      ? { ...remote.storage, governor: shared }
+      : maxBytesInFlight === undefined
+        ? remote.storage
+        : {
+            ...remote.storage,
+            governor: createStorageAccess({
+              ...DEFAULT_STORAGE_ACCESS_POLICY,
+              maxBytesInFlight,
+            }),
+          };
   let op = 0;
   const deps: LocalSyncDeps = {
     db,
@@ -162,4 +167,67 @@ it("never commits more parts at once than the memory budget holds", async () => 
   const sizes = await commitsOf(f);
   expect(sizes.reduce((a, b) => a + b, 0)).toBe(12);
   expect(Math.max(...sizes)).toBeLessThanOrEqual(3);
+});
+
+const deadline = <T>(work: Promise<T>, ms = 10_000) =>
+  Promise.race([
+    work,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("apply did not settle")), ms),
+    ),
+  ]);
+const long = (id: string) => ({ id, pad: 'é"x'.repeat(1500) });
+
+it("applies a record that spans more parts than the budget holds", async () => {
+  // About 9,000 bytes in parts of 300, with room for three parts: a reservation
+  // per part would wait for a fourth that only a commit could free.
+  const f = await fixture(2 * 3 * 300);
+  await f.head("a", [long("big"), { id: "after" }], { pieceBytes: 300 });
+  await deadline(applyConnection(f.deps, f.id));
+  const rows = await f.db.query<{ body: string }>(
+    "SELECT body FROM records WHERE stream = 'a' ORDER BY pk_hash",
+  );
+  expect(rows.map((r) => JSON.parse(r.body).id).sort()).toEqual([
+    "after",
+    "big",
+  ]);
+  const whole = await f.deps.blobs.governor.reserve(2 * 3 * 300);
+  whole();
+});
+
+it("settles connections that apply together under one budget", async () => {
+  const governor = createStorageAccess({
+    ...DEFAULT_STORAGE_ACCESS_POLICY,
+    maxBytesInFlight: 2 * 3 * 300,
+  });
+  const fixtures = await Promise.all(
+    [0, 1, 2].map(() => fixture(undefined, governor)),
+  );
+  for (const f of fixtures)
+    await f.head("a", [long("one"), long("two"), { id: "end" }], {
+      pieceBytes: 300,
+    });
+  await deadline(
+    Promise.all(fixtures.map((f) => applyConnection(f.deps, f.id))),
+  );
+  for (const f of fixtures)
+    expect(
+      await f.db.query("SELECT 1 FROM records WHERE stream = 'a'"),
+    ).toHaveLength(3);
+  const whole = await governor.reserve(2 * 3 * 300);
+  whole();
+});
+
+it("gives its memory back when a continuation part of a record is missing", async () => {
+  const f = await fixture(2 * 3 * 300);
+  const h = await f.head("a", [long("big")], { pieceBytes: 300 });
+  f.blobs.delete(`${h.scope}/g1-p-${h.parts[7]!.hash}`);
+  await expect(deadline(applyConnection(f.deps, f.id))).rejects.toThrow(
+    "apply: missing part blob",
+  );
+  const whole = await Promise.race([
+    f.deps.blobs.governor.reserve(2 * 3 * 300).then((r) => (r(), "granted")),
+    new Promise((resolve) => setTimeout(() => resolve("waiting"), 100)),
+  ]);
+  expect(whole).toBe("granted");
 });

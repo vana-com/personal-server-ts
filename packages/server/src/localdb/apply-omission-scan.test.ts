@@ -24,7 +24,7 @@ afterEach(async () => {
 
 const pkOf = (n: number) => n.toString(16).padStart(64, "0");
 
-async function streamOf(count: number) {
+async function streamOf(count: number, bodyBytes: number | null = 10) {
   const db = await openLocalDb(openBetterSqlite3(":memory:"), {
     owner,
     network: "test",
@@ -35,8 +35,14 @@ async function streamOf(count: number) {
   await db.batch(
     Array.from({ length: count }, (_, n) => ({
       sql: `INSERT INTO records (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, body_bytes)
-            VALUES ('c1', 's', ?, ?, 1, 'r1', ?, ?, NULL, 10)`,
-      params: [pkOf(n), `k${n}`, JSON.stringify({ id: n }), `sha${n}`],
+            VALUES ('c1', 's', ?, ?, 1, 'r1', ?, ?, NULL, ?)`,
+      params: [
+        pkOf(n),
+        `k${n}`,
+        JSON.stringify({ id: n }),
+        `sha${n}`,
+        bodyBytes,
+      ],
     })),
   );
   return db as unknown as LocalSyncDeps["db"];
@@ -92,4 +98,22 @@ describe("the delete of rows a head omits", () => {
     );
     expect(left.map((r) => r.pk_hash)).toEqual([0, 1, 2, 3, 4, 5].map(pkOf));
   });
+
+  it.each([null, 0])(
+    "drops an omitted row whose recorded size is %s",
+    async (size) => {
+      const db = await streamOf(6, size);
+      await db.batch(
+        [0, 1].map((n) => ({
+          sql: "INSERT INTO temp.apply_keys (op, pk_hash) VALUES ('op1', ?)",
+          params: [pkOf(n)],
+        })),
+      );
+      await db.batch(withOrigin("remote", applyDelete("op1", "c1", "s", 5)));
+      const left = await db.query<{ pk_hash: string }>(
+        "SELECT pk_hash FROM records WHERE connection_id = 'c1' AND stream = 's' ORDER BY pk_hash",
+      );
+      expect(left.map((r) => r.pk_hash)).toEqual([0, 1].map(pkOf));
+    },
+  );
 });
