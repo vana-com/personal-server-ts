@@ -32,6 +32,19 @@ export interface SyncStatus {
    */
   deletions?: TombstoneResubmitSnapshot;
   /**
+   * Storage deletes queued behind a tombstone, as of the last drain, whatever
+   * the transport can do about them: `remaining` markers in all. `waiting` of
+   * them a later pass finishes by itself (finality pending, or a key to
+   * retry). The rest are parked behind a rolled-back scope, which stays until
+   * the user deletes it again (see `deletions.failed`), or cannot run because
+   * `unavailable` names a missing port. Absent until a drain has run.
+   */
+  blobDeletions?: {
+    remaining: number;
+    waiting: number;
+    unavailable: "delete-port" | "finality-port" | null;
+  };
+  /**
    * Local entries that are too large to upload (kept locally, not synced),
    * and failing uploads that are backing off or have stopped. Each list is
    * empty when nothing is owed.

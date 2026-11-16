@@ -23,6 +23,9 @@ vi.mock("../workers/delete.js", () => ({
     superseded: [],
     failed: [],
     remaining: 0,
+    waiting: 0,
+    parked: [],
+    unavailable: null,
   })),
 }));
 

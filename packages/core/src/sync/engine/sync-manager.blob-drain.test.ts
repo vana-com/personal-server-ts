@@ -52,7 +52,13 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function setup(options: { finality?: TombstoneFinalityState } = {}) {
+function setup(
+  options: {
+    finality?: TombstoneFinalityState;
+    withFinality?: boolean;
+    withDeleteData?: boolean;
+  } = {},
+) {
   let finality = options.finality ?? PENDING;
   const store = createMemoryPendingBlobDeletionStore();
   const ready = store.add([MARKER]);
@@ -98,9 +104,11 @@ function setup(options: { finality?: TombstoneFinalityState } = {}) {
       pollInterval: 60_000,
       localSync: { cycle },
       changeProbe: { read, intervalMs: 5_000, push },
-      deleteData: deleteData as never,
+      ...(options.withDeleteData === false
+        ? {}
+        : { deleteData: deleteData as never }),
       pendingBlobDeletions: pending,
-      tombstoneFinality,
+      ...(options.withFinality === false ? {} : { tombstoneFinality }),
     } satisfies SyncManagerOptions,
   );
   return {
@@ -190,27 +198,98 @@ describe("a switched device owes storage deletes whose tombstone is not final", 
     await t.manager.stop();
   });
 
-  it("a rolled-back tombstone is never re-sent through legacy storage", async () => {
-    const t = setup({
-      finality: {
-        finalized: null,
-        settling: false,
-        rolledBack: {
-          tombstoneVersion: "3",
-          head: {
-            dataPointId: "0xdp",
-            expectedVersion: "2",
-            dataHash: "0x" + "11".repeat(32),
-            metadataHash: "0x" + "22".repeat(32),
-          },
-        },
-      } as never,
-    });
+  it("without a finality port it frees nothing: the markers stay and the status says why", async () => {
+    // The worker's no-port branch releases every marker at once. A switched
+    // pass cannot tell whether the tombstone may still roll back, so it
+    // must not take that branch.
+    const t = setup({ withFinality: false });
     await t.start();
     await vi.advanceTimersByTimeAsync(5 * 60_000);
-    expect(t.deleteData.tombstone).not.toHaveBeenCalled();
     expect(t.deleteData.deleteBlobVersions).not.toHaveBeenCalled();
     expect(await t.store.list()).toEqual([MARKER]);
+    expect(t.manager.getStatus().blobDeletions).toEqual({
+      remaining: 1,
+      waiting: 0,
+      unavailable: "finality-port",
+    });
     await t.manager.stop();
+  });
+
+  it("without a delete port the pass does not claim the debt cleared", async () => {
+    const t = setup({ withDeleteData: false });
+    await t.start();
+    expect(await t.store.list()).toEqual([MARKER]);
+    expect(t.manager.getStatus().blobDeletions).toEqual({
+      remaining: 1,
+      waiting: 0,
+      unavailable: "delete-port",
+    });
+    await t.manager.stop();
+  });
+
+  describe("a rolled-back tombstone", () => {
+    const ROLLED_BACK = {
+      finalized: null,
+      settling: false,
+      rolledBack: {
+        tombstoneVersion: "3",
+        head: {
+          dataPointId: "0xdp",
+          expectedVersion: "2",
+          dataHash: "0x" + "11".repeat(32),
+          metadataHash: "0x" + "22".repeat(32),
+        },
+      },
+    } as never;
+
+    it("is parked: one visible failure, ciphertext kept, no tombstone sent, no timer cycle", async () => {
+      const t = setup({ finality: ROLLED_BACK });
+      await t.start();
+      expect(t.deleteData.tombstone).not.toHaveBeenCalled();
+      expect(t.deleteData.deleteBlobVersions).not.toHaveBeenCalled();
+      expect(await t.store.list()).toEqual([MARKER]);
+      const status = t.manager.getStatus();
+      expect(status.deletions?.failed).toEqual([
+        expect.objectContaining({
+          scope: MARKER.scope,
+          tombstoneVersion: "3",
+          reason: "no-reissue-path",
+        }),
+      ]);
+      expect(
+        status.errors.filter((e) => e.scope === MARKER.scope),
+      ).toHaveLength(1);
+      expect(status.blobDeletions).toEqual({
+        remaining: 1,
+        waiting: 0,
+        unavailable: null,
+      });
+
+      // Parked debt is not runnable work: the device goes quiet.
+      t.cycle.mockClear();
+      t.tombstoneFinality.tombstoneState.mockClear();
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+      expect(t.cycle).not.toHaveBeenCalled();
+      expect(t.tombstoneFinality.tombstoneState).not.toHaveBeenCalled();
+      await t.manager.stop();
+    });
+
+    it("is read again on a relevant change, reported once, and freed when a later delete is final", async () => {
+      const t = setup({ finality: ROLLED_BACK });
+      await t.start();
+      await t.manager.trigger(); // another pass: the same rollback
+      expect(
+        t.manager.getStatus().errors.filter((e) => e.scope === MARKER.scope),
+      ).toHaveLength(1);
+
+      t.setFinality(FINAL); // the user deleted again and it settled
+      await t.manager.trigger();
+      expect(t.deleteData.deleteBlobVersions).toHaveBeenCalledTimes(1);
+      expect(await t.store.list()).toEqual([]);
+      const status = t.manager.getStatus();
+      expect(status.deletions?.failed).toEqual([]);
+      expect(status.blobDeletions).toBeUndefined();
+      await t.manager.stop();
+    });
   });
 });

@@ -738,6 +738,9 @@ describe("retryPendingBlobDeletions", () => {
       superseded: [],
       failed: [{ scope: "a.b", version: "2", error: "still down" }],
       remaining: 1,
+      waiting: 1,
+      parked: [],
+      unavailable: null,
     });
     expect(await pending.list()).toEqual([{ scope: "a.b", version: "2" }]);
   });
@@ -921,6 +924,9 @@ describe("retryPendingBlobDeletions", () => {
       superseded: [],
       failed: [],
       remaining: 0,
+      waiting: 0,
+      parked: [],
+      unavailable: null,
     });
   });
 });
