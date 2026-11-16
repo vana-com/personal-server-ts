@@ -67,12 +67,15 @@ TieOf(op) == IF Mode \in {"equalStampToday","dropKind"} THEN 0 ELSE op.body
 KindRank(op) == IF op.kind = "omit" THEN (IF Mode = "omitInclusive" THEN 2 ELSE 0)
                 ELSE IF op.kind = "delete" THEN (IF Mode = "dropKind" THEN 1 ELSE 2)
                 ELSE 1
-\* The packing into one number is exact only for ord < 3 and body < 100 (the multipliers 3
-\* and 100); the ASSUME below checks the corpus against it. A larger domain needs the tuple
-\* compare that SqlRank.tla uses.
-Rank(op) == 100 * (3 * (3 * op.stamp + KindRank(op)) + OrdOf(op)) + TieOf(op)
-ASSUME \A i \in 1..Len(Batches) : \A j \in 1..Len(Batches[i]) :
-         Batches[i][j].ord < 3 /\ Batches[i][j].body < 100
+\* The packing into one number is exact by construction: each radix is one more than the
+\* largest value the corpus uses in that field (kinds have three ranks), so no field can
+\* carry into the next. SqlRank.tla compares the tuple instead and needs no packing.
+CorpusOps == UNION {{Batches[i][j] : j \in 1..Len(Batches[i])} : i \in 1..Len(Batches)}
+MaxOf(S) == CHOOSE m \in S : \A x \in S : x <= m
+KindBase == 3
+OrdBase == MaxOf({o.ord : o \in CorpusOps}) + 1
+BodyBase == MaxOf({o.body : o \in CorpusOps}) + 1
+Rank(op) == BodyBase * (OrdBase * (KindBase * op.stamp + KindRank(op)) + OrdOf(op)) + TieOf(op)
 Min2(a,b) == IF a < b THEN a ELSE b
 \* An omission cutoff is a strict boundary: an observation AT cutoff wins.
 Merge(state,op,bad,fs) ==
@@ -325,7 +328,7 @@ CaughtUp == \A d \in Devices : deviceEpoch[d]=epoch /\ position[d]=Len(log)
 \* The intended winner of a key, from the log alone and independent of apply order: the
 \* operation greatest in (stamp, ord, kind). Computed with the ordinal in every mode, so the
 \* equalStampToday mutant is judged against the intended order and not its own.
-IntendedRank(op) == 100 * (3 * (3 * op.stamp + KindRank(op)) + op.ord) + op.body
+IntendedRank(op) == BodyBase * (OrdBase * (KindBase * op.stamp + KindRank(op)) + op.ord) + op.body
 IntendedBody(k) ==
   LET ops == {o \in AllOps(log) : o.key = k}
   IN IF ops = {} THEN 0

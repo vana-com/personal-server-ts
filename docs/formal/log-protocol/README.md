@@ -284,8 +284,8 @@ Mode `equalStampToday` is the mutant that ignores ordinal and body hash.
 
 | Configuration          | Expected                                     | Actual                                                                                                                                          | Distinct states               | Depth | Wall time |
 | ---------------------- | -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- | ----- | --------- |
-| EqualStampToday.cfg    | FAIL P7                                      | FAIL P7 (`traces/EqualStampToday.txt`): a reader applies batch 2 (bodies 12, 22) after batch 1 (11, 21) at one stamp and keeps the first bodies | 730 at failure                | 6     | <1 s      |
-| EqualStamp.cfg         | PASS (P1–P5, P7, EventuallyConverged)        | PASS, state space complete, no error found                                                                                                      | 3,447,086                     | 31    | 11 min    |
+| EqualStampToday.cfg    | FAIL P7                                      | FAIL P7 (`traces/EqualStampToday.txt`): a reader applies batch 2 (bodies 12, 22) after batch 1 (11, 21) at one stamp and keeps the first bodies | 704 at failure                | 6     | <1 s      |
+| EqualStamp.cfg         | PASS (P1–P5, P7, EventuallyConverged)        | PASS, state space complete, no error found                                                                                                      | 3,447,086                     | 31    | 17 min    |
 | EqualStampLifetime.cfg | no violation (same, with Reset and Rollback) | BOUNDED: stopped at 40 min (exit 124), no invariant error in explored states; 9.5M states left on queue; liveness not checked                   | at least 81,930,672 (partial) | n/a   | 40 min    |
 
 Each run used `-workers 4`, `nice -n 19`, one job at a time, and its own
@@ -296,7 +296,7 @@ config, because together with the equal-stamp corpus they grew the space
 without bound.
 
 The other configs still fail where expected (DropGap P2, OmissionInclusive P3,
-DropKind OrderOK). Good.cfg and LostPush.cfg were not rerun: the base corpus
+DropKind OrderOK). Rerun 11-16 with radices derived from the corpus: EqualStampToday fails P7 (704 distinct states at failure), DropKind fails OrderOK, EqualStamp completes with the same 3,447,086 states and no error. Good.cfg and LostPush.cfg were not rerun: the base corpus
 has ord 0 throughout and `Rank` reduces to the old order there, so their
 results are unchanged by construction, not by a new run.
 
@@ -363,8 +363,9 @@ Not modelled: the SEEN stamp, `promoteSeen` and a stored stamp older than the
 run's. They act between different stamps. The older-stamp case of
 `replaceOwnRunRows` is covered by the same `rankAfter`: a row with an older
 stamp ranks below the run's batch whatever its ordinal. The `LogProtocol.tla`
-rank packing is exact only for ordinal below 3 and body below 100; an `ASSUME`
-checks the corpus. A larger domain needs the tuple compare.
+rank packing takes its radices from the corpus (one more than the largest
+ordinal and body it uses; kinds have three ranks), so it is exact for any
+corpus. `SqlRank.tla` compares the tuple and packs nothing.
 
 ## Per-stream heads beside the log (`apply.ts`)
 
@@ -378,15 +379,32 @@ order is one total order, so a part and a log entry arriving in either order
 give one row. `equal-stamp-order.test.ts` has a `part` step (same SQL options as
 `applyOneOnce`) in its exhaustive and random sequences, and
 `log-protocol.test.ts` loads a head and a log naming one key at one stamp
-through a first load, a progressive first load and a compacted snapshot.
+through a first load, a progressive first load and a compacted snapshot. Those
+tests assert first-load devices only. The writer and a reader that already
+followed the log are cycled and asserted in the boundary tests (below).
 
-Not covered, and not an ordering matter: a log-on device that already follows
-the log does not read a head whose registry version is not above its own
-(`applyOneOnce`, the `head_version > read.version` answer), at any stamp. So a
-head that a log-off writer publishes beside a log reaches first loads and not
-devices that follow it. The tests show the same split at a later stamp.
+Boundary, not an ordering matter: a log-on device that already follows the log
+does not read a head whose registry version is not above its own
+(`applyOneOnce`, the `head_version > read.version` answer), at any stamp. A first
+load reads it. So a head published outside the followed log reaches first loads
+and not the devices that follow it. `log-protocol.test.ts` pins this at an equal
+stamp and at a later one (the second case is decided by the stamp alone, so the
+ordinal plays no part). The test expects today's split; closing the boundary
+changes its expected values.
+
+What publishes a head beside a log is not only the flag. A log-off device does.
+So does a log-on device whose registry has no batch route, or that cached "no
+batch route" earlier: `publishLog` returns `null` and the caller publishes per
+stream (`log-publish.ts:184-185`, `232-234`). A fleet whose flags are all on is
+not by that fact free of this boundary, for example during a gateway rollout.
+No test here drives that fallback. A device that flips from log on to log off on
+one database also fails its per-stream publish with a `UNIQUE` error on
+`stream_versions` (the log's apply allocates versions there); that refusal
+predates the ordinal. Whether it leaves the records, the remote head and the
+retry consistent is not verified here.
 
 With the log off and admission on (`publishWhileCollecting`) a device stores
 `stamp_n` in its own rows and orders its own bodies by it. No log segment is
 written and a head holds no ordinal. A device that turns the log on after it
-published a head publishes its changes then, and a first load reads one row.
+published a head, then a first load, both hold the final body (the test asserts
+bodies only).
