@@ -1838,6 +1838,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             "Completion requires an owner token",
           );
         }
+        const refusal = refuseRecordWrite(reqId);
+        if (refusal) return refusal;
         const method = c.req.query("method");
         const generation = Number(c.req.query("binding_generation") ?? NaN);
         if (!method || !Number.isSafeInteger(generation) || generation < 1) {
