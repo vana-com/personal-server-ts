@@ -114,6 +114,9 @@ export function readPartsAhead<P extends SizedPart, T = Uint8Array>(
   blobs: Pick<StreamSyncBlobs, "governor">,
   parts: readonly P[],
   fetch: (part: P) => Promise<T>,
+  // Optional observer for causal tests: called only after a whole unit is ready.
+  // Production callers omit it. Observers must not throw or retain fetched bytes.
+  onReady?: (first: number, last: number) => void,
 ): PartReader<P, T> {
   const units: Unit[] = [];
   for (let i = 0; i < parts.length; i++) {
@@ -199,6 +202,8 @@ export function readPartsAhead<P extends SizedPart, T = Uint8Array>(
             (value) => {
               unit.fetched++;
               end(slot)?.resolve(value);
+              if (unit.fetched === unit.last - unit.first + 1)
+                onReady?.(unit.first, unit.last);
             },
             (error) => end(slot)?.reject(error),
           )
