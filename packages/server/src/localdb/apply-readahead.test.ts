@@ -3,6 +3,8 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { sha256 } from "@noble/hashes/sha2";
 import { pkHash } from "@opendatalabs/personal-server-ts-stream-sync";
+import * as streamSync from "@opendatalabs/personal-server-ts-stream-sync";
+import * as partReadahead from "../../../core/src/localdb/part-readahead.js";
 import {
   connectionQueue,
   openLocalDb,
@@ -16,6 +18,14 @@ import {
 } from "../../../core/src/stream-sync/storage-retry.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.js";
+
+// Keep the package exports spyable even when the workspace resolves it as ESM.
+vi.mock(
+  "@opendatalabs/personal-server-ts-stream-sync",
+  async (importOriginal) => ({
+    ...(await importOriginal<typeof streamSync>()),
+  }),
+);
 
 const drivers: SqlDriver[] = [];
 afterEach(async () => {
@@ -266,53 +276,167 @@ const storedIds = async (f: Awaited<ReturnType<typeof fixture>>) =>
     .map((r) => (JSON.parse(r.body) as { id: string }).id)
     .sort();
 
-/** Holds the first commit until every part of the head has been fetched. */
-function holdFirstCommit(
-  f: Awaited<ReturnType<typeof fixture>>,
-  fetchedParts: number,
+/** One deadline per scenario; every gate wait shares it, and it is cleared. */
+async function acknowledgedScenario(
+  run: (wait: <T>(work: Promise<T>) => Promise<T>) => Promise<void>,
 ) {
-  let fetched = 0;
-  const get = f.deps.blobs.get.bind(f.deps.blobs);
-  f.deps.blobs.get = async (key) => {
-    const bytes = await get(key);
-    if (key.includes("/g1-p-")) fetched++;
-    return bytes;
-  };
-  const batch = f.db.batch.bind(f.db);
-  let held = false;
-  vi.spyOn(f.db, "batch").mockImplementation(async (statements) => {
-    if (!held && statements.some((s) => s.sql.includes("temp.incoming"))) {
-      held = true;
-      while (fetched < fetchedParts) await new Promise((r) => setTimeout(r, 5));
-    }
-    return batch(statements);
+  let timer!: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error("apply scenario did not settle")),
+      10_000,
+    );
   });
+  const wait = <T>(work: Promise<T>): Promise<T> =>
+    Promise.race([work, timeout]);
+  try {
+    await run(wait);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function acknowledgement<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 it("commits the parts it has verified before it raises the error of the next one", async () => {
   const f = await fixture();
   const order = await idsInPartOrder(lettered.map((r) => r.id));
   const h = await f.head("a", lettered);
-  // The third part's bytes do not match the hash the head declares for it.
   f.blobs.set(
     `${h.scope}/g1-p-${h.parts[2]!.hash}`,
     new Uint8Array(h.parts[2]!.bytes).fill(7),
   );
-  holdFirstCommit(f, 4);
-  await expect(deadline(applyConnection(progressive(f), f.id))).rejects.toThrow(
-    /part SHA-256 does not match/,
+  const thirdReady = acknowledgement<boolean>();
+  const firstSubmitted = acknowledgement();
+  const releaseFirst = acknowledgement();
+  const secondSubmitted = acknowledgement();
+  const releaseSecond = acknowledgement();
+  const validationFailed = acknowledgement<unknown>();
+  const realAhead = partReadahead.readPartsAhead;
+  const aheadSpy = vi
+    .spyOn(partReadahead, "readPartsAhead")
+    .mockImplementation(function <
+      P extends partReadahead.SizedPart,
+      T = Uint8Array,
+    >(
+      blobs: Parameters<typeof realAhead>[0],
+      parts: readonly P[],
+      fetch: (part: P) => Promise<T>,
+    ): partReadahead.PartReader<P, T> {
+      const reader = realAhead(blobs, parts, (part) => {
+        const pending = fetch(part);
+        // Register after readPartsAhead has attached its own fulfillment
+        // handler: that handler increments fetched before our observation.
+        // This is promise ordering, not a GET acknowledgement or timer.
+        queueMicrotask(() => {
+          void pending.then(
+            () => {
+              if (parts.indexOf(part) === 2)
+                thirdReady.resolve(reader.ready(2));
+            },
+            () => {
+              if (parts.indexOf(part) === 2) thirdReady.resolve(false);
+            },
+          );
+        });
+        return pending;
+      });
+      return reader;
+    });
+  const realFrames = streamSync.framesOfParts;
+  const framesSpy = vi
+    .spyOn(streamSync, "framesOfParts")
+    .mockImplementation(async function* (
+      ...args: Parameters<typeof realFrames>
+    ) {
+      try {
+        yield* realFrames(...args);
+      } catch (error) {
+        validationFailed.resolve(error);
+        throw error;
+      }
+    });
+  const batch = f.db.batch.bind(f.db);
+  let submissions = 0;
+  const batchSpy = vi
+    .spyOn(f.db, "batch")
+    .mockImplementation(async (statements) => {
+      if (statements.some((s) => s.sql.includes("INSERT INTO temp.incoming"))) {
+        submissions++;
+        if (submissions === 1) {
+          firstSubmitted.resolve();
+          await releaseFirst.promise;
+        } else if (submissions === 2) {
+          secondSubmitted.resolve();
+          await releaseSecond.promise;
+        }
+      }
+      return batch(statements);
+    });
+  const outcome = applyConnection(progressive(f), f.id).then(
+    () => ({ error: undefined }),
+    (error: unknown) => ({ error }),
   );
-  // The first two parts were verified before the third failed: both are
-  // durable and shown, the third and the fourth are not, and the stream is
-  // not complete.
-  expect(await storedIds(f)).toEqual([order[0], order[1]].sort());
-  expect(await partial(f)).toEqual([{ parts_applied: 2, failed: 1 }]);
-  expect(
-    await f.db.query("SELECT 1 FROM stream_state WHERE complete = 1"),
-  ).toHaveLength(0);
-  expect(
-    await f.db.query("SELECT 1 FROM temp.incoming WHERE op LIKE 'readahead-%'"),
-  ).toHaveLength(0);
+  try {
+    await acknowledgedScenario(async (wait) => {
+      try {
+        await wait(firstSubmitted.promise);
+        expect(await wait(thirdReady.promise)).toBe(true);
+        releaseFirst.resolve();
+        const failure = await wait(validationFailed.promise);
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toMatch(
+          /part SHA-256 does not match/,
+        );
+        // If the catch flush is removed, outcome settles without a second
+        // submission; do not hang waiting for an event the mutant cannot emit.
+        await wait(
+          Promise.race([
+            secondSubmitted.promise,
+            outcome.then(() => undefined),
+          ]),
+        );
+        expect(await wait(storedIds(f))).toEqual([order[0]]);
+        releaseSecond.resolve();
+        expect((await wait(outcome)).error).toBe(failure);
+        // Mutation oracle: removing apply.ts's catch flush leaves only the
+        // first part durable and fails these two-part durability assertions.
+        expect(await wait(storedIds(f))).toEqual([order[0], order[1]].sort());
+        expect(await wait(partial(f))).toEqual([
+          { parts_applied: 2, failed: 1 },
+        ]);
+        expect(submissions).toBe(2);
+        expect(
+          await wait(
+            f.db.query("SELECT 1 FROM stream_state WHERE complete = 1"),
+          ),
+        ).toHaveLength(0);
+        expect(
+          await wait(
+            f.db.query(
+              "SELECT 1 FROM temp.incoming WHERE op LIKE 'readahead-%'",
+            ),
+          ),
+        ).toHaveLength(0);
+      } finally {
+        releaseFirst.resolve();
+        releaseSecond.resolve();
+        await wait(outcome).catch(() => undefined);
+      }
+    });
+  } finally {
+    releaseFirst.resolve();
+    releaseSecond.resolve();
+    aheadSpy.mockRestore();
+    framesSpy.mockRestore();
+    batchSpy.mockRestore();
+  }
 });
 
 it("gives a fetch that is still running its memory when it ends, after the apply has failed", async () => {
@@ -481,40 +605,56 @@ it("commits only what precedes a part that fails, when the parts after it arrive
   const records = Array.from({ length: 5 }, (_, i) => ({ id: `row-${i}` }));
   const h = await f.head("a", records);
   const order = await idsInPartOrder(records.map((r) => r.id));
-  // Every GET waits at a barrier. They end last part first, and the second
-  // part's fails.
-  const gates = h.parts.map(() => {
-    let open!: () => void;
-    const opened = new Promise<void>((r) => (open = r));
-    return { opened, open };
-  });
-  let started = 0;
+  const gates = h.parts.map(() => acknowledgement());
+  const started = h.parts.map(() => acknowledgement());
+  const returned = h.parts.map(() => acknowledgement());
+  const arrivals: number[] = [];
   const get = f.deps.blobs.get.bind(f.deps.blobs);
   f.deps.blobs.get = async (key) => {
     const at = h.parts.findIndex((p) => key.endsWith(p.hash));
     if (at === -1) return get(key);
-    started++;
-    await gates[at]!.opened;
-    if (at === 1) throw new Error("storage failure on part 1");
-    return get(key);
+    started[at]!.resolve();
+    await gates[at]!.promise;
+    try {
+      if (at === 1) throw new Error("storage failure on part 1");
+      return await get(key);
+    } finally {
+      arrivals.push(at);
+      returned[at]!.resolve();
+    }
   };
   const outcome = applyConnection(progressive(f), f.id).then(
     () => "applied",
     (error: Error) => error.message,
   );
-  while (started < h.parts.length) await new Promise((r) => setTimeout(r, 5));
-  for (const at of [4, 3, 2, 1, 0]) {
-    gates[at]!.open();
-    await new Promise((r) => setTimeout(r, 20));
+  try {
+    await acknowledgedScenario(async (wait) => {
+      try {
+        await wait(Promise.all(started.map((s) => s.promise)));
+        for (const at of [4, 3, 2, 1, 0]) {
+          gates[at]!.resolve();
+          await wait(returned[at]!.promise);
+        }
+        expect(arrivals).toEqual([4, 3, 2, 1, 0]);
+        expect(await wait(outcome)).toBe("storage failure on part 1");
+        expect(await wait(storedIds(f))).toEqual([order[0]]);
+        expect(await wait(partial(f))).toEqual([
+          { parts_applied: 1, failed: 1 },
+        ]);
+        await wait(
+          f.deps.blobs.governor
+            .reserve(DEFAULT_STORAGE_ACCESS_POLICY.maxBytesInFlight)
+            .then((release) => release()),
+        );
+      } finally {
+        for (const gate of gates) gate.resolve();
+        await wait(outcome).catch(() => undefined);
+      }
+    });
+  } finally {
+    for (const gate of gates) gate.resolve();
+    f.deps.blobs.get = get;
   }
-  expect(await deadline(outcome)).toBe("storage failure on part 1");
-  // Only the first part precedes the failure: the three that arrived early
-  // are not committed.
-  expect(await storedIds(f)).toEqual([order[0]]);
-  expect(await partial(f)).toEqual([{ parts_applied: 1, failed: 1 }]);
-  expect(
-    await reacquires(f, DEFAULT_STORAGE_ACCESS_POLICY.maxBytesInFlight),
-  ).toBe("granted");
 });
 
 it("commits no record of a head whose long record is missing a part, and finishes once the part is back", async () => {
