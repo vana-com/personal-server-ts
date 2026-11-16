@@ -68,6 +68,26 @@ export interface FakeGatewayOptions {
    * accepts 16 rows and 16 conditions.
    */
   readonly policy?: { rows: number; requires: number; bytes: number };
+  /**
+   * The registry's connection-log fence: a write that is not a tombstone, to a
+   * stream row of a connection whose log row exists, loses with a 409. So does
+   * one whose log row the same batch names, whatever becomes of that log row
+   * (it is no committed log write). Every write the registry would apply is
+   * fenced, an append and a refresh of a pending row alike; a replay and a
+   * sequence conflict are answered as before. The
+   * scope grammar below is the registry's own, written out here and not taken
+   * from the client's parser, so a drift between the two shows in a test.
+   */
+  readonly connectionLogFence?: boolean;
+}
+
+// `pdpp.<connector>~[<16 hex>].<stream>`, as the registry reads it.
+const STREAM_ROW_SCOPE = /^pdpp\.([^.~]+)~([0-9a-f]{16})?\.(.+)$/;
+/** The log row scope that fences a write to `scope`; null when none does. */
+function fencingLogScope(scope: string): string | null {
+  const match = STREAM_ROW_SCOPE.exec(scope);
+  if (!match || match[3] === "~log") return null;
+  return `pdpp.${match[1]}~${match[2] ?? ""}.~log`;
 }
 
 export function createFakeGateway(options: FakeGatewayOptions) {
@@ -143,6 +163,23 @@ export function createFakeGateway(options: FakeGatewayOptions) {
           metadataHash: head.metadataHash,
           ...(options.isTombstone(head) && { deletedAt: "2026-01-01" }),
         };
+      };
+      /**
+       * The log row that makes this write lose, when the fence is on: the log
+       * row exists, or the request names it (`named`), whatever the request
+       * makes of it.
+       */
+      const fencedBy = (
+        scope: string,
+        version: Version,
+        named: ReadonlySet<string>,
+      ): string | null => {
+        if (!options.connectionLogFence || options.isTombstone(version))
+          return null;
+        const log = fencingLogScope(scope);
+        return log !== null && (named.has(log) || versions.has(log))
+          ? log
+          : null;
       };
       const failure = (failed: FailedRequirement) => {
         const { scope, reason, expectedVersion } = failed;
@@ -230,6 +267,15 @@ export function createFakeGateway(options: FakeGatewayOptions) {
         if (Number(body.expectedVersion) !== rows.length + 1) {
           return json(409, { latestVersion: String(rows.length) });
         }
+        const log = fencedBy(body.scope, body, new Set());
+        if (log !== null) {
+          return json(409, {
+            success: false,
+            code: "connection-log-exists",
+            logScope: log,
+            latestVersion: String(rows.length),
+          });
+        }
         gateway.write(body.scope, {
           dataHash: body.dataHash,
           metadataHash: body.metadataHash,
@@ -268,6 +314,9 @@ export function createFakeGateway(options: FakeGatewayOptions) {
       }
       const bad = requirementFails(body.requires ?? []);
       if (bad) return json(409, failure(bad));
+      const requestScopes = new Set<string>(
+        body.rows.map((row: BatchRow) => row.scope),
+      );
       const results = body.rows.map((row: BatchRow) => {
         const rows = versions.get(row.scope) ?? [];
         const head = rows[rows.length - 1];
@@ -288,6 +337,21 @@ export function createFakeGateway(options: FakeGatewayOptions) {
             scope: row.scope,
             status: 201,
             version: row.expectedVersion,
+          };
+        }
+        // What the registry would apply (an append, or a refresh of the
+        // pending head) is judged by the connection-log fence first.
+        const applies =
+          !isReplay &&
+          (Number(row.expectedVersion) === rows.length + 1 ||
+            (options.refresh && Number(row.expectedVersion) === rows.length));
+        if (applies && fencedBy(row.scope, row, requestScopes) !== null) {
+          return {
+            scope: row.scope,
+            status: 409,
+            reason: "log-exists",
+            latestVersion: String(rows.length),
+            latestDataHash: null,
           };
         }
         const fence = row.expectedHeadDataHash;

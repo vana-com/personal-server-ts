@@ -33,12 +33,19 @@
 (* a per-stream commit loses while the log row exists (the gateway checks  *)
 (* it in the commit's transaction); the loser reads the registry again and *)
 (* follows the log. The model shows the gate is complete exactly with it.  *)
+(*                                                                         *)
+(* HeadCond = TRUE is the strongest client-only alternative: the first log *)
+(* write requires the heads it read to be unchanged. It is not enough:     *)
+(* it binds only the device that creates the log, and only a build that    *)
+(* sends it (see the README).                                              *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets
 
 CONSTANTS K1, K2, K3,   \* the kind of device 1, 2, 3
           GateOn,       \* TRUE: the proposed gate
           Fence,        \* TRUE: the registry refuses a head commit once the log row exists
+          HeadCond,     \* TRUE: a client-only closure: the first log write requires the
+                        \*       heads it read to be unchanged (positive conditions only)
           Writes        \* writes each device collects (1 or 2)
 
 Devs == 1..3
@@ -48,6 +55,7 @@ Id(d, k) == (d - 1) * Writes + k          \* the k-th write of device d
 Ids == 1..(3 * Writes)
 
 VARIABLES heads, late, log2, log1, logFmt,
+          seenHeads, \* the heads a device read before its commit
           view,      \* write ids a device shows
           pend,      \* the write a device holds, not yet published
           nextK,     \* writes a device has collected
@@ -55,7 +63,7 @@ VARIABLES heads, late, log2, log1, logFmt,
           stale,     \* the registry changed since the device last read it
           status     \* "ok", "update_required" or "error"
 
-vars == <<heads, late, log2, log1, logFmt, view, pend, nextK, seen, stale, status>>
+vars == <<heads, late, log2, log1, logFmt, seenHeads, view, pend, nextK, seen, stale, status>>
 
 Collected == UNION {{Id(d, k) : k \in 1..(nextK[d] - 1)} : d \in Devs}
 \* What a device that follows the log can show: the heads written before the
@@ -70,6 +78,7 @@ TypeOK ==
 
 Init ==
   /\ heads = {} /\ late = {} /\ log2 = {} /\ log1 = {} /\ logFmt = 0
+  /\ seenHeads = [d \in Devs |-> {}]
   /\ view = [d \in Devs |-> {}]
   /\ pend = [d \in Devs |-> {}]
   /\ nextK = [d \in Devs |-> 1]
@@ -82,7 +91,7 @@ Collect(d) ==
   /\ pend' = [pend EXCEPT ![d] = {Id(d, nextK[d])}]
   /\ view' = [view EXCEPT ![d] = @ \cup {Id(d, nextK[d])}]
   /\ nextK' = [nextK EXCEPT ![d] = @ + 1]
-  /\ UNCHANGED <<heads, late, log2, log1, logFmt, seen, stale, status>>
+  /\ UNCHANGED <<heads, late, log2, log1, logFmt, seenHeads, seen, stale, status>>
 
 \* Does this device read the log row's content?
 FollowsLog(d) ==
@@ -101,7 +110,7 @@ Read(d) ==
         ELSE IF logFmt = 1 /\ Kind[d] = "newOn" THEN "error"   \* today: the cycle throws
         ELSE "ok"]
   /\ stale' = [stale EXCEPT ![d] = FALSE]
-  /\ UNCHANGED <<heads, late, log2, log1, logFmt, pend, nextK, seen>>
+  /\ UNCHANGED <<heads, late, log2, log1, logFmt, seenHeads, pend, nextK, seen>>
 
 \* Writes go through the log when the device may start it or (gate) the row exists.
 WritesLog(d, fmt) ==
@@ -118,6 +127,7 @@ PubRead(d) ==
             /\ UNCHANGED seen
        ELSE /\ seen' = [seen EXCEPT ![d] = logFmt]
             /\ UNCHANGED status
+  /\ seenHeads' = [seenHeads EXCEPT ![d] = heads]
   /\ UNCHANGED <<heads, late, log2, log1, logFmt, view, pend, nextK, stale>>
 
 OthersStale(d) == [e \in Devs |-> IF e = d THEN stale[e] ELSE TRUE]
@@ -129,7 +139,11 @@ PubCommit(d) ==
   /\ LET fmt == seen[d] IN
      IF WritesLog(d, fmt)
      THEN LET mine == IF Kind[d] = "oldOn" THEN 1 ELSE 2 IN
-          IF logFmt \in {0, mine} /\ (mine = 1 \/ log2 \subseteq view[d])
+          IF /\ logFmt \in {0, mine} /\ (mine = 1 \/ log2 \subseteq view[d])
+             \* HeadCond: creating the log is conditional on the heads it read (a
+             \* head's version moved => the condition fails). Positive conditions
+             \* only: it cannot say "no head will be written after me".
+             /\ (~HeadCond \/ logFmt # 0 \/ heads = seenHeads[d])
           THEN /\ logFmt' = mine
                /\ log1' = IF mine = 1 THEN log1 \cup pend[d] ELSE log1
                /\ log2' = IF mine = 2 THEN log2 \cup pend[d] ELSE log2
@@ -149,7 +163,7 @@ PubCommit(d) ==
                /\ stale' = OthersStale(d)
                /\ UNCHANGED <<log2, log1, logFmt, status>>
   /\ seen' = [seen EXCEPT ![d] = -1]
-  /\ UNCHANGED <<view, nextK>>
+  /\ UNCHANGED <<view, nextK, seenHeads>>
 
 Next == \E d \in Devs : Collect(d) \/ Read(d) \/ PubRead(d) \/ PubCommit(d)
 

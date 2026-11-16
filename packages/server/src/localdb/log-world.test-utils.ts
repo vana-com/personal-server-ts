@@ -59,6 +59,7 @@ export async function world(options: {
   const hashes = await controlHashes(async (b) => keccak_256(b), keyCheck);
   const gateway = createFakeGateway({
     owner: OWNER,
+    connectionLogFence: true,
     isTombstone: (v) =>
       v.dataHash === hashes.tombstoneData &&
       v.metadataHash === hashes.tombstoneMetadata,
