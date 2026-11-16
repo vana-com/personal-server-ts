@@ -18,9 +18,12 @@
   },
   "files": [
     "dist",
-    "dist-test"
+    "dist-test",
+    "contracts"
   ],
   "exports": {
+    "./host-contract.json": "./contracts/host-contract.json",
+    "./replace-conformance.json": "./contracts/replace-conformance.json",
     "./config": {
       "types": "./dist/config/index.d.ts",
       "import": "./dist/config/index.js"

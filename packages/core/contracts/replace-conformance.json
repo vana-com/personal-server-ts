@@ -2,7 +2,7 @@
   "version": 1,
   "contract": "SPECS-r5.md H (lines 804-824); partial proven-stream ruling confirmed 2026-11-10",
   "sourceTableSha256": "497d62c3490cb197641bcf3488bafeaaabb5f31ac1edb8a1432c40c832a86fc2",
-  "proofPort": "provenFullStreams certifies this run's whole-stream success: completed, mutable state, nonempty snapshot, matching records, no time range, skipped delete, own error, or gap. The source proof field alone was not that certification. Oversize is not a skip in PS-2.",
+  "proofPort": "provenFullStreams certifies this run's whole-stream success: completed, mutable state, matching records, no time range, skipped delete, own error, or gap. The source proof field alone was not that certification. Oversize is not a skip in PS-2. An empty snapshot is certified when the coverage report counts no keys.",
   "retired560SurfaceDetail": "Case 5 keeps the published key set until CAS; legacy withheld metadata is retired by the PS-2 database read contract.",
   "cases": [
     {
@@ -386,9 +386,9 @@
         "outcome": "succeeded",
         "collectionMode": "full_refresh",
         "coveredStreams": ["items"],
-        "provenFullStreams": []
+        "provenFullStreams": ["items"]
       },
-      "replace": false
+      "replace": true
     },
     {
       "id": "2208-unproven-empty",
