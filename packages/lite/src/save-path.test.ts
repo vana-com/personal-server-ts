@@ -187,4 +187,16 @@ describe("the save path of a Web write", () => {
     expect(segmentPuts).toHaveLength(1);
     expect(commits).toHaveLength(1);
   });
+
+  it("resolves publish() when the registry commit answers, not after the cycle's reads", async () => {
+    const { server, collect, commits } = await savePathWorld();
+    await collect("run-1");
+    await server.publish();
+    const resolvedAt = Math.round(performance.now());
+    const committedAt = commits[0]!.at;
+    // The commit made the save durable. What follows it is the local
+    // bookkeeping of one SQLite batch, never another registry request
+    // (one is `WIRE_MS`).
+    expect(resolvedAt - committedAt).toBeLessThan(WIRE_MS / 2);
+  });
 });

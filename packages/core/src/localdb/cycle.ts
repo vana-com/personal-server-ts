@@ -47,10 +47,16 @@ export interface EarlyPublish {
  * `/sync/trigger` and `/sync/file/:id` (trigger = this; file =
  * `syncConnection` for the one connection, then read).
  */
-export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
-  const early = deps.logProtocol
-    ? await publishEarly(deps)
-    : new Map<string, EarlyPublish>();
+export async function runCycle(
+  deps: LocalSyncDeps,
+  /** What an early publish this call's caller already made (see `runPublish`). */
+  made?: Map<string, EarlyPublish>,
+): Promise<CycleReport> {
+  const early =
+    made ??
+    (deps.logProtocol
+      ? await publishEarly(deps)
+      : new Map<string, EarlyPublish>());
   const connections = await bootstrapConnections(deps);
   return {
     connections: await Promise.all(
@@ -59,6 +65,66 @@ export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
       ),
     ),
   };
+}
+
+/**
+ * What a caller that saved something awaits: the publication of what is
+ * pending, ending at the registry commit. It is the cycle's early publish
+ * alone. The cycle's listing and apply read the registry for what other
+ * devices wrote, and nothing the save wrote waits for them: a commit makes it
+ * durable. The sync manager's own cycle (the wake a run's rows raise, the
+ * timer) runs the rest.
+ *
+ * A pass the early publish cannot settle takes the whole cycle, with the early
+ * publish's results already in hand: a connection that has an error or any
+ * result but published or noop (a deferral, a backoff, a refusal), a fresh
+ * connection that deferred (another device made its row), and a connection
+ * the early publish does not take (deleted, foreign, or a reconnect), which
+ * only the cycle's listing and apply can place. A device without the log
+ * protocol runs the whole cycle: only the log's writer commits without
+ * reading the registry first.
+ */
+export async function runPublish(deps: LocalSyncDeps): Promise<CycleReport> {
+  if (!deps.logProtocol) return runCycle(deps);
+  const fresh = new Set(
+    (await newConnectionsWithStreams(deps)).map((c) => c.connectionId),
+  );
+  const early = await publishEarly(deps);
+  // A fresh connection has streams, so no result at all means its deferral was
+  // dropped (`publishEarly`); a known connection with no streams has none.
+  const settled = [...early].every(
+    ([connectionId, e]) =>
+      e.error === null &&
+      (e.published.length > 0 || !fresh.has(connectionId)) &&
+      e.published.every(
+        (r) => r.outcome === "published" || r.outcome === "noop",
+      ),
+  );
+  if (!settled || (await hasUnplacedConnections(deps)))
+    return runCycle(deps, early);
+  return {
+    connections: [...early].map(([connectionId, e]) => ({
+      connectionId,
+      applied: [],
+      published: e.published,
+      error: null,
+    })),
+  };
+}
+
+/**
+ * A connection with streams that the early publish takes neither as active nor
+ * as new: it waits for the cycle's listing.
+ */
+async function hasUnplacedConnections(deps: LocalSyncDeps): Promise<boolean> {
+  const rows = await deps.db.query(
+    `SELECT 1 FROM connections c
+      WHERE EXISTS (SELECT 1 FROM stream_state s WHERE s.connection_id = c.connection_id)
+        AND NOT (c.control_state = 'active'
+                 OR (c.control_state = 'absent' AND c.generation = 1))
+      LIMIT 1`,
+  );
+  return rows.length > 0;
 }
 
 /**

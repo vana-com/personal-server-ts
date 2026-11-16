@@ -16,7 +16,12 @@ import {
 import { applyConnection } from "./apply.js";
 import { bootstrapConnections } from "./bootstrap.js";
 import { createBlobStore, type BlobStore } from "./blobs.js";
-import { runCycle, syncConnection, type CycleReport } from "./cycle.js";
+import {
+  runCycle,
+  runPublish,
+  syncConnection,
+  type CycleReport,
+} from "./cycle.js";
 import { createConnectionDeleter, type ConnectionDeleter } from "./delete.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
@@ -57,6 +62,12 @@ export interface LocalSync {
   readonly blobs: BlobStore;
   /** `/sync/trigger` and the timer: C.4 order, apply then publish. */
   cycle(): Promise<CycleReport>;
+  /**
+   * A save's await: publish what is pending and return when the registry has
+   * committed it (`runPublish`). Apply and the registry listing run in the
+   * next `cycle()`, not here.
+   */
+  publish(): Promise<CycleReport>;
   /** Apply remote heads without publishing (download hook). */
   apply(): Promise<void>;
   /** `/sync/file/:id`: apply and publish that connection, then read. */
@@ -297,6 +308,10 @@ export function createLocalSync(
     async cycle() {
       await resume();
       return runCycle(deps);
+    },
+    async publish() {
+      await resume();
+      return runPublish(deps);
     },
     async apply() {
       await resume();
