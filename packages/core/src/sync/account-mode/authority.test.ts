@@ -582,6 +582,53 @@ describe("the account-mode record", () => {
       });
     });
 
+    it("settles and releases the lock for a backlog larger than a call can take as arguments", async () => {
+      // The bookkeeping must not spread the pending set into Math.max or
+      // Math.min: a backlog this size throws a RangeError there, and a throw
+      // before the release would hold the lock forever.
+      const BACKLOG = 150_000;
+      const memory = createMemoryModeRecordStore();
+      const entered = deferred();
+      const gate = deferred();
+      let gating = false;
+      const store: ModeRecordStore = {
+        load: () => memory.load(),
+        save: async (owner, record) => {
+          if (gating) {
+            gating = false;
+            entered.resolve();
+            await gate.promise;
+          }
+          await memory.save(owner, record);
+        },
+      };
+      const { authority } = await verifiedOff(store);
+      gating = true;
+      const submitted = [
+        authority.submitEvidence({ owner: OWNER, state: "off", generation: 3 }),
+      ];
+      await entered.promise;
+      for (let i = 0; i < BACKLOG; i += 1) {
+        submitted.push(
+          authority.submitEvidence({
+            owner: OWNER,
+            state: "off",
+            generation: 3,
+          }),
+        );
+      }
+      // A write asked for with the whole backlog pending.
+      const write = authority.commitLegacy(OWNER, () => "wrote");
+      gate.resolve();
+      await Promise.all(submitted);
+      // The write's cohort has settled; the backlog's last answer is current.
+      expect(await write).toEqual({ ok: true, value: "wrote" });
+      expect(await authority.commitLegacy(OWNER, () => "again")).toEqual({
+        ok: true,
+        value: "again",
+      });
+    }, 60_000);
+
     it("takes back a live permission for an answer older than the record: Off 2, then a stale On 1 or a stale Off 1", async () => {
       for (const state of ["on", "off"] as const) {
         const { authority } = await verifiedOff();

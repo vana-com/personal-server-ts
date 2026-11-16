@@ -204,7 +204,9 @@ export function createModeAuthority(
     if (!pending || pending.size === 0) return Promise.resolve();
     return new Promise((resolve) => {
       const waiters = cohortWaiters.get(key) ?? [];
-      waiters.push({ through: Math.max(...pending), resolve });
+      // Tickets are issued in order, so the latest one for this owner is at
+      // or above every pending answer's.
+      waiters.push({ through: latest.get(key) ?? 0, resolve });
       cohortWaiters.set(key, waiters);
     });
   }
@@ -212,8 +214,9 @@ export function createModeAuthority(
   function settle(key: string, ticket: number): void {
     const pending = unsettled.get(key);
     pending?.delete(ticket);
-    const oldest =
-      pending && pending.size > 0 ? Math.min(...pending) : Infinity;
+    // Tickets are added in increasing order and a Set keeps insertion order,
+    // so the first one is the oldest. No spread: the set is unbounded.
+    const oldest = pending?.values().next().value ?? Infinity;
     if (pending?.size === 0) unsettled.delete(key);
     const waiters = cohortWaiters.get(key) ?? [];
     const waiting = waiters.filter((w) => w.through >= oldest);
@@ -272,10 +275,14 @@ export function createModeAuthority(
           eligible =
             latest.get(owner) === ticket && generation >= next.generation;
         } finally {
-          if (eligible) verified.add(owner);
-          else verified.delete(owner);
-          settle(owner, ticket);
-          release?.();
+          // The release comes last, whatever the bookkeeping does.
+          try {
+            if (eligible) verified.add(owner);
+            else verified.delete(owner);
+            settle(owner, ticket);
+          } finally {
+            release?.();
+          }
         }
       } else {
         await ready;
