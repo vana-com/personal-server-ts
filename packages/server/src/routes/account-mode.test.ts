@@ -144,10 +144,28 @@ describe("POST /v1/account-mode/evidence", () => {
       status: 503,
     });
     expect((await legacyWrite()).status).toBe(503);
+  });
+
+  // UNKNOWN_AS_OFF: a failed read after an Off is not an Off.
+  it("pauses legacy writes at a failed read after an Off, and resumes at the next verified answer", async () => {
     await post(evidence("off"));
-    expect((await (await post(evidence("unknown"))).json()).decision).toBe(
-      "legacy",
+    expect((await legacyWrite()).status).toBe(201);
+    const failed = await post(evidence("unknown"));
+    expect(failed.status).toBe(503);
+    expect(failed.headers.get("retry-after")).toBe("5");
+    expect(await failed.json()).toEqual({
+      decision: "refuse",
+      code: "ACCOUNT_MODE_UNKNOWN",
+      status: 503,
+    });
+    // The same answer from a host that sends what it saw instead of a state.
+    expect((await post({ owner: owner.address, rawStatus: 502 })).status).toBe(
+      503,
     );
+    expect((await legacyWrite()).status).toBe(503);
+    const resumed = await post(evidence("off"));
+    expect(await resumed.json()).toEqual({ decision: "legacy" });
+    expect((await legacyWrite()).status).toBe(201);
   });
 
   it("accepts and ignores the fetchStartedAt and rawStatus fields older hosts send", async () => {
@@ -155,6 +173,29 @@ describe("POST /v1/account-mode/evidence", () => {
       evidence("off", { fetchStartedAt: Date.now(), rawStatus: 200 }),
     );
     expect(await res.json()).toEqual({ decision: "legacy" });
+  });
+
+  it("reads what a host saw when the body names no state", async () => {
+    const seen = (extra: Record<string, unknown>) => ({
+      owner: owner.address,
+      fetchStartedAt: Date.now(),
+      ...extra,
+    });
+    // No response, a 5xx and the Account's own failure body (no generation)
+    // are unknown: nothing is stored.
+    for (const failed of [
+      { rawStatus: null },
+      { rawStatus: 502, streamSync: false, generation: 1 },
+      { rawStatus: 200, streamSync: false },
+    ]) {
+      expect((await post(seen(failed))).status).toBe(503);
+    }
+    expect((await legacyWrite()).status).toBe(503);
+    const res = await post(
+      seen({ rawStatus: 200, streamSync: true, generation: 4 }),
+    );
+    expect(await res.json()).toEqual({ decision: "streams" });
+    expect((await legacyWrite()).status).toBe(426);
   });
 
   it("keeps an Off with no expiry", async () => {

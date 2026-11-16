@@ -65,9 +65,7 @@ const declaration = {
   ],
 };
 const connectionId = "pdpp.fixture~";
-const config = ServerConfigSchema.parse({
-  streamSync: { write: false, read: false },
-});
+const config = ServerConfigSchema.parse({});
 const request = (observedAt: number) => ({
   connector: "fixture",
   artifactDigest: "fixture",

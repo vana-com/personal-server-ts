@@ -107,7 +107,6 @@ async function world() {
       tunnel: { enabled: false },
       sync: { enabled: true },
       logging: { level: "fatal", pretty: false },
-      streamSync: { write: true },
       pdpp: {
         enabled: true,
         declarationPaths: [join(root, "declaration.json")],

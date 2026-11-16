@@ -258,3 +258,96 @@ describe("verdict", () => {
     expect(seal.verdict()).toBe("switched");
   });
 });
+
+describe("a failed read of the Account after an Off", () => {
+  // UNKNOWN_AS_OFF: the seal, the early refusal and the workers' verdict
+  // answer from one place, so none of them keeps writing on the old Off.
+  it("is a retryable 503 at commit, admit and verdict, until the next verified answer", async () => {
+    const { authority, seal } = await sealOver("off");
+    await authority.submitEvidence({ owner: OWNER, state: "unknown" });
+    let ran = 0;
+    const refused = await seal
+      .commit(() => {
+        ran += 1;
+      })
+      .catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(LegacyWriteRefusedError);
+    expect((refused as LegacyWriteRefusedError).verdict).toBe("unknown");
+    expect(ran).toBe(0);
+    expect(seal.admit()?.status).toBe(503);
+    expect(seal.verdict()).toBe("unknown");
+    // A removal is admitted in every mode.
+    expect(await seal.remove(() => "removed")).toBe("removed");
+
+    await authority.submitEvidence(evidence("off"));
+    expect(seal.admit()).toBeNull();
+    expect(seal.verdict()).toBe("allow");
+    expect(await seal.commit(() => "stored")).toBe("stored");
+  });
+
+  it("refuses at commit, admit and verdict after an On whose save failed, until a later answer applies", async () => {
+    const memory = createMemoryModeRecordStore();
+    let failSaves = false;
+    const authority = createModeAuthority({
+      store: {
+        load: () => memory.load(),
+        save: async (owner, record) => {
+          if (failSaves) throw new Error("disk full");
+          await memory.save(owner, record);
+        },
+      },
+    });
+    await authority.ready;
+    const seal = createLegacyWriteSeal({ authority, owner: OWNER });
+    await authority.submitEvidence({ ...evidence("off"), generation: 2 });
+    expect(seal.admit()).toBeNull();
+    failSaves = true;
+    await expect(
+      authority.submitEvidence({ ...evidence("on"), generation: 2 }),
+    ).rejects.toThrow("disk full");
+    let ran = 0;
+    const refused = await seal
+      .commit(() => {
+        ran += 1;
+      })
+      .catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(LegacyWriteRefusedError);
+    expect((refused as LegacyWriteRefusedError).verdict).toBe("unknown");
+    expect(ran).toBe(0);
+    expect(seal.admit()?.status).toBe(503);
+    expect(seal.verdict()).toBe("unknown");
+    failSaves = false;
+    await authority.submitEvidence({ ...evidence("on"), generation: 2 });
+    expect(seal.verdict()).toBe("switched");
+  });
+
+  it("refuses at admit and verdict from the moment an On arrives, before its save has finished", async () => {
+    const memory = createMemoryModeRecordStore();
+    const saveGate = gate();
+    const saveEntered = gate();
+    const authority = createModeAuthority({
+      store: {
+        load: () => memory.load(),
+        save: async (owner, record) => {
+          if (record.answer === "on") {
+            saveEntered.open();
+            await saveGate.opened;
+          }
+          await memory.save(owner, record);
+        },
+      },
+    });
+    await authority.ready;
+    const seal = createLegacyWriteSeal({ authority, owner: OWNER });
+    await authority.submitEvidence({ ...evidence("off"), generation: 2 });
+    expect(seal.verdict()).toBe("allow");
+    const on = authority.submitEvidence({ ...evidence("on"), generation: 2 });
+    // No await since the On was submitted: it has arrived, nothing is applied.
+    expect(seal.admit()?.status).toBe(503);
+    expect(seal.verdict()).toBe("unknown");
+    await saveEntered.opened;
+    saveGate.open();
+    await on;
+    expect(seal.verdict()).toBe("switched");
+  });
+});

@@ -52,13 +52,10 @@ export const DEFAULTS = {
     lastProcessedTimestamp: null,
   },
   streamSync: {
-    // Whole-file stream sync publish. Off by default; legacy uploads are
-    // unchanged either way.
-    write: false,
-    // Off by default. When true, this server imports stream-sync heads and
-    // serves logical reads from complete stream views (§2.10). When false,
-    // reads are exactly as before.
-    read: false,
+    // There is no write or read key: whether this server writes and reads
+    // through stream sync is the account-mode authority's answer (see
+    // `sync/account-mode`), not a setting. A saved config that still names
+    // either key parses and the key is dropped.
     // Off by default. When true, the old legacy files, a one-time seed, are
     // removed after this server's own import of them finishes, for a switched
     // owner. When false the same step only reads them back and reports.
@@ -257,8 +254,6 @@ export const ServerConfigSchema = z.object({
     .default(DEFAULTS.sync),
   streamSync: z
     .object({
-      write: z.boolean().default(DEFAULTS.streamSync.write),
-      read: z.boolean().default(DEFAULTS.streamSync.read),
       retireLegacy: z.boolean().default(DEFAULTS.streamSync.retireLegacy),
       changeProbeMs: z
         .number()

@@ -66,6 +66,7 @@ export function fixedModeAuthority(
     ready: Promise.resolve(),
     submitEvidence: async () => decision,
     read: () => decision,
+    legacyWriteDecision: () => decision,
     commitLegacy: async (_owner, write) =>
       decision.kind === "legacy"
         ? { ok: true as const, value: await write() }

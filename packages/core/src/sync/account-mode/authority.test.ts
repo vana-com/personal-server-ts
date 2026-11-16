@@ -27,7 +27,7 @@ async function authorityWith(store = createMemoryModeRecordStore()) {
 }
 
 describe("the account-mode record", () => {
-  it("is unknown before the first answer: reads stay legacy, legacy writes pause", async () => {
+  it("is unknown before the first answer: reads and legacy writes pause", async () => {
     const { authority } = await authorityWith();
     expect(authority.read(OWNER)).toMatchObject({
       kind: "refuse",
@@ -46,16 +46,495 @@ describe("the account-mode record", () => {
     expect(authority.read(OWNER).kind).toBe("refuse");
   });
 
-  it("takes Off then lets legacy writes run, and is never unknown again", async () => {
+  it("takes Off then lets legacy writes run", async () => {
     const { authority } = await authorityWith();
     await authority.submitEvidence({ owner: OWNER, state: "off" });
     expect(authority.read(OWNER)).toEqual({ kind: "legacy" });
+    expect(authority.legacyWriteDecision(OWNER)).toEqual({ kind: "legacy" });
     expect(await authority.commitLegacy(OWNER, () => 7)).toEqual({
       ok: true,
       value: 7,
     });
-    await authority.submitEvidence({ owner: OWNER, state: "unknown" });
-    expect(authority.read(OWNER)).toEqual({ kind: "legacy" });
+  });
+
+  describe("a failed read of the Account after an Off", () => {
+    const UNKNOWN = {
+      kind: "refuse",
+      code: "ACCOUNT_MODE_UNKNOWN",
+      status: 503,
+    };
+
+    it("pauses legacy writes, keeps reads on the record, and keeps the record", async () => {
+      const { authority, store } = await authorityWith();
+      await authority.submitEvidence({
+        owner: OWNER,
+        state: "off",
+        generation: 2,
+      });
+      const answered = await authority.submitEvidence({
+        owner: OWNER,
+        state: "unknown",
+      });
+      expect(answered).toEqual(UNKNOWN);
+      expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+      let ran = false;
+      expect(
+        await authority.commitLegacy(OWNER, () => {
+          ran = true;
+        }),
+      ).toEqual({ ok: false, decision: UNKNOWN });
+      expect(ran).toBe(false);
+      // Reads are not writes: the person's data stays readable while the
+      // Account cannot be reached.
+      expect(authority.read(OWNER)).toEqual({ kind: "legacy" });
+      // The record, with its generation, is history the failed read cannot erase.
+      expect(store.saved.get("0xabc")).toMatchObject({
+        answer: "off",
+        generation: 2,
+      });
+    });
+
+    it("ends at the next verified answer at the record's generation or higher", async () => {
+      const { authority } = await authorityWith();
+      await authority.submitEvidence({
+        owner: OWNER,
+        state: "off",
+        generation: 2,
+      });
+      await authority.submitEvidence({ owner: OWNER, state: "unknown" });
+      expect(
+        await authority.submitEvidence({
+          owner: OWNER,
+          state: "off",
+          generation: 2,
+        }),
+      ).toEqual({ kind: "legacy" });
+      expect(await authority.commitLegacy(OWNER, () => 5)).toEqual({
+        ok: true,
+        value: 5,
+      });
+    });
+
+    it("lets an On through: a failed read never lowers a switched account", async () => {
+      const { authority } = await authorityWith();
+      await authority.submitEvidence({ owner: OWNER, state: "off" });
+      await authority.submitEvidence({ owner: OWNER, state: "unknown" });
+      expect(
+        await authority.submitEvidence({ owner: OWNER, state: "on" }),
+      ).toEqual({ kind: "streams" });
+      await authority.submitEvidence({ owner: OWNER, state: "unknown" });
+      expect(authority.legacyWriteDecision(OWNER)).toEqual({
+        kind: "streams",
+      });
+      expect(await authority.commitLegacy(OWNER, () => 1)).toMatchObject({
+        ok: false,
+        decision: { code: "LEGACY_REFUSED_SWITCHED", status: 426 },
+      });
+    });
+
+    it("pauses only the owner whose read failed", async () => {
+      const { authority } = await authorityWith();
+      await authority.submitEvidence({ owner: OWNER, state: "off" });
+      await authority.submitEvidence({ owner: "0xOther", state: "off" });
+      await authority.submitEvidence({ owner: OWNER, state: "unknown" });
+      expect(authority.legacyWriteDecision("0xother")).toEqual({
+        kind: "legacy",
+      });
+    });
+
+    it("does not stop a legacy write that started before the failed read", async () => {
+      const { authority } = await authorityWith();
+      await authority.submitEvidence({ owner: OWNER, state: "off" });
+      const gate = deferred();
+      const started = deferred();
+      const inFlight = authority.commitLegacy(OWNER, async () => {
+        started.resolve();
+        await gate.promise;
+        return "done";
+      });
+      await started.promise;
+      await authority.submitEvidence({ owner: OWNER, state: "unknown" });
+      gate.resolve();
+      expect(await inFlight).toEqual({ ok: true, value: "done" });
+    });
+
+    it("refuses legacy writes in a restarted process until it has its own verified answer", async () => {
+      const store = createMemoryModeRecordStore();
+      const first = createModeAuthority({ store });
+      await first.submitEvidence({ owner: OWNER, state: "off" });
+      await first.submitEvidence({ owner: OWNER, state: "unknown" });
+      // Each restart starts with no verified answer, however often it repeats.
+      for (let restart = 0; restart < 2; restart += 1) {
+        const restarted = createModeAuthority({ store });
+        await restarted.ready;
+        // The saved Off still serves reads; it cannot authorize a write.
+        expect(restarted.read(OWNER)).toEqual({ kind: "legacy" });
+        expect(restarted.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+        let ran = false;
+        expect(
+          await restarted.commitLegacy(OWNER, () => {
+            ran = true;
+          }),
+        ).toEqual({ ok: false, decision: UNKNOWN });
+        expect(ran).toBe(false);
+      }
+      const third = createModeAuthority({ store });
+      await third.ready;
+      await third.submitEvidence({ owner: OWNER, state: "off" });
+      expect(await third.commitLegacy(OWNER, () => 3)).toEqual({
+        ok: true,
+        value: 3,
+      });
+    });
+
+    it("keeps a saved On refusing writes and serving streams after a restart", async () => {
+      const store = createMemoryModeRecordStore();
+      const first = createModeAuthority({ store });
+      await first.submitEvidence({ owner: OWNER, state: "on" });
+      const restarted = createModeAuthority({ store });
+      await restarted.ready;
+      expect(restarted.read(OWNER)).toEqual({ kind: "streams" });
+      expect(await restarted.commitLegacy(OWNER, () => 1)).toMatchObject({
+        ok: false,
+        decision: { code: "LEGACY_REFUSED_SWITCHED", status: 426 },
+      });
+    });
+
+    it("is not reopened by a verified answer that was already in flight when a failed read arrived", async () => {
+      // An Off at a higher generation waits on its save; a failed read is
+      // submitted and finishes meanwhile; the save then completes.
+      const memory = createMemoryModeRecordStore();
+      const saveGate = deferred();
+      const saveEntered = deferred();
+      let gateSaves = false;
+      const store: ModeRecordStore = {
+        load: () => memory.load(),
+        save: async (owner, record) => {
+          if (gateSaves) {
+            saveEntered.resolve();
+            await saveGate.promise;
+          }
+          await memory.save(owner, record);
+        },
+      };
+      const { authority } = await authorityWith(store);
+      await authority.submitEvidence({
+        owner: OWNER,
+        state: "off",
+        generation: 0,
+      });
+      gateSaves = true;
+      const slowOff = authority.submitEvidence({
+        owner: OWNER,
+        state: "off",
+        generation: 1,
+      });
+      // The real save has been entered: the answer is in flight.
+      await saveEntered.promise;
+      expect(
+        await authority.submitEvidence({ owner: OWNER, state: "unknown" }),
+      ).toEqual(UNKNOWN);
+      saveGate.resolve();
+      // The slow answer was asked before the failed read, so it cannot say the
+      // Account is readable now.
+      expect(await slowOff).toEqual(UNKNOWN);
+      expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+      expect(await authority.commitLegacy(OWNER, () => 1)).toEqual({
+        ok: false,
+        decision: UNKNOWN,
+      });
+      await authority.submitEvidence({
+        owner: OWNER,
+        state: "off",
+        generation: 1,
+      });
+      expect(await authority.commitLegacy(OWNER, () => 2)).toEqual({
+        ok: true,
+        value: 2,
+      });
+    });
+
+    it("refuses legacy writes after an On whose save failed, until a later answer applies", async () => {
+      // Off at generation 2 is verified in this process; the On that follows
+      // cannot be saved. The latest evidence says switched, so the older Off
+      // must not keep authorizing writes.
+      const memory = createMemoryModeRecordStore();
+      let failSaves = false;
+      const store: ModeRecordStore = {
+        load: () => memory.load(),
+        save: async (owner, record) => {
+          if (failSaves) throw new Error("disk full");
+          await memory.save(owner, record);
+        },
+      };
+      const { authority } = await authorityWith(store);
+      await authority.submitEvidence({
+        owner: OWNER,
+        state: "off",
+        generation: 2,
+      });
+      expect(await authority.commitLegacy(OWNER, () => 1)).toEqual({
+        ok: true,
+        value: 1,
+      });
+      failSaves = true;
+      await expect(
+        authority.submitEvidence({ owner: OWNER, state: "on", generation: 2 }),
+      ).rejects.toThrow("disk full");
+      expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+      let ran = false;
+      expect(
+        await authority.commitLegacy(OWNER, () => {
+          ran = true;
+        }),
+      ).toEqual({ ok: false, decision: UNKNOWN });
+      expect(ran).toBe(false);
+      // Reads still follow the record that was saved.
+      expect(authority.read(OWNER)).toEqual({ kind: "legacy" });
+      failSaves = false;
+      // A later answer that applies ends it: here the On lands.
+      expect(
+        await authority.submitEvidence({
+          owner: OWNER,
+          state: "on",
+          generation: 2,
+        }),
+      ).toEqual({ kind: "streams" });
+      expect(await authority.commitLegacy(OWNER, () => 2)).toMatchObject({
+        ok: false,
+        decision: { code: "LEGACY_REFUSED_SWITCHED", status: 426 },
+      });
+    });
+
+    it("keeps the pause through an older generation: Off 2, unknown, then a verified answer at 1", async () => {
+      const { authority } = await authorityWith();
+      await authority.submitEvidence({
+        owner: OWNER,
+        state: "off",
+        generation: 2,
+      });
+      await authority.submitEvidence({ owner: OWNER, state: "unknown" });
+      for (const state of ["off", "on"] as const) {
+        expect(
+          await authority.submitEvidence({
+            owner: OWNER,
+            state,
+            generation: 1,
+          }),
+        ).toEqual(UNKNOWN);
+        expect(await authority.commitLegacy(OWNER, () => 1)).toEqual({
+          ok: false,
+          decision: UNKNOWN,
+        });
+      }
+      await authority.submitEvidence({
+        owner: OWNER,
+        state: "off",
+        generation: 2,
+      });
+      expect(await authority.commitLegacy(OWNER, () => 3)).toEqual({
+        ok: true,
+        value: 3,
+      });
+    });
+
+    it("does not reopen on an answer older than the record: a stale Off or a stale On", async () => {
+      const store = createMemoryModeRecordStore([
+        ["0xabc", { answer: "off", generation: 2, receivedAt: 1 }],
+      ]);
+      const { authority } = await authorityWith(store);
+      // Nothing verified in this process yet, and an older answer is not one.
+      for (const state of ["off", "on"] as const) {
+        expect(
+          await authority.submitEvidence({
+            owner: OWNER,
+            state,
+            generation: 1,
+          }),
+        ).toEqual(UNKNOWN);
+        expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+        expect(authority.read(OWNER)).toEqual({ kind: "legacy" });
+      }
+      expect(
+        await authority.submitEvidence({
+          owner: OWNER,
+          state: "off",
+          generation: 2,
+        }),
+      ).toEqual({ kind: "legacy" });
+    });
+  });
+
+  describe("evidence that has arrived but is not applied yet", () => {
+    const UNKNOWN = {
+      kind: "refuse",
+      code: "ACCOUNT_MODE_UNKNOWN",
+      status: 503,
+    };
+
+    async function verifiedOff(store?: ModeRecordStore) {
+      const made = await authorityWith(store);
+      await made.authority.submitEvidence({
+        owner: OWNER,
+        state: "off",
+        generation: 2,
+      });
+      return made;
+    }
+
+    it("fences a legacy write that was asked for before the On arrived and has not started", async () => {
+      const memory = createMemoryModeRecordStore();
+      let failSaves = false;
+      const store: ModeRecordStore = {
+        load: () => memory.load(),
+        save: async (owner, record) => {
+          if (failSaves) throw new Error("disk full");
+          await memory.save(owner, record);
+        },
+      };
+      const { authority } = await verifiedOff(store);
+      failSaves = true;
+      let ran = false;
+      // Both calls are made before either has awaited anything: the write is
+      // asked for first and has not started, then the On arrives.
+      const write = authority.commitLegacy(OWNER, () => {
+        ran = true;
+      });
+      const on = authority.submitEvidence({
+        owner: OWNER,
+        state: "on",
+        generation: 2,
+      });
+      // The early checks refuse as soon as the answer has arrived.
+      expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+      const settled = await Promise.allSettled([write, on]);
+      expect(ran).toBe(false);
+      expect(settled[0]).toEqual({
+        status: "fulfilled",
+        value: { ok: false, decision: UNKNOWN },
+      });
+      expect(settled[1].status).toBe("rejected");
+    });
+
+    it("fences a legacy write asked for after the On arrived, and refuses it as switched once the On applies", async () => {
+      const memory = createMemoryModeRecordStore();
+      const saveGate = deferred();
+      const saveEntered = deferred();
+      const store: ModeRecordStore = {
+        load: () => memory.load(),
+        save: async (owner, record) => {
+          if (record.answer === "on") {
+            saveEntered.resolve();
+            await saveGate.promise;
+          }
+          await memory.save(owner, record);
+        },
+      };
+      const { authority } = await verifiedOff(store);
+      const on = authority.submitEvidence({
+        owner: OWNER,
+        state: "on",
+        generation: 2,
+      });
+      await saveEntered.promise;
+      expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+      let ran = false;
+      const write = authority.commitLegacy(OWNER, () => {
+        ran = true;
+      });
+      saveGate.resolve();
+      expect(await on).toEqual({ kind: "streams" });
+      expect(await write).toMatchObject({
+        ok: false,
+        decision: { code: "LEGACY_REFUSED_SWITCHED", status: 426 },
+      });
+      expect(ran).toBe(false);
+    });
+
+    it("lets a write that had already started drain, and the On waits for it", async () => {
+      const { authority } = await verifiedOff();
+      const entered = deferred();
+      const finish = deferred();
+      const write = authority.commitLegacy(OWNER, async () => {
+        entered.resolve();
+        await finish.promise;
+        return "wrote";
+      });
+      await entered.promise;
+      const on = authority.submitEvidence({
+        owner: OWNER,
+        state: "on",
+        generation: 2,
+      });
+      expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+      expect(authority.read(OWNER)).toEqual({ kind: "legacy" });
+      finish.resolve();
+      expect(await write).toEqual({ ok: true, value: "wrote" });
+      expect(await on).toEqual({ kind: "streams" });
+    });
+
+    it("does not refuse a write that waits for an answer that applies and is current: an Off poll", async () => {
+      const memory = createMemoryModeRecordStore();
+      const saveGate = deferred();
+      const saveEntered = deferred();
+      let gateSaves = false;
+      const store: ModeRecordStore = {
+        load: () => memory.load(),
+        save: async (owner, record) => {
+          if (gateSaves) {
+            saveEntered.resolve();
+            await saveGate.promise;
+          }
+          await memory.save(owner, record);
+        },
+      };
+      const { authority } = await verifiedOff(store);
+      gateSaves = true;
+      // A newer generation of Off: it has to be saved, so it is in flight.
+      const poll = authority.submitEvidence({
+        owner: OWNER,
+        state: "off",
+        generation: 3,
+      });
+      await saveEntered.promise;
+      const write = authority.commitLegacy(OWNER, () => "wrote");
+      saveGate.resolve();
+      expect(await poll).toEqual({ kind: "legacy" });
+      expect(await write).toEqual({ ok: true, value: "wrote" });
+    });
+
+    it("takes back a live permission for an answer older than the record: Off 2, then a stale On 1 or a stale Off 1", async () => {
+      for (const state of ["on", "off"] as const) {
+        const { authority } = await verifiedOff();
+        expect(
+          await authority.submitEvidence({
+            owner: OWNER,
+            state,
+            generation: 1,
+          }),
+        ).toEqual(UNKNOWN);
+        expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+        let ran = false;
+        expect(
+          await authority.commitLegacy(OWNER, () => {
+            ran = true;
+          }),
+        ).toEqual({ ok: false, decision: UNKNOWN });
+        expect(ran).toBe(false);
+        // The saved record is unchanged and reads still follow it.
+        expect(authority.read(OWNER)).toEqual({ kind: "legacy" });
+        // A later current answer ends the pause.
+        await authority.submitEvidence({
+          owner: OWNER,
+          state: "off",
+          generation: 2,
+        });
+        expect(await authority.commitLegacy(OWNER, () => 1)).toEqual({
+          ok: true,
+          value: 1,
+        });
+      }
+    });
   });
 
   it("latches On: a later Off at the same generation is ignored, and legacy writes get 426", async () => {
@@ -212,13 +691,16 @@ describe("the commit fence", () => {
     const { authority } = await authorityWith();
     await authority.submitEvidence({ owner: OWNER, state: "off" });
     const gate = deferred();
+    const entered = deferred();
     const events: string[] = [];
     const inFlight = authority.commitLegacy(OWNER, async () => {
       events.push("write-start");
+      entered.resolve();
       await gate.promise;
       events.push("write-end");
     });
-    await Promise.resolve();
+    // The write has started: this is the one the On must wait for.
+    await entered.promise;
     const latch = authority
       .submitEvidence({ owner: OWNER, state: "on" })
       .then(() => events.push("on"));

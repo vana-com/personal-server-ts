@@ -9,6 +9,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createMemoryModeRecordStore } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import type { ServerContext } from "../bootstrap.js";
 import { initializeDatabase } from "../storage/index-schema.js";
 import {
@@ -316,30 +317,52 @@ describe("legacy-migration-no-old-writer", () => {
   it("a legacy write in flight finishes before the switch lands, and none starts after it", async () => {
     const { root, declared } = await world();
     writeLegacyStore(root);
-    const { context } = await start(root, declared, { retireLegacy: true });
+    // An in-memory record store: the On's whole path is then microtasks only,
+    // so draining them below lets it go as far as the seal allows.
+    const { context } = await start(root, declared, {
+      retireLegacy: true,
+      accountModeStore: createMemoryModeRecordStore(),
+    });
     const owner = context.serverOwner!;
     await context.accountModeAuthority.submitEvidence({ owner, state: "off" });
 
-    // A legacy write is under way when the Account answers On.
+    // A legacy write is under way when the Account answers On: the answer is
+    // submitted only after the write's callback has been entered. (A write
+    // that was asked for but has not started when the answer arrives is
+    // refused instead; the authority tests cover that.)
     let release!: () => void;
     let finishedWrite = false;
+    const order: string[] = [];
+    let entered!: () => void;
+    const writeEntered = new Promise<void>((resolve) => (entered = resolve));
     const inFlight = context.legacyWriteSeal.commit(
       () =>
         new Promise<void>((resolve) => {
           release = () => {
             finishedWrite = true;
+            order.push("write-ended");
             resolve();
           };
+          entered();
         }),
     );
+    await writeEntered;
     const watch = watchRun(context);
     const answered = context.accountModeAuthority.submitEvidence({
       owner,
       state: "on",
     });
     let landed = false;
-    void answered.then(() => (landed = true));
-    await sleep(200);
+    void answered.then(() => {
+      landed = true;
+      order.push("switch-landed");
+    });
+    // The On has reached its request for the exclusive lock: its own wait on
+    // `ready` is queued before this one on the same promise, and it asks for
+    // the lock in the step after it. Then run every microtask to completion:
+    // the On has gone as far as it can, and only the write's hold stops it.
+    await context.accountModeAuthority.ready;
+    await new Promise((resolve) => setImmediate(resolve));
     expect(landed).toBe(false);
     expect(watch.lines.filter((l) => /legacy/i.test(l.message))).toEqual([]);
 
@@ -347,6 +370,8 @@ describe("legacy-migration-no-old-writer", () => {
     await inFlight;
     await answered;
     expect(finishedWrite).toBe(true);
+    // The write ended first, and only then did the switch land.
+    expect(order).toEqual(["write-ended", "switch-landed"]);
 
     // No old writer starts while the import runs, or after it.
     let ran = 0;

@@ -74,7 +74,7 @@ export interface LegacyWriteSeal {
 
 export type SealAuthority = Pick<
   ModeAuthority,
-  "read" | "commitLegacy" | "commitRemoval"
+  "legacyWriteDecision" | "commitLegacy" | "commitRemoval"
 >;
 
 export interface LegacyWriteSealInput {
@@ -106,7 +106,7 @@ export function createLegacyWriteSeal(
     },
     remove: (work) => input.authority.commitRemoval(work),
     admit() {
-      switch (verdictOf(input.authority.read(owner))) {
+      switch (verdictOf(input.authority.legacyWriteDecision(owner))) {
         case "allow":
           return null;
         case "switched":
@@ -116,12 +116,15 @@ export function createLegacyWriteSeal(
       }
     },
     verdict() {
-      return verdictOf(input.authority.read(owner));
+      return verdictOf(input.authority.legacyWriteDecision(owner));
     },
   };
 }
 
-/** Off allows; On is 426; no answer yet is the retryable 503. */
+/**
+ * Off allows; On is 426; no answer yet, or an Off whose latest read of the
+ * Account failed, is the retryable 503.
+ */
 function verdictOf(decision: ModeDecision): "allow" | LegacyWriteVerdict {
   if (decision.kind === "legacy") return "allow";
   if (decision.kind === "streams") return "switched";

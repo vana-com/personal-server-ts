@@ -60,7 +60,6 @@ async function bootWriter(options?: {
       tunnel: { enabled: false },
       sync: { enabled: true },
       logging: { level: "warn", pretty: false },
-      streamSync: { write: true },
     }),
     {
       serverDir: tempDir,

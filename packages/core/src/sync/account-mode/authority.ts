@@ -3,8 +3,38 @@
  * write seals share with the On latch.
  *
  * - `read` is synchronous and never waits: before the first answer it is
- *   `unknown` (reads stay legacy, legacy writes pause), after it `streams` or
- *   `legacy`.
+ *   `unknown` (reads and legacy writes pause), after it `streams` or `legacy`.
+ *   It follows the saved record only, so the person's data stays readable
+ *   while the Account cannot be reached.
+ * - `legacyWriteDecision` is what a legacy write gets. It is `read`, except
+ *   that an Off authorizes a write only after a verified answer obtained in
+ *   this process, and only while that answer is still the latest evidence.
+ *   A saved Off is history, not permission: a restart starts with none, and a
+ *   failed read (the host posts `unknown`) takes it away. Either way legacy
+ *   writes get a retryable 503 until the next verified, current answer (its
+ *   generation not below the record's), and nothing is erased: the record, its
+ *   generation and an On stay as they were. A device that kept writing on a
+ *   remembered Off could not tell that another device had switched the
+ *   Account.
+ * - Evidence is numbered per owner when it arrives, before any await. A
+ *   verified answer takes effect only if no later evidence was submitted, so a
+ *   slow save cannot undo a failed read that finished first.
+ * - An answer that has arrived and is not applied yet suspends the permission
+ *   from its arrival: `legacyWriteDecision` is `unknown` for that owner, and a
+ *   `commitLegacy` that has not started waits for the answer to settle, then
+ *   judges again. So no write starts on a permission that an arrived answer
+ *   may contradict, and an Off poll that applies unchanged only delays a
+ *   write. Only a write already running keeps its hold; the On waits for it.
+ *   When the answer settles, the permission is back only if the answer was
+ *   applied, is the latest, and is current (its generation is not below the
+ *   record's). An answer that fails to apply, or is older than the record,
+ *   leaves the owner without permission until a later current answer. This
+ *   is a change to the in-memory write permission only: the saved record and
+ *   what reads follow stay as they were.
+ * - This is a local guarantee. It cannot make a switch on another device
+ *   atomic with this device's storage: a write between the last verified read
+ *   and the next one is detected afterwards, not prevented. Preventing it needs
+ *   the registry to refuse legacy-protocol writes.
  * - A load that fails leaves the authority unloaded: `read` stays `unknown`
  *   for every owner, `submitEvidence` saves nothing, and the next
  *   `submitEvidence` retries the load before judging the evidence.
@@ -36,7 +66,11 @@ export type CommitResult<T> =
 /** What a host says about one owner after asking the Account. */
 export interface ModeEvidenceInput {
   owner: string;
-  /** `unknown` (or anything else) changes nothing and returns the decision. */
+  /**
+   * `unknown` (or anything else): the host could not read the Account. It
+   * changes no record; it pauses legacy writes for an Off until a verified,
+   * current answer, and returns the decision.
+   */
   state: "on" | "off" | "unknown";
   /** Absent means 0. */
   generation?: number;
@@ -45,7 +79,14 @@ export interface ModeEvidenceInput {
 export interface ModeAuthority {
   /** Settles once the saved records are loaded. Never rejects; boot may skip it. */
   readonly ready: Promise<void>;
+  /** The mode that reads and listings follow: the saved record, nothing else. */
   read(owner: string): ModeDecision;
+  /**
+   * What a legacy write gets right now, with no lock: for an early refusal or
+   * a worker that wants to stop. The commit fence (`commitLegacy`) is the
+   * decision; this is never a permission.
+   */
+  legacyWriteDecision(owner: string): ModeDecision;
   submitEvidence(input: ModeEvidenceInput): Promise<ModeDecision>;
   /** Run `write` as a legacy write: only for an owner whose answer is Off. */
   commitLegacy<T>(
@@ -73,6 +114,27 @@ export function createModeAuthority(
   const warn = options.onWarning ?? (() => {});
   const records = new Map<string, AccountModeRecord>();
   const lock = createRwLock();
+  /**
+   * Owners whose latest evidence in this process was a verified answer that
+   * is current (its generation is not older than the record's). In memory
+   * only: a record is history and survives a restart, this is what the host
+   * saw since this process started, so a restart starts empty.
+   */
+  const verified = new Set<string>();
+  /**
+   * The number of the latest evidence submitted for each owner, taken before
+   * the first await. A verified answer ends a pause only while it is still the
+   * latest: one asked before a later submission cannot speak for the Account's
+   * state after it.
+   */
+  const latest = new Map<string, number>();
+  let submissions = 0;
+  /**
+   * Answers (on or off) that have arrived and not settled, per owner, and the
+   * waiters for the count to reach zero. Counted before the first await.
+   */
+  const unsettled = new Map<string, number>();
+  const settledWaiters = new Map<string, Array<() => void>>();
   let loaded = false;
   let loadFailed = false;
   let closed = false;
@@ -117,15 +179,56 @@ export function createModeAuthority(
     return record.answer === "on" ? { kind: "streams" } : { kind: "legacy" };
   }
 
+  function legacyWriteDecision(owner: string): ModeDecision {
+    const decision = read(owner);
+    if (decision.kind !== "legacy") return decision;
+    const key = typeof owner === "string" ? normalizeOwner(owner) : null;
+    return key !== null && verified.has(key) && !unsettled.has(key)
+      ? decision
+      : UNKNOWN_DECISION;
+  }
+
+  function settledOf(key: string): Promise<void> {
+    if (!unsettled.has(key)) return Promise.resolve();
+    return new Promise((resolve) => {
+      const waiters = settledWaiters.get(key) ?? [];
+      waiters.push(resolve);
+      settledWaiters.set(key, waiters);
+    });
+  }
+
+  function settle(key: string): void {
+    const left = (unsettled.get(key) ?? 1) - 1;
+    if (left > 0) {
+      unsettled.set(key, left);
+      return;
+    }
+    unsettled.delete(key);
+    const waiters = settledWaiters.get(key) ?? [];
+    settledWaiters.delete(key);
+    for (const resolve of waiters) resolve();
+  }
+
   return {
     ready,
     read,
+    legacyWriteDecision,
     async submitEvidence(input) {
-      await ready;
+      // Before the first await, so a failed read takes effect at once and not
+      // behind an earlier answer that is still waiting on its save.
       const owner = normalizeOwner(input.owner);
-      if (input.state === "on" || input.state === "off") {
-        const release = await lock.exclusive();
+      const ticket = (submissions += 1);
+      latest.set(owner, ticket);
+      const answered = input.state === "on" || input.state === "off";
+      if (!answered) verified.delete(owner);
+      else unsettled.set(owner, (unsettled.get(owner) ?? 0) + 1);
+      if (answered) {
+        // Settled in the `finally`, under the lock, whatever happens.
+        let release: (() => void) | undefined;
+        let eligible = false;
         try {
+          await ready;
+          release = await lock.exclusive();
           // Retried under the lock, so the exclusive request is queued before
           // the load starts: an On still waits for legacy writes in flight,
           // and no legacy write starts after it.
@@ -135,23 +238,36 @@ export function createModeAuthority(
             return read(owner);
           }
           const prev = records.get(owner);
+          const generation = input.generation ?? 0;
           const next = applyAnswer(
             prev,
-            input.state,
-            input.generation ?? 0,
+            input.state as "on" | "off",
+            generation,
             now(),
           );
           if (next !== prev) {
             await options.store.save(owner, next);
             records.set(owner, next);
           }
+          // Permission for this process only when the answer was applied,
+          // nothing was submitted after it, and it is not older than the
+          // record. Any other end takes the earlier permission back.
+          eligible =
+            latest.get(owner) === ticket && generation >= next.generation;
         } finally {
-          release();
+          if (eligible) verified.add(owner);
+          else verified.delete(owner);
+          settle(owner);
+          release?.();
         }
       } else {
+        await ready;
         await retryLoadIfFailed();
+        // Nothing to add: the pause was set above, with no lock. A legacy
+        // write already running keeps its shared hold, and every write that
+        // starts later reads it inside its own hold.
       }
-      const decision = read(owner);
+      const decision = legacyWriteDecision(owner);
       if (decision.kind === "streams") {
         try {
           options.onOn?.(owner);
@@ -163,22 +279,36 @@ export function createModeAuthority(
     },
     async commitLegacy(owner, write) {
       await ready;
-      const release = await lock.shared();
-      try {
-        // No await between this read and the start of the write.
-        const decision = closed ? UNKNOWN_DECISION : read(owner);
-        if (decision.kind === "legacy") {
-          return { ok: true, value: await write() };
+      const key = typeof owner === "string" ? normalizeOwner(owner) : null;
+      for (;;) {
+        // An answer that has arrived and is not applied yet may contradict the
+        // permission: wait for it, outside the lock (its exclusive request
+        // may be queued behind other shared holders), then judge again.
+        if (key !== null) await settledOf(key);
+        const release = await lock.shared();
+        if (key !== null && unsettled.has(key)) {
+          // An answer arrived while this write waited for the lock.
+          release();
+          continue;
         }
-        return {
-          ok: false,
-          decision:
-            decision.kind === "streams"
-              ? SWITCHED_REFUSAL
-              : (decision as RefuseDecision),
-        };
-      } finally {
-        release();
+        try {
+          // No await between the checks above and the start of the write.
+          const decision = closed
+            ? UNKNOWN_DECISION
+            : legacyWriteDecision(owner);
+          if (decision.kind === "legacy") {
+            return { ok: true, value: await write() };
+          }
+          return {
+            ok: false,
+            decision:
+              decision.kind === "streams"
+                ? SWITCHED_REFUSAL
+                : (decision as RefuseDecision),
+          };
+        } finally {
+          release();
+        }
       }
     },
     async commitRemoval(work) {

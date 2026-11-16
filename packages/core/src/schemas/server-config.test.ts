@@ -26,8 +26,6 @@ describe("ServerConfigSchema — streamSync.retireLegacy", () => {
   it("retire-legacy-default-off", () => {
     expect(DEFAULTS.streamSync.retireLegacy).toBe(false);
     expect(ServerConfigSchema.parse({ streamSync: {} }).streamSync).toEqual({
-      write: false,
-      read: false,
       retireLegacy: false,
       progressiveFirstLoad: false,
       changeProbeMs: 5_000,
@@ -68,20 +66,21 @@ describe("ServerConfigSchema — streamSync.retireLegacy", () => {
   });
 });
 
-describe("ServerConfigSchema — streamSync.refuseLegacyWrites (removed)", () => {
-  it("a saved config that still names it parses, and the key is dropped", () => {
+describe("ServerConfigSchema — streamSync.write, read, refuseLegacyWrites (removed)", () => {
+  it("a saved config that still names them parses, and the keys are dropped", () => {
     const parsed = ServerConfigSchema.parse({
-      streamSync: { write: true, refuseLegacyWrites: true },
+      streamSync: { write: true, read: true, refuseLegacyWrites: true },
     });
     expect(parsed.streamSync).toEqual({
-      write: true,
-      read: false,
       retireLegacy: false,
       progressiveFirstLoad: false,
       changeProbeMs: 5_000,
       changePush: true,
     });
-    expect("refuseLegacyWrites" in DEFAULTS.streamSync).toBe(false);
+    for (const key of ["write", "read", "refuseLegacyWrites"]) {
+      expect(key in DEFAULTS.streamSync).toBe(false);
+      expect(key in parsed.streamSync).toBe(false);
+    }
   });
 });
 

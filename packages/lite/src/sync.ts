@@ -30,6 +30,7 @@ import {
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
   streamSyncNetwork,
+  streamSyncFlagsOn,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { LITE_PART_TARGET_BYTES } from "./stream-sync-budget.js";
 import {
@@ -180,6 +181,12 @@ export interface PsLiteSyncOptions {
    * `LocalSyncDeps.progressiveFirstLoad`.
    */
   streamSyncProgressiveFirstLoad?: boolean;
+  /**
+   * The design flags to turn on, as one comma list of names (see
+   * `STREAM_SYNC_DESIGN_FLAGS`). A host passes the list as it got it and holds
+   * no flag table. A flag's own option above wins.
+   */
+  streamSyncFlags?: string;
   stateStore: PsLiteStateStore;
   storage: DataStoragePort;
   ownerAddress?: `0x${string}`;
@@ -586,6 +593,8 @@ export async function createPsLiteSyncManager(
     else await localDb?.close();
   }
 
+  // Which design flags are on: the host's list. A browser has no environment.
+  const designFlags = streamSyncFlagsOn(options.streamSyncFlags);
   // One registry client for the cycle's reads and the change probe.
   const streamSyncRegistry: StreamSyncRegistry =
     options.streamSyncRegistry ??
@@ -639,12 +648,14 @@ export async function createPsLiteSyncManager(
           recordsCommitted: () => syncManager?.notifyRecordsCommitted(),
           progressiveFirstLoad:
             options.streamSyncProgressiveFirstLoad ??
-            options.config.streamSync.progressiveFirstLoad,
+            (designFlags.progressiveFirstLoad ||
+              options.config.streamSync.progressiveFirstLoad),
           partTargetBytes: LITE_PART_TARGET_BYTES,
-          ...(options.streamSyncPublishWhileCollecting === true
+          ...((options.streamSyncPublishWhileCollecting ??
+          designFlags.publishWhileCollecting)
             ? { publishWhileCollecting: true }
             : {}),
-          ...(options.streamSyncLogProtocol === true
+          ...((options.streamSyncLogProtocol ?? designFlags.logProtocol)
             ? { logProtocol: true }
             : {}),
         };

@@ -53,6 +53,7 @@ afterEach(async () => {
 });
 
 type Flags = {
+  streamSyncFlags?: string;
   streamSyncPublishWhileCollecting?: boolean;
   streamSyncLogProtocol?: boolean;
   streamSyncProgressiveFirstLoad?: boolean;
@@ -65,9 +66,7 @@ async function depsFor(flags: Flags) {
     ownerSignature: signature,
   });
   const lite = await createPsLiteSyncManager({
-    config: ServerConfigSchema.parse({
-      streamSync: { write: false, read: false },
-    }),
+    config: ServerConfigSchema.parse({}),
     autoStartSync: false,
     localDb: { openDriver: async () => openBetterSqlite3(":memory:") },
     accountStorageMode: { owner: account.address, read: () => "switched" },
@@ -116,6 +115,27 @@ describe("PS-Lite stream-sync design flags", () => {
     },
   );
 
+  it.each(FLAGS)(
+    "the list naming only %s turns that flag on and no other",
+    async (flag) => {
+      const deps = await depsFor({ streamSyncFlags: `${flag}, nonsense` });
+      for (const [other] of FLAGS) {
+        expect(deps[other] ?? false).toBe(other === flag);
+      }
+    },
+  );
+
+  it.each(FLAGS)(
+    "lets the own option of %s win over a list that names it",
+    async (flag, option) => {
+      const deps = await depsFor({
+        streamSyncFlags: flag,
+        [option]: false,
+      });
+      expect(deps[flag] ?? false).toBe(false);
+    },
+  );
+
   // `startPersonalServer` (what the Web host calls) spreads its options into
   // `createIndexedDbPsLiteRuntime`; the option must survive that hop too.
   it.each(FLAGS)(
@@ -140,7 +160,6 @@ describe("PS-Lite stream-sync design flags", () => {
           configDefaults: {
             gateway: { url: "https://gateway.local" },
             sync: { enabled: false },
-            streamSync: { write: true },
           },
           ...(on ? { [option]: true } : {}),
         });

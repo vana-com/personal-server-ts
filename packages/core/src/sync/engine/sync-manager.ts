@@ -153,9 +153,9 @@ export interface SyncManagerOptions {
   /** Exact owner scopes to hydrate before the first full download cycle. */
   hydrateScopes?: string[];
   /**
-   * Whole-file stream sync (`streamSync.write`, default off). When `write`
-   * is true, each upload cycle runs the stream-sync publisher after the
-   * legacy upload. When it is false or absent, nothing changes.
+   * A host's whole-file publisher hook (default absent). When `write` is
+   * true, each upload cycle runs the publisher after the legacy upload. When
+   * it is false or absent, nothing changes. No server config key sets it.
    */
   streamSync?: {
     readonly write: boolean;

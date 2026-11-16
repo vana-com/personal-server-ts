@@ -13,7 +13,7 @@ import type { OwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-c
  * stream names and counts only: never a record, a blob key or an issue detail.
  * `issues` counts import problems still open.
  *
- * Only the owner may call it. With `streamSync.read` off the route answers 404.
+ * Only the owner may call it. Without a stream-sync read port the route answers 404.
  */
 
 import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
@@ -32,7 +32,7 @@ export interface StreamSyncReadStatusRouteDeps {
   devToken?: string;
   accessToken?: string;
   tokenStore?: TokenStore;
-  /** Absent when `streamSync.read` is off: every call answers 404. */
+  /** Absent when there is no read port: every call answers 404. */
   localSync?: LocalSync | (() => Promise<LocalSync>);
   accountStorageMode?: OwnedAccountStorageMode;
   streamSyncRead: StreamSyncReadPort | undefined;
