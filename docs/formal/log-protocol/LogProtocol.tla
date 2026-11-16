@@ -5,7 +5,8 @@ ASSUME /\ MaxSteps \in 6..8
        /\ KeepTail = 1
        /\ Mode \in {"good","gap","outOfOrder","droppedDeleteEffect","forgetTombstone",
                     "omitNoCutoff","omitInclusive","dropKind","replayFromBase",
-                    "grouped","groupedSkip","equalStamp","equalStampToday"}
+                    "grouped","groupedSkip","equalStamp","equalStampToday",
+                    "keyed","keyedSkip","keyedEarly"}
 Devices == {1,2,3}
 Keys == {1,2}
 Writers == {1,2}
@@ -141,9 +142,10 @@ LamportVisible(log) ==
    LamportLog([j \in Keys |-> [counter |-> 0,body |-> 0]],log)[k].body]
 
 VARIABLES epoch, log, retained, cut, snapshot, budget, stopped,
-          deviceEpoch, position, known, data, hints, prefixOK, monotoneOK, omissionOK
+          deviceEpoch, position, known, data, hints, prefixOK, monotoneOK, omissionOK,
+          stage, stageAt
 vars == <<epoch,log,retained,cut,snapshot,budget,stopped,
-          deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK>>
+          deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK,stage,stageAt>>
 Init ==
  /\ epoch = 1 /\ log = <<>> /\ retained = {} /\ cut = 0 /\ snapshot = Empty
  /\ budget = 0 /\ stopped = FALSE
@@ -153,6 +155,8 @@ Init ==
  /\ data = [d \in Devices |-> Empty]
  /\ hints = {}
  /\ prefixOK = TRUE /\ monotoneOK = TRUE /\ omissionOK = TRUE
+ /\ stage = [d \in Devices |-> Empty]
+ /\ stageAt = [d \in Devices |-> [k \in Keys |-> 0]]
 
 AllOps(history) == UNION { {history[i][j] : j \in 1..Len(history[i])} :
                            i \in 1..Len(history) }
@@ -164,17 +168,19 @@ Commit ==
     /\ hints' = hints \cup {[generation |-> epoch, at |-> p]}
  /\ budget' = budget+1
  /\ UNCHANGED <<epoch,cut,snapshot,stopped,deviceEpoch,position,known,data,
-                prefixOK,monotoneOK,omissionOK>>
+                prefixOK,monotoneOK,omissionOK,stage,stageAt>>
 Stop ==
  /\ ~stopped /\ stopped' = TRUE
  /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,
-                deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK>>
+                deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK,stage,stageAt>>
 \* Reset is an authoritative new lifetime, not wall-clock inference.
 \* Offline devices do not learn it instantly; their old view remains until read.
 Reset ==
  /\ AllowReset /\ ~stopped /\ epoch=1 /\ Len(log)>=2 /\ budget<MaxSteps
  /\ epoch'=2 /\ log' = <<>> /\ retained'={} /\ cut'=0 /\ snapshot'=Empty
  /\ budget'=budget+1
+ /\ stage' = [d \in Devices |-> Empty]
+ /\ stageAt' = [d \in Devices |-> [k \in Keys |-> 0]]
  /\ UNCHANGED <<stopped,deviceEpoch,position,known,data,hints,
                 prefixOK,monotoneOK,omissionOK>>
 \* Registry rollback (at most one: it needs epoch 1 and leaves epoch 2). The authoritative head
@@ -190,6 +196,8 @@ Rollback ==
         /\ epoch' = 2 /\ cut' = 0 /\ snapshot' = Empty
         /\ retained' = {p \in 1..Len(newLog) : p > 0}
  /\ budget' = budget+1
+ /\ stage' = [d \in Devices |-> Empty]
+ /\ stageAt' = [d \in Devices |-> [k \in Keys |-> 0]]
  /\ UNCHANGED <<stopped,deviceEpoch,position,known,data,hints,
                 prefixOK,monotoneOK,omissionOK>>
 \* A full check adopts the current lifetime and resets a device that was on another one.
@@ -202,6 +210,9 @@ FullCheck(d) ==
     IN /\ position' = IF relabel THEN [position EXCEPT ![d]=0] ELSE position
        /\ data' = IF relabel THEN [data EXCEPT ![d]=Empty] ELSE data
  /\ monotoneOK' = (monotoneOK /\ epoch >= deviceEpoch[d])
+ /\ stage' = IF deviceEpoch[d] # epoch THEN [stage EXCEPT ![d]=Empty] ELSE stage
+ /\ stageAt' = IF deviceEpoch[d] # epoch
+               THEN [stageAt EXCEPT ![d]=[k \in Keys |-> 0]] ELSE stageAt
  /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,hints,prefixOK,omissionOK>>
 \* Deliver does NOT consume the hint, permitting duplicate/reordered delivery.
 \* Stale lifetime hints carry no authority to roll a device back.
@@ -210,11 +221,11 @@ Deliver(d,h) ==
  /\ known' = IF h.generation=deviceEpoch[d] /\ h.at>known[d]
              THEN [known EXCEPT ![d]=h.at] ELSE known
  /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
-                deviceEpoch,position,data,hints,prefixOK,monotoneOK,omissionOK>>
+                deviceEpoch,position,data,hints,prefixOK,monotoneOK,omissionOK,stage,stageAt>>
 Drop(h) ==
  /\ h \in hints /\ hints'=hints \ {h}
  /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
-                deviceEpoch,position,known,data,prefixOK,monotoneOK,omissionOK>>
+                deviceEpoch,position,known,data,prefixOK,monotoneOK,omissionOK,stage,stageAt>>
 Compact ==
  /\ Len(log)>KeepTail /\ cut < Len(log)-KeepTail
  /\ cut'=Len(log)-KeepTail
@@ -225,7 +236,7 @@ Compact ==
               ELSE FoldLog(Empty,Prefix(log,cut'))
  /\ retained'={p \in retained : p>cut'}
  /\ UNCHANGED <<epoch,log,budget,stopped,deviceEpoch,position,known,data,hints,
-                prefixOK,monotoneOK,omissionOK>>
+                prefixOK,monotoneOK,omissionOK,stage,stageAt>>
 \* A reader behind the snapshot merges it into the rows it already has.
 Install(d) ==
  /\ deviceEpoch[d]=epoch /\ position[d]<cut /\ known[d]>=cut
@@ -233,7 +244,7 @@ Install(d) ==
  /\ position'=[position EXCEPT ![d]=cut]
  /\ monotoneOK'=(monotoneOK /\ cut>=position[d])
  /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
-                deviceEpoch,known,hints,prefixOK,omissionOK>>
+                deviceEpoch,known,hints,prefixOK,omissionOK,stage,stageAt>>
 OmissionSafeFor(state,ops) ==
  \A i \in 1..Len(ops):
    LET op == ops[i]
@@ -251,7 +262,7 @@ Apply(d,p) ==
  /\ monotoneOK'=(monotoneOK /\ p>=position[d])
  /\ omissionOK'=(omissionOK /\ OmissionSafeFor(data[d],log[p]))
  /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
-                deviceEpoch,known,hints>>
+                deviceEpoch,known,hints,stage,stageAt>>
 \* Mutant: treating a later position hint as an applied checkpoint without
 \* detecting/fetching its missing predecessors.
 SkipGap(d) ==
@@ -259,7 +270,7 @@ SkipGap(d) ==
  /\ position'=[position EXCEPT ![d]=known[d]]
  /\ prefixOK'=FALSE
  /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
-                deviceEpoch,known,data,hints,monotoneOK,omissionOK>>
+                deviceEpoch,known,data,hints,monotoneOK,omissionOK,stage,stageAt>>
 \* Group commit (a first load applies the segments it holds in few transactions): ONE
 \* transaction applies the retained segments position+1..q in order, and writes position q
 \* with the last of them (as `Apply` writes it with one). No state between them is committed,
@@ -272,7 +283,7 @@ FoldRun(state,from,to) ==
  IF from > to THEN state
  ELSE FoldRun(FoldOps(state,log[from],FALSE,from),from+1,to)
 ApplyRun(d,q) ==
- /\ Mode \in {"grouped","groupedSkip"}
+ /\ Mode \in {"grouped","groupedSkip","keyed","keyedSkip","keyedEarly"}
  /\ deviceEpoch[d]=epoch /\ position[d]>=cut
  /\ q \in retained /\ q<=known[d] /\ q>position[d]+1
  /\ \A p \in (position[d]+1)..q : p \in retained
@@ -287,9 +298,65 @@ ApplyRun(d,q) ==
  /\ omissionOK'=(omissionOK /\ \A p \in (position[d]+1)..q :
        OmissionSafeFor(FoldRun(data[d],position[d]+1,p-1),log[p]))
  /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
+                deviceEpoch,known,hints,stage,stageAt>>
+\* Keyed first load (a device with no rows and no position loads a log that has never compacted
+\* key by key instead of segment by segment). The host stages the run's operations by key,
+\* then, bucket by bucket, folds each key's operations in position order into its rows. Those
+\* rows are not visible (no stream version) and the position is still 0, so no reader sees a
+\* state between the buckets and a crash leaves nothing a reader trusts: `StageLost` and a
+\* later `KeyedLoad` repeat the work. The position and the rows become visible in ONE
+\* transaction, `KeyedPublish`, once every key is folded to the same run end q.
+\* keyedSkip mutant: a key's fold leaves out the segment before the last (as a stage that
+\* lost rows would). keyedEarly mutant: the position is written while a key is not yet folded.
+KeyedGate(d) ==
+ /\ Mode \in {"keyed","keyedSkip","keyedEarly"}
+ /\ deviceEpoch[d]=epoch /\ cut=0 /\ position[d]=0 /\ data[d]=Empty
+RECURSIVE KeyOps(_,_)
+KeyOps(ops,k) == IF Len(ops)=0 THEN <<>>
+                 ELSE IF Head(ops).key=k THEN <<Head(ops)>> \o KeyOps(Tail(ops),k)
+                 ELSE KeyOps(Tail(ops),k)
+RECURSIVE FoldKeyRun(_,_,_,_)
+FoldKeyRun(state,k,from,to) ==
+ IF from > to THEN state
+ ELSE FoldKeyRun(FoldOps(state,KeyOps(log[from],k),FALSE,from),k,from+1,to)
+KeyedLoad(d,k,q) ==
+ /\ KeyedGate(d)
+ /\ q \in retained /\ q<=known[d] /\ q>=2
+ /\ \A j \in Keys : stageAt[d][j] \in {0,q}
+ /\ stage' = [stage EXCEPT ![d][k] =
+      IF Mode="keyedSkip" /\ q>=3
+      THEN FoldKeyRun(FoldKeyRun(Empty,k,1,q-2),k,q,q)[k]
+      ELSE FoldKeyRun(Empty,k,1,q)[k]]
+ /\ stageAt' = [stageAt EXCEPT ![d][k]=q]
+ /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
+                deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK>>
+KeyedPublish(d,q) ==
+ /\ KeyedGate(d)
+ /\ q \in retained /\ q<=known[d]
+ /\ IF Mode="keyedEarly" THEN \E k \in Keys : stageAt[d][k]=q
+    ELSE \A k \in Keys : stageAt[d][k]=q
+ /\ data' = [data EXCEPT ![d]=stage[d]]
+ /\ position' = [position EXCEPT ![d]=q]
+ /\ prefixOK' = prefixOK
+ /\ monotoneOK' = (monotoneOK /\ q>=position[d])
+ /\ omissionOK' = (omissionOK /\ \A p \in 1..q :
+       OmissionSafeFor(FoldRun(Empty,1,p-1),log[p]))
+ /\ stage' = [stage EXCEPT ![d]=Empty]
+ /\ stageAt' = [stageAt EXCEPT ![d]=[k \in Keys |-> 0]]
+ /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
                 deviceEpoch,known,hints>>
+StageLost(d) ==
+ /\ Mode \in {"keyed","keyedSkip","keyedEarly"}
+ /\ \E k \in Keys : stageAt[d][k] # 0
+ /\ stage' = [stage EXCEPT ![d]=Empty]
+ /\ stageAt' = [stageAt EXCEPT ![d]=[k \in Keys |-> 0]]
+ /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
+                deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK>>
 Recover(d) == Install(d) \/ (\E p \in retained : Apply(d,p)) \/ SkipGap(d)
               \/ (\E q \in retained : ApplyRun(d,q))
+              \/ (\E k \in Keys, q \in retained : KeyedLoad(d,k,q))
+              \/ (\E q \in retained : KeyedPublish(d,q))
+              \/ StageLost(d)
 Next ==
  \/ Commit \/ Stop \/ Reset \/ Compact \/ Rollback
  \/ \E d \in Devices : FullCheck(d) \/ Recover(d)

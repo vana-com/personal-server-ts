@@ -102,6 +102,16 @@ adopting a newer epoch, so monotonicity means the pair (epoch, position).
   steps with no committed state between them (each segment folds over the rows
   of the ones before it). The `groupedSkip` mutant leaves out the middle
   segments and must fail P5.
+- KeyedLoad / KeyedPublish / StageLost (`Mode` keyed, keyedSkip, keyedEarly): a
+  device with position 0 and no rows, over a log that has never compacted,
+  folds the log key by key into a staging area (`KeyedLoad(d,k,q)`: key k's
+  operations from segments 1..q), in any key order, any number of times.
+  `KeyedPublish(d,q)` writes the rows and the position q in ONE transaction,
+  and only when every key is folded to q. `StageLost` drops the staging area
+  (a crash, or the next start). Reset, Rollback and FullCheck clear it. The
+  `keyedSkip` mutant leaves a key's fold without the segment before its last
+  (a stage that lost rows) and must fail P1. The `keyedEarly` mutant publishes
+  while a key is not yet folded and must fail P5.
 
 ## Properties and expected host results
 
@@ -118,6 +128,9 @@ adopting a newer epoch, so monotonicity means the pair (epoch, position).
 | LamportDifference.cfg     | FAIL StampEqualsLamport             | P6 orders choose different winners                                                              |
 | Grouped.cfg               | PASS within this finite abstraction | group commit (`ApplyRun`): TypeOK, P1–P5, OrderOK                                               |
 | GroupedSkip.cfg           | FAIL P5                             | a group commit that leaves out the segments between its first and last                          |
+| Keyed.cfg                 | PASS within this finite abstraction | key-ordered first load (`KeyedLoad`, `KeyedPublish`, `StageLost`): TypeOK, P1–P5, OrderOK       |
+| KeyedSkip.cfg             | FAIL P1                             | a key's fold that leaves out a segment                                                          |
+| KeyedEarly.cfg            | FAIL P5                             | the position written while a key is not yet folded                                              |
 
 Corpus (batch 6): an equal-cutoff omission (key 1, stamp 5) meets the live
 stamp-5 row, and an older omission (key 2, stamp 1) sits below the live delete.
@@ -208,6 +221,23 @@ old `DropTombstone` mutant, renamed.
 These are the first TLC results for this model. They are a check of the finite
 abstraction only, within the scope limits above. They do not show a refinement
 to the implementation.
+
+## Key-ordered first load (host run, 2026-11-16)
+
+TLC 2.19, `-workers 4`, `nice -n 19`, one job at a time, metadirs deleted after
+each run. Expected results were stated before the run: `Keyed.cfg` holds,
+`KeyedSkip.cfg` fails P1, `KeyedEarly.cfg` fails P5.
+
+| Configuration  | Expected | Actual                                                                                                                            | Distinct states     | Depth | Wall time       |
+| -------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------- | ----- | --------------- |
+| Keyed.cfg      | PASS     | BOUNDED: stopped at the 25 min limit; no invariant error in the explored states (462,751,607 generated, 41,591,212 left on queue) | at least 56,493,699 | n/a   | 25 min, stopped |
+| KeyedSkip.cfg  | FAIL P1  | FAIL P1 as expected: a key's fold omits a segment, then the keyed publish installs rows that differ from the reference            | 5,922 at failure    | 8     | 1 s             |
+| KeyedEarly.cfg | FAIL P5  | FAIL P5 as expected: the position is written while a key is not folded, so a device claims a prefix it does not hold              | 791 at failure      | 6     | <1 s            |
+
+`Keyed.cfg` did not finish, so its PASS is not established: the model is bounded
+evidence, the same status as `Good.cfg`. Its space is larger than `Grouped.cfg`'s
+because fold progress per key adds state. Traces: `traces/KeyedSkip.txt`,
+`traces/KeyedEarly.txt`.
 
 ## #705 r3 extension (host run, 2026-11-15)
 

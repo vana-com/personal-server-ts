@@ -87,6 +87,11 @@ export async function world(options: {
       /** A host that serves a first load's applied parts while it fills. */
       progressiveFirstLoad?: boolean;
       /**
+       * `false` applies a first load segment by segment, never key by key
+       * (`LocalSyncDeps.keyedFirstLoad`): the result a keyed load is compared with.
+       */
+      keyedFirstLoad?: boolean;
+      /**
        * The byte budget of this device's transfers. A budget below one
        * segment makes an apply fetch and commit one segment at a time.
        */
@@ -146,6 +151,7 @@ export async function world(options: {
         ? { publishWhileCollecting: true }
         : {}),
       ...(hooks.progressiveFirstLoad ? { progressiveFirstLoad: true } : {}),
+      ...(hooks.keyedFirstLoad === false ? { keyedFirstLoad: false } : {}),
       ...(options.partTargetBytes !== undefined
         ? { partTargetBytes: options.partTargetBytes }
         : {}),

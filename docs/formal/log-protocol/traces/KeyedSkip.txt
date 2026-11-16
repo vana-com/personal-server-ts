@@ -1,0 +1,431 @@
+Error: Invariant P1 is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ omissionOK = TRUE
+/\ epoch = 1
+/\ monotoneOK = TRUE
+/\ retained = {}
+/\ cut = 0
+/\ stopped = FALSE
+/\ log = <<>>
+/\ hints = {}
+/\ stage = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ data = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ position = <<0, 0, 0>>
+/\ deviceEpoch = <<1, 1, 1>>
+/\ prefixOK = TRUE
+/\ stageAt = <<<<0, 0>>, <<0, 0>>, <<0, 0>>>>
+/\ known = <<0, 0, 0>>
+/\ snapshot = << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+   [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
+/\ budget = 0
+
+State 2: <Commit line 131, col 2 to line 139, col 62 of module LogProtocol>
+/\ omissionOK = TRUE
+/\ epoch = 1
+/\ monotoneOK = TRUE
+/\ retained = {1}
+/\ cut = 0
+/\ stopped = FALSE
+/\ log = << << [ stamp |-> 3,
+        body |-> 11,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 1,
+        counter |-> 1 ],
+      [ stamp |-> 1,
+        body |-> 21,
+        kind |-> "upsert",
+        key |-> 2,
+        writer |-> 1,
+        counter |-> 1 ] >> >>
+/\ hints = {[generation |-> 1, at |-> 1]}
+/\ stage = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ data = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ position = <<0, 0, 0>>
+/\ deviceEpoch = <<1, 1, 1>>
+/\ prefixOK = TRUE
+/\ stageAt = <<<<0, 0>>, <<0, 0>>, <<0, 0>>>>
+/\ known = <<0, 0, 0>>
+/\ snapshot = << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+   [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
+/\ budget = 1
+
+State 3: <Commit line 131, col 2 to line 139, col 62 of module LogProtocol>
+/\ omissionOK = TRUE
+/\ epoch = 1
+/\ monotoneOK = TRUE
+/\ retained = {1, 2}
+/\ cut = 0
+/\ stopped = FALSE
+/\ log = << << [ stamp |-> 3,
+        body |-> 11,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 1,
+        counter |-> 1 ],
+      [ stamp |-> 1,
+        body |-> 21,
+        kind |-> "upsert",
+        key |-> 2,
+        writer |-> 1,
+        counter |-> 1 ] >>,
+   << [ stamp |-> 2,
+        body |-> 12,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 2,
+        counter |-> 2 ],
+      [ stamp |-> 2,
+        body |-> 0,
+        kind |-> "delete",
+        key |-> 2,
+        writer |-> 2,
+        counter |-> 2 ] >> >>
+/\ hints = {[generation |-> 1, at |-> 1], [generation |-> 1, at |-> 2]}
+/\ stage = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ data = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ position = <<0, 0, 0>>
+/\ deviceEpoch = <<1, 1, 1>>
+/\ prefixOK = TRUE
+/\ stageAt = <<<<0, 0>>, <<0, 0>>, <<0, 0>>>>
+/\ known = <<0, 0, 0>>
+/\ snapshot = << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+   [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
+/\ budget = 2
+
+State 4: <Commit line 131, col 2 to line 139, col 62 of module LogProtocol>
+/\ omissionOK = TRUE
+/\ epoch = 1
+/\ monotoneOK = TRUE
+/\ retained = {1, 2, 3}
+/\ cut = 0
+/\ stopped = FALSE
+/\ log = << << [ stamp |-> 3,
+        body |-> 11,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 1,
+        counter |-> 1 ],
+      [ stamp |-> 1,
+        body |-> 21,
+        kind |-> "upsert",
+        key |-> 2,
+        writer |-> 1,
+        counter |-> 1 ] >>,
+   << [ stamp |-> 2,
+        body |-> 12,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 2,
+        counter |-> 2 ],
+      [ stamp |-> 2,
+        body |-> 0,
+        kind |-> "delete",
+        key |-> 2,
+        writer |-> 2,
+        counter |-> 2 ] >>,
+   << [ stamp |-> 5,
+        body |-> 13,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 1,
+        counter |-> 3 ] >> >>
+/\ hints = { [generation |-> 1, at |-> 1],
+  [generation |-> 1, at |-> 2],
+  [generation |-> 1, at |-> 3] }
+/\ stage = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ data = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ position = <<0, 0, 0>>
+/\ deviceEpoch = <<1, 1, 1>>
+/\ prefixOK = TRUE
+/\ stageAt = <<<<0, 0>>, <<0, 0>>, <<0, 0>>>>
+/\ known = <<0, 0, 0>>
+/\ snapshot = << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+   [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
+/\ budget = 3
+
+State 5: <FullCheck line 174, col 2 to line 184, col 90 of module LogProtocol>
+/\ omissionOK = TRUE
+/\ epoch = 1
+/\ monotoneOK = TRUE
+/\ retained = {1, 2, 3}
+/\ cut = 0
+/\ stopped = FALSE
+/\ log = << << [ stamp |-> 3,
+        body |-> 11,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 1,
+        counter |-> 1 ],
+      [ stamp |-> 1,
+        body |-> 21,
+        kind |-> "upsert",
+        key |-> 2,
+        writer |-> 1,
+        counter |-> 1 ] >>,
+   << [ stamp |-> 2,
+        body |-> 12,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 2,
+        counter |-> 2 ],
+      [ stamp |-> 2,
+        body |-> 0,
+        kind |-> "delete",
+        key |-> 2,
+        writer |-> 2,
+        counter |-> 2 ] >>,
+   << [ stamp |-> 5,
+        body |-> 13,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 1,
+        counter |-> 3 ] >> >>
+/\ hints = { [generation |-> 1, at |-> 1],
+  [generation |-> 1, at |-> 2],
+  [generation |-> 1, at |-> 3] }
+/\ stage = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ data = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ position = <<0, 0, 0>>
+/\ deviceEpoch = <<1, 1, 1>>
+/\ prefixOK = TRUE
+/\ stageAt = <<<<0, 0>>, <<0, 0>>, <<0, 0>>>>
+/\ known = <<3, 0, 0>>
+/\ snapshot = << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+   [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
+/\ budget = 3
+
+State 6: <Recover line 325, col 19 to line 325, col 66 of module LogProtocol>
+/\ omissionOK = TRUE
+/\ epoch = 1
+/\ monotoneOK = TRUE
+/\ retained = {1, 2, 3}
+/\ cut = 0
+/\ stopped = FALSE
+/\ log = << << [ stamp |-> 3,
+        body |-> 11,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 1,
+        counter |-> 1 ],
+      [ stamp |-> 1,
+        body |-> 21,
+        kind |-> "upsert",
+        key |-> 2,
+        writer |-> 1,
+        counter |-> 1 ] >>,
+   << [ stamp |-> 2,
+        body |-> 12,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 2,
+        counter |-> 2 ],
+      [ stamp |-> 2,
+        body |-> 0,
+        kind |-> "delete",
+        key |-> 2,
+        writer |-> 2,
+        counter |-> 2 ] >>,
+   << [ stamp |-> 5,
+        body |-> 13,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 1,
+        counter |-> 3 ] >> >>
+/\ hints = { [generation |-> 1, at |-> 1],
+  [generation |-> 1, at |-> 2],
+  [generation |-> 1, at |-> 3] }
+/\ stage = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 1, rank |-> 2, body |-> 21, first |-> 1] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ data = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ position = <<0, 0, 0>>
+/\ deviceEpoch = <<1, 1, 1>>
+/\ prefixOK = TRUE
+/\ stageAt = <<<<0, 3>>, <<0, 0>>, <<0, 0>>>>
+/\ known = <<3, 0, 0>>
+/\ snapshot = << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+   [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
+/\ budget = 3
+
+State 7: <Recover line 325, col 19 to line 325, col 66 of module LogProtocol>
+/\ omissionOK = TRUE
+/\ epoch = 1
+/\ monotoneOK = TRUE
+/\ retained = {1, 2, 3}
+/\ cut = 0
+/\ stopped = FALSE
+/\ log = << << [ stamp |-> 3,
+        body |-> 11,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 1,
+        counter |-> 1 ],
+      [ stamp |-> 1,
+        body |-> 21,
+        kind |-> "upsert",
+        key |-> 2,
+        writer |-> 1,
+        counter |-> 1 ] >>,
+   << [ stamp |-> 2,
+        body |-> 12,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 2,
+        counter |-> 2 ],
+      [ stamp |-> 2,
+        body |-> 0,
+        kind |-> "delete",
+        key |-> 2,
+        writer |-> 2,
+        counter |-> 2 ] >>,
+   << [ stamp |-> 5,
+        body |-> 13,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 1,
+        counter |-> 3 ] >> >>
+/\ hints = { [generation |-> 1, at |-> 1],
+  [generation |-> 1, at |-> 2],
+  [generation |-> 1, at |-> 3] }
+/\ stage = << << [stamp |-> 5, rank |-> 10, body |-> 13, first |-> 3],
+      [stamp |-> 1, rank |-> 2, body |-> 21, first |-> 1] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ data = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ position = <<0, 0, 0>>
+/\ deviceEpoch = <<1, 1, 1>>
+/\ prefixOK = TRUE
+/\ stageAt = <<<<3, 3>>, <<0, 0>>, <<0, 0>>>>
+/\ known = <<3, 0, 0>>
+/\ snapshot = << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+   [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
+/\ budget = 3
+
+State 8: <Recover line 326, col 19 to line 326, col 55 of module LogProtocol>
+/\ omissionOK = TRUE
+/\ epoch = 1
+/\ monotoneOK = TRUE
+/\ retained = {1, 2, 3}
+/\ cut = 0
+/\ stopped = FALSE
+/\ log = << << [ stamp |-> 3,
+        body |-> 11,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 1,
+        counter |-> 1 ],
+      [ stamp |-> 1,
+        body |-> 21,
+        kind |-> "upsert",
+        key |-> 2,
+        writer |-> 1,
+        counter |-> 1 ] >>,
+   << [ stamp |-> 2,
+        body |-> 12,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 2,
+        counter |-> 2 ],
+      [ stamp |-> 2,
+        body |-> 0,
+        kind |-> "delete",
+        key |-> 2,
+        writer |-> 2,
+        counter |-> 2 ] >>,
+   << [ stamp |-> 5,
+        body |-> 13,
+        kind |-> "upsert",
+        key |-> 1,
+        writer |-> 1,
+        counter |-> 3 ] >> >>
+/\ hints = { [generation |-> 1, at |-> 1],
+  [generation |-> 1, at |-> 2],
+  [generation |-> 1, at |-> 3] }
+/\ stage = << << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ data = << << [stamp |-> 5, rank |-> 10, body |-> 13, first |-> 3],
+      [stamp |-> 1, rank |-> 2, body |-> 21, first |-> 1] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>,
+   << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+      [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >> >>
+/\ position = <<3, 0, 0>>
+/\ deviceEpoch = <<1, 1, 1>>
+/\ prefixOK = TRUE
+/\ stageAt = <<<<0, 0>>, <<0, 0>>, <<0, 0>>>>
+/\ known = <<3, 0, 0>>
+/\ snapshot = << [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0],
+   [stamp |-> 0, rank |-> 0, body |-> 0, first |-> 0] >>
+/\ budget = 3
+
