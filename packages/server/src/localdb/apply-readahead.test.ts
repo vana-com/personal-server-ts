@@ -690,3 +690,131 @@ it("commits no record of a head whose long record is missing a part, and finishe
   expect(await storedIds(f)).toEqual(["big", after].sort());
   expect(await partial(f)).toEqual([]);
 });
+
+it("resumes a first load after the second group commit crashes", async () => {
+  const f = await fixture();
+  const h = await f.head("a", values(6));
+  const deps = { ...f.deps, progressiveFirstLoad: true };
+  const snapshot = async () => ({
+    records: await f.db.query<{ pk_hash: string; body: string }>(
+      "SELECT pk_hash,body FROM records WHERE connection_id=? AND stream='a' ORDER BY pk_hash",
+      [f.id],
+    ),
+    head: await f.db.query<Record<string, unknown>>(
+      "SELECT * FROM stream_state WHERE connection_id=? AND stream='a'",
+      [f.id],
+    ),
+    partial: await f.db.query<Record<string, unknown>>(
+      "SELECT * FROM stream_partial WHERE connection_id=? AND stream='a'",
+      [f.id],
+    ),
+    parts: await f.db.query<Record<string, unknown>>(
+      "SELECT * FROM head_parts WHERE connection_id=? AND stream='a'",
+      [f.id],
+    ),
+  });
+  const batch = f.db.batch.bind(f.db);
+  const crash = new Error("simulated second group commit crash");
+  let groups = 0;
+  let crashed = false;
+  let omissionDeletes = 0;
+  let committed: Awaited<ReturnType<typeof snapshot>> | undefined;
+  const spy = vi.spyOn(f.db, "batch").mockImplementation(async (statements) => {
+    if (statements.some((s) => /DELETE\s+FROM\s+records\b/i.test(s.sql)))
+      omissionDeletes++;
+    // A dead process cannot persist a failed marker or run finally cleanup.
+    // Refuse every write after the crash until the fresh apply below.
+    if (crashed) throw crash;
+    const rows = statements.filter((s) =>
+      s.sql.includes("INSERT INTO temp.incoming"),
+    ).length;
+    if (rows > 0 && ++groups === 2) {
+      crashed = true;
+      throw crash;
+    }
+    const result = await batch(statements);
+    if (rows > 0 && groups === 1) committed = await snapshot();
+    return result;
+  });
+  const bounded = async <T>(work: Promise<T>): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        work,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("crash/resume did not settle")),
+            10_000,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  try {
+    await expect(bounded(applyConnection(deps, f.id))).rejects.toBe(crash);
+    expect(groups).toBe(2);
+    expect(omissionDeletes).toBe(0);
+    if (committed === undefined) throw new Error("first group never committed");
+    expect(committed.records).toHaveLength(1);
+    expect(committed.head).toHaveLength(1);
+    expect(committed.head[0]?.complete).toBe(0);
+    expect(committed.partial).toHaveLength(1);
+    expect(committed.parts).toEqual([]);
+    // Exact persisted state is the first commit, not the attempted second one.
+    expect(await snapshot()).toEqual(committed);
+    expect(
+      await f.db.query(
+        "SELECT apply_partial FROM connections WHERE connection_id=?",
+        [f.id],
+      ),
+    ).toEqual([{ apply_partial: 1 }]);
+
+    // Fresh queue, read-ahead and operation IDs; only persisted data is reused.
+    // Keep the same DB handle solely because this fixture is in-memory.
+    spy.mockRestore();
+    vi.spyOn(f.db, "batch").mockImplementation(async (statements) => {
+      if (statements.some((s) => /DELETE\s+FROM\s+records\b/i.test(s.sql)))
+        omissionDeletes++;
+      return batch(statements);
+    });
+    let op = 0;
+    await bounded(
+      applyConnection(
+        {
+          ...deps,
+          queue: connectionQueue(),
+          newOp: () => `resumed-${++op}`,
+        },
+        f.id,
+      ),
+    );
+    const resumed = await snapshot();
+    expect(resumed.records.map((r) => JSON.parse(r.body).id).sort()).toEqual(
+      values(6)
+        .map((r) => r.id)
+        .sort(),
+    );
+    expect(new Set(resumed.records.map((r) => r.pk_hash)).size).toBe(6);
+    expect(resumed.records).toHaveLength(6);
+    expect(resumed.partial).toEqual([]);
+    expect(resumed.parts).toHaveLength(h.parts.length);
+    expect(resumed.head[0]).toMatchObject({
+      complete: 1,
+      head_version: committed.partial[0]!.version,
+      head_generation: committed.partial[0]!.generation,
+      head_data_hash: committed.partial[0]!.data_hash,
+    });
+    expect(
+      await f.db.query(
+        "SELECT apply_partial FROM connections WHERE connection_id=?",
+        [f.id],
+      ),
+    ).toEqual([{ apply_partial: 0 }]);
+    // Proves the SQL observer recognizes the final-only omission deletion.
+    expect(omissionDeletes).toBeGreaterThan(0);
+  } finally {
+    vi.mocked(f.db.batch).mockRestore();
+  }
+});
