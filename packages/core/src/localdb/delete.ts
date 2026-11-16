@@ -9,6 +9,8 @@ import {
   encodeHead,
   HEAD_FORMAT,
   headBlobName,
+  isLogStream,
+  logScope,
   parseScope,
   sameControl,
   streamScope,
@@ -232,16 +234,29 @@ export function createConnectionDeleter(
             current.kind === "active" ? current.generation : current.version,
         });
     }
-    for (const entry of listedStreams) {
+    const listed = listedStreams.flatMap((entry) => {
       const parsed = parseScope(entry.scope);
-      if (parsed?.kind === "stream" && parsed.connector === connector) {
-        listing.set(entry.scope, { ...entry.read });
-        streams.push({
-          ns: parsed.ns,
-          stream: parsed.stream,
-          control: controls.get(parsed.ns) ?? { kind: "absent" },
-        });
-      }
+      return parsed?.kind === "stream" && parsed.connector === connector
+        ? [{ entry, parsed }]
+        : [];
+    });
+    // A connection that has a log row is carried by the log: its lifetimes end
+    // with the control row (`log-apply.ts`), the registry refuses a write to
+    // one of its stream rows while the log row exists (409), and its readers
+    // follow the log, never a stream row. The log row itself is no stream.
+    const logNamespaces = new Set(
+      listed
+        .filter(({ parsed }) => isLogStream(parsed.stream))
+        .map(({ parsed }) => parsed.ns),
+    );
+    for (const { entry, parsed } of listed) {
+      if (logNamespaces.has(parsed.ns)) continue;
+      listing.set(entry.scope, { ...entry.read });
+      streams.push({
+        ns: parsed.ns,
+        stream: parsed.stream,
+        control: controls.get(parsed.ns) ?? { kind: "absent" },
+      });
     }
     const empty = pins.length === 0 && streams.length === 0;
     if (!empty) {
@@ -249,10 +264,17 @@ export function createConnectionDeleter(
         ...options.declaredStreams(connector),
         ...manifestStreamLister(options.retainedManifests?.() ?? [])(connector),
       ]);
-      if (declared.size === 0 && streams.length === 0)
+      if (
+        declared.size === 0 &&
+        streams.length === 0 &&
+        logNamespaces.size === 0
+      )
         throw new ConnectorNotVerifiedError(connector);
       for (const name of declared)
-        if (!streams.some((s) => s.ns === "" && s.stream === name))
+        if (
+          !logNamespaces.has("") &&
+          !streams.some((s) => s.ns === "" && s.stream === name)
+        )
           streams.push({
             ns: "",
             stream: name,
@@ -473,6 +495,10 @@ export function createConnectionDeleter(
        */
       batched?: { readonly batcher: DeleteBatcher; readonly ended: number },
     ) {
+      // The log row is the connection's own, not a stream's: an intent saved
+      // before the plan skipped it still names it, and a delete head written
+      // over it would leave a log no reader can follow.
+      if (isLogStream(target.stream)) return;
       const scope = streamScope(connector, target.ns, target.stream);
       // The listed row serves the first attempt of this stream only: a retry,
       // or the per-stream path after a batch, reads the registry.
@@ -689,6 +715,15 @@ export function createConnectionDeleter(
           if (!(error instanceof RegistryRefusedError && error.status === 409))
             throw error;
           conflict = true;
+        }
+        if (
+          conflict &&
+          (await deps.registry.read(logScope(connector, target.ns))).found
+        ) {
+          // The log row appeared after the plan, so the registry now refuses
+          // every write to this stream's row (409). The log carries the stream.
+          finished = true;
+          break;
         }
         if (conflict) {
           controlSeen.delete(target.ns);
@@ -993,7 +1028,14 @@ export function createConnectionDeleter(
       const landing = schedule(connector);
       landing.done.catch((error) =>
         deps.logger.warn(
-          { connector, reason: error instanceof Error ? error.name : "Error" },
+          {
+            connector,
+            reason: error instanceof Error ? error.name : "Error",
+            // The cause an operator needs: a delete that stays pending blocks
+            // every reconnect, and the name alone ("Error") does not say why.
+            message: error instanceof Error ? error.message : String(error),
+            ...(error instanceof Error && { stack: error.stack }),
+          },
           "connection delete pending",
         ),
       );
