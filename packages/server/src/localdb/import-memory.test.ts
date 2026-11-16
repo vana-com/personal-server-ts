@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, it } from "vitest";
+import { IMPORT_CHUNK_BYTES } from "../../../core/src/localdb/legacy-import.js";
 import { run } from "../../../core/src/test-support/memory-oracle.js";
 import {
   createImportMemoryFixture,
@@ -12,7 +13,6 @@ import {
 } from "./import-memory-fixture.test-utils.js";
 import type { ImportMemoryResult } from "./import-memory.child.js";
 
-const fixtures: ImportMemoryFixture[] = [];
 let root: string;
 let childModule: string;
 let sample = 0;
@@ -21,13 +21,6 @@ beforeAll(() => {
   mkdirSync(temporary, { recursive: true });
   root = mkdtempSync(join(temporary, "ps3-import-memory-"));
   childModule = buildImportMemoryChild(root);
-  for (const multiplier of [1, 4]) {
-    const directory = join(root, String(multiplier));
-    mkdirSync(directory);
-    fixtures.push(
-      createImportMemoryFixture(directory, MEMORY_ROWS * multiplier),
-    );
-  }
 }, 600_000);
 afterAll(() => {
   if (root) rmSync(root, { recursive: true, force: true });
@@ -120,56 +113,98 @@ async function measure(
   return measured;
 }
 
-// Allow two existing 4 MiB source-page workspaces for the decode/merge handoff
-// and allocator/GC scatter. This constant does not scale with the input: 4x
-// adds 105.5 MiB of rows, and LOAD_WHOLE must fail this exact comparison.
-// The attribution probe separately reports actual page-cache and batch bytes.
-const PAGE_MARGIN = 2 * 4 * 1024 * 1024;
-function expectBoundedGrowth(small: number, large: number) {
-  expect(large).toBeLessThanOrEqual(small + PAGE_MARGIN);
+// What the test protects: the import holds a batch, not the input. Two
+// readings carry that claim, and each bound is derived from it.
+//
+// 1. Live bytes (main-isolate heap plus external after two full collections,
+//    rows still reachable). This is retention, and it does not depend on
+//    timing: across repeated children it was identical to the byte, and the
+//    clean import held 0.1 MiB more at 4x than at 1x (upload) or 1.1 MiB less
+//    (node). A correct import may hold at most one batch more at the larger
+//    size, so the margin is one batch, IMPORT_CHUNK_BYTES (4 MiB). Retaining
+//    every 10th row adds 10 MiB between 1x and 4x, every 4th 26 MiB, the whole
+//    input 106 MiB.
+// 2. Peak resident size, a high-water mark. It is a maximum over the run, so it
+//    rises with run length and with when the 25 ms collector timer fires: the
+//    clean upload peak rose 70, 78, 84, 90, 91 MiB at 1x, 4x, 16x, 32x, 64x
+//    and stopped (a per-row leak would keep climbing), and CI saw 2 to 12 MiB of
+//    4x-minus-1x on code that never touched the import. A margin tighter than
+//    that noise cannot tell a clean import from one that keeps every 10th row,
+//    so this reading only guards against materializing the input: the peak may
+//    not grow by more than half the bytes the larger input adds.
+const LIVE_MARGIN = IMPORT_CHUNK_BYTES;
+interface Growth {
+  addedBytes: number;
+  peak: { small: number; large: number };
+  live: { small: number; large: number };
 }
-async function compare(path: "node" | "upload", retention: Retention = {}) {
-  const small: number[] = [];
-  const large: number[] = [];
-  // RSS includes allocator/collector and startup scatter. Compare the median
-  // of three independent children at each size; keep every raw peak above.
-  // Every retention mutant uses the identical sampling and growth assertion.
-  for (let repetition = 0; repetition < 3; repetition++) {
-    small.push((await measure(fixtures[0]!, path, retention)).peakBytes);
-    large.push((await measure(fixtures[1]!, path, retention)).peakBytes);
+function expectBoundedLive({ live }: Growth) {
+  expect(live.large).toBeLessThanOrEqual(live.small + LIVE_MARGIN);
+}
+function expectBoundedPeak({ peak, addedBytes }: Growth) {
+  expect(peak.large).toBeLessThanOrEqual(peak.small + addedBytes / 2);
+}
+async function compare(
+  path: "node" | "upload",
+  retention: Retention = {},
+): Promise<Growth> {
+  // Fixtures exist only for this comparison and are removed on success and on
+  // failure; the 1x and 4x inputs together are about 0.6 GB.
+  const directory = mkdtempSync(join(root, "fixtures-"));
+  try {
+    const fixtures = [1, 4].map((multiplier) => {
+      const at = join(directory, String(multiplier));
+      mkdirSync(at);
+      return createImportMemoryFixture(at, MEMORY_ROWS * multiplier);
+    });
+    const peak = { small: [] as number[], large: [] as number[] };
+    const live = { small: [] as number[], large: [] as number[] };
+    // Compare the median of three independent children at each size; keep
+    // every raw reading above. Every retention mutant uses the same sampling.
+    for (let repetition = 0; repetition < 3; repetition++) {
+      for (const [size, fixture] of [
+        ["small", fixtures[0]!],
+        ["large", fixtures[1]!],
+      ] as const) {
+        const measured = await measure(fixture, path, retention);
+        peak[size].push(measured.peakBytes);
+        live[size].push(measured.result.liveBytes);
+      }
+    }
+    const median = (values: number[]) => [...values].sort((a, b) => a - b)[1]!;
+    const growth: Growth = {
+      addedBytes: fixtures[1]!.bytes - fixtures[0]!.bytes,
+      peak: { small: median(peak.small), large: median(peak.large) },
+      live: { small: median(live.small), large: median(live.large) },
+    };
+    process.stdout.write(
+      "IMPORT_MEMORY_COMPARISON " +
+        JSON.stringify({ path, ...retention, peak, live, median: growth }) +
+        "\n",
+    );
+    return growth;
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
-  const median = (values: number[]) => [...values].sort((a, b) => a - b)[1]!;
-  const result = { small: median(small), large: median(large) };
-  process.stdout.write(
-    "IMPORT_MEMORY_COMPARISON " +
-      JSON.stringify({
-        path,
-        ...retention,
-        small,
-        large,
-        median: result,
-      }) +
-      "\n",
-  );
-  return result;
 }
 it.each(["node", "upload"] as const)(
   "import-memory-does-not-grow-%s",
   async (path) => {
-    const { small, large } = await compare(path);
-    expectBoundedGrowth(small, large);
+    const growth = await compare(path);
+    expectBoundedLive(growth);
+    expectBoundedPeak(growth);
   },
   1_800_000,
 );
 it("import-load-whole-mutant-fails", async () => {
-  const { small, large } = await compare("upload", { loadWhole: true });
-  expect(() => expectBoundedGrowth(small, large)).toThrow();
+  const growth = await compare("upload", { loadWhole: true });
+  expect(() => expectBoundedLive(growth)).toThrow();
+  expect(() => expectBoundedPeak(growth)).toThrow();
 }, 1_800_000);
-// Partial retention. At equal resident bytes per payload byte, keeping one row
-// in N adds (9,000 - 2,250) / N rows of 16 KiB between 1x and 4x: 10.55 MiB for
-// N = 10 (2.55 MiB above the 8 MiB margin) and 26.37 MiB for N = 4. RSS is not
-// an exact byte counter, so the repetition count in the PR body, not this
-// arithmetic, is the claim about how reliably each is caught.
+// Partial retention. Keeping one row in N adds (9,000 - 2,250) / N rows of
+// 16 KiB between 1x and 4x: 10.55 MiB for N = 10 and 26.37 MiB for N = 4, both
+// above the one-batch live margin. The peak reading is not asserted here: the
+// noise above is larger than the N = 10 signal.
 it.each(
   (["node", "upload"] as const).flatMap((path) =>
     [10, 4].map((retainEvery) => [path, retainEvery] as const),
@@ -177,8 +212,8 @@ it.each(
 )(
   "import-%s-retaining-every-%ith-record-fails",
   async (path, retainEvery) => {
-    const { small, large } = await compare(path, { retainEvery });
-    expect(() => expectBoundedGrowth(small, large)).toThrow();
+    const growth = await compare(path, { retainEvery });
+    expect(() => expectBoundedLive(growth)).toThrow();
   },
   1_800_000,
 );

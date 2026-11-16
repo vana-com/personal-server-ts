@@ -29,7 +29,7 @@ import type { ImportReceipt, ImportSource } from "./legacy-import-types.js";
  * count of the import, sets the peak.
  */
 export const IMPORT_CHUNK_ROWS = 2048;
-const IMPORT_CHUNK_BYTES = 4 * 1024 * 1024;
+export const IMPORT_CHUNK_BYTES = 4 * 1024 * 1024;
 
 /** Import refusals are diagnostics; copy removal has its own exact-byte fence. */
 export type LegacyImportResult =
