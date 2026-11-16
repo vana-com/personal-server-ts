@@ -79,7 +79,7 @@ import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 // snapshot and the commit. The caller must not hold it. applyConnection and
 // purgeConnection, called inside a turn, run inline in that turn.
 
-import { keccakOf, nobleStreamCrypto } from "../stream-sync/crypto-port.js";
+import { keccakOf, type StreamCryptoPort } from "../stream-sync/crypto-port.js";
 import {
   HEAD_FORMAT,
   classifyControl,
@@ -361,12 +361,13 @@ function logSendGate(
 }
 
 /** metadataHash for a head: keccak over the UTF-8 JSON of the envelope facts. */
-export function metadataHashFor(
+export async function metadataHashFor(
   scope: string,
   collectedAt: string,
   sizeBytes: number,
-): `0x${string}` {
-  return `0x${toHex(nobleStreamCrypto.keccak256(utf8(JSON.stringify({ scope, collectedAt, sizeBytes }))))}`;
+  port: StreamCryptoPort | undefined,
+): Promise<`0x${string}`> {
+  return `0x${toHex(await keccakOf(port)(utf8(JSON.stringify({ scope, collectedAt, sizeBytes }))))}`;
 }
 
 export type ConnectionRow = {
@@ -1720,10 +1721,11 @@ async function signHead(
   prepared: Prepared,
 ) {
   const newVersion = candidate.registryVersion + 1;
-  const metadataHash = metadataHashFor(
+  const metadataHash = await metadataHashFor(
     context.scope,
     new Date(candidate.head.observedAt).toISOString(),
     encryptedLength,
+    deps.streamCrypto,
   );
   const signature = await deps.signer.signAddData({
     ownerAddress: deps.ownerAddress,

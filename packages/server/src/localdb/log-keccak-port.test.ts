@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { nobleStreamCrypto } from "../../../core/src/stream-sync/crypto-port.js";
 import type { StreamCryptoPort } from "../../../core/src/stream-sync/crypto-port.js";
 import { applyConnection } from "../../../core/src/localdb/index.js";
+import { metadataHashFor } from "../../../core/src/localdb/publish.js";
 import {
   CONNECTION_ID,
   closeWorldDrivers,
@@ -26,14 +27,16 @@ const PAD = 3_000;
 /** A port that runs noble and writes down the length of every input. */
 function recordingPort(digest?: (data: Uint8Array) => Uint8Array) {
   const sizes: number[] = [];
+  const inputs: Uint8Array[] = [];
   const port: StreamCryptoPort = {
     ...nobleStreamCrypto,
     keccak256(data) {
       sizes.push(data.length);
+      inputs.push(data.slice());
       return digest ? digest(data) : nobleStreamCrypto.keccak256(data);
     },
   };
-  return { port, sizes };
+  return { port, sizes, inputs };
 }
 
 async function publishedLog(w: World) {
@@ -142,4 +145,55 @@ describe("the Keccak-256 of a log segment", () => {
     );
     expect(await d.position()).toBeLessThan(SEGMENTS);
   });
+});
+
+it.each([false, true])(
+  "writer metadata hashing uses the supplied port (log=%s)",
+  async (logProtocol) => {
+    const w = await world({ streams: 1, logProtocol });
+    const { port, inputs } = recordingPort();
+    const writer = await w.device("metadata-writer", true, {
+      streamCrypto: port,
+    });
+    await writer.run(
+      "metadata-run",
+      [{ stream: S0, id: "metadata-row", v: 1 }],
+      { full: false, covered: [S0], observedAt: 1001 },
+    );
+    await writer.cycle();
+    const metadata = inputs.flatMap((bytes) => {
+      try {
+        const value = JSON.parse(new TextDecoder().decode(bytes));
+        return value &&
+          typeof value === "object" &&
+          Object.keys(value).join(",") === "scope,collectedAt,sizeBytes"
+          ? [value]
+          : [];
+      } catch {
+        return [];
+      }
+    });
+    expect(metadata).toHaveLength(1);
+    expect(metadata[0].scope).toEqual(expect.any(String));
+    expect(metadata[0].scope.length).toBeGreaterThan(0);
+    expect(metadata[0].collectedAt).toBe(new Date(1001).toISOString());
+    expect(metadata[0].sizeBytes).toBeGreaterThan(0);
+  },
+);
+
+it("metadata hash returns the injected digest and retains the no-host fallback", async () => {
+  const scope = "fixture.metadata",
+    collectedAt = "2026-01-01T00:00:00.000Z",
+    sizeBytes = 17;
+  const bytes = new TextEncoder().encode(
+    JSON.stringify({ scope, collectedAt, sizeBytes }),
+  );
+  const { port, inputs } = recordingPort(() => new Uint8Array(32).fill(7));
+  expect(await metadataHashFor(scope, collectedAt, sizeBytes, port)).toBe(
+    "0x" + "07".repeat(32),
+  );
+  expect(inputs).toEqual([bytes]);
+  expect(await metadataHashFor(scope, collectedAt, sizeBytes, undefined)).toBe(
+    "0x" + Buffer.from(nobleStreamCrypto.keccak256(bytes)).toString("hex"),
+  );
 });

@@ -42,7 +42,20 @@ describe("the node stream-crypto port", () => {
     }
   });
 
-  it("hashes Keccak-256 the same as noble, and not as SHA3-256", () => {
+  it("hashes native Keccak-256 the same as noble, and not as SHA3-256", (context) => {
+    try {
+      const known = createHash("keccak-256").update("abc").digest("hex");
+      if (
+        known !==
+        "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"
+      ) {
+        context.skip("Runtime keccak-256 fails the Ethereum known answer");
+        return;
+      }
+    } catch {
+      context.skip("Runtime OpenSSL has no native keccak-256");
+      return;
+    }
     for (const size of [0, 1, 135, 136, 137, 100_000, 3 * 1024 * 1024 + 5]) {
       const data = bytesOf(size);
       expect(
@@ -159,4 +172,45 @@ describe("the node stream-crypto port", () => {
       0,
     );
   });
+});
+
+it("selects and continues using a native implementation after its known-answer probe", async () => {
+  const inputs: Uint8Array[] = [];
+  vi.resetModules();
+  vi.doMock("node:crypto", async (importOriginal) => {
+    const real = await importOriginal<typeof NodeCrypto>();
+    return {
+      ...real,
+      createHash: (algorithm: string) => {
+        if (algorithm !== "keccak-256") return real.createHash(algorithm);
+        let input = new Uint8Array();
+        return {
+          update(data: Uint8Array) {
+            input = Uint8Array.from(data);
+            inputs.push(input);
+            return this;
+          },
+          digest() {
+            return Buffer.from(nobleStreamCrypto.keccak256(input));
+          },
+        };
+      },
+    };
+  });
+  try {
+    const { nodeStreamCrypto: port } = await import("./node-stream-crypto.js");
+    expect(inputs).toEqual([new TextEncoder().encode("abc")]);
+    for (const size of [0, 1, 137, 3 * 1024 * 1024 + 5]) {
+      const data = bytesOf(size),
+        before = inputs.length;
+      expect(Buffer.from(port.keccak256(data))).toEqual(
+        Buffer.from(nobleStreamCrypto.keccak256(data)),
+      );
+      expect(inputs.length).toBe(before + 1);
+      expect(inputs.at(-1)).toEqual(data);
+    }
+  } finally {
+    vi.doUnmock("node:crypto");
+    vi.resetModules();
+  }
 });
