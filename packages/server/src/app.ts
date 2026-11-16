@@ -348,6 +348,7 @@ export interface AppDeps {
     declarations: StreamDeclarationRegistry;
     instancesForSubject?: (subjectId: string) => string[];
     instancesForSource?: (subjectId: string, sourceId: string) => string[];
+    sourceIdForConnector?: (connector: string) => string | undefined;
     readBlobBytes?: (
       blobId: string,
     ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
@@ -575,6 +576,7 @@ export function createApp(deps: AppDeps): Hono {
         ownerSubjectId: deps.serverOwner,
         instancesForSubject: deps.pdpp.instancesForSubject,
         instancesForSource: deps.pdpp.instancesForSource,
+        sourceIdForConnector: deps.pdpp.sourceIdForConnector,
         bindingStore: deps.pdpp.bindingStore,
         configuredMethods: deps.pdpp.configuredMethods,
         // An `api_error` on the resource surface is a server fault and must

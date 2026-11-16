@@ -1,14 +1,16 @@
 import { grantIsCandidate } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
+  listPdppRecords,
+  localRecord,
+  localRecordJson,
+  projectFields,
   refuseLegacyWrite,
+  type LocalRecord,
   type OwnedAccountStorageMode,
+  type RecordHistory,
+  type RecordListPlan,
 } from "@opendatalabs/personal-server-ts-core/api";
-import {
-  listCursor,
-  type RecordQuery,
-  type StoredRecord,
-} from "@opendatalabs/personal-server-ts-core/localdb";
-import { Buffer } from "node:buffer";
+import { type RecordQuery } from "@opendatalabs/personal-server-ts-core/localdb";
 import { parseRecordQuery } from "./pdpp-record-query.js";
 import type { ReplicaReader } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import { Hono, type Context } from "hono";
@@ -40,8 +42,6 @@ import {
   resolveReadScope,
   summarizeIngest,
   type IngestOutcome,
-  type ChangesSinceOptions,
-  type ChangesSincePage,
   type PdppRecordEnvelopeInput,
   type PdppRecordRow,
   type PdppRecordStore,
@@ -224,10 +224,7 @@ export interface PdppRecordsRouteDeps {
    * authorized projection at both horizons, return unprojected rows, and expire
    * when current records cannot answer exactly. No legacy or current-only
    * approximation may substitute for an unavailable historical body. */
-  recordHistory?: (
-    stream: string,
-    options: ChangesSinceOptions,
-  ) => Promise<ChangesSincePage>;
+  recordHistory?: RecordHistory;
   /** Writes and write-side lookups. Reads go through `reads`. */
   store: PdppRecordStore;
   /**
@@ -263,6 +260,8 @@ export interface PdppRecordsRouteDeps {
   instancesForSubject?: (subjectId: string) => string[];
   /** Active connections covered by a source-scoped owner token. */
   instancesForSource?: (subjectId: string, sourceId: string) => string[];
+  /** The registered source a connector id names; `source=` accepts it. */
+  sourceIdForConnector?: (connector: string) => string | undefined;
   /**
    * Owner access feed. PDPP reads must appear in the SAME feed as legacy
    * `/v1/data/{scope}` reads, or adopting PDPP would silently make an owner's
@@ -604,6 +603,107 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     return deps.recordQuery;
   }
 
+  /** The unswitched account's list: legacy rows, read through `reads`. */
+  function legacyRecordList(
+    context: PdppTokenContext,
+    plan: RecordListPlan,
+  ): Record<string, unknown> {
+    const { stream, scope, instanceIds, query } = plan;
+    const { limit, clamped, order, cursor } = query;
+    const fields = scope.fields;
+    const meta = clamped
+      ? {
+          warnings: [
+            { code: "limit_clamped", message: "limit clamped to 100" },
+          ],
+        }
+      : undefined;
+
+    if (query.changesSince !== undefined) {
+      // Eligibility compares the frozen candidate grant projection; sparse
+      // request fields shape only the response. Legacy profiles retain their
+      // existing request-field eligibility. The store returns raw rows.
+      // (spec §4:
+      // a record whose only change was to an unauthorized field must not
+      // appear as "changed" at all). The store returns each row's RAW,
+      // unprojected data regardless of `fields` — response-shaping
+      // projection happens only at toRecordJson below, after
+      // recordWithinGrantTimeConstraint has already run against the real
+      // field value. This split matters: if the store projected the
+      // returned data too, a grant whose fields exclude the
+      // time_constraint field would silently break that filter.
+      const page = reads(context).changesSince(stream, {
+        instanceIds,
+        changesSince:
+          grantIsCandidate(context.grant) && query.changesSince === "beginning"
+            ? undefined
+            : query.changesSince,
+        cursor,
+        limit,
+        fields: grantIsCandidate(context.grant)
+          ? scope.streamGrant!.fields
+          : fields,
+        ...(grantIsCandidate(context.grant) && {
+          expireOnErasure: true,
+          isVisible: (row: {
+            recordKey: string;
+            data: Record<string, unknown>;
+          }) =>
+            recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
+            recordWithinGrantTimeConstraint(row.data, scope.streamGrant),
+        }),
+      });
+      const visible = page.data.filter((row) => {
+        if (grantIsCandidate(context.grant)) return true; // store compared both authorized historical states
+        if (row.deleted) {
+          return recordKeyWithinGrantResources(
+            row.recordKey,
+            scope.streamGrant,
+          );
+        }
+        return (
+          recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
+          recordWithinGrantTimeConstraint(row.data, scope.streamGrant)
+        );
+      });
+      return {
+        object: "list",
+        has_more: page.hasMore,
+        ...(page.nextCursor && { next_cursor: page.nextCursor }),
+        ...(page.nextChangesSince && {
+          next_changes_since: page.nextChangesSince,
+        }),
+        data: visible.map((row) =>
+          toRecordJson(stream, row, fields, grantIsCandidate(context.grant)),
+        ),
+        ...(clamped && { meta }),
+      };
+    }
+
+    const page = reads(context).listRecords(stream, {
+      instanceIds,
+      limit,
+      order,
+      cursor,
+      // Only a replica preview reader returns removal rows; only the owner
+      // may see one.
+      isVisible: (row) =>
+        recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
+        (row.deleted
+          ? context.tokenKind === "owner"
+          : recordWithinGrantTimeConstraint(row.data, scope.streamGrant)),
+    });
+    return {
+      object: "list",
+      has_more: page.hasMore,
+      ...(page.nextCursor && { next_cursor: page.nextCursor }),
+      data: page.data.map((row) =>
+        toRecordJson(stream, row, fields, grantIsCandidate(context.grant)),
+      ),
+      ...(meta && { meta }),
+    };
+  }
+
   /** Retain the standalone legacy behaviour when no mode port is supplied. */
   function refuseRecordWrite(reqId: string): Response | null {
     const refusal = refuseLegacyWrite(deps.accountStorageMode);
@@ -791,20 +891,43 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     return { declaration, ownerInstanceIds };
   }
 
-  function ownerInstances(context: PdppTokenContext): string[] {
+  /**
+   * The connections an owner token may read. A `source` narrows the read and
+   * never widens it: a token scoped to one source refuses any other, and a
+   * token with no source scope reads only the source the request names.
+   */
+  function ownerInstances(
+    context: PdppTokenContext,
+    source?: string,
+  ): string[] {
     if (context.tokenKind !== "owner") return [];
+    const subject = requireSubjectId(context);
+    const requested =
+      source === undefined
+        ? undefined
+        : (deps.sourceIdForConnector?.(source) ?? source);
     if (context.sourceId) {
+      if (requested !== undefined && requested !== context.sourceId) {
+        throw new PdppError(
+          "grant_stream_not_allowed",
+          "Owner token is not scoped to the requested source",
+        );
+      }
       const current =
-        deps.instancesForSource?.(
-          requireSubjectId(context),
-          context.sourceId,
-        ) ?? [];
+        deps.instancesForSource?.(subject, context.sourceId) ?? [];
       if (!context.instanceIds) return current;
       return context.instanceIds.filter((instance) =>
         current.includes(instance),
       );
     }
-    const current = deps.instancesForSubject?.(requireSubjectId(context));
+    if (requested !== undefined) {
+      const inSource = deps.instancesForSource?.(subject, requested) ?? [];
+      if (!context.instanceIds) return inSource;
+      return context.instanceIds.filter((instance) =>
+        inSource.includes(instance),
+      );
+    }
+    const current = deps.instancesForSubject?.(subject);
     if (!current) return [];
     if (!context.instanceIds) return [];
     return context.instanceIds.filter((instance) => current.includes(instance));
@@ -1074,196 +1197,25 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       return sendError(c, mapInactiveToError(context!), reqId);
 
     try {
-      const query = parseRecordQuery(
-        c.req.url,
-        "listRecords",
-        context!.tokenKind,
-      );
-      const localQuery = localRecords();
       const stream = c.req.param("stream");
-
-      const { declaration, ownerInstanceIds } = readDeclaration(
-        context!,
-        stream,
-      );
-      const scope = resolveReadScope(
-        context!,
-        stream,
-        declaration,
-        query.fields,
-      );
-      const effectiveInstanceIds =
-        context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
-      if (context!.tokenKind === "client") {
-        requireRegisteredConnections(effectiveInstanceIds);
-      }
-      if (context!.tokenKind === "owner" && effectiveInstanceIds.length === 0) {
-        throw new PdppError(
-          "grant_stream_not_allowed",
-          "Owner token is not scoped to a currently owned instance",
-        );
-      }
-
-      const { limit, clamped, order, cursor } = query;
-      const fields = scope.fields;
-
-      if (localQuery) {
-        const page = await localRecordPage(
-          localQuery,
-          stream,
-          effectiveInstanceIds,
-          query,
-          scope.streamGrant,
-          context!.tokenKind === "owner",
-          deps.recordHistory,
-          grantIsCandidate(context!.grant),
-          grantIsCandidate(context!.grant)
-            ? scope.streamGrant?.fields
-            : scope.fields,
-        );
-        const response = c.json(
-          {
-            object: "list",
-            has_more: page.hasMore,
-            ...(page.nextCursor !== null && { next_cursor: page.nextCursor }),
-            ...(page.nextChangesSince !== undefined && {
-              next_changes_since: page.nextChangesSince,
-            }),
-            data: page.data.map((row) =>
-              localRecordJson(
-                stream,
-                row,
-                fields,
-                grantIsCandidate(context!.grant),
-              ),
-            ),
-            ...(clamped && {
-              meta: {
-                warnings: [
-                  { code: "limit_clamped", message: "limit clamped to 100" },
-                ],
-              },
-            }),
-          },
-          200,
-          { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
-        );
-        await logClientRead(c, context, stream, "completed", reqId);
-        return response;
-      }
-
-      if (query.changesSince !== undefined) {
-        // Eligibility compares the frozen candidate grant projection; sparse
-        // request fields shape only the response. Legacy profiles retain their
-        // existing request-field eligibility. The store returns raw rows.
-        // (spec §4:
-        // a record whose only change was to an unauthorized field must not
-        // appear as "changed" at all). The store returns each row's RAW,
-        // unprojected data regardless of `fields` — response-shaping
-        // projection happens only at toRecordJson below, after
-        // recordWithinGrantTimeConstraint has already run against the real
-        // field value. This split matters: if the store projected the
-        // returned data too, a grant whose fields exclude the
-        // time_constraint field would silently break that filter.
-        const page = reads(context!).changesSince(stream, {
-          instanceIds: effectiveInstanceIds,
-          changesSince:
-            grantIsCandidate(context!.grant) &&
-            query.changesSince === "beginning"
-              ? undefined
-              : query.changesSince,
-          cursor,
-          limit,
-          fields: grantIsCandidate(context!.grant)
-            ? scope.streamGrant!.fields
-            : fields,
-          ...(grantIsCandidate(context!.grant) && {
-            expireOnErasure: true,
-            isVisible: (row: {
-              recordKey: string;
-              data: Record<string, unknown>;
-            }) =>
-              recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-              recordWithinGrantTimeConstraint(row.data, scope.streamGrant),
-          }),
-        });
-        const visible = page.data.filter((row) => {
-          if (grantIsCandidate(context!.grant)) return true; // store compared both authorized historical states
-          if (row.deleted) {
-            return recordKeyWithinGrantResources(
-              row.recordKey,
-              scope.streamGrant,
-            );
-          }
-          return (
-            recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-            recordWithinGrantTimeConstraint(row.data, scope.streamGrant)
-          );
-        });
-        const meta = clamped
-          ? {
-              warnings: [
-                { code: "limit_clamped", message: "limit clamped to 100" },
-              ],
-            }
-          : {};
-        return c.json(
-          {
-            object: "list",
-            has_more: page.hasMore,
-            ...(page.nextCursor && { next_cursor: page.nextCursor }),
-            ...(page.nextChangesSince && {
-              next_changes_since: page.nextChangesSince,
-            }),
-            data: visible.map((row) =>
-              toRecordJson(
-                stream,
-                row,
-                fields,
-                grantIsCandidate(context!.grant),
-              ),
-            ),
-            ...(clamped && { meta }),
-          },
-          200,
-          { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
-        );
-      }
-
-      const page = reads(context!).listRecords(stream, {
-        instanceIds: effectiveInstanceIds,
-        limit,
-        order,
-        cursor,
-        // Only a replica preview reader returns removal rows; only the owner
-        // may see one.
-        isVisible: (row) =>
-          recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-          (row.deleted
-            ? context!.tokenKind === "owner"
-            : recordWithinGrantTimeConstraint(row.data, scope.streamGrant)),
-      });
-      const meta = clamped
-        ? {
-            warnings: [
-              { code: "limit_clamped", message: "limit clamped to 100" },
-            ],
-          }
-        : undefined;
-      const response = c.json(
+      const result = await listPdppRecords(
         {
-          object: "list",
-          has_more: page.hasMore,
-          ...(page.nextCursor && { next_cursor: page.nextCursor }),
-          data: page.data.map((row) =>
-            toRecordJson(stream, row, fields, grantIsCandidate(context?.grant)),
-          ),
-          ...(meta && { meta }),
+          accountMode: deps.accountStorageMode,
+          recordQuery: deps.recordQuery,
+          recordHistory: deps.recordHistory,
+          declarations: deps.declarations,
+          ownerInstances,
+          requireRegisteredConnections,
+          legacy: (plan) => Promise.resolve(legacyRecordList(context!, plan)),
         },
-        200,
-        { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+        { url: c.req.url, stream, context: context! },
       );
-      await logClientRead(c, context, stream, "completed", reqId);
+      const response = c.json(result.body, 200, {
+        "Request-Id": reqId,
+        "PDPP-Version": PDPP_VERSION,
+      });
+      if (result.feed)
+        await logClientRead(c, context, stream, "completed", reqId);
       return response;
     } catch (err) {
       const mapped = mapAndLog(
@@ -2132,308 +2084,6 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   });
 
   return app;
-}
-
-interface LocalRecord {
-  readonly instance: string;
-  readonly recordKey: string;
-  readonly data: Record<string, unknown>;
-  readonly emittedAt: string | null;
-  readonly deleted?: boolean;
-}
-
-function localRecord(instance: string, record: StoredRecord): LocalRecord {
-  const data: unknown = JSON.parse(record.body);
-  if (data === null || typeof data !== "object" || Array.isArray(data)) {
-    throw new Error("Local record data is not an object");
-  }
-  return {
-    instance,
-    recordKey: record.recordKey,
-    data: data as Record<string, unknown>,
-    emittedAt: new Date(record.emittedAt).toISOString(),
-  };
-}
-
-function localRecordJson(
-  stream: string,
-  row: LocalRecord,
-  fields: string[] | undefined,
-  candidate: boolean,
-) {
-  const identity = {
-    object: "record",
-    id: row.recordKey,
-    ...(candidate && { instance_id: row.instance }),
-    stream,
-  };
-  if (row.deleted) {
-    // RecordQuery exposes the removal sequence, not a deletion timestamp.
-    return candidate
-      ? { ...identity, deleted: true }
-      : { ...identity, deleted: true, deleted_at: null, emitted_at: null };
-  }
-  return {
-    ...identity,
-    data: projectFields(row.data, fields),
-    emitted_at: row.emittedAt,
-  };
-}
-
-/** Multi-connection continuation keeps a key per connection, including ties. */
-function localListCursors(
-  cursor: string | undefined,
-  stream: string,
-  instances: string[],
-): (string | undefined)[] {
-  if (instances.length === 1) return [cursor];
-  if (cursor === undefined) return instances.map(() => undefined);
-  try {
-    const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
-    if (
-      value.kind !== "local-records" ||
-      value.stream !== stream ||
-      JSON.stringify(value.instances) !== JSON.stringify(instances) ||
-      !Array.isArray(value.after) ||
-      value.after.length !== instances.length ||
-      !value.after.every(
-        (key: unknown) => key === null || typeof key === "string",
-      )
-    ) {
-      throw new Error("invalid cursor");
-    }
-    return value.after.map((key: string | null) => key ?? undefined);
-  } catch {
-    throw new PdppError("invalid_cursor", "Cursor does not match this stream");
-  }
-}
-
-function localSequence(value: string): number {
-  const number = value === "beginning" ? 0 : Number(value);
-  if (
-    (value !== "beginning" && !/^(0|[1-9][0-9]*)$/.test(value)) ||
-    !Number.isSafeInteger(number)
-  ) {
-    throw new PdppError("invalid_cursor", "Change cursor must be a sequence");
-  }
-  return number;
-}
-
-/** Only authorized connection ids enter the query; projection follows filtering. */
-async function localRecordPage(
-  query: RecordQuery,
-  stream: string,
-  instanceIds: string[],
-  input: ReturnType<typeof parseRecordQuery>,
-  streamGrant: StreamGrant | undefined,
-  owner: boolean,
-  history: PdppRecordsRouteDeps["recordHistory"],
-  candidate: boolean,
-  eligibilityFields: string[] | undefined,
-): Promise<{
-  data: LocalRecord[];
-  hasMore: boolean;
-  nextCursor: string | null;
-  nextChangesSince?: string;
-}> {
-  const instances = [...new Set(instanceIds)].sort();
-  const visible = (row: LocalRecord) =>
-    recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
-    (row.deleted || recordWithinGrantTimeConstraint(row.data, streamGrant));
-  if (input.changesSince !== undefined) {
-    if (!owner) {
-      if (!history)
-        throw new PdppError(
-          "STREAM_HISTORY_UNAVAILABLE",
-          "Grant-safe stream change history is unavailable",
-        );
-      const page = await history(stream, {
-        instanceIds: instances,
-        changesSince:
-          candidate && input.changesSince === "beginning"
-            ? undefined
-            : input.changesSince,
-        cursor: input.cursor,
-        limit: input.limit,
-        fields: eligibilityFields,
-        expireOnErasure: candidate,
-        isVisible: (row) =>
-          recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
-          recordWithinGrantTimeConstraint(row.data, streamGrant),
-      });
-      return {
-        data: page.data.map((row) => ({
-          instance: row.instance,
-          recordKey: row.recordKey,
-          data: row.deleted ? {} : row.data,
-          emittedAt: row.emittedAt,
-          deleted: row.deleted,
-        })),
-        hasMore: page.hasMore,
-        nextCursor: page.nextCursor ?? null,
-        nextChangesSince: page.nextChangesSince,
-      };
-    }
-    const since = localSequence(input.changesSince);
-    const after =
-      input.cursor === undefined ? since : localSequence(input.cursor);
-    if (after < since) {
-      throw new PdppError(
-        "invalid_cursor",
-        "Change cursor precedes changes_since",
-      );
-    }
-    const changes: {
-      seq: number;
-      row: LocalRecord | null;
-    }[] = [];
-    let more = false;
-    for (const instance of instances) {
-      const page = await query.changesSince({
-        connectionId: instance,
-        stream,
-        cursor: after,
-        limit: input.limit,
-      });
-      if (page === "gone") {
-        throw new PdppError(
-          "cursor_expired",
-          "changes_since cursor has expired",
-        );
-      }
-      more ||= page.nextCursor !== null;
-      for (const change of page.changes) {
-        changes.push({
-          seq: change.seq,
-          row:
-            change.op === "remove"
-              ? {
-                  instance,
-                  recordKey: change.recordKey,
-                  data: {},
-                  emittedAt: null,
-                  deleted: true,
-                }
-              : change.record === null
-                ? null
-                : localRecord(instance, change.record),
-        });
-      }
-    }
-    changes.sort((a, b) => a.seq - b.seq);
-    const page = changes.slice(0, input.limit);
-    const hasMore = more || changes.length > input.limit;
-    const last = page.at(-1)?.seq ?? after;
-    return {
-      data: page.flatMap(({ row }) => (row && visible(row) ? [row] : [])),
-      hasMore,
-      nextCursor: hasMore ? String(last) : null,
-      nextChangesSince: String(last),
-    };
-  }
-
-  if (!owner) {
-    if (!history)
-      throw new PdppError(
-        "STREAM_HISTORY_UNAVAILABLE",
-        "Grant-safe stream snapshots are unavailable",
-      );
-    // Reuse the query module's frozen, visibility-filtered initial snapshot.
-    // Hidden identities never consume a page or escape in a list cursor.
-    const page = await history(stream, {
-      purpose: "listing",
-      instanceIds: instances,
-      cursor: input.cursor,
-      limit: input.limit,
-      fields: eligibilityFields,
-      isVisible: (row) =>
-        visible({
-          instance: row.instance,
-          recordKey: row.recordKey,
-          data: row.data,
-          emittedAt: row.emittedAt,
-          deleted: false,
-        }),
-    });
-    return {
-      data: page.data.map((row) => ({
-        instance: row.instance,
-        recordKey: row.recordKey,
-        data: row.deleted ? {} : row.data,
-        emittedAt: row.emittedAt,
-        deleted: row.deleted,
-      })),
-      hasMore: page.hasMore,
-      nextCursor: page.nextCursor ?? null,
-    };
-  }
-
-  const after = localListCursors(input.cursor, stream, instances);
-  const records: { index: number; record: StoredRecord }[] = [];
-  let more = false;
-  for (const [index, instance] of instances.entries()) {
-    const page = await query.listRecords({
-      connectionId: instance,
-      stream,
-      cursor: after[index],
-      limit: input.limit,
-    });
-    more ||= page.nextCursor !== null;
-    for (const record of page.records) records.push({ index, record });
-  }
-  // SQLite record_key order is binary UTF-8, independent of locale or stamp_o.
-  records.sort(
-    (a, b) =>
-      Buffer.compare(
-        Buffer.from(a.record.recordKey),
-        Buffer.from(b.record.recordKey),
-      ) || a.index - b.index,
-  );
-  const page = records.slice(0, input.limit);
-  const hasMore = more || records.length > input.limit;
-  for (const entry of page)
-    after[entry.index] = listCursor(
-      entry.record.recordKey,
-      entry.record.pkHash,
-    );
-  const nextCursor = !hasMore
-    ? null
-    : instances.length === 1
-      ? after[0]!
-      : Buffer.from(
-          JSON.stringify({
-            kind: "local-records",
-            stream,
-            instances,
-            after: after.map((key) => key ?? null),
-          }),
-        ).toString("base64url");
-  return {
-    data: page
-      .map(({ index, record }) => localRecord(instances[index]!, record))
-      .filter(visible),
-    hasMore,
-    nextCursor,
-  };
-}
-
-/**
- * Applies the grant's field projection to a record's data for the response
- * body. Callers MUST filter by time_constraint against the record's
- * unprojected data BEFORE calling this — projecting first would strip the
- * time_constraint field before it can be compared, silently breaking the
- * filter for any grant whose fields don't happen to include that field.
- */
-function projectFields(
-  data: Record<string, unknown>,
-  fields: string[] | undefined,
-): Record<string, unknown> {
-  if (!fields) return data;
-  const projected: Record<string, unknown> = {};
-  for (const field of fields) {
-    if (field in data) projected[field] = data[field];
-  }
-  return projected;
 }
 
 /**
