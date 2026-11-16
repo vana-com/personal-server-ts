@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type * as fsPromises from "node:fs/promises";
 import type * as localState from "./mcp/local-state.js";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { access, mkdtemp, readdir, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -27,8 +27,8 @@ import {
   enableReplicaWriterIdentity,
 } from "./storage/pdpp-replica-writer-identity.js";
 
-// Holds one MCP state write at its rename so a test can stop the server while
-// the write is in flight. Unarmed, every rename passes straight through.
+// Holds one real MCP atomic write before its temp file is created.
+// Unarmed, filesystem operations pass straight through.
 const heldWrite = vi.hoisted(() => {
   const gate: {
     armed: boolean;
@@ -39,6 +39,7 @@ const heldWrite = vi.hoisted(() => {
     closeAwaited: Promise<void>;
     closeAwaitedNow: () => void;
     closeSettled: boolean;
+    temporaryOpens: number;
   } = {
     armed: false,
     reached: Promise.resolve(),
@@ -47,6 +48,7 @@ const heldWrite = vi.hoisted(() => {
     closeAwaited: Promise.resolve(),
     closeAwaitedNow: () => undefined,
     closeSettled: false,
+    temporaryOpens: 0,
   };
   return gate;
 });
@@ -86,17 +88,20 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof fsPromises>();
   return {
     ...actual,
-    rename: async (from: string, to: string) => {
-      if (heldWrite.armed && to.endsWith("mcp-state.json")) {
+    open: async (...args: Parameters<typeof actual.open>) => {
+      const path = typeof args[0] === "string" ? args[0] : "";
+      const temporary = /mcp-state\.json\.[a-f0-9]+\.tmp$/.test(path);
+      if (temporary && heldWrite.armed) {
         heldWrite.armed = false;
-        heldWrite.target = to;
+        heldWrite.target = path.replace(/\.[a-f0-9]+\.tmp$/, "");
         const released = new Promise<void>((resolve) => {
           heldWrite.release = resolve;
         });
         heldWrite.reachedNow();
         await released;
       }
-      return actual.rename(from, to);
+      if (temporary) heldWrite.temporaryOpens++;
+      return actual.open(...args);
     },
   };
 });
@@ -171,7 +176,7 @@ async function startTestServer(
     await rm(rootPath, { recursive: true, force: true });
   });
   if (declareUnswitched) await declareOff(ps);
-  return { ps, gateway, port };
+  return { ps, gateway, port, rootPath };
 }
 
 async function boundPort(ps: PersonalServerHandle): Promise<number> {
@@ -730,8 +735,8 @@ describe("startPersonalServer node handle", () => {
     expect(ps.stop()).toBe(first);
   });
 
-  it("stop waits for an MCP lastUsedAt write that is still in flight", async () => {
-    const { ps, port } = await startTestServer();
+  it("stop waits for an MCP lastUsedAt write before its temp file is created", async () => {
+    const { ps, port, rootPath } = await startTestServer();
     const ownerPost = async (path: string, body: unknown) => {
       const bytes = new TextEncoder().encode(JSON.stringify(body));
       const auth = await buildWeb3SignedHeader({
@@ -765,6 +770,7 @@ describe("startPersonalServer node handle", () => {
       heldWrite.closeAwaitedNow = resolve;
     });
     heldWrite.closeSettled = false;
+    const opensBefore = heldWrite.temporaryOpens;
     heldWrite.armed = true;
     let stopping: Promise<void> | undefined;
     try {
@@ -779,6 +785,10 @@ describe("startPersonalServer node handle", () => {
       expect(response.status).toBe(200);
       await heldWrite.reached;
       const directory = dirname(heldWrite.target ?? "");
+      expect(heldWrite.temporaryOpens).toBe(opensBefore);
+      expect(
+        (await readdir(directory)).filter((name) => name.endsWith(".tmp")),
+      ).toEqual([]);
 
       stopping = ps.stop();
       // Stop awaits the MCP state's drain while the write is still held. A
@@ -789,6 +799,8 @@ describe("startPersonalServer node handle", () => {
       ]);
       expect(first).toBe("awaited");
       expect(heldWrite.closeSettled).toBe(false);
+      expect(ps.stop()).toBe(stopping);
+      expect(heldWrite.temporaryOpens).toBe(opensBefore);
 
       heldWrite.release();
       await stopping;
@@ -797,6 +809,11 @@ describe("startPersonalServer node handle", () => {
       const after = await readdir(directory);
       expect(after).toContain("mcp-state.json");
       expect(after.filter((name) => name.endsWith(".tmp"))).toEqual([]);
+      expect(heldWrite.temporaryOpens).toBe(opensBefore + 1);
+      await rm(rootPath, { recursive: true, force: true });
+      await ps.stop();
+      expect(heldWrite.temporaryOpens).toBe(opensBefore + 1);
+      await expect(access(rootPath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       heldWrite.armed = false;
       heldWrite.release();
