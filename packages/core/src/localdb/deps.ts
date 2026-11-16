@@ -67,7 +67,9 @@ export interface LocalSyncDeps {
    * Default on. A first load of a log that does not fit one commit's memory
    * budget loads key by key (`log-keyed.ts`). Off: it applies segment by
    * segment in position order, as it does for every other pass. A test that
-   * wants the segment-by-segment result to compare against turns it off.
+   * wants the segment-by-segment result to compare against turns it off. A
+   * device that holds the rows of a key-ordered load that stopped, and has the
+   * flag off, drops those rows and loads again (`rebaselineKeyedLoad`).
    */
   readonly keyedFirstLoad?: boolean;
   /**

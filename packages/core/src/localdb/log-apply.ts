@@ -55,7 +55,9 @@ import {
 } from "./log-batch.js";
 import {
   loadKeyed,
+  keyedLoadBlocked,
   planKeyedLoad,
+  rebaselineKeyedLoad,
   unfinishedKeyedLoad,
   type KeyedSource,
 } from "./log-keyed.js";
@@ -265,7 +267,9 @@ async function applyLogPass(
   // move it. So while the marker stands, no branch below may write a cursor:
   // not the lifetime branches, which write `log_state` without applying
   // anything, and not a device that somehow holds both a cursor and the marker.
-  const pending = await readKeyedPending(deps, connectionId);
+  // A log that cannot finish that load (`keyedLoadBlocked`) ends it instead:
+  // the marker and its rows go, and the first load starts again from the log.
+  let pending = await readKeyedPending(deps, connectionId);
   if (pending !== null && local.position !== 0)
     throw unfinishedKeyedLoad(pending, "this device holds a cursor above 0");
 
@@ -348,6 +352,7 @@ async function applyLogPass(
   let since = local.position;
   let plan = planOpsSince(head, headRef, since);
   let snapshot: SnapshotPointer | null = null;
+  let gap = false;
   if (plan.kind === "gap") {
     if (plan.reason === "ahead_of_head")
       throw new LogDivergedError(
@@ -356,27 +361,46 @@ async function applyLogPass(
     // A full check. Behind `base` the log no longer holds the prefix: a
     // snapshot does, and it is installed first. Without one (a log that began
     // after the streams were published) the per-stream path holds it.
-    if (deps.progressiveFirstLoad === true && pending === null) {
-      const after = planOpsSince(head, headRef, head.base);
-      return {
-        applied: await loadProgressively(
-          deps,
-          connectionId,
-          scope,
-          context,
-          head,
-          allRefs,
-          head.snapshot ?? null,
-          after.kind === "segments" ? after.refs : [],
-        ),
-      };
-    }
+    gap = true;
     since = head.base;
     plan = planOpsSince(head, headRef, since);
     // Behind `base` the snapshot is installed first, then the tail: one pass.
     snapshot = head.snapshot ?? null;
   }
   const tail = plan.kind === "segments" ? plan.refs : [];
+  if (pending !== null) {
+    const last = tail.at(-1);
+    const blocked = keyedLoadBlocked(deps, pending, {
+      snapshotPresent: snapshot !== null,
+      target: last
+        ? {
+            position: last.position,
+            base: head.base,
+            refs: allRefs.filter((ref) => ref.position <= last.position),
+            snapshot: head.snapshot,
+          }
+        : null,
+    });
+    if (blocked !== null) {
+      await rebaselineKeyedLoad(deps, connectionId, blocked);
+      pending = null;
+    }
+  }
+  if (gap && deps.progressiveFirstLoad === true && pending === null) {
+    const after = planOpsSince(head, headRef, head.base);
+    return {
+      applied: await loadProgressively(
+        deps,
+        connectionId,
+        scope,
+        context,
+        head,
+        allRefs,
+        head.snapshot ?? null,
+        after.kind === "segments" ? after.refs : [],
+      ),
+    };
+  }
   if (tail.length === 0 && snapshot === null && pending === null)
     return { applied: 0 };
   if (deps.progressiveFirstLoad === true && pending === null)

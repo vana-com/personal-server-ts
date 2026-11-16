@@ -73,6 +73,7 @@ import type { SqlStatement } from "./driver.js";
 import { tombstoneOmissions } from "./admit.js";
 import { planCompaction } from "./log-compact.js";
 import { readLogState, writeLogState, type LogState } from "./log-apply.js";
+import { rowsPerStatement } from "./log-batch.js";
 import {
   replaceDelete,
   seenBeforeParams,
@@ -102,7 +103,8 @@ import { unwriteRefusedRun } from "./unwrite.js";
 
 const keccak = async (bytes: Uint8Array) => keccak_256(bytes);
 const MAX_ATTEMPTS = 5;
-const KEYS_PER_QUERY = 400;
+/** Keys a query binds: the delete lookup binds a connection, a stream and two positions beside them. */
+const KEYS_PER_QUERY = rowsPerStatement(1, 4);
 
 /** Registries that answered the batch route with 404 or 405: the log needs it. */
 const withoutBatchRoute = new WeakSet<StreamSyncRegistry>();
