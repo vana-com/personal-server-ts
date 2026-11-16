@@ -207,6 +207,92 @@ describe("MCP durable state close", () => {
     );
   });
 
+  it("refuses a write a detached continuation starts after its operation returned", async () => {
+    const s = await seeded();
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    let detached!: Promise<unknown>;
+    await s.state.exclusive(async () => {
+      // Started inside the operation, never awaited by it.
+      detached = gate.then(() =>
+        s.state.connections.update(s.id, { lastUsedAt: "detached" }),
+      );
+      detached.catch(() => undefined);
+    });
+    await s.state.close();
+    const bytes = await readFile(s.path);
+    const files = await readdir(s.directory);
+
+    open();
+    await expect(detached).rejects.toThrow(CLOSED);
+    expect(await readdir(s.directory)).toEqual(files);
+    expect((await readFile(s.path)).equals(bytes)).toBe(true);
+  });
+
+  it("revokes an operation's writes when its callback throws", async () => {
+    const s = await seeded();
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    let detached!: Promise<unknown>;
+    await expect(
+      s.state.exclusive(async () => {
+        detached = gate.then(() =>
+          s.state.connections.update(s.id, { lastUsedAt: "after-throw" }),
+        );
+        detached.catch(() => undefined);
+        throw new Error("callback failed");
+      }),
+    ).rejects.toThrow("callback failed");
+    await s.state.close();
+    const bytes = await readFile(s.path);
+
+    open();
+    await expect(detached).rejects.toThrow(CLOSED);
+    expect((await readFile(s.path)).equals(bytes)).toBe(true);
+  });
+
+  it("rejects a close made from inside an admitted operation, then closes from outside", async () => {
+    const s = await seeded();
+    await expect(
+      s.state.exclusive(async () => {
+        await s.state.close();
+      }),
+    ).rejects.toThrow("cannot be closed from inside");
+    // The refused call did not close the state: a write still lands.
+    await s.state.connections.update(s.id, { lastUsedAt: "after-refusal" });
+    await s.state.close();
+    await expect(
+      s.state.connections.update(s.id, { lastUsedAt: "late" }),
+    ).rejects.toThrow(CLOSED);
+  });
+
+  it("rejects a close made from inside an admitted operation while a close is in progress", async () => {
+    const s = await seeded();
+    let entered!: () => void;
+    const running = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const inside = s.state.exclusive(async () => {
+      entered();
+      await gate;
+      await s.state.close();
+    });
+    inside.catch(() => undefined);
+    await running;
+    const outside = s.state.close();
+    open();
+    await expect(inside).rejects.toThrow("cannot be closed from inside");
+    await outside;
+  });
+
   it("returns one promise for repeated closes", async () => {
     const s = await seeded();
     const first = s.state.close();

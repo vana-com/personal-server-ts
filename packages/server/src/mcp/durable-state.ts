@@ -211,16 +211,17 @@ export async function openMcpDurableState(options: {
   };
   // One admission gate for every operation that can write. Once close()
   // begins, each entry point refuses new work synchronously. An operation
-  // admitted earlier runs to completion, and its own writes stay admitted
-  // through `admitted`, so a multi-step exclusive operation is never refused
-  // halfway.
+  // admitted earlier runs to completion, and writes made while it is active
+  // stay admitted through its token, so a multi-step exclusive operation is
+  // never refused halfway. The token is revoked when the operation settles, so
+  // work it leaves running afterwards is refused like any later call.
   let closed = false;
   let closing: Promise<void> | undefined;
-  const admitted = new AsyncLocalStorage<true>();
+  const admitted = new AsyncLocalStorage<{ active: boolean }>();
   const refused = <T>(): Promise<T> =>
     Promise.reject(new Error("MCP state is closed"));
   const mutate = <T>(change: (draft: State) => T): Promise<T> => {
-    if (closed && !admitted.getStore()) return refused();
+    if (closed && !admitted.getStore()?.active) return refused();
     const result = writes.then(async () => {
       assertActive();
       const draft = structuredClone(state);
@@ -605,14 +606,30 @@ export async function openMcpDurableState(options: {
     getIdentity: (id) => read((current) => current.identities[id] ?? null),
     exclusive<T>(operation: () => Promise<T>): Promise<T> {
       if (closed) return refused();
-      const result = operations.then(() => admitted.run(true, operation));
+      const result = operations.then(async () => {
+        const token = { active: true };
+        try {
+          return await admitted.run(token, operation);
+        } finally {
+          token.active = false;
+        }
+      });
       operations = result.catch(() => undefined);
       return result;
     },
     close() {
+      // Close waits for every admitted operation, so an operation that closed
+      // the state would wait for itself.
+      if (admitted.getStore()?.active)
+        return Promise.reject(
+          new Error(
+            "MCP state cannot be closed from inside one of its operations",
+          ),
+        );
       closed = true;
       // Admitted operations queue their own writes, so settle them before the
-      // writes. Nothing new is admitted now, so both tails are final.
+      // writes. Nothing new is admitted once their tokens are revoked, so both
+      // tails are final.
       return (closing ??= (async () => {
         await operations;
         await writes;
