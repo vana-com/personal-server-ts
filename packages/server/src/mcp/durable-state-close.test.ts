@@ -293,6 +293,57 @@ describe("MCP durable state close", () => {
     await outside;
   });
 
+  it("rejects a close made from a rollback resolver, then drains from outside", async () => {
+    const target = await emptyTarget();
+    await target.state.importSnapshot(
+      await snapshot("m-resolver"),
+      "m-resolver",
+    );
+    await expect(
+      target.state.prepareRollback("m-resolver", async () => {
+        await target.state.close();
+        return { identity, generation: 1 };
+      }),
+    ).rejects.toThrow("cannot be closed from inside");
+    // The refused close left the state open and the lifecycle usable.
+    await target.state.connections.update(
+      (await target.state.connections.list())[0]!.id,
+      { lastUsedAt: "after-refusal" },
+    );
+    await target.state.close();
+    await expect(
+      target.state.connections.update("any", { lastUsedAt: "late" }),
+    ).rejects.toThrow(CLOSED);
+  });
+
+  it("rejects a close made from a rollback resolver while a close is in progress", async () => {
+    const target = await emptyTarget();
+    await target.state.importSnapshot(
+      await snapshot("m-resolver"),
+      "m-resolver",
+    );
+    let entered!: () => void;
+    const running = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const inside = target.state.prepareRollback("m-resolver", async () => {
+      entered();
+      await gate;
+      await target.state.close();
+      return { identity, generation: 1 };
+    });
+    inside.catch(() => undefined);
+    await running;
+    const outside = target.state.close();
+    open();
+    await expect(inside).rejects.toThrow("cannot be closed from inside");
+    await outside;
+  });
+
   it("returns one promise for repeated closes", async () => {
     const s = await seeded();
     const first = s.state.close();

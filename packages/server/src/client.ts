@@ -110,7 +110,16 @@ export async function startPersonalServer(
   let lastPreparedRegistration: PersonalServerRegistrationRequest | null = null;
   const setStatus = (nextStatus: PersonalServerStatus): void => {
     status = nextStatus;
-    options.onStatus?.(nextStatus);
+    // The observer only reports; it cannot veto startup or skip cleanup, so a
+    // throw from it is logged and dropped.
+    try {
+      options.onStatus?.(nextStatus);
+    } catch (err) {
+      context.logger.warn(
+        { err, status: nextStatus },
+        "Status observer failed",
+      );
+    }
   };
 
   // Port 0 asks the OS for a free port. The listener binds it once, here,

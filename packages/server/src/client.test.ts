@@ -804,6 +804,27 @@ describe("startPersonalServer node handle", () => {
     }
   }, 30_000);
 
+  it("treats a throwing status observer as non-fatal and still cleans up on stop", async () => {
+    const seen: string[] = [];
+    heldWrite.closeSettled = false;
+    const { ps, port } = await startTestServer(createGateway(), true, {
+      onStatus: (status) => {
+        seen.push(status);
+        throw new Error(`observer failed at ${status}`);
+      },
+    });
+    // The throw at "ready" did not abort startup: the handle works.
+    expect(seen).toContain("ready");
+    expect((await fetch(`http://127.0.0.1:${port}/health`)).status).toBe(200);
+
+    await ps.stop();
+    // The throw at "stopped" did not skip cleanup: the listener is closed and
+    // the MCP state's drain ran to completion.
+    expect(seen).toContain("stopped");
+    expect(heldWrite.closeSettled).toBe(true);
+    await expect(fetch(`http://127.0.0.1:${port}/health`)).rejects.toThrow();
+  });
+
   it("stops idempotently", async () => {
     const { ps } = await startTestServer();
 
