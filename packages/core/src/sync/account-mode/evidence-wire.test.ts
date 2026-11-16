@@ -79,7 +79,7 @@ describe("parseEvidenceBody: a host sends either the state or what it saw", () =
     expect(parseEvidenceBody({ rawStatus: 200 })).toBeNull();
   });
 
-  it("an unnamed state with a stated one in the same body: the stated one wins", () => {
+  it("a body that names a state and also what the host saw: the named state wins", () => {
     expect(
       parseEvidenceBody({
         owner: OWNER,

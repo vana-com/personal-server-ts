@@ -115,24 +115,26 @@ describe("PS-Lite stream-sync design flags", () => {
     },
   );
 
-  it("turns on the flags the one comma list names, and no others", async () => {
-    expect(
-      await depsFor({ streamSyncFlags: "logProtocol, nonsense" }),
-    ).toMatchObject({ logProtocol: true });
-    const deps =
-      ((engineDeps.length = 0),
-      await depsFor({ streamSyncFlags: "logProtocol" }));
-    expect(deps.publishWhileCollecting ?? false).toBe(false);
-    expect(deps.progressiveFirstLoad ?? false).toBe(false);
-  });
+  it.each(FLAGS)(
+    "the list naming only %s turns that flag on and no other",
+    async (flag) => {
+      const deps = await depsFor({ streamSyncFlags: `${flag}, nonsense` });
+      for (const [other] of FLAGS) {
+        expect(deps[other] ?? false).toBe(other === flag);
+      }
+    },
+  );
 
-  it("lets a flag's own option win over the list", async () => {
-    const deps = await depsFor({
-      streamSyncFlags: "logProtocol",
-      streamSyncLogProtocol: false,
-    });
-    expect(deps.logProtocol ?? false).toBe(false);
-  });
+  it.each(FLAGS)(
+    "lets the own option of %s win over a list that names it",
+    async (flag, option) => {
+      const deps = await depsFor({
+        streamSyncFlags: flag,
+        [option]: false,
+      });
+      expect(deps[flag] ?? false).toBe(false);
+    },
+  );
 
   // `startPersonalServer` (what the Web host calls) spreads its options into
   // `createIndexedDbPsLiteRuntime`; the option must survive that hop too.
