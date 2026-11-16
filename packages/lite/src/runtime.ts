@@ -172,13 +172,6 @@ export interface PsLiteAuthAdapter extends PersonalServerApiAuthPort {
 
 export interface PsLiteRuntimeOptions {
   localSync?: () => Promise<LocalSync>;
-  /**
-   * The streams a connector declares, as the sync engine is given them. With
-   * it, `GET /v1/streams/:stream/records` refuses an undeclared stream or
-   * unknown source as the Node host does; without it, any stream of an active
-   * connection reads and an undeclared one lists empty.
-   */
-  streamSyncDeclaredStreams?: (connector: string) => readonly string[];
   streamSyncSeed?: SeedIntake | null;
   history?: LocalHistory;
 
@@ -1574,7 +1567,6 @@ export function createPsLiteRuntime(
               accountStorageMode,
               authorizeOwner: (req) => auth.authorizeOwner(req),
               ownerAddress,
-              declaredStreams: options.streamSyncDeclaredStreams,
             },
           );
         }

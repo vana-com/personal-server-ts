@@ -47,6 +47,12 @@ export interface LocalSync {
   recordsFor(link: ConnectionLink): RecordQuery;
   changesFor(link: ConnectionLink): ReturnType<typeof createGrantHistory>;
   readonly history: LocalHistory;
+  /** What connections here declare: the one source both hosts read it from. */
+  readonly declarations: {
+    streamsOf(connector: string): readonly string[];
+    /** Connectors with an active connection in this database. */
+    connectors(): Promise<readonly string[]>;
+  };
   readonly olderVersions: OlderVersions;
   readonly blobs: BlobStore;
   /** `/sync/trigger` and the timer: C.4 order, apply then publish. */
@@ -277,6 +283,15 @@ export function createLocalSync(
       aliasScopes: options.aliasScopes,
       aliasTargets: options.aliasTargets,
     }),
+    declarations: {
+      streamsOf: options.declaredStreams,
+      connectors: async () =>
+        (
+          await readerOf(deps.db).query<{ connector: string }>(
+            "SELECT DISTINCT connector FROM connections WHERE control_state='active' ORDER BY connector",
+          )
+        ).map((row) => row.connector),
+    },
     olderVersions,
     blobs: createBlobStore(deps),
     async cycle() {
