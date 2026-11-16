@@ -317,6 +317,9 @@ function timerPeriod(requested: number | undefined): number {
  * connection that failed, or a stream whose publish backs off or waits on a
  * condition, is tried again only by a later cycle. A position cannot stand in
  * for that cycle, so the pass is not settled and the timer keeps running. A
+ * connection whose log this build cannot read (`status: "update_required"`)
+ * owes nothing: a later cycle of this build reads the same format and refuses
+ * again, so only an update changes it, and the status shows it until then. A
  * report of another shape says nothing and leaves nothing owed.
  */
 function reportLeavesWork(report: unknown): boolean {
@@ -324,10 +327,12 @@ function reportLeavesWork(report: unknown): boolean {
     ?.connections;
   if (!Array.isArray(connections)) return false;
   return connections.some((connection: unknown) => {
-    const { error, published } = (connection ?? {}) as {
+    const { error, published, status } = (connection ?? {}) as {
       error?: unknown;
       published?: unknown;
+      status?: unknown;
     };
+    if (status === "update_required") return false;
     if (error !== null && error !== undefined) return true;
     return (
       Array.isArray(published) &&
@@ -562,7 +567,13 @@ export function createSyncManager(
         const errorsBefore = errorSeq;
         syncedPosition = undefined;
         const settle = () => {
-          if (blocked !== null || errorSeq !== errorsBefore) return;
+          // The update-required block is a diagnostic of a refusal no retry
+          // changes (`reportLeavesWork`); any other block means no cycle ran.
+          if (
+            (blocked !== null && blocked.reason !== "update_required") ||
+            errorSeq !== errorsBefore
+          )
+            return;
           syncedPosition = startedUnder;
         };
         const canRun = await (options?.canSync?.() ?? { ok: true });

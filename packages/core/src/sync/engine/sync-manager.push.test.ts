@@ -867,6 +867,76 @@ describe("the push position", () => {
       },
     );
 
+    describe("a connection whose log this build cannot read", () => {
+      // The real report shape: the cycle sets both the error text and
+      // `status: "update_required"` for it. No later cycle of this build
+      // changes that outcome, so it owes no retry; the block stays shown.
+      const refused = (id: string) => ({
+        connectionId: id,
+        applied: [],
+        published: [],
+        error: "apply: invalid log segment 3 (unsupported_format)",
+        status: "update_required" as const,
+      });
+      const ordinary = (error: string | null, outcome = "noop") => ({
+        connectionId: "other",
+        applied: [],
+        published: [{ stream: "s", outcome, watermark: null }],
+        error,
+      });
+
+      it("alone: settles under a healthy push, keeps the block, stays quiet on timer and probe ticks, and a poke still cycles", async () => {
+        const { manager, cycle } = await pokedInto({
+          connections: [refused("c")],
+        });
+        expect(cycle).toHaveBeenCalledTimes(1); // the poke
+        expect(manager.getStatus().blocked?.reason).toBe("update_required");
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+        expect(cycle).toHaveBeenCalledTimes(1); // no timer cycle, no probe
+        expect(manager.getStatus().blocked?.reason).toBe("update_required");
+        await manager.stop();
+      });
+
+      it("a poke at the same position still runs a cycle after it settled", async () => {
+        const { push, state } = fakePush();
+        const cycle = vi.fn(async () => ({ connections: [refused("c")] }));
+        const manager = build({
+          localSync: { cycle },
+          changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
+        });
+        manager.start();
+        await vi.advanceTimersByTimeAsync(0);
+        state.handlers!.onHealth(true);
+        state.handlers!.onPosition("7");
+        await vi.advanceTimersByTimeAsync(60_000);
+        cycle.mockClear();
+        state.handlers!.onChange();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(cycle).toHaveBeenCalledTimes(1);
+        await manager.stop();
+      });
+
+      it.each([
+        ["an ordinary error", ordinary("boom")],
+        ["a publish that backs off", ordinary(null, "backoff")],
+        ["a stream deferred on a condition", ordinary(null, "deferred")],
+      ] as const)(
+        "beside %s on another connection: not settled, one retry per interval",
+        async (_name, other) => {
+          const { manager, cycle } = await pokedInto({
+            connections: [refused("c"), other],
+          });
+          expect(cycle).toHaveBeenCalledTimes(1);
+          await vi.advanceTimersByTimeAsync(60_000);
+          expect(cycle).toHaveBeenCalledTimes(2);
+          await vi.advanceTimersByTimeAsync(60_000);
+          expect(cycle).toHaveBeenCalledTimes(3);
+          expect(manager.getStatus().blocked?.reason).toBe("update_required");
+          await manager.stop();
+        },
+      );
+    });
+
     it("every connection done: quiet again", async () => {
       const { manager, cycle } = await pokedInto(
         report({ outcomes: ["published", "noop", "refused", "purged"] }),
