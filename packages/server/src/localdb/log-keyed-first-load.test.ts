@@ -1238,3 +1238,127 @@ describe("log first load, key by key: a per-stream head admitted while a load is
     expect(await d.db.query("SELECT * FROM log_replay")).toEqual([]);
   });
 });
+
+describe("log first load, key by key: the merge a load into an empty connection skips", () => {
+  const RECORD_MERGES = /^(UPDATE|DELETE FROM) (records|log_tombstones)\b/;
+
+  /** The statements a keyed load of this log runs in one device. */
+  async function loadRecording(w: World, id: string) {
+    const d = await connected(w, id, { maxBytesInFlight: await splitting(w) });
+    const sql: string[] = [];
+    onCommit(d, async (statements) => {
+      for (const s of statements) sql.push(s.sql);
+    });
+    await applyConnection(d.deps, CONNECTION_ID);
+    return { d, sql };
+  }
+
+  it("writes each key range with one insert and no merge, to the rows a segment-by-segment load writes", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    // Keys written once: none is complex, so every key takes the simple path.
+    const a = await w.device("a");
+    for (let n = 1; n <= 12; n++)
+      await step(a, n, [
+        { stream: n % 2 ? S0 : S1, id: `once-${n}`, pad: 4_000 },
+        { stream: S0, id: `also-${n}`, pad: 4_000 },
+      ]);
+    const reference = await connected(w, "reference", {
+      keyedFirstLoad: false,
+    });
+    await applyConnection(reference.deps, CONNECTION_ID);
+
+    const { d, sql } = await loadRecording(w, "empty");
+    const ranges = sql.filter((s) => s.startsWith("DROP TABLE log_stage_"));
+    expect(ranges.length).toBeGreaterThan(1);
+    // None of the statements that merge a staged key with a row the
+    // connection holds ran: it held none.
+    expect(sql.filter((s) => RECORD_MERGES.test(s.trim()))).toEqual([]);
+    const got = await tables(d);
+    const expected = await tables(reference);
+    expect(got.records).toEqual(expected.records);
+    expect(got.tombstones).toEqual(expected.tombstones);
+    expect(got.changes).toEqual(expected.changes);
+    expect(got.state).toEqual(expected.state);
+  });
+
+  // What the connection holds that a staged key can meet. Each makes the load
+  // merge, and ends where a segment-by-segment load of the same device ends.
+  const held: {
+    name: string;
+    seed: (d: Device, row: Record<string, unknown>) => Promise<void>;
+  }[] = [
+    {
+      name: "its own newer row of a key",
+      seed: (d, r) =>
+        d.db.batch([
+          {
+            sql: `INSERT INTO records (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, body_bytes)
+                  VALUES (?, ?, ?, ?, 1000000, 'zz', '{"own":true}', 'x', 12)`,
+            params: [CONNECTION_ID, r.stream, r.pk_hash, r.record_key],
+          },
+        ]),
+    },
+    {
+      name: "a tombstone of a key",
+      seed: (d, r) =>
+        d.db.batch([
+          {
+            sql: `INSERT INTO log_tombstones (connection_id, stream, pk_hash, stamp_o, stamp_r, rank)
+                  VALUES (?, ?, ?, 1000000, 'zz', 0)`,
+            params: [CONNECTION_ID, r.stream, r.pk_hash],
+          },
+        ]),
+    },
+    {
+      name: "a delete of a key it has not published",
+      seed: (d, r) =>
+        d.db.batch([
+          {
+            sql: `INSERT INTO record_changes (connection_id, stream, pk_hash, record_key, op, stamp_o, stamp_r, origin, explicit_delete)
+                  VALUES (?, ?, ?, ?, 'remove', 1000000, 'zz', 'local', 1)`,
+            params: [CONNECTION_ID, r.stream, r.pk_hash, r.record_key],
+          },
+        ]),
+    },
+  ];
+
+  for (const { name, seed } of held)
+    it(`merges every key when the connection holds ${name}`, async () => {
+      const w = await world({ streams: 2, logProtocol: true });
+      await history(w);
+      // A key the log writes (taken from a load that holds nothing).
+      const probe = await connected(w, "probe", { keyedFirstLoad: false });
+      await applyConnection(probe.deps, CONNECTION_ID);
+      const row = (await tables(probe)).records.find((r) =>
+        String(r.record_key).includes("once-1"),
+      ) as Record<string, unknown>;
+      expect(row).toBeDefined();
+
+      const reference = await connected(w, "reference", {
+        keyedFirstLoad: false,
+      });
+      await seed(reference, row);
+      await applyConnection(reference.deps, CONNECTION_ID);
+
+      const d = await connected(w, "seeded", {
+        maxBytesInFlight: await splitting(w),
+      });
+      await seed(d, row);
+      const sql: string[] = [];
+      onCommit(d, async (statements) => {
+        for (const s of statements) sql.push(s.sql);
+      });
+      await applyConnection(d.deps, CONNECTION_ID);
+      expect(
+        sql.filter((s) => s.startsWith("DROP TABLE log_stage_")).length,
+      ).toBeGreaterThan(1);
+      // It took the merge, which this device's load needs.
+      expect(sql.some((s) => RECORD_MERGES.test(s.trim()))).toBe(true);
+      const got = await tables(d);
+      const expected = await tables(reference);
+      expect(got.records).toEqual(expected.records);
+      expect(got.tombstones).toEqual(expected.tombstones);
+      expect(got.state).toEqual(expected.state);
+      expect(got.changes).toEqual(expected.changes);
+    });
+});

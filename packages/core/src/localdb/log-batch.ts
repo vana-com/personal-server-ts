@@ -24,7 +24,12 @@ import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import type { LogState } from "./log-state.js";
 import { writeLogState } from "./log-state.js";
-import { mergeIncoming, seenPair, withOrigin } from "./merge.js";
+import {
+  insertIncoming,
+  mergeIncoming,
+  seenPair,
+  withOrigin,
+} from "./merge.js";
 import { readPartsAhead } from "./part-readahead.js";
 import {
   holdKeys,
@@ -438,6 +443,21 @@ export function mergeStaged(
     }),
   );
   return statements;
+}
+
+/**
+ * `mergeStaged` for rows whose keys the connection holds nowhere: it has no
+ * row of them to merge with, no tombstone to refuse them, and no unpublished
+ * delete to honour. Then every statement of the merge but the insert changes
+ * nothing, and each one still scans the rows (about a third of a key-ordered
+ * first load's time in SQLite). The caller owns the claim
+ * (`holdsNothing` in log-keyed.ts).
+ */
+export function mergeStagedIntoEmpty(
+  connectionId: string,
+  op: string,
+): SqlStatement[] {
+  return insertIncoming(op, connectionId, { onlyNew: false });
 }
 
 /**
