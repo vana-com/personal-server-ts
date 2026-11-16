@@ -1,9 +1,14 @@
-import { applyConnection, type ApplyResult } from "./apply.js";
+import {
+  applyConnection,
+  connectionHasLog,
+  type ApplyResult,
+} from "./apply.js";
 import { bootstrapConnections, knownActiveConnections } from "./bootstrap.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { publishLog } from "./log-publish.js";
 import { publishConnection, type PublishResult } from "./publish.js";
 import { insideQueue } from "./slot.js";
+import { UpdateRequiredError } from "./update-required.js";
 
 export interface CycleReport {
   readonly connections: readonly {
@@ -12,13 +17,22 @@ export interface CycleReport {
     readonly published: readonly PublishResult[];
     /** Set when this connection's pass threw; other connections still ran. */
     readonly error: string | null;
+    /**
+     * Set when the connection's log is in a format this build cannot read:
+     * nothing was published for it and its pending changes stay pending. Rows
+     * applied before the log was read (older per-stream heads, a snapshot read
+     * before an unreadable segment) stay applied, and `applied` does not list
+     * them (see `UpdateRequiredError`).
+     */
+    readonly status?: "update_required";
   }[];
 }
 
 /** What a connection's early publish did, before the cycle read the registry. */
 export interface EarlyPublish {
   readonly published: readonly PublishResult[];
-  readonly error: string | null;
+  /** What the early publish threw, kept as thrown so its type survives. */
+  readonly error: unknown;
 }
 
 /**
@@ -54,7 +68,9 @@ export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
  *
  * Connections run concurrently, as in the rest of the cycle. A registry
  * without the batch route answers `null` and publishes nothing here; a
- * failure is kept for the connection's report and is not tried twice.
+ * failure is kept for the connection's report and is not tried twice. Only a
+ * device with the flag on publishes early; a device with it off publishes a
+ * connection that has a log after its apply (`syncConnection`).
  */
 async function publishEarly(
   deps: LocalSyncDeps,
@@ -67,14 +83,27 @@ async function publishEarly(
         if (published !== null)
           early.set(connectionId, { published, error: null });
       } catch (cause) {
-        early.set(connectionId, {
-          published: [],
-          error: cause instanceof Error ? cause.message : String(cause),
-        });
+        early.set(connectionId, { published: [], error: cause });
       }
     }),
   );
   return early;
+}
+
+/**
+ * Whether a publish of this connection goes through the log. A device starts a
+ * log on a connection that has none only with its flag on; a connection that
+ * has one is written through it by every device, whatever its flag: a head
+ * written beside the log is read by no device that follows the log, or
+ * replaces what the log holds on one that does. See `connectionHasLog`.
+ */
+async function writesLog(
+  deps: LocalSyncDeps,
+  connectionId: string,
+): Promise<boolean> {
+  return (
+    deps.logProtocol === true || (await connectionHasLog(deps, connectionId))
+  );
 }
 
 /**
@@ -95,23 +124,33 @@ export async function syncConnection(
   let applied: readonly ApplyResult[] = [];
   let published: readonly PublishResult[] = [];
   let error: string | null = null;
+  let status: "update_required" | undefined;
   try {
     // A pass includes publish, so it must not join an apply-only operation.
     applied = await deps.queue.run(connectionId, "publish", () =>
       applyConnection(insideQueue(deps, connectionId), connectionId),
     );
-    if (early?.error) throw new Error(early.error);
-    // With the log flag on, a connection publishes one segment and one commit
-    // per batch; `null` means this registry has no batch route, so the
-    // per-stream path publishes instead. What apply left to publish goes after
-    // what the early publish already sent.
+    if (early && early.error !== null) throw early.error;
+    // A connection with a log (or a device with the flag on) publishes one
+    // segment and one commit per batch; `null` means this registry has no
+    // batch route. With the flag on and no log the per-stream path publishes
+    // instead. A connection that has a log is never published per stream: its
+    // pending changes wait for a route that carries the log. What apply left
+    // to publish goes after what the early publish already sent.
+    const through = (await writesLog(deps, connectionId))
+      ? await publishLog(deps, connectionId)
+      : null;
+    if (through === null && (await connectionHasLog(deps, connectionId)))
+      throw new Error(
+        "stream sync: the connection has a log and this registry has no batch route; nothing is published until it has",
+      );
     published = [
       ...(early?.published ?? []),
-      ...((deps.logProtocol ? await publishLog(deps, connectionId) : null) ??
-        (await publishConnection(deps, connectionId))),
+      ...(through ?? (await publishConnection(deps, connectionId))),
     ];
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause);
+    if (cause instanceof UpdateRequiredError) status = "update_required";
     // The timer and `/sync/trigger` drop the report. A connection whose
     // publish keeps failing would otherwise stay unpublished with no trace:
     // its run ended as accepted, but nothing it holds becomes readable.
@@ -120,5 +159,11 @@ export async function syncConnection(
       "Stream sync cycle failed for a connection",
     );
   }
-  return { connectionId, applied, published, error };
+  return {
+    connectionId,
+    applied,
+    published,
+    error,
+    ...(status ? { status } : {}),
+  };
 }

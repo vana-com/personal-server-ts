@@ -24,6 +24,7 @@ import {
   type Head,
   type HeadPart,
   type JsonObject,
+  logScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { ConnectionQueue, LocalSyncDeps } from "./deps.js";
@@ -285,7 +286,16 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
         await applyOne(locked, id, connection, next, keyCheck, hashes, reuse),
       );
     }
-    if (deps.logProtocol && flight.all) {
+    if (!flight.all && !(await connectionHasLog(deps, id, reuse))) {
+      // A flight for streams does not list the registry, but the log row is
+      // how a device learns the connection keeps its data in a log, and a
+      // connection in a log is followed whichever stream asked: one read.
+      const row = await deps.registry.read(
+        logScope(connection.connector, connection.ns),
+      );
+      if (row.found) reuse.log = row;
+    }
+    if (await logFollowed(deps, id, reuse)) {
       // Streams published before the log, then the log on top of them.
       const [now] = await deps.db.query<{
         generation: number;
@@ -315,6 +325,43 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
       await clearPartial(deps, id, reuse);
     return [...answers.values()];
   });
+}
+
+/**
+ * Whether the connection has a log: its row is in the registry (the first log
+ * write puts it there, nothing removes it) or this device applied it. The
+ * connection's protocol is a property of the connection, not of the device.
+ * Without a log this reads nothing from the registry.
+ */
+export async function connectionHasLog(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  reuse?: { readonly log?: unknown },
+): Promise<boolean> {
+  if (reuse?.log !== undefined) return true;
+  return (
+    (
+      await deps.db.query("SELECT 1 FROM log_state WHERE connection_id = ?", [
+        connectionId,
+      ])
+    ).length > 0
+  );
+}
+
+/**
+ * Whether this device reads the connection through its log: when the
+ * connection has one, whatever the device's own `logProtocol` flag says. The
+ * flag only lets a device start a log on a connection that has none.
+ */
+export async function logFollowed(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  reuse?: { readonly log?: unknown },
+): Promise<boolean> {
+  return (
+    deps.logProtocol === true ||
+    (await connectionHasLog(deps, connectionId, reuse))
+  );
 }
 
 /** Apply one stream; concurrent requests share the connection's apply job. */
@@ -577,7 +624,11 @@ async function applyOneOnce(
   // `settled`, the mark stays, and only a read of a head that replaces the
   // stream (or a rebuild) clears it. Dropping the shortcut instead would replay
   // an older head over valid log state.
-  if (deps.logProtocol && state && state.head_version > read.version) {
+  if (
+    state &&
+    state.head_version > read.version &&
+    (await logFollowed(deps, id, reuse))
+  ) {
     const answer = result(stream, "noop");
     return reuse.partial ? early(answer) : settled(answer);
   }
@@ -662,27 +713,17 @@ async function applyOneOnce(
     state.complete === 1 &&
     state.head_version > state.last_delete_version &&
     state.head_generation === head.generation;
-  // With the log on, a connection that has a log is finished by `applyLog`
-  // after its heads: the log can delete or replace rows a head holds. A
-  // partial view of a head would show rows the finished result lacks, so such
-  // a connection's heads do not load progressively. The log's own pass does
-  // (`loadProgressively` in `log-apply.ts`), holding back the keys a later
-  // batch removes. A connection with no log, and a device with the log off,
-  // load their heads progressively.
+  // A connection that has a log is finished by `applyLog` after its heads, on
+  // every device whatever its flag: the log can delete or replace rows a head
+  // holds. A partial view of a head would show rows the finished result lacks,
+  // so such a connection's heads do not load progressively. The log's own pass
+  // does (`loadProgressively` in `log-apply.ts`), holding back the keys a later
+  // batch removes. A connection with no log loads its heads progressively.
   const progressive =
     deps.progressiveFirstLoad === true &&
     head.complete &&
     !hasCompleteHead &&
-    !(
-      deps.logProtocol === true &&
-      (reuse.log !== undefined ||
-        (
-          await deps.db.query(
-            "SELECT 1 FROM log_state WHERE connection_id = ?",
-            [id],
-          )
-        ).length > 0)
-    );
+    !(await connectionHasLog(deps, id, reuse));
   const [marker] = progressive
     ? await deps.db.query<{
         version: number;

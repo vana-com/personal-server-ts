@@ -14,6 +14,8 @@ vi.mock("../../../core/src/localdb/bootstrap.js", () => ({
 }));
 vi.mock("../../../core/src/localdb/apply.js", () => ({
   applyConnection: vi.fn(),
+  // Reset mocks answer undefined: no connection here has a log.
+  connectionHasLog: vi.fn(),
 }));
 vi.mock("../../../core/src/localdb/publish.js", () => ({
   publishConnection: vi.fn(),

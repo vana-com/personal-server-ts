@@ -66,8 +66,11 @@ export interface LocalSyncDeps {
   /**
    * Publish and apply through the stream-sync log (one segment and one
    * registry commit per batch, across streams) instead of per-stream heads.
-   * Default off. A connection that has published to the log is read through it
-   * by every device, so turn it on for all devices of an owner together.
+   * Default off. The flag lets this device START a log on a connection that has
+   * none. A connection that has a log (its row is in the registry) is read and
+   * written through it by every device of this build, whatever its flag; a
+   * device whose build cannot read the log's format refuses to write that
+   * connection and reports `update_required` (`UpdateRequiredError`).
    */
   readonly logProtocol?: boolean;
 }

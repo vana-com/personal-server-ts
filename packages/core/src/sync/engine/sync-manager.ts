@@ -317,6 +317,9 @@ function timerPeriod(requested: number | undefined): number {
  * connection that failed, or a stream whose publish backs off or waits on a
  * condition, is tried again only by a later cycle. A position cannot stand in
  * for that cycle, so the pass is not settled and the timer keeps running. A
+ * connection whose log this build cannot read (`status: "update_required"`)
+ * owes nothing: a later cycle of this build reads the same format and refuses
+ * again, so only an update changes it, and the status shows it until then. A
  * report of another shape says nothing and leaves nothing owed.
  */
 function reportLeavesWork(report: unknown): boolean {
@@ -324,10 +327,12 @@ function reportLeavesWork(report: unknown): boolean {
     ?.connections;
   if (!Array.isArray(connections)) return false;
   return connections.some((connection: unknown) => {
-    const { error, published } = (connection ?? {}) as {
+    const { error, published, status } = (connection ?? {}) as {
       error?: unknown;
       published?: unknown;
+      status?: unknown;
     };
+    if (status === "update_required") return false;
     if (error !== null && error !== undefined) return true;
     return (
       Array.isArray(published) &&
@@ -495,6 +500,49 @@ export function createSyncManager(
     }
   }
 
+  /**
+   * Clear the block a pass starts with. A connection that needs an update
+   * stays reported while the local cycle that can end it runs (and if that
+   * cycle throws): only a cycle that reports without it clears it
+   * (`runLocalCycle`). Any other block ends here.
+   */
+  function clearBlockBeforePass(mode: string | undefined): void {
+    const localCycleFollows = mode === "switched" && options?.localSync;
+    if (blocked?.reason === "update_required" && localCycleFollows) return;
+    blocked = null;
+  }
+
+  /**
+   * One cycle of the local stream database. A connection whose log this
+   * build cannot read is reported by the cycle as `update_required`: it is
+   * shown as the sync status's `blocked` reason, so every host that reads the
+   * status shows it without code of its own. It ends with a cycle that does
+   * not report one.
+   */
+  async function runLocalCycle(
+    localSync: NonNullable<SyncManagerOptions["localSync"]>,
+  ): Promise<unknown> {
+    const report = (await localSync.cycle()) as {
+      connections?: readonly { connectionId: string; status?: string }[];
+    } | null;
+    const waiting = (report?.connections ?? []).filter(
+      (c) => c.status === "update_required",
+    );
+    if (waiting.length > 0) {
+      blocked = {
+        reason: "update_required",
+        message:
+          "A connection's log is in a format this version cannot read. Update to sync it.",
+      };
+      uploadDeps.logger.warn(
+        { connections: waiting.map((c) => c.connectionId) },
+        "Sync blocked: update required",
+      );
+    } else if (blocked?.reason === "update_required") blocked = null;
+    statusMayHaveChanged();
+    return report;
+  }
+
   async function runCycle(): Promise<void> {
     // Prevent concurrent cycles
     if (cycleInFlight) {
@@ -519,7 +567,13 @@ export function createSyncManager(
         const errorsBefore = errorSeq;
         syncedPosition = undefined;
         const settle = () => {
-          if (blocked !== null || errorSeq !== errorsBefore) return;
+          // The update-required block is a diagnostic of a refusal no retry
+          // changes (`reportLeavesWork`); any other block means no cycle ran.
+          if (
+            (blocked !== null && blocked.reason !== "update_required") ||
+            errorSeq !== errorsBefore
+          )
+            return;
           syncedPosition = startedUnder;
         };
         const canRun = await (options?.canSync?.() ?? { ok: true });
@@ -528,14 +582,14 @@ export function createSyncManager(
           uploadDeps.logger.warn(blocked, "Sync cycle blocked");
           continue;
         }
-        blocked = null;
-        statusMayHaveChanged();
         // canSync can yield while Account changes. Sample only after it returns.
-        if (options?.accountStorageMode) {
-          const mode = options.accountStorageMode.read();
+        const mode = options?.accountStorageMode?.read();
+        clearBlockBeforePass(mode);
+        statusMayHaveChanged();
+        if (options?.accountStorageMode && mode !== undefined) {
           if (mode !== "unswitched") {
             if (mode === "switched" && options.localSync) {
-              const report = await options.localSync.cycle();
+              const report = await runLocalCycle(options.localSync);
               lastSync = new Date().toISOString();
               statusMayHaveChanged();
               if (!reportLeavesWork(report)) settle();
@@ -1269,13 +1323,13 @@ export function createSyncManager(
           statusMayHaveChanged();
           return;
         }
-        blocked = null;
+        const mode = options?.accountStorageMode?.read();
+        clearBlockBeforePass(mode);
         statusMayHaveChanged();
-        if (options?.accountStorageMode) {
-          const mode = options.accountStorageMode.read();
+        if (options?.accountStorageMode && mode !== undefined) {
           if (mode !== "unswitched") {
             if (mode === "switched" && options.localSync)
-              await options.localSync.cycle();
+              await runLocalCycle(options.localSync);
             else {
               blocked = {
                 reason: "account_mode_unknown",
