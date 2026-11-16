@@ -16,11 +16,6 @@ export interface LitePdppRecordsDeps {
   authorizeOwner(request: Request): Promise<void>;
   /** The owner's subject: the address this runtime serves. */
   ownerAddress(): string | undefined;
-  /**
-   * The streams a connector declares. Absent, any stream of an active
-   * connection reads (an undeclared one lists as empty rather than 404).
-   */
-  declaredStreams?: (connector: string) => readonly string[];
 }
 
 /**
@@ -65,8 +60,8 @@ export async function handleLitePdppRecordList(
       accountMode: deps.accountStorageMode,
       recordQuery: linked,
       declarations: liteDeclarations(
-        deps.declaredStreams,
-        new URL(request.url).searchParams.get("source") ?? undefined,
+        local.declarations,
+        await local.declarations.connectors(),
       ),
       ownerInstances: (_context, source) =>
         source === undefined || source === "" ? [] : [source],
@@ -86,10 +81,13 @@ export async function handleLitePdppRecordList(
   }
 }
 
-/** A declaration here only answers whether the stream exists. */
+/**
+ * A declaration here only answers whether the stream exists, as on Node:
+ * `forInstance` for one connection, `get` for any connection in this store.
+ */
 function liteDeclarations(
-  declared: ((connector: string) => readonly string[]) | undefined,
-  source: string | undefined,
+  declared: LocalSync["declarations"],
+  connectors: readonly string[],
 ): PdppRecordListPorts["declarations"] {
   const declaration = (stream: string): StreamDeclaration => ({
     name: stream,
@@ -99,19 +97,17 @@ function liteDeclarations(
     requiredFields: [],
   });
   const forInstance = (connector: string, stream: string) =>
-    !declared || declared(connector).includes(stream)
+    declared.streamsOf(connector).includes(stream)
       ? declaration(stream)
       : undefined;
   return {
-    // Node answers a stream no source declares with 404, and a request
-    // naming no source with the owner scope refusal. With no registry here,
-    // the named source stands in for "some source declares it".
     get: (stream) =>
-      !declared || source === undefined || forInstance(source, stream)
+      connectors.some((connector) => forInstance(connector, stream))
         ? declaration(stream)
         : undefined,
     forInstance,
-    declares: (stream) => !declared || stream.length > 0,
+    declares: (stream) =>
+      connectors.some((connector) => forInstance(connector, stream)),
     list: () => [],
   };
 }

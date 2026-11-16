@@ -82,7 +82,8 @@ async function switchedStore(): Promise<LocalSync> {
     },
     {
       resolveArtifact: () => undefined,
-      declaredStreams: () => ["posts"],
+      declaredStreams: (connector) =>
+        connector === CONNECTOR ? ["posts"] : [],
       olderVersionReads: () => true,
     },
   );
@@ -113,8 +114,6 @@ async function liteRuntime(local: LocalSync) {
     stateCapabilities: { config: "memory" },
     serverOwner: owner.address,
     localSync: async () => local,
-    streamSyncDeclaredStreams: (connector) =>
-      connector === CONNECTOR ? ["posts"] : [],
     auth: createWeb3SignedPsLiteAuth({
       origin: ORIGIN,
       ownerAddress: owner.address,
@@ -219,17 +218,6 @@ describe("GET /v1/streams/:stream/records on the Lite runtime", () => {
       }),
     );
   });
-
-  it("refuses an unknown source and an undeclared stream", async () => {
-    const runtime = await liteRuntime(await switchedStore());
-    expect(
-      (await liteGet(runtime, "/v1/streams/posts/records?source=other")).status,
-    ).toBe(404);
-    expect(
-      (await liteGet(runtime, `/v1/streams/nope/records?source=${CONNECTOR}`))
-        .status,
-    ).toBe(404);
-  });
 });
 
 describe("Node and Lite serve identical pages for one store", () => {
@@ -257,5 +245,23 @@ describe("Node and Lite serve identical pages for one store", () => {
       if (!liteBody.has_more) break;
     }
     expect(seen).toEqual(POSTS.map((post) => post.id));
+  });
+
+  it.each([
+    ["an undeclared stream", "/v1/streams/nope/records?source=meta"],
+    ["an unknown source", "/v1/streams/posts/records?source=other"],
+    ["no source", "/v1/streams/posts/records?limit=2"],
+    ["an empty source", "/v1/streams/posts/records?source="],
+  ])("answers %s with the same status and body", async (_name, path) => {
+    const local = await switchedStore();
+    const lite = await liteGet(await liteRuntime(local), path);
+    const node = await nodeGet(nodeApp(local), path);
+    const withoutRequestId = (body: { error: Record<string, unknown> }) => ({
+      error: { ...body.error, request_id: undefined },
+    });
+    expect(lite.status).toBe(node.status);
+    expect(withoutRequestId(await lite.json())).toEqual(
+      withoutRequestId(await node.json()),
+    );
   });
 });
