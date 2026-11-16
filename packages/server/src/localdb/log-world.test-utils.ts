@@ -93,6 +93,8 @@ export async function world(options: {
        * (`LocalSyncDeps.keyedFirstLoad`): the result a keyed load is compared with.
        */
       keyedFirstLoad?: boolean;
+      /** The host stages a key-ordered load in TEMP tables (`LocalSyncDeps.stageInTempStore`). */
+      stageInTempStore?: boolean;
       /**
        * The byte budget of this device's transfers. A budget below one
        * segment makes an apply fetch and commit one segment at a time.
@@ -156,6 +158,7 @@ export async function world(options: {
         : {}),
       ...(hooks.progressiveFirstLoad ? { progressiveFirstLoad: true } : {}),
       ...(hooks.keyedFirstLoad === false ? { keyedFirstLoad: false } : {}),
+      ...(hooks.stageInTempStore ? { stageInTempStore: true } : {}),
       ...(hooks.streamCrypto ? { streamCrypto: hooks.streamCrypto } : {}),
       ...(options.partTargetBytes !== undefined
         ? { partTargetBytes: options.partTargetBytes }

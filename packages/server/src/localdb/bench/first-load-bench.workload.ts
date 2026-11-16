@@ -49,6 +49,8 @@ const nodeStreamCrypto =
   arg("keccak", "native") === "noble"
     ? { ...hostCrypto, keccak256: nobleStreamCrypto.keccak256 }
     : hostCrypto;
+// The Node host stages in TEMP tables (`bootstrap.ts`); "off" is the before.
+const STAGE_TEMP = arg("stage-temp", "on") === "on";
 const REAL_CRYPTO = NODE_CRYPTO || arg("realcrypto", "off") === "on";
 const CAPTURE = arg("capture", "");
 // A directory: write a main-thread CPU profile of each reader cycle there.
@@ -148,7 +150,9 @@ function makeDeps(
     logger: { info: () => {}, warn: () => {} },
     now: () => Date.now(),
     newOp: () => `${deviceId}-${++op}`,
-    ...(NODE_CRYPTO ? { streamCrypto: nodeStreamCrypto } : {}),
+    ...(NODE_CRYPTO
+      ? { streamCrypto: nodeStreamCrypto, stageInTempStore: STAGE_TEMP }
+      : {}),
     ...(LOG ? { logProtocol: true } : {}),
     ...(PROGRESSIVE && timing ? { progressiveFirstLoad: true } : {}),
   } as LocalSyncDeps;

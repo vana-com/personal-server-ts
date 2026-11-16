@@ -95,7 +95,8 @@ describe("the Keccak-256 of a log segment", () => {
       const batch = db.batch.bind(db);
       db.batch = async (statements) => {
         for (const s of statements)
-          if (s.sql.startsWith("CREATE TABLE log_stage_")) stages.push(s.sql);
+          if (/^CREATE (TEMP )?TABLE log_stage_/.test(s.sql))
+            stages.push(s.sql);
         return batch(statements);
       };
       await applyConnection(d.deps, CONNECTION_ID);
