@@ -776,6 +776,15 @@ export function createConnectionDeleter(
           onUnusable: () => {
             batchOff = true;
           },
+          onRefused: (error) => {
+            // The per-stream path ends this delete. Later deletes skip a route
+            // that refused the request, and the warning names the refusal.
+            batchOff = true;
+            deps.logger.warn(
+              { connector, status: error.status, reason: error.message },
+              "registry refused the delete batch; deleting stream by stream",
+            );
+          },
         });
         /** Each participant sends one row or leaves, whatever else happens. */
         const participate = async (

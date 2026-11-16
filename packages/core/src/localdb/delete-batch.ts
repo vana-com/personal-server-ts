@@ -1,27 +1,27 @@
 /**
  * The first landing of a connection delete as batch requests: the control
- * fence and the stream tombstones of its namespaces in ONE `POST
- * /v1/data/batch` (split above the gateway's row limit).
+ * fences of its namespaces in one `POST /v1/data/batch`, then every stream
+ * tombstone in the next (each split above the gateway's row limit).
  *
  * Each participant (a fence, or a stream) submits at most one signed row, or
  * leaves without one. When every participant has done one or the other the
  * rows go out. No timer: a participant is never waited for past its own work.
  *
- * Why the fence still comes first:
- * - A stream row of namespace N is sent only with a condition on N's control
- *   row. The gateway judges conditions on the state before the batch's writes,
- *   in the transaction of those writes. In the chunk that holds N's fence row
- *   the condition is "control is active at the pin" (so the fence write, a CAS
- *   at pin + 1, cannot lose and no later lifetime exists). In a later chunk it
- *   is "control is the tombstone at pin + 1" (the fence landed earlier).
- *   Either way no stream row lands unless the fence is in its commit or an
- *   earlier one.
- * - Rows are ordered fences first, then streams, and chunks are sent in that
- *   order up to the last chunk that holds a fence. Only the chunks after it
- *   (streams only, their fences already committed) go out together.
- * - A row that loses its CAS, a failed condition, a missing or refusing batch
- *   route, all answer `fallback`: nothing is guessed and the caller runs the
- *   per-stream path, which re-reads and re-checks everything itself.
+ * Why two requests and not one:
+ * - A stream row of namespace N must land only if N's fence landed. The only
+ *   way to say so is a condition on N's control row, and the gateway refuses a
+ *   condition on a row the same request writes (HTTP 400). Rows of one request
+ *   also commit independently, so a fence that lost its compare-and-set would
+ *   not hold back the stream rows beside it.
+ * - So the fences go first, alone, each guarded by its own compare-and-set (the
+ *   next version, and the active head's data hash). The stream rows go next,
+ *   each namespace's rows resting on the condition "control is the tombstone at
+ *   pin + 1". No stream row lands unless its fence is already committed.
+ * - A fence that does not land, a failed condition, a missing batch route, or a
+ *   request the gateway refuses, all answer `fallback`: nothing is guessed and
+ *   the caller runs the per-stream path, which re-reads and re-checks
+ *   everything itself. A refusal of the request's shape is a defect of this
+ *   code, so it is reported through `onRefused`, never as a quiet limit.
  */
 import type { ControlHashes } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
@@ -63,36 +63,30 @@ export function createDeleteBatcher(options: {
   readonly hashes: Pick<ControlHashes, "activeData" | "tombstoneData">;
   /** Fences plus streams: each calls `submit` or `leave` once. */
   readonly participants: number;
-  /** The registry answered that it has no batch route, or refused the request shape. */
+  /** The registry answered that it has no batch route. */
   readonly onUnusable: () => void;
+  /** The registry refused the request (HTTP 4xx other than 409): a defect to surface. */
+  readonly onRefused: (error: RegistryRefusedError) => void;
 }): DeleteBatcher {
   let outstanding = options.participants;
   const parked: Parked[] = [];
-  const landedFences = new Set<string>();
 
+  /**
+   * The fence rows carry their own compare-and-set. The stream rows of a
+   * namespace rest on that namespace's fence having landed.
+   */
   const requiresFor = (chunk: readonly Parked[]): RegistryRequirement[] => {
     const requires: RegistryRequirement[] = [];
     const seen = new Set<string>();
     for (const part of chunk) {
       if (part.fence || seen.has(part.ns)) continue;
       seen.add(part.ns);
-      const pin = options.pins.get(part.ns)!;
-      const scope = options.controlScopeOf(part.ns);
-      requires.push(
-        chunk.some((q) => q.fence && q.ns === part.ns)
-          ? {
-              scope,
-              expectedVersion: String(pin),
-              notDeleted: true,
-              expectedDataHash: options.hashes.activeData,
-            }
-          : {
-              scope,
-              expectedVersion: String(pin + 1),
-              notDeleted: false,
-              expectedDataHash: options.hashes.tombstoneData,
-            },
-      );
+      requires.push({
+        scope: options.controlScopeOf(part.ns),
+        expectedVersion: String(options.pins.get(part.ns)! + 1),
+        notDeleted: false,
+        expectedDataHash: options.hashes.tombstoneData,
+      });
     }
     return requires;
   };
@@ -126,7 +120,6 @@ export function createDeleteBatcher(options: {
       let all = true;
       for (const [i, p] of chunk.entries()) {
         if (answer.rows[i]!.kind === "committed") {
-          if (p.fence) landedFences.add(p.ns);
           p.settle("committed");
         } else {
           p.settle("fallback");
@@ -136,9 +129,10 @@ export function createDeleteBatcher(options: {
       return all;
     } catch (error) {
       if (error instanceof RegistryRefusedError && error.status !== 409) {
-        // A gateway that refuses this request's shape (a limit it has and we
-        // do not know) is no worse off than one without the route.
-        options.onUnusable();
+        // The delete still ends, by the per-stream path. The refusal is
+        // reported: the gateway judged the request wrong, and a caller that
+        // swallowed that would never be fixed.
+        options.onRefused(error);
         return fallbackAll();
       }
       for (const p of chunk) p.fail(error);
@@ -147,36 +141,30 @@ export function createDeleteBatcher(options: {
   }
 
   async function flush() {
-    const rows = parked
-      .splice(0)
-      .sort(
-        (a, b) =>
-          Number(b.fence) - Number(a.fence) ||
-          (a.row.scope < b.row.scope ? -1 : a.row.scope > b.row.scope ? 1 : 0),
-      );
-    const chunks: Parked[][] = [];
-    for (let i = 0; i < rows.length; i += GATEWAY_MAX_BATCH_ROWS)
-      chunks.push(rows.slice(i, i + GATEWAY_MAX_BATCH_ROWS));
-    // Fences sort first, so the chunks that hold one are a prefix.
-    const lastFence = chunks.reduce(
-      (last, chunk, i) => (chunk.some((p) => p.fence) ? i : last),
-      -1,
-    );
+    const byScope = (a: Parked, b: Parked) =>
+      a.row.scope < b.row.scope ? -1 : a.row.scope > b.row.scope ? 1 : 0;
+    const rows = parked.splice(0);
+    const split = (list: Parked[]) => {
+      const chunks: Parked[][] = [];
+      for (let i = 0; i < list.length; i += GATEWAY_MAX_BATCH_ROWS)
+        chunks.push(list.slice(i, i + GATEWAY_MAX_BATCH_ROWS));
+      return chunks;
+    };
+    const fences = split(rows.filter((p) => p.fence).sort(byScope));
+    const streams = split(rows.filter((p) => !p.fence).sort(byScope));
     let healthy = true;
-    for (const [i, chunk] of chunks.entries()) {
-      if (i > lastFence) break;
+    for (const chunk of fences) {
       if (!healthy) {
         for (const p of chunk) p.settle("fallback");
         continue;
       }
       healthy = await send(chunk);
     }
-    const rest = chunks.slice(lastFence + 1);
     if (!healthy) {
-      for (const chunk of rest) for (const p of chunk) p.settle("fallback");
+      for (const chunk of streams) for (const p of chunk) p.settle("fallback");
       return;
     }
-    await Promise.all(rest.map(send));
+    await Promise.all(streams.map(send));
   }
 
   const arrived = () => {
