@@ -1224,10 +1224,11 @@ async function commitRound(
   const control = controlScope(connection.connector, connection.ns);
   const keyCheck = await deriveKeyCheck(held.keys.namespaceHmac);
   const hashes = await controlHashes(keccakOf(held.streamCrypto), keyCheck);
-  const metadataHash = metadataHashFor(
+  const metadataHash = await metadataHashFor(
     scope,
     new Date(candidate.observedAt).toISOString(),
     candidate.cipher.length,
+    held.streamCrypto,
   );
   const signature = await held.signer.signAddData({
     ownerAddress: held.ownerAddress,
