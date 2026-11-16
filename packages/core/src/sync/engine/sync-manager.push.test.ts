@@ -1175,3 +1175,149 @@ describe("the real subscription driving the manager", () => {
     await manager.stop();
   });
 });
+
+describe("the timer's retry of owed work reads only what is owed", () => {
+  // A healthy push announces every registry change, and the last pass that ran
+  // to its end read the registry at the position the push still reports. So a
+  // retry for work that pass left owed (a connection error, a deferred or
+  // backed-off publish) needs to read only those connections. Any other state
+  // retries in full.
+  const owing = (...ids: Array<string | undefined>) => ({
+    connections: ids.map((connectionId) => ({
+      ...(connectionId !== undefined && { connectionId }),
+      applied: [],
+      published: [{ stream: "s", outcome: "deferred", watermark: null }],
+      error: null,
+    })),
+  });
+  const clean = { connections: [] };
+
+  /** A device whose pass at each position reports what `answer` returns. */
+  function owedDevice(
+    answer: (scope: unknown, call: number) => unknown,
+    opts: { push?: boolean } = {},
+  ) {
+    const { push, state } = fakePush();
+    const cycle = vi.fn(async (scope?: unknown) =>
+      answer(scope, cycle.mock.calls.length),
+    );
+    const manager = build({
+      localSync: { cycle },
+      changeProbe: {
+        read: async () => "m1",
+        intervalMs: 5_000,
+        ...(opts.push === false ? {} : { push }),
+      },
+    });
+    return { manager, state, cycle };
+  }
+
+  async function online(t: ReturnType<typeof owedDevice>, position = "7") {
+    t.manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    t.state.handlers!.onHealth(true);
+    t.state.handlers!.onPosition(position);
+    // The first timer pass starts under the position and reports in full.
+    await vi.advanceTimersByTimeAsync(60_000);
+  }
+
+  it("retries the connection that is owed alone, not the whole registry", async () => {
+    const t = owedDevice(() => owing("c2"));
+    await online(t);
+    expect(t.cycle).toHaveBeenLastCalledWith(undefined); // the full pass
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(3 * 60_000);
+    expect(t.cycle.mock.calls).toEqual([
+      [{ connections: ["c2"] }],
+      [{ connections: ["c2"] }],
+      [{ connections: ["c2"] }],
+    ]);
+    await t.manager.stop();
+  });
+
+  it("names every connection that is owed, and only those", async () => {
+    const t = owedDevice((scope) =>
+      scope === undefined ? owing("c1", "c3") : owing("c3"),
+    );
+    await online(t);
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.cycle).toHaveBeenLastCalledWith({ connections: ["c1", "c3"] });
+    // c1 is done; the next retry is for c3 alone.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.cycle).toHaveBeenLastCalledWith({ connections: ["c3"] });
+    await t.manager.stop();
+  });
+
+  it("settles when the retry clears what was owed, then runs nothing", async () => {
+    const t = owedDevice((scope) =>
+      scope === undefined ? owing("c2") : clean,
+    );
+    await online(t);
+    await vi.advanceTimersByTimeAsync(60_000); // the retry clears c2
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+    expect(t.cycle).not.toHaveBeenCalled();
+    await t.manager.stop();
+  });
+
+  it("reads in full when the position moved since the pass that left work owed", async () => {
+    const t = owedDevice(() => owing("c2"));
+    await online(t, "7");
+    t.state.handlers!.onPosition("8"); // a wake that was lost on the way
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.cycle).toHaveBeenLastCalledWith(undefined);
+    // That pass ran under "8": the retries after it are for c2 alone.
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.cycle).toHaveBeenLastCalledWith({ connections: ["c2"] });
+    await t.manager.stop();
+  });
+
+  it("reads in full for a report that does not name the connection", async () => {
+    const t = owedDevice(() => owing(undefined));
+    await online(t);
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(2 * 60_000);
+    expect(t.cycle.mock.calls).toEqual([[undefined], [undefined]]);
+    await t.manager.stop();
+  });
+
+  it("reads in full when the push does not carry a position", async () => {
+    const t = owedDevice(() => owing("c2"), { push: false });
+    t.manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(2 * 60_000);
+    for (const [scope] of t.cycle.mock.calls) expect(scope).toBeUndefined();
+    await t.manager.stop();
+  });
+
+  it("a connection that failed is retried alone, and the failure is logged once, not every minute", async () => {
+    vi.mocked(logger.info).mockClear();
+    const t = owedDevice(() => ({
+      connections: [
+        {
+          connectionId: "c2",
+          applied: [],
+          published: [],
+          error: "storage unreachable",
+        },
+      ],
+    }));
+    await online(t);
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(t.cycle).toHaveBeenLastCalledWith({ connections: ["c2"] });
+    const owedLogs = vi
+      .mocked(logger.info)
+      .mock.calls.filter(
+        ([, message]) => message === "Sync pass left work owed",
+      );
+    expect(owedLogs).toHaveLength(1);
+    expect(owedLogs[0]![0]).toMatchObject({
+      connections: [{ connectionId: "c2", why: "error: storage unreachable" }],
+    });
+    await t.manager.stop();
+  });
+});

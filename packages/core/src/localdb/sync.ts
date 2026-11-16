@@ -26,6 +26,7 @@ import {
   runPublish,
   syncConnection,
   type CycleReport,
+  type CycleScope,
 } from "./cycle.js";
 import { createConnectionDeleter, type ConnectionDeleter } from "./delete.js";
 import type { LocalSyncDeps } from "./deps.js";
@@ -69,7 +70,7 @@ export interface LocalSync {
   };
   readonly blobs: BlobStore;
   /** `/sync/trigger` and the timer: C.4 order, apply then publish. */
-  cycle(): Promise<CycleReport>;
+  cycle(scope?: CycleScope): Promise<CycleReport>;
   /**
    * A save's await: publish what is pending and return when the registry has
    * committed it (`runPublish`). Apply and the registry listing run in the
@@ -327,9 +328,9 @@ export function createLocalSync(
         ).map((row) => row.connector),
     },
     blobs: createBlobStore(deps),
-    async cycle() {
+    async cycle(scope) {
       await resume();
-      return runCycle(deps);
+      return runCycle(deps, scope);
     },
     async publish() {
       await resume();

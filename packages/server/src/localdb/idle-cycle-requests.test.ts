@@ -42,6 +42,12 @@ async function world(connectors: number, streamsPer: number) {
       calls.push("registry.read");
       return inner.read(scope);
     },
+    batchPolicy: () => inner.batchPolicy(),
+    readBatchPolicy: () => inner.readBatchPolicy(),
+    async postBatch(request) {
+      calls.push("registry.batch");
+      return inner.postBatch(request);
+    },
     async post(request) {
       calls.push("registry.post");
       return inner.post(request);
@@ -126,7 +132,10 @@ async function world(connectors: number, streamsPer: number) {
     });
     await sync.intake.end(runId, endRequest({ lastBatch: 0, live: names }));
   }
-  await sync.cycle(); // publishes everything
+  const published = await sync.cycle(); // publishes everything
+  expect(published.connections.map((c) => c.error)).toEqual(
+    Array(connectors).fill(null),
+  );
   await sync.cycle(); // settles: a second pass finds nothing to do
   return { sync, calls };
 }
@@ -151,5 +160,44 @@ describe("an idle sync cycle", () => {
     console.log(`IDLE-CYCLE connections=${c} streams=${s}`, JSON.stringify(t));
     expect(w.calls.filter((x) => x === "registry.post")).toHaveLength(0);
     expect(w.calls.filter((x) => x === "blob.put")).toHaveLength(0);
+  });
+});
+
+describe("a retry scoped to the connections that are owed", () => {
+  // The manager retries owed work on its timer. When the change push shows the
+  // registry has not moved, the retry names the connections that are owed, and
+  // the cycle skips the listing and reads for those alone.
+  it("reads the registry for the owed connection only: no listing, and a share of the full cycle's reads", async () => {
+    const w = await world(6, 4);
+    w.calls.length = 0;
+    const report = await w.sync.cycle();
+    const full = tally(w.calls);
+    const owed = report.connections[2]!.connectionId;
+
+    w.calls.length = 0;
+    const scoped = await w.sync.cycle({ connections: [owed] });
+    const one = tally(w.calls);
+    console.log("SCOPED-CYCLE of 1/6", JSON.stringify({ full, one }));
+    expect(scoped.connections.map((c) => c.connectionId)).toEqual([owed]);
+    expect(w.calls).not.toContain("registry.list");
+    expect(w.calls).not.toContain("registry.post");
+    expect(full).toEqual({ "registry.list": 1, "registry.read": 6 });
+    expect(one).toEqual({ "registry.read": 2 });
+  });
+
+  it("an empty scope reads nothing", async () => {
+    const w = await world(3, 2);
+    w.calls.length = 0;
+    const report = await w.sync.cycle({ connections: [] });
+    expect(report.connections).toEqual([]);
+    expect(w.calls).toEqual([]);
+  });
+
+  it("leaves out a connection this database no longer holds", async () => {
+    const w = await world(2, 2);
+    w.calls.length = 0;
+    const report = await w.sync.cycle({ connections: ["gone"] });
+    expect(report.connections).toEqual([]);
+    expect(w.calls).toEqual([]);
   });
 });

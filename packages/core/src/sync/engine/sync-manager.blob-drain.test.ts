@@ -189,6 +189,19 @@ describe("a switched device owes storage deletes whose tombstone is not final", 
     await t.manager.stop();
   });
 
+  it("retries the debt alone: the clock reads no registry while only a delete is owed", async () => {
+    // The stream-sync cycle left nothing owed and the position has not moved:
+    // the clock's retry is the storage delete, which needs no registry read.
+    const t = setup();
+    await t.start();
+    t.cycle.mockClear();
+    t.tombstoneFinality.tombstoneState.mockClear();
+    await vi.advanceTimersByTimeAsync(3 * 60_000);
+    expect(t.cycle).not.toHaveBeenCalled();
+    expect(t.tombstoneFinality.tombstoneState).toHaveBeenCalledTimes(3);
+    await t.manager.stop();
+  });
+
   it("a retry that fails keeps the pass unsettled, so the clock retries it", async () => {
     const t = setup({ finality: FINAL });
     let storageUp = false;

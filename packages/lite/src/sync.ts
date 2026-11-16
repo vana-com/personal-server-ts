@@ -740,7 +740,7 @@ export async function createPsLiteSyncManager(
       {
         accountStorageMode: mode,
         localSync: {
-          cycle: async () => (await getLocalSync()).cycle(),
+          cycle: async (scope) => (await getLocalSync()).cycle(scope),
           applyDelta: async (delta) => (await getLocalSync()).applyDelta(delta),
         },
         ...(changeProbe && { changeProbe }),
