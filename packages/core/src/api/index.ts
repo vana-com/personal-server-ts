@@ -2292,6 +2292,13 @@ export {
 } from "./legacy-write-gate.js";
 
 export {
+  decideScopeDeletion,
+  type ScopeDeletionReceipt,
+  type ScopeDeletionStepName,
+  type ScopeDeletionVerdict,
+} from "./scope-delete-verdict.js";
+
+export {
   handleOwnerConnectorDelete,
   ownerConnectorRefusal,
   type ConnectionDeletePort,

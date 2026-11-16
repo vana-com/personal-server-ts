@@ -24,6 +24,7 @@
   "exports": {
     "./host-contract.json": "./contracts/host-contract.json",
     "./replace-conformance.json": "./contracts/replace-conformance.json",
+    "./scope-delete-receipt.json": "./contracts/scope-delete-receipt.json",
     "./config": {
       "types": "./dist/config/index.d.ts",
       "import": "./dist/config/index.js"
@@ -43,6 +44,10 @@
     "./api": {
       "types": "./dist/api/index.d.ts",
       "import": "./dist/api/index.js"
+    },
+    "./api/scope-delete-verdict": {
+      "types": "./dist/api/scope-delete-verdict.d.ts",
+      "import": "./dist/api/scope-delete-verdict.js"
     },
     "./localdb": {
       "types": "./dist/localdb/index.d.ts",
