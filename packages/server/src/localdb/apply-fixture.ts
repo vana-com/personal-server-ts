@@ -83,6 +83,8 @@ export async function remoteFixture(
       complete?: boolean;
       primaryKey?: string[];
       profile?: { key: string | null; version: string };
+      /** Rewrites the head's entry for a part (not the part's bytes), to make a head whose metadata is wrong. */
+      entry?: (part: HeadPart, index: number, total: number) => HeadPart;
     } = {},
   ) {
     const scope = streamScope(connector, ns, stream);
@@ -147,7 +149,9 @@ export async function remoteFixture(
         ? { replacedAt: options.replacedAt ?? options.o ?? 100 }
         : {}),
       recordCount: values.length,
-      parts,
+      parts: options.entry
+        ? parts.map((p, i) => options.entry!(p, i, parts.length))
+        : parts,
     });
     const { dataHash, blobName } = await digestHead(
       async (b) => keccak_256(b),
