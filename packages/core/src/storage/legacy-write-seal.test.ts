@@ -284,4 +284,40 @@ describe("a failed read of the Account after an Off", () => {
     expect(seal.verdict()).toBe("allow");
     expect(await seal.commit(() => "stored")).toBe("stored");
   });
+
+  it("refuses at commit, admit and verdict after an On whose save failed, until a later answer applies", async () => {
+    const memory = createMemoryModeRecordStore();
+    let failSaves = false;
+    const authority = createModeAuthority({
+      store: {
+        load: () => memory.load(),
+        save: async (owner, record) => {
+          if (failSaves) throw new Error("disk full");
+          await memory.save(owner, record);
+        },
+      },
+    });
+    await authority.ready;
+    const seal = createLegacyWriteSeal({ authority, owner: OWNER });
+    await authority.submitEvidence({ ...evidence("off"), generation: 2 });
+    expect(seal.admit()).toBeNull();
+    failSaves = true;
+    await expect(
+      authority.submitEvidence({ ...evidence("on"), generation: 2 }),
+    ).rejects.toThrow("disk full");
+    let ran = 0;
+    const refused = await seal
+      .commit(() => {
+        ran += 1;
+      })
+      .catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(LegacyWriteRefusedError);
+    expect((refused as LegacyWriteRefusedError).verdict).toBe("unknown");
+    expect(ran).toBe(0);
+    expect(seal.admit()?.status).toBe(503);
+    expect(seal.verdict()).toBe("unknown");
+    failSaves = false;
+    await authority.submitEvidence({ ...evidence("on"), generation: 2 });
+    expect(seal.verdict()).toBe("switched");
+  });
 });

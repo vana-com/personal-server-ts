@@ -205,11 +205,15 @@ describe("the account-mode record", () => {
       // submitted and finishes meanwhile; the save then completes.
       const memory = createMemoryModeRecordStore();
       const saveGate = deferred();
+      const saveEntered = deferred();
       let gateSaves = false;
       const store: ModeRecordStore = {
         load: () => memory.load(),
         save: async (owner, record) => {
-          if (gateSaves) await saveGate.promise;
+          if (gateSaves) {
+            saveEntered.resolve();
+            await saveGate.promise;
+          }
           await memory.save(owner, record);
         },
       };
@@ -225,7 +229,8 @@ describe("the account-mode record", () => {
         state: "off",
         generation: 1,
       });
-      await Promise.resolve();
+      // The real save has been entered: the answer is in flight.
+      await saveEntered.promise;
       expect(
         await authority.submitEvidence({ owner: OWNER, state: "unknown" }),
       ).toEqual(UNKNOWN);
@@ -246,6 +251,90 @@ describe("the account-mode record", () => {
       expect(await authority.commitLegacy(OWNER, () => 2)).toEqual({
         ok: true,
         value: 2,
+      });
+    });
+
+    it("refuses legacy writes after an On whose save failed, until a later answer applies", async () => {
+      // Off at generation 2 is verified in this process; the On that follows
+      // cannot be saved. The latest evidence says switched, so the older Off
+      // must not keep authorizing writes.
+      const memory = createMemoryModeRecordStore();
+      let failSaves = false;
+      const store: ModeRecordStore = {
+        load: () => memory.load(),
+        save: async (owner, record) => {
+          if (failSaves) throw new Error("disk full");
+          await memory.save(owner, record);
+        },
+      };
+      const { authority } = await authorityWith(store);
+      await authority.submitEvidence({
+        owner: OWNER,
+        state: "off",
+        generation: 2,
+      });
+      expect(await authority.commitLegacy(OWNER, () => 1)).toEqual({
+        ok: true,
+        value: 1,
+      });
+      failSaves = true;
+      await expect(
+        authority.submitEvidence({ owner: OWNER, state: "on", generation: 2 }),
+      ).rejects.toThrow("disk full");
+      expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+      let ran = false;
+      expect(
+        await authority.commitLegacy(OWNER, () => {
+          ran = true;
+        }),
+      ).toEqual({ ok: false, decision: UNKNOWN });
+      expect(ran).toBe(false);
+      // Reads still follow the record that was saved.
+      expect(authority.read(OWNER)).toEqual({ kind: "legacy" });
+      failSaves = false;
+      // A later answer that applies ends it: here the On lands.
+      expect(
+        await authority.submitEvidence({
+          owner: OWNER,
+          state: "on",
+          generation: 2,
+        }),
+      ).toEqual({ kind: "streams" });
+      expect(await authority.commitLegacy(OWNER, () => 2)).toMatchObject({
+        ok: false,
+        decision: { code: "LEGACY_REFUSED_SWITCHED", status: 426 },
+      });
+    });
+
+    it("keeps the pause through an older generation: Off 2, unknown, then a verified answer at 1", async () => {
+      const { authority } = await authorityWith();
+      await authority.submitEvidence({
+        owner: OWNER,
+        state: "off",
+        generation: 2,
+      });
+      await authority.submitEvidence({ owner: OWNER, state: "unknown" });
+      for (const state of ["off", "on"] as const) {
+        expect(
+          await authority.submitEvidence({
+            owner: OWNER,
+            state,
+            generation: 1,
+          }),
+        ).toEqual(UNKNOWN);
+        expect(await authority.commitLegacy(OWNER, () => 1)).toEqual({
+          ok: false,
+          decision: UNKNOWN,
+        });
+      }
+      await authority.submitEvidence({
+        owner: OWNER,
+        state: "off",
+        generation: 2,
+      });
+      expect(await authority.commitLegacy(OWNER, () => 3)).toEqual({
+        ok: true,
+        value: 3,
       });
     });
 

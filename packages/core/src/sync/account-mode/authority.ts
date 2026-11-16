@@ -18,7 +18,10 @@
  *   Account.
  * - Evidence is numbered per owner when it arrives, before any await. A
  *   verified answer takes effect only if no later evidence was submitted, so a
- *   slow save cannot undo a failed read that finished first.
+ *   slow save cannot undo a failed read that finished first. An answer that
+ *   arrives and cannot be applied (its save or the record load fails) takes
+ *   the earlier permission back, under the lock: the latest evidence says the
+ *   record is not what the permission was given for.
  * - This is a local guarantee. It cannot make a switch on another device
  *   atomic with this device's storage: a write between the last verified read
  *   and the next one is detected afterwards, not prevented. Preventing it needs
@@ -184,6 +187,11 @@ export function createModeAuthority(
       await ready;
       if (answered) {
         const release = await lock.exclusive();
+        // An answer that arrived and was not applied (a failed save, a failed
+        // load) is the latest evidence, and it is not an Off. The permission
+        // an earlier verified answer gave is taken back under this lock, so no
+        // legacy write can start on it, and only an applied answer restores it.
+        let applied = false;
         try {
           // Retried under the lock, so the exclusive request is queued before
           // the load starts: an On still waits for legacy writes in flight,
@@ -205,13 +213,14 @@ export function createModeAuthority(
             await options.store.save(owner, next);
             records.set(owner, next);
           }
+          applied = true;
           // Verified for this process only when nothing was submitted after
-          // it and it is not older than the record. A save that threw above
-          // never reaches this line, so it verifies nothing.
+          // it and it is not older than the record.
           if (latest.get(owner) === ticket && generation >= next.generation) {
             verified.add(owner);
           }
         } finally {
+          if (!applied) verified.delete(owner);
           release();
         }
       } else {
