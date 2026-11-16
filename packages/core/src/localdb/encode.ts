@@ -156,8 +156,8 @@ export class FrozenRowsChanged extends Error {
  * because a body is encoded whole. Row sizes are read `META_ROWS` at a time
  * and cut into pages; a page also holds at most `META_ROWS` rows.
  */
-const META_ROWS = 2048;
-const PAGE_BYTES = 2 * 1024 * 1024;
+export const META_ROWS = 2048;
+export const PAGE_BYTES = 2 * 1024 * 1024;
 
 /** The byte target a part is cut at: `deps.partTargetBytes`, default 4 MiB. */
 export function partTargetOf(deps: LocalSyncDeps): number {

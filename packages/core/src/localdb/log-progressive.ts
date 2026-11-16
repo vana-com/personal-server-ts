@@ -79,7 +79,8 @@ export function planLogLoad(
       if (operation.kind === "delete" || operation.kind === "omitted")
         entry.removedAt.set(operation.pkHash, index);
       else if (operation.kind === "complete")
-        for (const pk of operation.omitted) entry.removedAt.set(pk, index);
+        for (const { pkHash } of operation.omitted)
+          entry.removedAt.set(pkHash, index);
     }
   });
   const plans = new Map<string, StreamLoadPlan>();

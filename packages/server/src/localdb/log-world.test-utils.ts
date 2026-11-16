@@ -34,7 +34,7 @@ export const CONNECTION_ID = `pdpp.${CONNECTOR}~`;
 export const CONTROL = controlScope(CONNECTOR, "");
 export const LOG = logScope(CONNECTOR, "");
 export const sName = (i: number) => `s${i}`;
-export const idHash = (id: string) =>
+export const idHash = (id: string | number) =>
   pkHash(async (b) => sha256(b), { id }, ["id"]);
 
 const drivers: SqlDriver[] = [];
@@ -47,6 +47,8 @@ export async function world(options: {
   streams: number;
   logProtocol: boolean;
   partTargetBytes?: number;
+  /** The key types every stream's schema declares (none: undeclared). */
+  keyTypes?: readonly ("string" | "number" | "integer" | "boolean" | null)[];
 }) {
   const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
   const hashes = await controlHashes(async (b) => keccak_256(b), keyCheck);
@@ -138,6 +140,7 @@ export async function world(options: {
           semantics: "mutable_state" as const,
           primaryKey: ["id"],
           coverageStrategy: "full_inventory" as const,
+          ...(options.keyTypes ? { keyTypes: options.keyTypes } : {}),
         })),
       }),
       declaredStreams: () => names,
@@ -148,7 +151,7 @@ export async function world(options: {
       runId: string,
       records: readonly {
         stream: string;
-        id: string;
+        id: string | number;
         v?: number;
         pad?: number;
         blobId?: string;

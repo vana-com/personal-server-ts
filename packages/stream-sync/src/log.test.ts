@@ -11,6 +11,7 @@ import {
   decodeSnapshotPart,
   digestSnapshotPart,
   encodeSnapshotPart,
+  firstDeletionKeyMismatch,
   foldLog,
   partitionFold,
   shouldCompact,
@@ -27,12 +28,17 @@ import {
   verifySegment,
   type Segment,
   type SegmentRef,
+  type SnapshotPart,
 } from "./log.js";
-import { keccak256 } from "./test-support/ports.js";
+import { pkHash } from "./records.js";
+import { keccak256, nodePorts } from "./test-support/ports.js";
 
 const hash = (n: number): `0x${string}` =>
   `0x${n.toString(16).padStart(64, "0")}`;
 const pk = (n: number) => n.toString(16).padStart(64, "0");
+/** The canonical record key a test gives key `n`; a hash is not its inverse. */
+const rk = (n: number) => [`record-${n}`];
+const om = (n: number) => ({ pkHash: pk(n), key: rk(n) });
 
 function refs(from: number, to: number): SegmentRef[] {
   const out: SegmentRef[] = [];
@@ -80,13 +86,14 @@ function segment(over: Partial<Segment> = {}): Segment {
         kind: "delete",
         stream: "b",
         pkHash: pk(2),
+        key: rk(2),
         stamp: { o: 6, r: "run-1" },
       },
       {
         kind: "complete",
         stream: "a",
         cutoff: { o: 7, r: "run-2" },
-        omitted: [pk(3), pk(4)],
+        omitted: [om(3), om(4)],
       },
     ],
     ...over,
@@ -116,8 +123,8 @@ describe("segment codec", () => {
     const text = new TextDecoder().decode(bytes);
     expect(decodeSegment(utf8(`${text} `)).kind).toBe("malformed");
     expect(
-      decodeSegment(utf8(text.replace('"format":1', '"format":2'))),
-    ).toMatchObject({ kind: "unsupported_format", format: 2 });
+      decodeSegment(utf8(text.replace(`"format":${LOG_FORMAT}`, '"format":9'))),
+    ).toMatchObject({ kind: "unsupported_format", format: 9 });
     expect(decodeSegment(utf8(text.replace("{", '{"extra":1,'))).kind).toBe(
       "malformed",
     );
@@ -137,6 +144,7 @@ describe("segment codec", () => {
           kind: "delete",
           stream: "zz",
           pkHash: pk(1),
+          key: rk(1),
           stamp: { o: 1, r: "r" },
         },
       ],
@@ -163,7 +171,7 @@ describe("segment codec", () => {
           kind: "complete",
           stream: "a",
           cutoff: { o: 1, r: "r" },
-          omitted: [pk(4), pk(3)],
+          omitted: [om(4), om(3)],
         },
       ],
     });
@@ -285,6 +293,7 @@ const del = (stream: string, n: number, o: number, r = "r") => ({
   kind: "delete" as const,
   stream,
   pkHash: pk(n),
+  key: rk(n),
   stamp: { o, r },
 });
 const seg = (position: number, operations: Segment["operations"]) =>
@@ -309,7 +318,7 @@ describe("fold (P4)", () => {
             kind: "complete",
             stream: "a",
             cutoff: { o: 7, r: "r" },
-            omitted: [pk(3)],
+            omitted: [om(3)],
           },
         ]),
       ],
@@ -420,7 +429,9 @@ describe("snapshot part codec", () => {
     const text = new TextDecoder().decode(bytes);
     expect(decodeSnapshotPart(utf8(`${text} `)).kind).toBe("malformed");
     expect(
-      decodeSnapshotPart(utf8(text.replace('"format":1', '"format":9'))).kind,
+      decodeSnapshotPart(
+        utf8(text.replace(`"format":${LOG_FORMAT}`, '"format":9')),
+      ).kind,
     ).toBe("unsupported_format");
     expect(decodeSnapshotPart(utf8("[]")).kind).toBe("malformed");
   });
@@ -468,7 +479,9 @@ const complete = (stream: string, omitted: number[], o: number, r = "r") => ({
   kind: "complete" as const,
   stream,
   cutoff: { o, r },
-  omitted: omitted.map(pk).sort(),
+  omitted: omitted
+    .map(om)
+    .sort((x, y) => (x.pkHash < y.pkHash ? -1 : x.pkHash > y.pkHash ? 1 : 0)),
 });
 const kindsOf = (
   entries: readonly { kind: string; pkHash: string }[],
@@ -533,7 +546,13 @@ describe("fold: the deletion frontier (P2-3)", () => {
       ],
     });
     expect(fold.entries.filter((e) => e.pkHash === pk(1))).toEqual([
-      { kind: "delete", stream: "a", pkHash: pk(1), stamp: { o: 20, r: "r" } },
+      {
+        kind: "delete",
+        stream: "a",
+        pkHash: pk(1),
+        key: rk(1),
+        stamp: { o: 20, r: "r" },
+      },
       expect.objectContaining({
         kind: "upsert",
         firstSeen: 30,
@@ -634,6 +653,7 @@ describe("fold: the deletion frontier (P2-3)", () => {
       kind: "omitted" as const,
       stream: "a",
       pkHash: pk(1),
+      key: rk(1),
       stamp: { o: 5, r: "r" },
     };
     expect(() =>
@@ -644,5 +664,210 @@ describe("fold: the deletion frontier (P2-3)", () => {
       .decode(encodeSegment(segment()))
       .replace('"k":"d"', '"k":"o"');
     expect(decodeSegment(utf8(bytes)).kind).toBe("malformed");
+  });
+});
+
+// The canonical record key travels with every deletion, because a deletion
+// has no data to derive it from (an upsert has: its value and the stream's
+// primary key). A hash is one-way and drops the key's types, so a replica that
+// never held the record cannot recover the key from it.
+describe("deletions carry the canonical record key", () => {
+  const context = {
+    connector: "c",
+    ns: "fedcba9876543210",
+    generation: 1,
+    keyCheck: "0123456789abcdef",
+    position: 1,
+  };
+  const wireOf = (bytes: Uint8Array) =>
+    JSON.parse(new TextDecoder().decode(bytes)) as {
+      operations?: Record<string, unknown>[];
+      entries?: Record<string, unknown>[];
+    };
+
+  it("a segment's delete and completion round-trip with their keys", () => {
+    const s = segment();
+    const decoded = decodeSegment(encodeSegment(s));
+    expect(decoded).toEqual({ kind: "ok", segment: s });
+    const ops = (decoded as { segment: Segment }).segment.operations;
+    expect(ops[1]).toMatchObject({ kind: "delete", key: rk(2) });
+    expect(ops[2]).toMatchObject({
+      kind: "complete",
+      omitted: [om(3), om(4)],
+    });
+    // The wire form names the key beside the hash, never instead of it.
+    const wire = wireOf(encodeSegment(s)).operations!;
+    expect(wire[1]).toMatchObject({ k: "d", p: pk(2), rk: rk(2) });
+    expect(wire[2]).toMatchObject({
+      k: "c",
+      omit: [
+        { p: pk(3), rk: rk(3) },
+        { p: pk(4), rk: rk(4) },
+      ],
+    });
+  });
+
+  it("the fold keeps the key on the tombstone of a key it never saw an upsert for", () => {
+    const fold = foldLog({
+      snapshot: [],
+      segments: [
+        seg(1, [del("a", 2, 8), complete("a", [3], 7)]),
+        seg(2, [up("a", 4, 1), complete("a", [4], 5)]),
+      ],
+    });
+    const entry = (n: number) => fold.entries.find((e) => e.pkHash === pk(n));
+    expect(entry(2)).toMatchObject({ kind: "delete", key: rk(2) });
+    expect(entry(3)).toMatchObject({ kind: "omitted", key: rk(3) });
+    expect(entry(4)).toMatchObject({ kind: "omitted", key: rk(4) });
+  });
+
+  it("a snapshot part carries the key of its delete and omitted entries, and a second fold keeps it", () => {
+    const first = foldLog({
+      snapshot: [],
+      segments: [
+        seg(1, [del("a", 2, 8), complete("a", [3], 7), up("a", 5, 1)]),
+      ],
+    });
+    const parts = partitionFold(first, context, 1);
+    const wires = parts.flatMap(
+      (p) => wireOf(encodeSnapshotPart(p)).entries ?? [],
+    );
+    expect(wires.find((w) => w["k"] === "d")).toMatchObject({
+      p: pk(2),
+      rk: rk(2),
+    });
+    expect(wires.find((w) => w["k"] === "o")).toMatchObject({
+      p: pk(3),
+      rk: rk(3),
+    });
+    const decoded = parts.map((p) => decodeSnapshotPart(encodeSnapshotPart(p)));
+    expect(decoded.every((d) => d.kind === "ok")).toBe(true);
+    const reloaded = decoded.map((d) => (d as { part: SnapshotPart }).part);
+    const refolded = foldLog({ snapshot: reloaded, segments: [] });
+    expect(refolded.entries).toEqual(first.entries);
+    expect(
+      refolded.entries.filter((e) => e.kind !== "upsert").map((e) => e.key),
+    ).toEqual([rk(2), rk(3)]);
+  });
+
+  it("refuses a deletion that names no key, or names it badly", () => {
+    const text = new TextDecoder().decode(encodeSegment(segment()));
+    const without = text.replace(`"rk":["record-2"],`, "");
+    expect(without).not.toBe(text);
+    expect(decodeSegment(utf8(without)).kind).toBe("malformed");
+    const typed = text.replace(`"rk":["record-2"]`, '"rk":"record-2"');
+    expect(typed).not.toBe(text);
+    expect(decodeSegment(utf8(typed)).kind).toBe("malformed");
+    for (const bad of ["[]", "[null]", "[[1]]", '[{"a":1}]']) {
+      const odd = text.replace(`"rk":["record-2"]`, `"rk":${bad}`);
+      expect(decodeSegment(utf8(odd)).kind).toBe("malformed");
+    }
+    // The old completion shape, a bare list of hashes, is not read either.
+    const bare = text.replace(
+      /"omit":\[[^\]]*\]/,
+      `"omit":["${pk(3)}","${pk(4)}"]`,
+    );
+    expect(bare).not.toBe(text);
+    expect(decodeSegment(utf8(bare)).kind).toBe("malformed");
+    // An upsert needs none: its key derives from its value.
+    expect(text).not.toMatch(/"k":"u"[^}]*"rk"/);
+  });
+
+  it("a hash-only segment of format 1 is unsupported, not read as keyless", () => {
+    // What this build wrote before the key: format 1, `omit` a list of hashes.
+    const old = new TextDecoder()
+      .decode(encodeSegment(segment()))
+      .replace(`"format":${LOG_FORMAT}`, '"format":1')
+      .replace(`,"rk":["record-2"]`, "");
+    expect(LOG_FORMAT).toBe(2);
+    expect(decodeSegment(utf8(old))).toEqual({
+      kind: "unsupported_format",
+      format: 1,
+    });
+    const part = new TextDecoder()
+      .decode(
+        encodeSnapshotPart(
+          partitionFold(
+            foldLog({ snapshot: [], segments: [seg(1, [del("a", 2, 8)])] }),
+            context,
+          )[0]!,
+        ),
+      )
+      .replace(`"format":${LOG_FORMAT}`, '"format":1');
+    expect(decodeSnapshotPart(utf8(part)).kind).toBe("unsupported_format");
+  });
+});
+
+describe("a deletion's key is bound to its hash", () => {
+  const sha256 = nodePorts.sha256;
+  const hashOf = (id: string | number) => pkHash(sha256, { id }, ["id"]);
+  const metas = [meta("a")];
+  const delOf = async (hashFor: string | number, key: (string | number)[]) => ({
+    kind: "delete" as const,
+    stream: "a",
+    pkHash: await hashOf(hashFor),
+    key,
+    stamp: { o: 1, r: "r" },
+  });
+
+  it("accepts each form of deletion whose key is the one its hash covers, of either type", async () => {
+    const ops = [
+      await delOf("A", ["A"]),
+      await delOf(1, [1]),
+      await delOf("1", ["1"]),
+      {
+        kind: "omitted" as const,
+        stream: "a",
+        pkHash: await hashOf(2),
+        key: [2],
+        stamp: { o: 1, r: "r" },
+      },
+      {
+        kind: "complete" as const,
+        stream: "a",
+        cutoff: { o: 2, r: "r" },
+        omitted: [{ pkHash: await hashOf("3"), key: ["3"] }],
+      },
+    ];
+    expect(await firstDeletionKeyMismatch(sha256, metas, ops)).toBeNull();
+  });
+
+  it("names the first delete, omitted entry or completion omission whose key is another's", async () => {
+    const wrong = await delOf("A", ["B"]);
+    expect(await firstDeletionKeyMismatch(sha256, metas, [wrong])).toEqual({
+      stream: "a",
+      pkHash: wrong.pkHash,
+    });
+    const omitted = { ...wrong, kind: "omitted" as const };
+    expect(
+      await firstDeletionKeyMismatch(sha256, metas, [omitted]),
+    ).toMatchObject({
+      pkHash: wrong.pkHash,
+    });
+    const complete = {
+      kind: "complete" as const,
+      stream: "a",
+      cutoff: { o: 2, r: "r" },
+      omitted: [
+        { pkHash: await hashOf("ok"), key: ["ok"] },
+        { pkHash: wrong.pkHash, key: ["B"] },
+      ],
+    };
+    expect(
+      await firstDeletionKeyMismatch(sha256, metas, [complete]),
+    ).toMatchObject({
+      pkHash: wrong.pkHash,
+    });
+  });
+
+  it("does not take 1 for '1': a key of the other type names another record", async () => {
+    const asNumber = await delOf("1", [1]);
+    const asString = await delOf(1, ["1"]);
+    expect(
+      await firstDeletionKeyMismatch(sha256, metas, [asNumber]),
+    ).not.toBeNull();
+    expect(
+      await firstDeletionKeyMismatch(sha256, metas, [asString]),
+    ).not.toBeNull();
   });
 });

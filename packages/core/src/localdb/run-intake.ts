@@ -416,6 +416,14 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
                 d.incremental === false ? 0 : 1,
               ],
             },
+            ...(d.keyTypes
+              ? [
+                  {
+                    sql: "UPDATE stream_state SET key_types=? WHERE connection_id=? AND stream=?",
+                    params: [JSON.stringify(d.keyTypes), id, d.name],
+                  },
+                ]
+              : []),
             {
               sql: `INSERT INTO run_streams(run_id,stream,delete_snapshot,basis_version,basis_generation,basis_data_hash,primary_key,profile_key,profile_version,full_read,coverage_strategy,semantics)
             SELECT ?,stream,last_delete_version,CASE WHEN head_version>0 THEN head_version ELSE NULL END,CASE WHEN head_version>0 THEN head_generation ELSE ? END,head_data_hash,?,NULL,?,?,?,?
@@ -528,8 +536,11 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           let bodySha256: string;
           let recordKey: string;
           let hash: string;
+          let keyValues: string;
           try {
-            primaryKeyValues(record.data, primaryKey);
+            keyValues = canonicalJson(
+              primaryKeyValues(record.data, primaryKey) as JsonValue,
+            );
             recordKey = computeRecordKeyFromData(record.data, primaryKey);
             if (
               record.key !== undefined &&
@@ -547,8 +558,8 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             throw invalid("invalid record or primary key");
           }
           rows.push({
-            sql: `INSERT OR REPLACE INTO run_rows(run_id,stream,pk_hash,record_key,body,body_sha256,op)
-          SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM runs WHERE run_id=? AND state='collecting' AND last_batch=?)`,
+            sql: `INSERT OR REPLACE INTO run_rows(run_id,stream,pk_hash,record_key,body,body_sha256,op,pk_values)
+          SELECT ?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM runs WHERE run_id=? AND state='collecting' AND last_batch=?)`,
             params: [
               runId,
               record.stream,
@@ -557,6 +568,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
               body,
               bodySha256,
               record.op === "delete" ? "delete" : "upsert",
+              keyValues,
               runId,
               run.last_batch,
             ],

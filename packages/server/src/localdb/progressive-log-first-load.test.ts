@@ -197,7 +197,7 @@ async function sevenSegments(w: World) {
   const omits = segments
     .get(6)!
     .operations.flatMap((op) => (op.kind === "complete" ? op.omitted : []));
-  expect(omits).toEqual([await idHash("A3")]);
+  expect(omits.map((o) => o.pkHash)).toEqual([await idHash("A3")]);
   return a;
 }
 

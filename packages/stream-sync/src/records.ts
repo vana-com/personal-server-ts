@@ -111,6 +111,80 @@ export async function pkHash(
   );
 }
 
+/**
+ * True when `key` is the primary-key tuple `hash` names for a stream with this
+ * `primaryKey`: one value per key field, each a string, finite number or
+ * boolean, and `sha256(canonicalJson(key)) === hash`. That is the same input
+ * `pkHash` hashes, so a deletion that carries the tuple needs no search and
+ * names exactly one record.
+ */
+export async function deletionKeyMatchesHash(
+  sha256: Sha256,
+  primaryKey: readonly string[],
+  key: readonly unknown[],
+  hash: string,
+): Promise<boolean> {
+  if (!HEX64.test(hash) || primaryKey.length === 0) return false;
+  if (key.length !== primaryKey.length) return false;
+  if (
+    !key.every(
+      (v) =>
+        typeof v === "string" ||
+        typeof v === "boolean" ||
+        (typeof v === "number" && Number.isFinite(v)),
+    )
+  )
+    return false;
+  return (await sha256Hex(sha256, utf8(canonicalJson(key)))) === hash;
+}
+
+/** The JSON Schema type a stream declares for a primary-key field. */
+export type KeyFieldType = "string" | "number" | "integer" | "boolean";
+
+/**
+ * The typed primary-key values of a record, rebuilt from its canonical record
+ * key (spec-core.md §4, every component a string) and the types its stream
+ * declares for the key fields; `null` when the declaration does not determine
+ * them. A value is rebuilt only where the string is exactly what that type
+ * prints (`7` for a number, never `7.0` or `07`). The rebuilt tuple is a guess
+ * until it hashes to the record's hash (`deletionKeyMatchesHash`): a connector
+ * whose data disagrees with its declared schema fails that check and is not
+ * guessed at.
+ */
+export function keyFromRecordKey(
+  primaryKey: readonly string[],
+  keyTypes: readonly (KeyFieldType | null)[] | null,
+  recordKey: string,
+): (string | number | boolean)[] | null {
+  if (keyTypes === null || keyTypes.length !== primaryKey.length) return null;
+  let parts: unknown[];
+  if (primaryKey.length === 1) parts = [recordKey];
+  else {
+    try {
+      parts = JSON.parse(recordKey) as unknown[];
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(parts) || parts.length !== primaryKey.length)
+      return null;
+  }
+  const key: (string | number | boolean)[] = [];
+  for (const [i, part] of parts.entries()) {
+    const type = keyTypes[i];
+    if (typeof part !== "string" || !type) return null;
+    if (type === "string") key.push(part);
+    else if (type === "boolean") {
+      if (part !== "true" && part !== "false") return null;
+      key.push(part === "true");
+    } else {
+      const n = Number(part);
+      if (!Number.isFinite(n) || String(n) !== part) return null;
+      key.push(n);
+    }
+  }
+  return key;
+}
+
 function checkPkHash(hash: string): void {
   if (!HEX64.test(hash)) {
     throw new InvalidArgumentError(

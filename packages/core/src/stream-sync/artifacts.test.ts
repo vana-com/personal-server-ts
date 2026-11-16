@@ -145,3 +145,60 @@ describe("manifestStreamLister", () => {
     ]);
   });
 });
+
+describe("the key types a stream's schema declares", () => {
+  const declared = (streams: unknown[]) =>
+    manifestArtifact(
+      JSON.stringify({ connector_key: "k", version: "1", streams }),
+    )?.declarations.streams;
+
+  it("are read per key field, in key order, from the embedded schema", () => {
+    expect(
+      declared([
+        {
+          name: "a",
+          primary_key: ["id", "kind", "flag", "n"],
+          schema: {
+            type: "object",
+            properties: {
+              id: { type: "integer" },
+              kind: { type: "string" },
+              flag: { type: "boolean" },
+              n: { type: "number" },
+            },
+          },
+        },
+      ]),
+    ).toMatchObject([{ keyTypes: ["integer", "string", "boolean", "number"] }]);
+  });
+
+  it("are null where the schema does not determine one: no property, a union, an unusable type", () => {
+    const [stream] = declared([
+      {
+        name: "a",
+        primary_key: ["id", "u", "o"],
+        schema: {
+          properties: {
+            u: { type: ["string", "integer"] },
+            o: { type: "object" },
+          },
+        },
+      },
+    ])!;
+    expect(stream).not.toHaveProperty("keyTypes");
+    const [mixed] = declared([
+      {
+        name: "a",
+        primary_key: ["id", "u"],
+        schema: { properties: { id: { type: "string" }, u: {} } },
+      },
+    ])!;
+    expect(mixed).toMatchObject({ keyTypes: ["string", null] });
+  });
+
+  it("are absent when the stream declares no schema", () => {
+    expect(
+      declared([{ name: "a", primary_key: ["id"] }])![0],
+    ).not.toHaveProperty("keyTypes");
+  });
+});
