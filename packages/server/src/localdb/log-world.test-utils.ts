@@ -31,6 +31,7 @@ import {
 } from "../../../core/src/stream-sync/storage-retry.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { createFakeGateway } from "./fake-gateway.js";
+import type { RequestTrace } from "./request-trace.test-utils.js";
 
 export const OWNER = `0x${"11".repeat(20)}` as const;
 export const CONNECTOR = "fixture";
@@ -54,6 +55,8 @@ export async function world(options: {
   partTargetBytes?: number;
   /** The key types every stream's schema declares (none: undeclared). */
   keyTypes?: readonly ("string" | "number" | "integer" | "boolean" | null)[];
+  /** Every gateway and storage request of every device goes through this trace. */
+  trace?: RequestTrace;
 }) {
   const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
   const hashes = await controlHashes(async (b) => keccak_256(b), keyCheck);
@@ -75,6 +78,7 @@ export async function world(options: {
     keys: () => [...store.keys()],
     delete: (key: string) => store.delete(key),
   };
+  const trace = options.trace;
   const names = Array.from({ length: options.streams }, (_, i) => sName(i));
   let clock = 1000;
 
@@ -114,7 +118,21 @@ export async function world(options: {
       registry: createGatewayStreamSyncRegistry({
         gatewayUrl: "https://gateway.test",
         ownerAddress: OWNER,
-        fetch: gateway.fetch,
+        fetch: trace
+          ? (((input: string, init?: RequestInit) => {
+              const url = new URL(input);
+              const method = init?.method ?? "GET";
+              const kind =
+                url.pathname === "/v1/data/batch"
+                  ? "batch"
+                  : url.pathname === "/v1/data"
+                    ? method === "GET"
+                      ? "list"
+                      : "post"
+                    : "read";
+              return trace.track(kind, "", () => gateway.fetch(input, init));
+            }) as unknown as typeof fetch)
+          : gateway.fetch,
       }),
       blobs: {
         governor:
@@ -127,12 +145,19 @@ export async function world(options: {
         async get(key) {
           gets.push(key);
           await hooks.beforeGet?.(key);
-          return innerBlobs.get(key);
+          return trace
+            ? trace.track("get", "", () => innerBlobs.get(key))
+            : innerBlobs.get(key);
         },
-        exists: (key) => innerBlobs.exists(key),
+        exists: (key) =>
+          trace
+            ? trace.track("exists", "", () => innerBlobs.exists(key))
+            : innerBlobs.exists(key),
         async put(key, bytes) {
           await hooks.beforePut?.(key);
-          await innerBlobs.put(key, bytes);
+          if (trace)
+            await trace.track("put", "", () => innerBlobs.put(key, bytes));
+          else await innerBlobs.put(key, bytes);
           puts.push(key);
         },
       },
@@ -189,12 +214,15 @@ export async function world(options: {
         observedAt?: number;
         /** Bytes the record named by `blobId` carries, sent before the run ends. */
         blob?: { hash: string; bytes: Uint8Array };
+        /** The connector the run collects for (default: the world's one connector). */
+        connector?: string;
       } = {},
     ) => {
       clock++;
+      const connector = opts.connector ?? CONNECTOR;
       await sync.intake.begin(runId, {
-        connector: CONNECTOR,
-        artifactDigest: CONNECTOR,
+        connector,
+        artifactDigest: connector,
         wantFull: opts.full ?? true,
         observedAt: opts.observedAt,
         owner: { address: OWNER, leaseId: null },

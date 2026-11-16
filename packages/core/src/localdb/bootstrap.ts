@@ -158,6 +158,22 @@ export async function knownActiveConnections(
 }
 
 /**
+ * A connection this device has only ever seen absent, at its first generation,
+ * and that holds streams: the first save of a new connection. Its control row
+ * is the one the first publish creates, so the registry has nothing for the
+ * publish to wait for. Reads nothing from the registry.
+ */
+export async function newConnectionsWithStreams(
+  deps: LocalSyncDeps,
+): Promise<readonly ConnectionRow[]> {
+  return deps.db.query<SqlConnection>(
+    `${SELECT_CONNECTIONS} WHERE control_state = 'absent' AND generation = 1
+       AND EXISTS (SELECT 1 FROM stream_state s WHERE s.connection_id = connections.connection_id)
+     ORDER BY connection_id`,
+  );
+}
+
+/**
  * C.0 step 2, inside the connection queue and before any row is staged:
  * read the control row and the stream rows, then apply every stream whose
  * registry version differs from `head_version` or whose `head_parts` is empty
