@@ -2961,6 +2961,7 @@ async function commitBatch(
   statements.push({
     sql: `UPDATE stream_state SET head_version = ?, head_generation = ?,
             head_data_hash = ?, head_blob = ?, publish_watermark = ?,
+            consumed_version = ?, consumed_generation = ?, consumed_data_hash = ?,
             last_delete_version = ?, primary_key = ?, profile_key = ?, profile_version = ?, complete = ?,
             needs_full = CASE WHEN ? = 1 THEN 0 WHEN ? > 0 THEN 1 ELSE needs_full END
           WHERE connection_id = ? AND stream = ?`,
@@ -2970,6 +2971,9 @@ async function commitBatch(
       input.dataHash,
       input.blobName,
       input.watermark ?? 0,
+      input.version,
+      input.generation,
+      input.dataHash,
       input.lastDeleteVersion,
       JSON.stringify(input.primaryKey),
       input.profile.key,

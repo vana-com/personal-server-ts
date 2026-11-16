@@ -2797,4 +2797,122 @@ describe("log protocol: the ordinal with the log off", () => {
     expect(row).toMatchObject([{ body: '{"id":"K","v":2}' }]);
     expect(await keyOf(a)).toMatchObject([{ body: '{"id":"K","v":2}' }]);
   });
+
+// A per-stream head committed before the log exists (docs/formal/log-protocol/
+// HeadCursor.tla). The device's local `head_version` counts the log's own
+// rounds, so it cannot also say which registry head the device consumed.
+// ---------------------------------------------------------------------------
+describe("log protocol: a per-stream head that predates the log is consumed once, by identity", () => {
+  const S = sName(0);
+  const s0 = streamScope(CONNECTOR, "", S);
+  const rowIds = async (d: Device) =>
+    (
+      await d.db.query<{ record_key: string }>(
+        "SELECT record_key FROM records WHERE stream = ? ORDER BY record_key",
+        [S],
+      )
+    ).map((r) => r.record_key);
+  const localVersion = async (d: Device) =>
+    (
+      await d.db.query<{ head_version: number }>(
+        "SELECT head_version FROM stream_state WHERE stream = ?",
+        [S],
+      )
+    )[0]!.head_version;
+
+  /**
+   * Registry head 1 holds `a0`. Device `a` and `caught` consume it. Before any
+   * log exists another device commits head 2 with a new key `z`. Device `a` had
+   * ended runs with many large rows, so its first publish takes several rounds.
+   */
+  async function beforeTheLog() {
+    const w = await world({
+      streams: 1,
+      logProtocol: false,
+      partTargetBytes: 3000,
+    });
+    const legacy = await w.device("legacy", false);
+    await legacy.run("run-1", [{ stream: S, id: "a0" }]);
+    await legacy.cycle();
+    const a = await w.device("a", true);
+    await a.cycle();
+    const caught = await w.device("caught", true);
+    await caught.cycle();
+    // Local changes on `a`: they stay unpublished until its next cycle.
+    await a.run(
+      "run-a",
+      Array.from({ length: 12 }, (_, i) => ({
+        stream: S,
+        id: `l${String(i).padStart(2, "0")}`,
+        pad: 500,
+      })),
+      { full: false, covered: [S] },
+    );
+    // The other device's head 2: a new key, before any log row.
+    await legacy.run("run-2", [{ stream: S, id: "z" }], {
+      full: false,
+      covered: [S],
+    });
+    await legacy.cycle();
+    expect(w.gateway.rowsOf(s0)).toBe(2);
+    return { w, legacy, a, caught };
+  }
+
+  it("the registry head 2 reaches the log writer, a caught-up reader and a fresh reader alike", async () => {
+    const { w, a, caught } = await beforeTheLog();
+    await a.cycle();
+    // The writer published several rounds, so its local version passed the
+    // registry's head version. That is the state that hid head 2.
+    expect(await a.position()).toBeGreaterThan(1);
+    expect(await localVersion(a)).toBeGreaterThan(2);
+    const fresh = await w.device("fresh", true);
+    for (const d of [caught, fresh, a, caught, fresh, a]) await d.cycle();
+
+    const want = await rowIds(fresh);
+    expect(want).toEqual(expect.arrayContaining(["a0", "z", "l00", "l11"]));
+    expect(await rowIds(a)).toEqual(want);
+    expect(await rowIds(caught)).toEqual(want);
+    expect(await a.rows()).toEqual(await fresh.rows());
+    expect(await caught.rows()).toEqual(await fresh.rows());
+  }, 60_000);
+
+  it("control: a head already consumed is not read again, however far the log moved the local version", async () => {
+    const { w, a, caught } = await beforeTheLog();
+    const fresh = await w.device("fresh", true);
+    for (const d of [a, caught, fresh, a]) await d.cycle();
+    const headReads = (d: Device) =>
+      d.gets.filter((k) => k.startsWith(`${s0}/`)).length;
+    const before = headReads(a);
+    await a.cycle();
+    await a.cycle();
+    expect(headReads(a)).toBe(before);
+    expect(await rowIds(a)).toEqual(await rowIds(fresh));
+  }, 60_000);
+
+  it("control: a head older than the one consumed is not applied over newer rows", async () => {
+    const { w, a, caught } = await beforeTheLog();
+    const fresh = await w.device("fresh", true);
+    for (const d of [a, caught, fresh, a]) await d.cycle();
+    const settled = await rowIds(a);
+    // The per-stream registry reads back at head 1.
+    const rows = w.gateway.versions.get(s0)!;
+    while (rows.length > 1) rows.pop();
+    await a.cycle();
+    expect(await rowIds(a)).toEqual(settled);
+  }, 60_000);
+  it("control: the same registry version under another hash is not the consumed head", async () => {
+    const { w, a, caught } = await beforeTheLog();
+    const fresh = await w.device("fresh", true);
+    for (const d of [a, caught, fresh, a]) await d.cycle();
+    const rows = w.gateway.versions.get(s0)!;
+    const last = rows[rows.length - 1]!;
+    rows[rows.length - 1] = {
+      ...last,
+      dataHash: `0x${"ab".repeat(32)}`,
+    };
+    // The device goes to read that head: its blob is not there.
+    await expect(applyConnection(a.deps, CONNECTION_ID)).rejects.toThrow(
+      "missing head blob",
+    );
+  }, 60_000);
 });

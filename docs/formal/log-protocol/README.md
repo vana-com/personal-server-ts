@@ -479,3 +479,27 @@ With the log off and admission on (`publishWhileCollecting`) a device stores
 written and a head holds no ordinal. A device that turns the log on after it
 published a head, then a first load, both hold the final body (the test asserts
 bodies only).
+
+## HeadCursor: a per-stream head that predates the log
+
+`HeadCursor.tla` is a separate small model (one stream, three devices). It adds
+what this model leaves out: a registry per-stream head committed by another
+device before any log row exists (the gateway refuses it afterwards), the log
+writer's rounds, and the two numbers a device keeps: `lver` (the local
+`head_version`, which log rounds and applied segments advance) and `cons` (the
+last registry head consumed). A row is `[rank, live]`; a head apply merges the
+head's rows and then drops rows the head lacks whose rank is at or below its
+cutoff. Pending unpublished local changes, compaction and snapshots are not
+modelled. The corpus (two heads, two rounds) is a model limit, not a claim.
+
+| Configuration                | Skip rule              | After admitting a head | TLC result (EventuallyConverged)                                                                 |
+| ---------------------------- | ---------------------- | ---------------------- | ------------------------------------------------------------------------------------------------ |
+| HeadCursor-today.cfg         | `lver > head version`  | log not replayed       | FAIL                                                                                             |
+| HeadCursor-todayRebase.cfg   | `lver > head version`  | log replayed from 0    | FAIL: the writer keeps `cons=1`, `lver=3`, never reads head 2                                    |
+| HeadCursor-fixedNoRebase.cfg | `head version <= cons` | log not replayed       | FAIL: the head's cutoff drops the writer's own row `a`; position stays, replay never restores it |
+| HeadCursor-fixed.cfg         | `head version <= cons` | log replayed from 0    | PASS: 4568 states generated, 658 distinct, depth complete                                        |
+
+Run on 2026-11-16, TLC 2.19 (`tla2tools.jar` 1.7.4, Java 17), `-workers 4`.
+Traces: `traces/head-cursor-*.txt`. The two mutants show that both halves of the
+fix are needed: the cursor (skip by consumption) and the replay (a head applied
+over log rows can drop them).
