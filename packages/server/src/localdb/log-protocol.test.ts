@@ -2823,6 +2823,29 @@ describe("log protocol: a per-stream head that predates the log is consumed once
     )[0]!.head_version;
 
   /**
+   * The head of a device that has not seen the log: a current build follows a
+   * log it finds, so the registry hides the log row while the device writes.
+   */
+  async function headWithoutLog(
+    w: Awaited<ReturnType<typeof world>>,
+    legacy: Device,
+    runId: string,
+    id: string,
+  ) {
+    const log = w.gateway.versions.get(LOG);
+    w.gateway.versions.delete(LOG);
+    try {
+      await legacy.run(runId, [{ stream: S, id }], {
+        full: false,
+        covered: [S],
+      });
+      await legacy.cycle();
+    } finally {
+      if (log) w.gateway.versions.set(LOG, log);
+    }
+  }
+
+  /**
    * Registry head 1 holds `a0`. Device `a` and `caught` consume it. Before any
    * log exists another device commits head 2 with a new key `z`. Device `a` had
    * ended runs with many large rows, so its first publish takes several rounds.
@@ -2925,11 +2948,7 @@ describe("log protocol: a per-stream head that predates the log is consumed once
     await a.cycle();
     const published = await a.position();
     expect(published).toBeGreaterThan(0);
-    await legacy.run("run-2", [{ stream: S, id: "z" }], {
-      full: false,
-      covered: [S],
-    });
-    await legacy.cycle();
+    await headWithoutLog(w, legacy, "run-2", "z");
     const fresh = await w.device("fresh", true);
     await fresh.cycle();
     const want = await rowIds(fresh);
@@ -2968,11 +2987,7 @@ describe("log protocol: a per-stream head that predates the log is consumed once
       ],
       { full: false, covered: [S] },
     );
-    await legacy.run("run-2", [{ stream: S, id: "z" }], {
-      full: false,
-      covered: [S],
-    });
-    await legacy.cycle();
+    await headWithoutLog(w, legacy, "run-2", "z");
     // The head is admitted and the log read, with nothing published yet.
     await applyConnection(a.deps, CONNECTION_ID);
     expect(await rowIds(a)).toEqual(
@@ -2998,11 +3013,7 @@ describe("log protocol: a per-stream head that predates the log is consumed once
     const segments = await w.segments();
     const head = segments.get(Math.max(...segments.keys()))!;
     expect(head.snapshot).toBeTruthy();
-    await legacy.run("run-2", [{ stream: S, id: "z" }], {
-      full: false,
-      covered: [S],
-    });
-    await legacy.cycle();
+    await headWithoutLog(w, legacy, "run-2", "z");
     const fresh = await w.device("fresh", true);
     await fresh.cycle();
     const want = await rowIds(fresh);
@@ -3029,11 +3040,7 @@ describe("log protocol: a per-stream head that predates the log is consumed once
       await a.cycle();
     }
     expect(await a.position()).toBe(2);
-    await legacy.run("run-2", [{ stream: S, id: "z" }], {
-      full: false,
-      covered: [S],
-    });
-    await legacy.cycle();
+    await headWithoutLog(w, legacy, "run-2", "z");
     const before = { rows: await a.rows(), position: await a.position() };
     w.gateway.versions.get(LOG)!.pop(); // the log registry is at position 1 again
     await expect(applyStream(a.deps, CONNECTION_ID, S)).rejects.toThrow(

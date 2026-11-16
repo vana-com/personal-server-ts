@@ -25,7 +25,6 @@ import {
   type Head,
   type HeadPart,
   type JsonObject,
-  logScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { ConnectionQueue, LocalSyncDeps } from "./deps.js";
