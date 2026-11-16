@@ -265,33 +265,6 @@ describe("Node and Lite serve identical pages for one store", () => {
       withoutRequestId(await node.json()),
     );
   });
-
-  it("answers the canonical source id like its connector id", async () => {
-    const local = await switchedStore();
-    const runtime = await liteRuntime(local);
-    const app = nodeApp(local);
-    const path = `/v1/streams/posts/records?limit=3&source=${encodeURIComponent(SOURCE_ID)}`;
-    const [lite, node] = [
-      await liteGet(runtime, path),
-      await nodeGet(app, path),
-    ];
-    expect(lite.status).toBe(200);
-    expect(node.status).toBe(200);
-    const body = await lite.json();
-    expect(body).toEqual(await node.json());
-    expect(body.data.map((row: { id: string }) => row.id)).toEqual(
-      POSTS.slice(0, 3).map((post) => post.id),
-    );
-  });
-
-  it("answers an unknown canonical source id as a source the caller may not read", async () => {
-    const local = await switchedStore();
-    const path = `/v1/streams/posts/records?source=${encodeURIComponent("https://registry.test/connectors/other")}`;
-    const lite = await liteGet(await liteRuntime(local), path);
-    const node = await nodeGet(nodeApp(local), path);
-    expect(lite.status).toBe(403);
-    expect(lite.status).toBe(node.status);
-  });
 });
 
 describe("PDPP-Version negotiation on both hosts", () => {
@@ -318,8 +291,8 @@ describe("PDPP-Version negotiation on both hosts", () => {
     host: "lite" | "node",
     local: LocalSync,
     version: string | undefined,
+    path = `/v1/streams/posts/records?source=${CONNECTOR}`,
   ) {
-    const path = `/v1/streams/posts/records?source=${CONNECTOR}`;
     const headers: Record<string, string> =
       version === undefined ? {} : { "PDPP-Version": version };
     if (host === "node") {
@@ -367,5 +340,28 @@ describe("PDPP-Version negotiation on both hosts", () => {
     );
     expect(lite.calls.queries).toBe(0);
     expect(node.calls.queries).toBe(0);
+  });
+
+  const sameTail = `https://unconfigured.invalid/another-source/${CONNECTOR}`;
+
+  it("refuses a source id that only shares a connector's last segment, with no query", async () => {
+    const path = `/v1/streams/posts/records?source=${encodeURIComponent(sameTail)}`;
+    const [lite, node] = [await countedStore(), await countedStore()];
+    const liteResponse = await get("lite", lite.local, undefined, path);
+    const nodeResponse = await get("node", node.local, undefined, path);
+    expect(liteResponse.status).toBe(403);
+    expect(nodeResponse.status).toBe(403);
+    expect(lite.calls.queries).toBe(0);
+    expect(node.calls.queries).toBe(0);
+  });
+
+  it("refuses the configured canonical id on Lite, which holds no source ids; Node serves it", async () => {
+    const path = `/v1/streams/posts/records?source=${encodeURIComponent(SOURCE_ID)}`;
+    const [lite, node] = [await countedStore(), await countedStore()];
+    const liteResponse = await get("lite", lite.local, undefined, path);
+    const nodeResponse = await get("node", node.local, undefined, path);
+    expect(liteResponse.status).toBe(403);
+    expect(lite.calls.queries).toBe(0);
+    expect(nodeResponse.status).toBe(200);
   });
 });
