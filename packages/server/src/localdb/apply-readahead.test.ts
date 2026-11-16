@@ -845,7 +845,9 @@ it("resumes a first load after the second group commit crashes", async () => {
     expect(groups).toBe(2);
     expect(omissionDeletes).toBe(0);
     if (committed === undefined) throw new Error("first group never committed");
-    expect(committed.records.map((r) => JSON.parse(r.body).id)).toEqual([order[0]]);
+    expect(committed.records.map((r) => JSON.parse(r.body).id)).toEqual([
+      order[0],
+    ]);
     expect(committed.head).toHaveLength(1);
     expect(committed.head[0]?.complete).toBe(0);
     // Column names and progress semantics come from partial-load.ts.
@@ -878,16 +880,26 @@ it("resumes a first load after the second group commit crashes", async () => {
     spy.mockRestore();
     let finalBatches = 0;
     vi.spyOn(f.db, "batch").mockImplementation(async (statements) => {
-      const final = statements.some((s) => s.sql.includes("INSERT OR REPLACE INTO stream_versions"));
-      const omits = statements.some((s) => /DELETE\s+FROM\s+records\b/i.test(s.sql));
+      const final = statements.some((s) =>
+        s.sql.includes("INSERT OR REPLACE INTO stream_versions"),
+      );
+      const omits = statements.some((s) =>
+        /DELETE\s+FROM\s+records\b/i.test(s.sql),
+      );
       if (final) finalBatches++;
       if (omits) {
         omissionDeletes++;
         // An omission may run only alongside installation of the final head,
         // never in a row-group commit or in an independent cleanup batch.
         expect(final).toBe(true);
-        expect(statements.some((s) => s.sql.includes("UPDATE stream_state SET primary_key="))).toBe(true);
-        expect(statements.some((s) => s.sql.includes("DELETE FROM stream_partial"))).toBe(true);
+        expect(
+          statements.some((s) =>
+            s.sql.includes("UPDATE stream_state SET primary_key="),
+          ),
+        ).toBe(true);
+        expect(
+          statements.some((s) => s.sql.includes("DELETE FROM stream_partial")),
+        ).toBe(true);
       }
       const result = await batch(statements);
       if (final) {
@@ -919,16 +931,33 @@ it("resumes a first load after the second group commit crashes", async () => {
     expect(new Set(resumed.records.map((r) => r.pk_hash)).size).toBe(6);
     expect(resumed.records).toHaveLength(6);
     expect(resumed.partial).toEqual([]);
-    expect(resumed.parts.map((p) => ({
-      prefix: p.prefix, seq: p.seq, part_hash: p.part_hash,
-      bytes: p.bytes, count: p.count,
-    }))).toEqual(h.parts.map((p, seq) => ({
-      prefix: p.prefix, seq, part_hash: p.hash, bytes: p.bytes, count: p.count,
-    })));
+    expect(
+      resumed.parts.map((p) => ({
+        prefix: p.prefix,
+        seq: p.seq,
+        part_hash: p.part_hash,
+        bytes: p.bytes,
+        count: p.count,
+      })),
+    ).toEqual(
+      h.parts.map((p, seq) => ({
+        prefix: p.prefix,
+        seq,
+        part_hash: p.hash,
+        bytes: p.bytes,
+        count: p.count,
+      })),
+    );
     expect(resumed.versions).toHaveLength(1);
     expect(resumed.versions[0]).toMatchObject({
-      version: 1, generation: 1, head_blob: h.blobName, head_format: 4,
-      record_count: 6, observed_at: 100, complete: 1, kind: "applied",
+      version: 1,
+      generation: 1,
+      head_blob: h.blobName,
+      head_format: 4,
+      record_count: 6,
+      observed_at: 100,
+      complete: 1,
+      kind: "applied",
     });
     expect(resumed.head[0]).toMatchObject({
       complete: 1,
