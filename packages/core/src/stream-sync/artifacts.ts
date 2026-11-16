@@ -64,6 +64,7 @@ interface DeclaredStreamShape {
   readonly coverage_strategy?: CoverageStrategy;
   readonly consent_time_field?: unknown;
   readonly key_types?: readonly (KeyFieldType | null)[];
+  readonly state_parents?: readonly string[];
 }
 
 function streamDeclaration(
@@ -85,7 +86,20 @@ function streamDeclaration(
     stream.consent_time_field !== ""
       ? { consentTimeField: stream.consent_time_field }
       : {}),
+    ...(stream.state_parents?.length
+      ? { stateParents: stream.state_parents }
+      : {}),
   };
+}
+
+/** `state_stream`, then each string of `parent_streams`. Others are ignored. */
+function stateParentsOf(stream: Record<string, unknown>): string[] {
+  const parents =
+    typeof stream.state_stream === "string" ? [stream.state_stream] : [];
+  if (Array.isArray(stream.parent_streams))
+    for (const parent of stream.parent_streams)
+      if (typeof parent === "string") parents.push(parent);
+  return parents;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -180,6 +194,7 @@ export function manifestArtifact(document: string): VerifiedArtifact | null {
           CoverageStrategy | undefined,
         consent_time_field: stream.consent_time_field,
         key_types: keyTypesOf(stream.schema, stream.primary_key),
+        state_parents: stateParentsOf(stream),
       }),
     );
   }

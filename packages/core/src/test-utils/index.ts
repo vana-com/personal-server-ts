@@ -35,3 +35,4 @@ export {
   fixedLegacyWriteSeal,
   openLegacyWriteSealForTests,
 } from "./legacy-write-seal.js";
+export { SILENT_STREAM, endRequest } from "./run-end.js";

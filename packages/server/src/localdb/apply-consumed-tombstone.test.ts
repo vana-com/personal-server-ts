@@ -15,6 +15,7 @@ import {
 } from "../../../core/src/localdb/apply.js";
 import { createRunIntakeStore } from "../../../core/src/localdb/run-intake.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.js";
 
@@ -130,11 +131,7 @@ describe("a tombstone that is already consumed", () => {
       batch: 0,
       records: [{ stream: "items", data: { id: "new" } }],
     });
-    await f.end.end("run", {
-      outcome: "retry_pending",
-      coveredStreams: [],
-      lastBatch: 0,
-    });
+    await f.end.end("run", endRequest({ lastBatch: 0, live: ["items"] }));
     expect(await f.records()).toEqual([{ record_key: "new" }]);
     await applyStream(f.deps, f.id, "items");
     expect(await f.records()).toEqual([{ record_key: "new" }]);

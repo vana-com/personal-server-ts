@@ -1,0 +1,1062 @@
+{
+  "version": 1,
+  "contract": "Whether a stream-sync run's work is saved (decideRunSaved). receipt_or_status: a Web write's saved. strict_receipt: retiring old copies; a status alone never retires.",
+  "cases": [
+    {
+      "id": "receipt_or_status-receipt-covers-run",
+      "why": "A sound receipt that lists the run covers it.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": true,
+        "proof": "receipt",
+        "connectionId": "c~"
+      }
+    },
+    {
+      "id": "strict_receipt-receipt-covers-run",
+      "why": "A sound receipt that lists the run covers it.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": true,
+        "proof": "receipt",
+        "connectionId": "c~"
+      }
+    },
+    {
+      "id": "receipt_or_status-lost-reply-status-published",
+      "why": "No receipt (a lost reply); the run's durable status is published.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [],
+        "status": {
+          "runId": "run-1",
+          "state": "published",
+          "streams": [
+            {
+              "name": "items",
+              "state": "published"
+            }
+          ]
+        },
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": true,
+        "proof": "status",
+        "connectionId": null
+      }
+    },
+    {
+      "id": "strict_receipt-lost-reply-retire",
+      "why": "Retirement never deletes on a status alone.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [],
+        "status": {
+          "runId": "run-1",
+          "state": "published",
+          "streams": [
+            {
+              "name": "items",
+              "state": "published"
+            }
+          ]
+        },
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "no_receipt"
+      }
+    },
+    {
+      "id": "receipt_or_status-status-pending",
+      "why": "Pending is not saved.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [],
+        "status": {
+          "runId": "run-1",
+          "state": "pending",
+          "streams": [
+            {
+              "name": "items",
+              "state": "pending"
+            }
+          ]
+        },
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "no_receipt"
+      }
+    },
+    {
+      "id": "receipt_or_status-status-superseded",
+      "why": "Superseded is not saved.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [],
+        "status": {
+          "runId": "run-1",
+          "state": "superseded",
+          "streams": [
+            {
+              "name": "items",
+              "state": "superseded"
+            }
+          ]
+        },
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "no_receipt"
+      }
+    },
+    {
+      "id": "receipt_or_status-status-unknown",
+      "why": "Unknown is not saved.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [],
+        "status": {
+          "runId": "run-1",
+          "state": "unknown",
+          "streams": [
+            {
+              "name": "items",
+              "state": "unknown"
+            }
+          ]
+        },
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "no_receipt"
+      }
+    },
+    {
+      "id": "receipt_or_status-status-of-another-run",
+      "why": "A status for another run proves nothing.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [],
+        "status": {
+          "runId": "run-2",
+          "state": "published",
+          "streams": [
+            {
+              "name": "items",
+              "state": "published"
+            }
+          ]
+        },
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "no_receipt"
+      }
+    },
+    {
+      "id": "receipt_or_status-status-missing-required-stream",
+      "why": "A published status must name every required stream published.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [],
+        "status": {
+          "runId": "run-1",
+          "state": "published",
+          "streams": [
+            {
+              "name": "other",
+              "state": "published"
+            }
+          ]
+        },
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "no_receipt"
+      }
+    },
+    {
+      "id": "receipt_or_status-noop-cycle-then-status",
+      "why": "A noop cycle's receipt does not list the run; the status still can.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-0"]
+          }
+        ],
+        "status": {
+          "runId": "run-1",
+          "state": "published",
+          "streams": [
+            {
+              "name": "items",
+              "state": "published"
+            }
+          ]
+        },
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": true,
+        "proof": "status",
+        "connectionId": null
+      }
+    },
+    {
+      "id": "strict_receipt-noop-cycle",
+      "why": "A noop cycle's receipt does not list the run.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-0"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "no_receipt"
+      }
+    },
+    {
+      "id": "receipt-from-two-connections",
+      "why": "Receipts for the run must name one connection.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          },
+          {
+            "connectionId": "c~other",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "connection_mismatch"
+      }
+    },
+    {
+      "id": "receipt-head-version-zero",
+      "why": "A head at version 0 is no publication.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 0,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "no_receipt"
+      }
+    },
+    {
+      "id": "receipt-head-generation-zero",
+      "why": "A head at generation 0 is no publication.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 0,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "no_receipt"
+      }
+    },
+    {
+      "id": "receipt-empty-data-hash",
+      "why": "A head without a data hash is no publication.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": ""
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "no_receipt"
+      }
+    },
+    {
+      "id": "receipt-negative-watermark",
+      "why": "A watermark below 0 is not this database's.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": -1,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "no_receipt"
+      }
+    },
+    {
+      "id": "receipt-other-connector",
+      "why": "A receipt for another connector proves nothing.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "d",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "no_receipt"
+      }
+    },
+    {
+      "id": "required-stream-uncovered",
+      "why": "Every required stream needs a receipt.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items", "more"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "streams_uncovered"
+      }
+    },
+    {
+      "id": "required-streams-all-covered",
+      "why": "Two required streams, two receipts.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items", "more"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          },
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "more",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": true,
+        "proof": "receipt",
+        "connectionId": "c~"
+      }
+    },
+    {
+      "id": "no-required-streams",
+      "why": "A run that must publish nothing is never saved.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": [],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": {
+          "runId": "run-1",
+          "state": "published",
+          "streams": [
+            {
+              "name": "items",
+              "state": "published"
+            }
+          ]
+        },
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "no_required_streams"
+      }
+    },
+    {
+      "id": "two-live-connections",
+      "why": "Exactly one live connection of the connector.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~", "c~other"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "connection_mismatch"
+      }
+    },
+    {
+      "id": "live-connection-is-another",
+      "why": "The live connection must be the receipt's.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~other"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "connection_mismatch"
+      }
+    },
+    {
+      "id": "no-live-connection",
+      "why": "A connection deleted locally is not saved.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": [],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "connection_mismatch"
+      }
+    },
+    {
+      "id": "strict-without-connection-list",
+      "why": "Retirement needs the local connection list.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": null,
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "connection_unknown"
+      }
+    },
+    {
+      "id": "receipt_or_status-without-connection-list",
+      "why": "A host without a local connection list relies on control.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": null,
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": true,
+        "proof": "receipt",
+        "connectionId": "c~"
+      }
+    },
+    {
+      "id": "status-with-two-live-connections",
+      "why": "A status proof still needs exactly one live connection when the host knows them.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [],
+        "status": {
+          "runId": "run-1",
+          "state": "published",
+          "streams": [
+            {
+              "name": "items",
+              "state": "published"
+            }
+          ]
+        },
+        "liveConnections": ["c~", "c~other"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "connection_mismatch"
+      }
+    },
+    {
+      "id": "control-deleted",
+      "why": "A connection deleted since is not saved.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "deleted",
+          "version": 4
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "not_active"
+      }
+    },
+    {
+      "id": "control-foreign",
+      "why": "A connection another owner holds is not saved.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "foreign",
+          "version": 4
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "not_active"
+      }
+    },
+    {
+      "id": "control-absent",
+      "why": "No control row is not saved.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "absent"
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "not_active"
+      }
+    },
+    {
+      "id": "control-unknown",
+      "why": "An unread control state is not saved.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": null,
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "not_active"
+      }
+    }
+  ]
+}

@@ -5,9 +5,15 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   RunIntakeError,
-  type EndRequest,
+  type BeginResponse,
   type EndResponse,
 } from "../stream-sync/intake.js";
+import {
+  parseEndRequest,
+  planRunFinish,
+  type RunFinishPlan,
+  type RunFinishStream,
+} from "../stream-sync/run-finish-plan.js";
 import {
   compareConnectorVersions,
   planStreamStep,
@@ -25,18 +31,21 @@ import { deleteRunRecords, mergeIncoming, withOrigin } from "./merge.js";
 import { decideReplace } from "./replace.js";
 
 /**
- * Run end and abort, in the connection queue (C.1 "end"). Order: fence;
- * `planStreamStep` per stream on local state (refused = drop the stream's
- * `run_rows`; deferred or publish/noop = merge, store the decision, advance
- * the floor); then the checkpoint and retry rule in the SAME batch
- * (`retry_pending` merges accepted streams and saves only a checkpoint that
- * does not advance a refused stream); then the EndResult table. The result
- * of `end` is `EndResult`; `stuck` stays false until publish says otherwise.
+ * Run end and abort, in the connection queue (C.1 "end"). Order: the run's
+ * finish plan from the host's observations (`planRunFinish`; a `failed` plan
+ * ends the run as an abort); fence; `planStreamStep` per stream on local
+ * state (refused = drop the stream's `run_rows`; deferred or publish/noop =
+ * merge the covered streams' upserts and every stream's deletes, store the
+ * decision, advance the floor); then the checkpoint and retry rule in the
+ * SAME batch (`retry_pending` merges accepted streams and saves only a
+ * checkpoint that does not advance a refused stream); then the EndResult
+ * table. `stuck` stays false until publish says otherwise.
  */
-type RunEndResponse = Pick<EndResponse, "result" | "updateRequired">;
+type RunEndResponse = Omit<EndResponse, "stuck">;
 
 export interface RunEndStore {
-  end(runId: string, req: EndRequest): Promise<RunEndResponse>;
+  /** `body` is the host's `EndRequest`; its shape is checked here. */
+  end(runId: string, body: unknown): Promise<RunEndResponse>;
   abort(runId: string, reason: "failed" | "cancelled"): Promise<void>;
   /**
    * The runs of a process that is gone: those `collecting` now. Run bindings
@@ -64,7 +73,50 @@ type Run = {
   state: "collecting" | "ended";
   last_batch: number;
   admitting: number;
+  begin_response: string | null;
 };
+
+/** The run's START per declared stream. Runs stored no response before it existed. */
+function declaredStreams(
+  run: Run,
+  streams: readonly { stream: string; coverage_strategy: string | null }[],
+): Record<string, RunFinishStream> {
+  const declared: Record<string, RunFinishStream> = Object.create(null);
+  const begin = run.begin_response
+    ? (JSON.parse(run.begin_response) as BeginResponse)
+    : null;
+  for (const stream of begin?.streams ?? [])
+    declared[stream.name] = {
+      mode: stream.mode,
+      coverageStrategy: stream.coverageStrategy ?? null,
+      stateParents: stream.stateParents ?? [],
+    };
+  for (const stream of streams)
+    declared[stream.stream] ??= {
+      mode: run.collection_mode,
+      coverageStrategy:
+        stream.coverage_strategy as RunFinishStream["coverageStrategy"],
+      stateParents: [],
+    };
+  return declared;
+}
+
+function answer(
+  plan: Pick<RunFinishPlan, "covered" | "provenFull" | "unconfirmed"> & {
+    readonly outcome: EndResponse["outcome"];
+  },
+  result: EndResponse["result"],
+  updateRequired: boolean,
+): RunEndResponse {
+  return {
+    result,
+    updateRequired,
+    outcome: plan.outcome,
+    coveredStreams: plan.covered,
+    provenFullStreams: plan.provenFull,
+    unconfirmed: plan.unconfirmed,
+  };
+}
 
 type Stream = {
   stream: string;
@@ -85,7 +137,8 @@ type Stream = {
   floor_version: string | null;
   floor_o: number | null;
   floor_r: string | null;
-  row_count: number;
+  upserts: number;
+  deletes: number;
   /** Set by batch admission: the connector is below the head's version or key. */
   marked_reason: string | null;
   unadmitted: number;
@@ -93,7 +146,12 @@ type Stream = {
 
 export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
   const { db, queue } = deps;
-  const end: RunEndStore["end"] = async (runId, req) => {
+  /** `abort`: end the run as failed or cancelled, whatever the host saw. */
+  const finish = async (
+    runId: string,
+    body: unknown,
+    abort?: "failed" | "cancelled",
+  ): Promise<RunEndResponse> => {
     const [binding] = await db.query<{ connection_id: string }>(
       "SELECT connection_id FROM runs WHERE run_id = ?",
       [runId],
@@ -125,16 +183,43 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           // Whatever the flag says now: tombstones outlive a flag that went off.
           ...compactTombstones(run.connection_id),
         ];
-        if (req.outcome === "failed" || req.outcome === "cancelled") {
+        const discard = async (
+          reason: "failed" | "cancelled",
+          unconfirmed: boolean,
+        ): Promise<RunEndResponse> => {
+          const response = answer(
+            { outcome: reason, covered: [], provenFull: [], unconfirmed },
+            "aborted",
+            false,
+          );
           await db.batch([
             {
               sql: "UPDATE run_streams SET decision = 'discarded', reason = ?, replace = 0, publication_state = 'superseded', publication_reason = ? WHERE run_id = ?",
-              params: [req.outcome, req.outcome, runId],
+              params: [reason, reason, runId],
             },
-            ...cleanup({ result: "aborted", updateRequired: false }),
+            ...cleanup(response),
           ]);
-          return { result: "aborted", updateRequired: false };
-        }
+          return response;
+        };
+        if (abort) return discard(abort, false);
+        const streams = await db.query<Stream>(
+          `SELECT rs.stream, rs.primary_key, rs.profile_key, rs.profile_version,
+                rs.full_read, rs.coverage_strategy, rs.semantics, rs.foreign_checkpoint, rs.seed,
+                s.primary_key AS local_primary_key, s.profile_key AS local_profile_key,
+                s.profile_version AS local_profile_version, s.complete,
+                s.head_version, s.head_generation, s.floor_version, s.floor_o, s.floor_r,
+                (SELECT COUNT(*) FROM run_rows rr WHERE rr.run_id = rs.run_id AND rr.stream = rs.stream AND rr.op = 'upsert') AS upserts,
+                (SELECT COUNT(*) FROM run_rows rr WHERE rr.run_id = rs.run_id AND rr.stream = rs.stream AND rr.op = 'delete') AS deletes,
+                rs.reason AS marked_reason, rs.unadmitted
+           FROM run_streams rs LEFT JOIN stream_state s
+             ON s.connection_id = ? AND s.stream = rs.stream
+          WHERE rs.run_id = ? ORDER BY rs.stream`,
+          [run.connection_id, runId],
+        );
+        const req = parseEndRequest(
+          body,
+          streams.map((stream) => stream.stream),
+        );
         if (req.lastBatch !== run.last_batch) {
           throw new RunIntakeError(
             "batch_gap",
@@ -142,8 +227,13 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             run.last_batch + 1,
           );
         }
+        const plan = planRunFinish(req, declaredStreams(run, streams));
+        if (plan.outcome === "failed")
+          return discard("failed", plan.unconfirmed);
+        const covered = new Set(plan.covered);
         const trips = await checkRunFence(deps, runId, "end");
         if (trips.length > 0) {
+          const fenced = answer(plan, "discarded", false);
           await db.batch([
             {
               sql: "UPDATE connections SET checkpoint = NULL WHERE connection_id = ?",
@@ -162,9 +252,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               WHERE connection_id = ? AND stream IN (SELECT stream FROM run_streams WHERE run_id = ?)`,
               params: [run.connection_id, runId],
             },
-            ...cleanup({ result: "discarded", updateRequired: false }),
+            ...cleanup(fenced),
           ]);
-          return { result: "discarded", updateRequired: false };
+          return fenced;
         }
         const [connection] = await db.query<{
           connector: string;
@@ -176,19 +266,6 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           [run.connection_id],
         );
         if (!connection) throw new RunIntakeError("gone");
-        const streams = await db.query<Stream>(
-          `SELECT rs.stream, rs.primary_key, rs.profile_key, rs.profile_version,
-                rs.full_read, rs.coverage_strategy, rs.semantics, rs.foreign_checkpoint, rs.seed,
-                s.primary_key AS local_primary_key, s.profile_key AS local_profile_key,
-                s.profile_version AS local_profile_version, s.complete,
-                s.head_version, s.head_generation, s.floor_version, s.floor_o, s.floor_r,
-                (SELECT COUNT(*) FROM run_rows rr WHERE rr.run_id = rs.run_id AND rr.stream = rs.stream) AS row_count,
-                rs.reason AS marked_reason, rs.unadmitted
-           FROM run_streams rs LEFT JOIN stream_state s
-             ON s.connection_id = ? AND s.stream = rs.stream
-          WHERE rs.run_id = ? ORDER BY rs.stream`,
-          [run.connection_id, runId],
-        );
         const [before] = await db.query<{ seq: number }>(
           "SELECT COALESCE(MAX(seq),0) AS seq FROM record_changes",
         );
@@ -198,7 +275,8 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         let merged = false;
         let lateAdmission = false;
         let updateRequired = false;
-        const retry = req.outcome === "retry_pending";
+        const outcome = plan.outcome;
+        const retry = outcome === "retry_pending";
         for (const stream of streams) {
           if (stream.local_primary_key === null) {
             throw new Error("Missing local stream state");
@@ -211,12 +289,15 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           // A partial run proves success per stream (r5 H), not for every
           // stream it initially requested whole. Publish must replay this
           // result, never the optimistic mode recorded at begin.
+          // An uncovered stream keeps only its explicit deletes.
+          const isCovered = covered.has(stream.stream);
+          const kept = (isCovered ? stream.upserts : 0) + stream.deletes;
           const full =
             !retry &&
-            req.coveredStreams.includes(stream.stream) &&
+            isCovered &&
             stream.full_read === 1 &&
-            (req.outcome === "succeeded" ||
-              (req.provenFullStreams ?? []).includes(stream.stream));
+            (outcome === "succeeded" ||
+              plan.provenFull.includes(stream.stream));
           const decision = planStreamStep(
             {
               head,
@@ -236,7 +317,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               profile,
               full,
               foreignCheckpoint: stream.foreign_checkpoint === 1,
-              empty: stream.row_count === 0,
+              empty: kept === 0,
               seed: stream.seed,
             },
           );
@@ -252,10 +333,10 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               stream: stream.stream,
               coverageStrategy: stream.coverage_strategy,
               semantics: stream.semantics,
-              outcome: req.outcome,
+              outcome,
               collectionMode: run.collection_mode,
-              coveredStreams: req.coveredStreams,
-              provenFullStreams: req.provenFullStreams ?? [],
+              coveredStreams: plan.covered,
+              provenFullStreams: plan.provenFull,
             });
           statements.push({
             sql: "UPDATE run_streams SET decision = ?, reason = ?, replace = ?, full_read = ?, publication_state = ?, publication_reason = ? WHERE run_id = ? AND stream = ?",
@@ -276,10 +357,12 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             continue;
           }
           // A run that admitted its batches has its upserts in `records` already,
-          // except a stream with rows staged and not admitted.
-          if (run.admitting === 1 && stream.unadmitted === 1)
+          // except a stream with rows staged and not admitted. Admitted upserts
+          // of an uncovered stream stay: publish while collecting shows rows
+          // before the run ends.
+          if (isCovered && run.admitting === 1 && stream.unadmitted === 1)
             lateAdmission = true;
-          if (run.admitting !== 1 || stream.unadmitted === 1)
+          if (isCovered && (run.admitting !== 1 || stream.unadmitted === 1))
             statements.push({
               sql: `INSERT INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
               SELECT ?, stream, pk_hash, record_key, ?, ?, body, body_sha256, ?
@@ -302,7 +385,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               deps.publishWhileCollecting === true,
             ),
           );
-          merged ||= stream.row_count > 0;
+          merged ||= kept > 0;
           const nextVersion =
             stream.floor_version === null ||
             compareConnectorVersions(profile.version, stream.floor_version) ===
@@ -358,21 +441,20 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             replaceOwnRunRows(op, run.connection_id, runId, run.o),
           );
         statements.push(...mergeIncoming(op, run.connection_id));
-        const candidate = req.checkpointCandidate;
+        const candidate = plan.candidate;
         const refused = Object.keys(results).filter(
           (stream) => results[stream]!.state === "discarded",
         );
+        const stored =
+          connection.checkpoint === null
+            ? null
+            : (JSON.parse(connection.checkpoint) as Record<string, unknown>);
         let retryCanSave = retry;
         if (retry && refused.length > 0) {
-          const stored =
-            connection.checkpoint === null
-              ? null
-              : (JSON.parse(connection.checkpoint) as Record<string, unknown>);
           // Cursors are opaque: only unchanged or absent refused-stream entries
           // prove that this candidate carries no progress for refused rows.
           retryCanSave =
             refused.length < streams.length &&
-            candidate != null &&
             refused.every(
               (stream) =>
                 !Object.prototype.hasOwnProperty.call(candidate, stream) ||
@@ -382,7 +464,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         }
         const canSave =
           retryCanSave ||
-          (req.outcome === "succeeded" &&
+          (outcome === "succeeded" &&
             run.generation !== null &&
             checkpointDecision({
               target: run.generation,
@@ -395,21 +477,22 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
                 (stream) => stream.seed === "unresolved",
               ),
             }).kind === "save");
-        const saved = candidate != null && canSave;
+        const saved = canSave;
         if (saved) {
+          // A stream the plan held back keeps the cursor it had.
           statements.push({
             sql: "UPDATE connections SET checkpoint = ? WHERE connection_id = ?",
-            params: [JSON.stringify(candidate), run.connection_id],
+            params: [
+              JSON.stringify({ ...stored, ...candidate }),
+              run.connection_id,
+            ],
           });
         }
-        const response: RunEndResponse = {
-          result: merged
-            ? "queued"
-            : saved
-              ? "checkpoint_only"
-              : "no_checkpoint",
+        const response = answer(
+          plan,
+          merged ? "queued" : saved ? "checkpoint_only" : "no_checkpoint",
           updateRequired,
-        };
+        );
         statements.push(...cleanup(response));
         await db.batch(withOrigin("local", statements));
         announceRecordsCommitted(deps);
@@ -418,9 +501,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
     );
   };
   return {
-    end,
+    end: (runId, body) => finish(runId, body),
     async abort(runId, reason) {
-      await end(runId, { outcome: reason, coveredStreams: [], lastBatch: -1 });
+      await finish(runId, undefined, reason);
     },
     async orphans() {
       const rows = await db.query<{ run_id: string }>(
@@ -433,11 +516,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
       const left: string[] = [];
       for (const runId of ids) {
         try {
-          await end(runId, {
-            outcome: "failed",
-            coveredStreams: [],
-            lastBatch: -1,
-          });
+          await finish(runId, undefined, "failed");
         } catch (error) {
           // Gone (deleted) or already ended: nothing left to end.
           if (error instanceof RunIntakeError && error.code === "gone")

@@ -805,9 +805,10 @@ describe("progressive first load, batches committed together", () => {
       id: string,
       records: { stream: string; id: string }[],
     ) => {
+      // Each run selects only the streams it writes, so each succeeds.
       await a.run(id, records, {
         full: false,
-        covered: [...new Set(records.map((r) => r.stream))],
+        selected: [...new Set(records.map((r) => r.stream))],
         observedAt: (observedAt += 100),
       });
       await a.cycle();

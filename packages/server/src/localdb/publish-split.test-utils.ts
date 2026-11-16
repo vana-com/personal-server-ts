@@ -24,6 +24,7 @@ import {
   type StreamSyncBlobs,
   type StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { endRequest } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 export const owner = `0x${"11".repeat(20)}` as const;
@@ -239,12 +240,17 @@ export async function makeDevice(
         owner: { address: owner, leaseId: null },
       });
     };
-    const end = (id: string) =>
-      sync.intake.end(id, {
-        outcome: "succeeded",
-        coveredStreams: ["items"],
-        lastBatch: 0,
-      });
+    /** End a run whose one stream sent what `sent` says (default: a record). */
+    const end = (id: string, sent: "live" | "deleted" | "nothing" = "live") =>
+      sync.intake.end(
+        id,
+        endRequest({
+          lastBatch: 0,
+          streams: ["items"],
+          ...(sent === "live" ? { live: ["items"] } : {}),
+          ...(sent === "deleted" ? { deleted: ["items"] } : {}),
+        }),
+      );
     const stream = async <T>(columns: string) =>
       (
         await db.query<T & Record<string, never>>(
@@ -263,7 +269,7 @@ export async function makeDevice(
           batch: 0,
           records: rows.map((key) => ({ stream: "items", data: { id: key } })),
         });
-        return end(id);
+        return end(id, rows.length > 0 ? "live" : "nothing");
       },
       /** A run that deletes records by key (PDPP `op: "delete"`). */
       async remove(id: string, keys: string[]) {
@@ -276,7 +282,7 @@ export async function makeDevice(
             data: { id: key },
           })),
         });
-        return end(id);
+        return end(id, "deleted");
       },
       /** Local record keys, ordered. */
       async keys(): Promise<string[]> {

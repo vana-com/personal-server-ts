@@ -46,6 +46,7 @@ import {
   MissingAttachmentError,
   uploadBlobs,
 } from "../../../core/dist/localdb/blobs.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const OWNER = `0x${"11".repeat(20)}` as const;
@@ -266,11 +267,7 @@ async function world(options: Options) {
         bytes,
       });
     }
-  await sync.intake.end("run-1", {
-    outcome: "succeeded",
-    coveredStreams: names,
-    lastBatch: 0,
-  });
+  await sync.intake.end("run-1", endRequest({ lastBatch: 0, live: names }));
   return {
     deps,
     db,
@@ -553,11 +550,7 @@ describe("streams of one connection publish together", () => {
         data: { id: `${stream}-new` },
       })),
     });
-    await sync.intake.end("run-2", {
-      outcome: "succeeded",
-      coveredStreams: names,
-      lastBatch: 0,
-    });
+    await sync.intake.end("run-2", endRequest({ lastBatch: 0, live: names }));
     await tombstoneControl(innerRegistry, 2);
     const before = calls.length;
     const results: readonly PublishResult[] = await publishConnection(
@@ -1419,11 +1412,10 @@ describe("a stream's transfer starts while its snapshot is still copying rows", 
         // An upload is out and the snapshot is still copying: the run ends now.
         await Promise.race([puts.firstPut, sleep(1500)]);
         uploadsOutAtEnd = puts.starts.length;
-        lateEnded = w.sync.intake.end("run-late", {
-          outcome: "succeeded",
-          coveredStreams: ["s0"],
-          lastBatch: 0,
-        });
+        lateEnded = w.sync.intake.end(
+          "run-late",
+          endRequest({ lastBatch: 0, live: ["s0"] }),
+        );
         await sleep(30);
       }),
     };
@@ -1560,11 +1552,10 @@ describe("a stream's transfer starts while its snapshot is still copying rows", 
                 batch: 0,
                 records: [{ stream: "s0", data: { id: "late-marker-row" } }],
               });
-              await w.sync.intake.end("run-late", {
-                outcome: "succeeded",
-                coveredStreams: ["s0"],
-                lastBatch: 0,
-              });
+              await w.sync.intake.end(
+                "run-late",
+                endRequest({ lastBatch: 0, live: ["s0"] }),
+              );
             })();
             // Count this prefix's spool rows over the read connection while its
             // batch runs: the reader sees none of them or all of them.
