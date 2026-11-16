@@ -63,9 +63,7 @@ async function fixture(
   const openDriver = vi.fn(async () =>
     available ? openBetterSqlite3(":memory:") : null,
   );
-  const config = ServerConfigSchema.parse({
-    streamSync: { write: false, read: false },
-  });
+  const config = ServerConfigSchema.parse({});
   const lite = await createPsLiteSyncManager({
     config,
     autoStartSync: false,

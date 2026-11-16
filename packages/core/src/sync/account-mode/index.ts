@@ -25,7 +25,9 @@ export {
 export { accountStorageModeOf, decisionToModeValue } from "./port.js";
 export {
   decisionBody,
+  parseAccountAnswer,
   parseEvidenceBody,
+  type AccountAnswerSeen,
   type DecisionBody,
   type EvidenceBody,
 } from "./evidence-wire.js";

@@ -167,6 +167,7 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   streamSyncPublishWhileCollecting?: PsLiteSyncOptions["streamSyncPublishWhileCollecting"];
   streamSyncLogProtocol?: PsLiteSyncOptions["streamSyncLogProtocol"];
   streamSyncProgressiveFirstLoad?: PsLiteSyncOptions["streamSyncProgressiveFirstLoad"];
+  streamSyncFlags?: PsLiteSyncOptions["streamSyncFlags"];
   /**
    * The host's replication ports (host contract §4): native persistence
    * with replica support and native object transfers. With the door on and
@@ -470,6 +471,7 @@ export async function createIndexedDbPsLiteRuntime(
         options.streamSyncPublishWhileCollecting,
       streamSyncLogProtocol: options.streamSyncLogProtocol,
       streamSyncProgressiveFirstLoad: options.streamSyncProgressiveFirstLoad,
+      streamSyncFlags: options.streamSyncFlags,
       diagnostics,
       logger: options.logger,
       lineageGateway,

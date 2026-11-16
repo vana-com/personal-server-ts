@@ -8,8 +8,8 @@
  *
  * A thin map from the JSON body to `StreamSyncIntake`; the same adapter
  * serves PS-Lite in process. Only the owner may call it. The route is
- * mounted only when `streamSync.write` is on: with the flag off the paths do
- * not exist, as before.
+ * mounted when the host supplies a run intake, and the intake serves only an
+ * owner whose account-mode answer is streams.
  *
  * Errors answer `{"error": "<name>", "message", "nextBatch"?}` with the
  * status of the name (V2 §2.6).

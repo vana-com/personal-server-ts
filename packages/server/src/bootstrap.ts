@@ -165,6 +165,7 @@ import {
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
   streamSyncNetwork,
+  streamSyncFlagsOn,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { eraseConnectorLeftovers } from "./stream-sync/erase-connector-leftovers.js";
 import { nodeStreamCrypto } from "./stream-sync/node-stream-crypto.js";
@@ -363,6 +364,12 @@ export interface CreateServerOptions {
    * both. See `LocalSyncDeps.progressiveFirstLoad`.
    */
   streamSyncProgressiveFirstLoad?: boolean;
+  /**
+   * The design flags to turn on, as one comma list of names (see
+   * `STREAM_SYNC_DESIGN_FLAGS`; env `PS_STREAM_SYNC_FLAGS`). A host passes the
+   * list as it got it and holds no flag table. A flag's own option above wins.
+   */
+  streamSyncFlags?: string;
   /**
    * Rotate the replica writer identity before this boot writes anything
    * (host contract §3.2). A host sets it when this database may be a copy:
@@ -893,6 +900,8 @@ async function bootstrapServer(
         "Stream sync is unavailable on this server",
       );
   }
+  // Which design flags are on: the host's list, then the environment.
+  const designFlags = streamSyncFlagsOn(options?.streamSyncFlags, process.env);
   // One registry client for the cycle's reads and the change probe.
   let streamSyncRegistryClient: StreamSyncRegistry | undefined;
   function streamSyncRegistry(): StreamSyncRegistry {
@@ -951,17 +960,16 @@ async function bootstrapServer(
           recordsCommitted: () => syncManager?.notifyRecordsCommitted(),
           progressiveFirstLoad:
             options?.streamSyncProgressiveFirstLoad ??
-            (process.env.PS_STREAM_SYNC_PROGRESSIVE_FIRST_LOAD === "true" ||
+            (designFlags.progressiveFirstLoad ||
               config.streamSync.progressiveFirstLoad),
           ...(options?.streamSyncPartTargetBytes === undefined
             ? {}
             : { partTargetBytes: options.streamSyncPartTargetBytes }),
           ...((options?.streamSyncPublishWhileCollecting ??
-          process.env.PS_PUBLISH_WHILE_COLLECTING === "true")
+          designFlags.publishWhileCollecting)
             ? { publishWhileCollecting: true }
             : {}),
-          ...((options?.streamSyncLogProtocol ??
-          process.env.PS_STREAM_SYNC_LOG_PROTOCOL === "true")
+          ...((options?.streamSyncLogProtocol ?? designFlags.logProtocol)
             ? { logProtocol: true }
             : {}),
         };

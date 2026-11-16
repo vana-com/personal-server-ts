@@ -389,7 +389,7 @@ export interface PersonalServerDataApiDeps {
    */
   legacyScopeView?: LegacyScopeViewPort;
   /**
-   * Stream-sync reads (`streamSync.read`). Absent = every read takes the
+   * Stream-sync reads. Absent = every read takes the
    * existing path, unchanged. Present: a latest read of a name a stream view
    * can serve is answered from the view (§2.10); a deleted connector's
    * names are refused at every version.

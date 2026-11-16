@@ -97,7 +97,6 @@ async function world(): Promise<ServerContext> {
       tunnel: { enabled: false },
       sync: { enabled: true },
       logging: { level: "fatal", pretty: false },
-      streamSync: { write: true },
     }),
     {
       rootPath: root,

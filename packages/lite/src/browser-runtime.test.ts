@@ -339,7 +339,6 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
         configDefaults: {
           gateway: { url: "https://gateway.local" },
           sync: { enabled: true },
-          streamSync: { write: true },
         },
       }),
     );
@@ -362,7 +361,6 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
         configDefaults: {
           gateway: { url: "https://gateway.local" },
           sync: { enabled: false },
-          streamSync: { write: true },
         },
       }),
     );
@@ -395,7 +393,6 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
         configDefaults: {
           gateway: { url: "https://gateway.local" },
           sync: { enabled: false },
-          streamSync: { write: true },
         },
       }),
     );
@@ -447,7 +444,6 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
         configDefaults: {
           gateway: { url: "https://gateway.local" },
           sync: { enabled: false },
-          streamSync: { write: true },
         },
       }),
     );
@@ -588,7 +584,6 @@ describe("createIndexedDbPsLiteRuntime own-write reads", () => {
       configDefaults: {
         gateway: { url: "https://gateway.local" },
         sync: { enabled: true },
-        streamSync: { write: true, read: true },
       },
     });
     await context.streamSyncIntake!.begin("run-1", {

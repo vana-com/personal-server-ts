@@ -164,7 +164,6 @@ async function openLite(opts: {
     streamSyncDeclaredStreams: () => [],
     config: ServerConfigSchema.parse({
       sync: { enabled: true },
-      streamSync: { read: true, write: true },
     }),
     localDb: opts.localDb,
     accountStorageMode: opts.accountStorageMode ?? {

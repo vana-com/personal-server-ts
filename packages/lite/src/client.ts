@@ -111,7 +111,7 @@ export type PersonalServerLitePublicationResult = {
 
 /** The Lite handle: the shared handle plus the host's run-intake door. */
 export type PersonalServerLiteHandle = PersonalServerHandle & {
-  /** In-process run intake; `null` unless `config.streamSync.write` is on. */
+  /** In-process run intake; `null` unless the host built a run intake. */
   readonly streamSyncIntake: RunIntake | null;
   /** One-time retained-snapshot intake, with the runtime's Account admission. */
   readonly streamSyncSeed: SeedIntake | null;

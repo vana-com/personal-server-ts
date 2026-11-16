@@ -211,7 +211,7 @@ export interface AppDeps {
   legacyWriteSeal?: LegacyWriteSeal;
   /** Canonical latest bodies for GET /v1/data; absent = file reads only. */
   legacyScopeView?: LegacyScopeViewPort;
-  /** Stream-sync reads (`streamSync.read`); absent = reads as before. */
+  /** Stream-sync reads; absent = reads as before. */
   streamSyncRead?: StreamSyncReadPort;
   /**
    * Gateway base URL — wired into the data route so the GET handler can

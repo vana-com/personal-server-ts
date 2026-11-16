@@ -1428,7 +1428,7 @@ export function createPsLiteRuntime(
             return errorResponse(
               400,
               "INVALID_ACCOUNT_MODE_EVIDENCE",
-              "Body must be {owner, state, generation?}",
+              "Body must be {owner, state, generation?} or {owner, rawStatus, streamSync?, generation?}",
             );
           }
           // authorizeOwner succeeded, so the caller is this runtime's owner,

@@ -93,7 +93,6 @@ async function fixture() {
       configDefaults: {
         sync: { enabled: false },
         gateway: { url: "https://gateway.local" },
-        streamSync: { write: false, read: false },
       },
     });
     contexts.push(context);

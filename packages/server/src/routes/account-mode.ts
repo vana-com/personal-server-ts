@@ -3,14 +3,16 @@
  *
  *   POST /v1/account-mode/evidence
  *     body {owner, state: "on"|"off"|"unknown", generation?}
+ *        or {owner, rawStatus, streamSync?, generation?}: what the host saw,
+ *        read by the module's one `parseAccountAnswer`
  *     -> 200 {decision: "streams"|"legacy"}
  *     -> 503 | 426 {decision: "refuse", code, status}
  *
  * Only the owner may call it, and only about the owner: a body that names any
  * other owner is answered 403 before the module is asked anything. A host that
- * has no answer posts `state: "unknown"`, which changes nothing and returns the
- * decision, so it doubles as a read. Fields the first hosts also send
- * (fetchStartedAt, rawStatus) are ignored. The HTTP status is the decision's
+ * has no answer posts `state: "unknown"` (or `rawStatus: null`), which changes
+ * nothing and returns the decision, so it doubles as a read. Fields the first
+ * hosts also send (fetchStartedAt) are ignored. The HTTP status is the decision's
  * own: 200 for streams and legacy, and 503 (retryable, `Retry-After: 5`)
  * before the owner's first answer.
  *
@@ -136,7 +138,7 @@ export function accountModeRoutes(deps: AccountModeRouteDeps): Hono {
       throw new ProtocolError(
         400,
         "INVALID_ACCOUNT_MODE_EVIDENCE",
-        "Body must be {owner, state, generation?}",
+        "Body must be {owner, state, generation?} or {owner, rawStatus, streamSync?, generation?}",
       );
     }
     // The caller is this server's owner and so is the body's owner.

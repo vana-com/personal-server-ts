@@ -244,7 +244,6 @@ describe("Node database composition", () => {
       remote,
       ServerConfigSchema.parse({
         ...config,
-        streamSync: { write: true },
         pdpp: {
           enabled: true,
           declarationPaths: [declarationPath],

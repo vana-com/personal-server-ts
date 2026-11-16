@@ -157,6 +157,29 @@ describe("POST /v1/account-mode/evidence", () => {
     expect(await res.json()).toEqual({ decision: "legacy" });
   });
 
+  it("reads what a host saw when the body names no state", async () => {
+    const seen = (extra: Record<string, unknown>) => ({
+      owner: owner.address,
+      fetchStartedAt: Date.now(),
+      ...extra,
+    });
+    // No response, a 5xx and the Account's own failure body (no generation)
+    // are unknown: nothing is stored.
+    for (const failed of [
+      { rawStatus: null },
+      { rawStatus: 502, streamSync: false, generation: 1 },
+      { rawStatus: 200, streamSync: false },
+    ]) {
+      expect((await post(seen(failed))).status).toBe(503);
+    }
+    expect((await legacyWrite()).status).toBe(503);
+    const res = await post(
+      seen({ rawStatus: 200, streamSync: true, generation: 4 }),
+    );
+    expect(await res.json()).toEqual({ decision: "streams" });
+    expect((await legacyWrite()).status).toBe(426);
+  });
+
   it("keeps an Off with no expiry", async () => {
     await post(evidence("off"));
     const later = createModeAuthority({

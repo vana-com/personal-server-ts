@@ -53,6 +53,7 @@ afterEach(async () => {
 });
 
 type Flags = {
+  streamSyncFlags?: string;
   streamSyncPublishWhileCollecting?: boolean;
   streamSyncLogProtocol?: boolean;
   streamSyncProgressiveFirstLoad?: boolean;
@@ -65,9 +66,7 @@ async function depsFor(flags: Flags) {
     ownerSignature: signature,
   });
   const lite = await createPsLiteSyncManager({
-    config: ServerConfigSchema.parse({
-      streamSync: { write: false, read: false },
-    }),
+    config: ServerConfigSchema.parse({}),
     autoStartSync: false,
     localDb: { openDriver: async () => openBetterSqlite3(":memory:") },
     accountStorageMode: { owner: account.address, read: () => "switched" },
@@ -116,6 +115,25 @@ describe("PS-Lite stream-sync design flags", () => {
     },
   );
 
+  it("turns on the flags the one comma list names, and no others", async () => {
+    expect(
+      await depsFor({ streamSyncFlags: "logProtocol, nonsense" }),
+    ).toMatchObject({ logProtocol: true });
+    const deps =
+      ((engineDeps.length = 0),
+      await depsFor({ streamSyncFlags: "logProtocol" }));
+    expect(deps.publishWhileCollecting ?? false).toBe(false);
+    expect(deps.progressiveFirstLoad ?? false).toBe(false);
+  });
+
+  it("lets a flag's own option win over the list", async () => {
+    const deps = await depsFor({
+      streamSyncFlags: "logProtocol",
+      streamSyncLogProtocol: false,
+    });
+    expect(deps.logProtocol ?? false).toBe(false);
+  });
+
   // `startPersonalServer` (what the Web host calls) spreads its options into
   // `createIndexedDbPsLiteRuntime`; the option must survive that hop too.
   it.each(FLAGS)(
@@ -140,7 +158,6 @@ describe("PS-Lite stream-sync design flags", () => {
           configDefaults: {
             gateway: { url: "https://gateway.local" },
             sync: { enabled: false },
-            streamSync: { write: true },
           },
           ...(on ? { [option]: true } : {}),
         });
