@@ -538,7 +538,11 @@ export function createSyncManager(
               const report = await options.localSync.cycle();
               lastSync = new Date().toISOString();
               statusMayHaveChanged();
-              if (!reportLeavesWork(report)) settle();
+              // Deletion debt is owed work like a backed-off publish: a blob
+              // waits on a tombstone's finality, a version-row change no
+              // position announces. Nothing is settled while any is left.
+              const debt = await drainPendingBlobDeletions(false);
+              if (!reportLeavesWork(report) && !debt.owed) settle();
             } else {
               blocked = {
                 reason:
@@ -713,9 +717,21 @@ export function createSyncManager(
       });
   }
 
-  async function runUploadCycle(): Promise<void> {
+  /**
+   * Finish the storage deletes whose covering tombstone has become final.
+   * Both modes call it inside the exclusive pass. `resubmit` is the legacy
+   * path only: it re-sends a rolled-back tombstone through `deleteScope`,
+   * which writes to legacy storage and is sealed once the account has
+   * switched. Without it the worker only waits for finality and then deletes
+   * the blob; a rolled-back scope stays queued until the user deletes it
+   * again. Returns whether deletion debt is still owed: markers left, a
+   * failed key, or a retry that threw.
+   */
+  async function drainPendingBlobDeletions(
+    resubmit: boolean,
+  ): Promise<{ owed: boolean }> {
     try {
-      await retryPendingBlobDeletions({
+      const result = await retryPendingBlobDeletions({
         deleteData: options?.deleteData,
         pendingBlobDeletions: options?.pendingBlobDeletions,
         tombstoneFinality: options?.tombstoneFinality,
@@ -723,15 +739,15 @@ export function createSyncManager(
         serverOwner: uploadDeps.serverOwner,
         storage: uploadDeps.storage,
         logger: uploadDeps.logger,
-        ...(options?.tombstoneFinality && options.deleteData
+        ...(resubmit && options?.tombstoneFinality && options.deleteData
           ? {
               tombstoneResubmits,
               // Already inside the mutation queue: call the worker directly.
-              async resubmitDeletion(scope, resubmit) {
+              async resubmitDeletion(scope, deleteOptions) {
                 const result = await deleteScope(
                   deleteScopeDeps(),
                   scope,
-                  resubmit,
+                  deleteOptions,
                 );
                 if (result.durable) deleteAdditionsAfter(scope);
                 return result;
@@ -750,12 +766,18 @@ export function createSyncManager(
             }
           : {}),
       });
+      return { owed: result.remaining > 0 || result.failed.length > 0 };
     } catch (err) {
       uploadDeps.logger.warn(
         { error: (err as Error).message },
         "Pending blob deletion retry failed",
       );
+      return { owed: true };
     }
+  }
+
+  async function runUploadCycle(): Promise<void> {
+    await drainPendingBlobDeletions(true);
 
     try {
       const uploadResults = await uploadAll(workerUploadDeps, {
