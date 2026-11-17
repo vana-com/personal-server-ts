@@ -533,6 +533,78 @@ describe("disk-backed bootstrap swap", () => {
     expect(await d.rows()).toEqual(await p.rows());
   });
 
+  it("discards a staged prefix when the head is rewritten and converges on retry", async () => {
+    const w = await world({ streams: 1 });
+    await history(w);
+    const d = await connect(w, "rewritten");
+    const batch = d.db.batch.bind(d.db);
+    let fail = true;
+    d.db.batch = async (statements) => {
+      if (
+        fail &&
+        statements.some(
+          (statement) =>
+            statement.sql.includes("INSERT INTO bootstrap_segments") &&
+            statement.params?.[0] === 2,
+        )
+      ) {
+        fail = false;
+        throw new Error("stop after prefix");
+      }
+      return batch(statements);
+    };
+    await expect(d.cycle()).rejects.toThrow("stop after prefix");
+    expect(
+      await d.db.query(
+        "SELECT position FROM bootstrap_segments WHERE position=1",
+      ),
+    ).toEqual([{ position: 1 }]);
+    expect(await d.position()).toBe(0);
+    const segments = await w.segments();
+    const first = segments.get(1)!;
+    const replacement = {
+      ...first,
+      operations: first.operations.map((op) =>
+        op.kind === "upsert"
+          ? { ...op, value: { ...(op.value as object), revised: true } }
+          : op,
+      ),
+    };
+    const firstBytes = encodeSegment(replacement);
+    const firstHash = await digestSegment(
+      async (bytes) => keccak_256(bytes),
+      firstBytes,
+    );
+    await w.innerBlobs.put(`${LOG}/${firstHash.blobName}`, firstBytes);
+    const head = segments.get(5)!;
+    const rewritten = {
+      ...head,
+      refs: head.refs.map((ref) =>
+        ref.position === 1
+          ? { ...ref, dataHash: firstHash.dataHash, bytes: firstBytes.length }
+          : ref,
+      ),
+    };
+    const headBytes = encodeSegment(rewritten);
+    const headHash = await digestSegment(
+      async (bytes) => keccak_256(bytes),
+      headBytes,
+    );
+    await w.innerBlobs.put(`${LOG}/${headHash.blobName}`, headBytes);
+    const metadataHash = w.gateway.versions.get(LOG)!.at(-1)!.metadataHash;
+    w.gateway.replaceHead(LOG, { dataHash: headHash.dataHash, metadataHash });
+    await d.cycle();
+    const fresh = await connect(w, "fresh-rewritten");
+    await fresh.cycle();
+    expect(await d.rows()).toEqual(await fresh.rows());
+    expect((await d.rows()).join(" ")).toContain("revised");
+    expect(await d.position()).toBe(await fresh.position());
+    expect(await d.position()).toBeGreaterThanOrEqual(5);
+    expect(await d.db.query("SELECT * FROM bootstrap_load")).toEqual([]);
+    await d.cycle();
+    expect(await d.rows()).toEqual(await fresh.rows());
+  });
+
   it("finishes a prefix-only stream after an advanced-head retry, with SQL-layer append rollback", async () => {
     const w = await world({ streams: 2 }),
       p = await w.device("publisher");
