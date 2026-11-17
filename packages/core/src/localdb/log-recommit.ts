@@ -112,7 +112,10 @@ export async function recommitApplied(
     if (answer.kind === "precondition_failed") return;
     // A refused one-row request: the row lost, unless the winner is this very
     // row (a resend).
-    if (answer.kind === "refused" && settleRow(answer.rows[0]!, row) !== "committed")
+    if (
+      answer.kind === "refused" &&
+      settleRow(answer.rows[0]!, row) !== "committed"
+    )
       return;
     head = ref.dataHash;
   }

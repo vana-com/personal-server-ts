@@ -314,7 +314,9 @@ const inFlight = new WeakMap<
   object,
   Map<string, Promise<readonly PublishResult[]>>
 >();
-function inFlightOf(db: object): Map<string, Promise<readonly PublishResult[]>> {
+function inFlightOf(
+  db: object,
+): Map<string, Promise<readonly PublishResult[]>> {
   let chain = inFlight.get(db);
   if (!chain) inFlight.set(db, (chain = new Map()));
   return chain;

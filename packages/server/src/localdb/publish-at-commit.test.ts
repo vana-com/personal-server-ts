@@ -54,7 +54,7 @@ describe("publish", () => {
     // The connection has a log, so nothing is published until the registry has
     // the route: the report says so and does not come back empty.
     expect(report.connections).toHaveLength(1);
-    expect(report.connections[0]!.error).toMatch(/no batch route/);
+    expect(report.connections[0]!.error).toMatch(/no batch contract/);
   });
 
   it("reconciles a timed-out commit before re-uploading its segment", async () => {

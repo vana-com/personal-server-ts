@@ -26,8 +26,8 @@ import {
   RegistryRefusedError,
   RegistryUnavailableError,
 } from "../../../core/src/stream-sync/ports.js";
-import { remoteFixture } from "./apply-fixture.js";
-import { legacyHeadRow } from "./legacy-head-fixture.js";
+import { remoteFixture } from "./apply-fixture.test-utils.js";
+import { legacyHeadRow } from "./legacy-head-fixture.test-utils.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}`;

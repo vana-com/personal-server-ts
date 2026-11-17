@@ -476,6 +476,12 @@ export function createFakeGateway(options: FakeGatewayOptions) {
       };
       if (results.some((r: { status: number }) => r.status === 409)) {
         rollBack();
+        // A lost reply is lost whatever the gateway answered: a resend of a
+        // request the gateway already holds is answered, and that answer lost.
+        if (gateway.dropNextBatchReply) {
+          gateway.dropNextBatchReply = false;
+          throw new TypeError("fetch failed");
+        }
         // The row that lost keeps its reason; a replay stays stored (201);
         // every row this request wrote is rolled back (424).
         return json(409, {
