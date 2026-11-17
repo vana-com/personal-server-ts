@@ -68,7 +68,7 @@ export async function runCycle(
   };
 }
 
-/** Retry only the named connections; a purged connection needs no pass. */
+/** Retry only the named connections using one shared owner listing. */
 async function runScoped(
   deps: LocalSyncDeps,
   scope: CycleScope,
@@ -81,15 +81,17 @@ async function runScoped(
     ).map((row) => row.id),
   );
   const ids = [...new Set(scope.connections)].filter((id) => held.has(id));
+  if (ids.length === 0) return { connections: [] };
   const only = new Set(ids);
   const candidates = await earlyCandidates(deps);
   const early = await publishEarly(deps, {
     active: candidates.active.filter((row) => only.has(row.connectionId)),
     fresh: candidates.fresh.filter((row) => only.has(row.connectionId)),
   });
+  const listed = await deps.registry.listOwnerRows();
   return {
     connections: await Promise.all(
-      ids.map((id) => syncConnection(deps, id, early.get(id))),
+      ids.map((id) => syncConnection(deps, id, early.get(id), listed)),
     ),
   };
 }
