@@ -1071,11 +1071,22 @@ describe("the subscription's lifecycle", () => {
     await vi.advanceTimersByTimeAsync(0);
     const old = state.handlers!;
     await manager.stop();
+    manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    state.handlers!.onHealth(true);
+    state.handlers!.onPosition("7");
+    await vi.advanceTimersByTimeAsync(60_000);
+    cycle.mockClear();
     read.mockClear();
     old.onChange();
-    old.onHealth(true);
-    await vi.advanceTimersByTimeAsync(0);
+    old.onHealth(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(cycle).not.toHaveBeenCalled();
     expect(read).not.toHaveBeenCalled();
+    state.handlers!.onChange();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cycle).toHaveBeenCalledTimes(1);
+    await manager.stop();
   });
 
   it("changes nothing for a probe without a push", async () => {
@@ -1182,7 +1193,7 @@ describe("the timer's retry of owed work reads only what is owed", () => {
   // retry for work that pass left owed (a connection error, a deferred or
   // backed-off publish) needs to read only those connections. Any other state
   // retries in full.
-  const owing = (...ids: Array<string | undefined>) => ({
+  const owing = (...ids: unknown[]) => ({
     connections: ids.map((connectionId) => ({
       ...(connectionId !== undefined && { connectionId }),
       applied: [],
@@ -1195,14 +1206,15 @@ describe("the timer's retry of owed work reads only what is owed", () => {
   /** A device whose pass at each position reports what `answer` returns. */
   function owedDevice(
     answer: (scope: unknown, call: number) => unknown,
-    opts: { push?: boolean } = {},
+    opts: { push?: boolean; canSync?: SyncManagerOptions["canSync"] } = {},
   ) {
     const { push, state } = fakePush();
     const cycle = vi.fn(async (scope?: unknown) =>
       answer(scope, cycle.mock.calls.length),
     );
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
+      canSync: opts.canSync,
       changeProbe: {
         read: async () => "m1",
         intervalMs: 5_000,
@@ -1290,6 +1302,7 @@ describe("the timer's retry of owed work reads only what is owed", () => {
     await vi.advanceTimersByTimeAsync(0);
     t.cycle.mockClear();
     await vi.advanceTimersByTimeAsync(2 * 60_000);
+    expect(t.cycle.mock.calls.length).toBeGreaterThan(0);
     for (const [scope] of t.cycle.mock.calls) expect(scope).toBeUndefined();
     await t.manager.stop();
   });
@@ -1318,6 +1331,140 @@ describe("the timer's retry of owed work reads only what is owed", () => {
     expect(owedLogs[0]![0]).toMatchObject({
       connections: [{ connectionId: "c2", why: "error: storage unreachable" }],
     });
+    await t.manager.stop();
+  });
+
+  function expectFull(t: ReturnType<typeof owedDevice>) {
+    expect(t.cycle.mock.calls.length).toBeGreaterThan(0);
+    for (const [scope] of t.cycle.mock.calls) expect(scope).toBeUndefined();
+  }
+
+  it("an unhealthy push retries in full on the timer", async () => {
+    const t = owedDevice(() => owing("c2"));
+    await online(t);
+    t.state.handlers!.onHealth(false);
+    await vi.advanceTimersByTimeAsync(0);
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expectFull(t);
+    await t.manager.stop();
+  });
+
+  it("a subscribed healthy push without a position retries in full", async () => {
+    const t = owedDevice(() => owing("c2"));
+    t.manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.state.subscribed).toBe(1);
+    t.state.handlers!.onHealth(true);
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expectFull(t);
+    await t.manager.stop();
+  });
+
+  it("a canSync block invalidates the scope from a completed owed pass", async () => {
+    let allowed = true;
+    const t = owedDevice(() => owing("c2"), {
+      canSync: () =>
+        allowed
+          ? { ok: true }
+          : { ok: false, reason: "paused", message: "paused" },
+    });
+    await online(t);
+    t.cycle.mockClear();
+    allowed = false;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.cycle).not.toHaveBeenCalled();
+    allowed = true;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expectFull(t);
+    await t.manager.stop();
+  });
+
+  it("a thrown pass invalidates the previous owed scope across a tick", async () => {
+    let phase: "owed" | "throw" | "clean" = "owed";
+    const t = owedDevice(() => {
+      if (phase === "throw") throw new Error("cycle failed");
+      return phase === "owed" ? owing("c2") : clean;
+    });
+    await online(t);
+    phase = "throw";
+    t.state.handlers!.onChange();
+    await vi.advanceTimersByTimeAsync(0);
+    phase = "clean";
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expectFull(t);
+    await t.manager.stop();
+  });
+
+  it("a pass still running across a tick owes a full follow-up, not the old scope", async () => {
+    let release!: (value: typeof clean) => void;
+    const held = new Promise<typeof clean>((resolve) => {
+      release = resolve;
+    });
+    let phase: "owed" | "held" | "clean" = "owed";
+    const t = owedDevice(() =>
+      phase === "held" ? held : phase === "owed" ? owing("c2") : clean,
+    );
+    await online(t);
+    phase = "held";
+    t.state.handlers!.onChange();
+    await vi.advanceTimersByTimeAsync(0);
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.cycle).not.toHaveBeenCalled();
+    phase = "clean";
+    release(clean);
+    await vi.advanceTimersByTimeAsync(0);
+    expectFull(t);
+    await t.manager.stop();
+  });
+
+  it.each([
+    { label: "null", ids: [null] },
+    { label: "numeric", ids: [42] },
+    { label: "valid and null", ids: ["c2", null] },
+    { label: "valid and numeric", ids: ["c2", 42] },
+  ])("an owed report with $label ids retries in full", async ({ ids }) => {
+    const t = owedDevice(() => owing(...ids));
+    await online(t);
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expectFull(t);
+    await t.manager.stop();
+  });
+
+  const refused = {
+    connectionId: "old-format",
+    status: "update_required",
+    error: "unreadable segment",
+    published: [],
+  };
+
+  it("update_required plus another owed connection retries in full", async () => {
+    const t = owedDevice(() => ({
+      connections: [refused, ...owing("c2").connections],
+    }));
+    await online(t);
+    expect(t.manager.getStatus().blocked?.reason).toBe("update_required");
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expectFull(t);
+    await t.manager.stop();
+  });
+
+  it("update_required wins over the same connection's error and settles the refusal", async () => {
+    const t = owedDevice(() => ({ connections: [refused] }));
+    await online(t);
+    expect(t.manager.getStatus().blocked?.reason).toBe("update_required");
+    t.cycle.mockClear();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(t.cycle).not.toHaveBeenCalled();
+    expect(t.manager.getStatus().blocked?.reason).toBe("update_required");
+    t.state.handlers!.onChange();
+    await vi.advanceTimersByTimeAsync(0);
+    expectFull(t);
     await t.manager.stop();
   });
 });

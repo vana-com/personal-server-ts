@@ -137,7 +137,7 @@ async function world(connectors: number, streamsPer: number) {
     Array(connectors).fill(null),
   );
   await sync.cycle(); // settles: a second pass finds nothing to do
-  return { sync, calls };
+  return { sync, calls, deps };
 }
 
 const tally = (calls: readonly string[]) =>
@@ -200,4 +200,48 @@ describe("a retry scoped to the connections that are owed", () => {
     expect(report.connections).toEqual([]);
     expect(w.calls).toEqual([]);
   });
+});
+it("keeps an acknowledged early publication when apply fails, and completes B", async () => {
+  const w = await world(2, 1);
+  const initial = await w.sync.cycle();
+  const [a, b] = initial.connections.map((c) => c.connectionId);
+  expect(a).toBeDefined();
+  expect(b).toBeDefined();
+  await w.sync.intake.begin("late-a", {
+    connector: "c0",
+    artifactDigest: "c0",
+    wantFull: false,
+    observedAt: 2000,
+    owner: { address: OWNER, leaseId: null },
+  });
+  await w.sync.intake.batch("late-a", {
+    batch: 0,
+    records: [{ stream: "s0", data: { id: "later", version: 2 } }],
+  });
+  await w.sync.intake.end("late-a", endRequest({ lastBatch: 0, live: ["s0"] }));
+  const postBatch = w.deps.registry.postBatch!.bind(w.deps.registry);
+  const read = w.deps.registry.read.bind(w.deps.registry);
+  let acknowledged = 0;
+  w.deps.registry.postBatch = async (request) => {
+    const result = await postBatch(request);
+    acknowledged++;
+    return result;
+  };
+  w.deps.registry.read = async (scope) => {
+    if (scope === a && acknowledged > 0)
+      throw new Error("apply read failed after commit");
+    return read(scope);
+  };
+  w.calls.length = 0;
+  const report = await w.sync.cycle({ connections: [a!, b!] });
+  expect(acknowledged).toBe(1);
+  expect(w.calls.filter((call) => call === "registry.batch")).toHaveLength(1);
+  const failed = report.connections.find((c) => c.connectionId === a)!;
+  expect(failed.error).toContain("apply read failed after commit");
+  expect(
+    failed.published.filter((result) => result.outcome === "published"),
+  ).toHaveLength(1);
+  expect(
+    report.connections.find((c) => c.connectionId === b)?.error,
+  ).toBeNull();
 });
