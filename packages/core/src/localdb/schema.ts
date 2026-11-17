@@ -574,4 +574,19 @@ END`,
     `ALTER TABLE record_changes ADD COLUMN publish_blocked_reason TEXT CHECK (publish_blocked_reason IN ('deferred','backoff','discarded','purged','refused'))`,
     `ALTER TABLE run_streams ADD COLUMN publish_blocked_reason TEXT CHECK (publish_blocked_reason IN ('deferred','backoff','discarded','purged','refused'))`,
   ],
+  [
+    `CREATE TABLE bootstrap_load(id INTEGER PRIMARY KEY CHECK(id=1),connection_id TEXT NOT NULL,generation INTEGER NOT NULL,base INTEGER NOT NULL,preview_done INTEGER NOT NULL DEFAULT 0)`,
+    `CREATE TABLE bootstrap_segments(position INTEGER PRIMARY KEY,data_hash TEXT NOT NULL,first_row INTEGER NOT NULL,last_row INTEGER NOT NULL,observed_at INTEGER NOT NULL,metas TEXT NOT NULL,removes INTEGER NOT NULL)`,
+    `CREATE TABLE bootstrap_deletions(connection_id TEXT NOT NULL,stream TEXT NOT NULL,pk_hash TEXT NOT NULL,record_key TEXT NOT NULL,stamp_o INTEGER NOT NULL,stamp_r TEXT NOT NULL,rank INTEGER NOT NULL,position INTEGER NOT NULL,entry_order INTEGER NOT NULL)`,
+    `CREATE TABLE bootstrap_preview(connection_id TEXT NOT NULL,stream TEXT NOT NULL,pk_hash TEXT NOT NULL,PRIMARY KEY(connection_id,stream,pk_hash)) WITHOUT ROWID`,
+    ...["INSERT", "UPDATE", "DELETE"].map(
+      (
+        event,
+      ) => `CREATE TRIGGER records_bootstrap_${event.toLowerCase()} BEFORE ${event} ON records
+      WHEN EXISTS(SELECT 1 FROM bootstrap_load b WHERE b.connection_id <> ${event === "INSERT" ? "NEW" : "OLD"}.connection_id
+        ${event === "UPDATE" ? "OR b.connection_id <> NEW.connection_id" : ""}
+        OR (SELECT origin FROM write_ctx WHERE id=1) IS NOT 'remote')
+      BEGIN SELECT RAISE(ABORT,'bootstrap_busy'); END`,
+    ),
+  ],
 ];

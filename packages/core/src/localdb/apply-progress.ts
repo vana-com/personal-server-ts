@@ -4,8 +4,8 @@ import type { LocalSyncDeps } from "./deps.js";
  * A wake for readers waiting on a connection's apply. Apply calls
  * `announceApplied` after each part commits; a reader that wants the first
  * part waits on `nextApplied` instead of on the whole apply. Keyed by the
- * database object, which every `LocalSyncDeps` of one open database shares
- * (the queue is rewrapped inside an apply job; the database is not).
+ * database's info object. Metered apply jobs wrap the database in a proxy,
+ * but preserve this identity, so an early read receives the preview wake.
  */
 const waiters = new WeakMap<object, Map<string, Set<() => void>>>();
 
@@ -14,7 +14,7 @@ export function announceApplied(
   deps: Pick<LocalSyncDeps, "db">,
   connectionId: string,
 ): void {
-  const byId = waiters.get(deps.db);
+  const byId = waiters.get(deps.db.info);
   const set = byId?.get(connectionId);
   if (!set) return;
   byId!.delete(connectionId);
@@ -30,10 +30,10 @@ export function nextApplied(
   deps: Pick<LocalSyncDeps, "db">,
   connectionId: string,
 ): Promise<void> {
-  let byId = waiters.get(deps.db);
+  let byId = waiters.get(deps.db.info);
   if (!byId) {
     byId = new Map();
-    waiters.set(deps.db, byId);
+    waiters.set(deps.db.info, byId);
   }
   let set = byId.get(connectionId);
   if (!set) {

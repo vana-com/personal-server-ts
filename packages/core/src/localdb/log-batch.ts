@@ -594,10 +594,11 @@ export async function commitStaged(
 ): Promise<void> {
   const statements: SqlStatement[] = [];
   // One by one: a group's statements can outnumber what a call takes as arguments.
+  const plannedBegins = new Set(begun);
   for (const batch of batches) {
     for (const [stream, hide] of batch.begins ?? [])
-      if (!begun.has(stream)) {
-        begun.add(stream);
+      if (!plannedBegins.has(stream)) {
+        plannedBegins.add(stream);
         for (const statement of hide) statements.push(statement);
       }
     for (const statement of batch.statements) statements.push(statement);
@@ -606,6 +607,7 @@ export async function commitStaged(
   }
   try {
     await deps.db.batch(withOrigin("remote", statements));
+    for (const stream of plannedBegins) begun.add(stream);
   } finally {
     await deps.db.batch(
       batches.map((batch) => ({
