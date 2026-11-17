@@ -91,12 +91,55 @@ test("checks the files npm actually packs", async (t) => {
     await t.test(`${name} rejects a computed runtime specifier`, () => {
       assertViolation(code("runtimePackage"), /unanalysable/i);
     });
-    await t.test(`${name} uses the existing packed-relative and builtin rules`, () => {
-      assertViolation(code('"./excluded.js"'), /unpacked relative target/);
-      assert.equal(check(code('"./present.js"')).status, 0);
-      assert.equal(check(code('"node:fs"')).status, 0);
-      // Extensionless/directory CJS resolution remains deliberately deferred.
-      assertViolation(code('"./present"'), /unpacked relative target/);
-    });
+    await t.test(
+      `${name} uses the existing packed-relative and builtin rules`,
+      () => {
+        assertViolation(code('"./excluded.js"'), /unpacked relative target/);
+        assert.equal(check(code('"./present.js"')).status, 0);
+        assert.equal(check(code('"node:fs"')).status, 0);
+        // Extensionless/directory CJS resolution remains deliberately deferred.
+        assertViolation(code('"./present"'), /unpacked relative target/);
+      },
+    );
   }
+
+  await t.test("allows only the listed bundle call site", () => {
+    const uiDir = path.join(fixture, "packages", "server", "dist", "ui");
+    fs.mkdirSync(uiDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(fixture, "packages", "server", "package.json"),
+      JSON.stringify({ name: "server", version: "1.0.0", files: ["dist"] }),
+    );
+    fs.rmSync(file);
+    fs.rmSync(path.join(pkg, "dist-test"), { recursive: true });
+    const bundle = path.join(uiDir, "ps-lite-debug.js");
+    const run = (code) => {
+      fs.writeFileSync(bundle, code);
+      return spawnSync(
+        process.execPath,
+        [path.join(fixture, "scripts/check-dist-imports.mjs")],
+        { encoding: "utf8" },
+      );
+    };
+    assert.equal(
+      run('import.meta.resolve("pdfjs-dist/package.json");').status,
+      0,
+    );
+    const other = run('import.meta.resolve("other-package/package.json");');
+    assert.equal(other.status, 1);
+    assert.match(other.stderr, /imports other-package/);
+    const unlisted = path.join(uiDir, "other.js");
+    fs.writeFileSync(
+      unlisted,
+      'import.meta.resolve("pdfjs-dist/package.json");',
+    );
+    fs.writeFileSync(bundle, "export {};");
+    const elsewhere = spawnSync(
+      process.execPath,
+      [path.join(fixture, "scripts/check-dist-imports.mjs")],
+      { encoding: "utf8" },
+    );
+    assert.equal(elsewhere.status, 1);
+    assert.match(elsewhere.stderr, /other\.js imports pdfjs-dist/);
+  });
 });

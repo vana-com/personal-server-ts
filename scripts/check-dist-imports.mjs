@@ -14,6 +14,14 @@ const violations = [];
 // Repository-relative paths and reasons for computed imports/loaders that cannot be made static.
 const computedImportAllowlist = new Map();
 const computedImports = [];
+// Exact "<repository-relative file>|<specifier>" pairs that stay undeclared on
+// purpose, with the reason. Everything else in the same file is still checked.
+const undeclaredImportAllowlist = new Map([
+  [
+    "packages/server/dist/ui/ps-lite-debug.js|pdfjs-dist/package.json",
+    "unpdf, inlined by esbuild, calls import.meta.resolve only when process.release.name is node (never in the browser) and inside try/catch, so a failed resolve falls back to defaults",
+  ],
+]);
 
 for (const dir of fs.readdirSync(path.join(root, "packages"))) {
   const pkgDir = path.join(root, "packages", dir);
@@ -78,7 +86,8 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
         expression.name.text === "resolve" &&
         (isRequireIdentifier(expression.expression) ||
           (ts.isMetaProperty(expression.expression) &&
-            expression.expression.keywordToken === ts.SyntaxKind.ImportKeyword &&
+            expression.expression.keywordToken ===
+              ts.SyntaxKind.ImportKeyword &&
             expression.expression.name.text === "meta")));
     const pending = [source];
     while (pending.length) {
@@ -126,7 +135,11 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
         const name = specifier.startsWith("@")
           ? specifier.split("/").slice(0, 2).join("/")
           : specifier.split("/")[0];
-        if (!allowed.has(name))
+        const relFile = path.relative(root, file).split(path.sep).join("/");
+        if (
+          !allowed.has(name) &&
+          !undeclaredImportAllowlist.has(`${relFile}|${specifier}`)
+        )
           violations.push(`${path.relative(root, file)} imports ${specifier}`);
       }
       ts.forEachChild(node, (child) => {
