@@ -251,18 +251,3 @@ export async function remoteFixture(
   }
   return { registry, storage, reads, blobs, head, setControl, hashes, control };
 }
-
-/**
- * A retained connector manifest, as a host holds it: it names the streams a
- * delete fences beyond the rows the registry lists.
- */
-export function retainedManifest(
-  connector: string,
-  streams: readonly string[],
-): string {
-  return JSON.stringify({
-    connector_key: connector,
-    version: "1",
-    streams: streams.map((name) => ({ name, primary_key: ["id"] })),
-  });
-}
