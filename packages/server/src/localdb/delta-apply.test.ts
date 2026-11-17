@@ -123,6 +123,9 @@ it("an explicit control observation wins over a listed control", async () => {
   const live = await here.deps.registry.read(CONTROL);
   if (!live.found) throw new Error("no control row");
   const observedControl = { ...live, version: live.version + 1, deleted: true };
+  const listedControl = listed.find((row) => row.scope === CONTROL)?.read;
+  expect(listedControl).toEqual(live);
+  expect(observedControl).not.toEqual(listedControl);
   const reads: string[] = [];
   const read = here.deps.registry.read.bind(here.deps.registry);
   here.deps.registry.read = async (scope) => {
