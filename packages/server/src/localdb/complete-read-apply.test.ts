@@ -33,7 +33,8 @@ describe("a complete read while a run ends on the same connection", () => {
   it("ends the body in an error once the run's rows are in the table, and the run is not held up", async () => {
     const w = await world({ streams: 1 });
     const a = await w.device("a");
-    const records = (ids: string[]) => ids.map((id) => ({ stream: STREAM, id }));
+    const records = (ids: string[]) =>
+      ids.map((id) => ({ stream: STREAM, id }));
     const before = Array.from(
       { length: COMPLETE_PAGE_SIZE + 5 },
       (_, i) => `a${i}`,
