@@ -944,6 +944,8 @@ describe("view changes", () => {
       { sql: "ALTER TABLE stream_state DROP COLUMN consumed_version" },
       { sql: "ALTER TABLE stream_state DROP COLUMN consumed_generation" },
       { sql: "ALTER TABLE stream_state DROP COLUMN consumed_data_hash" },
+      // The change index of a stream is on a table that stays.
+      { sql: "DROP INDEX record_changes_by_stream" },
       { sql: `PRAGMA user_version = ${viewMigration}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");

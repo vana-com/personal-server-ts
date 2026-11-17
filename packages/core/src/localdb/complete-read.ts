@@ -47,9 +47,9 @@ export async function changePin(db: SqlReader): Promise<number> {
  * to have had no row written, changed or removed since `since`, which is what
  * every write of a row leaves in `record_changes`. A compaction that erased
  * such an entry moves `change_floor` past `since`: the check then fails
- * instead of trusting an absence it can no longer see. The scan of
- * `record_changes` follows its rowid from `since` on, so it reads only what
- * was written after the pin.
+ * instead of trusting an absence it can no longer see. The check seeks
+ * `record_changes_by_stream` to the stream's entries after `since`, so what
+ * other streams and connections wrote meanwhile is not read.
  */
 export function completePage(
   head: PartialHead,
@@ -64,7 +64,7 @@ export function completePage(
                    AND c.control_state = 'active' AND c.deleted_at IS NULL
                    AND NOT EXISTS (SELECT 1 FROM delete_intents d WHERE d.connector = c.connector))
          AND (SELECT change_floor FROM db_meta WHERE id = 1) <= ?
-         AND NOT EXISTS (SELECT 1 FROM record_changes x NOT INDEXED
+         AND NOT EXISTS (SELECT 1 FROM record_changes x
                            WHERE x.seq > ? AND x.connection_id = ? AND x.stream = ?)) AS ok)
        SELECT g.ok AS ok, r.pk_hash AS pk_hash, r.body AS body
        FROM g LEFT JOIN (

@@ -555,4 +555,11 @@ END`,
     `CREATE INDEX records_size ON records(connection_id, stream, pk_hash, body_bytes)`,
     ...RECORDS_TRIGGERS,
   ],
+  [
+    // Whether a stream has a change after a sequence number, which each page of
+    // a complete read asks (complete-read.ts). `record_changes_by_key` leads
+    // with the key, so it cannot bound the sequence for a whole stream; the
+    // table's own order would read every later change of every connection.
+    `CREATE INDEX record_changes_by_stream ON record_changes(connection_id, stream, seq)`,
+  ],
 ];
