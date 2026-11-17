@@ -836,9 +836,6 @@ export function createSyncManager(
       } while (rerunRequested && isRunning && !paused);
     };
 
-    // A cycle that failed leaves what it queued behind; a new one starts clean.
-    queuedDeltas = [];
-    deltaBarred = false;
     // Set before the pass starts, not by it: the next held request can be sent
     // before the pass runs, and it must ask from where the pass will settle.
     inFlightTarget = knownPosition;
