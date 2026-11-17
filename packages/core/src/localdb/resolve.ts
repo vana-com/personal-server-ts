@@ -16,6 +16,7 @@ import {
   complete,
   connectionsOf,
   loadStreams,
+  isOptionalStream,
   projectAlias,
   readability,
   selectForTarget,
@@ -42,6 +43,12 @@ export interface LocalResolver {
 export interface LocalAliasTarget {
   readonly connector: string;
   readonly streams: readonly string[];
+  /**
+   * The streams a read must find installed and complete. The rest of
+   * `streams` are read when present and left out when absent. Absent: every
+   * stream of `streams` is required.
+   */
+  readonly requiredStreams?: readonly string[];
   readonly servedStream?: string;
   readonly windowed?: boolean;
   readonly project: (
@@ -339,8 +346,17 @@ export function createLocalResolver(
       all.find((s) => s.stream === name),
     );
     if (selected.some((s) => s && tombstoned(s))) return deleted();
-    if (selected.some((s) => !s || !complete(s, connection))) return noData();
-    const installed = selected as Stream[];
+    // A stream the alias serves without (see `requiredStreams`) may be absent;
+    // one that is installed must still be complete.
+    if (
+      selected.some((s, i) =>
+        s
+          ? !complete(s, connection)
+          : !isOptionalStream(candidate.target, candidate.target.streams[i]!),
+      )
+    )
+      return noData();
+    const installed = selected.filter((s): s is Stream => s !== undefined);
     const current = { ...candidate, connection, streams: installed };
     const cursor = cursorFor(current);
     if (input.cursor !== null && input.cursor !== cursor)

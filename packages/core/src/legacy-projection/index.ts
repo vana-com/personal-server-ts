@@ -100,19 +100,28 @@ export function legacyAliasScopes(scope: string) {
     );
     if (!targets.has(connector)) targets.set(connector, original);
   }
-  return [...targets].map(([connector, binding]) => ({
-    connector,
-    streams: binding.pdppStreams,
-    servedStream: binding.window?.parentStream,
-    windowed: Boolean(binding.window),
-    project: (records: readonly PdppRecord[], now: string) =>
-      projectPdppRecordsToLegacyPayload(scope, [...records], {
-        fetchedStreams: [...binding.pdppStreams],
-        profileKey: connector,
-        orderByPrimaryKey: true,
-        now,
-      }),
-  }));
+  return [...targets].map(([connector, binding]) => {
+    const required = requiredLegacyStreams(binding);
+    return {
+      connector,
+      streams: binding.pdppStreams,
+      requiredStreams: required,
+      servedStream: binding.window?.parentStream,
+      windowed: Boolean(binding.window),
+      project: (records: readonly PdppRecord[], now: string) =>
+        projectPdppRecordsToLegacyPayload(scope, [...records], {
+          // A stream the binding serves without is named only when it has rows.
+          fetchedStreams: binding.pdppStreams.filter(
+            (stream) =>
+              required.includes(stream) ||
+              records.some((record) => record.stream === stream),
+          ),
+          profileKey: connector,
+          orderByPrimaryKey: true,
+          now,
+        }),
+    };
+  });
 }
 
 /** Only declaration-reviewed profile keys may project into retained scopes. */

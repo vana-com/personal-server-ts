@@ -1,6 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { legacyAliasScopes } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
@@ -676,5 +677,89 @@ describe("a read holds no queue slot while its body is read", () => {
       bodies.push(record.body);
     expect(text.endsWith(`${bodies.join(",")}]}}`)).toBe(true);
     expect(bodies).toHaveLength(PAGE + 50);
+  });
+});
+
+describe("local resolve through the host's real legacy alias port", () => {
+  const ICLOUD = "icloud-notes";
+  const NOTE = {
+    id: "n1",
+    title: "Grocery list",
+    snippet: "milk",
+    folder_id: "f1",
+    is_pinned: false,
+    created_at: "2026-09-01T00:00:00Z",
+    modified_at: "2026-09-02T00:00:00Z",
+    has_attachments: false,
+    text_content: "milk",
+  };
+  async function icloud(streams: Record<string, Record<string, unknown>>) {
+    const f = await fixture();
+    await f.db.batch([
+      {
+        sql: `INSERT INTO connections
+        (connection_id, connector, ns, generation, control_state)
+        VALUES ('c1', ?, '', 2, 'active')`,
+        params: [ICLOUD],
+      },
+    ]);
+    for (const [stream, row] of Object.entries(streams)) {
+      await f.head(stream, { profile: ICLOUD });
+      await f.db.batch([
+        {
+          sql: `INSERT OR REPLACE INTO records
+          (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256)
+          VALUES ('c1', ?, 'hash', ?, 1000, 'run', ?, 'body-hash')`,
+          params: [stream, String(row.id), JSON.stringify(row)],
+        },
+      ]);
+    }
+    const resolver = createLocalResolver(f.deps, {
+      query: f.query,
+      olderVersions: f.olderVersions,
+      aliasScopes: () => ["icloud_notes.notes"].values(),
+      aliasTargets: legacyAliasScopes,
+    });
+    return resolver;
+  }
+
+  it("serves iCloud Notes from notes and folders when the connector has no profile stream", async () => {
+    const resolver = await icloud({
+      notes: NOTE,
+      folders: { id: "f1", name: "Notes" },
+    });
+    const read = await resolver.resolve(input("icloud_notes.notes"));
+    expect(read.kind).toBe("view");
+    if (read.kind !== "view") return;
+    const body = JSON.parse(await new Response(read.body).text()) as {
+      data: { userName: unknown; notes: { recordName: string }[] };
+    };
+    expect(body.data.userName).toBeNull();
+    expect(body.data.notes.map((n) => n.recordName)).toEqual(["n1"]);
+  });
+
+  it("reads an installed profile stream into iCloud Notes", async () => {
+    const resolver = await icloud({
+      notes: NOTE,
+      folders: { id: "f1", name: "Notes" },
+      profile: { id: "p1", user_name: "Ada" },
+    });
+    const read = await resolver.resolve(input("icloud_notes.notes"));
+    expect(read.kind).toBe("view");
+    if (read.kind !== "view") return;
+    const body = JSON.parse(await new Response(read.body).text()) as {
+      data: { userName: unknown };
+    };
+    expect(body.data.userName).toBe("Ada");
+  });
+
+  it("serves no iCloud Notes while folders is missing, even with a profile stream", async () => {
+    const resolver = await icloud({
+      notes: NOTE,
+      profile: { id: "p1", user_name: "Ada" },
+    });
+    expect(verdict(await resolver.resolve(input("icloud_notes.notes")))).toBe(
+      "no_data",
+    );
   });
 });

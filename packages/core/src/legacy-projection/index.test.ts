@@ -6,6 +6,7 @@ import instagramProfileSmall from "./__fixtures__/instagram.profile.small.json";
 import amazonPdppInput from "./__fixtures__/amazon.orders.pdpp-input.json";
 import {
   LEGACY_SCOPE_BINDINGS,
+  legacyAliasScopes,
   legacyScopeToPdppSelection,
   projectPdppRecordsToLegacyPayload,
   requiredLegacyStreams,
@@ -1697,6 +1698,37 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     // Connectors that predate the profile stream (the signed 0.1.0 declaration)
     // never had one. Legacy's fullName was always null for them, so the scope
     // keeps serving notes with that same null rather than disappearing.
+    it("hands the database the required streams of an alias, and the optional one only when it has rows", () => {
+      const [target] = legacyAliasScopes("icloud_notes.notes");
+      expect(target?.streams).toEqual(["notes", "folders", "profile"]);
+      expect(target?.requiredStreams).toEqual(["notes", "folders"]);
+      const note = {
+        id: "n1",
+        title: "t",
+        snippet: "s",
+        folder_id: "f1",
+        is_pinned: false,
+        created_at: "2026-09-01T00:00:00Z",
+        modified_at: "2026-09-02T00:00:00Z",
+        has_attachments: false,
+        text_content: "s",
+      };
+      const base = [
+        { stream: "notes", data: note },
+        { stream: "folders", data: { id: "f1", name: "Notes" } },
+      ];
+      expect(target?.project(base, "2026-10-01T00:00:00.000Z")).toMatchObject({
+        ok: true,
+        payload: { userName: null },
+      });
+      expect(
+        target?.project(
+          [...base, { stream: "profile", data: { id: "p", user_name: "Ada" } }],
+          "2026-10-01T00:00:00.000Z",
+        ),
+      ).toMatchObject({ ok: true, payload: { userName: "Ada" } });
+    });
+
     it("names profile as the one stream a host need not wait for", () => {
       const notes = LEGACY_SCOPE_BINDINGS.get("icloud_notes.notes")!;
       expect(requiredLegacyStreams(notes)).toEqual(["notes", "folders"]);

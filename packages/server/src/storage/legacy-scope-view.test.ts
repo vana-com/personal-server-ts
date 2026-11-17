@@ -8,6 +8,7 @@ import {
   type LegacyScopeAuthority,
   type LegacyCoverageVerdict,
 } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
+import { projectPdppRecordsToLegacyPayload } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
 import { initializeDatabase } from "./index-schema.js";
@@ -2035,6 +2036,89 @@ describe("legacy scope view over the real SQLite record store", () => {
         )
         .all(),
     ).toEqual([{ instance: "conn_i", generation: 1, method: "icloud-notes" }]);
+    // A later read with no legacy body to compare (the takeover is on record)
+    // still needs only notes' and folders' completion receipts.
+    const later = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) =>
+        sourceId === ICLOUD ? ["icloud-notes"] : [],
+    });
+    expect(later.listingFor("icloud_notes.notes").kind).toBe("canonical");
+    expect((await later.readLatest("icloud_notes.notes")).kind).toBe(
+      "canonical",
+    );
+  });
+
+  it("accepts the proven deletion of a legacy iCloud Notes note on notes and folders completion alone", async () => {
+    const ICLOUD = "https://registry.pdpp.dev/sources/icloud-notes";
+    legacyHead("icloud_notes.notes", "icloud_notes/notes/old.json");
+    connect(store, "conn_i", "icloud-notes", ICLOUD);
+    const note = (id: string) => ({
+      id,
+      title: `Note ${id}`,
+      snippet: "milk",
+      folder_id: "f1",
+      is_pinned: false,
+      created_at: "2026-09-01T00:00:00Z",
+      modified_at: "2026-09-02T00:00:00Z",
+      has_attachments: false,
+      text_content: "milk",
+    });
+    const rows = {
+      folders: [{ id: "f1", name: "Notes" }],
+      notes: [note("n1"), note("n2")],
+    };
+    for (const [stream, data] of Object.entries(rows)) {
+      store.replaceStream({
+        instance: "conn_i",
+        stream,
+        method: "icloud-notes",
+        generation: 1,
+        primaryKey: ["id"],
+        emittedAt: "2026-09-10T07:00:00.000Z",
+        sourceCollectedAt: "2026-09-09T07:00:00.000Z",
+        envelopes: data.map((row) => ({
+          instance: "conn_i",
+          stream,
+          key: row.id,
+          data: row,
+          emitted_at: "2026-09-10T07:00:00.000Z",
+        })),
+      });
+    }
+    const projected = projectPdppRecordsToLegacyPayload(
+      "icloud_notes.notes",
+      Object.entries({ ...rows, notes: [...rows.notes, note("n3")] }).flatMap(
+        ([stream, data]) => data.map((row) => ({ stream, data: row })),
+      ),
+      {
+        fetchedStreams: ["notes", "folders"],
+        profileKey: "icloud-notes",
+        orderByPrimaryKey: true,
+        now: "2026-01-01T00:00:00.000Z",
+      },
+    );
+    if (!projected.ok) throw new Error("fixture projection failed");
+    const legacy = projected.payload;
+    // The legacy file holds n3, which the later complete collection no longer
+    // has. A deletion is accepted only when every required stream proves it:
+    // collected later, with a current completion receipt.
+    const current = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) =>
+        sourceId === ICLOUD ? ["icloud-notes"] : [],
+      readLegacyHead: async () => ({
+        version: "1.0",
+        scope: "icloud_notes.notes",
+        collectedAt: "2026-01-01T00:00:00.000Z",
+        data: legacy,
+      }),
+    });
+    expect((await current.readLatest("icloud_notes.notes")).kind).toBe(
+      "canonical",
+    );
   });
 
   it("does not replace the legacy iCloud Notes file when folders is missing, even with a profile stream", async () => {

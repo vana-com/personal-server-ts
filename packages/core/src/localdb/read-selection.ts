@@ -107,6 +107,11 @@ export function targetsForScope(
   }));
 }
 
+/** Whether `target` serves without `stream`: the alias names it outside `requiredStreams`. */
+export const isOptionalStream = (target: Target, stream: string): boolean =>
+  target.alias?.requiredStreams !== undefined &&
+  !target.alias.requiredStreams.includes(stream);
+
 /** The stream whose head a read of `target` serves: its parent, if windowed. */
 export const servedStreamOf = (target: Target): string =>
   target.alias?.servedStream ?? target.streams[0]!;
@@ -307,7 +312,13 @@ export function selectForTarget(
   ) {
     return { candidate: undefined, tombstoned: true };
   }
-  if (selected.streams.length !== target.streams.length)
+  if (
+    target.streams.some(
+      (name) =>
+        !isOptionalStream(target, name) &&
+        !selected.streams.some((s) => s.stream === name),
+    )
+  )
     return { candidate: undefined, tombstoned: false };
   const states = selected.streams.map((s) =>
     readability(s, selected.connection, progressive),
