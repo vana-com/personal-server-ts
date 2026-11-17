@@ -1,6 +1,6 @@
 // The change check in each page of a complete body asks whether this stream
-// has any change after the pin. It must find the answer in the stream's own
-// entries, not by reading everything written after the pin: another
+// changed after the reader pinned it. It must be one primary-key lookup of the
+// stream's own mark, not a read of what was written after the pin: another
 // connection may import a million records while a body waits between pages.
 // Real SQLite and the real schema.
 import { afterEach, describe, expect, it } from "vitest";
@@ -40,7 +40,7 @@ describe("the change check of a complete body's page", () => {
     ["the first page", undefined],
     ["a later page", "0x00000041"],
   ])(
-    "%s finds the stream's changes through an index led by the connection, the stream and the sequence",
+    "%s is one primary-key lookup and reads no change log",
     async (_name, after) => {
       const db = await open();
       const { sql, params } = completePage(HEAD, 7, after);
@@ -48,26 +48,12 @@ describe("the change check of a complete body's page", () => {
         `EXPLAIN QUERY PLAN ${sql}`,
         params,
       );
-      const reads = steps.filter((s) => /\b(SEARCH|SCAN) x\b/.test(s.detail));
+      expect(steps.filter((s) => /record_changes/.test(s.detail))).toEqual([]);
+      const reads = steps.filter((s) => /^(SEARCH|SCAN) m\b/.test(s.detail));
       expect(reads).toHaveLength(1);
-      expect(reads[0]!.detail).toMatch(/^SEARCH x USING (COVERING )?INDEX /);
-      // Not the table's own order: that reads every change after the pin, of
-      // every stream and connection.
-      expect(reads[0]!.detail).not.toMatch(/INTEGER PRIMARY KEY/);
-      const index = /USING (?:COVERING )?INDEX (\w+)/.exec(
-        reads[0]!.detail,
-      )?.[1];
-      const columns = (
-        await db.query<{ seqno: number; name: string | null; key: number }>(
-          `PRAGMA index_xinfo(${index})`,
-        )
-      )
-        .filter((column) => column.key === 1)
-        .sort((x, y) => x.seqno - y.seqno)
-        .map((column) => column.name);
-      expect(columns.slice(0, 3)).toEqual(["connection_id", "stream", "seq"]);
-      // The step also bounds the sequence, so it seeks to the pin.
-      expect(reads[0]!.detail).toMatch(/seq>\?/);
+      expect(reads[0]!.detail).toMatch(
+        /^SEARCH m USING PRIMARY KEY \(connection_id=\? AND stream=\?\)/,
+      );
     },
   );
 });

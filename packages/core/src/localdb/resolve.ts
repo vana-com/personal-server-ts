@@ -8,7 +8,7 @@ import { applyConnection } from "./apply.js";
 import { nextApplied } from "./apply-progress.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
-import { changePin, completeBody } from "./complete-read.js";
+import { completeBody, pinStream } from "./complete-read.js";
 import { partialBody } from "./partial-read.js";
 import { createOlderVersions, type OlderVersions } from "./older-versions.js";
 import type { RecordQuery } from "./query.js";
@@ -330,8 +330,15 @@ export function createLocalResolver(
     input: ResolveInput,
     candidate: Candidate,
   ): Promise<ReadDecision> {
-    // Pinned before the head is read: see `changePin`.
-    const since = await changePin(readerOf(deps.db));
+    // A body of the database is pinned before the head is read: see
+    // `pinStream`. An alias is built in memory below and needs no pin.
+    const pin = candidate.target.alias
+      ? 0
+      : await pinStream(
+          deps.db,
+          candidate.connection.connection_id,
+          candidate.target.streams[0]!,
+        );
     const [connection] = (await connections(candidate.target.connector)).filter(
       (c) => c.connection_id === candidate.connection.connection_id,
     );
@@ -401,7 +408,7 @@ export function createLocalResolver(
               version: only.head_version,
               dataHash: only.head_data_hash!,
             },
-            since,
+            pin,
           );
     } else {
       const projected = await projectAlias(
