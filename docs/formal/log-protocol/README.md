@@ -169,6 +169,10 @@ adopting a newer epoch, so monotonicity means the pair (epoch, position).
 | KeyedLife.cfg             | BOUNDED, no violation               | Keyed with `AllowReset` and `Len(log) <= 3`: a lifetime change while durable rows exist                      |
 | KeyedRebase.cfg           | PASS (complete)                     | `Rebaseline`: LiveWhenCrashesEnd (the connection eventually serves once crashes end), TypeOK, P1–P5, OrderOK |
 | KeyedStuck.cfg            | FAIL LiveWhenCrashesEnd             | no `Rebaseline`: durable rows of a reset or compacted log leave the device stopped with position 0           |
+| Recommit.cfg              | PASS (complete)                     | `Recommit` after the registry loses one or two rows: EventuallyConverged, TypeOK, P1–P5, P7, OrderOK         |
+| RecommitOther.cfg         | PASS (complete)                     | as Recommit, and another segment may replace a lost row: TypeOK, P1–P5, P7, OrderOK (no liveness claim)      |
+| RecommitForeign.cfg       | FAIL P5                             | `Recommit` without the check that the registry's rows are the ones the device applied                        |
+| NoRecommit.cfg            | FAIL EventuallyConverged            | no `Recommit`: a device ahead of a rolled-back registry never converges                                      |
 
 Corpus (batch 6): an equal-cutoff omission (key 1, stamp 5) meets the live
 stamp-5 row, and an older omission (key 2, stamp 1) sits below the live delete.
@@ -324,6 +328,52 @@ registry that is behind the marker: it stays refused (`KeyedLeak` covers that
 safety property). The complete run is complete for this finite abstraction only: one
 device, two keys, at most six commits, resets and compactions, and it does not model
 the rows a device wrote locally and has not published.
+
+## A registry that lost log rows a device applied (host run, 2026-11-16)
+
+Question. A registry restored from a backup is behind the devices: the log rows of
+its newest positions are gone, and the segments they named are still in storage
+(content-addressed, never deleted). Before this change the device that applied them
+failed with `LogDivergedError` on every cycle. `log-recommit.ts` makes that device
+commit the lost segments again, in order, each against the registry's head. Does
+that restore convergence without breaking the fail-closed rule for a registry on
+another history?
+
+Model. `Rollback` in the four `RecommitModes` drops one or two rows and keeps at
+least one; in `recommitOther` and `recommitForeign` another corpus batch may take the
+first lost position (a writer that continued from the rolled-back registry). Epoch 2
+here marks only that the registry's history moved under the devices. `applied[d]` is
+the device's `log_state.refs` (a snapshot install keeps the registry's refs up to its
+position). `FullCheck` keeps a device's rows when the log holds, at each position the
+device applied, the segment it applied (`Explains`); otherwise the device is refused
+and takes no step. `Recommit(d)` appends `applied[d][Len(log)+1]` when `applied[d]`
+agrees with every row the log holds, and adopts the registry's history at its own
+position. Mutants: `recommitForeign` drops the agreement check (the code's check of
+the segment the registry names at its position); `noRecommit` has no `Recommit`.
+
+TLC 1.7.4 (2.19 engine, Java 17), `-workers 4 -Xmx4g`, `nice -n 19`, one job at a
+time. All four configurations: `Spec`, two devices, `MaxSteps = 6`,
+`AllowReset = FALSE`, `AllowRollback = TRUE`.
+
+| Configuration       | Expected                 | Actual                                                                                                                                                                        | Distinct states    | Depth | Wall time  |
+| ------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ----- | ---------- |
+| RecommitForeign.cfg | FAIL P5                  | FAIL P5 as expected: device 1 at position 3, `Rollback` replaces position 2 with another batch, `Recommit` puts its batch 3 over it and adopts (`traces/RecommitForeign.txt`) | 103,807 at failure | 10    | 2 s        |
+| NoRecommit.cfg      | FAIL EventuallyConverged | FAIL as expected: both devices at 3, `Rollback`, `Stop`; both stutter on epoch 1 with no step enabled (`traces/NoRecommit.txt`)                                               | 665,456 at failure | 15    | 65 s       |
+| RecommitOther.cfg   | PASS                     | PASS, complete: "Model checking completed. No error has been found." 108,505,589 states generated, 0 left on queue                                                            | 9,038,614          | 29    | 5 min      |
+| Recommit.cfg        | PASS                     | PASS, complete, EventuallyConverged included: 30,932,669 states generated, 0 left on queue                                                                                    | 2,345,350          | 29    | 7 min 22 s |
+
+Regression check of the extended model: DropGap, OutOfOrder (FAIL P2), ReplayFromBase,
+GroupedSkip, ForgetTombstone, KeyedBypass (FAIL P5) and KeyedStuck (FAIL
+LiveWhenCrashesEnd) fail as before, and KeyedRebase passes complete with the same
+1,093,310 distinct states as before `applied` was added.
+
+Limits. Two devices, two keys, at most six commits. Devices do not write in this model,
+so a device that recommits is never also publishing new rows; the code's recommit runs
+in the apply step, before the device's own publish. A registry that lost every row
+(`Len(log) = 0`) is not modelled, and the code does not recommit it (`recommitApplied`
+needs the row at the registry's position). A device whose refs do not cover each
+position from the registry's to its own is refused in the code; in the model `applied`
+always covers them.
 
 ## #705 r3 extension (host run, 2026-11-15)
 
