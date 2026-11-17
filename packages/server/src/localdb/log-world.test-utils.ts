@@ -148,6 +148,8 @@ export async function world(options: {
     });
     const deps: LocalSyncDeps = {
       db,
+      // Ordinary-path reference fixtures opt out; bootstrap tests opt in.
+      bootstrapFirstLoad: false,
       queue: connectionQueue(),
       registry: {
         ...registry,

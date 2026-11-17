@@ -1,3 +1,8 @@
+import {
+  loadBootstrap,
+  discardBootstrap,
+  FalseRemovalFact,
+} from "./log-bootstrap.js";
 // The reader of the stream-sync log (stream-sync/src/log.ts).
 //
 // One registry read says the log's position. A device at position n fetches
@@ -185,6 +190,18 @@ export async function applyLog(
       ? await deps.registry.read(scope)
       : listed;
   const classification = classifyStreamRow(read, context.hashes);
+  const [bootstrap] = await deps.db.query<{ generation: number; base: number }>(
+    "SELECT generation,base FROM bootstrap_load WHERE connection_id=?",
+    [connectionId],
+  );
+  if (
+    bootstrap &&
+    (classification !== "present" ||
+      bootstrap.generation !== context.generation ||
+      deps.bootstrapFirstLoad === false ||
+      deps.progressiveFirstLoad !== true)
+  )
+    await discardBootstrap(deps, connectionId);
   if (!read.found || classification === "absent") return { applied: 0 };
   // Rows an unfinished key-ordered load left (see `log-keyed.ts`) lie beyond
   // this device's position, and only a key-ordered load that covers them may
@@ -348,6 +365,51 @@ export async function applyLog(
   // as long. The segment-by-segment load takes the logs that fit one commit's budget, and
   // what a key-ordered load cannot take (a snapshot, a device that holds
   // streams). The key-ordered load lists the source at the head all the same.
+  if (bootstrap) {
+    const staged = await deps.db.query<{ position: number; data_hash: string }>(
+      "SELECT position,data_hash FROM bootstrap_segments",
+    );
+    if (
+      snapshot !== null ||
+      bootstrap.base !== head.base ||
+      staged.some(
+        (row) =>
+          !allRefs.some(
+            (ref) =>
+              ref.position === row.position &&
+              ref.dataHash.toLowerCase() === row.data_hash,
+          ),
+      )
+    )
+      await discardBootstrap(deps, connectionId);
+  }
+  if (
+    deps.bootstrapFirstLoad !== false &&
+    deps.progressiveFirstLoad === true &&
+    local.position === 0 &&
+    snapshot === null &&
+    pending === null &&
+    tail.length
+  ) {
+    const applied = await loadBootstrap({
+      deps,
+      connectionId,
+      generation: context.generation,
+      base: head.base,
+      head,
+      refs: tail,
+      fetch: async (ref) =>
+        (await fetchSegment(deps, scope, context, ref.dataHash, ref.position))
+          .segment,
+      state: {
+        position: head.position,
+        base: head.base,
+        refs: allRefs,
+        snapshot: head.snapshot,
+      },
+    });
+    if (applied !== null) return { applied };
+  }
   const buckets = await planKeyedLoad(
     deps,
     connectionId,
@@ -851,11 +913,24 @@ async function loadProgressively(
     const mine = headOf(marker.stream);
     if (
       marker.version === mine.version &&
-      marker.generation === mine.generation &&
-      marker.data_hash === mine.dataHash
-    )
+      marker.generation === mine.generation
+    ) {
       resumed.add(marker.stream);
-    else if (skip.has(marker.stream))
+      if (marker.data_hash !== mine.dataHash)
+        stale.push({
+          sql: "UPDATE stream_partial SET data_hash=?,head_blob=?,observed_at=?,failed=0,last_error=NULL WHERE connection_id=? AND stream=? AND version=? AND generation=? AND data_hash=?",
+          params: [
+            mine.dataHash,
+            mine.headBlob,
+            mine.observedAt,
+            connectionId,
+            marker.stream,
+            marker.version,
+            marker.generation,
+            marker.data_hash,
+          ],
+        });
+    } else if (skip.has(marker.stream))
       // A load this pass does not continue, of a stream that reads complete.
       stale.push({
         sql: "DELETE FROM stream_partial WHERE connection_id = ? AND stream = ?",
@@ -881,7 +956,7 @@ async function loadProgressively(
   }
   if (listed.length > 0) {
     await deps.db.batch(listed);
-    if (begun.size > 0) announceApplied(deps, connectionId);
+    if (begun.size > 0 || stale.length > 0) announceApplied(deps, connectionId);
   }
 
   // What a later batch removes: read from the segments that say they remove,
@@ -889,7 +964,21 @@ async function loadProgressively(
   const [firstPart] = await Promise.all([
     partRefs.length > 0 ? partAt(0) : Promise.resolve(undefined),
     ...removing.map(segmentAt),
-  ]);
+  ]).catch(async (error) => {
+    const stopped = [...new Set([...begun, ...resumed])].map(headOf);
+    if (stopped.length)
+      await deps.db
+        .batch(
+          stopped.map((identity) =>
+            failedRowStatement(identity, failureCode(error)),
+          ),
+        )
+        .then(
+          () => announceApplied(deps, connectionId),
+          () => undefined,
+        );
+    throw error;
+  });
   const removed = removalsOf(
     await Promise.all(
       tail
@@ -1076,9 +1165,7 @@ async function loadProgressively(
         // A segment the head says removes nothing was not read first. If it
         // removes a key, rows of the keys it removes may be showing.
         if (ref.removes === false && segmentRemoves(segment.operations))
-          throw new Error(
-            `apply: invalid log segment ${ref.position} (removes a key its ref says it does not)`,
-          );
+          throw new FalseRemovalFact();
         batch = segment;
       }
       const staged = await stageBatch(
@@ -1121,7 +1208,14 @@ async function loadProgressively(
       .map(headOf);
     if (stopped.length > 0)
       await deps.db
-        .batch(stopped.map((identity) => failedRowStatement(identity, code)))
+        .batch(
+          stopped.flatMap((identity) => [
+            ...(error instanceof FalseRemovalFact
+              ? hideStoredRows(connectionId, identity.stream)
+              : []),
+            failedRowStatement(identity, code),
+          ]),
+        )
         .then(
           () => announceApplied(deps, connectionId),
           () => undefined,

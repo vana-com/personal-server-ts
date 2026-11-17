@@ -17,6 +17,10 @@ export type ConnectionQueue = ReturnType<typeof connectionQueue>;
  * Spec: B.1, C.0-C.4.
  */
 export interface LocalSyncDeps {
+  /** Disk-backed first loads; defaults on for progressive hosts. False keeps the ordinary reference path. */
+  readonly bootstrapFirstLoad?: boolean;
+  /** Force the shared-table finish for a measured shadow comparison. */
+  readonly bootstrapFirstLoadFinish?: "copy";
   readonly db: SqlDriver;
   readonly queue: ConnectionQueue;
   readonly ownerAddress: `0x${string}`;

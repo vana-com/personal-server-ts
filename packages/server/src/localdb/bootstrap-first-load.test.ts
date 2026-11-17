@@ -1,0 +1,639 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type * as StreamSync from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  applyConnection,
+  type LocalSyncDeps,
+} from "../../../core/src/localdb/index.js";
+import { createLocalListing } from "../../../core/src/localdb/listing.js";
+import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
+import { createRecordQuery } from "../../../core/src/localdb/query.js";
+import { connectionQueue } from "../../../core/src/localdb/queue.js";
+import { loadBootstrap } from "../../../core/src/localdb/log-bootstrap.js";
+import {
+  pkHash,
+  type Segment,
+} from "@opendatalabs/personal-server-ts-stream-sync";
+import { sha256 } from "@noble/hashes/sha2";
+import { bootstrapSchema } from "../../../core/src/localdb/bootstrap-swap.js";
+import { firstOwnerRow } from "./bench/owner-row.js";
+import {
+  CONNECTION_ID,
+  CONNECTOR,
+  closeWorldDrivers,
+  world,
+  sName,
+} from "./log-world.test-utils.js";
+
+const writer = vi.hoisted(() => ({ lie: false }));
+vi.mock("@opendatalabs/personal-server-ts-stream-sync", async (original) => {
+  const real = await original<typeof StreamSync>();
+  return {
+    ...real,
+    segmentRemoves: (ops: Parameters<typeof real.segmentRemoves>[0]) =>
+      writer.lie ? false : real.segmentRemoves(ops),
+  };
+});
+afterEach(async () => {
+  writer.lie = false;
+  await closeWorldDrivers();
+});
+type World = Awaited<ReturnType<typeof world>>;
+type Device = Awaited<ReturnType<World["device"]>>;
+const scope = `pdpp.${CONNECTOR}.${sName(0)}`;
+const deferred = () => {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => (resolve = r));
+  return { promise, resolve };
+};
+async function connect(
+  w: World,
+  name: string,
+  beforeGet?: (key: string) => Promise<void>,
+) {
+  const d = await w.device(name, {
+    progressiveFirstLoad: true,
+    keyedFirstLoad: false,
+    beforeGet,
+  });
+  Object.assign(d.deps, { bootstrapFirstLoad: true });
+  await d.db.batch([
+    {
+      sql: "INSERT INTO connections(connection_id,connector,ns,generation,control_state,control_version) VALUES (?,?,'',1,'active',1)",
+      params: [CONNECTION_ID, CONNECTOR],
+    },
+  ]);
+  return d;
+}
+async function ownerSnapshot(d: Device) {
+  const queue = connectionQueue(),
+    done = deferred();
+  const held = queue.run(CONNECTION_ID, "apply", () => done.promise);
+  try {
+    if (
+      !(
+        await d.db.query("SELECT 1 FROM stream_partial WHERE connection_id=?", [
+          CONNECTION_ID,
+        ])
+      ).length
+    ) {
+      done.resolve();
+      await held;
+    }
+    const deps = { ...d.deps, queue } as LocalSyncDeps;
+    const result = await createLocalResolver(deps, {
+      query: createRecordQuery(d.db),
+    }).resolve({
+      scope,
+      connection: null,
+      cursor: null,
+      legacyFile: false,
+      isOwnerView: true,
+    });
+    if (result.kind !== "view") return { kind: result.kind, ids: [] };
+    const body = await new Response(result.body).json();
+    return {
+      kind: result.kind,
+      ids: body.data.records.map((r: { id: string }) => r.id).sort(),
+    };
+  } finally {
+    done.resolve();
+    await held;
+  }
+}
+async function history(w: World) {
+  const p = await w.device("publisher");
+  const publish = async (
+    id: string,
+    ids: string[],
+    o: number,
+    remove = false,
+  ) => {
+    await p.run(
+      id,
+      ids.map((id) => ({
+        stream: sName(0),
+        id,
+        ...(remove ? { remove: true } : {}),
+      })),
+      { full: id === "one", observedAt: o },
+    );
+    await p.cycle();
+  };
+  await publish("one", ["safe", "victim"], 10);
+  await publish("two", ["b"], 20);
+  await publish("three", ["victim"], 30, true);
+  await publish("four", ["c"], 40);
+  await publish("five", ["d"], 50);
+  return p;
+}
+describe("disk-backed bootstrap swap", () => {
+  it("returns an owner row before a held tail; listing counts only returned keys; final rows match the publication", async () => {
+    const w = await world({ streams: 1 });
+    const p = await history(w);
+    const keys = await w.segmentKeys();
+    const reached = deferred(),
+      release = deferred();
+    const d = await connect(w, "reader", async (key) => {
+      if (key === keys.get(4)) {
+        reached.resolve();
+        await release.promise;
+      }
+    });
+    const applying = applyConnection(d.deps, CONNECTION_ID);
+    try {
+      await Promise.race([reached.promise, applying]);
+      expect(await firstOwnerRow(d.deps, scope)).toMatchObject({ id: "safe" });
+      await expect(
+        d.db.batch([
+          { sql: "DELETE FROM write_ctx" },
+          { sql: "UPDATE records SET body='unclassified write'" },
+        ]),
+      ).rejects.toThrow("bootstrap_busy");
+      expect(await ownerSnapshot(d)).toMatchObject({ ids: ["safe"] });
+      const listed = await createLocalListing(d.deps).listScopes({
+        canRead: () => true,
+        includeLoading: true,
+      });
+      expect(listed.find((s) => s.scope === scope)?.records).toBe(1);
+      expect(await d.db.query("SELECT count(*) n FROM records")).toEqual([
+        { n: 2 },
+      ]);
+      expect(
+        await createLocalListing(d.deps).listScopes({ canRead: () => true }),
+      ).toEqual([]);
+    } finally {
+      release.resolve();
+      await applying;
+    }
+    expect(await d.rows()).toEqual(await p.rows());
+    expect((await ownerSnapshot(d)).ids).toEqual(["b", "c", "d", "safe"]);
+    expect(await d.position()).toBe(5);
+    expect(await d.db.query("SELECT * FROM bootstrap_load")).toEqual([]);
+    expect(await d.db.query("SELECT * FROM stream_partial")).toEqual([]);
+  });
+
+  it("hides all exposed preview keys when a false non-removal declaration is rejected", async () => {
+    writer.lie = true;
+    const w = await world({ streams: 1 });
+    await history(w);
+    writer.lie = false;
+    const keys = await w.segmentKeys(),
+      reached = deferred(),
+      release = deferred();
+    const d = await connect(w, "reader", async (key) => {
+      if (key === keys.get(3)) {
+        reached.resolve();
+        await release.promise;
+      }
+    });
+    const applying = applyConnection(d.deps, CONNECTION_ID);
+    const rejected = expect(applying).rejects.toThrow(/removes a key/);
+    try {
+      await reached.promise;
+      expect((await ownerSnapshot(d)).ids).toEqual(["safe", "victim"]);
+    } finally {
+      release.resolve();
+      await rejected;
+    }
+    expect((await ownerSnapshot(d)).ids).toEqual([]);
+    expect(await d.db.query("SELECT failed FROM stream_partial")).toEqual([
+      { failed: 1 },
+    ]);
+    expect(await d.position()).toBe(0);
+  });
+
+  it("marks prerequisite removal-fetch failure before preview as stopped", async () => {
+    const w = await world({ streams: 1 });
+    await history(w);
+    const bad = (await w.segmentKeys()).get(3)!;
+    const d = await connect(w, "reader", async (key) => {
+      if (key === bad) throw new Error("missing prerequisite");
+    });
+    await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toThrow(
+      "missing prerequisite",
+    );
+    expect(await d.db.query("SELECT failed FROM stream_partial")).toEqual([
+      { failed: 1 },
+    ]);
+    expect(await d.db.query("SELECT 1 FROM records")).toEqual([]);
+  });
+
+  it("rolls back a SQL failure after DROP records and resumes from durable segment receipts", async () => {
+    const w = await world({ streams: 1 });
+    const p = await history(w);
+    const d = await connect(w, "reader");
+    const batch = d.db.batch.bind(d.db);
+    let fail = true,
+      before: unknown;
+    d.db.batch = async (statements) => {
+      const at = statements.findIndex((s) => s.sql === "DROP TABLE records");
+      if (fail && at >= 0) {
+        fail = false;
+        before = await d.db.query(
+          "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+        );
+        return batch([
+          ...statements.slice(0, at + 1),
+          { sql: "SELECT impossible_column FROM missing_bootstrap_fault" },
+          ...statements.slice(at + 1),
+        ]);
+      }
+      return batch(statements);
+    };
+    await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toThrow(
+      /missing_bootstrap_fault/,
+    );
+    expect(
+      await d.db.query(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+      ),
+    ).toEqual(before);
+    expect(await d.position()).toBe(0);
+    expect(
+      await d.db.query("SELECT count(*) n FROM bootstrap_segments"),
+    ).toEqual([{ n: 5 }]);
+    expect(await d.db.query("SELECT failed FROM stream_partial")).toEqual([
+      { failed: 1 },
+    ]);
+    await applyConnection(d.deps, CONNECTION_ID);
+    expect(await d.rows()).toEqual(await p.rows());
+    expect(await d.position()).toBe(5);
+  });
+
+  it("rolls back every swap statement before the outer failure marker, then resumes", async () => {
+    const w = await world({ streams: 1 }),
+      p = await history(w),
+      d = await connect(w, "each-fault");
+    const schema = await bootstrapSchema(d.db);
+    const control = await connect(w, "trace"),
+      controlBatch = control.db.batch.bind(control.db);
+    let program: string[] = [];
+    control.db.batch = (statements) => {
+      if (statements.some((st) => st.sql === "DROP TABLE records"))
+        program = statements.map((st) => st.sql);
+      return controlBatch(statements);
+    };
+    await applyConnection(control.deps, CONNECTION_ID);
+    expect(program.length).toBeGreaterThan(0);
+    const batch = d.db.batch.bind(d.db);
+    const snapshot = async () => {
+      const master = await d.db.query<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+      );
+      const tables = [];
+      for (const { name } of master)
+        tables.push([
+          name,
+          await d.db.query(`SELECT * FROM "${name.replaceAll('"', '""')}"`),
+        ]);
+      return {
+        master: await d.db.query(
+          "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+        ),
+        tables,
+      };
+    };
+    let checked = 0;
+    for (let failAt = 0; failAt < program.length; failAt++) {
+      let armed = true;
+      d.db.batch = async (statements) => {
+        const swap = statements.some((st) => st.sql === "DROP TABLE records");
+        if (!swap || !armed) return batch(statements);
+        expect(statements.map((st) => st.sql)).toEqual(program);
+        armed = false;
+        const before = await snapshot(),
+          at = failAt;
+        try {
+          return await batch([
+            ...statements.slice(0, at + 1),
+            { sql: "SELECT invalid_column FROM swap_fault" },
+            ...statements.slice(at + 1),
+          ]);
+        } catch (error) {
+          expect(await snapshot()).toEqual(before);
+          checked++;
+          throw error;
+        }
+      };
+      await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toThrow(
+        /swap_fault/,
+      );
+      expect(armed).toBe(false);
+      expect(await d.position()).toBe(0);
+    }
+    expect(checked).toBe(program.length);
+    d.db.batch = batch;
+    await applyConnection(d.deps, CONNECTION_ID);
+    expect(await d.rows()).toEqual(await p.rows());
+    expect(
+      await d.db.query(
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='records' ORDER BY name",
+      ),
+    ).toEqual([...schema.triggers].sort((a, b) => (a.name < b.name ? -1 : 1)));
+    await p.run("after-swap", [{ stream: sName(0), id: "safe", v: 123 }], {
+      full: false,
+      observedAt: 100,
+    });
+    await p.cycle();
+    await applyConnection(d.deps, CONNECTION_ID);
+    expect(await d.rows()).toEqual(await p.rows());
+  });
+
+  it("finishes a prefix-only stream after an advanced-head retry, with SQL-layer append rollback", async () => {
+    const w = await world({ streams: 2 }),
+      p = await w.device("publisher");
+    const publish = async (run: string, s: number, id: string, full = true) => {
+      await p.run(run, [{ stream: sName(s), id }], {
+        selected: [sName(s)],
+        covered: [sName(s)],
+        full,
+      });
+      await p.cycle();
+    };
+    await publish("one", 0, "a");
+    await publish("two", 1, "b");
+    await publish("three", 1, "c", false);
+    const d = await connect(w, "reader"),
+      batch = d.db.batch.bind(d.db);
+    let fail = true;
+    d.db.batch = async (statements) => {
+      if (
+        fail &&
+        statements.some(
+          (s) =>
+            s.sql.includes("INSERT INTO bootstrap_segments") &&
+            s.params?.[0] === 2,
+        )
+      ) {
+        fail = false;
+        return batch([
+          ...statements.slice(0, -1),
+          { sql: "SELECT impossible_column FROM append_fault" },
+          ...statements.slice(-1),
+        ]);
+      }
+      return batch(statements);
+    };
+    await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toThrow(
+      /append_fault/,
+    );
+    expect(await d.db.query("SELECT position FROM bootstrap_segments")).toEqual(
+      [{ position: 1 }],
+    );
+    expect(await d.position()).toBe(0);
+    await publish("four", 1, "d", false);
+    await applyConnection(d.deps, CONNECTION_ID);
+    const fresh = await connect(w, "fresh");
+    await applyConnection(fresh.deps, CONNECTION_ID);
+    expect(await d.rows()).toEqual(await fresh.rows());
+    expect(
+      await d.db.query(
+        "SELECT stream,complete FROM stream_state ORDER BY stream",
+      ),
+    ).toEqual([
+      { stream: "s0", complete: 1 },
+      { stream: "s1", complete: 1 },
+    ]);
+    expect(await d.db.query("SELECT * FROM stream_partial")).toEqual([]);
+    expect(await d.db.query("SELECT * FROM partial_hidden")).toEqual([]);
+    expect(await d.position()).toBe(4);
+  });
+
+  it.each([true, false])(
+    "preserves other-connection evidence under the %s swap fact, including churn",
+    async (swap) => {
+      const w = await world({ streams: 1 }),
+        p = await history(w);
+      await p.run("change", [{ stream: sName(0), id: "safe", v: 2 }], {
+        full: false,
+        observedAt: 60,
+      });
+      await p.cycle();
+      await p.run("delete-b", [{ stream: sName(0), id: "b", remove: true }], {
+        full: false,
+        observedAt: 70,
+      });
+      await p.cycle();
+      await p.run(
+        "resurrect",
+        [
+          { stream: sName(0), id: "victim", v: 99 },
+          { stream: sName(0), id: "omitted" },
+        ],
+        { full: false, observedAt: 80 },
+      );
+      await p.cycle();
+      await p.run(
+        "full",
+        [
+          { stream: sName(0), id: "safe", v: 2 },
+          { stream: sName(0), id: "c" },
+          { stream: sName(0), id: "d" },
+          { stream: sName(0), id: "victim", v: 99 },
+        ],
+        { full: true, observedAt: 90 },
+      );
+      await p.cycle();
+      const d = await connect(w, "preserve"),
+        other = "pdpp.fixture~1111111111111111",
+        hash = await pkHash(async (bytes) => sha256(bytes), { id: "foreign" }, [
+          "id",
+        ]);
+      await d.db.batch([
+        {
+          sql: "INSERT INTO connections(connection_id,connector,ns,generation,control_state,control_version) VALUES(?,'fixture','1111111111111111',1,'active',1)",
+          params: [other],
+        },
+        {
+          sql: "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256,first_o) VALUES(?,'s0',?,'foreign',1,'other',?,'foreign-hash',1)",
+          params: [other, hash, JSON.stringify({ id: "foreign" })],
+        },
+      ]);
+      if (swap)
+        await d.db.batch([
+          { sql: "DELETE FROM records WHERE connection_id=?", params: [other] },
+        ]);
+      await d.db.batch([
+        {
+          sql: "INSERT INTO blob_refs(blob_id,connection_id,stream,pk_hash) VALUES('foreign-blob',?,'s0',?)",
+          params: [other, hash],
+        },
+      ]);
+      const snapshot = async () => ({
+        rows: await d.db.query("SELECT * FROM records WHERE connection_id=?", [
+          other,
+        ]),
+        changes: await d.db.query(
+          "SELECT * FROM record_changes WHERE connection_id=? ORDER BY seq",
+          [other],
+        ),
+        views: await d.db.query(
+          "SELECT * FROM view_versions WHERE connection_id=?",
+          [other],
+        ),
+        refs: await d.db.query(
+          "SELECT * FROM blob_refs WHERE connection_id=?",
+          [other],
+        ),
+      });
+      const before = await snapshot(),
+        root = await d.db.query(
+          "SELECT rootpage FROM sqlite_master WHERE type='table' AND name='records'",
+        );
+      const triggers = await d.db.query(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE type IN ('trigger','index') AND tbl_name='records' ORDER BY type,name",
+      );
+      const realBatch = d.db.batch.bind(d.db);
+      let stagingCommits = 0;
+      d.db.batch = (statements) => {
+        if (
+          statements.some((st) =>
+            st.sql.includes("INSERT INTO bootstrap_segments"),
+          )
+        )
+          stagingCommits++;
+        return realBatch(statements);
+      };
+      await applyConnection(d.deps, CONNECTION_ID);
+      expect(stagingCommits).toBeGreaterThan(0);
+      const afterRoot = await d.db.query(
+        "SELECT rootpage FROM sqlite_master WHERE type='table' AND name='records'",
+      );
+      if (swap) expect(afterRoot).not.toEqual(root);
+      else expect(afterRoot).toEqual(root);
+      expect(await snapshot()).toEqual(before);
+      expect(
+        await d.db.query(
+          "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE type IN ('trigger','index') AND tbl_name='records' ORDER BY type,name",
+        ),
+      ).toEqual(triggers);
+      const ordinary = await w.device("ordinary", { keyedFirstLoad: false });
+      await ordinary.db.batch([
+        {
+          sql: "INSERT INTO connections(connection_id,connector,ns,generation,control_state,control_version) VALUES(?,?,'',1,'active',1)",
+          params: [CONNECTION_ID, CONNECTOR],
+        },
+      ]);
+      await applyConnection(ordinary.deps, CONNECTION_ID);
+      const canonical = (reader: Device) =>
+        reader.db.query(
+          "SELECT connection_id,stream,pk_hash,record_key,body,body_sha256,stamp_o,stamp_r,stamp_n,first_o,seen_o,seen_r,body_bytes FROM records WHERE connection_id=? ORDER BY connection_id,stream,pk_hash",
+          [CONNECTION_ID],
+        );
+      expect(await canonical(d)).toEqual(await canonical(ordinary));
+      const target = (
+        await d.db.query(
+          "SELECT stream,record_key,body,stamp_o,stamp_r,stamp_n,first_o FROM records WHERE connection_id=? ORDER BY stream,record_key",
+          [CONNECTION_ID],
+        )
+      ).map((row) => JSON.stringify(row));
+      expect(target).toEqual(await p.rows());
+      expect(
+        (
+          await d.db.query<{ body: string }>(
+            "SELECT body FROM records WHERE connection_id=? ORDER BY record_key",
+            [CONNECTION_ID],
+          )
+        )
+          .map((r) => JSON.parse(r.body).id)
+          .sort(),
+      ).toEqual(["c", "d", "safe", "victim"]);
+    },
+  );
+
+  it.each([
+    { first: "delete", a: 10, second: "upsert", b: 5, live: false },
+    { first: "upsert", a: 10, second: "delete", b: 5, live: true },
+    { first: "delete", a: 10, second: "upsert", b: 10, live: false },
+    { first: "delete", a: 10, second: "upsert", b: 11, live: true },
+  ])(
+    "orders stamps rather than positions: $first $a, then $second $b",
+    async (test) => {
+      const w = await world({ streams: 1 }),
+        d = await connect(w, "stamps");
+      const hash = await pkHash(async (bytes) => sha256(bytes), { id: "k" }, [
+        "id",
+      ]);
+      const meta = {
+        stream: sName(0),
+        primaryKey: ["id"],
+        profile: { key: null, version: null },
+        complete: true,
+      };
+      const op = (kind: string, o: number) =>
+        kind === "upsert"
+          ? {
+              kind,
+              stream: sName(0),
+              pkHash: hash,
+              stamp: { o, r: "same-writer" },
+              value: { id: "k", v: o },
+              firstSeen: o,
+            }
+          : {
+              kind,
+              stream: sName(0),
+              pkHash: hash,
+              stamp: { o, r: "same-writer" },
+              key: ["k"],
+            };
+      const refs = [1, 2].map((position) => ({
+        position,
+        dataHash: `0x${String(position).repeat(64)}`,
+        bytes: 100,
+        removes: (position === 1 ? test.first : test.second) === "delete",
+      }));
+      const segments = [op(test.first, test.a), op(test.second, test.b)].map(
+        (operation, i) =>
+          ({
+            format: 2,
+            connector: CONNECTOR,
+            ns: "",
+            keyCheck: "",
+            position: i + 1,
+            base: 0,
+            generation: 1,
+            observedAt: 1,
+            streams: [meta],
+            operations: [operation],
+            refs: refs.slice(0, i),
+            snapshot: null,
+          }) as unknown as Segment,
+      );
+      await loadBootstrap({
+        deps: d.deps,
+        connectionId: CONNECTION_ID,
+        generation: 1,
+        base: 0,
+        head: segments[1]!,
+        refs,
+        fetch: async (ref) => segments[ref.position - 1]!,
+        state: { position: 2, base: 0, refs, snapshot: null },
+      });
+      const rows = await d.db.query<{ body: string; stamp_o: number }>(
+        "SELECT body,stamp_o FROM records",
+      );
+      expect(rows.map((r) => JSON.parse(r.body))).toEqual(
+        test.live ? [{ id: "k", v: Math.max(test.a, test.b) }] : [],
+      );
+      expect(await d.db.query("SELECT 1 FROM partial_hidden")).toEqual([]);
+      expect(await d.position()).toBe(2);
+    },
+  );
+
+  it.each(["view", "trigger", "foreign key"])(
+    "refuses a swap with an external %s reference",
+    async (kind) => {
+      const w = await world({ streams: 1 });
+      const d = await connect(w, "reader");
+      const sql =
+        kind === "view"
+          ? "CREATE VIEW records_consumer AS SELECT * FROM records"
+          : kind === "trigger"
+            ? "CREATE TRIGGER external_consumer AFTER INSERT ON connections BEGIN SELECT count(*) FROM records; END"
+            : "CREATE TABLE records_consumer(key TEXT REFERENCES records(pk_hash))";
+      await d.db.batch([{ sql }]);
+      await expect(bootstrapSchema(d.db)).rejects.toThrow(/external records/);
+    },
+  );
+});

@@ -6,11 +6,16 @@
 // Run it under `nice -n 19 ionice -c3`. `--dir` holds the databases, which
 // are removed afterwards. The default is a fresh directory under the OS temp
 // directory; pass a disk-backed `--dir` when that is in memory.
+import { firstOwnerRow } from "./owner-row.js";
+import { createHash, getHashes } from "node:crypto";
 import { keccak_256 } from "@noble/hashes/sha3";
 import { mkdirSync, mkdtempSync, rmSync, createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
+import { loadavg, freemem } from "node:os";
+import { partialPage } from "../../../../core/src/localdb/partial-read.js";
+import { createRecordQuery } from "../../../../core/src/localdb/query.js";
 import { Session } from "node:inspector/promises";
 import { readFileSync, writeFileSync } from "node:fs";
 import {
@@ -62,6 +67,11 @@ const CAPTURE = arg("capture", "");
 // below counts bytes written to the file and its journal over the reader's cycle.
 const WEB = arg("web", "off") === "on";
 const PAGE_SIZE = 65536;
+// Default exercises the shared disk-backed front end. --defer off is the
+// ordinary reference; --finish copy forces the common-table shadow candidate.
+const DEFER = arg("defer", "swap");
+if (!["swap", "off"].includes(DEFER))
+  throw new Error("--defer must be swap or off");
 const ioBytes = () => {
   const text = readFileSync("/proc/self/io", "utf8");
   const pick = (k: string) => Number(new RegExp(`${k}: (\\d+)`).exec(text)![1]);
@@ -124,6 +134,15 @@ function makeDeps(
   let op = 0;
   return {
     db,
+    bootstrapFirstLoad: timing !== null && DEFER === "swap",
+    ...(timing && DEFER === "swap"
+      ? {
+          bootstrapFirstLoad: true,
+          ...(arg("finish", "auto") === "copy"
+            ? { bootstrapFirstLoadFinish: "copy" as const }
+            : {}),
+        }
+      : {}),
     queue: connectionQueue(),
     registry: createGatewayStreamSyncRegistry({
       gatewayUrl: "https://gateway.test",
@@ -254,7 +273,28 @@ function instrument(
 }
 
 mkdirSync(DIR, { recursive: true });
+console.log(
+  "[runtime]",
+  JSON.stringify({
+    node: process.version,
+    openssl: process.versions.openssl,
+    nativeKeccak: getHashes().includes("keccak-256"),
+    mode: DEFER,
+    rows: ROWS,
+    runs: Number(arg("runs", "64")),
+    readers: READERS,
+    getMs: GET_MS,
+  }),
+);
 
+async function fingerprint(db: SqlDriver) {
+  const rows = await db.query(
+    "SELECT pk_hash, body_sha256, stamp_o, stamp_r, stamp_n, first_o FROM records ORDER BY connection_id, stream, pk_hash",
+  );
+  return createHash("sha256").update(JSON.stringify(rows)).digest("hex");
+}
+let expectedFingerprint = "";
+let expectedPosition = 0;
 // ---- publisher
 {
   const db = await openLocalDb(openBetterSqlite3(":memory:"), {
@@ -278,7 +318,7 @@ mkdirSync(DIR, { recursive: true });
     }),
   });
   const t0 = performance.now();
-  const RUNS = Number(arg("runs", "1"));
+  const RUNS = Number(arg("runs", "64"));
   const perRun = Math.ceil(ROWS / RUNS);
   let tIntake = 0;
   let tCycle = 0;
@@ -336,6 +376,26 @@ mkdirSync(DIR, { recursive: true });
   console.log(
     `[publisher] rows=${ROWS} intake=${((t1 - t0) / 1000).toFixed(1)}s publish-cycle=${((t2 - t1) / 1000).toFixed(1)}s blobs=${store.size} bytes=${(bytes / 1e6).toFixed(1)}MB`,
   );
+  expectedFingerprint = await fingerprint(db);
+  expectedPosition = (
+    await db.query<{ position: number }>(
+      "SELECT position FROM log_state WHERE connection_id=?",
+      [CONNECTION_ID],
+    )
+  )[0]!.position;
+  const exportFixture = arg("export-fixture", "");
+  if (exportFixture) {
+    mkdirSync(exportFixture, { recursive: true });
+    const entries = [...store].map(([key, bytes], i) => {
+      const file = `${i}.bin`;
+      writeFileSync(join(exportFixture, file), bytes);
+      return { key, file };
+    });
+    writeFileSync(
+      join(exportFixture, "index.json"),
+      JSON.stringify({ rows: ROWS, runs: RUNS, expectedFingerprint, entries }),
+    );
+  }
   await db.close();
 }
 
@@ -382,6 +442,27 @@ for (let r = 0; r < READERS; r++) {
       params: [CONNECTION_ID, CONNECTOR],
     },
   ]);
+  const originalBatch = db.batch.bind(db);
+  let stagedSegments = 0;
+  db.batch = async (statements) => {
+    if (
+      statements.some((st) => st.sql.includes("INSERT INTO bootstrap_segments"))
+    )
+      stagedSegments++;
+    const finish = statements.some((st) => st.sql === "DROP TABLE records")
+      ? "swap"
+      : statements.some((st) => st.sql === "DROP TABLE bootstrap_records")
+        ? "copy"
+        : null;
+    if (finish) timing.mark(`${finish}_batch_start`);
+    const result = await originalBatch(statements);
+    if (finish) timing.mark(`${finish}_batch_end`);
+    return result;
+  };
+  console.log(
+    `[host ${r}] load=${JSON.stringify(loadavg())} freeGB=${(freemem() / 1e9).toFixed(2)} defer=${DEFER}`,
+  );
+  const readSamples: unknown[] = [];
   // Memory the reader adds: the sampled peak above what the process held at the start.
   const before = process.memoryUsage();
   let peakRss = before.rss;
@@ -408,27 +489,83 @@ for (let r = 0; r < READERS; r++) {
   const poll = (async () => {
     let listed = false;
     let row = false;
-    while (polling && !(listed && row)) {
+    while (polling) {
       if (!listed) {
         const scopes = await listing.listScopes({
           canRead: () => true,
           includeLoading: true,
         });
-        if (scopes.length > 0) {
+        if (
+          scopes.some((scope) => scope.scope === `pdpp.${CONNECTOR}.${STREAM}`)
+        ) {
           listed = true;
           timing.mark("listed_at");
         }
       }
       if (!row) {
-        const [{ n }] = await db.query<{ n: number }>(
-          "SELECT EXISTS(SELECT 1 FROM records) AS n",
+        const ownerRow = await firstOwnerRow(
+          deps,
+          `pdpp.${CONNECTOR}.${STREAM}`,
         );
-        if (n === 1) {
+        if (ownerRow !== null) {
+          if (typeof ownerRow.id !== "string" || !ownerRow.id.startsWith("m-"))
+            throw new Error("unexpected owner row");
           row = true;
           timing.mark("first_row_at");
         }
       }
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      if (row) {
+        const [p] = await db.query<{
+          stream: string;
+          version: number;
+          generation: number;
+          data_hash: string;
+        }>(
+          "SELECT stream,version,generation,data_hash FROM stream_partial WHERE connection_id=? LIMIT 1",
+          [CONNECTION_ID],
+        );
+        if (p) {
+          const q = partialPage(
+            {
+              connectionId: CONNECTION_ID,
+              stream: p.stream,
+              version: p.version,
+              generation: p.generation,
+              dataHash: p.data_hash,
+            },
+            undefined,
+          );
+          let t = performance.now();
+          const page = await db.query(q.sql, q.params);
+          timing.max("partial_read_ms", performance.now() - t);
+          if (!page.some((x) => x.pk_hash !== null))
+            throw new Error("partial view lost its rows");
+          if (readSamples.length === 0) timing.mark("first_partial_page_at");
+          t = performance.now();
+          const list = await createRecordQuery(db).listRecords({
+            connectionId: CONNECTION_ID,
+            stream: STREAM,
+          });
+          timing.max("record_list_ms", performance.now() - t);
+          if (!list.records.length) throw new Error("record list lost rows");
+          t = performance.now();
+          const found = await createRecordQuery(db).getRecord({
+            connectionId: CONNECTION_ID,
+            stream: STREAM,
+            recordKey: list.records[0]!.recordKey,
+          });
+          timing.max("record_get_ms", performance.now() - t);
+          if (!found) throw new Error("getRecord lost its row");
+          if (readSamples.length < 4)
+            readSamples.push({
+              partialPlan: await db.query(
+                "EXPLAIN QUERY PLAN " + q.sql,
+                q.params,
+              ),
+            });
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, row ? 250 : 20));
     }
   })();
   const report = await sync.cycle();
@@ -464,12 +601,38 @@ for (let r = 0; r < READERS; r++) {
     `[reader ${r}] wall=${wall.toFixed(1)}s records=${n} progressive=${PROGRESSIVE}`,
     timing.report(),
   );
+  console.log(
+    `[proof ${r}]`,
+    JSON.stringify({
+      load: loadavg(),
+      readSamples,
+      stagedSegments,
+      indexes: await db.query(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='records'",
+      ),
+      integrity: await db.query("PRAGMA integrity_check"),
+    }),
+  );
+  if ((await fingerprint(db)) !== expectedFingerprint)
+    throw new Error("final state differs from publisher");
+  const [cursor] = await db.query<{ position: number }>(
+    "SELECT position FROM log_state WHERE connection_id=?",
+    [CONNECTION_ID],
+  );
+  if (cursor?.position !== expectedPosition)
+    throw new Error("final log cursor differs from publication");
+  if ((await db.query("SELECT 1 FROM stream_partial")).length)
+    throw new Error("load ended with partial markers");
+  if (n !== ROWS) throw new Error(`wrong row count: ${n}`);
+
   await db.close();
   if (arg("keep", "off") !== "on")
     for (const s of ["", "-wal", "-shm", ".lock"])
       rmSync(path + s, { force: true });
 }
-results.sort((a, b) => a - b);
-console.log(
-  `[summary] n=${results.length} p50=${results[Math.floor(results.length / 2)]!.toFixed(1)}s all=${results.map((x) => x.toFixed(1)).join(",")}`,
-);
+if (results.length > 0) {
+  results.sort((a, b) => a - b);
+  console.log(
+    `[summary] n=${results.length} p50=${results[Math.floor(results.length / 2)]!.toFixed(1)}s all=${results.map((x) => x.toFixed(1)).join(",")}`,
+  );
+}

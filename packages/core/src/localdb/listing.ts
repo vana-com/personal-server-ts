@@ -144,7 +144,9 @@ export function createLocalListing(
       records: number;
       stamped_at: number | null;
     }>(
-      `SELECT connection_id, stream, COUNT(*) AS records, MAX(${SEEN_O}) AS stamped_at FROM records GROUP BY connection_id, stream`,
+      `SELECT connection_id, stream, COUNT(*) AS records, MAX(${SEEN_O}) AS stamped_at FROM records r
+       ${progressive ? "WHERE NOT EXISTS (SELECT 1 FROM partial_hidden h WHERE h.connection_id=r.connection_id AND h.stream=r.stream AND h.pk_hash=r.pk_hash)" : ""}
+       GROUP BY connection_id, stream`,
     );
     const heads = await reads.db.query<{
       connection_id: string;
