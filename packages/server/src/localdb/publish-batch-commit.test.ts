@@ -1235,6 +1235,31 @@ describe("the size of a request is the gateway's advertised bound", () => {
     expect(sizes).toEqual([1, 24, 1]);
   });
 
+  // A written stream row fences its connection's log row, which the batch
+  // does not write. The gateway counts rows plus distinct fenced log rows
+  // against `lockedScopes` and answers 422 beyond it; the client packs to it.
+  it("a lock budget with a fence: a full pack passes, one more row waits for the next batch", async () => {
+    const sizes = await cycle({
+      streams: 30,
+      blobPolicy: wide,
+      gateway: {
+        policy: { rows: 31, requires: 40, bytes: 1_000_000, lockedScopes: 26 },
+      },
+    });
+    // The first commit alone (1 row + 1 fence); then 25 rows + 1 fence = 26,
+    // and the 4 left go in a third batch. No request was refused.
+    expect(sizes).toEqual([1, 25, 4]);
+  });
+
+  it("a gateway that sends no lock budget is packed to rows alone", async () => {
+    const sizes = await cycle({
+      streams: 30,
+      blobPolicy: wide,
+      gateway: { policy: { rows: 31, requires: 40, bytes: 1_000_000 } },
+    });
+    expect(sizes).toEqual([1, 29]);
+  });
+
   it("a gateway that advertises fewer rows gets fewer", async () => {
     const sizes = await cycle({
       streams: 8,
@@ -1258,6 +1283,19 @@ describe("Batch-Policy", () => {
       bytes: 3849121,
       requires: 2080,
     });
+  });
+  it("reads the lock budget when the gateway sends it", () => {
+    expect(
+      parseBatchPolicy("rows=31;bytes=3606546;requires=1952;lockedScopes=26"),
+    ).toEqual({ rows: 31, bytes: 3606546, requires: 1952, lockedScopes: 26 });
+  });
+  it("ignores a lock budget it cannot read, keeping the rest", () => {
+    expect(
+      parseBatchPolicy("rows=31;bytes=3606546;requires=1952;lockedScopes=26"),
+    ).toMatchObject({ lockedScopes: 26 });
+    expect(
+      parseBatchPolicy("rows=31;bytes=1;requires=1;lockedScopes=x"),
+    ).toBeUndefined();
   });
   it("reads nothing from a header it cannot read", () => {
     for (const bad of [
