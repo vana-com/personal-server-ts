@@ -140,6 +140,40 @@ it("an explicit control observation wins over a listed control", async () => {
   expect(await here.rows()).toEqual([]);
 });
 
+it("an old listing cannot roll back a reconnected generation", async () => {
+  const w = await world({ streams: 1 });
+  const peer = await w.device("peer");
+  const here = await w.device("here");
+  await peer.run("old", [{ stream: sName(0), id: "old" }]);
+  await peer.cycle();
+  await here.cycle();
+  const listed = await here.deps.registry.listOwnerRows();
+  const oldControl = listed.find((row) => row.scope === CONTROL)!.read;
+  const oldState = await localState(here);
+  await peer.sync.deleter.requestConnectionDelete(CONNECTOR);
+  expect(await peer.sync.deleter.resumeDeletes()).toEqual([]);
+  await here.cycle();
+  expect(await here.rows()).toEqual([]);
+  await peer.run("new", [{ stream: sName(0), id: "new" }], { connect: true });
+  await peer.cycle();
+  await here.cycle();
+  const current = await localState(here);
+  expect(current.connections[0]!.generation).toBeGreaterThan(
+    oldState.connections[0]!.generation,
+  );
+  expect(current.records.join(" ")).toContain('"new"');
+  const reads: string[] = [];
+  const read = here.deps.registry.read.bind(here.deps.registry);
+  here.deps.registry.read = async (scope) => {
+    reads.push(scope);
+    return read(scope);
+  };
+  await applyConnection(here.deps, CONNECTION_ID, listed, oldControl);
+  expect(await localState(here)).toEqual(current);
+  expect(reads).toContain(CONTROL);
+  expect((await here.rows()).join(" ")).not.toContain('"old"');
+});
+
 describe("applying a change delta", () => {
   it("a peer's log commit: no registry read, one segment GET, the rows a cycle gives (mutation: applyLog without the delta's read)", async () => {
     const { w, peer, here } = await peerCommitted();
