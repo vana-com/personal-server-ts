@@ -141,7 +141,9 @@ export interface BeginResponse {
    * before it collects (a save that reports the control version it observed)
    * would otherwise read again. Absent from an answer that replays an earlier
    * `begin` or an ended run, and `undefined` when the registry did not answer
-   * (the run begins offline).
+   * (the run begins offline). A replay therefore reads the same as an
+   * unreachable registry: a caller that needs the state after a replay reads
+   * the registry itself; the row is not stored with the run.
    */
   readonly control?: ControlState;
   readonly start: {

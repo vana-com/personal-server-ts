@@ -271,7 +271,9 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           ).length
         )
           throw new RunIntakeError("connection_stopped");
-        let synced = await syncBeforeBegin(deps, req.connector);
+        let synced = await syncBeforeBegin(deps, req.connector, {
+          foreign: "report",
+        });
         // Another key's control row: this owner cannot publish what a run
         // would collect. Nothing is written for it (`syncBeforeBegin`).
         if (synced.control?.kind === "foreign")
@@ -321,7 +323,9 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             throw error;
           }
           admittedControlVersion = version;
-          synced = await syncBeforeBegin(deps, req.connector);
+          synced = await syncBeforeBegin(deps, req.connector, {
+            foreign: "report",
+          });
           if (synced.unreachable)
             throw new RunIntakeError("control_basis_unavailable");
           if (synced.connection?.controlVersion !== admittedControlVersion)

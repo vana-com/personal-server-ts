@@ -71,18 +71,27 @@ async function savePathWorld() {
     owner: ownerAddress,
     isTombstone: () => false,
   });
-  const at = (t: number) => Math.round(t);
-  /** When each registry commit of the connection's log answered, and its scope. */
-  const commits: { readonly at: number; readonly landed: boolean }[] = [];
+  /** Each registry commit of the connection's log that was sent, and whether it landed. */
+  const commits: { readonly landed: boolean }[] = [];
+  /** Holds every registry listing until `releaseListings` (see the second test). */
+  let releaseListings!: () => void;
+  const listingsHeld = new Promise<void>((r) => (releaseListings = r));
+  let holdListings = false;
   const timedFetch = (async (input: string, init?: RequestInit) => {
     await sleep(WIRE_MS);
+    if (
+      holdListings &&
+      (init?.method ?? "GET") === "GET" &&
+      new URL(input).pathname === "/v1/data"
+    )
+      await listingsHeld;
     const response = await gateway.fetch(input, init);
     if (new URL(input).pathname === "/v1/data/batch") {
       const body = JSON.parse(String(init?.body)) as {
         rows: { scope: string }[];
       };
       if (body.rows.some((row) => row.scope === LOG))
-        commits.push({ at: at(performance.now()), landed: response.ok });
+        commits.push({ landed: response.ok });
     }
     return response;
   }) as unknown as typeof fetch;
@@ -173,7 +182,18 @@ async function savePathWorld() {
       lastBatch: 0,
     });
   };
-  return { server, collect, commits, segmentPuts, gateway };
+  return {
+    server,
+    collect,
+    commits,
+    segmentPuts,
+    gateway,
+    /** From now on a registry listing answers only after the returned release. */
+    holdListings: () => {
+      holdListings = true;
+      return releaseListings;
+    },
+  };
 }
 
 describe("the save path of a Web write", () => {
@@ -182,21 +202,25 @@ describe("the save path of a Web write", () => {
     await collect("run-1");
     const receipt = await server.publish();
     expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-1"]]);
-    // Let any second publish that the save started finish its own PUT and commit.
-    await sleep(WIRE_MS * 12);
+    // A second publish waits for any publish still running, so what it sees
+    // afterwards is everything the save sent.
+    await server.publish();
     expect(segmentPuts).toHaveLength(1);
     expect(commits).toHaveLength(1);
   });
 
-  it("resolves publish() when the registry commit answers, not after the cycle's reads", async () => {
-    const { server, collect, commits } = await savePathWorld();
+  it("resolves publish() at the registry commit, with every registry listing still unanswered", async () => {
+    const { server, collect, commits, holdListings } = await savePathWorld();
+    const release = holdListings();
     await collect("run-1");
-    await server.publish();
-    const resolvedAt = Math.round(performance.now());
-    const committedAt = commits[0]!.at;
-    // The commit made the save durable. What follows it is the local
-    // bookkeeping of one SQLite batch, never another registry request
-    // (one is `WIRE_MS`).
-    expect(resolvedAt - committedAt).toBeLessThan(WIRE_MS / 2);
+    // A publish that waited for the cycle's listing and apply would wait here
+    // for ever; the bound only turns that into a failure.
+    const outcome = await Promise.race([
+      server.publish().then(() => "resolved"),
+      sleep(5000).then(() => "waited for a listing"),
+    ]);
+    release();
+    expect(outcome).toBe("resolved");
+    expect(commits).toHaveLength(1);
   });
 });

@@ -28,6 +28,8 @@ function connectionId(connector: string, ns: string): string {
 const SELECT_CONNECTIONS = `SELECT connection_id AS connectionId, connector, ns,
   generation, control_state AS controlState, control_version AS controlVersion
   FROM connections`;
+const HAS_STREAMS = `EXISTS (SELECT 1 FROM stream_state s WHERE s.connection_id = connections.connection_id)`;
+
 type SqlConnection = ConnectionRow & Record<string, string | number>;
 
 async function cachedConnection(deps: LocalSyncDeps, id: string) {
@@ -169,8 +171,17 @@ export async function newConnectionsWithStreams(
 ): Promise<readonly ConnectionRow[]> {
   return deps.db.query<SqlConnection>(
     `${SELECT_CONNECTIONS} WHERE control_state = 'absent' AND generation = 1
-       AND EXISTS (SELECT 1 FROM stream_state s WHERE s.connection_id = connections.connection_id)
+       AND ${HAS_STREAMS}
      ORDER BY connection_id`,
+  );
+}
+
+/** Every connection that holds streams, whatever its control state. */
+export async function connectionsWithStreams(
+  deps: LocalSyncDeps,
+): Promise<readonly ConnectionRow[]> {
+  return deps.db.query<SqlConnection>(
+    `${SELECT_CONNECTIONS} WHERE ${HAS_STREAMS} ORDER BY connection_id`,
   );
 }
 
@@ -183,12 +194,14 @@ export async function newConnectionsWithStreams(
  *
  * `control` is the control row as the registry answered, classified for this
  * owner's key (`null` when the registry did not answer). A row under another
- * key (`foreign`) is reported and not saved: nothing local is written for a
- * connection this device cannot publish.
+ * key (`foreign`) is saved like any other, which later fences (a legacy
+ * import, a seed) read; `foreign: "report"` returns it and writes nothing,
+ * for a caller that refuses the connection before any local write (`begin`).
  */
 export async function syncBeforeBegin(
   deps: LocalSyncDeps,
   connector: string,
+  options: { readonly foreign?: "save" | "report" } = {},
 ): Promise<{
   readonly connection: ConnectionRow | null;
   readonly control: ControlState | null;
@@ -217,7 +230,7 @@ export async function syncBeforeBegin(
       };
     }
     const state = classifyControl(read, control);
-    if (state.kind === "foreign")
+    if (state.kind === "foreign" && options.foreign === "report")
       return {
         connection: await cachedConnection(locked, id),
         control: state,

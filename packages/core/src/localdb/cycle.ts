@@ -5,10 +5,11 @@ import {
 } from "./apply.js";
 import {
   bootstrapConnections,
+  connectionsWithStreams,
   knownActiveConnections,
   newConnectionsWithStreams,
 } from "./bootstrap.js";
-import type { LocalSyncDeps } from "./deps.js";
+import type { ConnectionRow, LocalSyncDeps } from "./deps.js";
 import { publishLog } from "./log-publish.js";
 import { publishConnection, type PublishResult } from "./publish.js";
 import { insideQueue } from "./slot.js";
@@ -55,7 +56,7 @@ export async function runCycle(
   const early =
     made ??
     (deps.logProtocol
-      ? await publishEarly(deps)
+      ? await publishEarly(deps, await earlyCandidates(deps))
       : new Map<string, EarlyPublish>());
   const connections = await bootstrapConnections(deps);
   return {
@@ -86,21 +87,28 @@ export async function runCycle(
  */
 export async function runPublish(deps: LocalSyncDeps): Promise<CycleReport> {
   if (!deps.logProtocol) return runCycle(deps);
-  const fresh = new Set(
-    (await newConnectionsWithStreams(deps)).map((c) => c.connectionId),
-  );
-  const early = await publishEarly(deps);
-  // A fresh connection has streams, so no result at all means its deferral was
+  const candidates = await earlyCandidates(deps);
+  const early = await publishEarly(deps, candidates);
+  const fresh = new Set(candidates.fresh.map((c) => c.connectionId));
+  // Every connection the early publish takes must have a result: a registry
+  // without the batch route answers `null` and leaves none, and a save is then
+  // not published (the cycle reports it or publishes it another way). A fresh
+  // connection has streams, so no published result means its deferral was
   // dropped (`publishEarly`); a known connection with no streams has none.
-  const settled = [...early].every(
-    ([connectionId, e]) =>
-      e.error === null &&
-      (e.published.length > 0 || !fresh.has(connectionId)) &&
-      e.published.every(
-        (r) => r.outcome === "published" || r.outcome === "noop",
-      ),
+  const settled = [...candidates.active, ...candidates.fresh].every(
+    ({ connectionId }) => {
+      const e = early.get(connectionId);
+      return (
+        e !== undefined &&
+        e.error === null &&
+        (e.published.length > 0 || !fresh.has(connectionId)) &&
+        e.published.every(
+          (r) => r.outcome === "published" || r.outcome === "noop",
+        )
+      );
+    },
   );
-  if (!settled || (await hasUnplacedConnections(deps)))
+  if (!settled || (await hasUnplacedConnections(deps, candidates)))
     return runCycle(deps, early);
   return {
     connections: [...early].map(([connectionId, e]) => ({
@@ -112,19 +120,33 @@ export async function runPublish(deps: LocalSyncDeps): Promise<CycleReport> {
   };
 }
 
+/** The connections the early publish takes: known active, and new with streams. */
+interface EarlyCandidates {
+  readonly active: readonly ConnectionRow[];
+  readonly fresh: readonly ConnectionRow[];
+}
+
+async function earlyCandidates(deps: LocalSyncDeps): Promise<EarlyCandidates> {
+  return {
+    active: await knownActiveConnections(deps),
+    fresh: await newConnectionsWithStreams(deps),
+  };
+}
+
 /**
  * A connection with streams that the early publish takes neither as active nor
  * as new: it waits for the cycle's listing.
  */
-async function hasUnplacedConnections(deps: LocalSyncDeps): Promise<boolean> {
-  const rows = await deps.db.query(
-    `SELECT 1 FROM connections c
-      WHERE EXISTS (SELECT 1 FROM stream_state s WHERE s.connection_id = c.connection_id)
-        AND NOT (c.control_state = 'active'
-                 OR (c.control_state = 'absent' AND c.generation = 1))
-      LIMIT 1`,
+async function hasUnplacedConnections(
+  deps: LocalSyncDeps,
+  { active, fresh }: EarlyCandidates,
+): Promise<boolean> {
+  const placed = new Set(
+    [...active, ...fresh].map(({ connectionId }) => connectionId),
   );
-  return rows.length > 0;
+  return (await connectionsWithStreams(deps)).some(
+    ({ connectionId }) => !placed.has(connectionId),
+  );
 }
 
 /**
@@ -144,10 +166,9 @@ async function hasUnplacedConnections(deps: LocalSyncDeps): Promise<boolean> {
  */
 async function publishEarly(
   deps: LocalSyncDeps,
+  { active, fresh }: EarlyCandidates,
 ): Promise<Map<string, EarlyPublish>> {
   const early = new Map<string, EarlyPublish>();
-  const active = await knownActiveConnections(deps);
-  const fresh = await newConnectionsWithStreams(deps);
   await Promise.all([
     ...active.map(async ({ connectionId }) => {
       try {

@@ -2,6 +2,7 @@
 // host that needs the row's state before it collects (the Web save) reads it
 // from `begin` and not from the registry a second time.
 import { afterEach, describe, expect, it } from "vitest";
+import { syncBeforeBegin } from "../../../core/src/localdb/bootstrap.js";
 import { RunIntakeError } from "../../../core/src/stream-sync/intake.js";
 import {
   CONNECTOR,
@@ -55,5 +56,16 @@ describe("begin returns the control row it read", () => {
     });
     expect(await d.db.query("SELECT 1 FROM connections")).toEqual([]);
     expect(await d.db.query("SELECT 1 FROM runs")).toEqual([]);
+  });
+
+  it("still saves a foreign control row for a caller that does not refuse it (import, seed)", async () => {
+    const w = await world({ streams: 1, logProtocol: true });
+    w.gateway.write(CONTROL, {
+      dataHash: `0x${"ab".repeat(32)}`,
+      metadataHash: `0x${"cd".repeat(32)}`,
+    });
+    const d = await w.device("d1");
+    const synced = await syncBeforeBegin(d.deps, CONNECTOR);
+    expect(synced.connection?.controlState).toBe("foreign");
   });
 });

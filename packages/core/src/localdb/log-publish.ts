@@ -233,7 +233,11 @@ function inFlightOf(
   return chain;
 }
 
-/** A published result outranks a later one that found nothing to send. */
+/**
+ * A published result outranks a later one that found nothing to send. Two
+ * published results of one stream keep the later receipt with the runs of both:
+ * a caller that asked for the first run's receipt still finds its run.
+ */
 function mergeResults(
   earlier: readonly PublishResult[],
   later: readonly PublishResult[],
@@ -243,11 +247,24 @@ function mergeResults(
     const held = byStream.get(result.stream);
     if (held?.outcome === "published" && result.outcome !== "published")
       continue;
-    byStream.set(result.stream, result);
+    byStream.set(
+      result.stream,
+      held?.outcome === "published" && result.outcome === "published"
+        ? unionRuns(held, result)
+        : result,
+    );
   }
   return [...byStream.values()].sort((a, b) =>
     a.stream.localeCompare(b.stream),
   );
+}
+
+function unionRuns(held: PublishResult, result: PublishResult): PublishResult {
+  if (!held.publication || !result.publication) return result;
+  const runIds = [
+    ...new Set([...held.publication.runIds, ...result.publication.runIds]),
+  ];
+  return { ...result, publication: { ...result.publication, runIds } };
 }
 
 async function publishRounds(
@@ -261,7 +278,12 @@ async function publishRounds(
       const earlier = results.get(result.stream);
       if (earlier?.outcome === "published" && result.outcome !== "published")
         continue;
-      results.set(result.stream, result);
+      results.set(
+        result.stream,
+        earlier?.outcome === "published" && result.outcome === "published"
+          ? unionRuns(earlier, result)
+          : result,
+      );
     }
   };
   let attempts = 0;
