@@ -134,3 +134,26 @@ it("a listed active control cannot revive a deletion already observed locally", 
     ),
   ).toEqual([{ control_state: "deleted" }]);
 });
+
+it("applies other connections before reporting a startup failure", async () => {
+  const w = await world({ streams: 1 });
+  const peer = await w.device("peer");
+  await peer.run("first", [{ stream: sName(0), id: "first" }]);
+  await peer.run("second", [{ stream: sName(0), id: "second" }], {
+    connector: "second-connector",
+  });
+  await peer.cycle();
+  const failure = new Error("first connection failed");
+  const attempted: string[] = [];
+  const here = await w.device("here", {
+    beforeGet: async (key) => {
+      attempted.push(key);
+      if (key.includes("pdpp.fixture")) throw failure;
+    },
+  });
+  await expect(here.sync.apply()).rejects.toBe(failure);
+  expect(attempted.some((key) => key.includes("second-connector"))).toBe(true);
+  const rows = (await here.rows()).join(" ");
+  expect(rows).toContain('"second"');
+  expect(rows).not.toContain('"first"');
+});
