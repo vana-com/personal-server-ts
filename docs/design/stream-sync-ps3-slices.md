@@ -1,6 +1,6 @@
 # PS-3 slices
 
-Base: `e3f6e16a` (PS-2 merged into `feat/stream-sync`). Interface branch: `feat/stream-sync-ps3`. This document is the committed copy of `~/.tmp/ps3-1110/SLICES.md`.
+Base: `e3f6e16a` (PS-2 merged into `feat/stream-sync`). Interface branch: `feat/stream-sync-ps3`. This document is the committed copy of the lane's local `SLICES.md`.
 
 Owner: Personal Server local database migration. Lifecycle: active implementation contract; update when ports or slice ownership change; archive after PS-3 acceptance. Implemented slices are recorded by their commits and tests; remaining stubs refuse. Existing exports remain unchanged; the localdb barrel only adds exports. Builders must not enable retirement by default.
 

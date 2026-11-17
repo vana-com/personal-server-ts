@@ -3,7 +3,7 @@
 Status: design, resolved 2026-09-02 (Kahtaf)  
 Parent: `260901-personal-server-gateway-enclave-architecture.md`, decisions 9 to 13, 19, 24, 26
 
-Binding: architecture doc decisions 9-13, 19, 24, 26 (`personal-server-ts/docs/260901-personal-server-gateway-enclave-architecture.md`), Spikes 0-2 (`docs/260902-enclave-spike-results.md`). Repos: `/Users/kahtaf/Documents/workspace_vana/{data-gateway,vana-sdk,unity-surfaces,personal-server-ts,personal-server-ts-spike-enclave}`.
+Binding: architecture doc decisions 9-13, 19, 24, 26 (`personal-server-ts/docs/260901-personal-server-gateway-enclave-architecture.md`), Spikes 0-2 (`docs/260902-enclave-spike-results.md`). Repos: `<workspace>/{data-gateway,vana-sdk,unity-surfaces,personal-server-ts,personal-server-ts-spike-enclave}`.
 
 ## 1. Flow
 
