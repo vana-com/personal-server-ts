@@ -16,11 +16,11 @@ import {
   complete,
   connectionsOf,
   loadStreams,
-  isOptionalStream,
   projectAlias,
   readability,
   selectForTarget,
   servedStreamOf,
+  servedStreams,
   targetsForScope,
   tombstoned,
   tombstonedForRead,
@@ -51,9 +51,14 @@ export interface LocalAliasTarget {
   readonly requiredStreams?: readonly string[];
   readonly servedStream?: string;
   readonly windowed?: boolean;
+  /**
+   * `fetched` names the streams the read served, whether or not they had
+   * rows: a stream left out of it was never read.
+   */
   readonly project: (
     records: readonly LocalAliasRecord[],
     now: string,
+    fetched: readonly string[],
   ) =>
     | { readonly ok: true; readonly payload: unknown }
     | { readonly ok: false; readonly error: { readonly kind: string } };
@@ -342,21 +347,17 @@ export function createLocalResolver(
     }
     if (connection.control_state === "foreign") return { kind: "key_mismatch" };
     const all = await streams(connection.connection_id);
-    const selected = candidate.target.streams.map((name) =>
-      all.find((s) => s.stream === name),
+    const { streams: installed, missingRequired } = servedStreams(
+      candidate.target,
+      candidate.target.streams.flatMap((name) => {
+        const s = all.find((s) => s.stream === name);
+        return s ? [s] : [];
+      }),
+      connection,
     );
-    if (selected.some((s) => s && tombstoned(s))) return deleted();
-    // A stream the alias serves without (see `requiredStreams`) may be absent;
-    // one that is installed must still be complete.
-    if (
-      selected.some((s, i) =>
-        s
-          ? !complete(s, connection)
-          : !isOptionalStream(candidate.target, candidate.target.streams[i]!),
-      )
-    )
+    if (installed.some(tombstoned)) return deleted();
+    if (missingRequired || installed.some((s) => !complete(s, connection)))
       return noData();
-    const installed = selected.filter((s): s is Stream => s !== undefined);
     const current = { ...candidate, connection, streams: installed };
     const cursor = cursorFor(current);
     if (input.cursor !== null && input.cursor !== cursor)

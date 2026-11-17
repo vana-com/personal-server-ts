@@ -6,6 +6,7 @@ import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
+import { targetsForScope } from "../../../core/src/localdb/read-selection.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import { readerOf, type SqlDriver } from "../../../core/src/localdb/driver.js";
 import type { RecordQuery } from "../../../core/src/localdb/query.js";
@@ -693,7 +694,11 @@ describe("local resolve through the host's real legacy alias port", () => {
     has_attachments: false,
     text_content: "milk",
   };
-  async function icloud(streams: Record<string, Record<string, unknown>>) {
+  async function icloud(
+    streams: Record<string, Record<string, unknown>>,
+    heads: Record<string, { complete?: boolean; floor?: number }> = {},
+    readStreams: string[] = [],
+  ) {
     const f = await fixture();
     await f.db.batch([
       {
@@ -704,7 +709,7 @@ describe("local resolve through the host's real legacy alias port", () => {
       },
     ]);
     for (const [stream, row] of Object.entries(streams)) {
-      await f.head(stream, { profile: ICLOUD });
+      await f.head(stream, { profile: ICLOUD, ...heads[stream] });
       await f.db.batch([
         {
           sql: `INSERT OR REPLACE INTO records
@@ -715,7 +720,13 @@ describe("local resolve through the host's real legacy alias port", () => {
       ]);
     }
     const resolver = createLocalResolver(f.deps, {
-      query: f.query,
+      query: {
+        ...f.query,
+        streamRecords: (connectionId, stream) => {
+          readStreams.push(stream);
+          return f.query.streamRecords(connectionId, stream);
+        },
+      },
       olderVersions: f.olderVersions,
       aliasScopes: () => ["icloud_notes.notes"].values(),
       aliasTargets: legacyAliasScopes,
@@ -761,5 +772,68 @@ describe("local resolve through the host's real legacy alias port", () => {
     expect(verdict(await resolver.resolve(input("icloud_notes.notes")))).toBe(
       "no_data",
     );
+  });
+
+  const userNameOf = async (read: Awaited<ReturnType<typeof readOf>>) => {
+    expect(read.kind).toBe("view");
+    if (read.kind !== "view") return undefined;
+    const body = JSON.parse(await new Response(read.body).text()) as {
+      data: { userName: unknown; notes: { recordName: string }[] };
+    };
+    expect(body.data.notes.map((n) => n.recordName)).toEqual(["n1"]);
+    return body.data.userName;
+  };
+  type Resolver = Awaited<ReturnType<typeof icloud>>;
+  const readOf = (resolver: Resolver) =>
+    resolver.resolve(input("icloud_notes.notes"));
+
+  it("serves iCloud Notes without a profile stream that was deleted", async () => {
+    const resolver = await icloud(
+      {
+        notes: NOTE,
+        folders: { id: "f1", name: "Notes" },
+        profile: { id: "p1", user_name: "Ada" },
+      },
+      { profile: { floor: 2 } },
+    );
+    expect(await userNameOf(await readOf(resolver))).toBeNull();
+  });
+
+  it("serves iCloud Notes without a profile stream that is incomplete, and never reads it", async () => {
+    const readStreams: string[] = [];
+    const resolver = await icloud(
+      {
+        notes: NOTE,
+        folders: { id: "f1", name: "Notes" },
+        profile: { id: "p1", user_name: "Ada" },
+      },
+      { profile: { complete: false } },
+      readStreams,
+    );
+    expect(await userNameOf(await readOf(resolver))).toBeNull();
+    expect(readStreams.sort()).toEqual(["folders", "notes"]);
+  });
+
+  it("reports iCloud Notes deleted when a required stream is deleted", async () => {
+    const resolver = await icloud(
+      {
+        notes: NOTE,
+        folders: { id: "f1", name: "Notes" },
+        profile: { id: "p1", user_name: "Ada" },
+      },
+      { folders: { floor: 2 } },
+    );
+    expect(verdict(await readOf(resolver))).toBe("deleted");
+  });
+
+  it("refuses an alias that declares no required stream", () => {
+    const [target] = legacyAliasScopes("icloud_notes.notes");
+    expect(() =>
+      targetsForScope(
+        "icloud_notes.notes",
+        new Set(["icloud_notes.notes"]),
+        () => [{ ...target!, requiredStreams: [] }],
+      ),
+    ).toThrow(/no required stream/);
   });
 });

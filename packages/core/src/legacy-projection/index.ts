@@ -108,14 +108,13 @@ export function legacyAliasScopes(scope: string) {
       requiredStreams: required,
       servedStream: binding.window?.parentStream,
       windowed: Boolean(binding.window),
-      project: (records: readonly PdppRecord[], now: string) =>
+      project: (
+        records: readonly PdppRecord[],
+        now: string,
+        fetched: readonly string[],
+      ) =>
         projectPdppRecordsToLegacyPayload(scope, [...records], {
-          // A stream the binding serves without is named only when it has rows.
-          fetchedStreams: binding.pdppStreams.filter(
-            (stream) =>
-              required.includes(stream) ||
-              records.some((record) => record.stream === stream),
-          ),
+          fetchedStreams: [...fetched],
           profileKey: connector,
           orderByPrimaryKey: true,
           now,

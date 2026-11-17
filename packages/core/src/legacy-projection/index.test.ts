@@ -1695,10 +1695,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       ).toBeNull();
     });
 
-    // Connectors that predate the profile stream (the signed 0.1.0 declaration)
-    // never had one. Legacy's fullName was always null for them, so the scope
-    // keeps serving notes with that same null rather than disappearing.
-    it("hands the database the required streams of an alias, and the optional one only when it has rows", () => {
+    it("hands the database the required streams of an alias and projects the streams it served", () => {
       const [target] = legacyAliasScopes("icloud_notes.notes");
       expect(target?.streams).toEqual(["notes", "folders", "profile"]);
       expect(target?.requiredStreams).toEqual(["notes", "folders"]);
@@ -1717,16 +1714,28 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         { stream: "notes", data: note },
         { stream: "folders", data: { id: "f1", name: "Notes" } },
       ];
-      expect(target?.project(base, "2026-10-01T00:00:00.000Z")).toMatchObject({
+      const now = "2026-10-01T00:00:00.000Z";
+      // Served without a profile stream.
+      expect(target?.project(base, now, ["notes", "folders"])).toMatchObject({
         ok: true,
         payload: { userName: null },
       });
+      // Served and empty: a fetched stream with zero rows stays named.
+      expect(
+        target?.project(base, now, ["notes", "folders", "profile"]),
+      ).toMatchObject({ ok: true, payload: { userName: null } });
       expect(
         target?.project(
           [...base, { stream: "profile", data: { id: "p", user_name: "Ada" } }],
-          "2026-10-01T00:00:00.000Z",
+          now,
+          ["notes", "folders", "profile"],
         ),
       ).toMatchObject({ ok: true, payload: { userName: "Ada" } });
+      // A required stream the database did not serve is reported missing.
+      expect(target?.project(base, now, ["notes", "profile"])).toEqual({
+        ok: false,
+        error: expect.objectContaining({ kind: "missing_stream" }),
+      });
     });
 
     it("names profile as the one stream a host need not wait for", () => {
@@ -1737,6 +1746,9 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       expect(requiredLegacyStreams(folders)).toEqual(folders.pdppStreams);
     });
 
+    // Connectors that predate the profile stream (the signed 0.1.0 declaration)
+    // never had one. Legacy's fullName was always null for them, so the scope
+    // keeps serving notes with that same null rather than disappearing.
     it("serves notes and folders without a profile stream, with the pre-profile userName of null", () => {
       const result = projectPdppRecordsToLegacyPayload(
         "icloud_notes.notes",

@@ -100,17 +100,45 @@ export function targetsForScope(
     return [{ connector: logical.connector, streams: [logical.stream] }];
   }
   if (!aliasNames.has(scope)) return [];
-  return (aliasTargets?.(scope) ?? []).map((alias) => ({
-    connector: alias.connector,
-    streams: alias.streams,
-    alias,
-  }));
+  return (aliasTargets?.(scope) ?? []).map((alias) => {
+    if (alias.requiredStreams?.length === 0) {
+      throw new Error(
+        `alias ${scope} declares no required stream: nothing would gate its read`,
+      );
+    }
+    return { connector: alias.connector, streams: alias.streams, alias };
+  });
 }
 
 /** Whether `target` serves without `stream`: the alias names it outside `requiredStreams`. */
-export const isOptionalStream = (target: Target, stream: string): boolean =>
+const isOptionalStream = (target: Target, stream: string): boolean =>
   target.alias?.requiredStreams !== undefined &&
   !target.alias.requiredStreams.includes(stream);
+
+/**
+ * The held streams of `target` that a read serves, and gates on. A stream the
+ * alias serves without counts only while it is complete: absent, deleted or
+ * incomplete, it is left out as if never installed, and neither gates the read
+ * nor contributes rows. Every other stream is kept for the gates, and
+ * `missingRequired` says one of them is not held at all.
+ */
+export function servedStreams(
+  target: Target,
+  held: readonly Stream[],
+  connection: Connection,
+): { streams: Stream[]; missingRequired: boolean } {
+  const streams = held.filter(
+    (s) => !isOptionalStream(target, s.stream) || complete(s, connection),
+  );
+  return {
+    streams,
+    missingRequired: target.streams.some(
+      (name) =>
+        !isOptionalStream(target, name) &&
+        !streams.some((s) => s.stream === name),
+    ),
+  };
+}
 
 /** The stream whose head a read of `target` serves: its parent, if windowed. */
 export const servedStreamOf = (target: Target): string =>
@@ -281,20 +309,26 @@ export function selectForTarget(
   // A first load's applied parts are served for a logical stream only: an
   // alias projects the whole head, which a partial head cannot give.
   const progressive = options.progressive === true && !target.alias;
-  const active: Candidate[] = [];
+  const active: (Candidate & { readonly missingRequired: boolean })[] = [];
   for (const { connection, streams: all } of connections) {
     if (connection.control_state !== "active" || connection.deleted_at !== null)
       continue;
     const rank = all
       .filter((s) => live(s, connection))
       .map((s) => s.observed_at ?? 0);
-    active.push({
+    const served = servedStreams(
       target,
-      connection,
-      streams: target.streams.flatMap((name) => {
+      target.streams.flatMap((name) => {
         const s = all.find((s) => s.stream === name);
         return s ? [s] : [];
       }),
+      connection,
+    );
+    active.push({
+      target,
+      connection,
+      streams: served.streams,
+      missingRequired: served.missingRequired,
       registered: rank.length ? Math.max(...rank) : -Infinity,
     });
   }
@@ -312,14 +346,9 @@ export function selectForTarget(
   ) {
     return { candidate: undefined, tombstoned: true };
   }
-  if (
-    target.streams.some(
-      (name) =>
-        !isOptionalStream(target, name) &&
-        !selected.streams.some((s) => s.stream === name),
-    )
-  )
+  if (selected.missingRequired) {
     return { candidate: undefined, tombstoned: false };
+  }
   const states = selected.streams.map((s) =>
     readability(s, selected.connection, progressive),
   );
@@ -372,15 +401,16 @@ export async function projectAlias(
   ) {
     return { kind: "no_data" };
   }
+  const fetched = candidate.streams.map((s) => s.stream);
   if (binding.windowed) {
-    const probe = binding.project([], now);
+    const probe = binding.project([], now, fetched);
     if (!probe.ok && probe.error.kind.includes("profile")) {
       return { kind: "no_data" };
     }
   }
   const records: LocalAliasRecord[] = [];
   let bytes = 0;
-  for (const stream of candidate.target.streams) {
+  for (const stream of fetched) {
     for await (const record of query.streamRecords(
       candidate.connection.connection_id,
       stream,
@@ -393,7 +423,7 @@ export async function projectAlias(
       });
     }
   }
-  const projected = binding.project(records, now);
+  const projected = binding.project(records, now, fetched);
   return projected.ok
     ? { kind: "ok", payload: projected.payload }
     : { kind: "no_data" };
