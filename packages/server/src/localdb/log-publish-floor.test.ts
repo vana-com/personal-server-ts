@@ -28,10 +28,52 @@ const six = (prefix: string) =>
     id: `${prefix}${i}`,
   }));
 
-async function openWorld(others: number) {
+// All expected applies must reach the registry boundary before any enters it.
+// Promise continuations then enter the real coalescer as one arrival cohort;
+// database scheduling and the trace's artificial latency cannot split it.
+function applyListingBarrier(others: number) {
+  const expected = new Set(
+    Array.from({ length: others }, (_, i) => `other${i}`),
+  );
+  const arrived = new Set<string>();
+  let armed = false;
+  let release!: () => void;
+  let reject!: (reason: Error) => void;
+  const ready = new Promise<void>((resolve, fail) => {
+    release = resolve;
+    reject = fail;
+  });
+  // A bad first arrival can reject before another caller starts waiting.
+  void ready.catch(() => {});
+  return {
+    arm: () => {
+      armed = true;
+    },
+    async beforeListStreamRows(connector: string) {
+      if (!armed) return;
+      if (!expected.has(connector) || arrived.has(connector)) {
+        const error = new Error(
+          `unexpected or duplicate apply listing: ${connector}`,
+        );
+        reject(error);
+        throw error;
+      }
+      arrived.add(connector);
+      if (arrived.size === expected.size) release();
+      await ready;
+    },
+    assertComplete: () =>
+      expect([...arrived].sort()).toEqual([...expected].sort()),
+  };
+}
+
+async function openWorld(
+  others: number,
+  beforeListStreamRows?: (connector: string) => Promise<void>,
+) {
   const trace = requestTrace(2);
   const w = await world({ streams: 6, logProtocol: true, trace });
-  const a = await w.device("a");
+  const a = await w.device("a", true, { beforeListStreamRows });
   for (let c = 0; c < others; c++) {
     await a.run(`other-${c}`, six("o"), { connector: `other${c}` });
     await a.cycle();
@@ -68,14 +110,25 @@ describe("log publish: the requests of one save", () => {
   it("listings of the owner's rows stay at three or fewer, however many other connections the owner has", async () => {
     const lists: number[] = [];
     for (const others of [1, 9]) {
-      const { trace, a } = await openWorld(others);
+      const barrier = applyListingBarrier(others);
+      const { trace, a } = await openWorld(
+        others,
+        barrier.beforeListStreamRows,
+      );
       await a.run("save", six("b"), {
         connector: "other0",
         full: false,
         covered: [sName(0)],
       });
       trace.clear();
+      barrier.arm();
       await a.cycle();
+      barrier.assertComplete();
+      for (const request of trace.requests.filter((r) => r.kind === "list")) {
+        expect(request.label, trace.describe()).toMatch(
+          /^(listControlRows|listStreamRows\(.+\)|listConnectionRows\(.+\)|probeChange) limit=\d+ cursor=.+$/,
+        );
+      }
       lists.push(trace.count("list"));
       // The publish itself is a PUT and a commit, ahead of everything else.
       expect(trace.depthToLast("batch"), trace.describe()).toBe(2);
@@ -83,8 +136,8 @@ describe("log publish: the requests of one save", () => {
       // contract of apply); nothing else is read one request at a time.
       expect(trace.count("read"), trace.describe()).toBe(others);
     }
-    // The cycle's own listing, and the listings concurrent applies share: at
-    // most two, however many connections apply.
+    // The cycle's own listing plus at most two shared apply listings.
+    // The arrival barrier, not requestTrace(2), defines the apply cohort.
     for (const n of lists) expect(n, `lists ${lists}`).toBeLessThanOrEqual(3);
   });
 
