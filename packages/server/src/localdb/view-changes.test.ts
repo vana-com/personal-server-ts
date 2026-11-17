@@ -29,6 +29,7 @@ import {
   importLegacySource,
 } from "../../../core/src/localdb/legacy-import.js";
 import { createImportLedger } from "../../../core/src/localdb/import-ledger.js";
+import { migrate } from "../../../core/src/localdb/migrate.js";
 import { MIGRATIONS } from "../../../core/src/localdb/schema.js";
 import { unwriteRefusedRun } from "../../../core/src/localdb/unwrite.js";
 import type { ImportSource } from "../../../core/src/localdb/legacy-import-types.js";
@@ -1080,6 +1081,61 @@ describe("view changes", () => {
       stream: "s0",
     });
     expect(JSON.parse(shown.records[0]!.body)).toMatchObject({ version: 2 });
+  });
+
+  it("(p) a migration whose statement fails leaves the file at its version with no table changed", async () => {
+    const s = shared();
+    const old = await device(s, "a");
+    await collect(old, "c0");
+    await old.cycle();
+    const raw = old.raw;
+    // The migration that adds the stream meta to the version rows, in three
+    // statements. The file goes back to the version before it, and it already
+    // has the third column, so the third statement fails after the first two
+    // ran in the same batch.
+    const metaMigration = MIGRATIONS.findIndex((statements) =>
+      statements.some((sql) =>
+        sql.includes("ALTER TABLE stream_versions ADD COLUMN profile_key"),
+      ),
+    );
+    expect(MIGRATIONS[metaMigration]).toHaveLength(3);
+    await raw.batch([
+      { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
+      { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
+      { sql: `PRAGMA user_version = ${metaMigration}` },
+    ]);
+    const state = async () => ({
+      version: await raw.query("PRAGMA user_version"),
+      schema: await raw.query(
+        "SELECT type, name, sql FROM sqlite_master ORDER BY type, name",
+      ),
+      columns: await raw.query("PRAGMA table_info(stream_versions)"),
+      versions: await raw.query(
+        "SELECT * FROM stream_versions ORDER BY connection_id, stream, version",
+      ),
+      records: await raw.query(
+        "SELECT connection_id, stream, pk_hash, body FROM records ORDER BY connection_id, stream, pk_hash",
+      ),
+      log: await raw.query("SELECT * FROM log_state ORDER BY connection_id"),
+    });
+    const before = await state();
+    expect(before.versions.length).toBeGreaterThan(0);
+    expect(
+      (before.columns as { name: string }[]).map((c) => c.name),
+    ).not.toContain("primary_key");
+
+    await expect(migrate(raw)).rejects.toThrow(/duplicate column/);
+    expect(await state()).toEqual(before);
+    expect(before.version).toEqual([{ user_version: metaMigration }]);
+
+    // The same file upgrades once the third column is not there.
+    await raw.batch([
+      { sql: "ALTER TABLE stream_versions DROP COLUMN profile_version" },
+    ]);
+    await migrate(raw);
+    expect(await raw.query("PRAGMA user_version")).toEqual([
+      { user_version: MIGRATIONS.length },
+    ]);
   });
 
   it("(g) a listener that syncs or reads does not loop, and sees the commit", async () => {

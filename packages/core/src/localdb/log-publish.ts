@@ -24,8 +24,9 @@
 // except that a stream whose replacing run applies goes whole (its omission
 // completion and its changes are one unit) when the whole fits one segment.
 // A larger one goes in rounds, and only the round with its completion says
-// the stream is complete. A single record larger than the target goes alone,
-// its body out of line.
+// the stream is complete. A completion larger than what a round has left goes
+// in pieces, each naming a range of the dropped keys in hash order. A single
+// record larger than the target goes alone, its body out of line.
 //
 // Runs it cannot place (refused, fenced, from another lifetime) are cleaned up
 // and the round starts over; runs it cannot order yet (deferred) hold only
@@ -87,6 +88,7 @@ import {
   replaceDelete,
   seenBeforeParams,
   SEEN_BEFORE,
+  type KeyRange,
   withOrigin,
 } from "./merge.js";
 import {
@@ -180,6 +182,12 @@ type Planned = {
    * this device's own and so not a write the replace must yield to.
    */
   readonly replacing: { readonly o: number; readonly r: string } | null;
+  /**
+   * The keys of `replacing` that this round's piece of its completion names.
+   * The commit drops them here as the last piece's commit drops the rest, so
+   * the next round lists only the keys still to send.
+   */
+  readonly omitting: KeyRange | null;
   readonly omitted: readonly LogOmission[];
   readonly bytes: number;
 };
@@ -528,6 +536,7 @@ async function snapshotRound(
       runIds: plan.steps.map((step) => step.runId),
       replace: null,
       replacing: null,
+      omitting: null,
       omitted: [],
       bytes: 0,
     };
@@ -602,11 +611,14 @@ async function snapshotRound(
     // this segment is full. One larger than a segment goes like any other
     // changes, over as many rounds as it needs. Its completion (the keys it
     // dropped) goes in the round that takes its last rows, or alone in the
-    // next, and only that round says the stream is complete: an earlier round
-    // says it is not, so a reader never takes a replace that is half
-    // published for a complete stream. Every operation merges per key by
-    // stamp, so rounds from other writers in between interleave as they would
-    // with any other changes.
+    // next. A completion larger than what is left of the segment goes in
+    // pieces over as many rounds as it needs: each is a completion at the
+    // run's cutoff for the next keys in hash order, an omission per key like
+    // any other. Only the round with the last piece says the stream is
+    // complete: an earlier round says it is not, so a reader never takes a
+    // replace that is half published for a complete stream. Every operation
+    // merges per key by stamp, so rounds from other writers in between
+    // interleave as they would with any other changes.
     const room = (size: number) => first || budget + size <= target;
     const sizeOf = (op: LogOperation) => opSize(op, target);
     const selected: { pk: string; seq: number }[] = [];
@@ -701,15 +713,28 @@ async function snapshotRound(
     // Rows of the stream wait for a later round; its completion waits with them.
     const rowsRest = rest;
     let completes = whole;
+    let piece: LogOmission[] = [];
     if (replace !== null && !whole && !rowsRest) {
-      const size = 100 + omittedSize(omitted);
-      if (room(bytes + size)) {
+      // An empty segment takes at least one key, so a round always progresses.
+      const fit = omissionsThatFit(omitted, target - budget - bytes - 100);
+      const take = fit === 0 && first ? 1 : fit;
+      if (take >= omitted.length) {
         completes = true;
-        bytes += size;
-      } else rest = true;
+        bytes += 100 + omittedSize(omitted);
+      } else {
+        rest = true;
+        piece = omitted.slice(0, take);
+        if (piece.length > 0) bytes += 100 + omittedSize(piece);
+      }
     }
-    // A replace whose completion waits, with no rows in this round, waits whole.
-    if (replace !== null && !completes && taken.length === 0) {
+    // A replace whose completion waits, with no rows or piece of its
+    // completion in this round, waits whole.
+    if (
+      replace !== null &&
+      !completes &&
+      taken.length === 0 &&
+      piece.length === 0
+    ) {
       planned.push({ ...base, ack: row.publish_watermark, rest: true });
       continue;
     }
@@ -731,13 +756,13 @@ async function snapshotRound(
       ack,
       operations: [
         ...orderedOperations(taken),
-        ...(completes && replace
+        ...(replace && (completes || piece.length > 0)
           ? [
               {
                 kind: "complete" as const,
                 stream,
                 cutoff: { o: replace.o, r: replace.r },
-                omitted,
+                omitted: completes ? omitted : piece,
               },
             ]
           : []),
@@ -750,7 +775,11 @@ async function snapshotRound(
       },
       replace: completes ? replace : null,
       replacing: replace !== null && !completes ? replace : null,
-      omitted: completes ? omitted : [],
+      omitting:
+        piece.length > 0
+          ? { from: piece[0]!.pkHash, to: piece.at(-1)!.pkHash }
+          : null,
+      omitted: completes ? omitted : piece,
       bytes,
     });
   }
@@ -909,8 +938,25 @@ function opSize(op: LogOperation, target: number): number {
 }
 
 /** An omission lists its hash and its typed key. */
+function omissionSize(o: LogOmission): number {
+  return 70 + JSON.stringify(o.key).length;
+}
+
 function omittedSize(omitted: readonly LogOmission[]): number {
-  return omitted.reduce((n, o) => n + 70 + JSON.stringify(o.key).length, 0);
+  return omitted.reduce((n, o) => n + omissionSize(o), 0);
+}
+
+/** How many of `omitted`, from the first, fit in `room` bytes. */
+function omissionsThatFit(
+  omitted: readonly LogOmission[],
+  room: number,
+): number {
+  let n = 0;
+  for (let used = 0; n < omitted.length; n += 1) {
+    used += omissionSize(omitted[n]!);
+    if (used > room) break;
+  }
+  return n;
 }
 
 /**
@@ -1042,11 +1088,18 @@ async function omittedHashes(
   connectionId: string,
   stream: string,
   replace: { o: number; r: string },
+  keys?: KeyRange,
 ): Promise<string[]> {
   const rows = await deps.db.query<{ pk_hash: string }>(
     `SELECT pk_hash FROM records WHERE connection_id = ? AND stream = ?
-        AND ${SEEN_BEFORE} ORDER BY pk_hash`,
-    [connectionId, stream, ...seenBeforeParams(replace.o, replace.r)],
+        AND ${SEEN_BEFORE}${keys ? " AND pk_hash >= ? AND pk_hash <= ?" : ""}
+      ORDER BY pk_hash`,
+    [
+      connectionId,
+      stream,
+      ...seenBeforeParams(replace.o, replace.r),
+      ...(keys ? [keys.from, keys.to] : []),
+    ],
   );
   return rows.map((row) => row.pk_hash);
 }
@@ -1270,7 +1323,15 @@ async function basisOf(
     );
     const omitted = p.replace
       ? await omittedHashes(deps, connectionId, p.stream, p.replace)
-      : [];
+      : p.replacing && p.omitting
+        ? await omittedHashes(
+            deps,
+            connectionId,
+            p.stream,
+            p.replacing,
+            p.omitting,
+          )
+        : [];
     streams.push([p.stream, state, runs, covered, omitted]);
   }
   return JSON.stringify([connection, log, intents, streams]);
@@ -1452,6 +1513,24 @@ async function commitRound(
           held.publishWhileCollecting === true,
         ),
         replaceDelete(connectionId, p.stream, p.replace.o, p.replace.r),
+      );
+    else if (p.replacing && p.omitting)
+      statements.push(
+        tombstoneOmissions(
+          connectionId,
+          p.stream,
+          p.replacing.o,
+          p.replacing.r,
+          held.publishWhileCollecting === true,
+          p.omitting,
+        ),
+        replaceDelete(
+          connectionId,
+          p.stream,
+          p.replacing.o,
+          p.replacing.r,
+          p.omitting,
+        ),
       );
   }
   for (const p of touched) {

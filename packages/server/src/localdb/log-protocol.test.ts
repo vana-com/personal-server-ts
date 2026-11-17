@@ -14,6 +14,7 @@ import {
   encodeSegment,
   firstDeletionKeyMismatch,
   LOG_FORMAT,
+  PART_LIMIT_BYTES,
   pkHash,
   primaryKeyValues,
   type LogKey,
@@ -881,6 +882,155 @@ describe("log protocol: size splitting", () => {
     expect(await reader.records()).toEqual(await a.records());
     expect(await reader.records()).toHaveLength(12);
     expect(await reader.position()).toBe(positions.length);
+  });
+});
+
+describe("log protocol: omissions over rounds", () => {
+  type Completion = Extract<WireOp, { kind: "complete" }>;
+  type WireOp = Segment["operations"][number];
+  const completionsIn = (ops: readonly WireOp[]) =>
+    ops.filter((o): o is Completion => o.kind === "complete");
+
+  it("a full replacement whose omissions alone exceed the segment limit publishes them in chunks, and a fresh reader has exactly the run's rows", async () => {
+    const w = await world({ streams: 1 });
+    const a = await w.device("a");
+    // Each omission names its typed key; long keys make 17,000 of them more
+    // than one segment may hold, with no row of the replacing run to send.
+    const pad = "k".repeat(1000);
+    const ids = Array.from({ length: 17_000 }, (_, i) => `${i}-${pad}`);
+    await a.run(
+      "run-1",
+      ids.map((id) => ({ stream: sName(0), id })),
+    );
+    await a.cycle();
+    const before = await a.position();
+    const kept = ids.slice(0, 2);
+    await a.run(
+      "run-2",
+      kept.map((id) => ({ stream: sName(0), id })),
+    );
+    await a.cycle();
+
+    const segments = await w.segments();
+    const keys = await w.segmentKeys();
+    const after = [...keys.keys()]
+      .filter((p) => p > before)
+      .sort((x, y) => x - y);
+    // Every segment decodes (a segment over the limit does not).
+    expect(after.every((p) => segments.has(p))).toBe(true);
+    for (const p of after)
+      expect(
+        (await w.innerBlobs.get(keys.get(p)!))!.length,
+      ).toBeLessThanOrEqual(PART_LIMIT_BYTES);
+    const chunks = after.map((p) => completionsIn(segments.get(p)!.operations));
+    expect(chunks.filter((c) => c.length > 0).length).toBeGreaterThan(1);
+    // The omissions stay omissions, at the run's cutoff, each key once.
+    const omitted = chunks
+      .flat()
+      .flatMap((c) => c.omitted.map((o) => o.pkHash));
+    expect(new Set(omitted).size).toBe(omitted.length);
+    expect(omitted).toHaveLength(ids.length - kept.length);
+    expect(
+      new Set(chunks.flat().map((c) => `${c.cutoff.o}/${c.cutoff.r}`)).size,
+    ).toBe(1);
+    expect(
+      after
+        .flatMap((p) => segments.get(p)!.operations)
+        .some((o) => o.kind === "delete"),
+    ).toBe(false);
+    for (const k of kept) expect(omitted).not.toContain(await idHash(k));
+    // Only the last segment says the stream is complete.
+    const said = after.map(
+      (p) =>
+        segments.get(p)!.streams.find((m) => m.stream === sName(0))?.complete,
+    );
+    expect(said.at(-1)).toBe(true);
+    expect(said.slice(0, -1).every((c) => c === false)).toBe(true);
+
+    const c = await w.device("c");
+    await c.cycle();
+    const records = await c.records();
+    expect(records).toHaveLength(kept.length);
+    expect(records).toEqual(await a.records());
+  }, 300_000);
+
+  it("a reader that applies some omission chunks and then the rest never gets an omitted key back", async () => {
+    const w = await world({ streams: 1, partTargetBytes: 3000 });
+    const reader = await w.device("reader");
+    let armed = false;
+    let puts = 0;
+    let midway: string[] | null = null;
+    let midwayComplete: number | null = null;
+    const a = await w.device("a", {
+      beforePut: async (key) => {
+        if (!armed || !key.includes(`${LOG}/s-`) || ++puts !== 2) return;
+        // The first chunk is committed and the second is not.
+        await reader.cycle();
+        midway = await reader.records();
+        midwayComplete =
+          (
+            await reader.db.query<{ complete: number }>(
+              "SELECT complete FROM stream_state WHERE stream = ?",
+              [sName(0)],
+            )
+          )[0]?.complete ?? null;
+      },
+    });
+    const ids = Array.from(
+      { length: 120 },
+      (_, i) => `id-${String(i).padStart(3, "0")}`,
+    );
+    const idOf = new Map<string, string>();
+    for (const id of ids) idOf.set(await idHash(id), id);
+    const held = (records: readonly string[]) =>
+      records.map(
+        (r) => (JSON.parse(r.slice(r.indexOf("=") + 1)) as { id: string }).id,
+      );
+    await a.run(
+      "run-1",
+      ids.map((id) => ({ stream: sName(0), id })),
+    );
+    await a.cycle();
+    await reader.cycle();
+    expect(await reader.records()).toHaveLength(ids.length);
+
+    armed = true;
+    const before = await a.position();
+    const kept = ids.slice(0, 2);
+    await a.run(
+      "run-2",
+      kept.map((id) => ({ stream: sName(0), id })),
+    );
+    await a.cycle();
+
+    const segments = await w.segments();
+    const after = [...segments.keys()]
+      .filter((p) => p > before)
+      .sort((x, y) => x - y);
+    expect(after.length).toBeGreaterThan(2);
+    const firstChunk = completionsIn(
+      segments.get(after[0]!)!.operations,
+    ).flatMap((c) => c.omitted.map((o) => idOf.get(o.pkHash)!));
+    expect(firstChunk.length).toBeGreaterThan(0);
+    expect(firstChunk.length).toBeLessThan(ids.length - kept.length);
+
+    // Midway: the first chunk's keys are gone, later ones are still held,
+    // and the stream does not say it is complete.
+    expect(midway).not.toBeNull();
+    const mid = held(midway!);
+    for (const id of firstChunk) expect(mid).not.toContain(id);
+    expect(mid.length).toBeGreaterThan(kept.length);
+    expect(midwayComplete).toBe(0);
+
+    await reader.cycle();
+    expect(held(await reader.records()).sort()).toEqual([...kept].sort());
+    expect(await reader.rows()).toEqual(await a.rows());
+    // Settled: another pass publishes nothing and the log does not move.
+    const settled = await a.position();
+    await a.cycle();
+    await reader.cycle();
+    expect(await a.position()).toBe(settled);
+    expect(held(await reader.records()).sort()).toEqual([...kept].sort());
   });
 });
 

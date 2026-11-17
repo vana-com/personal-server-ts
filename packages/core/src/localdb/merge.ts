@@ -323,13 +323,22 @@ export function replaceDelete(
   stream: string,
   stampO: number,
   stampR: string,
+  keys?: KeyRange,
 ): SqlStatement {
   return {
     sql: `DELETE FROM records WHERE connection_id = ? AND stream = ?
-   AND ${SEEN_BEFORE}`,
-    params: [connectionId, stream, ...seenBeforeParams(stampO, stampR)],
+   AND ${SEEN_BEFORE}${keys ? " AND pk_hash >= ? AND pk_hash <= ?" : ""}`,
+    params: [
+      connectionId,
+      stream,
+      ...seenBeforeParams(stampO, stampR),
+      ...(keys ? [keys.from, keys.to] : []),
+    ],
   };
 }
+
+/** The keys from `from` to `to`, both included, by `pk_hash`. */
+export type KeyRange = { readonly from: string; readonly to: string };
 
 /** Explicit PDPP deletes commit with their run, including a tombstone for a missing key. */
 export function deleteRunRecords(
