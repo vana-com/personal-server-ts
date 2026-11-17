@@ -1,4 +1,10 @@
-import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
+import {
+  createCipheriv,
+  createHmac,
+  generateKeyPairSync,
+  sign,
+  type KeyObject,
+} from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Duplex } from "node:stream";
 import tls from "node:tls";
@@ -301,9 +307,14 @@ async function echoThroughWasm(
 async function handshakeThenCapture(
   identity: Identity,
   request: string,
-): Promise<{ server: TlsServer; records: Buffer[] }> {
+): Promise<{
+  server: TlsServer;
+  records: Buffer[];
+  forge: (sequence: number, plaintext: string) => Buffer;
+}> {
   const server = new TlsServer(identity.certPem, identity.keyPem);
   const records: Buffer[] = [];
+  let trafficSecret: Buffer | undefined;
   let capturing = false;
   const pipe = new Duplex({
     read() {},
@@ -324,11 +335,21 @@ async function handshakeThenCapture(
     socket: pipe,
     servername: "localhost",
     ca: identity.certPem,
+    minVersion: "TLSv1.3",
+  });
+  // The key log hands the test the client's first application traffic secret,
+  // so it can build a record the server would accept.
+  client.on("keylog", (line: Buffer) => {
+    const [label, , secret] = line.toString().trim().split(" ");
+    if (label === "CLIENT_TRAFFIC_SECRET_0" && secret) {
+      trafficSecret = Buffer.from(secret, "hex");
+    }
   });
   await new Promise<void>((resolve, reject) => {
     client.once("secureConnect", () => resolve());
     client.once("error", reject);
   });
+  const cipherName = client.getCipher().name;
   capturing = true;
   client.write(request);
   // `finish` fires once the client has written its close_notify to the pump.
@@ -339,7 +360,113 @@ async function handshakeThenCapture(
   await finished;
   await new Promise<void>((resolve) => setImmediate(resolve));
   client.destroy();
-  return { server, records };
+  return {
+    server,
+    records,
+    forge: (sequence, plaintext) => {
+      if (!trafficSecret) throw new Error("no client traffic secret logged");
+      return forgeApplicationRecord(
+        cipherName,
+        trafficSecret,
+        sequence,
+        Buffer.from(plaintext),
+      );
+    },
+  };
+}
+
+/** HKDF-Expand-Label (RFC 8446 section 7.1), for outputs no longer than one hash block. */
+function hkdfExpandLabel(
+  hash: "sha256" | "sha384",
+  secret: Buffer,
+  label: string,
+  length: number,
+): Buffer {
+  const fullLabel = Buffer.from(`tls13 ${label}`);
+  const info = Buffer.concat([
+    Buffer.from([length >> 8, length & 0xff, fullLabel.length]),
+    fullLabel,
+    Buffer.from([0]),
+  ]);
+  return createHmac(hash, secret)
+    .update(Buffer.concat([info, Buffer.from([1])]))
+    .digest()
+    .subarray(0, length);
+}
+
+/**
+ * Build one TLS 1.3 application-data record the way the client would at
+ * `sequence`: AES-GCM under the key and IV from the traffic secret.
+ */
+function forgeApplicationRecord(
+  cipherName: string,
+  secret: Buffer,
+  sequence: number,
+  plaintext: Buffer,
+): Buffer {
+  if (!/^TLS_AES_(128|256)_GCM_SHA(256|384)$/.test(cipherName)) {
+    throw new Error(`cannot forge a record for ${cipherName}`);
+  }
+  const hash = cipherName.endsWith("SHA384") ? "sha384" : "sha256";
+  const keyBytes = cipherName.includes("AES_256") ? 32 : 16;
+  const key = hkdfExpandLabel(hash, secret, "key", keyBytes);
+  const nonce = Buffer.from(hkdfExpandLabel(hash, secret, "iv", 12));
+  nonce.writeUInt32BE(
+    (nonce.readUInt32BE(4) ^ Math.floor(sequence / 2 ** 32)) >>> 0,
+    4,
+  );
+  nonce.writeUInt32BE((nonce.readUInt32BE(8) ^ sequence) >>> 0, 8);
+  const inner = Buffer.concat([plaintext, Buffer.from([0x17])]);
+  const header = Buffer.from([0x17, 0x03, 0x03, 0, 0]);
+  header.writeUInt16BE(inner.length + 16, 3);
+  const cipher = createCipheriv(
+    keyBytes === 32 ? "aes-256-gcm" : "aes-128-gcm",
+    key,
+    nonce,
+  );
+  cipher.setAAD(header);
+  const body = Buffer.concat([cipher.update(inner), cipher.final()]);
+  return Buffer.concat([header, body, cipher.getAuthTag()]);
+}
+
+/** Split concatenated TLS records by their five-byte headers. */
+function splitRecords(bytes: Buffer): Buffer[] {
+  const out: Buffer[] = [];
+  for (let at = 0; at < bytes.length;) {
+    const end = at + 5 + bytes.readUInt16BE(at + 3);
+    out.push(bytes.subarray(at, end));
+    at = end;
+  }
+  return out;
+}
+
+/** Every chunk a client writes during a full handshake and a short request. */
+async function captureClientFlight(identity: Identity): Promise<Buffer[]> {
+  const server = new TlsServer(identity.certPem, identity.keyPem);
+  const chunks: Buffer[] = [];
+  const pipe = new Duplex({
+    read() {},
+    write(chunk: Buffer, _encoding, callback) {
+      chunks.push(Buffer.from(chunk));
+      const step = server.process_tls(new Uint8Array(chunk)) as Step;
+      if (step.tls.length > 0) pipe.push(Buffer.from(step.tls));
+      callback();
+    },
+  });
+  const client = tls.connect({
+    socket: pipe,
+    servername: "localhost",
+    ca: identity.certPem,
+  });
+  await new Promise<void>((resolve, reject) => {
+    client.once("secureConnect", () => resolve());
+    client.once("error", reject);
+  });
+  client.write("hi\n");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  client.destroy();
+  server.free();
+  return chunks;
 }
 
 describe("browser TLS server (real wasm, real TLS client)", () => {
@@ -507,5 +634,118 @@ describe("browser TLS server (real wasm, real TLS client)", () => {
       expect(Buffer.from(step.plaintext).toString()).toBe("hi\n");
       server.free();
     });
+
+    it("never turns a valid record after close_notify into plaintext", async () => {
+      // Control: a request record, then a forged record in sequence, is read.
+      const control = await handshakeThenCapture(identities[1], "hi\n");
+      const before = splitRecords(Buffer.concat(control.records));
+      // The client's change_cipher_spec and Finished, the request record
+      // (application sequence 0), and its close_notify (sequence 1).
+      expect(before.length).toBe(4);
+      const accepted = control.server.process_tls(
+        new Uint8Array(
+          Buffer.concat([...before.slice(0, 3), control.forge(1, "EVIL")]),
+        ),
+      ) as Step;
+      expect(Buffer.from(accepted.plaintext).toString()).toBe("hi\nEVIL");
+      control.server.free();
+
+      // The same forged record, one sequence number later, follows close_notify.
+      const { server, records, forge } = await handshakeThenCapture(
+        identities[1],
+        "hi\n",
+      );
+      const forged = forge(2, "EVIL");
+      const sameCall = server.process_tls(
+        new Uint8Array(Buffer.concat([...records, forged])),
+      ) as Step;
+      expect(Buffer.from(sameCall.plaintext).toString()).toBe("hi\n");
+      expect(() => server.process_tls(new Uint8Array(forged))).toThrow(
+        "peer closed the connection",
+      );
+      server.free();
+    });
+  });
+
+  describe("input that is not a valid TLS peer", () => {
+    // Under panic=abort a panic is an `unreachable` trap, which is a
+    // WebAssembly.RuntimeError. Hostile input must only ever throw strings.
+    it("throws only strings for random and corrupted records", async () => {
+      const identity = identities[1];
+      const flight = await captureClientFlight(identity);
+      expect(flight.length).toBeGreaterThan(1);
+      let state = 0x9e3779b9;
+      const random = (): number => {
+        state = (state + 0x6d2b79f5) | 0;
+        let t = Math.imul(state ^ (state >>> 15), 1 | state);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 2 ** 32;
+      };
+      const randomBytes = (n: number): Buffer =>
+        Buffer.from(
+          Array.from({ length: n }, () => Math.floor(random() * 256)),
+        );
+      const outcomes = { thrown: 0, accepted: 0 };
+      const feed = (server: TlsServer, bytes: Buffer): boolean => {
+        try {
+          server.process_tls(new Uint8Array(bytes));
+          outcomes.accepted++;
+          return true;
+        } catch (error) {
+          // A trap would be a RuntimeError, and the instance would be unusable.
+          expect(typeof error).toBe("string");
+          outcomes.thrown++;
+          return false;
+        }
+      };
+
+      for (let i = 0; i < 1500; i++) {
+        const server = new TlsServer(identity.certPem, identity.keyPem);
+        const strategy = i % 3;
+        if (strategy === 0) {
+          feed(server, randomBytes(1 + Math.floor(random() * 3000)));
+        } else if (strategy === 1) {
+          const header = Buffer.from([
+            20 + Math.floor(random() * 5),
+            3,
+            Math.floor(random() * 5),
+            0,
+            0,
+          ]);
+          const body = randomBytes(Math.floor(random() * 600));
+          header.writeUInt16BE(
+            random() < 0.5
+              ? body.length
+              : Math.floor(random() * 70000) & 0xffff,
+            3,
+          );
+          feed(server, Buffer.concat([header, body]));
+        } else {
+          // The real client flight with one flipped bit, then a cut.
+          const mutate = Math.floor(random() * flight.length);
+          for (let k = 0; k < flight.length; k++) {
+            let chunk = Buffer.from(flight[k]);
+            if (k === mutate && chunk.length > 0) {
+              chunk[Math.floor(random() * chunk.length)] ^=
+                1 << Math.floor(random() * 8);
+              if (random() < 0.3) {
+                chunk = chunk.subarray(0, Math.floor(random() * chunk.length));
+              }
+            }
+            if (!feed(server, chunk)) break;
+          }
+        }
+        server.free();
+      }
+      expect(outcomes.thrown).toBeGreaterThan(0);
+
+      // The module still works: nothing above trapped it.
+      const result = await echoThroughWasm(identity, {
+        maxVersion: "TLSv1.3",
+        request: makeRequest(1000),
+      });
+      expect(result.clientError).toBeUndefined();
+      expect(result.echoed.length).toBe(1000);
+    }, 60_000);
   });
 });
