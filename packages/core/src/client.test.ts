@@ -331,6 +331,28 @@ describe("Personal Server client helpers", () => {
     });
   });
 
+  it("cancels the body of a response it fails to read", async () => {
+    // A body it stops reading holds what produced it (a connection's queue, a
+    // socket) until something cancels it.
+    let cancelled: unknown;
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.enqueue(new TextEncoder().encode("{"));
+        },
+        cancel(reason) {
+          cancelled = reason ?? "cancelled";
+        },
+      }),
+    );
+    const failure = new Error("the body could not be read");
+    vi.spyOn(response, "text").mockRejectedValue(failure);
+    await expect(
+      parsePersonalServerJsonResponse(response, "data read"),
+    ).rejects.toBe(failure);
+    expect(cancelled).toBeDefined();
+  });
+
   it("surfaces flat contract error bodies (error as a string + top-level message)", async () => {
     // The data/scope contract layer emits `{ error: "CODE", message }` (flat),
     // unlike the protocol layer's `{ error: { errorCode, message } }` (nested).

@@ -865,6 +865,42 @@ async function validateStreamBody<
 }
 
 /**
+ * The body, with its source told to stop when the request is aborted. A
+ * response body reaches its source only when its consumer cancels it, and a
+ * consumer that has gone away (an aborted fetch, a closed page) may never do
+ * so; the abort signal is the one thing it leaves behind.
+ */
+function cancelOnAbort(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  const stop = () => {
+    reader.cancel(signal.reason).catch(() => undefined);
+  };
+  if (signal.aborted) stop();
+  else signal.addEventListener("abort", stop, { once: true });
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await reader.read();
+        if (next.done) {
+          signal.removeEventListener("abort", stop);
+          controller.close();
+        } else controller.enqueue(next.value);
+      } catch (error) {
+        signal.removeEventListener("abort", stop);
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      signal.removeEventListener("abort", stop);
+      return reader.cancel(reason);
+    },
+  });
+}
+
+/**
  * Serve a stream view: the envelope streams part by part. A charged read
  * has already paid (`paymentResponseHeader`).
  */
@@ -941,7 +977,7 @@ async function serveStreamSyncView(
   // also keeps @hono/node-server from reading the body ahead of the status:
   // a failure in that read-ahead would end the response with a
   // content-length of the bytes read so far, as if it were whole.
-  return new Response(decision.body, {
+  return new Response(cancelOnAbort(decision.body, request.signal), {
     status: 200,
     headers: {
       "Content-Type": "application/json",

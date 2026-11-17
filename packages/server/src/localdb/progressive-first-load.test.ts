@@ -19,6 +19,7 @@ import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import { createLocalListing } from "../../../core/src/localdb/listing.js";
 import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
+import { COMPLETE_PAGE_SIZE } from "../../../core/src/localdb/complete-read.js";
 import { createConnectionDeleter } from "../../../core/src/localdb/delete.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import {
@@ -1030,5 +1031,81 @@ describe("with the flag on, for a reader who is not the owner", () => {
     const view = await reading;
     expect(view.ids).toEqual(["a", "b", "c"]);
     expect(view.partial).toBeUndefined();
+  });
+});
+
+// A complete read gives its connection's queue back once it has decided its
+// headers, so an apply is free to replace the head while its body is read. The
+// body pages through the stream, and each page checks, in its own statement,
+// that the stream is still as the read found it.
+describe("a complete read while an apply replaces the stream's head", () => {
+  const ask = {
+    scope: SCOPE,
+    connection: null,
+    cursor: null,
+    legacyFile: false,
+    isOwnerView: true,
+  };
+  const within = <T>(work: Promise<T>, ms = 3000) =>
+    Promise.race([
+      work,
+      new Promise<"timeout">((r) => setTimeout(() => r("timeout"), ms)),
+    ]);
+
+  it("ends the body in an error when the apply has begun writing rows of the new head, and the apply is not held up", async () => {
+    const f = await harness({ progressive: false });
+    const before = Array.from(
+      { length: COMPLETE_PAGE_SIZE + 5 },
+      (_, i) => `a${i}`,
+    );
+    await f.remote.head("items", values(before));
+    await applyConnection(f.deps, f.id);
+    expect(await f.rows()).toHaveLength(COMPLETE_PAGE_SIZE + 5);
+
+    const decision = await f.resolver.resolve(ask);
+    if (decision.kind !== "view") throw new Error("missing view");
+    const reader = decision.body.getReader();
+    const decoder = new TextDecoder();
+    let served = "";
+    // The envelope, the opening of the list and fifty records of the first page, which holds more.
+    for (let i = 0; i < 52; i++)
+      served += decoder.decode((await reader.read()).value);
+
+    // The registry moves to a head that shares no key with the first. Its
+    // apply commits parts into the same table before it moves the head.
+    const after = Array.from(
+      { length: COMPLETE_PAGE_SIZE + 5 },
+      (_, i) => `b${i}`,
+    );
+    const next = await f.remote.head("items", values(after), { version: 2 });
+    const last = f.hold(next, COMPLETE_PAGE_SIZE + 4);
+    const applying = applyConnection(f.deps, f.id);
+    let mixed = false;
+    for (let turn = 0; turn < 300 && !mixed; turn++) {
+      mixed = (await f.rows()).some((id) => id.startsWith("b"));
+      if (!mixed) await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(mixed).toBe(true); // the apply wrote while the first body was open
+
+    let failure: unknown;
+    try {
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) break;
+        served += decoder.decode(next.value);
+      }
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(PartialViewMoved);
+    // What it served before the error is of the first head alone.
+    expect(served).toMatch(/"id":"a\d+"/);
+    expect(served).not.toMatch(/"id":"b\d+"/);
+
+    last.release();
+    expect(await within(applying)).not.toBe("timeout");
+    // A read begun now is the new head, whole.
+    const again = await f.read();
+    expect(again.ids).toEqual([...after].sort());
   });
 });

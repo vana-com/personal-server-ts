@@ -18,8 +18,10 @@ import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
-import type { SqlDriver } from "../../../core/src/localdb/driver.js";
+import { readerOf, type SqlDriver } from "../../../core/src/localdb/driver.js";
 import type { RecordQuery } from "../../../core/src/localdb/query.js";
+import { COMPLETE_PAGE_SIZE } from "../../../core/src/localdb/complete-read.js";
+import { PartialViewMoved } from "../../../core/src/localdb/partial-read.js";
 import type {
   ReadDecision,
   ResolveInput,
@@ -336,7 +338,8 @@ describe("local resolve", () => {
     expect(verdict(await f.resolver.resolve(input("fixture.alias")))).toBe(
       "no_data",
     );
-    expect(f.visited).toHaveBeenCalledTimes(1);
+    // A stream's own body is read from the database, not through the query.
+    expect(f.visited).not.toHaveBeenCalled();
     await f.head("children", { version: 5 });
     const alias = await f.resolver.resolve(input("fixture.alias"));
     expect(alias.kind).toBe("view");
@@ -530,5 +533,198 @@ describe("local resolve", () => {
     expect(
       await f.resolver.resolve(input(undefined, { cursor: result.cursor })),
     ).toEqual({ kind: "cursor_stale" });
+  });
+});
+
+/**
+ * A read decides its headers while it holds the connection's queue and gives
+ * the queue back there. Its body then pages through the stream, each page
+ * checking in its own statement that the stream is still the one the read was
+ * decided on, so a body nobody finishes reading costs nothing.
+ */
+describe("a read holds no queue slot while its body is read", () => {
+  const PAGE = COMPLETE_PAGE_SIZE;
+  const hex = (n: number) => `0x${n.toString(16).padStart(8, "0")}`;
+
+  async function seedRows(
+    f: Awaited<ReturnType<typeof fixture>>,
+    count: number,
+    stream = "items",
+    id = "c1",
+  ) {
+    const statements = Array.from({ length: count }, (_, i) => ({
+      sql: `INSERT INTO records
+        (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256)
+        VALUES (?, ?, ?, ?, 1000, 'run', ?, 'body-hash')`,
+      params: [
+        id,
+        stream,
+        hex((i * 7919) % count),
+        `key-${i}`,
+        JSON.stringify({ id: `r${(i * 7919) % count}`, value: "v" }),
+      ],
+    }));
+    for (let at = 0; at < statements.length; at += 500)
+      await f.db.batch(statements.slice(at, at + 500));
+  }
+
+  async function opened(count: number) {
+    const f = await fixture();
+    await f.connection();
+    await f.head();
+    await seedRows(f, count);
+    const decision = await f.resolver.resolve(input());
+    if (decision.kind !== "view") throw new Error("missing view");
+    return { f, decision, reader: decision.body.getReader() };
+  }
+  const within = <T>(work: Promise<T>, ms = 1500) =>
+    Promise.race([
+      work,
+      new Promise<"timeout">((r) => setTimeout(() => r("timeout"), ms)),
+    ]);
+  const decoder = new TextDecoder();
+  async function take(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    chunks: number,
+  ) {
+    let text = "";
+    for (let i = 0; i < chunks; i++) {
+      const next = await reader.read();
+      if (next.done) break;
+      text += decoder.decode(next.value);
+    }
+    return text;
+  }
+  async function rest(reader: ReadableStreamDefaultReader<Uint8Array>) {
+    let text = "";
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) return text;
+      text += decoder.decode(next.value);
+    }
+  }
+
+  it("an abandoned body blocks neither a second whole read nor an apply on its connection", async () => {
+    const { f, reader } = await opened(PAGE + 50);
+    // The first chunk, and then nothing: no more reads and no cancel, as a
+    // consumer that stops pulling leaves a body.
+    await reader.read();
+
+    const second = await within(f.resolver.resolve(input()).then(drain));
+    expect(second).not.toBe("timeout");
+    if (second !== "timeout")
+      expect(second.data.records).toHaveLength(PAGE + 50);
+    expect(
+      await within(f.deps.queue.run("c1", "apply", async () => "ran")),
+    ).toBe("ran");
+    expect(
+      await within(f.deps.queue.run("c1", "purge", async () => "ran")),
+    ).toBe("ran");
+    await reader.cancel();
+  });
+
+  it.each([0, 1, PAGE, PAGE + 1, 2 * PAGE + 7])(
+    "a stream of %i records is served byte for byte as the record query yields it",
+    async (count) => {
+      const f = await fixture();
+      await f.connection();
+      await f.head();
+      await seedRows(f, count);
+      const decision = await f.resolver.resolve(input());
+      if (decision.kind !== "view") throw new Error("missing view");
+      const text = await new Response(decision.body).text();
+      const bodies: string[] = [];
+      for await (const record of f.query.streamRecords("c1", "items"))
+        bodies.push(record.body);
+      const at = text.indexOf('"data":') + '"data":'.length;
+      expect(text.slice(at)).toBe(`{"records":[${bodies.join(",")}]}}`);
+      expect(bodies).toHaveLength(count);
+    },
+  );
+
+  it("serves the pages of a body in key order when the engine may run an unordered scan backwards", async () => {
+    const f = await fixture();
+    await f.connection();
+    await f.head();
+    await seedRows(f, 2 * PAGE + 7);
+    // The read connection runs the body's statements, not the writer.
+    await readerOf(f.db).query("PRAGMA reverse_unordered_selects = ON");
+    const decision = await f.resolver.resolve(input());
+    if (decision.kind !== "view") throw new Error("missing view");
+    const served = (await drain(decision)).data.records.map((r) => r.id);
+    const stored = (
+      await f.db.query<{ body: string }>(
+        "SELECT body FROM records WHERE stream = 'items' ORDER BY pk_hash",
+      )
+    ).map((r) => (JSON.parse(r.body) as { id: string }).id);
+    expect(served).toEqual(stored);
+    expect(served).toHaveLength(2 * PAGE + 7);
+  });
+
+  const moves: [string, string, unknown[]][] = [
+    [
+      "the stream's head moves",
+      "UPDATE stream_state SET head_version = 3, head_data_hash = 'h3' WHERE stream = 'items'",
+      [],
+    ],
+    [
+      "the connection's generation moves",
+      "UPDATE connections SET generation = 3",
+      [],
+    ],
+    [
+      "the connection is deleted",
+      "UPDATE connections SET control_state = 'deleted', deleted_at = 5",
+      [],
+    ],
+    [
+      "a delete intent is saved",
+      "INSERT INTO delete_intents(connector, delete_id, intent) VALUES ('fixture-source', 'd', 'x')",
+      [],
+    ],
+    // The commits of an apply write rows of the new head before the commit
+    // that moves the head, so the head alone does not say the rows moved.
+    [
+      "a row changes before the head does (an apply's first commits)",
+      "UPDATE records SET body = ?, body_sha256 = 'new', stamp_o = 2000 WHERE stream = 'items' AND pk_hash = ?",
+      [JSON.stringify({ id: "r200", value: "w" }), hex(200)],
+    ],
+    [
+      "a row is added",
+      "INSERT INTO records (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256) VALUES ('c1', 'items', ?, 'added', 1000, 'run', '{\"id\":\"x\"}', 'h')",
+      [hex(999)],
+    ],
+    [
+      "a row is removed",
+      "DELETE FROM records WHERE stream = 'items' AND pk_hash = ?",
+      [hex(230)],
+    ],
+  ];
+  it.each(moves)(
+    "the body ends in an error, not a mixed body, when %s",
+    async (_name, sql, params) => {
+      const { f, reader } = await opened(PAGE + 50);
+      // Records of the first page only: the second page is read later.
+      const before = await take(reader, 2 + 50);
+      await f.db.batch([{ sql, params: params as never }]);
+      await expect(rest(reader)).rejects.toBeInstanceOf(PartialViewMoved);
+      expect(before).toContain('"records":[');
+    },
+  );
+
+  it("writes outside the stream do not end the body", async () => {
+    const { f, reader } = await opened(PAGE + 50);
+    const before = await take(reader, 2 + 50);
+    await f.head("other", { version: 5 });
+    await seedRows(f, 30, "other");
+    await f.connection("active", "c2", "ab");
+    await f.head("items", { id: "c2" });
+    await seedRows(f, 30, "items", "c2");
+    const text = before + (await rest(reader));
+    const bodies: string[] = [];
+    for await (const record of f.query.streamRecords("c1", "items"))
+      bodies.push(record.body);
+    expect(text.endsWith(`${bodies.join(",")}]}}`)).toBe(true);
+    expect(bodies).toHaveLength(PAGE + 50);
   });
 });

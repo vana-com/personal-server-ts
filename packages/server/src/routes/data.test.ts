@@ -1498,9 +1498,9 @@ describe("GET /v1/data/:scope", () => {
   async function getWithAuth(
     app: ReturnType<typeof dataRoutes>,
     scope: string,
-    options: { grantId?: string; query?: string } = {},
+    options: { grantId?: string; query?: string; signal?: AbortSignal } = {},
   ) {
-    const { grantId = "grant-123", query = "" } = options;
+    const { grantId = "grant-123", query = "", signal } = options;
     // When testing the sub-app directly (not mounted at /v1/data),
     // the middleware sees the path as /${scope}
     const uri = `/${scope}`;
@@ -1514,6 +1514,7 @@ describe("GET /v1/data/:scope", () => {
     const url = query ? `/${scope}${query}` : `/${scope}`;
     return app.request(url, {
       headers: { Authorization: header },
+      ...(signal ? { signal } : {}),
     });
   }
 
@@ -2286,6 +2287,46 @@ describe("GET /v1/data/:scope", () => {
         await new Promise((r) => server.close(r));
       }
     }
+
+    it("cancels the body of a stream view when the request is aborted", async () => {
+      // A stream view holds what its source holds until its body ends or is
+      // cancelled, so a client that goes away must reach the source.
+      let cancelled: unknown;
+      const view: StreamSyncReadPort = {
+        async resolve() {
+          return {
+            kind: "view",
+            connector: "meta",
+            ns: "0123456789abcdef",
+            cursor: "pinned",
+            served: { scope: "pdpp.meta~0123456789abcdef.posts", version: 1 },
+            body: new ReadableStream<Uint8Array>({
+              pull(controller) {
+                controller.enqueue(new TextEncoder().encode("x"));
+              },
+              cancel(reason) {
+                cancelled = reason ?? "cancelled";
+              },
+            }),
+          };
+        },
+      };
+      const app = createApp({
+        accountStorageMode: fixedOwnedAccountStorageMode("switched"),
+        streamSyncRead: view,
+      });
+      const request = new AbortController();
+      const res = await getWithAuth(app, "instagram.posts", {
+        signal: request.signal,
+      });
+      expect(res.status).toBe(200);
+      const reader = res.body!.getReader();
+      await reader.read();
+      expect(cancelled).toBeUndefined();
+      request.abort(new Error("the client went away"));
+      await vi.waitFor(() => expect(cancelled).toBeDefined());
+      await reader.cancel().catch(() => undefined);
+    });
 
     for (const [label, failAfterMs] of [
       ["at once", null],

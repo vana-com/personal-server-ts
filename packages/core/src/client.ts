@@ -595,7 +595,14 @@ export async function parsePersonalServerJsonResponse<T>(
 }
 
 async function readJsonBody(response: Response): Promise<unknown> {
-  const text = await response.text();
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (error) {
+    // A body it stopped reading still holds what produced it.
+    await response.body?.cancel(error).catch(() => undefined);
+    throw error;
+  }
   if (!text) return null;
   try {
     return JSON.parse(text) as unknown;

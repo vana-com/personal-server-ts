@@ -8,6 +8,7 @@ import { applyConnection } from "./apply.js";
 import { nextApplied } from "./apply-progress.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
+import { changePin, completeBody } from "./complete-read.js";
 import { partialBody } from "./partial-read.js";
 import { createOlderVersions, type OlderVersions } from "./older-versions.js";
 import type { RecordQuery } from "./query.js";
@@ -118,37 +119,20 @@ function validCursor(text: string): boolean {
   }
 }
 
-function bodyStream(
-  chunks: AsyncIterable<string>,
-  release: () => void,
-): ReadableStream<Uint8Array> {
+function bodyStream(chunks: AsyncIterable<string>): ReadableStream<Uint8Array> {
   const iterator = chunks[Symbol.asyncIterator]();
-  let finished = false;
-  const finish = () => {
-    if (!finished) {
-      finished = true;
-      release();
-    }
-  };
   return new ReadableStream({
     async pull(controller) {
       try {
         const next = await iterator.next();
-        if (next.done) {
-          controller.close();
-          finish();
-        } else controller.enqueue(encoder.encode(next.value));
+        if (next.done) controller.close();
+        else controller.enqueue(encoder.encode(next.value));
       } catch (error) {
         controller.error(error);
-        finish();
       }
     },
     async cancel() {
-      try {
-        await iterator.return?.(undefined);
-      } finally {
-        finish();
-      }
+      await iterator.return?.(undefined);
     },
   });
 }
@@ -331,16 +315,23 @@ export function createLocalResolver(
             dataHash: load.dataHash,
           }),
         ),
-        () => {},
       ),
     };
   }
 
+  /**
+   * A complete read, decided while it holds the connection's queue and
+   * finished once its headers are decided: the body holds nothing. A body of
+   * the database pages through the stream and checks its head on every page
+   * (see `completeBody`); one from a retained head or a projected alias is
+   * built in memory here, so nothing it reads can change.
+   */
   async function build(
     input: ResolveInput,
     candidate: Candidate,
-    release: () => void,
   ): Promise<ReadDecision> {
+    // Pinned before the head is read: see `changePin`.
+    const since = await changePin(readerOf(deps.db));
     const [connection] = (await connections(candidate.target.connector)).filter(
       (c) => c.connection_id === candidate.connection.connection_id,
     );
@@ -398,11 +389,20 @@ export function createLocalResolver(
     let payload: AsyncIterable<string>;
     const binding = candidate.target.alias;
     if (!binding) {
-      payload = rawPayload(
-        readQuery,
-        connection.connection_id,
-        installed[0]!.stream,
-      );
+      const only = installed[0]!;
+      payload = fallback.has(only.stream)
+        ? rawPayload(readQuery, connection.connection_id, only.stream)
+        : completeBody(
+            readerOf(deps.db),
+            {
+              connectionId: connection.connection_id,
+              generation: connection.generation,
+              stream: only.stream,
+              version: only.head_version,
+              dataHash: only.head_data_hash!,
+            },
+            since,
+          );
     } else {
       const projected = await projectAlias(
         binding,
@@ -433,7 +433,6 @@ export function createLocalResolver(
           Math.max(...installed.map((s) => s.observed_at ?? 0)),
           payload,
         ),
-        release,
       ),
     };
   }
@@ -515,21 +514,13 @@ export function createLocalResolver(
         const partial = await buildPartial({ ...input, scope }, chosen);
         if (partial) return partial;
       }
-      // Keep the queue until EOF/cancel: otherwise a paged body could contain
-      // records from a newer apply while its served value names the old head.
-      return new Promise<ReadDecision>((resolve, reject) => {
-        void deps.queue
-          .run(chosen.connection.connection_id, "end", async () => {
-            let release!: () => void;
-            const done = new Promise<void>((r) => {
-              release = r;
-            });
-            const decision = await build({ ...input, scope }, chosen, release);
-            resolve(decision);
-            if ("body" in decision) await done;
-          })
-          .catch(reject);
-      });
+      // The queue is held to decide the headers and no longer: a body held it
+      // until its reader finished or cancelled, which a reader that stopped
+      // pulling never did, and every apply and read of the connection waited.
+      // The body checks its head itself, on every page.
+      return deps.queue.run(chosen.connection.connection_id, "end", () =>
+        build({ ...input, scope }, chosen),
+      );
     },
   };
 }
