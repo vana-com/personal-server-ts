@@ -28,6 +28,11 @@ export interface CycleReport {
   }[];
 }
 
+/** The connections a retry owes while the registry position is unchanged. */
+export interface CycleScope {
+  readonly connections: readonly string[];
+}
+
 /** What a connection's early publish did, before the cycle read the registry. */
 export interface EarlyPublish {
   readonly published: readonly PublishResult[];
@@ -45,8 +50,10 @@ export interface EarlyPublish {
  */
 export async function runCycle(
   deps: LocalSyncDeps,
+  scope?: CycleScope,
   made?: Map<string, EarlyPublish>,
 ): Promise<CycleReport> {
+  if (scope) return runScoped(deps, scope);
   const early = made ?? (await publishEarly(deps, await earlyCandidates(deps)));
   // One listing after early publish, shared by bootstrap and all applies.
   const listed = await deps.registry.listOwnerRows();
@@ -56,6 +63,32 @@ export async function runCycle(
       connections.map(({ connectionId }) =>
         syncConnection(deps, connectionId, early.get(connectionId), listed),
       ),
+    ),
+  };
+}
+
+/** Retry only the named connections; a purged connection needs no pass. */
+async function runScoped(
+  deps: LocalSyncDeps,
+  scope: CycleScope,
+): Promise<CycleReport> {
+  const held = new Set(
+    (
+      await deps.db.query<{ id: string }>(
+        "SELECT connection_id AS id FROM connections",
+      )
+    ).map((row) => row.id),
+  );
+  const ids = [...new Set(scope.connections)].filter((id) => held.has(id));
+  const only = new Set(ids);
+  const candidates = await earlyCandidates(deps);
+  const early = await publishEarly(deps, {
+    active: candidates.active.filter((row) => only.has(row.connectionId)),
+    fresh: candidates.fresh.filter((row) => only.has(row.connectionId)),
+  });
+  return {
+    connections: await Promise.all(
+      ids.map((id) => syncConnection(deps, id, early.get(id))),
     ),
   };
 }
@@ -99,7 +132,7 @@ export async function runPublish(deps: LocalSyncDeps): Promise<CycleReport> {
     },
   );
   if (!settled || (await hasUnplacedConnections(deps, candidates)))
-    return runCycle(deps, early);
+    return runCycle(deps, undefined, early);
   return {
     connections: [...early].map(([connectionId, e]) => ({
       connectionId,

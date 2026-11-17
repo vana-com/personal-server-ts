@@ -1311,7 +1311,7 @@ async function bootstrapServer(
       ...(changeProbe && { changeProbe }),
       ...(localSyncSource && {
         localSync: {
-          cycle: async () => (await localSyncSource()).cycle(),
+          cycle: async (scope) => (await localSyncSource()).cycle(scope),
           applyDelta: async (delta) =>
             (await localSyncSource()).applyDelta(delta),
         },

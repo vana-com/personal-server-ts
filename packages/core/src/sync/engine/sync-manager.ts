@@ -90,7 +90,7 @@ export interface ChangeProbe {
  * cycle.
  *
  * A clean cycle threw nothing, was not blocked and left no work behind (see
- * `reportLeavesWork`). A legacy (unswitched) cycle is never clean: its retries
+ * `connectionsOwingWork`). A legacy (unswitched) cycle is never clean: its retries
  * run on the clock, and no position announces them. While the push is healthy
  * and the last cycle was clean, an idle device costs one held request per
  * period. That holds only for what the gateway's position covers: the data
@@ -124,7 +124,9 @@ export interface SyncManagerOptions {
   /** Personal Server hosts always supply their owner-bound Account mode. */
   accountStorageMode?: Pick<OwnedAccountStorageMode, "read">;
   localSync?: {
-    cycle(): Promise<unknown>;
+    cycle(scope?: {
+      readonly connections: readonly string[];
+    }): Promise<unknown>;
     /**
      * Apply a change delta without the cycle's registry reads, when it can
      * (`applyRegistryDelta`).
@@ -330,37 +332,59 @@ function timerPeriod(requested: number | undefined): number {
   return Math.min(Math.floor(requested), MAX_TIMER_DELAY_MS);
 }
 
+/** What one connection of a cycle's report left owed, and why. */
+interface OwedConnection {
+  /** `null` when the report does not name the connection. */
+  readonly connectionId: string | null;
+  readonly why: string;
+}
+
 /**
- * True when a stream-sync cycle's report says it left work that nothing in the
- * registry announces. The cycle reports per connection and does not throw: a
- * connection that failed, or a stream whose publish backs off or waits on a
- * condition, is tried again only by a later cycle. A position cannot stand in
- * for that cycle, so the pass is not settled and the timer keeps running. A
- * connection whose log this build cannot read (`status: "update_required"`)
- * owes nothing: a later cycle of this build reads the same format and refuses
- * again, so only an update changes it, and the status shows it until then. A
- * report of another shape says nothing and leaves nothing owed.
+ * The connections a stream-sync cycle's report says it left work on, that
+ * nothing in the registry announces. The cycle reports per connection and does
+ * not throw: a connection that failed, or a stream whose publish backs off or
+ * waits on a condition, is tried again only by a later cycle. A position
+ * cannot stand in for that cycle, so the pass is not settled and the timer
+ * keeps running, for these connections alone (see `owedScope`). A connection
+ * whose log this build cannot read (`status: "update_required"`) owes nothing:
+ * a later cycle of this build reads the same format and refuses again, so
+ * only an update changes it, and the status shows it until then. A report of
+ * another shape says nothing and leaves nothing owed.
  */
-function reportLeavesWork(report: unknown): boolean {
+function connectionsOwingWork(report: unknown): OwedConnection[] {
   const connections = (report as { connections?: unknown } | null | undefined)
     ?.connections;
-  if (!Array.isArray(connections)) return false;
-  return connections.some((connection: unknown) => {
-    const { error, published, status } = (connection ?? {}) as {
+  if (!Array.isArray(connections)) return [];
+  const owed: OwedConnection[] = [];
+  for (const connection of connections as unknown[]) {
+    const { connectionId, error, published, status } = (connection ?? {}) as {
+      connectionId?: unknown;
       error?: unknown;
       published?: unknown;
       status?: unknown;
     };
-    if (status === "update_required") return false;
-    if (error !== null && error !== undefined) return true;
-    return (
-      Array.isArray(published) &&
-      published.some((result: { outcome?: unknown } | null) => {
-        const outcome = result?.outcome;
-        return outcome === "backoff" || outcome === "deferred";
-      })
+    if (status === "update_required") continue;
+    const id = typeof connectionId === "string" ? connectionId : null;
+    if (error !== null && error !== undefined) {
+      owed.push({ connectionId: id, why: `error: ${String(error)}` });
+      continue;
+    }
+    if (!Array.isArray(published)) continue;
+    const waiting = (
+      published as ({ stream?: unknown; outcome?: unknown } | null)[]
+    ).filter(
+      (result) =>
+        result?.outcome === "backoff" || result?.outcome === "deferred",
     );
-  });
+    if (waiting.length > 0)
+      owed.push({
+        connectionId: id,
+        why: waiting
+          .map((result) => `${String(result?.stream)}: ${result?.outcome}`)
+          .join(", "),
+      });
+  }
+  return owed;
 }
 
 export function createSyncManager(
@@ -433,6 +457,18 @@ export function createSyncManager(
   // finish clean.
   let knownPosition: string | undefined;
   let syncedPosition: string | undefined;
+  // What the last pass that ran to its end left owed, and the position it
+  // started under. Null while a pass runs or when the last one did not end
+  // clean. A retry limited to `connections` is sound only while the push still
+  // reports that position: see `owedScope`.
+  let lastPass: {
+    readonly position: string;
+    readonly connections: readonly string[];
+  } | null = null;
+  // The owed work last reported, so the log says it when it changes, not on
+  // every pass.
+  let owedReported = "";
+
   // A format this build cannot read needs an update, not repeated polling.
   // This position suppresses that repeat but is never offered as `since`.
   let refusedPosition: string | undefined;
@@ -556,8 +592,9 @@ export function createSyncManager(
    */
   async function runLocalCycle(
     localSync: NonNullable<SyncManagerOptions["localSync"]>,
+    scope?: { readonly connections: readonly string[] },
   ): Promise<unknown> {
-    const report = (await localSync.cycle()) as {
+    const report = (await localSync.cycle(scope)) as {
       connections?: readonly { connectionId: string; status?: string }[];
     } | null;
     const waiting = (report?.connections ?? []).filter(
@@ -654,7 +691,42 @@ export function createSyncManager(
     return debt.owed ? "owed" : "settle";
   }
 
-  async function runCycle(delta?: RegistryChangeDelta): Promise<void> {
+  /**
+   * Say what a pass left owed, once per change: a pass that leaves the same
+   * work every minute would otherwise log it every minute, and a pass that
+   * clears it says so.
+   */
+  function reportOwed(owed: OwedConnection[], debtOwed: boolean): void {
+    const signature = JSON.stringify([
+      owed.map((entry) => [entry.connectionId, entry.why]),
+      debtOwed,
+    ]);
+    if (signature === owedReported) return;
+    const hadOwed = owedReported !== "";
+    owedReported = owed.length === 0 && !debtOwed ? "" : signature;
+    if (owedReported === "") {
+      if (hadOwed) uploadDeps.logger.info("Sync pass owes nothing");
+      return;
+    }
+    uploadDeps.logger.info(
+      {
+        connections: owed.map((entry) => ({
+          connectionId: entry.connectionId,
+          why: entry.why,
+        })),
+        blobDeletionDebt: debtOwed,
+      },
+      "Sync pass left work owed",
+    );
+  }
+
+  async function runCycle(
+    delta?: RegistryChangeDelta,
+    retry?: {
+      readonly connections: readonly string[];
+      readonly position: string;
+    },
+  ): Promise<void> {
     // Prevent concurrent cycles
     if (cycleInFlight) {
       // The follow-up is owed. Its delta, if the request had one, waits for
@@ -691,10 +763,19 @@ export function createSyncManager(
         const heldUpTo = syncedPosition;
         inFlightTarget = startedUnder;
         syncedPosition = undefined;
+        lastPass = null;
+        // A retry is limited to what was owed only if nothing in the registry
+        // moved between the decision and this pass; a follow-up pass (a request
+        // arrived) reads everything.
+        const scope =
+          retry && startedUnder === retry.position
+            ? { connections: retry.connections }
+            : undefined;
+        retry = undefined;
         refusedPosition = undefined;
         const settle = () => {
           // The update-required block is a diagnostic of a refusal no retry
-          // changes (`reportLeavesWork`); any other block means no cycle ran.
+          // changes (`connectionsOwingWork`); any other block means no cycle ran.
           if (
             (blocked !== null && blocked.reason !== "update_required") ||
             errorSeq !== errorsBefore
@@ -732,14 +813,31 @@ export function createSyncManager(
         if (options?.accountStorageMode && mode !== undefined) {
           if (mode !== "unswitched") {
             if (mode === "switched" && options.localSync) {
-              const report = await runLocalCycle(options.localSync);
+              // Nothing owed on a connection and a scope with none: no cycle.
+              const report =
+                scope && scope.connections.length === 0
+                  ? { connections: [] }
+                  : await runLocalCycle(options.localSync, scope);
               lastSync = new Date().toISOString();
               statusMayHaveChanged();
               // Deletion debt is owed work like a backed-off publish: a blob
               // waits on a tombstone's finality, a version-row change no
               // position announces. Nothing is settled while any is left.
               const debt = await drainPendingBlobDeletions("switched");
-              if (!reportLeavesWork(report) && !debt.owed) settle();
+              const owed = connectionsOwingWork(report);
+              reportOwed(owed, debt.owed);
+              if (owed.length === 0 && !debt.owed) settle();
+              // Only a pass that named every owed connection can be retried
+              // for those alone; any other outcome retries in full.
+              if (
+                startedUnder !== undefined &&
+                errorSeq === errorsBefore &&
+                owed.every((entry) => entry.connectionId !== null)
+              )
+                lastPass = {
+                  position: startedUnder,
+                  connections: owed.map((entry) => entry.connectionId!),
+                };
             } else {
               blocked = {
                 reason:
@@ -1282,11 +1380,34 @@ export function createSyncManager(
     );
   }
 
+  /**
+   * What the timer retries when the push does not cover a full cycle. The
+   * push announces every registry change (`pushAnnouncesChanges`), and the last
+   * pass that ran to its end read the registry at the position the push still
+   * reports, so nothing but the work that pass left owed can have changed: the
+   * retry reads those connections alone. Any other state (no push, a moved
+   * position, a pass that did not end, a block, a connection the report did not
+   * name) retries in full, as before.
+   */
+  function owedScope():
+    | { readonly connections: readonly string[]; readonly position: string }
+    | undefined {
+    if (
+      !pushAnnouncesChanges() ||
+      cycleInFlight !== null ||
+      blocked !== null ||
+      lastPass === null ||
+      lastPass.position !== knownPosition
+    )
+      return undefined;
+    return lastPass;
+  }
+
   function startInterval(): void {
     if (intervalId !== null) return;
     intervalId = setInterval(() => {
       if (pushCovers()) return;
-      runCycle().catch(() => {
+      runCycle(undefined, owedScope()).catch(() => {
         // Errors already captured in ring buffer
       });
     }, pollInterval);

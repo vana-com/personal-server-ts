@@ -43,6 +43,7 @@ export {
   runPublish,
   syncConnection,
   type CycleReport,
+  type CycleScope,
 } from "./cycle.js";
 export { UpdateRequiredError } from "./update-required.js";
 export { purgeConnection } from "./purge.js";
