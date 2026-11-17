@@ -174,6 +174,7 @@ adopting a newer epoch, so monotonicity means the pair (epoch, position).
 | RecommitForeign.cfg       | FAIL P5                             | `Recommit` without the check that the registry's rows are the ones the device applied                         |
 | NoRecommit.cfg            | FAIL EventuallyConverged            | no `Recommit`: a device ahead of a rolled-back registry never converges                                       |
 | Rebase.cfg                | PASS (complete)                     | `Rebase` when another segment replaced a row the device applied: NoLoss, Faithful, TypeOK, P1–P5, P7, OrderOK |
+| RebaseLive.cfg            | PASS (complete)                     | `Rebase` with one device (`rebaseLive`): EventuallyConverged                                                  |
 | RebaseRows.cfg            | FAIL NoLoss                         | a rebase that queues only the keys the device holds a record of, not its deletes and omissions                |
 | RebaseExplicit.cfg        | FAIL Faithful                       | a rebase that queues an omission as an explicit delete                                                        |
 
@@ -408,17 +409,21 @@ TLC 1.7.4 (2.19 engine, Java 17), `-workers 4 -Xmx4g`, `nice -n 19`, one job at 
 All configurations: `Spec`, two devices, `MaxSteps = 6`, `AllowReset = FALSE`,
 `AllowRollback = TRUE`, `KeepTail = 1`.
 
-| Configuration      | Expected      | Actual                                                                                                                                                                                                            | Distinct states   | Depth | Wall time   |
-| ------------------ | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- | ----- | ----------- |
-| RebaseRows.cfg     | FAIL NoLoss   | FAIL NoLoss as expected: device 1 applies a delete of key 1 at stamp 3, `Rollback` replaces that position with another batch, `Rebase` queues no deletion, and key 1 is back at stamp 1 (`traces/RebaseRows.txt`) | 25,171 at failure | 9     | 1 s         |
-| RebaseExplicit.cfg | FAIL Faithful | FAIL Faithful as expected: `Rebase` queues the omission of key 2 as an explicit delete, an operation no writer made (`traces/RebaseExplicit.txt`)                                                                 | 53,348 at failure | 10    | 1 s         |
-| Rebase.cfg         | PASS          | PASS, complete: "Model checking completed. No error has been found." 171,269,269 states generated, 0 left on queue                                                                                                | 14,084,246        | 29    | 14 min 49 s |
+| Configuration      | Expected      | Actual                                                                                                                                                                                                                                               | Distinct states   | Depth | Wall time    |
+| ------------------ | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- | ----- | ------------ |
+| RebaseRows.cfg     | FAIL NoLoss   | FAIL NoLoss as expected: device 1 applies a delete of key 1 at stamp 3, `Rollback` replaces that position with another batch, `Rebase` queues no deletion, and key 1 is back at stamp 1 (`traces/RebaseRows.txt`)                                    | 25,171 at failure | 9     | 1 s          |
+| RebaseExplicit.cfg | FAIL Faithful | FAIL Faithful as expected: `Rebase` queues the omission of key 2 as an explicit delete, an operation no writer made (`traces/RebaseExplicit.txt`)                                                                                                    | 53,348 at failure | 10    | 1 s          |
+| Rebase.cfg         | PASS          | PASS, complete: "Model checking completed. No error has been found." 171,269,269 states generated, 0 left on queue                                                                                                                                   | 14,084,246        | 29    | 14 min 49 s  |
+| RebaseLive.cfg     | PASS          | NOT COMPLETE: stopped at the 1 h limit with 233,437 distinct states and 50,911 on the queue; the 12 partial temporal checks (the last over 174,637 states) found no violation. TLC ran at under 1,000 states a minute under the host's IO contention |                   |       | 1 h, stopped |
 
 The first `Rebase.cfg` run failed TypeOK at depth 16: two devices each rebased once and
 the log reached seven positions, past `MaxSteps`. A seed is a commit the writers'
 budget does not count, and each device rebases at most once (one rollback epoch), so
 TypeOK now bounds positions by `LogBound`, `MaxSteps` plus one per device in the rebase
-modes.
+modes. `RebaseLive.cfg` checks EventuallyConverged with one device (`rebaseLive`), as the
+other liveness runs do: a device's recovery does not depend on another device's. A two-device
+liveness run would cover the 14 million states above with its behaviour graph on
+disk; the host did not finish one.
 
 Limits. The rebase is one step here; the code takes three (seed and reset in one
 commit, then the apply, then the publish), and a crash between them leaves queued

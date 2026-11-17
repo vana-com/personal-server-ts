@@ -14,7 +14,8 @@ KeyedModes == {"keyed","keyedSkip","keyedEarly","keyedLeak","keyedBypass",
 \* explains, and that cannot recommit, rebases (`Rebase`). rebaseRows (mutant): the rebase
 \* queues only the keys the device holds a record of, not its deletions and omissions.
 \* rebaseExplicit (mutant): it queues an omission as an explicit delete at its cutoff.
-RebaseModes == {"rebase","rebaseRows","rebaseExplicit"}
+\* rebaseLive: rebase with one device, for the liveness run.
+RebaseModes == {"rebase","rebaseLive","rebaseRows","rebaseExplicit"}
 RecommitModes == {"recommit","recommitOther","recommitForeign","noRecommit"} \cup RebaseModes
 ASSUME /\ MaxSteps \in 6..8
        /\ KeepTail = 1
@@ -24,9 +25,9 @@ ASSUME /\ MaxSteps \in 6..8
                     "keyed","keyedSkip","keyedEarly","keyedLeak","keyedBypass",
                     "keyedRebase","keyedStuck",
                     "recommit","recommitOther","recommitForeign","noRecommit",
-                    "rebase","rebaseRows","rebaseExplicit"}
+                    "rebase","rebaseLive","rebaseRows","rebaseExplicit"}
 \* A device's recovery does not depend on another device's: the liveness runs use one.
-Devices == IF Mode \in {"keyedRebase","keyedStuck"} THEN {1}
+Devices == IF Mode \in {"keyedRebase","keyedStuck","rebaseLive"} THEN {1}
            ELSE IF Mode \in RecommitModes THEN {1,2} ELSE {1,2,3}
 Keys == {1,2}
 Writers == {1,2}
