@@ -37,6 +37,22 @@ describe("createRateLimitPolicyFeed", () => {
     expect(seen).toHaveLength(2);
   });
 
+  it("sends through the fetch it was given, leaving globalThis.fetch alone", async () => {
+    const global = vi.fn(async () => new Response(""));
+    vi.stubGlobal("fetch", global);
+    const given = vi.fn(
+      async () =>
+        new Response("", { headers: { "ratelimit-policy": '"put";q=5;w=1' } }),
+    );
+    const feed = createRateLimitPolicyFeed(given as unknown as typeof fetch);
+    const seen: unknown[] = [];
+    feed.subscribe((policy) => seen.push(policy));
+    await feed.fetch("https://storage.test/");
+    expect(given).toHaveBeenCalledTimes(1);
+    expect(global).not.toHaveBeenCalled();
+    expect(seen).toEqual([{ named: { put: { limit: 5, windowMs: 1_000 } } }]);
+  });
+
   it("reports nothing when a response carries no policy", async () => {
     vi.stubGlobal(
       "fetch",
