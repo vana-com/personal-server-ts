@@ -62,11 +62,6 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
   record_count INTEGER NOT NULL, observed_at INTEGER NOT NULL, complete INTEGER NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN ('published','applied','delete')),
   PRIMARY KEY (connection_id, stream, version)) WITHOUT ROWID;`,
-    `CREATE TABLE head_parts (
-  connection_id TEXT NOT NULL, stream TEXT NOT NULL,
-  prefix TEXT NOT NULL CHECK (prefix NOT GLOB '*[^01]*' AND length(prefix) <= 16),
-  seq INTEGER NOT NULL, part_hash TEXT NOT NULL, bytes INTEGER NOT NULL, count INTEGER NOT NULL,
-  PRIMARY KEY (connection_id, stream, prefix, seq)) WITHOUT ROWID;`,
     `CREATE TABLE runs (
   run_id TEXT PRIMARY KEY CHECK (run_id NOT GLOB '*[^A-Za-z0-9._-]*' AND length(run_id) BETWEEN 1 AND 128),
   connection_id TEXT NOT NULL, o INTEGER NOT NULL, generation INTEGER,
@@ -172,18 +167,9 @@ END;`,
     `ALTER TABLE run_streams ADD COLUMN published_watermark INTEGER`,
     `ALTER TABLE run_streams ADD COLUMN publication_reason TEXT`,
   ],
-  [
-    // The rows one publish attempt sends, copied under the connection's slot
-    // so the upload reads a copy that later writes cannot move. Local only,
-    // never published or applied: an attempt deletes its rows when it ends,
-    // and `openLocalDb` deletes any left by a crash.
-    `CREATE TABLE publish_spool (
-  attempt TEXT NOT NULL, connection_id TEXT NOT NULL, pk_hash TEXT NOT NULL,
-  stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL, first_o INTEGER,
-  body_sha256 TEXT NOT NULL, body_bytes INTEGER NOT NULL, body TEXT NOT NULL,
-  PRIMARY KEY (attempt, pk_hash)) WITHOUT ROWID;`,
-    `CREATE INDEX publish_spool_by_connection ON publish_spool(connection_id)`,
-  ],
+  // A table of the per-stream head path (`publish_spool`) was created here.
+  // The slot stays, so a database's version keeps its meaning.
+  [],
   [
     // The newest stamp of a run that observed this row's body, when that is
     // newer than the stamp in the published bytes. Local only: never in a
@@ -439,33 +425,6 @@ END`,
     // with a changed body, at the same stamp; the later batch is the fresher
     // observation. 0 for a row from before the column and for a run's first batch.
     `ALTER TABLE records ADD COLUMN stamp_n INTEGER NOT NULL DEFAULT 0`,
-
-    // The last registry per-stream head this device consumed completely:
-    // `head_version` cannot say it, because the log's own rounds also advance
-    // `head_version` (a local number above anything the registry holds). A row
-    // is written only when a head's apply (or this device's own publish of a
-    // head) finishes; the log never touches it. A row of a connection with no
-    // log took its head as consumed. A connection that followed a log did not:
-    // its `head_version` may be a log's local number, so its heads are read
-    // once more.
-    `ALTER TABLE stream_state ADD COLUMN consumed_version INTEGER NOT NULL DEFAULT 0`,
-    `ALTER TABLE stream_state ADD COLUMN consumed_generation INTEGER`,
-    `ALTER TABLE stream_state ADD COLUMN consumed_data_hash TEXT`,
-    `UPDATE stream_state SET consumed_version = head_version, consumed_generation = head_generation,
-        consumed_data_hash = head_data_hash
-      WHERE head_version > 0 AND head_data_hash IS NOT NULL
-        AND NOT EXISTS (SELECT 1 FROM log_state l WHERE l.connection_id = stream_state.connection_id)`,
-
-    // The log replay a head admission owes. A per-stream head merged beside a
-    // log can drop rows the log holds, so the head batch resets the log
-    // cursor (`log_state`) and writes this row in the same batch: one row
-    // per connection, present until a replay of the log has been validated
-    // and finished. `position` and `last_ref` are the cursor the batch
-    // replaced (0 and null for a device that held none): the evidence that a
-    // registry log behind that position, or naming another segment there, is
-    // not a continuation. Local only.
-    `CREATE TABLE log_replay (
-  connection_id TEXT PRIMARY KEY, position INTEGER NOT NULL, last_ref TEXT) WITHOUT ROWID;`,
   ],
   [
     // A key-ordered first load of the log (log-keyed.ts) writes its rows one
@@ -480,16 +439,12 @@ END`,
   refs TEXT NOT NULL) WITHOUT ROWID`,
   ],
   [
-    // The connection log is the only protocol, so the state the per-stream
-    // head path kept beside it is gone: the parts a head was built from
-    // (`head_parts`), the replay a head admission owed (`log_replay`) and the
-    // registry head a device had consumed (`consumed_*`). Local only.
+    // The tables of the per-stream head path, on a database created before
+    // the migrations above stopped creating them. The `consumed_*` columns of
+    // `stream_state` such a database has stay: nothing reads them, and
+    // SQLite before 3.35 (a phone's 3.22) cannot drop a column.
     `DROP TABLE IF EXISTS head_parts`,
     `DROP TABLE IF EXISTS log_replay`,
-    `ALTER TABLE stream_state DROP COLUMN consumed_version`,
-    `ALTER TABLE stream_state DROP COLUMN consumed_generation`,
-    `ALTER TABLE stream_state DROP COLUMN consumed_data_hash`,
-    // The copy a head publish attempt sent from (`publish_spool`) went with it.
     `DROP TABLE IF EXISTS publish_spool`,
   ],
   [
