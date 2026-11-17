@@ -1,6 +1,5 @@
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import type { ListedScope } from "../../../core/src/localdb/listing.js";
-import { createOlderVersions } from "../../../core/src/localdb/older-versions.js";
 import { seenStamp } from "../../../core/src/localdb/merge.js";
 import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import {
@@ -25,7 +24,6 @@ export async function referenceListScopes(
   const aliasNames = [...(deps.aliasScopes?.() ?? [])];
   const resolver = createLocalResolver(deps, {
     query: createRecordQuery(deps.db),
-    olderVersions: createOlderVersions(deps, { enabled: () => false }),
     aliasScopes: () => aliasNames,
     aliasTargets: deps.aliasTargets,
   });

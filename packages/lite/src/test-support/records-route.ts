@@ -75,7 +75,6 @@ export async function syncedStore(
     },
     {
       resolveArtifact: () => null,
-      olderVersionReads: () => true,
     },
   );
   await local.apply();

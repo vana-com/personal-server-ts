@@ -11,11 +11,13 @@ import {
   createMemoryStreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { RegistryUnavailableError } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { logScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}` as const;
 const connection = "pdpp.fixture-source~";
+const log = logScope("fixture-source", "");
 const drivers: SqlDriver[] = [];
 afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
@@ -62,7 +64,6 @@ async function world(seed = true) {
           semantics: "mutable_state",
         })),
       }),
-      olderVersionReads: () => true,
     });
     const collect = async (
       id: string,
@@ -307,10 +308,10 @@ describe("#560 five basis/skew traces", () => {
       publish: false,
     });
     let crashed = false;
-    const post = registry.post.bind(registry);
-    registry.post = async (request) => {
-      const answer = await post(request);
-      if (!crashed && request.scope.endsWith(".A")) {
+    const postBatch = registry.postBatch!.bind(registry);
+    registry.postBatch = async (request) => {
+      const answer = await postBatch(request);
+      if (!crashed && request.rows.some((row) => row.scope === log)) {
         crashed = true;
         throw new Error("simulated reply loss after CAS");
       }
@@ -322,9 +323,9 @@ describe("#560 five basis/skew traces", () => {
     await a.publish();
     await b.sync.apply();
     expect(await b.rows("A")).toEqual(["a"]);
-    const version = await registry.read(connection + ".A");
+    const version = await registry.read(log);
     await a.publish();
-    expect(await registry.read(connection + ".A")).toEqual(version);
+    expect(await registry.read(log)).toEqual(version);
   });
 });
 

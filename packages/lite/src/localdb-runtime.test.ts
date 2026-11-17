@@ -23,17 +23,14 @@ it("Lite HTTP history and status use the same database facade and its counters",
   });
   await authority.ready;
   await authority.submitEvidence({ owner, state: "on" });
-  const counts = { served: 2, gone: 1, off: 0 };
   const status = {
     listed: true,
     connections: [],
     issues: [],
-    olderVersionReads: counts,
   };
   const additions = vi.fn(async () => ({ total: 7 }));
   const local = {
     listing: { status: async () => status },
-    olderVersions: { counts: () => counts },
   } as unknown as LocalSync;
   const getLocalSync = vi.fn(async () => local);
   const accessLog = createMemoryPsLiteAccessLogStore();
@@ -70,9 +67,11 @@ it("Lite HTTP history and status use the same database facade and its counters",
       }),
     );
   expect(await (await get("/v1/sync/status")).json()).toEqual(status);
-  expect(
-    (await (await get("/v1/stream-sync/read-status")).json()).olderVersionReads,
-  ).toEqual(counts);
+  expect(await (await get("/v1/stream-sync/read-status")).json()).toEqual({
+    listed: true,
+    streams: expect.any(Object),
+    issues: 0,
+  });
   expect((await (await get("/v1/data/additions")).json()).total).toBe(7);
   expect(additions).toHaveBeenCalledTimes(1);
   const connection = await createMcpConnection(

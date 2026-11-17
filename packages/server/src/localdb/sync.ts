@@ -4,7 +4,10 @@ import {
   legacyAliasScopes,
 } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { legacyConnectorKey } from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
-import type { ImportProjectionPort } from "@opendatalabs/personal-server-ts-core/localdb";
+import type {
+  ImportProjectionPort,
+  LocalSync,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 
 /** The one host composition site supplies the frozen catalogue to database
  * listing, read-back and legacy access. It owns no projection algorithms. */
@@ -27,7 +30,7 @@ export function createServerLocalSync(
     Parameters<typeof createLocalSync>[1],
     "aliasScopes" | "aliasTargets"
   >,
-) {
+): LocalSync {
   return createLocalSync(deps, {
     ...options,
     aliasScopes,

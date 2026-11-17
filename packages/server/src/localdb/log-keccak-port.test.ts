@@ -59,7 +59,7 @@ async function reader(
   id: string,
   hooks: Parameters<World["device"]>[2],
 ) {
-  const d = await w.device(id, true, hooks);
+  const d = await w.device(id, hooks);
   await d.db.batch([
     {
       sql: "INSERT INTO connections(connection_id,connector,ns,generation,control_state,control_version) VALUES (?,?,'',1,'active',1)",
@@ -83,7 +83,7 @@ describe("the Keccak-256 of a log segment", () => {
   ])(
     "is taken from the host's port, once per segment, %s",
     async (_name, keyed) => {
-      const w = await world({ streams: 1, logProtocol: true });
+      const w = await world({ streams: 1 });
       await publishedLog(w);
       const lengths = await segmentLengths(w);
       const { port, sizes } = recordingPort();
@@ -114,7 +114,7 @@ describe("the Keccak-256 of a log segment", () => {
   );
 
   it("refuses a segment whose bytes the port's digest does not match, and exposes no row", async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     await publishedLog(w);
     // A port that disagrees with the registry about every segment.
     const { port } = recordingPort((data) =>
@@ -131,7 +131,7 @@ describe("the Keccak-256 of a log segment", () => {
   });
 
   it("refuses a segment with one flipped byte through the native port's digest too", async () => {
-    const w = await world({ streams: 1, logProtocol: true });
+    const w = await world({ streams: 1 });
     await publishedLog(w);
     const keys = [...(await w.segmentKeys()).values()];
     const victim = keys[2]!;
@@ -147,39 +147,36 @@ describe("the Keccak-256 of a log segment", () => {
   });
 });
 
-it.each([false, true])(
-  "writer metadata hashing uses the supplied port (log=%s)",
-  async (logProtocol) => {
-    const w = await world({ streams: 1, logProtocol });
-    const { port, inputs } = recordingPort();
-    const writer = await w.device("metadata-writer", true, {
-      streamCrypto: port,
-    });
-    await writer.run(
-      "metadata-run",
-      [{ stream: S0, id: "metadata-row", v: 1 }],
-      { full: false, covered: [S0], observedAt: 1001 },
-    );
-    await writer.cycle();
-    const metadata = inputs.flatMap((bytes) => {
-      try {
-        const value = JSON.parse(new TextDecoder().decode(bytes));
-        return value &&
-          typeof value === "object" &&
-          Object.keys(value).join(",") === "scope,collectedAt,sizeBytes"
-          ? [value]
-          : [];
-      } catch {
-        return [];
-      }
-    });
-    expect(metadata).toHaveLength(1);
-    expect(metadata[0].scope).toEqual(expect.any(String));
-    expect(metadata[0].scope.length).toBeGreaterThan(0);
-    expect(metadata[0].collectedAt).toBe(new Date(1001).toISOString());
-    expect(metadata[0].sizeBytes).toBeGreaterThan(0);
-  },
-);
+it("writer metadata hashing uses the supplied port", async () => {
+  const w = await world({ streams: 1 });
+  const { port, inputs } = recordingPort();
+  const writer = await w.device("metadata-writer", {
+    streamCrypto: port,
+  });
+  await writer.run("metadata-run", [{ stream: S0, id: "metadata-row", v: 1 }], {
+    full: false,
+    covered: [S0],
+    observedAt: 1001,
+  });
+  await writer.cycle();
+  const metadata = inputs.flatMap((bytes) => {
+    try {
+      const value = JSON.parse(new TextDecoder().decode(bytes));
+      return value &&
+        typeof value === "object" &&
+        Object.keys(value).join(",") === "scope,collectedAt,sizeBytes"
+        ? [value]
+        : [];
+    } catch {
+      return [];
+    }
+  });
+  expect(metadata).toHaveLength(1);
+  expect(metadata[0].scope).toEqual(expect.any(String));
+  expect(metadata[0].scope.length).toBeGreaterThan(0);
+  expect(metadata[0].collectedAt).toBe(new Date(1001).toISOString());
+  expect(metadata[0].sizeBytes).toBeGreaterThan(0);
+});
 
 it("metadata hash returns the injected digest and retains the no-host fallback", async () => {
   const scope = "fixture.metadata",

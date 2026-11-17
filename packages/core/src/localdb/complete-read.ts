@@ -83,9 +83,11 @@ export async function clearMark(
  * query sorts the page again: at most `PAGE_SIZE` rows, never the stream.
  *
  * The check is the rule `partialBody` applies to a head that completed: the
- * stream's installed head is the one the read was decided on, and its
- * connection is still active, of the same generation, with no delete intent.
- * Both answer in the statement that reads the rows.
+ * stream's installed head (its version and data hash) is the one the read was
+ * decided on, and its connection is still active, of the same generation,
+ * with no delete intent. Both answer in the statement that reads the rows. A
+ * head that stopped being complete, or moved to another generation, has a
+ * version of its own, so the version names those too.
  *
  * One more clause, because of how a head replaces another. An apply writes the
  * rows of a new head into the table in commits of its own, and moves the
@@ -104,7 +106,7 @@ export function completePage(
   return {
     sql: `WITH g AS (SELECT (
          EXISTS (SELECT 1 FROM stream_state s WHERE s.connection_id = ? AND s.stream = ?
-                   AND s.complete = 1 AND s.head_version = ? AND s.head_generation = ? AND s.head_data_hash = ?)
+                   AND s.head_version = ? AND s.head_data_hash = ?)
          AND EXISTS (SELECT 1 FROM connections c WHERE c.connection_id = ? AND c.generation = ?
                    AND c.control_state = 'active' AND c.deleted_at IS NULL
                    AND NOT EXISTS (SELECT 1 FROM delete_intents d WHERE d.connector = c.connector))
@@ -121,7 +123,6 @@ export function completePage(
       head.connectionId,
       head.stream,
       head.version,
-      head.generation,
       head.dataHash,
       head.connectionId,
       head.generation,

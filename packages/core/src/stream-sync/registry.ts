@@ -548,13 +548,7 @@ export function createGatewayStreamSyncRegistry(
       return { seq: body.seq, changed: body.changed };
     },
 
-    listConnectionRows: (connector, ns) =>
-      listRows((scope) => {
-        const parsed = parseScope(scope);
-        return (
-          parsed !== null && parsed.connector === connector && parsed.ns === ns
-        );
-      }),
+    listOwnerRows: () => listRows(() => true),
   };
 }
 

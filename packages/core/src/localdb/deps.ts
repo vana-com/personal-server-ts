@@ -57,12 +57,13 @@ export interface LocalSyncDeps {
    */
   readonly publishWhileCollecting?: boolean;
   /**
-   * Default off. On: a stream with no complete head is readable by its owner
-   * from its first applied part, in an explicit partial state, and fills in
-   * as parts apply (`stream_partial`). Off: a stream is readable only when
-   * its head is complete, as before. A first load that loads key by key
-   * (`keyedFirstLoad`) does so with this on too, and its streams are
-   * readable when it ends (see `planKeyedLoad`).
+   * Default off. On: a stream whose first load is not complete is readable by
+   * its owner from its first applied batch, in an explicit partial state, and
+   * fills in as batches apply (`stream_partial`). Off: a stream is readable
+   * only when its load is complete, as before. A first load that loads the
+   * log key by key (`keyedFirstLoad`) does so with this on too, and its
+   * streams are readable when its last key range commits (see
+   * `planKeyedLoad`).
    */
   readonly progressiveFirstLoad?: boolean;
   /**
@@ -74,16 +75,6 @@ export interface LocalSyncDeps {
    * flag off, drops those rows and loads again (`rebaselineKeyedLoad`).
    */
   readonly keyedFirstLoad?: boolean;
-  /**
-   * Publish and apply through the stream-sync log (one segment and one
-   * registry commit per batch, across streams) instead of per-stream heads.
-   * Default off. The flag lets this device START a log on a connection that has
-   * none. A connection that has a log (its row is in the registry) is read and
-   * written through it by every device of this build, whatever its flag; a
-   * device whose build cannot read the log's format refuses to write that
-   * connection and reports `update_required` (`UpdateRequiredError`).
-   */
-  readonly logProtocol?: boolean;
 }
 
 /** The one call every commit of local rows makes (run end, import). */

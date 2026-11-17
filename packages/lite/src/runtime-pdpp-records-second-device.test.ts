@@ -7,7 +7,7 @@
  * that connection's streams.
  *
  * Real: the Lite runtime and its owner auth, the database composition and
- * its apply of a remote registry's heads and tombstones.
+ * its apply of a remote registry's connection log.
  */
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -31,6 +31,24 @@ async function recordsOf(
   const response = await liteGet(await liteRuntime(local), path(stream));
   const body = await response.json();
   return { status: response.status, body };
+}
+
+/** A stream delete at version 2, above the head of the stream's one load. */
+async function deleteStream(
+  db: Awaited<ReturnType<typeof syncedStore>>["db"],
+  stream: string,
+) {
+  const [row] = await db.query<{ head_version: number }>(
+    "SELECT head_version FROM stream_state WHERE stream = ?",
+    [stream],
+  );
+  expect(row?.head_version).toBe(1);
+  await db.batch([
+    {
+      sql: "UPDATE stream_state SET last_delete_version = 2 WHERE stream = ?",
+      params: [stream],
+    },
+  ]);
 }
 
 describe("the records route on a device that synced a connection", () => {
@@ -65,23 +83,16 @@ describe("the records route on a device that synced a connection", () => {
     expect(status).toBe(404);
   });
 
-  it("stops serving a stream once its delete is applied", async () => {
-    const { local, remote } = await syncedStore(async (r) => {
+  // The connection log carries no delete of one stream (the delete lane owns
+  // that), so the delete's local state is planted: its version above the
+  // stream's head.
+  it("stops serving a stream whose delete is newer than its head", async () => {
+    const { local, db } = await syncedStore(async (r) => {
       await r.head("posts", POSTS);
       await r.head("drafts", [{ id: "d1" }]);
     });
     expect((await recordsOf(local, "drafts")).status).toBe(200);
-    const scope = (await remote.registry.listStreamRows(CONNECTOR)).find((e) =>
-      e.scope.endsWith("drafts"),
-    )!.scope;
-    remote.reads.set(scope, {
-      found: true,
-      version: 2,
-      dataHash: remote.hashes.tombstoneData,
-      metadataHash: remote.hashes.tombstoneMetadata,
-      deleted: true,
-    });
-    await local.apply();
+    await deleteStream(db, "drafts");
     expect((await recordsOf(local, "drafts")).status).toBe(404);
     expect((await recordsOf(local, "posts")).status).toBe(200);
   });
@@ -107,18 +118,10 @@ describe("the records route on a device that synced a connection", () => {
       version: number;
       generation: number;
     }) => {
-      const { local, remote, db } = await syncedStore(async (r) => {
+      const { local, db } = await syncedStore(async (r) => {
         await r.head("posts", POSTS);
       });
-      const scope = (await remote.registry.listStreamRows(CONNECTOR))[0]!.scope;
-      remote.reads.set(scope, {
-        found: true,
-        version: 2,
-        dataHash: remote.hashes.tombstoneData,
-        metadataHash: remote.hashes.tombstoneMetadata,
-        deleted: true,
-      });
-      await local.apply();
+      await deleteStream(db, "posts");
       expect(await local.declarations.streamsOf(CONNECTOR)).toEqual([]);
       await db.batch([
         {

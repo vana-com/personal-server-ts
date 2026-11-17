@@ -15,14 +15,12 @@ const auth = {
 const headers = { authorization: "Bearer test-owner" };
 
 describe("database route wiring", () => {
-  it("awaits a connection sync before reading a file, uses the cycle for trigger and exposes history counts", async () => {
+  it("awaits a connection sync before reading a file, uses the cycle for trigger and exposes read status", async () => {
     const order: string[] = [];
-    const counts = { served: 2, gone: 1, off: 3 };
     const status = {
       listed: 1,
       connections: [],
       issues: [],
-      olderVersionReads: counts,
     };
     const localSync = {
       cycle: vi.fn(async () => {
@@ -32,7 +30,6 @@ describe("database route wiring", () => {
         order.push("sync");
       }),
       listing: { status: vi.fn(async () => status) },
-      olderVersions: { counts: () => counts },
     } as unknown as LocalSync;
     const app = syncRoutes({
       ...auth,
@@ -68,10 +65,11 @@ describe("database route wiring", () => {
       streamSyncRead: undefined,
       localSync,
     });
-    expect(
-      (await (await readStatus.request("/", { headers })).json())
-        .olderVersionReads,
-    ).toEqual(counts);
+    expect(await (await readStatus.request("/", { headers })).json()).toEqual({
+      listed: 1,
+      streams: expect.any(Object),
+      issues: 0,
+    });
   });
 
   it("authenticates blob puts and forwards bytes only within the size ceiling", async () => {

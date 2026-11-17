@@ -57,7 +57,7 @@ describe("GET /v1/data/:scope/versions with a logical stream name", () => {
         now: () => OBSERVED,
         newOp: () => "op",
       } as LocalSyncDeps,
-      { olderVersionReads: () => true },
+      {},
     );
     const deps: PersonalServerDataApiDeps = {
       auth: {
@@ -121,7 +121,7 @@ describe("GET /v1/data/:scope/versions with a logical stream name", () => {
       scope: SCOPE,
       versions: [
         {
-          fileId: "blob-3",
+          fileId: null,
           schemaId: null,
           collectedAt: new Date(OBSERVED).toISOString(),
           version: 3,

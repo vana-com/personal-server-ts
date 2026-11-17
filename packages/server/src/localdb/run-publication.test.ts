@@ -10,8 +10,8 @@ import {
   controlHashes,
   controlScope,
   deriveKeyCheck,
+  logScope,
   pkHash,
-  streamScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   MemoryStreamSyncRegistry,
@@ -24,8 +24,8 @@ import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import { MIGRATIONS } from "../../../core/src/localdb/schema.js";
 import { withOrigin } from "../../../core/src/localdb/merge.js";
-import { applyStream } from "../../../core/src/localdb/apply.js";
-import { publishConnection } from "../../../core/src/localdb/publish.js";
+import { applyConnection } from "../../../core/src/localdb/apply.js";
+import { publishLog } from "../../../core/src/localdb/log-publish.js";
 import { purgeConnection } from "../../../core/src/localdb/purge.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
 import { unwriteRefusedRun } from "../../../core/src/localdb/unwrite.js";
@@ -146,6 +146,13 @@ async function restart(world: World): Promise<void> {
   world.deps = deps;
 }
 
+/** One publish of the connection through its log (a registry with the batch route). */
+async function publish(deps: LocalSyncDeps, connectionId: string) {
+  const results = await publishLog(deps, connectionId);
+  if (results === null) throw new Error("the registry has no batch route");
+  return results;
+}
+
 const BEGIN_REQUEST = JSON.stringify({
   connector: CONNECTOR,
   artifactDigest: "digest",
@@ -213,18 +220,18 @@ const status = (world: World, runId: string) =>
   readPublicationStatus(world.deps.db, runId);
 const stateOf = (result: Awaited<ReturnType<typeof status>>, stream: string) =>
   result.streams.find((s) => s.name === stream);
-const head = async (world: World, stream: string) => {
-  const read = await world.registry.read(streamScope(CONNECTOR, NS, stream));
-  if (!read.found) throw new Error("no registry head");
+const LOG = logScope(CONNECTOR, NS);
+/** The registry row a publication lands on: the connection's log. */
+const head = async (world: World) => {
+  const read = await world.registry.read(LOG);
+  if (!read.found) throw new Error("no registry log row");
   return read;
 };
-const streamPosts = (world: World, stream: string) =>
-  world.registry.log.filter(
-    (post) => post.scope === streamScope(CONNECTOR, NS, stream),
-  );
-const failStream = (world: World, stream: string, active: () => boolean) => {
+const logPosts = (world: World) =>
+  world.registry.log.filter((post) => post.scope === LOG);
+const failLog = (world: World, active: () => boolean) => {
   world.registry.beforePost = async (request) => {
-    if (active() && request.scope === streamScope(CONNECTOR, NS, stream))
+    if (active() && request.scope === LOG)
       throw new Error("storage unavailable");
   };
 };
@@ -239,11 +246,11 @@ describe("run publication state", () => {
     );
     expect((await status(world, "r1")).state).toBe("pending");
 
-    await publishConnection(world.deps, CONNECTION_ID); // the reply is dropped
+    await publish(world.deps, CONNECTION_ID); // the reply is dropped
     await restart(world);
 
     const after = await status(world, "r1");
-    const registered = await head(world, A);
+    const registered = await head(world);
     expect(after).toEqual({
       runId: "r1",
       state: "published",
@@ -284,16 +291,16 @@ describe("run publication state", () => {
     await endRun(world, "r1");
     const before = await readEndReceipt(world.deps.db, "r1");
     let down = true;
-    failStream(world, A, () => down);
+    failLog(world, () => down);
 
-    await expect(publishConnection(world.deps, CONNECTION_ID)).rejects.toThrow(
+    await expect(publish(world.deps, CONNECTION_ID)).rejects.toThrow(
       "storage unavailable",
     );
     expect((await status(world, "r1")).state).toBe("pending");
     expect(await readEndReceipt(world.deps.db, "r1")).toEqual(before);
 
     down = false;
-    await publishConnection(world.deps, CONNECTION_ID);
+    await publish(world.deps, CONNECTION_ID);
     expect((await status(world, "r1")).state).toBe("published");
     // Head and evidence moved together: the stored head is the evidence's head.
     const [state] = await world.deps.db.query(
@@ -309,17 +316,17 @@ describe("run publication state", () => {
     const world = await makeWorld();
     await collect(world, "r1", 1000, { [A]: ["x"] }, { full: false });
     await endRun(world, "r1");
-    await publishConnection(world.deps, CONNECTION_ID);
-    const posts = streamPosts(world, A).length;
+    await publish(world.deps, CONNECTION_ID);
+    const posts = logPosts(world).length;
 
     // A later run found nothing new. Nothing is posted, yet it is saved.
     await collect(world, "r2", 2000, { [A]: [] }, { full: false });
     await endRun(world, "r2");
     expect((await status(world, "r2")).state).toBe("pending");
-    const [again] = await publishConnection(world.deps, CONNECTION_ID);
+    const [again] = await publish(world.deps, CONNECTION_ID);
     expect(again).toMatchObject({ outcome: "noop", watermark: 1 });
     expect(again?.publication).toBeUndefined(); // no transient receipt
-    expect(streamPosts(world, A)).toHaveLength(posts);
+    expect(logPosts(world)).toHaveLength(posts);
     expect(stateOf(await status(world, "r2"), A)?.publication).toMatchObject({
       version: 1,
       watermark: 1,
@@ -333,7 +340,7 @@ describe("run publication state", () => {
     const world = await makeWorld();
     await collect(world, "r1", 1000, { [A]: ["x"] }, { full: false });
     await endRun(world, "r1");
-    await publishConnection(world.deps, CONNECTION_ID);
+    await publish(world.deps, CONNECTION_ID);
 
     // A local change the registry head does not hold yet, then a run that
     // found nothing: its plan is a noop, but "saved" would be false.
@@ -354,38 +361,27 @@ describe("run publication state", () => {
     );
     await collect(world, "r2", 2000, { [A]: [] }, { full: false });
     await endRun(world, "r2");
-    failStream(world, A, () => true);
+    failLog(world, () => true);
 
-    await expect(publishConnection(world.deps, CONNECTION_ID)).rejects.toThrow(
+    await expect(publish(world.deps, CONNECTION_ID)).rejects.toThrow(
       "storage unavailable",
     );
     expect((await status(world, "r2")).state).toBe("pending");
   });
 
-  it("recovers a lost local commit of an empty full run without a new post", async () => {
+  it("reads an empty full run as published once the log carries what it removed", async () => {
     const world = await makeWorld();
     await collect(world, "r1", 1000, { [A]: ["x"] }, { full: false });
     await endRun(world, "r1");
-    await publishConnection(world.deps, CONNECTION_ID);
-    // r2 flips the head to complete; the registry commits, the local commit is lost.
+    await publish(world.deps, CONNECTION_ID);
     await collect(world, "r2", 2000, { [A]: [] });
     await endRun(world, "r2");
-    world.registry.afterPost = async (request) => {
-      if (request.scope === streamScope(CONNECTOR, NS, A))
-        throw new Error("crash after the registry committed");
-    };
-    await expect(publishConnection(world.deps, CONNECTION_ID)).rejects.toThrow(
-      "crash after",
-    );
-    expect(streamPosts(world, A)).toHaveLength(2);
     expect((await status(world, "r2")).state).toBe("pending");
-
-    world.registry.afterPost = undefined;
-    await restart(world);
-    await publishConnection(world.deps, CONNECTION_ID);
-    expect(streamPosts(world, A)).toHaveLength(2);
-    expect(stateOf(await status(world, "r2"), A)?.publication?.version).toBe(2);
+    await publish(world.deps, CONNECTION_ID);
     expect((await status(world, "r2")).state).toBe("published");
+    const posts = logPosts(world).length;
+    await publish(world.deps, CONNECTION_ID);
+    expect(logPosts(world)).toHaveLength(posts);
   });
 
   it("never marks published when the crash is after the CAS, then recovers through the hash-equal path", async () => {
@@ -393,19 +389,19 @@ describe("run publication state", () => {
     await collect(world, "r1", 1000);
     await endRun(world, "r1");
     world.registry.afterPost = async (request) => {
-      if (request.scope === streamScope(CONNECTOR, NS, A))
+      if (request.scope === LOG)
         throw new Error("crash after the registry committed");
     };
-    await expect(publishConnection(world.deps, CONNECTION_ID)).rejects.toThrow(
+    await expect(publish(world.deps, CONNECTION_ID)).rejects.toThrow(
       "crash after",
     );
-    expect(streamPosts(world, A)).toHaveLength(1);
+    expect(logPosts(world)).toHaveLength(1);
     expect((await status(world, "r1")).state).toBe("pending");
 
     world.registry.afterPost = undefined;
     await restart(world);
-    await publishConnection(world.deps, CONNECTION_ID);
-    expect(streamPosts(world, A)).toHaveLength(1); // matched the head, no second post
+    await publish(world.deps, CONNECTION_ID);
+    expect(logPosts(world)).toHaveLength(1); // matched the head, no second post
     expect(stateOf(await status(world, "r1"), A)?.publication?.version).toBe(1);
     expect((await status(world, "r1")).state).toBe("published");
   });
@@ -455,7 +451,7 @@ describe("run publication state", () => {
     it("reads superseded right after an applied generation reset, with no publish between", async () => {
       const world = await pendingRun();
       const hashes = await hashesOf(world);
-      await applyStream(
+      await applyConnection(
         readsAs(
           world,
           CONTROL,
@@ -467,7 +463,6 @@ describe("run publication state", () => {
           false,
         )(world.deps),
         CONNECTION_ID,
-        A,
       );
       const [connection] = await world.deps.db.query(
         "SELECT generation, control_state FROM connections",
@@ -481,33 +476,6 @@ describe("run publication state", () => {
         streams: [
           { name: A, state: "superseded", reason: "generation_changed" },
         ],
-      });
-    });
-
-    it("reads superseded right after an applied stream tombstone, with no publish between", async () => {
-      const world = await pendingRun();
-      const hashes = await hashesOf(world);
-      await applyStream(
-        readsAs(
-          world,
-          streamScope(CONNECTOR, NS, A),
-          {
-            version: 2,
-            data: hashes.tombstoneData,
-            metadata: hashes.tombstoneMetadata,
-          },
-          true,
-        )(world.deps),
-        CONNECTION_ID,
-        A,
-      );
-      const [row] = await world.deps.db.query(
-        "SELECT last_delete_version FROM stream_state",
-      );
-      expect(row!.last_delete_version).toBe(2);
-      expect(await status(world, "r1")).toMatchObject({
-        state: "superseded",
-        streams: [{ name: A, state: "superseded", reason: "stream_deleted" }],
       });
     });
 
@@ -536,7 +504,7 @@ describe("run publication state", () => {
         Object.fromEntries(streams.map((stream) => [stream, ["x"]])),
       );
       await endRun(world, "r1", [...streams]);
-      await publishConnection(world.deps, CONNECTION_ID);
+      await publish(world.deps, CONNECTION_ID);
       expect((await status(world, "r1")).state).toBe("published");
       return world;
     }
@@ -621,31 +589,29 @@ describe("run publication state", () => {
     });
   });
 
-  it("publishes a multi-stream run per stream: A saved, B pending, then both after B finishes", async () => {
+  it("commits a multi-stream run in one log write: pending in every stream while it fails, published in every stream after", async () => {
     const world = await makeWorld([A, B]);
     await collect(world, "r1", 1000, { [A]: ["a1"], [B]: ["b1"] });
     await endRun(world, "r1", [A, B]);
     let down = true;
-    failStream(world, B, () => down);
-    await expect(
-      publishConnection(world.deps, CONNECTION_ID),
-    ).rejects.toThrow();
+    failLog(world, () => down);
+    await expect(publish(world.deps, CONNECTION_ID)).rejects.toThrow();
 
     const partial = await status(world, "r1");
     expect(partial.state).toBe("pending");
     expect(partial.streams.map((s) => [s.name, s.state])).toEqual([
-      [A, "published"],
+      [A, "pending"],
       [B, "pending"],
     ]);
-    const evidenceA = stateOf(partial, A)?.publication;
 
     await restart(world);
     down = false;
-    await publishConnection(world.deps, CONNECTION_ID);
+    await publish(world.deps, CONNECTION_ID);
     const done = await status(world, "r1");
     expect(done.state).toBe("published");
-    expect(stateOf(done, A)?.publication).toEqual(evidenceA);
+    expect(stateOf(done, A)?.publication?.version).toBe(1);
     expect(stateOf(done, B)?.publication?.version).toBe(1);
+    expect(logPosts(world)).toHaveLength(1);
   });
 
   it("never compares the publish watermark with the run's observation time", async () => {
@@ -662,7 +628,7 @@ describe("run publication state", () => {
     const huge = await makeWorld();
     await collect(huge, "r1", 8_000_000_000_000_000);
     await endRun(huge, "r1");
-    await publishConnection(huge.deps, CONNECTION_ID);
+    await publish(huge.deps, CONNECTION_ID);
     expect(stateOf(await status(huge, "r1"), A)?.publication?.watermark).toBe(
       1,
     );
@@ -698,7 +664,7 @@ describe("run publication state", () => {
     });
     await collect(world, "new", 2000);
     await endRun(world, "new");
-    await publishConnection(world.deps, CONNECTION_ID);
+    await publish(world.deps, CONNECTION_ID);
     expect((await status(world, "new")).state).toBe("published");
     expect((await status(world, "old")).state).toBe("unknown");
   });
@@ -714,7 +680,7 @@ describe("run publication state", () => {
         sql: `UPDATE stream_state SET floor_version = '2.0.0'`,
       },
     ]);
-    await publishConnection(refused.deps, CONNECTION_ID);
+    await publish(refused.deps, CONNECTION_ID);
     expect(await status(refused, "r1")).toMatchObject({
       state: "unknown",
       reason: "no_accepted_streams",
@@ -797,19 +763,19 @@ describe("run publication state", () => {
     const world = await makeWorld();
     await collect(world, "r1", 1000, { [A]: ["a", "b"] });
     await endRun(world, "r1");
-    await publishConnection(world.deps, CONNECTION_ID);
+    await publish(world.deps, CONNECTION_ID);
 
     // A later incremental run overwrites key a. The old run was still saved:
     // "saved" is a historical fact, not a claim that its bodies are current.
     await collect(world, "r2", 2000, { [A]: ["a"] }, { full: false });
     await endRun(world, "r2");
-    await publishConnection(world.deps, CONNECTION_ID);
+    await publish(world.deps, CONNECTION_ID);
     expect((await status(world, "r1")).state).toBe("published");
     expect((await status(world, "r2")).state).toBe("published");
 
     // A newer replacing run drops everything below it.
     await collect(world, "r3", 3000, { [A]: ["c"] });
-    const head1 = await head(world, A);
+    const head1 = await head(world);
     await endRun(world, "r3");
     await world.deps.db.batch([
       {
@@ -817,7 +783,7 @@ describe("run publication state", () => {
         params: [head1.version, head1.dataHash],
       },
     ]);
-    await publishConnection(world.deps, CONNECTION_ID);
+    await publish(world.deps, CONNECTION_ID);
     expect((await status(world, "r3")).state).toBe("published");
     for (const older of ["r1", "r2"])
       expect((await status(world, older)).streams[0]).toMatchObject({
@@ -834,7 +800,6 @@ describe("run publication state", () => {
       await endRun(world, "r1");
       const sync = createLocalSync(world.deps, {
         resolveArtifact: () => null,
-        olderVersionReads: () => false,
       });
       const code = (work: Promise<unknown>) =>
         work.then(

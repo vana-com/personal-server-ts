@@ -24,19 +24,6 @@ export interface PublishMeter {
   bytesUploaded: number;
 }
 
-export function newPublishMeter(): PublishMeter {
-  return {
-    planMs: 0,
-    transferMs: 0,
-    uploadMs: 0,
-    headRegisterMs: 0,
-    blobGets: 0,
-    blobPuts: 0,
-    partsUploaded: 0,
-    bytesUploaded: 0,
-  };
-}
-
 /** Run `work` and hand its duration to `add`, also when it throws. */
 export async function timed<T>(
   deps: Pick<LocalSyncDeps, "now">,
@@ -77,20 +64,5 @@ export function meteredBlobs(
       await timed(deps, add, () => deps.blobs.put(key, bytes, beforeAttempt));
       meter.bytesUploaded += bytes.length;
     },
-  };
-}
-
-/** The fields of the log line, named as a journey reads them. */
-export function publishTimings(meter: PublishMeter, totalMs: number) {
-  return {
-    planMs: meter.planMs,
-    encodeEncryptMs: Math.max(0, meter.transferMs - meter.uploadMs),
-    partsUploaded: meter.partsUploaded,
-    bytesUploaded: meter.bytesUploaded,
-    blobGets: meter.blobGets,
-    blobPuts: meter.blobPuts,
-    uploadMs: meter.uploadMs,
-    headRegisterMs: meter.headRegisterMs,
-    totalMs,
   };
 }

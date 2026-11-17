@@ -15,8 +15,6 @@ import {
 import {
   applyConnection,
   applyLog,
-  applyStream,
-  publishConnection,
   LogDivergedError,
 } from "../../../core/src/localdb/index.js";
 import {
@@ -28,7 +26,6 @@ import { withOrigin } from "../../../core/src/localdb/merge.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import {
   CONNECTION_ID,
-  LOG,
   OWNER,
   closeWorldDrivers,
   sName,
@@ -46,7 +43,7 @@ const S1 = sName(1);
 const WRITES_POSITION = "INSERT OR REPLACE INTO log_state";
 
 async function connected(w: World, id: string, hooks = {}) {
-  const d = await w.device(id, true, hooks);
+  const d = await w.device(id, hooks);
   await d.db.batch([
     {
       sql: "INSERT INTO connections(connection_id,connector,ns,generation,control_state,control_version) VALUES (?,?,'',1,'active',1)",
@@ -176,7 +173,7 @@ function onCommit(
 
 describe("log first load, key by key", () => {
   it("ends in what a segment-by-segment apply ends in, for every kind of key history", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     await history(w);
     const reference = await connected(w, "reference", {
       keyedFirstLoad: false,
@@ -246,7 +243,7 @@ describe("log first load, key by key", () => {
   });
 
   it("keeps a first load's streams unreadable and its position at 0 until its last commit", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     await history(w);
     const keyed = await connected(w, "keyed", {
       maxBytesInFlight: await splitting(w),
@@ -273,7 +270,7 @@ describe("log first load, key by key", () => {
   });
 
   it("holds at most its memory budget (a segment more when the budget is under one)", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     await history(w);
     const budget = await splitting(w);
     const keyed = await connected(w, "keyed", { maxBytesInFlight: budget });
@@ -294,7 +291,7 @@ describe("log first load, key by key", () => {
   });
 
   it("ends right when it runs again after a stop at any commit", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     await history(w);
     const reference = await connected(w, "reference", {
       keyedFirstLoad: false,
@@ -341,7 +338,7 @@ describe("log first load, key by key", () => {
   });
 
   it("keeps what precedes a segment it cannot fetch, raises the error, and goes on when it is there", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     await history(w);
     const keys = await w.segmentKeys();
     const missing = keys.get(6)!;
@@ -379,7 +376,7 @@ describe("log first load, key by key", () => {
   });
 
   it("loads the segment-by-segment way when the log fits one commit or the device holds streams", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     await history(w);
     // The default budget holds the whole log: nothing to split.
     const fits = await connected(w, "fits");
@@ -429,7 +426,6 @@ describe("log first load, key by key: a run that emits a key again at its stamp"
   it("keeps the batch ordinal of a key, and the body the order picks, as a segment-by-segment load does", async () => {
     const w = await world({
       streams: 2,
-      logProtocol: true,
       publishWhileCollecting: true,
     });
     const a = await w.device("a");
@@ -511,7 +507,7 @@ async function stoppedAfterFirstRange(w: World, id: string, hooks = {}) {
 
 describe("log first load, key by key: what an unfinished load leaves", () => {
   it("publishes nothing from a retry that holds a shorter prefix than the rows it left", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     await history(w);
     const keys = await w.segmentKeys();
     const missing = keys.get(6)!;
@@ -569,7 +565,7 @@ describe("log first load, key by key: what an unfinished load leaves", () => {
   });
 
   it("keeps the position it means to publish from its first key range to its last", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     await history(w);
     const d = await connected(w, "keyed", {
       maxBytesInFlight: await splitting(w),
@@ -596,7 +592,7 @@ describe("log first load, key by key: what an unfinished load leaves", () => {
   });
 
   it("rebaselines over rows of another log, and ends in the log it reads", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     await history(w);
     const d = await stoppedAfterFirstRange(w, "other");
     // The same position, named by a segment this log does not have.
@@ -618,7 +614,7 @@ describe("log first load, key by key: what an unfinished load leaves", () => {
   });
 
   it("rebaselines when the flag is off, and loads segment by segment", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     await history(w);
     const d = await stoppedAfterFirstRange(w, "switched");
     // A host that turned the flag off now: the marker names rows no
@@ -673,7 +669,7 @@ async function compactLog(w: World, a: Device, from: number) {
 
 describe("log first load, key by key: a log that can no longer finish it", () => {
   it("serves the snapshot and the tail when the log compacts after a stopped load", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const a = await history(w);
     const d = await stoppedAfterFirstRange(w, "retry");
     expect((await tables(d)).records.length).toBeGreaterThan(0);
@@ -689,7 +685,7 @@ describe("log first load, key by key: a log that can no longer finish it", () =>
   });
 
   it("serves a log whose base moved by a rewrite that holds the marker's positions under other segments", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     await history(w);
     const d = await stoppedAfterFirstRange(w, "rewritten");
     // The marker's base is not the log's.
@@ -701,7 +697,7 @@ describe("log first load, key by key: a log that can no longer finish it", () =>
   });
 
   it("keeps the writes the device has not published, and publishes them after", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const a = await history(w);
     const d = await stoppedAfterFirstRange(w, "local");
     await compactLog(w, a, 100);
@@ -787,7 +783,7 @@ describe("log first load, key by key: a log that can no longer finish it", () =>
   });
 
   it("drops a row of the stopped load that a local write does not stand behind", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const a = await history(w);
     const d = await stoppedAfterFirstRange(w, "all-remote");
     const left = (await tables(d)).records.length;
@@ -812,7 +808,7 @@ describe("log first load, key by key: a log that can no longer finish it", () =>
   });
 
   it("drops the rows, the tombstones and the marker together or not at all", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const a = await history(w);
     const d = await stoppedAfterFirstRange(w, "atomic");
     await compactLog(w, a, 100);
@@ -944,7 +940,7 @@ describe("log first load, key by key: the marker stops every other way to move t
     });
   }
   async function stopped(id: string) {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     await history(w);
     const d = await stoppedAfterFirstRange(w, id);
     expect(await d.position()).toBe(0);
@@ -1047,7 +1043,7 @@ describe("log first load, key by key: what it holds", () => {
   }
 
   it("counts the rows of keys that are only deleted", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const ids = Array.from({ length: 60 }, (_, i) => `gone-${i}`);
     await deletes(w, ids);
     const { asked } = await holds(w, "keyed", await splitting(w));
@@ -1058,7 +1054,7 @@ describe("log first load, key by key: what it holds", () => {
   });
 
   it("weighs a row by its UTF-8 bytes, and a deletion by its keys", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const d = await connected(w, "weigh");
     const utf8 = (text: string | null) =>
       text === null ? 0 : new TextEncoder().encode(text).length;
@@ -1100,7 +1096,7 @@ describe("log first load, key by key: what it holds", () => {
   });
 
   it("applies a key whose history is over the budget a slice at a time, to the same rows", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const a = await w.device("a");
     // One key rewritten in every segment, each rewrite as big as a segment's rest.
     for (let n = 1; n <= 14; n++)
@@ -1130,7 +1126,7 @@ describe("log first load, key by key: what it holds", () => {
   });
 
   it("splits a range whose keys share a hash prefix by the next digits", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const d = await connected(w, "pages");
     const row = (hash: string, position: number, body: string) => ({
       sql: `INSERT INTO t (position, kind, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o)
@@ -1166,109 +1162,5 @@ describe("log first load, key by key: what it holds", () => {
       covered += rows!.n;
     }
     expect(covered).toBe(total!.n);
-  });
-});
-
-describe("log first load, key by key: a per-stream head admitted while a load is unfinished", () => {
-  const rowKeys = async (d: Device) =>
-    (
-      await d.db.query<{ record_key: string }>(
-        "SELECT record_key FROM records ORDER BY record_key",
-      )
-    ).map((r) => r.record_key);
-
-  /**
-   * A build that does not follow the log (one without the gate in the cycle)
-   * publishes a head of each stream after a keyed load stopped: with `full` it
-   * omits the keys of the log it did not carry. `publishConnection` is what such
-   * a build does (see mixed-fleet.test.ts).
-   */
-  async function lateHeads(w: World, full: boolean) {
-    const legacy = await w.device("legacy", false);
-    // The gateway refuses a per-stream head once the log row exists, so the
-    // build writes while it cannot see the row: it read the registry just
-    // before the log's first write.
-    const log = w.gateway.versions.get(LOG);
-    w.gateway.versions.delete(LOG);
-    try {
-      for (const [n, stream] of [S0, S1].entries()) {
-        await legacy.run(`run-L${n}`, [{ stream, id: `late-${n}`, v: 1 }], {
-          full,
-          covered: [stream],
-          observedAt: 5000 + n,
-        });
-        await publishConnection(legacy.deps, CONNECTION_ID);
-      }
-    } finally {
-      if (log) w.gateway.versions.set(LOG, log);
-    }
-  }
-
-  for (const full of [true, false]) {
-    it(`ends in the rows a device that read the head and then the log ends in (head run full: ${full})`, async () => {
-      const w = await world({ streams: 2, logProtocol: true });
-      await history(w);
-      const d = await stoppedAfterFirstRange(w, "late");
-      const written = await rowKeys(d);
-      expect(written.length).toBeGreaterThan(0);
-      await lateHeads(w, full);
-
-      // Each stream's head is admitted on its own, as a stream's apply does,
-      // and the apply reads the log over it before it returns: the stopped
-      // load's rows beyond the cursor are the head's to drop, and the log's
-      // to bring back.
-      for (const stream of [S0, S1])
-        expect((await applyStream(d.deps, CONNECTION_ID, stream)).outcome).toBe(
-          "applied",
-        );
-      await applyConnection(d.deps, CONNECTION_ID);
-
-      const reference = await connected(w, "reference", {
-        keyedFirstLoad: false,
-      });
-      await applyConnection(reference.deps, CONNECTION_ID);
-      const want = await tables(reference);
-      const got = await tables(d);
-      expect(got.records).toEqual(want.records);
-      expect(got.tombstones).toEqual(want.tombstones);
-      expect(await d.db.query("SELECT * FROM log_keyed_pending")).toEqual([]);
-      expect(await d.position()).toBe(await reference.position());
-    });
-  }
-
-  it("a log pass that cannot finish after a head is admitted publishes no position, and the obligation stays", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
-    await history(w);
-    const keys = await w.segmentKeys();
-    const missing = keys.get(6)!;
-    const bytes = (await w.innerBlobs.get(missing))!;
-    const d = await stoppedAfterFirstRange(w, "short");
-    await lateHeads(w, false);
-
-    // The apply of a stream admits its head and reads the log over it. It
-    // cannot fetch segment 6. Rows from beyond 5 are in `records` whatever the
-    // head dropped, so the marker must still refuse position 5.
-    await w.innerBlobs.delete(missing);
-    await expect(applyStream(d.deps, CONNECTION_ID, S0)).rejects.toThrow();
-    expect(await d.position()).toBe(0);
-    expect(await d.db.query("SELECT * FROM log_state")).toEqual([]);
-    expect((await d.db.query("SELECT * FROM log_keyed_pending")).length).toBe(
-      1,
-    );
-    // The head batch left the marker alone and stored the replay it owes.
-    expect((await d.db.query("SELECT * FROM log_replay")).length).toBe(1);
-
-    await w.innerBlobs.put(missing, bytes);
-    await applyStream(d.deps, CONNECTION_ID, S1);
-    await applyConnection(d.deps, CONNECTION_ID);
-    const reference = await connected(w, "reference", {
-      keyedFirstLoad: false,
-    });
-    await applyConnection(reference.deps, CONNECTION_ID);
-    expect((await tables(d)).records).toEqual(
-      (await tables(reference)).records,
-    );
-    expect(await d.db.query("SELECT * FROM log_keyed_pending")).toEqual([]);
-    expect(await d.db.query("SELECT * FROM log_replay")).toEqual([]);
   });
 });

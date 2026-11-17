@@ -195,6 +195,7 @@ export async function runLegacyRetireDryRun(
         post: unavailable,
         listControlRows: unavailable,
         listStreamRows: unavailable,
+        listOwnerRows: unavailable,
       },
       blobs: {
         // Every request refuses, so nothing is ever held: a governor of its

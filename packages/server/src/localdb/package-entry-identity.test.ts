@@ -44,6 +44,9 @@ it("an unavailable error thrown from the stream-sync entry is the class apply an
     blobs: remote.storage,
     registry: {
       ...remote.registry,
+      read: async () => {
+        throw unavailable;
+      },
       listStreamRows: async () => {
         throw unavailable;
       },

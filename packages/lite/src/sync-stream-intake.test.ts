@@ -111,7 +111,6 @@ async function fixture(
     },
     {
       resolveArtifact: () => declaration,
-      olderVersionReads: () => true,
     },
   );
   return { lite, node, openDriver };

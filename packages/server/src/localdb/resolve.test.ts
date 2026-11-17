@@ -1,17 +1,5 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { sha256 } from "@noble/hashes/sha2";
-import { keccak_256 } from "@noble/hashes/sha3";
-import {
-  canonicalJson,
-  digestHead,
-  encodeFramePart,
-  encodeHead,
-  frameOfLine,
-  partBlobName,
-  pkHash,
-  streamScope,
-} from "@opendatalabs/personal-server-ts-stream-sync";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
@@ -140,7 +128,6 @@ async function fixture() {
       yield* records;
     },
   };
-  const olderVersions = { read: vi.fn(), list: vi.fn(), counts: vi.fn() };
   const blobs = new Map<string, Uint8Array>();
   const deps = {
     db,
@@ -177,7 +164,6 @@ async function fixture() {
       );
   const resolver = createLocalResolver(deps, {
     query,
-    olderVersions,
     aliasScopes: () => ["fixture.alias", "fixture.unsupported"].values(),
     aliasTargets,
   });
@@ -291,7 +277,6 @@ async function fixture() {
     record,
     resolver,
     visited,
-    olderVersions,
     clear,
   };
 }
@@ -304,7 +289,6 @@ describe("local resolve", () => {
     await f.record();
     const isolated = createLocalResolver(f.deps, {
       query: f.query,
-      olderVersions: f.olderVersions,
       aliasTargets: () => {
         throw new Error("Unlisted alias target consulted");
       },
@@ -365,67 +349,34 @@ describe("local resolve", () => {
     expect(f.visited).not.toHaveBeenCalled();
   });
 
-  it("retains the complete head after a partial image replaces records, with history disabled and a fresh resolver", async () => {
+  it("serves the local records when an incomplete version follows the retained complete one", async () => {
     const f = await fixture();
     await f.connection();
     await f.head("items", { version: 1 });
-    const scope = streamScope(CONNECTOR, "", "items");
-    const sha = async (bytes: Uint8Array) => sha256(bytes);
-    const value = { id: "original", value: "retained" };
-    const k = await pkHash(sha, value, ["id"]);
-    const frame = await frameOfLine(
-      sha,
-      k,
-      canonicalJson({ o: 1000, r: "run", v: value }),
+    // The log merges per key: the rows of the complete version stay in
+    // `records` under the newer, incomplete one, beside the rows it adds.
+    const original = { id: "original", value: "retained" };
+    const added = { id: "added", value: "partial" };
+    await f.db.batch(
+      [original, added].map((value, i) => ({
+        sql: `INSERT INTO records
+        (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256)
+        VALUES ('c1', 'items', ?, ?, ?, 'run', ?, 'body-hash')`,
+        params: [`hash-${i}`, value.id, 1000 * (i + 1), JSON.stringify(value)],
+      })),
     );
-    const part = (await encodeFramePart(sha, "", [{ k, bytes: frame.bytes }]))!;
-    const head = encodeHead({
-      connector: CONNECTOR,
-      ns: "",
-      stream: "items",
-      generation: 2,
-      complete: true,
-      format: 4,
-      lastDeleteVersion: 0,
-      keyCheck: "0000000000000000",
-      observedAt: 1000,
-      parts: [part.entry],
-      primaryKey: ["id"],
-      profile: { key: null, version: "1" },
-      recordCount: 1,
-    });
-    const { blobName } = await digestHead(
-      async (bytes) => keccak_256(bytes),
-      head,
-    );
-    f.blobs.set(`${scope}/${blobName}`, head);
-    f.blobs.set(`${scope}/${partBlobName(2, part.entry.hash)}`, part.data);
-    await f.db.batch([
-      {
-        sql: "UPDATE stream_versions SET head_blob = ?, head_format = 4 WHERE version = 1",
-        params: [blobName],
-      },
-    ]);
     await f.head("items", { version: 2, complete: false });
-    await f.record("items", "partial");
-    const historyOff = {
-      ...f.olderVersions,
-      read: vi.fn(async () => "gone" as const),
-    };
-    const fresh = createLocalResolver(f.deps, {
-      query: f.query,
-      olderVersions: historyOff,
-    });
-    const result = await fresh.resolve(input());
+    const result = await f.resolver.resolve(input());
     expect(result.kind).toBe("view");
     if (result.kind !== "view") throw new Error("missing retained view");
-    expect(result.served?.version).toBe(1);
-    expect((await drain(result)).data.records).toEqual([value]);
-    expect(historyOff.read).not.toHaveBeenCalled();
+    // The rows served are the installed version's.
+    expect(result.served?.version).toBe(2);
+    expect((await drain(result)).data.records).toEqual([original, added]);
+    // No complete version above the deletion floor: nothing is served.
     await f.db.batch([
       { sql: "UPDATE stream_state SET last_delete_version = 1" },
     ]);
-    expect(verdict(await fresh.resolve(input()))).toBe("no_data");
+    expect(verdict(await f.resolver.resolve(input()))).toBe("no_data");
   });
 
   it("#573 exercises the 3 x 5 x 2 JSON matrix; foreign and older images never win", async () => {
@@ -523,7 +474,6 @@ describe("local resolve", () => {
     expect((await drain(result)).data.records).toEqual([
       { id: "key", value: "installed" },
     ]);
-    expect(f.olderVersions.read).not.toHaveBeenCalled();
     const again = await f.resolver.resolve(
       input(undefined, { cursor: result.cursor }),
     );

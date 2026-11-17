@@ -478,7 +478,6 @@ describe("PS Lite local database composition", () => {
         }),
         expect.objectContaining({
           resolveArtifact: expect.any(Function),
-          olderVersionReads: expect.any(Function),
         }),
       );
       const passed = vi.mocked(createLocalSync).mock.calls[0]![0].db;

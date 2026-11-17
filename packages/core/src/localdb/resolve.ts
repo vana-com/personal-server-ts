@@ -10,7 +10,6 @@ import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
 import { completeBody, pinStream } from "./complete-read.js";
 import { partialBody } from "./partial-read.js";
-import { createOlderVersions, type OlderVersions } from "./older-versions.js";
 import type { RecordQuery } from "./query.js";
 import {
   chooseCandidate,
@@ -74,10 +73,11 @@ function cursorFor(c: Candidate): string {
       c.streams.map((s) => [
         s.stream,
         {
-          // A stream served from its first load is pinned at the head it loads.
+          // A stream served from its first load is pinned at the head it
+          // loads; any other stream at the log position its records are at.
           b: c.partialStreams?.includes(s.stream)
             ? s.partial!.version
-            : s.head_version,
+            : s.installed_version,
           h: JSON.stringify([s.primary_key, s.profile_key, s.profile_version]),
         },
       ]),
@@ -137,20 +137,6 @@ function bodyStream(chunks: AsyncIterable<string>): ReadableStream<Uint8Array> {
   });
 }
 
-async function* rawPayload(
-  query: RecordQuery,
-  connectionId: string,
-  stream: string,
-): AsyncGenerator<string> {
-  yield '{"records":[';
-  let first = true;
-  for await (const record of query.streamRecords(connectionId, stream)) {
-    yield (first ? "" : ",") + record.body;
-    first = false;
-  }
-  yield "]}";
-}
-
 async function* envelope(
   scope: string,
   observedAt: number,
@@ -169,12 +155,10 @@ export function createLocalResolver(
   deps: LocalSyncDeps,
   parts: {
     readonly query: RecordQuery;
-    readonly olderVersions: OlderVersions;
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
   },
 ): LocalResolver {
-  const completeReads = createOlderVersions(deps, { enabled: () => true });
   const streams = (connectionId: string): Promise<Stream[]> =>
     loadStreams(deps, connectionId);
 
@@ -362,59 +346,27 @@ export function createLocalResolver(
     if (input.cursor !== null && input.cursor !== cursor)
       return { kind: "cursor_stale" };
 
-    const fallback = new Map<string, readonly Record<string, unknown>[]>();
-    for (const stream of installed) {
-      if (stream.head_version === stream.installed_version) continue;
-      const body = await completeReads.read(
-        streamScope(connection.connector, connection.ns, stream.stream),
-        { fileId: stream.head_blob! },
-      );
-      if (body === "gone") return noData();
-      fallback.set(
-        stream.stream,
-        (await new Response(body).json()) as Record<string, unknown>[],
-      );
-    }
-    const readQuery: RecordQuery = {
-      ...parts.query,
-      async *streamRecords(connectionId, stream) {
-        const retained = fallback.get(stream);
-        if (!retained) {
-          yield* parts.query.streamRecords(connectionId, stream);
-          return;
-        }
-        for (const row of retained)
-          yield {
-            stream,
-            recordKey: "",
-            pkHash: "",
-            body: JSON.stringify(row),
-            emittedAt: 0,
-          };
-      },
-    };
     let payload: AsyncIterable<string>;
     const binding = candidate.target.alias;
     if (!binding) {
       const only = installed[0]!;
-      payload = fallback.has(only.stream)
-        ? rawPayload(readQuery, connection.connection_id, only.stream)
-        : completeBody(
-            readerOf(deps.db),
-            {
-              connectionId: connection.connection_id,
-              generation: connection.generation,
-              stream: only.stream,
-              version: only.head_version,
-              dataHash: only.head_data_hash!,
-            },
-            pin,
-          );
+      payload = completeBody(
+        readerOf(deps.db),
+        {
+          connectionId: connection.connection_id,
+          generation: connection.generation,
+          stream: only.stream,
+          // The stream's installed head: the identity every page checks.
+          version: only.installed_version,
+          dataHash: only.head_data_hash!,
+        },
+        pin,
+      );
     } else {
       const projected = await projectAlias(
         binding,
         current,
-        readQuery,
+        parts.query,
         new Date(deps.now()).toISOString(),
       );
       if (projected.kind === "too_large") {
@@ -432,7 +384,7 @@ export function createLocalResolver(
       cursor,
       served: {
         scope: streamScope(connection.connector, connection.ns, servedStream),
-        version: head.head_version,
+        version: head.installed_version,
       },
       body: bodyStream(
         envelope(

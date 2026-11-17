@@ -93,7 +93,6 @@ async function world(
           ],
         };
       },
-      olderVersionReads: () => true,
     });
     const begin = (
       id: string,

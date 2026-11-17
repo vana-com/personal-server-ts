@@ -54,9 +54,9 @@ async function world(connectors: number, streamsPer: number) {
       calls.push("registry.list");
       return inner.listStreamRows(connector);
     },
-    async listConnectionRows(connector, ns) {
+    async listOwnerRows() {
       calls.push("registry.list");
-      return inner.listConnectionRows(connector, ns);
+      return inner.listOwnerRows();
     },
     async probeChange() {
       calls.push("registry.probe");
@@ -107,7 +107,6 @@ async function world(connectors: number, streamsPer: number) {
         primaryKey: ["id"],
       })),
     }),
-    olderVersionReads: () => true,
   });
   let runs = 0;
   for (let c = 0; c < connectors; c++) {

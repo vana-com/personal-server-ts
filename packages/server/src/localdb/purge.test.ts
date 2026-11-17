@@ -46,7 +46,7 @@ describe("purgeConnection", () => {
 
   /**
    * Two connections. c1 is purged; c2 must be untouched. c1 holds two
-   * records, one run row, one head part, and refs to a shared blob and a
+   * records, one run row, and refs to a shared blob and a
    * blob only it references; it also holds one blob ref whose record does
    * not exist, so only the explicit `blob_refs` delete removes it. One
    * blob has no refs at all.
@@ -70,9 +70,6 @@ describe("purgeConnection", () => {
       },
       {
         sql: "INSERT INTO run_rows(run_id, stream, pk_hash, record_key, body, body_sha256) VALUES ('r1','s','aa01','1','{}','sha-{}'), ('r2','s','bb01','1','{}','sha-{}')",
-      },
-      {
-        sql: "INSERT INTO head_parts VALUES ('c1','s','0',0,'h0',10,1), ('c2','s','0',0,'h1',10,1)",
       },
       {
         sql: "INSERT INTO blobs(blob_id, mime_type, size_bytes) VALUES ('b-shared','text/plain',4), ('b-only-c1','text/plain',4), ('b-only-c2','text/plain',4), ('b-orphan','text/plain',4)",
@@ -117,22 +114,6 @@ describe("purgeConnection", () => {
         "SELECT run_id, pk_hash FROM run_rows WHERE run_id = 'r2'",
       ),
     ).toEqual([{ run_id: "r2", pk_hash: "bb01" }]);
-  });
-
-  it("deletes the connection's head_parts", async () => {
-    const { db } = await fresh();
-    await seed(db);
-    await purge(db);
-    expect(
-      await db.query(
-        "SELECT prefix FROM head_parts WHERE connection_id = 'c1'",
-      ),
-    ).toEqual([]);
-    expect(
-      await db.query(
-        "SELECT prefix FROM head_parts WHERE connection_id = 'c2'",
-      ),
-    ).toEqual([{ prefix: "0" }]);
   });
 
   it("deletes the connection's blob_refs and unreferenced blobs, and keeps blobs another connection still references", async () => {
