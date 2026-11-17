@@ -231,32 +231,24 @@ describe("changes that follow one another", () => {
     await t.manager.stop();
   });
 
-  it("a burst during one pass queues one delta and ends at the final version", async () => {
-    const first = held(APPLIED);
-    const t = setup();
-    t.applyDelta.mockImplementationOnce(first.then);
-    await started(t);
-    await write(t); // pass 1 opens
-    let last = "";
-    for (let i = 0; i < 5; i++) last = await write(t);
-    expect(t.applyDelta).toHaveBeenCalledTimes(1);
-    first.release();
-    await flush();
-    // One follow-up pass, whatever the burst's size. The queued delta cannot
-    // chain (the position it follows is not the one the pass settled at), so
-    // the guard sends the follow-up to one full cycle, never to N.
-    expect(t.applyDelta.mock.calls.length + t.cycle.mock.calls.length).toBe(2);
-    expect(t.cycle).toHaveBeenCalledTimes(1);
-    // The device ends at the final version: the next write chains from it.
-    expect(t.feed.requests.at(-1)).toEqual({ after: last, since: last });
-    const next = await write(t);
-    expect(t.applyDelta).toHaveBeenCalledTimes(2);
-    expect(t.applyDelta.mock.calls[1]![0]).toMatchObject({
-      since: last,
-      seq: next,
-    });
-    await t.manager.stop();
-  });
+  it.each([3, 5, 10])(
+    "a burst of %i changes applies every delta without a full cycle",
+    async (count) => {
+      const first = held(APPLIED);
+      const t = setup();
+      t.applyDelta.mockImplementationOnce(first.then);
+      await started(t);
+      await write(t);
+      let last = "";
+      for (let i = 0; i < count; i++) last = await write(t);
+      first.release();
+      await flush();
+      expect(t.applyDelta).toHaveBeenCalledTimes(count + 1);
+      expect(t.cycle).not.toHaveBeenCalled();
+      expect(t.feed.requests.at(-1)).toEqual({ after: last, since: last });
+      await t.manager.stop();
+    },
+  );
 
   it("a delete that lands while a pass runs is applied after it: the tombstone reaches the purge", async () => {
     const first = held(APPLIED);

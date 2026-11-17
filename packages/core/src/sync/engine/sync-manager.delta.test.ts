@@ -313,6 +313,26 @@ describe("a change delta", () => {
     await t.manager.stop();
   });
 
+  it("a missing link falls back to a full cycle without applying across the gap", async () => {
+    const t = setup();
+    await settled(t);
+    let release!: () => void;
+    t.applyDelta.mockImplementationOnce(
+      () =>
+        new Promise<DeltaApplyResult>((resolve) => {
+          release = () => resolve(APPLIED);
+        }),
+    );
+    await answer(t, delta("7", "8"), "8");
+    await answer(t, delta("8", "9"), "9");
+    await answer(t, delta("10", "11"), "11");
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    expect(t.applyDelta.mock.calls.map(([d]) => d.seq)).not.toContain("11");
+    await t.manager.stop();
+  });
+
   it("overlapping answers serialize through persistence and a late older answer cannot settle (mutation: concurrent cycles or regressing position)", async () => {
     const t = setup();
     await settled(t);
