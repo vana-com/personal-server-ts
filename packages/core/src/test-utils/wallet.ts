@@ -1,3 +1,4 @@
+import { encodeBase64Url, decodeBase64UrlUtf8 } from "../encoding/base64url.js";
 /**
  * Test wallet utilities for Web3Signed auth testing.
  * Provides deterministic wallets and header builders for integration tests.
@@ -92,12 +93,7 @@ export async function buildWeb3SignedHeader(params: {
 
 /** Base64url without padding, matching the SDK's encoder. */
 function base64UrlEncode(bytes: Uint8Array): string {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCodePoint(byte);
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
+  return encodeBase64Url(bytes);
 }
 
 /**
@@ -131,13 +127,7 @@ async function buildWeb3SignedHeaderWithClaims(
     grantId: params.grantId,
   });
   const payloadBase64 = base.slice("Web3Signed ".length).split(".")[0] ?? "";
-  const padded = payloadBase64
-    .replace(/-/g, "+")
-    .replace(/_/g, "/")
-    .padEnd(payloadBase64.length + ((4 - (payloadBase64.length % 4)) % 4), "=");
-  const decoded = new TextDecoder().decode(
-    Uint8Array.from(atob(padded), (char) => char.charCodeAt(0)),
-  );
+  const decoded = decodeBase64UrlUtf8(payloadBase64);
   const claims = { ...JSON.parse(decoded), ...extra } as Record<
     string,
     unknown

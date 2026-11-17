@@ -1,3 +1,4 @@
+import { decodeBase64UrlUtf8 } from "../encoding/base64url.js";
 /**
  * Builder attribution for delegated writes.
  *
@@ -133,15 +134,7 @@ export function canonicalizeSignedUri(uri: string): string {
 }
 
 function base64UrlDecode(value: string): string {
-  const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
-  const padded = base64.padEnd(
-    base64.length + ((4 - (base64.length % 4)) % 4),
-    "=",
-  );
-  const binary = atob(padded);
-  return new TextDecoder().decode(
-    Uint8Array.from(binary, (char) => char.charCodeAt(0)),
-  );
+  return decodeBase64UrlUtf8(value);
 }
 
 /**

@@ -1,3 +1,4 @@
+import { decodeBase64UrlUtf8 } from "../encoding/base64url.js";
 import type { LocalListing } from "../localdb/listing.js";
 import { isOwnAppRead } from "../payment/own-app.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
@@ -1659,12 +1660,7 @@ async function parseProducerProvenance(
   if (!encoded) return undefined;
   try {
     const value = JSON.parse(
-      new TextDecoder().decode(
-        Uint8Array.from(
-          atob(encoded.replace(/-/g, "+").replace(/_/g, "/")),
-          (char) => char.charCodeAt(0),
-        ),
-      ),
+      decodeBase64UrlUtf8(encoded),
     ) as LegacyProducerProvenance;
     if (
       !value ||

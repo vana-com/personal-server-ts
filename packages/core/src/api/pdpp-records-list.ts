@@ -1,3 +1,7 @@
+import {
+  decodeBase64UrlUtf8,
+  encodeBase64UrlUtf8,
+} from "../encoding/base64url.js";
 import { PDPP_VERSION } from "../pdpp-version.js";
 import { grantIsCandidate } from "../pdpp/types.js";
 import type { OwnedAccountStorageMode } from "./account-storage-mode.js";
@@ -81,7 +85,7 @@ export function localListCursors(
   if (instances.length === 1) return [cursor];
   if (cursor === undefined) return instances.map(() => undefined);
   try {
-    const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    const value = JSON.parse(decodeBase64UrlUtf8(cursor));
     if (
       value.kind !== "local-records" ||
       value.stream !== stream ||
@@ -276,9 +280,9 @@ export async function localRecordPage(
   // SQLite record_key order is binary UTF-8, independent of locale or stamp_o.
   records.sort(
     (a, b) =>
-      Buffer.compare(
-        Buffer.from(a.record.recordKey),
-        Buffer.from(b.record.recordKey),
+      compareBytes(
+        new TextEncoder().encode(a.record.recordKey),
+        new TextEncoder().encode(b.record.recordKey),
       ) || a.index - b.index,
   );
   const page = records.slice(0, input.limit);
@@ -292,14 +296,14 @@ export async function localRecordPage(
     ? null
     : instances.length === 1
       ? after[0]!
-      : Buffer.from(
+      : encodeBase64UrlUtf8(
           JSON.stringify({
             kind: "local-records",
             stream,
             instances,
             after: after.map((key) => key ?? null),
           }),
-        ).toString("base64url");
+        );
   return {
     data: page
       .map(({ index, record }) => localRecord(instances[index]!, record))
@@ -554,4 +558,12 @@ export function resolveOwnerSource(
   lookup: SourceLookup,
 ): string {
   return lookup.sourceIdForConnector(source) ?? source;
+}
+
+/** SQLite BINARY collation compares unsigned UTF-8 bytes, then length. */
+function compareBytes(a: Uint8Array, b: Uint8Array): number {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    if (a[i] !== b[i]) return a[i]! - b[i]!;
+  }
+  return a.length - b.length;
 }
