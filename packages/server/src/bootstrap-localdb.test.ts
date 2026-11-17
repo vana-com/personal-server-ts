@@ -15,7 +15,7 @@ import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schema
 import { createMemoryModeRecordStore } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { endRequest } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createStreamSyncKeyPorts } from "../../core/src/stream-sync/crypto.js";
-import { remoteFixture } from "./localdb/apply-fixture.js";
+import { remoteFixture } from "./localdb/apply-fixture.test-utils.js";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import * as legacyImport from "./localdb/legacy-store-import.js";
 

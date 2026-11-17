@@ -12,7 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createMemoryModeRecordStore } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { createStreamSyncKeyPorts } from "../../core/src/stream-sync/crypto.js";
-import { remoteFixture } from "./localdb/apply-fixture.js";
+import { remoteFixture } from "./localdb/apply-fixture.test-utils.js";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
 

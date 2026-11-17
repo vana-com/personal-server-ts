@@ -6,7 +6,7 @@ import {
   type SqlDriver,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
-import { remoteFixture } from "./apply-fixture.js";
+import { remoteFixture } from "./apply-fixture.test-utils.js";
 import { createServerLocalSync } from "./sync.js";
 const drivers: SqlDriver[] = [];
 afterEach(async () => {

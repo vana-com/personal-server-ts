@@ -25,8 +25,8 @@ import {
   RegistryRefusedError,
   RegistryUnavailableError,
 } from "../../../core/src/stream-sync/ports.js";
-import { remoteFixture, retainedManifest } from "./apply-fixture.js";
-import { legacyHeadRow } from "./legacy-head-fixture.js";
+import { remoteFixture, retainedManifest } from "./apply-fixture.test-utils.js";
+import { legacyHeadRow } from "./legacy-head-fixture.test-utils.js";
 import { createFakeGateway } from "./fake-gateway.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
