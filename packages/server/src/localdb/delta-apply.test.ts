@@ -89,6 +89,11 @@ async function applied(w: World, device: Device, delta: RegistryChangeDelta) {
 }
 
 /** What a device holds for its connections, apart from per-device ids. */
+// Publish watermarks are local change-sequence cursors; a full cycle advances
+// them, while a download-only startup apply does not.
+const remoteStreamState = (rows: Record<string, unknown>[]) =>
+  rows.map(({ publish_watermark: _watermark, ...state }) => state);
+
 async function localState(device: Device) {
   const q = (sql: string) => device.db.query(sql);
   return {
@@ -178,6 +183,35 @@ it("an old listing cannot roll back a reconnected generation", async () => {
 });
 
 describe("applying a change delta", () => {
+  it("startup apply and cycle converge after a peer update", async () => {
+    const w = await world({ streams: 2 });
+    const peer = await w.device("peer");
+    const here = await w.device("startup");
+    const twin = await w.device("cycle");
+    await peer.run("seed", records("a"));
+    await peer.cycle();
+    await here.cycle();
+    await twin.cycle();
+    const before = await localState(here);
+    expect(await localState(twin)).toEqual(before);
+    await peer.run("update", [{ stream: sName(0), id: "a-0-1", pad: 64 }], {
+      full: false,
+      covered: [sName(0)],
+    });
+    await peer.cycle();
+    const peerRows = await peer.rows();
+    expect(peerRows).not.toEqual(before.records);
+    await here.sync.apply();
+    await twin.cycle();
+    const startup = await localState(here);
+    const cycled = await localState(twin);
+    expect(cycled.records).toEqual(peerRows);
+    expect(startup.records).toEqual(cycled.records);
+    expect(remoteStreamState(startup.streams)).toEqual(
+      remoteStreamState(cycled.streams),
+    );
+    expect(await here.position()).toBe(await twin.position());
+  });
   it("a peer's log commit: no registry read, one segment GET, the rows a cycle gives (mutation: applyLog without the delta's read)", async () => {
     const { w, peer, here } = await peerCommitted();
     const delta = await deltaOf(here, [LOG]);
@@ -776,6 +810,42 @@ describe("a peer's connection delete", () => {
     return { w, peer, here, twin, scopes };
   }
 
+  it.each(["delete", "re-create"] as const)(
+    "startup apply and cycle converge after a peer %s",
+    async (change) => {
+      const { peer, here, twin } = await peerDeleted();
+      const before = await localState(here);
+      expect(before.records.length).toBeGreaterThan(0);
+      expect(await localState(twin)).toEqual(before);
+      if (change === "re-create") {
+        await peer.sync.intake.begin("startup-reconnect", {
+          connector: CONNECTOR,
+          artifactDigest: CONNECTOR,
+          connect: true,
+          observedAt: 3000,
+          owner: { address: OWNER, leaseId: null },
+        });
+        await peer.sync.intake.abort("startup-reconnect", "cancelled");
+        await peer.run("new-lifetime", [{ stream: sName(1), id: "new" }]);
+        await peer.cycle();
+      }
+      const peerRows = await peer.rows();
+      expect(peerRows).not.toEqual(before.records);
+      if (change === "delete") expect(peerRows).toEqual([]);
+      else expect(await peer.records()).toHaveLength(1);
+      // No local writes: both receivers observe the same settled peer state.
+      await here.sync.apply();
+      await twin.cycle();
+      const startup = await localState(here);
+      const cycled = await localState(twin);
+      expect(cycled.records).toEqual(peerRows);
+      expect(startup.records).toEqual(cycled.records);
+      expect(remoteStreamState(startup.streams)).toEqual(
+        remoteStreamState(cycled.streams),
+      );
+      expect(startup.connections).toEqual(cycled.connections);
+    },
+  );
   it("applies with no registry read and no GET, leaving what a cycle leaves (mutation: control tombstones handed to the cycle)", async () => {
     const { w, here, twin, scopes } = await peerDeleted();
     expect(scopes).toContain(CONTROL);

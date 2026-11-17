@@ -8,6 +8,7 @@ import {
   world,
 } from "./log-world.test-utils.js";
 
+import { requestTrace } from "./request-trace.test-utils.js";
 afterEach(closeWorldDrivers);
 
 it("starts the head GET from the owner's listing without another registry read", async () => {
@@ -106,6 +107,54 @@ it("reuses one owner listing for two connections", async () => {
   }
   expect(await here.rows()).toEqual(await peer.rows());
   expect(await here.rows()).toHaveLength(2);
+});
+
+it("startup apply replay of the same listing preserves rows and performs no second remote write", async () => {
+  const trace = requestTrace();
+  const w = await world({ streams: 1, trace });
+  const peer = await w.device("peer");
+  await peer.run("seed", [{ stream: sName(0), id: "first" }]);
+  await peer.cycle();
+  const here = await w.device("here");
+  const list = here.deps.registry.listOwnerRows.bind(here.deps.registry);
+  const listed = await list();
+  let lists = 0;
+  here.deps.registry.listOwnerRows = async () => {
+    // Count the real request, but replay the same captured owner rows.
+    await list();
+    lists += 1;
+    return listed;
+  };
+  const streams = () =>
+    here.db.query("SELECT * FROM stream_state ORDER BY connection_id, stream");
+  try {
+    trace.clear();
+    await here.sync.apply();
+    expect(lists).toBe(1);
+    expect(trace.count("get")).toBeGreaterThan(0);
+    const firstRows = await here.rows();
+    const firstStreams = await streams();
+    const firstPosition = await here.position();
+    expect(firstRows).toEqual(await peer.rows());
+    expect(firstRows.length).toBeGreaterThan(0);
+    expect(firstStreams.length).toBeGreaterThan(0);
+
+    trace.clear();
+    await here.sync.apply();
+    expect(lists).toBe(2);
+    expect(await here.rows()).toEqual(firstRows);
+    expect(await streams()).toEqual(firstStreams);
+    expect(await here.position()).toBe(firstPosition);
+    // One listing and no other registry/storage operation excludes both
+    // registry commits and blob PUTs, not merely duplicate GETs.
+    expect(trace.count("list")).toBe(1);
+    expect(trace.count("read")).toBe(0);
+    expect(trace.count("get")).toBe(0);
+    expect(trace.count(), trace.describe()).toBe(1);
+    expect(trace.describe()).toMatch(/^list:listOwnerRows /);
+  } finally {
+    here.deps.registry.listOwnerRows = list;
+  }
 });
 
 it("a listed active control cannot revive a deletion already observed locally", async () => {
