@@ -1,64 +1,86 @@
-// Fails when a built runtime file (packages/*/dist) imports a package that the
-// repo lists only as a devDependency. Test-only modules belong in a separate
-// output (see packages/core/tsconfig.test-support.json) or in the tsconfig
-// `exclude` list, so consumers never receive them.
+// Check every emitted JS file in published packages against its own manifest.
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
+import { builtinModules } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
-const rootPkg = readJson(path.join(root, "package.json"));
-const devOnly = (pkg) => {
-  const runtime = new Set([
-    ...Object.keys(pkg.dependencies ?? {}),
-    ...Object.keys(pkg.peerDependencies ?? {}).filter(
-      (name) => !pkg.peerDependenciesMeta?.[name]?.optional,
-    ),
-  ]);
-  return new Set(
-    Object.keys({ ...rootPkg.devDependencies, ...pkg.devDependencies }).filter(
-      (name) => !runtime.has(name),
-    ),
-  );
-};
-const packageName = (spec) =>
-  spec.startsWith("@")
-    ? spec.split("/").slice(0, 2).join("/")
-    : spec.split("/")[0];
-const importRe =
-  /^\s*(?:import|export)\s[^'"]*?from\s+['"]([^'"]+)['"]|^\s*import\s+['"]([^'"]+)['"]|\bimport\(\s*['"]([^'"]+)['"]\s*\)/gm;
-
+const builtins = new Set(
+  builtinModules.flatMap((name) => [name, `node:${name}`]),
+);
 const violations = [];
+
 for (const dir of fs.readdirSync(path.join(root, "packages"))) {
   const pkgDir = path.join(root, "packages", dir);
+  const manifestPath = path.join(pkgDir, "package.json");
+  if (!fs.existsSync(manifestPath)) continue;
+  const pkg = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  if (pkg.private) continue;
   const dist = path.join(pkgDir, "dist");
-  if (!fs.existsSync(dist)) continue;
-  const forbidden = devOnly(readJson(path.join(pkgDir, "package.json")));
-  const walk = (current) => {
-    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
-      const file = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        if (entry.name !== "node_modules" && entry.name !== "bundle")
-          walk(file);
-      } else if (entry.name.endsWith(".js")) {
-        // dist/scripts holds build-time tools (e.g. bundle verification), which
-        // the runtime consumers already treat as dev-tool users.
-        if (path.relative(dist, file).startsWith(`scripts${path.sep}`))
-          continue;
-        for (const m of fs.readFileSync(file, "utf8").matchAll(importRe)) {
-          const spec = m[1] ?? m[2] ?? m[3];
-          if (!spec.startsWith(".") && forbidden.has(packageName(spec))) {
-            violations.push(`${path.relative(root, file)} imports ${spec}`);
-          }
-        }
+  if (!fs.existsSync(dist)) {
+    violations.push(`${path.relative(root, dist)} is missing`);
+    continue;
+  }
+  const allowed = new Set([
+    pkg.name,
+    ...Object.keys(pkg.dependencies ?? {}),
+    ...Object.keys(pkg.optionalDependencies ?? {}),
+    ...Object.keys(pkg.peerDependencies ?? {}),
+  ]);
+  const [{ files }] = JSON.parse(
+    execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+      cwd: pkgDir,
+      encoding: "utf8",
+    }),
+  );
+  for (const { path: packedPath } of files) {
+    if (!packedPath.startsWith("dist/") || !/\.(?:c?js|mjs)$/.test(packedPath))
+      continue;
+    const file = path.join(pkgDir, packedPath);
+    const source = ts.createSourceFile(
+      file,
+      fs.readFileSync(file, "utf8"),
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.JS,
+    );
+    const pending = [source];
+    while (pending.length) {
+      const node = pending.pop();
+      let specifier;
+      if (
+        (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
+        node.moduleSpecifier &&
+        ts.isStringLiteral(node.moduleSpecifier)
+      ) {
+        specifier = node.moduleSpecifier.text;
+      } else if (
+        ts.isCallExpression(node) &&
+        node.arguments.length === 1 &&
+        ts.isStringLiteral(node.arguments[0]) &&
+        (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+          (ts.isIdentifier(node.expression) &&
+            node.expression.text === "require"))
+      ) {
+        specifier = node.arguments[0].text;
       }
+      if (specifier && !specifier.startsWith(".") && !builtins.has(specifier)) {
+        const name = specifier.startsWith("@")
+          ? specifier.split("/").slice(0, 2).join("/")
+          : specifier.split("/")[0];
+        if (!allowed.has(name))
+          violations.push(`${path.relative(root, file)} imports ${specifier}`);
+      }
+      ts.forEachChild(node, (child) => {
+        pending.push(child);
+      });
     }
-  };
-  walk(dist);
+  }
 }
-if (violations.length > 0) {
+if (violations.length) {
   console.error(violations.join("\n"));
   process.exit(1);
 }
-console.log("ok: no packages/*/dist file imports a devDependency");
+console.log("ok: published dist imports are declared runtime dependencies");
