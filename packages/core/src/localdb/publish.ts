@@ -109,15 +109,20 @@ type RetainedRun = {
   row_count: number;
 };
 
-/** The identical request twice at most: a lost reply is resent once. */
+/**
+ * Resend a lost reply once. Notify its owner before resending: a later refusal
+ * cannot erase the first send's ambiguous outcome.
+ */
 export async function postBatchOnce(
   registry: StreamSyncRegistry,
   request: SignedRegistryBatch,
+  onAmbiguous?: () => void,
 ): Promise<RegistryBatchResult> {
   try {
     return await registry.postBatch!(request);
   } catch (error) {
     if (!(error instanceof AmbiguousRegistryReplyError)) throw error;
+    onAmbiguous?.();
   }
   // The first send may have landed. The gateway answers a row it already holds
   // with its own hash, which settleRow reads as published. A second lost

@@ -64,7 +64,10 @@ import {
   type SegmentRef,
   type SnapshotPointer,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { type StreamSyncRegistry } from "../stream-sync/ports.js";
+import {
+  RegistryRefusedError,
+  type StreamSyncRegistry,
+} from "../stream-sync/ports.js";
 import { StorageDeferredError } from "../stream-sync/storage-retry.js";
 import { sameHead, type PlanHead } from "../stream-sync/publish-plan.js";
 import { keccakOf } from "../stream-sync/crypto-port.js";
@@ -107,7 +110,7 @@ import {
   type StreamPlan,
 } from "./publish.js";
 import { BODY_BYTES } from "./part-layout.js";
-import { purgeConnection } from "./purge.js";
+import { connectionLifetime, purgeConnection } from "./purge.js";
 import { insideQueue } from "./slot.js";
 import { unwriteRefusedRun } from "./unwrite.js";
 
@@ -193,6 +196,9 @@ type Planned = {
 };
 
 type Candidate = {
+  readonly lifetime: object;
+  readonly connector: string;
+  readonly ns: string;
   readonly basis: string;
   readonly state: LogState;
   /** What the segment carries: after a compaction, `base` is the folded position and `refs` is empty. */
@@ -241,7 +247,7 @@ type Committed =
 
 /**
  * Publish a connection through the log. `null`: this registry has no batch
- * route, so the caller publishes per stream.
+ * route, so nothing can be published.
  */
 export async function publishLog(
   deps: LocalSyncDeps,
@@ -265,7 +271,7 @@ export async function publishLog(
     try {
       const results = await publishRounds(deps, connectionId, clock);
       return results === null || before === null
-        ? (results ?? before)
+        ? results
         : mergeResults(before, results);
     } finally {
       logPublishPhases(deps, connectionId, clock);
@@ -293,11 +299,17 @@ function inFlightOf(
   return chain;
 }
 
-/**
- * A published result outranks a later one that found nothing to send. Two
- * published results of one stream keep the later receipt with the runs of both:
- * a caller that asked for the first run's receipt still finds its run.
- */
+/** Only a noop can yield to an earlier receipt; refusals survive both merges. */
+function mergeResult(
+  held: PublishResult | undefined,
+  next: PublishResult,
+): PublishResult {
+  if (!held || held.outcome === "noop") return next;
+  if (next.outcome === "noop") return held;
+  if (held.outcome !== "published") return held;
+  return next.outcome === "published" ? unionRuns(held, next) : next;
+}
+
 function mergeResults(
   earlier: readonly PublishResult[],
   later: readonly PublishResult[],
@@ -305,14 +317,7 @@ function mergeResults(
   const byStream = new Map<string, PublishResult>();
   for (const result of [...earlier, ...later]) {
     const held = byStream.get(result.stream);
-    if (held?.outcome === "published" && result.outcome !== "published")
-      continue;
-    byStream.set(
-      result.stream,
-      held?.outcome === "published" && result.outcome === "published"
-        ? unionRuns(held, result)
-        : result,
-    );
+    byStream.set(result.stream, mergeResult(held, result));
   }
   return [...byStream.values()].sort((a, b) =>
     a.stream.localeCompare(b.stream),
@@ -320,22 +325,117 @@ function mergeResults(
 }
 
 function unionRuns(held: PublishResult, result: PublishResult): PublishResult {
-  if (!held.publication || !result.publication) return result;
+  if (
+    !held.publication ||
+    !result.publication ||
+    held.publication.head.generation !== result.publication.head.generation
+  )
+    return result;
   const runIds = [
     ...new Set([...held.publication.runIds, ...result.publication.runIds]),
   ];
   return { ...result, publication: { ...result.publication, runIds } };
 }
 
-// Keep an uploaded candidate until its commit has a definite answer. Retrying
-// that commit first preserves its hash, position and receipt even if the reply
-// was lost. The weak database owner releases it when the database is released.
-type PendingCommit = { readonly candidate: Candidate; transferred: boolean };
+// Process-local lifecycle: uploading -> uploaded (commit unresolved) ->
+// committed/refused. The uploaded state records whether a reply was ambiguous.
+// A lifetime or basis change invalidates a candidate. An ambiguous commit must
+// be reconciled before invalidation can release it; invalidated work never
+// transfers or posts again. Only terminal, reconciled states leave the map.
+type CandidateState =
+  | { readonly kind: "uploading" }
+  | { readonly kind: "uploaded"; readonly ambiguous: boolean }
+  | { readonly kind: "committed" }
+  | { readonly kind: "refused" }
+  | { readonly kind: "invalidated"; readonly ambiguous: boolean };
+type PendingCommit = { readonly candidate: Candidate; state: CandidateState };
+type CandidateEvent =
+  | "uploaded"
+  | "ambiguous"
+  | "committed"
+  | "refused"
+  | "invalidated"
+  | "reconciled";
 const pendingCommits = new WeakMap<object, Map<string, PendingCommit>>();
 function pendingOf(db: object): Map<string, PendingCommit> {
   let pending = pendingCommits.get(db);
   if (!pending) pendingCommits.set(db, (pending = new Map()));
   return pending;
+}
+function isInvalidated(entry: PendingCommit): boolean {
+  return entry.state.kind === "invalidated";
+}
+function hasAmbiguousCommit(entry: PendingCommit): boolean {
+  return (
+    (entry.state.kind === "uploaded" || entry.state.kind === "invalidated") &&
+    entry.state.ambiguous
+  );
+}
+function transition(entry: PendingCommit, event: CandidateEvent): void {
+  const state = entry.state;
+  if (event === "invalidated") {
+    entry.state = { kind: "invalidated", ambiguous: hasAmbiguousCommit(entry) };
+  } else if (event === "reconciled" && state.kind === "committed") {
+    return;
+  } else if (
+    event === "reconciled" &&
+    (state.kind === "uploaded" || state.kind === "invalidated")
+  ) {
+    entry.state = { kind: state.kind, ambiguous: false };
+  } else if (event === "uploaded" && state.kind === "uploading") {
+    entry.state = { kind: "uploaded", ambiguous: false };
+  } else if (event === "ambiguous" && state.kind === "uploaded") {
+    entry.state = { kind: "uploaded", ambiguous: true };
+  } else if (
+    event === "committed" &&
+    (state.kind === "uploaded" || state.kind === "committed")
+  ) {
+    entry.state = { kind: "committed" };
+  } else if (
+    event === "refused" &&
+    state.kind === "uploaded" &&
+    !state.ambiguous
+  ) {
+    entry.state = { kind: "refused" };
+  } else {
+    throw new Error(
+      `publish: invalid candidate transition ${state.kind} -> ${event}`,
+    );
+  }
+}
+function releaseCandidate(
+  pending: Map<string, PendingCommit>,
+  id: string,
+  entry: PendingCommit,
+) {
+  if (
+    hasAmbiguousCommit(entry) ||
+    entry.state.kind === "uploading" ||
+    entry.state.kind === "uploaded"
+  )
+    throw new Error("publish: cannot release an unsettled candidate");
+  pending.delete(id);
+}
+async function invalidateExpiredCandidate(
+  held: LocalSyncDeps,
+  id: string,
+  entry: PendingCommit,
+) {
+  const [row] = await held.db.query<{
+    generation: number;
+    control_state: string;
+  }>(
+    "SELECT generation, control_state FROM connections WHERE connection_id = ?",
+    [id],
+  );
+  if (
+    entry.candidate.lifetime !== connectionLifetime(held.db, id) ||
+    !row ||
+    row.generation !== entry.candidate.generation ||
+    row.control_state !== "active" ||
+    (await hasDeleteIntent(held, entry.candidate.connector))
+  )
+    transition(entry, "invalidated");
 }
 
 async function publishRounds(
@@ -346,21 +446,49 @@ async function publishRounds(
   const results = new Map<string, PublishResult>();
   const keep = (list: readonly PublishResult[]) => {
     for (const result of list) {
-      const earlier = results.get(result.stream);
-      if (earlier?.outcome === "published" && result.outcome !== "published")
-        continue;
       results.set(
         result.stream,
-        earlier?.outcome === "published" && result.outcome === "published"
-          ? unionRuns(earlier, result)
-          : result,
+        mergeResult(results.get(result.stream), result),
       );
     }
   };
   let attempts = 0;
   const pending = pendingOf(deps.db);
   for (;;) {
-    const retained = pending.get(connectionId);
+    let retained = pending.get(connectionId);
+    if (retained) {
+      const entry = retained;
+      const recovered = await deps.queue.run(
+        connectionId,
+        "publish",
+        async () => {
+          const held = insideQueue(deps, connectionId);
+          await invalidateExpiredCandidate(held, connectionId, entry);
+          if (hasAmbiguousCommit(entry) || entry.state.kind === "committed")
+            return reconcileCandidate(held, connectionId, entry);
+          if (
+            !isInvalidated(entry) &&
+            (await basisOf(
+              held,
+              connectionId,
+              entry.candidate.planned,
+              await readLogState(held, connectionId),
+            )) !== entry.candidate.basis
+          )
+            transition(entry, "invalidated");
+          return null;
+        },
+      );
+      if (recovered) keep(recovered);
+      if (
+        entry.state.kind === "invalidated" ||
+        entry.state.kind === "committed" ||
+        entry.state.kind === "refused"
+      ) {
+        releaseCandidate(pending, connectionId, entry);
+        retained = undefined;
+      }
+    }
     const turn: Snapshot = retained
       ? { kind: "candidate", candidate: retained.candidate }
       : await clock.time("snapshot", () =>
@@ -386,16 +514,19 @@ async function publishRounds(
       continue;
     }
     const { candidate } = turn;
-    const transfer = retained ?? { candidate, transferred: false };
+    const transfer: PendingCommit = retained ?? {
+      candidate,
+      state: { kind: "uploading" },
+    };
     pending.set(connectionId, transfer);
     // TRANSFER: no slot. Objects are content addressed and authorize nothing
     // until the registry commit, so nothing orders one PUT before another:
     // the attachments, the snapshot parts and the segment that names them go
     // at once and the commit waits for all of them. The commit's one
     // dependency is the objects it names.
-    const scope = await logScopeOf(deps, connectionId);
+    const scope = logScope(candidate.connector, candidate.ns);
     try {
-      if (!transfer.transferred) {
+      if (transfer.state.kind === "uploading") {
         await allTransferred([
           candidate.attachments.length > 0
             ? clock.time("attachments", () =>
@@ -421,7 +552,7 @@ async function publishRounds(
             ]),
           ),
         ]);
-        transfer.transferred = true;
+        transition(transfer, "uploaded");
       }
     } catch (error) {
       // Storage kept refusing past its retry budget. Nothing is wrong with the
@@ -436,20 +567,33 @@ async function publishRounds(
       break;
     }
 
-    const committed = await clock.time("commit", () =>
-      deps.queue.run(connectionId, "publish", () =>
-        commitRound(
-          insideQueue(deps, connectionId),
-          connectionId,
-          candidate,
-          clock,
+    let committed: Committed;
+    try {
+      committed = await clock.time("commit", () =>
+        deps.queue.run(connectionId, "publish", () =>
+          commitRound(
+            insideQueue(deps, connectionId),
+            connectionId,
+            transfer,
+            clock,
+          ),
         ),
-      ),
-    );
-    pending.delete(connectionId);
+      );
+    } catch (error) {
+      if (
+        error instanceof RegistryRefusedError &&
+        transfer.state.kind === "uploaded" &&
+        !hasAmbiguousCommit(transfer)
+      ) {
+        transition(transfer, "refused");
+        releaseCandidate(pending, connectionId, transfer);
+      }
+      throw error;
+    }
+    releaseCandidate(pending, connectionId, transfer);
     if (committed.kind === "unsupported") {
       withoutBatchRoute.add(deps.registry);
-      return results.size > 0 ? [...results.values()] : null;
+      return null;
     }
     if (committed.kind === "retry") {
       if (++attempts >= MAX_ATTEMPTS) {
@@ -465,7 +609,10 @@ async function publishRounds(
   return [...results.values()].sort((a, b) => a.stream.localeCompare(b.stream));
 }
 
-/** Probe retried transfers only; a fresh save remains PUT then commit. */
+/**
+ * Probe retries only. Storage must publish complete objects atomically:
+ * existence proves the whole immutable object is available.
+ */
 async function putIfMissing(
   deps: LocalSyncDeps,
   key: string,
@@ -483,17 +630,6 @@ async function allTransferred(
   const results = await Promise.allSettled(transfers);
   const failed = results.find((r) => r.status === "rejected");
   if (failed) throw failed.reason;
-}
-
-async function logScopeOf(
-  deps: LocalSyncDeps,
-  connectionId: string,
-): Promise<string> {
-  const [row] = await deps.db.query<{ connector: string; ns: string }>(
-    "SELECT connector, ns FROM connections WHERE connection_id = ?",
-    [connectionId],
-  );
-  return logScope(row!.connector, row!.ns);
 }
 
 async function backoff(
@@ -1026,6 +1162,9 @@ async function snapshotRound(
   return {
     kind: "candidate",
     candidate: {
+      lifetime: connectionLifetime(held.db, connectionId),
+      connector: connection.connector,
+      ns: connection.ns,
       basis: await basisOf(held, connectionId, planned, log),
       state: log,
       base,
@@ -1523,21 +1662,29 @@ async function compaction(
 async function commitRound(
   held: LocalSyncDeps,
   connectionId: string,
-  candidate: Candidate,
+  entry: PendingCommit,
   clock: PhaseClock,
 ): Promise<Committed> {
+  const candidate = entry.candidate;
+  await invalidateExpiredCandidate(held, connectionId, entry);
+  if (entry.state.kind === "invalidated")
+    return { kind: "retry", conflict: false };
   const [connection] = await held.db.query<ConnectionRow>(
     "SELECT connector, ns, generation FROM connections WHERE connection_id = ?",
     [connectionId],
   );
-  if (!connection || connection.generation !== candidate.generation)
+  if (!connection || connection.generation !== candidate.generation) {
+    transition(entry, "invalidated");
     return { kind: "retry", conflict: false };
+  }
   const log = await readLogState(held, connectionId);
   if (
     (await basisOf(held, connectionId, candidate.planned, log)) !==
     candidate.basis
-  )
+  ) {
+    transition(entry, "invalidated");
     return { kind: "retry", conflict: false };
+  }
   const results = (outcome: PublishResult["outcome"]): Committed => ({
     kind: "done",
     more: false,
@@ -1547,8 +1694,10 @@ async function commitRound(
       watermark: p.watermark,
     })),
   });
-  if (await hasDeleteIntent(held, connection.connector))
+  if (await hasDeleteIntent(held, connection.connector)) {
+    transition(entry, "invalidated");
     return results("deferred");
+  }
 
   const scope = logScope(connection.connector, connection.ns);
   const control = controlScope(connection.connector, connection.ns);
@@ -1578,21 +1727,31 @@ async function commitRound(
     }),
   };
   const answer = await clock.time("registry-commit", () =>
-    postBatchOnce(held.registry, {
-      ownerAddress: held.ownerAddress,
-      rows: [row],
-      requires: [
-        {
-          scope: control,
-          expectedVersion: String(connection.generation),
-          notDeleted: true,
-          expectedDataHash: hashes.activeData,
-        },
-      ],
-    }),
+    postBatchOnce(
+      held.registry,
+      {
+        ownerAddress: held.ownerAddress,
+        rows: [row],
+        requires: [
+          {
+            scope: control,
+            expectedVersion: String(connection.generation),
+            notDeleted: true,
+            expectedDataHash: hashes.activeData,
+          },
+        ],
+      },
+      () => transition(entry, "ambiguous"),
+    ),
   );
-  if (answer.kind === "unsupported") return { kind: "unsupported" };
+  if (answer.kind === "unsupported") {
+    await reconcileBeforeRefusal(held, connectionId, entry);
+    if (entry.state.kind === "uploaded") transition(entry, "refused");
+    return { kind: "unsupported" };
+  }
   if (answer.kind === "precondition_failed") {
+    await reconcileBeforeRefusal(held, connectionId, entry);
+    if (entry.state.kind === "uploaded") transition(entry, "refused");
     const verdict = answer.failure
       ? settleRequirementFailure(answer.failure, control)
       : null;
@@ -1604,8 +1763,11 @@ async function commitRound(
     }
     return results("deferred");
   }
-  if (!(await lifetimeHolds(held, connectionId, connection.generation)))
+  if (!(await lifetimeHolds(held, connectionId, connection.generation))) {
+    await reconcileBeforeRefusal(held, connectionId, entry);
+    transition(entry, "invalidated");
     return results("deferred");
+  }
   const settlement = settleRow(answer.rows[0]!, {
     expectedVersion: row.expectedVersion,
     dataHash: row.dataHash,
@@ -1613,10 +1775,15 @@ async function commitRound(
   if (settlement === "conflict") {
     // Another writer holds this position. Take its segments, then plan again.
     await applyConnection(held, connectionId);
+    transition(entry, "reconciled");
+    transition(entry, "invalidated");
     return { kind: "retry", conflict: true };
   }
-  if (await hasDeleteIntent(held, connection.connector))
+  transition(entry, "committed");
+  if (await hasDeleteIntent(held, connection.connector)) {
+    transition(entry, "invalidated");
     return results("deferred");
+  }
 
   // The registry took the segment: record it, in one batch.
   const newRef: SegmentRef = {
@@ -1708,6 +1875,63 @@ async function commitRound(
       },
     );
   }
+  statements.push(
+    ...(await candidateAcknowledgements(held, connectionId, candidate)),
+  );
+  statements.push(
+    writeLogState(connectionId, {
+      position: candidate.position,
+      base: candidate.base,
+      refs: [...candidate.refs, newRef],
+      snapshot: candidate.snapshot,
+    }),
+    ...(await compaction(held, connectionId, candidate.planned)),
+  );
+  await clock.time("local-commit", () =>
+    held.db.batch(withOrigin("refresh", statements)),
+  );
+
+  const more = candidate.planned.some((p) => p.rest);
+  return {
+    kind: "done",
+    more,
+    results: publishedResults(connectionId, candidate),
+  };
+}
+
+function publishedResults(
+  connectionId: string,
+  candidate: Candidate,
+): PublishResult[] {
+  return candidate.planned.map((p): PublishResult => ({
+    stream: p.stream,
+    outcome: p.included ? "published" : p.plan.deferred ? "deferred" : "noop",
+    watermark: p.ack,
+    ...(p.included && {
+      publication: {
+        connectionId,
+        connector: candidate.connector,
+        ns: candidate.ns,
+        stream: p.stream,
+        head: {
+          version: candidate.position,
+          generation: candidate.generation,
+          dataHash: candidate.dataHash,
+        },
+        watermark: p.ack,
+        runIds: p.runIds,
+      },
+    }),
+  }));
+}
+
+async function candidateAcknowledgements(
+  held: LocalSyncDeps,
+  connectionId: string,
+  candidate: Candidate,
+): Promise<SqlStatement[]> {
+  const statements: SqlStatement[] = [];
+  const touched = candidate.planned.filter((p) => p.included);
   // A replace still under way read the stream at its basis; the segment this
   // round committed is this device's own, so the basis moves to it (after the
   // head columns above have).
@@ -1717,7 +1941,8 @@ async function commitRound(
         sql: `UPDATE run_streams SET
                 basis_version = (SELECT head_version FROM stream_state WHERE connection_id = ? AND stream = ?),
                 basis_data_hash = ?, basis_generation = ?
-               WHERE run_id = ? AND stream = ? AND replace = 1`,
+               WHERE run_id = ? AND stream = ? AND replace = 1
+                 AND (SELECT head_data_hash FROM stream_state WHERE connection_id = ? AND stream = ?) = ?`,
         params: [
           connectionId,
           p.stream,
@@ -1725,6 +1950,9 @@ async function commitRound(
           candidate.generation,
           p.replacing.r,
           p.stream,
+          connectionId,
+          p.stream,
+          candidate.dataHash,
         ],
       });
   for (const p of candidate.planned) {
@@ -1746,42 +1974,59 @@ async function commitRound(
         params: [p.ack, connectionId, p.stream, p.ack],
       });
   }
-  statements.push(
-    writeLogState(connectionId, {
-      position: candidate.position,
-      base: candidate.base,
-      refs: [...candidate.refs, newRef],
-      snapshot: candidate.snapshot,
-    }),
-    ...(await compaction(held, connectionId, candidate.planned)),
-  );
-  await clock.time("local-commit", () =>
-    held.db.batch(withOrigin("refresh", statements)),
-  );
 
-  const more = candidate.planned.some((p) => p.rest);
-  return {
-    kind: "done",
-    more,
-    results: candidate.planned.map((p): PublishResult => ({
-      stream: p.stream,
-      outcome: p.included ? "published" : p.plan.deferred ? "deferred" : "noop",
-      watermark: p.ack,
-      ...(p.included && {
-        publication: {
-          connectionId,
-          connector: connection.connector,
-          ns: connection.ns,
-          stream: p.stream,
-          head: {
-            version: candidate.position,
-            generation: candidate.generation,
-            dataHash: candidate.dataHash,
-          },
-          watermark: p.ack,
-          runIds: p.runIds,
-        },
-      }),
-    })),
-  };
+  return statements;
+}
+
+async function reconcileBeforeRefusal(
+  held: LocalSyncDeps,
+  connectionId: string,
+  entry: PendingCommit,
+) {
+  if (!hasAmbiguousCommit(entry)) return;
+  await reconcileCandidate(held, connectionId, entry);
+}
+
+async function reconcileCandidate(
+  held: LocalSyncDeps,
+  connectionId: string,
+  entry: PendingCommit,
+): Promise<readonly PublishResult[] | null> {
+  const candidate = entry.candidate;
+  const scope = logScope(candidate.connector, candidate.ns);
+  const read = await held.registry.read(scope);
+  if (isInvalidated(entry)) {
+    transition(entry, "reconciled");
+    return null;
+  }
+  // Apply the registry's history before looking at the local basis. Applying
+  // preserves newer local rows; acknowledgement covers only this candidate's
+  // runs and watermark, never the collector that ended while its reply was lost.
+  await applyConnection(held, connectionId, [{ scope, read }]);
+  await invalidateExpiredCandidate(held, connectionId, entry);
+  if (isInvalidated(entry)) {
+    transition(entry, "reconciled");
+    return null;
+  }
+  const log = await readLogState(held, connectionId);
+  const own =
+    read.found &&
+    read.version >= candidate.position &&
+    log.refs.some(
+      (r) =>
+        r.position === candidate.position && r.dataHash === candidate.dataHash,
+    );
+  if (!own) {
+    transition(entry, "reconciled");
+    transition(entry, "invalidated");
+    return null;
+  }
+  transition(entry, "committed");
+  await held.db.batch(
+    withOrigin("refresh", [
+      ...(await candidateAcknowledgements(held, connectionId, candidate)),
+      ...(await compaction(held, connectionId, candidate.planned)),
+    ]),
+  );
+  return publishedResults(connectionId, candidate);
 }
