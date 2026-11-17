@@ -95,14 +95,16 @@ const workerGrowthKiB = (worker: WorkerMeasurement) =>
 
 /** A worker sample in a fresh seeded directory, for the one re-measure. */
 function measureWorker(sizeBytes: number): WorkerMeasurement {
-  const directory = mkdtempSync(join(memoryRoot, "replica-memory-"));
+  let directory: string | undefined;
   try {
+    directory = mkdtempSync(join(memoryRoot, "replica-memory-"));
     runFixture("seed", directory, sizeBytes);
     return JSON.parse(
       runFixture("measure", directory, sizeBytes),
     ) as WorkerMeasurement;
   } finally {
-    rmSync(directory, { recursive: true, force: true });
+    if (directory !== undefined)
+      rmSync(directory, { recursive: true, force: true });
   }
 }
 
@@ -115,10 +117,13 @@ it("smoke-guards transport-worker RSS at 32, 64 and 128 MiB blobs (coarse, not a
   }[] = [];
   for (const sizeMiB of [32, 64, 128]) {
     const sizeBytes = sizeMiB * 1024 * 1024;
-    const directory = mkdtempSync(join(memoryRoot, "replica-memory-"));
-    const promoteDirectory = mkdtempSync(join(memoryRoot, "replica-promote-"));
-    const plainDirectory = mkdtempSync(join(memoryRoot, "replica-plain-"));
+    let directory: string | undefined;
+    let promoteDirectory: string | undefined;
+    let plainDirectory: string | undefined;
     try {
+      directory = mkdtempSync(join(memoryRoot, "replica-memory-"));
+      promoteDirectory = mkdtempSync(join(memoryRoot, "replica-promote-"));
+      plainDirectory = mkdtempSync(join(memoryRoot, "replica-plain-"));
       runFixture("seed", directory, sizeBytes);
       let worker = JSON.parse(
         runFixture("measure", directory, sizeBytes),
@@ -140,9 +145,9 @@ it("smoke-guards transport-worker RSS at 32, 64 and 128 MiB blobs (coarse, not a
         plain,
       });
     } finally {
-      rmSync(directory, { recursive: true, force: true });
-      rmSync(promoteDirectory, { recursive: true, force: true });
-      rmSync(plainDirectory, { recursive: true, force: true });
+      for (const dir of [directory, promoteDirectory, plainDirectory]) {
+        if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
+      }
     }
   }
   console.log("replica memory", results);
