@@ -107,7 +107,10 @@ export interface ChangePush {
    * failed attempt calls nothing. `onHealth(true)`: the channel answered
    * lately, so positions can be trusted; `onHealth(false)`: it failed or went
    * quiet, so do not rely on one. `since()` is read as each held request is
-   * sent: the position the manager holds the registry up to, if any.
+   * sent: the position the manager holds the registry up to once its work in
+   * flight ends, if any. A pass that has started or is queued counts: the
+   * request asks for what follows the position that pass settles at, so a
+   * change that lands during it comes back as a delta.
    */
   subscribe(handlers: {
     onChange(delta: RegistryChangeDelta | undefined): void;
@@ -383,6 +386,20 @@ export function createSyncManager(
   // have seen. It is owed one more cycle and is dropped only by running one (or
   // by a stop). A pass clears it on entry, so it never re-arms itself.
   let rerunRequested = false;
+  // What the running cycle owes beyond `rerunRequested`, for a request that
+  // arrived with a change delta. `queuedDelta` is the newest such delta (one
+  // slot: a pass can start under only one position, the latest the push
+  // reported, so an older delta cannot serve it); `deltaBarred` is set by a
+  // request that had none, which owes the follow-up a full pass. The next pass
+  // takes both and clears them. `deltaPass` still decides delta or full.
+  let queuedDelta: RegistryChangeDelta | undefined;
+  let deltaBarred = false;
+  // The position the cycle in flight will settle at if it ends clean: the
+  // position its pass started under. The held request asks from it (see
+  // `since` in `startChangePush`), so a change that lands during the pass
+  // comes back with a delta. Read only while a cycle is in flight, and set by
+  // each cycle before its pass starts.
+  let inFlightTarget: string | undefined;
   // Failed cycles in a row, and the pending retry of the follow-up they owe.
   // `retryTimer` set means cooling down: a pushed change only marks the flag.
   let cycleFailures = 0;
@@ -643,9 +660,16 @@ export function createSyncManager(
   async function runCycle(delta?: RegistryChangeDelta): Promise<void> {
     // Prevent concurrent cycles
     if (cycleInFlight) {
-      // The delta was read against the position a settled pass holds; the
-      // pass in flight moves it, so the follow-up is a full pass.
+      // The follow-up is owed. Its delta, if the request had one, waits for
+      // it: the request asked from the position the pass in flight settles at
+      // (`inFlightTarget`), which is what the follow-up holds when that pass
+      // ends clean. When it does not, `deltaPass` sees another position and the
+      // follow-up is a full pass, as it is for a request without a delta.
       rerunRequested = true;
+      if (delta === undefined) {
+        deltaBarred = true;
+        queuedDelta = undefined;
+      } else if (!deltaBarred) queuedDelta = delta;
       return cycleInFlight;
     }
 
@@ -657,15 +681,18 @@ export function createSyncManager(
         // streak ends at that boundary, not when the whole cycle returns, or a
         // failure in a pass that follows a success would back off as a repeat.
         if (!first) cycleFailures = 0;
-        const passDelta = first ? delta : undefined;
+        const passDelta = first ? delta : queuedDelta;
         first = false;
         rerunRequested = false;
+        queuedDelta = undefined;
+        deltaBarred = false;
         // Sample before anything is read: every change up to this position is
         // in the registry when the pass reads. Nothing is settled until it
         // ends clean.
         const startedUnder = knownPosition;
         const errorsBefore = errorSeq;
         const heldUpTo = syncedPosition;
+        inFlightTarget = startedUnder;
         syncedPosition = undefined;
         refusedPosition = undefined;
         const settle = () => {
@@ -805,6 +832,12 @@ export function createSyncManager(
       } while (rerunRequested && isRunning && !paused);
     };
 
+    // A cycle that failed leaves what it queued behind; a new one starts clean.
+    queuedDelta = undefined;
+    deltaBarred = false;
+    // Set before the pass starts, not by it: the next held request can be sent
+    // before the pass runs, and it must ask from where the pass will settle.
+    inFlightTarget = knownPosition;
     // A failed cycle ends its exclusive operation at once: callers get its
     // error and queued mutations run. A follow-up it still owes (the dirty
     // flag) waits out a cooldown first: see `scheduleRetry`.
@@ -1320,7 +1353,18 @@ export function createSyncManager(
           return;
         cycleNow(delta);
       },
-      since: () => syncedPosition,
+      // The position this device holds the registry up to once its work in
+      // flight ends: the target of the pass running, or of the follow-up a
+      // request queued (it starts under the latest position the push gave).
+      // Between cycles that is the last clean pass's. A pass that does not
+      // end clean leaves no position (`syncedPosition` is cleared when a pass
+      // starts), so after it the request asks from none.
+      since: () =>
+        cycleInFlight === null
+          ? syncedPosition
+          : rerunRequested
+            ? knownPosition
+            : inFlightTarget,
       onHealth(healthy) {
         if (run !== lifecycle) return;
         const wasHealthy = pushHealthy;
@@ -1405,6 +1449,8 @@ export function createSyncManager(
       clearNotifyTimer();
       clearRetryTimer();
       rerunRequested = false;
+      queuedDelta = undefined;
+      deltaBarred = false;
       isRunning = false;
       paused = false;
       owedWhilePaused = false;

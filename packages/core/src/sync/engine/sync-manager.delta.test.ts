@@ -245,6 +245,23 @@ describe("a change delta", () => {
     await t.manager.stop();
   });
 
+  it("a request without a delta that arrives during a cycle makes the follow-up a full pass, whatever delta comes after it (mutation: queued delta kept)", async () => {
+    const t = setup();
+    await settled(t);
+    let release!: () => void;
+    t.cycle.mockImplementationOnce(
+      () => new Promise<void>((resolve) => (release = resolve)),
+    );
+    await answer(t, delta("6", "8"), "8"); // a full cycle, held open
+    await answer(t, undefined, "9"); // a poke with no delta
+    await answer(t, delta("8", "10"), "10"); // would apply on its own
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.applyDelta).not.toHaveBeenCalled();
+    expect(t.cycle).toHaveBeenCalledTimes(2);
+    await t.manager.stop();
+  });
+
   it("a poke without a delta (the first answer after a failure) runs the cycle", async () => {
     const t = setup();
     await settled(t);
@@ -267,10 +284,32 @@ describe("a change delta", () => {
     await answer(t, { since: "7", seq: "8", reset: true }, "8");
     expect(t.applyDelta).not.toHaveBeenCalled();
     expect(t.cycle).toHaveBeenCalledTimes(1);
-    expect(t.handlers().since?.()).toBeUndefined();
+    // The held request asks from the position the listing settles at, so a
+    // change that lands meanwhile comes back as a delta; nothing is settled
+    // yet, and a listing that fails leaves no position (next test).
+    expect(t.handlers().since?.()).toBe("8");
     persist();
     await vi.advanceTimersByTimeAsync(0);
     expect(t.handlers().since?.()).toBe("8");
+    await t.manager.stop();
+  });
+
+  it("a reset whose listing fails settles nothing: the delta that follows it runs the cycle (mutation: the asked-from position settled at the pass's start)", async () => {
+    const t = setup();
+    await settled(t);
+    let fail!: (error: Error) => void;
+    t.cycle.mockImplementationOnce(
+      () => new Promise<void>((_resolve, reject) => (fail = reject)),
+    );
+    await answer(t, { since: "7", seq: "8", reset: true }, "8");
+    expect(t.handlers().since?.()).toBe("8");
+    fail(new Error("listing failed"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.handlers().since?.()).toBeUndefined();
+    t.cycle.mockClear();
+    await answer(t, delta("8", "9"), "9");
+    expect(t.applyDelta).not.toHaveBeenCalled();
+    expect(t.cycle).toHaveBeenCalledTimes(1);
     await t.manager.stop();
   });
 
@@ -288,7 +327,9 @@ describe("a change delta", () => {
     await answer(t, delta("7", "9"), "9");
     expect(t.applyDelta).toHaveBeenCalledTimes(1);
     expect(t.cycle).not.toHaveBeenCalled();
-    expect(t.handlers().since?.()).toBeUndefined();
+    // The second answer waits behind the first pass; the request that follows
+    // it asks from the position the follow-up pass will start under.
+    expect(t.handlers().since?.()).toBe("9");
     persist();
     await vi.advanceTimersByTimeAsync(0);
     expect(t.cycle).toHaveBeenCalledTimes(1);
