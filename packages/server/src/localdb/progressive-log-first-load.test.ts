@@ -481,9 +481,7 @@ describe("progressive first load, log protocol on", () => {
     });
     expect((await body.next()).value).toBe('{"records":[');
     for (let i = 0; i < 100; i++) expect((await body.next()).done).toBe(false);
-    const deleter = createConnectionDeleter(b.deps, {
-      declaredStreams: () => [STREAM],
-    });
+    const deleter = createConnectionDeleter(b.deps, {});
     const requested = deleter
       .requestConnectionDelete(CONNECTOR)
       .catch(() => undefined);

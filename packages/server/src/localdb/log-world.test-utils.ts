@@ -201,7 +201,14 @@ export async function world(options: {
           ...(options.keyTypes ? { keyTypes: options.keyTypes } : {}),
         })),
       }),
-      declaredStreams: () => names,
+      // The host's retained manifest names the streams a delete fences.
+      retainedManifests: () => [
+        JSON.stringify({
+          connector_key: CONNECTOR,
+          version: "1",
+          streams: names.map((name) => ({ name, primary_key: ["id"] })),
+        }),
+      ],
       olderVersionReads: () => true,
     });
     /** One run that writes `records` and ends covering `covered`. */

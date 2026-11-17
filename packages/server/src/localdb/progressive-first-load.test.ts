@@ -510,9 +510,7 @@ describe("progressive first load", () => {
     for (let i = 0; i < 100; i++) expect((await body.next()).done).toBe(false); // the first page
     // The delete saves its intent, then waits for the connection's queue, which
     // the apply holds until the held part arrives.
-    const deleter = createConnectionDeleter(f.deps, {
-      declaredStreams: () => ["items"],
-    });
+    const deleter = createConnectionDeleter(f.deps, {});
     const requested = deleter
       .requestConnectionDelete("fixture-source")
       .catch(() => undefined);

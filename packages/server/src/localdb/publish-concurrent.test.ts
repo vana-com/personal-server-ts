@@ -226,7 +226,6 @@ async function world(options: Options) {
         primaryKey: ["id"],
       })),
     }),
-    declaredStreams: () => names,
     olderVersionReads: () => true,
   });
   await sync.intake.begin("run-1", {
@@ -534,7 +533,6 @@ describe("streams of one connection publish together", () => {
           primaryKey: ["id"],
         })),
       }),
-      declaredStreams: () => names,
       olderVersionReads: () => true,
     });
     await sync.intake.begin("run-2", {

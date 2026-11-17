@@ -77,7 +77,6 @@ export async function buildStreamDb(
           { name: "items", semantics: "mutable_state", primaryKey: ["id"] },
         ],
       }),
-      declaredStreams: () => ["items"],
       olderVersionReads: () => true,
     });
     await sync.intake.begin("seed", {

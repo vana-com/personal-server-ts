@@ -40,7 +40,6 @@ beforeEach(() => {
 it("composes catalogue and alias ports at the host boundary", () => {
   createServerLocalSync({} as never, {
     resolveArtifact: async () => null,
-    declaredStreams: () => [],
     olderVersionReads: () => false,
   });
   const options = ports.build.mock.calls[0]![1];

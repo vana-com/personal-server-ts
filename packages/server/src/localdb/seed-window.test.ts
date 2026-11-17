@@ -89,7 +89,6 @@ async function openDevice(
         coverageStrategy: "full_inventory" as const,
       })),
     }),
-    declaredStreams: () => streams,
     olderVersionReads: () => true,
   });
   const keys = async (stream = "items") =>

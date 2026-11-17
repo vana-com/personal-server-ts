@@ -834,7 +834,6 @@ describe("run publication state", () => {
       await endRun(world, "r1");
       const sync = createLocalSync(world.deps, {
         resolveArtifact: () => null,
-        declaredStreams: () => [],
         olderVersionReads: () => false,
       });
       const code = (work: Promise<unknown>) =>

@@ -62,7 +62,6 @@ async function world(seed = true) {
           semantics: "mutable_state",
         })),
       }),
-      declaredStreams: () => ["A", "B"],
       olderVersionReads: () => true,
     });
     const collect = async (

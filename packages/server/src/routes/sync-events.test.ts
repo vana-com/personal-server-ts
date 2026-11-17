@@ -81,7 +81,6 @@ async function device(
           },
         ],
       }),
-      declaredStreams: () => ["s0"],
       olderVersionReads: () => true,
     },
   );

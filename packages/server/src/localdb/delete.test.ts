@@ -33,6 +33,13 @@ const drivers: SqlDriver[] = [];
 afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
 });
+/** A retained connector manifest: it names a stream the registry holds no row for. */
+const manifestOf = (streams: readonly string[]) =>
+  JSON.stringify({
+    connector_key: "fixture-source",
+    version: "1",
+    streams: streams.map((name) => ({ name, primary_key: ["id"] })),
+  });
 async function world(
   file?: string,
   names: readonly string[] = ["items"],
@@ -88,9 +95,7 @@ async function world(
     };
     await bootstrapConnections(deps);
     await applyConnection(deps, fixture.control);
-    const deleter = createConnectionDeleter(deps, {
-      declaredStreams: () => names,
-    });
+    const deleter = createConnectionDeleter(deps, {});
     devices.push({ db, deps, deleter });
   }
   return {
@@ -185,9 +190,7 @@ it("resumes a saved stream pin after a failed post without losing the intent", a
   expect(JSON.parse(saved!.intent).streams[0].pin).toBe(2);
   expect(await f.a.db.query("SELECT * FROM records")).toEqual([]);
   f.registry.beforePost = undefined;
-  const resumed = createConnectionDeleter(f.a.deps, {
-    declaredStreams: () => [],
-  });
+  const resumed = createConnectionDeleter(f.a.deps, {});
   expect(await resumed.resumeDeletes()).toEqual([]);
   expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 2 });
   expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
@@ -214,7 +217,7 @@ it("resumes a pinned delete even when the old head cannot be read", async () => 
         },
       },
     },
-    { declaredStreams: () => [] },
+    {},
   );
   expect(await resumed.resumeDeletes()).toEqual([]);
   expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
@@ -289,9 +292,7 @@ it("a reconnect that wins the fence race is never tombstoned, and the ended life
 it("ConnectorNotVerifiedError refuses a pin-only connection before persisting or purging", async () => {
   const f = await world();
   f.registry.listStreamRows = async () => [];
-  const store = createConnectionDeleter(f.a.deps, {
-    declaredStreams: () => [],
-  });
+  const store = createConnectionDeleter(f.a.deps, {});
   await expect(
     store.requestConnectionDelete("fixture-source"),
   ).rejects.toMatchObject({ name: "ConnectorNotVerifiedError" });
@@ -319,7 +320,7 @@ it("the second device's unpublished rows are purged along with its imported rows
 it("deletion fences declared rowless streams after the control tombstone", async () => {
   const f = await world();
   const store = createConnectionDeleter(f.a.deps, {
-    declaredStreams: () => ["items", "rowless"],
+    retainedManifests: () => [manifestOf(["items", "rowless"])],
   });
   await store.requestConnectionDelete("fixture-source");
   expect(await store.resumeDeletes()).toEqual([]);
@@ -427,7 +428,7 @@ it("resumes an intent from a reopened SQLite database after a crash", async () =
     f.registry.beforePost = undefined;
     const resumed = createConnectionDeleter(
       { ...f.a.deps, db, queue: connectionQueue() },
-      { declaredStreams: () => [] },
+      {},
     );
     expect(await resumed.resumeDeletes()).toEqual([]);
     expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
@@ -521,9 +522,9 @@ it("an absent registry answer never clears a local-only delete, but explicit con
     await db.query("SELECT generation FROM runs WHERE run_id='offline-run'"),
   ).toEqual([{ generation: null }]);
   registry.beforeRead = undefined;
-  await createConnectionDeleter(deps, {
-    declaredStreams: () => ["items"],
-  }).requestConnectionDelete("fixture-source");
+  await createConnectionDeleter(deps, {}).requestConnectionDelete(
+    "fixture-source",
+  );
   for (const run of ["scheduled-1", "scheduled-2"]) {
     await applyConnection(deps, f.control);
     await bootstrapConnections(deps);
@@ -925,9 +926,7 @@ it("the fence phase is saved with the version it expects, and a restart resumes 
   expect(JSON.parse(saved!.intent).fences).toEqual([{ ns: "", version: 2 }]);
   f.registry.beforePost = undefined;
   const posts = vi.spyOn(f.registry, "post");
-  const restarted = createConnectionDeleter(f.a.deps, {
-    declaredStreams: () => [],
-  });
+  const restarted = createConnectionDeleter(f.a.deps, {});
   expect(await restarted.resumeDeletes()).toEqual([]);
   expect(posts.mock.calls.map(([post]) => post.scope)).toEqual([f.head.scope]);
 });
@@ -950,9 +949,7 @@ it("an intent saved before the fence existed, with its streams landed, finishes 
     },
   ]);
   f.registry.beforePost = undefined;
-  const resumed = createConnectionDeleter(f.a.deps, {
-    declaredStreams: () => [],
-  });
+  const resumed = createConnectionDeleter(f.a.deps, {});
   expect(await resumed.resumeDeletes()).toEqual([]);
   expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
   expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);

@@ -166,9 +166,7 @@ async function addDevice(
     db,
     deps,
     offline,
-    deleter: createConnectionDeleter(deps, {
-      declaredStreams: () => ["items"],
-    }),
+    deleter: createConnectionDeleter(deps, {}),
   };
   w.devices.push(device);
   return device;
@@ -1019,9 +1017,7 @@ it.each([false, true])(
       );
     };
     await begin("before-delete");
-    const deleter = createConnectionDeleter(w.a.deps, {
-      declaredStreams: () => names,
-    });
+    const deleter = createConnectionDeleter(w.a.deps, {});
     await deleter.requestConnectionDelete(declaration.connector);
     expect(await deleter.resumeDeletes()).toEqual([]);
     for (const name of names) {
@@ -1181,9 +1177,7 @@ const twoStreams = {
 
 /** A deleter of `device` that knows both streams, so "events" is a declared stream with no row yet. */
 const twoStreamDeleter = (device: Device) =>
-  createConnectionDeleter(device.deps, {
-    declaredStreams: () => ["items", "events"],
-  });
+  createConnectionDeleter(device.deps, {});
 
 /** `deleter` lands the fence, then stops before any stream is cleaned. */
 async function fencedThenStopped(

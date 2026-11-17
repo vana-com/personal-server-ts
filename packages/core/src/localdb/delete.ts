@@ -123,7 +123,6 @@ function withinBudget(work: Promise<boolean>, ms?: number): Promise<boolean> {
 export function createConnectionDeleter(
   deps: LocalSyncDeps,
   options: {
-    readonly declaredStreams: (connector: string) => readonly string[];
     readonly retainedManifests?: () => readonly string[];
     readonly eraseLegacy?: (connector: string) => Promise<void>;
     /**
@@ -260,10 +259,11 @@ export function createConnectionDeleter(
     }
     const empty = pins.length === 0 && streams.length === 0;
     if (!empty) {
-      const declared = new Set([
-        ...options.declaredStreams(connector),
-        ...manifestStreamLister(options.retainedManifests?.() ?? [])(connector),
-      ]);
+      // Streams the registry lists are fenced from its rows; a retained
+      // manifest adds the ones this device holds no row for yet.
+      const declared = new Set(
+        manifestStreamLister(options.retainedManifests?.() ?? [])(connector),
+      );
       if (
         declared.size === 0 &&
         streams.length === 0 &&

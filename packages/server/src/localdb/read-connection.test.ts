@@ -87,7 +87,6 @@ describe("read connection", () => {
   const localFor = (db: SqlDriver) =>
     createServerLocalSync(depsFor(db), {
       resolveArtifact: () => undefined,
-      declaredStreams: () => [],
       olderVersionReads: () => true,
     });
 

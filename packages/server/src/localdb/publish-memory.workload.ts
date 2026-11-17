@@ -89,7 +89,6 @@ export async function buildPublishMemoryDb(
           { name: "items", semantics: "mutable_state", primaryKey: ["id"] },
         ],
       }),
-      declaredStreams: () => ["items"],
       olderVersionReads: () => true,
     });
     await sync.intake.begin("seed", {

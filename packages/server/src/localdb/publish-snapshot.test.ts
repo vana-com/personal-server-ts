@@ -134,7 +134,6 @@ async function world(
         { name: "items", semantics: "mutable_state", primaryKey: ["id"] },
       ],
     }),
-    declaredStreams: () => ["items"],
     olderVersionReads: () => true,
   });
   const request = {

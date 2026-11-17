@@ -64,7 +64,6 @@ async function world(
             },
           ],
         }),
-        declaredStreams: () => ["items"],
         olderVersionReads: () => true,
       },
     );

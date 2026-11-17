@@ -124,7 +124,6 @@ async function world(options: Options) {
         primaryKey: ["id"],
       })),
     }),
-    declaredStreams: () => names,
     olderVersionReads: () => true,
   });
   /** One run that writes `records` (stream, id) and ends covering `covered`. */

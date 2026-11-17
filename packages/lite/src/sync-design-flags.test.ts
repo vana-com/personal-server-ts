@@ -74,7 +74,6 @@ async function depsFor(flags: Flags) {
     streamSyncRegistry: createMemoryStreamSyncRegistry(),
     streamSyncBlobs: createMemoryStreamSyncBlobs(),
     streamSyncDeclarations: () => null,
-    streamSyncDeclaredStreams: () => [],
     stateStore,
     storage: createMemoryPsLiteStorage(),
     ownerSignature: signature,
@@ -163,7 +162,6 @@ describe("PS-Lite stream-sync design flags", () => {
             builderToken: "builder-token",
           }),
           active: true,
-          streamSyncDeclaredStreams: () => [],
           localDb: { openDriver: async () => openBetterSqlite3(":memory:") },
           configDefaults: {
             gateway: { url: "https://gateway.local" },

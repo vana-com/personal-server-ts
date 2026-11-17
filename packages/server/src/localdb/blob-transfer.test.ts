@@ -57,7 +57,6 @@ async function fixture(late = false) {
             { name: "media", semantics: "mutable_state", primaryKey: ["id"] },
           ],
         }),
-        declaredStreams: () => ["media"],
         olderVersionReads: () => true,
       }),
     };
