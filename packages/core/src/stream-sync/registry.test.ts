@@ -900,8 +900,15 @@ describe("listings of concurrent callers", () => {
     expect(begun).toHaveLength(2);
     const s1 = streamScope("acme", "", "s1");
     const s2 = streamScope("acme", "", "s2");
+    // A caller handed the second listing settles here, before any third begins.
+    const settledEarly = new Promise<never>((_, reject) => {
+      late.then(
+        () => reject(new Error("late caller settled before fresh L3")),
+        reject,
+      );
+    });
     begun[1]!.release(["pdpp.acme~", s1]);
-    await started(2);
+    await Promise.race([started(2), settledEarly]);
     expect(begun).toHaveLength(3);
     begun[2]!.release(["pdpp.acme~", s1, s2]);
     expect((await first).map((r) => r.scope)).toEqual(["pdpp.acme~"]);
