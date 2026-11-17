@@ -387,12 +387,9 @@ export function createSyncManager(
   // by a stop). A pass clears it on entry, so it never re-arms itself.
   let rerunRequested = false;
   // What the running cycle owes beyond `rerunRequested`, for a request that
-  // arrived with a change delta. `queuedDelta` is the newest such delta (one
-  // slot: a pass can start under only one position, the latest the push
-  // reported, so an older delta cannot serve it); `deltaBarred` is set by a
-  // request that had none, which owes the follow-up a full pass. The next pass
-  // takes both and clears them. `deltaPass` still decides delta or full.
-  let queuedDelta: RegistryChangeDelta | undefined;
+  // arrived with change deltas. The next pass takes the queued deltas in
+  // order; a request without one requires a full pass instead.
+  let queuedDeltas: RegistryChangeDelta[] = [];
   let deltaBarred = false;
   // The position the cycle in flight will settle at if it ends clean: the
   // position its pass started under. The held request asks from it (see
@@ -668,8 +665,8 @@ export function createSyncManager(
       rerunRequested = true;
       if (delta === undefined) {
         deltaBarred = true;
-        queuedDelta = undefined;
-      } else if (!deltaBarred) queuedDelta = delta;
+        queuedDeltas = [];
+      } else if (!deltaBarred) queuedDeltas.push(delta);
       return cycleInFlight;
     }
 
@@ -681,10 +678,10 @@ export function createSyncManager(
         // streak ends at that boundary, not when the whole cycle returns, or a
         // failure in a pass that follows a success would back off as a repeat.
         if (!first) cycleFailures = 0;
-        const passDelta = first ? delta : queuedDelta;
+        const passDeltas = first ? (delta ? [delta] : []) : queuedDeltas;
         first = false;
         rerunRequested = false;
-        queuedDelta = undefined;
+        queuedDeltas = [];
         deltaBarred = false;
         // Sample before anything is read: every change up to this position is
         // in the registry when the pass reads. Nothing is settled until it
@@ -707,10 +704,17 @@ export function createSyncManager(
             refusedPosition = startedUnder;
           else syncedPosition = startedUnder;
         };
-        const byDelta =
-          passDelta === undefined
-            ? "full"
-            : await deltaPass(passDelta, heldUpTo, startedUnder);
+        let byDelta: "settle" | "owed" | "full" =
+          passDeltas.length === 0 ? "full" : "settle";
+        let held = heldUpTo;
+        for (let i = 0; i < passDeltas.length && byDelta !== "full"; i++) {
+          const d = passDeltas[i]!;
+          const target = i === passDeltas.length - 1 ? startedUnder : d.seq;
+          const result = await deltaPass(d, held, target);
+          if (result === "full") byDelta = "full";
+          else if (result === "owed") byDelta = "owed";
+          held = d.seq;
+        }
         if (byDelta !== "full") {
           if (byDelta === "settle") settle();
           continue;
@@ -832,9 +836,6 @@ export function createSyncManager(
       } while (rerunRequested && isRunning && !paused);
     };
 
-    // A cycle that failed leaves what it queued behind; a new one starts clean.
-    queuedDelta = undefined;
-    deltaBarred = false;
     // Set before the pass starts, not by it: the next held request can be sent
     // before the pass runs, and it must ask from where the pass will settle.
     inFlightTarget = knownPosition;
@@ -1360,11 +1361,13 @@ export function createSyncManager(
       // end clean leaves no position (`syncedPosition` is cleared when a pass
       // starts), so after it the request asks from none.
       since: () =>
-        cycleInFlight === null
-          ? syncedPosition
-          : rerunRequested
-            ? knownPosition
-            : inFlightTarget,
+        options?.accountStorageMode?.read() !== "switched"
+          ? undefined
+          : cycleInFlight === null
+            ? syncedPosition
+            : rerunRequested
+              ? knownPosition
+              : inFlightTarget,
       onHealth(healthy) {
         if (run !== lifecycle) return;
         const wasHealthy = pushHealthy;
@@ -1449,7 +1452,7 @@ export function createSyncManager(
       clearNotifyTimer();
       clearRetryTimer();
       rerunRequested = false;
-      queuedDelta = undefined;
+      queuedDeltas = [];
       deltaBarred = false;
       isRunning = false;
       paused = false;
