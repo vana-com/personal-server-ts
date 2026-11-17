@@ -8,6 +8,7 @@ import {
   LEGACY_SCOPE_BINDINGS,
   legacyScopeToPdppSelection,
   projectPdppRecordsToLegacyPayload,
+  requiredLegacyStreams,
 } from "./index.js";
 import amazonOrdersSchema from "./legacy-schemas/amazon.orders.json";
 import chatgptConversationsSchema from "./legacy-schemas/chatgpt.conversations.json";
@@ -1696,6 +1697,14 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     // Connectors that predate the profile stream (the signed 0.1.0 declaration)
     // never had one. Legacy's fullName was always null for them, so the scope
     // keeps serving notes with that same null rather than disappearing.
+    it("names profile as the one stream a host need not wait for", () => {
+      const notes = LEGACY_SCOPE_BINDINGS.get("icloud_notes.notes")!;
+      expect(requiredLegacyStreams(notes)).toEqual(["notes", "folders"]);
+      // A binding that declares no optional stream requires every stream.
+      const folders = LEGACY_SCOPE_BINDINGS.get("icloud_notes.folders")!;
+      expect(requiredLegacyStreams(folders)).toEqual(folders.pdppStreams);
+    });
+
     it("serves notes and folders without a profile stream, with the pre-profile userName of null", () => {
       const result = projectPdppRecordsToLegacyPayload(
         "icloud_notes.notes",

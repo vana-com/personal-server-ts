@@ -22,6 +22,18 @@ import type {
   ProjectionResult,
 } from "./types.js";
 
+/**
+ * The bound streams a host must have completed before it serves a binding:
+ * every stream except the ones the projection serves without. Every host
+ * reads this one rule; none compares against `pdppStreams` itself.
+ */
+export function requiredLegacyStreams(
+  binding: Pick<LegacyScopeBinding, "pdppStreams" | "optionalStreams">,
+): string[] {
+  const optional = new Set(binding.optionalStreams ?? []);
+  return binding.pdppStreams.filter((stream) => !optional.has(stream));
+}
+
 export { ANTHROPIC_LIVE_BINDINGS } from "./bindings.js";
 export { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
 export { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
