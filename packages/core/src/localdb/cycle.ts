@@ -80,8 +80,9 @@ export async function runPublish(deps: LocalSyncDeps): Promise<CycleReport> {
   const early = await publishEarly(deps, candidates);
   const fresh = new Set(candidates.fresh.map((c) => c.connectionId));
   // Every connection the early publish takes must have a result: a registry
-  // without the batch route answers `null` and leaves none, and a save is then
-  // not published (the cycle reports it or publishes it another way). A fresh
+  // without the batch route throws `RegistryBatchRouteMissingError`, which is
+  // kept as the connection's error and leaves no result: nothing is published
+  // (the cycle reports it). A fresh
   // connection has streams, so no published result means its deferral was
   // dropped (`publishEarly`); a known connection with no streams has none.
   const settled = [...candidates.active, ...candidates.fresh].every(
@@ -147,8 +148,9 @@ async function hasUnplacedConnections(
  * head. Apply then follows as before.
  *
  * Connections run concurrently, as in the rest of the cycle. A registry
- * without the batch route answers `null` and publishes nothing here; a
- * failure is kept for the connection's report and is not tried twice.
+ * without the batch route throws `RegistryBatchRouteMissingError` and
+ * publishes nothing here; a failure, that one included, is kept for the
+ * connection's report and is not tried twice.
  */
 async function publishEarly(
   deps: LocalSyncDeps,
@@ -159,8 +161,7 @@ async function publishEarly(
     ...active.map(async ({ connectionId }) => {
       try {
         const published = await publishLog(deps, connectionId);
-        if (published !== null)
-          early.set(connectionId, { published, error: null });
+        early.set(connectionId, { published, error: null });
       } catch (cause) {
         early.set(connectionId, { published: [], error: cause });
       }
@@ -173,11 +174,10 @@ async function publishEarly(
     ...fresh.map(async ({ connectionId }) => {
       try {
         const published = await publishLog(deps, connectionId);
-        if (published !== null)
-          early.set(connectionId, {
-            published: published.filter((r) => r.outcome !== "deferred"),
-            error: null,
-          });
+        early.set(connectionId, {
+          published: published.filter((r) => r.outcome !== "deferred"),
+          error: null,
+        });
       } catch (cause) {
         early.set(connectionId, { published: [], error: cause });
       }
@@ -212,14 +212,11 @@ export async function syncConnection(
       applyConnection(insideQueue(deps, connectionId), connectionId, listed),
     );
     if (early && early.error !== null) throw early.error;
-    // One segment and one commit per batch; `null` means this registry has no
-    // batch route, so nothing can be published until it has. What apply left
-    // to publish goes after what the early publish already sent.
+    // One segment and one commit per batch. A registry without the batch
+    // route fails it (`RegistryBatchRouteMissingError`): nothing is published
+    // until it has one. What apply left to publish goes after what the early
+    // publish already sent.
     const through = await publishLog(deps, connectionId);
-    if (through === null)
-      throw new Error(
-        "stream sync: this registry has no batch route; nothing is published until it has",
-      );
     published = [...(early?.published ?? []), ...through];
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause);

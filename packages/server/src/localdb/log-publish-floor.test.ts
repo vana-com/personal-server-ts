@@ -6,9 +6,8 @@
 //
 // The floor of a save is one segment PUT and one registry commit, the commit
 // after the PUT because it names the object: depth 2. A first save of a new
-// connection adds the one request that creates its control row, which the
-// commit also needs (the commit's condition names it): depth 3 when the post
-// comes first, since the PUT is planned after the control verdict.
+// connection creates its control row in that same commit (the commit's
+// condition is judged on the state it commits), so it is depth 2 as well.
 import { sha256 } from "@noble/hashes/sha2";
 import { afterEach, describe, expect, it } from "vitest";
 import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -46,15 +45,34 @@ async function openWorld(
 }
 
 describe("log publish: the requests of one save", () => {
-  it("a first save of a new connection creates its control row, puts the segment and commits: depth 3, one control post", async () => {
+  it("a first save of a new connection puts the segment, then commits the control row and the log row in one request: depth 2, no control post (mutant: FIRST_SAVE_READS_CONTROL)", async () => {
     const { trace, a } = await openWorld(0);
     await a.run("first", six("a"), { connector: "fresh" });
     trace.clear();
     await a.cycle();
-    expect(trace.depthToLast("batch"), trace.describe()).toBe(3);
-    expect(trace.count("post"), trace.describe()).toBe(1);
+    expect(trace.depthToLast("batch"), trace.describe()).toBe(2);
+    expect(trace.count("post"), trace.describe()).toBe(0);
     expect(trace.count("put"), trace.describe()).toBe(1);
     expect(trace.count("batch"), trace.describe()).toBe(1);
+  });
+
+  it("a first save under a Batch-Policy with no room for its two rows fails clearly after the gateway refuses it, with no extra round trip, and writes nothing (mutant: NO_POLICY_ROOM_CHECK)", async () => {
+    const trace = requestTrace(2);
+    const w = await world({
+      streams: 6,
+      trace,
+      policy: { rows: 1, requires: 16, bytes: 65_536 },
+    });
+    const a = await w.device("a");
+    await a.run("first", six("a"), { connector: "fresh" });
+    await expect(a.cycle()).rejects.toThrow(
+      /Batch-Policy rows=1;requires=16 has no room for one request of 2 rows and 1 conditions/,
+    );
+    expect(w.gateway.rowsOf(streamScope("fresh", "", "~log"))).toBe(0);
+    // The gateway's refusal carries the policy, so the clear failure costs no
+    // request of its own: one commit sent, no policy read after it.
+    expect(trace.count("batch"), trace.describe()).toBe(1);
+    expect(trace.count("policy"), trace.describe()).toBe(0);
   });
 
   it("a later save is a PUT and a commit: depth 2", async () => {

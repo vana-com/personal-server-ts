@@ -4,21 +4,33 @@
  * URL (tests, the stream-sync harnesses) passes it where the gateway client
  * would go. Every committed post is kept in `log`, in order. `beforePost` and
  * `afterPost` let a test hold a post before or after it commits (a batch calls
- * them once per row). The connection log is written only through `postBatch`,
- * which judges the conditions and each row as the gateway does.
+ * them once per row).
+ *
+ * It serves the gateway's batch contract: one all-or-nothing request,
+ * conditions judged on the state the request commits. `serveBatch` changes
+ * the policy it advertises; `stopServingBatch` makes it a gateway without
+ * the route.
  */
 import {
+  controlHashes,
   parseScope,
   type ControlRead,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import type {
-  RegistryBatchResult,
-  RegistryBatchRow,
-  RegistryPostResult,
-  SignedRegistryBatch,
-  SignedRegistryPost,
-  StreamSyncBlobs,
-  StreamSyncRegistry,
+import { gatewayBatchRefusal } from "../localdb/batch-contract.js";
+import { streamSyncHashes } from "./crypto.js";
+import {
+  RegistryBatchRouteMissingError,
+  RegistryRefusedError,
+  type RegistryBatchPolicy,
+  type RegistryBatchResult,
+  type RegistryBatchRow,
+  type RegistryPostResult,
+  type RegistryRequirement,
+  type RegistryRequirementFailure,
+  type SignedRegistryBatch,
+  type SignedRegistryPost,
+  type StreamSyncBlobs,
+  type StreamSyncRegistry,
 } from "./ports.js";
 import {
   createStorageAccess,
@@ -29,6 +41,8 @@ import {
 interface Version {
   readonly dataHash: string;
   readonly metadataHash: string;
+  /** The signature the row was written with: a replay must carry the same. */
+  readonly signature: string;
   readonly at: string;
 }
 
@@ -70,6 +84,7 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
     rows.push({
       dataHash: request.dataHash,
       metadataHash: request.metadataHash,
+      signature: request.signature,
       at: new Date(this.baseMs + rows.length * 1000).toISOString(),
     });
     this.versions.set(request.scope, rows);
@@ -82,70 +97,162 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
     return { kind: "committed" };
   }
 
+  /** The batch contract this registry serves; `undefined`: no batch route. */
+  private batch?: {
+    readonly policy: RegistryBatchPolicy;
+    readonly isTombstone?: (dataHash: string) => boolean;
+  } = { policy: GATEWAY_BATCH_POLICY };
+  /** Every batch request the route received, in order. */
+  readonly batches: SignedRegistryBatch[] = [];
+
   /**
-   * The gateway's `POST /v1/data/batch`: every condition is judged first (one
-   * that fails writes nothing), then each row lands or loses on its own. A row
-   * whose version and hash are the head's is a resend and answers as a
-   * conflict that names its own hash, which the caller reads as published.
+   * Serve `POST /v1/data/batch` with `policy`. `isTombstone` says which data
+   * hash is a delete, for `notDeleted` conditions; by default, the control
+   * tombstone every device writes.
    */
+  serveBatch(
+    policy: RegistryBatchPolicy,
+    isTombstone?: (dataHash: string) => boolean,
+  ): void {
+    this.batch = { policy, ...(isTombstone && { isTombstone }) };
+  }
+
+  /** A gateway that serves no batch route: `postBatch` answers 404. */
+  stopServingBatch(): void {
+    this.batch = undefined;
+  }
+
+  batchPolicy(): RegistryBatchPolicy | undefined {
+    return this.batch?.policy;
+  }
+
+  async readBatchPolicy(): Promise<RegistryBatchPolicy | undefined> {
+    return this.batch?.policy;
+  }
+
   async postBatch(request: SignedRegistryBatch): Promise<RegistryBatchResult> {
-    for (const req of request.requires) {
-      const rows = this.versions.get(req.scope);
-      const head = rows?.[rows.length - 1];
-      const reason = !rows
-        ? ("absent" as const)
-        : String(rows.length) !== req.expectedVersion
-          ? ("version-mismatch" as const)
-          : req.expectedDataHash !== undefined &&
-              req.expectedDataHash.toLowerCase() !==
-                head!.dataHash.toLowerCase()
-            ? ("data-hash-mismatch" as const)
-            : undefined;
-      if (reason !== undefined)
-        return {
-          kind: "precondition_failed",
-          failure: {
-            scope: req.scope,
-            reason,
-            latestVersion: rows ? String(rows.length) : null,
-            deleted: false,
-          },
-        };
-    }
-    const results: RegistryBatchRow[] = [];
-    for (const row of request.rows) {
-      const post = { ...row, ownerAddress: request.ownerAddress };
-      await this.beforePost?.(post);
-      const rows = this.versions.get(row.scope) ?? [];
-      const head = rows[rows.length - 1];
-      const latest = {
-        latestVersion: String(rows.length),
-        latestDataHash: head?.dataHash ?? null,
-      };
-      const fence = row.expectedHeadDataHash;
+    const batch = this.batch;
+    if (!batch) throw new RegistryBatchRouteMissingError("HTTP 404");
+    const tombstone = (await CONTROL_TOMBSTONE).tombstoneData;
+    const isTombstone =
+      batch.isTombstone ??
+      ((dataHash: string) => dataHash.toLowerCase() === tombstone);
+    this.batches.push(request);
+    // A test holds each row here as it holds a single post: before the
+    // request's transaction begins.
+    for (const row of request.rows)
+      await this.beforePost?.({ ownerAddress: request.ownerAddress, ...row });
+    const refusal = gatewayBatchRefusal(request, batch.policy);
+    if (refusal !== null)
+      throw new RegistryRefusedError(`batch POST refused: ${refusal}`, 400);
+    const failed = async (
+      need: RegistryRequirement,
+    ): Promise<RegistryRequirementFailure | null> => {
+      const row = await this.read(need.scope);
+      const fail = (
+        reason: NonNullable<RegistryRequirementFailure["reason"]>,
+      ): RegistryRequirementFailure => ({
+        scope: need.scope,
+        reason,
+        latestVersion: row.found ? String(row.version) : null,
+        deleted: row.found && isTombstone(row.dataHash),
+      });
+      if (!row.found) return fail("absent");
+      if (need.notDeleted && isTombstone(row.dataHash)) return fail("deleted");
+      if (String(row.version) !== need.expectedVersion)
+        return fail("version-mismatch");
       if (
-        Number(row.expectedVersion) !== rows.length + 1 ||
-        (fence !== undefined &&
-          head?.dataHash.toLowerCase() !== fence.toLowerCase())
+        need.expectedDataHash !== undefined &&
+        row.dataHash.toLowerCase() !== need.expectedDataHash.toLowerCase()
+      )
+        return fail("data-hash-mismatch");
+      return null;
+    };
+    const written = new Set(request.rows.map((row) => row.scope));
+    // Conditions on rows the request does not write: the state before it,
+    // which is the state it commits.
+    for (const need of request.requires) {
+      if (written.has(need.scope)) continue;
+      const failure = await failed(need);
+      if (failure) return { kind: "precondition_failed", failure };
+    }
+    const before = new Map(
+      [...written].map((scope) => [scope, this.versions.get(scope)?.slice()]),
+    );
+    const logged = this.log.length;
+    const rollBack = () => {
+      for (const [scope, kept] of before)
+        if (kept === undefined) this.versions.delete(scope);
+        else this.versions.set(scope, kept);
+      this.log.length = logged;
+    };
+    const rows: (RegistryBatchRow & { written?: true })[] = [];
+    for (const row of request.rows) {
+      const stored = this.versions.get(row.scope) ?? [];
+      const at = stored[Number(row.expectedVersion) - 1];
+      if (
+        at !== undefined &&
+        at.dataHash.toLowerCase() === row.dataHash.toLowerCase() &&
+        at.signature.toLowerCase() === row.signature.toLowerCase()
       ) {
-        results.push({ kind: "conflict", ...latest });
+        // A replay, as the gateway judges one (`replaysStoredRow`, without
+        // `exclusive`, which a batch never sets): the same data hash and the
+        // same signature, so the same signer sent it again. Another signer's
+        // row at that version is a conflict, whatever it holds.
+        rows.push({ kind: "committed" });
         continue;
       }
-      rows.push({
+      const head = stored.at(-1);
+      if (
+        Number(row.expectedVersion) !== stored.length + 1 ||
+        (row.expectedHeadDataHash !== undefined &&
+          head?.dataHash.toLowerCase() !==
+            row.expectedHeadDataHash.toLowerCase())
+      ) {
+        rows.push({
+          kind: "conflict",
+          latestVersion: stored.length > 0 ? String(stored.length) : null,
+          latestDataHash: head?.dataHash ?? null,
+        });
+        continue;
+      }
+      stored.push({
         dataHash: row.dataHash,
         metadataHash: row.metadataHash,
-        at: new Date(this.baseMs + rows.length * 1000).toISOString(),
+        signature: row.signature,
+        at: new Date(this.baseMs + stored.length * 1000).toISOString(),
       });
-      this.versions.set(row.scope, rows);
+      this.versions.set(row.scope, stored);
       this.log.push({
         scope: row.scope,
-        version: rows.length,
+        version: stored.length,
         dataHash: row.dataHash,
       });
-      await this.afterPost?.(post);
-      results.push({ kind: "committed" });
+      rows.push({ kind: "committed", written: true });
     }
-    return { kind: "rows", rows: results };
+    if (rows.some((row) => row.kind === "conflict")) {
+      rollBack();
+      return {
+        kind: "refused",
+        rows: rows.map(({ written, ...row }) =>
+          written ? { kind: "not_written" } : row,
+        ),
+      };
+    }
+    // Conditions on rows it writes: the state after its writes.
+    for (const need of request.requires) {
+      if (!written.has(need.scope)) continue;
+      const failure = await failed(need);
+      if (failure) {
+        rollBack();
+        return { kind: "precondition_failed", failure };
+      }
+    }
+    // Committed. A test may hold the caller after the commit, per row.
+    for (const [i, row] of request.rows.entries())
+      if (rows[i]!.written)
+        await this.afterPost?.({ ownerAddress: request.ownerAddress, ...row });
+    return { kind: "committed" };
   }
 
   async probeChange() {
@@ -182,6 +289,24 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
 }
 
 /** A fresh in-memory registry (see `MemoryStreamSyncRegistry`). */
+/**
+ * The policy the gateway advertises (`Batch-Policy`), as `deriveBatchBounds()`
+ * computes it from the backend's limits in data-gateway `lib/batch-bounds.ts`
+ * (31 rows once the lock count includes the registry change trigger's
+ * relations).
+ */
+const GATEWAY_BATCH_POLICY: RegistryBatchPolicy = {
+  rows: 31,
+  requires: 1952,
+  bytes: 3_606_546,
+};
+
+/** The control tombstone's hashes: a constant label, the same for every key. */
+const CONTROL_TOMBSTONE = controlHashes(
+  streamSyncHashes.keccak256,
+  "0".repeat(16),
+);
+
 export function createMemoryStreamSyncRegistry(): StreamSyncRegistry {
   return new MemoryStreamSyncRegistry();
 }

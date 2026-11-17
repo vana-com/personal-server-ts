@@ -11,7 +11,6 @@ import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { pino } from "pino";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
-import { ConnectorNotVerifiedError } from "@opendatalabs/personal-server-ts-core/localdb";
 import type {
   ConnectionDeletePort,
   StorageModeRead,
@@ -290,24 +289,6 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
         error: { code: status, errorCode, message: expect.any(String) },
       });
     }
-  });
-
-  it("answers 503 CONNECTOR_NOT_VERIFIED when the writer cannot name the streams", async () => {
-    const response = await del(
-      await makeApp({
-        switched: true,
-        connectionDelete: {
-          requestConnectionDelete: async (connector) => {
-            throw new ConnectorNotVerifiedError(connector);
-          },
-        },
-      }),
-      "/v1/owner/connectors/github",
-    );
-    expect(response.status).toBe(503);
-    expect((await response.json()).error.errorCode).toBe(
-      "CONNECTOR_NOT_VERIFIED",
-    );
   });
 
   it("answers another method with 405 to the owner only (mutant: METHOD_BEFORE_AUTH)", async () => {

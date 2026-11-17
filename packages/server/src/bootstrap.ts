@@ -980,7 +980,6 @@ async function bootstrapServer(
         const facade = createServerLocalSync(deps, {
           resolveArtifact: (digest) =>
             manifestArtifactResolver(pdppAuth?.retainedManifests ?? [])(digest),
-          retainedManifests: () => pdppAuth?.retainedManifests ?? [],
           eraseLegacy: (connector) =>
             eraseConnectorLeftovers(connector, {
               storage: rawDataStorage,

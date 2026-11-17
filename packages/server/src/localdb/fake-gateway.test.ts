@@ -58,9 +58,11 @@ describe("the fake registry's connection-log fence, in a batch", () => {
     const out = await batch(g, [row(STREAM, 1), row(OTHER_STREAM, 1)]);
     expect(out.map((r) => [r.status, r.reason ?? null])).toEqual([
       [409, "log-exists"],
-      [201, null],
+      // All or nothing: the row beside the loser is not written.
+      [424, null],
     ]);
     expect(g.rowsOf(STREAM)).toBe(0);
+    expect(g.rowsOf(OTHER_STREAM)).toBe(0);
   });
 
   for (const order of ["log first", "stream first"] as const) {
@@ -137,12 +139,15 @@ describe("the fake registry's connection-log fence, in a batch", () => {
     it(`${order}: a batch that creates the log row refuses the stream row too`, async () => {
       const g = gateway();
       const out = byScope(await batch(g, arrange(row(LOG, 1), row(STREAM, 1))));
-      expect(out.get(LOG)).toMatchObject({ status: 201 });
+      // The stream row loses, so the request writes nothing: not the log row
+      // either.
+      expect(out.get(LOG)).toMatchObject({ status: 424 });
       expect(out.get(STREAM)).toMatchObject({
         status: 409,
         reason: "log-exists",
       });
       expect(g.rowsOf(STREAM)).toBe(0);
+      expect(g.rowsOf(LOG)).toBe(0);
     });
   }
 
@@ -163,5 +168,26 @@ describe("the fake registry's connection-log fence, in a batch", () => {
       { ...row(STREAM, 1), dataHash: TOMBSTONE, metadataHash: TOMBSTONE },
     ]);
     expect(out).toMatchObject({ status: 201 });
+  });
+});
+
+describe("the fake registry's replay rule, in a batch", () => {
+  it("replays a stored row for the same data hash and signature, and refuses the same data from another signer", async () => {
+    const g = createFakeGateway({
+      owner: OWNER,
+      replay: "created",
+      isTombstone: (v) => v.dataHash === TOMBSTONE,
+    });
+    const first = row(STREAM, 1, "a", { signature: "0x01" });
+    expect(await batch(g, [first])).toMatchObject([{ status: 201 }]);
+    // The same signer sends it again (a lost reply): stored, nothing written.
+    expect(await batch(g, [first])).toMatchObject([{ status: 201 }]);
+    // Another signer's identical commitment is not a replay: the version is
+    // taken.
+    const other = { ...first, signature: "0x02" };
+    expect(await batch(g, [other])).toMatchObject([
+      { status: 409, reason: "stale" },
+    ]);
+    expect(g.rowsOf(STREAM)).toBe(1);
   });
 });

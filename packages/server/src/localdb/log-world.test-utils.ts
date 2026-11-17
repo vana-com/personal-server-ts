@@ -32,7 +32,6 @@ import {
   DEFAULT_STORAGE_ACCESS_POLICY,
 } from "../../../core/src/stream-sync/storage-retry.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
-import { retainedManifest } from "./apply-fixture.test-utils.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { createFakeGateway, type FakeGatewayOptions } from "./fake-gateway.js";
 import type { RequestTrace } from "./request-trace.test-utils.js";
@@ -230,8 +229,6 @@ export async function world(options: {
           ...(options.keyTypes ? { keyTypes: options.keyTypes } : {}),
         })),
       }),
-      // The host's retained manifest names the streams a delete fences.
-      retainedManifests: () => [retainedManifest(CONNECTOR, names)],
     });
     /** One run that writes `records` and ends covering `covered`. */
     const run = async (
@@ -251,6 +248,8 @@ export async function world(options: {
         covered?: readonly string[];
         full?: boolean;
         observedAt?: number;
+        /** An explicit connect by the owner: the only start of a deleted connection. */
+        connect?: boolean;
         /** Bytes the record named by `blobId` carries, sent before the run ends. */
         blob?: { hash: string; bytes: Uint8Array };
         /** The connector the run collects for (default: the world's one connector). */
@@ -268,6 +267,7 @@ export async function world(options: {
             ? connector
             : `${connector}@${opts.version}`,
         wantFull: opts.full ?? true,
+        ...(opts.connect ? { connect: true } : {}),
         observedAt: opts.observedAt,
         owner: { address: OWNER, leaseId: null },
       });

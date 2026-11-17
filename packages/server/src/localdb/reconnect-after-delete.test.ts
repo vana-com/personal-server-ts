@@ -8,7 +8,6 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  controlScope,
   logScope,
   streamScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -24,7 +23,6 @@ import {
 afterEach(closeWorldDrivers);
 
 const LOG = logScope(CONNECTOR, "");
-const CONTROL = controlScope(CONNECTOR, "");
 const connect = (runId: string) => ({
   runId,
   request: {
@@ -98,13 +96,13 @@ describe.each([
   });
 });
 
-it("a log row that appears after the delete was planned ends the stream cleanup", async () => {
+it("a delete leaves the connection log as it is, whatever the listing showed", async () => {
   const w = await world({ streams: 3 });
   const a = await w.device("a");
   await a.run("run-1", [{ stream: sName(0), id: "1" }]);
   await a.cycle();
-  // The plan listed the connection before the log row existed: it names the
-  // declared streams, and the registry now refuses each write to one.
+  // A listing that misses the log row changes nothing: the delete writes the
+  // fence only.
   const registry = a.deps.registry;
   const listStreamRows = registry.listStreamRows.bind(registry);
   registry.listStreamRows = async (connector) =>
@@ -114,7 +112,7 @@ it("a log row that appears after the delete was planned ends the stream cleanup"
   expect(w.gateway.versions.get(LOG)).toHaveLength(1);
 });
 
-it("planning excludes the log and every listed or declared stream in its namespace", async () => {
+it("planning names the control pins only: no listed or declared stream, and not the log", async () => {
   const w = await world({ streams: 3 });
   const a = await w.device("plan-guard");
   await a.run("run-plan", [{ stream: sName(0), id: "old" }]);
@@ -148,70 +146,15 @@ it("planning excludes the log and every listed or declared stream in its namespa
       a.sync.deleter.requestConnectionDelete(CONNECTOR),
     ).rejects.toBe(stop);
     expect(planned).toBeDefined();
-    expect(planned!.pins).not.toHaveLength(0);
-    expect(planned!.streams).toEqual([]);
-    expect(planned!.streams?.some((pin) => pin.stream === "~log")).toBe(false);
+    // The plan names control pins only: no stream, listed or declared, and
+    // not the log.
+    expect(planned).toEqual({
+      id: expect.any(String),
+      pins: [expect.anything()],
+    });
     expect(await a.db.query("SELECT 1 FROM delete_intents")).toEqual([]);
   } finally {
     a.db.batch = batch;
     registry.listStreamRows = list;
-  }
-});
-
-it("resumes an older saved log pin without planning or advancing the log version", async () => {
-  // A permissive gateway makes a missing cleanStream guard observable as a
-  // successful destructive write, not an incidental conflict-based exit.
-  const w = await world({
-    streams: 3,
-    connectionLogFence: false,
-  });
-  const a = await w.device("legacy-intent");
-  await a.run("run-legacy", [{ stream: sName(0), id: "old" }]);
-  await a.cycle();
-  const before = await a.deps.registry.read(LOG);
-  const control = await a.deps.registry.read(CONTROL);
-  expect(before.found).toBe(true);
-  expect(control.found).toBe(true);
-  if (!before.found || !control.found) throw new Error("missing fixture rows");
-  const versions = w.gateway.versions.get(LOG)!.length;
-  const intent: DeleteIntent = {
-    id: "saved-before-log-guard",
-    pins: [{ ns: "", version: control.version }],
-    streams: [
-      {
-        ns: "",
-        stream: "~log",
-        pin: before.version + 1,
-        control: { kind: "active", generation: control.version },
-      },
-    ],
-  };
-  await a.db.batch([
-    {
-      sql: "INSERT OR REPLACE INTO delete_intents(connector,delete_id,intent) VALUES (?,?,?)",
-      params: [CONNECTOR, intent.id!, JSON.stringify(intent)],
-    },
-  ]);
-  const list = a.deps.registry.listStreamRows.bind(a.deps.registry);
-  a.deps.registry.listStreamRows = async () => {
-    throw new Error("resuming a stored intent must not plan");
-  };
-  try {
-    expect(await a.sync.deleter.resumeDeletes()).toEqual([]);
-    a.deps.registry.listStreamRows = list;
-    expect(await a.db.query("SELECT 1 FROM delete_intents")).toEqual([]);
-    expect(await a.deps.registry.read(LOG)).toEqual(before);
-    expect(w.gateway.versions.get(LOG)).toHaveLength(versions);
-    expect(await a.deps.registry.read(CONTROL)).toMatchObject({
-      found: true,
-      version: control.version + 1,
-    });
-    const { runId, request } = connect("reconnect-legacy");
-    expect((await a.sync.intake.begin(runId, request)).status).toBe(
-      "collecting",
-    );
-    await a.sync.intake.abort("reconnect-legacy", "cancelled");
-  } finally {
-    a.deps.registry.listStreamRows = list;
   }
 });

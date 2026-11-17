@@ -15,44 +15,90 @@
 // What this file does not know: how a commit is made (sign, send, local write).
 // The caller's `flush` does that, inside the slot, for the entries it is given.
 
-import type {
-  RegistryBatchRow,
-  RegistryRequirementFailure,
+import {
+  RegistryBatchRouteMissingError,
+  type RegistryBatchPolicy,
+  type RegistryBatchRow,
+  type RegistryRequirementFailure,
+  type StreamSyncRegistry,
 } from "../stream-sync/ports.js";
 import type { LocalSyncDeps } from "./deps.js";
 
 /**
- * What every gateway that has the batch route accepts: 16 rows and 16
- * conditions in one request (the fixed caps of the first gateway to ship it).
- * A caller uses these until a batch answer advertises the gateway's own bounds
- * (`Batch-Policy`, read by `registry.batchPolicy()`), and for a gateway that
- * never does. They are not tuning knobs: see `batchBounds`.
+ * The bounds of one batch request on this registry: the policy the gateway
+ * advertised (`Batch-Policy`). `undefined` when it has advertised none: the
+ * caller sends no batch then, and no number stands in for the gateway's. A
+ * caller that needs it before its first request reads it with
+ * `registry.readBatchPolicy()`.
  */
-export const GATEWAY_MAX_BATCH_ROWS = 16;
-export const GATEWAY_MAX_BATCH_REQUIRES = 16;
-
-/**
- * The bounds of one batch request on this registry: what its last batch answer
- * advertised, else the fixed caps every gateway accepts.
- */
-export function batchBounds(registry: LocalSyncDeps["registry"]): {
-  readonly rows: number;
-  readonly requires: number;
-  /** See `RegistryBatchPolicy.lockedScopes`; absent when the gateway sends none. */
-  readonly lockedScopes?: number;
-} {
-  const policy = registry.batchPolicy?.();
-  return {
-    rows: policy?.rows ?? GATEWAY_MAX_BATCH_ROWS,
-    requires: policy?.requires ?? GATEWAY_MAX_BATCH_REQUIRES,
-    ...(policy?.lockedScopes !== undefined && {
-      lockedScopes: policy.lockedScopes,
-    }),
-  };
+export function batchBounds(
+  registry: LocalSyncDeps["registry"],
+): RegistryBatchPolicy | undefined {
+  return registry.batchPolicy?.();
 }
 
-/** What a stream's commit does with the registry's answer to its row. */
-export type RowSettlement = "committed" | "conflict";
+/**
+ * The gateway's `Batch-Policy` has no room for a request the caller cannot
+ * split (a first save's control row and log row commit together). Not a race:
+ * nothing goes until the gateway advertises a larger policy.
+ */
+export class RegistryBatchPolicyTooSmallError extends Error {
+  constructor(
+    readonly policy: RegistryBatchPolicy,
+    readonly rows: number,
+    readonly requires: number,
+  ) {
+    super(
+      `Batch-Policy rows=${policy.rows};requires=${policy.requires} has no room for one request of ${rows} rows and ${requires} conditions`,
+    );
+    this.name = "RegistryBatchPolicyTooSmallError";
+  }
+}
+
+/** Throws when a known policy has no room for a request of this shape. */
+export function checkBatchRoom(
+  policy: RegistryBatchPolicy | undefined,
+  request: {
+    readonly rows: readonly unknown[];
+    readonly requires: readonly unknown[];
+  },
+): void {
+  if (
+    policy !== undefined &&
+    (request.rows.length > policy.rows ||
+      request.requires.length > policy.requires)
+  )
+    throw new RegistryBatchPolicyTooSmallError(
+      policy,
+      request.rows.length,
+      request.requires.length,
+    );
+}
+
+/**
+ * The gateway's batch bounds, for a caller that commits only in batches (a
+ * connection delete, a log publish). Read once per process. Throws
+ * `RegistryBatchRouteMissingError` when the gateway serves no batch contract,
+ * and `AmbiguousRegistryReplyError` when the policy read got no answer.
+ */
+export async function requireBatchPolicy(
+  registry: StreamSyncRegistry,
+): Promise<RegistryBatchPolicy> {
+  if (registry.postBatch === undefined)
+    throw new RegistryBatchRouteMissingError("this registry has no batch port");
+  const policy = await (registry.readBatchPolicy?.() ??
+    Promise.resolve(registry.batchPolicy?.()));
+  if (policy === undefined)
+    throw new RegistryBatchRouteMissingError("no Batch-Policy advertised");
+  return policy;
+}
+
+/**
+ * What a commit does with the registry's answer to its row in a refused
+ * request. `not_written`: the row lost nothing of its own; another row of the
+ * request lost, and this one may be sent again.
+ */
+export type RowSettlement = "committed" | "conflict" | "not_written";
 
 /**
  * A row the gateway answered as a conflict whose winner is this very row (same
@@ -63,7 +109,7 @@ export function settleRow(
   row: RegistryBatchRow,
   sent: { readonly expectedVersion: string; readonly dataHash: string },
 ): RowSettlement {
-  if (row.kind === "committed") return "committed";
+  if (row.kind !== "conflict") return row.kind;
   return row.latestVersion === sent.expectedVersion &&
     row.latestDataHash !== null &&
     row.latestDataHash.toLowerCase() === sent.dataHash.toLowerCase()

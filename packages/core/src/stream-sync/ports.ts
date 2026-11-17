@@ -89,12 +89,12 @@ export type SignedBatchRow = Omit<SignedRegistryPost, "ownerAddress"> & {
 };
 
 /**
- * Several writes of one owner in one request, with conditions on other rows.
- * The conditions are the batch's: if one fails nothing is written. Each row
- * then lands or loses on its own, and a row that lost does not affect its
- * siblings. The conditions are judged on every request, a replay included.
- * `rows` may be empty when `requires` is not: nothing is written and the
- * answer says whether every condition holds.
+ * Several writes of one owner in one request: one all-or-nothing transaction.
+ * Every row is stored, or nothing is written. The conditions are judged on the
+ * state the request commits, so a condition may name a row the request writes;
+ * they are judged on every request, a replay included. `rows` may be empty
+ * when `requires` is not: nothing is written and the answer says whether every
+ * condition holds.
  */
 export interface SignedRegistryBatch {
   readonly ownerAddress: string;
@@ -106,7 +106,8 @@ export interface SignedRegistryBatch {
  * What the gateway says one batch request may hold (its `Batch-Policy`
  * response header). `rows` and `requires` are item counts, and both can be full
  * in one request; `bytes` is the size of that full request of the largest
- * legal items, so a request within the counts is within `bytes`.
+ * legal items, so a request within the counts is within `bytes`. The gateway
+ * derives them from its backend's limits.
  */
 export interface RegistryBatchPolicy {
   readonly rows: number;
@@ -122,23 +123,28 @@ export interface RegistryBatchPolicy {
   readonly lockedScopes?: number;
 }
 
+/** One row of a refused batch (409 `conflict`): nothing of the request was written. */
 export type RegistryBatchRow =
-  /** 201: written. */
+  /** 201: the version was already stored (a replay); it stays stored. */
   | { readonly kind: "committed" }
   /**
-   * 409: the gateway holds this version or a later one. The winner's version
-   * and data hash come with it; a row whose hash is the winner's is already
-   * published (a resend).
+   * 409: this row lost, so the request was refused. The gateway holds this
+   * version or a later one; the winner's version and data hash come with it. A
+   * row whose hash is the winner's is already published (a resend).
    */
   | {
       readonly kind: "conflict";
       readonly latestVersion: string | null;
       readonly latestDataHash: string | null;
-    };
+    }
+  /** 424: not written, because another row lost. */
+  | { readonly kind: "not_written" };
 
 export type RegistryBatchResult =
-  /** The gateway has no batch route (404 or 405). Nothing was written. */
-  | { readonly kind: "unsupported" }
+  /** 200: every row is stored (written now, or a replay). */
+  | { readonly kind: "committed" }
+  /** 409 `conflict`: a row lost; nothing was written. One entry per request row, in order. */
+  | { readonly kind: "refused"; readonly rows: readonly RegistryBatchRow[] }
   /**
    * A condition failed. Nothing was written, for any row. `failure` is `null`
    * when the gateway did not say which condition or why: the caller reads the
@@ -147,9 +153,7 @@ export type RegistryBatchResult =
   | {
       readonly kind: "precondition_failed";
       readonly failure: RegistryRequirementFailure | null;
-    }
-  /** 2xx: one result per request row, in request order. */
-  | { readonly kind: "rows"; readonly rows: readonly RegistryBatchRow[] };
+    };
 
 /** Neither committed nor refused: resend the persisted request unchanged. */
 export class AmbiguousRegistryReplyError extends Error {
@@ -287,6 +291,21 @@ export class RegistryRefusedError extends Error {
   }
 }
 
+/**
+ * The gateway serves no batch contract: `POST /v1/data/batch` answered 404 or
+ * 405, or the route advertises no `Batch-Policy`. Stream sync needs it: a
+ * connection delete and a log publish each commit in one batch, and there is
+ * no per-row path to fall back to. `answer` says what the gateway answered.
+ */
+export class RegistryBatchRouteMissingError extends Error {
+  constructor(readonly answer: string) {
+    super(
+      `the data gateway serves no batch contract at POST /v1/data/batch (${answer}); stream sync needs a gateway that serves it`,
+    );
+    this.name = "RegistryBatchRouteMissingError";
+  }
+}
+
 export interface StreamSyncRegistry {
   /** Authoritative read: `GET /v1/data/:id?includeDeleted=true`. */
   read(scope: string): Promise<ControlRead>;
@@ -301,24 +320,32 @@ export interface StreamSyncRegistry {
     request: ConditionalRegistryPost,
   ): Promise<ConditionalPostResult>;
   /**
-   * `POST /v1/data/batch`: every row and every condition in one request.
-   * Absent on a registry without a batch route. `unsupported` when the
-   * gateway answers 404 or 405; the adapter remembers that, so later calls
-   * send nothing. Throws `AmbiguousRegistryReplyError`: resend the same
-   * request; a row that already landed answers as a conflict with its own hash
-   * (or as committed).
+   * `POST /v1/data/batch`: every row and every condition in one all-or-nothing
+   * request. Throws `RegistryBatchRouteMissingError` when the gateway has no
+   * batch route. Throws `AmbiguousRegistryReplyError`: resend the same
+   * request; a row that already landed answers as committed (a replay).
    */
   postBatch?(request: SignedRegistryBatch): Promise<RegistryBatchResult>;
   /**
-   * The bounds the gateway advertised on its last batch answer, or `undefined`
-   * before any answer (and from a gateway that predates the header). A caller
-   * that has none sends no more than the old gateway's fixed 16 rows and 16
-   * conditions.
+   * The policy the gateway advertised on its last batch answer or policy
+   * read, or `undefined` when it has advertised none yet.
    */
   batchPolicy?(): RegistryBatchPolicy | undefined;
   /**
+   * The gateway's batch policy: the one already known, else asked once per
+   * process (`OPTIONS /v1/data/batch`; concurrent callers share the request).
+   * `undefined`: the gateway answered and advertises none (no batch route, or
+   * a route without the header). Throws `AmbiguousRegistryReplyError` when
+   * the request got no answer; the next call asks again.
+   */
+  readBatchPolicy?(): Promise<RegistryBatchPolicy | undefined>;
+  /**
    * Every control scope row of the owner (`pdpp.<c>~<ns>`), deleted or not.
    * Used for the per-session control listing (§2.4 `controls`).
+   *
+   * Each listed row is as fresh as a read of it begun after the call: a
+   * listing is never a copy taken before it. (A row may move after, as after
+   * any read.) A connection delete takes its pins from it.
    */
   listControlRows(): Promise<
     readonly { readonly scope: string; readonly read: ControlRead }[]

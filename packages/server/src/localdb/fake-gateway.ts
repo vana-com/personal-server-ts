@@ -9,13 +9,15 @@ import {
   fencingLogScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 
-type Version = { dataHash: string; metadataHash: string };
+/** `signature` is the signer's; a row a test writes directly has none. */
+type Version = { dataHash: string; metadataHash: string; signature?: string };
 
 type BatchRow = {
   scope: string;
   expectedVersion: string;
   dataHash: string;
   metadataHash: string;
+  signature?: string;
   expectedHeadDataHash?: string;
 };
 
@@ -33,6 +35,8 @@ type FailedRequirement = {
 };
 
 export type GatewayCall =
+  /** OPTIONS /v1/data/batch: a read of the batch policy. */
+  | { readonly kind: "policy" }
   | { readonly kind: "read"; readonly scope: string }
   | { readonly kind: "list" }
   | {
@@ -68,9 +72,9 @@ export interface FakeGatewayOptions {
    */
   readonly refresh?: boolean;
   /**
-   * The bounds the gateway advertises in `Batch-Policy` on every batch answer
-   * and enforces with a 400. Absent: an old gateway that sends no header and
-   * accepts 16 rows and 16 conditions.
+   * The bounds the gateway advertises in `Batch-Policy` on every answer of the
+   * batch route (a preflight included) and enforces with a 400. Absent: 16
+   * rows, 16 conditions, 64 KiB.
    */
   readonly policy?: {
     rows: number;
@@ -83,6 +87,8 @@ export interface FakeGatewayOptions {
      */
     lockedScopes?: number;
   };
+  /** `false`: the batch route sends no `Batch-Policy` (it still enforces it). */
+  readonly advertisePolicy?: boolean;
   /**
    * The registry's connection-log fence: a write that is not a tombstone, to a
    * stream row of a connection whose log row exists, loses with a 409. So does
@@ -104,6 +110,17 @@ export function createFakeGateway(options: FakeGatewayOptions) {
   const failFences = new Set<string>();
   const stickyFences = new Set<string>();
   let batchRoute = options.batchRoute;
+  const policy = {
+    rows: 16,
+    requires: 16,
+    bytes: 65_536,
+    ...options.policy,
+  };
+  const policyHeader = `rows=${policy.rows};bytes=${policy.bytes};requires=${policy.requires}${
+    options.policy?.lockedScopes === undefined
+      ? ""
+      : `;lockedScopes=${options.policy.lockedScopes}`
+  }`;
   const gateway = {
     calls,
     versions,
@@ -153,16 +170,27 @@ export function createFakeGateway(options: FakeGatewayOptions) {
         new Response(JSON.stringify(body), {
           status,
           headers:
-            options.policy && url.pathname === "/v1/data/batch"
-              ? {
-                  "batch-policy": `rows=${options.policy.rows};bytes=${options.policy.bytes};requires=${options.policy.requires}${
-                    options.policy.lockedScopes === undefined
-                      ? ""
-                      : `;lockedScopes=${options.policy.lockedScopes}`
-                  }`,
-                }
+            url.pathname === "/v1/data/batch" &&
+            batchRoute !== 404 &&
+            batchRoute !== 405 &&
+            options.advertisePolicy !== false
+              ? { "batch-policy": policyHeader }
               : {},
         });
+      // A preflight: the batch route answers it with its policy; a gateway
+      // without the route answers it from another route, with none.
+      if (method === "OPTIONS") {
+        calls.push({ kind: "policy" });
+        return new Response(null, {
+          status: 204,
+          headers:
+            batchRoute !== 404 &&
+            batchRoute !== 405 &&
+            options.advertisePolicy !== false
+              ? { "batch-policy": policyHeader }
+              : {},
+        });
+      }
       const rowJson = (scope: string) => {
         const rows = versions.get(scope)!;
         const head = rows[rows.length - 1]!;
@@ -289,6 +317,7 @@ export function createFakeGateway(options: FakeGatewayOptions) {
         gateway.write(body.scope, {
           dataHash: body.dataHash,
           metadataHash: body.metadataHash,
+          signature: body.signature,
         });
         return json(201, { success: true });
       }
@@ -302,8 +331,8 @@ export function createFakeGateway(options: FakeGatewayOptions) {
       await gateway.beforeBatch?.(call);
       // As the gateway: 1 to `maxRows` rows, or none when `requires` names
       // something, and at most `maxRequires` conditions.
-      const maxRows = options.policy?.rows ?? 16;
-      const maxRequires = options.policy?.requires ?? 16;
+      const maxRows = policy.rows;
+      const maxRequires = policy.requires;
       const hasRequires =
         Array.isArray(body.requires) && body.requires.length > 0;
       if (
@@ -335,10 +364,22 @@ export function createFakeGateway(options: FakeGatewayOptions) {
           });
         }
       }
-      const bad = requirementFails(body.requires ?? []);
-      if (bad) return json(409, failure(bad));
       const requestScopes = new Set<string>(
         body.rows.map((row: BatchRow) => row.scope),
+      );
+      const requires: Requirement[] = body.requires ?? [];
+      // One all-or-nothing transaction. Conditions on rows the request does
+      // not write are judged first; those on rows it writes, on the state it
+      // would commit.
+      const bad = requirementFails(
+        requires.filter((req) => !requestScopes.has(req.scope)),
+      );
+      if (bad) return json(409, failure(bad));
+      const before = new Map(
+        [...requestScopes].map((scope) => [
+          scope,
+          versions.has(scope) ? [...versions.get(scope)!] : undefined,
+        ]),
       );
       const results = body.rows.map((row: BatchRow) => {
         const rows = versions.get(row.scope) ?? [];
@@ -352,9 +393,13 @@ export function createFakeGateway(options: FakeGatewayOptions) {
             latestDataHash: head?.dataHash ?? null,
           };
         }
+        // A replay is the same data hash and the same signature, as the
+        // registry judges one (`replaysStoredRow`; a batch is never
+        // `exclusive`): another signer's row at that version is a conflict.
         const isReplay =
           Number(row.expectedVersion) === rows.length &&
-          head?.dataHash === row.dataHash;
+          head?.dataHash === row.dataHash &&
+          head.signature?.toLowerCase() === row.signature?.toLowerCase();
         if (isReplay && options.replay === "created") {
           return {
             scope: row.scope,
@@ -396,11 +441,13 @@ export function createFakeGateway(options: FakeGatewayOptions) {
           gateway.write(row.scope, {
             dataHash: row.dataHash,
             metadataHash: row.metadataHash,
+            signature: row.signature,
           });
           return {
             scope: row.scope,
             status: 201,
             version: row.expectedVersion,
+            written: true,
           };
         }
         if (
@@ -411,11 +458,13 @@ export function createFakeGateway(options: FakeGatewayOptions) {
           gateway.replaceHead(row.scope, {
             dataHash: row.dataHash,
             metadataHash: row.metadataHash,
+            signature: row.signature,
           });
           return {
             scope: row.scope,
             status: 201,
             version: row.expectedVersion,
+            written: true,
           };
         }
         return {
@@ -427,11 +476,50 @@ export function createFakeGateway(options: FakeGatewayOptions) {
           latestDataHash: head?.dataHash ?? null,
         };
       });
+      // The transaction rolls back: nothing of the request is written.
+      const rollBack = () => {
+        for (const [scope, rows] of before) {
+          if (rows === undefined) versions.delete(scope);
+          else versions.set(scope, rows);
+        }
+      };
+      if (results.some((r: { status: number }) => r.status === 409)) {
+        rollBack();
+        // A lost reply is lost whatever the gateway answered: a resend of a
+        // request the gateway already holds is answered, and that answer lost.
+        if (gateway.dropNextBatchReply) {
+          gateway.dropNextBatchReply = false;
+          throw new TypeError("fetch failed");
+        }
+        // The row that lost keeps its reason; a replay stays stored (201);
+        // every row this request wrote is rolled back (424).
+        return json(409, {
+          success: false,
+          error: "conflict",
+          results: results.map(
+            ({ written, ...r }: { written?: boolean; scope: string }) =>
+              written ? { scope: r.scope, status: 424 } : r,
+          ),
+        });
+      }
+      const after = requirementFails(
+        requires.filter((req) => requestScopes.has(req.scope)),
+      );
+      if (after) {
+        rollBack();
+        return json(409, failure(after));
+      }
       if (gateway.dropNextBatchReply) {
         gateway.dropNextBatchReply = false;
         throw new TypeError("fetch failed");
       }
-      return json(200, { success: true, results, requires: { ok: true } });
+      return json(200, {
+        success: true,
+        results: results.map(
+          ({ written: _, ...r }: { written?: boolean }) => r,
+        ),
+        requires: { ok: true },
+      });
     }) as unknown as typeof fetch,
   };
   return gateway;

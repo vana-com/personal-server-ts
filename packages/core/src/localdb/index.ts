@@ -49,7 +49,6 @@ export { purgeConnection } from "./purge.js";
 export {
   createConnectionDeleter,
   ConnectionDeleteSuperseded,
-  ConnectorNotVerifiedError,
   ConnectionStoppedError,
   type ConnectionDeleter,
   type DeleteIntent,

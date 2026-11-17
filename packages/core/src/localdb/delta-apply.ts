@@ -263,10 +263,9 @@ async function publishAndFinish(
     ...(await newConnectionsWithStreams(deps)),
   ];
   for (const { connectionId } of publishable) {
-    const published = await publishLog(deps, connectionId);
+    await publishLog(deps, connectionId);
     if (await hasPendingLogPublication(deps, connectionId))
       return cycle("the publisher still has eligible work");
-    if (published === null) return cycle("the publisher is unavailable");
   }
   return {
     outcome: "applied",
