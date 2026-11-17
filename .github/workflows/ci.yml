@@ -22,6 +22,8 @@ jobs:
       - run: npm run lint
       - run: npm run lint:eslint
       - run: npm run format:check
+      # A committed binary must not carry the build machine's home path.
+      - run: npm run check:binary-paths
 
   test:
     name: Test (Node ${{ matrix.node-version }})

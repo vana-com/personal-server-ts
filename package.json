@@ -27,6 +27,7 @@
     "test:replica-crash-full": "REPLICA_ORACLE_NIGHTLY=1 vitest run packages/server/src/storage/pdpp-replica-contract.custody.test.ts",
     "test:replica-nightly": "REPLICA_ORACLE_NIGHTLY=1 vitest run packages/core/src/replication/record-reducer.test.ts packages/server/src/storage/pdpp-replica-contract.custody.test.ts packages/server/src/storage/pdpp-replica-contract.manifest.test.ts packages/server/src/storage/pdpp-replica-writer-authority.test.ts packages/server/src/storage/replica-oracle",
     "check:dist": "node scripts/check-dist-imports.mjs",
+    "check:binary-paths": "bash scripts/check-binary-home-paths.sh",
     "contracts:write": "tsx packages/core/scripts/write-host-contract.ts && prettier --write packages/core/contracts/host-contract.json",
     "lint": "tsc --build --force",
     "lint:eslint": "eslint 'packages/*/src/**/*.ts'",
