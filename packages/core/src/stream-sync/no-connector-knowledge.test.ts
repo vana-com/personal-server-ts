@@ -3,13 +3,14 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 /**
  * Host code that decides which streams a connection has, and fences them on
@@ -108,9 +109,16 @@ function violations(files: readonly string[], ids: ReadonlySet<string>) {
 const path = (relative: string) =>
   fileURLToPath(new URL(relative, import.meta.url));
 
-/** `entry` and every file it reaches through relative imports and re-exports. */
+/**
+ * `entry` and every file it reaches through a relative import, re-export or
+ * dynamic `import("./x.js")`, at any depth of the file. An import whose
+ * specifier is not a literal cannot be followed, so it throws: a closure with a
+ * hole must not read as a clean closure. Non-relative specifiers are packages,
+ * not source of this repository, and are not followed.
+ */
 export function relativeImportClosure(entry: string): string[] {
   const seen = new Set<string>();
+  const unfollowed: string[] = [];
   const visit = (file: string) => {
     if (seen.has(file)) return;
     seen.add(file);
@@ -120,23 +128,44 @@ export function relativeImportClosure(entry: string): string[] {
       ts.ScriptTarget.Latest,
       true,
     );
-    for (const statement of source.statements) {
+    const follow = (specifier: string) => {
+      if (specifier.startsWith("."))
+        visit(join(dirname(file), specifier).replace(/\.js$/, ".ts"));
+    };
+    const walk = (node: ts.Node) => {
       if (
-        (ts.isImportDeclaration(statement) ||
-          ts.isExportDeclaration(statement)) &&
-        statement.moduleSpecifier !== undefined &&
-        ts.isStringLiteral(statement.moduleSpecifier) &&
-        statement.moduleSpecifier.text.startsWith(".")
+        (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
+        node.moduleSpecifier !== undefined &&
+        ts.isStringLiteral(node.moduleSpecifier)
       )
-        visit(
-          join(dirname(file), statement.moduleSpecifier.text).replace(
-            /\.js$/,
-            ".ts",
-          ),
-        );
-    }
+        follow(node.moduleSpecifier.text);
+      else if (
+        ts.isCallExpression(node) &&
+        node.expression.kind === ts.SyntaxKind.ImportKeyword
+      ) {
+        const specifier = node.arguments[0];
+        if (
+          specifier !== undefined &&
+          (ts.isStringLiteral(specifier) ||
+            ts.isNoSubstitutionTemplateLiteral(specifier))
+        )
+          follow(specifier.text);
+        else {
+          const { line } = source.getLineAndCharacterOfPosition(
+            node.getStart(source),
+          );
+          unfollowed.push(`${file}:${line + 1}`);
+        }
+      }
+      ts.forEachChild(node, walk);
+    };
+    walk(source);
   };
   visit(entry);
+  if (unfollowed.length > 0)
+    throw new Error(
+      `unanalysable dynamic import (not a string literal): ${unfollowed.join(", ")}`,
+    );
   return [...seen].sort();
 }
 
@@ -154,6 +183,18 @@ const TABLE: readonly { name: string; files: () => string[] }[] = [
     files: () => relativeImportClosure(path("../../../lite/src/sync.ts")),
   },
 ];
+
+/** Temporary trees a test made; removed after each test. */
+const tempTrees: string[] = [];
+const tempTree = () => {
+  const root = mkdtempSync(join(tmpdir(), "no-connector-"));
+  tempTrees.push(root);
+  return root;
+};
+afterEach(() => {
+  for (const root of tempTrees.splice(0))
+    rmSync(root, { recursive: true, force: true });
+});
 
 describe("host sync code names no connector", () => {
   const ids = connectorIds();
@@ -203,7 +244,7 @@ describe("host sync code names no connector", () => {
 
   describe("the directory walk", () => {
     it("flags a nested production module and skips tests and fixtures", () => {
-      const root = mkdtempSync(join(tmpdir(), "no-connector-"));
+      const root = tempTree();
       mkdirSync(join(root, "deep", "er"), { recursive: true });
       mkdirSync(join(root, "__fixtures__"));
       writeFileSync(join(root, "ok.ts"), `export const x = 1;\n`);
@@ -225,6 +266,95 @@ describe("host sync code names no connector", () => {
         "/ok.ts",
       ]);
       expect(violations(files, ids)).toEqual(['deep/er/named.ts: "oura"']);
+    });
+  });
+
+  describe("the relative-import closure", () => {
+    const tree = (files: Record<string, string>) => {
+      const root = tempTree();
+      for (const [name, text] of Object.entries(files))
+        writeFileSync(join(root, name), text);
+      return root;
+    };
+    const names = (root: string, files: readonly string[]) =>
+      files.map((file) => file.slice(root.length + 1));
+
+    it("follows a static import and a re-export", () => {
+      const root = tree({
+        "entry.ts": `import { a } from "./a.js"; export * from "./b.js";\n`,
+        "a.ts": `export const a = 1;\n`,
+        "b.ts": `export const b = 2;\n`,
+      });
+      expect(
+        names(root, relativeImportClosure(join(root, "entry.ts"))),
+      ).toEqual(["a.ts", "b.ts", "entry.ts"]);
+    });
+
+    it("follows a dynamic import nested in a function and finds the id it holds", () => {
+      const root = tree({
+        "entry.ts":
+          `export async function load() {\n` +
+          `  if (true) { return (await import("./policy.js")).connector; }\n` +
+          `}\n`,
+        "policy.ts": `export const connector = "oura";\n`,
+      });
+      const files = relativeImportClosure(join(root, "entry.ts"));
+      expect(names(root, files)).toEqual(["entry.ts", "policy.ts"]);
+      expect(violations(files, ids)).toEqual([
+        expect.stringContaining('policy.ts: "oura"'),
+      ]);
+    });
+
+    it("follows a no-substitution template specifier", () => {
+      const root = tree({
+        "entry.ts": "export const load = () => import(`./late.js`);\n",
+        "late.ts": `export const x = 1;\n`,
+      });
+      expect(
+        names(root, relativeImportClosure(join(root, "entry.ts"))),
+      ).toEqual(["entry.ts", "late.ts"]);
+    });
+
+    it("terminates on a cycle that runs through dynamic edges", () => {
+      const root = tree({
+        "a.ts": `import "./b.js"; export const a = 1;\n`,
+        "b.ts": `export const toC = () => import("./c.js");\n`,
+        "c.ts": `export const toA = () => import("./a.js");\n`,
+        "self.ts": `export const me = () => import("./self.js");\n`,
+      });
+      expect(names(root, relativeImportClosure(join(root, "a.ts")))).toEqual([
+        "a.ts",
+        "b.ts",
+        "c.ts",
+      ]);
+      expect(names(root, relativeImportClosure(join(root, "self.ts")))).toEqual(
+        ["self.ts"],
+      );
+    });
+
+    it("does not follow a package specifier", () => {
+      const root = tree({
+        "entry.ts": `export const load = () => import("node:fs");\n`,
+      });
+      expect(
+        names(root, relativeImportClosure(join(root, "entry.ts"))),
+      ).toEqual(["entry.ts"]);
+    });
+
+    it("fails closed on a computed dynamic import anywhere in the closure", () => {
+      const root = tree({
+        "entry.ts": `import "./inner.js";\n`,
+        "inner.ts": `export const load = (name: string) => import(name);\n`,
+      });
+      expect(() => relativeImportClosure(join(root, "entry.ts"))).toThrow(
+        /unanalysable dynamic import.*inner\.ts:1/,
+      );
+      const templated = tree({
+        "t.ts": "export const load = (n: string) => import(`./${n}.js`);\n",
+      });
+      expect(() => relativeImportClosure(join(templated, "t.ts"))).toThrow(
+        /unanalysable dynamic import/,
+      );
     });
   });
 });

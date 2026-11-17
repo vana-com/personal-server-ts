@@ -23,6 +23,13 @@ import {
 afterEach(closeWorldDrivers);
 
 const NEVER_PUBLISHED = sName(1);
+const connect = (observedAt: number) => ({
+  connector: CONNECTOR,
+  artifactDigest: CONNECTOR,
+  connect: true,
+  observedAt,
+  owner: { address: OWNER, leaseId: null },
+});
 const request = (observedAt: number) => ({
   connector: CONNECTOR,
   artifactDigest: CONNECTOR,
@@ -87,6 +94,16 @@ describe("a stream declared and never published", () => {
             provenFullStreams: [NEVER_PUBLISHED],
           }),
         );
+      // The control row as the registry holds it now, before any delete. This
+      // is read from the fake gateway's store, not from the code under test.
+      const controlRows = w.gateway.versions.get(CONTROL)!;
+      const head = controlRows[controlRows.length - 1]!;
+      const observed = {
+        scope: CONTROL,
+        expectedVersion: String(controlRows.length),
+        notDeleted: true,
+        expectedDataHash: head.dataHash,
+      };
       const logPublishes = (from: number) =>
         w.gateway.calls
           .slice(from)
@@ -94,7 +111,7 @@ describe("a stream declared and never published", () => {
           .filter((call) =>
             call.body.rows.some((row) => String(row.scope).includes("~log")),
           );
-      return { w, a, b, end, logPublishes };
+      return { w, a, b, end, logPublishes, observed };
     };
 
     it("publishes when nothing was deleted (positive control)", async () => {
@@ -112,7 +129,7 @@ describe("a stream declared and never published", () => {
     });
 
     it("is refused by the gateway's control condition after the delete", async () => {
-      const { w, a, b, end, logPublishes } = await setup();
+      const { w, a, b, end, logPublishes, observed } = await setup();
       await a.sync.deleter.requestConnectionDelete(CONNECTOR);
       expect(await a.sync.deleter.resumeDeletes()).toEqual([]);
       const before = w.gateway.calls.length;
@@ -120,15 +137,46 @@ describe("a stream declared and never published", () => {
       await end();
       await b.cycle();
 
-      // B did attempt the publish, and named the control row as a condition.
+      // B did attempt the publish. It named the control row with the whole
+      // condition: the version and data hash the registry held when B began.
       const attempts = logPublishes(before);
       expect(attempts).toHaveLength(1);
-      expect(attempts[0]?.body.requires).toEqual([
-        expect.objectContaining({ scope: CONTROL, notDeleted: true }),
-      ]);
+      expect(attempts[0]?.body.requires).toEqual([observed]);
       // The gateway refused it: no new log version, nothing written for `s1`.
       expect(w.gateway.versions.get(LOG)).toHaveLength(1);
       expect([...w.gateway.versions.keys()].sort()).toEqual([CONTROL, LOG]);
+      expect(await b.records()).toEqual([]);
+      await a.cycle();
+      expect(await a.records()).toEqual([]);
+    });
+
+    it("is refused after the connection is deleted and connected again before the commit", async () => {
+      const { w, a, b, end, logPublishes, observed } = await setup();
+      await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+      expect(await a.sync.deleter.resumeDeletes()).toEqual([]);
+      // The connection is connected again: a new lifetime begins on the same
+      // control row, so the row is no longer deleted.
+      const reconnect = await a.sync.intake.begin("reconnect", connect(6000));
+      expect(reconnect.status).toBe("collecting");
+      await a.sync.intake.abort("reconnect", "cancelled");
+      const controlRows = w.gateway.versions.get(CONTROL)!;
+      const head = controlRows[controlRows.length - 1]!;
+      // Setup: the delete and the reconnect each wrote a control version, and
+      // the head carries the same data hash as the one B observed. Of the
+      // condition's three parts only the version can now refuse the old run.
+      expect(controlRows).toHaveLength(Number(observed.expectedVersion) + 2);
+      expect(head.dataHash).toBe(observed.expectedDataHash);
+      const logVersions = w.gateway.versions.get(LOG)!.length;
+      const before = w.gateway.calls.length;
+
+      await end();
+      await b.cycle();
+
+      const attempts = logPublishes(before);
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]?.body.requires).toEqual([observed]);
+      // The old lifetime's publish is refused: no new log version, no record.
+      expect(w.gateway.versions.get(LOG)).toHaveLength(logVersions);
       expect(await b.records()).toEqual([]);
       await a.cycle();
       expect(await a.records()).toEqual([]);
