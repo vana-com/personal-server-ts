@@ -65,6 +65,14 @@ describe("begin returns the control row it read", () => {
       dataHash: hashes.tombstoneData,
       metadataHash: hashes.tombstoneMetadata,
     });
+    // Full saves admit from local state. Observe the deletion first so this
+    // exercises known-reconnect admission rather than an optimistic stale save.
+    await d.cycle();
+    expect(
+      await d.db.query(
+        "SELECT control_state, control_version FROM connections",
+      ),
+    ).toEqual([{ control_state: "deleted", control_version: 2 }]);
     w.gateway.calls.length = 0;
     const begun = await d.sync.intake.begin("r2", {
       ...request(),

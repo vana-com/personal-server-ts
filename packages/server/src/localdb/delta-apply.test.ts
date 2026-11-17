@@ -862,7 +862,10 @@ describe("the receive path's depth", () => {
     trace.clear();
     await twin.cycle();
     expect(await localState(twin)).toEqual(await localState(here));
-    expect(trace.count(), trace.describe()).toBe(3);
+    // Apply reuses listed control; publish still checks the deleted control.
+    expect(trace.count(), trace.describe()).toBe(2);
+    expect(trace.count("list")).toBe(1);
+    expect(trace.count("read")).toBe(1);
     expect(trace.depth()).toBeGreaterThan(1);
   });
 
@@ -894,16 +897,17 @@ describe("the receive path's depth", () => {
     trace.clear();
     await twin.cycle();
     expect(await twin.rows()).toEqual(await here.rows());
-    expect(trace.count(), trace.describe()).toBe(3);
+    // The listing supplies both control and log; only the segment is fetched.
+    expect(trace.count(), trace.describe()).toBe(2);
     expect(trace.count("list")).toBe(1);
-    expect(trace.count("read")).toBe(1);
+    expect(trace.count("read")).toBe(0);
     expect(trace.count("get")).toBe(1);
     expect(trace.depthToLast("get")).toBeGreaterThan(1);
   });
 });
 
 describe("empty delta and idle full cycle request counts", () => {
-  it("an empty delta does no reads; an invoked idle cycle still lists and reads control", async () => {
+  it("an empty delta does no reads; an invoked idle cycle only lists", async () => {
     const trace = requestTrace();
     const w = await world({ streams: 2, trace });
     const peer = await w.device("peer");
@@ -919,8 +923,8 @@ describe("empty delta and idle full cycle request counts", () => {
     expect(trace.count()).toBe(0);
     trace.clear();
     await here.cycle();
-    expect(trace.count(), trace.describe()).toBe(2);
+    expect(trace.count(), trace.describe()).toBe(1);
     expect(trace.count("list")).toBe(1);
-    expect(trace.count("read")).toBe(1);
+    expect(trace.count("read")).toBe(0);
   });
 });

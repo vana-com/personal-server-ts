@@ -142,10 +142,13 @@ export interface BeginResponse {
   readonly stuck: boolean;
   readonly binding: { readonly keyCheck: string };
   /**
-   * The control row this `begin` read or committed on reconnect, classified for
+   * The control basis this `begin` admitted against, classified for
    * the owner's key: what a caller that must know the connection's state
    * before it collects (a save that reports the control version it observed)
-   * would otherwise read again. Absent from an answer that replays an earlier
+   * would otherwise read again. An explicit full collection can use its local
+   * applied basis: the publication commit validates that lifetime and log
+   * position atomically. Retry and reconnect admission read the registry.
+   * Absent from an answer that replays an earlier
    * `begin` or an ended run, and `undefined` when the registry did not answer
    * (the run begins offline). A replay therefore reads the same as an
    * unreachable registry: a caller that needs the state after a replay reads
