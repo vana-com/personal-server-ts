@@ -13,6 +13,7 @@ import {
   legacyBindingsForProfile,
   META_040_BINDINGS,
   OURA_BROWSER_BINDINGS,
+  requiredLegacyStreams,
   STRAVA_BROWSER_BINDINGS,
 } from "../legacy-projection/index.js";
 import {
@@ -356,7 +357,14 @@ type Decision =
       records: CanonicalLegacyReadStore;
       selection: CanonicalConnectionSelection;
       generation: number;
+      /** Every stream the binding reads: what holds data, and what a cached view depends on. */
       streams: readonly string[];
+      /**
+       * The streams that must be complete before the canonical view serves,
+       * replaces a legacy file or proves a deletion: `streams` less those the
+       * binding serves without (`requiredLegacyStreams` owns the rule).
+       */
+      requiredStreams: readonly string[];
     };
 
 export function createLegacyScopeView(
@@ -538,6 +546,7 @@ export function createLegacyScopeView(
       selection: { instance, sourceId, method },
       generation: only.generation,
       streams: streamsByMethod.get(method) ?? [],
+      requiredStreams: requiredStreamsOf(scope, method),
     };
   }
 
@@ -662,7 +671,7 @@ export function createLegacyScopeView(
     const collectedAt = listedCollectedAt(
       decision.records,
       decision.selection.instance,
-      decision.streams,
+      decision.requiredStreams,
     );
     return collectedAt === null
       ? { kind: "refused" }
@@ -1056,7 +1065,11 @@ export function createLegacyScopeView(
       legacyHead !== null &&
       replacementEligible &&
       read.complete &&
-      allStreamsProvenAfter(read, decision.streams, legacyHead.collectedAt)
+      allStreamsProvenAfter(
+        read,
+        decision.requiredStreams,
+        legacyHead.collectedAt,
+      )
     ) {
       const confirmed = authority.confirmRead(
         scope,
@@ -1168,7 +1181,7 @@ export function createLegacyScopeView(
           projectionOmissions: read.projectionOmissions,
           canonicalNewer: allStreamsNewerThan(
             read,
-            decision.streams,
+            decision.requiredStreams,
             legacyHead.collectedAt,
           ),
           // A partial row is present, only short of detail, so it does not
@@ -1182,7 +1195,7 @@ export function createLegacyScopeView(
             (read.diagnostics.unproven?.length ?? 0) === 0 &&
             allStreamsProvenAfter(
               read,
-              decision.streams,
+              decision.requiredStreams,
               legacyHead.collectedAt,
             ),
           ...input.coverageThresholds,
@@ -1367,7 +1380,7 @@ function missingCompletionReceipts(
   const receipts = decision.records.listStreamCompletions(
     decision.selection.instance,
   );
-  return decision.streams.filter((stream) => {
+  return decision.requiredStreams.filter((stream) => {
     const liveCount =
       listings.find((entry) => entry.stream === stream)?.recordCount ?? 0;
     return !receipts.some(
@@ -1523,6 +1536,12 @@ function scopeMethods(scope: string): Map<string, readonly string[]> {
     if (binding) methods.set(method, binding.pdppStreams);
   }
   return methods;
+}
+
+/** The streams a method's binding for `scope` needs complete; see `Decision.requiredStreams`. */
+function requiredStreamsOf(scope: string, method: string): readonly string[] {
+  const binding = legacyBindingsForProfile(method).get(scope);
+  return binding ? requiredLegacyStreams(binding) : [];
 }
 
 function boundScopes(): string[] {

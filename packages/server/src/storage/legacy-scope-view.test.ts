@@ -1954,6 +1954,150 @@ describe("legacy scope view over the real SQLite record store", () => {
     ).toEqual([{ instance: "conn_a", generation: 1, method: "oura" }]);
   });
 
+  it("replaces the legacy iCloud Notes file once notes and folders are complete, with no profile stream", async () => {
+    const ICLOUD = "https://registry.pdpp.dev/sources/icloud-notes";
+    legacyHead("icloud_notes.notes", "icloud_notes/notes/old.json");
+    connect(store, "conn_i", "icloud-notes", ICLOUD);
+    const complete = { method: "icloud-notes" };
+    store.replaceStream({
+      instance: "conn_i",
+      stream: "folders",
+      method: "icloud-notes",
+      generation: 1,
+      primaryKey: ["id"],
+      emittedAt: "2026-09-10T07:00:00.000Z",
+      sourceCollectedAt: "2026-09-09T07:00:00.000Z",
+      envelopes: [
+        {
+          instance: "conn_i",
+          stream: "folders",
+          key: "f1",
+          data: { id: "f1", name: "Notes" },
+          emitted_at: "2026-09-10T07:00:00.000Z",
+        },
+      ],
+    });
+    store.replaceStream({
+      instance: "conn_i",
+      stream: "notes",
+      method: complete.method,
+      generation: 1,
+      primaryKey: ["id"],
+      emittedAt: "2026-09-10T07:00:00.000Z",
+      sourceCollectedAt: "2026-09-09T07:00:00.000Z",
+      envelopes: [
+        {
+          instance: "conn_i",
+          stream: "notes",
+          key: "n1",
+          data: {
+            id: "n1",
+            title: "Grocery list",
+            snippet: "milk",
+            folder_id: "f1",
+            is_pinned: false,
+            created_at: "2026-09-01T00:00:00Z",
+            modified_at: "2026-09-02T00:00:00Z",
+            has_attachments: false,
+            text_content: "milk",
+          },
+          emitted_at: "2026-09-10T07:00:00.000Z",
+        },
+      ],
+    });
+    const current = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) =>
+        sourceId === ICLOUD ? ["icloud-notes"] : [],
+      readLegacyHead: async () => ({
+        version: "1.0",
+        scope: "icloud_notes.notes",
+        collectedAt: "2026-01-01T00:00:00.000Z",
+        data: { userName: null, notes: [] },
+      }),
+    });
+    const read = await current.readLatest("icloud_notes.notes");
+    expect(read.kind).toBe("canonical");
+    if (read.kind !== "canonical")
+      throw new Error(
+        "notes and folders complete did not replace the legacy file",
+      );
+    expect(JSON.stringify(read.envelope.data)).toContain("Grocery list");
+    expect(current.listingFor("icloud_notes.notes")).toEqual({
+      kind: "canonical",
+      collectedAt: read.envelope.collectedAt,
+    });
+    expect(
+      db
+        .prepare(
+          "SELECT instance, generation, method FROM legacy_scope_takeovers",
+        )
+        .all(),
+    ).toEqual([{ instance: "conn_i", generation: 1, method: "icloud-notes" }]);
+  });
+
+  it("does not replace the legacy iCloud Notes file when folders is missing, even with a profile stream", async () => {
+    const ICLOUD = "https://registry.pdpp.dev/sources/icloud-notes";
+    legacyHead("icloud_notes.notes", "icloud_notes/notes/old.json");
+    connect(store, "conn_i", "icloud-notes", ICLOUD);
+    for (const [stream, key, data] of [
+      ["profile", "p1", { id: "p1", user_name: "Ada" }],
+      [
+        "notes",
+        "n1",
+        {
+          id: "n1",
+          title: "Grocery list",
+          snippet: "milk",
+          folder_id: "f1",
+          is_pinned: false,
+          created_at: "2026-09-01T00:00:00Z",
+          modified_at: "2026-09-02T00:00:00Z",
+          has_attachments: false,
+          text_content: "milk",
+        },
+      ],
+    ] as const) {
+      store.replaceStream({
+        instance: "conn_i",
+        stream,
+        method: "icloud-notes",
+        generation: 1,
+        primaryKey: ["id"],
+        emittedAt: "2026-09-10T07:00:00.000Z",
+        sourceCollectedAt: "2026-09-09T07:00:00.000Z",
+        envelopes: [
+          {
+            instance: "conn_i",
+            stream,
+            key,
+            data,
+            emitted_at: "2026-09-10T07:00:00.000Z",
+          },
+        ],
+      });
+    }
+    const current = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) =>
+        sourceId === ICLOUD ? ["icloud-notes"] : [],
+      readLegacyHead: async () => ({
+        version: "1.0",
+        scope: "icloud_notes.notes",
+        collectedAt: "2026-01-01T00:00:00.000Z",
+        data: { userName: null, notes: [] },
+      }),
+    });
+    const read = await current.readLatest("icloud_notes.notes");
+    expect(read.kind).not.toBe("canonical");
+    expect(current.listingFor("icloud_notes.notes").kind).not.toBe("canonical");
+    expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+      [],
+    );
+  });
+
   it("accepts an empty completed replacement without deleting indexed legacy files", async () => {
     legacyHead("oura.activity", "oura/activity/old.json");
     const indexed = db.prepare("SELECT * FROM data_files").all();
