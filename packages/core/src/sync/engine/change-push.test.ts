@@ -65,6 +65,7 @@ function subscribed(
       order.push(`position:${p}`);
       positions.push(p);
     },
+    since: () => undefined,
   });
   return { ...s, push, pokes, health, positions, order, stop };
 }
@@ -335,6 +336,8 @@ describe("a request the registry never cancels", () => {
     const stop = push.subscribe({
       onChange: pokes,
       onHealth: (h) => health.push(h),
+      onPosition: () => {},
+      since: () => undefined,
     });
     await flush();
     expect(vi.getTimerCount()).toBe(1); // the request's deadline
@@ -380,5 +383,75 @@ describe("listeners on the subscription's lifetime signal", () => {
     stop();
     expect(abortListeners(lifetime)).toBe(0);
     vi.unstubAllGlobals();
+  });
+});
+
+describe("the delta", () => {
+  it("each held request after the first carries the manager's since, read as it is sent (mutation: since never sent)", async () => {
+    const s = scripted();
+    const sent: Array<string | undefined> = [];
+    const wait = s.registry.waitForChange!;
+    (s.registry as { waitForChange: Wait }).waitForChange = (
+      after,
+      waitMs,
+      signal,
+      since,
+    ) => {
+      sent.push(since);
+      return wait(after, waitMs, signal, undefined);
+    };
+    let held: string | undefined = "4";
+    const push = createRegistryChangePush(s.registry)!;
+    const stop = push.subscribe({
+      onChange: () => {},
+      onHealth: () => {},
+      onPosition: () => {},
+      since: () => held,
+    });
+    await flush();
+    s.calls[0].answer({ seq: "4", changed: true });
+    await flush();
+    held = "5";
+    s.calls[1].answer({ seq: "5", changed: true });
+    await flush();
+    // The first request has no cursor and so no delta to ask for.
+    expect(sent).toEqual([undefined, "4", "5"]);
+    stop();
+  });
+
+  it("a changed answer hands its delta to onChange; the poke after a failure has none (mutation: delta on every poke)", async () => {
+    const s = scripted();
+    const push = createRegistryChangePush(s.registry)!;
+    const deltas: unknown[] = [];
+    const stop = push.subscribe({
+      onChange: (d) => deltas.push(d),
+      onHealth: () => {},
+      onPosition: () => {},
+      since: () => "4",
+    });
+    await flush();
+    s.calls[0].answer({ seq: "4", changed: true });
+    await flush();
+    const delta = {
+      since: "4",
+      seq: "5",
+      reset: true as const,
+    };
+    (s.calls[1].answer as (a: unknown) => void)({
+      seq: "5",
+      changed: true,
+      delta,
+    });
+    await flush();
+    s.calls[2].fail(new Error("down"));
+    await vi.advanceTimersByTimeAsync(5_000);
+    (s.calls[3].answer as (a: unknown) => void)({
+      seq: "5",
+      changed: false,
+      delta,
+    });
+    await flush();
+    expect(deltas).toEqual([undefined, delta, undefined]);
+    stop();
   });
 });

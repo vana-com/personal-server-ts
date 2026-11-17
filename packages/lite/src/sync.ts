@@ -743,7 +743,10 @@ export async function createPsLiteSyncManager(
       },
       {
         accountStorageMode: mode,
-        localSync: { cycle: async () => (await getLocalSync()).cycle() },
+        localSync: {
+          cycle: async () => (await getLocalSync()).cycle(),
+          applyDelta: async (delta) => (await getLocalSync()).applyDelta(delta),
+        },
         ...(changeProbe && { changeProbe }),
         deleteData,
         pendingBlobDeletions,

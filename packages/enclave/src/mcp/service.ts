@@ -33,6 +33,8 @@ export interface McpMigrationSnapshot {
 }
 
 export interface McpIngressControl {
+  /** Actual TCP port assigned after the ingress listener is listening. */
+  readonly port: number;
   active(): Promise<boolean>;
   exportForMigration(request: {
     migrationId: string;
@@ -107,7 +109,12 @@ export async function startMcpRouter(
   )
     throw new Error("MCP_REDIRECT_URIS must list the allowed HTTPS callbacks");
   const port = Number(env.MCP_INGRESS_PORT ?? "8788");
-  if (!Number.isSafeInteger(port) || port < 1 || port > 65535)
+  if (
+    !Number.isSafeInteger(port) ||
+    port < 0 ||
+    port > 65535 ||
+    (port === 0 && env.MCP_INGRESS_PORT !== "0")
+  )
     throw new Error("MCP_INGRESS_PORT is invalid");
   const derived = await deps.client.deriveKey(
     "mcp/ingress/state/v1",
@@ -208,13 +215,21 @@ export async function startMcpRouter(
     server.once("listening", resolve);
     server.once("error", reject);
   });
-  deps.logger.info({ origin: origin.origin, port }, "TEE MCP ingress started");
+  const address = server.address();
+  if (!address || typeof address === "string")
+    throw new Error("Expected a bound MCP TCP listener");
+  const boundPort = address.port;
+  deps.logger.info(
+    { origin: origin.origin, port: boundPort },
+    "TEE MCP ingress started",
+  );
   let closed: Promise<void> | undefined;
   const close = (): Promise<void> =>
     (closed ??= new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),
     ));
   return {
+    port: boundPort,
     active: async () => {
       const status = await state.migrationStatus();
       return (

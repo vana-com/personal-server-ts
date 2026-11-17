@@ -25,7 +25,7 @@ import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { openRecordStore } from "../pdpp/records-bootstrap.js";
-import { remoteFixture } from "./apply-fixture.js";
+import { remoteFixture } from "./apply-fixture.test-utils.js";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type {
   LegacyWriteHold,

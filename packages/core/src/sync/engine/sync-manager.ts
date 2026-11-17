@@ -21,6 +21,10 @@ import { createDownloadRetryMemory } from "../retry-memory.js";
 import { createTombstoneResubmitTracker } from "../tombstone-resubmits.js";
 import { changePushBackoffMs } from "./change-push.js";
 import type {
+  DeltaApplyResult,
+  RegistryChangeDelta,
+} from "../../stream-sync/ports.js";
+import type {
   DeleteDataPort,
   PendingBlobDeletionStore,
   TombstoneFinalityPort,
@@ -98,21 +102,32 @@ export interface ChangePush {
    * the registry's position as of an answer; it comes before the `onChange` of
    * the same answer. `onChange` means the registry's sequence moved since the
    * last answer, or the first answer after a failure came back: run a cycle.
-   * Both are called on a successful answer only; a failed attempt calls
-   * nothing. `onHealth(true)`: the channel answered lately, so positions can be
-   * trusted; `onHealth(false)`: it failed or went quiet, so do not rely on one.
+   * Its `delta`, when the gateway sent one, is what changed after the `since`
+   * the request carried. Both are called on a successful answer only; a
+   * failed attempt calls nothing. `onHealth(true)`: the channel answered
+   * lately, so positions can be trusted; `onHealth(false)`: it failed or went
+   * quiet, so do not rely on one. `since()` is read as each held request is
+   * sent: the position the manager holds the registry up to, if any.
    */
   subscribe(handlers: {
-    onChange(): void;
+    onChange(delta: RegistryChangeDelta | undefined): void;
     onHealth(healthy: boolean): void;
     onPosition(position: string): void;
+    since(): string | undefined;
   }): () => void;
 }
 
 export interface SyncManagerOptions {
   /** Personal Server hosts always supply their owner-bound Account mode. */
   accountStorageMode?: Pick<OwnedAccountStorageMode, "read">;
-  localSync?: { cycle(): Promise<unknown> };
+  localSync?: {
+    cycle(): Promise<unknown>;
+    /**
+     * Apply a change delta without the cycle's registry reads, when it can
+     * (`applyRegistryDelta`).
+     */
+    applyDelta(delta: RegistryChangeDelta): Promise<DeltaApplyResult>;
+  };
 
   /** Polling interval in milliseconds (default: 60_000 = 1 minute) */
   pollInterval?: number;
@@ -404,6 +419,9 @@ export function createSyncManager(
   // finish clean.
   let knownPosition: string | undefined;
   let syncedPosition: string | undefined;
+  // A format this build cannot read needs an update, not repeated polling.
+  // This position suppresses that repeat but is never offered as `since`.
+  let refusedPosition: string | undefined;
   // The host paused the manager (no one is looking): no request, no timer.
   // `owedWhilePaused` remembers a local ingest that arrived meanwhile.
   let paused = false;
@@ -546,9 +564,87 @@ export function createSyncManager(
     return report;
   }
 
-  async function runCycle(): Promise<void> {
+  /**
+   * The first pass of a cycle that a change delta started: apply the delta
+   * instead of the cycle's registry reads (the server row, the owner listing,
+   * and each connection's control row). `settle`: the pass ended clean; `owed`: the delta
+   * is applied and deletion debt is left, as a full pass that left it would
+   * end; `full`: a full pass must run (see `DeltaApplyResult`).
+   *
+   * Why it is the same as a full pass. The last clean pass started under
+   * `heldUpTo`, so this device held the registry as of that position, and a
+   * clean pass found its server registered. The gateway numbers changes in
+   * commit order with no gap, and the delta lists every row whose latest
+   * change is above `delta.since`, read in one snapshot at `delta.seq`. When
+   * `delta.since` is `heldUpTo`, no server change is in it, and every row in
+   * it is applied, the device holds what the registry held at `delta.seq`:
+   * what a full pass that started under it would read. The manager settles
+   * the pass at `delta.seq` only when that is also the position the push
+   * reported last (`startedUnder`), as for any pass. Only the switched
+   * (stream database) pass has this path; a legacy pass reads per scope.
+   */
+  async function deltaPass(
+    delta: RegistryChangeDelta,
+    heldUpTo: string | undefined,
+    startedUnder: string | undefined,
+  ): Promise<"settle" | "owed" | "full"> {
+    const localSync = options?.localSync;
+    if (
+      !localSync ||
+      delta.reset ||
+      delta.since !== heldUpTo ||
+      delta.seq !== startedUnder ||
+      blocked !== null ||
+      options?.accountStorageMode?.read() !== "switched"
+    )
+      return "full";
+    const started = Date.now();
+    let result: DeltaApplyResult;
+    try {
+      result = await localSync.applyDelta(delta);
+    } catch (error) {
+      // Whatever failed is the full pass's to meet and report.
+      downloadDeps.logger.warn(
+        { error: (error as Error).message },
+        "Change delta apply failed; running a full cycle",
+      );
+      return "full";
+    }
+    if (result.outcome !== "applied") {
+      downloadDeps.logger.debug(
+        { reason: result.reason },
+        "Change delta needs a full cycle",
+      );
+      return "full";
+    }
+    lastSync = new Date().toISOString();
+    statusMayHaveChanged();
+    const debt = await drainPendingBlobDeletions("switched");
+    // One line per wake a delta served: the receive side's hops after the
+    // held request answered (its answer carried the delta, so no read sits
+    // between them). `blobMs` is the segment GETs; the rest of `applyMs` is
+    // the local apply and its commit, after which a read sees the rows.
+    downloadDeps.logger.info(
+      {
+        since: delta.since,
+        seq: delta.seq,
+        rows: delta.rows.length,
+        connections: result.connections,
+        blobGets: result.blobGets,
+        blobMs: result.blobMs,
+        applyMs: result.applyMs,
+        totalMs: Date.now() - started,
+      },
+      "Change delta applied",
+    );
+    return debt.owed ? "owed" : "settle";
+  }
+
+  async function runCycle(delta?: RegistryChangeDelta): Promise<void> {
     // Prevent concurrent cycles
     if (cycleInFlight) {
+      // The delta was read against the position a settled pass holds; the
+      // pass in flight moves it, so the follow-up is a full pass.
       rerunRequested = true;
       return cycleInFlight;
     }
@@ -561,6 +657,7 @@ export function createSyncManager(
         // streak ends at that boundary, not when the whole cycle returns, or a
         // failure in a pass that follows a success would back off as a repeat.
         if (!first) cycleFailures = 0;
+        const passDelta = first ? delta : undefined;
         first = false;
         rerunRequested = false;
         // Sample before anything is read: every change up to this position is
@@ -568,7 +665,9 @@ export function createSyncManager(
         // ends clean.
         const startedUnder = knownPosition;
         const errorsBefore = errorSeq;
+        const heldUpTo = syncedPosition;
         syncedPosition = undefined;
+        refusedPosition = undefined;
         const settle = () => {
           // The update-required block is a diagnostic of a refusal no retry
           // changes (`reportLeavesWork`); any other block means no cycle ran.
@@ -577,8 +676,18 @@ export function createSyncManager(
             errorSeq !== errorsBefore
           )
             return;
-          syncedPosition = startedUnder;
+          if (blocked?.reason === "update_required")
+            refusedPosition = startedUnder;
+          else syncedPosition = startedUnder;
         };
+        const byDelta =
+          passDelta === undefined
+            ? "full"
+            : await deltaPass(passDelta, heldUpTo, startedUnder);
+        if (byDelta !== "full") {
+          if (byDelta === "settle") settle();
+          continue;
+        }
         const canRun = await (options?.canSync?.() ?? { ok: true });
         if (!canRun.ok) {
           blocked = { reason: canRun.reason, message: canRun.message };
@@ -1118,7 +1227,7 @@ export function createSyncManager(
       pushHealthy &&
       cycleInFlight === null &&
       knownPosition !== undefined &&
-      knownPosition === syncedPosition
+      (knownPosition === syncedPosition || knownPosition === refusedPosition)
     );
   }
 
@@ -1178,22 +1287,40 @@ export function createSyncManager(
     // join a timed probe read in flight, so a probe that never answers cannot
     // hold it up; `runCycle` still runs one cycle at a time. It reads no marker
     // and publishes none: see `pulledMarker`.
-    const cycleNow = () => {
+    const cycleNow = (delta?: RegistryChangeDelta) => {
       if (retryTimer !== null) {
         // Cooling down after a failed cycle: the request is owed, and the
         // retry timer runs it. A push neither skips nor restarts the wait.
         rerunRequested = true;
         return;
       }
-      runCycle().catch(() => {
+      runCycle(delta).catch(() => {
         // Errors already captured in ring buffer
       });
     };
     stopPush = push.subscribe({
-      onChange() {
+      onChange(delta) {
         if (run !== lifecycle || !isRunning) return;
-        cycleNow();
+        // A reset can describe a restored registry whose counter went back.
+        // It always owes a listing. Ordinary late answers cannot move either
+        // the observed or the applied position backwards.
+        if (delta?.reset) {
+          // A lower counter needs a fresh baseline after the listing. It
+          // cannot settle this answer's older position, even after restore.
+          knownPosition =
+            knownPosition !== undefined &&
+            BigInt(delta.seq) < BigInt(knownPosition)
+              ? undefined
+              : delta.seq;
+        } else if (
+          delta &&
+          syncedPosition !== undefined &&
+          BigInt(delta.seq) <= BigInt(syncedPosition)
+        )
+          return;
+        cycleNow(delta);
       },
+      since: () => syncedPosition,
       onHealth(healthy) {
         if (run !== lifecycle) return;
         const wasHealthy = pushHealthy;
@@ -1206,7 +1333,11 @@ export function createSyncManager(
       },
       onPosition(position) {
         if (run !== lifecycle || !isRunning) return;
-        knownPosition = position;
+        if (
+          knownPosition === undefined ||
+          BigInt(position) >= BigInt(knownPosition)
+        )
+          knownPosition = position;
       },
     });
   }
@@ -1249,6 +1380,7 @@ export function createSyncManager(
       nextTimedProbeAt = 0;
       knownPosition = undefined;
       syncedPosition = undefined;
+      refusedPosition = undefined;
       statusMayHaveChanged(); // running: true
 
       // Crash recovery: run one cycle immediately on start

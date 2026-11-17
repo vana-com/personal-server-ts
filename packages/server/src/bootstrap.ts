@@ -1311,7 +1311,11 @@ async function bootstrapServer(
       accountStorageMode,
       ...(changeProbe && { changeProbe }),
       ...(localSyncSource && {
-        localSync: { cycle: async () => (await localSyncSource()).cycle() },
+        localSync: {
+          cycle: async () => (await localSyncSource()).cycle(),
+          applyDelta: async (delta) =>
+            (await localSyncSource()).applyDelta(delta),
+        },
       }),
       deleteData,
       hydrateScopes: options?.hydrateScopes,

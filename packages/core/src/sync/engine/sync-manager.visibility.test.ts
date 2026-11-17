@@ -10,6 +10,7 @@ import type { UploadWorkerDeps } from "../workers/upload.js";
 import type { StreamSyncRegistry } from "../../stream-sync/ports.js";
 import { createRegistryChangeProbe } from "./change-probe.js";
 import { createSyncManager, type SyncManagerOptions } from "./sync-manager.js";
+import { deltaToCycle } from "./local-sync.test-helper.js";
 
 const logger = {
   info: vi.fn(),
@@ -103,7 +104,7 @@ function managerOver(
   cycle: () => Promise<unknown>,
 ) {
   return build({
-    localSync: { cycle },
+    localSync: { cycle, applyDelta: deltaToCycle },
     changeProbe: createRegistryChangeProbe(gateway.registry, {
       intervalMs: 5_000,
     })!,

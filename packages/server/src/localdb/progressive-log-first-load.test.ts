@@ -38,7 +38,7 @@ import {
   sName,
   world,
 } from "./log-world.test-utils.js";
-import { retainedManifest } from "./apply-fixture.js";
+import { retainedManifest } from "./apply-fixture.test-utils.js";
 
 afterEach(closeWorldDrivers);
 

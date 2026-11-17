@@ -27,6 +27,7 @@ import {
   type ConditionalRegistryPost,
   type RegistryBatchPolicy,
   type RegistryBatchResult,
+  type RegistryChangeDelta,
   type RegistryBatchRow,
   type RegistryPostResult,
   type RegistryRequirement,
@@ -509,12 +510,13 @@ export function createGatewayStreamSyncRegistry(
       return `${newest.changedAt}|${String(newest.id)}|${String(newest.expectedVersion)}`;
     },
 
-    async waitForChange(after, waitMs, signal) {
+    async waitForChange(after, waitMs, signal, since) {
       const params = new URLSearchParams({ user: options.ownerAddress });
       if (after !== undefined) {
         params.set("after", after);
         params.set("wait", String(Math.max(0, Math.round(waitMs / 1000))));
       }
+      if (since !== undefined) params.set("since", since);
       const res = await fetchImpl(
         `${base}/v1/data/changes?${params.toString()}`,
         { signal },
@@ -525,7 +527,7 @@ export function createGatewayStreamSyncRegistry(
       // route is told apart by what it answers: 404 or 405, or the 400 its
       // `/v1/data/:dataPointId` handler gives the id `changes` ("Invalid
       // dataPointId..."). Any other 400 is the change route refusing this
-      // request (the route's own errors name `user`, `after` or `wait`): a
+      // request (the route's own errors name `user`, `after`, `wait` or `since`): a
       // failure that may pass, not an absence.
       if (
         res.status === 404 ||
@@ -537,18 +539,78 @@ export function createGatewayStreamSyncRegistry(
       if (!res.ok) {
         throw new Error(`registry change wait failed: ${res.status}`);
       }
-      const body = (await res.json()) as { seq?: unknown; changed?: unknown };
+      const body = (await res.json()) as {
+        seq?: unknown;
+        changed?: unknown;
+        delta?: unknown;
+      };
       if (
         typeof body.seq !== "string" ||
-        !/^(0|[1-9]\d*)$/.test(body.seq) ||
+        !DECIMAL.test(body.seq) ||
         typeof body.changed !== "boolean"
       ) {
         throw new Error("registry change answer is not {seq, changed}");
       }
-      return { seq: body.seq, changed: body.changed };
+      // A changed answer to a request that sent `since` carries its delta
+      // (rows or reset). One that does not, or carries another request's, or
+      // one this client cannot read, fails the request: the push then pokes a
+      // full pull on its next answer.
+      if (!body.changed || since === undefined)
+        return { seq: body.seq, changed: body.changed };
+      const delta = parseDelta(body.delta, since, body.seq);
+      if (delta === undefined)
+        throw new Error(
+          `registry change answer has no readable delta for since=${since}`,
+        );
+      return { seq: body.seq, changed: true, delta };
     },
 
     listOwnerRows: () => listRows(() => true),
+  };
+}
+
+const DECIMAL = /^(0|[1-9]\d*)$/;
+
+/**
+ * The `delta` of a changed answer, or `undefined` when there is none or it is
+ * not the delta of this request (another `since`) or not well formed (the
+ * caller refuses the answer). Rows are
+ * read as the listing's rows are: a row whose version or hashes are not valid
+ * makes the whole delta unreadable, never a partial one.
+ */
+function parseDelta(
+  value: unknown,
+  since: string,
+  seq: string,
+): RegistryChangeDelta | undefined {
+  const delta = asRecord(value);
+  if (!delta || delta.since !== since) return undefined;
+  if (delta.reset === true) return { since, seq, reset: true };
+  if (
+    delta.reset !== false ||
+    !Array.isArray(delta.rows) ||
+    !Array.isArray(delta.gone) ||
+    typeof delta.serversChanged !== "boolean" ||
+    !delta.gone.every((id) => typeof id === "string")
+  )
+    return undefined;
+  const rows: { scope: string; read: ControlRead }[] = [];
+  for (const raw of delta.rows) {
+    const row = asRecord(raw);
+    if (!row || typeof row.scope !== "string") return undefined;
+    try {
+      rows.push({ scope: row.scope, read: toControlRead(row) });
+    } catch {
+      return undefined;
+    }
+  }
+  return {
+    since,
+    seq,
+    reset: false,
+    rows,
+    gone: delta.gone as string[],
+    serversChanged: delta.serversChanged,
   };
 }
 
@@ -558,7 +620,8 @@ const LEGACY_REFUSAL = "Invalid dataPointId";
  * True when a 400 is the gateway's `/v1/data/:dataPointId` handler refusing the
  * path segment `changes`, which is what a gateway without the change route
  * answers. That handler's refusals say "Invalid dataPointId"; the change
- * route's own 400s say "Invalid user", "Invalid after" or "Invalid wait".
+ * route's own 400s say "Invalid user", "Invalid after", "Invalid wait" or
+ * "Invalid since".
  */
 async function isLegacyRouteRefusal(res: Response): Promise<boolean> {
   try {

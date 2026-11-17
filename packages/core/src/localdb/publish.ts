@@ -162,8 +162,8 @@ export async function hasDeleteIntent(
  * against the floor of its time, and a later, higher floor must not refuse it
  * and unwrite rows a newer run only re-observed.
  */
-async function retainedRuns(
-  deps: LocalSyncDeps,
+export async function retainedRuns(
+  deps: Pick<LocalSyncDeps, "db">,
   connectionId: string,
   stream: string,
 ): Promise<RetainedRun[]> {
