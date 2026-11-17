@@ -1,4 +1,7 @@
-import { PersonalServerClientError } from "@opendatalabs/personal-server-ts-core/client";
+import {
+  PersonalServerClientError,
+  PersonalServerReadInterrupted,
+} from "@opendatalabs/personal-server-ts-core/client";
 import { describe, expect, it } from "vitest";
 import { createPersonalServerClient } from "./personal-server-client.js";
 
@@ -122,5 +125,81 @@ describe("createPersonalServerClient", () => {
     await expect(client.listData()).rejects.toBeInstanceOf(
       PersonalServerClientError,
     );
+  });
+
+  describe("readData when its body stops before the end", () => {
+    const envelope = { records: [{ id: "a" }] };
+    /** A 200 whose body starts and then errors, as a view that moved does. */
+    const interrupted = (reason: unknown = new TypeError("network error")) =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"records":['));
+          },
+          pull(controller) {
+            controller.error(reason);
+          },
+        }),
+        { status: 200 },
+      );
+    const clientOver = (
+      replies: (() => Response)[],
+      server = recordingFetch(() => {
+        const next = replies.shift();
+        if (!next) throw new Error("more reads than expected");
+        return next();
+      }),
+    ) => ({
+      server,
+      client: createPersonalServerClient({
+        fetch: server.fetch,
+        origin: "https://ps.example",
+        auth: { bearerToken: "owner-token" },
+      }),
+    });
+
+    it("reads again, as a new request, and returns the settled body", async () => {
+      const { server, client } = clientOver([
+        () => interrupted(),
+        () => json(envelope),
+      ]);
+      await expect(client.readData("a.b")).resolves.toEqual(envelope);
+      expect(server.requests).toHaveLength(2);
+      expect(server.requests[1]).not.toBe(server.requests[0]);
+      expect(server.requests[1].headers.get("Authorization")).toBe(
+        "Bearer owner-token",
+      );
+    });
+
+    it("ends with the typed error, not a loop, when every read is interrupted", async () => {
+      const replies = Array.from({ length: 10 }, () => () => interrupted());
+      const { server, client } = clientOver(replies);
+      const error = await client.readData("a.b").catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(PersonalServerReadInterrupted);
+      expect(error).toMatchObject({ errorCode: "READ_INTERRUPTED" });
+      expect(server.requests).toHaveLength(3);
+    });
+
+    it("does not read again after an error status", async () => {
+      const { server, client } = clientOver([
+        () => json({ error: "FORBIDDEN", message: "no" }, 403),
+        () => json(envelope),
+      ]);
+      await expect(client.readData("a.b")).rejects.toBeInstanceOf(
+        PersonalServerClientError,
+      );
+      expect(server.requests).toHaveLength(1);
+    });
+
+    it("does not read again for a call that is not a data read", async () => {
+      const { server, client } = clientOver([
+        () => interrupted(),
+        () => json({ scopes: [], total: 0 }),
+      ]);
+      await expect(client.listData()).rejects.toBeInstanceOf(
+        PersonalServerReadInterrupted,
+      );
+      expect(server.requests).toHaveLength(1);
+    });
   });
 });

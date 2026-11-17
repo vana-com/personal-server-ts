@@ -548,6 +548,28 @@ END`,
      WHERE primary_key IS NULL`,
   ],
   [
+    // Whether a stream's rows changed after a reader looked, which each page of
+    // a complete read asks (complete-read.ts). Every write of a row leaves an
+    // entry in `record_changes`, so a trigger on that table sees them all. It
+    // writes the mark only for the first change after a reader cleared it:
+    // `dirty` says a change came since, `epoch` counts those first changes. A
+    // trigger that wrote on every row would cost every record write; this one
+    // reads one primary-key row.
+    `CREATE TABLE stream_change_marks (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL,
+  epoch INTEGER NOT NULL, dirty INTEGER NOT NULL,
+  PRIMARY KEY (connection_id, stream)) WITHOUT ROWID`,
+    `CREATE TRIGGER stream_change_marks_ai AFTER INSERT ON record_changes
+WHEN NOT EXISTS (SELECT 1 FROM stream_change_marks m
+                  WHERE m.connection_id = NEW.connection_id AND m.stream = NEW.stream AND m.dirty = 1)
+BEGIN
+  INSERT OR REPLACE INTO stream_change_marks(connection_id, stream, epoch, dirty)
+  VALUES (NEW.connection_id, NEW.stream,
+          COALESCE((SELECT epoch FROM stream_change_marks
+                     WHERE connection_id = NEW.connection_id AND stream = NEW.stream), 0) + 1, 1);
+END`,
+  ],
+  [
     // Why eligible work is still waiting. Completion reads this only while work remains.
     `ALTER TABLE record_changes ADD COLUMN publish_blocked_reason TEXT CHECK (publish_blocked_reason IN ('deferred','backoff','discarded','purged','refused'))`,
     `ALTER TABLE run_streams ADD COLUMN publish_blocked_reason TEXT CHECK (publish_blocked_reason IN ('deferred','backoff','discarded','purged','refused'))`,
