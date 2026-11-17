@@ -443,7 +443,7 @@ describe("legacy scope binding self-check", () => {
       }
     });
 
-    it(`${scope}: a stream declared optional is served without, and every other stream is declared required`, () => {
+    it(`${scope}: a stream declared optional is served without it`, () => {
       for (const optional of binding.optionalStreams ?? []) {
         expect(binding.pdppStreams).toContain(optional);
         const fetchedStreams = binding.pdppStreams.filter(
