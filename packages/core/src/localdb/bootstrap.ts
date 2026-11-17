@@ -207,7 +207,11 @@ export async function connectionsWithStreams(
 export async function syncBeforeBegin(
   deps: LocalSyncDeps,
   connector: string,
-  options: { readonly foreign?: "save" | "report" } = {},
+  options: {
+    readonly foreign?: "save" | "report";
+    /** A successful reconnect write, used instead of reading control again. */
+    readonly committedControl?: ControlRead;
+  } = {},
 ): Promise<{
   readonly connection: ConnectionRow | null;
   readonly control: ControlState | null;
@@ -221,7 +225,9 @@ export async function syncBeforeBegin(
     const control = await hashes(locked);
     let read: ControlRead;
     try {
-      read = await deps.registry.read(controlScope(connector, ns));
+      read =
+        options.committedControl ??
+        (await deps.registry.read(controlScope(connector, ns)));
     } catch (error) {
       // Only an unreachable registry goes on offline. A refusal (403), an
       // unreadable answer or a control row of the wrong shape is not "offline".
@@ -246,13 +252,13 @@ export async function syncBeforeBegin(
     await purgeDeleted(locked, connection);
     if (connection.controlState === "active") {
       try {
-        // Apply reads the control row and the log row itself, after this
-        // call began. Only an unreachable registry that apply met before its
+        // Reuse this call's control observation; apply still reads the log.
+        // Only an unreachable registry that apply met before its
         // first local write, with no earlier apply left half done, goes on
         // offline: nothing new was learned and nothing changed. Apply has no
         // rollback, so an unavailable error after a write rejects, as do
         // integrity, key and database failures.
-        await applyConnection(locked, id);
+        await applyConnection(locked, id, undefined, read);
       } catch (error) {
         // A log this build cannot read stops this connection's apply, not the
         // join: the cycle's pass for the connection applies again and reports

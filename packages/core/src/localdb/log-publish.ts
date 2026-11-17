@@ -327,6 +327,17 @@ function unionRuns(held: PublishResult, result: PublishResult): PublishResult {
   return { ...result, publication: { ...result.publication, runIds } };
 }
 
+// Keep an uploaded candidate until its commit has a definite answer. Retrying
+// that commit first preserves its hash, position and receipt even if the reply
+// was lost. The weak database owner releases it when the database is released.
+type PendingCommit = { readonly candidate: Candidate; transferred: boolean };
+const pendingCommits = new WeakMap<object, Map<string, PendingCommit>>();
+function pendingOf(db: object): Map<string, PendingCommit> {
+  let pending = pendingCommits.get(db);
+  if (!pending) pendingCommits.set(db, (pending = new Map()));
+  return pending;
+}
+
 async function publishRounds(
   deps: LocalSyncDeps,
   connectionId: string,
@@ -347,13 +358,17 @@ async function publishRounds(
     }
   };
   let attempts = 0;
+  const pending = pendingOf(deps.db);
   for (;;) {
-    const turn = await clock.time("snapshot", () =>
-      deps.queue.run(connectionId, "publish", async () => {
-        const held = insideQueue(deps, connectionId);
-        return snapshotRound(held, connectionId, clock);
-      }),
-    );
+    const retained = pending.get(connectionId);
+    const turn: Snapshot = retained
+      ? { kind: "candidate", candidate: retained.candidate }
+      : await clock.time("snapshot", () =>
+          deps.queue.run(connectionId, "publish", async () => {
+            const held = insideQueue(deps, connectionId);
+            return snapshotRound(held, connectionId, clock);
+          }),
+        );
     if (turn.kind === "done") {
       // Bytes that arrived after their records were published still go up.
       if (turn.attachments && turn.attachments.length > 0) {
@@ -371,6 +386,8 @@ async function publishRounds(
       continue;
     }
     const { candidate } = turn;
+    const transfer = retained ?? { candidate, transferred: false };
+    pending.set(connectionId, transfer);
     // TRANSFER: no slot. Objects are content addressed and authorize nothing
     // until the registry commit, so nothing orders one PUT before another:
     // the attachments, the snapshot parts and the segment that names them go
@@ -378,21 +395,34 @@ async function publishRounds(
     // dependency is the objects it names.
     const scope = await logScopeOf(deps, connectionId);
     try {
-      await Promise.all([
-        candidate.attachments.length > 0
-          ? clock.time("attachments", () =>
-              uploadBlobs(deps, candidate.attachments),
-            )
-          : undefined,
-        clock.time("segment-put", () =>
-          Promise.all([
-            ...candidate.objects.map((object) =>
-              deps.blobs.put(`${scope}/${object.name}`, object.cipher),
-            ),
-            deps.blobs.put(`${scope}/${candidate.blobName}`, candidate.cipher),
-          ]),
-        ),
-      ]);
+      if (!transfer.transferred) {
+        await allTransferred([
+          candidate.attachments.length > 0
+            ? clock.time("attachments", () =>
+                uploadBlobs(deps, candidate.attachments),
+              )
+            : undefined,
+          clock.time("segment-put", () =>
+            allTransferred([
+              ...candidate.objects.map((object) =>
+                putIfMissing(
+                  deps,
+                  `${scope}/${object.name}`,
+                  object.cipher,
+                  retained !== undefined || attempts > 0,
+                ),
+              ),
+              putIfMissing(
+                deps,
+                `${scope}/${candidate.blobName}`,
+                candidate.cipher,
+                retained !== undefined || attempts > 0,
+              ),
+            ]),
+          ),
+        ]);
+        transfer.transferred = true;
+      }
     } catch (error) {
       // Storage kept refusing past its retry budget. Nothing is wrong with the
       // data: nothing was committed, so the changes stay queued and the next
@@ -416,6 +446,7 @@ async function publishRounds(
         ),
       ),
     );
+    pending.delete(connectionId);
     if (committed.kind === "unsupported") {
       withoutBatchRoute.add(deps.registry);
       return results.size > 0 ? [...results.values()] : null;
@@ -432,6 +463,26 @@ async function publishRounds(
     if (!committed.more) break;
   }
   return [...results.values()].sort((a, b) => a.stream.localeCompare(b.stream));
+}
+
+/** Probe retried transfers only; a fresh save remains PUT then commit. */
+async function putIfMissing(
+  deps: LocalSyncDeps,
+  key: string,
+  bytes: Uint8Array,
+  checkExisting: boolean,
+) {
+  if (!checkExisting || !(await deps.blobs.exists(key)))
+    await deps.blobs.put(key, bytes);
+}
+
+// A failed transfer must not leave another PUT running into the next retry.
+async function allTransferred(
+  transfers: readonly (Promise<unknown> | undefined)[],
+) {
+  const results = await Promise.allSettled(transfers);
+  const failed = results.find((r) => r.status === "rejected");
+  if (failed) throw failed.reason;
 }
 
 async function logScopeOf(

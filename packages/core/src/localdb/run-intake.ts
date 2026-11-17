@@ -13,6 +13,7 @@ import {
   streamScope,
   toHex,
   type JsonValue,
+  type ControlState,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   computeRecordKeyFromData,
@@ -278,7 +279,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
         // would collect. Nothing is written for it (`syncBeforeBegin`).
         if (synced.control?.kind === "foreign")
           throw new RunIntakeError("control_foreign");
-        const observed = synced.control ?? undefined;
+        let observed: ControlState | undefined = synced.control ?? undefined;
         if (req.expectedControlVersion !== undefined) {
           if (synced.unreachable)
             throw new RunIntakeError("control_basis_unavailable");
@@ -323,9 +324,19 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             throw error;
           }
           admittedControlVersion = version;
+          // The successful compare-and-set is the control observation. Reuse
+          // it while applying the log; a second GET adds no admission safety.
           synced = await syncBeforeBegin(deps, req.connector, {
             foreign: "report",
+            committedControl: {
+              found: true,
+              version,
+              dataHash: hashes.activeData,
+              metadataHash: hashes.activeMetadata,
+              deleted: false,
+            },
           });
+          observed = synced.control ?? undefined;
           if (synced.unreachable)
             throw new RunIntakeError("control_basis_unavailable");
           if (synced.connection?.controlVersion !== admittedControlVersion)

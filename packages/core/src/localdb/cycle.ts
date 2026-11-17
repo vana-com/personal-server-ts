@@ -43,12 +43,12 @@ export interface EarlyPublish {
  * `/sync/trigger` and `/sync/file/:id` (trigger = this; file =
  * `syncConnection` for the one connection, then read).
  */
-export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
-  const early = await publishEarly(deps);
-  // One listing for the whole cycle, taken after the early publish: the
-  // bootstrap reads the control rows from it and every apply its log row. Each
-  // apply's own listing would be shared only by the applies that reach it while
-  // it is out, so the count would follow how their control reads line up.
+export async function runCycle(
+  deps: LocalSyncDeps,
+  made?: Map<string, EarlyPublish>,
+): Promise<CycleReport> {
+  const early = made ?? (await publishEarly(deps, await earlyCandidates(deps)));
+  // One listing after early publish, shared by bootstrap and all applies.
   const listed = await deps.registry.listOwnerRows();
   const connections = await bootstrapConnections(deps, listed);
   return {
@@ -73,12 +73,9 @@ export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
  * result but published or noop (a deferral, a backoff, a refusal), a fresh
  * connection that deferred (another device made its row), and a connection
  * the early publish does not take (deleted, foreign, or a reconnect), which
- * only the cycle's listing and apply can place. A device without the log
- * protocol runs the whole cycle: only the log's writer commits without
- * reading the registry first.
+ * only the cycle's listing and apply can place.
  */
 export async function runPublish(deps: LocalSyncDeps): Promise<CycleReport> {
-  if (!deps.logProtocol) return runCycle(deps);
   const candidates = await earlyCandidates(deps);
   const early = await publishEarly(deps, candidates);
   const fresh = new Set(candidates.fresh.map((c) => c.connectionId));
@@ -105,7 +102,6 @@ export async function runPublish(deps: LocalSyncDeps): Promise<CycleReport> {
   return {
     connections: [...early].map(([connectionId, e]) => ({
       connectionId,
-      applied: [],
       published: e.published,
       error: null,
     })),

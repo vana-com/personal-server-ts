@@ -16,6 +16,7 @@ import {
 import { logScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { openBetterSqlite3 } from "../../server/src/localdb/better-sqlite3-driver.js";
 import { createFakeGateway } from "../../server/src/localdb/fake-gateway.js";
+import { endRequest } from "../../core/src/test-utils/run-end.js";
 import { startPersonalServer } from "./client.js";
 import { createMockPsLiteGateway } from "./test-support/gateway.js";
 import {
@@ -139,7 +140,6 @@ async function savePathWorld() {
       fetch: timedFetch,
     }),
     streamSyncBlobs: blobs,
-    streamSyncLogProtocol: true,
     streamSyncPublishWhileCollecting: true,
     streamSyncDeclaredStreams: () => ["items"],
     streamSyncDeclarations: (connector: string) => ({
@@ -175,12 +175,14 @@ async function savePathWorld() {
         { stream: "items", data: { id: "2" } },
       ],
     });
-    await server.streamSyncIntake!.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: ["items"],
-      provenFullStreams: ["items"],
-      lastBatch: 0,
-    });
+    await server.streamSyncIntake!.end(
+      runId,
+      endRequest({
+        live: ["items"],
+        provenFullStreams: ["items"],
+        lastBatch: 0,
+      }),
+    );
   };
   return {
     server,
@@ -209,18 +211,33 @@ describe("the save path of a Web write", () => {
     expect(commits).toHaveLength(1);
   });
 
+  it("rejects a save whose registry commit fails", async () => {
+    const { server, collect, commits, gateway } = await savePathWorld();
+    gateway.beforeBatch = () => {
+      throw new TypeError("commit timed out");
+    };
+    await collect("run-1");
+    await expect(server.publish()).rejects.toThrow(/no reply/);
+    expect(commits).toEqual([]);
+  });
+
   it("resolves publish() at the registry commit, with every registry listing still unanswered", async () => {
     const { server, collect, commits, holdListings } = await savePathWorld();
     const release = holdListings();
-    await collect("run-1");
-    // A publish that waited for the cycle's listing and apply would wait here
-    // for ever; the bound only turns that into a failure.
-    const outcome = await Promise.race([
-      server.publish().then(() => "resolved"),
-      sleep(5000).then(() => "waited for a listing"),
-    ]);
-    release();
-    expect(outcome).toBe("resolved");
-    expect(commits).toHaveLength(1);
+    // Always release the fake wire, including on an intake failure.
+    try {
+      await collect("run-1");
+      // A publish that waited for the cycle's listing and apply would wait here
+      // for ever; the bound only turns that into a failure.
+      const outcome = await Promise.race([
+        server.publish().then(() => "resolved"),
+        sleep(5000).then(() => "waited for a listing"),
+      ]);
+      release();
+      expect(outcome).toBe("resolved");
+      expect(commits).toHaveLength(1);
+    } finally {
+      release();
+    }
   });
 });
