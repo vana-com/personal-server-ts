@@ -305,6 +305,51 @@ describe("close", () => {
     expect(sockets[0]!.destroyed).toBe(true);
   });
 
+  it("can be called again after it has finished", async () => {
+    const { url } = await peer();
+    const { fetch: send, close } = createKeepAliveFetch();
+    await (await send(url)).text();
+
+    await close();
+
+    await expect(close()).resolves.toBeUndefined();
+    await expect(close({ graceMs: 10 })).resolves.toBeUndefined();
+  });
+
+  it("can be called again while the first call waits on a request in flight", async () => {
+    let arrived!: () => void;
+    const requestArrived = new Promise<void>((resolve) => (arrived = resolve));
+    const { url } = await peer((_request, response) => {
+      arrived();
+      setTimeout(() => response.end("late"), 200);
+    });
+    const { fetch: send, close } = createKeepAliveFetch();
+    const inFlight = send(url);
+    await requestArrived;
+
+    const both = Promise.all([close(), close()]);
+
+    expect(await (await inFlight).text()).toBe("late");
+    await expect(both).resolves.toEqual([undefined, undefined]);
+  });
+
+  it("can be called again after the grace time aborted a request", async () => {
+    let arrived!: () => void;
+    const requestArrived = new Promise<void>((resolve) => (arrived = resolve));
+    const { url } = await peer(() => arrived());
+    const { fetch: send, close } = createKeepAliveFetch();
+    const inFlight = send(url);
+    const aborted = expect(inFlight).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    await requestArrived;
+
+    await close({ graceMs: 50 });
+    await aborted;
+
+    await expect(close()).resolves.toBeUndefined();
+  });
+
   it("lets a request in flight finish before it closes the pool", async () => {
     let arrived!: () => void;
     const requestArrived = new Promise<void>((resolve) => (arrived = resolve));

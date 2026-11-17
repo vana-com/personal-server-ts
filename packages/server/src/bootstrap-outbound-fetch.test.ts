@@ -223,6 +223,15 @@ describe("the host's outbound fetch", () => {
     expect(pools.closed).toBe(1);
   });
 
+  it("lets cleanup run twice: a harness that restarts a boot cleans the old one again", async () => {
+    const context = await boot();
+
+    await context.cleanup();
+    await expect(context.cleanup()).resolves.toBeUndefined();
+
+    contexts.splice(contexts.indexOf(context), 1);
+  });
+
   it("leaves a fetch the host passed to its owner, making no pool of its own", async () => {
     const context = await boot(
       vi.fn(

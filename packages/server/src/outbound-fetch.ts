@@ -63,7 +63,9 @@ export interface KeepAliveFetch {
   /**
    * Waits for requests in flight to finish, then closes every connection. A
    * request still running after `graceMs` is aborted. For server shutdown: stop
-   * accepting work, drain it, then close the pool.
+   * accepting work, drain it, then close the pool. Calling it again, while the
+   * first call runs or after it has finished, returns the first call's outcome
+   * (its `graceMs` applies).
    */
   close(options?: { graceMs?: number }): Promise<void>;
 }
@@ -111,7 +113,8 @@ export function createKeepAliveFetch(
       return through(input, init);
     }
   };
-  const close = async ({ graceMs = CLOSE_GRACE_MS } = {}) => {
+  let closing: Promise<void> | undefined;
+  const closeOnce = async (graceMs: number) => {
     // `Agent.destroy` after `Agent.close` leaves a request in flight pending,
     // so the end of the grace time aborts requests through their signal. An
     // aborted request ends, and `close` then finishes.
@@ -123,5 +126,10 @@ export function createKeepAliveFetch(
       clearTimeout(timer);
     }
   };
+  // `Agent.close` destroys the agent when it is done, and a second `close` on
+  // a destroyed agent rejects. A caller that stops the host twice must get the
+  // first outcome again, so every call shares the first one's promise.
+  const close = ({ graceMs = CLOSE_GRACE_MS } = {}) =>
+    (closing ??= closeOnce(graceMs));
   return { fetch: keepAliveFetch, close };
 }
