@@ -1,6 +1,6 @@
 // The stored size of a row (`records.body_bytes`), which the log's snapshot
-// pages read to cut pages without reading bodies, and the driver's frozen read
-// view (`SqlDriver.snapshot`). A file database and the real driver.
+// pages read to cut pages without reading bodies. A file database and the real
+// driver.
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
