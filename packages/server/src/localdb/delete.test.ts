@@ -7,6 +7,7 @@ import {
   type SqlDriver,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
+  createGatewayStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
   createMemoryStreamSyncRegistry,
   type MemoryStreamSyncRegistry,
@@ -26,6 +27,7 @@ import {
 } from "../../../core/src/stream-sync/ports.js";
 import { remoteFixture, retainedManifest } from "./apply-fixture.js";
 import { legacyHeadRow } from "./legacy-head-fixture.js";
+import { createFakeGateway } from "./fake-gateway.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}`;
@@ -1428,3 +1430,62 @@ it("a batch bound the gateway advertised sets the size of the stream requests", 
   expect(again.batches.map((b) => b.rows.length)).toEqual([1, 6, 6, 6, 2]);
   expect(again.singles).toEqual([]);
 });
+
+for (const lockedScopes of [26, undefined, 1]) {
+  it(`a 30-stream delete respects the advertised lock budget ${lockedScopes ?? "absent"}`, async () => {
+    const f = await world(undefined, names(30));
+    const gateway = createFakeGateway({
+      owner,
+      connectionLogFence: true,
+      policy: {
+        rows: 31,
+        requires: 40,
+        bytes: 1_000_000,
+        ...(lockedScopes === undefined ? {} : { lockedScopes }),
+      },
+      isTombstone: (row) =>
+        row.dataHash === f.hashes.tombstoneData &&
+        row.metadataHash === f.hashes.tombstoneMetadata,
+    });
+    for (const [scope, row] of f.reads)
+      if (row.found) gateway.write(scope, row);
+    const statuses: number[] = [];
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test",
+      ownerAddress: owner,
+      fetch: (async (input: string, init?: RequestInit) => {
+        const response = await gateway.fetch(input, init);
+        statuses.push(response.status);
+        return response;
+      }) as typeof fetch,
+    });
+    const deleter = createConnectionDeleter({ ...f.a.deps, registry }, {});
+    await deleter.requestConnectionDelete("fixture-source");
+    expect(await deleter.resumeDeletes()).toEqual([]);
+    expect(statuses).not.toContain(422);
+    const batches = gateway.batches();
+    expect(batches.map((b) => b.body.rows.length)).toEqual(
+      lockedScopes === 26 ? [1, 25, 5] : lockedScopes === 1 ? [1] : [1, 30],
+    );
+    const singles = gateway.calls.filter((c) => c.kind === "post");
+    // A singleton cannot fit a budget of one. It settles through the normal
+    // per-stream path, without sending an empty or oversized batch or looping.
+    expect(singles).toHaveLength(lockedScopes === 1 ? 30 : 0);
+    for (const batch of batches.slice(1)) {
+      const rows = batch.body.rows;
+      expect(
+        new Set(rows.map((r) => r.scope.split(".").slice(0, 2).join("."))).size,
+      ).toBe(1);
+      expect(
+        rows.every(
+          (r) =>
+            r.dataHash !== f.hashes.tombstoneData ||
+            r.metadataHash !== f.hashes.tombstoneMetadata,
+        ),
+      ).toBe(true);
+      if (lockedScopes !== undefined)
+        expect(rows.length + 1).toBeLessThanOrEqual(lockedScopes);
+    }
+    for (const head of f.heads) expect(gateway.rowsOf(head.scope)).toBe(2);
+  });
+}
