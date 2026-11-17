@@ -1,3 +1,4 @@
+import { encodeBase64Url } from "../encoding/base64url.js";
 /**
  * Owner-only MCP connection management. Implements the four endpoints listed
  * in §2 of 260604-PLAN-vana-mcp-personal-server.md:
@@ -145,12 +146,7 @@ function bytesToHex(bytes: Uint8Array): string {
 }
 
 function bytesToBase64Url(bytes: Uint8Array): string {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  // `btoa` exists in modern browsers AND Node ≥18 (the engines version that
-  // PS Lite and personal-server-ts already target).
-  const base64 = btoa(binary);
-  return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return encodeBase64Url(bytes);
 }
 
 export async function hashConnectionToken(token: string): Promise<string> {

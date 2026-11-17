@@ -32,7 +32,10 @@
  *   everything itself. A refusal of the request's shape is a defect of this
  *   code, so it is reported through `onRefused`, never as a quiet limit.
  */
-import type { ControlHashes } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  countFencedLogScopes,
+  type ControlHashes,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   AmbiguousRegistryReplyError,
   RegistryRefusedError,
@@ -69,7 +72,10 @@ export function createDeleteBatcher(options: {
   readonly controlScopeOf: (ns: string) => string;
   /** The version each namespace's control row held when the delete was planned. */
   readonly pins: ReadonlyMap<string, number>;
-  readonly hashes: Pick<ControlHashes, "activeData" | "tombstoneData">;
+  readonly hashes: Pick<
+    ControlHashes,
+    "activeData" | "tombstoneData" | "tombstoneMetadata"
+  >;
   /** Each calls `submit` or `leave` once: one per fence, one per stream. */
   readonly fenceParticipants: number;
   readonly streamParticipants: number;
@@ -160,28 +166,38 @@ export function createDeleteBatcher(options: {
   const byScope = (a: Parked, b: Parked) =>
     a.row.scope < b.row.scope ? -1 : a.row.scope > b.row.scope ? 1 : 0;
 
-  /**
-   * Chunks of at most the gateway's rows and conditions: a stream chunk names
-   * one condition per namespace it holds, a fence chunk none.
-   */
+  /** Split at the advertised row, condition and connection-log lock bounds. */
   function split(list: readonly Parked[]): Parked[][] {
     const bounds = batchBounds(options.registry);
+    const fits = (chunk: readonly Parked[]): boolean => {
+      if (
+        chunk.length > bounds.rows ||
+        requiresFor(chunk).length > bounds.requires
+      )
+        return false;
+      if (bounds.lockedScopes === undefined) return true;
+      const fences = countFencedLogScopes(
+        chunk.map((part) => part.row),
+        (row) =>
+          row.dataHash.toLowerCase() === options.hashes.tombstoneData &&
+          row.metadataHash.toLowerCase() === options.hashes.tombstoneMetadata,
+      );
+      return fences === 0 || chunk.length + fences <= bounds.lockedScopes;
+    };
     const chunks: Parked[][] = [];
     let chunk: Parked[] = [];
-    let namespaces = new Set<string>();
     for (const part of list) {
-      const needs = part.fence || namespaces.has(part.ns) ? 0 : 1;
-      if (
-        chunk.length > 0 &&
-        (chunk.length >= bounds.rows ||
-          namespaces.size + needs > bounds.requires)
-      ) {
-        chunks.push(chunk);
+      if (!fits([...chunk, part])) {
+        if (chunk.length > 0) chunks.push(chunk);
         chunk = [];
-        namespaces = new Set();
+        // Even one row can exceed the lock budget. Settle it once through the
+        // per-stream path; never send an empty or oversized batch or retry it here.
+        if (!fits([part])) {
+          part.settle("fallback");
+          continue;
+        }
       }
       chunk.push(part);
-      if (!part.fence) namespaces.add(part.ns);
     }
     if (chunk.length > 0) chunks.push(chunk);
     return chunks;

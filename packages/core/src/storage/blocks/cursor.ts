@@ -1,3 +1,7 @@
+import {
+  decodeBase64UrlUtf8,
+  encodeBase64UrlUtf8,
+} from "../../encoding/base64url.js";
 const DATA_BLOCK_CURSOR_VERSION = 1;
 
 export interface DataBlockCursor {
@@ -169,25 +173,12 @@ export function validateDataBlockCursor(
 }
 
 function encodeBase64Url(value: string): string {
-  const bytes = new TextEncoder().encode(value);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
+  return encodeBase64UrlUtf8(value);
 }
 
 function decodeBase64Url(value: string): string | null {
   try {
-    const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = base64.padEnd(
-      base64.length + ((4 - (base64.length % 4)) % 4),
-      "=",
-    );
-    const binary = atob(padded);
-    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-    return new TextDecoder().decode(bytes);
+    return decodeBase64UrlUtf8(value);
   } catch {
     return null;
   }
