@@ -306,8 +306,8 @@ describe("stream-sync run intake route", () => {
     expect(canonicalJson(view.get("big"))).toBe(canonicalJson(big));
   }, 120_000);
 
-  it("takes a 30 MiB record through the batch route; the log cannot carry it, and the cycle says so", async () => {
-    const { sync, call } = await build("route-30mib");
+  it("takes a 30 MiB record through the batch route, and the log carries it out of line", async () => {
+    const { sync, call, read } = await build("route-30mib");
     const body = beginBody();
     await call("PUT", "big2", body);
     const huge = { id: "huge", pad: 'é"\\}{'.repeat(5 * 1024 * 1024) };
@@ -325,11 +325,16 @@ describe("stream-sync run intake route", () => {
       lastBatch: 0,
     });
     expect(ended.status).toBe(200);
-    // One segment holds at most 16 MiB (stream-sync log.ts), and a record is
-    // never split across segments, so this connection publishes nothing.
+    // One segment holds at most 16 MiB (stream-sync log.ts) and a record is
+    // never split across segments, so the body goes out of line.
     expect(
-      (await sync.cycle()).connections.map((c) => [c.published, c.error]),
-    ).toEqual([[[], "segment exceeds the 16 MiB segment limit"]]);
+      (await sync.cycle()).connections.map((c) => [
+        c.published.length > 0,
+        c.error,
+      ]),
+    ).toEqual([[true, null]]);
+    const view = await read(body.connector);
+    expect(canonicalJson(view.get("huge"))).toBe(canonicalJson(huge));
   }, 120_000);
 
   it("refuses a request that declares a body over the ceiling", async () => {

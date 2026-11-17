@@ -30,6 +30,9 @@ import {
   type Segment,
   type SegmentRef,
   type SnapshotPart,
+  type WireSegment,
+  bodyPieceBlobName,
+  isBodyPieceBlobName,
 } from "./log.js";
 import { pkHash } from "./records.js";
 import { keccak256, nodePorts } from "./test-support/ports.js";
@@ -129,6 +132,36 @@ describe("segment codec", () => {
     expect(decodeSegment(utf8(text.replace("{", '{"extra":1,'))).kind).toBe(
       "malformed",
     );
+  });
+
+  it("round-trips an upsert whose body is out of line, and refuses a malformed body reference", () => {
+    const byRef: WireSegment = {
+      ...segment(),
+      operations: [
+        {
+          kind: "upsert-ref",
+          stream: "a",
+          pkHash: pk(1),
+          stamp: { o: 5, r: "run-1" },
+          ordinal: 2,
+          firstSeen: 3,
+          body: { sha256: pk(9), bytes: 10, pieces: [hash(7), hash(8)] },
+        },
+      ],
+    };
+    const bytes = encodeSegment(byRef);
+    expect(decodeSegment(bytes)).toEqual({ kind: "ok", segment: byRef });
+    const text = new TextDecoder().decode(bytes);
+    // A value and a body reference at once, no piece, a length the pieces
+    // cannot hold, and a sha256 that is not 64 hex are each malformed.
+    for (const bad of [
+      text.replace('"x":{', '"v":{},"x":{'),
+      text.replace(`"p":["${hash(7)}","${hash(8)}"]`, '"p":[]'),
+      text.replace('"b":10', '"b":1'),
+      text.replace(`"h":"${pk(9)}"`, '"h":"00"'),
+    ])
+      expect(decodeSegment(utf8(bad)).kind).toBe("malformed");
+    expect(isBodyPieceBlobName(bodyPieceBlobName(hash(7)))).toBe(true);
   });
 
   it("rejects refs with a gap or the wrong dense positions", () => {

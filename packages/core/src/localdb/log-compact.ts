@@ -38,12 +38,16 @@ import {
 import type { LocalSyncDeps } from "./deps.js";
 import { keccakOf } from "../stream-sync/crypto-port.js";
 import { fetchSegment, fetchSnapshotPart, type LogState } from "./log-apply.js";
+import { putBodiesOutOfLine } from "./log-bodies.js";
 
 export interface CompactionPlan {
   /** What the next segment's `snapshot` is. Its position is the next `base`. */
   readonly snapshot: SnapshotPointer;
-  /** The part objects to upload before the segment, by blob name. */
-  readonly parts: readonly {
+  /**
+   * Objects to upload before the segment, by blob name: the parts, and the
+   * pieces of the out-of-line bodies they name that are not in storage yet.
+   */
+  readonly objects: readonly {
     readonly name: string;
     readonly cipher: Uint8Array;
   }[];
@@ -113,8 +117,14 @@ export async function planCompaction(
     ),
   ]);
   const fold = foldLog({ snapshot: parts, segments });
+  const outOfLine = await putBodiesOutOfLine(
+    deps,
+    input.scope,
+    fold.entries,
+    target,
+  );
   const folded = partitionFold(
-    fold,
+    { streams: fold.streams, entries: outOfLine.ops },
     {
       connector: input.connector,
       ns: input.ns,
@@ -124,7 +134,7 @@ export async function planCompaction(
     },
     target,
   );
-  const built: { name: string; cipher: Uint8Array }[] = [];
+  const built: { name: string; cipher: Uint8Array }[] = [...outOfLine.pieces];
   const pointer: { dataHash: `0x${string}`; bytes: number }[] = [];
   for (const part of folded) {
     const clear = encodeSnapshotPart(part);
@@ -140,6 +150,6 @@ export async function planCompaction(
   }
   return {
     snapshot: { position: log.position, parts: pointer },
-    parts: built,
+    objects: built,
   };
 }

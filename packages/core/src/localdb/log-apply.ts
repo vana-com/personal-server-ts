@@ -40,6 +40,7 @@ import {
   type SnapshotPointer,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { keccakOf } from "../stream-sync/crypto-port.js";
+import { resolveBodies } from "./log-bodies.js";
 import { announceApplied } from "./apply-progress.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
@@ -532,7 +533,11 @@ export async function fetchSegment(
     throw new Error(
       `apply: invalid log segment ${position} (${verified.kind})`,
     );
-  return { ...verified, cipherBytes: cipher.length };
+  const segment: Segment = {
+    ...verified.segment,
+    operations: await resolveBodies(deps, scope, verified.segment.operations),
+  };
+  return { segment, bytes: verified.bytes, cipherBytes: cipher.length };
 }
 
 /** One snapshot part, fetched, decrypted and verified. */
@@ -565,7 +570,10 @@ export async function fetchSnapshotPart(
     );
   if (verified.kind !== "ok")
     throw new Error(`apply: invalid log snapshot part (${verified.kind})`);
-  return verified.part;
+  return {
+    ...verified.part,
+    entries: await resolveBodies(deps, scope, verified.part.entries),
+  };
 }
 
 /**

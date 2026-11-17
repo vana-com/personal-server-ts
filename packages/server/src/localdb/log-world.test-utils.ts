@@ -11,8 +11,8 @@ import {
   deriveKeyCheck,
   logScope,
   pkHash,
-  type Segment,
-  type SnapshotPart,
+  type WireSegment,
+  type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { sha256 } from "@noble/hashes/sha2";
 import {
@@ -302,7 +302,7 @@ export async function world(options: {
 
   /** The decoded segments in the blob store, by position. */
   const segments = async () => {
-    const out = new Map<number, Segment>();
+    const out = new Map<number, WireSegment>();
     for (const key of innerBlobs.keys()) {
       if (!key.startsWith(`${LOG}/s-`)) continue;
       const bytes = await innerBlobs.get(key);
@@ -323,8 +323,8 @@ export async function world(options: {
     return out;
   };
   /** The snapshot parts a head points at, decoded, in pointer order. */
-  const snapshotParts = async (head: Segment) => {
-    const parts: SnapshotPart[] = [];
+  const snapshotParts = async (head: WireSegment) => {
+    const parts: WireSnapshotPart[] = [];
     for (const ref of head.snapshot!.parts) {
       const decoded = decodeSnapshotPart(
         (await innerBlobs.get(`${LOG}/q-${ref.dataHash.slice(2)}`))!,

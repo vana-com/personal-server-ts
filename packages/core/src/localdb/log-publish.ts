@@ -65,6 +65,7 @@ import { type StreamSyncRegistry } from "../stream-sync/ports.js";
 import { StorageDeferredError } from "../stream-sync/storage-retry.js";
 import { sameHead, type PlanHead } from "../stream-sync/publish-plan.js";
 import { keccakOf } from "../stream-sync/crypto-port.js";
+import { putBodiesOutOfLine } from "./log-bodies.js";
 import { applyConnection } from "./apply.js";
 import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 import { settleRequirementFailure, settleRow } from "./batch-commit.js";
@@ -172,8 +173,11 @@ type Candidate = {
   readonly base: number;
   readonly refs: readonly SegmentRef[];
   readonly snapshot: SnapshotPointer | null;
-  /** Snapshot part objects to upload before the segment. */
-  readonly snapshotParts: readonly {
+  /**
+   * Objects the segment names, to upload before it: snapshot parts and the
+   * pieces of out-of-line bodies.
+   */
+  readonly objects: readonly {
     readonly name: string;
     readonly cipher: Uint8Array;
   }[];
@@ -281,8 +285,8 @@ async function publishRounds(
           : undefined,
         clock.time("segment-put", () =>
           Promise.all([
-            ...candidate.snapshotParts.map((part) =>
-              deps.blobs.put(`${scope}/${part.name}`, part.cipher),
+            ...candidate.objects.map((object) =>
+              deps.blobs.put(`${scope}/${object.name}`, object.cipher),
             ),
             deps.blobs.put(`${scope}/${candidate.blobName}`, candidate.cipher),
           ]),
@@ -789,7 +793,14 @@ async function snapshotRound(
       `publish: a deletion's key does not match its hash (${mismatch.stream}/${mismatch.pkHash})`,
     );
   const encodeStart = clock.now();
-  const clear = encodeSegment(segment);
+  // A body larger than one object goes out of line (stream-sync `log.ts`).
+  const outOfLine = await putBodiesOutOfLine(
+    held,
+    scope,
+    segment.operations,
+    target,
+  );
+  const clear = encodeSegment({ ...segment, operations: outOfLine.ops });
   const { dataHash, blobName } = await digestSegment(
     keccakOf(held.streamCrypto),
     clear,
@@ -816,7 +827,7 @@ async function snapshotRound(
       base,
       refs,
       snapshot,
-      snapshotParts: compaction?.parts ?? [],
+      objects: [...(compaction?.objects ?? []), ...outOfLine.pieces],
       position,
       generation: connection.generation,
       dataHash,
