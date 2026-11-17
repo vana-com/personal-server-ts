@@ -205,6 +205,43 @@ describe("a stream declared and never published", () => {
 });
 
 /**
+ * A device that never held the connector's manifest can delete the connection.
+ * Delete planning reads the registry's control rows and nothing else, so it
+ * needs no list of streams from the host.
+ */
+describe("a connection deleted from a device that never held it", () => {
+  it("lands the fence for a connection that never published, and refuses the creator's later run", async () => {
+    const w = await world({ streams: 2 });
+    const a = await w.device("a");
+    const b = await w.device("b");
+    // A connects and its first run covers nothing: no log row, no stream row.
+    await a.run("run-a", [], { covered: [] });
+    await a.cycle();
+    expect([...w.gateway.versions.keys()]).toEqual([CONTROL]);
+
+    // B has applied nothing: no connection, no stream row, no manifest.
+    expect(await b.db.query("SELECT 1 FROM connections")).toEqual([]);
+    const request = await b.sync.deleter.requestConnectionDelete(CONNECTOR);
+    expect(request.fenced).toBe(true);
+    expect(await b.sync.deleter.resumeDeletes()).toEqual([]);
+
+    // The control tombstone is the only registry write.
+    expect([...w.gateway.versions.keys()]).toEqual([CONTROL]);
+    expect(w.gateway.versions.get(CONTROL)).toHaveLength(2);
+
+    // A has not applied the delete. Its next run is refused at admission.
+    await expect(
+      a.run("run-a2", [{ stream: NEVER_PUBLISHED, id: "late" }]),
+    ).rejects.toMatchObject({ message: "connection_stopped" });
+    await a.cycle();
+    expect(await a.records()).toEqual([]);
+    expect(await b.records()).toEqual([]);
+    expect([...w.gateway.versions.keys()]).toEqual([CONTROL]);
+    expect(w.gateway.versions.get(CONTROL)).toHaveLength(2);
+  });
+});
+
+/**
  * What a second device lacks. The writing device keeps a `stream_state` row for
  * every stream its manifest declares; a replica gets one only from a segment
  * that touched the stream, and a segment is written for a stream a run covers.
