@@ -289,7 +289,9 @@ export function createLocalSync(
     declarations: {
       streamsOf: async (connector) =>
         // A stream whose delete floor reaches its head is `tombstoned` for
-        // reads (read-selection.ts); one with no head yet is mid first load.
+        // reads (read-selection.ts), unless a load of a newer head of this
+        // generation has applied parts (`partialReadable`). One with no head
+        // yet and no floor is mid first load.
         (
           await readerOf(deps.db).query<{ stream: string }>(
             `SELECT DISTINCT s.stream FROM stream_state s
@@ -297,7 +299,12 @@ export function createLocalSync(
               WHERE c.connector = ? AND c.control_state = 'active'
                 AND c.deleted_at IS NULL
                 AND (s.last_delete_version = 0
-                     OR s.head_version > s.last_delete_version)
+                     OR s.head_version > s.last_delete_version
+                     OR EXISTS (SELECT 1 FROM stream_partial p
+                                 WHERE p.connection_id = s.connection_id
+                                   AND p.stream = s.stream
+                                   AND p.generation = c.generation
+                                   AND p.version > s.last_delete_version))
               ORDER BY s.stream`,
             [connector],
           )

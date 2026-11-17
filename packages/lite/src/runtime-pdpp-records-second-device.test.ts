@@ -100,6 +100,52 @@ describe("the records route on a device that synced a connection", () => {
   // Applying a delete floors the connection's streams too, so these two
   // states reach the read only from a connection whose streams are not yet
   // floored (a delete in flight, a legacy import): its streams are not served.
+  // A load of a newer head after a delete keeps the delete floor until it
+  // completes; its applied parts are what a reader may show meanwhile.
+  describe("a stream reloading after its delete", () => {
+    const reloading = async (partial: {
+      version: number;
+      generation: number;
+    }) => {
+      const { local, remote, db } = await syncedStore(async (r) => {
+        await r.head("posts", POSTS);
+      });
+      const scope = (await remote.registry.listStreamRows(CONNECTOR))[0]!.scope;
+      remote.reads.set(scope, {
+        found: true,
+        version: 2,
+        dataHash: remote.hashes.tombstoneData,
+        metadataHash: remote.hashes.tombstoneMetadata,
+        deleted: true,
+      });
+      await local.apply();
+      expect(await local.declarations.streamsOf(CONNECTOR)).toEqual([]);
+      await db.batch([
+        {
+          sql: `INSERT INTO stream_partial (connection_id, stream, version,
+                  generation, data_hash, head_blob, observed_at, parts_applied,
+                  parts_total, records_total)
+                VALUES ('pdpp.${CONNECTOR}~', 'posts', ?, ?, '0x00', 'blob', 1, 1, 3, 3)`,
+          params: [partial.version, partial.generation],
+        },
+      ]);
+      return local;
+    };
+
+    it("is named once parts of a newer head of the connection's generation are applied", async () => {
+      const local = await reloading({ version: 3, generation: 1 });
+      expect(await local.declarations.streamsOf(CONNECTOR)).toEqual(["posts"]);
+    });
+
+    it.each([
+      ["a head no newer than the delete", { version: 2, generation: 1 }],
+      ["another generation of the connection", { version: 3, generation: 2 }],
+    ])("is not named for parts of %s", async (_name, partial) => {
+      const local = await reloading(partial);
+      expect(await local.declarations.streamsOf(CONNECTOR)).toEqual([]);
+    });
+  });
+
   it.each([
     ["control state is not active", "control_state = 'deleted'"],
     ["row is marked deleted", "deleted_at = 1"],
