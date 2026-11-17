@@ -1,3 +1,4 @@
+import { encodeBase64Url, decodeBase64Url } from "../../encoding/base64url.js";
 import {
   createCipheriv,
   createDecipheriv,
@@ -97,7 +98,7 @@ function sealCursor(
   ]);
   return (
     prefix +
-    Buffer.concat([iv, cipher.getAuthTag(), encrypted]).toString("base64url")
+    encodeBase64Url(Buffer.concat([iv, cipher.getAuthTag(), encrypted]))
   );
 }
 
@@ -113,8 +114,8 @@ function openCursor(
     const encoded = token.slice(prefix.length);
     if (!/^[A-Za-z0-9_-]+$/.test(encoded))
       throw new DeclarationWitnessCursorError();
-    const bytes = Buffer.from(encoded, "base64url");
-    if (bytes.length <= 28 || bytes.toString("base64url") !== encoded) {
+    const bytes = Buffer.from(decodeBase64Url(encoded));
+    if (bytes.length <= 28 || encodeBase64Url(bytes) !== encoded) {
       throw new DeclarationWitnessCursorError();
     }
     const decipher = createDecipheriv(
