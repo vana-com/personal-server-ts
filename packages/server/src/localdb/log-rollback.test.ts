@@ -199,7 +199,8 @@ describe("log rebase: a deterministic convergence trace", () => {
 
     // a repairs; its commit lands but the reply is lost.
     w.gateway.dropNextBatchReply = true;
-    await a.sync.cycle();
+    const lost = await a.sync.cycle();
+    expect(lost.connections.map((x) => x.error)).toEqual([null]);
     expect(w.gateway.dropNextBatchReply).toBe(false);
     const afterLost = w.gateway.rowsOf(LOG);
     expect(afterLost).toBeGreaterThan(1);
@@ -217,9 +218,10 @@ describe("log rebase: a deterministic convergence trace", () => {
       });
       await c.sync.cycle();
     };
-    await b.sync.cycle();
+    const repair = await b.sync.cycle();
     w.gateway.beforeBatch = undefined;
     expect(diverged).toBe(true);
+    expect(repair.connections.map((x) => x.error)).toEqual([null]);
 
     // Quiet: nobody collects. Cycle every device until the registry stops
     // moving and the devices agree, within a bound.
