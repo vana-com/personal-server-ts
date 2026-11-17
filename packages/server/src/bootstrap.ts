@@ -206,6 +206,13 @@ export interface ServerContext {
   setLocalApprovalOrigin: (origin?: string) => void;
   devToken?: string;
   startBackgroundServices: () => Promise<void>;
+  /**
+   * Stops background work and releases the stores and the outbound pool. The
+   * caller first stops accepting requests and lets those in flight finish
+   * (`runShutdown`, which exits instead if they overrun). The outbound pool
+   * then closes last, and gives a background request still in flight a grace
+   * time to finish.
+   */
   cleanup: () => Promise<void>;
   /** This boot's replication door, decided before any record store opened. */
   replicationStatus: ReplicationDoorStatus;
@@ -424,8 +431,11 @@ async function bootstrapServer(
   const logger = createLogger(config.logging);
   const startedAt = new Date();
   const isEnclave = options?.profile === "enclave";
-  const outboundFetch =
-    options?.outboundFetch ?? (isEnclave ? undefined : createKeepAliveFetch());
+  // The host's own pool, closed at cleanup. An injected fetch belongs to its
+  // caller.
+  const keepAlive =
+    options?.outboundFetch || isEnclave ? undefined : createKeepAliveFetch();
+  const outboundFetch = options?.outboundFetch ?? keepAlive?.fetch;
   if (isEnclave && process.env.VANA_OWNER_PRIVATE_KEY) {
     throw new Error("VANA_OWNER_PRIVATE_KEY is forbidden in enclave profile");
   }
@@ -1855,6 +1865,11 @@ async function bootstrapServer(
         indexManager.close();
       }
     });
+    // Last: the stops above send through it until they have settled. A
+    // background request still in flight (a sync or replication step) gets the
+    // pool's grace time to finish. An inbound request is not covered here:
+    // `runShutdown` has already drained inbound requests or exited.
+    await attempt(() => keepAlive?.close());
     if (errors.length > 0) throw errors[0];
   };
 
