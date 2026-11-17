@@ -20,6 +20,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./client": {
+      "types": "./dist/personal-server-client.d.ts",
+      "import": "./dist/personal-server-client.js"
+    },
     "./additions-worker": "./dist/additions-worker.bundle.js",
     "./history-probe-worker": {
       "types": "./dist/history-probe.worker.d.ts",

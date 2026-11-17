@@ -1,0 +1,349 @@
+{
+  "format": 1,
+  "routes": [
+    {
+      "path": "/.well-known/oauth-authorization-server",
+      "hosts": ["lite", "server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/.well-known/oauth-authorization-server/pdpp/v1",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/.well-known/oauth-protected-resource",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/.well-known/oauth-protected-resource/mcp",
+      "hosts": ["lite", "server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/auth/device",
+      "hosts": ["lite", "server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/auth/device/approve",
+      "hosts": ["lite", "server"],
+      "methods": ["GET", "POST"]
+    },
+    {
+      "path": "/auth/device/poll",
+      "hosts": ["lite", "server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/auth/device/token",
+      "hosts": ["lite", "server"],
+      "methods": ["DELETE", "POST"]
+    },
+    {
+      "path": "/enclave/v1/fleet",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/enclave/v1/fleet/readiness",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/enclave/v1/jobs",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/enclave/v1/jobs/execute",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/enclave/v1/mcp",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/health",
+      "hosts": ["lite", "server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/mcp",
+      "hosts": ["lite", "server"],
+      "methods": ["ALL"]
+    },
+    {
+      "path": "/mcp/oauth/authorize",
+      "hosts": ["lite", "server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/mcp/oauth/register",
+      "hosts": ["lite", "server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/mcp/oauth/token",
+      "hosts": ["lite", "server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/mcp/scope-request/open",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/mcp/session",
+      "hosts": ["lite", "server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/oauth/token",
+      "hosts": ["lite", "server"],
+      "methods": ["ALL"]
+    },
+    {
+      "path": "/pdpp",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/pdpp/capabilities",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/pdpp/connections",
+      "hosts": ["server"],
+      "methods": ["DELETE", "GET", "PUT"]
+    },
+    {
+      "path": "/pdpp/declarations",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/pdpp/instances",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/pdpp/v1",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/pdpp/v1/.well-known/oauth-authorization-server",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/pdpp/v1/authorize",
+      "hosts": ["server"],
+      "methods": ["GET", "POST"]
+    },
+    {
+      "path": "/pdpp/v1/grants",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/pdpp/v1/introspect",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/pdpp/v1/owner/token",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/pdpp/v1/revoke",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/pdpp/v1/token",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/ui",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/ui/api",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/ui/api/bootstrap",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/ui/api/config",
+      "hosts": ["lite", "server"],
+      "methods": ["ALL"]
+    },
+    {
+      "path": "/ui/api/registration",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/ui/api/registration/server",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/ui/api/rpc/files",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/v1/access-logs",
+      "hosts": ["lite", "server"],
+      "methods": ["ALL"]
+    },
+    {
+      "path": "/v1/account-mode",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/v1/account-mode/evidence",
+      "hosts": ["lite", "server"],
+      "methods": ["ALL", "POST"]
+    },
+    {
+      "path": "/v1/blobs",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/v1/blobs/ingest",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/v1/data",
+      "hosts": ["lite", "server"],
+      "methods": ["ALL", "DELETE", "GET", "POST", "PUT"]
+    },
+    {
+      "path": "/v1/derivatives",
+      "hosts": ["lite", "server"],
+      "methods": ["ALL"]
+    },
+    {
+      "path": "/v1/diagnostics",
+      "hosts": ["lite"]
+    },
+    {
+      "path": "/v1/grants",
+      "hosts": ["lite", "server"],
+      "methods": ["ALL", "DELETE"]
+    },
+    {
+      "path": "/v1/import/oura-browser",
+      "hosts": ["lite", "server"],
+      "methods": ["ALL"]
+    },
+    {
+      "path": "/v1/import/oura-browser/requirements",
+      "hosts": ["lite", "server"],
+      "methods": ["ALL"]
+    },
+    {
+      "path": "/v1/mcp/activity",
+      "hosts": ["lite", "server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/v1/mcp/connections",
+      "hosts": ["lite", "server"],
+      "methods": ["DELETE", "GET", "POST", "PUT"]
+    },
+    {
+      "path": "/v1/mcp/oauth/authorizations",
+      "hosts": ["lite", "server"],
+      "methods": ["GET", "POST"]
+    },
+    {
+      "path": "/v1/owner/connectors",
+      "hosts": ["server"],
+      "methods": ["ALL", "DELETE"]
+    },
+    {
+      "path": "/v1/records/completions",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/v1/replication/status",
+      "hosts": ["lite"]
+    },
+    {
+      "path": "/v1/replication/sync",
+      "hosts": ["lite"]
+    },
+    {
+      "path": "/v1/stream-sync",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/v1/stream-sync/read-status",
+      "hosts": ["lite", "server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/v1/stream-sync/runs",
+      "hosts": ["server"],
+      "methods": ["POST", "PUT"]
+    },
+    {
+      "path": "/v1/stream-sync/seed",
+      "hosts": ["server"],
+      "methods": ["GET", "PUT"]
+    },
+    {
+      "path": "/v1/streams",
+      "hosts": ["server"],
+      "methods": ["DELETE", "GET", "POST"]
+    },
+    {
+      "path": "/v1/sync",
+      "hosts": ["lite", "server"],
+      "methods": ["ALL"]
+    },
+    {
+      "path": "/v1/sync/events",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/v1/sync/file",
+      "hosts": ["lite", "server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/v1/sync/status",
+      "hosts": ["lite", "server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/v1/sync/trigger",
+      "hosts": ["lite", "server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/v1/write",
+      "hosts": ["server"]
+    },
+    {
+      "path": "/v1/write/session",
+      "hosts": ["lite", "server"],
+      "methods": ["POST"]
+    }
+  ]
+}

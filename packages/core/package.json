@@ -23,6 +23,7 @@
   ],
   "exports": {
     "./host-contract.json": "./contracts/host-contract.json",
+    "./routes.json": "./contracts/routes.json",
     "./replace-conformance.json": "./contracts/replace-conformance.json",
     "./scope-delete-receipt.json": "./contracts/scope-delete-receipt.json",
     "./config": {
