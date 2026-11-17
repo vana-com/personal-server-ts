@@ -52,6 +52,62 @@ it("starts the head GET from the owner's listing without another registry read",
   expect(await here.rows()).toEqual(await peer.rows());
 });
 
+it("reuses one owner listing for two connections", async () => {
+  const w = await world({ streams: 1 });
+  const peer = await w.device("peer");
+  await peer.run("first", [{ stream: sName(0), id: "first" }]);
+  await peer.run("second", [{ stream: sName(0), id: "second" }], {
+    connector: "second-connector",
+  });
+  await peer.cycle();
+
+  const arrivals: string[] = [];
+  let notify!: () => void;
+  let arrived = new Promise<void>((resolve) => {
+    notify = resolve;
+  });
+  const releases: (() => void)[] = [];
+  const here = await w.device("here", {
+    beforeGet: async (key) => {
+      arrivals.push(key);
+      const held = new Promise<void>((resolve) => {
+        releases.push(resolve);
+      });
+      notify();
+      await held;
+    },
+  });
+  const events: string[] = [];
+  const list = here.deps.registry.listOwnerRows.bind(here.deps.registry);
+  here.deps.registry.listOwnerRows = async () => {
+    const rows = await list();
+    events.push("listed");
+    return rows;
+  };
+  const read = here.deps.registry.read.bind(here.deps.registry);
+  here.deps.registry.read = async (scope) => {
+    events.push(`read:${scope}`);
+    return read(scope);
+  };
+  const pull = here.sync.apply();
+  try {
+    await arrived;
+    expect(events).toEqual(["listed"]);
+    arrived = new Promise<void>((resolve) => {
+      notify = resolve;
+    });
+    releases[0]!();
+    await arrived;
+    expect(arrivals).toHaveLength(2);
+    expect(events).toEqual(["listed"]);
+  } finally {
+    for (const release of releases) release();
+    await pull;
+  }
+  expect(await here.rows()).toEqual(await peer.rows());
+  expect(await here.rows()).toHaveLength(2);
+});
+
 it("a listed active control cannot revive a deletion already observed locally", async () => {
   const w = await world({ streams: 1 });
   const peer = await w.device("peer");
