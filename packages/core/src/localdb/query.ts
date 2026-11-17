@@ -176,10 +176,14 @@ export function createRecordQuery(db: SqlReader): RecordQuery {
     },
 
     async getRecord({ connectionId, stream, recordKey }) {
+      // `+pk_hash`: no index may supply this order. Otherwise the planner
+      // walks the whole stream in key order to stop at the first match,
+      // rather than finding the few rows of the record key in
+      // `records_by_key` and sorting them.
       const rows = await db.query<RecordRow>(
         `SELECT ${RECORD_COLUMNS} FROM records
          WHERE connection_id = ? AND stream = ? AND record_key = ?
-         ORDER BY pk_hash LIMIT 1`,
+         ORDER BY +pk_hash LIMIT 1`,
         [connectionId, stream, recordKey],
       );
       return rows[0] ? stored(rows[0]) : null;

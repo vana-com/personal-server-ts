@@ -917,9 +917,17 @@ describe("view changes", () => {
         .flat()
         .flatMap((sql) => /^CREATE TRIGGER (\w+)/.exec(sql)?.[1] ?? [])
         .map((trigger) => ({ sql: `DROP TRIGGER IF EXISTS ${trigger}` })),
+      // A table built under another name and renamed onto one that stays
+      // (the rowid `records`) has no table of its own to drop.
       ...MIGRATIONS.slice(viewMigration + 1)
         .flat()
         .flatMap((sql) => /^CREATE TABLE (\w+)/.exec(sql)?.[1] ?? [])
+        .filter(
+          (table) =>
+            !MIGRATIONS.flat().some((sql) =>
+              sql.startsWith(`ALTER TABLE ${table} RENAME TO `),
+            ),
+        )
         .map((table) => ({ sql: `DROP TABLE ${table}` })),
       // Publish while collecting adds columns after the view counters too.
       { sql: "ALTER TABLE runs DROP COLUMN admitting" },
