@@ -28,6 +28,7 @@ import {
   createGatewayStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
 } from "../../../../core/src/stream-sync/index.js";
+import { endRequest } from "../../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "../better-sqlite3-driver.js";
 import { createFakeGateway } from "../fake-gateway.js";
 import { createStreamSyncKeyPorts } from "../../../../core/src/stream-sync/crypto.js";
@@ -283,12 +284,14 @@ mkdirSync(DIR, { recursive: true });
         });
       await sync.intake.batch(runId, { batch: b++, records });
     }
-    await sync.intake.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: [STREAM],
-      lastBatch: b - 1,
-      ...(RUNS === 1 ? { provenFullStreams: [STREAM] } : {}),
-    });
+    await sync.intake.end(
+      runId,
+      endRequest({
+        lastBatch: b - 1,
+        live: [STREAM],
+        ...(RUNS === 1 ? { provenFullStreams: [STREAM] } : {}),
+      }),
+    );
     const tb = performance.now();
     const report = await sync.cycle();
     const err = report.connections.find((c) => c.error !== null);

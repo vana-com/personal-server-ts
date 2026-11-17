@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { IDBFactory } from "fake-indexeddb";
 import { afterEach, expect, it, vi } from "vitest";
+import { endRequest } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { privateKeyToAccount } from "viem/accounts";
 import { signOwnerMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import {
@@ -186,12 +187,10 @@ it("skips a late seed once a real collection owns the stream", async () => {
     batch: 0,
     records: [{ stream: "items", data: { id: "a", value: "new" } }],
   });
-  await intake.end("real-run", {
-    outcome: "succeeded",
-    coveredStreams: ["items"],
-    provenFullStreams: ["items"],
-    lastBatch: 0,
-  });
+  await intake.end(
+    "real-run",
+    endRequest({ lastBatch: 0, live: ["items"], provenFullStreams: ["items"] }),
+  );
   await context.runtime.streamSyncSeed!.put(
     "fixture-source",
     "items",

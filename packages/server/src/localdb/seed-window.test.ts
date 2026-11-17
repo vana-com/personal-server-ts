@@ -20,6 +20,7 @@ import {
 } from "../../../core/src/stream-sync/index.js";
 import { createSeedStaging } from "../../../core/src/stream-sync/seed-staging.js";
 import { createFsStreamSyncFiles } from "../stream-sync/fs-files.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 // A stream's one-time seed window closes at its first real write. These tests
@@ -124,12 +125,19 @@ async function openDevice(
           data: { id: key },
         })),
       });
-      await sync.intake.end(id, {
-        outcome: "succeeded",
-        coveredStreams: [stream],
-        lastBatch: 0,
-        ...(options.remove ? {} : { provenFullStreams: [stream] }),
-      });
+      await sync.intake.end(
+        id,
+        endRequest({
+          lastBatch: 0,
+          streams: [stream],
+          ...(rows.length === 0
+            ? {}
+            : options.remove
+              ? { deleted: [stream] }
+              : { live: [stream] }),
+          ...(options.remove ? {} : { provenFullStreams: [stream] }),
+        }),
+      );
     },
     async publish() {
       expect(
@@ -491,7 +499,8 @@ it("a fresh device that only applied a remote head refuses a seed for that strea
 it("an accepted run that declared a stream but wrote nothing to it closes the window until a real write", async () => {
   const w = await world();
   const a = await w.device("a");
-  // Accepted with no rows and no coverage for "items".
+  // Accepted with no rows and no coverage for "items": the connector asked
+  // to be retried before it wrote anything.
   await a.sync.intake.begin("empty", {
     connector: "fixture",
     artifactDigest: "fixture",
@@ -500,11 +509,12 @@ it("an accepted run that declared a stream but wrote nothing to it closes the wi
     owner: { address: owner, leaseId: null },
   });
   await a.sync.intake.batch("empty", { batch: 0, records: [] });
-  await a.sync.intake.end("empty", {
-    outcome: "succeeded",
-    coveredStreams: [],
-    lastBatch: 0,
-  });
+  expect(
+    await a.sync.intake.end(
+      "empty",
+      endRequest({ lastBatch: 0, streams: ["items"], retry: true }),
+    ),
+  ).toMatchObject({ outcome: "retry_pending", coveredStreams: [] });
   await a.publish();
   expect(await a.keys()).toEqual([]);
   expect(await a.seed("install-1", ["A"])).toEqual(refused);

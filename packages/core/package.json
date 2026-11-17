@@ -25,6 +25,8 @@
     "./host-contract.json": "./contracts/host-contract.json",
     "./routes.json": "./contracts/routes.json",
     "./replace-conformance.json": "./contracts/replace-conformance.json",
+    "./run-finish-plan.json": "./contracts/run-finish-plan.json",
+    "./run-saved.json": "./contracts/run-saved.json",
     "./scope-delete-receipt.json": "./contracts/scope-delete-receipt.json",
     "./config": {
       "types": "./dist/config/index.d.ts",

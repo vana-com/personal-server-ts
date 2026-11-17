@@ -18,6 +18,7 @@ import {
   MemoryStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
 } from "../../../core/src/stream-sync/index.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"11".repeat(20)}` as const;
@@ -146,11 +147,7 @@ async function world(
       stream: "items",
       data: { id, text: `${id}:${tag}`.padEnd(pad, "x") },
     }));
-  const end = {
-    outcome: "succeeded" as const,
-    coveredStreams: ["items"],
-    lastBatch: 0,
-  };
+  const end = endRequest({ lastBatch: 0, live: ["items"] });
   const load = async (
     runId: string,
     ids: string[],
@@ -382,11 +379,7 @@ it("records the stored size on insert, on a body change and on a restamp", async
       { stream: "items", data: { id: "b", text: "plain" } },
     ],
   });
-  await w.sync.intake.end("r1", {
-    outcome: "succeeded",
-    coveredStreams: ["items"],
-    lastBatch: 0,
-  });
+  await w.sync.intake.end("r1", endRequest({ lastBatch: 0, live: ["items"] }));
   const inserted = await sizes(w);
   expect(inserted.map((r) => r.k)).toEqual(["a", "b"]);
   for (const row of inserted) expect(row.stored).toBe(row.real);
@@ -464,11 +457,10 @@ for (const mode of ["null", "mixed"] as const) {
         owner: { address: owner, leaseId: null },
       });
       await w.sync.intake.batch("utf8", { batch: 0, records });
-      await w.sync.intake.end("utf8", {
-        outcome: "succeeded",
-        coveredStreams: ["items"],
-        lastBatch: 0,
-      });
+      await w.sync.intake.end(
+        "utf8",
+        endRequest({ lastBatch: 0, live: ["items"] }),
+      );
       expect(await sizes(w)).toHaveLength(2051);
     }
     await fallback.db.query(

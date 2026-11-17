@@ -32,6 +32,7 @@ import { createImportLedger } from "../../../core/src/localdb/import-ledger.js";
 import { MIGRATIONS } from "../../../core/src/localdb/schema.js";
 import { unwriteRefusedRun } from "../../../core/src/localdb/unwrite.js";
 import type { ImportSource } from "../../../core/src/localdb/legacy-import-types.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const OWNER = `0x${"11".repeat(20)}` as const;
@@ -149,11 +150,7 @@ async function collect(
       data: { id: `${stream}-${row}`, version },
     })),
   });
-  await sync.intake.end(runId, {
-    outcome: "succeeded",
-    coveredStreams: streams,
-    lastBatch: 0,
-  });
+  await sync.intake.end(runId, endRequest({ lastBatch: 0, live: streams }));
 }
 
 function shared(): Shared {

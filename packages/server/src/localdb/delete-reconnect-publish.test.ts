@@ -57,6 +57,7 @@ import {
 } from "../../../core/src/stream-sync/delete-metadata.js";
 import { remoteFixture } from "./apply-fixture.js";
 import { postStreamDeleteOnly } from "./legacy-delete-fixture.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}`;
@@ -211,12 +212,15 @@ async function collect(
     batch: 0,
     records: ids.map((id) => ({ stream, data: { [key]: id } })),
   });
-  await createRunEndStore(device.deps).end(runId, {
-    outcome: "succeeded",
-    coveredStreams: [stream],
-    lastBatch: 0,
-    provenFullStreams: [stream],
-  });
+  await createRunEndStore(device.deps).end(
+    runId,
+    endRequest({
+      lastBatch: 0,
+      streams: [stream],
+      live: ids.length > 0 ? [stream] : [],
+      provenFullStreams: [stream],
+    }),
+  );
   return { runId, mode: begun.start.collection_mode };
 }
 
@@ -1009,12 +1013,10 @@ it.each([false, true])(
         batch: 0,
         records: names.map((stream) => ({ stream, data: { id: runId } })),
       });
-      await createRunEndStore(w.a.deps).end(runId, {
-        outcome: "succeeded",
-        coveredStreams: names,
-        lastBatch: 0,
-        provenFullStreams: names,
-      });
+      await createRunEndStore(w.a.deps).end(
+        runId,
+        endRequest({ lastBatch: 0, live: names, provenFullStreams: names }),
+      );
     };
     await begin("before-delete");
     const deleter = createConnectionDeleter(w.a.deps, {

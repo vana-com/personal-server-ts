@@ -2,6 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { endRequest } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { privateKeyToAccount } from "viem/accounts";
 import { signOwnerMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import {
@@ -178,12 +179,11 @@ describe("Lite save and delete cycle", () => {
       batch: 0,
       records: [{ stream: "items", data: { id: "rec-1", value: 1 } }],
     });
-    const end = {
-      outcome: "succeeded" as const,
-      coveredStreams: ["items"],
-      provenFullStreams: ["items"],
+    const end = endRequest({
       lastBatch: 0,
-    };
+      live: ["items"],
+      provenFullStreams: ["items"],
+    });
     const receipt = await intake.end("run-save", end);
     await lite.syncManager.trigger();
 
@@ -212,11 +212,10 @@ describe("Lite save and delete cycle", () => {
         ],
       }),
     ).toMatchObject({ accepted: 1 });
-    await next.end("run-delete", {
-      outcome: "succeeded",
-      coveredStreams: ["items"],
-      lastBatch: 0,
-    });
+    await next.end(
+      "run-delete",
+      endRequest({ lastBatch: 0, deleted: ["items"] }),
+    );
     await lite.syncManager.trigger();
     expect(await readerKeys()).toEqual([]);
 
@@ -235,12 +234,14 @@ describe("Lite save and delete cycle", () => {
       batch: 0,
       records: [{ stream: "items", data: { id: "rec-1", value: 1 } }],
     });
-    await intake.end("run-save", {
-      outcome: "succeeded",
-      coveredStreams: ["items"],
-      provenFullStreams: ["items"],
-      lastBatch: 0,
-    });
+    await intake.end(
+      "run-save",
+      endRequest({
+        lastBatch: 0,
+        live: ["items"],
+        provenFullStreams: ["items"],
+      }),
+    );
     const owner = account.address;
     const other = `0x${"2".repeat(40)}` as const;
     const authority = createModeAuthority({
