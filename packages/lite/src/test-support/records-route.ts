@@ -23,7 +23,7 @@ import {
   createMemoryPsLiteTokenStore,
 } from "./memory.js";
 import { openBetterSqlite3 } from "../../../server/src/localdb/better-sqlite3-driver.js";
-import { remoteFixture } from "../../../server/src/localdb/apply-fixture.js";
+import { remoteFixture } from "../../../server/src/localdb/apply-fixture.test-utils.js";
 import { createServerLocalSync } from "../../../server/src/localdb/sync.js";
 
 export const ORIGIN = "https://ps-lite.local";

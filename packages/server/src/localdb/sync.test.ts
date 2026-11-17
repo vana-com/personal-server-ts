@@ -9,7 +9,7 @@ import { createStreamSyncIntake } from "../../../core/src/stream-sync/intake.js"
 import { createLocalSync } from "../../../core/src/localdb/sync.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
-import { remoteFixture } from "./apply-fixture.js";
+import { remoteFixture } from "./apply-fixture.test-utils.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 

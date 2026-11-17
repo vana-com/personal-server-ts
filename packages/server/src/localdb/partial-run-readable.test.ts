@@ -9,7 +9,7 @@ import { createMemoryModeRecordStore } from "@opendatalabs/personal-server-ts-co
 import { createStreamSyncKeyPorts } from "../../../core/src/stream-sync/crypto.js";
 import { createServer, type ServerContext } from "../bootstrap.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
-import { remoteFixture } from "./apply-fixture.js";
+import { remoteFixture } from "./apply-fixture.test-utils.js";
 
 const contexts: ServerContext[] = [];
 const directories: string[] = [];
