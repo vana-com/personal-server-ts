@@ -257,9 +257,10 @@ export type RegistryChangeDelta =
  * deleted log row of a live connection, a row of a connection this device
  * does not hold, a removed row, a server change, a reset, a partial apply
  * standing on any connection), or the apply did not reach the delta's
- * position; nothing is settled and the caller runs a
- * cycle. `applied`: the device holds what the registry held at the delta's
- * `seq`, for everything a switched cycle reads.
+ * position, or the publisher left deferred work; nothing is settled and the
+ * caller runs a cycle. `applied`: the device has applied through the delta's
+ * `seq` and completed the cycle's publisher, including recovery work created
+ * by applying the log. Reaching the supplied version alone is insufficient.
  */
 export type DeltaApplyResult =
   | {

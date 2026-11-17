@@ -1,3 +1,4 @@
+import { encodeBase64Url } from "../encoding/base64url.js";
 /**
  * PKCE (RFC 7636) for the PDPP authorization-code flow.
  *
@@ -30,10 +31,12 @@ const VERIFIER_RE = /^[A-Za-z0-9\-._~]{43,128}$/;
 
 /**
  * base64url per RFC 7636 §appendix A: standard base64 with `+/` mapped to
- * `-_` and padding stripped. Node's `base64url` encoding already does this.
+ * `-_` and padding stripped. The shared codec applies these transformations.
  */
 export function computeS256Challenge(verifier: string): string {
-  return createHash("sha256").update(verifier, "ascii").digest("base64url");
+  return encodeBase64Url(
+    createHash("sha256").update(verifier, "ascii").digest(),
+  );
 }
 
 export type PkceFailureCode =

@@ -1,5 +1,5 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 126 and seed 7584654210961493050 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 2516636] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 32 and seed 4938955377685325096 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 3910190] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file RegistryDelta.tla
 Parsing file Naturals.tla
 Parsing file FiniteSets.tla
@@ -10,13 +10,13 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module RegistryDelta
-Starting... (2026-11-17 04:19:23)
+Starting... (2026-11-17 05:07:06)
 Implied-temporal checking--satisfiability problem has 1 branches.
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-11-17 04:19:23.
-Checking temporal properties for the current state space with 100611 total distinct states at (2026-11-17 04:19:26)
-Finished checking temporal properties in 00s at 2026-11-17 04:19:27
-Progress(12) at 2026-11-17 04:19:27: 783,966 states generated (783,966 s/min), 215,990 distinct states found (215,990 ds/min), 115,378 states left on queue.
+Finished computing initial states: 1 distinct state generated at 2026-11-17 05:07:06.
+Checking temporal properties for the current state space with 84850 total distinct states at (2026-11-17 05:07:09)
+Finished checking temporal properties in 00s at 2026-11-17 05:07:10
+Progress(12) at 2026-11-17 05:07:10: 680,107 states generated (680,107 s/min), 189,724 distinct states found (189,724 ds/min), 104,879 states left on queue.
 Error: Invariant NoSkip is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -38,8 +38,9 @@ State 1: <Initial predicate>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
+/\ debt = FALSE
 
-State 2: <Begin line 96, col 3 to line 101, col 60 of module RegistryDelta>
+State 2: <Begin line 97, col 3 to line 102, col 66 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "open", scope |-> "ctl", op |-> "tomb", seq |-> 0] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
 /\ chg = [ctl |-> 0, log |-> 0]
@@ -58,8 +59,9 @@ State 2: <Begin line 96, col 3 to line 101, col 60 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
+/\ debt = FALSE
 
-State 3: <Number line 106, col 3 to line 114, col 60 of module RegistryDelta>
+State 3: <Number line 107, col 3 to line 115, col 66 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "numbered", scope |-> "ctl", op |-> "tomb", seq |-> 1] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
 /\ chg = [ctl |-> 0, log |-> 0]
@@ -78,8 +80,9 @@ State 3: <Number line 106, col 3 to line 114, col 60 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
+/\ debt = FALSE
 
-State 4: <Commit line 117, col 3 to line 127, col 91 of module RegistryDelta>
+State 4: <Commit line 118, col 3 to line 128, col 97 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "idle", scope |-> "ctl", op |-> "tomb", seq |-> 1] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
 /\ chg = [ctl |-> 1, log |-> 0]
@@ -98,8 +101,9 @@ State 4: <Commit line 117, col 3 to line 127, col 91 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
+/\ debt = FALSE
 
-State 5: <Begin line 96, col 3 to line 101, col 60 of module RegistryDelta>
+State 5: <Begin line 97, col 3 to line 102, col 66 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "open", scope |-> "ctl", op |-> "act", seq |-> 0] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
 /\ chg = [ctl |-> 1, log |-> 0]
@@ -118,8 +122,9 @@ State 5: <Begin line 96, col 3 to line 101, col 60 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
+/\ debt = FALSE
 
-State 6: <Begin line 96, col 3 to line 101, col 60 of module RegistryDelta>
+State 6: <Begin line 97, col 3 to line 102, col 66 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "open", scope |-> "ctl", op |-> "act", seq |-> 0] @@
   w2 :> [phase |-> "open", scope |-> "log", op |-> "app", seq |-> 0] )
 /\ chg = [ctl |-> 1, log |-> 0]
@@ -138,8 +143,9 @@ State 6: <Begin line 96, col 3 to line 101, col 60 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
+/\ debt = FALSE
 
-State 7: <Number line 106, col 3 to line 114, col 60 of module RegistryDelta>
+State 7: <Number line 107, col 3 to line 115, col 66 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "open", scope |-> "ctl", op |-> "act", seq |-> 0] @@
   w2 :> [phase |-> "numbered", scope |-> "log", op |-> "app", seq |-> 2] )
 /\ chg = [ctl |-> 1, log |-> 0]
@@ -158,8 +164,9 @@ State 7: <Number line 106, col 3 to line 114, col 60 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
+/\ debt = FALSE
 
-State 8: <Commit line 117, col 3 to line 127, col 91 of module RegistryDelta>
+State 8: <Commit line 118, col 3 to line 128, col 97 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "open", scope |-> "ctl", op |-> "act", seq |-> 0] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 2] )
 /\ chg = [ctl |-> 1, log |-> 2]
@@ -178,8 +185,9 @@ State 8: <Commit line 117, col 3 to line 127, col 91 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
+/\ debt = FALSE
 
-State 9: <Number line 106, col 3 to line 114, col 60 of module RegistryDelta>
+State 9: <Number line 107, col 3 to line 115, col 66 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "numbered", scope |-> "ctl", op |-> "act", seq |-> 3] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 2] )
 /\ chg = [ctl |-> 1, log |-> 2]
@@ -198,8 +206,9 @@ State 9: <Number line 106, col 3 to line 114, col 60 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
+/\ debt = FALSE
 
-State 10: <Delta line 176, col 3 to line 190, col 90 of module RegistryDelta>
+State 10: <Delta line 177, col 3 to line 191, col 96 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "numbered", scope |-> "ctl", op |-> "act", seq |-> 3] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 2] )
 /\ chg = [ctl |-> 1, log |-> 2]
@@ -218,8 +227,9 @@ State 10: <Delta line 176, col 3 to line 190, col 90 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 1, log |-> 0], rkind |-> "tomb", handoff |-> FALSE]
 /\ since = 0
+/\ debt = FALSE
 
-State 11: <ApplyDelta line 195, col 3 to line 198, col 39 of module RegistryDelta>
+State 11: <ApplyDelta line 196, col 3 to line 200, col 39 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "numbered", scope |-> "ctl", op |-> "act", seq |-> 3] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 2] )
 /\ chg = [ctl |-> 1, log |-> 2]
@@ -238,8 +248,9 @@ State 11: <ApplyDelta line 195, col 3 to line 198, col 39 of module RegistryDelt
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 1, log |-> 0], rkind |-> "tomb", handoff |-> FALSE]
 /\ since = 0
+/\ debt = FALSE
 
-State 12: <Commit line 117, col 3 to line 127, col 91 of module RegistryDelta>
+State 12: <Commit line 118, col 3 to line 128, col 97 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "idle", scope |-> "ctl", op |-> "act", seq |-> 3] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 2] )
 /\ chg = [ctl |-> 3, log |-> 2]
@@ -258,8 +269,9 @@ State 12: <Commit line 117, col 3 to line 127, col 91 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 1, log |-> 0], rkind |-> "tomb", handoff |-> FALSE]
 /\ since = 0
+/\ debt = FALSE
 
-State 13: <SettleDelta line 201, col 3 to line 204, col 45 of module RegistryDelta>
+State 13: <SettleDelta line 203, col 3 to line 207, col 51 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "idle", scope |-> "ctl", op |-> "act", seq |-> 3] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 2] )
 /\ chg = [ctl |-> 3, log |-> 2]
@@ -278,8 +290,9 @@ State 13: <SettleDelta line 201, col 3 to line 204, col 45 of module RegistryDel
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 1, log |-> 0], rkind |-> "tomb", handoff |-> FALSE]
 /\ since = 2
+/\ debt = FALSE
 
-State 14: <Delta line 176, col 3 to line 190, col 90 of module RegistryDelta>
+State 14: <Delta line 177, col 3 to line 191, col 96 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "idle", scope |-> "ctl", op |-> "act", seq |-> 3] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 2] )
 /\ chg = [ctl |-> 3, log |-> 2]
@@ -298,8 +311,9 @@ State 14: <Delta line 176, col 3 to line 190, col 90 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 2, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 2
+/\ debt = FALSE
 
-State 15: <ApplyDelta line 195, col 3 to line 198, col 39 of module RegistryDelta>
+State 15: <ApplyDelta line 196, col 3 to line 200, col 39 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "idle", scope |-> "ctl", op |-> "act", seq |-> 3] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 2] )
 /\ chg = [ctl |-> 3, log |-> 2]
@@ -318,9 +332,10 @@ State 15: <ApplyDelta line 195, col 3 to line 198, col 39 of module RegistryDelt
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 2, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 2
+/\ debt = FALSE
 
-4005537 states generated, 1352897 distinct states found, 593030 states left on queue.
+3835807 states generated, 1166616 distinct states found, 529456 states left on queue.
 The depth of the complete state graph search is 15.
-The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 12 and the 95th percentile is 4).
-Finished in 15s at (2026-11-17 04:19:39)
+The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 13 and the 95th percentile is 5).
+Finished in 13s at (2026-11-17 05:07:20)
 exit 12

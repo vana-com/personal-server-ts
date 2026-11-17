@@ -4,6 +4,11 @@
 // driver run against it. Signatures are not checked.
 import { computeDataPointId } from "@opendatalabs/personal-server-ts-core/sync";
 
+import {
+  countFencedLogScopes,
+  fencingLogScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
+
 type Version = { dataHash: string; metadataHash: string };
 
 type BatchRow = {
@@ -85,19 +90,10 @@ export interface FakeGatewayOptions {
    * (it is no committed log write). Every write the registry would apply is
    * fenced, an append and a refresh of a pending row alike; a replay and a
    * sequence conflict are answered as before. The
-   * scope grammar below is the registry's own, written out here and not taken
-   * from the client's parser, so a drift between the two shows in a test.
+   * scope grammar is the registry's own, shared with the client's lock-budget
+   * counting rather than the more permissive legacy read parser.
    */
   readonly connectionLogFence?: boolean;
-}
-
-// `pdpp.<connector>~[<16 hex>].<stream>`, as the registry reads it.
-const STREAM_ROW_SCOPE = /^pdpp\.([^.~]+)~([0-9a-f]{16})?\.(.+)$/;
-/** The log row scope that fences a write to `scope`; null when none does. */
-function fencingLogScope(scope: string): string | null {
-  const match = STREAM_ROW_SCOPE.exec(scope);
-  if (!match || match[3] === "~log") return null;
-  return `pdpp.${match[1]}~${match[2] ?? ""}.~log`;
 }
 
 export function createFakeGateway(options: FakeGatewayOptions) {
@@ -328,20 +324,14 @@ export function createFakeGateway(options: FakeGatewayOptions) {
       }
       const lockedScopes = options.policy?.lockedScopes;
       if (lockedScopes !== undefined) {
-        const written = new Set<string>(
-          body.rows.map((row: BatchRow) => row.scope),
+        const fences = countFencedLogScopes(
+          body.rows as BatchRow[],
+          options.isTombstone,
         );
-        const fences = new Set<string>();
-        for (const row of body.rows as BatchRow[]) {
-          const log = fencingLogScope(row.scope);
-          if (log !== null && !written.has(log) && !options.isTombstone(row)) {
-            fences.add(log);
-          }
-        }
-        if (fences.size > 0 && body.rows.length + fences.size > lockedScopes) {
+        if (fences > 0 && body.rows.length + fences > lockedScopes) {
           return json(422, {
             success: false,
-            error: `rows plus the connection log rows they fence lock ${body.rows.length + fences.size} scopes; the limit is ${lockedScopes}`,
+            error: `rows plus the connection log rows they fence lock ${body.rows.length + fences} scopes; the limit is ${lockedScopes}`,
           });
         }
       }

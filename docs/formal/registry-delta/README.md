@@ -1,6 +1,6 @@
 # Registry change delta: TLC model
 
-`RegistryDelta.tla` models the gateway's change feed with deltas. Writers commit registry rows for one owner. A reader holds a cursor and asks for every row that changed after it. The model checks that a reader that applies those answers never skips a committed change, and that a reset is always followed by a full listing. Delta receipt, persistence, and cursor settlement are separate actions. The reader admits no second answer while persistence or settlement is unfinished.
+`RegistryDelta.tla` models the gateway's change feed with deltas. Writers commit registry rows for one owner. A reader holds a cursor and asks for every row that changed after it. The model checks that a reader that applies those answers never skips a committed change, and that a reset is always followed by a full listing. Delta receipt, persistence, publishing, and cursor settlement are separate actions. The reader admits no second answer while persistence or settlement is unfinished.
 
 The gateway side it models (data-gateway, migration `0070_registry_change_rows.sql`):
 
@@ -25,7 +25,17 @@ Ordinary answers at or below the applied position are discarded. An older observ
 
 Across connections, the applier awaits every operation even when one fails. Successful siblings stay persisted; a failure runs the fallback cycle only after all siblings finish. Real SQLite tests cover two connections with one failed and one blocked operation. The model still has only one connection and does not enumerate partial multi-connection failures or delayed network answers; those are host-test obligations.
 
-`node docs/formal/registry-delta/mutations.mjs` runs four executable mutations, restoring each source before exit: advertise an unreadable reset as applied, settle a reset before the fallback promise completes, let an older answer regress the observed position, and return on the first failed connection. Each mutation must fail its named assertion. The overlap test also holds an older apply open while a newer answer arrives.
+`node docs/formal/registry-delta/mutations.mjs` runs five executable mutations, restoring each source before exit: omit the post-apply publish, advertise an unreadable reset as applied, settle a reset before the fallback promise completes, let an older answer regress the observed position, and return on the first failed connection. Each mutation must fail its named assertion. The overlap test also holds an older apply open while a newer answer arrives.
+
+## Publish debt after apply
+
+Reaching the supplied log version does not prove a complete cycle. A registry restored and written along another history can make `applyLog` rebase. The rebase queues recovered records, explicit deletes, and omissions for publication. First-log seeding also queues existing records. Neither operation emits a host publish wake.
+
+Before returning `applied`, the delta path now runs `publishLog`, the same publisher as the full cycle, for known active connections and new local connections with streams. This reuses the publisher's complete eligibility and completion rules instead of copying its change, run, omission, metadata, or attachment queries. A deferred or backed-off result hands control to the full cycle; an exception follows the existing fallback path. The common no-op publisher takes no network request. Recovery can publish extra segments, as a full cycle would.
+
+The regression restores the registry to position 1, gives another device a different history through position 3, and applies that non-reset log delta to a device at position 3. Only the delta runs on the recovering device. The peer and a fresh device must then read its recovered records, explicit delete, and omission from the registry. Removing the publish step fails convergence. Separate tests cover first-log seeding with no pending change or run and a local write to another connection during the delta GET.
+
+Other remote operations use the remote origin and do not independently create eligible local changes; the publisher still makes that decision. A same-connection local write is ordered by the connection queue. Connections are selected again after apply, so a different connection created during apply is included. A write admitted after the final publish snapshot has the same boundary as a full cycle and retains the normal host intake wake; apply-created debt does not depend on that wake.
 
 ## Request counts after the log-only cycle change
 
@@ -43,29 +53,31 @@ Steady idle with healthy push is already zero cycle requests on both paths: the 
 
 ## Properties
 
+- `SettledHasNoDebt` (invariant): a settled reader has no unpublished apply-created work.
 - `NoSkip` (invariant): for every row, the reader holds at least the version that was committed at or below its cursor.
 - `ResetThenListing` (action property): while a reset is owed, the cursor does not move except by the listing.
 - `CatchUp` (liveness): once writers stop, the reader ends holding exactly the registry.
 
 ## Results
 
-The current run separates persisted apply from cursor settlement. Raw outputs below are from this model.
+The current run separates persisted apply, publication, and cursor settlement. Apply nondeterministically creates publish debt, abstracting a rebase, seeding, or a racing local write. Only publication clears it. `SettledHasNoDebt` requires every idle reader to have no debt. The model does not represent the forked histories or recovery operations themselves; the SQLite regression proves those concrete effects. Raw outputs below are from this model.
 
 Two writers, one reader, two rows, at most 4 transactions. The floor may rise once. Each mutation switches off one design choice. The checker is `tla2tools.jar` from the TLA+ tools release v1.7.4, which reports itself as "TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)". 4 workers, `nice 19`. Raw output is in `out/`.
 
-| config                | what it changes                                           | result            | states                         |
-| --------------------- | --------------------------------------------------------- | ----------------- | ------------------------------ |
-| D1-design             | nothing: the design (`ControlRows = "apply"`)             | pass (all three)  | 12457990 gen, 4653810 distinct |
-| D0-control-handoff    | every control row hands to the cycle (the earlier design) | pass (all three)  | 12613320 gen, 4702958 distinct |
-| M1-sequence           | number from a lock-free sequence (`nextval()`)            | `NoSkip` VIOLATED | 55901 gen, 19545 distinct      |
-| M2-two-reads          | records and counter read in two statements                | `NoSkip` VIOLATED | 2208 gen, 936 distinct         |
-| M3-reset-no-listing   | a reset moves the cursor without a listing                | `NoSkip` VIOLATED | 1758 gen, 815 distinct         |
-| M4-no-floor           | no reset for a cursor below the floor                     | `NoSkip` VIOLATED | 13914 gen, 4794 distinct       |
-| M5-no-gone-records    | a hard delete removes its change record                   | `NoSkip` VIOLATED | 12023 gen, 4159 distinct       |
-| M6-reconnect-by-delta | a control row active again is applied from the delta      | `NoSkip` VIOLATED | 4005537 gen, 1352897 distinct  |
-| M7-tombstone-ignored  | a control tombstone in the delta is skipped               | `NoSkip` VIOLATED | 6894 gen, 2580 distinct        |
+| config                | what it changes                                           | result                      | states                         |
+| --------------------- | --------------------------------------------------------- | --------------------------- | ------------------------------ |
+| D1-design             | nothing: the design (`ControlRows = "apply"`)             | pass (all four)             | 15899085 gen, 5506180 distinct |
+| D0-control-handoff    | every control row hands to the cycle (the earlier design) | pass (all four)             | 15458899 gen, 5415968 distinct |
+| M1-sequence           | number from a lock-free sequence (`nextval()`)            | `NoSkip` VIOLATED           | 92571 gen, 30725 distinct      |
+| M2-two-reads          | records and counter read in two statements                | `NoSkip` VIOLATED           | 1498 gen, 667 distinct         |
+| M3-reset-no-listing   | a reset moves the cursor without a listing                | `NoSkip` VIOLATED           | 1191 gen, 600 distinct         |
+| M4-no-floor           | no reset for a cursor below the floor                     | `NoSkip` VIOLATED           | 14703 gen, 5102 distinct       |
+| M5-no-gone-records    | a hard delete removes its change record                   | `NoSkip` VIOLATED           | 18564 gen, 6391 distinct       |
+| M6-reconnect-by-delta | a control row active again is applied from the delta      | `NoSkip` VIOLATED           | 3835807 gen, 1166616 distinct  |
+| M7-tombstone-ignored  | a control tombstone in the delta is skipped               | `NoSkip` VIOLATED           | 7785 gen, 2890 distinct        |
+| M8-publish-debt       | skips the post-apply publisher                            | `SettledHasNoDebt` VIOLATED | 1418 gen, 677 distinct         |
 
-Every design choice is needed: switching off any one of them lets the reader skip a committed change. M6's trace: a delete and a log append arrive in one delta (the delete is applied, the log skipped); a reconnect then arrives alone and is applied from the delta, and the reader never fetches the log of the new lifetime. A reconnect therefore runs the cycle.
+M1–M7 each let the reader skip a committed change. M8 lets it settle with unpublished recovery work; `NoSkip` alone does not detect that defect. M6 demonstrates why a reconnect requires the cycle: accepting its control row alone can leave the log of the new lifetime unread.
 
 ## Run
 

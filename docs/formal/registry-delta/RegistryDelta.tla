@@ -42,7 +42,7 @@ EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS Writers, MaxTxns, NoWriter,
           Numbering, OneSnapshot, ResetLists, HonorFloor, GoneRecords,
-          ControlRows
+          ControlRows, DrainDebt
 
 Scopes == {"ctl", "log"}
 \* What a write does to each row. "gone": a hard delete (a failed
@@ -67,10 +67,11 @@ VARIABLES
   rkind,     \* reader: its connection's control as it holds it ("act", "tomb", "gone")
   rphase,    \* reader: idle, rows, applying, settling, or listing
   rbuf,      \* reader: the snapshot decision awaiting apply
+  debt,      \* apply-created publish work (rebase, seed, or a racing write)
   rcursor    \* reader: the cursor a pending apply or listing will set
 
 vars == <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
-          since, view, rkind, rphase, rbuf, rcursor>>
+          since, view, rkind, rphase, rbuf, rcursor, debt>>
 
 Max(a, b) == IF a > b THEN a ELSE b
 
@@ -86,7 +87,7 @@ Init ==
   /\ kind = [ctl |-> "act", log |-> "app"]
   /\ hist = {} /\ txns = 0 /\ floor = 0 /\ floored = FALSE
   /\ since = 0 /\ view = [s \in Scopes |-> 0] /\ rkind = "act"
-  /\ rphase = "idle" /\ rcursor = 0
+  /\ rphase = "idle" /\ rcursor = 0 /\ debt = FALSE
   /\ rbuf = [handoff |-> FALSE, view |-> [s \in Scopes |-> 0], rkind |-> "act"]
 
 -----------------------------------------------------------------------------
@@ -98,7 +99,7 @@ Begin(w) ==
        txn' = [txn EXCEPT ![w] = [phase |-> "open", scope |-> s, op |-> o, seq |-> 0]]
   /\ txns' = txns + 1
   /\ UNCHANGED <<counter, nextSeq, lock, ver, kind, chg, hist, floor, floored,
-                 since, view, rkind, rphase, rbuf, rcursor>>
+                 since, view, rkind, rphase, rbuf, rcursor, debt>>
 
 \* Take the number: at the write (trigger IMMEDIATE) or at COMMIT (DEFERRED);
 \* the interleavings cover both.
@@ -111,7 +112,7 @@ Number(w) ==
        ELSE /\ txn' = [txn EXCEPT ![w].phase = "numbered", ![w].seq = nextSeq]
             /\ nextSeq' = nextSeq + 1 /\ UNCHANGED lock
   /\ UNCHANGED <<counter, ver, kind, chg, hist, txns, floor, floored,
-                 since, view, rkind, rphase, rbuf, rcursor>>
+                 since, view, rkind, rphase, rbuf, rcursor, debt>>
 
 Commit(w) ==
   /\ txn[w].phase = "numbered"
@@ -124,14 +125,14 @@ Commit(w) ==
         /\ hist' = hist \cup {<<n, s, ver[s] + 1>>}
   /\ lock' = IF lock = w THEN NoWriter ELSE lock
   /\ txn' = [txn EXCEPT ![w].phase = "idle"]
-  /\ UNCHANGED <<nextSeq, txns, floor, floored, since, view, rkind, rphase, rbuf, rcursor>>
+  /\ UNCHANGED <<nextSeq, txns, floor, floored, since, view, rkind, rphase, rbuf, rcursor, debt>>
 
 Abort(w) ==
   /\ txn[w].phase \in {"open", "numbered"}
   /\ lock' = IF lock = w THEN NoWriter ELSE lock
   /\ txn' = [txn EXCEPT ![w].phase = "idle"]
   /\ UNCHANGED <<counter, nextSeq, ver, kind, chg, hist, txns, floor, floored,
-                 since, view, rkind, rphase, rbuf, rcursor>>
+                 since, view, rkind, rphase, rbuf, rcursor, debt>>
 
 \* History below here was never recorded (the migration that adds records).
 RaiseFloor ==
@@ -139,7 +140,7 @@ RaiseFloor ==
   /\ floor' = counter /\ floored' = TRUE
   /\ chg' = [s \in Scopes |-> IF chg[s] <= counter THEN 0 ELSE chg[s]]
   /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, hist, txns,
-                 since, view, rkind, rphase, rbuf, rcursor>>
+                 since, view, rkind, rphase, rbuf, rcursor, debt>>
 
 -----------------------------------------------------------------------------
 (* Reader *)
@@ -187,21 +188,31 @@ Delta ==
               ELSE /\ rphase' = "applying" /\ rcursor' = counter
                    /\ UNCHANGED <<since, view, rkind>>
   /\ rbuf' = Decide
-  /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored>>
+  /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored, debt>>
 
 \* The host serializes answers. Persist every connection before settling;
 \* no second answer is admitted while either stage is unfinished.
 ApplyDelta ==
   /\ rphase = "applying"
+  /\ debt' \in BOOLEAN
   /\ view' = rbuf.view /\ rkind' = rbuf.rkind /\ rphase' = "settling"
   /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
                  since, rbuf, rcursor>>
 
 SettleDelta ==
   /\ rphase = "settling"
+  /\ (~debt \/ ~DrainDebt)
   /\ since' = rcursor /\ rphase' = "idle"
   /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
-                 view, rkind, rbuf, rcursor>>
+                 view, rkind, rbuf, rcursor, debt>>
+
+\* Abstract rebase/seed debt: only the publisher clears it. Concrete history
+\* forks and the recovery operations remain covered by the SQLite tests.
+PublishDebt ==
+  /\ rphase = "settling" /\ debt /\ DrainDebt
+  /\ debt' = FALSE
+  /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
+                 since, view, rkind, rphase, rbuf, rcursor>>
 
 \* Mutation: the records first, the counter in a later statement.
 DeltaRows ==
@@ -209,7 +220,7 @@ DeltaRows ==
   /\ rbuf' = Decide
   /\ rphase' = "rows"
   /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
-                 since, view, rkind, rcursor>>
+                 since, view, rkind, rcursor, debt>>
 
 DeltaCounter ==
   /\ rphase = "rows"
@@ -219,7 +230,7 @@ DeltaCounter ==
        ELSE /\ view' = rbuf.view /\ rkind' = rbuf.rkind /\ since' = counter
             /\ rphase' = "idle" /\ UNCHANGED rcursor
   /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
-                 rbuf>>
+                 rbuf, debt>>
 
 \* The full listing a reset or a handoff owes: every row as it is now. The
 \* cursor is the one the answer carried, which is no later than this read.
@@ -227,18 +238,21 @@ Listing ==
   /\ rphase = "listing"
   /\ view' = ver /\ rkind' = kind["ctl"] /\ since' = rcursor /\ rphase' = "idle"
   /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
-                 rbuf, rcursor>>
+                 rbuf, rcursor, debt>>
 
 Next ==
   \/ \E w \in Writers : Begin(w) \/ Number(w) \/ Commit(w) \/ Abort(w)
   \/ RaiseFloor
-  \/ Delta \/ DeltaRows \/ DeltaCounter \/ ApplyDelta \/ SettleDelta \/ Listing
+  \/ Delta \/ DeltaRows \/ DeltaCounter \/ ApplyDelta \/ PublishDebt \/ SettleDelta \/ Listing
 
-Spec == Init /\ [][Next]_vars /\ WF_vars(Delta \/ DeltaRows \/ DeltaCounter \/ ApplyDelta \/ SettleDelta \/ Listing)
+Spec == Init /\ [][Next]_vars /\ WF_vars(Delta \/ DeltaRows \/ DeltaCounter \/ ApplyDelta \/ PublishDebt \/ SettleDelta \/ Listing)
              /\ \A w \in Writers : WF_vars(Number(w) \/ Commit(w))
 
 -----------------------------------------------------------------------------
 (* Properties *)
+
+\* A successful pass cannot leave recovery publication behind.
+SettledHasNoDebt == rphase = "idle" => ~debt
 
 \* The reader holds every change numbered at or below its cursor: the control
 \* row always, and the log row while it holds the connection active (a deleted

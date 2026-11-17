@@ -5,7 +5,8 @@
 // Decide every connection before applying any. Tombstones save the control
 // row and purge; logs of active connections apply through the supplied row.
 // A reconnect, unsupported row, partial apply, delete intent, or incomplete
-// apply hands back to the cycle. Pending local writes still use the cycle.
+// apply hands back to the cycle. Every successful apply then runs the cycle's
+// publisher before settling.
 //
 // The host owns answer ordering and cursor settlement: SyncManager runs one
 // pass at a time and advances since only after this promise (or the fallback
@@ -29,7 +30,12 @@ import type {
   RegistryChangeDelta,
   StreamSyncBlobs,
 } from "../stream-sync/ports.js";
-import { saveControl } from "./bootstrap.js";
+import {
+  knownActiveConnections,
+  newConnectionsWithStreams,
+  saveControl,
+} from "./bootstrap.js";
+import { publishLog } from "./log-publish.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { applyLog } from "./log-apply.js";
 import { readLogState } from "./log-state.js";
@@ -88,7 +94,7 @@ export async function applyRegistryDelta(
   // its connection: the cycle re-applies every partial connection it meets.
   if (connections.some((row) => row.apply_partial !== 0))
     return cycle("a connection has a partial apply");
-  if (byConnection.size === 0) return applied(started, 0, 0);
+  if (byConnection.size === 0) return publishAndFinish(deps, started, 0, 0);
 
   const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
   const hashes = await controlHashes(keccakOf(deps.streamCrypto), keyCheck);
@@ -177,7 +183,7 @@ export async function applyRegistryDelta(
   if (failed?.status === "rejected") throw failed.reason;
   if (!reached.every((r) => r.status === "fulfilled" && r.value === true))
     return cycle("a connection the delta cannot finish here");
-  return applied(started, moved, deletes.length, timed);
+  return publishAndFinish(deps, started, moved, deletes.length, timed);
 }
 
 /**
@@ -242,12 +248,28 @@ async function deleteIntent(deps: LocalSyncDeps, connector: string) {
   return rows.length > 0;
 }
 
-function applied(
+async function publishAndFinish(
+  deps: LocalSyncDeps,
   started: number,
   connections: number,
   deleted: number,
   timed?: ReturnType<typeof timedBlobs>,
-): DeltaApplyResult {
+): Promise<DeltaApplyResult> {
+  // Rebase and first-log seeding can create changes without a host wake.
+  // Use the publisher itself: it also owns omissions, run metadata, blobs,
+  // and writes arriving during apply, including connections absent from delta.
+  const publishable = [
+    ...(await knownActiveConnections(deps)),
+    ...(await newConnectionsWithStreams(deps)),
+  ];
+  for (const { connectionId } of publishable) {
+    const published = await publishLog(deps, connectionId);
+    if (
+      published === null ||
+      published.some((r) => r.outcome === "deferred" || r.outcome === "backoff")
+    )
+      return cycle("the publisher left work for a full cycle");
+  }
   return {
     outcome: "applied",
     connections,

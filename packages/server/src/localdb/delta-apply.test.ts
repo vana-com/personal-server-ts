@@ -368,19 +368,33 @@ describe("applying a change delta", () => {
     expect(await here.position()).toBeLessThan(newest);
   });
 
-  it("an active connection without local log state loads through the supplied log row", async () => {
+  it("first-log seeding publishes records with no pending change or run", async () => {
     const { w, peer, here } = await peerCommitted();
+    await here.run("pre-log", [{ stream: sName(0), id: "seed-only" }], {
+      full: false,
+    });
+    // Persisted pre-log/import state: records, without a queued run or change.
     await here.db.batch([
       {
         sql: "DELETE FROM log_state WHERE connection_id=?",
         params: [CONNECTION_ID],
       },
+      {
+        sql: "DELETE FROM record_changes WHERE connection_id=?",
+        params: [CONNECTION_ID],
+      },
+      {
+        sql: "UPDATE run_streams SET publication_state='published' WHERE run_id='pre-log'",
+      },
     ]);
     const out = await applied(w, here, await deltaOf(here, [LOG]));
     expect(out.result.outcome).toBe("applied");
-    expect(out.registryCalls).toEqual([]);
-    expect(await here.rows()).toEqual(await peer.rows());
-    expect(await here.position()).toBe(await peer.position());
+    expect(out.registryCalls.some((c) => c.kind === "batch")).toBe(true);
+    await peer.cycle();
+    expect(await peer.rows()).toEqual(await here.rows());
+    expect(
+      (await peer.records()).some((r) => r.startsWith("s0/seed-only=")),
+    ).toBe(true);
   });
 
   it("a connection with a delete intent hands to the cycle (mutation: no delete-intent check)", async () => {
@@ -466,6 +480,94 @@ describe("applying a change delta", () => {
     const { w, here } = await peerCommitted();
     const out = await applied(w, here, { since: "0", seq: "2", reset: true });
     expect(out.result.outcome).toBe("cycle");
+  });
+});
+
+describe("publish work created during delta apply", () => {
+  it("a fork at the held position republishes recovery records, deletes and omissions without another local action", async () => {
+    const w = await world({ streams: 1 });
+    const a = await w.device("a");
+    await a.run(
+      "first",
+      ["x", "v", "w"].map((id) => ({ stream: sName(0), id })),
+      { observedAt: 1100 },
+    );
+    await a.cycle();
+    const b = await w.device("b");
+    await b.cycle();
+    await a.run("delete", [{ stream: sName(0), id: "x", remove: true }], {
+      full: false,
+      observedAt: 1300,
+    });
+    await a.cycle();
+    await a.run(
+      "omit",
+      ["w", "z"].map((id) => ({ stream: sName(0), id })),
+      { observedAt: 1400 },
+    );
+    await a.cycle();
+    expect(await a.position()).toBe(3);
+    w.gateway.versions.get(LOG)!.splice(-2);
+    await b.run(
+      "fork",
+      ["q", "x", "v"].map((id) => ({ stream: sName(0), id })),
+      { full: false, observedAt: 1200 },
+    );
+    await b.cycle();
+    await b.run("fork-more", [{ stream: sName(0), id: "extra" }], {
+      full: false,
+      observedAt: 1250,
+    });
+    await b.cycle();
+    expect(await b.position()).toBe(3);
+    expect(await a.sync.applyDelta(await deltaOf(a, [LOG]))).toMatchObject({
+      outcome: "applied",
+    });
+    // No follow-up on A: its recovery must already be in the registry.
+    await b.cycle();
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    expect((await a.records()).map((r) => r.split("=")[0])).toEqual([
+      "s0/extra",
+      "s0/q",
+      "s0/w",
+      "s0/z",
+    ]);
+    expect(await b.rows()).toEqual(await a.rows());
+    expect(await fresh.rows()).toEqual(await a.rows());
+  });
+
+  it("publishes a local write to another connection arriving during the delta's GET", async () => {
+    const w = await world({ streams: 1 });
+    const peer = await w.device("peer");
+    let racing = false;
+    const here = await w.device("here", {
+      beforeGet: async () => {
+        if (!racing) return;
+        racing = false;
+        await here.run(
+          "racing-write",
+          [{ stream: sName(0), id: "local-only" }],
+          { connector: "other", full: false },
+        );
+      },
+    });
+    await peer.run("base", [{ stream: sName(0), id: "base" }]);
+    await peer.cycle();
+    await here.cycle();
+    await peer.run("remote", [{ stream: sName(0), id: "remote" }], {
+      full: false,
+    });
+    await peer.cycle();
+    racing = true;
+    expect(
+      await here.sync.applyDelta(await deltaOf(here, [LOG])),
+    ).toMatchObject({ outcome: "applied" });
+    await peer.cycle();
+    expect(await peer.rows()).toEqual(await here.rows());
+    expect(
+      (await peer.records()).some((r) => r.startsWith("s0/local-only=")),
+    ).toBe(true);
   });
 });
 

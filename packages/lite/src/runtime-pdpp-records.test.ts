@@ -6,7 +6,8 @@
  * the database composition (heads, SQLite apply) and the linked RecordQuery.
  * Stubbed: the PDPP token resolver on the Node side.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { Buffer as BrowserBuffer } from "buffer/";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
 import { buildWeb3SignedHeader } from "@opendatalabs/personal-server-ts-core/test-utils";
@@ -26,6 +27,7 @@ import { pdppRecordsRoutes } from "../../server/src/routes/pdpp-records.js";
 
 const SOURCE_ID = "https://registry.test/connectors/meta";
 afterEach(closeStores);
+afterEach(() => vi.unstubAllGlobals());
 
 const POSTS = ["p1", "p2", "p3", "p4", "p5"].map((id, index) => ({
   id,
@@ -87,6 +89,28 @@ async function nodeGet(
 }
 
 describe("GET /v1/streams/:stream/records on the Lite runtime", () => {
+  it("serves page two with the browser Buffer shim", async () => {
+    const runtime = await liteRuntime(await switchedStore());
+    vi.stubGlobal("Buffer", BrowserBuffer);
+    const path = `/v1/streams/posts/records?limit=2&source=${CONNECTOR}`;
+    const first = await liteGet(runtime, path);
+    expect(first.status, await first.clone().text()).toBe(200);
+    const page = await first.json();
+    expect(page.data.map((row: { id: string }) => row.id)).toEqual([
+      "p1",
+      "p2",
+    ]);
+    expect(page.has_more).toBe(true);
+    const second = await liteGet(
+      runtime,
+      `${path}&cursor=${encodeURIComponent(page.next_cursor)}`,
+    );
+    expect(second.status, await second.clone().text()).toBe(200);
+    expect(
+      (await second.json()).data.map((row: { id: string }) => row.id),
+    ).toEqual(["p3", "p4"]);
+  });
+
   it("serves the switched owner's first page and a next cursor", async () => {
     const runtime = await liteRuntime(await switchedStore());
     const res = await liteGet(

@@ -1,3 +1,7 @@
+import {
+  decodeBase64UrlUtf8,
+  encodeBase64UrlUtf8,
+} from "../encoding/base64url.js";
 import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { encodeCursor, decodeCursor } from "../storage/pdpp-records/cursor.js";
 import {
@@ -93,7 +97,7 @@ const LIST_CURSOR_PREFIX = "v2.";
 export function listCursor(recordKey: string, pkHash: string): string {
   return (
     LIST_CURSOR_PREFIX +
-    Buffer.from(JSON.stringify([recordKey, pkHash])).toString("base64url")
+    encodeBase64UrlUtf8(JSON.stringify([recordKey, pkHash]))
   );
 }
 
@@ -104,10 +108,7 @@ function parseListCursor(cursor: string): {
   if (cursor.startsWith(LIST_CURSOR_PREFIX)) {
     try {
       const value: unknown = JSON.parse(
-        Buffer.from(
-          cursor.slice(LIST_CURSOR_PREFIX.length),
-          "base64url",
-        ).toString("utf8"),
+        decodeBase64UrlUtf8(cursor.slice(LIST_CURSOR_PREFIX.length)),
       );
       if (
         Array.isArray(value) &&

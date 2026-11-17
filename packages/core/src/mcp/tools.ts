@@ -1,3 +1,7 @@
+import {
+  decodeBase64UrlUtf8,
+  encodeBase64UrlUtf8,
+} from "../encoding/base64url.js";
 import { isMemoryScope, isSystemScope } from "../policy/reserved-scopes.js";
 /**
  * MCP tool surface. Phase 1 / §4 of 260604-PLAN-vana-mcp-personal-server.md.
@@ -1576,29 +1580,12 @@ interface SearchCursorPayload {
 }
 
 function encodeSearchCursor(payload: SearchCursorPayload): string {
-  const json = JSON.stringify(payload);
-  // TextEncoder + Uint8Array → base64url without Node.js Buffer dependency
-  const bytes = new TextEncoder().encode(json);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
+  return encodeBase64UrlUtf8(JSON.stringify(payload));
 }
 
 function decodeSearchCursor(raw: string): SearchCursorPayload | null {
   try {
-    const base64 = raw.replace(/-/g, "+").replace(/_/g, "/");
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    const json = new TextDecoder().decode(bytes);
-    const payload = JSON.parse(json);
+    const payload = JSON.parse(decodeBase64UrlUtf8(raw));
     if (
       typeof payload === "object" &&
       payload !== null &&
