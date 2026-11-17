@@ -13,8 +13,8 @@ import ts from "typescript";
 import { afterEach, describe, expect, it } from "vitest";
 
 /**
- * Host code that decides which streams a connection has, and fences them on
- * delete, reads a manifest's `streams[]` and names no connector. The check for
+ * Host code that decides which streams a connection has, and the delete that
+ * fences it, names no connector. The check for
  * `localdb` is `localdb/no-connector-knowledge.test.ts`; this one covers the
  * rest of the sync path.
  *
