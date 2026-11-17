@@ -130,16 +130,24 @@ type StreamRow = LocalStream & {
   /**
    * The meta of the version this stream's head stands for: what the log last
    * said. A run's end writes the stream's own meta before its publish, so the
-   * stream's columns are not it. `complete` is 0 when the stream has no head.
+   * stream's columns are not it. NULL when the stream has no head.
    */
-  published_complete: number;
-  published_primary_key: string;
+  published_complete: number | null;
+  published_primary_key: string | null;
   published_profile_key: string | null;
   published_profile_version: string | null;
 };
 
-/** The stream as the log last described it: the base a plan starts from. */
+/**
+ * The stream as the log last described it: the base a plan starts from. A
+ * stream with no head was never described, so its own state is the base.
+ */
 function asPublished(row: StreamRow): LocalStream {
+  if (row.head_version === 0) return row;
+  if (row.published_primary_key === null || row.published_complete === null)
+    throw new Error(
+      `publish: stream ${row.stream} has head version ${row.head_version} and no meta for it`,
+    );
   return {
     ...row,
     primary_key: row.published_primary_key,
@@ -407,10 +415,9 @@ async function snapshotRound(
     `SELECT s.stream, s.primary_key, s.profile_key, s.profile_version, s.complete,
             s.floor_version, s.floor_o, s.floor_r, s.last_delete_version,
             s.head_version, s.head_generation, s.head_data_hash, s.publish_watermark,
-            coalesce(v.complete, 0) AS published_complete,
-            coalesce(v.primary_key, s.primary_key) AS published_primary_key,
-            coalesce(v.profile_key, s.profile_key) AS published_profile_key,
-            coalesce(v.profile_version, s.profile_version) AS published_profile_version
+            v.complete AS published_complete, v.primary_key AS published_primary_key,
+            v.profile_key AS published_profile_key,
+            v.profile_version AS published_profile_version
        FROM stream_state s
        LEFT JOIN stream_versions v
          ON v.connection_id = s.connection_id AND v.stream = s.stream
@@ -481,13 +488,14 @@ async function snapshotRound(
     }
     if (connection.generation !== 1)
       await excludeSeedsIfAny(held, connectionId, stream);
+    // The plan's base is what the log last said, not what the run's end wrote.
+    const published = asPublished(row);
     const plan = await planStream(
       held,
       connectionId,
       connection,
       stream,
-      // The plan's base is what the log last said, not what the run's end wrote.
-      asPublished(row),
+      published,
       null,
       row.head_version,
       row.head_data_hash,
@@ -571,12 +579,12 @@ async function snapshotRound(
       (row.head_version === 0 ||
         !sameHead(head, {
           generation: row.head_generation ?? head.generation,
-          primaryKey: JSON.parse(row.published_primary_key),
+          primaryKey: JSON.parse(published.primary_key),
           profile: {
-            key: row.published_profile_key ?? connection.connector,
-            version: row.published_profile_version ?? "0",
+            key: published.profile_key ?? connection.connector,
+            version: published.profile_version ?? "0",
           },
-          complete: row.published_complete === 1,
+          complete: published.complete === 1,
         }));
     const metaPublishes =
       metaChanged && plan.steps.some((s) => s.decision.kind === "publish");

@@ -450,10 +450,25 @@ END`,
   [
     // The stream meta the log said at each local version, beside its
     // `complete`. A run's end writes its own meta into `stream_state` before
-    // its publish, so the publish compares the run with these. NULL on a row
-    // written before this column: the stream's own meta stands in.
+    // its publish, so the publish compares the run with these. Every writer
+    // of a version row sets them.
     `ALTER TABLE stream_versions ADD COLUMN primary_key TEXT`,
     `ALTER TABLE stream_versions ADD COLUMN profile_key TEXT`,
     `ALTER TABLE stream_versions ADD COLUMN profile_version TEXT`,
+  ],
+  [
+    // A version row written before those columns gets the stream's own meta,
+    // so the publish can read every row's meta from the row itself.
+    `UPDATE stream_versions SET
+       primary_key = (SELECT s.primary_key FROM stream_state s
+                       WHERE s.connection_id = stream_versions.connection_id
+                         AND s.stream = stream_versions.stream),
+       profile_key = (SELECT s.profile_key FROM stream_state s
+                       WHERE s.connection_id = stream_versions.connection_id
+                         AND s.stream = stream_versions.stream),
+       profile_version = (SELECT s.profile_version FROM stream_state s
+                           WHERE s.connection_id = stream_versions.connection_id
+                             AND s.stream = stream_versions.stream)
+     WHERE primary_key IS NULL`,
   ],
 ];
