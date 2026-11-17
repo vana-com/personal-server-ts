@@ -934,6 +934,8 @@ describe("view changes", () => {
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_version" },
+      { sql: "ALTER TABLE record_changes DROP COLUMN publish_blocked_reason" },
+      { sql: "ALTER TABLE run_streams DROP COLUMN publish_blocked_reason" },
       { sql: `PRAGMA user_version = ${viewMigration}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");
@@ -1026,6 +1028,8 @@ describe("view changes", () => {
         sql: "ALTER TABLE stream_state ADD COLUMN consumed_generation INTEGER",
       },
       { sql: "ALTER TABLE stream_state ADD COLUMN consumed_data_hash TEXT" },
+      { sql: "ALTER TABLE record_changes DROP COLUMN publish_blocked_reason" },
+      { sql: "ALTER TABLE run_streams DROP COLUMN publish_blocked_reason" },
       { sql: `PRAGMA user_version = ${rowidVersion}` },
     ]);
 
@@ -1107,6 +1111,9 @@ describe("view changes", () => {
       // A later migration made the mark of a stream's changes.
       { sql: "DROP TRIGGER stream_change_marks_ai" },
       { sql: "DROP TABLE stream_change_marks" },
+      // A later migration recorded why eligible work waits.
+      { sql: "ALTER TABLE record_changes DROP COLUMN publish_blocked_reason" },
+      { sql: "ALTER TABLE run_streams DROP COLUMN publish_blocked_reason" },
       { sql: `PRAGMA user_version = ${metaMigration}` },
     ]);
     const state = async () => ({

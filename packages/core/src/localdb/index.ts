@@ -38,7 +38,12 @@ export {
 } from "./log-apply.js";
 export { publishLog } from "./log-publish.js";
 export { unwriteRefusedRun } from "./unwrite.js";
-export { runCycle, syncConnection, type CycleReport } from "./cycle.js";
+export {
+  runCycle,
+  runPublish,
+  syncConnection,
+  type CycleReport,
+} from "./cycle.js";
 export { UpdateRequiredError } from "./update-required.js";
 export { purgeConnection } from "./purge.js";
 export {

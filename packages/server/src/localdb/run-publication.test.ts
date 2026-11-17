@@ -324,8 +324,13 @@ describe("run publication state", () => {
     await endRun(world, "r2");
     expect((await status(world, "r2")).state).toBe("pending");
     const [again] = await publish(world.deps, CONNECTION_ID);
-    expect(again).toMatchObject({ outcome: "noop", watermark: 1 });
-    expect(again?.publication).toBeUndefined(); // no transient receipt
+    // The call started with pending run evidence. Completion reports its
+    // durable acknowledgement even though no segment needed posting.
+    expect(again).toMatchObject({
+      outcome: "published",
+      watermark: 1,
+      publication: { runIds: ["r2"], head: { version: 1 } },
+    });
     expect(logPosts(world)).toHaveLength(posts);
     expect(stateOf(await status(world, "r2"), A)?.publication).toMatchObject({
       version: 1,

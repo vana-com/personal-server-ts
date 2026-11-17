@@ -618,7 +618,7 @@ export async function startPersonalServer(
   async function publishCycle(): Promise<PersonalServerLitePublicationResult> {
     if (status === "stopped" || !runtimeBundle?.getLocalSync)
       throw new Error("Stream publication is unavailable");
-    const report = await (await runtimeBundle.getLocalSync()).cycle();
+    const report = await (await runtimeBundle.getLocalSync()).publish();
     const publications: PublicationReceipt[] = [];
     for (const connection of report.connections) {
       if (connection.error) throw new Error(connection.error);

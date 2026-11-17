@@ -7,6 +7,7 @@ import {
   parseScope,
   type ControlRead,
   type ControlHashes,
+  type ControlState,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { streamSyncHashes } from "../stream-sync/crypto.js";
 import {
@@ -27,6 +28,8 @@ function connectionId(connector: string, ns: string): string {
 const SELECT_CONNECTIONS = `SELECT connection_id AS connectionId, connector, ns,
   generation, control_state AS controlState, control_version AS controlVersion
   FROM connections`;
+const HAS_STREAMS = `EXISTS (SELECT 1 FROM stream_state s WHERE s.connection_id = connections.connection_id)`;
+
 type SqlConnection = ConnectionRow & Record<string, string | number>;
 
 async function cachedConnection(deps: LocalSyncDeps, id: string) {
@@ -175,8 +178,17 @@ export async function newConnectionsWithStreams(
 ): Promise<readonly ConnectionRow[]> {
   return deps.db.query<SqlConnection>(
     `${SELECT_CONNECTIONS} WHERE control_state = 'absent' AND generation = 1
-       AND EXISTS (SELECT 1 FROM stream_state s WHERE s.connection_id = connections.connection_id)
+       AND ${HAS_STREAMS}
      ORDER BY connection_id`,
+  );
+}
+
+/** Every connection that holds streams, whatever its control state. */
+export async function connectionsWithStreams(
+  deps: LocalSyncDeps,
+): Promise<readonly ConnectionRow[]> {
+  return deps.db.query<SqlConnection>(
+    `${SELECT_CONNECTIONS} WHERE ${HAS_STREAMS} ORDER BY connection_id`,
   );
 }
 
@@ -185,12 +197,24 @@ export async function newConnectionsWithStreams(
  * read the control row, then apply the connection's log up to the position
  * the registry holds. `unreachable` = the registry did not answer (C.0
  * step 3); a caller with no connection stages `generation_unbound`.
+ *
+ * `control` is the control row as the registry answered, classified for this
+ * owner's key (`null` when the registry did not answer). A row under another
+ * key (`foreign`) is saved like any other, which later fences (a legacy
+ * import, a seed) read; `foreign: "report"` returns it and writes nothing,
+ * for a caller that refuses the connection before any local write (`begin`).
  */
 export async function syncBeforeBegin(
   deps: LocalSyncDeps,
   connector: string,
+  options: {
+    readonly foreign?: "save" | "report";
+    /** A successful reconnect write, used instead of reading control again. */
+    readonly committedControl?: ControlRead;
+  } = {},
 ): Promise<{
   readonly connection: ConnectionRow | null;
+  readonly control: ControlState | null;
   readonly unreachable: boolean;
 }> {
   // The pinned intake contract has no account identity (R23).
@@ -201,7 +225,9 @@ export async function syncBeforeBegin(
     const control = await hashes(locked);
     let read: ControlRead;
     try {
-      read = await deps.registry.read(controlScope(connector, ns));
+      read =
+        options.committedControl ??
+        (await deps.registry.read(controlScope(connector, ns)));
     } catch (error) {
       // Only an unreachable registry goes on offline. A refusal (403), an
       // unreadable answer or a control row of the wrong shape is not "offline".
@@ -211,20 +237,28 @@ export async function syncBeforeBegin(
       if (await partiallyApplied(locked, id)) throw error;
       return {
         connection: await cachedConnection(locked, id),
+        control: null,
         unreachable: true,
       };
     }
+    const state = classifyControl(read, control);
+    if (state.kind === "foreign" && options.foreign === "report")
+      return {
+        connection: await cachedConnection(locked, id),
+        control: state,
+        unreachable: false,
+      };
     const connection = await saveControl(locked, connector, ns, read, control);
     await purgeDeleted(locked, connection);
     if (connection.controlState === "active") {
       try {
-        // Apply reads the control row and the log row itself, after this
-        // call began. Only an unreachable registry that apply met before its
+        // Reuse this call's control observation; apply still reads the log.
+        // Only an unreachable registry that apply met before its
         // first local write, with no earlier apply left half done, goes on
         // offline: nothing new was learned and nothing changed. Apply has no
         // rollback, so an unavailable error after a write rejects, as do
         // integrity, key and database failures.
-        await applyConnection(locked, id);
+        await applyConnection(locked, id, undefined, read);
       } catch (error) {
         // A log this build cannot read stops this connection's apply, not the
         // join: the cycle's pass for the connection applies again and reports
@@ -232,18 +266,21 @@ export async function syncBeforeBegin(
         if (error instanceof UpdateRequiredError)
           return {
             connection: await cachedConnection(locked, id),
+            control: state,
             unreachable: false,
           };
         if (!(error instanceof RegistryUnavailableBeforeWriteError))
           throw error;
         return {
           connection: await cachedConnection(locked, id),
+          control: state,
           unreachable: true,
         };
       }
     }
     return {
       connection: await cachedConnection(locked, id),
+      control: state,
       unreachable: false,
     };
   });

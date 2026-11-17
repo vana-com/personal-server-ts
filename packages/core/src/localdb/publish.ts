@@ -25,6 +25,7 @@ import {
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { dropRunRows, withOrigin } from "./merge.js";
+import { PENDING_RUN } from "./publication-work.js";
 import { checkRunFence } from "./fence.js";
 import { replaceMayApply } from "./replace.js";
 
@@ -109,15 +110,20 @@ type RetainedRun = {
   row_count: number;
 };
 
-/** The identical request twice at most: a lost reply is resent once. */
+/**
+ * Resend a lost reply once. Notify its owner before resending: a later refusal
+ * cannot erase the first send's ambiguous outcome.
+ */
 export async function postBatchOnce(
   registry: StreamSyncRegistry,
   request: SignedRegistryBatch,
+  onAmbiguous?: () => void,
 ): Promise<RegistryBatchResult> {
   try {
     return await registry.postBatch!(request);
   } catch (error) {
     if (!(error instanceof AmbiguousRegistryReplyError)) throw error;
+    onAmbiguous?.();
   }
   // The first send may have landed. The gateway answers a row it already holds
   // with its own hash, which settleRow reads as published. A second lost
@@ -169,9 +175,7 @@ export async function retainedRuns(
             (SELECT COUNT(*) FROM run_rows rr
               WHERE rr.run_id = r.run_id AND rr.stream = rs.stream) AS row_count
        FROM runs r JOIN run_streams rs ON rs.run_id = r.run_id
-      WHERE r.connection_id = ? AND rs.stream = ? AND r.state = 'ended'
-        AND rs.decision IN ('publish', 'noop', 'deferred')
-        AND rs.publication_state = 'pending'
+      WHERE r.connection_id = ? AND rs.stream = ? AND ${PENDING_RUN}
       ORDER BY r.o, r.run_id`,
     [connectionId, stream],
   );
@@ -492,7 +496,7 @@ export async function runPublicationStatements(
     statements.push({
       sql: `UPDATE run_streams SET publication_state = 'published',
               published_generation = ?, published_version = ?, published_data_hash = ?,
-              published_watermark = ?, publication_reason = NULL
+              published_watermark = ?, publication_reason = NULL, publish_blocked_reason = NULL
             WHERE stream = ? AND publication_state = 'pending'
               AND run_id IN (${chunk.map(() => "?").join(",")})`,
       params: [

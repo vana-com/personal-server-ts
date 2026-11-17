@@ -13,6 +13,7 @@ import {
   streamScope,
   toHex,
   type JsonValue,
+  type ControlState,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   computeRecordKeyFromData,
@@ -271,7 +272,14 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           ).length
         )
           throw new RunIntakeError("connection_stopped");
-        let synced = await syncBeforeBegin(deps, req.connector);
+        let synced = await syncBeforeBegin(deps, req.connector, {
+          foreign: "report",
+        });
+        // Another key's control row: this owner cannot publish what a run
+        // would collect. Nothing is written for it (`syncBeforeBegin`).
+        if (synced.control?.kind === "foreign")
+          throw new RunIntakeError("control_foreign");
+        let observed: ControlState | undefined = synced.control ?? undefined;
         if (req.expectedControlVersion !== undefined) {
           if (synced.unreachable)
             throw new RunIntakeError("control_basis_unavailable");
@@ -316,7 +324,19 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             throw error;
           }
           admittedControlVersion = version;
-          synced = await syncBeforeBegin(deps, req.connector);
+          // The successful compare-and-set is the control observation. Reuse
+          // it while applying the log; a second GET adds no admission safety.
+          synced = await syncBeforeBegin(deps, req.connector, {
+            foreign: "report",
+            committedControl: {
+              found: true,
+              version,
+              dataHash: hashes.activeData,
+              metadataHash: hashes.activeMetadata,
+              deleted: false,
+            },
+          });
+          observed = synced.control ?? undefined;
           if (synced.unreachable)
             throw new RunIntakeError("control_basis_unavailable");
           if (synced.connection?.controlVersion !== admittedControlVersion)
@@ -472,7 +492,11 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           throw error;
         }
         active.set(runId, { request: text, response });
-        return response;
+        // The control row is the caller's to read once: a replay or a stored
+        // receipt answers without it, and it is not saved with the run.
+        return observed === undefined
+          ? response
+          : { ...response, control: observed };
       }),
     batch: (runId, req) =>
       serial(runId, async () => {

@@ -569,4 +569,9 @@ BEGIN
                      WHERE connection_id = NEW.connection_id AND stream = NEW.stream), 0) + 1, 1);
 END`,
   ],
+  [
+    // Why eligible work is still waiting. Completion reads this only while work remains.
+    `ALTER TABLE record_changes ADD COLUMN publish_blocked_reason TEXT CHECK (publish_blocked_reason IN ('deferred','backoff','discarded','purged','refused'))`,
+    `ALTER TABLE run_streams ADD COLUMN publish_blocked_reason TEXT CHECK (publish_blocked_reason IN ('deferred','backoff','discarded','purged','refused'))`,
+  ],
 ];

@@ -211,6 +211,7 @@ describe("local database bootstrap", () => {
     );
     expect(await syncBeforeBegin(d, connector)).toEqual({
       connection: known,
+      control: null,
       unreachable: true,
     });
     expect(known).toMatchObject({
@@ -222,6 +223,7 @@ describe("local database bootstrap", () => {
     const empty = await fresh();
     expect(await syncBeforeBegin(deps(empty, registry), connector)).toEqual({
       connection: null,
+      control: null,
       unreachable: true,
     });
     expect(await empty.query("SELECT count(*) AS n FROM connections")).toEqual([
