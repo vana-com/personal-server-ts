@@ -507,6 +507,13 @@ try {
   const wallMs = performance.now() - t0,
     pageWrites = Math.round((io() - w0) / 65536);
   mark();
+  for (const row of cache
+    .prepare("SELECT body,body_sha256 FROM records")
+    .iterate())
+    assert.equal(
+      createHash("sha256").update(row.body).digest("hex"),
+      row.body_sha256,
+    );
   const resultRows = await db.query(
     "SELECT pk_hash,body_sha256,stamp_o,stamp_r,stamp_n,first_o FROM records ORDER BY connection_id,stream,pk_hash",
   );

@@ -143,8 +143,17 @@ describe("disk-backed bootstrap swap", () => {
       }
     });
     const applying = applyConnection(d.deps, CONNECTION_ID);
+    let firstRow: unknown;
+    const earlyRead = (async () => {
+      // Before the source is seeded, an owner read can return no data. Retry
+      // that decision; a read waiting on the preview must wake before the tail.
+      do {
+        firstRow = await firstOwnerRow(d.deps, scope);
+      } while (firstRow === null);
+    })();
     try {
       await Promise.race([reached.promise, applying]);
+      await expect.poll(() => firstRow).toMatchObject({ id: "safe" });
       expect(await firstOwnerRow(d.deps, scope)).toMatchObject({ id: "safe" });
       await expect(
         d.db.batch([
@@ -167,6 +176,7 @@ describe("disk-backed bootstrap swap", () => {
     } finally {
       release.resolve();
       await applying;
+      await earlyRead;
     }
     expect(await d.rows()).toEqual(await p.rows());
     expect((await ownerSnapshot(d)).ids).toEqual(["b", "c", "d", "safe"]);

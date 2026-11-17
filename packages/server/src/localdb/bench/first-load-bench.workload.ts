@@ -2,7 +2,7 @@
 // readers (own file DB each) over the same published blobs. Generic synthetic
 // stream, no connector knowledge. Usage:
 //   npx tsx packages/server/src/localdb/bench/first-load-bench.workload.ts \
-//     --rows 198001 --progressive off --readers 3 --get-ms 250 --node-crypto on
+//     --rows 198001 --runs 64 --progressive on --readers 3 --get-ms 250 --node-crypto on
 // Run it under `nice -n 19 ionice -c3`. `--dir` holds the databases, which
 // are removed afterwards. The default is a fresh directory under the OS temp
 // directory; pass a disk-backed `--dir` when that is in memory.
@@ -135,12 +135,9 @@ function makeDeps(
   return {
     db,
     bootstrapFirstLoad: timing !== null && DEFER === "swap",
-    ...(timing && DEFER === "swap"
+    ...(timing && DEFER === "swap" && arg("finish", "auto") === "copy"
       ? {
-          bootstrapFirstLoad: true,
-          ...(arg("finish", "auto") === "copy"
-            ? { bootstrapFirstLoadFinish: "copy" as const }
-            : {}),
+          bootstrapFirstLoadFinish: "copy" as const,
         }
       : {}),
     queue: connectionQueue(),
@@ -288,6 +285,28 @@ console.log(
 );
 
 async function fingerprint(db: SqlDriver) {
+  let after = ["", "", ""];
+  for (;;) {
+    const page = await db.query<{
+      connection_id: string;
+      stream: string;
+      pk_hash: string;
+      body: string;
+      body_sha256: string;
+    }>(
+      `SELECT connection_id,stream,pk_hash,body,body_sha256 FROM records
+       WHERE (connection_id,stream,pk_hash)>(?,?,?) ORDER BY connection_id,stream,pk_hash LIMIT 256`,
+      after,
+    );
+    if (!page.length) break;
+    for (const row of page)
+      if (
+        createHash("sha256").update(row.body).digest("hex") !== row.body_sha256
+      )
+        throw new Error("stored body differs from its published digest");
+    const last = page.at(-1)!;
+    after = [last.connection_id, last.stream, last.pk_hash];
+  }
   const rows = await db.query(
     "SELECT pk_hash, body_sha256, stamp_o, stamp_r, stamp_n, first_o FROM records ORDER BY connection_id, stream, pk_hash",
   );
@@ -483,7 +502,7 @@ for (let r = 0; r < READERS; r++) {
   const io0 = ioBytes();
   const t0 = performance.now();
   // What a user sees first: the source in the owner's listing, and the first
-  // stored row. Polled on the same thread as the load, as a page would be.
+  // row returned by the owner resolver. Polled beside the load, as a page would be.
   const listing = createLocalListing(deps as never);
   let polling = true;
   const poll = (async () => {
