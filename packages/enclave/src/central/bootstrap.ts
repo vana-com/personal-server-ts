@@ -67,7 +67,12 @@ function required(env: NodeJS.ProcessEnv, key: string): string {
 }
 function port(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
   const value = Number(env[key] ?? fallback);
-  if (!Number.isSafeInteger(value) || value < 1 || value > 65535)
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > 65535 ||
+    (value === 0 && env[key] !== "0")
+  )
     throw new Error(`${key} is invalid`);
   return value;
 }
@@ -79,6 +84,7 @@ export async function startFleetCentral(
 ): Promise<{
   controller: FleetController;
   identity: FleetPeerIdentity;
+  ports: { control: number; admin: number; peer: number; mcp: number };
   close(): Promise<void>;
 }> {
   env = await verifiedFleetEnvironment(env, {
@@ -480,16 +486,38 @@ export async function startFleetCentral(
         }),
     ),
   );
+  // Read addresses only after every listener has emitted listening.
+  const boundPort = (server: (typeof servers)[number]): number => {
+    const address = server.address();
+    if (!address || typeof address === "string")
+      throw new Error("Expected a bound TCP listener");
+    return address.port;
+  };
+  const ports = {
+    control: boundPort(servers[0]!),
+    admin: boundPort(servers[1]!),
+    peer: boundPort(servers[2]!),
+    mcp: mcp.port,
+  };
   let stopped = false;
   const timers = new Set<ReturnType<typeof setTimeout>>();
+  const inFlight = new Set<Promise<unknown>>();
+  const track = (operation: () => Promise<unknown>): Promise<void> => {
+    const pending = Promise.resolve()
+      .then(operation)
+      .then(() => undefined)
+      .catch(() => logger.warn({}, "Fleet reconcile unavailable"));
+    inFlight.add(pending);
+    void pending.then(() => inFlight.delete(pending));
+    return pending;
+  };
   const schedule = (interval: number, operation: () => Promise<void>): void => {
     const timer = setTimeout(() => {
       timers.delete(timer);
-      void operation()
-        .catch(() => logger.warn({}, "Fleet reconcile unavailable"))
-        .finally(() => {
-          if (!stopped) schedule(interval, operation);
-        });
+      if (stopped) return;
+      void track(operation).finally(() => {
+        if (!stopped) schedule(interval, operation);
+      });
     }, interval);
     timer.unref();
     timers.add(timer);
@@ -517,7 +545,7 @@ export async function startFleetCentral(
     );
   });
   const attestAll = () =>
-    Promise.all(
+    Promise.allSettled(
       workers.map(async (worker) => {
         const nodeId = worker.policy.identity.nodeId;
         try {
@@ -530,12 +558,15 @@ export async function startFleetCentral(
           recordAdmitFailure(nodeId, error);
         }
       }),
-    );
+    ).then((outcomes) => {
+      const failure = outcomes.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+    });
   schedule(30_000, async () => {
     await attestAll();
   });
   // Staging may precede worker activation. No admission failure silently relaxes policy.
-  void attestAll();
+  void track(attestAll);
   logger.info(
     {
       nodeId: identity.nodeId,
@@ -547,9 +578,12 @@ export async function startFleetCentral(
   return {
     controller,
     identity,
+    ports,
     async close() {
       stopped = true;
       for (const timer of timers) clearTimeout(timer);
+      timers.clear();
+      await Promise.allSettled(inFlight);
       await mcp.close();
       await Promise.all(
         servers.map(

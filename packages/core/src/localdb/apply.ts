@@ -68,9 +68,11 @@ type Flight = {
   /**
    * The listing the flight reads its log row from, when every caller of the
    * flight brought this same one (`applyConnection`). A caller with another
-   * listing, or none, joins and clears it: the flight then lists for itself.
+   * listing, or none, joins and clears it: the flight then reads the row.
    */
   listed?: OwnerRows;
+  /** Control read taken by every caller before joining this flight. */
+  observedControl?: ControlRead;
 };
 type Slot = { running: Flight; next?: Flight };
 const slots = new WeakMap<ConnectionQueue, Map<string, Slot>>();
@@ -78,6 +80,7 @@ function request(
   deps: LocalSyncDeps,
   id: string,
   listed: OwnerRows | undefined,
+  observedControl: ControlRead | undefined,
 ): Promise<void> {
   let byId = slots.get(deps.queue);
   if (!byId) {
@@ -86,13 +89,15 @@ function request(
   }
   const join = (flight: Flight) => {
     if (flight.listed !== listed) flight.listed = undefined;
+    if (flight.observedControl !== observedControl)
+      flight.observedControl = undefined;
     return flight.promise;
   };
   const slot = byId.get(id);
   if (slot) {
     if (!slot.running.closed) return join(slot.running);
     if (slot.next) return join(slot.next);
-    const next = newFlight(listed);
+    const next = newFlight(listed, observedControl);
     slot.next = next;
     next.promise = slot.running.promise
       .then(
@@ -102,16 +107,20 @@ function request(
       .then(() => launch(deps, id, next, byId, slot));
     return next.promise;
   }
-  const flight = newFlight(listed);
+  const flight = newFlight(listed, observedControl);
   const created: Slot = { running: flight };
   byId.set(id, created);
   flight.promise = launch(deps, id, flight, byId, created);
   return flight.promise;
 }
-const newFlight = (listed: OwnerRows | undefined): Flight => ({
+const newFlight = (
+  listed: OwnerRows | undefined,
+  observedControl: ControlRead | undefined,
+): Flight => ({
   closed: false,
   promise: Promise.resolve(),
   ...(listed ? { listed } : {}),
+  ...(observedControl ? { observedControl } : {}),
 });
 function launch(
   deps: LocalSyncDeps,
@@ -172,27 +181,29 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
     }
     const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
     const hashes = await controlHashes(keccakOf(deps.streamCrypto), keyCheck);
-    const initial = await control(locked, id, connection, hashes, reuse);
+    const initial = await control(
+      locked,
+      id,
+      connection,
+      hashes,
+      reuse,
+      flight.observedControl,
+    );
     if (initial.kind !== "active") {
       // A purged connection has nothing left to repair.
       if (initial.kind === "deleted") await clearPartial(deps, id, reuse);
       return;
     }
-    // The connection's data is its log. The owner's listing says where the log
-    // stands: the cycle's one listing when every caller of this flight came
-    // with it, else one this flight takes (concurrent applies share it). A
-    // read of each log row would be one request per connection.
+    // The connection's data is its log. The cycle's one listing of the owner
+    // says where the log stands when every caller of this flight came with
+    // it; without it `applyLog` reads the log row.
     await applyLog(locked, id, {
       connector: connection.connector,
       ns: connection.ns,
       generation: initial.generation,
       keyCheck,
       hashes,
-      read: logRowOf(
-        flight.listed ??
-          (await deps.registry.listStreamRows(connection.connector)),
-        connection,
-      ),
+      read: flight.listed && logRowOf(flight.listed, connection),
     });
     // A pass that ran to its end has applied the log through the position it
     // read, which is what the mark waits for.
@@ -224,14 +235,16 @@ function logRowOf(
 /**
  * Apply the connection's log; concurrent requests share one flight. `listed`
  * is a listing of the owner's rows the caller took for this apply (a sync
- * cycle's); without it the apply lists for itself.
+ * cycle's); without it the apply reads the connection's log row. A caller
+ * already holding the connection slot may pass its control read as well.
  */
 export function applyConnection(
   deps: LocalSyncDeps,
   connectionId: string,
   listed?: OwnerRows,
+  observedControl?: ControlRead,
 ): Promise<void> {
-  return request(deps, connectionId, listed);
+  return request(deps, connectionId, listed, observedControl);
 }
 
 async function control(
@@ -240,10 +253,13 @@ async function control(
   connection: Connection,
   hashes: ControlHashes,
   reuse: Reuse,
+  observedControl?: ControlRead,
 ) {
-  const read = await deps.registry.read(
-    controlScope(connection.connector, connection.ns),
-  );
+  const read =
+    observedControl ??
+    (await deps.registry.read(
+      controlScope(connection.connector, connection.ns),
+    ));
   const state = classifyControl(read, hashes);
   // A stale active read cannot undo a deletion this device already observed.
   // Check before purging/resetting stream state as well as before the row update.

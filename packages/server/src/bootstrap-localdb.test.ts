@@ -13,8 +13,9 @@ import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createMemoryModeRecordStore } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import { endRequest } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createStreamSyncKeyPorts } from "../../core/src/stream-sync/crypto.js";
-import { remoteFixture } from "./localdb/apply-fixture.js";
+import { remoteFixture } from "./localdb/apply-fixture.test-utils.js";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import * as legacyImport from "./localdb/legacy-store-import.js";
 
@@ -277,26 +278,27 @@ describe("Node database composition", () => {
     });
     const batch = await send("/v1/stream-sync/runs/intake/batches", "POST", {
       batch: 0,
-      records: [{ stream: "items", data: { id: "from-intake" } }],
+      records: [],
     });
     expect(batch.status).toBe(200);
-    expect(await batch.json()).toMatchObject({ accepted: 1 });
-    const end = await send("/v1/stream-sync/runs/intake/end", "POST", {
+    expect(await batch.json()).toMatchObject({ accepted: 0 });
+    // A connector that asked to be retried before it sent records keeps its cursor.
+    const end = await send(
+      "/v1/stream-sync/runs/intake/end",
+      "POST",
+      endRequest({
+        lastBatch: 0,
+        streams: ["items"],
+        retry: true,
+        checkpoints: { items: "C1" },
+      }),
+    );
+    expect(end.status).toBe(200);
+    expect(await end.json()).toMatchObject({
+      result: "checkpoint_only",
       outcome: "retry_pending",
       coveredStreams: [],
-      lastBatch: 0,
-      checkpointCandidate: { items: "C1" },
     });
-    expect(end.status).toBe(200);
-    expect(await end.json()).toMatchObject({ result: "queued" });
-    const rows = await (
-      await context.getLocalSync!()
-    ).query.listRecords({
-      connectionId: "pdpp.fixture-source~",
-      stream: "items",
-      limit: 10,
-    });
-    expect(rows.records.map((r) => r.recordKey)).toEqual(["from-intake"]);
     const resumed = await send("/v1/stream-sync/runs/resumed", "PUT", {
       connector: "fixture-source",
       artifactDigest: digest,
@@ -314,12 +316,15 @@ describe("Node database composition", () => {
     });
     expect(
       (
-        await send("/v1/stream-sync/runs/resumed/end", "POST", {
-          outcome: "succeeded",
-          coveredStreams: ["items"],
-          provenFullStreams: ["items"],
-          lastBatch: 0,
-        })
+        await send(
+          "/v1/stream-sync/runs/resumed/end",
+          "POST",
+          endRequest({
+            lastBatch: 0,
+            live: ["items"],
+            provenFullStreams: ["items"],
+          }),
+        )
       ).status,
     ).toBe(200);
     expect(
@@ -343,12 +348,15 @@ describe("Node database composition", () => {
     ).toBe(200);
     expect(
       (
-        await send("/v1/stream-sync/runs/zz-full/end", "POST", {
-          outcome: "succeeded",
-          coveredStreams: ["items"],
-          provenFullStreams: ["items"],
-          lastBatch: 0,
-        })
+        await send(
+          "/v1/stream-sync/runs/zz-full/end",
+          "POST",
+          endRequest({
+            lastBatch: 0,
+            live: ["items"],
+            provenFullStreams: ["items"],
+          }),
+        )
       ).status,
     ).toBe(200);
     const report = await (await context.getLocalSync!()).cycle();

@@ -45,11 +45,12 @@ const published = (id: string) => [
   { stream: id, outcome: "published" as const, watermark: 1 },
 ];
 // The mocked siblings only need the real queue, not database or network ports.
-// The registry has no one-pass listing, so each apply lists for itself.
+// The cycle's one listing of the owner; the mocked siblings only pass it on.
+const LISTED: readonly never[] = [];
 const dependencies = () =>
   ({
     queue: connectionQueue(),
-    registry: {},
+    registry: { listOwnerRows: async () => LISTED },
     logger: { info: vi.fn(), warn: vi.fn() },
   }) as unknown as LocalSyncDeps;
 
@@ -150,7 +151,7 @@ describe("local database cycle", () => {
       "publish:direct",
     ]);
     expect(bootstrapConnections).toHaveBeenCalledTimes(1);
-    expect(bootstrapConnections).toHaveBeenCalledWith(deps, undefined);
+    expect(bootstrapConnections).toHaveBeenCalledWith(deps, LISTED);
   });
 
   it("reports a connection's failure without stopping the other connections", async () => {

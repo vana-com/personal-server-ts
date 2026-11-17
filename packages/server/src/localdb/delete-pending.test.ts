@@ -13,8 +13,8 @@ import { RegistryRefusedError } from "../../../core/src/stream-sync/ports.js";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import { createLocalSync } from "../../../core/src/localdb/sync.js";
-import { remoteFixture } from "./apply-fixture.js";
-import { legacyHeadRow } from "./legacy-head-fixture.js";
+import { remoteFixture } from "./apply-fixture.test-utils.js";
+import { legacyHeadRow } from "./legacy-head-fixture.test-utils.js";
 import { deriveKeyCheck } from "@opendatalabs/personal-server-ts-stream-sync";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
@@ -85,8 +85,6 @@ async function stuckDelete(
         { name: "items", semantics: "mutable_state", primaryKey: ["id"] },
       ],
     }),
-    declaredStreams: () => ["items"],
-    olderVersionReads: () => true,
     deleteRetryMs: { first: 5, max: 20 },
   });
   syncs.push(sync);

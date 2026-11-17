@@ -11,6 +11,7 @@ import {
   MemoryStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
 } from "../../../core/src/stream-sync/index.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"11".repeat(20)}` as const;
@@ -69,8 +70,6 @@ async function world() {
             },
           ],
         }),
-        declaredStreams: () => ["items"],
-        olderVersionReads: () => true,
       });
     return { db, sync: reopen(), reopen };
   };
@@ -81,20 +80,12 @@ async function world() {
     batch: 0,
     records: [{ stream: "items", data: { id: "seed" } }],
   });
-  await a.sync.intake.end("seed", {
-    outcome: "succeeded",
-    coveredStreams: ["items"],
-    lastBatch: 0,
-  });
+  await a.sync.intake.end("seed", itemsEnd);
   await a.sync.cycle();
   await b.sync.apply();
   return { a, b, registry };
 }
-const endRequest = {
-  outcome: "succeeded" as const,
-  coveredStreams: ["items"],
-  lastBatch: 0,
-};
+const itemsEnd = endRequest({ lastBatch: 0, live: ["items"] });
 
 it("refuses a stale retry basis when another device deleted after the caller read", async () => {
   const { a, b, registry } = await world();
@@ -124,7 +115,7 @@ it("replays the original queued local receipt after publication without a second
     batch: 0,
     records: [{ stream: "items", data: { id: "work" } }],
   });
-  const ended = await a.sync.intake.end("work", endRequest);
+  const ended = await a.sync.intake.end("work", itemsEnd);
   expect(ended.result).toBe("queued");
   await a.sync.cycle();
   const published = await registry.read(stream);
@@ -134,7 +125,7 @@ it("replays the original queued local receipt after publication without a second
     observedAt: 2000,
   });
   expect(replay).toMatchObject({ status: "ended", receipt: ended });
-  expect(await restarted.intake.end("work", endRequest)).toEqual(ended);
+  expect(await restarted.intake.end("work", itemsEnd)).toEqual(ended);
   await restarted.cycle();
   expect(await registry.read(stream)).toEqual(published);
   expect(
@@ -155,7 +146,7 @@ it("replays a discarded receipt after a fresh facade without reconnecting", asyn
   await b.sync.deleter.requestConnectionDelete("fixture");
   await b.sync.deleter.resumeDeletes();
   await a.sync.apply();
-  const ended = await a.sync.intake.end("discarded", endRequest);
+  const ended = await a.sync.intake.end("discarded", itemsEnd);
   expect(ended.result).toBe("discarded");
   const posts = registry.log.length;
   const restarted = a.reopen();
@@ -165,7 +156,7 @@ it("replays a discarded receipt after a fresh facade without reconnecting", asyn
       request({ connect: true, expectedControlVersion: 1 }),
     ),
   ).toMatchObject({ status: "ended", receipt: ended });
-  expect(await restarted.intake.end("discarded", endRequest)).toEqual(ended);
+  expect(await restarted.intake.end("discarded", itemsEnd)).toEqual(ended);
   expect(registry.log).toHaveLength(posts);
   expect(await registry.read(control)).toMatchObject({ version: 2 });
 });
@@ -240,13 +231,13 @@ it("an offline end remains queued and its local receipt replays without publicat
     batch: 0,
     records: [{ stream: "items", data: { id: "offline" } }],
   });
-  const ended = await a.sync.intake.end("offline", endRequest);
+  const ended = await a.sync.intake.end("offline", itemsEnd);
   expect(ended.result).toBe("queued");
   const restarted = a.reopen();
   expect(await restarted.intake.begin("offline", request())).toMatchObject({
     status: "ended",
     receipt: ended,
   });
-  expect(await restarted.intake.end("offline", endRequest)).toEqual(ended);
+  expect(await restarted.intake.end("offline", itemsEnd)).toEqual(ended);
   expect(registry.log).toHaveLength(posts);
 });

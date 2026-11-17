@@ -64,7 +64,10 @@ export interface RegistryChangePushOptions {
  *
  *  - every answer reports its sequence as the position (`onPosition`), before
  *    anything else, so the cycle a poke starts samples the position it follows;
- *  - an answer that says `changed` is a poke (`onChange`): the manager pulls;
+ *  - an answer that says `changed` is a poke (`onChange`): the manager pulls,
+ *    or applies the answer's delta. Each held request sends the position the
+ *    manager holds the registry up to (`since`), so the gateway can answer
+ *    with what changed after it;
  *  - the first answer after any failure is a poke too, whether or not the
  *    sequence moved, so a poke lost with the connection costs one pull. A
  *    failed attempt is not a poke: with every answer lost, only the manager's
@@ -132,7 +135,12 @@ export function createRegistryChangePush(
           lifetime.signal.addEventListener("abort", onStop, { once: true });
         });
         try {
-          const wait = waitForChange!(cursor, waitMs, request.signal);
+          const wait = waitForChange!(
+            cursor,
+            waitMs,
+            request.signal,
+            cursor === undefined ? undefined : handlers.since(),
+          );
           wait.catch(() => {}); // a late failure after the race is not ours
           const answer = await Promise.race([wait, ended]);
           if (lifetime.signal.aborted) return "failed";
@@ -143,7 +151,7 @@ export function createRegistryChangePush(
           handlers.onPosition(answer.seq);
           if (answer.changed || afterFailure) {
             afterFailure = false;
-            handlers.onChange();
+            handlers.onChange(answer.changed ? answer.delta : undefined);
           }
           return "answer";
         } catch (error) {

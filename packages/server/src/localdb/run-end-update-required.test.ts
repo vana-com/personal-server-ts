@@ -4,8 +4,8 @@ import type { SqlDriver } from "../../../core/src/localdb/driver.js";
 import { TEMP_TABLES } from "../../../core/src/localdb/merge.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
-import type { EndRequest } from "../../../core/src/stream-sync/intake.js";
 import { MIGRATIONS } from "../../../core/src/localdb/schema.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 // These two dependencies are interface-only at this slice's base.
@@ -66,13 +66,11 @@ async function fixture() {
       })),
     ]);
   };
-  const end = (runId: string, request: Partial<EndRequest> = {}) =>
-    store.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: ["items"],
-      lastBatch: 0,
-      ...request,
-    });
+  const end = (
+    runId: string,
+    request: Omit<Parameters<typeof endRequest>[0], "lastBatch"> = {},
+  ) =>
+    store.end(runId, endRequest({ lastBatch: 0, live: ["items"], ...request }));
   const records = () =>
     db.query(
       "SELECT * FROM records WHERE connection_id = ? AND stream = ? ORDER BY pk_hash",
@@ -138,10 +136,8 @@ describe("run end update required", () => {
       },
     ]);
     expect(
-      await f.end("old-seed", {
-        checkpointCandidate: { items: "advanced" },
-      }),
-    ).toEqual({ result: "no_checkpoint", updateRequired: true });
+      await f.end("old-seed", { checkpoints: { items: "advanced" } }),
+    ).toMatchObject({ result: "no_checkpoint", updateRequired: true });
     await expectRefused(f, "old-seed");
     expect(await f.snapshot()).toEqual(before);
   });
@@ -162,10 +158,8 @@ describe("run end update required", () => {
       },
     ]);
     expect(
-      await f.end("old-unbound", {
-        checkpointCandidate: { items: "advanced" },
-      }),
-    ).toEqual({ result: "no_checkpoint", updateRequired: true });
+      await f.end("old-unbound", { checkpoints: { items: "advanced" } }),
+    ).toMatchObject({ result: "no_checkpoint", updateRequired: true });
     await expectRefused(f, "old-unbound");
     expect(await f.snapshot()).toEqual(before);
   });
@@ -176,10 +170,10 @@ describe("run end update required", () => {
     await f.stage("old-retry", "1", 200);
     expect(
       await f.end("old-retry", {
-        outcome: "retry_pending",
-        checkpointCandidate: { items: "advanced" },
+        retry: true,
+        checkpoints: { items: "advanced" },
       }),
-    ).toEqual({ result: "no_checkpoint", updateRequired: true });
+    ).toMatchObject({ result: "no_checkpoint", updateRequired: true });
     await expectRefused(f, "old-retry");
     expect(await f.snapshot()).toEqual(before);
   });
@@ -200,7 +194,8 @@ describe("run end update required", () => {
     );
     const stored = await f.checkpoint();
     // A changed refused cursor blocks the entire candidate. An unchanged
-    // refused cursor still permits progress for the accepted stream.
+    // refused cursor still permits progress for the accepted stream. The
+    // retry run sent no records, so the plan holds back no cursor.
     for (const [runId, cursor, observedAt] of [
       ["mixed-unsafe", "advanced", 200],
       ["mixed-safe", "stored", 300],
@@ -211,26 +206,28 @@ describe("run end update required", () => {
           sql: "INSERT INTO run_streams (run_id, stream, delete_snapshot, primary_key, profile_key, profile_version) SELECT run_id, ?, delete_snapshot, primary_key, profile_key, profile_version FROM run_streams WHERE run_id = ? AND stream = ?",
           params: ["accepted", runId, "items"],
         },
-        {
-          sql: "INSERT INTO run_rows (run_id, stream, pk_hash, record_key, body, body_sha256) SELECT run_id, ?, pk_hash, record_key, body, body_sha256 FROM run_rows WHERE run_id = ? AND stream = ?",
-          params: ["accepted", runId, "items"],
-        },
+        { sql: "DELETE FROM run_rows WHERE run_id = ?", params: [runId] },
       ]);
       const candidate = { items: cursor, accepted: runId };
       expect(
         await f.end(runId, {
-          outcome: "retry_pending",
-          coveredStreams: ["items", "accepted"],
-          checkpointCandidate: candidate,
+          live: [],
+          streams: ["items", "accepted"],
+          retry: true,
+          checkpoints: candidate,
         }),
-      ).toEqual({ result: "queued", updateRequired: true });
+      ).toMatchObject({
+        result: cursor === "advanced" ? "no_checkpoint" : "checkpoint_only",
+        updateRequired: true,
+      });
       expect(
         await f.db.query(
           "SELECT stream, decision, reason FROM run_streams WHERE run_id = ? ORDER BY stream",
           [runId],
         ),
       ).toEqual([
-        { stream: "accepted", decision: "publish", reason: null },
+        // Only the refused stream is this test's subject.
+        expect.objectContaining({ stream: "accepted", reason: null }),
         {
           stream: "items",
           decision: "refused",
@@ -257,7 +254,7 @@ describe("run end update required", () => {
           "SELECT COUNT(*) AS n FROM records WHERE stream = ? AND stamp_r = ?",
           ["accepted", runId],
         ),
-      ).toEqual([{ n: 2 }]);
+      ).toEqual([{ n: 0 }]);
       expect(await f.checkpoint()).toBe(
         cursor === "advanced" ? stored : JSON.stringify(candidate),
       );
@@ -284,7 +281,7 @@ describe("run end update required", () => {
               params: ["current-deferred"],
             },
       ]);
-      expect(await f.end("current-deferred")).toEqual({
+      expect(await f.end("current-deferred")).toMatchObject({
         result: "queued",
         updateRequired: false,
       });

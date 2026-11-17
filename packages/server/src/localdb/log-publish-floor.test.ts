@@ -55,12 +55,12 @@ describe("log publish: the requests of one save", () => {
     expect(trace.count("batch"), trace.describe()).toBe(1);
   });
 
-  it("a first save under a Batch-Policy with no room for its two rows fails clearly and writes nothing (mutant: NO_POLICY_ROOM_CHECK)", async () => {
+  it("a first save under a Batch-Policy with no room for its two rows fails clearly after the gateway refuses it, with no extra round trip, and writes nothing (mutant: NO_POLICY_ROOM_CHECK)", async () => {
     const trace = requestTrace(2);
     const w = await world({
       streams: 6,
       trace,
-      batchPolicy: { rows: 1, requires: 16, bytes: 65_536 },
+      policy: { rows: 1, requires: 16, bytes: 65_536 },
     });
     const a = await w.device("a");
     await a.run("first", six("a"), { connector: "fresh" });
@@ -68,6 +68,10 @@ describe("log publish: the requests of one save", () => {
       /Batch-Policy rows=1;requires=16 has no room for one request of 2 rows and 1 conditions/,
     );
     expect(w.gateway.rowsOf(streamScope("fresh", "", "~log"))).toBe(0);
+    // The gateway's refusal carries the policy, so the clear failure costs no
+    // request of its own: one commit sent, no policy read after it.
+    expect(trace.count("batch"), trace.describe()).toBe(1);
+    expect(trace.count("policy"), trace.describe()).toBe(0);
   });
 
   it("a later save is a PUT and a commit: depth 2", async () => {
@@ -147,7 +151,7 @@ describe("log apply: the cycle's listing is a hint", () => {
     await a.cycle();
     // A listing a cycle took, then a commit of this device after it (a run's
     // end publishes while the cycle is still bootstrapping).
-    const listed = await a.deps.registry.listOwnerRows!();
+    const listed = await a.deps.registry.listOwnerRows();
     await a.run("second", [{ stream: sName(0), id: "y" }], {
       full: false,
       covered: [sName(0)],

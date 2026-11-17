@@ -1,0 +1,35 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 47 and seed -884320674395479768 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 1379738] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file RegistryDelta.tla
+Parsing file Naturals.tla
+Parsing file FiniteSets.tla
+Parsing file TLC.tla
+Parsing file Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module RegistryDelta
+Starting... (2026-11-17 05:51:30)
+Implied-temporal checking--satisfiability problem has 1 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-17 05:51:30.
+Checking temporal properties for the current state space with 91985 total distinct states at (2026-11-17 05:51:33)
+Finished checking temporal properties in 00s at 2026-11-17 05:51:34
+Progress(12) at 2026-11-17 05:51:34: 740,175 states generated (740,175 s/min), 207,448 distinct states found (207,448 ds/min), 115,465 states left on queue.
+Checking temporal properties for the current state space with 4072388 total distinct states at (2026-11-17 05:52:34)
+Finished checking temporal properties in 45s at 2026-11-17 05:53:19
+Progress(18) at 2026-11-17 05:53:19: 16,799,235 states generated (16,059,060 s/min), 5,663,741 distinct states found (5,456,293 ds/min), 1,591,342 states left on queue.
+Progress(28) at 2026-11-17 05:54:06: 29,488,837 states generated, 9,694,028 distinct states found, 0 states left on queue.
+Checking temporal properties for the complete state space with 9694028 total distinct states at (2026-11-17 05:54:06)
+Finished checking temporal properties in 01min 44s at 2026-11-17 05:55:51
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 1.0E-5
+  based on the actual fingerprints:  val = 4.3E-4
+29488837 states generated, 9694028 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 28.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 13 and the 95th percentile is 3).
+Finished in 04min 21s at (2026-11-17 05:55:52)
+exit 0

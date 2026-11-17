@@ -8,8 +8,8 @@ import { applyConnection } from "./apply.js";
 import { nextApplied } from "./apply-progress.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
+import { completeBody, pinStream } from "./complete-read.js";
 import { partialBody } from "./partial-read.js";
-import { createOlderVersions, type OlderVersions } from "./older-versions.js";
 import type { RecordQuery } from "./query.js";
 import {
   chooseCandidate,
@@ -73,10 +73,11 @@ function cursorFor(c: Candidate): string {
       c.streams.map((s) => [
         s.stream,
         {
-          // A stream served from its first load is pinned at the head it loads.
+          // A stream served from its first load is pinned at the head it
+          // loads; any other stream at the log position its records are at.
           b: c.partialStreams?.includes(s.stream)
             ? s.partial!.version
-            : s.head_version,
+            : s.installed_version,
           h: JSON.stringify([s.primary_key, s.profile_key, s.profile_version]),
         },
       ]),
@@ -118,53 +119,22 @@ function validCursor(text: string): boolean {
   }
 }
 
-function bodyStream(
-  chunks: AsyncIterable<string>,
-  release: () => void,
-): ReadableStream<Uint8Array> {
+function bodyStream(chunks: AsyncIterable<string>): ReadableStream<Uint8Array> {
   const iterator = chunks[Symbol.asyncIterator]();
-  let finished = false;
-  const finish = () => {
-    if (!finished) {
-      finished = true;
-      release();
-    }
-  };
   return new ReadableStream({
     async pull(controller) {
       try {
         const next = await iterator.next();
-        if (next.done) {
-          controller.close();
-          finish();
-        } else controller.enqueue(encoder.encode(next.value));
+        if (next.done) controller.close();
+        else controller.enqueue(encoder.encode(next.value));
       } catch (error) {
         controller.error(error);
-        finish();
       }
     },
     async cancel() {
-      try {
-        await iterator.return?.(undefined);
-      } finally {
-        finish();
-      }
+      await iterator.return?.(undefined);
     },
   });
-}
-
-async function* rawPayload(
-  query: RecordQuery,
-  connectionId: string,
-  stream: string,
-): AsyncGenerator<string> {
-  yield '{"records":[';
-  let first = true;
-  for await (const record of query.streamRecords(connectionId, stream)) {
-    yield (first ? "" : ",") + record.body;
-    first = false;
-  }
-  yield "]}";
 }
 
 async function* envelope(
@@ -185,12 +155,10 @@ export function createLocalResolver(
   deps: LocalSyncDeps,
   parts: {
     readonly query: RecordQuery;
-    readonly olderVersions: OlderVersions;
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
   },
 ): LocalResolver {
-  const completeReads = createOlderVersions(deps, { enabled: () => true });
   const streams = (connectionId: string): Promise<Stream[]> =>
     loadStreams(deps, connectionId);
 
@@ -331,16 +299,30 @@ export function createLocalResolver(
             dataHash: load.dataHash,
           }),
         ),
-        () => {},
       ),
     };
   }
 
+  /**
+   * A complete read, decided while it holds the connection's queue and
+   * finished once its headers are decided: the body holds nothing. A body of
+   * the database pages through the stream and checks its head on every page
+   * (see `completeBody`); one from a retained head or a projected alias is
+   * built in memory here, so nothing it reads can change.
+   */
   async function build(
     input: ResolveInput,
     candidate: Candidate,
-    release: () => void,
   ): Promise<ReadDecision> {
+    // A body of the database is pinned before the head is read: see
+    // `pinStream`. An alias is built in memory below and needs no pin.
+    const pin = candidate.target.alias
+      ? 0
+      : await pinStream(
+          deps.db,
+          candidate.connection.connection_id,
+          candidate.target.streams[0]!,
+        );
     const [connection] = (await connections(candidate.target.connector)).filter(
       (c) => c.connection_id === candidate.connection.connection_id,
     );
@@ -364,50 +346,27 @@ export function createLocalResolver(
     if (input.cursor !== null && input.cursor !== cursor)
       return { kind: "cursor_stale" };
 
-    const fallback = new Map<string, readonly Record<string, unknown>[]>();
-    for (const stream of installed) {
-      if (stream.head_version === stream.installed_version) continue;
-      const body = await completeReads.read(
-        streamScope(connection.connector, connection.ns, stream.stream),
-        { fileId: stream.head_blob! },
-      );
-      if (body === "gone") return noData();
-      fallback.set(
-        stream.stream,
-        (await new Response(body).json()) as Record<string, unknown>[],
-      );
-    }
-    const readQuery: RecordQuery = {
-      ...parts.query,
-      async *streamRecords(connectionId, stream) {
-        const retained = fallback.get(stream);
-        if (!retained) {
-          yield* parts.query.streamRecords(connectionId, stream);
-          return;
-        }
-        for (const row of retained)
-          yield {
-            stream,
-            recordKey: "",
-            pkHash: "",
-            body: JSON.stringify(row),
-            emittedAt: 0,
-          };
-      },
-    };
     let payload: AsyncIterable<string>;
     const binding = candidate.target.alias;
     if (!binding) {
-      payload = rawPayload(
-        readQuery,
-        connection.connection_id,
-        installed[0]!.stream,
+      const only = installed[0]!;
+      payload = completeBody(
+        readerOf(deps.db),
+        {
+          connectionId: connection.connection_id,
+          generation: connection.generation,
+          stream: only.stream,
+          // The stream's installed head: the identity every page checks.
+          version: only.installed_version,
+          dataHash: only.head_data_hash!,
+        },
+        pin,
       );
     } else {
       const projected = await projectAlias(
         binding,
         current,
-        readQuery,
+        parts.query,
         new Date(deps.now()).toISOString(),
       );
       if (projected.kind === "too_large") {
@@ -425,7 +384,7 @@ export function createLocalResolver(
       cursor,
       served: {
         scope: streamScope(connection.connector, connection.ns, servedStream),
-        version: head.head_version,
+        version: head.installed_version,
       },
       body: bodyStream(
         envelope(
@@ -433,7 +392,6 @@ export function createLocalResolver(
           Math.max(...installed.map((s) => s.observed_at ?? 0)),
           payload,
         ),
-        release,
       ),
     };
   }
@@ -515,21 +473,13 @@ export function createLocalResolver(
         const partial = await buildPartial({ ...input, scope }, chosen);
         if (partial) return partial;
       }
-      // Keep the queue until EOF/cancel: otherwise a paged body could contain
-      // records from a newer apply while its served value names the old head.
-      return new Promise<ReadDecision>((resolve, reject) => {
-        void deps.queue
-          .run(chosen.connection.connection_id, "end", async () => {
-            let release!: () => void;
-            const done = new Promise<void>((r) => {
-              release = r;
-            });
-            const decision = await build({ ...input, scope }, chosen, release);
-            resolve(decision);
-            if ("body" in decision) await done;
-          })
-          .catch(reject);
-      });
+      // The queue is held to decide the headers and no longer: a body held it
+      // until its reader finished or cancelled, which a reader that stopped
+      // pulling never did, and every apply and read of the connection waited.
+      // The body checks its head itself, on every page.
+      return deps.queue.run(chosen.connection.connection_id, "end", () =>
+        build({ ...input, scope }, chosen),
+      );
     },
   };
 }

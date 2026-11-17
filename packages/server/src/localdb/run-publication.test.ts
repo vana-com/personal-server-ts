@@ -35,6 +35,7 @@ import {
   readEndReceipt,
   readPublicationStatus,
 } from "../../../core/src/localdb/run-receipts.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const CONNECTOR = "test-conn";
@@ -209,11 +210,10 @@ async function collect(
 }
 
 async function endRun(world: World, runId: string, streams = [A]) {
-  return createRunEndStore(world.deps).end(runId, {
-    outcome: "succeeded",
-    coveredStreams: streams,
-    lastBatch: 0,
-  });
+  return createRunEndStore(world.deps).end(
+    runId,
+    endRequest({ lastBatch: 0, live: streams }),
+  );
 }
 
 const status = (world: World, runId: string) =>
@@ -324,8 +324,13 @@ describe("run publication state", () => {
     await endRun(world, "r2");
     expect((await status(world, "r2")).state).toBe("pending");
     const [again] = await publish(world.deps, CONNECTION_ID);
-    expect(again).toMatchObject({ outcome: "noop", watermark: 1 });
-    expect(again?.publication).toBeUndefined(); // no transient receipt
+    // The call started with pending run evidence. Completion reports its
+    // durable acknowledgement even though no segment needed posting.
+    expect(again).toMatchObject({
+      outcome: "published",
+      watermark: 1,
+      publication: { runIds: ["r2"], head: { version: 1 } },
+    });
     expect(logPosts(world)).toHaveLength(posts);
     expect(stateOf(await status(world, "r2"), A)?.publication).toMatchObject({
       version: 1,
@@ -692,11 +697,7 @@ describe("run publication state", () => {
     // Failed run: every stream discarded.
     const failed = await makeWorld();
     await collect(failed, "r1", 1000);
-    await createRunEndStore(failed.deps).end("r1", {
-      outcome: "failed",
-      coveredStreams: [],
-      lastBatch: -1,
-    });
+    await createRunEndStore(failed.deps).abort("r1", "failed");
     expect(await status(failed, "r1")).toMatchObject({
       state: "unknown",
       streams: [{ state: "superseded", reason: "failed" }],
@@ -711,12 +712,10 @@ describe("run publication state", () => {
         params: [CONNECTION_ID],
       },
     ]);
-    await createRunEndStore(bare.deps).end("r1", {
-      outcome: "succeeded",
-      coveredStreams: [],
-      lastBatch: 0,
-      checkpointCandidate: { x: 1 },
-    });
+    await createRunEndStore(bare.deps).end(
+      "r1",
+      endRequest({ lastBatch: 0, checkpoints: { x: 1 } }),
+    );
     expect(await readEndReceipt(bare.deps.db, "r1")).toMatchObject({
       result: "checkpoint_only",
     });
@@ -806,8 +805,6 @@ describe("run publication state", () => {
       await endRun(world, "r1");
       const sync = createLocalSync(world.deps, {
         resolveArtifact: () => null,
-        declaredStreams: () => [],
-        olderVersionReads: () => false,
       });
       const code = (work: Promise<unknown>) =>
         work.then(

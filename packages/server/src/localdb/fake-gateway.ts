@@ -4,6 +4,11 @@
 // driver run against it. Signatures are not checked.
 import { computeDataPointId } from "@opendatalabs/personal-server-ts-core/sync";
 
+import {
+  countFencedLogScopes,
+  fencingLogScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
+
 type Version = { dataHash: string; metadataHash: string };
 
 type BatchRow = {
@@ -73,6 +78,12 @@ export interface FakeGatewayOptions {
     rows: number;
     requires: number;
     bytes: number;
+    /**
+     * Advertised as `lockedScopes` and enforced with a 422, as the registry
+     * does: a batch whose written rows fence at least one log row it does not
+     * write holds at most this many rows plus distinct such log rows.
+     */
+    lockedScopes?: number;
   };
   /** `false`: the batch route sends no `Batch-Policy` (it still enforces it). */
   readonly advertisePolicy?: boolean;
@@ -83,19 +94,10 @@ export interface FakeGatewayOptions {
    * (it is no committed log write). Every write the registry would apply is
    * fenced, an append and a refresh of a pending row alike; a replay and a
    * sequence conflict are answered as before. The
-   * scope grammar below is the registry's own, written out here and not taken
-   * from the client's parser, so a drift between the two shows in a test.
+   * scope grammar is the registry's own, shared with the client's lock-budget
+   * counting rather than the more permissive legacy read parser.
    */
   readonly connectionLogFence?: boolean;
-}
-
-// `pdpp.<connector>~[<16 hex>].<stream>`, as the registry reads it.
-const STREAM_ROW_SCOPE = /^pdpp\.([^.~]+)~([0-9a-f]{16})?\.(.+)$/;
-/** The log row scope that fences a write to `scope`; null when none does. */
-function fencingLogScope(scope: string): string | null {
-  const match = STREAM_ROW_SCOPE.exec(scope);
-  if (!match || match[3] === "~log") return null;
-  return `pdpp.${match[1]}~${match[2] ?? ""}.~log`;
 }
 
 export function createFakeGateway(options: FakeGatewayOptions) {
@@ -112,7 +114,11 @@ export function createFakeGateway(options: FakeGatewayOptions) {
     bytes: 65_536,
     ...options.policy,
   };
-  const policyHeader = `rows=${policy.rows};bytes=${policy.bytes};requires=${policy.requires}`;
+  const policyHeader = `rows=${policy.rows};bytes=${policy.bytes};requires=${policy.requires}${
+    options.policy?.lockedScopes === undefined
+      ? ""
+      : `;lockedScopes=${options.policy.lockedScopes}`
+  }`;
   const gateway = {
     calls,
     versions,
@@ -342,6 +348,19 @@ export function createFakeGateway(options: FakeGatewayOptions) {
           error: `requires has at most ${maxRequires} entries`,
         });
       }
+      const lockedScopes = options.policy?.lockedScopes;
+      if (lockedScopes !== undefined) {
+        const fences = countFencedLogScopes(
+          body.rows as BatchRow[],
+          options.isTombstone,
+        );
+        if (fences > 0 && body.rows.length + fences > lockedScopes) {
+          return json(422, {
+            success: false,
+            error: `rows plus the connection log rows they fence lock ${body.rows.length + fences} scopes; the limit is ${lockedScopes}`,
+          });
+        }
+      }
       const requestScopes = new Set<string>(
         body.rows.map((row: BatchRow) => row.scope),
       );
@@ -457,6 +476,12 @@ export function createFakeGateway(options: FakeGatewayOptions) {
       };
       if (results.some((r: { status: number }) => r.status === 409)) {
         rollBack();
+        // A lost reply is lost whatever the gateway answered: a resend of a
+        // request the gateway already holds is answered, and that answer lost.
+        if (gateway.dropNextBatchReply) {
+          gateway.dropNextBatchReply = false;
+          throw new TypeError("fetch failed");
+        }
         // The row that lost keeps its reason; a replay stays stored (201);
         // every row this request wrote is rolled back (424).
         return json(409, {

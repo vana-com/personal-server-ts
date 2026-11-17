@@ -15,6 +15,7 @@ import {
   createMemoryStreamSyncBlobs,
 } from "../../../core/src/stream-sync/index.js";
 import { logScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}` as const;
@@ -82,8 +83,6 @@ async function world() {
           },
         ],
       }),
-      declaredStreams: () => ["A"],
-      olderVersionReads: () => true,
     });
     /** One run that observes `rows` in full, then one sync cycle. */
     const refresh = async (
@@ -112,12 +111,15 @@ async function world() {
           batch: 0,
           records: rows.map((data) => ({ stream: "A", data })),
         });
-      await sync.intake.end(id, {
-        outcome: "succeeded",
-        coveredStreams: ["A"],
-        provenFullStreams: options.full === false ? [] : ["A"],
-        lastBatch: rows.length ? 0 : -1,
-      });
+      await sync.intake.end(
+        id,
+        endRequest({
+          lastBatch: rows.length ? 0 : -1,
+          streams: ["A"],
+          live: rows.length ? ["A"] : [],
+          provenFullStreams: options.full === false ? [] : ["A"],
+        }),
+      );
       if (options.cycle !== false) await cycle();
     };
     const cycle = async () => {

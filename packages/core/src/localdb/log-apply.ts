@@ -13,13 +13,14 @@
 //
 // A device that is behind the log's `base` installs the snapshot the head
 // names, then applies the tail. A registry that is BEHIND this device (a
-// rollback or restore), or that names another segment at a position this
-// device already applied, is not a continuation: the rows, tombstones and
-// checkpoints this device holds came from segments the log no longer has, and
-// replaying into them is not the log's fold. That fails closed
-// (`LogDivergedError`, nothing applied, the position unchanged). A rebaseline
-// that rebuilds them from the log, with the local overlay kept apart, is later
-// work.
+// rollback or restore) whose row is one this device applied lost only rows:
+// this device commits the segments it applied above it again, in order
+// (`log-recommit.ts`). A registry that names another segment at a position
+// this device applied is not a continuation: the rows, tombstones and
+// checkpoints this device holds came from segments the log no longer has.
+// This device queues what only those segments held as changes of its own and
+// reads the registry's log from the last position both agree on
+// (`log-rebase.ts`).
 
 import {
   classifyStreamRow,
@@ -40,6 +41,9 @@ import {
   type SnapshotPointer,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { keccakOf } from "../stream-sync/crypto-port.js";
+import { resolveBodies } from "./log-bodies.js";
+import { rebaseOnLog } from "./log-rebase.js";
+import { seedFromRecords } from "./log-seed.js";
 import { announceApplied } from "./apply-progress.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
@@ -67,6 +71,7 @@ import {
   writeLogState,
   type LogState,
 } from "./log-state.js";
+import { recommitApplied } from "./log-recommit.js";
 import { UpdateRequiredError } from "./update-required.js";
 import {
   failedRowStatement,
@@ -153,9 +158,18 @@ export async function applyLog(
   deps: LocalSyncDeps,
   connectionId: string,
   context: LogApplyContext,
+  rebased = false,
 ): Promise<{ readonly applied: number }> {
   const scope = logScope(context.connector, context.ns);
   const local = await readLogState(deps, connectionId);
+  // A log that does not continue this device's history: put back what only
+  // that history held, then read the log from where both agree. Once per
+  // pass: a log that diverges again under the second read is refused.
+  const rebase = async (registry: readonly SegmentRef[], why: string) => {
+    if (rebased) throw new LogDivergedError(why);
+    await rebaseOnLog(deps, connectionId, context, local, registry);
+    return applyLog(deps, connectionId, context, true);
+  };
   // A listed row is a hint taken before this apply. One behind this device can
   // be a listing taken before this device's own later commit, so it is read
   // again before it is believed.
@@ -193,15 +207,37 @@ export async function applyLog(
     return { applied: 0 };
   }
 
-  // A registry behind this device is a rollback or a restore. What this device
-  // applied from the segments above the registry's position is still in its
-  // rows, tombstones and checkpoints, and replaying the log into them does not
-  // give the log's fold. Failing closed keeps the position true: it is not
-  // moved back, and nothing is applied.
-  if (local.position > read.version)
-    throw new LogDivergedError(
-      `apply: the log registry is at position ${read.version}, behind this device at ${local.position}`,
-    );
+  // A registry behind this device is a rollback or a restore. The segments
+  // above its position are still in storage, and this device applied them: it
+  // commits them again, in order (`recommitApplied`), so the log is the one
+  // this device's rows are the fold of. A registry row this device did not
+  // apply is another history, which this device rebases onto.
+  if (local.position > read.version) {
+    try {
+      await recommitApplied(deps, connectionId, context, local, read);
+      return { applied: 0 };
+    } catch (error) {
+      if (!(error instanceof LogDivergedError)) throw error;
+      const named = await fetchSegment(
+        deps,
+        scope,
+        context,
+        read.dataHash,
+        read.version,
+      );
+      return rebase(
+        [
+          ...named.segment.refs,
+          {
+            position: read.version,
+            dataHash: read.dataHash.toLowerCase() as `0x${string}`,
+            bytes: named.bytes,
+          },
+        ],
+        error.message,
+      );
+    }
+  }
 
   const lastRef = local.refs.at(-1);
   if (
@@ -233,6 +269,11 @@ export async function applyLog(
     return { applied: 0 };
   }
   if (head.generation > context.generation) return { applied: 0 };
+  // This device's first install of the connection's log. What it holds from
+  // before goes into the log with its next publish (`log-seed.ts`). An
+  // unfinished key-ordered load already passed here at its start.
+  if (local.position === 0 && pending === null)
+    await seedFromRecords(deps, connectionId);
 
   const headRef: SegmentRef = {
     position: head.position,
@@ -249,7 +290,8 @@ export async function applyLog(
       named &&
       named.dataHash.toLowerCase() !== lastRef.dataHash.toLowerCase()
     )
-      throw new LogDivergedError(
+      return rebase(
+        allRefs,
         `apply: the log names a different segment at position ${lastRef.position} than this device applied`,
       );
   }
@@ -259,7 +301,8 @@ export async function applyLog(
   let gap = false;
   if (plan.kind === "gap") {
     if (plan.reason === "ahead_of_head")
-      throw new LogDivergedError(
+      return rebase(
+        allRefs,
         `apply: the log's newest position ${head.position} is behind this device at ${since}`,
       );
     // A full check. Behind `base` the log no longer holds the prefix: a
@@ -290,7 +333,20 @@ export async function applyLog(
       pending = null;
     }
   }
-  if (gap && deps.progressiveFirstLoad === true && pending === null) {
+  // A first load of a log too big for one commit loads key by key (see
+  // `log-keyed.ts`), on a host that shows streams while they load too; the
+  // segments are the same, and so is their order.
+  const buckets = await planKeyedLoad(
+    deps,
+    connectionId,
+    local,
+    snapshot !== null,
+    tail,
+    pending,
+  );
+  const progressive =
+    deps.progressiveFirstLoad === true && pending === null && buckets === null;
+  if (gap && progressive) {
     const after = planOpsSince(head, headRef, head.base);
     return {
       applied: await loadProgressively(
@@ -307,7 +363,7 @@ export async function applyLog(
   }
   if (tail.length === 0 && snapshot === null && pending === null)
     return { applied: 0 };
-  if (deps.progressiveFirstLoad === true && pending === null)
+  if (progressive)
     return {
       applied: await loadProgressively(
         deps,
@@ -321,16 +377,6 @@ export async function applyLog(
       ),
     };
 
-  // A first load of a log too big for one commit loads key by key (see
-  // `log-keyed.ts`); the segments are the same, and so is their order.
-  const buckets = await planKeyedLoad(
-    deps,
-    connectionId,
-    local,
-    snapshot !== null,
-    tail,
-    pending,
-  );
   if (buckets !== null) {
     await loadKeyed(
       deps,
@@ -507,7 +553,7 @@ export async function fetchSegment(
   context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
   dataHash: string,
   position: number,
-): Promise<{ segment: Segment; bytes: number }> {
+): Promise<{ segment: Segment; bytes: number; cipherBytes: number }> {
   const cipher = await deps.blobs.get(`${scope}/${segmentBlobName(dataHash)}`);
   if (cipher === null)
     throw new Error(`apply: missing log segment ${position}`);
@@ -531,7 +577,11 @@ export async function fetchSegment(
     throw new Error(
       `apply: invalid log segment ${position} (${verified.kind})`,
     );
-  return verified;
+  const segment: Segment = {
+    ...verified.segment,
+    operations: await resolveBodies(deps, scope, verified.segment.operations),
+  };
+  return { segment, bytes: verified.bytes, cipherBytes: cipher.length };
 }
 
 /** One snapshot part, fetched, decrypted and verified. */
@@ -564,7 +614,10 @@ export async function fetchSnapshotPart(
     );
   if (verified.kind !== "ok")
     throw new Error(`apply: invalid log snapshot part (${verified.kind})`);
-  return verified.part;
+  return {
+    ...verified.part,
+    entries: await resolveBodies(deps, scope, verified.part.entries),
+  };
 }
 
 /**

@@ -26,6 +26,26 @@ export default tseslint.config(
   ...tseslint.configs.recommended,
   eslintConfigPrettier,
   {
+    files: ["packages/core/src/**/*.ts", "packages/lite/src/**/*.ts"],
+    ignores: ["**/*.test.ts"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: 'CallExpression > Literal.arguments[value="base64url"]',
+          message:
+            "Use the portable encoding/base64url codec instead of a Buffer encoding.",
+        },
+        {
+          selector:
+            'MemberExpression[object.name="Buffer"][property.name="compare"], MemberExpression[object.name="Buffer"][computed=true][property.value="compare"]',
+          message:
+            "Compare Uint8Array bytes without Buffer.compare for browser compatibility.",
+        },
+      ],
+    },
+  },
+  {
     // Runs in browsers and WebViews: no Node built-ins.
     files: [
       "packages/core/src/legacy-projection/**/*.ts",

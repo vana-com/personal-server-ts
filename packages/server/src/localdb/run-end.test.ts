@@ -11,6 +11,7 @@ import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import { checkRunFence } from "../../../core/src/localdb/fence.js";
 import { decideReplace } from "../../../core/src/localdb/replace.js";
 import type { EndRequest } from "../../../core/src/stream-sync/intake.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 vi.mock("../../../core/src/localdb/fence.js", () => ({
@@ -102,15 +103,19 @@ async function begin(
   ]);
 }
 
+/** The end of a run whose one stream `s` sent records, or stayed silent. */
 const request = (
-  outcome: EndRequest["outcome"],
+  sent: "live" | "silent" | "skipped" | "gap",
   checkpoint = false,
-): EndRequest => ({
-  outcome,
-  coveredStreams: ["s"],
-  lastBatch: 0,
-  ...(checkpoint ? { checkpointCandidate: { s: "cursor" } } : {}),
-});
+): EndRequest =>
+  endRequest({
+    lastBatch: 0,
+    streams: ["s"],
+    ...(sent === "live" ? { live: ["s"] } : {}),
+    ...(sent === "skipped" ? { skipped: ["s"] } : {}),
+    ...(sent === "gap" ? { observe: { s: { detailGap: "fatal" } } } : {}),
+    ...(checkpoint ? { checkpoints: { s: "cursor" } } : {}),
+  });
 const keys = async (db: SqlDriver) =>
   (
     await db.query<{ record_key: string }>(
@@ -127,23 +132,18 @@ const checkpoint = async (db: SqlDriver) =>
 describe("run end", () => {
   it("EndResult table", async () => {
     const cases = [
-      { name: "failed", outcome: "failed", rows: 1, expected: "aborted" },
-      { name: "cancelled", outcome: "cancelled", rows: 1, expected: "aborted" },
-      { name: "abort", outcome: "failed", rows: 1, expected: "aborted" },
-      { name: "fenced", outcome: "succeeded", rows: 1, expected: "discarded" },
-      { name: "merged", outcome: "succeeded", rows: 1, expected: "queued" },
+      { name: "failed", sent: "skipped", rows: 1, expected: "aborted" },
+      { name: "cancelled", sent: "live", rows: 1, expected: "aborted" },
+      { name: "abort", sent: "live", rows: 1, expected: "aborted" },
+      { name: "fenced", sent: "live", rows: 1, expected: "discarded" },
+      { name: "merged", sent: "live", rows: 1, expected: "queued" },
       {
         name: "checkpoint",
-        outcome: "succeeded",
+        sent: "silent",
         rows: 0,
         expected: "checkpoint_only",
       },
-      {
-        name: "empty",
-        outcome: "succeeded",
-        rows: 0,
-        expected: "no_checkpoint",
-      },
+      { name: "empty", sent: "gap", rows: 0, expected: "no_checkpoint" },
     ] as const;
     for (const row of cases) {
       const { db, store } = await fresh();
@@ -160,21 +160,22 @@ describe("run end", () => {
           },
         ]);
       }
-      if (row.name === "abort") {
-        // abort has a void API, but shares the failed/cancelled cleanup path.
-        await expect(store.abort(row.name, "failed")).resolves.toBeUndefined();
+      if (row.name === "abort" || row.name === "cancelled") {
+        // abort has a void API, but shares the failed cleanup path.
+        const reason = row.name === "abort" ? "failed" : "cancelled";
+        await expect(store.abort(row.name, reason)).resolves.toBeUndefined();
         expect(
           await db.query("SELECT decision, reason FROM run_streams"),
           row.name,
-        ).toEqual([{ decision: "discarded", reason: "failed" }]);
+        ).toEqual([{ decision: "discarded", reason }]);
       } else {
         expect(
           await store.end(
             row.name,
-            request(row.outcome, row.name === "checkpoint"),
+            request(row.sent, row.name === "checkpoint"),
           ),
           row.name,
-        ).toEqual({ result: row.expected, updateRequired: false });
+        ).toMatchObject({ result: row.expected, updateRequired: false });
       }
       expect(await db.query("SELECT state FROM runs"), row.name).toEqual([
         { state: "ended" },
@@ -198,34 +199,213 @@ describe("run end", () => {
     }
   });
 
-  it("retry-pending-keeps-progress", async () => {
-    const { db, store } = await fresh(0);
-    const first = Array.from({ length: 50 }, (_, index) => `r${index + 1}`);
-    await begin(db, "run-A", 1, 50);
-    const batches = vi.spyOn(db, "batch");
-    // Even a replacement verdict cannot turn a retry into a full replacement.
-    vi.mocked(decideReplace).mockReturnValue(true);
+  it("answers the outcome and streams it decided from the observations", async () => {
+    const { db, store } = await fresh();
+    await begin(db, "run", 1, 1);
+    expect(await store.end("run", request("live", true))).toEqual({
+      result: "queued",
+      updateRequired: false,
+      outcome: "succeeded",
+      coveredStreams: ["s"],
+      provenFullStreams: [],
+      unconfirmed: false,
+    });
+  });
+
+  it("aborts a run whose observations confirm no stream", async () => {
+    const { db, store } = await fresh();
+    await begin(db, "run", 1, 1);
+    expect(await store.end("run", request("skipped", true))).toEqual({
+      result: "aborted",
+      updateRequired: false,
+      outcome: "failed",
+      coveredStreams: [],
+      provenFullStreams: [],
+      unconfirmed: true,
+    });
+    expect(await keys(db)).toEqual([]);
+    expect(await checkpoint(db)).toBeNull();
+  });
+
+  it("keeps an uncovered stream's explicit deletes and drops its upserts", async () => {
+    const { db, store } = await fresh();
+    await db.batch([
+      {
+        sql: `INSERT INTO stream_state
+          (connection_id, stream, primary_key, semantics, incremental,
+           profile_key, profile_version, complete, head_version, head_generation)
+          VALUES ('c1', 't', '["id"]', 'mutable_state', 1, 'example', '1.0.0', 1, 1, 1)`,
+      },
+      {
+        sql: `INSERT INTO records (connection_id, stream, pk_hash, record_key, body, body_sha256, stamp_o, stamp_r, first_o)
+          VALUES ('c1', 't', 'hash-old', 'old', '{}', 'digest-old', 1, 'seed', 1)`,
+      },
+    ]);
+    await begin(db, "run", 1, 1);
+    await db.batch([
+      {
+        sql: `INSERT INTO run_streams
+          (run_id, stream, delete_snapshot, primary_key, profile_key, profile_version, full_read)
+          VALUES ('run', 't', 0, '["id"]', 'example', '1.0.0', 1)`,
+      },
+      {
+        sql: "INSERT INTO run_rows (run_id, stream, pk_hash, record_key, body, body_sha256) VALUES ('run', 't', 'hash-new', 'new', '{}', 'digest-new')",
+      },
+      {
+        sql: "INSERT INTO run_rows (run_id, stream, pk_hash, record_key, body, body_sha256, op) VALUES ('run', 't', 'hash-old', 'old', '{}', 'digest-old', 'delete')",
+      },
+    ]);
     expect(
-      await store.end("run-A", {
-        outcome: "retry_pending",
+      await store.end(
+        "run",
+        endRequest({
+          lastBatch: 0,
+          live: ["s", "t"],
+          deleted: ["t"],
+          skipped: ["t"],
+          checkpoints: { s: "S1", t: "T1" },
+        }),
+      ),
+    ).toMatchObject({
+      result: "queued",
+      outcome: "partial",
+      coveredStreams: ["s"],
+    });
+    expect(
+      await db.query(
+        "SELECT stream, record_key FROM records WHERE connection_id = 'c1' ORDER BY stream, record_key",
+      ),
+    ).toEqual([{ stream: "s", record_key: "r1" }]);
+  });
+
+  it("publishes the explicit delete of a stream DONE named failed, and none of its upserts", async () => {
+    const { db, store } = await fresh();
+    await db.batch([
+      {
+        sql: `INSERT INTO stream_state
+          (connection_id, stream, primary_key, semantics, incremental,
+           profile_key, profile_version, complete, head_version, head_generation)
+          VALUES ('c1', 't', '["id"]', 'mutable_state', 1, 'example', '1.0.0', 1, 1, 1)`,
+      },
+      {
+        sql: `INSERT INTO records (connection_id, stream, pk_hash, record_key, body, body_sha256, stamp_o, stamp_r, first_o)
+          VALUES ('c1', 't', 'hash-old', 'old', '{}', 'digest-old', 1, 'seed', 1)`,
+      },
+    ]);
+    await begin(db, "run", 1, 0);
+    await db.batch([
+      {
+        sql: `INSERT INTO run_streams
+          (run_id, stream, delete_snapshot, primary_key, profile_key, profile_version, full_read)
+          VALUES ('run', 't', 0, '["id"]', 'example', '1.0.0', 1)`,
+      },
+      {
+        sql: "INSERT INTO run_rows (run_id, stream, pk_hash, record_key, body, body_sha256) VALUES ('run', 't', 'hash-new', 'new', '{}', 'digest-new')",
+      },
+      {
+        sql: "INSERT INTO run_rows (run_id, stream, pk_hash, record_key, body, body_sha256, op) VALUES ('run', 't', 'hash-old', 'old', '{}', 'digest-old', 'delete')",
+      },
+    ]);
+    expect(
+      await store.end(
+        "run",
+        endRequest({
+          lastBatch: 0,
+          streams: ["s"],
+          live: ["t"],
+          deleted: ["t"],
+          finish: "failed_done_upsert_only",
+          observe: { t: { failedInDone: true } },
+          checkpoints: { t: "T1" },
+        }),
+      ),
+    ).toMatchObject({
+      result: "queued",
+      outcome: "partial",
+      coveredStreams: [],
+    });
+    expect(
+      await db.query(
+        "SELECT stream, record_key FROM records WHERE connection_id = 'c1' ORDER BY stream, record_key",
+      ),
+    ).toEqual([]);
+    expect(await checkpoint(db)).toBeNull();
+  });
+
+  it("refuses an end body in the old outcome shape", async () => {
+    const { db, store } = await fresh();
+    await begin(db, "run", 1, 1);
+    await expect(
+      store.end("run", {
+        outcome: "succeeded",
         coveredStreams: ["s"],
-        provenFullStreams: ["s"],
-        checkpointCandidate: { s: "C50" },
         lastBatch: 0,
       }),
-    ).toEqual({ result: "queued", updateRequired: false });
-    const endBatch = batches.mock.calls.at(-1)![0];
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(await db.query("SELECT state FROM runs")).toEqual([
+      { state: "collecting" },
+    ]);
+  });
+
+  it("replays the first answer to a repeated end", async () => {
+    const { db, store } = await fresh();
+    await begin(db, "run", 1, 1);
+    const first = await store.end("run", request("live", true));
+    expect(await store.end("run", request("skipped"))).toEqual(first);
+  });
+
+  it("a saved candidate keeps the cursor of a stream it held back", async () => {
+    const { db, store } = await fresh(0);
+    await db.batch([
+      {
+        sql: `UPDATE connections SET checkpoint = '{"s":"C0","other":"O0"}' WHERE connection_id = 'c1'`,
+      },
+    ]);
+    await begin(db, "run", 1, 2);
+    // A retry run that sent records holds that stream's cursor.
     expect(
-      endBatch.some((statement) =>
-        statement.sql.includes("INSERT INTO records"),
+      await store.end(
+        "run",
+        endRequest({
+          lastBatch: 0,
+          live: ["s"],
+          retry: true,
+          checkpoints: { s: "C2" },
+        }),
       ),
-    ).toBe(true);
+    ).toMatchObject({ outcome: "retry_pending", coveredStreams: [] });
+    expect(await keys(db)).toEqual([]);
+    expect(JSON.parse((await checkpoint(db))!)).toEqual({
+      s: "C0",
+      other: "O0",
+    });
+  });
+
+  it("retry-pending-keeps-progress", async () => {
+    const { db, store } = await fresh(0);
+    // A connector asks to be retried before it sends records: its job token
+    // is kept, and nothing is merged or replaced.
+    await begin(db, "run-A", 1, 0);
+    const batches = vi.spyOn(db, "batch");
+    vi.mocked(decideReplace).mockReturnValue(true);
+    expect(
+      await store.end(
+        "run-A",
+        endRequest({
+          lastBatch: 0,
+          streams: ["s"],
+          retry: true,
+          provenFullStreams: ["s"],
+          checkpoints: { s: "C50" },
+        }),
+      ),
+    ).toMatchObject({ result: "checkpoint_only", updateRequired: false });
+    const endBatch = batches.mock.calls.at(-1)![0];
     expect(
       endBatch.some((statement) =>
         statement.sql.includes("UPDATE connections SET checkpoint"),
       ),
     ).toBe(true);
-    expect(await keys(db)).toEqual(first);
     expect(await db.query("SELECT complete FROM stream_state")).toEqual([
       { complete: 0 },
     ]);
@@ -234,36 +414,22 @@ describe("run end", () => {
     ).toEqual([{ replace: 0 }]);
     expect(decideReplace).not.toHaveBeenCalled();
 
-    // Model a producer resuming from the persisted cursor, not a replay of A.
+    // Model a producer resuming from the persisted cursor.
     const resume = JSON.parse((await checkpoint(db))!) as { s: string };
     expect(resume.s).toBe("C50");
     const next = Number(resume.s.slice(1)) + 1;
     await begin(db, "run-B", next, 60, 20);
-    const received = await db.query<{ record_key: string }>(
-      "SELECT record_key FROM run_rows WHERE run_id = 'run-B' ORDER BY record_key",
-    );
-    expect(received).toHaveLength(10);
-    expect(received.every((row) => !first.includes(row.record_key))).toBe(true);
     vi.mocked(decideReplace).mockReturnValue(false);
     expect(
-      await store.end("run-B", {
-        outcome: "succeeded",
-        coveredStreams: ["s"],
-        checkpointCandidate: { s: "C60" },
-        lastBatch: 0,
-      }),
-    ).toEqual({ result: "queued", updateRequired: false });
+      await store.end(
+        "run-B",
+        endRequest({ lastBatch: 0, live: ["s"], checkpoints: { s: "C60" } }),
+      ),
+    ).toMatchObject({ result: "queued", updateRequired: false });
     expect(await keys(db)).toEqual(
-      Array.from({ length: 60 }, (_, index) => `r${index + 1}`),
+      Array.from({ length: 10 }, (_, index) => `r${index + 51}`),
     );
-    const counts = await db.query<{ record_key: string; n: number }>(
-      `SELECT record_key, COUNT(*) AS n FROM record_changes
-         WHERE connection_id = 'c1' AND stream = 's' AND origin = 'local'
-         GROUP BY record_key ORDER BY length(record_key), record_key`,
-    );
-    expect(counts.filter((row) => first.includes(row.record_key))).toEqual(
-      first.map((record_key) => ({ record_key, n: 1 })),
-    );
+    expect(JSON.parse((await checkpoint(db))!)).toEqual({ s: "C60" });
     expect(await db.query("SELECT COUNT(*) AS n FROM run_rows")).toEqual([
       { n: 0 },
     ]);
@@ -280,10 +446,12 @@ describe("run end", () => {
       },
     ]);
     await begin(db, "old-version", 1, 1);
-    expect(await store.end("old-version", request("succeeded", true))).toEqual({
-      result: "no_checkpoint",
-      updateRequired: true,
-    });
+    expect(await store.end("old-version", request("live", true))).toMatchObject(
+      {
+        result: "no_checkpoint",
+        updateRequired: true,
+      },
+    );
     expect(await db.query("SELECT decision, reason FROM run_streams")).toEqual([
       { decision: "refused", reason: "connector_update_required" },
     ]);

@@ -8,7 +8,8 @@ import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schema
 import { createMemoryModeRecordStore } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { createStreamSyncKeyPorts } from "../../../core/src/stream-sync/crypto.js";
 import { createServer, type ServerContext } from "../bootstrap.js";
-import { remoteFixture } from "./apply-fixture.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
+import { remoteFixture } from "./apply-fixture.test-utils.js";
 
 const contexts: ServerContext[] = [];
 const directories: string[] = [];
@@ -106,7 +107,7 @@ async function world() {
       id: string,
       observedAt: number,
       rows: Record<string, number>,
-      end: Record<string, unknown>,
+      end: EndShape,
       value = 0,
     ) {
       const begin = await send(`/v1/stream-sync/runs/${id}`, "PUT", {
@@ -130,11 +131,16 @@ async function world() {
         });
         expect(batch.status).toBe(200);
       }
-      const response = await send(`/v1/stream-sync/runs/${id}/end`, "POST", {
-        checkpointCandidate: {},
-        lastBatch: records.length > 0 ? 0 : -1,
-        ...end,
-      });
+      const response = await send(
+        `/v1/stream-sync/runs/${id}/end`,
+        "POST",
+        endRequest({
+          lastBatch: records.length > 0 ? 0 : -1,
+          streams: ALL,
+          live: Object.keys(rows).filter((stream) => rows[stream]! > 0),
+          ...end,
+        }),
+      );
       expect(response.status).toBe(200);
       return response.json();
     },
@@ -163,50 +169,47 @@ async function world() {
   };
 }
 
-/**
- * The end request Desktop sends when a run fails after finishing some streams
- * (`EndRequest::body` in apps/desktop/src-tauri/src/commands/pdpp_stream_sync_run.rs,
- * built by `finish_plan(RunKind::CertifiedFailedDone | FailedDoneUpsertOnly)`
- * and `with_proven_full` in pdpp_runtime.rs): outcome `partial`, the covered
- * streams, the covered streams it read whole, and no cursor.
- */
-const failedDone = (covered: string[], proven: string[]) => ({
-  outcome: "partial",
-  coveredStreams: covered,
-  provenFullStreams: proven,
-  checkpointCandidate: {},
-});
-const ALL = STREAMS.map(([name]) => name);
-// Live shape: two streams finished and proven, two skipped for having no
-// records, one failed and left retry-pending (not covered).
+/** What the host saw of a run, beyond the records it sent. */
+type EndShape = Omit<Parameters<typeof endRequest>[0], "lastBatch">;
+const ALL: string[] = STREAMS.map(([name]) => name);
+// Live shape: two streams finished and proven, two sent no records, and a
+// failed DONE named ads as failed.
 const FINISHED = ["profile", "following"];
 const SKIPPED = ["posts", "post_likes"];
-const upsertOnly = failedDone(ALL, []);
+/** A failed DONE that named its failed stream, as Desktop reports it. */
+const failedDone = (proven: string[], skipped: string[] = []): EndShape => ({
+  finish: "certified_failed_done",
+  observe: { ads: { failedInDone: true } },
+  provenFullStreams: proven,
+  skipped,
+});
+/** A failed DONE that named nothing: only its records count. */
+const upsertOnly: EndShape = { finish: "failed_done_upsert_only" };
 
 const SHAPES: {
   name: string;
-  earlier: Record<string, unknown>[];
-  end: ReturnType<typeof failedDone>;
+  earlier: EndShape[];
+  end: EndShape;
 }[] = [
   {
     name: "after an earlier upsert-only run left incomplete heads",
     earlier: [upsertOnly],
-    end: failedDone([...FINISHED, ...SKIPPED], FINISHED),
+    end: failedDone(FINISHED),
   },
   {
     name: "as the first run of the connection",
     earlier: [],
-    end: failedDone([...FINISHED, ...SKIPPED], FINISHED),
+    end: failedDone(FINISHED),
   },
   {
-    name: "with the skipped siblings left out of the covered streams",
+    name: "with the siblings that sent nothing skipped",
     earlier: [upsertOnly],
-    end: failedDone(FINISHED, FINISHED),
+    end: failedDone(FINISHED, SKIPPED),
   },
   {
     name: "after two earlier upsert-only runs",
     earlier: [upsertOnly, upsertOnly],
-    end: failedDone([...FINISHED, ...SKIPPED], FINISHED),
+    end: failedDone(FINISHED),
   },
 ];
 
@@ -256,11 +259,7 @@ describe("a failed run's finished streams are served", () => {
       "whole",
       1_000,
       { profile: 1, following: 19 },
-      {
-        outcome: "succeeded",
-        coveredStreams: ALL,
-        provenFullStreams: ALL,
-      },
+      { provenFullStreams: ALL },
     );
     await w.publish();
     await w.run(
@@ -280,7 +279,7 @@ describe("a failed run's finished streams are served", () => {
       "failed-done",
       1_000,
       { profile: 1, following: 19 },
-      failedDone(FINISHED, FINISHED),
+      failedDone(FINISHED, SKIPPED),
     );
     await w.publish();
     // One cycle applies the log this device wrote.

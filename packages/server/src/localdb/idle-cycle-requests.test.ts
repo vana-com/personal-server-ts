@@ -19,6 +19,7 @@ import {
   type MemoryStreamSyncRegistry,
   type StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const OWNER = `0x${"11".repeat(20)}` as const;
@@ -55,7 +56,7 @@ async function world(connectors: number, streamsPer: number) {
     },
     async listOwnerRows() {
       calls.push("registry.list");
-      return inner.listOwnerRows!();
+      return inner.listOwnerRows();
     },
     async probeChange() {
       calls.push("registry.probe");
@@ -106,8 +107,6 @@ async function world(connectors: number, streamsPer: number) {
         primaryKey: ["id"],
       })),
     }),
-    declaredStreams: () => names,
-    olderVersionReads: () => true,
   });
   let runs = 0;
   for (let c = 0; c < connectors; c++) {
@@ -125,11 +124,7 @@ async function world(connectors: number, streamsPer: number) {
         { stream, data: { id: `${stream}-0`, version: 1 } },
       ]),
     });
-    await sync.intake.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: names,
-      lastBatch: 0,
-    });
+    await sync.intake.end(runId, endRequest({ lastBatch: 0, live: names }));
   }
   await sync.cycle(); // publishes everything
   await sync.cycle(); // settles: a second pass finds nothing to do

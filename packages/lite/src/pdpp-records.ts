@@ -69,10 +69,19 @@ export async function handleLitePdppRecordList(
       namespace: "",
     }));
     const connectors = await local.declarations.connectors();
+    // The port is synchronous: read each connector's streams once per request.
+    const streams = new Map(
+      await Promise.all(
+        connectors.map(
+          async (connector) =>
+            [connector, await local.declarations.streamsOf(connector)] as const,
+        ),
+      ),
+    );
     const ports: PdppRecordListPorts = {
       accountMode: deps.accountStorageMode,
       recordQuery: linked,
-      declarations: liteDeclarations(local.declarations, connectors),
+      declarations: liteDeclarations(connectors, streams),
       // Lite holds connector ids only, not canonical source ids. `source`
       // names a held connector exactly; any other string names no source here
       // and is refused as a source the caller may not read.
@@ -105,8 +114,8 @@ export async function handleLitePdppRecordList(
  * `forInstance` for one connection, `get` for any connection in this store.
  */
 function liteDeclarations(
-  declared: LocalSync["declarations"],
   connectors: readonly string[],
+  streams: ReadonlyMap<string, readonly string[]>,
 ): PdppRecordListPorts["declarations"] {
   const declaration = (stream: string): StreamDeclaration => ({
     name: stream,
@@ -116,9 +125,7 @@ function liteDeclarations(
     requiredFields: [],
   });
   const forInstance = (connector: string, stream: string) =>
-    declared.streamsOf(connector).includes(stream)
-      ? declaration(stream)
-      : undefined;
+    streams.get(connector)?.includes(stream) ? declaration(stream) : undefined;
   return {
     get: (stream) =>
       connectors.some((connector) => forInstance(connector, stream))

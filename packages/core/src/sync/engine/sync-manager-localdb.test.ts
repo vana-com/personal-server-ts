@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createSyncManager } from "./sync-manager.js";
 import { downloadAll, downloadScopes } from "../workers/download.js";
+import { deltaToCycle } from "./local-sync.test-helper.js";
 
 describe("database sync hooks", () => {
   it("rechecks Account after canSync, then uses one database cycle without any legacy reads or hydration", async () => {
@@ -23,7 +24,7 @@ describe("database sync hooks", () => {
     const cycle = vi.fn(async () => {});
     const manager = createSyncManager(upload as never, download as never, {
       accountStorageMode: { read: () => mode },
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       canSync: async () => {
         mode = "switched";
         return { ok: true };
@@ -85,7 +86,10 @@ describe("database sync hooks", () => {
         serverOwner: "0x1234",
       } as never,
       { logger } as never,
-      { accountStorageMode: { read: () => "switched" }, localSync: { cycle } },
+      {
+        accountStorageMode: { read: () => "switched" },
+        localSync: { cycle, applyDelta: deltaToCycle },
+      },
     );
     await manager.trigger();
     expect(manager.getStatus().blocked?.reason).toBe("update_required");
@@ -119,7 +123,10 @@ describe("database sync hooks", () => {
         serverOwner: "0x1234",
       } as never,
       { logger } as never,
-      { accountStorageMode: { read: () => "switched" }, localSync: { cycle } },
+      {
+        accountStorageMode: { read: () => "switched" },
+        localSync: { cycle, applyDelta: deltaToCycle },
+      },
     );
     await manager.trigger();
     expect(manager.getStatus().blocked?.reason).toBe("update_required");

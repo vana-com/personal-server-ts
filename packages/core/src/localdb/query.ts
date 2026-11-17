@@ -1,3 +1,7 @@
+import {
+  decodeBase64UrlUtf8,
+  encodeBase64UrlUtf8,
+} from "../encoding/base64url.js";
 import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { encodeCursor, decodeCursor } from "../storage/pdpp-records/cursor.js";
 import {
@@ -93,7 +97,7 @@ const LIST_CURSOR_PREFIX = "v2.";
 export function listCursor(recordKey: string, pkHash: string): string {
   return (
     LIST_CURSOR_PREFIX +
-    Buffer.from(JSON.stringify([recordKey, pkHash])).toString("base64url")
+    encodeBase64UrlUtf8(JSON.stringify([recordKey, pkHash]))
   );
 }
 
@@ -104,10 +108,7 @@ function parseListCursor(cursor: string): {
   if (cursor.startsWith(LIST_CURSOR_PREFIX)) {
     try {
       const value: unknown = JSON.parse(
-        Buffer.from(
-          cursor.slice(LIST_CURSOR_PREFIX.length),
-          "base64url",
-        ).toString("utf8"),
+        decodeBase64UrlUtf8(cursor.slice(LIST_CURSOR_PREFIX.length)),
       );
       if (
         Array.isArray(value) &&
@@ -176,10 +177,14 @@ export function createRecordQuery(db: SqlReader): RecordQuery {
     },
 
     async getRecord({ connectionId, stream, recordKey }) {
+      // `+pk_hash`: no index may supply this order. Otherwise the planner
+      // walks the whole stream in key order to stop at the first match,
+      // rather than finding the few rows of the record key in
+      // `records_by_key` and sorting them.
       const rows = await db.query<RecordRow>(
         `SELECT ${RECORD_COLUMNS} FROM records
          WHERE connection_id = ? AND stream = ? AND record_key = ?
-         ORDER BY pk_hash LIMIT 1`,
+         ORDER BY +pk_hash LIMIT 1`,
         [connectionId, stream, recordKey],
       );
       return rows[0] ? stored(rows[0]) : null;
@@ -264,7 +269,7 @@ export function createRecordQuery(db: SqlReader): RecordQuery {
 }
 
 /** Frozen grant projections over the current table. Lost bodies expire the cursor;
- * published older bodies remain owned by older-versions, never a local archive.
+ * no older body is kept: the connection log holds none per stream.
  */
 export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
   return async (

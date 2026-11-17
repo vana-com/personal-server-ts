@@ -167,15 +167,19 @@ export function keyedBuckets(
  * Whether this pass loads key by key, and into how many ranges. It does when
  * the device holds nothing of the log's streams (no stream version, so no
  * reader serves a row, and no position) and the log is more than the memory
- * budget can apply in one commit. Not for a progressive load, which shows a
- * stream while it loads (`progressiveFirstLoad`), nor with a snapshot: its
- * parts are key-ordered already and load as they are.
+ * budget can apply in one commit. Not with a snapshot: its parts are
+ * key-ordered already and load as they are.
+ *
+ * A host that shows a stream while it loads (`progressiveFirstLoad`) loads
+ * key by key too. Segment by segment, each commit rewrites most of the table
+ * (see the top of this file): on the Web's OPFS a 198,001-row log took 378 s
+ * that way and 26 s key by key, and the rows the progressive load would show
+ * meanwhile reach no listing, which serves a stream only once its head is
+ * complete. The key-ordered load shows the streams when its last range
+ * commits.
  */
 export async function planKeyedLoad(
-  deps: Pick<
-    LocalSyncDeps,
-    "db" | "blobs" | "progressiveFirstLoad" | "keyedFirstLoad"
-  >,
+  deps: Pick<LocalSyncDeps, "db" | "blobs" | "keyedFirstLoad">,
   connectionId: string,
   local: LogState,
   snapshotPresent: boolean,
@@ -206,7 +210,6 @@ export async function planKeyedLoad(
   }
   if (
     deps.keyedFirstLoad === false ||
-    deps.progressiveFirstLoad === true ||
     snapshotPresent ||
     local.position !== 0 ||
     tail.length < 2

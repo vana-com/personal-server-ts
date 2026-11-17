@@ -2,6 +2,17 @@ import { forgetUploadedBlobs } from "./blobs.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { withOrigin } from "./merge.js";
 
+// A purge ends the local lifetime even if a later observation restores the
+// same registry generation. Retained publishers compare this token in-slot.
+const lifetimes = new WeakMap<object, Map<string, object>>();
+export function connectionLifetime(db: object, connectionId: string): object {
+  let entries = lifetimes.get(db);
+  if (!entries) lifetimes.set(db, (entries = new Map()));
+  let token = entries.get(connectionId);
+  if (!token) entries.set(connectionId, (token = {}));
+  return token;
+}
+
 /**
  * F.5 step 1: the local purge of one connection, in the connection queue
  * (kind "purge"), in ONE batch with origin `purge`: delete the connection's
@@ -80,6 +91,8 @@ export async function purgeConnection(
         },
       ]),
     );
+    // Rotate only after the purge batch commits, before releasing its slot.
+    lifetimes.get(deps.db)?.delete(connectionId);
     // The lifetime is over: nothing uploaded for it is known to be there.
     forgetUploadedBlobs(deps.db);
     deps.logger.info(

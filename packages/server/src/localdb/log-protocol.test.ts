@@ -14,6 +14,7 @@ import {
   encodeSegment,
   firstDeletionKeyMismatch,
   LOG_FORMAT,
+  PART_LIMIT_BYTES,
   pkHash,
   primaryKeyValues,
   type LogKey,
@@ -31,6 +32,7 @@ import {
   recordKeyOfKey,
 } from "../../../core/src/localdb/log-apply.js";
 import { PAGE_BYTES } from "../../../core/src/localdb/log-publish.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { computeRecordKeyFromData } from "../../../core/src/storage/pdpp-records/record-key.js";
 import {
   applySegmentOperations,
@@ -169,26 +171,17 @@ describe("log protocol", () => {
     await b.cycle();
     expect(await b.position()).toBe(1);
 
-    // Ahead of the registry (a restored registry): fail closed, with nothing
-    // fetched or applied and the position kept (see the P2-2 tests).
+    // Ahead of the registry with no segment of its own above it, so nothing
+    // to put back: the device goes back to the last position both agree on
+    // (see the P2-2 tests).
     await b.db.batch([
       {
         sql: "UPDATE log_state SET position = 9 WHERE connection_id = ?",
         params: [CONNECTION_ID],
       },
     ]);
-    const before = b.gets.length;
-    await expect(b.cycle()).rejects.toThrow(/behind this device/);
-    expect(await b.position()).toBe(9);
-    expect(b.gets.slice(before).some((k) => k.startsWith(`${LOG}/s-`))).toBe(
-      false,
-    );
-    await b.db.batch([
-      {
-        sql: "UPDATE log_state SET position = 1 WHERE connection_id = ?",
-        params: [CONNECTION_ID],
-      },
-    ]);
+    await b.cycle();
+    expect(await b.position()).toBe(1);
 
     // Segment 2 is missing: segment 3 must not apply.
     await a.run("run-2", [{ stream: sName(0), id: "two" }], {
@@ -901,6 +894,155 @@ describe("log protocol: size splitting", () => {
   });
 });
 
+describe("log protocol: omissions over rounds", () => {
+  type Completion = Extract<WireOp, { kind: "complete" }>;
+  type WireOp = Segment["operations"][number];
+  const completionsIn = (ops: readonly WireOp[]) =>
+    ops.filter((o): o is Completion => o.kind === "complete");
+
+  it("a full replacement whose omissions alone exceed the segment limit publishes them in chunks, and a fresh reader has exactly the run's rows", async () => {
+    const w = await world({ streams: 1 });
+    const a = await w.device("a");
+    // Each omission names its typed key; long keys make 17,000 of them more
+    // than one segment may hold, with no row of the replacing run to send.
+    const pad = "k".repeat(1000);
+    const ids = Array.from({ length: 17_000 }, (_, i) => `${i}-${pad}`);
+    await a.run(
+      "run-1",
+      ids.map((id) => ({ stream: sName(0), id })),
+    );
+    await a.cycle();
+    const before = await a.position();
+    const kept = ids.slice(0, 2);
+    await a.run(
+      "run-2",
+      kept.map((id) => ({ stream: sName(0), id })),
+    );
+    await a.cycle();
+
+    const segments = await w.segments();
+    const keys = await w.segmentKeys();
+    const after = [...keys.keys()]
+      .filter((p) => p > before)
+      .sort((x, y) => x - y);
+    // Every segment decodes (a segment over the limit does not).
+    expect(after.every((p) => segments.has(p))).toBe(true);
+    for (const p of after)
+      expect(
+        (await w.innerBlobs.get(keys.get(p)!))!.length,
+      ).toBeLessThanOrEqual(PART_LIMIT_BYTES);
+    const chunks = after.map((p) => completionsIn(segments.get(p)!.operations));
+    expect(chunks.filter((c) => c.length > 0).length).toBeGreaterThan(1);
+    // The omissions stay omissions, at the run's cutoff, each key once.
+    const omitted = chunks
+      .flat()
+      .flatMap((c) => c.omitted.map((o) => o.pkHash));
+    expect(new Set(omitted).size).toBe(omitted.length);
+    expect(omitted).toHaveLength(ids.length - kept.length);
+    expect(
+      new Set(chunks.flat().map((c) => `${c.cutoff.o}/${c.cutoff.r}`)).size,
+    ).toBe(1);
+    expect(
+      after
+        .flatMap((p) => segments.get(p)!.operations)
+        .some((o) => o.kind === "delete"),
+    ).toBe(false);
+    for (const k of kept) expect(omitted).not.toContain(await idHash(k));
+    // Only the last segment says the stream is complete.
+    const said = after.map(
+      (p) =>
+        segments.get(p)!.streams.find((m) => m.stream === sName(0))?.complete,
+    );
+    expect(said.at(-1)).toBe(true);
+    expect(said.slice(0, -1).every((c) => c === false)).toBe(true);
+
+    const c = await w.device("c");
+    await c.cycle();
+    const records = await c.records();
+    expect(records).toHaveLength(kept.length);
+    expect(records).toEqual(await a.records());
+  }, 300_000);
+
+  it("a reader that applies some omission chunks and then the rest never gets an omitted key back", async () => {
+    const w = await world({ streams: 1, partTargetBytes: 3000 });
+    const reader = await w.device("reader");
+    let armed = false;
+    let puts = 0;
+    let midway: string[] | null = null;
+    let midwayComplete: number | null = null;
+    const a = await w.device("a", {
+      beforePut: async (key) => {
+        if (!armed || !key.includes(`${LOG}/s-`) || ++puts !== 2) return;
+        // The first chunk is committed and the second is not.
+        await reader.cycle();
+        midway = await reader.records();
+        midwayComplete =
+          (
+            await reader.db.query<{ complete: number }>(
+              "SELECT complete FROM stream_state WHERE stream = ?",
+              [sName(0)],
+            )
+          )[0]?.complete ?? null;
+      },
+    });
+    const ids = Array.from(
+      { length: 120 },
+      (_, i) => `id-${String(i).padStart(3, "0")}`,
+    );
+    const idOf = new Map<string, string>();
+    for (const id of ids) idOf.set(await idHash(id), id);
+    const held = (records: readonly string[]) =>
+      records.map(
+        (r) => (JSON.parse(r.slice(r.indexOf("=") + 1)) as { id: string }).id,
+      );
+    await a.run(
+      "run-1",
+      ids.map((id) => ({ stream: sName(0), id })),
+    );
+    await a.cycle();
+    await reader.cycle();
+    expect(await reader.records()).toHaveLength(ids.length);
+
+    armed = true;
+    const before = await a.position();
+    const kept = ids.slice(0, 2);
+    await a.run(
+      "run-2",
+      kept.map((id) => ({ stream: sName(0), id })),
+    );
+    await a.cycle();
+
+    const segments = await w.segments();
+    const after = [...segments.keys()]
+      .filter((p) => p > before)
+      .sort((x, y) => x - y);
+    expect(after.length).toBeGreaterThan(2);
+    const firstChunk = completionsIn(
+      segments.get(after[0]!)!.operations,
+    ).flatMap((c) => c.omitted.map((o) => idOf.get(o.pkHash)!));
+    expect(firstChunk.length).toBeGreaterThan(0);
+    expect(firstChunk.length).toBeLessThan(ids.length - kept.length);
+
+    // Midway: the first chunk's keys are gone, later ones are still held,
+    // and the stream does not say it is complete.
+    expect(midway).not.toBeNull();
+    const mid = held(midway!);
+    for (const id of firstChunk) expect(mid).not.toContain(id);
+    expect(mid.length).toBeGreaterThan(kept.length);
+    expect(midwayComplete).toBe(0);
+
+    await reader.cycle();
+    expect(held(await reader.records()).sort()).toEqual([...kept].sort());
+    expect(await reader.rows()).toEqual(await a.rows());
+    // Settled: another pass publishes nothing and the log does not move.
+    const settled = await a.position();
+    await a.cycle();
+    await reader.cycle();
+    expect(await a.position()).toBe(settled);
+    expect(held(await reader.records()).sort()).toEqual([...kept].sort());
+  });
+});
+
 describe("log protocol: attachments", () => {
   const bytes = new Uint8Array(5000).fill(7);
   const hash = Buffer.from(sha256(bytes)).toString("hex");
@@ -1090,7 +1232,7 @@ describe("log protocol: boundary kinds at equal stamps (P2-1)", () => {
   });
 });
 
-describe("log protocol: a registry that is behind or on another history fails closed (P2-2)", () => {
+describe("log protocol: a registry behind this device gets its lost segments back; one on another history gets what only the device's history held (P2-2)", () => {
   /** a writes an insert (position 1) and a delete (position 2); b applies both. */
   const history = async () => {
     const w = await world({ streams: 1 });
@@ -1116,18 +1258,22 @@ describe("log protocol: a registry that is behind or on another history fails cl
     return { w, a, b };
   };
 
-  it("a registry rolled back below the applied position is not read as caught up", async () => {
+  it("a registry rolled back below the applied position is not read as caught up: the device commits the lost segment again", async () => {
     const { w, b } = await history();
     const before = { rows: await b.rows(), position: await b.position() };
     w.gateway.versions.get(LOG)!.pop(); // the registry is at position 1 again
-    await expect(b.cycle()).rejects.toThrow(/behind this device/);
+    await b.cycle();
     expect(await b.position()).toBe(before.position);
     expect(await b.rows()).toEqual(before.rows);
+    expect(w.gateway.rowsOf(LOG)).toBe(before.position);
+    // A device that never read the log gets the delete at position 2.
+    const c = await w.device("c");
+    await c.cycle();
+    expect(await c.rows()).toEqual(before.rows);
   });
 
-  it("the same position under a different segment is not read as caught up", async () => {
+  it("the same position under a different segment is not read as caught up: the device reads it and puts back the delete only its history held", async () => {
     const { w, b } = await history();
-    const before = { rows: await b.rows(), position: await b.position() };
     w.gateway.versions.get(LOG)!.pop();
     // Another device continues the rolled-back log with its own segment 2.
     const c = await w.device("c");
@@ -1139,9 +1285,15 @@ describe("log protocol: a registry that is behind or on another history fails cl
     });
     await c.cycle();
     expect(await c.position()).toBe(2);
-    await expect(b.cycle()).rejects.toThrow(/different segment/);
-    expect(await b.position()).toBe(before.position);
-    expect(await b.rows()).toEqual(before.rows);
+    await b.cycle();
+    expect(await b.position()).toBe(3);
+    const ids = (await b.records()).map((r) => r.split("=")[0]);
+    expect(ids).toEqual([`${sName(0)}/from-c`, `${sName(0)}/x`]);
+    await c.cycle();
+    const d = await w.device("d");
+    await d.cycle();
+    expect(await c.rows()).toEqual(await b.rows());
+    expect(await d.rows()).toEqual(await b.rows());
   });
 });
 
@@ -2110,12 +2262,14 @@ describe("log protocol: a run emits a key again after an interim publish", () =>
       records: records.map((data) => ({ stream, data })),
     });
   const end = (d: Device, lastBatch: number, runId = RUN) =>
-    d.sync.intake.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: [stream],
-      provenFullStreams: [stream],
-      lastBatch,
-    });
+    d.sync.intake.end(
+      runId,
+      endRequest({
+        lastBatch,
+        live: [stream],
+        provenFullStreams: [stream],
+      }),
+    );
   const body = (v: number) => `s0/K={"id":"K","v":${v}}`;
 
   it("converges to the later batch on the writer, a fresh reader and a reader that applied the first body", async () => {

@@ -12,7 +12,7 @@ import {
   RegistryUnavailableError,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
-import { remoteFixture } from "./apply-fixture.js";
+import { remoteFixture } from "./apply-fixture.test-utils.js";
 
 // The server imports the core package through its entries. The registry
 // classifies unavailability with `instanceof`, so an error thrown by a
@@ -44,6 +44,9 @@ it("an unavailable error thrown from the stream-sync entry is the class apply an
     blobs: remote.storage,
     registry: {
       ...remote.registry,
+      read: async () => {
+        throw unavailable;
+      },
       listStreamRows: async () => {
         throw unavailable;
       },

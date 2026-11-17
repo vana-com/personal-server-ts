@@ -1,11 +1,12 @@
 import { applyConnection } from "./apply.js";
 import {
   bootstrapConnections,
+  connectionsWithStreams,
   knownActiveConnections,
   newConnectionsWithStreams,
   type OwnerRows,
 } from "./bootstrap.js";
-import type { LocalSyncDeps } from "./deps.js";
+import type { ConnectionRow, LocalSyncDeps } from "./deps.js";
 import { publishLog } from "./log-publish.js";
 import type { PublishResult } from "./publish.js";
 import { insideQueue } from "./slot.js";
@@ -42,13 +43,13 @@ export interface EarlyPublish {
  * `/sync/trigger` and `/sync/file/:id` (trigger = this; file =
  * `syncConnection` for the one connection, then read).
  */
-export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
-  const early = await publishEarly(deps);
-  // One listing for the whole cycle, taken after the early publish: the
-  // bootstrap reads the control rows from it and every apply its log row. Each
-  // apply's own listing would be shared only by the applies that reach it while
-  // it is out, so the count would follow how their control reads line up.
-  const listed = await deps.registry.listOwnerRows?.();
+export async function runCycle(
+  deps: LocalSyncDeps,
+  made?: Map<string, EarlyPublish>,
+): Promise<CycleReport> {
+  const early = made ?? (await publishEarly(deps, await earlyCandidates(deps)));
+  // One listing after early publish, shared by bootstrap and all applies.
+  const listed = await deps.registry.listOwnerRows();
   const connections = await bootstrapConnections(deps, listed);
   return {
     connections: await Promise.all(
@@ -57,6 +58,83 @@ export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
       ),
     ),
   };
+}
+
+/**
+ * What a caller that saved something awaits: the publication of what is
+ * pending, ending at the registry commit. It is the cycle's early publish
+ * alone. The cycle's listing and apply read the registry for what other
+ * devices wrote, and nothing the save wrote waits for them: a commit makes it
+ * durable. The sync manager's own cycle (the wake a run's rows raise, the
+ * timer) runs the rest.
+ *
+ * A pass the early publish cannot settle takes the whole cycle, with the early
+ * publish's results already in hand: a connection that has an error or any
+ * result but published or noop (a deferral, a backoff, a refusal), a fresh
+ * connection that deferred (another device made its row), and a connection
+ * the early publish does not take (deleted, foreign, or a reconnect), which
+ * only the cycle's listing and apply can place.
+ */
+export async function runPublish(deps: LocalSyncDeps): Promise<CycleReport> {
+  const candidates = await earlyCandidates(deps);
+  const early = await publishEarly(deps, candidates);
+  const fresh = new Set(candidates.fresh.map((c) => c.connectionId));
+  // Every connection the early publish takes must have a result: a registry
+  // without the batch route answers `null` and leaves none, and a save is then
+  // not published (the cycle reports it or publishes it another way). A fresh
+  // connection has streams, so no published result means its deferral was
+  // dropped (`publishEarly`); a known connection with no streams has none.
+  const settled = [...candidates.active, ...candidates.fresh].every(
+    ({ connectionId }) => {
+      const e = early.get(connectionId);
+      return (
+        e !== undefined &&
+        e.error === null &&
+        (e.published.length > 0 || !fresh.has(connectionId)) &&
+        e.published.every(
+          (r) => r.outcome === "published" || r.outcome === "noop",
+        )
+      );
+    },
+  );
+  if (!settled || (await hasUnplacedConnections(deps, candidates)))
+    return runCycle(deps, early);
+  return {
+    connections: [...early].map(([connectionId, e]) => ({
+      connectionId,
+      published: e.published,
+      error: null,
+    })),
+  };
+}
+
+/** The connections the early publish takes: known active, and new with streams. */
+interface EarlyCandidates {
+  readonly active: readonly ConnectionRow[];
+  readonly fresh: readonly ConnectionRow[];
+}
+
+async function earlyCandidates(deps: LocalSyncDeps): Promise<EarlyCandidates> {
+  return {
+    active: await knownActiveConnections(deps),
+    fresh: await newConnectionsWithStreams(deps),
+  };
+}
+
+/**
+ * A connection with streams that the early publish takes neither as active nor
+ * as new: it waits for the cycle's listing.
+ */
+async function hasUnplacedConnections(
+  deps: LocalSyncDeps,
+  { active, fresh }: EarlyCandidates,
+): Promise<boolean> {
+  const placed = new Set(
+    [...active, ...fresh].map(({ connectionId }) => connectionId),
+  );
+  return (await connectionsWithStreams(deps)).some(
+    ({ connectionId }) => !placed.has(connectionId),
+  );
 }
 
 /**
@@ -74,10 +152,9 @@ export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
  */
 async function publishEarly(
   deps: LocalSyncDeps,
+  { active, fresh }: EarlyCandidates,
 ): Promise<Map<string, EarlyPublish>> {
   const early = new Map<string, EarlyPublish>();
-  const active = await knownActiveConnections(deps);
-  const fresh = await newConnectionsWithStreams(deps);
   await Promise.all([
     ...active.map(async ({ connectionId }) => {
       try {

@@ -9,7 +9,7 @@ import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { createLocalListing } from "../../../core/src/localdb/listing.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
-import { remoteFixture } from "./apply-fixture.js";
+import { remoteFixture } from "./apply-fixture.test-utils.js";
 
 const drivers: SqlDriver[] = [];
 afterEach(async () => {

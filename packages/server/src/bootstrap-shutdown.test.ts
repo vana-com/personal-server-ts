@@ -17,7 +17,7 @@ import {
 import type * as AccountModeModule from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import type * as SyncModule from "@opendatalabs/personal-server-ts-core/sync";
 import { createStreamSyncKeyPorts } from "../../core/src/stream-sync/crypto.js";
-import { remoteFixture } from "./localdb/apply-fixture.js";
+import { remoteFixture } from "./localdb/apply-fixture.test-utils.js";
 import { createServer, type ServerContext } from "./bootstrap.js";
 
 const failures = vi.hoisted(() => ({

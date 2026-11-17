@@ -10,6 +10,7 @@ import type { Logger } from "../../logger/index.js";
 import type { DownloadWorkerDeps } from "../workers/download.js";
 import type { UploadWorkerDeps } from "../workers/upload.js";
 import { createSyncManager, type SyncManagerOptions } from "./sync-manager.js";
+import { deltaToCycle } from "./local-sync.test-helper.js";
 
 const logger = {
   info: vi.fn(),
@@ -35,7 +36,7 @@ function build(
     { logger } as unknown as DownloadWorkerDeps,
     {
       accountStorageMode: { read: () => "switched" },
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       pollInterval: 60_000,
       ...options,
     },

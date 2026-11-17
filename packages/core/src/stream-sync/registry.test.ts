@@ -3,7 +3,10 @@ import {
   controlScope,
   streamScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { createGatewayStreamSyncRegistry } from "./registry.js";
+import {
+  createGatewayStreamSyncRegistry,
+  parseBatchPolicy,
+} from "./registry.js";
 import { RegistryUnavailableError } from "./ports.js";
 
 const hash = (byte: string) => `0x${byte.repeat(32)}`;
@@ -573,6 +576,7 @@ describe("waitForChange", () => {
       "9",
       25_000,
       controller.signal,
+      undefined,
     );
     expect(answer).toEqual({ seq: "12", changed: true });
     const url = new URL(urls[0]!);
@@ -593,6 +597,7 @@ describe("waitForChange", () => {
       undefined,
       25_000,
       new AbortController().signal,
+      undefined,
     );
     expect(new URL(urls[0]!).searchParams.has("after")).toBe(false);
   });
@@ -601,7 +606,12 @@ describe("waitForChange", () => {
     for (const status of [404, 405]) {
       const { registry } = waiting(() => new Response("no", { status }));
       await expect(
-        registry.waitForChange!("1", 25_000, new AbortController().signal),
+        registry.waitForChange!(
+          "1",
+          25_000,
+          new AbortController().signal,
+          undefined,
+        ),
       ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
     }
   });
@@ -621,7 +631,12 @@ describe("waitForChange", () => {
           ),
       );
       await expect(
-        registry.waitForChange!(after, 25_000, new AbortController().signal),
+        registry.waitForChange!(
+          after,
+          25_000,
+          new AbortController().signal,
+          undefined,
+        ),
       ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
     }
   });
@@ -643,6 +658,7 @@ describe("waitForChange", () => {
       undefined,
       25_000,
       new AbortController().signal,
+      undefined,
     ).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(Error);
     expect((failure as Error).name).not.toBe("ChangeFeedAbsentError");
@@ -662,10 +678,20 @@ describe("waitForChange", () => {
         : new Response(JSON.stringify({ seq: "4", changed: true }));
     });
     await expect(
-      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+      registry.waitForChange!(
+        undefined,
+        25_000,
+        new AbortController().signal,
+        undefined,
+      ),
     ).rejects.toThrow(/400/);
     await expect(
-      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+      registry.waitForChange!(
+        undefined,
+        25_000,
+        new AbortController().signal,
+        undefined,
+      ),
     ).resolves.toEqual({ seq: "4", changed: true });
     expect(urls).toHaveLength(2);
   });
@@ -678,11 +704,21 @@ describe("waitForChange", () => {
         : new Response("no", { status: 404 }),
     );
     await expect(
-      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+      registry.waitForChange!(
+        undefined,
+        25_000,
+        new AbortController().signal,
+        undefined,
+      ),
     ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
     upgraded = true;
     await expect(
-      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+      registry.waitForChange!(
+        undefined,
+        25_000,
+        new AbortController().signal,
+        undefined,
+      ),
     ).resolves.toEqual({ seq: "1", changed: true });
     expect(urls).toHaveLength(2);
   });
@@ -693,7 +729,12 @@ describe("waitForChange", () => {
     );
     for (let attempt = 0; attempt < 3; attempt += 1) {
       await expect(
-        registry.waitForChange!("1", 25_000, new AbortController().signal),
+        registry.waitForChange!(
+          "1",
+          25_000,
+          new AbortController().signal,
+          undefined,
+        ),
       ).rejects.toThrow(/503/);
     }
     expect(urls).toHaveLength(3);
@@ -702,7 +743,12 @@ describe("waitForChange", () => {
   it("throws on any other failure, and on an answer that is not a sequence", async () => {
     const down = waiting(() => new Response("no", { status: 503 }));
     await expect(
-      down.registry.waitForChange!("1", 25_000, new AbortController().signal),
+      down.registry.waitForChange!(
+        "1",
+        25_000,
+        new AbortController().signal,
+        undefined,
+      ),
     ).rejects.toThrow(/503/);
     for (const body of [
       {},
@@ -712,7 +758,12 @@ describe("waitForChange", () => {
     ]) {
       const bad = waiting(() => new Response(JSON.stringify(body)));
       await expect(
-        bad.registry.waitForChange!("1", 25_000, new AbortController().signal),
+        bad.registry.waitForChange!(
+          "1",
+          25_000,
+          new AbortController().signal,
+          undefined,
+        ),
       ).rejects.toThrow(/change answer/);
     }
   });
@@ -790,7 +841,7 @@ describe("an unreachable registry is told apart from a refusing one", () => {
   const listings = {
     listStreamRows: (r: ReturnType<typeof over>) => r.listStreamRows("acme"),
     listControlRows: (r: ReturnType<typeof over>) => r.listControlRows(),
-    listOwnerRows: (r: ReturnType<typeof over>) => r.listOwnerRows!(),
+    listOwnerRows: (r: ReturnType<typeof over>) => r.listOwnerRows(),
   };
   it.each([
     ["a network error", new TypeError("terminated")],
@@ -858,6 +909,13 @@ describe("listings of concurrent callers", () => {
   /** A fetch whose listings answer only when released, in the order begun. */
   function held() {
     const begun: { release: (rows: string[]) => void }[] = [];
+    const starts = Array.from({ length: 3 }, () => {
+      let signal!: () => void;
+      const promise = new Promise<void>((resolve) => {
+        signal = resolve;
+      });
+      return { promise, signal };
+    });
     const fetch = (() =>
       new Promise<Response>((resolve) => {
         begun.push({
@@ -880,8 +938,9 @@ describe("listings of concurrent callers", () => {
               ),
             ),
         });
+        starts[begun.length - 1]?.signal();
       })) as unknown as typeof fetch;
-    return { begun, fetch };
+    return { begun, fetch, started: (index: number) => starts[index]!.promise };
   }
   const registryOver = (fetch: typeof globalThis.fetch) =>
     createGatewayStreamSyncRegistry({
@@ -891,18 +950,18 @@ describe("listings of concurrent callers", () => {
     });
 
   it("a call made while a listing is out waits for a listing that begins after it, and callers that arrive meanwhile share that one", async () => {
-    const { begun, fetch } = held();
+    const { begun, fetch, started } = held();
     const registry = registryOver(fetch);
     const first = registry.listControlRows();
     await new Promise((resolve) => setTimeout(resolve, 0));
     const second = registry.listControlRows();
     const third = registry.listStreamRows("acme");
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await started(0);
     // One request is out: the later calls did not take it, and began none.
     expect(begun).toHaveLength(1);
     begun[0]!.release(["pdpp.acme~"]);
     expect((await first).map((r) => r.scope)).toEqual(["pdpp.acme~"]);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await started(1);
     // The later calls share one listing, begun after the first one ended.
     expect(begun).toHaveLength(2);
     begun[1]!.release(["pdpp.acme~", streamScope("acme", "", "s1")]);
@@ -911,24 +970,41 @@ describe("listings of concurrent callers", () => {
     expect(begun).toHaveLength(2);
   });
 
-  it("calls made in one run of code share one listing: no write can land between them", async () => {
-    const { begun, fetch } = held();
+  it("a caller arriving after L2 starts gets a fresh L3, not the earlier cohort's answer", async () => {
+    const { begun, fetch, started } = held();
     const registry = registryOver(fetch);
-    const controls = registry.listControlRows();
-    const streams = registry.listStreamRows("acme");
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    const first = registry.listControlRows();
+    await started(0);
+    const cohort = [
+      registry.listControlRows(),
+      registry.listOwnerRows(),
+      registry.listStreamRows("acme"),
+    ];
     expect(begun).toHaveLength(1);
-    begun[0]!.release(["pdpp.acme~", streamScope("acme", "", "s1")]);
-    expect((await controls).map((r) => r.scope)).toEqual(["pdpp.acme~"]);
-    expect((await streams).map((r) => r.scope)).toEqual([
-      streamScope("acme", "", "s1"),
-    ]);
-    // A call in a later run of code does not take that listing.
-    const later = registry.listControlRows();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    begun[0]!.release(["pdpp.acme~"]);
+    await started(1);
     expect(begun).toHaveLength(2);
-    begun[1]!.release([]);
-    expect(await later).toEqual([]);
+    const late = registry.listOwnerRows();
+    expect(begun).toHaveLength(2);
+    const s1 = streamScope("acme", "", "s1");
+    const s2 = streamScope("acme", "", "s2");
+    // A caller handed the second listing settles here, before any third begins.
+    const settledEarly = new Promise<never>((_, reject) => {
+      late.then(
+        () => reject(new Error("late caller settled before fresh L3")),
+        reject,
+      );
+    });
+    begun[1]!.release(["pdpp.acme~", s1]);
+    await Promise.race([started(2), settledEarly]);
+    expect(begun).toHaveLength(3);
+    begun[2]!.release(["pdpp.acme~", s1, s2]);
+    expect((await first).map((r) => r.scope)).toEqual(["pdpp.acme~"]);
+    expect(
+      (await Promise.all(cohort)).map((rows) => rows.map((r) => r.scope)),
+    ).toEqual([["pdpp.acme~"], ["pdpp.acme~", s1], [s1]]);
+    expect((await late).map((r) => r.scope)).toEqual(["pdpp.acme~", s1, s2]);
+    expect(begun).toHaveLength(3);
   });
 
   it("a failed listing fails its own callers and not the ones waiting for the next", async () => {
@@ -950,6 +1026,169 @@ describe("listings of concurrent callers", () => {
     await expect(first).rejects.toBeInstanceOf(RegistryUnavailableError);
     await expect(second).resolves.toEqual([]);
     expect(calls).toBe(2);
+  });
+});
+
+describe("waitForChange with since", () => {
+  const owner = "0x" + "11".repeat(20);
+  const LOG = "pdpp.fixture~.~log";
+  const ROW = {
+    scope: LOG,
+    expectedVersion: "4",
+    dataHash: "0x" + "aa".repeat(32),
+    metadataHash: "0x" + "bb".repeat(32),
+    deletedAt: null,
+  };
+
+  function answering(body: unknown) {
+    const urls: string[] = [];
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test/",
+      ownerAddress: owner,
+      fetch: (async (url: string) => {
+        urls.push(url);
+        return new Response(JSON.stringify(body));
+      }) as typeof fetch,
+    });
+    const wait = (since?: string) =>
+      registry.waitForChange!("3", 25_000, new AbortController().signal, since);
+    return { wait, urls };
+  }
+
+  it("sends since, and reads the delta's rows as the listing's rows (mutation: since not sent)", async () => {
+    const { wait, urls } = answering({
+      seq: "5",
+      changed: true,
+      delta: {
+        since: "3",
+        reset: false,
+        rows: [ROW],
+        gone: ["0x01"],
+        serversChanged: true,
+      },
+    });
+    const answer = await wait("3");
+    expect(new URL(urls[0]!).searchParams.get("since")).toBe("3");
+    expect(answer).toEqual({
+      seq: "5",
+      changed: true,
+      delta: {
+        since: "3",
+        seq: "5",
+        reset: false,
+        rows: [
+          {
+            scope: LOG,
+            read: {
+              found: true,
+              version: 4,
+              dataHash: ROW.dataHash,
+              metadataHash: ROW.metadataHash,
+              deleted: false,
+            },
+          },
+        ],
+        gone: ["0x01"],
+        serversChanged: true,
+      },
+    });
+  });
+
+  it("a reset carries no rows", async () => {
+    const { wait } = answering({
+      seq: "5",
+      changed: true,
+      delta: { since: "3", reset: true },
+    });
+    expect((await wait("3")).delta).toEqual({
+      since: "3",
+      seq: "5",
+      reset: true,
+    });
+  });
+
+  it("without since, nothing is sent and a delta in the answer is not read", async () => {
+    const { wait, urls } = answering({
+      seq: "5",
+      changed: true,
+      delta: { since: "3", reset: true },
+    });
+    const answer = await wait(undefined);
+    expect(new URL(urls[0]!).searchParams.has("since")).toBe(false);
+    expect(answer).toEqual({ seq: "5", changed: true });
+  });
+
+  it.each([
+    [
+      "for another since (mutation: since not matched)",
+      { since: "2", reset: true },
+    ],
+    [
+      "with a row whose version is not valid (mutation: rows read loosely)",
+      {
+        since: "3",
+        reset: false,
+        rows: [{ ...ROW, expectedVersion: "x" }],
+        gone: [],
+        serversChanged: false,
+      },
+    ],
+    [
+      "without gone",
+      { since: "3", reset: false, rows: [], serversChanged: false },
+    ],
+    ["not an object", "delta"],
+    ["missing (mutation: a missing delta read as none)", undefined],
+  ])(
+    "a changed answer to a since with a delta %s fails the request, never half read",
+    async (_name, delta) => {
+      const { wait } = answering({ seq: "5", changed: true, delta });
+      await expect(wait("3")).rejects.toThrow(/delta/);
+    },
+  );
+
+  it("an unchanged answer carries no delta", async () => {
+    const { wait } = answering({
+      seq: "3",
+      changed: false,
+      delta: { since: "3", reset: true },
+    });
+    expect(await wait("3")).toEqual({ seq: "3", changed: false });
+  });
+});
+
+describe("Batch-Policy", () => {
+  it("parses the header the gateway sends", () => {
+    expect(parseBatchPolicy("rows=36;bytes=3849121;requires=2080")).toEqual({
+      rows: 36,
+      bytes: 3849121,
+      requires: 2080,
+    });
+  });
+  it("reads the lock budget when the gateway sends it", () => {
+    expect(
+      parseBatchPolicy("rows=31;bytes=3606546;requires=1952;lockedScopes=26"),
+    ).toEqual({ rows: 31, bytes: 3606546, requires: 1952, lockedScopes: 26 });
+  });
+  it("ignores a lock budget it cannot read, keeping the rest", () => {
+    expect(
+      parseBatchPolicy("rows=31;bytes=3606546;requires=1952;lockedScopes=26"),
+    ).toMatchObject({ lockedScopes: 26 });
+    expect(
+      parseBatchPolicy("rows=31;bytes=1;requires=1;lockedScopes=x"),
+    ).toBeUndefined();
+  });
+  it("reads nothing from a header it cannot read", () => {
+    for (const bad of [
+      null,
+      "",
+      "rows=16",
+      "rows=0;bytes=1;requires=1",
+      "rows=x;bytes=1;requires=1",
+      "rows=1;bytes=1",
+    ]) {
+      expect(parseBatchPolicy(bad)).toBeUndefined();
+    }
   });
 });
 

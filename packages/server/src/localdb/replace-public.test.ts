@@ -9,6 +9,7 @@ import {
   createMemoryStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
 } from "../../../core/src/stream-sync/index.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const drivers: SqlDriver[] = [];
@@ -63,8 +64,6 @@ async function world(
             },
           ],
         }),
-        declaredStreams: () => ["items"],
-        olderVersionReads: () => true,
       },
     );
     return {
@@ -97,12 +96,15 @@ async function world(
           batch: 0,
           records: rows.map((key) => ({ stream: "items", data: { id: key } })),
         });
-        await sync.intake.end(id, {
-          outcome: "succeeded",
-          coveredStreams: ["items"],
-          lastBatch: 0,
-          ...(options.proven ? { provenFullStreams: ["items"] } : {}),
-        });
+        await sync.intake.end(
+          id,
+          endRequest({
+            lastBatch: 0,
+            streams: ["items"],
+            live: rows.length > 0 ? ["items"] : [],
+            ...(options.proven ? { provenFullStreams: ["items"] } : {}),
+          }),
+        );
       },
       async publish() {
         expect(

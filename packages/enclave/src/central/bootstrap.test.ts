@@ -1,10 +1,16 @@
-import { createServer } from "node:net";
-import { generateKeyPairSync, randomBytes, sign } from "node:crypto";
+import {
+  generateKeyPairSync,
+  randomBytes,
+  sign,
+  type KeyObject,
+} from "node:crypto";
 import {
   canonicalFleetConfigPayload,
   type FleetSecurityConfigPayload,
 } from "../fleet/security-config.js";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readFile } from "node:fs/promises";
+import * as fs from "node:fs/promises";
+import * as mcpService from "../mcp/service.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it, vi } from "vitest";
@@ -15,14 +21,9 @@ import { createMcpConnection } from "@opendatalabs/personal-server-ts-core/mcp";
 import { openMcpDurableState } from "@opendatalabs/personal-server-ts-server/mcp/tee";
 import { userPsId } from "@opendatalabs/vana-sdk/protocol/identity";
 import type { FleetOwner, FleetWorkerPort } from "../fleet/contracts.js";
-async function freePort() {
-  const server = createServer();
-  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
-  const address = server.address();
-  if (!address || typeof address === "string") throw new Error("Expected port");
-  await new Promise<void>((r, j) => server.close((e) => (e ? j(e) : r())));
-  return String(address.port);
-}
+
+vi.mock("node:fs/promises", { spy: true });
+
 it("rejects unsigned runtime configuration before reading any protected central state", async () => {
   const path = await mkdtemp(join(tmpdir(), "central-config-"));
   const dstack = createFakeDstackClient({ appId: "1".repeat(40) });
@@ -43,14 +44,14 @@ it("rejects unsigned runtime configuration before reading any protected central 
         FLEET_CONTROL_HOST: "127.0.0.1",
         FLEET_ADMIN_HOST: "127.0.0.1",
         FLEET_PEER_HOST: "127.0.0.1",
-        FLEET_CONTROL_PORT: await freePort(),
-        FLEET_ADMIN_PORT: await freePort(),
-        FLEET_PEER_PORT: await freePort(),
+        FLEET_CONTROL_PORT: "0",
+        FLEET_ADMIN_PORT: "0",
+        FLEET_PEER_PORT: "0",
         MCP_PUBLIC_ORIGIN: "https://mcp-dev.vana.org",
         MCP_APPROVAL_URL: "https://web.invalid/approve",
         MCP_STATE_PATH: join(path, "mcp.sealed"),
         MCP_INGRESS_HOST: "127.0.0.1",
-        MCP_INGRESS_PORT: await freePort(),
+        MCP_INGRESS_PORT: "0",
         MCP_REDIRECT_URIS: '["https://claude.ai/api/mcp/auth_callback"]',
       },
       dstack,
@@ -85,14 +86,14 @@ it("stages an authenticated empty directory paused and ignores unsigned runtime 
     FLEET_CONTROL_HOST: "127.0.0.1",
     FLEET_ADMIN_HOST: "127.0.0.1",
     FLEET_PEER_HOST: "127.0.0.1",
-    FLEET_CONTROL_PORT: await freePort(),
-    FLEET_ADMIN_PORT: await freePort(),
-    FLEET_PEER_PORT: await freePort(),
+    FLEET_CONTROL_PORT: "0",
+    FLEET_ADMIN_PORT: "0",
+    FLEET_PEER_PORT: "0",
     MCP_PUBLIC_ORIGIN: "https://mcp-dev.vana.org",
     MCP_APPROVAL_URL: "https://web.invalid/approve",
     MCP_STATE_PATH: join(path, "mcp.sealed"),
     MCP_INGRESS_HOST: "127.0.0.1",
-    MCP_INGRESS_PORT: await freePort(),
+    MCP_INGRESS_PORT: "0",
     MCP_REDIRECT_URIS: '["https://claude.ai/api/mcp/auth_callback"]',
     MCP_MIGRATION_REQUIRED: "1",
   };
@@ -136,10 +137,27 @@ it("stages an authenticated empty directory paused and ignores unsigned runtime 
       dstack,
       requestFetch,
     );
+    expect(Object.keys(runtime.ports).sort()).toEqual([
+      "admin",
+      "control",
+      "mcp",
+      "peer",
+    ]);
+    expect(new Set(Object.values(runtime.ports)).size).toBe(4);
+    for (const port of Object.values(runtime.ports)) {
+      expect(Number.isInteger(port)).toBe(true);
+      expect(port).toBeGreaterThan(0);
+      expect(port).toBeLessThanOrEqual(65535);
+    }
+    const mcpResponse = await fetch(`http://127.0.0.1:${runtime.ports.mcp}/`);
+    expect(mcpResponse.status).toBe(503);
+    await expect(mcpResponse.json()).resolves.toEqual({
+      error: "MCP migration pending",
+    });
     expect(runtime.identity.nodeId).toBe("controller");
     expect(runtime.controller.paused()).toBe(true);
     expect(runtime.controller.nodeStatus()).toEqual([]);
-    const request = (port: string, route: string, token: string) =>
+    const request = (port: number, route: string, token: string) =>
       fetch(`http://127.0.0.1:${port}/fleet/v1/${route}`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}` },
@@ -148,27 +166,27 @@ it("stages an authenticated empty directory paused and ignores unsigned runtime 
     expect(
       (
         await request(
-          env.FLEET_ADMIN_PORT,
+          runtime!.ports.admin,
           "status",
           env.FLEET_CONTROLLER_ADMIN_TOKEN,
         )
       ).status,
     ).toBe(200);
     expect(
-      (await request(env.FLEET_ADMIN_PORT, "status", "attacker".repeat(10)))
+      (await request(runtime!.ports.admin, "status", "attacker".repeat(10)))
         .status,
     ).toBe(401);
     expect(
       (
         await request(
-          env.FLEET_ADMIN_PORT,
+          runtime!.ports.admin,
           "activate",
           env.FLEET_CONTROLLER_ADMIN_TOKEN,
         )
       ).status,
     ).toBe(503);
     expect(
-      (await request(env.FLEET_CONTROL_PORT, "ensure", env.FLEET_GATEWAY_TOKEN))
+      (await request(runtime!.ports.control, "ensure", env.FLEET_GATEWAY_TOKEN))
         .status,
     ).toBe(503);
     expect(requestFetch).not.toHaveBeenCalled();
@@ -196,14 +214,14 @@ it("activates a signed net-new empty controller without an imported MCP snapshot
     FLEET_CONTROL_HOST: "127.0.0.1",
     FLEET_ADMIN_HOST: "127.0.0.1",
     FLEET_PEER_HOST: "127.0.0.1",
-    FLEET_CONTROL_PORT: await freePort(),
-    FLEET_ADMIN_PORT: await freePort(),
-    FLEET_PEER_PORT: await freePort(),
+    FLEET_CONTROL_PORT: "0",
+    FLEET_ADMIN_PORT: "0",
+    FLEET_PEER_PORT: "0",
     MCP_PUBLIC_ORIGIN: "https://mcp-dev.vana.org",
     MCP_APPROVAL_URL: "https://web.invalid/approve",
     MCP_STATE_PATH: join(path, "mcp.sealed"),
     MCP_INGRESS_HOST: "127.0.0.1",
-    MCP_INGRESS_PORT: await freePort(),
+    MCP_INGRESS_PORT: "0",
     MCP_REDIRECT_URIS: '["https://claude.ai/api/mcp/auth_callback"]',
     MCP_MIGRATION_REQUIRED: "0",
   };
@@ -246,7 +264,7 @@ it("activates a signed net-new empty controller without an imported MCP snapshot
     );
     expect(runtime.controller.paused()).toBe(true);
     const response = await fetch(
-      `http://127.0.0.1:${env.FLEET_ADMIN_PORT}/fleet/v1/activate`,
+      `http://127.0.0.1:${runtime!.ports.admin}/fleet/v1/activate`,
       {
         method: "POST",
         headers: {
@@ -286,14 +304,14 @@ it("keeps imported approved owners paused on partial enrollment and reconciles a
     FLEET_CONTROL_HOST: "127.0.0.1",
     FLEET_ADMIN_HOST: "127.0.0.1",
     FLEET_PEER_HOST: "127.0.0.1",
-    FLEET_CONTROL_PORT: await freePort(),
-    FLEET_ADMIN_PORT: await freePort(),
-    FLEET_PEER_PORT: await freePort(),
+    FLEET_CONTROL_PORT: "0",
+    FLEET_ADMIN_PORT: "0",
+    FLEET_PEER_PORT: "0",
     MCP_PUBLIC_ORIGIN: "https://mcp-dev.vana.org",
     MCP_APPROVAL_URL: "https://web.invalid/approve",
     MCP_STATE_PATH: join(path, "mcp.sealed"),
     MCP_INGRESS_HOST: "127.0.0.1",
-    MCP_INGRESS_PORT: await freePort(),
+    MCP_INGRESS_PORT: "0",
     MCP_REDIRECT_URIS: '["https://claude.ai/api/mcp/auth_callback"]',
     MCP_MIGRATION_REQUIRED: "1",
   };
@@ -412,7 +430,7 @@ it("keeps imported approved owners paused on partial enrollment and reconciles a
       requestFetch,
     );
     const admin = (route: string, body: unknown = {}) =>
-      fetch(`http://127.0.0.1:${env.FLEET_ADMIN_PORT}/fleet/v1/${route}`, {
+      fetch(`http://127.0.0.1:${runtime!.ports.admin}/fleet/v1/${route}`, {
         method: "POST",
         headers: {
           authorization: `Bearer ${env.FLEET_CONTROLLER_ADMIN_TOKEN}`,
@@ -505,6 +523,7 @@ it("keeps imported approved owners paused on partial enrollment and reconciles a
         nodeId: "worker-being-drained",
         nodeIncarnation: "incarnation",
         capacity: 1,
+        live: 0,
         draining: false,
         unavailable: false,
       },
@@ -609,14 +628,14 @@ async function controllerEnv(
     FLEET_CONTROL_HOST: "127.0.0.1",
     FLEET_ADMIN_HOST: "127.0.0.1",
     FLEET_PEER_HOST: "127.0.0.1",
-    FLEET_CONTROL_PORT: await freePort(),
-    FLEET_ADMIN_PORT: await freePort(),
-    FLEET_PEER_PORT: await freePort(),
+    FLEET_CONTROL_PORT: "0",
+    FLEET_ADMIN_PORT: "0",
+    FLEET_PEER_PORT: "0",
     MCP_PUBLIC_ORIGIN: "https://mcp-dev.vana.org",
     MCP_APPROVAL_URL: "https://web.invalid/approve",
     MCP_STATE_PATH: join(path, "mcp.sealed"),
     MCP_INGRESS_HOST: "127.0.0.1",
-    MCP_INGRESS_PORT: await freePort(),
+    MCP_INGRESS_PORT: "0",
     MCP_REDIRECT_URIS: '["https://claude.ai/api/mcp/auth_callback"]',
     MCP_MIGRATION_REQUIRED: "0",
   };
@@ -625,7 +644,7 @@ async function controllerEnv(
 function signedConfig(
   env: Record<string, string>,
   info: { appId: string; instanceId: string },
-  keys: ReturnType<typeof generateKeyPairSync<"ed25519">>,
+  keys: { publicKey: KeyObject; privateKey: KeyObject },
   expiresAt: string | null = new Date(Date.now() + 60_000).toISOString(),
 ): Record<string, string> {
   const payload: FleetSecurityConfigPayload = {
@@ -760,7 +779,7 @@ it("keeps stopped members visible and warns once per admission failure code", as
     ]);
 
     const status = (await (
-      await fetch(`http://127.0.0.1:${env.FLEET_ADMIN_PORT}/fleet/v1/status`, {
+      await fetch(`http://127.0.0.1:${runtime!.ports.admin}/fleet/v1/status`, {
         method: "POST",
         headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
         body: "{}",
@@ -820,7 +839,7 @@ it("publishes the controller bundle window and identity on admin status", async 
       },
     );
     const response = await fetch(
-      `http://127.0.0.1:${env.FLEET_ADMIN_PORT}/fleet/v1/status`,
+      `http://127.0.0.1:${runtime!.ports.admin}/fleet/v1/status`,
       {
         method: "POST",
         headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
@@ -862,14 +881,14 @@ it("boots a controller whose signed config names mainnet", async () => {
     FLEET_CONTROL_HOST: "127.0.0.1",
     FLEET_ADMIN_HOST: "127.0.0.1",
     FLEET_PEER_HOST: "127.0.0.1",
-    FLEET_CONTROL_PORT: await freePort(),
-    FLEET_ADMIN_PORT: await freePort(),
-    FLEET_PEER_PORT: await freePort(),
+    FLEET_CONTROL_PORT: "0",
+    FLEET_ADMIN_PORT: "0",
+    FLEET_PEER_PORT: "0",
     MCP_PUBLIC_ORIGIN: "https://mcp.invalid",
     MCP_APPROVAL_URL: "https://web.invalid/approve",
     MCP_STATE_PATH: join(path, "mcp.sealed"),
     MCP_INGRESS_HOST: "127.0.0.1",
-    MCP_INGRESS_PORT: await freePort(),
+    MCP_INGRESS_PORT: "0",
     MCP_REDIRECT_URIS: '["https://claude.ai/api/mcp/auth_callback"]',
     MCP_MIGRATION_REQUIRED: "1",
   };
@@ -914,6 +933,112 @@ it("boots a controller whose signed config names mainnet", async () => {
     expect(runtime.controller.paused()).toBe(true);
   } finally {
     await runtime?.close();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
+it("close drains pending admission before closing services or returning state ownership", async () => {
+  const path = await mkdtemp(join(tmpdir(), "central-close-admission-"));
+  const dstack = createFakeDstackClient({ appId: CONTROLLER_APP_ID });
+  const info = await dstack.info();
+  const keys = generateKeyPairSync("ed25519");
+  const env = await controllerEnv(path, [workerEntry(2)]);
+  let release!: (value: Response) => void;
+  let entered!: () => void;
+  const admission = new Promise<Response>((resolve) => {
+    release = resolve;
+  });
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const requestFetch = vi.fn<typeof fetch>(() => {
+    entered();
+    return admission;
+  });
+  const serviceClose = vi.fn();
+  const originalStart = mcpService.startMcpRouter;
+  const start = vi
+    .spyOn(mcpService, "startMcpRouter")
+    .mockImplementation(async (...args) => {
+      const service = await originalStart(...args);
+      if (!service) return service;
+      const close = service.close.bind(service);
+      return {
+        ...service,
+        close: async () => {
+          serviceClose();
+          await close();
+        },
+      };
+    });
+  const open = vi.spyOn(fs, "open");
+  const mkdir = vi.spyOn(fs, "mkdir");
+  const rename = vi.spyOn(fs, "rename");
+  const logs = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  let runtime: Awaited<ReturnType<typeof startFleetCentral>> | undefined;
+  let closing: Promise<void> | undefined;
+  try {
+    runtime = await startFleetCentral(
+      signedConfig(env, info, keys),
+      dstack,
+      requestFetch,
+    );
+    await started;
+    // Initial declaration is already unavailable. Make the pending failure
+    // perform a real persisted transition, not an idempotent no-op.
+    await runtime.controller.admit({
+      nodeId: "worker-2",
+      nodeIncarnation: "i1",
+      capacity: 1,
+      worker: {
+        activity: vi.fn(),
+        prepare: vi.fn(async () => []),
+        readiness: vi.fn(async () => []),
+        renew: vi.fn(),
+        execute: vi.fn(),
+        release: vi.fn(),
+      },
+    });
+    let resolved = false;
+    closing = runtime.close().then(() => {
+      resolved = true;
+    });
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    // Decisive mutation oracle: without the in-flight await, close invokes
+    // mcp.close synchronously even though admission is still held.
+    expect(serviceClose).not.toHaveBeenCalled();
+    release(new Response("admission refused", { status: 503 }));
+    await closing;
+    expect(resolved).toBe(true);
+    expect(serviceClose).toHaveBeenCalledTimes(1);
+    expect(runtime.controller.nodeStatus()[0]).toMatchObject({
+      unavailable: true,
+    });
+    const persisted = await readFile(env.FLEET_STATE_PATH!, "utf8");
+    expect(JSON.parse(persisted).nodes["worker-2"].unavailable).toBe(true);
+    const writes = [
+      open.mock.calls.length,
+      mkdir.mock.calls.length,
+      rename.mock.calls.length,
+    ];
+    // Cross an event-loop turn, not a delay, after all controlled work settled.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect([
+      open.mock.calls.length,
+      mkdir.mock.calls.length,
+      rename.mock.calls.length,
+    ]).toEqual(writes);
+    expect(await readFile(env.FLEET_STATE_PATH!, "utf8")).toBe(persisted);
+  } finally {
+    release(new Response("admission refused", { status: 503 }));
+    if (closing) await closing;
+    else await runtime?.close();
+    start.mockRestore();
+    open.mockRestore();
+    mkdir.mockRestore();
+    rename.mockRestore();
+    logs.mockRestore();
     await rm(path, { recursive: true, force: true });
   }
 });

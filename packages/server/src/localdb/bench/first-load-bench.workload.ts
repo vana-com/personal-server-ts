@@ -3,10 +3,13 @@
 // stream, no connector knowledge. Usage:
 //   npx tsx packages/server/src/localdb/bench/first-load-bench.workload.ts \
 //     --rows 198001 --progressive off --readers 3 --get-ms 250 --node-crypto on
-// Run it under `nice -n 19 ionice -c3`. `--dir` holds the databases and is
-// removed afterwards; the default is on disk, since /tmp may be memory.
+// Run it under `nice -n 19 ionice -c3`. `--dir` holds the databases, which
+// are removed afterwards. The default is a fresh directory under the OS temp
+// directory; pass a disk-backed `--dir` when that is in memory.
 import { keccak_256 } from "@noble/hashes/sha3";
-import { mkdirSync, rmSync, createWriteStream } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, createWriteStream } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { Session } from "node:inspector/promises";
 import { writeFileSync } from "node:fs";
@@ -25,6 +28,7 @@ import {
   createGatewayStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
 } from "../../../../core/src/stream-sync/index.js";
+import { endRequest } from "../../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "../better-sqlite3-driver.js";
 import { createFakeGateway } from "../fake-gateway.js";
 import { createStreamSyncKeyPorts } from "../../../../core/src/stream-sync/crypto.js";
@@ -54,7 +58,10 @@ const CAPTURE = arg("capture", "");
 const PROF = arg("prof", "");
 // A reader's GET takes this long (a store's latency), so GET and apply can overlap.
 const GET_MS = Number(arg("get-ms", "0"));
-const DIR = arg("dir", `${process.env.HOME}/.tmp/first-load-bench`);
+// The work directory: the bench writes large SQLite files there. By default a
+// fresh one under the OS temp directory; pass --dir (or set TMPDIR) for a
+// disk-backed one when the temp directory is in memory.
+const DIR = arg("dir", "") || mkdtempSync(join(tmpdir(), "first-load-bench-"));
 const realKeys = REAL_CRYPTO
   ? createStreamSyncKeyPorts(
       `0x${"ab".repeat(64)}1b`,
@@ -235,8 +242,6 @@ mkdirSync(DIR, { recursive: true });
         },
       ],
     }),
-    declaredStreams: () => [STREAM],
-    olderVersionReads: () => true,
   });
   const t0 = performance.now();
   const RUNS = Number(arg("runs", "1"));
@@ -275,12 +280,14 @@ mkdirSync(DIR, { recursive: true });
         });
       await sync.intake.batch(runId, { batch: b++, records });
     }
-    await sync.intake.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: [STREAM],
-      lastBatch: b - 1,
-      ...(RUNS === 1 ? { provenFullStreams: [STREAM] } : {}),
-    });
+    await sync.intake.end(
+      runId,
+      endRequest({
+        lastBatch: b - 1,
+        live: [STREAM],
+        ...(RUNS === 1 ? { provenFullStreams: [STREAM] } : {}),
+      }),
+    );
     const tb = performance.now();
     const report = await sync.cycle();
     const err = report.connections.find((c) => c.error !== null);
@@ -327,8 +334,6 @@ for (let r = 0; r < READERS; r++) {
         },
       ],
     }),
-    declaredStreams: () => [STREAM],
-    olderVersionReads: () => true,
   });
   await db.batch([
     {

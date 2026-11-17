@@ -2,6 +2,7 @@
  * P03/P04 own persistence and lifecycle; hosts compose the database facade.
  */
 import type {
+  ControlState,
   JsonValue,
   KeyFieldType,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -32,6 +33,11 @@ export const RUN_INTAKE_ERROR_STATUS = {
   restricted_scope_unsupported: 422,
   control_basis_mismatch: 409,
   control_basis_unavailable: 503,
+  /**
+   * The registry's control row for this connector is under another key, so this
+   * owner key cannot publish a run. Refused before anything is written locally.
+   */
+  control_foreign: 409,
 } as const;
 
 export type RunIntakeErrorName = keyof typeof RUN_INTAKE_ERROR_STATUS;
@@ -74,6 +80,12 @@ export interface IntakeStreamDeclaration {
    * before typed keys were kept name its typed key (see `keyFromRecordKey`).
    */
   readonly keyTypes?: readonly (KeyFieldType | null)[];
+  /**
+   * The streams whose STATE this stream's cursor depends on: the manifest's
+   * `state_stream` then its `parent_streams`. Run end holds a parent's cursor
+   * when a child is blocked, and drops a child's cursor when a parent has none.
+   */
+  readonly stateParents?: readonly string[];
 }
 
 export interface IntakeDeclarations {
@@ -129,6 +141,17 @@ export interface BeginResponse {
   readonly discardReason: "registry_unreachable" | null;
   readonly stuck: boolean;
   readonly binding: { readonly keyCheck: string };
+  /**
+   * The control row this `begin` read or committed on reconnect, classified for
+   * the owner's key: what a caller that must know the connection's state
+   * before it collects (a save that reports the control version it observed)
+   * would otherwise read again. Absent from an answer that replays an earlier
+   * `begin` or an ended run, and `undefined` when the registry did not answer
+   * (the run begins offline). A replay therefore reads the same as an
+   * unreachable registry: a caller that needs the state after a replay reads
+   * the registry itself; the row is not stored with the run.
+   */
+  readonly control?: ControlState;
   readonly start: {
     readonly collection_mode: "full_refresh" | "incremental";
     readonly state: JsonValue | null;
@@ -141,6 +164,7 @@ export interface BeginResponse {
     readonly consentTimeField?: string;
     /** Collection profile §3.5. Missing declarations never authorize deletion. */
     readonly coverageStrategy?: CoverageStrategy;
+    readonly stateParents?: readonly string[];
     readonly mode: "full_refresh" | "incremental";
   }[];
 }
@@ -173,10 +197,50 @@ export interface BatchResponse {
   readonly updateRequired?: boolean;
 }
 
+/**
+ * How a run's connector finished, as the host saw it. `completed`: DONE
+ * succeeded. `certified_failed_done`: DONE failed and named the streams that
+ * failed, so the others can count. `failed_done_upsert_only`: DONE failed
+ * without that certification, so only records count.
+ */
+export type RunFinish =
+  "completed" | "certified_failed_done" | "failed_done_upsert_only";
+
+/**
+ * What the host saw of one selected stream. Facts only: run end decides from
+ * them whether the stream is covered and whether its cursor may move. A
+ * run-wide skip (one that names no stream) is reported on every stream.
+ */
+export interface StreamObservation {
+  /** The stream's records, folded by key in order, leave a live record. */
+  readonly liveRecord: boolean;
+  /** The stream emitted at least one explicit delete. */
+  readonly explicitDelete: boolean;
+  /** A SKIP_RESULT for this stream (or the run) the runtime can retry. */
+  readonly retryableSkip: boolean;
+  /** A SKIP_RESULT for this stream (or the run) the runtime cannot retry. */
+  readonly otherSkip: boolean;
+  /** The host refused the stream's data before sending it. */
+  readonly preflightExclusion: boolean;
+  /**
+   * A DETAIL_GAP for this stream. `retryable` when any gap did not say
+   * `retryable: false`; `fatal` when every gap did.
+   */
+  readonly detailGap: "none" | "retryable" | "fatal";
+  /** A DETAIL_COVERAGE report for this stream that the host could not accept. */
+  readonly invalidDetailCoverage: boolean;
+  /** A failed DONE named this stream as failed. */
+  readonly failedInDone: boolean;
+  /** The connector's last DETAIL_COVERAGE report for this stream, as sent. */
+  readonly detailCoverage?: JsonValue;
+}
+
 export interface EndRequest {
-  readonly outcome: EndOutcome;
-  readonly coveredStreams: readonly string[];
-  readonly checkpointCandidate?: Readonly<Record<string, JsonValue>> | null;
+  readonly finish: RunFinish;
+  /** Every stream the run selected, and only those. */
+  readonly streams: Readonly<Record<string, StreamObservation>>;
+  /** The connector's STATE per stream, as emitted. */
+  readonly checkpoints: Readonly<Record<string, JsonValue>>;
   readonly lastBatch: number;
   /** H: streams the producer proved it read whole. P05 applies the per-stream replacement proof. */
   readonly provenFullStreams?: readonly string[];
@@ -187,6 +251,17 @@ export interface EndResponse {
   readonly stuck: boolean;
   /** At least one stream was refused because this app needs an update. */
   readonly updateRequired: boolean;
+  /** What the run's observations made it. `failed` ended it with nothing kept. */
+  readonly outcome: EndOutcome;
+  /** The streams whose records this run kept (deletes are kept for every stream). */
+  readonly coveredStreams: readonly string[];
+  /** The covered streams this run may replace whole. */
+  readonly provenFullStreams: readonly string[];
+  /**
+   * The run confirmed no selected stream: every stream was skipped, or silent
+   * where a silent stream cannot count.
+   */
+  readonly unconfirmed: boolean;
 }
 
 /**

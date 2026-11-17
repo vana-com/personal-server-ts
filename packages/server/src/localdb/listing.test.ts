@@ -10,7 +10,6 @@ import { addConnection, addStream } from "./local-state-fixture.js";
 
 const opened: SqlDriver[] = [];
 const dirs: string[] = [];
-const olderCounts = { served: 2, gone: 3, off: 4 };
 
 async function fresh(
   options: { aliasScopes?: () => Iterable<string> } = {
@@ -34,7 +33,6 @@ async function fresh(
     now: () => 2000,
     newOp: () => "listing-op",
   } as unknown as LocalSyncDeps;
-  const counts = vi.fn(() => olderCounts);
   const project = vi.fn<(records: readonly unknown[]) => unknown>(() => ({
     ok: true as const,
     payload: {},
@@ -42,25 +40,21 @@ async function fresh(
   return {
     db,
     warn,
-    counts,
     project,
-    listing: createLocalListing(
-      {
-        ...deps,
-        aliasTargets: (scope) =>
-          scope === "example.summary"
-            ? [
-                {
-                  connector: "sample",
-                  streams: ["items"],
-                  project: project as never,
-                },
-              ]
-            : [],
-        ...options,
-      },
-      counts,
-    ),
+    listing: createLocalListing({
+      ...deps,
+      aliasTargets: (scope) =>
+        scope === "example.summary"
+          ? [
+              {
+                connector: "sample",
+                streams: ["items"],
+                project: project as never,
+              },
+            ]
+          : [],
+      ...options,
+    }),
   };
 }
 
@@ -196,7 +190,7 @@ describe("local listing #597", () => {
   });
 
   it("lists no scope for a connection with no applied head, as a read serves none", async () => {
-    const { db, listing, counts } = await fresh();
+    const { db, listing } = await fresh();
     await seed(db, "absent");
     expect(await listing.listScopes({ canRead: () => true })).toEqual([]);
     expect(await listing.status()).toEqual({
@@ -218,9 +212,7 @@ describe("local listing #597", () => {
         },
       ],
       issues: [],
-      olderVersionReads: olderCounts,
     });
-    expect(counts).toHaveBeenCalledTimes(1);
   });
 
   it("lists an alias only when its installed records project", async () => {

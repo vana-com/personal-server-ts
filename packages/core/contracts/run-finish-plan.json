@@ -1,0 +1,3237 @@
+{
+  "version": 1,
+  "contract": "Stream-sync run end: outcome, covered streams, checkpoint candidate and whole streams from host observations (planRunFinish).",
+  "source": "Ported from the Desktop host's planner (covered streams with source answers, safe checkpoints, the finish plan, and the retry rule that withholds cursors of unsent records), which this replaces.",
+  "capture": "What the connector emitted, in protocol terms: records per stream (key, op), SKIP_RESULT (stream absent = run-wide; retryable as the runtime decides), DETAIL_GAP (retryable unless it said retryable:false), DETAIL_COVERAGE reports, reports the host refused, streams the host refused before sending, and the streams a failed DONE named failed. input.streams is the observation every host must map that capture to.",
+  "cases": [
+    {
+      "id": "completed-all-covered",
+      "why": "Every stream answered: succeeded, every cursor moves.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ],
+          "b": [
+            {
+              "key": 1
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["a", "b"],
+        "provenFull": [],
+        "candidate": {
+          "a": "ca",
+          "b": "cb"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "partial-skipped-stream",
+      "why": "A skipped stream is not covered and keeps its cursor.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "skips": [
+          {
+            "stream": "b",
+            "retryable": false
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": true,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["a"],
+        "provenFull": [],
+        "candidate": {
+          "a": "ca"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "silent-incremental-covered",
+      "why": "A silent incremental stream is covered and its cursor moves.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["a", "b"],
+        "provenFull": [],
+        "candidate": {
+          "a": "ca",
+          "b": "cb"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "silent-full-refresh-uncovered",
+      "why": "A silent stream this run would clear is not covered.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "full_refresh"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["a"],
+        "provenFull": [],
+        "candidate": {
+          "a": "ca"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "silent-full-refresh-with-explicit-delete-covered",
+      "why": "An explicit delete answers for a full-refresh stream.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "full_refresh"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ],
+          "b": [
+            {
+              "key": 1,
+              "op": "delete"
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": true,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["a", "b"],
+        "provenFull": [],
+        "candidate": {
+          "a": "ca",
+          "b": "cb"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "full-refresh-proven-empty-covered",
+      "why": "A whole-stream proof answers for an empty full-refresh stream.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "full_refresh"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        },
+        "provenFullStreams": ["b"]
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["a", "b"],
+        "provenFull": ["b"],
+        "candidate": {
+          "a": "ca",
+          "b": "cb"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "full-refresh-run-all-silent-unconfirmed",
+      "why": "A full-refresh run where no stream answered confirms nothing and fails.",
+      "declared": {
+        "a": {
+          "mode": "full_refresh"
+        },
+        "b": {
+          "mode": "full_refresh"
+        }
+      },
+      "capture": {},
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "failed",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": true
+      }
+    },
+    {
+      "id": "full-refresh-deleted-then-reupserted-key-is-live",
+      "why": "Records fold by key in order: a re-upsert after a delete leaves a live record.",
+      "declared": {
+        "a": {
+          "mode": "full_refresh"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1,
+              "op": "delete"
+            },
+            {
+              "key": 1
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": true,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["a"],
+        "provenFull": [],
+        "candidate": {
+          "a": "ca"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "full-refresh-upserted-then-deleted-key-is-not-live",
+      "why": "Records fold by key in order: an upsert deleted later in the same run leaves no live record, and the delete still answers the stream.",
+      "declared": {
+        "a": {
+          "mode": "full_refresh"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            },
+            {
+              "key": 1,
+              "op": "delete"
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": false,
+            "explicitDelete": true,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["a"],
+        "provenFull": [],
+        "candidate": {
+          "a": "ca"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "retry-real-plan-withholds-streams-with-records",
+      "why": "A retry run covers nothing; streams with captured records keep their cursor, record-free tokens move.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental"
+        },
+        "d": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ],
+          "b": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "skips": [
+          {
+            "retryable": true
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "c": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "d": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb",
+          "c": "cc",
+          "d": "cd"
+        }
+      },
+      "expect": {
+        "outcome": "retry_pending",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {
+          "c": "cc",
+          "d": "cd"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "retry-without-records-keeps-every-token",
+      "why": "A retry run with no records keeps every safe cursor.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "skips": [
+          {
+            "retryable": true
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "retry_pending",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {
+          "a": "ca",
+          "b": "cb"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "retry-unsent-child-withholds-parent-and-siblings",
+      "why": "g <- p <- c and p <- d: an unsent child holds every ancestor, and a held parent drops its other children.",
+      "declared": {
+        "g": {
+          "mode": "incremental"
+        },
+        "p": {
+          "mode": "incremental",
+          "stateParents": ["g"]
+        },
+        "c": {
+          "mode": "incremental",
+          "stateParents": ["p"]
+        },
+        "d": {
+          "mode": "incremental",
+          "stateParents": ["p"]
+        },
+        "x": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "c": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "skips": [
+          {
+            "retryable": true
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "c": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "d": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "g": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "p": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "x": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "g": "cg",
+          "p": "cp",
+          "c": "cc",
+          "d": "cd",
+          "x": "cx"
+        }
+      },
+      "expect": {
+        "outcome": "retry_pending",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {
+          "x": "cx"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "retry-unsent-parent-keeps-other-parents",
+      "why": "c depends on p and q; an unsent p drops c but never q.",
+      "declared": {
+        "p": {
+          "mode": "incremental"
+        },
+        "q": {
+          "mode": "incremental"
+        },
+        "x": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental",
+          "stateParents": ["p", "q"]
+        }
+      },
+      "capture": {
+        "records": {
+          "p": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "skips": [
+          {
+            "retryable": true
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "c": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "p": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "q": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "x": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "p": "cp",
+          "q": "cq",
+          "c": "cc",
+          "x": "cx"
+        }
+      },
+      "expect": {
+        "outcome": "retry_pending",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {
+          "q": "cq",
+          "x": "cx"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "retry-unsent-parent-withholds-children",
+      "why": "An unsent parent drops its children's cursors.",
+      "declared": {
+        "p": {
+          "mode": "incremental"
+        },
+        "x": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental",
+          "stateParents": ["p"]
+        }
+      },
+      "capture": {
+        "records": {
+          "p": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "skips": [
+          {
+            "retryable": true
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "c": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "p": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "x": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "p": "cp",
+          "c": "cc",
+          "x": "cx"
+        }
+      },
+      "expect": {
+        "outcome": "retry_pending",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {
+          "x": "cx"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "retry-record-bearing-child-withholds-whole-family",
+      "why": "An unsent child withholds its parent's cursor too.",
+      "declared": {
+        "p": {
+          "mode": "incremental"
+        },
+        "x": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental",
+          "stateParents": ["p"]
+        }
+      },
+      "capture": {
+        "records": {
+          "c": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "skips": [
+          {
+            "retryable": true
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "c": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "p": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "x": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "p": "cp",
+          "c": "cc",
+          "x": "cx"
+        }
+      },
+      "expect": {
+        "outcome": "retry_pending",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {
+          "x": "cx"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "retry-explicit-delete-covers-nothing",
+      "why": "A retry run's explicit deletes still count, but the stream is not covered and keeps its cursor.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1,
+              "op": "delete"
+            }
+          ]
+        },
+        "skips": [
+          {
+            "retryable": true
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": false,
+            "explicitDelete": true,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "retry_pending",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {
+          "b": "cb"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "retryable-and-other-skips",
+      "why": "A retryable skip makes the run retry; an other skip blocks that stream's cursor.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ],
+          "b": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "skips": [
+          {
+            "stream": "a",
+            "retryable": true
+          },
+          {
+            "stream": "b",
+            "retryable": false
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": true,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "c": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb",
+          "c": "cc"
+        }
+      },
+      "expect": {
+        "outcome": "retry_pending",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {
+          "c": "cc"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "retryable-skip-keeps-own-token",
+      "why": "A retryable skip of a record-free stream keeps that stream's job token.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "b": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "skips": [
+          {
+            "stream": "a",
+            "retryable": true
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "retry_pending",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {
+          "a": "ca"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "run-wide-other-skip-unconfirmed",
+      "why": "A skip that names no stream skips every stream: nothing confirmed, the run fails.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "skips": [
+          {
+            "retryable": false
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": true,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": true,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "failed",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": true
+      }
+    },
+    {
+      "id": "unconfirmed-with-explicit-delete",
+      "why": "A run that confirmed nothing still keeps its explicit deletes, and moves no cursor.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1,
+              "op": "delete"
+            }
+          ]
+        },
+        "skips": [
+          {
+            "retryable": false
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": false,
+            "explicitDelete": true,
+            "retryableSkip": false,
+            "otherSkip": true,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": true,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "retry_pending",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": true
+      }
+    },
+    {
+      "id": "parent-blocked-by-grandchild",
+      "why": "z <- m <- a: a skipped grandchild blocks its parent and grandparent, transitively.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "x": {
+          "mode": "incremental"
+        },
+        "m": {
+          "mode": "incremental",
+          "stateParents": ["a"]
+        },
+        "z": {
+          "mode": "incremental",
+          "stateParents": ["m"]
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ],
+          "m": [
+            {
+              "key": 1
+            }
+          ],
+          "x": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "skips": [
+          {
+            "stream": "z",
+            "retryable": false
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "m": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "x": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "z": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": true,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "m": "cm",
+          "z": "cz",
+          "x": "cx"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["a", "m", "x"],
+        "provenFull": [],
+        "candidate": {
+          "x": "cx"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "child-pruned-when-parent-has-no-cursor",
+      "why": "c depends on p and q; p emitted no cursor, so c loses its own, and q keeps its own.",
+      "declared": {
+        "p": {
+          "mode": "incremental"
+        },
+        "q": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental",
+          "stateParents": ["p", "q"]
+        }
+      },
+      "capture": {
+        "records": {
+          "p": [
+            {
+              "key": 1
+            }
+          ],
+          "q": [
+            {
+              "key": 1
+            }
+          ],
+          "c": [
+            {
+              "key": 1
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "c": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "p": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "q": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "q": "cq",
+          "c": "cc"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["c", "p", "q"],
+        "provenFull": [],
+        "candidate": {
+          "q": "cq"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "parent-detail-accounting-incomplete-report",
+      "why": "A detail report short of whole holds the parent's cursor, and the child's with it.",
+      "declared": {
+        "p": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental",
+          "coverageStrategy": "parent_detail_accounting",
+          "stateParents": ["p"]
+        }
+      },
+      "capture": {
+        "records": {
+          "p": [
+            {
+              "key": 1
+            }
+          ],
+          "c": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "detailCoverage": {
+          "c": {
+            "considered": 5,
+            "covered": 4,
+            "required_keys": [],
+            "hydrated_keys": [],
+            "state_stream": "p"
+          }
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "c": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false,
+            "detailCoverage": {
+              "considered": 5,
+              "covered": 4,
+              "required_keys": [],
+              "hydrated_keys": [],
+              "state_stream": "p"
+            }
+          },
+          "p": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "p": "cp",
+          "c": "cc"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["c", "p"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "parent-detail-accounting-complete-report",
+      "why": "A whole detail report naming the parent lets both cursors move.",
+      "declared": {
+        "p": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental",
+          "coverageStrategy": "parent_detail_accounting",
+          "stateParents": ["p"]
+        }
+      },
+      "capture": {
+        "records": {
+          "p": [
+            {
+              "key": 1
+            }
+          ],
+          "c": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "detailCoverage": {
+          "c": {
+            "considered": 5,
+            "covered": 5,
+            "required_keys": ["k1"],
+            "hydrated_keys": ["k1", "k2"],
+            "state_stream": "p"
+          }
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "c": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false,
+            "detailCoverage": {
+              "considered": 5,
+              "covered": 5,
+              "required_keys": ["k1"],
+              "hydrated_keys": ["k1", "k2"],
+              "state_stream": "p"
+            }
+          },
+          "p": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "p": "cp",
+          "c": "cc"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["c", "p"],
+        "provenFull": [],
+        "candidate": {
+          "p": "cp",
+          "c": "cc"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "parent-detail-accounting-unhydrated-key",
+      "why": "A required key the report did not hydrate holds the parent.",
+      "declared": {
+        "p": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental",
+          "coverageStrategy": "parent_detail_accounting",
+          "stateParents": ["p"]
+        }
+      },
+      "capture": {
+        "records": {
+          "p": [
+            {
+              "key": 1
+            }
+          ],
+          "c": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "detailCoverage": {
+          "c": {
+            "considered": 5,
+            "covered": 5,
+            "required_keys": ["k1"],
+            "hydrated_keys": ["k2"],
+            "state_stream": "p"
+          }
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "c": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false,
+            "detailCoverage": {
+              "considered": 5,
+              "covered": 5,
+              "required_keys": ["k1"],
+              "hydrated_keys": ["k2"],
+              "state_stream": "p"
+            }
+          },
+          "p": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "p": "cp",
+          "c": "cc"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["c", "p"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "parent-detail-accounting-wrong-state-stream",
+      "why": "A report naming another STATE stream holds the declared parent.",
+      "declared": {
+        "p": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental",
+          "coverageStrategy": "parent_detail_accounting",
+          "stateParents": ["p"]
+        }
+      },
+      "capture": {
+        "records": {
+          "p": [
+            {
+              "key": 1
+            }
+          ],
+          "c": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "detailCoverage": {
+          "c": {
+            "considered": 5,
+            "covered": 5,
+            "required_keys": [],
+            "hydrated_keys": [],
+            "state_stream": "other"
+          }
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "c": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false,
+            "detailCoverage": {
+              "considered": 5,
+              "covered": 5,
+              "required_keys": [],
+              "hydrated_keys": [],
+              "state_stream": "other"
+            }
+          },
+          "p": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "p": "cp",
+          "c": "cc"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["c", "p"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "parent-detail-accounting-without-parent",
+      "why": "With no declared parent the stream is its own parent: no report holds its own cursor.",
+      "declared": {
+        "x": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental",
+          "coverageStrategy": "parent_detail_accounting"
+        }
+      },
+      "capture": {
+        "records": {
+          "c": [
+            {
+              "key": 1
+            }
+          ],
+          "x": [
+            {
+              "key": 1
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "c": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "x": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "c": "cc",
+          "x": "cx"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["c", "x"],
+        "provenFull": [],
+        "candidate": {
+          "x": "cx"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "fatal-detail-gap-not-covered",
+      "why": "A stream with a detail gap is not covered; outside a retry a fatal gap does not block other cursors.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ],
+          "b": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "detailGaps": [
+          {
+            "stream": "a",
+            "retryable": false
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "fatal",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["b"],
+        "provenFull": [],
+        "candidate": {
+          "b": "cb"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "retryable-detail-gap-on-parent",
+      "why": "A retryable detail gap on a parent blocks it and prunes its child.",
+      "declared": {
+        "p": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental",
+          "stateParents": ["p"]
+        }
+      },
+      "capture": {
+        "records": {
+          "p": [
+            {
+              "key": 1
+            }
+          ],
+          "c": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "detailGaps": [
+          {
+            "stream": "p",
+            "retryable": true
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "c": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "p": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "retryable",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "p": "cp",
+          "c": "cc"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["c"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "fatal-detail-gap-on-parent-blocks",
+      "why": "Any detail gap on a declared parent blocks the parent's cursor.",
+      "declared": {
+        "p": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental",
+          "stateParents": ["p"]
+        }
+      },
+      "capture": {
+        "records": {
+          "p": [
+            {
+              "key": 1
+            }
+          ],
+          "c": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "detailGaps": [
+          {
+            "stream": "p",
+            "retryable": false
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "c": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "p": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "fatal",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "p": "cp",
+          "c": "cc"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["c"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "fatal-detail-gap-blocks-under-retry",
+      "why": "Under a retry a fatal detail gap blocks that stream's cursor.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "skips": [
+          {
+            "retryable": true
+          }
+        ],
+        "detailGaps": [
+          {
+            "stream": "a",
+            "retryable": false
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "fatal",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": true,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "retry_pending",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {
+          "b": "cb"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "preflight-exclusion",
+      "why": "A stream the host refused before sending is skipped: not covered, cursor held.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ],
+          "b": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "preflightExclusions": ["a"]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": true,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["b"],
+        "provenFull": [],
+        "candidate": {
+          "b": "cb"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "invalid-detail-coverage-covered-but-held",
+      "why": "An invalid detail report does not uncover the stream, but holds its cursor.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ],
+          "b": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "invalidDetailCoverage": ["a"]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": true,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["a", "b"],
+        "provenFull": [],
+        "candidate": {
+          "b": "cb"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "proven-full-only-for-covered",
+      "why": "Only covered streams are named whole.",
+      "declared": {
+        "a": {
+          "mode": "full_refresh"
+        },
+        "b": {
+          "mode": "full_refresh"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "skips": [
+          {
+            "stream": "b",
+            "retryable": false
+          }
+        ]
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": true,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        },
+        "provenFullStreams": ["a", "b"]
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["a"],
+        "provenFull": ["a"],
+        "candidate": {
+          "a": "ca"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "cursor-without-covered-stream-dropped",
+      "why": "A cursor for a stream the run did not cover never moves.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "full_refresh"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["a"],
+        "provenFull": [],
+        "candidate": {
+          "a": "ca"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "certified-failed-done",
+      "why": "A certified failed DONE keeps the healthy streams' records, names them whole, and moves no cursor.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ],
+          "b": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "skips": [
+          {
+            "stream": "b",
+            "retryable": false
+          }
+        ],
+        "failedInDone": ["b"]
+      },
+      "input": {
+        "finish": "certified_failed_done",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": true,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": true
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["a"],
+        "provenFull": ["a"],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "certified-failed-done-held-parent",
+      "why": "A failed child holds its healthy parent; nothing is left to keep, so the run fails.",
+      "declared": {
+        "p": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental",
+          "stateParents": ["p"]
+        }
+      },
+      "capture": {
+        "records": {
+          "p": [
+            {
+              "key": 1
+            }
+          ],
+          "c": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "skips": [
+          {
+            "stream": "c",
+            "retryable": false
+          }
+        ],
+        "failedInDone": ["c"]
+      },
+      "input": {
+        "finish": "certified_failed_done",
+        "streams": {
+          "c": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": true,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": true
+          },
+          "p": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "p": "cp",
+          "c": "cc"
+        }
+      },
+      "expect": {
+        "outcome": "failed",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "certified-failed-done-cursor-only",
+      "why": "A certified failed DONE with only a healthy cursor still ends partial, keeping nothing.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "b": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "skips": [
+          {
+            "stream": "b",
+            "retryable": false
+          }
+        ],
+        "failedInDone": ["b"]
+      },
+      "input": {
+        "finish": "certified_failed_done",
+        "streams": {
+          "a": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": true,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": true
+          }
+        },
+        "checkpoints": {
+          "a": "ca"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "certified-failed-done-short-report-not-whole",
+      "why": "A coverage report short of whole keeps the stream's records but never names it whole.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ],
+          "b": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "skips": [
+          {
+            "stream": "b",
+            "retryable": false
+          }
+        ],
+        "failedInDone": ["b"],
+        "detailCoverage": {
+          "a": {
+            "considered": 3,
+            "covered": 3,
+            "gap_keys": ["k"]
+          }
+        }
+      },
+      "input": {
+        "finish": "certified_failed_done",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false,
+            "detailCoverage": {
+              "considered": 3,
+              "covered": 3,
+              "gap_keys": ["k"]
+            }
+          },
+          "b": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": true,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": true
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["a"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "certified-without-failed-stream-is-upsert-only",
+      "why": "A certified failed DONE that names no failed stream counts as upsert-only.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "certified_failed_done",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        },
+        "provenFullStreams": ["a"]
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["a"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "failed-done-upsert-only",
+      "why": "An uncertified failed DONE keeps the records of unskipped streams, names nothing whole, moves no cursor.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "failed_done_upsert_only",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        },
+        "provenFullStreams": ["a"]
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["a"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "failed-done-upsert-only-failed-stream-not-covered",
+      "why": "An uncertified failed DONE never covers a stream DONE named failed, even one with records and no skip.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ],
+          "b": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "failedInDone": ["b"]
+      },
+      "input": {
+        "finish": "failed_done_upsert_only",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": true
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["a"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "failed-done-upsert-only-only-failed-stream-kept-nothing",
+      "why": "An uncertified failed DONE whose only records belong to a stream DONE named failed keeps nothing: the run failed.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "b": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "failedInDone": ["b"]
+      },
+      "input": {
+        "finish": "failed_done_upsert_only",
+        "streams": {
+          "a": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": true
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "failed",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "failed-done-upsert-only-nothing-kept",
+      "why": "A failed DONE with nothing to keep fails.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {},
+      "input": {
+        "finish": "failed_done_upsert_only",
+        "streams": {
+          "a": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "failed",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "failed-done-upsert-only-delete-kept",
+      "why": "A failed DONE with only a delete keeps it.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1,
+              "op": "delete"
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "failed_done_upsert_only",
+        "streams": {
+          "a": {
+            "liveRecord": false,
+            "explicitDelete": true,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {}
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["a"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "failed-done-failed-stream-with-delete-is-not-covered",
+      "why": "A stream named failed in DONE is never covered, even when it also sent an explicit delete. Run end still keeps that delete; packages/server/src/localdb/run-end.test.ts asserts it.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            },
+            {
+              "key": 2,
+              "op": "delete"
+            }
+          ]
+        },
+        "failedInDone": ["a"]
+      },
+      "input": {
+        "finish": "failed_done_upsert_only",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": true,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": true
+          }
+        },
+        "checkpoints": {
+          "a": "ca"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "unselected-parent-drops-child-cursor",
+      "why": "A child whose parent this run did not select keeps no cursor.",
+      "declared": {
+        "p": {
+          "mode": "incremental"
+        },
+        "c": {
+          "mode": "incremental",
+          "stateParents": ["p"]
+        },
+        "x": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "c": [
+            {
+              "key": 1
+            }
+          ],
+          "x": [
+            {
+              "key": 1
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "c": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "x": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "c": "cc",
+          "x": "cx"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["c", "x"],
+        "provenFull": [],
+        "candidate": {
+          "x": "cx"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "no-selected-streams-succeeds",
+      "why": "A run that selected no stream has nothing to confirm: it succeeds and moves no cursor.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {},
+      "input": {
+        "finish": "completed",
+        "streams": {},
+        "checkpoints": {
+          "a": "ca"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    }
+  ]
+}

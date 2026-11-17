@@ -44,6 +44,7 @@ import { createMockPsLiteGateway } from "./test-support/gateway.js";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
+  endRequest,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
 import {
@@ -82,7 +83,6 @@ function memoryBundle(): PsLitePersistenceBundle {
 
 function build(bundle: PsLitePersistenceBundle) {
   return createUnswitchedIndexedDbPsLiteRuntime({
-    streamSyncDeclaredStreams: () => [],
     ownerAddress,
     ownerSignature,
     persistence: bundle,
@@ -116,7 +116,6 @@ describe("createIndexedDbPsLiteRuntime persistence injection", () => {
       ownerSignature,
       persistence: hostBundle,
       storageFactory: factory,
-      streamSyncDeclaredStreams: () => [],
       gateway: createMockPsLiteGateway(),
       configDefaults: {
         gateway: { url: "https://gateway.local" },
@@ -150,7 +149,6 @@ describe("createIndexedDbPsLiteRuntime persistence injection", () => {
   it("rejects a partial bundle instead of mixing native and IndexedDB stores", async () => {
     await expect(
       createIndexedDbPsLiteRuntime({
-        streamSyncDeclaredStreams: () => [],
         ownerAddress,
         ownerSignature,
         persistence: {} as PsLitePersistenceBundle,
@@ -307,7 +305,6 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
       builderToken: "builder-token",
     }),
     active: true,
-    streamSyncDeclaredStreams: () => [],
     ...extra,
   });
   const digest = `sha256:${"ab".repeat(32)}`;
@@ -560,7 +557,6 @@ describe("createIndexedDbPsLiteRuntime own-write reads", () => {
     );
     const dbName = `ps-lite-own-reads-${Math.random()}`;
     const context = await createSwitchedIndexedDbPsLiteRuntime({
-      streamSyncDeclaredStreams: () => [],
       ownerAddress,
       ownerSignature,
       dbName,
@@ -596,12 +592,14 @@ describe("createIndexedDbPsLiteRuntime own-write reads", () => {
       batch: 0,
       records: [{ stream: "items", data: { id: "a", v: 1 } }],
     });
-    await context.streamSyncIntake!.end("run-1", {
-      outcome: "succeeded",
-      coveredStreams: ["items"],
-      provenFullStreams: ["items"],
-      lastBatch: 0,
-    });
+    await context.streamSyncIntake!.end(
+      "run-1",
+      endRequest({
+        lastBatch: 0,
+        live: ["items"],
+        provenFullStreams: ["items"],
+      }),
+    );
     await context.localSync!.cycle();
 
     const read = await context.runtime.fetch(
@@ -641,7 +639,6 @@ describe("createIndexedDbPsLiteRuntime write sessions", () => {
     // Default wiring: the route exists, and refuses an unauthenticated
     // handshake rather than 404ing as if delegated writes were unsupported.
     const withDefaults = await createUnswitchedIndexedDbPsLiteRuntime({
-      streamSyncDeclaredStreams: () => [],
       ...base,
       dbName: "ps-lite-write-default",
       storageDbName: "ps-lite-write-default-storage",
@@ -651,7 +648,6 @@ describe("createIndexedDbPsLiteRuntime write sessions", () => {
     // A caller that brings its own auth adapter owns the wiring: we must not
     // mint tokens that adapter has never heard of.
     const withOwnAuth = await createUnswitchedIndexedDbPsLiteRuntime({
-      streamSyncDeclaredStreams: () => [],
       ...base,
       dbName: "ps-lite-write-own-auth",
       storageDbName: "ps-lite-write-own-auth-storage",
@@ -701,7 +697,6 @@ describe("createIndexedDbPsLiteRuntime data listings", () => {
     ]);
     const getGrant = vi.fn(async () => null);
     const { runtime } = await createUnswitchedIndexedDbPsLiteRuntime({
-      streamSyncDeclaredStreams: () => [],
       ownerAddress,
       ownerSignature,
       persistence: memoryBundle(),
@@ -943,7 +938,6 @@ describe("the legacy import wake of a runtime", () => {
 
   it("starts nothing when the host passes no importer", async () => {
     const runtime = await createIndexedDbPsLiteRuntime({
-      streamSyncDeclaredStreams: () => [],
       ownerAddress,
       ownerSignature,
       persistence: memoryBundle(),
@@ -997,7 +991,6 @@ describe("startPersonalServer publication receipts", () => {
       },
       streamSyncRegistry: createMemoryStreamSyncRegistry(),
       streamSyncBlobs: createMemoryStreamSyncBlobs(),
-      streamSyncDeclaredStreams: () => ["items"],
       streamSyncDeclarations: (connector: string) => ({
         connector,
         version: "1",
@@ -1031,12 +1024,14 @@ describe("startPersonalServer publication receipts", () => {
       batch: 0,
       records: [{ stream: "items", data: { id: "a" } }],
     });
-    await server.streamSyncIntake!.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: ["items"],
-      provenFullStreams: ["items"],
-      lastBatch: 0,
-    });
+    await server.streamSyncIntake!.end(
+      runId,
+      endRequest({
+        lastBatch: 0,
+        live: ["items"],
+        provenFullStreams: ["items"],
+      }),
+    );
   }
   it("returns both connections' confirmed heads and run coverage, then nothing new", async () => {
     const { options } = await setup();

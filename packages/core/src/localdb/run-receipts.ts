@@ -11,7 +11,7 @@ import {
 import type { SqlDriver, SqlReader } from "./driver.js";
 import { streamFenceTrip } from "./fence.js";
 
-export type LocalEndReceipt = Pick<EndResponse, "result" | "updateRequired">;
+export type LocalEndReceipt = Omit<EndResponse, "stuck">;
 
 /** Immutable local acknowledgement. Publication is a separate operation. */
 export async function readEndReceipt(

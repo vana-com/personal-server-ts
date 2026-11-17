@@ -40,7 +40,7 @@ import {
   type SqlDriver,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import { openBetterSqlite3 } from "../../server/src/localdb/better-sqlite3-driver.js";
-import { remoteFixture } from "../../server/src/localdb/apply-fixture.js";
+import { remoteFixture } from "../../server/src/localdb/apply-fixture.test-utils.js";
 import { createServerLocalSync } from "../../server/src/localdb/sync.js";
 const drivers: SqlDriver[] = [];
 afterEach(async () => {
@@ -165,15 +165,12 @@ async function streamView(): Promise<StreamSyncReadPort> {
     },
     {
       resolveArtifact: () => undefined,
-      declaredStreams: () => ["posts", "post_likes"],
-      olderVersionReads: () => true,
     },
   );
   await local.apply();
   return {
     resolve: (input) => local.resolver.resolve(input),
     listScopes: (input) => local.listing.listScopes(input),
-    olderVersions: local.olderVersions,
   };
 }
 

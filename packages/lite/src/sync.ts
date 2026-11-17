@@ -32,6 +32,7 @@ import {
   streamSyncNetwork,
   streamSyncFlagsOn,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { wasmStreamCrypto } from "./wasm-stream-crypto.js";
 import { LITE_PART_TARGET_BYTES } from "./stream-sync-budget.js";
 import {
   createVersionInventoryClient,
@@ -133,20 +134,12 @@ export interface PsLiteSyncOptions {
   localDb?: LiteLocalDbOptions;
   /** Stable host device identity; defaults to this server account. */
   localDbDeviceId?: string;
-  /** Whether the local database may fetch historical versions. */
-  olderVersionReads?: () => boolean;
   /**
    * Resolves a run's `artifactDigest` to declarations the host verified
    * (run-intake contract v2 §6). Without it every run answers
    * `unknown_artifact`.
    */
   streamSyncDeclarations?: ResolveArtifact;
-  /**
-   * The stream names a connector declares, from the manifests the host
-   * verified (`manifestStreamLister` over the same documents the host passes
-   * to `streamSyncDeclarations`).
-   */
-  streamSyncDeclaredStreams: (connector: string) => readonly string[];
   /**
    * Verified manifests retained for seed-descriptor admission. Seed profiles
    * and primary keys must match one of these documents. Default: none.
@@ -628,6 +621,9 @@ export async function createPsLiteSyncManager(
             options.streamSyncBlobs ??
             createStorageStreamSyncBlobs(storageAdapter),
           keys: createStreamSyncKeyPorts(options.ownerSignature),
+          // A reader hashes every segment it applies; noble's Keccak is the
+          // largest CPU cost of a first load on a browser's main thread.
+          streamCrypto: await wasmStreamCrypto(),
           signer,
           logger,
           now: Date.now,
@@ -647,12 +643,8 @@ export async function createPsLiteSyncManager(
           aliasScopes: () => LEGACY_SCOPE_BINDINGS.keys(),
           aliasTargets: legacyAliasScopes,
           resolveArtifact: options.streamSyncDeclarations ?? (() => null),
-          declaredStreams: options.streamSyncDeclaredStreams,
           eraseLegacy: (connector) =>
             eraseLegacyScopesOf(connector, options.storage),
-          olderVersionReads:
-            options.olderVersionReads ??
-            (() => options.config.olderVersionReads),
         });
       }
       return localSync;
@@ -747,7 +739,10 @@ export async function createPsLiteSyncManager(
       },
       {
         accountStorageMode: mode,
-        localSync: { cycle: async () => (await getLocalSync()).cycle() },
+        localSync: {
+          cycle: async () => (await getLocalSync()).cycle(),
+          applyDelta: async (delta) => (await getLocalSync()).applyDelta(delta),
+        },
         ...(changeProbe && { changeProbe }),
         deleteData,
         pendingBlobDeletions,
@@ -807,18 +802,6 @@ export async function createPsLiteSyncManager(
           (await getLocalSync()).resolver.resolve(input),
         listScopes: async (input) =>
           (await getLocalSync()).listing.listScopes(input),
-        olderVersions: {
-          read: async (...args) =>
-            (await getLocalSync()).olderVersions.read(...args),
-          list: async (...args) =>
-            (await getLocalSync()).olderVersions.list(...args),
-          counts: () =>
-            localSync?.olderVersions.counts() ?? {
-              served: 0,
-              gone: 0,
-              off: 0,
-            },
-        },
       },
     };
   } catch (error) {

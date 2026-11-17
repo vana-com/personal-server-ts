@@ -20,6 +20,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./client": {
+      "types": "./dist/personal-server-client.d.ts",
+      "import": "./dist/personal-server-client.js"
+    },
     "./additions-worker": "./dist/additions-worker.bundle.js",
     "./history-probe-worker": {
       "types": "./dist/history-probe.worker.d.ts",
@@ -33,6 +37,7 @@
     "dist"
   ],
   "scripts": {
+    "build:tls-wasm": "bash scripts/build-tls-wasm.sh",
     "copy-tls": "mkdir -p dist/browser-tls-rustls && cp src/browser-tls-rustls/* dist/browser-tls-rustls/",
     "build": "tsc --build && npm run copy-tls && npm run build-worker",
     "build-worker": "esbuild src/additions-worker.ts --bundle --platform=browser --format=esm --target=es2022 --outfile=dist/additions-worker.bundle.js && esbuild src/history-probe.worker.ts --bundle --platform=browser --format=esm --target=es2022 --outfile=dist/history-probe-worker.bundle.js"
@@ -40,6 +45,7 @@
   "dependencies": {
     "@opendatalabs/personal-server-ts-core": "*",
     "@opendatalabs/vana-sdk": "3.23.0-pr.211.36da1d8",
+    "hash-wasm": "^4.12.0",
     "node-forge": "^1.4.0",
     "viem": "^2.54.2",
     "openpgp": "6.3.0"

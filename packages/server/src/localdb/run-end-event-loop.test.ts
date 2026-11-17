@@ -11,8 +11,9 @@ import type {
 } from "../../../core/src/stream-sync/intake.js";
 import { createRunIntakeStore } from "../../../core/src/localdb/run-intake.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
-import { remoteFixture } from "./apply-fixture.js";
+import { remoteFixture } from "./apply-fixture.test-utils.js";
 
 const owner = `0x${"12".repeat(20)}` as const;
 const declaration: IntakeDeclarations = {
@@ -100,13 +101,12 @@ describe("run end does not hold the event loop", () => {
       );
       await f.store.batch("run", { batch: batch++, records });
     }
-    const request_ = {
-      outcome: "succeeded" as const,
-      coveredStreams: ["items"],
-      provenFullStreams: ["items"],
+    const request_ = endRequest({
       lastBatch: batch - 1,
-      checkpointCandidate: { items: "C" },
-    };
+      live: ["items"],
+      provenFullStreams: ["items"],
+      checkpoints: { items: "C" },
+    });
     const mergeMs = { value: 0 };
     const blocked = await longestLoopBlock(async () => {
       const t0 = performance.now();
