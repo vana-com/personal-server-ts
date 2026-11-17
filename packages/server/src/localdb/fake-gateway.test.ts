@@ -170,3 +170,24 @@ describe("the fake registry's connection-log fence, in a batch", () => {
     expect(out).toMatchObject({ status: 201 });
   });
 });
+
+describe("the fake registry's replay rule, in a batch", () => {
+  it("replays a stored row for the same data hash and signature, and refuses the same data from another signer", async () => {
+    const g = createFakeGateway({
+      owner: OWNER,
+      replay: "created",
+      isTombstone: (v) => v.dataHash === TOMBSTONE,
+    });
+    const first = row(STREAM, 1, "a", { signature: "0x01" });
+    expect(await batch(g, [first])).toMatchObject([{ status: 201 }]);
+    // The same signer sends it again (a lost reply): stored, nothing written.
+    expect(await batch(g, [first])).toMatchObject([{ status: 201 }]);
+    // Another signer's identical commitment is not a replay: the version is
+    // taken.
+    const other = { ...first, signature: "0x02" };
+    expect(await batch(g, [other])).toMatchObject([
+      { status: 409, reason: "stale" },
+    ]);
+    expect(g.rowsOf(STREAM)).toBe(1);
+  });
+});

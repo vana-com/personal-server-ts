@@ -41,6 +41,8 @@ import {
 interface Version {
   readonly dataHash: string;
   readonly metadataHash: string;
+  /** The signature the row was written with: a replay must carry the same. */
+  readonly signature: string;
   readonly at: string;
 }
 
@@ -82,6 +84,7 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
     rows.push({
       dataHash: request.dataHash,
       metadataHash: request.metadataHash,
+      signature: request.signature,
       at: new Date(this.baseMs + rows.length * 1000).toISOString(),
     });
     this.versions.set(request.scope, rows);
@@ -190,9 +193,12 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
       if (
         at !== undefined &&
         at.dataHash.toLowerCase() === row.dataHash.toLowerCase() &&
-        at.metadataHash.toLowerCase() === row.metadataHash.toLowerCase()
+        at.signature.toLowerCase() === row.signature.toLowerCase()
       ) {
-        // A replay: the row is stored already.
+        // A replay, as the gateway judges one (`replaysStoredRow`, without
+        // `exclusive`, which a batch never sets): the same data hash and the
+        // same signature, so the same signer sent it again. Another signer's
+        // row at that version is a conflict, whatever it holds.
         rows.push({ kind: "committed" });
         continue;
       }
@@ -213,6 +219,7 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
       stored.push({
         dataHash: row.dataHash,
         metadataHash: row.metadataHash,
+        signature: row.signature,
         at: new Date(this.baseMs + stored.length * 1000).toISOString(),
       });
       this.versions.set(row.scope, stored);
@@ -283,13 +290,15 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
 
 /** A fresh in-memory registry (see `MemoryStreamSyncRegistry`). */
 /**
- * The policy the gateway advertises (`Batch-Policy`), derived there from its
- * backend's limits (data-gateway `lib/batch-bounds.ts`).
+ * The policy the gateway advertises (`Batch-Policy`), as `deriveBatchBounds()`
+ * computes it from the backend's limits in data-gateway `lib/batch-bounds.ts`
+ * (31 rows once the lock count includes the registry change trigger's
+ * relations).
  */
 const GATEWAY_BATCH_POLICY: RegistryBatchPolicy = {
-  rows: 36,
-  requires: 2152,
-  bytes: 3_979_801,
+  rows: 31,
+  requires: 1952,
+  bytes: 3_606_546,
 };
 
 /** The control tombstone's hashes: a constant label, the same for every key. */

@@ -147,6 +147,8 @@ async function rivalPost(
   scope: string,
   version: number,
   hashes: { dataHash: `0x${string}`; metadataHash: `0x${string}` },
+  /** The deleting device signs "0x00"; a rival is another signer by default. */
+  signature = "0x01",
 ) {
   const { beforePost, afterPost } = f.registry;
   f.registry.beforePost = undefined;
@@ -159,7 +161,7 @@ async function rivalPost(
         ownerAddress: owner,
         scope,
         expectedVersion: String(version),
-        signature: "0x00",
+        signature,
       }),
     ).toEqual({ kind: "committed" });
   } finally {
@@ -420,13 +422,34 @@ it("fences past the advertised bound go in requests within it, in flight togethe
 // Races: a fence the request did not store is read again and settled alone.
 // ---------------------------------------------------------------------------
 
-it("a fence another device already wrote is a replay: the request commits and the tombstone is written once", async () => {
+it("a fence another signer already wrote is refused by the batch, and the per-row pass confirms it: the tombstone is written once", async () => {
   const f = await world();
   const singles = countSingles(f);
   f.registry.beforePost = async (row) => {
     if (row.scope !== f.control) return;
-    // Another device's delete lands the same tombstone first.
+    // Another device's delete lands the same tombstone first, under its own
+    // signature. The registry replays only a row with the same data hash and
+    // the same signature, so this row is not a replay of ours.
     await rivalPost(f, f.control, 2, tombstone(f));
+  };
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  f.registry.beforePost = undefined;
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  // The one batch lost its fence and wrote nothing; the fence went alone and
+  // a read confirmed the rival's tombstone.
+  expect(f.registry.batches).toHaveLength(1);
+  expect(singles).toEqual([f.control]);
+  expect(controlWrites(f)).toEqual([1, 2]);
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+it("a fence the same signer already wrote is a replay: the request commits and the tombstone is written once", async () => {
+  const f = await world();
+  const singles = countSingles(f);
+  f.registry.beforePost = async (row) => {
+    if (row.scope !== f.control) return;
+    // This device's own earlier send landed (its reply was lost).
+    await rivalPost(f, f.control, 2, tombstone(f), "0x00");
   };
   await f.a.deleter.requestConnectionDelete("fixture-source");
   f.registry.beforePost = undefined;
@@ -468,8 +491,9 @@ it("a fence that loses refuses its request; a replayed fence counts as written, 
   f.registry.beforePost = async (row) => {
     if (raced.has(row.scope)) return;
     raced.add(row.scope);
-    // Another device's delete already wrote this fence: a replay.
-    if (row.scope === f.control) await rivalPost(f, f.control, 2, tombstone(f));
+    // This device's own earlier send already wrote this fence: a replay.
+    if (row.scope === f.control)
+      await rivalPost(f, f.control, 2, tombstone(f), "0x00");
     // Its other key moves the work namespace on, then deletes it: the fence
     // at version 2 loses, and the namespace is tombstoned past the pin.
     if (row.scope === work) {

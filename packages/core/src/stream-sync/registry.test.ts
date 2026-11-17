@@ -186,6 +186,46 @@ it("sends every row and every condition in one request; a 200 is a commit of eve
   expect(result).toEqual({ kind: "committed" });
 });
 
+it.each([
+  [
+    "a 409 row beside a stored one (a route from before batches were all-or-nothing)",
+    {
+      "pdpp.x~.a": { status: 409, reason: "stale", latestVersion: "6" },
+      "pdpp.x~.b": { status: 201, version: "2" },
+    },
+  ],
+  [
+    "a 424 row",
+    {
+      "pdpp.x~.a": { status: 201, version: "2" },
+      "pdpp.x~.b": { status: 424 },
+    },
+  ],
+  ["a row with no result", { "pdpp.x~.a": { status: 201, version: "2" } }],
+  [
+    "a 2xx status other than 201",
+    {
+      "pdpp.x~.a": { status: 201, version: "2" },
+      "pdpp.x~.b": { status: 200, version: "2" },
+    },
+  ],
+])(
+  "a 200 with success:true is a commit only when every row is stored (201): %s is not",
+  async (_name, statuses) => {
+    const { registry } = gatewayAnswering(() => results200(statuses));
+    await expect(registry.postBatch!(batchRequest)).rejects.toBeInstanceOf(
+      AmbiguousRegistryReplyError,
+    );
+  },
+);
+
+it("a batch of conditions alone (no rows) is committed by a 200 that stores none", async () => {
+  const { registry } = gatewayAnswering(() => results200({}));
+  expect(
+    await registry.postBatch!({ ...batchRequest, rows: [] }),
+  ).toEqual({ kind: "committed" });
+});
+
 it("a 409 conflict wrote nothing: one answer per row in request order, the loser with its winner, a replay stored, the rest not written", async () => {
   const { registry } = gatewayAnswering(
     () =>

@@ -202,7 +202,49 @@ export function createConnectionDeleter(
       )
     );
   }
-  async function purgeLocal(connector: string, intent: DeleteIntent) {
+  /**
+   * Run `work` holding the queue of every local connection of `connector`, so
+   * no commit of theirs is in flight, and none starts, until it ends. A first
+   * save commits a connection's control row and first segment in one request
+   * under that queue; a plan that listed the registry while one was in flight
+   * would find no control row to fence, and the commit would land after the
+   * delete answered. Waiting here puts the commit before the listing, which
+   * then pins its control row. A commit that waits behind the hold begins
+   * after the delete saved its intent (which defers it) or purged the
+   * connection (which changes its basis, so it plans again). Only a delete
+   * with a local connection no pin covers needs it.
+   */
+  async function holdingConnections<T>(
+    connector: string,
+    work: (held: ReadonlySet<string>) => Promise<T>,
+  ): Promise<T> {
+    const ids = (
+      await deps.db.query<{ connection_id: string }>(
+        "SELECT connection_id FROM connections WHERE connector=? ORDER BY connection_id",
+        [connector],
+      )
+    ).map((row) => row.connection_id);
+    const hold = (i: number): Promise<T> =>
+      i === ids.length
+        ? work(new Set(ids))
+        : deps.queue.run(ids[i]!, "purge", () => hold(i + 1));
+    return hold(0);
+  }
+  async function hasUnpinnedConnection(
+    connector: string,
+    intent: DeleteIntent,
+  ) {
+    const rows = await deps.db.query<{ ns: string }>(
+      "SELECT ns FROM connections WHERE connector=?",
+      [connector],
+    );
+    return rows.some((row) => !intent.pins.some((p) => p.ns === row.ns));
+  }
+  async function purgeLocal(
+    connector: string,
+    intent: DeleteIntent,
+    held: ReadonlySet<string> = new Set(),
+  ) {
     const connections = await deps.db.query<{
       connection_id: string;
       ns: string;
@@ -215,7 +257,11 @@ export function createConnectionDeleter(
     for (const connection of connections) {
       const pin = intent.pins.find((p) => p.ns === connection.ns);
       if (pin && connection.generation > pin.version) continue;
-      await deps.queue.run(connection.connection_id, "purge", async () => {
+      const inQueue = held.has(connection.connection_id)
+        ? (work: () => Promise<void>) => work()
+        : (work: () => Promise<void>) =>
+            deps.queue.run(connection.connection_id, "purge", work);
+      await inQueue(async () => {
         const [current] = await deps.db.query<{ generation: number }>(
           "SELECT generation FROM connections WHERE connection_id=?",
           [connection.connection_id],
@@ -453,19 +499,38 @@ export function createConnectionDeleter(
         `delete:${connector}`,
         "purge",
         async () => {
-          const open = await readIntent(connector);
+          const decide = async (
+            planned: Awaited<ReturnType<typeof plan>>,
+            held: ReadonlySet<string>,
+          ) => {
+            const open = await readIntent(connector);
+            const empty = planned.intent.pins.length === 0;
+            if (open && (empty || samePlan(open, planned.intent))) return open;
+            if (empty) {
+              await purgeLocal(connector, planned.intent, held);
+              await options.eraseLegacy?.(connector);
+              return null;
+            }
+            await save(connector, planned.intent);
+            listings.set(planned.intent.id!, planned.listing);
+            await purgeLocal(connector, planned.intent, held);
+            return planned.intent;
+          };
           const planned = await plan(connector);
-          const empty = planned.intent.pins.length === 0;
-          if (open && (empty || samePlan(open, planned.intent))) return open;
-          if (empty) {
-            await purgeLocal(connector, planned.intent);
-            await options.eraseLegacy?.(connector);
-            return null;
-          }
-          await save(connector, planned.intent);
-          listings.set(planned.intent.id!, planned.listing);
-          await purgeLocal(connector, planned.intent);
-          return planned.intent;
+          // A local connection with no control row in the listing may be
+          // creating it: its first save commits control row and first segment
+          // in one request, under the connection's queue. That listing cannot
+          // tell whether the commit is in flight. Wait for the queue, then
+          // list again: the commit has landed (the listing pins its control
+          // row) or none is in flight and none starts before the intent is
+          // saved or the connection purged. A connection every pin covers
+          // needs no wait: its fence is a compare-and-set on the row the
+          // listing showed.
+          if (await hasUnpinnedConnection(connector, planned.intent))
+            return holdingConnections(connector, async (held) =>
+              decide(await plan(connector), held),
+            );
+          return decide(planned, new Set());
         },
       );
       if (!intent) return { deleteId: deps.newOp(), fenced: true };

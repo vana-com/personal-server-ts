@@ -64,9 +64,9 @@ export async function remoteFixture(
   };
   // The bounds the gateway derives and advertises in `Batch-Policy`.
   const policy: RegistryBatchPolicy = {
-    rows: 36,
-    requires: 2152,
-    bytes: 3_979_801,
+    rows: 31,
+    requires: 1952,
+    bytes: 3_606_546,
   };
   const registry: StreamSyncRegistry = {
     batchPolicy: () => policy,

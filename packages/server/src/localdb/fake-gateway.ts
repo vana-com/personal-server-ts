@@ -9,13 +9,15 @@ import {
   fencingLogScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 
-type Version = { dataHash: string; metadataHash: string };
+/** `signature` is the signer's; a row a test writes directly has none. */
+type Version = { dataHash: string; metadataHash: string; signature?: string };
 
 type BatchRow = {
   scope: string;
   expectedVersion: string;
   dataHash: string;
   metadataHash: string;
+  signature?: string;
   expectedHeadDataHash?: string;
 };
 
@@ -315,6 +317,7 @@ export function createFakeGateway(options: FakeGatewayOptions) {
         gateway.write(body.scope, {
           dataHash: body.dataHash,
           metadataHash: body.metadataHash,
+          signature: body.signature,
         });
         return json(201, { success: true });
       }
@@ -390,9 +393,13 @@ export function createFakeGateway(options: FakeGatewayOptions) {
             latestDataHash: head?.dataHash ?? null,
           };
         }
+        // A replay is the same data hash and the same signature, as the
+        // registry judges one (`replaysStoredRow`; a batch is never
+        // `exclusive`): another signer's row at that version is a conflict.
         const isReplay =
           Number(row.expectedVersion) === rows.length &&
-          head?.dataHash === row.dataHash;
+          head?.dataHash === row.dataHash &&
+          head.signature?.toLowerCase() === row.signature?.toLowerCase();
         if (isReplay && options.replay === "created") {
           return {
             scope: row.scope,
@@ -434,6 +441,7 @@ export function createFakeGateway(options: FakeGatewayOptions) {
           gateway.write(row.scope, {
             dataHash: row.dataHash,
             metadataHash: row.metadataHash,
+            signature: row.signature,
           });
           return {
             scope: row.scope,
@@ -450,6 +458,7 @@ export function createFakeGateway(options: FakeGatewayOptions) {
           gateway.replaceHead(row.scope, {
             dataHash: row.dataHash,
             metadataHash: row.metadataHash,
+            signature: row.signature,
           });
           return {
             scope: row.scope,

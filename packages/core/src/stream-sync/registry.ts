@@ -476,11 +476,25 @@ export function createGatewayStreamSyncRegistry(
       if (res.status < 200 || res.status >= 300) {
         throw ambiguousOrRefused(what, res, await res.text().catch(() => ""));
       }
-      // A commit says so. A 2xx body that does not (a proxy's page) may come
-      // from something other than the route.
-      if (asRecord(await jsonOf(res))?.success !== true) {
+      // A commit says so, and gives every row the status 201 (written now, or
+      // a replay of a stored version). A 2xx body that does not (a proxy's
+      // page) may come from something other than the route. A route that
+      // predates all-or-nothing answers 200 `success: true` with a 409 row
+      // beside stored ones: that row lost, so the batch is not a commit.
+      const body = asRecord(await jsonOf(res));
+      const results = body?.results;
+      const everyRowStored =
+        Array.isArray(results) &&
+        request.rows.every((row) =>
+          results.some(
+            (result) =>
+              asRecord(result)?.scope === row.scope &&
+              asRecord(result)?.status === 201,
+          ),
+        );
+      if (body?.success !== true || !everyRowStored) {
         throw new AmbiguousRegistryReplyError(
-          `${what} answered ${res.status} without a commit`,
+          `${what} answered ${res.status} without a commit of every row`,
         );
       }
       return { kind: "committed" };
