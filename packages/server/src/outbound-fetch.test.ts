@@ -9,8 +9,11 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
+import { createServer as createTlsServer } from "node:https";
+import { generateKeyPairSync } from "node:crypto";
 import type { AddressInfo, Socket } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import forge from "node-forge";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createGatewayStreamSyncRegistry } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createKeepAliveFetch } from "./outbound-fetch.js";
 
@@ -193,6 +196,99 @@ describe("a reused socket the server resets", () => {
   });
 });
 
+describe("an aborted GET", () => {
+  it("is not sent again, even on a connection that had answered before", async () => {
+    const received: string[] = [];
+    let arrived!: () => void;
+    const secondArrived = new Promise<void>((resolve) => (arrived = resolve));
+    const { url } = await peer((request, response) => {
+      received.push(`${request.method} ${request.url}`);
+      if (received.length === 1) return response.end("ok");
+      arrived();
+    });
+    const sent = vi.fn(globalThis.fetch);
+    const { fetch: send } = createKeepAliveFetch(sent);
+    await (await send(url)).text();
+    await sleep(50);
+    const controller = new AbortController();
+    const pending = send(url, { signal: controller.signal });
+    const aborted = expect(pending).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    await secondArrived;
+
+    controller.abort();
+
+    await aborted;
+    await sleep(100);
+    expect(received).toEqual(["GET /", "GET /"]);
+    // An aborted request is not handed to the transport a second time.
+    expect(sent).toHaveBeenCalledTimes(2);
+  });
+});
+
+/** A self-signed certificate for 127.0.0.1, made with the host's own crypto. */
+function selfSigned() {
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  });
+  const cert = forge.pki.createCertificate();
+  cert.publicKey = forge.pki.publicKeyFromPem(
+    publicKey.export({ type: "spki", format: "pem" }).toString(),
+  );
+  cert.serialNumber = "01";
+  cert.validity.notBefore = new Date(Date.now() - 60_000);
+  cert.validity.notAfter = new Date(Date.now() + 3_600_000);
+  const subject = [{ name: "commonName", value: "127.0.0.1" }];
+  cert.setSubject(subject);
+  cert.setIssuer(subject);
+  const key = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  cert.sign(
+    forge.pki.privateKeyFromPem(
+      privateKey.export({ type: "pkcs1", format: "pem" }).toString(),
+    ),
+    forge.md.sha256.create(),
+  );
+  return { key, cert: forge.pki.certificateToPem(cert) };
+}
+
+describe("over HTTPS", () => {
+  it("retries a registry read once when the server reset a reused connection", async () => {
+    vi.stubEnv("NODE_TLS_REJECT_UNAUTHORIZED", "0");
+    try {
+      const perSocket = new Map<Socket, number>();
+      const sockets: Socket[] = [];
+      const server = createTlsServer(selfSigned(), (request, response) => {
+        const count = (perSocket.get(request.socket) ?? 0) + 1;
+        perSocket.set(request.socket, count);
+        if (count > 1) return request.socket.destroy();
+        response.statusCode = 404;
+        response.setHeader("connection", "keep-alive");
+        response.end("{}");
+      });
+      server.on("secureConnection", (socket) => sockets.push(socket));
+      servers.push(server as unknown as Server);
+      await new Promise<void>((resolve) =>
+        server.listen(0, "127.0.0.1", () => resolve()),
+      );
+      const url = `https://127.0.0.1:${(server.address() as AddressInfo).port}/`;
+      const registry = createGatewayStreamSyncRegistry({
+        gatewayUrl: url,
+        ownerAddress: "0x1111111111111111111111111111111111111111",
+        fetch: createKeepAliveFetch().fetch,
+      });
+
+      expect(await registry.read("pdpp.a~b")).toEqual({ found: false });
+      await sleep(100);
+      expect(await registry.read("pdpp.c~d")).toEqual({ found: false });
+
+      expect(sockets).toHaveLength(2);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
 describe("close", () => {
   it("closes the pooled connections, so the server sees them end", async () => {
     const { url, sockets } = await peer();
@@ -207,5 +303,40 @@ describe("close", () => {
 
     await closed;
     expect(sockets[0]!.destroyed).toBe(true);
+  });
+
+  it("lets a request in flight finish before it closes the pool", async () => {
+    let arrived!: () => void;
+    const requestArrived = new Promise<void>((resolve) => (arrived = resolve));
+    const { url, sockets } = await peer((_request, response) => {
+      arrived();
+      setTimeout(() => response.end("late"), 200);
+    });
+    const { fetch: send, close } = createKeepAliveFetch();
+    const inFlight = send(url);
+    await requestArrived;
+
+    const closing = close();
+
+    expect(await (await inFlight).text()).toBe("late");
+    await closing;
+    await sleep(50);
+    expect(sockets[0]!.destroyed).toBe(true);
+  });
+
+  it("aborts a request that is still in flight once the grace time has passed", async () => {
+    let arrived!: () => void;
+    const requestArrived = new Promise<void>((resolve) => (arrived = resolve));
+    const { url } = await peer(() => arrived());
+    const { fetch: send, close } = createKeepAliveFetch();
+    const inFlight = send(url);
+    const failed = expect(inFlight).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    await requestArrived;
+
+    await close({ graceMs: 100 });
+
+    await failed;
   });
 });

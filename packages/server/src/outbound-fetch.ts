@@ -38,10 +38,13 @@ function methodOf(input: Parameters<typeof fetch>[0], init?: RequestInit) {
 }
 
 /**
- * The peer closed a connection that had already answered a request, as this
- * request went out: undici fails the request with `UND_ERR_SOCKET` and does
- * not retry. The socket has read bytes only when an earlier request used it, so
- * a connection that failed on its first request is not this case.
+ * The peer closed a connection as this request went out, after the connection
+ * had received bytes: `undici` fails the request with `UND_ERR_SOCKET` and does
+ * not retry. `bytesRead > 0` is what the check can see. It holds for a reused
+ * connection, and it also holds when the peer sent part of a reply to this
+ * request, or (over TLS) only its handshake. It does not prove the request
+ * never reached the peer. That is safe because only GET and HEAD are resent,
+ * and only once.
  */
 function resetReusedSocket(error: unknown): boolean {
   const cause = (error as { cause?: { code?: string; socket?: SocketInfo } })
@@ -52,13 +55,17 @@ interface SocketInfo {
   bytesRead?: number;
 }
 
+/** How long {@link KeepAliveFetch.close} lets a request in flight finish. */
+export const CLOSE_GRACE_MS = 5_000;
+
 export interface KeepAliveFetch {
   readonly fetch: typeof fetch;
   /**
-   * Closes every connection and fails any request still in flight. For server
-   * shutdown, after the callers that send through `fetch` have stopped.
+   * Waits for requests in flight to finish, then closes every connection. A
+   * request still running after `graceMs` is aborted. For server shutdown: stop
+   * accepting work, drain it, then close the pool.
    */
-  close(): Promise<void>;
+  close(options?: { graceMs?: number }): Promise<void>;
 }
 
 /**
@@ -82,8 +89,19 @@ export function createKeepAliveFetch(
     keepAliveTimeout: KEEP_ALIVE_IDLE_MS,
     keepAliveMaxTimeout: KEEP_ALIVE_IDLE_MS,
   });
-  const through = (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
-    send(input, { ...init, dispatcher } as RequestInit);
+  const pastGrace = new AbortController();
+  const through = (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const signals = [
+      init?.signal,
+      input instanceof Request ? input.signal : undefined,
+      pastGrace.signal,
+    ].filter((signal) => signal != null);
+    return send(input, {
+      ...init,
+      signal: AbortSignal.any(signals),
+      dispatcher,
+    } as RequestInit);
+  };
   const keepAliveFetch: typeof fetch = async (input, init) => {
     try {
       return await through(input, init);
@@ -93,5 +111,17 @@ export function createKeepAliveFetch(
       return through(input, init);
     }
   };
-  return { fetch: keepAliveFetch, close: () => dispatcher.destroy() };
+  const close = async ({ graceMs = CLOSE_GRACE_MS } = {}) => {
+    // `Agent.destroy` after `Agent.close` leaves a request in flight pending,
+    // so the end of the grace time aborts requests through their signal. An
+    // aborted request ends, and `close` then finishes.
+    const timer = setTimeout(() => pastGrace.abort(), graceMs);
+    try {
+      // Ends idle connections now and waits for the busy ones.
+      await dispatcher.close();
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  return { fetch: keepAliveFetch, close };
 }

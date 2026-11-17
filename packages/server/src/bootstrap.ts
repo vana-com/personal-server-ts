@@ -206,6 +206,12 @@ export interface ServerContext {
   setLocalApprovalOrigin: (origin?: string) => void;
   devToken?: string;
   startBackgroundServices: () => Promise<void>;
+  /**
+   * Stops background work and releases the stores and the outbound pool. The
+   * caller first stops accepting requests and lets those in flight finish
+   * (`runShutdown`): a request still running finishes, because the pool closes
+   * gracefully, but it finds the stores closed.
+   */
   cleanup: () => Promise<void>;
   /** This boot's replication door, decided before any record store opened. */
   replicationStatus: ReplicationDoorStatus;
@@ -1858,7 +1864,8 @@ async function bootstrapServer(
         indexManager.close();
       }
     });
-    // Last: the stops above send through it until they have settled.
+    // Last: the stops above send through it until they have settled. Closing
+    // waits for a request still in flight, up to the pool's grace time.
     await attempt(() => keepAlive?.close());
     if (errors.length > 0) throw errors[0];
   };
