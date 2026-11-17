@@ -78,7 +78,7 @@ describe("publish", () => {
     );
   });
 
-  it("names the runs of both when a second publish waits behind the first", async () => {
+  it("returns the runs of both to a publish that waits behind another", async () => {
     const w = await world({ streams: 1, logProtocol: true });
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
@@ -92,8 +92,12 @@ describe("publish", () => {
     });
     await d.run("r1", [{ stream: "s0", id: "a" }]);
     const first = d.sync.publish();
-    // The first publish holds its upload; a run that ends meanwhile is what
-    // the second publish sends.
+    // The first publish holds its upload; a run that ends meanwhile joins its
+    // next round, and the second publish, which waits for the first, must
+    // still return the receipt that names both runs. (`mergeResults` keeps
+    // the runs of both receipts when each publish sent one; no run order in
+    // the fake world makes the second publish send a run of its own, so that
+    // union is not pinned by a test.)
     while (!held) await new Promise((r) => setImmediate(r));
     await d.run("r2", [{ stream: "s0", id: "b" }]);
     const second = d.sync.publish();
