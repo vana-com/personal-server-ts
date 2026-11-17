@@ -22,8 +22,10 @@
 // A batch is bounded by the part target: a round takes the changes of streams
 // in order until the target is reached and leaves the rest for the next round,
 // except that a stream whose replacing run applies goes whole (its omission
-// completion and its changes are one unit). A single record larger than the
-// target still goes, alone.
+// completion and its changes are one unit) when the whole fits one segment.
+// A larger one goes in rounds, and only the round with its completion says
+// the stream is complete. A single record larger than the target goes alone,
+// its body out of line.
 //
 // Runs it cannot place (refused, fenced, from another lifetime) are cleaned up
 // and the round starts over; runs it cannot order yet (deferred) hold only
@@ -161,7 +163,14 @@ type Planned = {
   readonly operations: LogOperation[];
   readonly meta: LogStreamMeta | null;
   readonly runIds: readonly string[];
+  /** The replace this round completes: its rows below the cutoff go. */
   readonly replace: { readonly o: number; readonly r: string } | null;
+  /**
+   * A replace whose rows this round carries but whose completion waits for a
+   * later round. Its basis moves to the segment this round commits, which is
+   * this device's own and so not a write the replace must yield to.
+   */
+  readonly replacing: { readonly o: number; readonly r: string } | null;
   readonly omitted: readonly LogOmission[];
   readonly bytes: number;
 };
@@ -508,6 +517,7 @@ async function snapshotRound(
       meta: null,
       runIds: plan.steps.map((step) => step.runId),
       replace: null,
+      replacing: null,
       omitted: [],
       bytes: 0,
     };
@@ -574,16 +584,26 @@ async function snapshotRound(
       continue;
     }
     // Changes go in the order they were made, until the segment reaches the
-    // part target, measured on the operations themselves. A stream that
-    // replaces goes whole (its completion and its changes are one unit), but
-    // still waits for the next round if the segment is full. The first thing
-    // in a segment always goes, however large, so a round always progresses.
+    // part target, measured on the operations themselves. The first thing in
+    // a segment always goes, however large, so a round always progresses.
+    //
+    // A replacing stream whose rows and completion fit one segment goes whole
+    // (a reader sees the replace at once), or waits for the next round if
+    // this segment is full. One larger than a segment goes like any other
+    // changes, over as many rounds as it needs. Its completion (the keys it
+    // dropped) goes in the round that takes its last rows, or alone in the
+    // next, and only that round says the stream is complete: an earlier round
+    // says it is not, so a reader never takes a replace that is half
+    // published for a complete stream. Every operation merges per key by
+    // stamp, so rounds from other writers in between interleave as they would
+    // with any other changes.
     const room = (size: number) => first || budget + size <= target;
-    const atomic = replace !== null;
+    const sizeOf = (op: LogOperation) => opSize(op, target);
     const selected: { pk: string; seq: number }[] = [];
     const taken: LogOperation[] = [];
-    let bytes = omittedSize(omitted) + 100;
+    let bytes = 100;
     let rest = false;
+    let whole = false;
     // A stream with a change the log cannot say stops here: nothing of it is
     // published or acknowledged this round (`plan.deferred`, as for a stream
     // that waits on its runs), so no change is lost without a trace.
@@ -609,7 +629,7 @@ async function snapshotRound(
         ack: row.publish_watermark,
       });
     };
-    if (atomic) {
+    if (replace !== null) {
       const { ops: found, untyped } = await operationsFor(
         held,
         connectionId,
@@ -622,18 +642,22 @@ async function snapshotRound(
         stop(untyped);
         continue;
       }
-      const size =
-        bytes + [...found.values()].reduce((n, op) => n + opSize(op), 0);
-      if (!room(size)) {
-        planned.push({ ...base, ack: row.publish_watermark, rest: true });
-        continue;
+      let size = bytes + 100 + omittedSize(omitted);
+      for (const op of found.values()) size += sizeOf(op);
+      if (size <= target) {
+        if (!room(size)) {
+          planned.push({ ...base, ack: row.publish_watermark, rest: true });
+          continue;
+        }
+        // A stream can hold more keys than a call takes as arguments (a
+        // spread of ~125k overflows the stack), so these go one by one.
+        for (const group of groups) selected.push(group);
+        for (const op of found.values()) taken.push(op);
+        bytes = size;
+        whole = true;
       }
-      // A stream can hold more keys than a call takes as arguments (a spread
-      // of ~125k overflows the stack), so these are appended one by one.
-      for (const group of groups) selected.push(group);
-      for (const op of found.values()) taken.push(op);
-      bytes = size;
-    } else {
+    }
+    if (!whole)
       scan: for (const batch of chunked(groups, KEYS_PER_QUERY)) {
         const { ops: found, untyped } = await operationsFor(
           held,
@@ -649,7 +673,7 @@ async function snapshotRound(
         }
         for (const group of batch) {
           const op = found.get(group.pk);
-          const size = op ? opSize(op) : 0;
+          const size = op ? sizeOf(op) : 0;
           if (!room(bytes + size)) {
             rest = true;
             break scan;
@@ -660,22 +684,36 @@ async function snapshotRound(
           first = false;
         }
       }
-      if (selected.length === 0 && groups.length > 0) {
-        planned.push({ ...base, ack: row.publish_watermark, rest: true });
-        continue;
-      }
+    if (selected.length === 0 && groups.length > 0) {
+      planned.push({ ...base, ack: row.publish_watermark, rest: true });
+      continue;
+    }
+    // Rows of the stream wait for a later round; its completion waits with them.
+    const rowsRest = rest;
+    let completes = whole;
+    if (replace !== null && !whole && !rowsRest) {
+      const size = 100 + omittedSize(omitted);
+      if (room(bytes + size)) {
+        completes = true;
+        bytes += size;
+      } else rest = true;
+    }
+    // A replace whose completion waits, with no rows in this round, waits whole.
+    if (replace !== null && !completes && taken.length === 0) {
+      planned.push({ ...base, ack: row.publish_watermark, rest: true });
+      continue;
     }
     // Changes that carry no operation are nothing to publish: the rows a
     // replacing run dropped are deleted locally in the commit that publishes
     // its completion, and those deletions are changes above that commit's
     // watermark. Counted as work they would cost a segment that says nothing.
-    if (!atomic && !rest && taken.length === 0 && !metaPublishes) {
+    if (!completes && !rest && taken.length === 0 && !metaPublishes) {
       planned.push({ ...base });
       continue;
     }
     budget += bytes;
     first = false;
-    const ack = rest ? selected.at(-1)!.seq : watermark;
+    const ack = rowsRest ? selected.at(-1)!.seq : watermark;
     planned.push({
       ...base,
       included: true,
@@ -683,7 +721,7 @@ async function snapshotRound(
       ack,
       operations: [
         ...orderedOperations(taken),
-        ...(replace
+        ...(completes && replace
           ? [
               {
                 kind: "complete" as const,
@@ -698,10 +736,11 @@ async function snapshotRound(
         stream,
         primaryKey: head.primaryKey,
         profile: head.profile as LogStreamMeta["profile"],
-        complete: head.complete,
+        complete: replace !== null && !completes ? false : head.complete,
       },
-      replace,
-      omitted,
+      replace: completes ? replace : null,
+      replacing: replace !== null && !completes ? replace : null,
+      omitted: completes ? omitted : [],
       bytes,
     });
   }
@@ -843,12 +882,20 @@ async function snapshotRound(
   };
 }
 
-function opSize(op: LogOperation): number {
-  return op.kind === "upsert"
-    ? 160 + JSON.stringify(op.value).length
-    : op.kind === "delete"
-      ? 160 + JSON.stringify(op.key).length
-      : 100 + omittedSize(op.omitted);
+/**
+ * What `op` adds to a segment. A body longer than `target` goes out of line
+ * (`log-bodies.ts`): the segment carries only its piece hashes.
+ */
+function opSize(op: LogOperation, target: number): number {
+  if (op.kind === "upsert") {
+    const length = JSON.stringify(op.value).length;
+    return length > target
+      ? 260 + 70 * Math.ceil(length / target)
+      : 160 + length;
+  }
+  return op.kind === "delete"
+    ? 160 + JSON.stringify(op.key).length
+    : 100 + omittedSize(op.omitted);
 }
 
 /** An omission lists its hash and its typed key. */
@@ -1468,6 +1515,25 @@ async function commitRound(
       },
     );
   }
+  // A replace still under way read the stream at its basis; the segment this
+  // round committed is this device's own, so the basis moves to it (after the
+  // head columns above have).
+  for (const p of touched)
+    if (p.replacing)
+      statements.push({
+        sql: `UPDATE run_streams SET
+                basis_version = (SELECT head_version FROM stream_state WHERE connection_id = ? AND stream = ?),
+                basis_data_hash = ?, basis_generation = ?
+               WHERE run_id = ? AND stream = ? AND replace = 1`,
+        params: [
+          connectionId,
+          p.stream,
+          candidate.dataHash,
+          candidate.generation,
+          p.replacing.r,
+          p.stream,
+        ],
+      });
   for (const p of candidate.planned) {
     if (p.plan.deferred) continue;
     if (!p.rest)
