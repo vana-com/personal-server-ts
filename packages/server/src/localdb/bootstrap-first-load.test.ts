@@ -398,6 +398,55 @@ describe("disk-backed bootstrap swap", () => {
     expect(await d.position()).toBe(0);
   });
 
+  it("blocks a foreign insert after the swap decision while bootstrap owns records", async () => {
+    const w = await world({ streams: 1 });
+    const peer = await history(w);
+    const d = await connect(w, "swap-race");
+    const other = "pdpp.fixture~1111111111111111";
+    await d.db.batch([
+      {
+        sql: "INSERT INTO connections(connection_id,connector,ns,generation,control_state,control_version) VALUES(?,'fixture','1111111111111111',1,'active',1)",
+        params: [other],
+      },
+    ]);
+    const batch = d.db.batch.bind(d.db);
+    let attempted = false;
+    d.db.batch = async (statements) => {
+      if (
+        !attempted &&
+        statements.some((statement) => statement.sql === "DROP TABLE records")
+      ) {
+        attempted = true;
+        await expect(
+          batch([
+            { sql: "UPDATE write_ctx SET origin='remote' WHERE id=1" },
+            {
+              sql: `INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256,first_o)
+            SELECT ?,stream,pk_hash,record_key,stamp_o,stamp_r,?,'foreign-hash',first_o FROM records
+            WHERE connection_id=? AND stream='s0' AND record_key='safe'`,
+              params: [
+                other,
+                JSON.stringify({ id: "safe", source: "B" }),
+                CONNECTION_ID,
+              ],
+            },
+            { sql: "UPDATE write_ctx SET origin='local' WHERE id=1" },
+          ]),
+        ).rejects.toThrow("bootstrap_busy");
+        expect(
+          await d.db.query("SELECT body FROM records WHERE connection_id=?", [
+            other,
+          ]),
+        ).toEqual([]);
+      }
+      return batch(statements);
+    };
+    await applyConnection(d.deps, CONNECTION_ID);
+    expect(attempted).toBe(true);
+    expect(await d.rows()).toEqual(await peer.rows());
+    expect(await d.position()).toBe(5);
+  });
+
   it("rolls back a SQL failure after DROP records and resumes from durable segment receipts", async () => {
     const w = await world({ streams: 1 });
     const p = await history(w);
