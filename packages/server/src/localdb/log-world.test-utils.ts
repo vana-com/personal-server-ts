@@ -30,6 +30,7 @@ import {
   createStorageAccess,
   DEFAULT_STORAGE_ACCESS_POLICY,
 } from "../../../core/src/stream-sync/storage-retry.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { createFakeGateway } from "./fake-gateway.js";
 import type { RequestTrace } from "./request-trace.test-utils.js";
@@ -213,6 +214,9 @@ export async function world(options: {
         remove?: boolean;
       }[],
       opts: {
+        /** The streams the run selected (default: every stream). */
+        selected?: readonly string[];
+        /** The selected streams it covers; the others were skipped. */
         covered?: readonly string[];
         full?: boolean;
         observedAt?: number;
@@ -256,12 +260,23 @@ export async function world(options: {
           mimeType: "application/octet-stream",
           bytes: opts.blob.bytes,
         });
-      await sync.intake.end(runId, {
-        outcome: "succeeded",
-        coveredStreams: opts.covered ?? names,
-        lastBatch: 0,
-        ...(opts.full === false ? {} : { provenFullStreams: names }),
-      });
+      const selected = opts.selected ?? names;
+      const covered = opts.covered ?? selected;
+      await sync.intake.end(
+        runId,
+        endRequest({
+          lastBatch: 0,
+          streams: selected,
+          live: records
+            .filter((record) => !record.remove)
+            .map((record) => record.stream),
+          deleted: records
+            .filter((record) => record.remove)
+            .map((record) => record.stream),
+          skipped: selected.filter((name) => !covered.includes(name)),
+          ...(opts.full === false ? {} : { provenFullStreams: selected }),
+        }),
+      );
     };
     const cycle = async () => {
       const report = await sync.cycle();

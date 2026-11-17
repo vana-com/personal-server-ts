@@ -2,9 +2,11 @@
 
 Run from this repository on Linux with Node 22 and the existing workspace dependencies. The harness requires `prlimit` and `/proc` to disable core dumps and measure each child process's high-water RSS. Build this checkout's core first so workspace imports use this branch's code.
 
+`WORK_DIR` is a disk-backed work directory of your choice.
+
 ```sh
-mkdir -p "$HOME/.tmp"
-export TMPDIR="$HOME/.tmp"
+mkdir -p "$WORK_DIR"
+export TMPDIR="$WORK_DIR"
 ./node_modules/.bin/tsc --build packages/core
 ./node_modules/.bin/tsx scripts/pdpp-replica-dev-preflight.ts
 ./node_modules/.bin/vitest run \
@@ -12,21 +14,21 @@ export TMPDIR="$HOME/.tmp"
   packages/core/src/replication/evidence.test.ts \
   packages/server/src/storage/pdpp-replication-transport.test.ts --maxWorkers=1
 ./node_modules/.bin/tsx scripts/pdpp-replica-live-journey.ts \
-  "$HOME/.tmp/replica-journey.json"
+  "$WORK_DIR/replica-journey.json"
 ```
 
 The separate sender-crash probe is:
 
 ```sh
 ./node_modules/.bin/tsx scripts/pdpp-replica-live-journey.ts \
-  "$HOME/.tmp/replica-put-retry.json" --put-retry-only
+  "$WORK_DIR/replica-put-retry.json" --put-retry-only
 ```
 
 The pending visibility probe is:
 
 ```sh
 ./node_modules/.bin/tsx scripts/pdpp-replica-live-journey.ts \
-  "$HOME/.tmp/replica-visibility.json" --visibility-only
+  "$WORK_DIR/replica-visibility.json" --visibility-only
 ```
 
 It measures each receiving reader independently from the source write in both directions. The owner must first read the record with `confirmation: "not yet confirmed"`, while grant reads, canonical rows and received operations still exclude it. The receiver is killed and restarted during that interval; its owner preview must survive without exposing the record to the grant reader. Finalized evidence then allows promotion, after which the grant reader sees exactly one imported operation and the owner marker disappears. The receipt reports `ownerVisibleMs` and `appVisibleMs`; polling adds two seconds plus one worker cycle of observation uncertainty. This probe exercises the Node reader API, not an HTTP token or consent flow.

@@ -650,7 +650,8 @@
         "provenFullStreams": ["items"]
       },
       "replace": true,
-      "publishedKeys": ["a"]
+      "publishedKeys": ["a"],
+      "retired": "Hosts do not replay this case: it tests what a reader keeps after publication, which the Personal Server's own tests cover. Core still checks its replace input."
     },
     {
       "id": "560-case-2",
@@ -667,7 +668,8 @@
         "provenFullStreams": []
       },
       "replace": false,
-      "publishedKeys": ["a", "b"]
+      "publishedKeys": ["a", "b"],
+      "retired": "Hosts do not replay this case: it tests what a reader keeps after publication, which the Personal Server's own tests cover. Core still checks its replace input."
     },
     {
       "id": "560-case-3",
@@ -684,7 +686,8 @@
         "provenFullStreams": ["items"]
       },
       "replace": true,
-      "publishedKeys": ["a", "c"]
+      "publishedKeys": ["a", "c"],
+      "retired": "Hosts do not replay this case: it tests what a reader keeps after publication, which the Personal Server's own tests cover. Core still checks its replace input."
     },
     {
       "id": "560-case-4",
@@ -701,7 +704,8 @@
         "provenFullStreams": ["items"]
       },
       "replace": true,
-      "publishedKeys": ["a", "c"]
+      "publishedKeys": ["a", "c"],
+      "retired": "Hosts do not replay this case: it tests what a reader keeps after publication, which the Personal Server's own tests cover. Core still checks its replace input."
     },
     {
       "id": "560-case-5",
@@ -718,7 +722,8 @@
         "provenFullStreams": ["items"]
       },
       "replace": true,
-      "publishedKeys": ["a"]
+      "publishedKeys": ["a"],
+      "retired": "Hosts do not replay this case: it tests what a reader keeps after publication, which the Personal Server's own tests cover. Core still checks its replace input."
     }
   ]
 }

@@ -130,14 +130,20 @@ export interface RateLimitPolicyFeed {
   subscribe(listener: QuotaListener): () => void;
 }
 
-export function createRateLimitPolicyFeed(): RateLimitPolicyFeed {
+/**
+ * `fetchImpl` is the transport every request goes through; a Node host passes
+ * one that keeps its connections open. Without it, `globalThis.fetch` is read
+ * per call, so a replaced global is honoured.
+ */
+export function createRateLimitPolicyFeed(
+  fetchImpl?: typeof fetch,
+): RateLimitPolicyFeed {
   const listeners = new Set<QuotaListener>();
   let latest: string | undefined;
   let current: QuotaPolicies | undefined;
   return {
-    // `globalThis.fetch` is read per call, so a replaced global is honoured.
     async fetch(input, init) {
-      const response = await globalThis.fetch(input, init);
+      const response = await (fetchImpl ?? globalThis.fetch)(input, init);
       const header = response.headers.get("ratelimit-policy");
       if (header && header !== latest) {
         latest = header;

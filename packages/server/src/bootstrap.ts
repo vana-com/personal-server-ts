@@ -11,6 +11,7 @@ import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
 import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { createServerLocalSync } from "./localdb/sync.js";
+import { createKeepAliveFetch } from "./outbound-fetch.js";
 import { createLegacyStoreRunner } from "./localdb/legacy-store-import.js";
 import { createLocalSeed } from "./localdb/seed.js";
 import { createSeedStaging } from "./stream-sync/seed-staging.js";
@@ -205,6 +206,13 @@ export interface ServerContext {
   setLocalApprovalOrigin: (origin?: string) => void;
   devToken?: string;
   startBackgroundServices: () => Promise<void>;
+  /**
+   * Stops background work and releases the stores and the outbound pool. The
+   * caller first stops accepting requests and lets those in flight finish
+   * (`runShutdown`, which exits instead if they overrun). The outbound pool
+   * then closes last, and gives a background request still in flight a grace
+   * time to finish.
+   */
   cleanup: () => Promise<void>;
   /** This boot's replication door, decided before any record store opened. */
   replicationStatus: ReplicationDoorStatus;
@@ -334,6 +342,12 @@ export interface CreateServerOptions {
    */
   streamSyncRegistry?: StreamSyncRegistry;
   /**
+   * The `fetch` for every request to the data gateway and to storage. Default:
+   * one that keeps connections open between requests (`createKeepAliveFetch`),
+   * except in an enclave, which uses `globalThis.fetch`. A test passes its own.
+   */
+  outboundFetch?: typeof fetch;
+  /**
    * The stream-sync blob store. Default: the storage service at `gateway.url`.
    * A test with no storage service passes its own (for example
    * `createMemoryStreamSyncBlobs()`).
@@ -410,6 +424,11 @@ async function bootstrapServer(
   const logger = createLogger(config.logging);
   const startedAt = new Date();
   const isEnclave = options?.profile === "enclave";
+  // The host's own pool, closed at cleanup. An injected fetch belongs to its
+  // caller.
+  const keepAlive =
+    options?.outboundFetch || isEnclave ? undefined : createKeepAliveFetch();
+  const outboundFetch = options?.outboundFetch ?? keepAlive?.fetch;
   if (isEnclave && process.env.VANA_OWNER_PRIVATE_KEY) {
     throw new Error("VANA_OWNER_PRIVATE_KEY is forbidden in enclave profile");
   }
@@ -827,6 +846,7 @@ async function bootstrapServer(
     ? createGatewayLineageClient({
         gatewayUrl: config.gateway.url,
         requestSigner,
+        fetch: outboundFetch,
       })
     : undefined;
 
@@ -903,6 +923,7 @@ async function bootstrapServer(
       createGatewayStreamSyncRegistry({
         gatewayUrl: config.gateway.url,
         ownerAddress: serverOwner!,
+        fetch: outboundFetch,
       }));
   }
   async function getLocalSync(): Promise<LocalSync> {
@@ -936,6 +957,7 @@ async function bootstrapServer(
           serverOwner: serverOwner!,
           serverAccount: serverAccount!,
           reads: "signed",
+          fetch: outboundFetch,
         });
         const deps: LocalSyncDeps = {
           db,
@@ -1034,6 +1056,7 @@ async function bootstrapServer(
     createGatewayDataPointFeed({
       gatewayUrl: config.gateway.url,
       ownerRequestSigner: additionsOwnerSigner,
+      fetch: outboundFetch,
     });
   // Read-side memory of tombstones, shared by the sync workers (which feed
   // it) and the data route (which consults it on every read).
@@ -1150,6 +1173,7 @@ async function bootstrapServer(
         gatewayUrl: config.gateway.url,
         ownerAddress: serverOwner,
         ownerSigner: additionsInventorySigner,
+        fetch: outboundFetch,
       }),
       storageAdapter:
         options?.additionsWriter?.storageAdapter ??
@@ -1158,6 +1182,7 @@ async function bootstrapServer(
           serverOwner,
           serverAccount,
           reads: isEnclave ? "public" : "signed",
+          fetch: outboundFetch,
         }),
       masterKey: legacyMasterKey(masterKeySignature),
       signer: options?.additionsWriter?.signer ?? serverSigner,
@@ -1179,6 +1204,7 @@ async function bootstrapServer(
       serverOwner,
       serverAccount,
       reads: isEnclave ? "public" : "signed",
+      fetch: outboundFetch,
     });
 
     const cursor = createSyncCursor(syncCursorPath, {
@@ -1210,6 +1236,7 @@ async function bootstrapServer(
       ? null
       : createGatewayDeleteDataPort({
           gatewayUrl: config.gateway.url,
+          fetch: outboundFetch,
           dataPointFeed,
           // Reserved vana.system.* heads: the gateway refuses an unsigned
           // read of them (owner wallet only) but admits this registered
@@ -1220,6 +1247,7 @@ async function bootstrapServer(
                   gatewayUrl: config.gateway.url,
                   ownerAddress: serverOwner,
                   ownerSigner: requestSigner,
+                  fetch: outboundFetch,
                 }).head(scope)
             : undefined,
           serverOwner,
@@ -1250,6 +1278,7 @@ async function bootstrapServer(
           gatewayUrl: config.gateway.url,
           ownerAddress: serverOwner,
           ownerSigner: additionsInventorySigner,
+          fetch: outboundFetch,
         }),
       );
     }
@@ -1458,6 +1487,7 @@ async function bootstrapServer(
                   serverOwner,
                   serverAccount,
                   reads: "signed",
+                  fetch: outboundFetch,
                 }),
                 gateway: gatewayClient,
                 feed: dataPointFeed,
@@ -1824,6 +1854,11 @@ async function bootstrapServer(
         indexManager.close();
       }
     });
+    // Last: the stops above send through it until they have settled. A
+    // background request still in flight (a sync or replication step) gets the
+    // pool's grace time to finish. An inbound request is not covered here:
+    // `runShutdown` has already drained inbound requests or exited.
+    await attempt(() => keepAlive?.close());
     if (errors.length > 0) throw errors[0];
   };
 

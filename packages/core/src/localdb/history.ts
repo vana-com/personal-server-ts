@@ -202,6 +202,8 @@ export function createLocalHistory(
 
       // One statement keeps rows, control visibility and frontiers in one
       // committed snapshot, including a connection deleted in a single batch.
+      // It reads every row: `NOT INDEXED` reads them in storage order, not
+      // in the order of an index whose rows are scattered in the table.
       const rows = await reads.db.query<{
         connection_id: string;
         connector: string;
@@ -218,7 +220,7 @@ WHERE c.control_state = 'active'
 UNION ALL
 SELECT c.connection_id, c.connector, r.stream, r.first_o,
        COUNT(*) AS row_count, NULL AS head_version
-FROM records r
+FROM records r NOT INDEXED
 JOIN connections c ON c.connection_id = r.connection_id
 WHERE c.control_state = 'active'
 GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);

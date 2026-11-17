@@ -10,6 +10,11 @@
 // The rule these tests hold to: a row is shown only if the finished log keeps
 // it. A segment is applied only after every later segment is fetched, so a key
 // that a later segment deletes or omits is never shown, at any point.
+//
+// The devices turn the key-ordered first load off (`keyedFirstLoad: false`):
+// with a budget of one segment, a first load would otherwise load key by key
+// (`planKeyedLoad`) and show nothing until it ends. These tests hold the
+// segment-by-segment pass that a load the key-ordered plan declines takes.
 import { afterEach, describe, expect, it } from "vitest";
 import {
   logScope,
@@ -111,6 +116,7 @@ function afterCommits(
 async function reference(w: World, hooks = {}) {
   const d = await w.device("reference", {
     progressiveFirstLoad: true,
+    keyedFirstLoad: false,
     maxBytesInFlight: ONE_AT_A_TIME,
     ...hooks,
   });
@@ -280,6 +286,7 @@ describe("progressive first load, log protocol on", () => {
     await sevenSegments(w);
     const b = await w.device("b", {
       progressiveFirstLoad: true,
+      keyedFirstLoad: false,
       maxBytesInFlight: ONE_AT_A_TIME,
     });
     await connect(b);
@@ -309,6 +316,7 @@ describe("progressive first load, log protocol on", () => {
     await sevenSegments(w);
     const b = await w.device("b", {
       progressiveFirstLoad: true,
+      keyedFirstLoad: false,
       maxBytesInFlight: ONE_AT_A_TIME,
     });
     await connect(b);
@@ -352,6 +360,7 @@ describe("progressive first load, log protocol on", () => {
     await publish(a, "run-5", ["D"], { observedAt: 1500 });
     const b = await w.device("b", {
       progressiveFirstLoad: true,
+      keyedFirstLoad: false,
       maxBytesInFlight: ONE_AT_A_TIME,
     });
     await connect(b);
@@ -379,6 +388,7 @@ describe("progressive first load, log protocol on", () => {
     await sevenSegments(w);
     const b = await w.device("b", {
       progressiveFirstLoad: true,
+      keyedFirstLoad: false,
       maxBytesInFlight: ONE_AT_A_TIME,
     });
     await connect(b);
@@ -414,6 +424,7 @@ describe("progressive first load, log protocol on", () => {
     await publish(a, "run-3", ["tail2"], { observedAt: 1300 });
     const b = await w.device("b", {
       progressiveFirstLoad: true,
+      keyedFirstLoad: false,
       maxBytesInFlight: ONE_AT_A_TIME,
     });
     await connect(b);
@@ -451,6 +462,7 @@ describe("progressive first load, log protocol on", () => {
     await publish(a, "run-3", ["tail2"], { observedAt: 1300 });
     const b = await w.device("b", {
       progressiveFirstLoad: true,
+      keyedFirstLoad: false,
       maxBytesInFlight: ONE_AT_A_TIME,
     });
     await connect(b);
@@ -555,6 +567,7 @@ describe(
       const arrived = new Promise<void>((r) => (blocked = r));
       const b = await w.device("b", {
         progressiveFirstLoad: true,
+        keyedFirstLoad: false,
         beforeGet: async (key) => {
           if (key !== slow) return;
           blocked();
@@ -601,6 +614,7 @@ describe(
       w.innerBlobs.delete(key);
       const b = await w.device("b", {
         progressiveFirstLoad: true,
+        keyedFirstLoad: false,
         maxBytesInFlight: ONE_AT_A_TIME,
       });
       await connect(b);
@@ -634,7 +648,10 @@ describe(
       const one = await reference(w);
       await applyConnection(one.deps, CONNECTION_ID);
 
-      const b = await w.device("b", { progressiveFirstLoad: true });
+      const b = await w.device("b", {
+        progressiveFirstLoad: true,
+        keyedFirstLoad: false,
+      });
       await connect(b);
       const db = b.db as unknown as { batch: Device["db"]["batch"] };
       const batch = db.batch.bind(db);
@@ -668,7 +685,10 @@ describe(
       const key = partKey(head, last);
       const bytes = (await w.innerBlobs.get(key))!;
       w.innerBlobs.delete(key);
-      const b = await w.device("b", { progressiveFirstLoad: true });
+      const b = await w.device("b", {
+        progressiveFirstLoad: true,
+        keyedFirstLoad: false,
+      });
       await connect(b);
       await expect(applyConnection(b.deps, CONNECTION_ID)).rejects.toThrow(
         "missing log snapshot part",
@@ -734,6 +754,7 @@ describe("progressive first load, batches committed together", () => {
 
     const grouped = await w.device("grouped", {
       progressiveFirstLoad: true,
+      keyedFirstLoad: false,
     });
     await connect(grouped);
     const commits = afterCommits(grouped, async () => undefined);
@@ -747,7 +768,10 @@ describe("progressive first load, batches committed together", () => {
   it("a key a later batch deletes or omits is in no view, at any commit, though the batches commit together", async () => {
     const w = await world({ streams: 1 });
     await sevenSegments(w);
-    const b = await w.device("b", { progressiveFirstLoad: true });
+    const b = await w.device("b", {
+      progressiveFirstLoad: true,
+      keyedFirstLoad: false,
+    });
     await connect(b);
     const reads = reader(b);
     const views: string[][] = [];
@@ -779,7 +803,10 @@ describe("progressive first load, batches committed together", () => {
     await publish(a, "run-5", ["D"], { observedAt: 1500 });
     const one = await reference(w);
     await applyConnection(one.deps, CONNECTION_ID);
-    const b = await w.device("b", { progressiveFirstLoad: true });
+    const b = await w.device("b", {
+      progressiveFirstLoad: true,
+      keyedFirstLoad: false,
+    });
     await connect(b);
     const reads = reader(b);
     const views: string[][] = [];
@@ -804,9 +831,10 @@ describe("progressive first load, batches committed together", () => {
       id: string,
       records: { stream: string; id: string }[],
     ) => {
+      // Each run selects only the streams it writes, so each succeeds.
       await a.run(id, records, {
         full: false,
-        covered: [...new Set(records.map((r) => r.stream))],
+        selected: [...new Set(records.map((r) => r.stream))],
         observedAt: (observedAt += 100),
       });
       await a.cycle();
@@ -825,7 +853,10 @@ describe("progressive first load, batches committed together", () => {
 
   it("a stream is complete when its own last batch commits, not when the group that holds it would", async () => {
     const { w, x, y, z } = await threeStreams();
-    const b = await w.device("b", { progressiveFirstLoad: true });
+    const b = await w.device("b", {
+      progressiveFirstLoad: true,
+      keyedFirstLoad: false,
+    });
     await connect(b);
     const states: { last: number; partial: string[]; complete: string[] }[] =
       [];
@@ -867,6 +898,7 @@ describe("progressive first load, batches committed together", () => {
     await expect(applyConnection(one.deps, CONNECTION_ID)).rejects.toThrow();
     const grouped = await w.device("grouped", {
       progressiveFirstLoad: true,
+      keyedFirstLoad: false,
     });
     await connect(grouped);
     await expect(
@@ -894,6 +926,7 @@ describe("progressive first load, batches committed together", () => {
     );
     const grouped = await w.device("grouped", {
       progressiveFirstLoad: true,
+      keyedFirstLoad: false,
     });
     await connect(grouped);
     const commits = afterCommits(grouped, async () => undefined, {
@@ -937,7 +970,10 @@ describe("progressive first load, batches committed together", () => {
     await applyConnection(one.deps, CONNECTION_ID);
     expect(oneCommits.length).toBe(7);
 
-    const b = await w.device("b", { progressiveFirstLoad: true });
+    const b = await w.device("b", {
+      progressiveFirstLoad: true,
+      keyedFirstLoad: false,
+    });
     await connect(b);
     // The first commit is one batch; the second carries the ones fetched with it.
     const commits = afterCommits(b, async () => undefined, { failCommit: 2 });

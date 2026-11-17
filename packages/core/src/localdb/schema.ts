@@ -13,6 +13,47 @@ const bumpConnector = (row: "NEW" | "OLD") =>
   `INSERT OR REPLACE INTO view_versions(connection_id, version) SELECT c.connection_id, COALESCE(v.version, 0) + 1 FROM connections c LEFT JOIN view_versions v ON v.connection_id = c.connection_id WHERE c.connector = ${row}.connector AND c.control_state = 'active';`;
 
 /**
+ * The triggers of `records` as the migrations up to the rowid rebuild left
+ * them (`records_key_type_conflict`, `records_ai/au/ad` from migration 1,
+ * `view_records_*` from the view migration), created again by that rebuild.
+ * A conformance test checks the rebuild keeps their text.
+ */
+const RECORDS_TRIGGERS: readonly string[] = [
+  `CREATE TRIGGER records_key_type_conflict BEFORE INSERT ON records
+WHEN (SELECT origin FROM write_ctx WHERE id = 1) <> 'remote'
+ AND EXISTS (SELECT 1 FROM records x WHERE x.connection_id = NEW.connection_id
+             AND x.stream = NEW.stream AND x.record_key = NEW.record_key AND x.pk_hash <> NEW.pk_hash)
+BEGIN SELECT RAISE(ABORT, 'key_type_conflict'); END`,
+  `CREATE TRIGGER records_ai AFTER INSERT ON records BEGIN
+  INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin)
+  VALUES (NEW.connection_id,NEW.stream,NEW.pk_hash,NEW.record_key,'upsert',NEW.stamp_o,NEW.stamp_r,
+          (SELECT origin FROM write_ctx WHERE id = 1));
+END`,
+  `CREATE TRIGGER records_au AFTER UPDATE OF stamp_o, stamp_r, body_sha256 ON records BEGIN
+  INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin)
+  VALUES (NEW.connection_id,NEW.stream,NEW.pk_hash,NEW.record_key,'upsert',NEW.stamp_o,NEW.stamp_r,
+          (SELECT origin FROM write_ctx WHERE id = 1));
+END`,
+  `CREATE TRIGGER records_ad AFTER DELETE ON records BEGIN
+  INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin)
+  VALUES (OLD.connection_id,OLD.stream,OLD.pk_hash,OLD.record_key,'remove',OLD.stamp_o,OLD.stamp_r,
+          (SELECT origin FROM write_ctx WHERE id = 1));
+  DELETE FROM blob_refs WHERE connection_id = OLD.connection_id AND stream = OLD.stream AND pk_hash = OLD.pk_hash;
+END`,
+  `CREATE TRIGGER view_records_ai AFTER INSERT ON records BEGIN
+  ${bumpView("NEW")}
+END`,
+  `CREATE TRIGGER view_records_au AFTER UPDATE OF stamp_o, stamp_r, body_sha256, seen_o, first_o ON records
+WHEN OLD.stamp_o IS NOT NEW.stamp_o OR OLD.stamp_r IS NOT NEW.stamp_r OR OLD.body_sha256 IS NOT NEW.body_sha256
+  OR OLD.first_o IS NOT NEW.first_o OR COALESCE(OLD.seen_o, OLD.stamp_o) IS NOT COALESCE(NEW.seen_o, NEW.stamp_o) BEGIN
+  ${bumpView("NEW")}
+END`,
+  `CREATE TRIGGER view_records_ad AFTER DELETE ON records BEGIN
+  ${bumpView("OLD")}
+END`,
+];
+
+/**
  * Migration 1 of the local database, taken from the SQL proof. Shared SQL keeps
  * to SQLite 3.22: no UPSERT, RETURNING, JSON1, window functions or STRICT.
  * Each migration is one batch; `migrate` appends `PRAGMA user_version`.
@@ -437,6 +478,41 @@ END`,
     `CREATE TABLE log_keyed_pending (
   connection_id TEXT PRIMARY KEY, position INTEGER NOT NULL, base INTEGER NOT NULL,
   refs TEXT NOT NULL) WITHOUT ROWID`,
+  ],
+  [
+    // `records` becomes a rowid table with a unique key. A WITHOUT ROWID
+    // table keeps each row in the b-tree of its key, and a row here is a few
+    // KB (`body`), more than 1/20 of a page, which SQLite's guidance
+    // (withoutrowid.html) puts outside what that layout suits. `pk_hash` is a
+    // hash, so a load that does not arrive in key order puts every insert on
+    // a random leaf of a tree as large as the table, and the page cache holds
+    // a small part of it. Even an insert at the end of the key order rewrites
+    // two neighbours of the leaf it fills: SQLite moves an append to a new
+    // page (`balance_quick`) only in a rowid table. A rowid table appends each
+    // row in insert order whatever its key, and the key's random inserts land
+    // in `records_key`, whose entries hold no body. Every index and trigger is
+    // created again with the same columns: dropping the table drops them.
+    // Their entries now end with the rowid where they ended with the key.
+    // Naming `pk_hash` in them would keep ties in key order, but it makes
+    // every load insert at random places in two more indexes, and with the
+    // key index they no longer fit the page cache of a browser's first load:
+    // the write count of that load triples. A tie on `record_key` is sorted
+    // at read time instead, and the hashes a replacement omits are found
+    // through the table, one row each.
+    `CREATE TABLE records_rowid (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL,
+  record_key TEXT NOT NULL, stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL,
+  body TEXT NOT NULL, body_sha256 TEXT NOT NULL, first_o INTEGER, seen_o INTEGER, seen_r TEXT, body_bytes INTEGER, stamp_n INTEGER NOT NULL DEFAULT 0)`,
+    `INSERT INTO records_rowid (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, seen_o, seen_r, body_bytes, stamp_n)
+  SELECT connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, seen_o, seen_r, body_bytes, stamp_n FROM records ORDER BY connection_id, stream, pk_hash`,
+    `DROP TABLE records`,
+    `ALTER TABLE records_rowid RENAME TO records`,
+    `CREATE UNIQUE INDEX records_key ON records(connection_id, stream, pk_hash)`,
+    `CREATE INDEX records_by_key ON records(connection_id, stream, record_key)`,
+    `CREATE INDEX records_by_first ON records(first_o) WHERE first_o IS NOT NULL`,
+    `CREATE INDEX records_by_observation ON records(connection_id, stream, COALESCE(seen_o, stamp_o), COALESCE(seen_r, stamp_r))`,
+    `CREATE INDEX records_size ON records(connection_id, stream, pk_hash, body_bytes)`,
+    ...RECORDS_TRIGGERS,
   ],
   [
     // The tables of the per-stream head path, on a database created before

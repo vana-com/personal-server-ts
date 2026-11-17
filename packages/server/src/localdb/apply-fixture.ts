@@ -6,6 +6,7 @@
  * (a real database, the real intake, the real batch commit), so what the
  * device under test reads is what a real remote device wrote.
  */
+import { endRequest } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { afterEach } from "vitest";
 import { keccak_256 } from "@noble/hashes/sha3";
 import {
@@ -215,12 +216,15 @@ export async function remoteFixture(
         batch: 0,
         records: values.map((data) => ({ stream, data })),
       });
-    await sync.intake.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: [stream],
-      provenFullStreams: [stream],
-      lastBatch: values.length > 0 ? 0 : -1,
-    });
+    await sync.intake.end(
+      runId,
+      endRequest({
+        lastBatch: values.length > 0 ? 0 : -1,
+        streams: [stream],
+        live: values.length > 0 ? [stream] : [],
+        provenFullStreams: [stream],
+      }),
+    );
     const report = await sync.cycle();
     const failed = report.connections.find((c) => c.error !== null);
     if (failed) throw new Error(`fixture author cycle failed: ${failed.error}`);

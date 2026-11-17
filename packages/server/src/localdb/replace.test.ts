@@ -12,6 +12,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { RegistryUnavailableError } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { logScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}` as const;
@@ -70,8 +71,11 @@ async function world(seed = true) {
       at: number,
       input: {
         rows: Partial<Record<"A" | "B", string[]>>;
-        outcome?: "succeeded" | "partial" | "retry_pending";
-        covered?: string[];
+        /** Streams the connector skipped. */
+        skipped?: string[];
+        /** Per-stream observation fields beyond the records sent. */
+        observe?: Parameters<typeof endRequest>[0]["observe"];
+        retry?: boolean;
         proven?: string[];
         full?: boolean;
         publish?: boolean;
@@ -89,12 +93,18 @@ async function world(seed = true) {
         ids!.map((key) => ({ stream, data: { id: key } })),
       );
       if (records.length) await sync.intake.batch(id, { batch: 0, records });
-      await sync.intake.end(id, {
-        outcome: input.outcome ?? "succeeded",
-        coveredStreams: input.covered ?? ["A", "B"],
-        provenFullStreams: input.proven ?? ["A", "B"],
-        lastBatch: records.length ? 0 : -1,
-      });
+      await sync.intake.end(
+        id,
+        endRequest({
+          lastBatch: records.length ? 0 : -1,
+          streams: ["A", "B"],
+          live: records.map((record) => record.stream),
+          skipped: input.skipped ?? [],
+          retry: input.retry ?? false,
+          ...(input.observe ? { observe: input.observe } : {}),
+          provenFullStreams: input.proven ?? ["A", "B"],
+        }),
+      );
       if (input.publish !== false) await publish();
     };
     const publish = async () => {
@@ -135,8 +145,7 @@ describe("r5 H per-stream replacement through real intake/apply/publish", () => 
     const { a, b } = await world();
     await a.collect("partial", 5000, {
       rows: { A: ["a"], B: ["x"] },
-      outcome: "partial",
-      covered: ["A"],
+      skipped: ["B"],
       proven: ["A"],
     });
     expect(
@@ -156,14 +165,14 @@ describe("r5 H per-stream replacement through real intake/apply/publish", () => 
 
   it.each(["own error", "own gap"])(
     "a stream with %s never replaces even while another succeeds",
-    async () => {
+    async (kind) => {
       const { a, b } = await world();
-      // The producer cannot put B in provenFullStreams after its own error/gap,
-      // even when it listed B as covered before that error was known.
+      // The producer cannot put B in provenFullStreams after its own error/gap.
       await a.collect("own-error", 5000, {
         rows: { A: ["a"], B: ["x"] },
-        outcome: "partial",
-        covered: ["A", "B"],
+        ...(kind === "own error"
+          ? { skipped: ["B"] }
+          : { observe: { B: { detailGap: "fatal" as const } } }),
         proven: ["A"],
       });
       await b.sync.apply();
@@ -184,8 +193,7 @@ describe("r5 H per-stream replacement through real intake/apply/publish", () => 
     const { a } = await world(false);
     await a.collect("retry", 5000, {
       rows: { A: ["a"] },
-      outcome: "retry_pending",
-      covered: [],
+      retry: true,
       proven: [],
     });
     expect(
@@ -200,7 +208,6 @@ describe("#560 replacement key-set cases", () => {
     const { a, b } = await world();
     await a.collect("refresh", 5000, {
       rows: { A: ["a"] },
-      covered: ["A"],
       proven: ["A"],
     });
     await b.sync.apply();
@@ -210,7 +217,6 @@ describe("#560 replacement key-set cases", () => {
     const { a, b } = await world();
     await a.collect("refresh", 5000, {
       rows: { A: ["a"] },
-      covered: [],
       proven: [],
     });
     await b.sync.apply();
@@ -221,13 +227,11 @@ describe("#560 replacement key-set cases", () => {
     await b.collect("late", 9000, {
       rows: { A: ["c"] },
       full: false,
-      covered: ["A"],
       proven: [],
     });
     await a.sync.apply();
     await a.collect("refresh", 5000, {
       rows: { A: ["a"] },
-      covered: ["A"],
       proven: ["A"],
     });
     await b.sync.apply();
@@ -237,14 +241,12 @@ describe("#560 replacement key-set cases", () => {
     const { a, b } = await world();
     await a.collect("refresh", 5000, {
       rows: { A: ["a"] },
-      covered: ["A"],
       proven: ["A"],
     });
     await b.sync.apply();
     await b.collect("after", 6000, {
       rows: { A: ["c"] },
       full: false,
-      covered: ["A"],
       proven: [],
     });
     await a.sync.apply();
@@ -254,7 +256,6 @@ describe("#560 replacement key-set cases", () => {
     const { a, b } = await world();
     await a.collect("refresh", 5000, {
       rows: { A: ["a"] },
-      covered: ["A"],
       proven: ["A"],
       publish: false,
     });
@@ -278,13 +279,11 @@ describe("#560 five basis/skew traces", () => {
       const { a, b } = await world();
       await a.collect(trace.queued, trace.q, {
         rows: { A: ["a"] },
-        covered: ["A"],
         proven: trace.proof ? ["A"] : [],
         publish: false,
       });
       await b.collect(trace.other, trace.o, {
         rows: { A: ["a", "c"] },
-        covered: ["A"],
         proven: ["A"],
       });
       await a.publish();
@@ -297,7 +296,6 @@ describe("#560 five basis/skew traces", () => {
     const { a, b } = await world();
     await a.collect("mine", 5000, {
       rows: { A: ["a"] },
-      covered: ["A"],
       proven: ["A"],
     });
     await b.sync.apply();
@@ -307,7 +305,6 @@ describe("#560 five basis/skew traces", () => {
     const { a, b, registry } = await world();
     await a.collect("mine", 5000, {
       rows: { A: ["a"] },
-      covered: ["A"],
       proven: ["A"],
       publish: false,
     });
@@ -337,7 +334,6 @@ it("an offline unknown basis merges; a later verified basis can replace", async 
   const { a, b, registry } = await world(false);
   await a.collect("old-local", 1000, {
     rows: { A: ["old"] },
-    covered: ["A"],
     proven: [],
     publish: false,
   });
@@ -348,7 +344,6 @@ it("an offline unknown basis merges; a later verified basis can replace", async 
   try {
     await a.collect("offline", 5000, {
       rows: { A: ["a"] },
-      covered: ["A"],
       proven: ["A"],
       publish: false,
     });
@@ -365,7 +360,6 @@ it("an offline unknown basis merges; a later verified basis can replace", async 
   expect(await b.rows("A")).toEqual(["a", "old"]);
   await a.collect("verified", 6000, {
     rows: { A: ["a"] },
-    covered: ["A"],
     proven: ["A"],
   });
   await b.sync.apply();
@@ -374,7 +368,7 @@ it("an offline unknown basis merges; a later verified basis can replace", async 
 
 it("a declared full-inventory empty proof replaces the old image", async () => {
   const { a, b } = await world();
-  await a.collect("empty", 5000, { rows: {}, covered: ["A"], proven: ["A"] });
+  await a.collect("empty", 5000, { rows: {}, proven: ["A"] });
   expect(
     await a.db.query(
       "SELECT replace FROM run_streams WHERE run_id='empty' AND stream='A'",

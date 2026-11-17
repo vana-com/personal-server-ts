@@ -15,6 +15,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createMemoryModeRecordStore } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import { endRequest } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type * as SyncModule from "@opendatalabs/personal-server-ts-core/sync";
 import { createStreamSyncKeyPorts } from "../../core/src/stream-sync/crypto.js";
 import { remoteFixture } from "./localdb/apply-fixture.js";
@@ -147,12 +148,18 @@ async function world() {
         records: [{ stream: "items", data: { id } }],
       });
       expect(batch.status).toBe(200);
-      return send(`${base}/end`, "POST", {
-        outcome,
-        coveredStreams: outcome === "succeeded" ? ["items"] : [],
-        provenFullStreams: outcome === "succeeded" ? ["items"] : [],
-        lastBatch: 0,
-      });
+      // A failed run: the connector skipped its one stream.
+      return send(
+        `${base}/end`,
+        "POST",
+        outcome === "succeeded"
+          ? endRequest({
+              lastBatch: 0,
+              live: ["items"],
+              provenFullStreams: ["items"],
+            })
+          : endRequest({ lastBatch: 0, live: ["items"], skipped: ["items"] }),
+      );
     },
   });
   return { context, post, intake };

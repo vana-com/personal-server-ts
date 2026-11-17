@@ -20,6 +20,7 @@ import {
   RunIntakeError,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { canonicalJson } from "@opendatalabs/personal-server-ts-stream-sync";
+import { endRequest } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { openBetterSqlite3 } from "../localdb/better-sqlite3-driver.js";
 import {
   MAX_BATCH_REQUEST_BYTES,
@@ -166,14 +167,26 @@ describe("stream-sync run intake route", () => {
       accepted: 2,
       deletesSkipped: 0,
     });
-    const ended = await call("POST", "r1/end", {
+    const ended = await call(
+      "POST",
+      "r1/end",
+      endRequest({
+        lastBatch: 0,
+        live: ["items"],
+        deleted: ["items"],
+        checkpoints: { items: "c1" },
+      }),
+    );
+    expect(ended.status).toBe(200);
+    expect(await ended.json()).toEqual({
+      result: "queued",
+      stuck: false,
+      updateRequired: false,
       outcome: "succeeded",
       coveredStreams: ["items"],
-      checkpointCandidate: { items: "c1" },
-      lastBatch: 0,
+      provenFullStreams: [],
+      unconfirmed: false,
     });
-    expect(ended.status).toBe(200);
-    expect(await ended.json()).toMatchObject({ result: "queued" });
     // The early publish writes the log; the cycle's own pass finds nothing left.
     expect(
       (await sync.cycle()).connections
@@ -191,11 +204,7 @@ describe("stream-sync run intake route", () => {
       batch: 0,
       records: [{ stream: "items", data: { id: "kept" } }],
     });
-    const end = {
-      outcome: "succeeded",
-      coveredStreams: ["items"],
-      lastBatch: 0,
-    };
+    const end = endRequest({ lastBatch: 0, live: ["items"] });
     const first = await call("POST", "receipt/end", end);
     expect(first.status).toBe(200);
     const receipt = await first.json();
@@ -245,6 +254,15 @@ describe("stream-sync run intake route", () => {
       nextBatch: 0,
     });
 
+    // The old outcome body is not an end body.
+    const old = await call("POST", "e4/end", {
+      outcome: "succeeded",
+      coveredStreams: [],
+      lastBatch: -1,
+    });
+    expect(old.status).toBe(400);
+    expect(await old.json()).toMatchObject({ error: "invalid_request" });
+
     const aborted = await call("POST", "e4/abort", { reason: "cancelled" });
     expect(aborted.status).toBe(200);
     const late = await call("POST", "e4/batches", { batch: 0, records: [] });
@@ -291,12 +309,15 @@ describe("stream-sync run intake route", () => {
     });
     expect(sent.status).toBe(200);
     expect(await sent.json()).toMatchObject({ accepted: 3, applied: true });
-    const ended = await call("POST", "big1/end", {
-      outcome: "succeeded",
-      coveredStreams: ["items"],
-      checkpointCandidate: { items: "c1" },
-      lastBatch: 0,
-    });
+    const ended = await call(
+      "POST",
+      "big1/end",
+      endRequest({
+        lastBatch: 0,
+        live: ["items"],
+        checkpoints: { items: "c1" },
+      }),
+    );
     expect(ended.status).toBe(200);
     expect(
       (await sync.cycle()).connections.flatMap((c) => c.error ?? []),
@@ -318,12 +339,15 @@ describe("stream-sync run intake route", () => {
     });
     expect(sent.status).toBe(200);
     expect(await sent.json()).toMatchObject({ accepted: 1, applied: true });
-    const ended = await call("POST", "big2/end", {
-      outcome: "succeeded",
-      coveredStreams: ["items"],
-      checkpointCandidate: { items: "c1" },
-      lastBatch: 0,
-    });
+    const ended = await call(
+      "POST",
+      "big2/end",
+      endRequest({
+        lastBatch: 0,
+        live: ["items"],
+        checkpoints: { items: "c1" },
+      }),
+    );
     expect(ended.status).toBe(200);
     // One segment holds at most 16 MiB (stream-sync log.ts) and a record is
     // never split across segments, so the body goes out of line.

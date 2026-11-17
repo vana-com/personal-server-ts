@@ -1,6 +1,7 @@
 // The stored size of a row (`records.body_bytes`), which the log's snapshot
 // pages read to cut pages without reading bodies. A file database and the real
 // driver.
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
@@ -75,11 +76,7 @@ async function world() {
         data: { id, text: `${id}:${tag}`.padEnd(pad, "x") },
       })),
     });
-    await sync.intake.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: ["items"],
-      lastBatch: 0,
-    });
+    await sync.intake.end(runId, endRequest({ lastBatch: 0, live: ["items"] }));
   };
   return { sync, db, load };
 }
@@ -108,11 +105,7 @@ it("records the stored size on insert, on a body change and on a restamp", async
       { stream: "items", data: { id: "b", text: "plain" } },
     ],
   });
-  await w.sync.intake.end("r1", {
-    outcome: "succeeded",
-    coveredStreams: ["items"],
-    lastBatch: 0,
-  });
+  await w.sync.intake.end("r1", endRequest({ lastBatch: 0, live: ["items"] }));
   const inserted = await sizes(w);
   expect(inserted.map((r) => r.k)).toEqual(["a", "b"]);
   for (const row of inserted) expect(row.stored).toBe(row.real);

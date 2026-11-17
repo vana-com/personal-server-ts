@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { endRequest } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { privateKeyToAccount } from "viem/accounts";
 import { signOwnerMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import {
@@ -135,12 +136,10 @@ async function collect(
     batch: 0,
     records: [{ stream: "items", data: { id: key, value: o } }],
   });
-  await intake.end(run, {
-    outcome: "succeeded",
-    coveredStreams: ["items"],
-    provenFullStreams: ["items"],
-    lastBatch: 0,
-  });
+  await intake.end(
+    run,
+    endRequest({ lastBatch: 0, live: ["items"], provenFullStreams: ["items"] }),
+  );
 }
 describe("Lite database intake", () => {
   it("uses the same model in both directions across Lite and Node", async () => {

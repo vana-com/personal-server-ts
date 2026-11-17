@@ -25,6 +25,7 @@ import {
   type MemoryStreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import { endRequest } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { openBetterSqlite3 } from "../localdb/better-sqlite3-driver.js";
 import { syncRoutes } from "./sync.js";
 
@@ -99,11 +100,7 @@ async function collect(sync: LocalSync, connector: string, version: number) {
     batch: 0,
     records: [{ stream: "s0", data: { id: "s0-0", version } }],
   });
-  await sync.intake.end(runId, {
-    outcome: "succeeded",
-    coveredStreams: ["s0"],
-    lastBatch: 0,
-  });
+  await sync.intake.end(runId, endRequest({ lastBatch: 0, live: ["s0"] }));
 }
 
 /** The frames of an event stream, read one at a time. */

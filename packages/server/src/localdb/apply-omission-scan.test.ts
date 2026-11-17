@@ -73,7 +73,7 @@ describe("the delete of rows a head omits", () => {
       expect(text).toMatch(/SEARCH records USING COVERING INDEX records_size/);
       // The rows the keys name: one search by key each, never a range scan.
       expect(text).toMatch(
-        /SEARCH records USING PRIMARY KEY \(connection_id=\? AND stream=\? AND pk_hash=\?\)/,
+        /SEARCH records USING (COVERING )?INDEX \w+ \(connection_id=\? AND stream=\? AND pk_hash=\?\)/,
       );
       expect(text).not.toMatch(/SCAN records/);
     }

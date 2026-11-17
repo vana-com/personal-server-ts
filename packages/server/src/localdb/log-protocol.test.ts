@@ -31,6 +31,7 @@ import {
   recordKeyOfKey,
 } from "../../../core/src/localdb/log-apply.js";
 import { PAGE_BYTES } from "../../../core/src/localdb/log-publish.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { computeRecordKeyFromData } from "../../../core/src/storage/pdpp-records/record-key.js";
 import {
   applySegmentOperations,
@@ -2102,12 +2103,14 @@ describe("log protocol: a run emits a key again after an interim publish", () =>
       records: records.map((data) => ({ stream, data })),
     });
   const end = (d: Device, lastBatch: number, runId = RUN) =>
-    d.sync.intake.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: [stream],
-      provenFullStreams: [stream],
-      lastBatch,
-    });
+    d.sync.intake.end(
+      runId,
+      endRequest({
+        lastBatch,
+        live: [stream],
+        provenFullStreams: [stream],
+      }),
+    );
   const body = (v: number) => `s0/K={"id":"K","v":${v}}`;
 
   it("converges to the later batch on the writer, a fresh reader and a reader that applied the first body", async () => {

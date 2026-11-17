@@ -32,6 +32,7 @@ import { createImportLedger } from "../../../core/src/localdb/import-ledger.js";
 import { MIGRATIONS } from "../../../core/src/localdb/schema.js";
 import { unwriteRefusedRun } from "../../../core/src/localdb/unwrite.js";
 import type { ImportSource } from "../../../core/src/localdb/legacy-import-types.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const OWNER = `0x${"11".repeat(20)}` as const;
@@ -148,11 +149,7 @@ async function collect(
       data: { id: `${stream}-${row}`, version },
     })),
   });
-  await sync.intake.end(runId, {
-    outcome: "succeeded",
-    coveredStreams: streams,
-    lastBatch: 0,
-  });
+  await sync.intake.end(runId, endRequest({ lastBatch: 0, live: streams }));
 }
 
 function shared(): Shared {
@@ -910,9 +907,17 @@ describe("view changes", () => {
         .flat()
         .flatMap((sql) => /^CREATE TRIGGER (\w+)/.exec(sql)?.[1] ?? [])
         .map((trigger) => ({ sql: `DROP TRIGGER IF EXISTS ${trigger}` })),
+      // A table built under another name and renamed onto one that stays
+      // (the rowid `records`) has no table of its own to drop.
       ...MIGRATIONS.slice(viewMigration + 1)
         .flat()
         .flatMap((sql) => /^CREATE TABLE (\w+)/.exec(sql)?.[1] ?? [])
+        .filter(
+          (table) =>
+            !MIGRATIONS.flat().some((sql) =>
+              sql.startsWith(`ALTER TABLE ${table} RENAME TO `),
+            ),
+        )
         .map((table) => ({ sql: `DROP TABLE IF EXISTS ${table}` })),
       // Publish while collecting adds columns after the view counters too.
       { sql: "ALTER TABLE runs DROP COLUMN admitting" },
@@ -951,6 +956,130 @@ describe("view changes", () => {
     await collect(upgraded, "c0", 2); // a change to a connection with no counter yet
     await upgraded.views.settled();
     expect(new Set(ids(seen).flat())).toEqual(new Set(["pdpp.c0~"]));
+  });
+
+  it("(o) a populated database at the version that made records a rowid table upgrades to the last migration with its log intact", async () => {
+    const s = shared();
+    const old = await device(s, "a");
+    await collect(old, "c0");
+    await old.cycle();
+    await collect(old, "c1");
+    await old.cycle();
+    const raw = old.raw;
+    drivers.splice(drivers.indexOf(old.db), 1); // the reopened device owns the close
+    // The build whose last migration rebuilt `records` as a rowid table. Its
+    // database is at that migration's version; the log's later migrations
+    // come after it.
+    const rowidVersion =
+      MIGRATIONS.findIndex((statements) =>
+        statements.some((sql) => sql.includes("CREATE TABLE records_rowid")),
+      ) + 1;
+    expect(rowidVersion).toBeGreaterThan(0);
+    expect(rowidVersion).toBeLessThan(MIGRATIONS.length);
+    const before = {
+      records: await raw.query(
+        "SELECT connection_id, stream, pk_hash, body FROM records ORDER BY connection_id, stream, pk_hash",
+      ),
+      log: await raw.query("SELECT * FROM log_state ORDER BY connection_id"),
+    };
+    expect(before.records.length).toBeGreaterThan(0);
+    expect(before.log.length).toBe(2);
+    // Put the file back as that build left it. It still created the tables of
+    // the per-stream head path and the consumed-head columns, and its version
+    // rows had no stream meta.
+    await raw.batch([
+      { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
+      { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
+      { sql: "ALTER TABLE stream_versions DROP COLUMN profile_version" },
+      {
+        sql: `CREATE TABLE head_parts (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL,
+  prefix TEXT NOT NULL CHECK (prefix NOT GLOB '*[^01]*' AND length(prefix) <= 16),
+  seq INTEGER NOT NULL, part_hash TEXT NOT NULL, bytes INTEGER NOT NULL, count INTEGER NOT NULL,
+  PRIMARY KEY (connection_id, stream, prefix, seq)) WITHOUT ROWID`,
+      },
+      {
+        sql: `CREATE TABLE publish_spool (
+  attempt TEXT NOT NULL, connection_id TEXT NOT NULL, pk_hash TEXT NOT NULL,
+  stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL, first_o INTEGER,
+  body_sha256 TEXT NOT NULL, body_bytes INTEGER NOT NULL, body TEXT NOT NULL,
+  PRIMARY KEY (attempt, pk_hash)) WITHOUT ROWID`,
+      },
+      {
+        sql: "CREATE INDEX publish_spool_by_connection ON publish_spool(connection_id)",
+      },
+      {
+        sql: `CREATE TABLE log_replay (
+  connection_id TEXT PRIMARY KEY, position INTEGER NOT NULL, last_ref TEXT) WITHOUT ROWID`,
+      },
+      {
+        sql: "INSERT INTO head_parts VALUES ('pdpp.c0~', 's0', '0', 0, '0x00', 1, 1)",
+      },
+      { sql: "INSERT INTO log_replay VALUES ('pdpp.c0~', 1, NULL)" },
+      {
+        sql: "ALTER TABLE stream_state ADD COLUMN consumed_version INTEGER NOT NULL DEFAULT 0",
+      },
+      {
+        sql: "ALTER TABLE stream_state ADD COLUMN consumed_generation INTEGER",
+      },
+      { sql: "ALTER TABLE stream_state ADD COLUMN consumed_data_hash TEXT" },
+      { sql: `PRAGMA user_version = ${rowidVersion}` },
+    ]);
+
+    const upgraded = await device(s, "a", { driver: raw });
+    expect(await upgraded.db.query("PRAGMA user_version")).toEqual([
+      { user_version: MIGRATIONS.length },
+    ]);
+    const tables = (
+      await upgraded.db.query<{ name: string; sql: string }>(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'table'",
+      )
+    ).reduce<Record<string, string>>(
+      (all, t) => ({ ...all, [t.name]: t.sql }),
+      {},
+    );
+    // The head path's tables are gone; the rowid records table and the log's
+    // tables are both there.
+    for (const name of ["head_parts", "publish_spool", "log_replay"])
+      expect(tables[name]).toBeUndefined();
+    expect(tables.records).toBeDefined();
+    expect(tables.records).not.toMatch(/WITHOUT ROWID/);
+    for (const name of ["log_state", "log_tombstones", "log_keyed_pending"])
+      expect(tables[name]).toBeDefined();
+    expect(
+      await upgraded.db.query(
+        "SELECT connection_id, stream, pk_hash, body FROM records ORDER BY connection_id, stream, pk_hash",
+      ),
+    ).toEqual(before.records);
+    expect(
+      await upgraded.db.query("SELECT * FROM log_state ORDER BY connection_id"),
+    ).toEqual(before.log);
+    // Every version row gets the stream meta it had no column for.
+    expect(
+      await upgraded.db.query(
+        `SELECT COUNT(*) AS n FROM stream_versions v JOIN stream_state s
+           ON s.connection_id = v.connection_id AND s.stream = v.stream
+         WHERE v.primary_key IS NOT s.primary_key
+            OR v.profile_key IS NOT s.profile_key
+            OR v.profile_version IS NOT s.profile_version`,
+      ),
+    ).toEqual([{ n: 0 }]);
+    expect(
+      await upgraded.db.query("SELECT COUNT(*) AS n FROM stream_versions"),
+    ).not.toEqual([{ n: 0 }]);
+
+    // The upgraded device publishes a change through its log, and another
+    // device reads it.
+    await upgraded.cycle();
+    await collect(upgraded, "c0", 2);
+    await upgraded.cycle();
+    const b = await device(s, "b");
+    await b.cycle();
+    const shown = await b.query.listRecords({
+      connectionId: "pdpp.c0~",
+      stream: "s0",
+    });
+    expect(JSON.parse(shown.records[0]!.body)).toMatchObject({ version: 2 });
   });
 
   it("(g) a listener that syncs or reads does not loop, and sees the commit", async () => {

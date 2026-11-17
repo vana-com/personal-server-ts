@@ -23,6 +23,7 @@ import {
   pendingAdmits,
 } from "../../../core/src/localdb/log-keyed.js";
 import { withOrigin } from "../../../core/src/localdb/merge.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import {
   CONNECTION_ID,
   OWNER,
@@ -204,6 +205,41 @@ describe("log first load, key by key", () => {
     // The shape the history makes: an omitted key is gone, a resurrected one is back.
     expect(expected.records.length).toBeGreaterThan(5);
     expect(expected.tombstones.length).toBeGreaterThan(0);
+  });
+
+  it("loads key by key on a host that shows streams while they load, and ends in the same tables", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    await history(w);
+    const reference = await connected(w, "reference", {
+      keyedFirstLoad: false,
+    });
+    await applyConnection(reference.deps, CONNECTION_ID);
+
+    const progressive = await connected(w, "progressive", {
+      maxBytesInFlight: await splitting(w),
+      progressiveFirstLoad: true,
+    });
+    const stages: string[] = [];
+    let partialMarks = 0;
+    onCommit(progressive, async (statements) => {
+      for (const s of statements) {
+        if (s.sql.startsWith("CREATE TABLE log_stage_")) stages.push(s.sql);
+        if (s.sql.includes("INTO stream_partial")) partialMarks++;
+      }
+    });
+    await applyConnection(progressive.deps, CONNECTION_ID);
+
+    // Key by key: several ranges, and no segment-by-segment partial view.
+    expect(stages.length).toBeGreaterThan(1);
+    expect(partialMarks).toBe(0);
+    const expected = await tables(reference);
+    const got = await tables(progressive);
+    expect(got.records).toEqual(expected.records);
+    expect(got.tombstones).toEqual(expected.tombstones);
+    expect(got.streams).toEqual(expected.streams);
+    expect(got.heads).toEqual(expected.heads);
+    expect(got.state).toEqual(expected.state);
+    expect(got.changes).toEqual(expected.changes);
   });
 
   it("keeps a first load's streams unreadable and its position at 0 until its last commit", async () => {
@@ -419,12 +455,10 @@ describe("log first load, key by key: a run that emits a key again at its stamp"
       { id: "twice", v: 2 },
       { id: "later", v: 1, pad: 4_000 },
     ]);
-    await a.sync.intake.end(run, {
-      outcome: "succeeded",
-      coveredStreams: [S0],
-      provenFullStreams: [],
-      lastBatch: 1,
-    });
+    await a.sync.intake.end(
+      run,
+      endRequest({ lastBatch: 1, live: [S0], provenFullStreams: [] }),
+    );
     await a.cycle();
 
     const plain = await connected(w, "plain", { keyedFirstLoad: false });

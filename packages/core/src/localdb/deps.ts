@@ -60,7 +60,10 @@ export interface LocalSyncDeps {
    * Default off. On: a stream whose first load is not complete is readable by
    * its owner from its first applied batch, in an explicit partial state, and
    * fills in as batches apply (`stream_partial`). Off: a stream is readable
-   * only when its load is complete, as before.
+   * only when its load is complete, as before. A first load that loads the
+   * log key by key (`keyedFirstLoad`) does so with this on too, and its
+   * streams are readable when its last key range commits (see
+   * `planKeyedLoad`).
    */
   readonly progressiveFirstLoad?: boolean;
   /**
