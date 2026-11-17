@@ -17,7 +17,7 @@ import { sha256 } from "@noble/hashes/sha2";
 import { keccak_256 } from "@noble/hashes/sha3";
 import { bootstrapSchema } from "../../../core/src/localdb/bootstrap-swap.js";
 import { copyBootstrapRecords } from "../../../core/src/localdb/bootstrap-copy.js";
-import { firstOwnerRow } from "./bench/owner-row.js";
+import { firstOwnerRow } from "./bench/owner-row.test-utils.js";
 import {
   CONNECTION_ID,
   CONNECTOR,

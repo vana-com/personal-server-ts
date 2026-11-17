@@ -6,7 +6,7 @@
 // Run it under `nice -n 19 ionice -c3`. `--dir` holds the databases, which
 // are removed afterwards. The default is a fresh directory under the OS temp
 // directory; pass a disk-backed `--dir` when that is in memory.
-import { firstOwnerRow } from "./owner-row.js";
+import { firstOwnerRow } from "./owner-row.test-utils.js";
 import { createHash, getHashes } from "node:crypto";
 import { keccak_256 } from "@noble/hashes/sha3";
 import { mkdirSync, mkdtempSync, rmSync, createWriteStream } from "node:fs";
