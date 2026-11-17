@@ -991,6 +991,9 @@ describe("view changes", () => {
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_version" },
+      // The mark of a stream's changes came after that build too.
+      { sql: "DROP TRIGGER stream_change_marks_ai" },
+      { sql: "DROP TABLE stream_change_marks" },
       {
         sql: `CREATE TABLE head_parts (
   connection_id TEXT NOT NULL, stream TEXT NOT NULL,
@@ -1101,6 +1104,9 @@ describe("view changes", () => {
     await raw.batch([
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
+      // A later migration made the mark of a stream's changes.
+      { sql: "DROP TRIGGER stream_change_marks_ai" },
+      { sql: "DROP TABLE stream_change_marks" },
       { sql: `PRAGMA user_version = ${metaMigration}` },
     ]);
     const state = async () => ({

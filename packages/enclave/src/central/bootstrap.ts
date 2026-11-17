@@ -67,7 +67,12 @@ function required(env: NodeJS.ProcessEnv, key: string): string {
 }
 function port(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
   const value = Number(env[key] ?? fallback);
-  if (!Number.isSafeInteger(value) || value < 1 || value > 65535)
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > 65535 ||
+    (value === 0 && env[key] !== "0")
+  )
     throw new Error(`${key} is invalid`);
   return value;
 }
@@ -79,6 +84,7 @@ export async function startFleetCentral(
 ): Promise<{
   controller: FleetController;
   identity: FleetPeerIdentity;
+  ports: { control: number; admin: number; peer: number; mcp: number };
   close(): Promise<void>;
 }> {
   env = await verifiedFleetEnvironment(env, {
@@ -480,6 +486,19 @@ export async function startFleetCentral(
         }),
     ),
   );
+  // Read addresses only after every listener has emitted listening.
+  const boundPort = (server: (typeof servers)[number]): number => {
+    const address = server.address();
+    if (!address || typeof address === "string")
+      throw new Error("Expected a bound TCP listener");
+    return address.port;
+  };
+  const ports = {
+    control: boundPort(servers[0]!),
+    admin: boundPort(servers[1]!),
+    peer: boundPort(servers[2]!),
+    mcp: mcp.port,
+  };
   let stopped = false;
   const timers = new Set<ReturnType<typeof setTimeout>>();
   const inFlight = new Set<Promise<unknown>>();
@@ -559,6 +578,7 @@ export async function startFleetCentral(
   return {
     controller,
     identity,
+    ports,
     async close() {
       stopped = true;
       for (const timer of timers) clearTimeout(timer);

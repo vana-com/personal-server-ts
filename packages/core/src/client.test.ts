@@ -10,6 +10,7 @@ import {
   dataVersionsPath,
   parsePersonalServerJsonResponse,
   PersonalServerClientError,
+  PersonalServerReadInterrupted,
   submitPersonalServerRegistration,
 } from "./client.js";
 
@@ -329,6 +330,72 @@ describe("Personal Server client helpers", () => {
       errorCode: "INVALID_SIGNATURE",
       details: { reason: "Missing Web3Signed prefix" },
     });
+  });
+
+  it("cancels the body of a response it fails to read", async () => {
+    // A body it stops reading holds what produced it (a connection's queue, a
+    // socket) until something cancels it.
+    let cancelled: unknown;
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.enqueue(new TextEncoder().encode("{"));
+        },
+        cancel(reason) {
+          cancelled = reason ?? "cancelled";
+        },
+      }),
+    );
+    const failure = new Error("the body could not be read");
+    vi.spyOn(response, "text").mockRejectedValue(failure);
+    const error = await parsePersonalServerJsonResponse(
+      response,
+      "data read",
+    ).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PersonalServerReadInterrupted);
+    expect((error as PersonalServerReadInterrupted).cause).toBe(failure);
+    expect(cancelled).toBeDefined();
+  });
+
+  it("types a body that stops mid-read as a retryable interrupted read, whatever stopped it", async () => {
+    // In process the body errors with the producer's own error (a view that
+    // moved); over HTTP the connection drops and the reader sees a network
+    // error. Both reach the caller as the same typed, retryable error.
+    for (const stopped of [
+      Object.assign(new Error("the head it was reading moved"), {
+        name: "PartialViewMoved",
+      }),
+      new TypeError("network error"),
+    ]) {
+      const response = new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"records":['));
+          },
+          pull(controller) {
+            controller.error(stopped);
+          },
+        }),
+      );
+      const error = await parsePersonalServerJsonResponse(
+        response,
+        "data read",
+      ).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(PersonalServerReadInterrupted);
+      expect(error).toBeInstanceOf(PersonalServerClientError);
+      expect(error).toMatchObject({
+        errorCode: "READ_INTERRUPTED",
+        retryable: true,
+        status: 200,
+        cause: stopped,
+      });
+    }
+  });
+
+  it("does not call a body that finished but is not JSON an interrupted read", async () => {
+    await expect(
+      parsePersonalServerJsonResponse(new Response("not json"), "data read"),
+    ).resolves.toBe("not json");
   });
 
   it("surfaces flat contract error bodies (error as a string + top-level message)", async () => {
