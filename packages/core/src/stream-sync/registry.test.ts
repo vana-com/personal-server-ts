@@ -221,9 +221,9 @@ it.each([
 
 it("a batch of conditions alone (no rows) is committed by a 200 that stores none", async () => {
   const { registry } = gatewayAnswering(() => results200({}));
-  expect(
-    await registry.postBatch!({ ...batchRequest, rows: [] }),
-  ).toEqual({ kind: "committed" });
+  expect(await registry.postBatch!({ ...batchRequest, rows: [] })).toEqual({
+    kind: "committed",
+  });
 });
 
 it("a 409 conflict wrote nothing: one answer per row in request order, the loser with its winner, a replay stored, the rest not written", async () => {
