@@ -32,6 +32,7 @@ import {
   streamSyncNetwork,
   streamSyncFlagsOn,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { wasmStreamCrypto } from "./wasm-stream-crypto.js";
 import { LITE_PART_TARGET_BYTES } from "./stream-sync-budget.js";
 import {
   createVersionInventoryClient,
@@ -641,6 +642,9 @@ export async function createPsLiteSyncManager(
             options.streamSyncBlobs ??
             createStorageStreamSyncBlobs(storageAdapter),
           keys: createStreamSyncKeyPorts(options.ownerSignature),
+          // A reader hashes every segment it applies; noble's Keccak is the
+          // largest CPU cost of a first load on a browser's main thread.
+          streamCrypto: await wasmStreamCrypto(),
           signer,
           logger,
           now: Date.now,
