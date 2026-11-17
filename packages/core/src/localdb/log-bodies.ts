@@ -26,6 +26,7 @@ import {
   type LogUpsertByRef,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { keccakOf } from "../stream-sync/crypto-port.js";
+import { PARTS_IN_FLIGHT } from "../stream-sync/storage-retry.js";
 import type { LocalSyncDeps } from "./deps.js";
 
 /** One piece of an out-of-line body, encrypted, by its blob name in the log scope. */
@@ -127,18 +128,36 @@ async function fetchBody(
   scope: string,
   body: LogBodyRef,
 ): Promise<JsonObject> {
-  const clear = await Promise.all(
-    body.pieces.map(async (hash) => {
-      const cipher = await deps.blobs.get(
-        `${scope}/${bodyPieceBlobName(hash)}`,
-      );
-      if (cipher === null)
-        throw new Error("apply: missing a piece of an out-of-line body");
-      const piece = await deps.keys.decrypt(scope, cipher);
-      if ((await keccakHex(keccakOf(deps.streamCrypto), piece)) !== hash)
-        throw new Error("apply: an out-of-line body piece fails its hash");
-      return piece;
-    }),
+  // At most the store gate's width of GETs at once: more would only wait in
+  // the gate, ahead of every other reader's requests.
+  const clear: Uint8Array[] = [];
+  let next = 0;
+  let failed = false;
+  const fetchPieces = async () => {
+    while (!failed && next < body.pieces.length) {
+      const index = next++;
+      const hash = body.pieces[index]!;
+      try {
+        const cipher = await deps.blobs.get(
+          `${scope}/${bodyPieceBlobName(hash)}`,
+        );
+        if (cipher === null)
+          throw new Error("apply: missing a piece of an out-of-line body");
+        const piece = await deps.keys.decrypt(scope, cipher);
+        if ((await keccakHex(keccakOf(deps.streamCrypto), piece)) !== hash)
+          throw new Error("apply: an out-of-line body piece fails its hash");
+        clear[index] = piece;
+      } catch (error) {
+        failed = true;
+        throw error;
+      }
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(PARTS_IN_FLIGHT, body.pieces.length) },
+      fetchPieces,
+    ),
   );
   const length = clear.reduce((n, piece) => n + piece.length, 0);
   if (length !== body.bytes)
