@@ -278,6 +278,60 @@ describe("run end", () => {
     ).toEqual([{ stream: "s", record_key: "r1" }]);
   });
 
+  it("publishes the explicit delete of a stream DONE named failed, and none of its upserts", async () => {
+    const { db, store } = await fresh();
+    await db.batch([
+      {
+        sql: `INSERT INTO stream_state
+          (connection_id, stream, primary_key, semantics, incremental,
+           profile_key, profile_version, complete, head_version, head_generation)
+          VALUES ('c1', 't', '["id"]', 'mutable_state', 1, 'example', '1.0.0', 1, 1, 1)`,
+      },
+      {
+        sql: `INSERT INTO records (connection_id, stream, pk_hash, record_key, body, body_sha256, stamp_o, stamp_r, first_o)
+          VALUES ('c1', 't', 'hash-old', 'old', '{}', 'digest-old', 1, 'seed', 1)`,
+      },
+    ]);
+    await begin(db, "run", 1, 0);
+    await db.batch([
+      {
+        sql: `INSERT INTO run_streams
+          (run_id, stream, delete_snapshot, primary_key, profile_key, profile_version, full_read)
+          VALUES ('run', 't', 0, '["id"]', 'example', '1.0.0', 1)`,
+      },
+      {
+        sql: "INSERT INTO run_rows (run_id, stream, pk_hash, record_key, body, body_sha256) VALUES ('run', 't', 'hash-new', 'new', '{}', 'digest-new')",
+      },
+      {
+        sql: "INSERT INTO run_rows (run_id, stream, pk_hash, record_key, body, body_sha256, op) VALUES ('run', 't', 'hash-old', 'old', '{}', 'digest-old', 'delete')",
+      },
+    ]);
+    expect(
+      await store.end(
+        "run",
+        endRequest({
+          lastBatch: 0,
+          streams: ["s"],
+          live: ["t"],
+          deleted: ["t"],
+          finish: "failed_done_upsert_only",
+          observe: { t: { failedInDone: true } },
+          checkpoints: { t: "T1" },
+        }),
+      ),
+    ).toMatchObject({
+      result: "queued",
+      outcome: "partial",
+      coveredStreams: [],
+    });
+    expect(
+      await db.query(
+        "SELECT stream, record_key FROM records WHERE connection_id = 'c1' ORDER BY stream, record_key",
+      ),
+    ).toEqual([]);
+    expect(await checkpoint(db)).toBeNull();
+  });
+
   it("refuses an end body in the old outcome shape", async () => {
     const { db, store } = await fresh();
     await begin(db, "run", 1, 1);
