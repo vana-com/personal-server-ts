@@ -28,6 +28,7 @@ import {
   type IntakeDeclarations,
 } from "../stream-sync/intake.js";
 import { syncBeforeBegin } from "./bootstrap.js";
+import type { ConnectionRow } from "./deps.js";
 import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { checkRunFence } from "./fence.js";
@@ -272,9 +273,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           ).length
         )
           throw new RunIntakeError("connection_stopped");
-        let synced = await syncBeforeBegin(deps, req.connector, {
-          foreign: "report",
-        });
+        let synced = await collectionBasis(deps, req);
         // Another key's control row: this owner cannot publish what a run
         // would collect. Nothing is written for it (`syncBeforeBegin`).
         if (synced.control?.kind === "foreign")
@@ -711,4 +710,46 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
         };
       }),
   };
+}
+
+/**
+ * An explicit full collection needs no remote checkpoint. Its local head is
+ * the immutable replacement basis; publish compares that log position and
+ * control lifetime atomically. A competing commit applies the winner and
+ * replans without replacing rows this collector never observed.
+ * Retry admission, reconnect and repair still need an authoritative read.
+ */
+async function collectionBasis(
+  deps: LocalSyncDeps,
+  request: BeginRequest,
+): Promise<Awaited<ReturnType<typeof syncBeforeBegin>>> {
+  if (
+    request.connect === true &&
+    request.expectedControlVersion === undefined
+  ) {
+    const id = controlScope(request.connector, "");
+    const local = await deps.queue.run(id, "end", async () => {
+      const [row] = await deps.db.query<
+        ConnectionRow & { partial: number } & Record<string, string | number>
+      >(
+        `SELECT connection_id AS connectionId, connector, ns, generation,
+          control_state AS controlState, control_version AS controlVersion,
+          apply_partial AS partial FROM connections WHERE connection_id=?`,
+        [id],
+      );
+      if (
+        row &&
+        (row.partial ||
+          (row.controlState !== "active" && row.controlState !== "absent"))
+      )
+        return null;
+      const control: ControlState =
+        row?.controlState === "active"
+          ? { kind: "active", generation: row.generation }
+          : { kind: "absent" };
+      return { connection: row ?? null, control, unreachable: false };
+    });
+    if (local) return local;
+  }
+  return syncBeforeBegin(deps, request.connector, { foreign: "report" });
 }

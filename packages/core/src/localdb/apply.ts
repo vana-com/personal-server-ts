@@ -255,6 +255,19 @@ async function control(
   reuse: Reuse,
   observedControl?: ControlRead,
 ) {
+  // A cycle's listing already observed control. A local commit/reconnect
+  // after that snapshot makes it stale; only that case needs a fresh read.
+  if (observedControl) {
+    const [basis] = await deps.db.query<{ control_version: number }>(
+      "SELECT control_version FROM connections WHERE connection_id=?",
+      [id],
+    );
+    if (
+      (observedControl.found ? observedControl.version : 0) <
+      (basis?.control_version ?? 0)
+    )
+      observedControl = undefined;
+  }
   const read =
     observedControl ??
     (await deps.registry.read(
@@ -262,7 +275,6 @@ async function control(
     ));
   const state = classifyControl(read, hashes);
   // A stale active read cannot undo a deletion this device already observed.
-  // Check before purging/resetting stream state as well as before the row update.
   const [local] = await deps.db.query<{
     control_state: string;
     control_version: number;
