@@ -91,6 +91,7 @@ import {
   encodeHead,
   framesCarryFirstSeen,
   headBlobName,
+  logScope,
   omissionCutoff,
   streamScope,
   toHex,
@@ -118,6 +119,7 @@ import { applyConnection } from "./apply.js";
 import {
   batchBounds,
   createCommitGroup,
+  fitsRowBounds,
   settleRequirementFailure,
   settleRow,
   type CommitGroup,
@@ -1897,8 +1899,17 @@ function connectionCommits(
         const bounds = batchBounds(deps.registry);
         const writes = (list: readonly CommitEntry[]) =>
           list.filter(writesHead).length;
+        // A written stream row fences its connection's log row, which this
+        // batch does not write: one more lock for each distinct one.
+        const fences = (list: readonly HeadEntry[]) =>
+          new Set(
+            list.map(({ context: { connection } }) =>
+              logScope(connection.connector, connection.ns),
+            ),
+          ).size;
+        const written = [...taken, next].filter(writesHead);
         return writesHead(next)
-          ? writes(taken) < bounds.rows
+          ? fitsRowBounds(bounds, written.length, fences(written))
           : taken.length - writes(taken) < bounds.requires - 1;
       },
     }),

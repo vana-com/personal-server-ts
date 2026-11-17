@@ -67,7 +67,17 @@ export interface FakeGatewayOptions {
    * and enforces with a 400. Absent: an old gateway that sends no header and
    * accepts 16 rows and 16 conditions.
    */
-  readonly policy?: { rows: number; requires: number; bytes: number };
+  readonly policy?: {
+    rows: number;
+    requires: number;
+    bytes: number;
+    /**
+     * Advertised as `lockedScopes` and enforced with a 422, as the registry
+     * does: a batch whose written rows fence at least one log row it does not
+     * write holds at most this many rows plus distinct such log rows.
+     */
+    lockedScopes?: number;
+  };
   /**
    * The registry's connection-log fence: a write that is not a tombstone, to a
    * stream row of a connection whose log row exists, loses with a 409. So does
@@ -149,7 +159,11 @@ export function createFakeGateway(options: FakeGatewayOptions) {
           headers:
             options.policy && url.pathname === "/v1/data/batch"
               ? {
-                  "batch-policy": `rows=${options.policy.rows};bytes=${options.policy.bytes};requires=${options.policy.requires}`,
+                  "batch-policy": `rows=${options.policy.rows};bytes=${options.policy.bytes};requires=${options.policy.requires}${
+                    options.policy.lockedScopes === undefined
+                      ? ""
+                      : `;lockedScopes=${options.policy.lockedScopes}`
+                  }`,
                 }
               : {},
         });
@@ -311,6 +325,25 @@ export function createFakeGateway(options: FakeGatewayOptions) {
           success: false,
           error: `requires has at most ${maxRequires} entries`,
         });
+      }
+      const lockedScopes = options.policy?.lockedScopes;
+      if (lockedScopes !== undefined) {
+        const written = new Set<string>(
+          body.rows.map((row: BatchRow) => row.scope),
+        );
+        const fences = new Set<string>();
+        for (const row of body.rows as BatchRow[]) {
+          const log = fencingLogScope(row.scope);
+          if (log !== null && !written.has(log) && !options.isTombstone(row)) {
+            fences.add(log);
+          }
+        }
+        if (fences.size > 0 && body.rows.length + fences.size > lockedScopes) {
+          return json(422, {
+            success: false,
+            error: `rows plus the connection log rows they fence lock ${body.rows.length + fences.size} scopes; the limit is ${lockedScopes}`,
+          });
+        }
       }
       const bad = requirementFails(body.requires ?? []);
       if (bad) return json(409, failure(bad));

@@ -578,7 +578,7 @@ async function isLegacyRouteRefusal(res: Response): Promise<boolean> {
 }
 
 /**
- * `Batch-Policy: rows=<R>;bytes=<B>;requires=<Q>`. `undefined` when the header
+ * `Batch-Policy: rows=<R>;bytes=<B>;requires=<Q>[;lockedScopes=<L>]`. `undefined` when the header
  * is absent or any field is not a positive integer: a client that cannot read
  * the bounds keeps the ones it had.
  */
@@ -605,5 +605,14 @@ export function parseBatchPolicy(
     !Number.isSafeInteger(bytes)
   )
     return undefined;
-  return { rows, requires, bytes };
+  // Optional, and ignored when it is not a positive integer: an older gateway
+  // sends none, and a client without it packs to `rows` alone.
+  const lockedScopes = fields.get("lockedScopes");
+  return {
+    rows,
+    requires,
+    bytes,
+    ...(lockedScopes !== undefined &&
+      Number.isSafeInteger(lockedScopes) && { lockedScopes }),
+  };
 }

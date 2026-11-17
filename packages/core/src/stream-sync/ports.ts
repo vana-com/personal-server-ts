@@ -112,6 +112,14 @@ export interface RegistryBatchPolicy {
   readonly rows: number;
   readonly requires: number;
   readonly bytes: number;
+  /**
+   * Only when the gateway sends it. A batch that writes stream rows of a
+   * connection fences that connection's log row, which the batch does not
+   * write; the gateway locks one entry per row and one per distinct such log
+   * row. A batch with at least one of them holds at most `lockedScopes` rows
+   * plus distinct fenced log rows. Without a fence `rows` is the only limit.
+   */
+  readonly lockedScopes?: number;
 }
 
 export type RegistryBatchRow =
