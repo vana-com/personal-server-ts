@@ -424,8 +424,11 @@ async function bootstrapServer(
   const logger = createLogger(config.logging);
   const startedAt = new Date();
   const isEnclave = options?.profile === "enclave";
-  const outboundFetch =
-    options?.outboundFetch ?? (isEnclave ? undefined : createKeepAliveFetch());
+  // The host's own pool, closed at cleanup. An injected fetch belongs to its
+  // caller.
+  const keepAlive =
+    options?.outboundFetch || isEnclave ? undefined : createKeepAliveFetch();
+  const outboundFetch = options?.outboundFetch ?? keepAlive?.fetch;
   if (isEnclave && process.env.VANA_OWNER_PRIVATE_KEY) {
     throw new Error("VANA_OWNER_PRIVATE_KEY is forbidden in enclave profile");
   }
@@ -1855,6 +1858,8 @@ async function bootstrapServer(
         indexManager.close();
       }
     });
+    // Last: the stops above send through it until they have settled.
+    await attempt(() => keepAlive?.close());
     if (errors.length > 0) throw errors[0];
   };
 

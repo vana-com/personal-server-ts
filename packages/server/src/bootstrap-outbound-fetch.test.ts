@@ -17,17 +17,38 @@ import type * as AdditionsModule from "@opendatalabs/personal-server-ts-core/add
 import type * as LineageModule from "@opendatalabs/personal-server-ts-core/lineage";
 import type * as StreamSyncModule from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type * as SyncModule from "@opendatalabs/personal-server-ts-core/sync";
+import type * as OutboundFetchModule from "./outbound-fetch.js";
 import { createServer, type ServerContext } from "./bootstrap.js";
 
 const given = vi.hoisted(
   () => new Map<string, Array<typeof fetch | undefined>>(),
 );
+const pools = vi.hoisted(() => ({ made: 0, closed: 0 }));
 function record(client: string, options: { fetch?: typeof fetch } | undefined) {
   const list = given.get(client) ?? [];
   list.push(options?.fetch);
   given.set(client, list);
 }
 
+vi.mock("./outbound-fetch.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof OutboundFetchModule>();
+  return {
+    ...actual,
+    createKeepAliveFetch: (
+      ...args: Parameters<typeof actual.createKeepAliveFetch>
+    ) => {
+      const pool = actual.createKeepAliveFetch(...args);
+      pools.made += 1;
+      return {
+        ...pool,
+        close: async () => {
+          pools.closed += 1;
+          await pool.close();
+        },
+      };
+    },
+  };
+});
 vi.mock(
   "@opendatalabs/personal-server-ts-core/storage/adapters",
   async (importOriginal) => {
@@ -113,8 +134,10 @@ vi.mock(
 const contexts: ServerContext[] = [];
 const directories: string[] = [];
 afterEach(async () => {
-  given.clear();
   for (const context of contexts.splice(0)) await context.cleanup();
+  given.clear();
+  pools.made = 0;
+  pools.closed = 0;
   for (const directory of directories.splice(0))
     await rm(directory, { recursive: true, force: true });
   vi.unstubAllEnvs();
@@ -187,5 +210,30 @@ describe("the host's outbound fetch", () => {
     }
     const all = CLIENTS.flatMap((client) => given.get(client) ?? []);
     expect(new Set(all).size, "one fetch for every client").toBe(1);
+  });
+
+  it("closes the host's connection pool when the server stops", async () => {
+    const context = await boot();
+    expect(pools.made).toBe(1);
+    expect(pools.closed).toBe(0);
+
+    await context.cleanup();
+    contexts.splice(contexts.indexOf(context), 1);
+
+    expect(pools.closed).toBe(1);
+  });
+
+  it("leaves a fetch the host passed to its owner, making no pool of its own", async () => {
+    const context = await boot(
+      vi.fn(
+        async () => new Response("{}", { status: 404 }),
+      ) as unknown as typeof fetch,
+    );
+
+    await context.cleanup();
+    contexts.splice(contexts.indexOf(context), 1);
+
+    expect(pools.made).toBe(0);
+    expect(pools.closed).toBe(0);
   });
 });

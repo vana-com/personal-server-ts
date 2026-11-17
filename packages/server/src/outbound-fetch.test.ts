@@ -11,6 +11,7 @@ import {
 } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
+import { createGatewayStreamSyncRegistry } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createKeepAliveFetch } from "./outbound-fetch.js";
 
 const servers: Server[] = [];
@@ -51,7 +52,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 describe("createKeepAliveFetch", () => {
   it("reuses the socket for a request sent 6 s after the last one", async () => {
     const { url, sockets } = await peer();
-    const send = createKeepAliveFetch();
+    const { fetch: send } = createKeepAliveFetch();
 
     expect(await (await send(url)).text()).toBe("ok");
     await sleep(6_000);
@@ -81,7 +82,7 @@ describe("createKeepAliveFetch", () => {
         response.end();
       });
     });
-    const send = createKeepAliveFetch();
+    const { fetch: send } = createKeepAliveFetch();
 
     for (const size of [1024 * 1024, 2048]) {
       await (
@@ -99,7 +100,7 @@ describe("createKeepAliveFetch", () => {
 
   it("still succeeds when the peer closed the idle socket before the next request", async () => {
     const { url, sockets } = await peer();
-    const send = createKeepAliveFetch();
+    const { fetch: send } = createKeepAliveFetch();
 
     expect(await (await send(url)).text()).toBe("ok");
     for (const socket of sockets) socket.destroy();
@@ -118,12 +119,93 @@ describe("createKeepAliveFetch", () => {
     }) as typeof fetch;
     try {
       const { url } = await peer();
-      const send = createKeepAliveFetch();
+      const { fetch: send } = createKeepAliveFetch();
       globalThis.fetch = original;
       await (await send(url)).text();
       expect(seen).toEqual([url]);
     } finally {
       globalThis.fetch = original;
     }
+  });
+});
+
+describe("a reused socket the server resets", () => {
+  const owner = "0x1111111111111111111111111111111111111111";
+
+  /**
+   * A peer that answers the first request of each connection with a 404 and
+   * resets the connection on the next one without a reply: what a client sees
+   * when the server closed the idle connection as the request went out.
+   */
+  async function resettingPeer() {
+    const received: string[] = [];
+    const perSocket = new Map<Socket, number>();
+    const { url, sockets } = await peer((request, response) => {
+      received.push(`${request.method} ${request.url}`);
+      const count = (perSocket.get(request.socket) ?? 0) + 1;
+      perSocket.set(request.socket, count);
+      if (count > 1) return request.socket.destroy();
+      response.statusCode = 404;
+      response.end("{}");
+    });
+    return { url, sockets, received };
+  }
+
+  it("lets a registry read retry once, instead of reporting the registry unreachable", async () => {
+    const { url, sockets } = await resettingPeer();
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: url,
+      ownerAddress: owner,
+      fetch: createKeepAliveFetch().fetch,
+    });
+
+    expect(await registry.read("pdpp.a~b")).toEqual({ found: false });
+    await sleep(100);
+    expect(await registry.read("pdpp.c~d")).toEqual({ found: false });
+
+    expect(sockets).toHaveLength(2);
+  });
+
+  it("does not send a POST again: the first may have reached the peer", async () => {
+    const { url, received } = await resettingPeer();
+    const { fetch: send } = createKeepAliveFetch();
+    await (await send(url, { method: "POST", body: "a" })).text();
+    await sleep(100);
+
+    await expect(send(url, { method: "POST", body: "b" })).rejects.toThrow(
+      "fetch failed",
+    );
+
+    expect(received).toEqual(["POST /", "POST /"]);
+  });
+
+  it("does not send a GET again when its connection had answered nothing", async () => {
+    const received: string[] = [];
+    const { url } = await peer((request) => {
+      received.push(String(request.method));
+      request.socket.destroy();
+    });
+    const { fetch: send } = createKeepAliveFetch();
+
+    await expect(send(url)).rejects.toThrow("fetch failed");
+
+    expect(received).toEqual(["GET"]);
+  });
+});
+
+describe("close", () => {
+  it("closes the pooled connections, so the server sees them end", async () => {
+    const { url, sockets } = await peer();
+    const { fetch: send, close } = createKeepAliveFetch();
+    await (await send(url)).text();
+    expect(sockets).toHaveLength(1);
+    const closed = new Promise<void>((resolve) =>
+      sockets[0]!.once("close", () => resolve()),
+    );
+
+    await close();
+
+    await closed;
+    expect(sockets[0]!.destroyed).toBe(true);
   });
 });
