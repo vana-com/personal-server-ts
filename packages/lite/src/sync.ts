@@ -128,6 +128,8 @@ export interface PsLiteOwnerSyncSigner
 }
 
 export interface PsLiteSyncOptions {
+  /** Host registration gate: while closed, switched sync only pulls owner data. */
+  registrationReady?: () => boolean;
   accountStorageMode?: OwnedAccountStorageMode;
   config: ServerConfig;
   /** Host-owned SQLite database; a missing driver makes switched sync unavailable. */
@@ -740,7 +742,16 @@ export async function createPsLiteSyncManager(
       {
         accountStorageMode: mode,
         localSync: {
-          cycle: async (scope) => (await getLocalSync()).cycle(scope),
+          cycle: async (scope) => {
+            const sync = await getLocalSync();
+            if (options.registrationReady && !options.registrationReady()) {
+              // Binding was verified above; registry and encrypted blob reads
+              // confer no server publication authority. No pending writes leave.
+              await sync.apply();
+              return { connections: [] };
+            }
+            return sync.cycle(scope);
+          },
           applyDelta: async (delta) => (await getLocalSync()).applyDelta(delta),
         },
         ...(changeProbe && { changeProbe }),
@@ -754,6 +765,12 @@ export async function createPsLiteSyncManager(
         tombstoneFinality,
         async canSync() {
           if (options.ownerSyncSigner) return { ok: true };
+          if (
+            options.registrationReady &&
+            !options.registrationReady() &&
+            mode.read() !== "unswitched"
+          )
+            return { ok: true };
           try {
             const serverInfo = await gateway.getServer(
               options.serverAccount.address,

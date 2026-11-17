@@ -343,8 +343,14 @@ export function createLocalSync(
     },
     async apply() {
       await resume();
-      for (const connection of await bootstrapConnections(deps)) {
-        await applyConnection(deps, connection.connectionId);
+      const listed = await deps.registry.listOwnerRows();
+      for (const connection of await bootstrapConnections(deps, listed)) {
+        await applyConnection(
+          deps,
+          connection.connectionId,
+          listed,
+          listed.find((row) => row.scope === connection.connectionId)?.read,
+        );
       }
     },
     async syncConnection(connectionId) {
