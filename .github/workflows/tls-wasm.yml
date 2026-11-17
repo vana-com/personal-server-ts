@@ -10,6 +10,8 @@ on:
       - packages/lite/src/browser-tls-rustls/**
       - packages/lite/scripts/build-tls-wasm.sh
       - scripts/check-binary-home-paths.sh
+      - .cargo/**
+      - rust-toolchain*
       - .github/workflows/tls-wasm.yml
   push:
     branches: [main, develop]
@@ -18,6 +20,8 @@ on:
       - packages/lite/src/browser-tls-rustls/**
       - packages/lite/scripts/build-tls-wasm.sh
       - scripts/check-binary-home-paths.sh
+      - .cargo/**
+      - rust-toolchain*
       - .github/workflows/tls-wasm.yml
 
 jobs:
@@ -46,4 +50,10 @@ jobs:
         working-directory: packages/lite
         run: bash scripts/build-tls-wasm.sh
       - name: Fail if the rebuild differs from the committed files
-        run: git diff --exit-code --stat -- packages/lite/src/browser-tls-rustls
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "The rebuild changed or added files:" >&2
+            git status --short >&2
+            git diff --stat >&2
+            exit 1
+          fi

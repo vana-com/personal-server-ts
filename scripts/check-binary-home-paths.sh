@@ -3,8 +3,9 @@
 #
 # Compiled output embeds the build machine's source paths, so a committed
 # binary can leak a username. With no arguments this checks every tracked
-# *.wasm, *.node, *.so, *.dylib and *.pyc file; with arguments it checks those
-# files. It prints the file and the number of matches, never the matched path.
+# *.wasm, *.node, *.so, *.dylib, *.pyc, *.a, *.rlib, *.o, *.dll, *.exe and *.map
+# file; with arguments it checks those files. It prints the file and the number
+# of matches, never the matched path.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
@@ -12,7 +13,8 @@ cd "$(git rev-parse --show-toplevel)"
 if [ "$#" -gt 0 ]; then
   files=("$@")
 else
-  mapfile -t files < <(git ls-files -- '*.wasm' '*.node' '*.so' '*.dylib' '*.pyc')
+  mapfile -t files < <(git ls-files -- '*.wasm' '*.node' '*.so' '*.dylib' '*.pyc' \
+    '*.a' '*.rlib' '*.o' '*.dll' '*.exe' '*.map')
 fi
 
 status=0
