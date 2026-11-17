@@ -15,6 +15,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createMemoryModeRecordStore } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import { endRequest } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type * as SyncModule from "@opendatalabs/personal-server-ts-core/sync";
 import { createStreamSyncKeyPorts } from "../../core/src/stream-sync/crypto.js";
 import { remoteFixture } from "./localdb/apply-fixture.js";
@@ -85,21 +86,9 @@ async function world() {
     `0x${"11".repeat(32)}`,
   ).signMessage({ message: "Disposable publish wake fixture" });
   const remote = await remoteFixture(createStreamSyncKeyPorts(signature));
-  const post = vi.fn(
-    async (request: Parameters<typeof remote.registry.post>[0]) => {
-      const prior = remote.reads.get(request.scope);
-      const version = prior?.found ? prior.version + 1 : 1;
-      remote.reads.set(request.scope, {
-        found: true,
-        version,
-        dataHash: request.dataHash,
-        metadataHash: request.metadataHash,
-        deleted: false,
-      });
-      return { kind: "committed" as const };
-    },
-  );
-  remote.registry.post = post;
+  // The publish is one batch commit: count those.
+  const post = vi.fn(remote.registry.postBatch!.bind(remote.registry));
+  remote.registry.postBatch = post;
   vi.stubEnv("PS_ACCESS_TOKEN", "publish-wake-fixture");
   vi.stubEnv("VANA_OWNER_PRIVATE_KEY", "");
   const context = await createServer(
@@ -159,12 +148,18 @@ async function world() {
         records: [{ stream: "items", data: { id } }],
       });
       expect(batch.status).toBe(200);
-      return send(`${base}/end`, "POST", {
-        outcome,
-        coveredStreams: outcome === "succeeded" ? ["items"] : [],
-        provenFullStreams: outcome === "succeeded" ? ["items"] : [],
-        lastBatch: 0,
-      });
+      // A failed run: the connector skipped its one stream.
+      return send(
+        `${base}/end`,
+        "POST",
+        outcome === "succeeded"
+          ? endRequest({
+              lastBatch: 0,
+              live: ["items"],
+              provenFullStreams: ["items"],
+            })
+          : endRequest({ lastBatch: 0, live: ["items"], skipped: ["items"] }),
+      );
     },
   });
   return { context, post, intake };

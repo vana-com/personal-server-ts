@@ -1,24 +1,28 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
-import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
+import {
+  bootstrapConnections,
+  knownActiveConnections,
+  newConnectionsWithStreams,
+} from "../../../core/src/localdb/bootstrap.js";
 import { runCycle, syncConnection } from "../../../core/src/localdb/cycle.js";
 import type {
   ConnectionRow,
   LocalSyncDeps,
 } from "../../../core/src/localdb/deps.js";
-import { publishConnection } from "../../../core/src/localdb/publish.js";
+import { publishLog } from "../../../core/src/localdb/log-publish.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 
 vi.mock("../../../core/src/localdb/bootstrap.js", () => ({
   bootstrapConnections: vi.fn(),
+  knownActiveConnections: vi.fn(),
+  newConnectionsWithStreams: vi.fn(),
 }));
 vi.mock("../../../core/src/localdb/apply.js", () => ({
   applyConnection: vi.fn(),
-  // Reset mocks answer undefined: no connection here has a log.
-  connectionHasLog: vi.fn(),
 }));
-vi.mock("../../../core/src/localdb/publish.js", () => ({
-  publishConnection: vi.fn(),
+vi.mock("../../../core/src/localdb/log-publish.js", () => ({
+  publishLog: vi.fn(),
 }));
 
 function deferred() {
@@ -37,20 +41,25 @@ const connection = (connectionId: string): ConnectionRow => ({
   controlState: "active",
   controlVersion: 1,
 });
-const applied = (id: string) => [
-  { stream: id, outcome: "applied" as const, partsDownloaded: 1, partsKept: 0 },
-];
 const published = (id: string) => [
   { stream: id, outcome: "published" as const, watermark: 1 },
 ];
 // The mocked siblings only need the real queue, not database or network ports.
+// The cycle's one listing of the owner; the mocked siblings only pass it on.
+const LISTED: readonly never[] = [];
 const dependencies = () =>
   ({
     queue: connectionQueue(),
+    registry: { listOwnerRows: async () => LISTED },
     logger: { info: vi.fn(), warn: vi.fn() },
   }) as unknown as LocalSyncDeps;
 
-beforeEach(() => vi.resetAllMocks());
+beforeEach(() => {
+  vi.resetAllMocks();
+  // No connection here is known to the device before the listing.
+  vi.mocked(knownActiveConnections).mockResolvedValue([]);
+  vi.mocked(newConnectionsWithStreams).mockResolvedValue([]);
+});
 
 describe("local database cycle", () => {
   it("lists first and applies before publishing each queued connection", async () => {
@@ -83,10 +92,9 @@ describe("local database cycle", () => {
           await applyReady.promise;
         }
         events.push(`apply:${id}:end`);
-        return applied(id);
       }),
     );
-    vi.mocked(publishConnection).mockImplementation((queued, id) =>
+    vi.mocked(publishLog).mockImplementation((queued, id) =>
       queued.queue.run(id, "publish", async () => {
         events.push(`publish:${id}`);
         if (id === "second") otherPublished.resolve();
@@ -98,7 +106,7 @@ describe("local database cycle", () => {
     await listingStarted.promise;
     expect(events).toEqual(["listing:start"]);
     expect(applyConnection).not.toHaveBeenCalled();
-    expect(publishConnection).not.toHaveBeenCalled();
+    expect(publishLog).not.toHaveBeenCalled();
     listingReady.resolve();
     await otherPublished.promise;
     // One connection's existing operation does not hold up the other.
@@ -130,7 +138,6 @@ describe("local database cycle", () => {
     expect(report.connections).toEqual(
       ["first", "second"].map((id) => ({
         connectionId: id,
-        applied: applied(id),
         published: published(id),
         error: null,
       })),
@@ -144,7 +151,7 @@ describe("local database cycle", () => {
       "publish:direct",
     ]);
     expect(bootstrapConnections).toHaveBeenCalledTimes(1);
-    expect(bootstrapConnections).toHaveBeenCalledWith(deps);
+    expect(bootstrapConnections).toHaveBeenCalledWith(deps, LISTED);
   });
 
   it("reports a connection's failure without stopping the other connections", async () => {
@@ -154,9 +161,8 @@ describe("local database cycle", () => {
     );
     vi.mocked(applyConnection).mockImplementation(async (_deps, id) => {
       if (id === "apply-fails") throw new Error("apply failed");
-      return applied(id);
     });
-    vi.mocked(publishConnection).mockImplementation(async (_deps, id) => {
+    vi.mocked(publishLog).mockImplementation(async (_deps, id) => {
       if (id === "publish-fails") throw "publish failed";
       return published(id);
     });
@@ -165,27 +171,25 @@ describe("local database cycle", () => {
       connections: [
         {
           connectionId: "apply-fails",
-          applied: [],
           published: [],
           error: "apply failed",
         },
         {
           connectionId: "publish-fails",
-          applied: applied("publish-fails"),
           published: [],
           error: "publish failed",
         },
         {
           connectionId: "succeeds",
-          applied: applied("succeeds"),
           published: published("succeeds"),
           error: null,
         },
       ],
     });
-    expect(vi.mocked(publishConnection).mock.calls.map(([, id]) => id)).toEqual(
-      ["publish-fails", "succeeds"],
-    );
+    expect(vi.mocked(publishLog).mock.calls.map(([, id]) => id)).toEqual([
+      "publish-fails",
+      "succeeds",
+    ]);
     // The failure is logged, not only returned: the timer drops the report.
     expect(vi.mocked(deps.logger.warn).mock.calls).toEqual([
       [
@@ -204,11 +208,9 @@ describe("local database cycle", () => {
     vi.mocked(bootstrapConnections).mockResolvedValue(
       ["slow-failure", "healthy"].map(connection),
     );
-    vi.mocked(applyConnection).mockImplementation(async (_deps, id) =>
-      applied(id),
-    );
+    vi.mocked(applyConnection).mockResolvedValue(undefined);
     const healthyPublished = deferred();
-    vi.mocked(publishConnection).mockImplementation(async (_deps, id) => {
+    vi.mocked(publishLog).mockImplementation(async (_deps, id) => {
       if (id === "healthy") {
         healthyPublished.resolve();
         return published(id);
@@ -235,8 +237,9 @@ describe("local database cycle", () => {
       }),
     ]);
     // The healthy connection published before the failing one gave up.
-    expect(vi.mocked(publishConnection).mock.calls.map(([, id]) => id)).toEqual(
-      ["slow-failure", "healthy"],
-    );
+    expect(vi.mocked(publishLog).mock.calls.map(([, id]) => id)).toEqual([
+      "slow-failure",
+      "healthy",
+    ]);
   });
 });

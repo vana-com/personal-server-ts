@@ -3,7 +3,7 @@
 // The held request's answer can carry what changed after the position the
 // manager holds (`since`). When the manager's last clean pass started under
 // exactly that position, applying the delta is the whole pass: no server row,
-// no listing, no control or stream row read. Every other case runs the full
+// no listing or control row read. Every other case runs the full
 // cycle it ran before. Each test names the mutation of `deltaPass` it pins.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Logger } from "../../logger/index.js";
@@ -68,7 +68,7 @@ function setup(
       return () => {};
     },
   };
-  const cycle = vi.fn(async () => {});
+  const cycle = vi.fn<() => Promise<unknown>>(async () => {});
   const applyDelta = vi.fn(opts.applyDelta ?? (async () => APPLIED));
   const canSync = vi.fn(async () => ({ ok: true as const }));
   const manager = createSyncManager(
@@ -250,6 +250,103 @@ describe("a change delta", () => {
     await settled(t);
     await answer(t, undefined, "8");
     expect(t.applyDelta).not.toHaveBeenCalled();
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    await t.manager.stop();
+  });
+
+  it("a reset waits for the full listing's persisted completion before advancing since (mutation: full cycle not awaited)", async () => {
+    const t = setup();
+    await settled(t);
+    let persist!: () => void;
+    t.cycle.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          persist = resolve;
+        }),
+    );
+    await answer(t, { since: "7", seq: "8", reset: true }, "8");
+    expect(t.applyDelta).not.toHaveBeenCalled();
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    expect(t.handlers().since?.()).toBeUndefined();
+    persist();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.handlers().since?.()).toBe("8");
+    await t.manager.stop();
+  });
+
+  it("overlapping answers serialize through persistence and a late older answer cannot settle (mutation: concurrent cycles or regressing position)", async () => {
+    const t = setup();
+    await settled(t);
+    let persist!: () => void;
+    t.applyDelta.mockImplementationOnce(
+      () =>
+        new Promise<DeltaApplyResult>((resolve) => {
+          persist = () => resolve(APPLIED);
+        }),
+    );
+    await answer(t, delta("7", "8"), "8");
+    await answer(t, delta("7", "9"), "9");
+    expect(t.applyDelta).toHaveBeenCalledTimes(1);
+    expect(t.cycle).not.toHaveBeenCalled();
+    expect(t.handlers().since?.()).toBeUndefined();
+    persist();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    expect(t.handlers().since?.()).toBe("9");
+    // The older request can also arrive after the newer pass finished.
+    await answer(t, delta("7", "8"), "8");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.handlers().since?.()).toBe("9");
+    expect(t.applyDelta).toHaveBeenCalledTimes(1);
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    await t.manager.stop();
+  });
+
+  it.each(["delta", "cycle"])(
+    "steady idle with healthy push runs no work with the %s path",
+    async (path) => {
+      const t = setup({
+        applyDelta: async () =>
+          path === "delta" ? APPLIED : { outcome: "cycle", reason: "disabled" },
+      });
+      await settled(t);
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(t.applyDelta).not.toHaveBeenCalled();
+      expect(t.cycle).not.toHaveBeenCalled();
+      expect(t.canSync).not.toHaveBeenCalled();
+      await t.manager.stop();
+    },
+  );
+
+  it("a lower reset lists again without settling an older answer", async () => {
+    const t = setup();
+    await settled(t, "9");
+    await answer(t, { since: "9", seq: "3", reset: true }, "3");
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    expect(t.handlers().since?.()).toBeUndefined();
+    t.handlers().onPosition("3");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.handlers().since?.()).toBe("3");
+    await t.manager.stop();
+  });
+
+  it("a reset whose listing cannot finish a connection never offers an applied cursor", async () => {
+    const t = setup();
+    await settled(t);
+    t.cycle.mockResolvedValueOnce({
+      connections: [
+        {
+          connectionId: "c",
+          error: "unreadable log",
+          status: "update_required",
+        },
+      ],
+    });
+    await answer(t, { since: "7", seq: "8", reset: true }, "8");
+    expect(t.handlers().since?.()).toBeUndefined();
+    expect(t.manager.getStatus().blocked?.reason).toBe("update_required");
+    // Keep the existing policy: an unsupported format does not poll forever.
+    await vi.advanceTimersByTimeAsync(60_000);
     expect(t.cycle).toHaveBeenCalledTimes(1);
     await t.manager.stop();
   });

@@ -4,7 +4,7 @@
 // Real SQLite, real staging files, real importer; no network.
 //
 //   npx tsx packages/server/src/localdb/seed-handoff.workload.ts \
-//     --dir ~/.tmp/<dir> --rows 198000 --row-bytes 2150 [--profile]
+//     --dir <work-dir> --rows 198000 --row-bytes 2150 [--profile]
 //
 // Prints one JSON object: the milliseconds each phase took (`stageMs`,
 // `importMs`), the bytes staged, and with `--profile` the time spent in each
@@ -183,8 +183,6 @@ export async function benchHandoff(options: {
           },
         ],
       }),
-      declaredStreams: () => [STREAM],
-      olderVersionReads: () => true,
     });
     const staging = createSeedStaging(
       createFsStreamSyncFiles(join(options.dir, "staging")),

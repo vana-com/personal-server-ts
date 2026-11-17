@@ -15,6 +15,7 @@ import {
 } from "../../../core/src/localdb/run-intake.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
 import { RegistryUnavailableError } from "../../../core/src/stream-sync/ports.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.js";
 
@@ -83,11 +84,7 @@ describe("P03 run intake", () => {
       }),
     ).toEqual({ applied: true, accepted: 1, deletesSkipped: 0 });
     expect(await f.db.query("SELECT * FROM records")).toEqual([]);
-    await f.end.end("run", {
-      outcome: "retry_pending",
-      coveredStreams: [],
-      lastBatch: 0,
-    });
+    await f.end.end("run", endRequest({ lastBatch: 0, live: ["items"] }));
     expect(await f.db.query("SELECT stamp_o,first_o FROM records")).toEqual([
       { stamp_o: 40, first_o: 40 },
     ]);
@@ -143,11 +140,7 @@ it("checks typed keys across a batch, staged runs, and stored records atomically
   await expect(
     f.store.batch("other", { batch: 0, records: [record("1")] }),
   ).rejects.toMatchObject({ message: "key_type_conflict" });
-  await f.end.end("run", {
-    outcome: "retry_pending",
-    coveredStreams: [],
-    lastBatch: 0,
-  });
+  await f.end.end("run", endRequest({ lastBatch: 0, live: ["items"] }));
   await expect(
     f.store.batch("other", { batch: 0, records: [record("1")] }),
   ).rejects.toMatchObject({ message: "key_type_conflict" });

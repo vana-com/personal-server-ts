@@ -127,19 +127,6 @@ describe("ServerConfigSchema — streamSync registry change push", () => {
   });
 });
 
-describe("ServerConfigSchema — olderVersionReads", () => {
-  it("olderVersionReads is a boolean that defaults to true and accepts false", () => {
-    expect(DEFAULTS.olderVersionReads).toBe(true);
-    expect(ServerConfigSchema.parse({}).olderVersionReads).toBe(true);
-    expect(
-      ServerConfigSchema.parse({ olderVersionReads: false }).olderVersionReads,
-    ).toBe(false);
-    expect(
-      ServerConfigSchema.safeParse({ olderVersionReads: "false" }).success,
-    ).toBe(false);
-  });
-});
-
 describe("ServerConfigSchema — sync fields", () => {
   it("default config has sync.enabled: false and sync.lastProcessedTimestamp: null", () => {
     const config = ServerConfigSchema.parse({});
@@ -376,5 +363,27 @@ describe("pdpp.protocolProfile", () => {
       ServerConfigSchema.safeParse({ pdpp: { protocolProfile: "candidate" } })
         .success,
     ).toBe(false);
+  });
+});
+
+describe("ServerConfigSchema — server.port", () => {
+  it.each([-1, 1.5, 65536, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects invalid configured port %s",
+    (port) => {
+      expect(ServerConfigSchema.safeParse({ server: { port } }).success).toBe(
+        false,
+      );
+    },
+  );
+
+  it("keeps configured ports concrete; ephemeral binding is a node handle option", () => {
+    expect(ServerConfigSchema.safeParse({ server: { port: 0 } }).success).toBe(
+      false,
+    );
+    for (const port of [1, 65535]) {
+      expect(ServerConfigSchema.parse({ server: { port } }).server.port).toBe(
+        port,
+      );
+    }
   });
 });

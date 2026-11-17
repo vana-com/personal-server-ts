@@ -216,65 +216,15 @@ const textOf = ({ sid, sql }) => {
   return sql;
 };
 
-/**
- * Snapshots (reader only): each is its own connection holding one read
- * transaction, pinned when `begin` returns. The WAL gives it the state
- * committed at that moment, whatever the writer commits after.
- */
-const snapshots = new Map();
-let snapshotSeq = 0;
-
 const run = {
   /** The writer's resolved path and file identity, for the reader to serve. */
   identity() {
     return { path, identity };
   },
-  begin() {
-    if (role !== "reader") throw new Error("sqlite_writer_cannot_snapshot");
-    checkReader();
-    const { opened } = openChecked(
-      () => new Database(path, { readonly: true, fileMustExist: true }),
-      identity,
-    );
-    try {
-      opened.pragma("query_only = ON");
-      // Only a WAL database lets the writer commit while a read transaction is
-      // open. Any other journal mode would block every write until release.
-      if (opened.pragma("journal_mode", { simple: true }) !== "wal")
-        throw new Error("sqlite_snapshot_needs_wal");
-      opened.exec("BEGIN");
-      // The read transaction starts at its first read: take it now.
-      opened.prepare("SELECT 1 FROM sqlite_master LIMIT 1").get();
-    } catch (error) {
-      opened.close();
-      throw error;
-    }
-    const snap = ++snapshotSeq;
-    snapshots.set(snap, { db: opened, cache: createStatementCache(opened) });
-    return snap;
-  },
-  release({ snap }) {
-    const held = snapshots.get(snap);
-    if (!held) return null;
-    snapshots.delete(snap);
-    try {
-      held.cache.clear();
-      held.db.close();
-    } catch {}
-    return null;
-  },
   query(statement) {
-    const { params, snap } = statement;
-    let cached;
-    if (snap !== undefined) {
-      const held = snapshots.get(snap);
-      if (!held) throw new Error("sqlite_snapshot_released");
-      cached = held.cache;
-    } else {
-      if (role === "reader") checkReader();
-      cached = cache;
-    }
-    const stmt = cached.prepare(textOf(statement));
+    const { params } = statement;
+    if (role === "reader") checkReader();
+    const stmt = cache.prepare(textOf(statement));
     if (stmt.reader) return stmt.all(...bind(params));
     stmt.run(...bind(params));
     return [];
@@ -300,12 +250,6 @@ const run = {
     }
   },
   close() {
-    for (const { db: held } of snapshots.values()) {
-      try {
-        held.close();
-      } catch {}
-    }
-    snapshots.clear();
     try {
       cache?.clear();
       db?.close();
@@ -368,15 +312,14 @@ let handled = 0;
  * its reply, whichever reply it was: `batch`, and `query` (a statement, or a
  * write with RETURNING). A write that throws can still have committed rows
  * (`INSERT OR FAIL` keeps the rows before the failing one), so an error reply
- * is no reason to skip it. A snapshot's query runs on its own read-only
- * connection; `close` and a handle that never opened have nothing to
- * checkpoint.
+ * is no reason to skip it. `close` and a handle that never opened have
+ * nothing to checkpoint.
  */
-const writesOwnConnection = ({ op, snap }) =>
+const writesOwnConnection = ({ op }) =>
   role === "writer" &&
   isFile &&
   !openError &&
-  (op === "batch" || (op === "query" && snap === undefined));
+  (op === "batch" || op === "query");
 
 parentPort.on("message", (message) => {
   if (++handled % 25 === 0) gc();

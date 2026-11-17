@@ -324,27 +324,29 @@ describe("bounded local scope list", () => {
     expect(f.queries.length).toBe(one);
   });
 
-  it("serves the installed image when a retained head is newer, without fetching it", async () => {
+  it("lists an alias over an incomplete version the way a read serves it: from the installed records", async () => {
     const f = await fixture();
     await addConnection(f.db, "alpha1", "alpha");
     await addStream(f.db, "alpha1", "a1", { profile: "alpha", version: 2 });
     await addStream(f.db, "alpha1", "a2", { profile: "alpha", version: 2 });
-    // A newer complete version the installed head has not caught up with.
+    // An incremental run installed version 3 over the complete version 2.
     await f.db.batch([
       {
-        sql: "INSERT INTO stream_versions(connection_id, stream, version, generation, head_blob, head_format, record_count, observed_at, complete, kind) VALUES ('alpha1', 'a1', 3, 2, 'newer', 3, 1, 8000, 1, 'applied')",
+        sql: "INSERT INTO stream_versions(connection_id, stream, version, generation, head_blob, head_format, record_count, observed_at, complete, kind) VALUES ('alpha1', 'a1', 3, 2, 'newer', 3, 1, 8000, 0, 'applied')",
+      },
+      {
+        sql: "UPDATE stream_state SET head_version = 3, complete = 0 WHERE connection_id = 'alpha1' AND stream = 'a1'",
       },
     ]);
     const listed = await f.listing.listScopes({ canRead: everything });
+    // The alias whose projection fails on those records is not listed.
     expect(scopesOf(listed)).toEqual([
-      "fixture.broken",
       "fixture.summary",
       "pdpp.alpha.a1",
       "pdpp.alpha.a2",
     ]);
     expect(f.portCalls).toEqual([]);
-    // Aliases are listed without projecting records a read would not serve.
-    expect(f.project).not.toHaveBeenCalled();
+    expect(f.project).toHaveBeenCalled();
   });
 
   it("carries latestCollectedAt as the ISO form of updatedAt, and omits it with no times", async () => {

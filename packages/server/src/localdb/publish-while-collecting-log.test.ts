@@ -15,6 +15,7 @@ import {
   createGatewayStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
 } from "../../../core/src/stream-sync/index.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { createFakeGateway } from "./fake-gateway.js";
 
@@ -82,7 +83,6 @@ async function world(options: {
       logger: { info: () => {}, warn: () => {} },
       now: () => clock,
       newOp: () => `${deviceId}-${++op}`,
-      logProtocol: true,
       ...(options.admit ? { publishWhileCollecting: true } : {}),
     };
     const sync = createLocalSync(deps, {
@@ -98,8 +98,6 @@ async function world(options: {
           },
         ],
       }),
-      declaredStreams: () => ["items"],
-      olderVersionReads: () => true,
     });
     const begin = (id: string, observedAt?: number) => {
       clock++;
@@ -111,29 +109,38 @@ async function world(options: {
         owner: { address: OWNER, leaseId: null },
       });
     };
+    /** What each run sent, for its end. */
+    const sent = new Map<string, { live: boolean; deleted: boolean }>();
     const batch = (
       id: string,
       n: number,
       rows: Array<string | { id: string; remove?: boolean }>,
-    ) =>
-      sync.intake.batch(id, {
-        batch: n,
-        records: rows.map((r) => {
-          const row = typeof r === "string" ? { id: r } : r;
-          return {
-            stream: "items",
-            ...(row.remove ? { op: "delete" as const } : {}),
-            data: { id: row.id },
-          };
-        }),
+    ) => {
+      const seen = sent.get(id) ?? { live: false, deleted: false };
+      const records = rows.map((r) => {
+        const row = typeof r === "string" ? { id: r } : r;
+        if (row.remove) seen.deleted = true;
+        else seen.live = true;
+        return {
+          stream: "items",
+          ...(row.remove ? { op: "delete" as const } : {}),
+          data: { id: row.id },
+        };
       });
+      sent.set(id, seen);
+      return sync.intake.batch(id, { batch: n, records });
+    };
     const end = (id: string, lastBatch: number, proven = false) =>
-      sync.intake.end(id, {
-        outcome: "succeeded",
-        coveredStreams: ["items"],
-        lastBatch,
-        ...(proven ? { provenFullStreams: ["items"] } : {}),
-      });
+      sync.intake.end(
+        id,
+        endRequest({
+          lastBatch,
+          streams: ["items"],
+          ...(sent.get(id)?.live ? { live: ["items"] } : {}),
+          ...(sent.get(id)?.deleted ? { deleted: ["items"] } : {}),
+          ...(proven ? { provenFullStreams: ["items"] } : {}),
+        }),
+      );
     const cycle = async () => {
       const report = await sync.cycle();
       const failed = report.connections.find((c) => c.error !== null);

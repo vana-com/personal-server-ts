@@ -5,15 +5,30 @@ CONSTANTS MaxSteps, Mode, AllowReset, AllowRollback, KeepTail
 \* (see Devices); keyedStuck is the load without the Rebaseline step.
 KeyedModes == {"keyed","keyedSkip","keyedEarly","keyedLeak","keyedBypass",
                "keyedRebase","keyedStuck"}
+\* Every mode of a registry that loses log rows a device applied (no new lifetime). recommit:
+\* the registry loses one or two positions, and the writers that continue write the same
+\* segments. recommitOther: a writer may continue with another segment. recommitForeign
+\* (mutant): the device commits its segments again without checking that the registry's row
+\* is one it applied. noRecommit (mutant): no Recommit step, the code before it.
+\* rebase: a writer may continue with another segment, and a device the log no longer
+\* explains, and that cannot recommit, rebases (`Rebase`). rebaseRows (mutant): the rebase
+\* queues only the keys the device holds a record of, not its deletions and omissions.
+\* rebaseExplicit (mutant): it queues an omission as an explicit delete at its cutoff.
+\* rebaseLive: rebase with one device, for the liveness run.
+RebaseModes == {"rebase","rebaseLive","rebaseRows","rebaseExplicit"}
+RecommitModes == {"recommit","recommitOther","recommitForeign","noRecommit"} \cup RebaseModes
 ASSUME /\ MaxSteps \in 6..8
        /\ KeepTail = 1
        /\ Mode \in {"good","gap","outOfOrder","droppedDeleteEffect","forgetTombstone",
                     "omitNoCutoff","omitInclusive","dropKind","replayFromBase",
                     "grouped","groupedSkip","equalStamp","equalStampToday",
                     "keyed","keyedSkip","keyedEarly","keyedLeak","keyedBypass",
-                    "keyedRebase","keyedStuck"}
+                    "keyedRebase","keyedStuck",
+                    "recommit","recommitOther","recommitForeign","noRecommit",
+                    "rebase","rebaseLive","rebaseRows","rebaseExplicit"}
 \* A device's recovery does not depend on another device's: the liveness runs use one.
-Devices == IF Mode \in {"keyedRebase","keyedStuck"} THEN {1} ELSE {1,2,3}
+Devices == IF Mode \in {"keyedRebase","keyedStuck","rebaseLive"} THEN {1}
+           ELSE IF Mode \in RecommitModes THEN {1,2} ELSE {1,2,3}
 Keys == {1,2}
 Writers == {1,2}
 \* Keys stand for (stream A,key a) and (stream B,key b).
@@ -56,7 +71,18 @@ EqualStampBatches ==
     <<OpN(2,3,0,1,3,"delete",0), OpN(1,3,0,2,3,"omit",0)>>,
     <<OpN(1,5,13,2,4,"upsert",0)>>,
     <<OpN(1,5,14,1,5,"upsert",0)>> >>
-Batches == IF Mode \in {"equalStamp","equalStampToday"} THEN EqualStampBatches ELSE BaseBatches
+\* The rebase corpus. Batch 1 is the prefix both histories share. The device's history then
+\* deletes key 1 (stamp 3) and a pass omits key 2 (cutoff 3); another writer's history may
+\* instead upsert key 2 at that same stamp (an observation at a cutoff passes it) or key 1 at
+\* an older stamp (which the delete must still win), or follow the omission with that upsert.
+RebaseBatches ==
+ << <<Op(1,1,11,1,1,"upsert"), Op(2,1,21,1,1,"upsert")>>,
+    <<Op(1,3,0,1,2,"delete")>>,
+    <<Op(2,3,0,1,3,"omit")>>,
+    <<Op(2,3,22,2,4,"upsert")>>,
+    <<Op(1,2,13,2,5,"upsert")>> >>
+Batches == IF Mode \in {"equalStamp","equalStampToday"} THEN EqualStampBatches
+           ELSE IF Mode \in RebaseModes THEN RebaseBatches ELSE BaseBatches
 \* Rank: the observation order (stamp, kind, ord, body) as one number; absent is rank 0 and
 \* every real operation ranks above it. Kind: omission < upsert < explicit delete (the
 \* registry's tombstone kinds). Deletes and omissions are run-end entries and carry no ordinal. The body
@@ -149,9 +175,12 @@ LamportVisible(log) ==
 
 VARIABLES epoch, log, retained, cut, snapshot, budget, stopped,
           deviceEpoch, position, known, data, hints, prefixOK, monotoneOK, omissionOK,
-          stage, stageAt, dur, durAt, durEp
+          stage, stageAt, dur, durAt, durEp, applied, rebasedOps
+\* applied[d]: the segments device d applied, in position order (the code's `log_state.refs`;
+\* the snapshot install keeps the registry's refs up to the snapshot position).
 vars == <<epoch,log,retained,cut,snapshot,budget,stopped,
-          deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp>>
+          deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp,
+          applied,rebasedOps>>
 Init ==
  /\ epoch = 1 /\ log = <<>> /\ retained = {} /\ cut = 0 /\ snapshot = Empty
  /\ budget = 0 /\ stopped = FALSE
@@ -166,6 +195,8 @@ Init ==
  /\ dur = [d \in Devices |-> Empty]
  /\ durAt = [d \in Devices |-> 0]
  /\ durEp = [d \in Devices |-> 1]
+ /\ applied = [d \in Devices |-> <<>>]
+ /\ rebasedOps = {}
 
 AllOps(history) == UNION { {history[i][j] : j \in 1..Len(history[i])} :
                            i \in 1..Len(history) }
@@ -176,12 +207,12 @@ Commit ==
     /\ retained' = retained \cup {p}
     /\ hints' = hints \cup {[generation |-> epoch, at |-> p]}
  /\ budget' = budget+1
- /\ UNCHANGED <<epoch,cut,snapshot,stopped,deviceEpoch,position,known,data,
-                prefixOK,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp>>
+ /\ UNCHANGED <<rebasedOps,epoch,cut,snapshot,stopped,deviceEpoch,position,known,data,
+                prefixOK,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp,applied>>
 Stop ==
  /\ ~stopped /\ stopped' = TRUE
- /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,
-                deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp>>
+ /\ UNCHANGED <<rebasedOps,epoch,log,retained,cut,snapshot,budget,
+                deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp,applied>>
 \* Reset is an authoritative new lifetime, not wall-clock inference.
 \* Offline devices do not learn it instantly; their old view remains until read.
 Reset ==
@@ -190,29 +221,35 @@ Reset ==
  /\ budget'=budget+1
  /\ stage' = [d \in Devices |-> Empty]
  /\ stageAt' = [d \in Devices |-> [k \in Keys |-> 0]]
- /\ UNCHANGED <<stopped,deviceEpoch,position,known,data,hints,
-                prefixOK,monotoneOK,omissionOK,dur,durAt,durEp>>
+ /\ UNCHANGED <<rebasedOps,stopped,deviceEpoch,position,known,data,hints,
+                prefixOK,monotoneOK,omissionOK,dur,durAt,durEp,applied>>
 \* Registry rollback (at most one: it needs epoch 1 and leaves epoch 2). The authoritative head
 \* moves back one batch and may be replaced by another corpus batch, so a device ahead of the
 \* head or holding the replaced batch is diverged. The new lifetime rebases the snapshot to
 \* Empty (cut 0), so no snapshot of the rolled-back history survives.
+\* In RecommitModes the registry loses one or two rows and keeps at least one; epoch 2 then
+\* marks only that the registry's history moved under the devices, which each device
+\* reconciles (`FullCheck` or `Recommit`). In recommit and noRecommit no other segment
+\* replaces them.
 Rollback ==
- /\ AllowRollback /\ ~stopped /\ epoch=1 /\ Len(log)>=2 /\ budget<MaxSteps
- /\ \E alt \in 0..Len(Batches) :
-     LET kept == SubSeq(log,1,Len(log)-1)
+ /\ AllowRollback /\ ~stopped /\ epoch=1 /\ budget<MaxSteps
+ /\ \E n \in (IF Mode \in RecommitModes THEN 1..2 ELSE 1..1),
+       alt \in (IF Mode \in {"recommit","noRecommit"} THEN {0} ELSE 0..Len(Batches)) :
+     LET kept == SubSeq(log,1,Len(log)-n)
          newLog == IF alt = 0 THEN kept ELSE Append(kept,Batches[alt])
-     IN /\ log' = newLog
+     IN /\ Len(log) >= n+1
+        /\ log' = newLog
         /\ epoch' = 2 /\ cut' = 0 /\ snapshot' = Empty
         /\ retained' = {p \in 1..Len(newLog) : p > 0}
  /\ budget' = budget+1
  /\ stage' = [d \in Devices |-> Empty]
  /\ stageAt' = [d \in Devices |-> [k \in Keys |-> 0]]
- /\ UNCHANGED <<stopped,deviceEpoch,position,known,data,hints,
-                prefixOK,monotoneOK,omissionOK,dur,durAt,durEp>>
+ /\ UNCHANGED <<rebasedOps,stopped,deviceEpoch,position,known,data,hints,
+                prefixOK,monotoneOK,omissionOK,dur,durAt,durEp,applied>>
 \* A device that holds durable unpublished rows (`durAt[d] # 0`: the code's `log_keyed_pending`
 \* marker) takes no other way to move its position or its rows: not a segment, a group, a
 \* snapshot, a lifetime change. Each of those would publish a cursor over rows it did not
-\* write or cannot account for, so the code refuses them (`LogDivergedError`) until a
+\* write or cannot account for, so the code refuses them (`unfinishedKeyedLoad`) until a
 \* key-ordered load that covers the rows publishes. keyedBypass mutant: no such refusal.
 NoPending(d) == Mode = "keyedBypass" \/ durAt[d] = 0
 \* The rows a device physically holds: the durable unpublished rows are in the live table, so
@@ -221,31 +258,37 @@ NoPending(d) == Mode = "keyedBypass" \/ durAt[d] = 0
 LiveRows(d) == [k \in Keys |-> MergeRow(data[d][k], dur[d][k])]
 \* A full check adopts the current lifetime and resets a device that was on another one.
 \* replayFromBase mutant: the device keeps its rows and position and replays from there.
+\* In RecommitModes a device keeps its rows when the registry's log holds, at every position
+\* the device applied, the segment it applied there (`Explains`); otherwise this step is not
+\* taken: the device recommits (`Recommit`) or, in RebaseModes, rebases (`Rebase`).
+Explains(d) == position[d] <= Len(log) /\ Prefix(log,position[d]) = applied[d]
 FullCheck(d) ==
  /\ (deviceEpoch[d] # epoch \/ known[d] # Len(log))
  /\ (deviceEpoch[d] # epoch => NoPending(d))
+ /\ (Mode \in RecommitModes /\ deviceEpoch[d] # epoch) => Explains(d)
  /\ deviceEpoch' = [deviceEpoch EXCEPT ![d]=epoch]
  /\ known' = [known EXCEPT ![d]=Len(log)]
- /\ LET relabel == deviceEpoch[d] # epoch /\ Mode # "replayFromBase"
+ /\ LET relabel == deviceEpoch[d] # epoch /\ Mode \notin ({"replayFromBase"} \cup RecommitModes)
     IN /\ position' = IF relabel THEN [position EXCEPT ![d]=0] ELSE position
        /\ data' = IF relabel THEN [data EXCEPT ![d]=Empty] ELSE data
+       /\ applied' = IF relabel THEN [applied EXCEPT ![d] = <<>>] ELSE applied
  /\ monotoneOK' = (monotoneOK /\ epoch >= deviceEpoch[d])
  /\ stage' = IF deviceEpoch[d] # epoch THEN [stage EXCEPT ![d]=Empty] ELSE stage
  /\ stageAt' = IF deviceEpoch[d] # epoch
                THEN [stageAt EXCEPT ![d]=[k \in Keys |-> 0]] ELSE stageAt
- /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,hints,prefixOK,omissionOK,dur,durAt,durEp>>
+ /\ UNCHANGED <<rebasedOps,epoch,log,retained,cut,snapshot,budget,stopped,hints,prefixOK,omissionOK,dur,durAt,durEp>>
 \* Deliver does NOT consume the hint, permitting duplicate/reordered delivery.
 \* Stale lifetime hints carry no authority to roll a device back.
 Deliver(d,h) ==
  /\ h \in hints
  /\ known' = IF h.generation=deviceEpoch[d] /\ h.at>known[d]
              THEN [known EXCEPT ![d]=h.at] ELSE known
- /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
-                deviceEpoch,position,data,hints,prefixOK,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp>>
+ /\ UNCHANGED <<rebasedOps,epoch,log,retained,cut,snapshot,budget,stopped,
+                deviceEpoch,position,data,hints,prefixOK,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp,applied>>
 Drop(h) ==
  /\ h \in hints /\ hints'=hints \ {h}
- /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
-                deviceEpoch,position,known,data,prefixOK,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp>>
+ /\ UNCHANGED <<rebasedOps,epoch,log,retained,cut,snapshot,budget,stopped,
+                deviceEpoch,position,known,data,prefixOK,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp,applied>>
 Compact ==
  /\ Len(log)>KeepTail /\ cut < Len(log)-KeepTail
  /\ cut'=Len(log)-KeepTail
@@ -255,16 +298,17 @@ Compact ==
               THEN ForgetTombstones(FoldLog(Empty,Prefix(log,cut')))
               ELSE FoldLog(Empty,Prefix(log,cut'))
  /\ retained'={p \in retained : p>cut'}
- /\ UNCHANGED <<epoch,log,budget,stopped,deviceEpoch,position,known,data,hints,
-                prefixOK,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp>>
+ /\ UNCHANGED <<rebasedOps,epoch,log,budget,stopped,deviceEpoch,position,known,data,hints,
+                prefixOK,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp,applied>>
 \* A reader behind the snapshot merges it into the rows it already has.
 Install(d) ==
  /\ NoPending(d)
  /\ deviceEpoch[d]=epoch /\ position[d]<cut /\ known[d]>=cut
  /\ data'=[data EXCEPT ![d]=[k \in Keys |-> MergeRow(LiveRows(d)[k],snapshot[k])]]
  /\ position'=[position EXCEPT ![d]=cut]
+ /\ applied'=[applied EXCEPT ![d]=Prefix(log,cut)]
  /\ monotoneOK'=(monotoneOK /\ cut>=position[d])
- /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
+ /\ UNCHANGED <<rebasedOps,epoch,log,retained,cut,snapshot,budget,stopped,
                 deviceEpoch,known,hints,prefixOK,omissionOK,stage,stageAt,dur,durAt,durEp>>
 OmissionSafeFor(state,ops) ==
  \A i \in 1..Len(ops):
@@ -280,10 +324,11 @@ Apply(d,p) ==
  /\ (Mode="outOfOrder" \/ p=position[d]+1)
  /\ data'=[data EXCEPT ![d]=FoldOps(LiveRows(d),log[p],Mode="omitNoCutoff",p)]
  /\ position'=[position EXCEPT ![d]=p]
+ /\ applied'=[applied EXCEPT ![d]=Append(applied[d],log[p])]
  /\ prefixOK'=(prefixOK /\ p=position[d]+1)
  /\ monotoneOK'=(monotoneOK /\ p>=position[d])
  /\ omissionOK'=(omissionOK /\ OmissionSafeFor(data[d],log[p]))
- /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
+ /\ UNCHANGED <<rebasedOps,epoch,log,retained,cut,snapshot,budget,stopped,
                 deviceEpoch,known,hints,stage,stageAt,dur,durAt,durEp>>
 \* Mutant: treating a later position hint as an applied checkpoint without
 \* detecting/fetching its missing predecessors.
@@ -292,8 +337,8 @@ SkipGap(d) ==
  /\ Mode="gap" /\ deviceEpoch[d]=epoch /\ known[d]>position[d]+1
  /\ position'=[position EXCEPT ![d]=known[d]]
  /\ prefixOK'=FALSE
- /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
-                deviceEpoch,known,data,hints,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp>>
+ /\ UNCHANGED <<rebasedOps,epoch,log,retained,cut,snapshot,budget,stopped,
+                deviceEpoch,known,data,hints,monotoneOK,omissionOK,stage,stageAt,dur,durAt,durEp,applied>>
 \* Group commit (a first load applies the segments it holds in few transactions): ONE
 \* transaction applies the retained segments position+1..q in order, and writes position q
 \* with the last of them (as `Apply` writes it with one). No state between them is committed,
@@ -316,12 +361,13 @@ ApplyRun(d,q) ==
       THEN FoldOps(FoldOps(data[d],log[position[d]+1],FALSE,position[d]+1),log[q],FALSE,q)
       ELSE FoldRun(LiveRows(d),position[d]+1,q)]
  /\ position'=[position EXCEPT ![d]=q]
+ /\ applied'=[applied EXCEPT ![d]=applied[d] \o SubSeq(log,position[d]+1,q)]
  \* Each constituent segment is the next position, so the prefix rule holds step by step.
  /\ prefixOK'=prefixOK
  /\ monotoneOK'=(monotoneOK /\ q>=position[d])
  /\ omissionOK'=(omissionOK /\ \A p \in (position[d]+1)..q :
        OmissionSafeFor(FoldRun(data[d],position[d]+1,p-1),log[p]))
- /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
+ /\ UNCHANGED <<rebasedOps,epoch,log,retained,cut,snapshot,budget,stopped,
                 deviceEpoch,known,hints,stage,stageAt,dur,durAt,durEp>>
 \* Keyed first load (a device with no rows and no position loads a log that has never compacted
 \* key by key instead of segment by segment). The host stages the run's operations by key
@@ -363,9 +409,9 @@ KeyedLoad(d,k,q) ==
       THEN FoldKeyRun(FoldKeyRun(Empty,k,1,q-2),k,q,q)[k]
       ELSE FoldKeyRun(Empty,k,1,q)[k]]
  /\ stageAt' = [stageAt EXCEPT ![d][k]=q]
- /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
+ /\ UNCHANGED <<rebasedOps,epoch,log,retained,cut,snapshot,budget,stopped,
                 deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK,
-                dur,durAt,durEp>>
+                dur,durAt,durEp,applied>>
 \* One bucket's rows become durable (the live table merges them), with the pending target
 \* in the same transaction. The position does not move.
 KeyedBucket(d,k) ==
@@ -375,9 +421,9 @@ KeyedBucket(d,k) ==
  /\ durAt' = [durAt EXCEPT ![d] = IF durAt[d] > stageAt[d][k] /\ durEp[d] = epoch
                                   THEN durAt[d] ELSE stageAt[d][k]]
  /\ durEp' = [durEp EXCEPT ![d] = epoch]
- /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
+ /\ UNCHANGED <<rebasedOps,epoch,log,retained,cut,snapshot,budget,stopped,
                 deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK,
-                stage,stageAt>>
+                stage,stageAt,applied>>
 \* A page of a bucket's complex rows (the code's `complexPages`): a run of one key's
 \* operations, committed alone, so the durable row holds a PARTIAL fold of the key (segments
 \* 1..j of the stage's 1..q, j < q), with the same pending target. Folding the rest at
@@ -389,9 +435,9 @@ KeyedPage(d,k,j) ==
  /\ durAt' = [durAt EXCEPT ![d] = IF durAt[d] > stageAt[d][k] /\ durEp[d] = epoch
                                   THEN durAt[d] ELSE stageAt[d][k]]
  /\ durEp' = [durEp EXCEPT ![d] = epoch]
- /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
+ /\ UNCHANGED <<rebasedOps,epoch,log,retained,cut,snapshot,budget,stopped,
                 deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK,
-                stage,stageAt>>
+                stage,stageAt,applied>>
 KeyedPublish(d,q) ==
  /\ KeyedGate(d)
  /\ q \in retained /\ q<=known[d]
@@ -400,6 +446,7 @@ KeyedPublish(d,q) ==
     ELSE \A k \in Keys : stageAt[d][k]=q
  /\ data' = [data EXCEPT ![d] = [k \in Keys |-> MergeRow(dur[d][k], stage[d][k])]]
  /\ position' = [position EXCEPT ![d]=q]
+ /\ applied' = [applied EXCEPT ![d]=Prefix(log,q)]
  /\ prefixOK' = prefixOK
  /\ monotoneOK' = (monotoneOK /\ q>=position[d])
  /\ omissionOK' = (omissionOK /\ \A p \in 1..q :
@@ -409,7 +456,7 @@ KeyedPublish(d,q) ==
  /\ dur' = [dur EXCEPT ![d]=Empty]
  /\ durAt' = [durAt EXCEPT ![d]=0]
  /\ durEp' = [durEp EXCEPT ![d]=epoch]
- /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
+ /\ UNCHANGED <<rebasedOps,epoch,log,retained,cut,snapshot,budget,stopped,
                 deviceEpoch,known,hints>>
 \* A crash, or the next start: the stage goes, the durable rows and the pending target stay.
 StageLost(d) ==
@@ -417,9 +464,9 @@ StageLost(d) ==
  /\ \E k \in Keys : stageAt[d][k] # 0
  /\ stage' = [stage EXCEPT ![d]=Empty]
  /\ stageAt' = [stageAt EXCEPT ![d]=[k \in Keys |-> 0]]
- /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
+ /\ UNCHANGED <<rebasedOps,epoch,log,retained,cut,snapshot,budget,stopped,
                 deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK,
-                dur,durAt,durEp>>
+                dur,durAt,durEp,applied>>
 \* A load of this log can no longer finish the durable rows (`durAt[d] # 0`) a stopped
 \* key-ordered load left: the log is of another lifetime (a reset or a rewrite) or it compacted,
 \* so a snapshot and a new base stand in for the prefix those rows came from. The code decides
@@ -446,9 +493,69 @@ Rebaseline(d) ==
  /\ durEp' = [durEp EXCEPT ![d]=epoch]
  /\ stage' = [stage EXCEPT ![d]=Empty]
  /\ stageAt' = [stageAt EXCEPT ![d]=[k \in Keys |-> 0]]
- /\ UNCHANGED <<epoch,log,retained,cut,snapshot,budget,stopped,
-                deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK>>
-Recover(d) == Install(d) \/ (\E p \in retained : Apply(d,p)) \/ SkipGap(d)
+ /\ UNCHANGED <<rebasedOps,epoch,log,retained,cut,snapshot,budget,stopped,
+                deviceEpoch,position,known,data,hints,prefixOK,monotoneOK,omissionOK,applied>>
+\* The recommit (`log-recommit.ts`): a device the registry is behind, whose segments agree with
+\* every row the registry still holds, commits its next segment again at the registry's next
+\* position, against the registry's head. It adopts the registry's history once the registry is
+\* at its position. Its rows do not change: they are the fold of the segments it applied, and
+\* the log now holds those segments. Other devices then read them like any commit.
+\* recommitForeign mutant: no agreement check (the code's check that the segment the registry
+\* names at its position is the one this device applied there).
+Recommit(d) ==
+ /\ Mode \in RecommitModes /\ Mode # "noRecommit"
+ /\ NoPending(d)
+ /\ deviceEpoch[d] # epoch /\ Len(log) >= 1 /\ Len(log) < position[d]
+ /\ Len(applied[d]) = position[d]
+ /\ Mode = "recommitForeign" \/ Prefix(applied[d],Len(log)) = log
+ /\ LET p == Len(log)+1 IN
+    /\ log' = Append(log,applied[d][p])
+    /\ retained' = retained \cup {p}
+    /\ hints' = hints \cup {[generation |-> epoch, at |-> p]}
+    /\ deviceEpoch' = IF p = position[d] THEN [deviceEpoch EXCEPT ![d]=epoch] ELSE deviceEpoch
+    /\ known' = IF p = position[d] THEN [known EXCEPT ![d]=p] ELSE known
+ /\ UNCHANGED <<rebasedOps,epoch,cut,snapshot,budget,stopped,position,data,prefixOK,monotoneOK,
+                omissionOK,stage,stageAt,dur,durAt,durEp,applied>>
+\* The rebase (`log-rebase.ts`): a device the registry's log no longer explains, and that
+\* cannot recommit (the log names another segment at a position it applied), puts back what
+\* only its history held. The fork is the last position both logs agree on; the segments the
+\* device applied after it are lost from the log. For every key they touched the device
+\* queues the operation that wins that key in its rows (`seedFromHistory`: a record, or the
+\* delete or omission that removed it), and the next publish writes them as one segment on
+\* top of the registry's log. One step here: the code queues and moves its position back in
+\* one commit, applies the registry's segments over its rows (merged by stamp) and then
+\* publishes. The device then holds the fold of the log it published to.
+Fork(d) == CHOOSE p \in 0..Min2(Len(applied[d]),Len(log)) :
+             /\ Prefix(applied[d],p) = Prefix(log,p)
+             /\ \A q \in (p+1)..Min2(Len(applied[d]),Len(log)) : Prefix(applied[d],q) # Prefix(log,q)
+CanRecommit(d) == Len(log) >= 1 /\ Len(log) < position[d] /\ Len(applied[d]) = position[d]
+                  /\ Prefix(applied[d],Len(log)) = log
+Winner(d,k) == CHOOSE o \in AllOps(applied[d]) : o.key = k /\ Rank(o) = data[d][k].rank
+SeedOp(d,k) == IF Mode = "rebaseExplicit" /\ Winner(d,k).kind = "omit"
+               THEN [Winner(d,k) EXCEPT !.kind = "delete"] ELSE Winner(d,k)
+SeedKeys(d) ==
+  LET touched == {o.key : o \in AllOps(SubSeq(applied[d],Fork(d)+1,Len(applied[d])))}
+  IN IF Mode = "rebaseRows" THEN {k \in touched : data[d][k].body # 0} ELSE touched
+Seed(d) == (IF 1 \in SeedKeys(d) THEN <<SeedOp(d,1)>> ELSE <<>>)
+           \o (IF 2 \in SeedKeys(d) THEN <<SeedOp(d,2)>> ELSE <<>>)
+Rebase(d) ==
+ /\ Mode \in RebaseModes
+ /\ NoPending(d)
+ /\ deviceEpoch[d] # epoch /\ ~Explains(d) /\ ~CanRecommit(d)
+ /\ LET newLog == IF Seed(d) = <<>> THEN log ELSE Append(log,Seed(d))
+    IN /\ log' = newLog
+       /\ retained' = retained \cup {p \in 1..Len(newLog) : p > Len(log)}
+       /\ hints' = IF Seed(d) = <<>> THEN hints
+                   ELSE hints \cup {[generation |-> epoch, at |-> Len(newLog)]}
+       /\ data' = [data EXCEPT ![d] = FoldLog(Empty,newLog)]
+       /\ position' = [position EXCEPT ![d] = Len(newLog)]
+       /\ applied' = [applied EXCEPT ![d] = newLog]
+       /\ known' = [known EXCEPT ![d] = Len(newLog)]
+       /\ deviceEpoch' = [deviceEpoch EXCEPT ![d] = epoch]
+       /\ rebasedOps' = rebasedOps \cup AllOps(applied[d])
+ /\ UNCHANGED <<epoch,cut,snapshot,budget,stopped,prefixOK,monotoneOK,omissionOK,
+                stage,stageAt,dur,durAt,durEp>>
+Recover(d) == Recommit(d) \/ Rebase(d) \/ Install(d) \/ (\E p \in retained : Apply(d,p)) \/ SkipGap(d)
               \/ Rebaseline(d)
               \/ (\E q \in retained : ApplyRun(d,q))
               \/ (\E k \in Keys, q \in retained : KeyedLoad(d,k,q))
@@ -477,10 +584,12 @@ NoPushSpec == Init /\ [][NoPushNext]_vars
         /\ WF_vars(Stop)
         /\ \A d \in Devices : WF_vars(FullCheck(d)) /\ WF_vars(Recover(d))
 
+LogBound == MaxSteps + (IF Mode \in RebaseModes THEN Cardinality(Devices) ELSE 0)
 TypeOK ==
  /\ epoch \in 1..2 /\ budget \in 0..MaxSteps /\ stopped \in BOOLEAN
  /\ cut \in 0..Len(log) /\ retained = (cut+1)..Len(log)
- /\ \A d \in Devices : position[d] \in 0..MaxSteps /\ known[d] \in 0..MaxSteps
+ \* A rebase appends one batch per device per epoch beyond the writers' commits.
+ /\ \A d \in Devices : position[d] \in 0..LogBound /\ known[d] \in 0..LogBound
                        /\ deviceEpoch[d] \in 1..epoch
 P1 == \A d \in Devices :
        (deviceEpoch[d]=epoch /\ position[d]=Len(log))
@@ -508,6 +617,13 @@ IntendedBody(k) ==
 P7 == \A d \in Devices :
        (deviceEpoch[d]=epoch /\ position[d]=Len(log))
        => \A k \in Keys : data[d][k].body = IntendedBody(k)
+\* After a rebase, the log loses nothing the device applied: every operation it applied is
+\* at or below the winner of its key in the log's fold, so neither a record nor a deletion
+\* of the device's history is undone by an older operation of the other one.
+NoLoss == \A o \in rebasedOps : FoldLog(Empty,log)[o.key].rank >= Rank(o)
+\* The log carries only operations some writer made: a rebase queues the device's own
+\* winners as they are, not an operation of another kind or rank.
+Faithful == AllOps(log) \subseteq CorpusOps
 EventuallyConverged == <>[](stopped /\ CaughtUp /\ P1)
 \* The crash that drops a stage (`StageLost`) is the environment's, and a device that is
 \* crashed again before every step never finishes a load, in any design. The liveness claim for

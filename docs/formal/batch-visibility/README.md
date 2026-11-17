@@ -321,7 +321,7 @@ Command: `java -XX:+UseParallelGC -Xmx2g -cp tla2tools.jar tlc2.TLC -workers 2 -
 (tla2tools 1.7.4, `nice -n 19 ionice -c3`, 900 s timeout per run). Each run ran
 alone. Depth for completed runs is TLC's "complete state graph search" depth. For
 unfinished runs it is the last `Progress(n)` level. Counts for unfinished runs are
-the last Progress line before the timeout. Logs are in `~/.tmp/tla-brief-meta/`
+the last Progress line before the timeout. Logs were local
 (not committed); state dirs were deleted after each run.
 
 | Config                           | K        | MaxSteps | Result                                                | States generated            | Distinct states            | Depth                    | Runtime       |

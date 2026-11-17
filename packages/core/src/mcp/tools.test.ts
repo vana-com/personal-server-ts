@@ -2024,6 +2024,39 @@ describe("mcp/tools", () => {
     expect(payload.limits.maxScopes).toBeGreaterThan(10);
   });
 
+  it("list_granted_scopes preserves collection time while size and readiness remain unknown", async () => {
+    const collectedAt = "2026-10-01T00:00:00.000Z";
+    const getScopeMetadata = vi.fn(async (scope: string) => ({
+      scope,
+      collectedAt,
+    }));
+    const readClient = createMinimalReadClient({ getScopeMetadata });
+    const result = await getTool("list_granted_scopes").handler(
+      {},
+      {
+        connection: {
+          ...createConnection(),
+          grants: [{ grantId: "grant-1", scopes: ["pdpp.oura.sleep"] }],
+        },
+        readClient,
+      },
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.scopes).toHaveLength(1);
+    expect(payload.scopes[0]).toMatchObject({
+      scope: "pdpp.oura.sleep",
+      collectedAt,
+      dataStatus: "unknown",
+      sizeClass: "unknown",
+      recommendedAccess: "search",
+    });
+    expect(payload.scopes[0]).not.toHaveProperty("sizeBytes");
+    expect(payload.scopes[0].reason).toContain("size is unknown");
+    expect(getScopeMetadata).toHaveBeenCalledWith("pdpp.oura.sleep", "grant-1");
+    expect(readClient.readScopeBlocks).not.toHaveBeenCalled();
+    expect(readClient.readRawScopeFile).not.toHaveBeenCalled();
+  });
+
   it("list_granted_scopes returns planning metadata for each scope", async () => {
     const readClient = createMinimalReadClient({
       getScopeMetadata: vi.fn((scope: string) => {

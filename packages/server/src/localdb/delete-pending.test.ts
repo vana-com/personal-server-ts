@@ -8,12 +8,15 @@ import {
   createMemoryStreamSyncBlobs,
   createMemoryStreamSyncRegistry,
   type MemoryStreamSyncRegistry,
+  type StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { RegistryRefusedError } from "../../../core/src/stream-sync/ports.js";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import { createLocalSync } from "../../../core/src/localdb/sync.js";
 import { remoteFixture } from "./apply-fixture.js";
+import { legacyHeadRow } from "./legacy-head-fixture.js";
+import { deriveKeyCheck } from "@opendatalabs/personal-server-ts-stream-sync";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}` as const;
@@ -35,8 +38,17 @@ async function stuckDelete(
   };
   const fixture = await remoteFixture(keys);
   const registry = createMemoryStreamSyncRegistry() as MemoryStreamSyncRegistry;
+  // A gateway without the batch route: the delete takes the per-stream path.
+  (registry as StreamSyncRegistry).postBatch = undefined;
   const blobs = createMemoryStreamSyncBlobs();
-  await fixture.head("items", [{ id: "base" }]);
+  await legacyHeadRow({
+    ...fixture,
+    keys,
+    keyCheck: await deriveKeyCheck((m) => keys.namespaceHmac(m)),
+    connector: "fixture-source",
+    ns: "",
+    stream: "items",
+  });
   for (const [key, value] of fixture.blobs) await blobs.put(key, value);
   for (const [scope, row] of fixture.reads)
     if (row.found)
@@ -76,8 +88,6 @@ async function stuckDelete(
         { name: "items", semantics: "mutable_state", primaryKey: ["id"] },
       ],
     }),
-    declaredStreams: () => ["items"],
-    olderVersionReads: () => true,
     deleteRetryMs: { first: 5, max: 20 },
   });
   syncs.push(sync);

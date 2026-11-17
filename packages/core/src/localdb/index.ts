@@ -1,10 +1,4 @@
-export type {
-  SqlDriver,
-  SqlReader,
-  SqlSnapshot,
-  SqlStatement,
-  SqlValue,
-} from "./driver.js";
+export type { SqlDriver, SqlReader, SqlStatement, SqlValue } from "./driver.js";
 export { readerOf } from "./driver.js";
 export { localDatabaseName } from "./name.js";
 export { LocalDbTooNew, migrate } from "./migrate.js";
@@ -34,12 +28,8 @@ export {
   replaceMayApply,
   type ReplaceInput,
 } from "./replace.js";
-export { applyConnection, applyStream, type ApplyResult } from "./apply.js";
-export {
-  publishConnection,
-  type PublishResult,
-  type PublicationReceipt,
-} from "./publish.js";
+export { applyConnection } from "./apply.js";
+export { type PublishResult, type PublicationReceipt } from "./publish.js";
 export {
   applyLog,
   LogDivergedError,
@@ -47,7 +37,6 @@ export {
   applySnapshotPart,
 } from "./log-apply.js";
 export { publishLog } from "./log-publish.js";
-export { encodePrefixes, type EncodedPart } from "./encode.js";
 export { unwriteRefusedRun } from "./unwrite.js";
 export { runCycle, syncConnection, type CycleReport } from "./cycle.js";
 export { UpdateRequiredError } from "./update-required.js";
@@ -71,12 +60,6 @@ export {
   type RecordQuery,
   type StoredRecord,
 } from "./query.js";
-export {
-  createOlderVersions,
-  type OlderVersionCounts,
-  type OlderVersions,
-  type VersionInfo,
-} from "./older-versions.js";
 export {
   createLocalResolver,
   type LocalResolver,

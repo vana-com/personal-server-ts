@@ -3,14 +3,19 @@
  * implements, held in process memory. A host that is built without a gateway
  * URL (tests, the stream-sync harnesses) passes it where the gateway client
  * would go. Every committed post is kept in `log`, in order. `beforePost` and
- * `afterPost` let a test hold a post before or after it commits.
+ * `afterPost` let a test hold a post before or after it commits (a batch calls
+ * them once per row). The connection log is written only through `postBatch`,
+ * which judges the conditions and each row as the gateway does.
  */
 import {
   parseScope,
   type ControlRead,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type {
+  RegistryBatchResult,
+  RegistryBatchRow,
   RegistryPostResult,
+  SignedRegistryBatch,
   SignedRegistryPost,
   StreamSyncBlobs,
   StreamSyncRegistry,
@@ -77,6 +82,72 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
     return { kind: "committed" };
   }
 
+  /**
+   * The gateway's `POST /v1/data/batch`: every condition is judged first (one
+   * that fails writes nothing), then each row lands or loses on its own. A row
+   * whose version and hash are the head's is a resend and answers as a
+   * conflict that names its own hash, which the caller reads as published.
+   */
+  async postBatch(request: SignedRegistryBatch): Promise<RegistryBatchResult> {
+    for (const req of request.requires) {
+      const rows = this.versions.get(req.scope);
+      const head = rows?.[rows.length - 1];
+      const reason = !rows
+        ? ("absent" as const)
+        : String(rows.length) !== req.expectedVersion
+          ? ("version-mismatch" as const)
+          : req.expectedDataHash !== undefined &&
+              req.expectedDataHash.toLowerCase() !==
+                head!.dataHash.toLowerCase()
+            ? ("data-hash-mismatch" as const)
+            : undefined;
+      if (reason !== undefined)
+        return {
+          kind: "precondition_failed",
+          failure: {
+            scope: req.scope,
+            reason,
+            latestVersion: rows ? String(rows.length) : null,
+            deleted: false,
+          },
+        };
+    }
+    const results: RegistryBatchRow[] = [];
+    for (const row of request.rows) {
+      const post = { ...row, ownerAddress: request.ownerAddress };
+      await this.beforePost?.(post);
+      const rows = this.versions.get(row.scope) ?? [];
+      const head = rows[rows.length - 1];
+      const latest = {
+        latestVersion: String(rows.length),
+        latestDataHash: head?.dataHash ?? null,
+      };
+      const fence = row.expectedHeadDataHash;
+      if (
+        Number(row.expectedVersion) !== rows.length + 1 ||
+        (fence !== undefined &&
+          head?.dataHash.toLowerCase() !== fence.toLowerCase())
+      ) {
+        results.push({ kind: "conflict", ...latest });
+        continue;
+      }
+      rows.push({
+        dataHash: row.dataHash,
+        metadataHash: row.metadataHash,
+        at: new Date(this.baseMs + rows.length * 1000).toISOString(),
+      });
+      this.versions.set(row.scope, rows);
+      this.log.push({
+        scope: row.scope,
+        version: rows.length,
+        dataHash: row.dataHash,
+      });
+      await this.afterPost?.(post);
+      results.push({ kind: "committed" });
+    }
+    return { kind: "rows", rows: results };
+  }
+
   async probeChange() {
     return this.log.length === 0 ? null : String(this.log.length);
   }
@@ -102,14 +173,10 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
     return out;
   }
 
-  async listConnectionRows(connector: string, ns: string) {
+  async listOwnerRows() {
     const out: { scope: string; read: ControlRead }[] = [];
-    for (const scope of this.versions.keys()) {
-      const parsed = parseScope(scope);
-      if (parsed?.connector === connector && parsed.ns === ns) {
-        out.push({ scope, read: await this.read(scope) });
-      }
-    }
+    for (const scope of this.versions.keys())
+      out.push({ scope, read: await this.read(scope) });
     return out;
   }
 }

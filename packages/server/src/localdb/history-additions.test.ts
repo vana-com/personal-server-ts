@@ -87,7 +87,6 @@ function history(db: SqlDriver, behind?: (id: string) => boolean) {
     ownerAddress: "0xabc",
   } as unknown as LocalSyncDeps;
   return createLocalHistory(deps, {
-    olderVersionReads: () => true,
     ...(behind ? { behind } : {}),
   });
 }

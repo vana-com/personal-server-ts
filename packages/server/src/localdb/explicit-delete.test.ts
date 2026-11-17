@@ -9,6 +9,7 @@ import {
   createMemoryStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
 } from "../../../core/src/stream-sync/index.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const drivers: SqlDriver[] = [];
@@ -64,8 +65,6 @@ async function world(
             },
           ],
         }),
-        declaredStreams: () => ["items"],
-        olderVersionReads: () => true,
       },
     );
     return {
@@ -105,12 +104,19 @@ async function world(
             data: { id: key },
           })),
         });
-        await sync.intake.end(id, {
-          outcome: "succeeded",
-          coveredStreams: ["items"],
-          lastBatch: 0,
-          ...(options.proven ? { provenFullStreams: ["items"] } : {}),
-        });
+        await sync.intake.end(
+          id,
+          endRequest({
+            lastBatch: 0,
+            streams: ["items"],
+            ...(rows.length === 0
+              ? {}
+              : options.remove
+                ? { deleted: ["items"] }
+                : { live: ["items"] }),
+            ...(options.proven ? { provenFullStreams: ["items"] } : {}),
+          }),
+        );
       },
       async publish() {
         expect(
@@ -178,11 +184,10 @@ it("a pending explicit tombstone wins over an older head learned before publish"
     records: [{ stream: "items", data: { id: "unseen" } }],
   });
   await a.run("delete-unseen", ["unseen"], { remove: true, observedAt: 2000 });
-  await b.sync.intake.end("older", {
-    outcome: "succeeded",
-    coveredStreams: ["items"],
-    lastBatch: 0,
-  });
+  await b.sync.intake.end(
+    "older",
+    endRequest({ lastBatch: 0, live: ["items"] }),
+  );
   await b.publish();
   await a.publish();
   await b.sync.apply();

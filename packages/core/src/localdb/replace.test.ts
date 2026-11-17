@@ -16,10 +16,12 @@ const fixture = JSON.parse(bytes.toString()) as {
     input: ReplaceInput;
     replace: boolean;
     source: { commit: string; path: string };
+    /** Why hosts do not replay this case. */
+    retired?: string;
   }[];
 };
 const SHA256 =
-  "cf246791fa8346f99010e424f3e3a0e208ddd600223f12b2b1a8a9a876dd86d3";
+  "6fecd54672fce78b93812110461de465d4e34a5adbdb9f2b9798c9b2f4c8256b";
 
 it("pins all 18 historical producer cases and #560 cases 1-5", () => {
   expect(createHash("sha256").update(bytes).digest("hex")).toBe(SHA256);
@@ -27,6 +29,12 @@ it("pins all 18 historical producer cases and #560 cases 1-5", () => {
     18,
   );
   expect(fixture.cases.filter((c) => c.id.startsWith("560-"))).toHaveLength(5);
+  // Hosts replay every case but the #560 reader cases, which core owns.
+  expect(
+    fixture.cases.filter((c) => c.retired !== undefined).map((c) => c.id),
+  ).toEqual(
+    fixture.cases.filter((c) => c.id.startsWith("560-")).map((c) => c.id),
+  );
   expect(new Set(fixture.cases.map((c) => c.id)).size).toBe(23);
   expect(
     fixture.cases.every((c) => /^[a-f0-9]{40}$/.test(c.source.commit)),

@@ -5,7 +5,7 @@ import { withOrigin } from "./merge.js";
 /**
  * F.5 step 1: the local purge of one connection, in the connection queue
  * (kind "purge"), in ONE batch with origin `purge`: delete the connection's
- * `records`, `run_rows`, `head_parts`, `blob_refs`, `publish_spool`, `stream_partial` rows and
+ * `records`, `run_rows`, `blob_refs`, `stream_partial` rows and
  * unreferenced `blobs`;
  * set `control_state='deleted'`; set `last_delete_version`; clear
  * `connections.checkpoint`. DELETES USER DATA. Spec: F.5, C.0 step 1.
@@ -38,10 +38,6 @@ export async function purgeConnection(
           params: [connectionId],
         },
         {
-          sql: "DELETE FROM head_parts WHERE connection_id = ?",
-          params: [connectionId],
-        },
-        {
           sql: "DELETE FROM blob_refs WHERE connection_id = ?",
           params: [connectionId],
         },
@@ -50,8 +46,7 @@ export async function purgeConnection(
    WHERE NOT EXISTS (SELECT 1 FROM blob_refs r WHERE r.blob_id = blobs.blob_id)`,
         },
         {
-          sql: `UPDATE stream_state SET last_delete_version = ?, consumed_version = 0,
-   consumed_generation = NULL, consumed_data_hash = NULL
+          sql: `UPDATE stream_state SET last_delete_version = ?
    WHERE connection_id = ?`,
           params: [deleted.controlVersion, connectionId],
         },
@@ -70,22 +65,12 @@ export async function purgeConnection(
           params: [connectionId],
         },
         {
-          sql: "DELETE FROM log_replay WHERE connection_id = ?",
-          params: [connectionId],
-        },
-        {
           sql: "DELETE FROM log_tombstones WHERE connection_id = ?",
           params: [connectionId],
         },
         // Publish while collecting remembers deletes of the same lifetime.
         {
           sql: "DELETE FROM record_tombstones WHERE connection_id = ?",
-          params: [connectionId],
-        },
-        // A publish copy of the deleted rows. Its transfer sees the rows gone
-        // and stops; the commit would refuse it in any case.
-        {
-          sql: "DELETE FROM publish_spool WHERE connection_id = ?",
           params: [connectionId],
         },
         // A first load in progress ends with the connection's rows.
@@ -103,9 +88,8 @@ export async function purgeConnection(
         controlVersion: deleted.controlVersion,
         recordsRemoved: changes[1],
         runRowsRemoved: changes[2],
-        headPartsRemoved: changes[3],
-        blobRefsRemoved: changes[4],
-        blobsRemoved: changes[5],
+        blobRefsRemoved: changes[3],
+        blobsRemoved: changes[4],
       },
       "purge connection",
     );

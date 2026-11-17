@@ -11,27 +11,23 @@ describe("the stream-sync design flags: one table", () => {
     const envs = STREAM_SYNC_DESIGN_FLAGS.map((flag) => flag.env);
     expect(new Set(names).size).toBe(names.length);
     expect(new Set(envs).size).toBe(envs.length);
-    expect(names).toEqual([
-      "publishWhileCollecting",
-      "logProtocol",
-      "progressiveFirstLoad",
-    ]);
+    expect(names).toEqual(["publishWhileCollecting", "progressiveFirstLoad"]);
   });
 
   it("is all off with no list and no environment", () => {
     expect(streamSyncFlagsOn(undefined)).toEqual({
       publishWhileCollecting: false,
-      logProtocol: false,
       progressiveFirstLoad: false,
     });
   });
 
   it("turns on the flags a comma list names, ignoring blanks, spaces and unknown names", () => {
     expect(
-      streamSyncFlagsOn(" logProtocol , nonsense,,progressiveFirstLoad "),
+      streamSyncFlagsOn(
+        " publishWhileCollecting , nonsense,,progressiveFirstLoad ",
+      ),
     ).toEqual({
-      publishWhileCollecting: false,
-      logProtocol: true,
+      publishWhileCollecting: true,
       progressiveFirstLoad: true,
     });
   });
@@ -39,15 +35,19 @@ describe("the stream-sync design flags: one table", () => {
   it("does not find a name on the object prototype", () => {
     expect(streamSyncFlagsOn("constructor,__proto__,toString")).toEqual({
       publishWhileCollecting: false,
-      logProtocol: false,
       progressiveFirstLoad: false,
     });
   });
 
   it("reads the list variable and each flag's own variable from an environment", () => {
     expect(
-      streamSyncFlagsOn(undefined, { [STREAM_SYNC_FLAGS_ENV]: "logProtocol" }),
-    ).toMatchObject({ logProtocol: true, publishWhileCollecting: false });
+      streamSyncFlagsOn(undefined, {
+        [STREAM_SYNC_FLAGS_ENV]: "progressiveFirstLoad",
+      }),
+    ).toMatchObject({
+      progressiveFirstLoad: true,
+      publishWhileCollecting: false,
+    });
     for (const flag of STREAM_SYNC_DESIGN_FLAGS) {
       expect(
         streamSyncFlagsOn(undefined, { [flag.env]: "true" })[flag.name],
@@ -61,7 +61,28 @@ describe("the stream-sync design flags: one table", () => {
 
   it("joins the list option and the environment", () => {
     expect(
-      streamSyncFlagsOn("logProtocol", { PS_PUBLISH_WHILE_COLLECTING: "true" }),
-    ).toMatchObject({ logProtocol: true, publishWhileCollecting: true });
+      streamSyncFlagsOn("progressiveFirstLoad", {
+        PS_PUBLISH_WHILE_COLLECTING: "true",
+      }),
+    ).toMatchObject({
+      progressiveFirstLoad: true,
+      publishWhileCollecting: true,
+    });
+  });
+
+  it("accepts the name of the removed logProtocol flag and its variable, and ignores both", () => {
+    // The connection log is the only protocol: a host that still passes the old
+    // name is not refused, and the name turns nothing on.
+    const off = {
+      publishWhileCollecting: false,
+      progressiveFirstLoad: false,
+    };
+    expect(streamSyncFlagsOn("logProtocol")).toEqual(off);
+    expect(
+      streamSyncFlagsOn(undefined, {
+        [STREAM_SYNC_FLAGS_ENV]: "logProtocol",
+        PS_STREAM_SYNC_LOG_PROTOCOL: "true",
+      }),
+    ).toEqual(off);
   });
 });

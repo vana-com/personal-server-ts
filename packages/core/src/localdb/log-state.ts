@@ -19,10 +19,10 @@ export interface LogState {
 
 /**
  * The registry's log is not a continuation of the one this device applied: it
- * is behind this device, or names another segment at a position this device
- * holds. A real rebaseline (rows, tombstones and checkpoints rebuilt from the
- * log, the local overlay kept apart) is not built; until it is, the device
- * refuses to read on top of state the log no longer vouches for.
+ * names another segment at a position this device holds. (A registry that is
+ * only behind gets the segments it lost committed again: `log-recommit.ts`.)
+ * `applyLog` rebases onto such a log (`log-rebase.ts`); it is thrown only when
+ * the log diverges again under the read that follows a rebase.
  */
 export class LogDivergedError extends Error {
   constructor(message: string) {

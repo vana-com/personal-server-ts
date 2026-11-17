@@ -1,43 +1,16 @@
-// Apply a change delta (`RegistryChangeDelta`) without the cycle's registry
-// reads.
+// Apply a registry change delta without a full cycle's registry reads.
+// The cycle takes one owner listing and reads each connection's control row;
+// its log row comes from the listing. A delta already carries changed rows.
 //
-// A full switched cycle reads, per wake, the control listing, each active
-// connection's control row, its stream rows, then the log row, before the one
-// read that moves data: the log segment. The gateway's delta already carries
-// every row that changed after the position this device holds, so for the
-// common changes (another device committed one log segment, or deleted a
-// connection) the device goes from the wake straight to the work.
+// Decide every connection before applying any. Tombstones save the control
+// row and purge; logs of active connections apply through the supplied row.
+// A reconnect, unsupported row, partial apply, delete intent, or incomplete
+// apply hands back to the cycle. Pending local writes still use the cycle.
 //
-// This path takes only what it can prove equal to a full cycle and hands
-// everything else back (`cycle`). A full cycle at the delta's `since` left
-// this device's connections, control rows and stream heads as the registry
-// held them then; the delta lists every row changed since. Per connection:
-//
-//  - a control row that is a tombstone: the cycle's own steps for it, with
-//    the delta's read in place of the listing's and the control read's. The
-//    row is saved as the listing saves it, and the connection is purged as a
-//    deleted control purges it. Its stream and log rows are not read: the
-//    cycle's apply returns at a deleted control before it lists them;
-//  - no control row, and this device holds the connection deleted: the same
-//    (its later stream tombstones change nothing a cycle reads);
-//  - a control row active at the lifetime this device holds (only its
-//    bookkeeping moved): nothing to do for it;
-//  - a log row of a connection this device holds active, already follows by
-//    its log, with no delete intent and no partial apply: `applyLog` with the
-//    delta's read, exactly the call the cycle ends with. It must reach the
-//    row's version with no partial mark standing, or the cycle runs;
-//  - anything else (another lifetime's control row, which needs a first load;
-//    a foreign one; a stream head or a deleted log row of a live connection; a
-//    log of a connection not held here; a log this device's own commit holds
-//    it past; a removed row; a server change; a reset): `cycle`.
-//
-// A partial mark on any connection, named in the delta or not, is a repair
-// the cycle owes: the whole delta is the cycle's.
-//
-// Each connection's work runs in its queue as an operation of its own: it
-// never joins another apply, whose answer would not be this delta's.
-// Nothing here writes the registry or publishes: pending local changes are
-// the cycle's (a local write asks for its own cycle).
+// The host owns answer ordering and cursor settlement: SyncManager runs one
+// pass at a time and advances since only after this promise (or the fallback
+// cycle) completes. A rejected connection must not leave sibling operations
+// running after this promise settles.
 
 import {
   classifyControl,
@@ -56,7 +29,6 @@ import type {
   RegistryChangeDelta,
   StreamSyncBlobs,
 } from "../stream-sync/ports.js";
-import { connectionHasLog } from "./apply.js";
 import { saveControl } from "./bootstrap.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { applyLog } from "./log-apply.js";
@@ -75,7 +47,6 @@ interface ConnectionRows {
   readonly ns: string;
   control?: ControlRead;
   log?: ControlRead;
-  heads: boolean;
 }
 
 interface Held {
@@ -101,12 +72,12 @@ export async function applyRegistryDelta(
     const id = controlScope(scope.connector, scope.ns);
     let rows = byConnection.get(id);
     if (!rows) {
-      rows = { connector: scope.connector, ns: scope.ns, heads: false };
+      rows = { connector: scope.connector, ns: scope.ns };
       byConnection.set(id, rows);
     }
     if (scope.kind === "control") rows.control = row.read;
     else if (isLogStream(scope.stream)) rows.log = row.read;
-    else rows.heads = true;
+    else return cycle("an unsupported stream row changed");
   }
   const connections = await deps.db.query<
     Held & Record<string, string | number>
@@ -146,7 +117,6 @@ export async function applyRegistryDelta(
       if (rows.control) deletes.push({ id, rows, read: rows.control });
       continue;
     }
-    if (rows.heads) return cycle("a stream head changed");
     if (!rows.log) continue;
     if (local?.control_state !== "active")
       return cycle("a log of a connection not held here");
@@ -162,7 +132,7 @@ export async function applyRegistryDelta(
   // Each reads its state there, so a delete or a reconnect that ran since the
   // read above makes it the cycle's. One that hands back leaves the others
   // applied: an apply is never wrong, only not proven complete.
-  const reached = await Promise.all([
+  const reached = await Promise.allSettled([
     ...deletes.map(({ id, rows, read }) =>
       deps.queue.run(id, "end", () =>
         applyDelete(insideQueue(deps, id), id, rows, read, hashes),
@@ -173,9 +143,6 @@ export async function applyRegistryDelta(
         const generation = held.get(id)!.generation;
         if (
           !(await liveAt(deps, id, generation)) ||
-          // A device that does not yet follow this connection by its log
-          // starts to in a cycle, which applies the streams under it first.
-          !(await connectionHasLog(deps, id)) ||
           (await deleteIntent(deps, rows.connector))
         )
           return false;
@@ -204,7 +171,11 @@ export async function applyRegistryDelta(
       }),
     ),
   ]);
-  if (!reached.every((r) => r === true))
+  // Wait for every connection before the host can start a fallback listing.
+  // Successful siblings stay persisted; the cycle repairs any partial one.
+  const failed = reached.find((r) => r.status === "rejected");
+  if (failed?.status === "rejected") throw failed.reason;
+  if (!reached.every((r) => r.status === "fulfilled" && r.value === true))
     return cycle("a connection the delta cannot finish here");
   return applied(started, moved, deletes.length, timed);
 }

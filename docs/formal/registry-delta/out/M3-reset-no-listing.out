@@ -1,5 +1,5 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 69 and seed 7577761128268615341 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 1810471] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 19 and seed 1381774283988863220 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 2514942] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file RegistryDelta.tla
 Parsing file Naturals.tla
 Parsing file FiniteSets.tla
@@ -10,10 +10,10 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module RegistryDelta
-Starting... (2026-11-16 16:54:34)
+Starting... (2026-11-17 04:19:20)
 Implied-temporal checking--satisfiability problem has 1 branches.
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-11-16 16:54:34.
+Finished computing initial states: 1 distinct state generated at 2026-11-17 04:19:20.
 Error: Invariant NoSkip is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -116,7 +116,7 @@ State 5: <RaiseFloor line 138, col 3 to line 142, col 60 of module RegistryDelta
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
 
-State 6: <Delta line 176, col 3 to line 189, col 96 of module RegistryDelta>
+State 6: <Delta line 176, col 3 to line 190, col 90 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "idle", scope |-> "ctl", op |-> "tomb", seq |-> 1] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
 /\ chg = [ctl |-> 0, log |-> 0]
@@ -136,8 +136,8 @@ State 6: <Delta line 176, col 3 to line 189, col 96 of module RegistryDelta>
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 1
 
-1275 states generated, 526 distinct states found, 356 states left on queue.
+1758 states generated, 815 distinct states found, 586 states left on queue.
 The depth of the complete state graph search is 6.
-The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 12 and the 95th percentile is 9).
-Finished in 00s at (2026-11-16 16:54:34)
+The average outdegree of the complete state graph is 4 (minimum is 0, the maximum 12 and the 95th percentile is 9).
+Finished in 00s at (2026-11-17 04:19:20)
 exit 12

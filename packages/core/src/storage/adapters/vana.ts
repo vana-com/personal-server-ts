@@ -43,6 +43,11 @@ export function createVanaSyncStorageAdapter(params: {
   reads?: "signed" | "public";
   /** Authentication origin, independently of a preview routing endpoint. */
   audience?: string;
+  /**
+   * The transport for every storage request (PUT, GET, HEAD, DELETE). A Node
+   * host passes one that reuses connections; the default is `globalThis.fetch`.
+   */
+  fetch?: typeof fetch;
 }): BoundedStorageAdapter {
   const endpoint = resolveVanaStorageEndpoint(params.config);
   // The SDK's vana-storage provider lowercases the owner before building the
@@ -62,7 +67,7 @@ export function createVanaSyncStorageAdapter(params: {
   // enclave sandbox --> public blob GET ----------> vana-storage
   // desktop/cloud ---> signed PUT / GET / DELETE -> vana-storage
   const blobPrefix = `${endpoint}/v1/chains/${chainId}/blobs/${owner}/`;
-  const feed = createRateLimitPolicyFeed();
+  const feed = createRateLimitPolicyFeed(params.fetch);
   const downloadBounded = boundedBlobDownload(blobPrefix, feed.fetch);
   if (params.reads === PUBLIC_READS) {
     // TODO(decision): blob reads stay public (architecture, resolved 2026-09-02); revisit if storage adds read auth.

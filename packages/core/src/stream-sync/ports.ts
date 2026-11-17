@@ -112,6 +112,14 @@ export interface RegistryBatchPolicy {
   readonly rows: number;
   readonly requires: number;
   readonly bytes: number;
+  /**
+   * Only when the gateway sends it. A batch that writes stream rows of a
+   * connection fences that connection's log row, which the batch does not
+   * write; the gateway locks one entry per row and one per distinct such log
+   * row. A batch with at least one of them holds at most `lockedScopes` rows
+   * plus distinct fenced log rows. Without a fence `rows` is the only limit.
+   */
+  readonly lockedScopes?: number;
 }
 
 export type RegistryBatchRow =
@@ -245,7 +253,7 @@ export type RegistryChangeDelta =
 
 /**
  * What applying a change delta did. `cycle`: the delta holds something only a
- * full cycle handles (a new or reconnected lifetime, a stream head or a
+ * full cycle handles (a new or reconnected lifetime, an unsupported row or a
  * deleted log row of a live connection, a row of a connection this device
  * does not hold, a removed row, a server change, a reset, a partial apply
  * standing on any connection), or the apply did not reach the delta's
@@ -323,17 +331,15 @@ export interface StreamSyncRegistry {
     connector: string,
   ): Promise<readonly { readonly scope: string; readonly read: ControlRead }[]>;
   /**
-   * The control row of one connection and every stream row in its namespace,
-   * deleted or not, in one pass over the owner's rows. A publish takes its
-   * snapshot's starting point from it instead of reading each row. The rows
-   * are a hint: the commit still re-checks the control row and posts with
-   * compare-and-set. A registry that cannot list in one pass leaves this out,
-   * and publish reads each row itself.
+   * Every row of the owner, control and stream, deleted or not, in one
+   * listing. A sync cycle takes it once and reads each connection's control
+   * and log rows from it, so the cycle's listings do not depend on when its
+   * applies run. The rows are a hint taken before the applies: an apply that
+   * holds a newer log position than the listing reads the row again.
    */
-  listConnectionRows?(
-    connector: string,
-    ns: string,
-  ): Promise<readonly { readonly scope: string; readonly read: ControlRead }[]>;
+  listOwnerRows(): Promise<
+    readonly { readonly scope: string; readonly read: ControlRead }[]
+  >;
   /**
    * One request: a marker of the owner's newest registry change, whatever the
    * number of rows (the gateway's change feed, newest first, one row). A

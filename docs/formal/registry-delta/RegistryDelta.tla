@@ -65,9 +65,9 @@ VARIABLES
   since,     \* reader: its cursor
   view,      \* reader: the version it holds per scope
   rkind,     \* reader: its connection's control as it holds it ("act", "tomb", "gone")
-  rphase,    \* reader: "idle", "rows" (between two reads), "listing" (reset owed)
-  rbuf,      \* reader: what the first of two reads decided
-  rcursor    \* reader: the cursor a pending listing will set
+  rphase,    \* reader: idle, rows, applying, settling, or listing
+  rbuf,      \* reader: the snapshot decision awaiting apply
+  rcursor    \* reader: the cursor a pending apply or listing will set
 
 vars == <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
           since, view, rkind, rphase, rbuf, rcursor>>
@@ -184,9 +184,24 @@ Delta ==
             IF d.handoff
               THEN /\ rphase' = "listing" /\ rcursor' = counter
                    /\ UNCHANGED <<since, view, rkind>>
-              ELSE /\ view' = d.view /\ rkind' = d.rkind /\ since' = counter
-                   /\ UNCHANGED <<rphase, rcursor>>
-  /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored, rbuf>>
+              ELSE /\ rphase' = "applying" /\ rcursor' = counter
+                   /\ UNCHANGED <<since, view, rkind>>
+  /\ rbuf' = Decide
+  /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored>>
+
+\* The host serializes answers. Persist every connection before settling;
+\* no second answer is admitted while either stage is unfinished.
+ApplyDelta ==
+  /\ rphase = "applying"
+  /\ view' = rbuf.view /\ rkind' = rbuf.rkind /\ rphase' = "settling"
+  /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
+                 since, rbuf, rcursor>>
+
+SettleDelta ==
+  /\ rphase = "settling"
+  /\ since' = rcursor /\ rphase' = "idle"
+  /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
+                 view, rkind, rbuf, rcursor>>
 
 \* Mutation: the records first, the counter in a later statement.
 DeltaRows ==
@@ -217,9 +232,9 @@ Listing ==
 Next ==
   \/ \E w \in Writers : Begin(w) \/ Number(w) \/ Commit(w) \/ Abort(w)
   \/ RaiseFloor
-  \/ Delta \/ DeltaRows \/ DeltaCounter \/ Listing
+  \/ Delta \/ DeltaRows \/ DeltaCounter \/ ApplyDelta \/ SettleDelta \/ Listing
 
-Spec == Init /\ [][Next]_vars /\ WF_vars(Delta \/ DeltaRows \/ DeltaCounter \/ Listing)
+Spec == Init /\ [][Next]_vars /\ WF_vars(Delta \/ DeltaRows \/ DeltaCounter \/ ApplyDelta \/ SettleDelta \/ Listing)
              /\ \A w \in Writers : WF_vars(Number(w) \/ Commit(w))
 
 -----------------------------------------------------------------------------

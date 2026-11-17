@@ -113,8 +113,6 @@ async function switchedFixture() {
       aliasScopes: () => Object.keys(ALIASES),
       aliasTargets: (scope) => ALIASES[scope] ?? [],
       resolveArtifact: () => null,
-      declaredStreams: () => [],
-      olderVersionReads: () => true,
     },
   );
   const deps = {
@@ -123,7 +121,6 @@ async function switchedFixture() {
     streamSyncRead: {
       resolve: sync.resolver.resolve,
       listScopes: sync.listing.listScopes,
-      olderVersions: sync.olderVersions,
     },
     accountMode: { read: () => "switched" as const },
     accountStorageMode: { owner: OWNER, read: () => "switched" as const },
@@ -214,7 +211,7 @@ describe("every scope GET /v1/data lists answers on every scope route", () => {
     expect(refused).toEqual([]);
   });
 
-  it("lists the versions of the stream the alias serves", async () => {
+  it("lists the version of the stream the alias serves", async () => {
     const { deps, seed } = await switchedFixture();
     await seed("plain", "c1", { items: [1, 2] });
     await seed("acme-browser", "c2", { events: [3, 4], details: [7, 8, 9] });
@@ -224,12 +221,13 @@ describe("every scope GET /v1/data lists answers on every scope route", () => {
       expect(response.status, name).toBe(200);
       return (await response.json()) as {
         scope: string;
-        versions: { version: number; fileId: string }[];
+        versions: { version: number; fileId: null }[];
         total: number;
       };
     };
     const logical = await versionsOf("pdpp.acme-browser.events");
-    expect(logical.versions.map((v) => v.version)).toEqual([4, 3]);
+    // Only the version a read serves: no older one has a body.
+    expect(logical.versions.map((v) => v.version)).toEqual([4]);
     for (const name of ["acme.events", "acme.window"]) {
       // The same page as the logical name of the stream it serves, under the
       // name that was asked for. `details` (7-9) is never the answer.
@@ -237,7 +235,7 @@ describe("every scope GET /v1/data lists answers on every scope route", () => {
     }
     expect(
       (await versionsOf("plain.items")).versions.map((v) => v.version),
-    ).toEqual([2, 1]);
+    ).toEqual([2]);
   });
 
   it("answers an alias with no stream data as 404, like its read", async () => {

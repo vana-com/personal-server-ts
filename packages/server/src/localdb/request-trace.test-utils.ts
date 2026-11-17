@@ -10,8 +10,16 @@ export type TracedRequest = {
   readonly end: number;
 };
 
-export function requestTrace(latencyMs = 5) {
+export function requestTrace(
+  /**
+   * How long each request is held: a fixed time, or one per request from its
+   * kind and how many of that kind came before it (to make requests that the
+   * code issues together answer at different times, as a loaded host does).
+   */
+  latencyMs: number | ((kind: string, nth: number) => number) = 5,
+) {
   const requests: TracedRequest[] = [];
+  const begun = new Map<string, number>();
   let tick = 0;
   const track = async <T>(
     kind: string,
@@ -19,7 +27,11 @@ export function requestTrace(latencyMs = 5) {
     run: () => Promise<T>,
   ): Promise<T> => {
     const begin = ++tick;
-    await new Promise((resolve) => setTimeout(resolve, latencyMs));
+    const nth = begun.get(kind) ?? 0;
+    begun.set(kind, nth + 1);
+    const wait =
+      typeof latencyMs === "number" ? latencyMs : latencyMs(kind, nth);
+    await new Promise((resolve) => setTimeout(resolve, wait));
     try {
       return await run();
     } finally {
@@ -54,6 +66,7 @@ export function requestTrace(latencyMs = 5) {
     depth: () => Math.max(0, ...requests.map(depthOf)),
     clear: () => {
       requests.length = 0;
+      begun.clear();
     },
     /** `kind:label` in order of beginning, for a failure message. */
     describe: () =>

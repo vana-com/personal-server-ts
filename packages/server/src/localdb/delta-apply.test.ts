@@ -33,7 +33,7 @@ const records = (prefix: string) =>
 
 /** Two devices that both hold the registry; the peer then commits once more. */
 async function peerCommitted() {
-  const w = await world({ streams: 2, logProtocol: true });
+  const w = await world({ streams: 2 });
   const peer = await w.device("peer");
   const here = await w.device("here");
   await peer.run("run-1", records("a"));
@@ -98,7 +98,6 @@ async function localState(device: Device) {
     ),
     log: await q("SELECT * FROM log_state ORDER BY connection_id"),
     records: await device.rows(),
-    heads: await q("SELECT count(*) AS n FROM head_parts"),
     blobRefs: await q("SELECT count(*) AS n FROM blob_refs"),
   };
 }
@@ -165,7 +164,7 @@ describe("applying a change delta", () => {
     expect(await here.rows()).toEqual(before);
   });
 
-  it("a stream head hands the whole delta to the cycle, applying nothing (mutation: stream heads skipped)", async () => {
+  it("an unsupported stream row hands the whole delta to the cycle, applying nothing (mutation: unsupported rows skipped)", async () => {
     const { w, here } = await peerCommitted();
     const before = await here.rows();
     const out = await applied(
@@ -222,10 +221,10 @@ describe("applying a change delta", () => {
   });
 
   it("a partial mark standing after the apply hands to the cycle (mutation: partial checked only before the apply)", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const peer = await w.device("peer");
     let markDuringGet = false;
-    const here = await w.device("here", true, {
+    const here = await w.device("here", {
       beforeGet: async () => {
         if (!markDuringGet) return;
         markDuringGet = false;
@@ -251,12 +250,12 @@ describe("applying a change delta", () => {
   });
 
   it("a delta that arrives while another apply of the connection runs does not take that apply's answer as its own (mutation: the delta joins an in-flight apply)", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const peer = await w.device("peer");
     let hold: Promise<void> | null = null;
     let reached!: () => void;
     const atGet = new Promise<void>((resolve) => (reached = resolve));
-    const here = await w.device("here", true, {
+    const here = await w.device("here", {
       beforeGet: async () => {
         if (!hold) return;
         reached();
@@ -309,7 +308,7 @@ describe("applying a change delta", () => {
   });
 
   it("a log of a connection this device does not hold hands to the cycle (mutation: no active-connection check)", async () => {
-    const w = await world({ streams: 2, logProtocol: true });
+    const w = await world({ streams: 2 });
     const peer = await w.device("peer");
     const fresh = await w.device("fresh");
     await peer.run("run-1", records("a"));
@@ -369,8 +368,8 @@ describe("applying a change delta", () => {
     expect(await here.position()).toBeLessThan(newest);
   });
 
-  it("a connection this device does not yet follow by its log hands to the cycle (mutation: no log-follow check)", async () => {
-    const { w, here } = await peerCommitted();
+  it("an active connection without local log state loads through the supplied log row", async () => {
+    const { w, peer, here } = await peerCommitted();
     await here.db.batch([
       {
         sql: "DELETE FROM log_state WHERE connection_id=?",
@@ -378,8 +377,10 @@ describe("applying a change delta", () => {
       },
     ]);
     const out = await applied(w, here, await deltaOf(here, [LOG]));
-    expect(out.result.outcome).toBe("cycle");
-    expect(out.gets).toEqual([]);
+    expect(out.result.outcome).toBe("applied");
+    expect(out.registryCalls).toEqual([]);
+    expect(await here.rows()).toEqual(await peer.rows());
+    expect(await here.position()).toBe(await peer.position());
   });
 
   it("a connection with a delete intent hands to the cycle (mutation: no delete-intent check)", async () => {
@@ -468,16 +469,70 @@ describe("applying a change delta", () => {
   });
 });
 
-describe.each([
-  { logProtocol: true, name: "log protocol (the control tombstone only)" },
-  {
-    logProtocol: false,
-    name: "stream heads (the control tombstone, then stream tombstones)",
-  },
-])("a peer's connection delete, $name", ({ logProtocol }) => {
-  /** Three devices that hold the registry; the peer then deletes the connection. */
+describe("multiple connections", () => {
+  it("waits for every connection after a sibling fails (mutation: fail-fast Promise.all)", async () => {
+    const w = await world({ streams: 1 });
+    const peer = await w.device("peer");
+    const here = await w.device("here");
+    for (const connector of [CONNECTOR, "other"]) {
+      await peer.run(
+        `first-${connector}`,
+        [{ stream: sName(0), id: "first" }],
+        { connector },
+      );
+    }
+    await peer.cycle();
+    await here.cycle();
+    for (const connector of [CONNECTOR, "other"]) {
+      await peer.run(`next-${connector}`, [{ stream: sName(0), id: "next" }], {
+        connector,
+        full: false,
+      });
+    }
+    await peer.cycle();
+    const delta = await deltaOf(here, [LOG, "pdpp.other~.~log"]);
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let failed!: () => void;
+    const atFailure = new Promise<void>((resolve) => {
+      failed = resolve;
+    });
+    let settled = false;
+    const applying = applyRegistryDelta(
+      {
+        ...here.deps,
+        queue: {
+          run: async (id, kind, work) => {
+            if (id === CONNECTION_ID) await hold;
+            else {
+              failed();
+              throw new Error("other connection failed");
+            }
+            return here.deps.queue.run(id, kind, work);
+          },
+        },
+      },
+      delta,
+    ).finally(() => {
+      settled = true;
+    });
+    // Attach the rejection handler before allowing either branch to finish.
+    const outcome = applying.catch((error: unknown) => error);
+    await atFailure;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const settledEarly = settled;
+    release();
+    expect(await outcome).toMatchObject({ message: "other connection failed" });
+    expect(settledEarly).toBe(false);
+    expect(await here.position()).toBe(await peer.position());
+  });
+});
+
+describe("a peer's connection delete", () => {
   async function peerDeleted(beforeDelete?: (peer: Device) => Promise<void>) {
-    const w = await world({ streams: 2, logProtocol });
+    const w = await world({ streams: 2 });
     const peer = await w.device("peer");
     const here = await w.device("here");
     const twin = await w.device("twin");
@@ -556,12 +611,7 @@ describe.each([
       });
       await peer.cycle();
     });
-    expect(scopes).toEqual(
-      expect.arrayContaining([
-        CONTROL,
-        logProtocol ? LOG : streamScope(CONNECTOR, "", sName(0)),
-      ]),
-    );
+    expect(scopes).toEqual(expect.arrayContaining([CONTROL, LOG]));
     const out = await applied(w, here, await deltaOf(here, scopes));
     expect(out.result).toMatchObject({ outcome: "applied", deleted: 1 });
     expect(out.gets).toEqual([]);
@@ -579,22 +629,6 @@ describe.each([
     await twin.cycle();
     expect(await localState(fresh)).toEqual(await localState(twin));
   });
-
-  // A log-protocol delete writes no row after its control tombstone.
-  it.runIf(!logProtocol)(
-    "later rows of the deleted connection, once the delete is held, are skipped (mutation: rows of a deleted connection handed to the cycle)",
-    async () => {
-      const { w, here, scopes } = await peerDeleted();
-      await here.cycle();
-      const before = await localState(here);
-      const rows = scopes.filter((s) => s !== CONTROL);
-      expect(rows).not.toEqual([]);
-      const out = await applied(w, here, await deltaOf(here, rows));
-      expect(out.result).toMatchObject({ outcome: "applied" });
-      expect(out.registryCalls).toEqual([]);
-      expect(await localState(here)).toEqual(before);
-    },
-  );
 
   it("a delete and a reconnect after it hand to the cycle (mutation: an active control of a new lifetime skipped)", async () => {
     const { w, peer, here } = await peerDeleted();
@@ -637,7 +671,7 @@ describe.each([
 describe("the receive path's depth", () => {
   it("a delete wake is zero requests deep; the cycle it replaces is not", async () => {
     const trace = requestTrace();
-    const w = await world({ streams: 2, logProtocol: true, trace });
+    const w = await world({ streams: 2, trace });
     const peer = await w.device("peer");
     const here = await w.device("here");
     const twin = await w.device("twin");
@@ -661,12 +695,13 @@ describe("the receive path's depth", () => {
     trace.clear();
     await twin.cycle();
     expect(await localState(twin)).toEqual(await localState(here));
+    expect(trace.count(), trace.describe()).toBe(3);
     expect(trace.depth()).toBeGreaterThan(1);
   });
 
   it("a delta wake is one request deep (the segment GET); the cycle it replaces is deeper", async () => {
     const trace = requestTrace();
-    const w = await world({ streams: 2, logProtocol: true, trace });
+    const w = await world({ streams: 2, trace });
     const peer = await w.device("peer");
     const here = await w.device("here");
     const twin = await w.device("twin");
@@ -692,6 +727,33 @@ describe("the receive path's depth", () => {
     trace.clear();
     await twin.cycle();
     expect(await twin.rows()).toEqual(await here.rows());
+    expect(trace.count(), trace.describe()).toBe(3);
+    expect(trace.count("list")).toBe(1);
+    expect(trace.count("read")).toBe(1);
+    expect(trace.count("get")).toBe(1);
     expect(trace.depthToLast("get")).toBeGreaterThan(1);
+  });
+});
+
+describe("empty delta and idle full cycle request counts", () => {
+  it("an empty delta does no reads; an invoked idle cycle still lists and reads control", async () => {
+    const trace = requestTrace();
+    const w = await world({ streams: 2, trace });
+    const peer = await w.device("peer");
+    const here = await w.device("here");
+    await peer.run("run-1", records("a"));
+    await peer.cycle();
+    await here.cycle();
+    const delta = await deltaOf(here, []);
+    trace.clear();
+    expect(await here.sync.applyDelta(delta)).toMatchObject({
+      outcome: "applied",
+    });
+    expect(trace.count()).toBe(0);
+    trace.clear();
+    await here.cycle();
+    expect(trace.count(), trace.describe()).toBe(2);
+    expect(trace.count("list")).toBe(1);
+    expect(trace.count("read")).toBe(1);
   });
 });

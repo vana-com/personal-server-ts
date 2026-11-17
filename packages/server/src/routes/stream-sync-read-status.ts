@@ -94,9 +94,6 @@ export function streamSyncReadStatusRoutes(
       listed: status.listed,
       streams,
       issues: status.issues.length,
-      ...(local && {
-        olderVersionReads: local.olderVersions.counts(),
-      }),
     });
   });
 

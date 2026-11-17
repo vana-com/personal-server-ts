@@ -1,5 +1,5 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 117 and seed -8903099787433167818 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 1812562] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 127 and seed 7125072506212019518 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 2521423] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file RegistryDelta.tla
 Parsing file Naturals.tla
 Parsing file FiniteSets.tla
@@ -10,10 +10,10 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module RegistryDelta
-Starting... (2026-11-16 16:54:39)
+Starting... (2026-11-17 04:19:40)
 Implied-temporal checking--satisfiability problem has 1 branches.
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-11-16 16:54:39.
+Finished computing initial states: 1 distinct state generated at 2026-11-17 04:19:40.
 Error: Invariant NoSkip is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -96,13 +96,53 @@ State 4: <Commit line 117, col 3 to line 127, col 91 of module RegistryDelta>
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
 
-State 5: <Delta line 176, col 3 to line 189, col 96 of module RegistryDelta>
+State 5: <Delta line 176, col 3 to line 190, col 90 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "idle", scope |-> "ctl", op |-> "tomb", seq |-> 1] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
 /\ chg = [ctl |-> 1, log |-> 0]
 /\ floor = 0
 /\ txns = 1
-/\ rcursor = 0
+/\ rcursor = 1
+/\ floored = FALSE
+/\ counter = 1
+/\ view = [ctl |-> 0, log |-> 0]
+/\ lock = NoWriter
+/\ kind = [ctl |-> "tomb", log |-> "app"]
+/\ hist = {<<1, "ctl", 1>>}
+/\ ver = [ctl |-> 1, log |-> 0]
+/\ rkind = "act"
+/\ rphase = "applying"
+/\ nextSeq = 1
+/\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
+/\ since = 0
+
+State 6: <ApplyDelta line 195, col 3 to line 198, col 39 of module RegistryDelta>
+/\ txn = ( w1 :> [phase |-> "idle", scope |-> "ctl", op |-> "tomb", seq |-> 1] @@
+  w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
+/\ chg = [ctl |-> 1, log |-> 0]
+/\ floor = 0
+/\ txns = 1
+/\ rcursor = 1
+/\ floored = FALSE
+/\ counter = 1
+/\ view = [ctl |-> 0, log |-> 0]
+/\ lock = NoWriter
+/\ kind = [ctl |-> "tomb", log |-> "app"]
+/\ hist = {<<1, "ctl", 1>>}
+/\ ver = [ctl |-> 1, log |-> 0]
+/\ rkind = "act"
+/\ rphase = "settling"
+/\ nextSeq = 1
+/\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
+/\ since = 0
+
+State 7: <SettleDelta line 201, col 3 to line 204, col 45 of module RegistryDelta>
+/\ txn = ( w1 :> [phase |-> "idle", scope |-> "ctl", op |-> "tomb", seq |-> 1] @@
+  w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
+/\ chg = [ctl |-> 1, log |-> 0]
+/\ floor = 0
+/\ txns = 1
+/\ rcursor = 1
 /\ floored = FALSE
 /\ counter = 1
 /\ view = [ctl |-> 0, log |-> 0]
@@ -116,8 +156,8 @@ State 5: <Delta line 176, col 3 to line 189, col 96 of module RegistryDelta>
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 1
 
-170 states generated, 122 distinct states found, 102 states left on queue.
-The depth of the complete state graph search is 5.
-The average outdegree of the complete state graph is 6 (minimum is 3, the maximum 11 and the 95th percentile is 11).
-Finished in 00s at (2026-11-16 16:54:39)
+6894 states generated, 2580 distinct states found, 1707 states left on queue.
+The depth of the complete state graph search is 7.
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 12 and the 95th percentile is 8).
+Finished in 00s at (2026-11-17 04:19:40)
 exit 12

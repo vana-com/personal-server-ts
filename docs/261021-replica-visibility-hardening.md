@@ -49,7 +49,7 @@ File surfaces read `DataStoragePort` (`createNodeDataStorage({indexManager, hier
 
 ## Connection quarantine (copy contract v3 A, H, I)
 
-A terminal batch quarantines every connection it touched and moves the integrity epoch in the same transaction. On Node, the fact is `pdpp_replica_quarantined_connections`, written without withdrawing stored rows, claims or bytes. Point reads, pages, stream lists, summaries, `changes_since`, blob metadata and references, confirmed bytes and `/v1/data` already withheld the connection from both readers through the store's shared predicate. Confirmed bytes come from the host byte source only after the reader authorizes a visible reference. The one red case was the change feed: its page cursors and session tokens did not expire on an epoch move, and now do. Lite has no epoch. Its connection-quarantine facts are the binding-conflict record and equivocation markers, under which `reconcile` withdraws rows and advances both view revisions. The confirmed-blob path now refuses bytes that only quarantined connections claim. Red logs: `r3w-node-changes-epoch-red.log`, `r3w-lite-quarantine-red-final.log` and `r3w-lite-binding-conflict-blob-red.log` under `~/.tmp/ps438-relaunch-logs/`.
+A terminal batch quarantines every connection it touched and moves the integrity epoch in the same transaction. On Node, the fact is `pdpp_replica_quarantined_connections`, written without withdrawing stored rows, claims or bytes. Point reads, pages, stream lists, summaries, `changes_since`, blob metadata and references, confirmed bytes and `/v1/data` already withheld the connection from both readers through the store's shared predicate. Confirmed bytes come from the host byte source only after the reader authorizes a visible reference. The one red case was the change feed: its page cursors and session tokens did not expire on an epoch move, and now do. Lite has no epoch. Its connection-quarantine facts are the binding-conflict record and equivocation markers, under which `reconcile` withdraws rows and advances both view revisions. The confirmed-blob path now refuses bytes that only quarantined connections claim. Red logs: `r3w-node-changes-epoch-red.log`, `r3w-lite-quarantine-red-final.log` and `r3w-lite-binding-conflict-blob-red.log` (local, not committed).
 
 ## Identity ambiguity
 
@@ -61,7 +61,7 @@ The Node adapter derives latest local values from `pdpp_mutation_journal.value_j
 
 ## Red evidence
 
-Run with Node 22.23.3 and `TMPDIR=$HOME/.tmp`:
+Run with Node 22.23.3 and `TMPDIR` set to a disk-backed directory:
 
 ```sh
 ./node_modules/.bin/vitest run packages/server/src/storage/pdpp-replication-receiver.test.ts \
@@ -82,13 +82,13 @@ The r1 relaunch recorded each item red before its production edit:
 - Cursor scope: unchanged declaration reconciliation wrote 8 view rows; a write to another stream expired the cursor; bumping a fake store's integrity epoch did not expire owner, grant or local-mode cursors.
 - Sparse view: the view held 100 and 1,000 overlay rows for 100 and 1,000 canonical rows; staging one pending key left 120 rows; constructing over 300 rows ran the reducer 300 times; the local projection covered unconflicted connections.
 
-The r2 relaunch recorded these red before each production edit (logs `r2-*-red*.log` under `~/.tmp/ps438-relaunch-logs/`):
+The r2 relaunch recorded these red before each production edit (logs `r2-*-red*.log` (local, not committed)):
 
 - App composition: through `createApp` with an enabled receiver, the owner's pending row returned 404, a grant read the confirmed received row of a source-conflicted connection (200), and `GET /v1/data/oura.activity` returned that row to the owner.
 - Lite pending blob bytes: after a winning pending deletion, and after an operation-ID variant, Lite still returned all 13 bytes.
 - Bounded reads: with pending overwrites masking every canonical row, a `limit=1` owner HTTP page visited 504 rows at 100 masked keys and 15,004 at 3,000; an owner stream summary visited 102 and 3,002.
 
-The r4 coordinator-branch lane recorded these before each production edit (logs `r4c-*.log` under `~/.tmp/ps438-relaunch-logs/`):
+The r4 coordinator-branch lane recorded these before each production edit (logs `r4c-*.log` (local, not committed)):
 
 - Chunked bytes: with 1 MiB + 4 KiB blobs, a pending record stayed hidden after its bytes arrived as received chunks (replayed claim), as received and canonical chunks (another connection's import) or as pending chunks (another pending batch). A forced full re-derive made it visible, and then losing the received chunks or quarantining the carrier left it visible.
 - Byte source: a corrupt retained received copy still left the pending record visible, with bytes the route could not serve (legacy and chunks); a corrupt first pending copy hid the record or its bytes although a second pending copy verified; a forged chunk-manifest size threw `RangeError: Array buffer allocation failed`; staging a pending record over a 1 MiB canonical blob read the whole blob through the store.
@@ -96,7 +96,7 @@ The r4 coordinator-branch lane recorded these before each production edit (logs 
 
 A differential run forced the full reducer for every key that the sparse fast path skips and logged any disagreement with canonical. Across 1,651 storage and route tests it logged none.
 
-Local raw logs are `~/.tmp/438-red.log`, `~/.tmp/438-node-strengthened-red.log`, `~/.tmp/438-http-red.log`, `~/.tmp/438-http-red-summary.log`, `~/.tmp/438-http-cursor-red.log`, `packages/lite/.evidence/pending-cardinality-red.log`, and the r1 logs under `~/.tmp/ps438-relaunch-logs/`. The evidence directory is ignored; this document records the failure mechanisms rather than checking generated logs into source control.
+Local raw logs are `438-red.log`, `438-node-strengthened-red.log`, `438-http-red.log`, `438-http-red-summary.log`, `438-http-cursor-red.log`, `packages/lite/.evidence/pending-cardinality-red.log`, and the r1 logs (local, not committed). The evidence directory is ignored; this document records the failure mechanisms rather than checking generated logs into source control.
 
 ## Measurements
 
@@ -115,7 +115,7 @@ Derived bytes after the change are the four expression indexes on the retained-o
 
 Idle `retry` no longer touches the view. It still costs 1.4–2.6 s at these sizes because the receiver's canonical reconcile reads the whole retained operation set; it did so before #438 as well. Making it incremental belongs to the transport scheduling lane.
 
-Rows visited after r2, counted by a SQL function in the per-row quarantine predicate (100 → 3,000 masked keys): owner HTTP descending `limit=1` page 4 → 4; owner stream summary 2 → 2; owner store page first/continuation 4/5–6 → 4/5–6. The write-time summary recompute steps over masked canonical rows once per changed stream per flush. A single-row canonical ingest on a fully masked 3,000-row stream took 1.6–1.9 ms median before (two runs) and 2.6–4.1 ms after (three runs); staging the 3,000-key mask took 12.4 s before and 8.4–24.2 s after. The host was under heavy CPU pressure (PSI cpu some avg60 ≈ 58%), so these timings show at most a small per-write cost and no reliable staging change. Script: `~/.tmp/ps438-r2-scratch/write-cost.mts`.
+Rows visited after r2, counted by a SQL function in the per-row quarantine predicate (100 → 3,000 masked keys): owner HTTP descending `limit=1` page 4 → 4; owner stream summary 2 → 2; owner store page first/continuation 4/5–6 → 4/5–6. The write-time summary recompute steps over masked canonical rows once per changed stream per flush. A single-row canonical ingest on a fully masked 3,000-row stream took 1.6–1.9 ms median before (two runs) and 2.6–4.1 ms after (three runs); staging the 3,000-key mask took 12.4 s before and 8.4–24.2 s after. The host was under heavy CPU pressure (PSI cpu some avg60 ≈ 58%), so these timings show at most a small per-write cost and no reliable staging change. Script: `write-cost.mts` (local scratch, not committed).
 
 ## Verification
 

@@ -3,7 +3,10 @@ import {
   controlScope,
   streamScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { createGatewayStreamSyncRegistry } from "./registry.js";
+import {
+  createGatewayStreamSyncRegistry,
+  parseBatchPolicy,
+} from "./registry.js";
 import { RegistryUnavailableError } from "./ports.js";
 
 const hash = (byte: string) => `0x${byte.repeat(32)}`;
@@ -801,8 +804,7 @@ describe("an unreachable registry is told apart from a refusing one", () => {
   const listings = {
     listStreamRows: (r: ReturnType<typeof over>) => r.listStreamRows("acme"),
     listControlRows: (r: ReturnType<typeof over>) => r.listControlRows(),
-    listConnectionRows: (r: ReturnType<typeof over>) =>
-      r.listConnectionRows("acme", ""),
+    listOwnerRows: (r: ReturnType<typeof over>) => r.listOwnerRows(),
   };
   it.each([
     ["a network error", new TypeError("terminated")],
@@ -870,6 +872,13 @@ describe("listings of concurrent callers", () => {
   /** A fetch whose listings answer only when released, in the order begun. */
   function held() {
     const begun: { release: (rows: string[]) => void }[] = [];
+    const starts = Array.from({ length: 3 }, () => {
+      let signal!: () => void;
+      const promise = new Promise<void>((resolve) => {
+        signal = resolve;
+      });
+      return { promise, signal };
+    });
     const fetch = (() =>
       new Promise<Response>((resolve) => {
         begun.push({
@@ -892,8 +901,9 @@ describe("listings of concurrent callers", () => {
               ),
             ),
         });
+        starts[begun.length - 1]?.signal();
       })) as unknown as typeof fetch;
-    return { begun, fetch };
+    return { begun, fetch, started: (index: number) => starts[index]!.promise };
   }
   const registryOver = (fetch: typeof globalThis.fetch) =>
     createGatewayStreamSyncRegistry({
@@ -903,23 +913,60 @@ describe("listings of concurrent callers", () => {
     });
 
   it("a call made while a listing is out waits for a listing that begins after it, and callers that arrive meanwhile share that one", async () => {
-    const { begun, fetch } = held();
+    const { begun, fetch, started } = held();
     const registry = registryOver(fetch);
     const first = registry.listControlRows();
     const second = registry.listControlRows();
     const third = registry.listStreamRows("acme");
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await started(0);
     // One request is out: the later calls did not take it, and began none.
     expect(begun).toHaveLength(1);
     begun[0]!.release(["pdpp.acme~"]);
     expect((await first).map((r) => r.scope)).toEqual(["pdpp.acme~"]);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await started(1);
     // The later calls share one listing, begun after the first one ended.
     expect(begun).toHaveLength(2);
     begun[1]!.release(["pdpp.acme~", streamScope("acme", "", "s1")]);
     expect((await second).map((r) => r.scope)).toEqual(["pdpp.acme~"]);
     expect((await third).length).toBe(1);
     expect(begun).toHaveLength(2);
+  });
+
+  it("a caller arriving after L2 starts gets a fresh L3, not the earlier cohort's answer", async () => {
+    const { begun, fetch, started } = held();
+    const registry = registryOver(fetch);
+    const first = registry.listControlRows();
+    await started(0);
+    const cohort = [
+      registry.listControlRows(),
+      registry.listOwnerRows(),
+      registry.listStreamRows("acme"),
+    ];
+    expect(begun).toHaveLength(1);
+    begun[0]!.release(["pdpp.acme~"]);
+    await started(1);
+    expect(begun).toHaveLength(2);
+    const late = registry.listOwnerRows();
+    expect(begun).toHaveLength(2);
+    const s1 = streamScope("acme", "", "s1");
+    const s2 = streamScope("acme", "", "s2");
+    // A caller handed the second listing settles here, before any third begins.
+    const settledEarly = new Promise<never>((_, reject) => {
+      late.then(
+        () => reject(new Error("late caller settled before fresh L3")),
+        reject,
+      );
+    });
+    begun[1]!.release(["pdpp.acme~", s1]);
+    await Promise.race([started(2), settledEarly]);
+    expect(begun).toHaveLength(3);
+    begun[2]!.release(["pdpp.acme~", s1, s2]);
+    expect((await first).map((r) => r.scope)).toEqual(["pdpp.acme~"]);
+    expect(
+      (await Promise.all(cohort)).map((rows) => rows.map((r) => r.scope)),
+    ).toEqual([["pdpp.acme~"], ["pdpp.acme~", s1], [s1]]);
+    expect((await late).map((r) => r.scope)).toEqual(["pdpp.acme~", s1, s2]);
+    expect(begun).toHaveLength(3);
   });
 
   it("a failed listing fails its own callers and not the ones waiting for the next", async () => {
@@ -1068,5 +1115,40 @@ describe("waitForChange with since", () => {
       delta: { since: "3", reset: true },
     });
     expect(await wait("3")).toEqual({ seq: "3", changed: false });
+  });
+});
+
+describe("Batch-Policy", () => {
+  it("parses the header the gateway sends", () => {
+    expect(parseBatchPolicy("rows=36;bytes=3849121;requires=2080")).toEqual({
+      rows: 36,
+      bytes: 3849121,
+      requires: 2080,
+    });
+  });
+  it("reads the lock budget when the gateway sends it", () => {
+    expect(
+      parseBatchPolicy("rows=31;bytes=3606546;requires=1952;lockedScopes=26"),
+    ).toEqual({ rows: 31, bytes: 3606546, requires: 1952, lockedScopes: 26 });
+  });
+  it("ignores a lock budget it cannot read, keeping the rest", () => {
+    expect(
+      parseBatchPolicy("rows=31;bytes=3606546;requires=1952;lockedScopes=26"),
+    ).toMatchObject({ lockedScopes: 26 });
+    expect(
+      parseBatchPolicy("rows=31;bytes=1;requires=1;lockedScopes=x"),
+    ).toBeUndefined();
+  });
+  it("reads nothing from a header it cannot read", () => {
+    for (const bad of [
+      null,
+      "",
+      "rows=16",
+      "rows=0;bytes=1;requires=1",
+      "rows=x;bytes=1;requires=1",
+      "rows=1;bytes=1",
+    ]) {
+      expect(parseBatchPolicy(bad)).toBeUndefined();
+    }
   });
 });

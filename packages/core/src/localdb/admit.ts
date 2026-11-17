@@ -7,6 +7,7 @@ import {
   rankAfter,
   SEEN_BEFORE,
   seenBeforeParams,
+  type KeyRange,
 } from "./merge.js";
 
 /**
@@ -261,11 +262,12 @@ export function tombstoneOmissions(
   stampO: number,
   stampR: string,
   flagOn: boolean,
+  keys?: KeyRange,
 ): SqlStatement {
   return {
     sql: `INSERT OR REPLACE INTO record_tombstones (connection_id, stream, pk_hash, stamp_o, stamp_r)
       SELECT connection_id, stream, pk_hash, ?, ? FROM records
-       WHERE connection_id = ? AND stream = ? AND ${SEEN_BEFORE}
+       WHERE connection_id = ? AND stream = ? AND ${SEEN_BEFORE}${keys ? " AND pk_hash >= ? AND pk_hash <= ?" : ""}
          AND (? = 1 OR ${OLDER_ADMITTING_RUN})
          AND NOT EXISTS (SELECT 1 FROM record_tombstones t
            WHERE t.connection_id = records.connection_id AND t.stream = records.stream
@@ -276,6 +278,7 @@ export function tombstoneOmissions(
       connectionId,
       stream,
       ...seenBeforeParams(stampO, stampR),
+      ...(keys ? [keys.from, keys.to] : []),
       flagOn ? 1 : 0,
       connectionId,
       stampO,

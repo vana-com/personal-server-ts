@@ -419,6 +419,9 @@ export function createSyncManager(
   // finish clean.
   let knownPosition: string | undefined;
   let syncedPosition: string | undefined;
+  // A format this build cannot read needs an update, not repeated polling.
+  // This position suppresses that repeat but is never offered as `since`.
+  let refusedPosition: string | undefined;
   // The host paused the manager (no one is looking): no request, no timer.
   // `owedWhilePaused` remembers a local ingest that arrived meanwhile.
   let paused = false;
@@ -563,8 +566,8 @@ export function createSyncManager(
 
   /**
    * The first pass of a cycle that a change delta started: apply the delta
-   * instead of the cycle's registry reads (the server row, the listing, each
-   * control and stream row). `settle`: the pass ended clean; `owed`: the delta
+   * instead of the cycle's registry reads (the server row, the owner listing,
+   * and each connection's control row). `settle`: the pass ended clean; `owed`: the delta
    * is applied and deletion debt is left, as a full pass that left it would
    * end; `full`: a full pass must run (see `DeltaApplyResult`).
    *
@@ -664,6 +667,7 @@ export function createSyncManager(
         const errorsBefore = errorSeq;
         const heldUpTo = syncedPosition;
         syncedPosition = undefined;
+        refusedPosition = undefined;
         const settle = () => {
           // The update-required block is a diagnostic of a refusal no retry
           // changes (`reportLeavesWork`); any other block means no cycle ran.
@@ -672,7 +676,9 @@ export function createSyncManager(
             errorSeq !== errorsBefore
           )
             return;
-          syncedPosition = startedUnder;
+          if (blocked?.reason === "update_required")
+            refusedPosition = startedUnder;
+          else syncedPosition = startedUnder;
         };
         const byDelta =
           passDelta === undefined
@@ -1221,7 +1227,7 @@ export function createSyncManager(
       pushHealthy &&
       cycleInFlight === null &&
       knownPosition !== undefined &&
-      knownPosition === syncedPosition
+      (knownPosition === syncedPosition || knownPosition === refusedPosition)
     );
   }
 
@@ -1295,6 +1301,23 @@ export function createSyncManager(
     stopPush = push.subscribe({
       onChange(delta) {
         if (run !== lifecycle || !isRunning) return;
+        // A reset can describe a restored registry whose counter went back.
+        // It always owes a listing. Ordinary late answers cannot move either
+        // the observed or the applied position backwards.
+        if (delta?.reset) {
+          // A lower counter needs a fresh baseline after the listing. It
+          // cannot settle this answer's older position, even after restore.
+          knownPosition =
+            knownPosition !== undefined &&
+            BigInt(delta.seq) < BigInt(knownPosition)
+              ? undefined
+              : delta.seq;
+        } else if (
+          delta &&
+          syncedPosition !== undefined &&
+          BigInt(delta.seq) <= BigInt(syncedPosition)
+        )
+          return;
         cycleNow(delta);
       },
       since: () => syncedPosition,
@@ -1310,7 +1333,11 @@ export function createSyncManager(
       },
       onPosition(position) {
         if (run !== lifecycle || !isRunning) return;
-        knownPosition = position;
+        if (
+          knownPosition === undefined ||
+          BigInt(position) >= BigInt(knownPosition)
+        )
+          knownPosition = position;
       },
     });
   }
@@ -1353,6 +1380,7 @@ export function createSyncManager(
       nextTimedProbeAt = 0;
       knownPosition = undefined;
       syncedPosition = undefined;
+      refusedPosition = undefined;
       statusMayHaveChanged(); // running: true
 
       // Crash recovery: run one cycle immediately on start

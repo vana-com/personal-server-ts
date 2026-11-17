@@ -1,7 +1,7 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
 Running breadth-first search Model-Checking with fp 1 and seed 6843333486966529481 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 2395052] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
-Parsing file /home/tnunamak/.tmp/floors-gap-1116/idle-push-root/ps/docs/formal/registry-poke/RegistryPoke.tla
-Parsing file /tmp/Naturals.tla
+Parsing file RegistryPoke.tla
+Parsing file Naturals.tla
 Semantic processing of module Naturals
 Semantic processing of module RegistryPoke
 Starting... (2026-11-15 22:39:10)

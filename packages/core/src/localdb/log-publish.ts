@@ -2,8 +2,8 @@
 //
 // One round publishes one batch: the changes of every stream that has work,
 // as ONE immutable segment object (one PUT) and ONE registry commit that
-// advances the connection's log position. The per-stream path writes a head
-// and parts per stream; here request count does not grow with stream count.
+// advances the connection's log position, so request count does not grow with
+// stream count. It is the only way a connection publishes.
 //
 //   SNAPSHOT (slot)   Decide, for each stream, what its publish is: apply the
 //     retained runs' plan (`planStream`), select the changes since the stream's
@@ -22,13 +22,15 @@
 // A batch is bounded by the part target: a round takes the changes of streams
 // in order until the target is reached and leaves the rest for the next round,
 // except that a stream whose replacing run applies goes whole (its omission
-// completion and its changes are one unit). A single record larger than the
-// target still goes, alone.
+// completion and its changes are one unit) when the whole fits one segment.
+// A larger one goes in rounds, and only the round with its completion says
+// the stream is complete. A completion larger than what a round has left goes
+// in pieces, each naming a range of the dropped keys in hash order. A single
+// record larger than the target goes alone, its body out of line.
 //
-// What this writer leaves to the per-stream path: nothing is published through
-// it. Runs it cannot place (refused, fenced, from another lifetime) are
-// cleaned up with the same helpers publish uses, and the round starts over;
-// runs it cannot order yet (deferred) hold only their own stream.
+// Runs it cannot place (refused, fenced, from another lifetime) are cleaned up
+// and the round starts over; runs it cannot order yet (deferred) hold only
+// their own stream.
 //
 // Compaction rides the batch's own commit (log-compact.ts): when the cost rule
 // or the head's bound says so, the segment carries a snapshot pointer, a new
@@ -63,8 +65,11 @@ import {
   type SnapshotPointer,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { type StreamSyncRegistry } from "../stream-sync/ports.js";
+import { StorageDeferredError } from "../stream-sync/storage-retry.js";
 import { sameHead, type PlanHead } from "../stream-sync/publish-plan.js";
 import { keccakOf } from "../stream-sync/crypto-port.js";
+import { putBodiesOutOfLine } from "./log-bodies.js";
+import { seedFromRecords } from "./log-seed.js";
 import { applyConnection } from "./apply.js";
 import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
 import { settleRequirementFailure, settleRow } from "./batch-commit.js";
@@ -83,6 +88,7 @@ import {
   replaceDelete,
   seenBeforeParams,
   SEEN_BEFORE,
+  type KeyRange,
   withOrigin,
 } from "./merge.js";
 import {
@@ -100,11 +106,19 @@ import {
   type PublishResult,
   type StreamPlan,
 } from "./publish.js";
-import { META_ROWS, PAGE_BYTES } from "./encode.js";
 import { BODY_BYTES } from "./part-layout.js";
 import { purgeConnection } from "./purge.js";
 import { insideQueue } from "./slot.js";
 import { unwriteRefusedRun } from "./unwrite.js";
+
+/**
+ * A transfer page holds at most `PAGE_BYTES` of bodies when two or more rows
+ * fit; a row larger than that is a page of its own (a body is encoded whole).
+ * Row sizes are read `META_ROWS` at a time and cut into pages; a page also
+ * holds at most `META_ROWS` rows.
+ */
+const META_ROWS = 2048;
+export const PAGE_BYTES = 2 * 1024 * 1024;
 
 const MAX_ATTEMPTS = 5;
 /** Keys a query binds: the delete lookup binds a connection, a stream and two positions beside them. */
@@ -113,7 +127,37 @@ const KEYS_PER_QUERY = rowsPerStatement(1, 4);
 /** Registries that answered the batch route with 404 or 405: the log needs it. */
 const withoutBatchRoute = new WeakSet<StreamSyncRegistry>();
 
-type StreamRow = LocalStream & { stream: string };
+type StreamRow = LocalStream & {
+  stream: string;
+  /**
+   * The meta of the version this stream's head stands for: what the log last
+   * said. A run's end writes the stream's own meta before its publish, so the
+   * stream's columns are not it. NULL when the stream has no head.
+   */
+  published_complete: number | null;
+  published_primary_key: string | null;
+  published_profile_key: string | null;
+  published_profile_version: string | null;
+};
+
+/**
+ * The stream as the log last described it: the base a plan starts from. A
+ * stream with no head was never described, so its own state is the base.
+ */
+function asPublished(row: StreamRow): LocalStream {
+  if (row.head_version === 0) return row;
+  if (row.published_primary_key === null || row.published_complete === null)
+    throw new Error(
+      `publish: stream ${row.stream} has head version ${row.head_version} and no meta for it`,
+    );
+  return {
+    ...row,
+    primary_key: row.published_primary_key,
+    profile_key: row.published_profile_key,
+    profile_version: row.published_profile_version,
+    complete: row.published_complete,
+  };
+}
 
 type Planned = {
   readonly stream: string;
@@ -130,7 +174,20 @@ type Planned = {
   readonly operations: LogOperation[];
   readonly meta: LogStreamMeta | null;
   readonly runIds: readonly string[];
+  /** The replace this round completes: its rows below the cutoff go. */
   readonly replace: { readonly o: number; readonly r: string } | null;
+  /**
+   * A replace whose rows this round carries but whose completion waits for a
+   * later round. Its basis moves to the segment this round commits, which is
+   * this device's own and so not a write the replace must yield to.
+   */
+  readonly replacing: { readonly o: number; readonly r: string } | null;
+  /**
+   * The keys of `replacing` that this round's piece of its completion names.
+   * The commit drops them here as the last piece's commit drops the rest, so
+   * the next round lists only the keys still to send.
+   */
+  readonly omitting: KeyRange | null;
   readonly omitted: readonly LogOmission[];
   readonly bytes: number;
 };
@@ -142,8 +199,11 @@ type Candidate = {
   readonly base: number;
   readonly refs: readonly SegmentRef[];
   readonly snapshot: SnapshotPointer | null;
-  /** Snapshot part objects to upload before the segment. */
-  readonly snapshotParts: readonly {
+  /**
+   * Objects the segment names, to upload before it: snapshot parts and the
+   * pieces of out-of-line bodies.
+   */
+  readonly objects: readonly {
     readonly name: string;
     readonly cipher: Uint8Array;
   }[];
@@ -242,21 +302,34 @@ async function publishRounds(
     // at once and the commit waits for all of them. The commit's one
     // dependency is the objects it names.
     const scope = await logScopeOf(deps, connectionId);
-    await Promise.all([
-      candidate.attachments.length > 0
-        ? clock.time("attachments", () =>
-            uploadBlobs(deps, candidate.attachments),
-          )
-        : undefined,
-      clock.time("segment-put", () =>
-        Promise.all([
-          ...candidate.snapshotParts.map((part) =>
-            deps.blobs.put(`${scope}/${part.name}`, part.cipher),
-          ),
-          deps.blobs.put(`${scope}/${candidate.blobName}`, candidate.cipher),
-        ]),
-      ),
-    ]);
+    try {
+      await Promise.all([
+        candidate.attachments.length > 0
+          ? clock.time("attachments", () =>
+              uploadBlobs(deps, candidate.attachments),
+            )
+          : undefined,
+        clock.time("segment-put", () =>
+          Promise.all([
+            ...candidate.objects.map((object) =>
+              deps.blobs.put(`${scope}/${object.name}`, object.cipher),
+            ),
+            deps.blobs.put(`${scope}/${candidate.blobName}`, candidate.cipher),
+          ]),
+        ),
+      ]);
+    } catch (error) {
+      // Storage kept refusing past its retry budget. Nothing is wrong with the
+      // data: nothing was committed, so the changes stay queued and the next
+      // cycle sends them again.
+      if (!(error instanceof StorageDeferredError)) throw error;
+      deps.logger.info(
+        { connectionId, error: error.message },
+        "stream sync: storage unavailable, publish left in the queue",
+      );
+      keep(await backoff(deps, connectionId));
+      break;
+    }
 
     const committed = await clock.time("commit", () =>
       deps.queue.run(connectionId, "publish", () =>
@@ -347,10 +420,17 @@ async function snapshotRound(
   if (!connection)
     throw new Error(`publish: unknown connection ${connectionId}`);
   const streams = await held.db.query<StreamRow>(
-    `SELECT stream, primary_key, profile_key, profile_version, complete,
-            floor_version, floor_o, floor_r, last_delete_version,
-            head_version, head_generation, head_data_hash, publish_watermark
-       FROM stream_state WHERE connection_id = ? ORDER BY stream`,
+    `SELECT s.stream, s.primary_key, s.profile_key, s.profile_version, s.complete,
+            s.floor_version, s.floor_o, s.floor_r, s.last_delete_version,
+            s.head_version, s.head_generation, s.head_data_hash, s.publish_watermark,
+            v.complete AS published_complete, v.primary_key AS published_primary_key,
+            v.profile_key AS published_profile_key,
+            v.profile_version AS published_profile_version
+       FROM stream_state s
+       LEFT JOIN stream_versions v
+         ON v.connection_id = s.connection_id AND v.stream = s.stream
+        AND v.version = s.head_version
+      WHERE s.connection_id = ? ORDER BY s.stream`,
     [connectionId],
   );
   const all = (outcome: PublishResult["outcome"]): Snapshot => ({
@@ -395,6 +475,12 @@ async function snapshotRound(
 
   const planStart = clock.now();
   const log = await readLogState(held, connectionId);
+  // A connection with no log yet starts it with everything this device holds
+  // (a device that applied a log first seeded when it did, `applyLog`).
+  const seeded =
+    log.position === 0
+      ? await seedFromRecords(held, connectionId)
+      : new Set<string>();
   const planned: Planned[] = [];
   const target = held.partTargetBytes ?? DEFAULT_PART_TARGET_BYTES;
   let budget = 0;
@@ -410,12 +496,14 @@ async function snapshotRound(
     }
     if (connection.generation !== 1)
       await excludeSeedsIfAny(held, connectionId, stream);
+    // The plan's base is what the log last said, not what the run's end wrote.
+    const published = asPublished(row);
     const plan = await planStream(
       held,
       connectionId,
       connection,
       stream,
-      row,
+      published,
       null,
       row.head_version,
       row.head_data_hash,
@@ -447,6 +535,8 @@ async function snapshotRound(
       meta: null,
       runIds: plan.steps.map((step) => step.runId),
       replace: null,
+      replacing: null,
+      omitting: null,
       omitted: [],
       bytes: 0,
     };
@@ -476,7 +566,7 @@ async function snapshotRound(
       watermark,
     );
     // A stream with no head yet (a first collection that publishes while it
-    // collects) is described by its local state, as the per-stream path does.
+    // collects) is described by its local state.
     const head: PlanHead | null =
       plan.finalHead ??
       (groups.length > 0
@@ -487,7 +577,10 @@ async function snapshotRound(
               key: row.profile_key ?? connection.connector,
               version: row.profile_version ?? row.floor_version ?? "0",
             },
-            complete: false,
+            // A seeded stream is what this device holds, head and all: its
+            // completeness is its own. Other changes with no run to describe
+            // them belong to a first collection that is still filling.
+            complete: seeded.has(stream) && row.complete === 1,
           }
         : null);
     const metaChanged =
@@ -495,12 +588,12 @@ async function snapshotRound(
       (row.head_version === 0 ||
         !sameHead(head, {
           generation: row.head_generation ?? head.generation,
-          primaryKey: JSON.parse(row.primary_key),
+          primaryKey: JSON.parse(published.primary_key),
           profile: {
-            key: row.profile_key ?? connection.connector,
-            version: row.profile_version ?? "0",
+            key: published.profile_key ?? connection.connector,
+            version: published.profile_version ?? "0",
           },
-          complete: row.complete === 1,
+          complete: published.complete === 1,
         }));
     const metaPublishes =
       metaChanged && plan.steps.some((s) => s.decision.kind === "publish");
@@ -510,16 +603,29 @@ async function snapshotRound(
       continue;
     }
     // Changes go in the order they were made, until the segment reaches the
-    // part target, measured on the operations themselves. A stream that
-    // replaces goes whole (its completion and its changes are one unit), but
-    // still waits for the next round if the segment is full. The first thing
-    // in a segment always goes, however large, so a round always progresses.
+    // part target, measured on the operations themselves. The first thing in
+    // a segment always goes, however large, so a round always progresses.
+    //
+    // A replacing stream whose rows and completion fit one segment goes whole
+    // (a reader sees the replace at once), or waits for the next round if
+    // this segment is full. One larger than a segment goes like any other
+    // changes, over as many rounds as it needs. Its completion (the keys it
+    // dropped) goes in the round that takes its last rows, or alone in the
+    // next. A completion larger than what is left of the segment goes in
+    // pieces over as many rounds as it needs: each is a completion at the
+    // run's cutoff for the next keys in hash order, an omission per key like
+    // any other. Only the round with the last piece says the stream is
+    // complete: an earlier round says it is not, so a reader never takes a
+    // replace that is half published for a complete stream. Every operation
+    // merges per key by stamp, so rounds from other writers in between
+    // interleave as they would with any other changes.
     const room = (size: number) => first || budget + size <= target;
-    const atomic = replace !== null;
+    const sizeOf = (op: LogOperation) => opSize(op, target);
     const selected: { pk: string; seq: number }[] = [];
     const taken: LogOperation[] = [];
-    let bytes = omittedSize(omitted) + 100;
+    let bytes = 100;
     let rest = false;
+    let whole = false;
     // A stream with a change the log cannot say stops here: nothing of it is
     // published or acknowledged this round (`plan.deferred`, as for a stream
     // that waits on its runs), so no change is lost without a trace.
@@ -545,7 +651,7 @@ async function snapshotRound(
         ack: row.publish_watermark,
       });
     };
-    if (atomic) {
+    if (replace !== null) {
       const { ops: found, untyped } = await operationsFor(
         held,
         connectionId,
@@ -558,18 +664,22 @@ async function snapshotRound(
         stop(untyped);
         continue;
       }
-      const size =
-        bytes + [...found.values()].reduce((n, op) => n + opSize(op), 0);
-      if (!room(size)) {
-        planned.push({ ...base, ack: row.publish_watermark, rest: true });
-        continue;
+      let size = bytes + 100 + omittedSize(omitted);
+      for (const op of found.values()) size += sizeOf(op);
+      if (size <= target) {
+        if (!room(size)) {
+          planned.push({ ...base, ack: row.publish_watermark, rest: true });
+          continue;
+        }
+        // A stream can hold more keys than a call takes as arguments (a
+        // spread of ~125k overflows the stack), so these go one by one.
+        for (const group of groups) selected.push(group);
+        for (const op of found.values()) taken.push(op);
+        bytes = size;
+        whole = true;
       }
-      // A stream can hold more keys than a call takes as arguments (a spread
-      // of ~125k overflows the stack), so these are appended one by one.
-      for (const group of groups) selected.push(group);
-      for (const op of found.values()) taken.push(op);
-      bytes = size;
-    } else {
+    }
+    if (!whole)
       scan: for (const batch of chunked(groups, KEYS_PER_QUERY)) {
         const { ops: found, untyped } = await operationsFor(
           held,
@@ -585,7 +695,7 @@ async function snapshotRound(
         }
         for (const group of batch) {
           const op = found.get(group.pk);
-          const size = op ? opSize(op) : 0;
+          const size = op ? sizeOf(op) : 0;
           if (!room(bytes + size)) {
             rest = true;
             break scan;
@@ -596,22 +706,49 @@ async function snapshotRound(
           first = false;
         }
       }
-      if (selected.length === 0 && groups.length > 0) {
-        planned.push({ ...base, ack: row.publish_watermark, rest: true });
-        continue;
+    if (selected.length === 0 && groups.length > 0) {
+      planned.push({ ...base, ack: row.publish_watermark, rest: true });
+      continue;
+    }
+    // Rows of the stream wait for a later round; its completion waits with them.
+    const rowsRest = rest;
+    let completes = whole;
+    let piece: LogOmission[] = [];
+    if (replace !== null && !whole && !rowsRest) {
+      // An empty segment takes at least one key, so a round always progresses.
+      const fit = omissionsThatFit(omitted, target - budget - bytes - 100);
+      const take = fit === 0 && first ? 1 : fit;
+      if (take >= omitted.length) {
+        completes = true;
+        bytes += 100 + omittedSize(omitted);
+      } else {
+        rest = true;
+        piece = omitted.slice(0, take);
+        if (piece.length > 0) bytes += 100 + omittedSize(piece);
       }
+    }
+    // A replace whose completion waits, with no rows or piece of its
+    // completion in this round, waits whole.
+    if (
+      replace !== null &&
+      !completes &&
+      taken.length === 0 &&
+      piece.length === 0
+    ) {
+      planned.push({ ...base, ack: row.publish_watermark, rest: true });
+      continue;
     }
     // Changes that carry no operation are nothing to publish: the rows a
     // replacing run dropped are deleted locally in the commit that publishes
     // its completion, and those deletions are changes above that commit's
     // watermark. Counted as work they would cost a segment that says nothing.
-    if (!atomic && !rest && taken.length === 0 && !metaPublishes) {
+    if (!completes && !rest && taken.length === 0 && !metaPublishes) {
       planned.push({ ...base });
       continue;
     }
     budget += bytes;
     first = false;
-    const ack = rest ? selected.at(-1)!.seq : watermark;
+    const ack = rowsRest ? selected.at(-1)!.seq : watermark;
     planned.push({
       ...base,
       included: true,
@@ -619,13 +756,13 @@ async function snapshotRound(
       ack,
       operations: [
         ...orderedOperations(taken),
-        ...(replace
+        ...(replace && (completes || piece.length > 0)
           ? [
               {
                 kind: "complete" as const,
                 stream,
                 cutoff: { o: replace.o, r: replace.r },
-                omitted,
+                omitted: completes ? omitted : piece,
               },
             ]
           : []),
@@ -634,10 +771,15 @@ async function snapshotRound(
         stream,
         primaryKey: head.primaryKey,
         profile: head.profile as LogStreamMeta["profile"],
-        complete: head.complete,
+        complete: replace !== null && !completes ? false : head.complete,
       },
-      replace,
-      omitted,
+      replace: completes ? replace : null,
+      replacing: replace !== null && !completes ? replace : null,
+      omitting:
+        piece.length > 0
+          ? { from: piece[0]!.pkHash, to: piece.at(-1)!.pkHash }
+          : null,
+      omitted: completes ? omitted : piece,
       bytes,
     });
   }
@@ -729,7 +871,14 @@ async function snapshotRound(
       `publish: a deletion's key does not match its hash (${mismatch.stream}/${mismatch.pkHash})`,
     );
   const encodeStart = clock.now();
-  const clear = encodeSegment(segment);
+  // A body larger than one object goes out of line (stream-sync `log.ts`).
+  const outOfLine = await putBodiesOutOfLine(
+    held,
+    scope,
+    segment.operations,
+    target,
+  );
+  const clear = encodeSegment({ ...segment, operations: outOfLine.ops });
   const { dataHash, blobName } = await digestSegment(
     keccakOf(held.streamCrypto),
     clear,
@@ -756,7 +905,7 @@ async function snapshotRound(
       base,
       refs,
       snapshot,
-      snapshotParts: compaction?.parts ?? [],
+      objects: [...(compaction?.objects ?? []), ...outOfLine.pieces],
       position,
       generation: connection.generation,
       dataHash,
@@ -772,17 +921,42 @@ async function snapshotRound(
   };
 }
 
-function opSize(op: LogOperation): number {
-  return op.kind === "upsert"
-    ? 160 + JSON.stringify(op.value).length
-    : op.kind === "delete"
-      ? 160 + JSON.stringify(op.key).length
-      : 100 + omittedSize(op.omitted);
+/**
+ * What `op` adds to a segment. A body longer than `target` goes out of line
+ * (`log-bodies.ts`): the segment carries only its piece hashes.
+ */
+function opSize(op: LogOperation, target: number): number {
+  if (op.kind === "upsert") {
+    const length = JSON.stringify(op.value).length;
+    return length > target
+      ? 260 + 70 * Math.ceil(length / target)
+      : 160 + length;
+  }
+  return op.kind === "delete"
+    ? 160 + JSON.stringify(op.key).length
+    : 100 + omittedSize(op.omitted);
 }
 
 /** An omission lists its hash and its typed key. */
+function omissionSize(o: LogOmission): number {
+  return 70 + JSON.stringify(o.key).length;
+}
+
 function omittedSize(omitted: readonly LogOmission[]): number {
-  return omitted.reduce((n, o) => n + 70 + JSON.stringify(o.key).length, 0);
+  return omitted.reduce((n, o) => n + omissionSize(o), 0);
+}
+
+/** How many of `omitted`, from the first, fit in `room` bytes. */
+function omissionsThatFit(
+  omitted: readonly LogOmission[],
+  room: number,
+): number {
+  let n = 0;
+  for (let used = 0; n < omitted.length; n += 1) {
+    used += omissionSize(omitted[n]!);
+    if (used > room) break;
+  }
+  return n;
 }
 
 /**
@@ -854,8 +1028,7 @@ async function establishControl(
  * the run deletes it: the row's data holds them with their types, and a
  * deletion's key is exactly what its hash was computed from.
  *
- * The bodies are read a page at a time, as the spool is (`PAGE_BYTES` of
- * bodies, or one row), after reading the rows' sizes alone (`META_ROWS` at a
+ * The bodies are read a page at a time (`PAGE_BYTES` of bodies, or one row), after reading the rows' sizes alone (`META_ROWS` at a
  * time): the shared SQL cannot return just the key fields of a body (a phone's
  * SQLite 3.22 has no JSON1), and a pass that drops many large records must not
  * hold them all at once. Only the small keys are kept.
@@ -915,11 +1088,18 @@ async function omittedHashes(
   connectionId: string,
   stream: string,
   replace: { o: number; r: string },
+  keys?: KeyRange,
 ): Promise<string[]> {
   const rows = await deps.db.query<{ pk_hash: string }>(
     `SELECT pk_hash FROM records WHERE connection_id = ? AND stream = ?
-        AND ${SEEN_BEFORE} ORDER BY pk_hash`,
-    [connectionId, stream, ...seenBeforeParams(replace.o, replace.r)],
+        AND ${SEEN_BEFORE}${keys ? " AND pk_hash >= ? AND pk_hash <= ?" : ""}
+      ORDER BY pk_hash`,
+    [
+      connectionId,
+      stream,
+      ...seenBeforeParams(replace.o, replace.r),
+      ...(keys ? [keys.from, keys.to] : []),
+    ],
   );
   return rows.map((row) => row.pk_hash);
 }
@@ -966,6 +1146,9 @@ async function operationsFor(
   /** Explicit deletes of these keys have no typed key and cannot be published. */
   readonly untyped: string[];
 }> {
+  // A remove change carries its typed key only from an explicit delete
+  // (`explicit_delete`) or from a seeded omission (`seedFromHistory`), which
+  // goes as the completion of that one key at its cutoff.
   const ops = new Map<string, LogOperation>();
   const untyped: string[] = [];
   for (const group of chunked(keys, KEYS_PER_QUERY)) {
@@ -1003,14 +1186,27 @@ async function operationsFor(
       record_key: string;
       stamp_o: number;
       stamp_r: string;
+      explicit_delete: number;
     }>(
-      `SELECT pk_hash, pk_values, record_key, stamp_o, stamp_r, MAX(seq) FROM record_changes
+      `SELECT pk_hash, pk_values, record_key, stamp_o, stamp_r, explicit_delete, MAX(seq) FROM record_changes
         WHERE connection_id = ? AND stream = ? AND seq > ? AND seq <= ?
-          AND op = 'remove' AND explicit_delete = 1 AND pk_hash IN (${goneMarks})
+          AND op = 'remove' AND (explicit_delete = 1 OR pk_values IS NOT NULL)
+          AND pk_hash IN (${goneMarks})
         GROUP BY pk_hash`,
       [connectionId, stream, from, to, ...gone],
     );
     for (const row of deletes) {
+      if (row.explicit_delete === 0) {
+        ops.set(row.pk_hash, {
+          kind: "complete",
+          stream,
+          cutoff: { o: row.stamp_o, r: row.stamp_r },
+          omitted: [
+            { pkHash: row.pk_hash, key: JSON.parse(row.pk_values!) as LogKey },
+          ],
+        });
+        continue;
+      }
       // A delete made before `pk_values` existed has only the lossy string
       // key. The stream's declared key types give the typed key back from it,
       // if the rebuilt tuple hashes to the record's hash; otherwise the log
@@ -1075,12 +1271,12 @@ async function declaredKey(
 
 /** Upserts, then deletes, each by key: one order for every writer. */
 function orderedOperations(ops: readonly LogOperation[]): LogOperation[] {
+  const pkOf = (op: LogOperation) =>
+    op.kind === "complete" ? (op.omitted[0]?.pkHash ?? "") : op.pkHash;
   return [...ops].sort(
     (a, b) =>
       (a.kind === "upsert" ? 0 : 1) - (b.kind === "upsert" ? 0 : 1) ||
-      (a as { pkHash: string }).pkHash.localeCompare(
-        (b as { pkHash: string }).pkHash,
-      ),
+      pkOf(a).localeCompare(pkOf(b)),
   );
 }
 
@@ -1127,7 +1323,15 @@ async function basisOf(
     );
     const omitted = p.replace
       ? await omittedHashes(deps, connectionId, p.stream, p.replace)
-      : [];
+      : p.replacing && p.omitting
+        ? await omittedHashes(
+            deps,
+            connectionId,
+            p.stream,
+            p.replacing,
+            p.omitting,
+          )
+        : [];
     streams.push([p.stream, state, runs, covered, omitted]);
   }
   return JSON.stringify([connection, log, intents, streams]);
@@ -1310,16 +1514,35 @@ async function commitRound(
         ),
         replaceDelete(connectionId, p.stream, p.replace.o, p.replace.r),
       );
+    else if (p.replacing && p.omitting)
+      statements.push(
+        tombstoneOmissions(
+          connectionId,
+          p.stream,
+          p.replacing.o,
+          p.replacing.r,
+          held.publishWhileCollecting === true,
+          p.omitting,
+        ),
+        replaceDelete(
+          connectionId,
+          p.stream,
+          p.replacing.o,
+          p.replacing.r,
+          p.omitting,
+        ),
+      );
   }
   for (const p of touched) {
     const meta = p.meta!;
     statements.push(
       {
         sql: `INSERT OR REPLACE INTO stream_versions (connection_id, stream, version, generation,
-                head_blob, head_format, record_count, observed_at, complete, kind)
+                head_blob, head_format, record_count, observed_at, complete, kind,
+                primary_key, profile_key, profile_version)
               SELECT ?, ?, MAX(s.head_version, s.last_delete_version) + 1, ?, ?, ?,
                      (SELECT COUNT(*) FROM records r WHERE r.connection_id = ? AND r.stream = ?),
-                     ?, ?, 'published'
+                     ?, ?, 'published', ?, ?, ?
                 FROM stream_state s WHERE s.connection_id = ? AND s.stream = ?`,
         params: [
           connectionId,
@@ -1331,6 +1554,9 @@ async function commitRound(
           p.stream,
           candidate.observedAt,
           meta.complete ? 1 : 0,
+          JSON.stringify(meta.primaryKey),
+          meta.profile.key,
+          meta.profile.version,
           connectionId,
           p.stream,
         ],
@@ -1356,6 +1582,25 @@ async function commitRound(
       },
     );
   }
+  // A replace still under way read the stream at its basis; the segment this
+  // round committed is this device's own, so the basis moves to it (after the
+  // head columns above have).
+  for (const p of touched)
+    if (p.replacing)
+      statements.push({
+        sql: `UPDATE run_streams SET
+                basis_version = (SELECT head_version FROM stream_state WHERE connection_id = ? AND stream = ?),
+                basis_data_hash = ?, basis_generation = ?
+               WHERE run_id = ? AND stream = ? AND replace = 1`,
+        params: [
+          connectionId,
+          p.stream,
+          candidate.dataHash,
+          candidate.generation,
+          p.replacing.r,
+          p.stream,
+        ],
+      });
   for (const p of candidate.planned) {
     if (p.plan.deferred) continue;
     if (!p.rest)
