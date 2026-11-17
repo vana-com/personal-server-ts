@@ -209,8 +209,9 @@ export interface ServerContext {
   /**
    * Stops background work and releases the stores and the outbound pool. The
    * caller first stops accepting requests and lets those in flight finish
-   * (`runShutdown`): a request still running finishes, because the pool closes
-   * gracefully, but it finds the stores closed.
+   * (`runShutdown`, which exits instead if they overrun). The outbound pool
+   * then closes last, and gives a background request still in flight a grace
+   * time to finish.
    */
   cleanup: () => Promise<void>;
   /** This boot's replication door, decided before any record store opened. */
@@ -1864,8 +1865,10 @@ async function bootstrapServer(
         indexManager.close();
       }
     });
-    // Last: the stops above send through it until they have settled. Closing
-    // waits for a request still in flight, up to the pool's grace time.
+    // Last: the stops above send through it until they have settled. A
+    // background request still in flight (a sync or replication step) gets the
+    // pool's grace time to finish. An inbound request is not covered here:
+    // `runShutdown` has already drained inbound requests or exited.
     await attempt(() => keepAlive?.close());
     if (errors.length > 0) throw errors[0];
   };

@@ -55,19 +55,24 @@ interface SocketInfo {
   bytesRead?: number;
 }
 
-/** How long {@link KeepAliveFetch.close} lets a request in flight finish. */
+/** The default for {@link KeepAliveFetchOptions.closeGraceMs}. */
 export const CLOSE_GRACE_MS = 5_000;
 
 export interface KeepAliveFetch {
   readonly fetch: typeof fetch;
   /**
    * Waits for requests in flight to finish, then closes every connection. A
-   * request still running after `graceMs` is aborted. For server shutdown: stop
-   * accepting work, drain it, then close the pool. Calling it again, while the
-   * first call runs or after it has finished, returns the first call's outcome
-   * (its `graceMs` applies).
+   * request still running when the grace time ends is aborted, and so is a
+   * response body its caller has not finished reading. For shutdown, after the
+   * callers that matter have drained. Calling it again returns when the first
+   * call has finished.
    */
-  close(options?: { graceMs?: number }): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface KeepAliveFetchOptions {
+  /** How long `close` waits for requests in flight. Default: 5 s. */
+  closeGraceMs?: number;
 }
 
 /**
@@ -83,6 +88,7 @@ export interface KeepAliveFetch {
  */
 export function createKeepAliveFetch(
   send: typeof fetch = globalThis.fetch,
+  { closeGraceMs = CLOSE_GRACE_MS }: KeepAliveFetchOptions = {},
 ): KeepAliveFetch {
   const dispatcher = new Agent({
     // Used when the peer sends no `Keep-Alive` hint; `keepAliveMaxTimeout` is
@@ -93,14 +99,12 @@ export function createKeepAliveFetch(
   });
   const pastGrace = new AbortController();
   const through = (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-    const signals = [
-      init?.signal,
-      input instanceof Request ? input.signal : undefined,
-      pastGrace.signal,
-    ].filter((signal) => signal != null);
+    // `fetch` takes the signal of `init` over the one of a `Request`.
+    const own =
+      init?.signal ?? (input instanceof Request ? input.signal : undefined);
     return send(input, {
       ...init,
-      signal: AbortSignal.any(signals),
+      signal: own ? AbortSignal.any([own, pastGrace.signal]) : pastGrace.signal,
       dispatcher,
     } as RequestInit);
   };
@@ -113,23 +117,22 @@ export function createKeepAliveFetch(
       return through(input, init);
     }
   };
-  let closing: Promise<void> | undefined;
-  const closeOnce = async (graceMs: number) => {
-    // `Agent.destroy` after `Agent.close` leaves a request in flight pending,
-    // so the end of the grace time aborts requests through their signal. An
-    // aborted request ends, and `close` then finishes.
-    const timer = setTimeout(() => pastGrace.abort(), graceMs);
+  const close = async () => {
+    // `Agent.close` destroys the agent when it is done, and `close` on a
+    // destroyed agent rejects. A close that runs while another is open joins it.
+    if (dispatcher.destroyed) return;
+    // The end of the grace time aborts what is still running through its
+    // signal. `Agent.destroy` cannot: `Agent.close` empties the agent's table
+    // of pools as it starts, so a `destroy` after it reaches no pool. Measured
+    // on undici 7.30 with Node 22 and 24: after `close` then `destroy`, a
+    // request without headers and a body not yet read both stay pending, and
+    // `close` never settles.
+    const timer = setTimeout(() => pastGrace.abort(), closeGraceMs);
     try {
-      // Ends idle connections now and waits for the busy ones.
       await dispatcher.close();
     } finally {
       clearTimeout(timer);
     }
   };
-  // `Agent.close` destroys the agent when it is done, and a second `close` on
-  // a destroyed agent rejects. A caller that stops the host twice must get the
-  // first outcome again, so every call shares the first one's promise.
-  const close = ({ graceMs = CLOSE_GRACE_MS } = {}) =>
-    (closing ??= closeOnce(graceMs));
   return { fetch: keepAliveFetch, close };
 }

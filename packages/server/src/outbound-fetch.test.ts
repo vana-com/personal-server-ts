@@ -313,7 +313,6 @@ describe("close", () => {
     await close();
 
     await expect(close()).resolves.toBeUndefined();
-    await expect(close({ graceMs: 10 })).resolves.toBeUndefined();
   });
 
   it("can be called again while the first call waits on a request in flight", async () => {
@@ -327,24 +326,28 @@ describe("close", () => {
     const inFlight = send(url);
     await requestArrived;
 
-    const both = Promise.all([close(), close()]);
+    const first = close();
+    const second = close();
 
     expect(await (await inFlight).text()).toBe("late");
-    await expect(both).resolves.toEqual([undefined, undefined]);
+    await expect(first).resolves.toBeUndefined();
+    await expect(second).resolves.toBeUndefined();
   });
 
   it("can be called again after the grace time aborted a request", async () => {
     let arrived!: () => void;
     const requestArrived = new Promise<void>((resolve) => (arrived = resolve));
     const { url } = await peer(() => arrived());
-    const { fetch: send, close } = createKeepAliveFetch();
+    const { fetch: send, close } = createKeepAliveFetch(undefined, {
+      closeGraceMs: 50,
+    });
     const inFlight = send(url);
     const aborted = expect(inFlight).rejects.toMatchObject({
       name: "AbortError",
     });
     await requestArrived;
 
-    await close({ graceMs: 50 });
+    await close();
     await aborted;
 
     await expect(close()).resolves.toBeUndefined();
@@ -369,18 +372,34 @@ describe("close", () => {
     expect(sockets[0]!.destroyed).toBe(true);
   });
 
+  it("aborts a response its caller holds and never reads, once the grace time has passed", async () => {
+    const { url } = await peer((_request, response) => {
+      response.write("partial");
+    });
+    const { fetch: send, close } = createKeepAliveFetch(undefined, {
+      closeGraceMs: 100,
+    });
+    const held = await send(url);
+
+    await close();
+
+    await expect(held.text()).rejects.toThrow();
+  });
+
   it("aborts a request that is still in flight once the grace time has passed", async () => {
     let arrived!: () => void;
     const requestArrived = new Promise<void>((resolve) => (arrived = resolve));
     const { url } = await peer(() => arrived());
-    const { fetch: send, close } = createKeepAliveFetch();
+    const { fetch: send, close } = createKeepAliveFetch(undefined, {
+      closeGraceMs: 100,
+    });
     const inFlight = send(url);
     const failed = expect(inFlight).rejects.toMatchObject({
       name: "AbortError",
     });
     await requestArrived;
 
-    await close({ graceMs: 100 });
+    await close();
 
     await failed;
   });
