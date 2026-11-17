@@ -49,11 +49,11 @@ const mark = async (db: SqlDriver, stream = "items") =>
     )
   )[0];
 /** The check each page makes, on the pin a reader holds. */
-const unchangedSince = async (db: SqlDriver, pin: number) =>
+const unchangedSince = async (db: SqlDriver, pin: number, stream = "items") =>
   (
     await db.query<{ ok: number }>(
-      "SELECT COALESCE((SELECT epoch FROM stream_change_marks WHERE connection_id = 'c1' AND stream = 'items'), 0) = ? AS ok",
-      [pin],
+      "SELECT COALESCE((SELECT epoch FROM stream_change_marks WHERE connection_id = 'c1' AND stream = ?), 0) = ? AS ok",
+      [stream, pin],
     )
   )[0]!.ok === 1;
 
@@ -150,8 +150,11 @@ describe("the mark of a stream", () => {
     const random = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
     let missed = 0;
     let detected = 0;
+    // One database for all trials: each trial has a stream of its own, and a
+    // mark is per stream, so the trials do not see each other.
+    const db = await open();
     for (let trial = 0; trial < 200; trial++) {
-      const db = await open();
+      const stream = `m${trial}`;
       const live = new Set<number>();
       let next = 0;
       let changes = 0;
@@ -166,22 +169,22 @@ describe("the mark of a stream", () => {
         if (x < 0.4) {
           const kind = live.size === 0 ? 0 : Math.floor(random() * 3);
           if (kind === 0) {
-            await add(db, "items", next);
+            await add(db, stream, next);
             live.add(next++);
           } else {
             const key = [...live][Math.floor(random() * live.size)]!;
             if (kind === 1)
               await db.batch([
                 {
-                  sql: "UPDATE records SET stamp_o = stamp_o + 1 WHERE pk_hash = ?",
-                  params: [hex(key)],
+                  sql: "UPDATE records SET stamp_o = stamp_o + 1 WHERE stream = ? AND pk_hash = ?",
+                  params: [stream, hex(key)],
                 },
               ]);
             else {
               await db.batch([
                 {
-                  sql: "DELETE FROM records WHERE pk_hash = ?",
-                  params: [hex(key)],
+                  sql: "DELETE FROM records WHERE stream = ? AND pk_hash = ?",
+                  params: [stream, hex(key)],
                 },
               ]);
               live.delete(key);
@@ -193,19 +196,17 @@ describe("the mark of a stream", () => {
         const reader = readers[x < 0.7 ? 0 : 1]!;
         if (reader.step === 0) {
           // The two steps of `pinStream`, taken apart so a write can fall between them.
-          reader.mark = await readMark(db, "c1", "items");
+          reader.mark = await readMark(db, "c1", stream);
           reader.step = 1;
         } else if (reader.step === 1) {
-          reader.pin = await clearMark(db, "c1", "items", reader.mark);
+          reader.pin = await clearMark(db, "c1", stream, reader.mark);
           reader.since = changes;
           reader.step = 2;
         } else if (changes > reader.since) {
-          if (await unchangedSince(db, reader.pin)) missed++;
+          if (await unchangedSince(db, reader.pin, stream)) missed++;
           else detected++;
         }
       }
-      await db.close();
-      drivers.pop();
     }
     expect(detected).toBeGreaterThan(100);
     expect(missed).toBe(0);
