@@ -81,7 +81,6 @@ async function device(
           },
         ],
       }),
-      olderVersionReads: () => true,
     },
   );
   return Object.assign(sync, { db });

@@ -1,5 +1,4 @@
 import type { LocalListing } from "../localdb/listing.js";
-import type { OlderVersions } from "../localdb/older-versions.js";
 import { isOwnAppRead } from "../payment/own-app.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
 import { HISTORY_PAGE_LIMIT, type LocalHistory } from "../localdb/history.js";
@@ -363,7 +362,6 @@ export interface StreamSyncReadPort {
   /** Per-stream counts and open import problems, for owner diagnostics. */
   status?(): StreamSyncReadStatus;
   listScopes?: LocalListing["listScopes"];
-  olderVersions?: OlderVersions;
 }
 
 export interface PersonalServerDataApiDeps {
@@ -3283,88 +3281,22 @@ export async function handlePersonalServerDataRequest(
             "Stream reads are not available",
           );
         }
-        let historical: ReadDecision | undefined;
-        if (!latestRead) {
-          let selected:
-            { scope: string; version: number; observedAt: number } | undefined;
-          const body = await deps.streamSyncRead.olderVersions?.read(
-            scopeResult.scope,
-            { fileId: fileIdParam, at: atParam },
-            (head) => {
-              selected = head;
-            },
+        // No older version has a body to serve: the connection log keeps
+        // none per stream. A selector (`fileId`, `at`, `view=stored`) reads
+        // nothing; a read without one serves the installed records.
+        if (!latestRead)
+          return errorResponse(
+            410,
+            "STREAM_HISTORY_UNAVAILABLE",
+            "Older versions are not available",
           );
-          if (!body || body === "gone")
-            return errorResponse(
-              410,
-              "STREAM_HISTORY_UNAVAILABLE",
-              "Older versions are not available",
-            );
-          if (!selected) {
-            await body.cancel();
-            return errorResponse(
-              503,
-              "STREAM_READ_UNAVAILABLE",
-              "The selected stream head is unavailable",
-            );
-          }
-          const head = selected;
-          const encoder = new TextEncoder();
-          const reader = body.getReader();
-          let started = false;
-          const wrapped = new ReadableStream<Uint8Array>({
-            async pull(controller) {
-              if (!started) {
-                started = true;
-                controller.enqueue(
-                  encoder.encode(
-                    JSON.stringify({
-                      version: "1.0",
-                      scope: scopeResult.scope,
-                      collectedAt: new Date(head.observedAt).toISOString(),
-                    }).slice(0, -1) + ',"data":{"records":',
-                  ),
-                );
-                return;
-              }
-              try {
-                const chunk = await reader.read();
-                if (chunk.done) {
-                  controller.enqueue(encoder.encode("}}"));
-                  controller.close();
-                  reader.releaseLock();
-                } else controller.enqueue(chunk.value);
-              } catch (error) {
-                controller.error(error);
-                reader.releaseLock();
-              }
-            },
-            async cancel(reason) {
-              try {
-                await reader.cancel(reason);
-              } finally {
-                reader.releaseLock();
-              }
-            },
-          });
-          historical = {
-            kind: "view",
-            connector: "",
-            ns: "",
-            cursor: "",
-            served: head,
-            body: wrapped,
-          };
-        }
-        const decision =
-          historical ??
-          (await deps.streamSyncRead.resolve({
-            scope: scopeResult.scope,
-            connection: latestRead ? url.searchParams.get("connection") : null,
-            cursor: latestRead ? url.searchParams.get("cursor") : null,
-            legacyFile: false,
-            isOwnerView: isOwnerView(authResult),
-          }));
+        const decision = await deps.streamSyncRead.resolve({
+          scope: scopeResult.scope,
+          connection: url.searchParams.get("connection"),
+          cursor: url.searchParams.get("cursor"),
+          legacyFile: false,
+          isOwnerView: isOwnerView(authResult),
+        });
         if (decision.kind === "local_pending") {
           await decision.body.cancel();
           return errorResponse(
@@ -3377,78 +3309,76 @@ export async function handlePersonalServerDataRequest(
         if (decision.kind === "unavailable" && decision.reason === "deleted") {
           throw new DataDeletedError({ scope: scopeResult.scope });
         }
-        if (latestRead || historical) {
-          if (
-            decision.kind === "pass" ||
-            decision.kind === "legacy" ||
-            decision.kind === "unavailable"
-          ) {
-            ownerNotes = decision;
-          }
-          const refusal = streamSyncRefusal(decision);
-          if (refusal) return refusal;
-          if (inProcess && wantsRawContent && decision.kind === "view") {
-            // A view has no raw bytes. Refused before any charge, log or
-            // fulfilment, so a caller never pays for a read it cannot use.
-            await decision.body.cancel();
-            return jsonResponse(
-              {
-                error: "STREAM_VIEW_NOT_RAW",
-                message: `Scope "${scopeResult.scope}" is served from its stream view, which has no raw binary content.`,
-                scope: scopeResult.scope,
-              },
-              { status: 409 },
-            );
-          }
-          if (decision.kind === "view") {
-            notifyDataRead(deps, { scope: scopeResult.scope });
-            // The same charge as a file read; the access record binds the
-            // stream head the view serves.
-            let paymentResponseHeader: string | undefined;
-            // An owner-only view with no registered head has nothing to
-            // charge against: the service serves it to the owner alone.
-            if (decision.served !== null) {
-              const served = decision.served;
-              const ownApp = await ownAppReadStatus(deps, authResult);
-              if (ownApp instanceof Response) {
-                await decision.body.cancel();
-                return ownApp;
-              }
-              const charge = readCharge(
-                deps,
-                scopeResult.scope,
-                authResult,
-                ownApp,
-              );
-              if (charge) {
-                let paid: Awaited<ReturnType<typeof payForRead>>;
-                try {
-                  paid = await payForRead(deps, request, charge, {
-                    scope: scopeResult.scope,
-                    servedEntry: served,
-                  });
-                } catch (error) {
-                  await decision.body.cancel();
-                  throw error;
-                }
-                if (paid.kind === "refused") {
-                  await decision.body.cancel();
-                  return paid.response;
-                }
-                paymentResponseHeader = paid.paymentResponseHeader;
-              }
-            }
-            const checked = await validateStreamBody(decision, inProcess);
-            await settle(decision.served);
-            return serveStreamSyncView(deps, request, {
+        if (
+          decision.kind === "pass" ||
+          decision.kind === "legacy" ||
+          decision.kind === "unavailable"
+        ) {
+          ownerNotes = decision;
+        }
+        const refusal = streamSyncRefusal(decision);
+        if (refusal) return refusal;
+        if (inProcess && wantsRawContent && decision.kind === "view") {
+          // A view has no raw bytes. Refused before any charge, log or
+          // fulfilment, so a caller never pays for a read it cannot use.
+          await decision.body.cancel();
+          return jsonResponse(
+            {
+              error: "STREAM_VIEW_NOT_RAW",
+              message: `Scope "${scopeResult.scope}" is served from its stream view, which has no raw binary content.`,
               scope: scopeResult.scope,
-              grantId,
+            },
+            { status: 409 },
+          );
+        }
+        if (decision.kind === "view") {
+          notifyDataRead(deps, { scope: scopeResult.scope });
+          // The same charge as a file read; the access record binds the
+          // stream head the view serves.
+          let paymentResponseHeader: string | undefined;
+          // An owner-only view with no registered head has nothing to
+          // charge against: the service serves it to the owner alone.
+          if (decision.served !== null) {
+            const served = decision.served;
+            const ownApp = await ownAppReadStatus(deps, authResult);
+            if (ownApp instanceof Response) {
+              await decision.body.cancel();
+              return ownApp;
+            }
+            const charge = readCharge(
+              deps,
+              scopeResult.scope,
               authResult,
-              decision: checked,
-              paymentResponseHeader,
-              inProcess,
-            });
+              ownApp,
+            );
+            if (charge) {
+              let paid: Awaited<ReturnType<typeof payForRead>>;
+              try {
+                paid = await payForRead(deps, request, charge, {
+                  scope: scopeResult.scope,
+                  servedEntry: served,
+                });
+              } catch (error) {
+                await decision.body.cancel();
+                throw error;
+              }
+              if (paid.kind === "refused") {
+                await decision.body.cancel();
+                return paid.response;
+              }
+              paymentResponseHeader = paid.paymentResponseHeader;
+            }
           }
+          const checked = await validateStreamBody(decision, inProcess);
+          await settle(decision.served);
+          return serveStreamSyncView(deps, request, {
+            scope: scopeResult.scope,
+            grantId,
+            authResult,
+            decision: checked,
+            paymentResponseHeader,
+            inProcess,
+          });
         }
         return errorResponse(
           404,

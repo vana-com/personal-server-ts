@@ -4,16 +4,17 @@
  * variable that also turns it on. A host passes the names it wants as one
  * comma list (`streamSyncFlags` option, or the `PS_STREAM_SYNC_FLAGS`
  * variable) and holds no table of its own; a name left out stays off and an
- * unknown name is ignored.
+ * unknown name is ignored. A flag that shipped on is removed from the table, and
+ * its name becomes an unknown one: a host that still passes `logProtocol` (the
+ * connection log is the only protocol now) is not refused.
  *
- * A flag's own explicit option (for example `streamSyncLogProtocol`) still
+ * A flag's own explicit option (for example `streamSyncPublishWhileCollecting`) still
  * wins over this list. What a flag means is owned where it is consumed (see
  * `LocalSyncDeps`), not here.
  */
 
 export const STREAM_SYNC_DESIGN_FLAGS = [
   { name: "publishWhileCollecting", env: "PS_PUBLISH_WHILE_COLLECTING" },
-  { name: "logProtocol", env: "PS_STREAM_SYNC_LOG_PROTOCOL" },
   {
     name: "progressiveFirstLoad",
     env: "PS_STREAM_SYNC_PROGRESSIVE_FIRST_LOAD",

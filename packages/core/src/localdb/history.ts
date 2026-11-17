@@ -25,10 +25,14 @@ export type HistoryResult<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly reason: "not_found" | "deleted" };
 
-/** One `/versions` item: the six fields of the legacy contract. */
+/**
+ * One `/versions` item: the six fields of the legacy contract. The list holds
+ * the one version a read serves, the stream's log position: the connection log
+ * keeps no body of an older one.
+ */
 export interface HistoryVersionItem {
-  /** `stream_versions.head_blob`. */
-  readonly fileId: string | null;
+  /** Always null: no version is read by `?fileId=`; read without a selector. */
+  readonly fileId: null;
   readonly schemaId: null;
   /** ISO string of the writer's `observed_at`, never import or registry time. */
   readonly collectedAt: string;
@@ -116,8 +120,6 @@ const trackedSince = (counts: Counts): string | null =>
 export function createLocalHistory(
   deps: LocalSyncDeps,
   options: {
-    /** The `olderVersionReads` server config value, read at each call (default true). */
-    readonly olderVersionReads: () => boolean;
     /** Registry freshness is not persisted by the current local database schema. */
     readonly behind?: (connectionId: string) => boolean;
     /** The host's legacy alias ports; the ones the read route resolves with. */
@@ -315,12 +317,11 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
       const located = await locate(scope);
       if ("gone" in located) return { ok: false, reason: located.gone };
       const { connector, ns, stream } = located;
-      // One statement gives control, frontier, total and page one snapshot.
-      const rows = await reads.db.query<{
+      // A stream shows one version, its head: one statement gives control,
+      // frontier and that version.
+      const [row] = await reads.db.query<{
         control_state: string;
         head_version: number | null;
-        total: number;
-        head_blob: string | null;
         observed_at: number | null;
         version: number | null;
       }>(
@@ -331,63 +332,46 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
                  ORDER BY connection_id LIMIT 1) c
            LEFT JOIN stream_state s ON s.connection_id = c.connection_id
              AND s.stream = ?
-         ), visible AS (
-           SELECT v.head_blob, v.observed_at, v.version
-           FROM context c JOIN stream_versions v
-             ON v.connection_id = c.connection_id AND v.stream = ?
-           WHERE c.control_state = 'active' AND v.generation = c.generation
-             AND v.version > c.last_delete_version
-             AND v.kind IN ('published', 'applied')
-             AND (? = 1 OR v.version = c.head_version)
-         ), page AS (
-           SELECT * FROM visible WHERE (? IS NULL OR version < ?)
-           ORDER BY version DESC LIMIT ?
          )
-         SELECT c.control_state, c.head_version,
-                (SELECT COUNT(*) FROM visible) AS total,
-                p.head_blob, p.observed_at, p.version
-         FROM context c LEFT JOIN page p ON 1 = 1
-         ORDER BY p.version DESC`,
-        [
-          connector,
-          ns,
-          stream,
-          stream,
-          options.olderVersionReads() ? 1 : 0,
-          cursor ?? null,
-          cursor ?? null,
-          limit + 1,
-        ],
+         SELECT c.control_state, c.head_version, v.observed_at, v.version
+         FROM context c LEFT JOIN stream_versions v
+           ON v.connection_id = c.connection_id AND v.stream = ?
+          AND c.control_state = 'active' AND v.generation = c.generation
+          AND v.version > c.last_delete_version
+          AND v.kind IN ('published', 'applied')
+          AND v.version = c.head_version`,
+        [connector, ns, stream, stream],
       );
-      const context = rows[0];
-      if (context?.control_state === "deleted") {
+      if (row?.control_state === "deleted") {
         return { ok: false, reason: "deleted" };
       }
-      if (
-        context?.control_state !== "active" ||
-        context.head_version === null
-      ) {
+      if (row?.control_state !== "active" || row.head_version === null) {
         return { ok: false, reason: "not_found" };
       }
-      const versions = rows.filter((row) => row.version !== null);
-      const page = versions.slice(0, limit);
+      const head =
+        row.version === null
+          ? null
+          : { observedAt: row.observed_at!, version: row.version };
+      const page =
+        head !== null && (cursor === undefined || head.version < cursor)
+          ? [head]
+          : [];
       return {
         ok: true,
         value: {
           scope,
-          versions: page.map((row) => ({
-            fileId: row.head_blob,
+          versions: page.map((version) => ({
+            fileId: null,
             schemaId: null,
-            collectedAt: new Date(row.observed_at!).toISOString(),
-            version: row.version!,
+            collectedAt: new Date(version.observedAt).toISOString(),
+            version: version.version,
             producer: null,
             producer_provenance: null,
           })),
-          total: context.total,
+          total: head === null ? 0 : 1,
           limit,
           offset: 0,
-          nextCursor:
-            versions.length > limit ? page[page.length - 1]!.version : null,
+          nextCursor: null,
         },
       };
     },

@@ -1,9 +1,9 @@
 // The writes that keep a stream's first load readable while it applies: the
 // row of `stream_partial`, and the list of keys `partial_hidden` keeps out of
-// the view. Both the per-stream path (`apply.ts`, a head's parts) and the log
-// path (`log-apply.ts`, a log's segments and snapshot parts) write them here,
-// and `partial-read.ts` is the one reader: a row is visible during a load when
-// it is stored and not in `partial_hidden`. No path has a predicate of its own.
+// the view. The log's apply (`log-apply.ts`, a log's segments and snapshot parts)
+// writes them here, and `partial-read.ts` is the one reader: a row is visible
+// during a load when it is stored and not in `partial_hidden`. No path has a
+// predicate of its own.
 
 import type { SqlStatement } from "./driver.js";
 

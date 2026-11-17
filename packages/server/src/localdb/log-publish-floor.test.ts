@@ -12,7 +12,9 @@
 import { sha256 } from "@noble/hashes/sha2";
 import { afterEach, describe, expect, it } from "vitest";
 import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import { applyConnection } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
+  CONNECTION_ID,
   CONNECTOR,
   closeWorldDrivers,
   sName,
@@ -28,52 +30,13 @@ const six = (prefix: string) =>
     id: `${prefix}${i}`,
   }));
 
-// All expected applies must reach the registry boundary before any enters it.
-// Promise continuations then enter the real coalescer as one arrival cohort;
-// database scheduling and the trace's artificial latency cannot split it.
-function applyListingBarrier(others: number) {
-  const expected = new Set(
-    Array.from({ length: others }, (_, i) => `other${i}`),
-  );
-  const arrived = new Set<string>();
-  let armed = false;
-  let release!: () => void;
-  let reject!: (reason: Error) => void;
-  const ready = new Promise<void>((resolve, fail) => {
-    release = resolve;
-    reject = fail;
-  });
-  // A bad first arrival can reject before another caller starts waiting.
-  void ready.catch(() => {});
-  return {
-    arm: () => {
-      armed = true;
-    },
-    async beforeListStreamRows(connector: string) {
-      if (!armed) return;
-      if (!expected.has(connector) || arrived.has(connector)) {
-        const error = new Error(
-          `unexpected or duplicate apply listing: ${connector}`,
-        );
-        reject(error);
-        throw error;
-      }
-      arrived.add(connector);
-      if (arrived.size === expected.size) release();
-      await ready;
-    },
-    assertComplete: () =>
-      expect([...arrived].sort()).toEqual([...expected].sort()),
-  };
-}
-
 async function openWorld(
   others: number,
-  beforeListStreamRows?: (connector: string) => Promise<void>,
+  latencyMs: Parameters<typeof requestTrace>[0] = 2,
 ) {
-  const trace = requestTrace(2);
-  const w = await world({ streams: 6, logProtocol: true, trace });
-  const a = await w.device("a", true, { beforeListStreamRows });
+  const trace = requestTrace(latencyMs);
+  const w = await world({ streams: 6, trace });
+  const a = await w.device("a");
   for (let c = 0; c < others; c++) {
     await a.run(`other-${c}`, six("o"), { connector: `other${c}` });
     await a.cycle();
@@ -107,43 +70,42 @@ describe("log publish: the requests of one save", () => {
     expect(trace.depthToLast("batch"), trace.describe()).toBe(2);
   });
 
-  it("listings of the owner's rows stay at three or fewer, however many other connections the owner has", async () => {
-    const lists: number[] = [];
-    for (const others of [1, 9]) {
-      const barrier = applyListingBarrier(others);
-      const { trace, a } = await openWorld(
-        others,
-        barrier.beforeListStreamRows,
-      );
-      await a.run("save", six("b"), {
-        connector: "other0",
-        full: false,
-        covered: [sName(0)],
-      });
-      trace.clear();
-      barrier.arm();
-      await a.cycle();
-      barrier.assertComplete();
-      for (const request of trace.requests.filter((r) => r.kind === "list")) {
-        expect(request.label, trace.describe()).toMatch(
-          /^(listControlRows|listStreamRows\(.+\)|listConnectionRows\(.+\)|probeChange) limit=\d+ cursor=.+$/,
-        );
+  // The applies of a cycle reach their listing when their own control read
+  // answers. On a loaded host those answers spread over more than one
+  // request's time; here each read is held 6 ms longer than the one before,
+  // so the spread is set, not left to the host's scheduler.
+  for (const [name, latency] of [
+    ["at one latency", 2],
+    [
+      "when the control reads answer at different times",
+      (kind: string, nth: number) => (kind === "read" ? 2 + 6 * nth : 2),
+    ],
+  ] as const)
+    it(`listings of the owner's rows: one per cycle, however many other connections the owner has (${name})`, async () => {
+      for (const others of [1, 9]) {
+        const { trace, a } = await openWorld(others, latency);
+        await a.run("save", six("b"), {
+          connector: "other0",
+          full: false,
+          covered: [sName(0)],
+        });
+        trace.clear();
+        await a.cycle();
+        // The publish itself is a PUT and a commit, ahead of everything else.
+        expect(trace.depthToLast("batch"), trace.describe()).toBe(2);
+        // Each connection's apply still reads its own control row (the
+        // freshness contract of apply); nothing else is read one request at a
+        // time.
+        expect(trace.count("read"), trace.describe()).toBe(others);
+        // The cycle's one listing, which every apply of the cycle reads its
+        // log row from.
+        expect(trace.count("list"), trace.describe()).toBe(1);
       }
-      lists.push(trace.count("list"));
-      // The publish itself is a PUT and a commit, ahead of everything else.
-      expect(trace.depthToLast("batch"), trace.describe()).toBe(2);
-      // Each connection's apply still reads its own control row (the freshness
-      // contract of apply); nothing else is read one request at a time.
-      expect(trace.count("read"), trace.describe()).toBe(others);
-    }
-    // The cycle's own listing plus at most two shared apply listings.
-    // The arrival barrier, not requestTrace(2), defines the apply cohort.
-    for (const n of lists) expect(n, `lists ${lists}`).toBeLessThanOrEqual(3);
-  });
+    });
 
   it("an attachment goes up beside the segment, not before it: depth 3 (probe, PUT), not 4", async () => {
     const trace = requestTrace(2);
-    const w = await world({ streams: 1, logProtocol: true, trace });
+    const w = await world({ streams: 1, trace });
     const a = await w.device("a");
     const bytes = new Uint8Array(5000).fill(7);
     const hash = Buffer.from(sha256(bytes)).toString("hex");
@@ -160,5 +122,28 @@ describe("log publish: the requests of one save", () => {
     expect(a.puts).toContain(key);
     expect(trace.count("put"), trace.describe()).toBe(2);
     expect(trace.depthToLast("batch"), trace.describe()).toBe(3);
+  });
+});
+
+describe("log apply: the cycle's listing is a hint", () => {
+  it("a listing taken before this device's own later commit is read again, not taken for a rolled-back registry", async () => {
+    const w = await world({ streams: 2 });
+    const a = await w.device("a");
+    await a.run("first", [{ stream: sName(0), id: "x" }]);
+    await a.cycle();
+    // A listing a cycle took, then a commit of this device after it (a run's
+    // end publishes while the cycle is still bootstrapping).
+    const listed = await a.deps.registry.listOwnerRows();
+    await a.run("second", [{ stream: sName(0), id: "y" }], {
+      full: false,
+      covered: [sName(0)],
+    });
+    await a.cycle();
+    const position = await a.position();
+    expect(position).toBe(2);
+    await expect(
+      applyConnection(a.deps, CONNECTION_ID, listed),
+    ).resolves.toBeUndefined();
+    expect(await a.position()).toBe(position);
   });
 });

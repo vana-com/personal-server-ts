@@ -3,10 +3,10 @@ import { build } from "esbuild";
 import { describe, expect, it } from "vitest";
 
 // The pure-JS port is the default so browser hosts run unchanged. A browser
-// bundle of the key ports and of the encoder must resolve with no Node module:
+// bundle of the key ports and of the log publisher must resolve with no Node module:
 // `platform: "browser"` fails the build on an unresolved `node:` import.
 describe("browser bundles of the stream-sync crypto path", () => {
-  it.each(["./crypto.ts", "../localdb/encode.ts"])(
+  it.each(["./crypto.ts", "../localdb/log-publish.ts"])(
     "%s bundles for the browser without node:crypto",
     async (entry) => {
       const result = await build({

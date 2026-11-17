@@ -135,7 +135,6 @@ async function streamView(): Promise<StreamSyncReadPort> {
   return {
     resolve: (input) => local.resolver.resolve(input),
     listScopes: (input) => local.listing.listScopes(input),
-    olderVersions: local.olderVersions,
   };
 }
 

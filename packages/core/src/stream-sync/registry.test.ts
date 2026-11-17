@@ -3,7 +3,10 @@ import {
   controlScope,
   streamScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { createGatewayStreamSyncRegistry } from "./registry.js";
+import {
+  createGatewayStreamSyncRegistry,
+  parseBatchPolicy,
+} from "./registry.js";
 import { RegistryUnavailableError } from "./ports.js";
 
 const hash = (byte: string) => `0x${byte.repeat(32)}`;
@@ -753,8 +756,7 @@ describe("an unreachable registry is told apart from a refusing one", () => {
   const listings = {
     listStreamRows: (r: ReturnType<typeof over>) => r.listStreamRows("acme"),
     listControlRows: (r: ReturnType<typeof over>) => r.listControlRows(),
-    listConnectionRows: (r: ReturnType<typeof over>) =>
-      r.listConnectionRows("acme", ""),
+    listOwnerRows: (r: ReturnType<typeof over>) => r.listOwnerRows(),
   };
   it.each([
     ["a network error", new TypeError("terminated")],
@@ -889,14 +891,14 @@ describe("listings of concurrent callers", () => {
     await started(0);
     const cohort = [
       registry.listControlRows(),
-      registry.listConnectionRows("acme", ""),
+      registry.listOwnerRows(),
       registry.listStreamRows("acme"),
     ];
     expect(begun).toHaveLength(1);
     begun[0]!.release(["pdpp.acme~"]);
     await started(1);
     expect(begun).toHaveLength(2);
-    const late = registry.listConnectionRows("acme", "");
+    const late = registry.listOwnerRows();
     expect(begun).toHaveLength(2);
     const s1 = streamScope("acme", "", "s1");
     const s2 = streamScope("acme", "", "s2");
@@ -937,5 +939,40 @@ describe("listings of concurrent callers", () => {
     await expect(first).rejects.toBeInstanceOf(RegistryUnavailableError);
     await expect(second).resolves.toEqual([]);
     expect(calls).toBe(2);
+  });
+});
+
+describe("Batch-Policy", () => {
+  it("parses the header the gateway sends", () => {
+    expect(parseBatchPolicy("rows=36;bytes=3849121;requires=2080")).toEqual({
+      rows: 36,
+      bytes: 3849121,
+      requires: 2080,
+    });
+  });
+  it("reads the lock budget when the gateway sends it", () => {
+    expect(
+      parseBatchPolicy("rows=31;bytes=3606546;requires=1952;lockedScopes=26"),
+    ).toEqual({ rows: 31, bytes: 3606546, requires: 1952, lockedScopes: 26 });
+  });
+  it("ignores a lock budget it cannot read, keeping the rest", () => {
+    expect(
+      parseBatchPolicy("rows=31;bytes=3606546;requires=1952;lockedScopes=26"),
+    ).toMatchObject({ lockedScopes: 26 });
+    expect(
+      parseBatchPolicy("rows=31;bytes=1;requires=1;lockedScopes=x"),
+    ).toBeUndefined();
+  });
+  it("reads nothing from a header it cannot read", () => {
+    for (const bad of [
+      null,
+      "",
+      "rows=16",
+      "rows=0;bytes=1;requires=1",
+      "rows=x;bytes=1;requires=1",
+      "rows=1;bytes=1",
+    ]) {
+      expect(parseBatchPolicy(bad)).toBeUndefined();
+    }
   });
 });

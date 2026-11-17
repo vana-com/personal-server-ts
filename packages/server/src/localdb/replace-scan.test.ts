@@ -12,10 +12,6 @@ import {
   replaceDelete,
   withOrigin,
 } from "../../../core/src/localdb/merge.js";
-import {
-  FRAME_OVERHEAD_BYTES,
-  replacedPrefixGroups,
-} from "../../../core/src/localdb/part-layout.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}` as const;
@@ -69,7 +65,7 @@ const plan = async (db: LocalSyncDeps["db"], sql: string, params: unknown[]) =>
   ).map((row) => row.detail);
 
 describe("the scan for rows a full refresh drops", () => {
-  it("seeks by observation age: no whole-stream scan, for the delete and the prefix groups", async () => {
+  it("seeks by observation age: no whole-stream scan for the delete", async () => {
     const db = await streamOf(2000, 2000);
     const statement = replaceDelete("c1", "s", 5, "r5");
     const details = await plan(db, statement.sql, [
@@ -77,30 +73,6 @@ describe("the scan for rows a full refresh drops", () => {
     ]);
     expect(details.join("\n")).toContain("records_by_observation");
     expect(details.join("\n")).not.toMatch(/SCAN/);
-  });
-
-  it("returns one entry per 16-bit key prefix, not one per dropped row", async () => {
-    const db = await streamOf(100, 3000);
-    const groups = await replacedPrefixGroups(db, "c1", "s", { o: 5, r: "r5" });
-    // 2998 rows are older than the marker: k0 and k1 were seen again at 9.
-    expect(groups.reduce((sum, g) => sum + g.rows, 0)).toBe(2998);
-    expect(groups.length).toBeLessThanOrEqual(300);
-    expect(groups.length).toBeLessThan(2998);
-    for (const group of groups) expect(group.prefix).toMatch(/^[0-9a-f]{4}$/);
-    // Each body is `{"id":N}`: the sum of lengths plus the frame overhead per row.
-    const [{ n }] = await db.query<{ n: number }>(
-      `SELECT SUM(LENGTH(CAST(body AS BLOB))) AS n FROM records WHERE stamp_o = 1 AND record_key NOT IN ('k0','k1')`,
-    );
-    expect(groups.reduce((sum, g) => sum + g.bytes, 0)).toBe(
-      Number(n) + 2998 * FRAME_OVERHEAD_BYTES,
-    );
-  });
-
-  it("finds nothing when every row was seen by the replacing run", async () => {
-    const db = await streamOf(500, 0);
-    expect(
-      await replacedPrefixGroups(db, "c1", "s", { o: 5, r: "r5" }),
-    ).toEqual([]);
   });
 });
 

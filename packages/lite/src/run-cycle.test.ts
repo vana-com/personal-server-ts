@@ -151,7 +151,6 @@ async function world() {
     },
     {
       resolveArtifact: () => declaration,
-      olderVersionReads: () => true,
     },
   );
   const readerKeys = async () => {

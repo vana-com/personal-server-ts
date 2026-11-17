@@ -268,7 +268,7 @@ export function createRecordQuery(db: SqlReader): RecordQuery {
 }
 
 /** Frozen grant projections over the current table. Lost bodies expire the cursor;
- * published older bodies remain owned by older-versions, never a local archive.
+ * no older body is kept: the connection log holds none per stream.
  */
 export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
   return async (

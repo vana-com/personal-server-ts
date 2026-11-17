@@ -86,21 +86,9 @@ async function world() {
     `0x${"11".repeat(32)}`,
   ).signMessage({ message: "Disposable publish wake fixture" });
   const remote = await remoteFixture(createStreamSyncKeyPorts(signature));
-  const post = vi.fn(
-    async (request: Parameters<typeof remote.registry.post>[0]) => {
-      const prior = remote.reads.get(request.scope);
-      const version = prior?.found ? prior.version + 1 : 1;
-      remote.reads.set(request.scope, {
-        found: true,
-        version,
-        dataHash: request.dataHash,
-        metadataHash: request.metadataHash,
-        deleted: false,
-      });
-      return { kind: "committed" as const };
-    },
-  );
-  remote.registry.post = post;
+  // The publish is one batch commit: count those.
+  const post = vi.fn(remote.registry.postBatch!.bind(remote.registry));
+  remote.registry.postBatch = post;
   vi.stubEnv("PS_ACCESS_TOKEN", "publish-wake-fixture");
   vi.stubEnv("VANA_OWNER_PRIVATE_KEY", "");
   const context = await createServer(

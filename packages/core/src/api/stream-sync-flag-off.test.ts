@@ -117,22 +117,15 @@ describe("#596 account-mode data reads", () => {
     expect(f.storageCalls).not.toHaveBeenCalled();
   });
 
-  it("wraps an explicit history read and binds settlement to that selected head", async () => {
+  it("answers 410 to a version selector: no older version has a body", async () => {
     const f = fixture("switched");
-    f.deps.streamSyncRead!.olderVersions = {
-      list: vi.fn(),
-      counts: () => ({ served: 0, gone: 0, off: 0 }),
-      read: vi.fn(async (_scope, _select, selected) => {
-        selected?.({ ...HEAD, observedAt: 1000 });
-        return new Response("[]").body!;
-      }),
-    };
-    const result = await get(f.deps, "?fileId=retained");
-    expect(result.status).toBe(200);
-    expect((await result.json()).data).toEqual({ records: [] });
-    expect(f.authorize).toHaveBeenLastCalledWith(
-      expect.objectContaining({ servedEntry: expect.objectContaining(HEAD) }),
-    );
+    for (const selector of ["?fileId=retained", "?at=2025-01-01T00:00:00Z"]) {
+      const result = await get(f.deps, selector);
+      expect(result.status).toBe(410);
+      expect((await result.json()).error.errorCode).toBe(
+        "STREAM_HISTORY_UNAVAILABLE",
+      );
+    }
     expect(f.resolve).not.toHaveBeenCalled();
     expect(f.storageCalls).not.toHaveBeenCalled();
   });

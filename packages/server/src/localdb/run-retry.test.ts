@@ -70,7 +70,6 @@ async function world() {
             },
           ],
         }),
-        olderVersionReads: () => true,
       });
     return { db, sync: reopen(), reopen };
   };

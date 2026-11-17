@@ -65,7 +65,6 @@ async function world(
             },
           ],
         }),
-        olderVersionReads: () => true,
       },
     );
     return {

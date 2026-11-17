@@ -134,8 +134,6 @@ export interface PsLiteSyncOptions {
   localDb?: LiteLocalDbOptions;
   /** Stable host device identity; defaults to this server account. */
   localDbDeviceId?: string;
-  /** Whether the local database may fetch historical versions. */
-  olderVersionReads?: () => boolean;
   /**
    * Resolves a run's `artifactDigest` to declarations the host verified
    * (run-intake contract v2 §6). Without it every run answers
@@ -160,12 +158,6 @@ export interface PsLiteSyncOptions {
   streamSyncBlobs?: StreamSyncBlobs;
   /** Publish while collecting, default off. See `LocalSyncDeps.publishWhileCollecting`. */
   streamSyncPublishWhileCollecting?: boolean;
-  /**
-   * Publish and apply through the stream-sync log, default off. The flag lets
-   * this device start a log on a connection that has none; a connection that
-   * has a log is followed whatever the flag. See `LocalSyncDeps.logProtocol`.
-   */
-  streamSyncLogProtocol?: boolean;
   /**
    * Serve a first load's applied parts while it fills. Default: the config key
    * `streamSync.progressiveFirstLoad`, off. An explicit option wins. See
@@ -649,9 +641,6 @@ export async function createPsLiteSyncManager(
           designFlags.publishWhileCollecting)
             ? { publishWhileCollecting: true }
             : {}),
-          ...((options.streamSyncLogProtocol ?? designFlags.logProtocol)
-            ? { logProtocol: true }
-            : {}),
         };
         localSync = createLocalSync(localSyncDeps, {
           aliasScopes: () => LEGACY_SCOPE_BINDINGS.keys(),
@@ -660,9 +649,6 @@ export async function createPsLiteSyncManager(
           retainedManifests: options.streamSyncRetainedManifests,
           eraseLegacy: (connector) =>
             eraseLegacyScopesOf(connector, options.storage),
-          olderVersionReads:
-            options.olderVersionReads ??
-            (() => options.config.olderVersionReads),
         });
       }
       return localSync;
@@ -817,18 +803,6 @@ export async function createPsLiteSyncManager(
           (await getLocalSync()).resolver.resolve(input),
         listScopes: async (input) =>
           (await getLocalSync()).listing.listScopes(input),
-        olderVersions: {
-          read: async (...args) =>
-            (await getLocalSync()).olderVersions.read(...args),
-          list: async (...args) =>
-            (await getLocalSync()).olderVersions.list(...args),
-          counts: () =>
-            localSync?.olderVersions.counts() ?? {
-              served: 0,
-              gone: 0,
-              off: 0,
-            },
-        },
       },
     };
   } catch (error) {

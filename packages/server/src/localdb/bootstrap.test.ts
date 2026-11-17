@@ -99,7 +99,6 @@ beforeEach(() => {
           sql: "DELETE FROM run_rows WHERE run_id IN (SELECT run_id FROM runs WHERE connection_id = ?)",
           params: [id],
         },
-        { sql: "DELETE FROM head_parts WHERE connection_id = ?", params: [id] },
         { sql: "DELETE FROM blob_refs WHERE connection_id = ?", params: [id] },
         {
           sql: "UPDATE connections SET control_state = 'deleted', checkpoint = NULL WHERE connection_id = ?",

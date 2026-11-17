@@ -89,7 +89,6 @@ async function openDevice(
         coverageStrategy: "full_inventory" as const,
       })),
     }),
-    olderVersionReads: () => true,
   });
   const keys = async (stream = "items") =>
     (await sync.query.listRecords({ connectionId, stream, limit: 100 })).records
@@ -224,7 +223,7 @@ it("an empty full refresh removes every seeded record for good", async () => {
   expect(await a.keys()).toEqual([]);
 });
 
-it("a publication whose head already matches the registry still closes the window", async () => {
+it("a publication of rows the registry already holds still closes the window", async () => {
   const w = await world();
   const a = await w.device("a");
   const b = await w.device("b");
@@ -233,7 +232,7 @@ it("a publication whose head already matches the registry still closes the windo
   await b.publish();
   await a.run("refresh", ["B"], { observedAt: 5000 });
   const report = await a.sync.cycle();
-  expect(report.connections[0]!.published[0]!.outcome).toBe("noop");
+  expect(report.connections[0]!.error).toBeNull();
   expect(await a.keys()).toEqual(["B"]);
   expect(await a.seed("install-2", ["A"])).toEqual(refused);
   expect(await a.keys()).toEqual(["B"]);

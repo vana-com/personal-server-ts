@@ -68,6 +68,23 @@
  *
  * WHEN TO COMPACT is a cost comparison (`shouldCompact`), derived below from
  * measured primitives, with the hard backstop above.
+ *
+ * ## Bodies out of line
+ *
+ * A segment and a part are each one object of at most `PART_LIMIT_BYTES`, and
+ * a record is never split across segments. A record whose upsert does not fit
+ * the writer's part target (the size of one object it PUTs) therefore goes
+ * OUT OF LINE, as an attachment store keeps a file beside the record that
+ * names it: its canonical JSON body is cut into pieces of at most that target,
+ * each encrypted and stored under the log scope by the Keccak-256 of its
+ * clear bytes (`v-<hex>`, `bodyPieceBlobName`), and the upsert carries the
+ * piece hashes, the body's length and its SHA-256 (`LogUpsertByRef`) instead
+ * of the value. Everything else about the upsert, and so the merge, is
+ * unchanged: `upsertAfter` compares the same body hash. A reader fetches the
+ * pieces, checks each against its hash and the whole against its SHA-256, and
+ * applies the upsert as if the body had been inline. Pieces are never deleted
+ * (as segments, see `log-compact.ts`), and a snapshot entry names the same
+ * pieces as the segment it folds.
  */
 
 import { sha256 as sha256Sync } from "@noble/hashes/sha2";
@@ -206,6 +223,28 @@ export interface LogUpsert {
   readonly value: JsonObject;
 }
 
+/**
+ * An upsert's body stored out of line (see "Bodies out of line" above): the
+ * clear pieces, in order, are the canonical JSON of the body.
+ */
+export interface LogBodyRef {
+  /** SHA-256 hex of the canonical JSON: `records.body_sha256`. */
+  readonly sha256: string;
+  /** Length of the canonical JSON in bytes: the sum of the clear pieces. */
+  readonly bytes: number;
+  /** Keccak-256 of each clear piece: blob `v-<hex>` (`bodyPieceBlobName`). */
+  readonly pieces: readonly `0x${string}`[];
+}
+
+/**
+ * An upsert whose body is out of line: the form it has in an encoded segment
+ * or part. A reader resolves it to a `LogUpsert` before it applies or folds it.
+ */
+export interface LogUpsertByRef extends Omit<LogUpsert, "kind" | "value"> {
+  readonly kind: "upsert-ref";
+  readonly body: LogBodyRef;
+}
+
 /** One primary-key value. A key is never null, an object or an array. */
 export type LogKeyValue = string | number | boolean;
 
@@ -288,7 +327,15 @@ export interface SnapshotPointer {
   readonly parts: readonly SnapshotPartRef[];
 }
 
-export interface Segment {
+/** An operation as a segment encodes it: an upsert's body may be out of line. */
+export type WireOperation = LogOperation | LogUpsertByRef;
+
+/**
+ * One batch of the log. `Op` is `LogOperation` once every body is in hand;
+ * `WireSegment` is the form encoded and decoded, whose upserts may name their
+ * bodies out of line.
+ */
+export interface Segment<Op extends WireOperation = LogOperation> {
   readonly format: typeof LOG_FORMAT;
   readonly connector: string;
   readonly ns: string;
@@ -309,8 +356,10 @@ export interface Segment {
   /** Older segments, positions `base+1 .. position-1`, ascending, no gap. */
   readonly refs: readonly SegmentRef[];
   readonly streams: readonly LogStreamMeta[];
-  readonly operations: readonly LogOperation[];
+  readonly operations: readonly Op[];
 }
+
+export type WireSegment = Segment<WireOperation>;
 
 /**
  * The most segments a head may list: the head limit over the largest encoded
@@ -356,7 +405,10 @@ export type LogEntry = LogUpsert | LogDelete | LogOmitted;
  * One part of a snapshot: the winners of a key range, sorted by (stream,
  * pkHash). Each part carries the stream metas, so a part applies by itself.
  */
-export interface SnapshotPart {
+/** A snapshot entry as a part encodes it: an upsert's body may be out of line. */
+export type WireEntry = LogEntry | LogUpsertByRef;
+
+export interface SnapshotPart<E extends WireEntry = LogEntry> {
   readonly format: typeof LOG_FORMAT;
   readonly connector: string;
   readonly ns: string;
@@ -367,8 +419,10 @@ export interface SnapshotPart {
   /** 0-based, in the order the pointer lists the parts. */
   readonly index: number;
   readonly streams: readonly LogStreamMeta[];
-  readonly entries: readonly LogEntry[];
+  readonly entries: readonly E[];
 }
+
+export type WireSnapshotPart = SnapshotPart<WireEntry>;
 
 const SNAPSHOT_BLOB = /^q-([0-9a-f]{64})$/;
 
@@ -387,6 +441,23 @@ export function isSnapshotPartBlobName(name: string): boolean {
   return SNAPSHOT_BLOB.test(name);
 }
 
+const BODY_PIECE_BLOB = /^v-([0-9a-f]{64})$/;
+
+/** `v-<hex>`: the blob name of one piece of an out-of-line body, from its hash. */
+export function bodyPieceBlobName(dataHash: string): string {
+  const hex = dataHash.startsWith("0x") ? dataHash.slice(2) : dataHash;
+  if (!/^[0-9a-f]{64}$/.test(hex)) {
+    throw new InvalidArgumentError(
+      `body piece hash is not 64 lowercase hex characters: ${dataHash}`,
+    );
+  }
+  return `v-${hex}`;
+}
+
+export function isBodyPieceBlobName(name: string): boolean {
+  return BODY_PIECE_BLOB.test(name);
+}
+
 /**
  * The first deletion (delete, omitted entry, or a completion's omission) whose
  * `key` is not the key its `pkHash` hashes for its stream, or `null`. A reader
@@ -398,12 +469,16 @@ export function isSnapshotPartBlobName(name: string): boolean {
 export async function firstDeletionKeyMismatch(
   sha256: Sha256,
   streams: readonly LogStreamMeta[],
-  operations: readonly (LogOperation | LogOmitted)[],
+  operations: readonly (WireOperation | WireEntry)[],
 ): Promise<{ readonly stream: string; readonly pkHash: string } | null> {
   const primaryKeyOf = new Map(streams.map((m) => [m.stream, m.primaryKey]));
   for (const op of operations) {
     const named =
-      op.kind === "complete" ? op.omitted : op.kind === "upsert" ? [] : [op];
+      op.kind === "complete"
+        ? op.omitted
+        : op.kind === "upsert" || op.kind === "upsert-ref"
+          ? []
+          : [op];
     for (const { pkHash, key } of named)
       if (
         !(await deletionKeyMatchesHash(
@@ -557,7 +632,10 @@ export function foldLog(input: {
  * carries the stream metas. The size of an entry is its wire size.
  */
 export function partitionFold(
-  fold: LogFold,
+  fold: {
+    readonly streams: readonly LogStreamMeta[];
+    readonly entries: readonly WireEntry[];
+  },
   context: {
     readonly connector: string;
     readonly ns: string;
@@ -566,8 +644,8 @@ export function partitionFold(
     readonly position: number;
   },
   targetBytes: number = DEFAULT_PART_TARGET_BYTES,
-): SnapshotPart[] {
-  const base = (index: number, entries: LogEntry[]): SnapshotPart => ({
+): WireSnapshotPart[] {
+  const base = (index: number, entries: WireEntry[]): WireSnapshotPart => ({
     format: LOG_FORMAT,
     ...context,
     index,
@@ -577,8 +655,8 @@ export function partitionFold(
   const metaBytes =
     JSON.stringify(fold.streams.map((m) => m.stream)).length +
     200 * fold.streams.length;
-  const parts: SnapshotPart[] = [];
-  let current: LogEntry[] = [];
+  const parts: WireSnapshotPart[] = [];
+  let current: WireEntry[] = [];
   let size = metaBytes;
   for (const entry of fold.entries) {
     const bytes = JSON.stringify(opToWire(entry)).length + 1;
@@ -744,6 +822,10 @@ const META_FIELDS = ["complete", "primaryKey", "profile", "stream"];
 const UPSERT_FIELDS = ["f", "k", "o", "p", "r", "s", "v"];
 /** An upsert of a run's later intake batch also carries its ordinal `n` (>= 1). */
 const UPSERT_ORDINAL_FIELDS = ["f", "k", "n", "o", "p", "r", "s", "v"];
+/** An upsert whose body is out of line carries `x` (`LogBodyRef`) in place of `v`. */
+const UPSERT_REF_FIELDS = ["f", "k", "o", "p", "r", "s", "x"];
+const UPSERT_REF_ORDINAL_FIELDS = ["f", "k", "n", "o", "p", "r", "s", "x"];
+const BODY_FIELDS = ["b", "h", "p"];
 const DELETE_FIELDS = ["k", "o", "p", "r", "rk", "s"];
 const COMPLETE_FIELDS = ["k", "o", "omit", "r", "s"];
 const OMISSION_FIELDS = ["p", "rk"];
@@ -804,15 +886,45 @@ function isKeyValues(value: unknown): boolean {
   );
 }
 
+/** A `LogBodyRef` on the wire: `{b: bytes, h: sha256 hex, p: piece hashes}`. */
+function bodyProblem(body: unknown): string | null {
+  if (!isPlainObject(body) || !exactKeys(body, BODY_FIELDS))
+    return "out-of-line body must be {b, h, p}";
+  const pieces = body["p"];
+  if (
+    !Array.isArray(pieces) ||
+    pieces.length === 0 ||
+    pieces.some((h) => typeof h !== "string" || !REGISTRY_HASH.test(h))
+  )
+    return "out-of-line body pieces must be a non-empty list of 0x + 64 hex";
+  if (!isHex64(body["h"])) return "out-of-line body sha256 must be 64 hex";
+  // Every piece holds at least one byte and fits one part.
+  if (
+    !isCount(body["b"], pieces.length) ||
+    body["b"] > pieces.length * PART_LIMIT_BYTES
+  )
+    return "out-of-line body length does not fit its pieces";
+  return null;
+}
+
 function operationProblem(op: unknown, at: string): string | null {
   if (!isPlainObject(op)) return `${at} must be an object`;
   const kind = op["k"];
   if (kind === "u") {
-    if (!exactKeys(op, UPSERT_FIELDS) && !exactKeys(op, UPSERT_ORDINAL_FIELDS))
-      return `${at} upsert fields`;
+    const inline =
+      exactKeys(op, UPSERT_FIELDS) || exactKeys(op, UPSERT_ORDINAL_FIELDS);
+    const byRef =
+      exactKeys(op, UPSERT_REF_FIELDS) ||
+      exactKeys(op, UPSERT_REF_ORDINAL_FIELDS);
+    if (!inline && !byRef) return `${at} upsert fields`;
     if (hasOwn(op, "n") && !isCount(op["n"], 1))
       return `${at} ordinal must be a count of at least 1`;
-    if (!isPlainObject(op["v"])) return `${at} value must be an object`;
+    if (inline && !isPlainObject(op["v"]))
+      return `${at} value must be an object`;
+    if (byRef) {
+      const problem = bodyProblem(op["x"]);
+      if (problem) return `${at} ${problem}`;
+    }
     if (op["f"] !== null && !isCount(op["f"], 0))
       return `${at} first-seen must be null or a count`;
   } else if (kind === "d" || kind === "o") {
@@ -959,8 +1071,19 @@ function segmentProblem(value: Record<string, unknown>): string | null {
   return null;
 }
 
-function opToWire(op: LogOperation | LogOmitted): Record<string, unknown> {
+function opToWire(op: WireOperation | WireEntry): Record<string, unknown> {
   switch (op.kind) {
+    case "upsert-ref":
+      return {
+        f: op.firstSeen,
+        k: "u",
+        ...(op.ordinal ? { n: op.ordinal } : {}),
+        o: op.stamp.o,
+        p: op.pkHash,
+        r: op.stamp.r,
+        s: op.stream,
+        x: { b: op.body.bytes, h: op.body.sha256, p: [...op.body.pieces] },
+      };
     case "upsert":
       return {
         f: op.firstSeen,
@@ -1001,7 +1124,7 @@ function opToWire(op: LogOperation | LogOmitted): Record<string, unknown> {
   }
 }
 
-function toWire(segment: Segment): Record<string, unknown> {
+function toWire(segment: WireSegment): Record<string, unknown> {
   return {
     base: segment.base,
     connector: segment.connector,
@@ -1036,7 +1159,7 @@ function toWire(segment: Segment): Record<string, unknown> {
 }
 
 /** Canonical clear segment bytes. Throws on a segment that would not decode. */
-export function encodeSegment(segment: Segment): Uint8Array {
+export function encodeSegment(segment: WireSegment): Uint8Array {
   const wire = toWire(segment);
   const problem = segmentProblem(wire);
   if (problem) throw new InvalidArgumentError(`invalid segment: ${problem}`);
@@ -1061,15 +1184,27 @@ export async function digestSegment(
 }
 
 export type DecodedSegment =
-  | { readonly kind: "ok"; readonly segment: Segment }
+  | { readonly kind: "ok"; readonly segment: WireSegment }
   | { readonly kind: "unsupported_format"; readonly format: unknown }
   | { readonly kind: "malformed"; readonly reason: string };
 
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
-function opFromWire(op: Record<string, unknown>): LogOperation | LogOmitted {
+function opFromWire(op: Record<string, unknown>): WireOperation | WireEntry {
   const stream = op["s"] as string;
   const stamp = { o: op["o"] as number, r: op["r"] as string };
+  if (op["k"] === "u" && hasOwn(op, "x")) {
+    const x = op["x"] as { b: number; h: string; p: `0x${string}`[] };
+    return {
+      kind: "upsert-ref",
+      stream,
+      pkHash: op["p"] as string,
+      stamp,
+      ...(hasOwn(op, "n") ? { ordinal: op["n"] as number } : {}),
+      firstSeen: op["f"] as number | null,
+      body: { sha256: x.h, bytes: x.b, pieces: x.p },
+    };
+  }
   if (op["k"] === "u")
     return {
       kind: "upsert",
@@ -1144,13 +1279,17 @@ export function decodeSegment(bytes: Uint8Array): DecodedSegment {
       // `segmentProblem` refuses a snapshot-only entry kind, so none is here.
       operations: (p["operations"] as Record<string, unknown>[]).map(
         opFromWire,
-      ) as LogOperation[],
+      ) as WireOperation[],
     },
   };
 }
 
 export type VerifiedSegment =
-  | { readonly kind: "ok"; readonly segment: Segment; readonly bytes: number }
+  | {
+      readonly kind: "ok";
+      readonly segment: WireSegment;
+      readonly bytes: number;
+    }
   | { readonly kind: "hash_mismatch" }
   | { readonly kind: "unsupported_format"; readonly format: unknown }
   | { readonly kind: "malformed"; readonly reason: string }
@@ -1235,7 +1374,7 @@ function partProblem(value: Record<string, unknown>): string | null {
 }
 
 /** Canonical clear part bytes. Throws on a part that would not decode. */
-export function encodeSnapshotPart(part: SnapshotPart): Uint8Array {
+export function encodeSnapshotPart(part: WireSnapshotPart): Uint8Array {
   const wire = {
     connector: part.connector,
     entries: part.entries.map(opToWire),
@@ -1270,7 +1409,7 @@ export async function digestSnapshotPart(
 }
 
 export type DecodedSnapshotPart =
-  | { readonly kind: "ok"; readonly part: SnapshotPart }
+  | { readonly kind: "ok"; readonly part: WireSnapshotPart }
   | { readonly kind: "unsupported_format"; readonly format: unknown }
   | { readonly kind: "malformed"; readonly reason: string };
 
@@ -1307,13 +1446,17 @@ export function decodeSnapshotPart(bytes: Uint8Array): DecodedSnapshotPart {
       streams: p["streams"] as LogStreamMeta[],
       entries: (p["entries"] as Record<string, unknown>[]).map(
         opFromWire,
-      ) as LogEntry[],
+      ) as WireEntry[],
     },
   };
 }
 
 export type VerifiedSnapshotPart =
-  | { readonly kind: "ok"; readonly part: SnapshotPart; readonly bytes: number }
+  | {
+      readonly kind: "ok";
+      readonly part: WireSnapshotPart;
+      readonly bytes: number;
+    }
   | { readonly kind: "hash_mismatch" }
   | { readonly kind: "unsupported_format"; readonly format: unknown }
   | { readonly kind: "malformed"; readonly reason: string }

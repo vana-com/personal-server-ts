@@ -99,7 +99,6 @@ async function depsFor(flags: Flags) {
 
 const FLAGS = [
   ["publishWhileCollecting", "streamSyncPublishWhileCollecting"],
-  ["logProtocol", "streamSyncLogProtocol"],
   ["progressiveFirstLoad", "streamSyncProgressiveFirstLoad"],
 ] as const;
 

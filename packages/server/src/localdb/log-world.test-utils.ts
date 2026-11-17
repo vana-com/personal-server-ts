@@ -12,8 +12,8 @@ import {
   deriveKeyCheck,
   logScope,
   pkHash,
-  type Segment,
-  type SnapshotPart,
+  type WireSegment,
+  type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { sha256 } from "@noble/hashes/sha2";
 import {
@@ -34,7 +34,7 @@ import {
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { retainedManifest } from "./apply-fixture.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
-import { createFakeGateway } from "./fake-gateway.js";
+import { createFakeGateway, type FakeGatewayOptions } from "./fake-gateway.js";
 import type { RequestTrace } from "./request-trace.test-utils.js";
 
 export const OWNER = `0x${"11".repeat(20)}` as const;
@@ -54,7 +54,6 @@ export async function closeWorldDrivers(): Promise<void> {
 
 export async function world(options: {
   streams: number;
-  logProtocol: boolean;
   publishWhileCollecting?: boolean;
   /** The registry's rule that refuses a stream row write beside a log row (default on). */
   connectionLogFence?: boolean;
@@ -63,12 +62,15 @@ export async function world(options: {
   keyTypes?: readonly ("string" | "number" | "integer" | "boolean" | null)[];
   /** Every gateway and storage request of every device goes through this trace. */
   trace?: RequestTrace;
+  /** The `Batch-Policy` the gateway advertises and enforces (`FakeGatewayOptions.policy`). */
+  policy?: FakeGatewayOptions["policy"];
 }) {
   const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
   const hashes = await controlHashes(async (b) => keccak_256(b), keyCheck);
   const gateway = createFakeGateway({
     owner: OWNER,
     connectionLogFence: options.connectionLogFence ?? true,
+    ...(options.policy && { policy: options.policy }),
     isTombstone: (v) =>
       v.dataHash === hashes.tombstoneData &&
       v.metadataHash === hashes.tombstoneMetadata,
@@ -90,7 +92,6 @@ export async function world(options: {
 
   async function device(
     deviceId: string,
-    logProtocol = options.logProtocol,
     hooks: {
       beforePut?: (key: string) => Promise<void>;
       /** Awaited before a blob is returned: stops an apply where it fetches. */
@@ -153,6 +154,8 @@ export async function world(options: {
         ...registry,
         listControlRows: () =>
           logicalCall.run("listControlRows", () => registry.listControlRows()),
+        listOwnerRows: () =>
+          logicalCall.run("listOwnerRows", () => registry.listOwnerRows()),
         listStreamRows: async (connector) => {
           if (hooks.beforeListStreamRows)
             await hooks.beforeListStreamRows(connector);
@@ -160,10 +163,6 @@ export async function world(options: {
             registry.listStreamRows(connector),
           );
         },
-        listConnectionRows: (connector, ns) =>
-          logicalCall.run(`listConnectionRows(${connector},${ns})`, () =>
-            registry.listConnectionRows(connector, ns),
-          ),
         ...(registry.probeChange && {
           probeChange: (signal?: AbortSignal) =>
             logicalCall.run("probeChange", () => registry.probeChange!(signal)),
@@ -207,7 +206,6 @@ export async function world(options: {
       logger: { info: () => {}, warn: () => {} },
       now: () => clock,
       newOp: () => `${deviceId}-${++op}`,
-      ...(logProtocol ? { logProtocol: true } : {}),
       ...(options.publishWhileCollecting
         ? { publishWhileCollecting: true }
         : {}),
@@ -219,9 +217,11 @@ export async function world(options: {
         : {}),
     };
     const sync = createLocalSync(deps, {
+      // A digest `<connector>@<version>` names a connector version; a bare
+      // connector name is version 1.
       resolveArtifact: (digest) => ({
-        connector: digest,
-        version: "1",
+        connector: digest.split("@")[0]!,
+        version: digest.split("@")[1] ?? "1",
         streams: names.map((name) => ({
           name,
           semantics: "mutable_state" as const,
@@ -232,7 +232,6 @@ export async function world(options: {
       }),
       // The host's retained manifest names the streams a delete fences.
       retainedManifests: () => [retainedManifest(CONNECTOR, names)],
-      olderVersionReads: () => true,
     });
     /** One run that writes `records` and ends covering `covered`. */
     const run = async (
@@ -256,13 +255,18 @@ export async function world(options: {
         blob?: { hash: string; bytes: Uint8Array };
         /** The connector the run collects for (default: the world's one connector). */
         connector?: string;
+        /** The connector version the run's artifact declares (default "1"). */
+        version?: string;
       } = {},
     ) => {
       clock++;
       const connector = opts.connector ?? CONNECTOR;
       await sync.intake.begin(runId, {
         connector,
-        artifactDigest: connector,
+        artifactDigest:
+          opts.version === undefined
+            ? connector
+            : `${connector}@${opts.version}`,
         wantFull: opts.full ?? true,
         observedAt: opts.observedAt,
         owner: { address: OWNER, leaseId: null },
@@ -344,7 +348,7 @@ export async function world(options: {
 
   /** The decoded segments in the blob store, by position. */
   const segments = async () => {
-    const out = new Map<number, Segment>();
+    const out = new Map<number, WireSegment>();
     for (const key of innerBlobs.keys()) {
       if (!key.startsWith(`${LOG}/s-`)) continue;
       const bytes = await innerBlobs.get(key);
@@ -365,8 +369,8 @@ export async function world(options: {
     return out;
   };
   /** The snapshot parts a head points at, decoded, in pointer order. */
-  const snapshotParts = async (head: Segment) => {
-    const parts: SnapshotPart[] = [];
+  const snapshotParts = async (head: WireSegment) => {
+    const parts: WireSnapshotPart[] = [];
     for (const ref of head.snapshot!.parts) {
       const decoded = decodeSnapshotPart(
         (await innerBlobs.get(`${LOG}/q-${ref.dataHash.slice(2)}`))!,
