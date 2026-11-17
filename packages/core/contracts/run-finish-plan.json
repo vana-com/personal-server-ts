@@ -2833,6 +2833,127 @@
       }
     },
     {
+      "id": "failed-done-upsert-only-failed-stream-not-covered",
+      "why": "An uncertified failed DONE never covers a stream DONE named failed, even one with records and no skip.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            }
+          ],
+          "b": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "failedInDone": ["b"]
+      },
+      "input": {
+        "finish": "failed_done_upsert_only",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": true
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["a"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "failed-done-upsert-only-only-failed-stream-kept-nothing",
+      "why": "An uncertified failed DONE whose only records belong to a stream DONE named failed keeps nothing: the run failed.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        },
+        "b": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "b": [
+            {
+              "key": 1
+            }
+          ]
+        },
+        "failedInDone": ["b"]
+      },
+      "input": {
+        "finish": "failed_done_upsert_only",
+        "streams": {
+          "a": {
+            "liveRecord": false,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          },
+          "b": {
+            "liveRecord": true,
+            "explicitDelete": false,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": true
+          }
+        },
+        "checkpoints": {
+          "a": "ca",
+          "b": "cb"
+        }
+      },
+      "expect": {
+        "outcome": "failed",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
       "id": "failed-done-upsert-only-nothing-kept",
       "why": "A failed DONE with nothing to keep fails.",
       "declared": {

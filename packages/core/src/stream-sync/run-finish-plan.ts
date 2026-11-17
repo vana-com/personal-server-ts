@@ -345,8 +345,12 @@ function planFailedDone(
   const certified =
     input.finish === "certified_failed_done" &&
     run.selected.some((stream) => run.obs(stream).failedInDone);
+  // A stream named failed in DONE is never covered, records or not.
   const published = run.selected.filter(
-    (stream) => !skipped(run.obs(stream)) && anyRecord(run.obs(stream)),
+    (stream) =>
+      !skipped(run.obs(stream)) &&
+      !run.obs(stream).failedInDone &&
+      anyRecord(run.obs(stream)),
   );
   if (!certified) {
     if (published.length === 0 && !anyDelete) return FAILED;

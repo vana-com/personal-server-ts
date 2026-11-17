@@ -39,6 +39,76 @@
       }
     },
     {
+      "id": "receipt_or_status-receipt-from-earlier-generation",
+      "why": "A receipt whose head is from an earlier generation than the active control names data a reconnect purged.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 3
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "stale_generation"
+      }
+    },
+    {
+      "id": "strict_receipt-receipt-from-earlier-generation",
+      "why": "A receipt whose head is from an earlier generation than the active control names data a reconnect purged.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 3
+        },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "stale_generation"
+      }
+    },
+    {
       "id": "strict_receipt-receipt-covers-run",
       "why": "A sound receipt that lists the run covers it.",
       "input": {

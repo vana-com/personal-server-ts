@@ -30,7 +30,10 @@ export interface RunSavedInput {
    * never answers saved.
    */
   readonly liveConnections: readonly string[] | null;
-  /** The connection's control state now. Saved needs `active`. */
+  /**
+   * The connection's control state now. Saved needs `active`, and a receipt
+   * proof needs every receipt's head in its generation.
+   */
   readonly control: ControlState | null;
   readonly mode: RunSavedMode;
 }
@@ -41,7 +44,8 @@ export type RunSavedRefusal =
   | "streams_uncovered"
   | "connection_mismatch"
   | "connection_unknown"
-  | "not_active";
+  | "not_active"
+  | "stale_generation";
 
 export type RunSavedVerdict =
   | {
@@ -101,6 +105,14 @@ export function decideRunSaved(input: RunSavedInput): RunSavedVerdict {
     const ids = new Set(receipts.map((receipt) => receipt.connectionId));
     if (ids.size !== 1) return refuse("connection_mismatch");
     connectionId = [...ids][0]!;
+    // A connection deleted and connected again purges every head of an
+    // earlier generation, so such a receipt names data that is gone.
+    const control = input.control;
+    if (
+      control?.kind === "active" &&
+      receipts.some((receipt) => receipt.head.generation !== control.generation)
+    )
+      return refuse("stale_generation");
   }
   if (input.liveConnections === null) {
     if (input.mode === "strict_receipt") return refuse("connection_unknown");
