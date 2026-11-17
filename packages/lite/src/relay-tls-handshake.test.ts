@@ -294,6 +294,54 @@ async function echoThroughWasm(
   return result;
 }
 
+/**
+ * Complete a handshake through the pump, then hold back what the client sends
+ * next: the TLS records for `request`, then its `close_notify`.
+ */
+async function handshakeThenCapture(
+  identity: Identity,
+  request: string,
+): Promise<{ server: TlsServer; records: Buffer[] }> {
+  const server = new TlsServer(identity.certPem, identity.keyPem);
+  const records: Buffer[] = [];
+  let capturing = false;
+  const pipe = new Duplex({
+    read() {},
+    write(chunk: Buffer, _encoding, callback) {
+      if (capturing) {
+        records.push(Buffer.from(chunk));
+      } else {
+        const step = server.process_tls(new Uint8Array(chunk)) as Step;
+        if (step.tls.length > 0) pipe.push(Buffer.from(step.tls));
+      }
+      callback();
+    },
+    final(callback) {
+      callback();
+    },
+  });
+  const client = tls.connect({
+    socket: pipe,
+    servername: "localhost",
+    ca: identity.certPem,
+  });
+  await new Promise<void>((resolve, reject) => {
+    client.once("secureConnect", () => resolve());
+    client.once("error", reject);
+  });
+  capturing = true;
+  client.write(request);
+  // `finish` fires once the client has written its close_notify to the pump.
+  const finished = new Promise<void>((resolve) =>
+    client.once("finish", () => resolve()),
+  );
+  client.end();
+  await finished;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  client.destroy();
+  return { server, records };
+}
+
 describe("browser TLS server (real wasm, real TLS client)", () => {
   const identities: Identity[] = [];
   beforeAll(() => {
@@ -397,5 +445,67 @@ describe("browser TLS server (real wasm, real TLS client)", () => {
     expect(typeof thrown).toBe("string");
     expect(thrown).toMatch(/corrupt message/);
     server.free();
+  });
+
+  it("keeps the fatal alert queued after a TLS error, and write_plaintext returns it", () => {
+    const server = new TlsServer(identities[1].certPem, identities[1].keyPem);
+    expect(() =>
+      server.process_tls(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])),
+    ).toThrow();
+    // The thrown string carries no bytes. The alert stays queued in rustls,
+    // so a caller that wants the peer to see it fetches it with an empty write.
+    const alert = server.write_plaintext(new Uint8Array(), false) as Step;
+    expect(alert.tls.length).toBeGreaterThan(0);
+    expect(alert.tls[0]).toBe(0x15); // TLS record type: alert
+    // The connection stays failed.
+    expect(() => server.process_tls(new Uint8Array([1, 2, 3]))).toThrow();
+    server.free();
+  });
+
+  describe("after the peer sends close_notify", () => {
+    it("returns the request that came with it, then rejects later input as peer closed", async () => {
+      const { server, records } = await handshakeThenCapture(
+        identities[1],
+        "hi\n",
+      );
+      expect(records.length).toBeGreaterThan(0);
+
+      const step = server.process_tls(
+        new Uint8Array(Buffer.concat(records)),
+      ) as Step;
+      expect(Buffer.from(step.plaintext).toString()).toBe("hi\n");
+      // The step does not flag the close; the relay reports stream ends.
+      expect(Object.keys(step).sort()).toEqual(
+        ["handshaking", "plaintext", "tls"].sort(),
+      );
+
+      let thrown: unknown;
+      try {
+        server.process_tls(new Uint8Array([1, 2, 3]));
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBe("peer closed the connection");
+      // An empty input is still a no-op, and the server can still answer.
+      expect(
+        (server.process_tls(new Uint8Array()) as Step).plaintext.length,
+      ).toBe(0);
+      expect(
+        (server.write_plaintext(new Uint8Array([65]), true) as Step).tls.length,
+      ).toBeGreaterThan(0);
+      server.free();
+    });
+
+    it("ignores bytes that follow close_notify in the same call", async () => {
+      const { server, records } = await handshakeThenCapture(
+        identities[1],
+        "hi\n",
+      );
+      const step = server.process_tls(
+        new Uint8Array(Buffer.concat([...records, Buffer.from([1, 2, 3])])),
+      ) as Step;
+      expect(Buffer.from(step.plaintext).toString()).toBe("hi\n");
+      server.free();
+    });
   });
 });

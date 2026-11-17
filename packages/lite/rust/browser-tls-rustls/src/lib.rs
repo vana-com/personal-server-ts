@@ -10,7 +10,18 @@
 //! Both methods return a plain object `{ plaintext, tls, handshaking }`:
 //! `plaintext` is the application data decrypted by this call, `tls` is the
 //! ciphertext to send to the peer, and `handshaking` is rustls's
-//! `is_handshaking()` after the call. A TLS failure is thrown as a string.
+//! `is_handshaking()` after the call.
+//!
+//! A TLS failure is thrown as a string, and the thrown string carries no
+//! bytes: the caller's `catch` (relay.ts) logs it and closes the stream. When
+//! rustls rejects the peer's bytes it queues a fatal alert, and that alert
+//! stays queued. `write_plaintext(empty, false)` returns it, so a caller that
+//! wants the peer to see the alert can fetch and send it after the error. The
+//! old binary behaves the same way.
+//!
+//! The step does not report that the peer sent `close_notify`: the relay
+//! tells the tab when a stream ends. Input that arrives after `close_notify`
+//! in a later call is an error; input after it in the same call is ignored.
 
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -28,6 +39,8 @@ fn js_err(message: impl ToString) -> JsValue {
 #[wasm_bindgen]
 pub struct TlsServer {
     conn: ServerConnection,
+    /// The peer sent `close_notify`: no more plaintext will arrive.
+    peer_closed: bool,
 }
 
 #[wasm_bindgen]
@@ -53,17 +66,28 @@ impl TlsServer {
         .map_err(js_err)?;
 
         let conn = ServerConnection::new(Arc::new(config)).map_err(js_err)?;
-        Ok(TlsServer { conn })
+        Ok(TlsServer {
+            conn,
+            peer_closed: false,
+        })
     }
 
     // Feeds ciphertext from the peer. An empty input is a no-op.
     pub fn process_tls(&mut self, input: &[u8]) -> Result<JsValue, JsValue> {
+        if self.peer_closed && !input.is_empty() {
+            return Err(js_err("peer closed the connection"));
+        }
         let mut plaintext = Vec::new();
         let mut remaining = input;
         while !remaining.is_empty() {
             let consumed = self.conn.read_tls(&mut remaining).map_err(js_err)?;
             self.conn.process_new_packets().map_err(js_err)?;
             self.drain_plaintext(&mut plaintext)?;
+            if self.peer_closed {
+                // Bytes after close_notify in this same call are dropped; the
+                // plaintext that came before it is still returned.
+                break;
+            }
             if consumed == 0 {
                 return Err(js_err("TLS input buffer is full"));
             }
@@ -101,7 +125,10 @@ impl TlsServer {
         loop {
             match self.conn.reader().read(&mut chunk) {
                 // Clean EOF: the peer sent close_notify.
-                Ok(0) => return Ok(()),
+                Ok(0) => {
+                    self.peer_closed = true;
+                    return Ok(());
+                }
                 Ok(n) => out.extend_from_slice(&chunk[..n]),
                 // No more plaintext available right now.
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),

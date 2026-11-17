@@ -14,7 +14,15 @@ server.free();
 - `plaintext`: application data this call decrypted.
 - `tls`: ciphertext to send to the peer.
 - `handshaking`: rustls `is_handshaking()` after the call.
-- A TLS failure is thrown as a string.
+- A TLS failure is thrown as a string. The string carries no bytes. rustls keeps
+  the fatal alert it queued, and `write_plaintext(new Uint8Array(), false)`
+  returns it. `relay.ts` does not fetch it today: it logs the error and closes
+  the stream.
+- The step does not report that the peer sent `close_notify`; the relay's
+  `stream.close` message ends a stream. Input in a later call after
+  `close_notify` throws `peer closed the connection`. Bytes after it in the same
+  call are dropped.
+- An empty input is a no-op.
 
 ## Rebuild
 
