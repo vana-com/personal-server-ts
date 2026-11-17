@@ -35,7 +35,7 @@ import {
   newConnectionsWithStreams,
   saveControl,
 } from "./bootstrap.js";
-import { publishLog } from "./log-publish.js";
+import { hasPendingLogPublication, publishLog } from "./log-publish.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { applyLog } from "./log-apply.js";
 import { readLogState } from "./log-state.js";
@@ -264,11 +264,9 @@ async function publishAndFinish(
   ];
   for (const { connectionId } of publishable) {
     const published = await publishLog(deps, connectionId);
-    if (
-      published === null ||
-      published.some((r) => r.outcome === "deferred" || r.outcome === "backoff")
-    )
-      return cycle("the publisher left work for a full cycle");
+    if (await hasPendingLogPublication(deps, connectionId))
+      return cycle("the publisher still has eligible work");
+    if (published === null) return cycle("the publisher is unavailable");
   }
   return {
     outcome: "applied",

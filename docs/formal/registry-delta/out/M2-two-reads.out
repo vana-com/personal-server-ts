@@ -1,5 +1,5 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 64 and seed -950069222018023609 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 3909564] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 87 and seed 4477256202945691236 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 1508106] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file RegistryDelta.tla
 Parsing file Naturals.tla
 Parsing file FiniteSets.tla
@@ -10,10 +10,10 @@ Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module TLC
 Semantic processing of module RegistryDelta
-Starting... (2026-11-17 05:07:02)
+Starting... (2026-11-17 05:55:54)
 Implied-temporal checking--satisfiability problem has 1 branches.
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-11-17 05:07:02.
+Finished computing initial states: 1 distinct state generated at 2026-11-17 05:55:54.
 Error: Invariant NoSkip is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -35,7 +35,7 @@ State 1: <Initial predicate>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
-/\ debt = FALSE
+/\ debt = 0
 
 State 2: <Begin line 97, col 3 to line 102, col 66 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "open", scope |-> "ctl", op |-> "tomb", seq |-> 0] @@
@@ -56,7 +56,7 @@ State 2: <Begin line 97, col 3 to line 102, col 66 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
-/\ debt = FALSE
+/\ debt = 0
 
 State 3: <Number line 107, col 3 to line 115, col 66 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "numbered", scope |-> "ctl", op |-> "tomb", seq |-> 1] @@
@@ -77,9 +77,9 @@ State 3: <Number line 107, col 3 to line 115, col 66 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
-/\ debt = FALSE
+/\ debt = 0
 
-State 4: <DeltaRows line 219, col 3 to line 223, col 52 of module RegistryDelta>
+State 4: <DeltaRows line 237, col 3 to line 241, col 52 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "numbered", scope |-> "ctl", op |-> "tomb", seq |-> 1] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
 /\ chg = [ctl |-> 0, log |-> 0]
@@ -98,7 +98,7 @@ State 4: <DeltaRows line 219, col 3 to line 223, col 52 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
-/\ debt = FALSE
+/\ debt = 0
 
 State 5: <Commit line 118, col 3 to line 128, col 97 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "idle", scope |-> "ctl", op |-> "tomb", seq |-> 1] @@
@@ -119,9 +119,9 @@ State 5: <Commit line 118, col 3 to line 128, col 97 of module RegistryDelta>
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 0
-/\ debt = FALSE
+/\ debt = 0
 
-State 6: <DeltaCounter line 226, col 3 to line 233, col 29 of module RegistryDelta>
+State 6: <DeltaCounter line 244, col 3 to line 251, col 29 of module RegistryDelta>
 /\ txn = ( w1 :> [phase |-> "idle", scope |-> "ctl", op |-> "tomb", seq |-> 1] @@
   w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
 /\ chg = [ctl |-> 1, log |-> 0]
@@ -140,10 +140,10 @@ State 6: <DeltaCounter line 226, col 3 to line 233, col 29 of module RegistryDel
 /\ nextSeq = 1
 /\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
 /\ since = 1
-/\ debt = FALSE
+/\ debt = 0
 
-1498 states generated, 667 distinct states found, 472 states left on queue.
+1464 states generated, 656 distinct states found, 467 states left on queue.
 The depth of the complete state graph search is 6.
 The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 12 and the 95th percentile is 9).
-Finished in 00s at (2026-11-17 05:07:02)
+Finished in 00s at (2026-11-17 05:55:55)
 exit 12

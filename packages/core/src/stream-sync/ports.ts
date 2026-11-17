@@ -257,10 +257,10 @@ export type RegistryChangeDelta =
  * deleted log row of a live connection, a row of a connection this device
  * does not hold, a removed row, a server change, a reset, a partial apply
  * standing on any connection), or the apply did not reach the delta's
- * position, or the publisher left deferred work; nothing is settled and the
- * caller runs a cycle. `applied`: the device has applied through the delta's
- * `seq` and completed the cycle's publisher, including recovery work created
- * by applying the log. Reaching the supplied version alone is insufficient.
+ * position, or the publisher still has eligible work; nothing is settled and
+ * the caller runs a cycle. `applied`: the device has applied through the
+ * delta's `seq`, run the publisher, and checked its local eligibility queries
+ * for remaining work. A reached version or aggregate receipt is insufficient.
  */
 export type DeltaApplyResult =
   | {

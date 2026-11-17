@@ -5,6 +5,14 @@ import { spawnSync } from "node:child_process";
 const manager = "packages/core/src/sync/engine/sync-manager.ts";
 const mutations = [
   {
+    name: "a partial publication settles with changes pending",
+    source: "packages/core/src/localdb/delta-apply.ts",
+    from: "if (await hasPendingLogPublication(deps, connectionId))",
+    to: "if (false)",
+    test: "packages/server/src/localdb/delta-apply.test.ts",
+    pattern: "successful first publication round",
+  },
+  {
     name: "delta settles without publishing apply-created debt",
     source: "packages/core/src/localdb/delta-apply.ts",
     from: "const published = await publishLog(deps, connectionId);",

@@ -35,6 +35,8 @@
 (*   ControlRows = "reconnect"  a control row active again is applied from *)
 (*                           the delta, without the cycle's listing        *)
 (*   ControlRows = "ignore"  a control tombstone in the delta is skipped   *)
+(* DrainDebt = FALSE omits the publication-debt guarantee (M8).            *)
+(* TrustPublished = TRUE trusts an earlier success after deferral (M9).    *)
 (* ControlRows = "handoff" is the earlier design: every control row hands  *)
 (* the delta to the cycle.                                                 *)
 (***************************************************************************)
@@ -42,7 +44,7 @@ EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS Writers, MaxTxns, NoWriter,
           Numbering, OneSnapshot, ResetLists, HonorFloor, GoneRecords,
-          ControlRows, DrainDebt
+          ControlRows, DrainDebt, TrustPublished
 
 Scopes == {"ctl", "log"}
 \* What a write does to each row. "gone": a hard delete (a failed
@@ -65,7 +67,7 @@ VARIABLES
   since,     \* reader: its cursor
   view,      \* reader: the version it holds per scope
   rkind,     \* reader: its connection's control as it holds it ("act", "tomb", "gone")
-  rphase,    \* reader: idle, rows, applying, settling, or listing
+  rphase,    \* reader: apply, publication rounds, check, retry, or listing
   rbuf,      \* reader: the snapshot decision awaiting apply
   debt,      \* apply-created publish work (rebase, seed, or a racing write)
   rcursor    \* reader: the cursor a pending apply or listing will set
@@ -87,7 +89,7 @@ Init ==
   /\ kind = [ctl |-> "act", log |-> "app"]
   /\ hist = {} /\ txns = 0 /\ floor = 0 /\ floored = FALSE
   /\ since = 0 /\ view = [s \in Scopes |-> 0] /\ rkind = "act"
-  /\ rphase = "idle" /\ rcursor = 0 /\ debt = FALSE
+  /\ rphase = "idle" /\ rcursor = 0 /\ debt = 0
   /\ rbuf = [handoff |-> FALSE, view |-> [s \in Scopes |-> 0], rkind |-> "act"]
 
 -----------------------------------------------------------------------------
@@ -194,14 +196,15 @@ Delta ==
 \* no second answer is admitted while either stage is unfinished.
 ApplyDelta ==
   /\ rphase = "applying"
-  /\ debt' \in BOOLEAN
+  /\ debt' \in {0, 2}
   /\ view' = rbuf.view /\ rkind' = rbuf.rkind /\ rphase' = "settling"
   /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
                  since, rbuf, rcursor>>
 
 SettleDelta ==
-  /\ rphase = "settling"
-  /\ (~debt \/ ~DrainDebt)
+  /\ rphase \in {"settling", "checking", "retrying"}
+  /\ (debt = 0 \/ ~DrainDebt
+       \/ (TrustPublished /\ rphase = "checking" /\ debt = 1))
   /\ since' = rcursor /\ rphase' = "idle"
   /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
                  view, rkind, rbuf, rcursor, debt>>
@@ -209,10 +212,27 @@ SettleDelta ==
 \* Abstract rebase/seed debt: only the publisher clears it. Concrete history
 \* forks and the recovery operations remain covered by the SQLite tests.
 PublishDebt ==
-  /\ rphase = "settling" /\ debt /\ DrainDebt
-  /\ debt' = FALSE
+  /\ rphase \in {"settling", "retrying"} /\ debt > 0 /\ DrainDebt
+  /\ debt' = debt - 1
   /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
                  since, view, rkind, rphase, rbuf, rcursor>>
+
+\* One round can publish while the next is deferred. With initial debt 2,
+\* debt 1 at this boundary means an earlier round already published. A receipt
+\* that retains that earlier success is not proof that the debt is gone.
+DeferPublication ==
+  /\ rphase = "settling" /\ debt > 0 /\ DrainDebt
+  /\ rphase' = "checking"
+  /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
+                 since, view, rkind, rbuf, rcursor, debt>>
+
+\* The local debt query hands a deferred publication to a later full cycle.
+\* Storage then recovers: the retry may need both remaining rounds.
+RetryPublication ==
+  /\ rphase = "checking" /\ debt > 0 /\ DrainDebt
+  /\ rphase' = "retrying"
+  /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
+                 since, view, rkind, rbuf, rcursor, debt>>
 
 \* Mutation: the records first, the counter in a later statement.
 DeltaRows ==
@@ -243,16 +263,16 @@ Listing ==
 Next ==
   \/ \E w \in Writers : Begin(w) \/ Number(w) \/ Commit(w) \/ Abort(w)
   \/ RaiseFloor
-  \/ Delta \/ DeltaRows \/ DeltaCounter \/ ApplyDelta \/ PublishDebt \/ SettleDelta \/ Listing
+  \/ Delta \/ DeltaRows \/ DeltaCounter \/ ApplyDelta \/ PublishDebt \/ DeferPublication \/ RetryPublication \/ SettleDelta \/ Listing
 
-Spec == Init /\ [][Next]_vars /\ WF_vars(Delta \/ DeltaRows \/ DeltaCounter \/ ApplyDelta \/ PublishDebt \/ SettleDelta \/ Listing)
+Spec == Init /\ [][Next]_vars /\ WF_vars(Delta \/ DeltaRows \/ DeltaCounter \/ ApplyDelta \/ PublishDebt \/ DeferPublication \/ RetryPublication \/ SettleDelta \/ Listing)
              /\ \A w \in Writers : WF_vars(Number(w) \/ Commit(w))
 
 -----------------------------------------------------------------------------
 (* Properties *)
 
 \* A successful pass cannot leave recovery publication behind.
-SettledHasNoDebt == rphase = "idle" => ~debt
+SettledHasNoDebt == rphase = "idle" => debt = 0
 
 \* The reader holds every change numbered at or below its cursor: the control
 \* row always, and the log row while it holds the connection active (a deleted

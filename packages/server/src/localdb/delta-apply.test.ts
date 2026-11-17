@@ -20,6 +20,7 @@ import {
   world,
 } from "./log-world.test-utils.js";
 import { requestTrace } from "./request-trace.test-utils.js";
+import { StorageDeferredError } from "../../../core/src/stream-sync/storage-retry.js";
 
 afterEach(closeWorldDrivers);
 
@@ -535,6 +536,70 @@ describe("publish work created during delta apply", () => {
     ]);
     expect(await b.rows()).toEqual(await a.rows());
     expect(await fresh.rows()).toEqual(await a.rows());
+  });
+
+  it("a successful first publication round followed by storage deferral leaves the delta unsettled", async () => {
+    const w = await world({ streams: 1, partTargetBytes: 3000 });
+    const peer = await w.device("peer");
+    let armed = false;
+    let puts = 0;
+    const here = await w.device("here", {
+      beforePut: async (key) => {
+        if (armed && key.includes(`${LOG}/s-`) && ++puts === 2)
+          throw new StorageDeferredError(
+            180_000,
+            new Error("storage deferred"),
+          );
+      },
+    });
+    await peer.run("base", [{ stream: sName(0), id: "base" }]);
+    await peer.cycle();
+    await here.cycle();
+    await here.run(
+      "pre-log",
+      Array.from({ length: 24 }, (_, i) => ({
+        stream: sName(0),
+        id: `seed-${i}`,
+        pad: 200,
+      })),
+      { full: false },
+    );
+    await here.db.batch([
+      {
+        sql: "DELETE FROM log_state WHERE connection_id=?",
+        params: [CONNECTION_ID],
+      },
+      {
+        sql: "DELETE FROM record_changes WHERE connection_id=?",
+        params: [CONNECTION_ID],
+      },
+      {
+        sql: "UPDATE run_streams SET publication_state='published' WHERE run_id='pre-log'",
+      },
+    ]);
+    const delta = await deltaOf(here, [LOG]);
+    const before = w.gateway.rowsOf(LOG);
+    armed = true;
+    const result = await here.sync.applyDelta(delta);
+    expect(puts).toBe(2);
+    expect(w.gateway.rowsOf(LOG)).toBe(before + 1);
+    const pending = async () =>
+      (
+        await here.db.query<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM record_changes c JOIN stream_state s
+         ON s.connection_id=c.connection_id AND s.stream=c.stream
+       WHERE c.connection_id=? AND c.seq>s.publish_watermark AND c.origin='import'`,
+          [CONNECTION_ID],
+        )
+      )[0]!.n;
+    expect(await pending()).toBeGreaterThan(0);
+    expect(result.outcome).toBe("cycle");
+    armed = false;
+    await here.cycle();
+    expect(await pending()).toBe(0);
+    await peer.cycle();
+    expect(await peer.rows()).toEqual(await here.rows());
+    expect(await peer.records()).toHaveLength(25);
   });
 
   it("publishes a local write to another connection arriving during the delta's GET", async () => {

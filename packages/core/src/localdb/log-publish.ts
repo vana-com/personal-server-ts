@@ -101,6 +101,7 @@ import {
   planStream,
   postBatchOnce,
   runPublicationStatements,
+  retainedRuns,
   type ConnectionRow,
   type LocalStream,
   type PublishResult,
@@ -1106,7 +1107,7 @@ async function omittedHashes(
 
 /** Changed keys since the watermark, oldest change first. */
 async function changedKeys(
-  deps: LocalSyncDeps,
+  deps: Pick<LocalSyncDeps, "db">,
   connectionId: string,
   stream: string,
   from: number,
@@ -1125,6 +1126,48 @@ async function changedKeys(
     [connectionId, stream, from, to],
   );
   return rows.map((row) => ({ pk: row.pk_hash, seq: row.seq }));
+}
+
+/**
+ * Local publication debt, independent of publishRounds' aggregate receipt.
+ * Read under the connection queue using the same changed-key and retained-run
+ * eligibility queries as snapshotRound/planStream. Pending runs also cover a
+ * metadata-only completion or an omission round after its records were sent.
+ */
+export async function hasPendingLogPublication(
+  deps: Pick<LocalSyncDeps, "db" | "queue">,
+  connectionId: string,
+): Promise<boolean> {
+  return deps.queue.run(connectionId, "publish", async () => {
+    const streams = await deps.db.query<{
+      stream: string;
+      publish_watermark: number;
+    }>(
+      "SELECT stream, publish_watermark FROM stream_state WHERE connection_id=?",
+      [connectionId],
+    );
+    const [last] = await deps.db.query<{ seq: number | null }>(
+      "SELECT MAX(seq) AS seq FROM record_changes WHERE connection_id=?",
+      [connectionId],
+    );
+    for (const row of streams) {
+      if ((await retainedRuns(deps, connectionId, row.stream)).length > 0)
+        return true;
+      if (
+        (
+          await changedKeys(
+            deps,
+            connectionId,
+            row.stream,
+            row.publish_watermark,
+            last?.seq ?? row.publish_watermark,
+          )
+        ).length > 0
+      )
+        return true;
+    }
+    return false;
+  });
 }
 
 /**
