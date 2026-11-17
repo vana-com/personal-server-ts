@@ -330,25 +330,21 @@ async function recordBlocked(
       result.outcome as (typeof blockedOrder)[number],
     );
     if (rank < 0) continue;
-    // Attach the reason to the pending rows themselves. Once those rows are
-    // acknowledged, their reason cannot leak into a later collector's work.
-    const retainsRank = `COALESCE(CASE publish_blocked_reason
-      WHEN 'deferred' THEN 0 WHEN 'backoff' THEN 1 WHEN 'discarded' THEN 2
-      WHEN 'purged' THEN 3 WHEN 'refused' THEN 4 END, -1) <= ?`;
+    // Each row records its latest attempt. Severity orders rows at completion,
+    // never attempts over time.
     await deps.db.batch([
       {
         sql: `UPDATE record_changes SET publish_blocked_reason=?
           WHERE connection_id=? AND stream=?
             AND seq > (SELECT publish_watermark FROM stream_state WHERE connection_id=? AND stream=?)
-            AND ${ELIGIBLE_CHANGE} AND ${retainsRank}`,
-        params: [result.outcome, id, result.stream, id, result.stream, rank],
+            AND ${ELIGIBLE_CHANGE}`,
+        params: [result.outcome, id, result.stream, id, result.stream],
       },
       {
         sql: `UPDATE run_streams SET publish_blocked_reason=? WHERE stream=?
           AND run_id IN (SELECT r.run_id FROM runs r JOIN run_streams rs ON rs.run_id=r.run_id
-            WHERE r.connection_id=? AND rs.stream=? AND ${PENDING_RUN})
-          AND ${retainsRank}`,
-        params: [result.outcome, result.stream, id, result.stream, rank],
+            WHERE r.connection_id=? AND rs.stream=? AND ${PENDING_RUN})`,
+        params: [result.outcome, result.stream, id, result.stream],
       },
     ]);
   }
@@ -410,17 +406,22 @@ async function completedResults(
       .flatMap((s) => (s.publication ? [s.publication] : []))
       .sort((a, b) => b.version - a.version)[0];
     const hadWork = item.hadChanges || item.runIds.length > 0;
-    const outcome = deleting
-      ? "deferred"
-      : connection?.control_state === "deleted"
-        ? "purged"
-        : pending
-          ? blocked
-          : superseded
-            ? "discarded"
-            : hadWork
-              ? "published"
-              : "noop";
+    const lifetimeEnded =
+      item.lifetime !== connectionLifetime(deps.db, id) ||
+      connection?.generation !== item.generation;
+    const outcome = lifetimeEnded
+      ? "purged"
+      : deleting
+        ? "deferred"
+        : connection?.control_state === "deleted"
+          ? "purged"
+          : pending
+            ? blocked
+            : superseded
+              ? "discarded"
+              : hadWork
+                ? "published"
+                : "noop";
     results.push({
       stream: item.stream,
       outcome,
@@ -1728,10 +1729,16 @@ async function commitIdle(
           runIds: p.runIds,
         })),
       );
-    statements.push({
-      sql: "UPDATE stream_state SET publish_watermark = ? WHERE connection_id = ? AND stream = ? AND publish_watermark < ?",
-      params: [p.ack, connectionId, p.stream, p.ack],
-    });
+    statements.push(
+      {
+        sql: "UPDATE stream_state SET publish_watermark = ? WHERE connection_id = ? AND stream = ? AND publish_watermark < ?",
+        params: [p.ack, connectionId, p.stream, p.ack],
+      },
+      {
+        sql: "UPDATE record_changes SET publish_blocked_reason=NULL WHERE connection_id=? AND stream=? AND seq <= ?",
+        params: [connectionId, p.stream, p.ack],
+      },
+    );
   }
   statements.push(...(await compaction(deps, connectionId, planned)));
   if (statements.length > 0)
@@ -2074,10 +2081,16 @@ async function candidateAcknowledgements(
         })),
       );
     if (p.included || !p.rest)
-      statements.push({
-        sql: "UPDATE stream_state SET publish_watermark = ? WHERE connection_id = ? AND stream = ? AND publish_watermark < ?",
-        params: [p.ack, connectionId, p.stream, p.ack],
-      });
+      statements.push(
+        {
+          sql: "UPDATE stream_state SET publish_watermark = ? WHERE connection_id = ? AND stream = ? AND publish_watermark < ?",
+          params: [p.ack, connectionId, p.stream, p.ack],
+        },
+        {
+          sql: "UPDATE record_changes SET publish_blocked_reason=NULL WHERE connection_id=? AND stream=? AND seq <= ?",
+          params: [connectionId, p.stream, p.ack],
+        },
+      );
   }
 
   return statements;

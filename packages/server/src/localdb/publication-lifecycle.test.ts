@@ -1,5 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2";
 import { afterEach, expect, it } from "vitest";
+import { StorageDeferredError } from "../../../core/src/stream-sync/storage-retry.js";
 import { publishLog } from "../../../core/src/localdb/log-publish.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import {
@@ -185,4 +186,86 @@ it("reports R1 published when reconciliation confirms a lost commit before a ref
     streams: [{ publication: { version: 2 } }],
   });
   expect(result?.map((r) => r.outcome)).toEqual(["published"]);
+});
+
+it("reports the latest fence refusal after storage backoff recovers", async () => {
+  const w = await world({ streams: 1 });
+  let down = false;
+  const d = await w.device("d1", {
+    beforePut: async () => {
+      if (down)
+        throw new StorageDeferredError(
+          180_000,
+          new Error("storage unavailable"),
+        );
+    },
+  });
+  await d.run("seed", [{ stream: "s0", id: "seed" }]);
+  await publishLog(d.deps, CONNECTION_ID);
+  await d.run("r1", [{ stream: "s0", id: "one" }]);
+  down = true;
+  expect(
+    (await publishLog(d.deps, CONNECTION_ID))?.map((r) => r.outcome),
+  ).toEqual(["backoff"]);
+  down = false;
+  w.gateway.failFenceOnce(CONTROL);
+  expect(
+    (await publishLog(d.deps, CONNECTION_ID))?.map((r) => r.outcome),
+  ).toEqual(["deferred"]);
+  expect((await d.sync.intake.publicationStatus("r1")).state).toBe("pending");
+  expect(
+    await d.db.query(
+      "SELECT publish_blocked_reason FROM run_streams WHERE run_id='r1'",
+    ),
+  ).toEqual([{ publish_blocked_reason: "deferred" }]);
+  expect(
+    (await publishLog(d.deps, CONNECTION_ID))?.map((r) => r.outcome),
+  ).toEqual(["published"]);
+  expect(
+    await d.db.query(
+      "SELECT publish_blocked_reason FROM run_streams WHERE run_id='r1'",
+    ),
+  ).toEqual([{ publish_blocked_reason: null }]);
+});
+
+it("reports collecting changes purged when delete and reconnect replace their lifetime during upload", async () => {
+  const w = await world({ streams: 1, publishWhileCollecting: true });
+  let hold = false;
+  let entered!: () => void;
+  const uploading = new Promise<void>((r) => (entered = r));
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const d = await w.device("d1", {
+    beforePut: async () => {
+      if (hold) {
+        hold = false;
+        entered();
+        await gate;
+      }
+    },
+  });
+  await d.run("seed", [{ stream: "s0", id: "seed" }]);
+  await publishLog(d.deps, CONNECTION_ID);
+  await d.sync.intake.begin("collecting", request());
+  await d.sync.intake.batch("collecting", {
+    batch: 0,
+    records: [{ stream: "s0", data: { id: "old" } }],
+  });
+  hold = true;
+  const first = publishLog(d.deps, CONNECTION_ID);
+  await uploading;
+  await d.sync.deleter.requestConnectionDelete(CONNECTOR);
+  expect(await d.sync.deleter.resumeDeletes()).toEqual([]);
+  await d.sync.intake.begin("new", request(true));
+  await d.sync.intake.batch("new", {
+    batch: 0,
+    records: [{ stream: "s0", data: { id: "new" } }],
+  });
+  await d.sync.intake.end("new", ended());
+  release();
+  expect((await first)?.map((r) => r.outcome)).toEqual(["purged"]);
+  await publishLog(d.deps, CONNECTION_ID);
+  expect((await d.sync.intake.publicationStatus("new")).state).toBe(
+    "published",
+  );
 });

@@ -496,7 +496,7 @@ export async function runPublicationStatements(
     statements.push({
       sql: `UPDATE run_streams SET publication_state = 'published',
               published_generation = ?, published_version = ?, published_data_hash = ?,
-              published_watermark = ?, publication_reason = NULL
+              published_watermark = ?, publication_reason = NULL, publish_blocked_reason = NULL
             WHERE stream = ? AND publication_state = 'pending'
               AND run_id IN (${chunk.map(() => "?").join(",")})`,
       params: [
