@@ -59,12 +59,15 @@ export async function world(options: {
   keyTypes?: readonly ("string" | "number" | "integer" | "boolean" | null)[];
   /** Every gateway and storage request of every device goes through this trace. */
   trace?: RequestTrace;
+  /** The gateway's `Batch-Policy` (default: the fake gateway's). */
+  batchPolicy?: { rows: number; requires: number; bytes: number };
 }) {
   const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
   const hashes = await controlHashes(async (b) => keccak_256(b), keyCheck);
   const gateway = createFakeGateway({
     owner: OWNER,
     connectionLogFence: options.connectionLogFence ?? true,
+    ...(options.batchPolicy && { policy: options.batchPolicy }),
     isTombstone: (v) =>
       v.dataHash === hashes.tombstoneData &&
       v.metadataHash === hashes.tombstoneMetadata,

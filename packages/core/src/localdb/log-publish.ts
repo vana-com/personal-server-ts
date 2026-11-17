@@ -68,6 +68,7 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   RegistryBatchRouteMissingError,
+  RegistryRefusedError,
   type RegistryRequirementFailure,
   type SignedBatchRow,
 } from "../stream-sync/ports.js";
@@ -75,7 +76,12 @@ import { sameHead, type PlanHead } from "../stream-sync/publish-plan.js";
 import { keccakOf } from "../stream-sync/crypto-port.js";
 import { applyConnection } from "./apply.js";
 import { listStreamBlobs, uploadBlobs, type BlobDescriptor } from "./blobs.js";
-import { settleRequirementFailure, settleRow } from "./batch-commit.js";
+import {
+  batchBounds,
+  checkBatchRoom,
+  settleRequirementFailure,
+  settleRow,
+} from "./batch-commit.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { tombstoneOmissions } from "./admit.js";
@@ -1422,11 +1428,20 @@ async function commitRound(
   const creation = candidate.createControl
     ? await controlCreation(held, control, hashes)
     : null;
+  const request = {
+    ownerAddress: held.ownerAddress,
+    rows: creation ? [creation, row] : [row],
+    requires: [controlCondition(control, connection, hashes)],
+  };
+  // These rows commit together or not at all, so a policy with no room for
+  // them fails the save. A policy not yet known comes with the gateway's
+  // refusal of the request.
+  checkBatchRoom(batchBounds(held.registry), request);
   const answer = await clock.time("registry-commit", () =>
-    postBatchOnce(held.registry, {
-      ownerAddress: held.ownerAddress,
-      rows: creation ? [creation, row] : [row],
-      requires: [controlCondition(control, connection, hashes)],
+    postBatchOnce(held.registry, request).catch((error: unknown) => {
+      if (error instanceof RegistryRefusedError)
+        checkBatchRoom(batchBounds(held.registry), request);
+      throw error;
     }),
   );
   if (answer.kind === "precondition_failed")

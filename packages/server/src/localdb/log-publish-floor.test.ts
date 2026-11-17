@@ -55,6 +55,21 @@ describe("log publish: the requests of one save", () => {
     expect(trace.count("batch"), trace.describe()).toBe(1);
   });
 
+  it("a first save under a Batch-Policy with no room for its two rows fails clearly and writes nothing (mutant: NO_POLICY_ROOM_CHECK)", async () => {
+    const trace = requestTrace(2);
+    const w = await world({
+      streams: 6,
+      trace,
+      batchPolicy: { rows: 1, requires: 16, bytes: 65_536 },
+    });
+    const a = await w.device("a");
+    await a.run("first", six("a"), { connector: "fresh" });
+    await expect(a.cycle()).rejects.toThrow(
+      /Batch-Policy rows=1;requires=16 has no room for one request of 2 rows and 1 conditions/,
+    );
+    expect(w.gateway.rowsOf(streamScope("fresh", "", "~log"))).toBe(0);
+  });
+
   it("a later save is a PUT and a commit: depth 2", async () => {
     const { trace, a } = await openWorld(0);
     await a.run("first", six("a"), { connector: "fresh" });

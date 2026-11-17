@@ -501,20 +501,34 @@ export function createGatewayStreamSyncRegistry(
     readBatchPolicy() {
       if (batchPolicy !== undefined) return Promise.resolve(batchPolicy);
       // The route sets `Batch-Policy` before it answers a preflight, so an
-      // OPTIONS request reads it without writing. A gateway whose answer has
-      // no header has no policy for this process's lifetime, as a 404 to the
-      // batch route has no route.
+      // OPTIONS request reads it without writing. Only two answers are kept
+      // for the process's lifetime: the header, and a 404 or 405 (no batch
+      // route). Any other answer says nothing lasting, so the next call asks
+      // again: an error status is no answer, and a success without the header
+      // is no policy for now.
       policyRead ??= fetchImpl(`${base}/v1/data/batch`, { method: "OPTIONS" })
-        .then((res) => {
-          batchPolicy =
-            parseBatchPolicy(res.headers.get("batch-policy")) ?? batchPolicy;
-          return batchPolicy;
-        })
         .catch((cause: unknown) => {
-          policyRead = undefined;
           throw new AmbiguousRegistryReplyError(
             `registry batch policy read got no reply: ${(cause as Error).message}`,
           );
+        })
+        .then((res) => {
+          const policy = parseBatchPolicy(res.headers.get("batch-policy"));
+          if (policy !== undefined) {
+            batchPolicy = policy;
+            return policy;
+          }
+          if (res.status === 404 || res.status === 405) return undefined;
+          policyRead = undefined;
+          if (res.status < 200 || res.status >= 300)
+            throw new AmbiguousRegistryReplyError(
+              `registry batch policy read answered ${res.status}`,
+            );
+          return undefined;
+        })
+        .catch((error: unknown) => {
+          policyRead = undefined;
+          throw error;
         });
       return policyRead;
     },

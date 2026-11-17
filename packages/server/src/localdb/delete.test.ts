@@ -38,8 +38,8 @@ afterEach(async () => {
 
 /**
  * Two devices of one owner over one registry. The connection has a control
- * row and, as an older build left them, a per-stream row and head blob for
- * each of `names`. `namespaces` adds control rows of other namespaces, each
+ * row and a per-stream row and head blob for each of `names` (a delete must
+ * leave them as they are). `namespaces` adds control rows of other namespaces, each
  * written by another key (`foreign`).
  */
 async function world(
@@ -223,7 +223,7 @@ it("persists the intent before the first registry write, writes the fence and no
   }
 });
 
-it("a delete reads no stream row and no head blob, and leaves the per-stream rows an older build wrote as they are (mutant: STREAM_CLEANUP)", async () => {
+it("a delete reads no stream row and no head blob, and leaves any per-stream row as it is (mutant: STREAM_CLEANUP)", async () => {
   const f = await world(undefined, ["items", "events", "profile", "history"]);
   const reads: string[] = [];
   const read = f.registry.read.bind(f.registry);
@@ -683,36 +683,6 @@ it("the fence is saved with the version it wrote, and a restart finishes without
   expect(await createConnectionDeleter(f.a.deps).resumeDeletes()).toEqual([]);
   expect(posts).not.toHaveBeenCalled();
   expect(f.registry.batches).toHaveLength(batches);
-  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
-});
-
-it("an intent an older build saved with stream pins finishes with the control tombstone alone", async () => {
-  const f = await world();
-  f.registry.beforePost = async () => {
-    throw new Error("offline fixture");
-  };
-  await f.a.deleter.requestConnectionDelete("fixture-source");
-  const [saved] = await f.a.db.query<{ intent: string }>(
-    "SELECT intent FROM delete_intents",
-  );
-  const older = {
-    ...JSON.parse(saved!.intent),
-    streams: [{ scope: f.head.scope, pin: 1 }],
-    streamsLanded: false,
-  };
-  await f.a.db.batch([
-    {
-      sql: "UPDATE delete_intents SET intent=?",
-      params: [JSON.stringify(older)],
-    },
-  ]);
-  f.registry.beforePost = undefined;
-  const before = f.registry.log.length;
-  expect(await createConnectionDeleter(f.a.deps).resumeDeletes()).toEqual([]);
-  expect(f.registry.log.slice(before).map((row) => row.scope)).toEqual([
-    f.control,
-  ]);
-  expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 1 });
   expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
 });
 
