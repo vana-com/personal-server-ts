@@ -34,7 +34,7 @@ import {
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { retainedManifest } from "./apply-fixture.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
-import { createFakeGateway } from "./fake-gateway.js";
+import { createFakeGateway, type FakeGatewayOptions } from "./fake-gateway.js";
 import type { RequestTrace } from "./request-trace.test-utils.js";
 
 export const OWNER = `0x${"11".repeat(20)}` as const;
@@ -62,12 +62,15 @@ export async function world(options: {
   keyTypes?: readonly ("string" | "number" | "integer" | "boolean" | null)[];
   /** Every gateway and storage request of every device goes through this trace. */
   trace?: RequestTrace;
+  /** The `Batch-Policy` the gateway advertises and enforces (`FakeGatewayOptions.policy`). */
+  policy?: FakeGatewayOptions["policy"];
 }) {
   const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
   const hashes = await controlHashes(async (b) => keccak_256(b), keyCheck);
   const gateway = createFakeGateway({
     owner: OWNER,
     connectionLogFence: options.connectionLogFence ?? true,
+    ...(options.policy && { policy: options.policy }),
     isTombstone: (v) =>
       v.dataHash === hashes.tombstoneData &&
       v.metadataHash === hashes.tombstoneMetadata,

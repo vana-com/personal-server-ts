@@ -38,11 +38,16 @@ export const GATEWAY_MAX_BATCH_REQUIRES = 16;
 export function batchBounds(registry: LocalSyncDeps["registry"]): {
   readonly rows: number;
   readonly requires: number;
+  /** See `RegistryBatchPolicy.lockedScopes`; absent when the gateway sends none. */
+  readonly lockedScopes?: number;
 } {
   const policy = registry.batchPolicy?.();
   return {
     rows: policy?.rows ?? GATEWAY_MAX_BATCH_ROWS,
     requires: policy?.requires ?? GATEWAY_MAX_BATCH_REQUIRES,
+    ...(policy?.lockedScopes !== undefined && {
+      lockedScopes: policy.lockedScopes,
+    }),
   };
 }
 
