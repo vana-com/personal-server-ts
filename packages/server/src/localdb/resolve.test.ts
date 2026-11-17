@@ -6,7 +6,6 @@ import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
-import { targetsForScope } from "../../../core/src/localdb/read-selection.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import { readerOf, type SqlDriver } from "../../../core/src/localdb/driver.js";
 import type { RecordQuery } from "../../../core/src/localdb/query.js";
@@ -824,16 +823,5 @@ describe("local resolve through the host's real legacy alias port", () => {
       { folders: { floor: 2 } },
     );
     expect(verdict(await readOf(resolver))).toBe("deleted");
-  });
-
-  it("refuses an alias that declares no required stream", () => {
-    const [target] = legacyAliasScopes("icloud_notes.notes");
-    expect(() =>
-      targetsForScope(
-        "icloud_notes.notes",
-        new Set(["icloud_notes.notes"]),
-        () => [{ ...target!, requiredStreams: [] }],
-      ),
-    ).toThrow(/no required stream/);
   });
 });

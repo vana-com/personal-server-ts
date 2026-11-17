@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import type { SqlDriver, SqlValue } from "../../../core/src/localdb/driver.js";
 import { createLocalListing } from "../../../core/src/localdb/listing.js";
+import type { AliasTargets } from "../../../core/src/localdb/resolve.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { addConnection, addStream } from "./local-state-fixture.js";
@@ -12,7 +13,10 @@ const opened: SqlDriver[] = [];
 const dirs: string[] = [];
 
 async function fresh(
-  options: { aliasScopes?: () => Iterable<string> } = {
+  options: {
+    aliasScopes?: () => Iterable<string>;
+    aliasTargets?: AliasTargets;
+  } = {
     aliasScopes: () => ["example.summary"],
   },
 ) {
@@ -246,6 +250,42 @@ describe("local listing #597", () => {
       { stream: "items", data: { id: "0", stream: "items" } },
     ]);
   });
+
+  it.each([
+    ["deleted", { lastDeleteVersion: 3, version: 3 }],
+    ["incomplete", { complete: false }],
+  ])(
+    "stamps an alias from the streams it serves, not from an optional stream that is %s",
+    async (_state, optional) => {
+      const { db, listing, project } = await fresh({
+        aliasScopes: () => ["example.summary"],
+        aliasTargets: () => [
+          {
+            connector: "sample",
+            streams: ["items", "extra"],
+            requiredStreams: ["items"],
+            project: project as never,
+          },
+        ],
+      });
+      await seed(db);
+      await addStream(db, "c1", "extra", {
+        generation: 1,
+        records: 0,
+        observedAt: 9000,
+        profile: "sample",
+        ...optional,
+      });
+      const listed = await listing.listScopes({
+        canRead: (scope) => scope === "example.summary",
+      });
+      expect(listed).toMatchObject([
+        { scope: "example.summary", updatedAt: 1234 },
+      ]);
+      expect(listed[0]?.latestCollectedAt).toBe(iso(1234));
+      expect(project.mock.calls[0]?.[2]).toEqual(["items"]);
+    },
+  );
 
   it("changes the cache key for every control-row and stream-head change", async () => {
     const { db, listing } = await fresh();

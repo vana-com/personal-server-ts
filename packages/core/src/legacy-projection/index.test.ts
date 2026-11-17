@@ -1738,6 +1738,23 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       });
     });
 
+    it("hands the database at least one required stream for every legacy scope", () => {
+      // A read gates only on required streams, so an alias with none would
+      // serve whatever a connection happens to hold. The self-check asserts
+      // the same of every binding; this asserts it of the alias port itself.
+      for (const scope of LEGACY_SCOPE_BINDINGS.keys()) {
+        for (const target of legacyAliasScopes(scope)) {
+          expect(
+            target.requiredStreams?.length,
+            `${scope}: no required stream`,
+          ).toBeGreaterThan(0);
+          for (const stream of target.requiredStreams ?? []) {
+            expect(target.streams, `${scope}: ${stream}`).toContain(stream);
+          }
+        }
+      }
+    });
+
     it("names profile as the one stream a host need not wait for", () => {
       const notes = LEGACY_SCOPE_BINDINGS.get("icloud_notes.notes")!;
       expect(requiredLegacyStreams(notes)).toEqual(["notes", "folders"]);

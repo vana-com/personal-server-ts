@@ -267,18 +267,21 @@ export function createLocalResolver(
       return deleted();
     if (connection.control_state === "foreign") return { kind: "key_mismatch" };
     const all = await streams(connection.connection_id);
-    const selected = candidate.target.streams.map((name) =>
-      all.find((s) => s.stream === name),
+    const { streams: served } = servedStreams(
+      candidate.target,
+      candidate.target.streams.flatMap((name) => {
+        const s = all.find((s) => s.stream === name);
+        return s ? [s] : [];
+      }),
+      connection,
     );
-    if (selected.some((s) => s && tombstonedForRead(s, connection, true)))
+    if (served.some((s) => tombstonedForRead(s, connection, true)))
       return deleted();
-    const states = selected.map((s) =>
-      s ? readability(s, connection, true) : "none",
-    );
+    const states = served.map((s) => readability(s, connection, true));
     if (states.includes("none")) return noData();
     if (!states.includes("partial")) return undefined;
     // A logical stream is one stream: an alias is never served partial.
-    const stream = selected[0]!;
+    const stream = served[0]!;
     const load = stream.partial!;
     const current = { ...candidate, connection, streams: [stream] };
     const cursor = cursorFor({ ...current, partialStreams: [stream.stream] });

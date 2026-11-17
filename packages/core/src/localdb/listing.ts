@@ -232,7 +232,7 @@ export function createLocalListing(
       const owner = chosen.connection;
       let records = 0;
       const times: number[] = [];
-      for (const stream of target.streams) {
+      for (const { stream } of chosen.streams) {
         const total = recordTotals.get(key(owner, stream));
         records += total?.records ?? 0;
         if (total?.stampedAt != null) times.push(total.stampedAt);

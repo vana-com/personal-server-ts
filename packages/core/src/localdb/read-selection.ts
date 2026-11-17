@@ -100,14 +100,11 @@ export function targetsForScope(
     return [{ connector: logical.connector, streams: [logical.stream] }];
   }
   if (!aliasNames.has(scope)) return [];
-  return (aliasTargets?.(scope) ?? []).map((alias) => {
-    if (alias.requiredStreams?.length === 0) {
-      throw new Error(
-        `alias ${scope} declares no required stream: nothing would gate its read`,
-      );
-    }
-    return { connector: alias.connector, streams: alias.streams, alias };
-  });
+  return (aliasTargets?.(scope) ?? []).map((alias) => ({
+    connector: alias.connector,
+    streams: alias.streams,
+    alias,
+  }));
 }
 
 /** Whether `target` serves without `stream`: the alias names it outside `requiredStreams`. */
