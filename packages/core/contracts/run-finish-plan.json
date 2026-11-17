@@ -479,6 +479,55 @@
       }
     },
     {
+      "id": "full-refresh-upserted-then-deleted-key-is-not-live",
+      "why": "Records fold by key in order: an upsert deleted later in the same run leaves no live record, and the delete still answers the stream.",
+      "declared": {
+        "a": {
+          "mode": "full_refresh"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            },
+            {
+              "key": 1,
+              "op": "delete"
+            }
+          ]
+        }
+      },
+      "input": {
+        "finish": "completed",
+        "streams": {
+          "a": {
+            "liveRecord": false,
+            "explicitDelete": true,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": false
+          }
+        },
+        "checkpoints": {
+          "a": "ca"
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["a"],
+        "provenFull": [],
+        "candidate": {
+          "a": "ca"
+        },
+        "unconfirmed": false
+      }
+    },
+    {
       "id": "retry-real-plan-withholds-streams-with-records",
       "why": "A retry run covers nothing; streams with captured records keep their cursor, record-free tokens move.",
       "declared": {
@@ -3039,6 +3088,54 @@
       "expect": {
         "outcome": "partial",
         "covered": ["a"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false
+      }
+    },
+    {
+      "id": "failed-done-failed-stream-delete-publishes",
+      "why": "A stream named failed in DONE is never covered, so its upserts are dropped, but its explicit delete still publishes.",
+      "declared": {
+        "a": {
+          "mode": "incremental"
+        }
+      },
+      "capture": {
+        "records": {
+          "a": [
+            {
+              "key": 1
+            },
+            {
+              "key": 2,
+              "op": "delete"
+            }
+          ]
+        },
+        "failedInDone": ["a"]
+      },
+      "input": {
+        "finish": "failed_done_upsert_only",
+        "streams": {
+          "a": {
+            "liveRecord": true,
+            "explicitDelete": true,
+            "retryableSkip": false,
+            "otherSkip": false,
+            "preflightExclusion": false,
+            "detailGap": "none",
+            "invalidDetailCoverage": false,
+            "failedInDone": true
+          }
+        },
+        "checkpoints": {
+          "a": "ca"
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": [],
         "provenFull": [],
         "candidate": {},
         "unconfirmed": false

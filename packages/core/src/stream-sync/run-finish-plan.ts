@@ -345,7 +345,8 @@ function planFailedDone(
   const certified =
     input.finish === "certified_failed_done" &&
     run.selected.some((stream) => run.obs(stream).failedInDone);
-  // A stream named failed in DONE is never covered, records or not.
+  // A stream named failed in DONE is never covered: its upserts are never
+  // kept, while its explicit deletes still publish (end keeps every delete).
   const published = run.selected.filter(
     (stream) =>
       !skipped(run.obs(stream)) &&

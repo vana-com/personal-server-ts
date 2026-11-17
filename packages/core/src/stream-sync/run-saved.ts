@@ -11,8 +11,9 @@ import type { RunPublicationStatus } from "./intake.js";
 /**
  * `receipt_or_status`: a publication receipt that lists the run, or, when
  * the cycle gave none (a lost reply, a noop cycle), the run's durable status
- * `published`. `strict_receipt`: only a receipt. Retiring old copies uses it:
- * no decision lets a status alone delete data.
+ * `published`, each stream naming its publication. `strict_receipt`: only a
+ * receipt. Retiring old copies uses it: no decision lets a status alone delete
+ * data.
  */
 export type RunSavedMode = "receipt_or_status" | "strict_receipt";
 
@@ -31,8 +32,9 @@ export interface RunSavedInput {
    */
   readonly liveConnections: readonly string[] | null;
   /**
-   * The connection's control state now. Saved needs `active`, and a receipt
-   * proof needs every receipt's head in its generation.
+   * The connection's control state now. Saved needs `active`, and a proof
+   * needs every receipt's head, or every published stream's publication, in
+   * its generation.
    */
   readonly control: ControlState | null;
   readonly mode: RunSavedMode;
@@ -88,16 +90,23 @@ export function decideRunSaved(input: RunSavedInput): RunSavedVerdict {
     receipts.some((receipt) => receipt.stream === stream),
   );
   const status = input.status;
-  const statusCovers =
+  // A published stream proves the run only with the publication it names,
+  // so its generation can be checked like a receipt's head.
+  const statusPublications =
     input.mode === "receipt_or_status" &&
     status !== null &&
     status.runId === input.runId &&
-    status.state === "published" &&
-    required.every((stream) =>
-      status.streams.some(
-        (entry) => entry.name === stream && entry.state === "published",
-      ),
-    );
+    status.state === "published"
+      ? required.map(
+          (stream) =>
+            status.streams.find(
+              (entry) => entry.name === stream && entry.state === "published",
+            )?.publication,
+        )
+      : [];
+  const statusCovers =
+    statusPublications.length > 0 &&
+    statusPublications.every((publication) => publication !== undefined);
   if (!receiptCovers && !statusCovers)
     return refuse(receipts.length > 0 ? "streams_uncovered" : "no_receipt");
   let connectionId: string | null = null;
@@ -105,15 +114,18 @@ export function decideRunSaved(input: RunSavedInput): RunSavedVerdict {
     const ids = new Set(receipts.map((receipt) => receipt.connectionId));
     if (ids.size !== 1) return refuse("connection_mismatch");
     connectionId = [...ids][0]!;
-    // A connection deleted and connected again purges every head of an
-    // earlier generation, so such a receipt names data that is gone.
-    const control = input.control;
-    if (
-      control?.kind === "active" &&
-      receipts.some((receipt) => receipt.head.generation !== control.generation)
-    )
-      return refuse("stale_generation");
   }
+  // A connection deleted and connected again purges every head of an
+  // earlier generation, so a proof from one names data that is gone.
+  const control = input.control;
+  const generations = receiptCovers
+    ? receipts.map((receipt) => receipt.head.generation)
+    : statusPublications.map((publication) => publication!.generation);
+  if (
+    control?.kind === "active" &&
+    generations.some((generation) => generation !== control.generation)
+  )
+    return refuse("stale_generation");
   if (input.liveConnections === null) {
     if (input.mode === "strict_receipt") return refuse("connection_unknown");
   } else if (

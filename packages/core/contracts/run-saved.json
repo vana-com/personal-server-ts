@@ -74,6 +74,42 @@
       }
     },
     {
+      "id": "receipt_or_status-receipt-after-reconnect",
+      "why": "A receipt from the generation a reconnect started proves the run.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 3,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 3
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": true,
+        "proof": "receipt",
+        "connectionId": "c~"
+      }
+    },
+    {
       "id": "strict_receipt-receipt-from-earlier-generation",
       "why": "A receipt whose head is from an earlier generation than the active control names data a reconnect purged.",
       "input": {
@@ -158,7 +194,13 @@
           "streams": [
             {
               "name": "items",
-              "state": "published"
+              "state": "published",
+              "publication": {
+                "generation": 2,
+                "version": 3,
+                "dataHash": "ab12",
+                "watermark": 7
+              }
             }
           ]
         },
@@ -176,6 +218,72 @@
       }
     },
     {
+      "id": "receipt_or_status-status-from-earlier-generation",
+      "why": "A published status from before a reconnect names data the reconnect purged.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [],
+        "status": {
+          "runId": "run-1",
+          "state": "published",
+          "streams": [
+            {
+              "name": "items",
+              "state": "published",
+              "publication": {
+                "generation": 2,
+                "version": 3,
+                "dataHash": "ab12",
+                "watermark": 7
+              }
+            }
+          ]
+        },
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 3
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "stale_generation"
+      }
+    },
+    {
+      "id": "receipt_or_status-status-without-publication",
+      "why": "A published status that names no publication cannot be checked against the generation, so it proves nothing.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [],
+        "status": {
+          "runId": "run-1",
+          "state": "published",
+          "streams": [
+            {
+              "name": "items",
+              "state": "published"
+            }
+          ]
+        },
+        "liveConnections": ["c~"],
+        "control": {
+          "kind": "active",
+          "generation": 2
+        },
+        "mode": "receipt_or_status"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "no_receipt"
+      }
+    },
+    {
       "id": "strict_receipt-lost-reply-retire",
       "why": "Retirement never deletes on a status alone.",
       "input": {
@@ -189,7 +297,13 @@
           "streams": [
             {
               "name": "items",
-              "state": "published"
+              "state": "published",
+              "publication": {
+                "generation": 2,
+                "version": 3,
+                "dataHash": "ab12",
+                "watermark": 7
+              }
             }
           ]
         },
@@ -309,7 +423,13 @@
           "streams": [
             {
               "name": "items",
-              "state": "published"
+              "state": "published",
+              "publication": {
+                "generation": 2,
+                "version": 3,
+                "dataHash": "ab12",
+                "watermark": 7
+              }
             }
           ]
         },
@@ -339,7 +459,13 @@
           "streams": [
             {
               "name": "other",
-              "state": "published"
+              "state": "published",
+              "publication": {
+                "generation": 2,
+                "version": 3,
+                "dataHash": "ab12",
+                "watermark": 7
+              }
             }
           ]
         },
@@ -383,7 +509,13 @@
           "streams": [
             {
               "name": "items",
-              "state": "published"
+              "state": "published",
+              "publication": {
+                "generation": 2,
+                "version": 3,
+                "dataHash": "ab12",
+                "watermark": 7
+              }
             }
           ]
         },
@@ -770,7 +902,13 @@
           "streams": [
             {
               "name": "items",
-              "state": "published"
+              "state": "published",
+              "publication": {
+                "generation": 2,
+                "version": 3,
+                "dataHash": "ab12",
+                "watermark": 7
+              }
             }
           ]
         },
@@ -976,7 +1114,13 @@
           "streams": [
             {
               "name": "items",
-              "state": "published"
+              "state": "published",
+              "publication": {
+                "generation": 2,
+                "version": 3,
+                "dataHash": "ab12",
+                "watermark": 7
+              }
             }
           ]
         },
@@ -1089,6 +1233,38 @@
         "control": {
           "kind": "absent"
         },
+        "mode": "strict_receipt"
+      },
+      "expect": {
+        "saved": false,
+        "reason": "not_active"
+      }
+    },
+    {
+      "id": "control-unreadable",
+      "why": "A host that cannot read the control state proves nothing active.",
+      "input": {
+        "runId": "run-1",
+        "connector": "c",
+        "requiredStreams": ["items"],
+        "receipts": [
+          {
+            "connectionId": "c~",
+            "connector": "c",
+            "ns": "",
+            "stream": "items",
+            "head": {
+              "version": 3,
+              "generation": 2,
+              "dataHash": "ab12"
+            },
+            "watermark": 7,
+            "runIds": ["run-1"]
+          }
+        ],
+        "status": null,
+        "liveConnections": ["c~"],
+        "control": null,
         "mode": "strict_receipt"
       },
       "expect": {
