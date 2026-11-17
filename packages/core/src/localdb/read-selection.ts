@@ -295,6 +295,13 @@ export async function loadStreams(
  * winner with a deleted stream is `tombstoned`; a winner that lacks a stream
  * or holds an incomplete one serves nothing.
  */
+/** An alias needs an actual required stream, even if every optional head is present. */
+export function invalidAliasBinding(binding: LocalAliasTarget): boolean {
+  return !(binding.requiredStreams ?? binding.streams).some((stream) =>
+    binding.streams.includes(stream),
+  );
+}
+
 export function selectForTarget(
   target: Target,
   connections: readonly {
@@ -302,7 +309,11 @@ export function selectForTarget(
     readonly streams: readonly Stream[];
   }[],
   options: { readonly progressive?: boolean } = {},
-): { candidate: Candidate | undefined; tombstoned: boolean } {
+):
+  | { candidate: Candidate | undefined; tombstoned: boolean; kind?: "selected" }
+  | { kind: "invalid_binding"; candidate: undefined; tombstoned: false } {
+  if (target.alias && invalidAliasBinding(target.alias))
+    return { kind: "invalid_binding", candidate: undefined, tombstoned: false };
   // A first load's applied parts are served for a logical stream only: an
   // alias projects the whole head, which a partial head cannot give.
   const progressive = options.progressive === true && !target.alias;
@@ -390,8 +401,10 @@ export async function projectAlias(
 ): Promise<
   | { readonly kind: "ok"; readonly payload: unknown }
   | { readonly kind: "no_data" }
+  | { readonly kind: "invalid_binding" }
   | { readonly kind: "too_large"; readonly bytes: number }
 > {
+  if (invalidAliasBinding(binding)) return { kind: "invalid_binding" };
   // Check all input heads, before reading even one record or creating a body.
   if (
     candidate.streams.some((s) => s.profile_key !== candidate.target.connector)
@@ -401,6 +414,8 @@ export async function projectAlias(
   const fetched = candidate.streams.map((s) => s.stream);
   if (binding.windowed) {
     const probe = binding.project([], now, fetched);
+    if (!probe.ok && probe.error.kind === "invalid_binding")
+      return { kind: "invalid_binding" };
     if (!probe.ok && probe.error.kind.includes("profile")) {
       return { kind: "no_data" };
     }
@@ -421,6 +436,8 @@ export async function projectAlias(
     }
   }
   const projected = binding.project(records, now, fetched);
+  if (!projected.ok && projected.error.kind === "invalid_binding")
+    return { kind: "invalid_binding" };
   return projected.ok
     ? { kind: "ok", payload: projected.payload }
     : { kind: "no_data" };

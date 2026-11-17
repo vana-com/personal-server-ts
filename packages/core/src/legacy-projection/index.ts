@@ -168,6 +168,9 @@ export function legacyScopeToPdppSelection(
     return { ok: false, error: { kind: "unknown_scope", scope } };
   }
 
+  if (requiredLegacyStreams(binding).length === 0)
+    return { ok: false, error: { kind: "invalid_binding", scope } };
+
   return {
     ok: true,
     selection: { source: binding.pdppSource, streams: binding.pdppStreams },
@@ -204,6 +207,8 @@ export function projectPdppRecordsToLegacyPayload(
     }
     return { ok: false, error: { kind: "unknown_scope", scope } };
   }
+  if (requiredLegacyStreams(binding).length === 0)
+    return { ok: false, error: { kind: "invalid_binding", scope } };
   let decodeDiagnostics: ProjectionDiagnostic[] = [];
   try {
     const decoded = decodeDeclaredRecordsForProjection(

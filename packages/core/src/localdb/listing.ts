@@ -225,6 +225,7 @@ export function createLocalListing(
     const entries: Entry[] = [];
     for (const scope of [...candidates].sort()) {
       const picks: Candidate[] = [];
+      let invalidBinding = false;
       for (const target of targets(scope)) {
         const picked = selectForTarget(
           target,
@@ -234,9 +235,13 @@ export function createLocalListing(
           })),
           { progressive },
         );
+        if (picked.kind === "invalid_binding") {
+          invalidBinding = true;
+          break;
+        }
         if (picked.candidate) picks.push(picked.candidate);
       }
-      const chosen = chooseCandidate(picks);
+      const chosen = invalidBinding ? undefined : chooseCandidate(picks);
       const target = chosen
         ? targets(scope).find(
             (entry) => entry.connector === chosen.connection.connector,

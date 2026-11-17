@@ -13,6 +13,7 @@ import { partialBody } from "./partial-read.js";
 import type { RecordQuery } from "./query.js";
 import {
   chooseCandidate,
+  invalidAliasBinding,
   complete,
   connectionsOf,
   loadStreams,
@@ -392,6 +393,7 @@ export function createLocalResolver(
       if (projected.kind === "too_large") {
         return { kind: "too_large", bytes: projected.bytes };
       }
+      if (projected.kind === "invalid_binding") return projected;
       if (projected.kind === "no_data") return noData();
       payload = single(JSON.stringify(projected.payload));
     }
@@ -432,6 +434,12 @@ export function createLocalResolver(
         new Set(parts.aliasScopes?.() ?? []),
         parts.aliasTargets,
       );
+      if (
+        targets.some(
+          (target) => target.alias && invalidAliasBinding(target.alias),
+        )
+      )
+        return { kind: "invalid_binding" };
       // A stream that is still loading is served to its owner alone.
       const progressive = progressiveFirstLoad && input.isOwnerView;
       const candidates: Candidate[] = [];
@@ -476,6 +484,7 @@ export function createLocalResolver(
           });
         }
         const picked = selectForTarget(target, loaded, { progressive });
+        if (picked.kind === "invalid_binding") return picked;
         if (picked.tombstoned) sawDeleted = true;
         if (picked.candidate) candidates.push(picked.candidate);
       }
