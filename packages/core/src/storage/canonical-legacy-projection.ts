@@ -54,7 +54,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/9";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/10";
 
 const DEFAULT_PAGE_SIZE = 500;
 const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
@@ -397,6 +397,12 @@ export async function readCanonicalLegacyScope(
 interface Snapshot {
   ok: true;
   generation: number;
+  /**
+   * The bound streams this read serves, in binding order: every required
+   * stream, and an optional one only while a current receipt proves its live
+   * set. Every later step reads this set, never the whole binding.
+   */
+  served: string[];
   listing: StreamListing[];
   /** In arrival order for an arrival-ordered binding, unless a gap says not. */
   rowsByStream: Map<string, PdppStoredRecord[]>;
@@ -430,8 +436,28 @@ function collectSnapshot(
   const rejected = checkConnection(binding, selection);
   if (rejected) return { ok: false, result: unavailable(rejected) };
   const listing = store.listStreams([instance]);
+  const receipts = store
+    .listStreamCompletions(instance)
+    .filter(
+      (receipt) =>
+        receipt.method === binding.method &&
+        receipt.generation === binding.generation,
+    );
+  // A stream the binding serves without counts only while a current receipt
+  // proves its live set. Otherwise it is left out before any read of it: no
+  // schema, rows, blobs or projection input, and never "fetched".
+  const served = streams.filter(
+    (stream) =>
+      !optionalStreams.has(stream) ||
+      receipts.some(
+        (receipt) =>
+          receipt.stream === stream &&
+          receipt.liveCount === countFor(listing, stream) &&
+          Number.isFinite(Date.parse(receipt.sourceCollectedAt)),
+      ),
+  );
   const streamSchemas: Record<string, Record<string, unknown>> = {};
-  for (const stream of streams) {
+  for (const stream of served) {
     const schema = declarations?.forInstance(instance, stream)?.schema;
     if (schema) streamSchemas[stream] = structuredClone(schema);
   }
@@ -439,7 +465,7 @@ function collectSnapshot(
   const rowsByStream = new Map<string, PdppStoredRecord[]>();
   const orderGaps: string[] = [];
   try {
-    for (const stream of streams) {
+    for (const stream of served) {
       const rows = readAllRows(store, instance, stream, pageSize);
       if (typeof rows === "string") {
         return { ok: false, result: inconsistent(rows) };
@@ -467,11 +493,9 @@ function collectSnapshot(
     throw error;
   }
   const completions = new Map<string, CanonicalStreamCompletion>();
-  for (const receipt of store.listStreamCompletions(instance)) {
+  for (const receipt of receipts) {
     if (
-      streams.includes(receipt.stream) &&
-      receipt.method === binding.method &&
-      receipt.generation === binding.generation &&
+      served.includes(receipt.stream) &&
       receipt.liveCount === rowsByStream.get(receipt.stream)?.length
     ) {
       completions.set(receipt.stream, receipt);
@@ -486,9 +510,9 @@ function collectSnapshot(
   ) {
     return { ok: false, result: unavailable({ reason: "no_synced_data" }) };
   }
-  // A stream the binding serves without needs no receipt: a connection that
-  // never collected it still projects.
-  const unprovenStreams = streams.filter(
+  // A stream the binding serves without is in `served` only with a receipt,
+  // so only a required stream can lack one here.
+  const unprovenStreams = served.filter(
     (stream) =>
       !optionalStreams.has(stream) &&
       !completions.has(stream) &&
@@ -511,7 +535,7 @@ function collectSnapshot(
   const blobContents = new Map<string, ClaudeBlobContents>();
   let requiredBytes = 0;
   const declaredBlobIds = new Set<string>();
-  for (const stream of streams) {
+  for (const stream of served) {
     // The binding projects these rows from their typed fields alone.
     if (ancillaryBlobStreams.has(stream)) continue;
     const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
@@ -657,6 +681,7 @@ function collectSnapshot(
   return {
     ok: true,
     generation: binding.generation,
+    served,
     listing,
     rowsByStream,
     orderGaps,
@@ -697,7 +722,7 @@ async function projectSnapshot(
   const {
     scope,
     selection,
-    streams,
+    served,
     binding,
     profileKey,
     rowsByStream,
@@ -706,7 +731,7 @@ async function projectSnapshot(
   } = input;
   const listingBefore = input.listing;
   const sourceRowCounts = Object.fromEntries(
-    streams.map((stream) => [stream, rowsByStream.get(stream)?.length ?? 0]),
+    served.map((stream) => [stream, rowsByStream.get(stream)?.length ?? 0]),
   );
 
   const expanded = [];
@@ -727,7 +752,7 @@ async function projectSnapshot(
       });
     }
   }
-  for (const stream of streams) {
+  for (const stream of served) {
     if (binding.ancillaryBlobStreams?.includes(stream)) continue;
     const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
     if (
@@ -779,7 +804,7 @@ async function projectSnapshot(
   if (collectedAt === null)
     return unavailable({ reason: "invalid_collected_at" });
 
-  let records = streams.flatMap((stream) =>
+  let records = served.flatMap((stream) =>
     (rowsByStream.get(stream) ?? []).map((row) => ({ stream, data: row.data })),
   );
   // Decode inline fields before inserting raw blob text; a JSON-string blob
@@ -836,16 +861,10 @@ async function projectSnapshot(
       });
     }
   }
-  // An optional stream the connection never collected is not "fetched".
-  const optional = new Set(binding.optionalStreams);
-  const fetchedStreams = streams.filter(
-    (stream) =>
-      !optional.has(stream) ||
-      completions.has(stream) ||
-      (rowsByStream.get(stream)?.length ?? 0) > 0,
-  );
+  // Every served stream was fetched, empty or not; an optional stream left
+  // out of `served` was never read, and is not named.
   const projected = projectPdppRecordsToLegacyPayload(scope, records, {
-    fetchedStreams,
+    fetchedStreams: served,
     ...(profileKey ? { profileKey } : {}),
     now: collectedAt,
     // Rows of an arrival-ordered scope go in as read. Without proof of that
@@ -882,7 +901,7 @@ async function projectSnapshot(
   }
   // Valid peers may deliver with omissions. If NOTHING of the item stream
   // survived, a "successful empty" would read as an empty history.
-  const itemStream = streams[0];
+  const itemStream = input.streams[0];
   const sourceRows = itemStream ? (sourceRowCounts[itemStream] ?? 0) : 0;
   const itemOmissions = omissions.filter(
     (entry) => entry.stream === itemStream,
@@ -910,7 +929,7 @@ async function projectSnapshot(
     binding,
     profileKey,
     generation: input.generation,
-    streams,
+    streams: served,
     rowsByStream,
     orderGaps,
     completions,
@@ -932,7 +951,7 @@ async function projectSnapshot(
     ...(input.includeStreamTimes
       ? {
           streamCollectionTimes: Object.fromEntries(
-            streams.map((stream) => {
+            served.map((stream) => {
               const receipt = completions.get(stream);
               if (receipt) return [stream, receipt.sourceCollectedAt];
               const rows = rowsByStream.get(stream) ?? [];
@@ -955,7 +974,7 @@ async function projectSnapshot(
             }),
           ),
           streamCompletionTimes: Object.fromEntries(
-            streams.map((stream) => [
+            served.map((stream) => [
               stream,
               completions.get(stream)?.sourceCollectedAt ?? null,
             ]),

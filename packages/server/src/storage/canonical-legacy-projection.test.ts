@@ -1507,6 +1507,201 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       });
     });
 
+    describe("an optional stream is served only with a current receipt", () => {
+      const NOTE = {
+        id: "n1",
+        title: "Grocery list",
+        snippet: "milk",
+        folder_id: "f1",
+        is_pinned: false,
+        created_at: "2026-09-01T00:00:00Z",
+        modified_at: "2026-09-02T00:00:00Z",
+        has_attachments: false,
+        text_content: "milk",
+      };
+      const PROFILE = { id: "p1", user_name: "Ada" };
+
+      function icloud() {
+        const a = connect("conn_a", "icloud-notes");
+        replace("conn_a", "folders", [{ id: "f1", name: "Notes" }], COLLECTED);
+        replace("conn_a", "notes", [NOTE], COLLECTED);
+        return a;
+      }
+
+      /** What the reader asked the store and the declarations about, by stream. */
+      async function readWithAccess(
+        selection: ReturnType<typeof icloud>,
+        requireCompletionReceipts = true,
+      ) {
+        const access: string[] = [];
+        const spy = new Proxy(store, {
+          get(target, key) {
+            const value = Reflect.get(target, key, target);
+            if (typeof value !== "function") return value;
+            if (key === "listRecords") {
+              return (stream: string, ...rest: unknown[]) => {
+                access.push(`rows:${stream}`);
+                return (value as (...a: unknown[]) => unknown).call(
+                  target,
+                  stream,
+                  ...rest,
+                );
+              };
+            }
+            if (key === "listArrivalOrder") {
+              return (instance: string, stream: string) => {
+                access.push(`arrival:${stream}`);
+                return target.listArrivalOrder(instance, stream);
+              };
+            }
+            return value.bind(target);
+          },
+        }) as typeof store;
+        const read = await readCanonicalLegacyScope({
+          store: spy,
+          scope: "icloud_notes.notes",
+          selection,
+          requireCompletionReceipts,
+          includeStreamTimes: true,
+          declarations: {
+            forInstance: (_instance, stream) => {
+              access.push(`schema:${stream}`);
+              return undefined;
+            },
+          },
+        });
+        return { read, access };
+      }
+
+      /** The read served notes and folders alone: the optional stream was never touched. */
+      function expectUnserved(
+        result: Awaited<ReturnType<typeof readWithAccess>>,
+      ) {
+        const { read, access } = result;
+        expect(read).toMatchObject({ ok: true, complete: true });
+        if (!read.ok) return;
+        expect(read.envelope.data).toMatchObject({
+          userName: null,
+          notes: [{ recordName: "n1" }],
+        });
+        expect(access.filter((entry) => entry.endsWith(":profile"))).toEqual(
+          [],
+        );
+        expect(Object.keys(read.diagnostics.sourceRowCounts).sort()).toEqual([
+          "folders",
+          "notes",
+        ]);
+        expect(Object.keys(read.streamCollectionTimes ?? {}).sort()).toEqual([
+          "folders",
+          "notes",
+        ]);
+        expect(Object.keys(read.streamCompletionTimes ?? {}).sort()).toEqual([
+          "folders",
+          "notes",
+        ]);
+      }
+
+      const withReceipt = (profile: Record<string, unknown>[]) =>
+        replace("conn_a", "profile", profile, COLLECTED);
+
+      it("leaves out a nonempty stream that has no receipt", async () => {
+        const a = icloud();
+        put("conn_a", "profile", [PROFILE]);
+        expect(receipts().map((r) => (r as { stream: string }).stream)).toEqual(
+          ["folders", "notes"],
+        );
+        expectUnserved(await readWithAccess(a));
+        expectUnserved(await readWithAccess(a, false));
+      });
+
+      it("serves the scope when the stream with no receipt holds a blob it cannot read", async () => {
+        const a = icloud();
+        const blob = store.storeBlobBytesForInstance({
+          instance: "conn_a",
+          method: METHOD,
+          generation: 1,
+          bytes: new TextEncoder().encode("profile body"),
+          mimeType: "text/plain",
+        });
+        put("conn_a", "profile", [
+          {
+            ...PROFILE,
+            blob_ref: {
+              blob_id: blob.blobId,
+              mime_type: "text/plain",
+              size_bytes: blob.sizeBytes,
+            },
+          },
+        ]);
+        expectUnserved(await readWithAccess(a));
+      });
+
+      it.each([
+        ["from another generation", "generation = 2"],
+        ["for another method", "method = 'other_method'"],
+        ["with a live count that is not the listing's", "live_count = 5"],
+        [
+          "with a source time that is not a time",
+          "source_collected_at = 'soon'",
+        ],
+      ])("leaves out a stream whose receipt is %s", async (_label, set) => {
+        const a = icloud();
+        withReceipt([PROFILE]);
+        db.prepare(
+          `UPDATE pdpp_stream_completion SET ${set} WHERE stream = 'profile'`,
+        ).run();
+        expectUnserved(await readWithAccess(a));
+      });
+
+      it("serves a stream whose receipt proves its rows", async () => {
+        const a = icloud();
+        withReceipt([PROFILE]);
+        const { read, access } = await readWithAccess(a);
+        expect(read).toMatchObject({ ok: true });
+        if (!read.ok) return;
+        expect(read.envelope.data).toMatchObject({ userName: "Ada" });
+        expect(read.diagnostics.sourceRowCounts).toMatchObject({ profile: 1 });
+        expect(access).toContain("rows:profile");
+      });
+
+      it("serves a stream whose receipt proves it is empty, with no name", async () => {
+        const a = icloud();
+        withReceipt([]);
+        const { read, access } = await readWithAccess(a);
+        expect(read).toMatchObject({ ok: true });
+        if (!read.ok) return;
+        expect(read.envelope.data).toMatchObject({ userName: null });
+        expect(read.diagnostics.sourceRowCounts).toMatchObject({ profile: 0 });
+        expect(access).toContain("rows:profile");
+      });
+
+      it("leaves out a stream after a real delete of its rows", async () => {
+        const a = icloud();
+        withReceipt([PROFILE]);
+        expect(
+          store.deleteRecord(
+            "conn_a",
+            "profile",
+            "p1",
+            "2026-09-11T00:00:00.000Z",
+            "mutable_state",
+          ),
+        ).toBe(true);
+        expectUnserved(await readWithAccess(a));
+      });
+
+      it("serves a different revision once the stream is served", async () => {
+        const a = icloud();
+        put("conn_a", "profile", [PROFILE]);
+        const before = await readWithAccess(a);
+        withReceipt([PROFILE]);
+        const after = await readWithAccess(a);
+        expect(before.read.ok && after.read.ok).toBe(true);
+        if (!before.read.ok || !after.read.ok) return;
+        expect(after.read.revision).not.toBe(before.read.revision);
+      });
+    });
+
     it("keeps a never-collected stream unavailable", async () => {
       const a = connect("conn_a", "oura");
       replace("conn_a", "sleep", [], COLLECTED);
