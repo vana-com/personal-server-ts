@@ -149,6 +149,20 @@ it("stages an authenticated empty directory paused and ignores unsigned runtime 
       expect(port).toBeGreaterThan(0);
       expect(port).toBeLessThanOrEqual(65535);
     }
+    // An unestablished session must reach the peer listener, not merely a
+    // plausible reported port or another central HTTP service.
+    const peerResponse = await fetch(
+      `http://127.0.0.1:${runtime.ports.peer}/fleet-peer/v1/call`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId: "unestablished-test-session" }),
+      },
+    );
+    expect(peerResponse.status).toBe(403);
+    await expect(peerResponse.json()).resolves.toEqual({
+      error: "peer_request_rejected",
+    });
     const mcpResponse = await fetch(`http://127.0.0.1:${runtime.ports.mcp}/`);
     expect(mcpResponse.status).toBe(503);
     await expect(mcpResponse.json()).resolves.toEqual({
