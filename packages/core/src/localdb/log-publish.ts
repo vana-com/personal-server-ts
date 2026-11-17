@@ -1085,6 +1085,9 @@ async function operationsFor(
   /** Explicit deletes of these keys have no typed key and cannot be published. */
   readonly untyped: string[];
 }> {
+  // A remove change carries its typed key only from an explicit delete
+  // (`explicit_delete`) or from a seeded omission (`seedFromHistory`), which
+  // goes as the completion of that one key at its cutoff.
   const ops = new Map<string, LogOperation>();
   const untyped: string[] = [];
   for (const group of chunked(keys, KEYS_PER_QUERY)) {
@@ -1122,14 +1125,27 @@ async function operationsFor(
       record_key: string;
       stamp_o: number;
       stamp_r: string;
+      explicit_delete: number;
     }>(
-      `SELECT pk_hash, pk_values, record_key, stamp_o, stamp_r, MAX(seq) FROM record_changes
+      `SELECT pk_hash, pk_values, record_key, stamp_o, stamp_r, explicit_delete, MAX(seq) FROM record_changes
         WHERE connection_id = ? AND stream = ? AND seq > ? AND seq <= ?
-          AND op = 'remove' AND explicit_delete = 1 AND pk_hash IN (${goneMarks})
+          AND op = 'remove' AND (explicit_delete = 1 OR pk_values IS NOT NULL)
+          AND pk_hash IN (${goneMarks})
         GROUP BY pk_hash`,
       [connectionId, stream, from, to, ...gone],
     );
     for (const row of deletes) {
+      if (row.explicit_delete === 0) {
+        ops.set(row.pk_hash, {
+          kind: "complete",
+          stream,
+          cutoff: { o: row.stamp_o, r: row.stamp_r },
+          omitted: [
+            { pkHash: row.pk_hash, key: JSON.parse(row.pk_values!) as LogKey },
+          ],
+        });
+        continue;
+      }
       // A delete made before `pk_values` existed has only the lossy string
       // key. The stream's declared key types give the typed key back from it,
       // if the rebuilt tuple hashes to the record's hash; otherwise the log
@@ -1194,12 +1210,12 @@ async function declaredKey(
 
 /** Upserts, then deletes, each by key: one order for every writer. */
 function orderedOperations(ops: readonly LogOperation[]): LogOperation[] {
+  const pkOf = (op: LogOperation) =>
+    op.kind === "complete" ? (op.omitted[0]?.pkHash ?? "") : op.pkHash;
   return [...ops].sort(
     (a, b) =>
       (a.kind === "upsert" ? 0 : 1) - (b.kind === "upsert" ? 0 : 1) ||
-      (a as { pkHash: string }).pkHash.localeCompare(
-        (b as { pkHash: string }).pkHash,
-      ),
+      pkOf(a).localeCompare(pkOf(b)),
   );
 }
 

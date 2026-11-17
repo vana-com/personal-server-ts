@@ -9,8 +9,8 @@
 //
 // The registry's row must be one this device applied: the segment the log
 // names at its position is the one this device has at that position. Any other
-// row is another history, and this device cannot say what its rows are the
-// fold of: that fails closed (`LogDivergedError`), as before.
+// row is another history: this throws `LogDivergedError`, and `applyLog`
+// rebases onto that history instead (`log-rebase.ts`).
 
 import {
   controlScope,

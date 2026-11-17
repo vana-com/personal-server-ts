@@ -168,26 +168,17 @@ describe("log protocol", () => {
     await b.cycle();
     expect(await b.position()).toBe(1);
 
-    // Ahead of the registry (a restored registry): fail closed, with nothing
-    // fetched or applied and the position kept (see the P2-2 tests).
+    // Ahead of the registry with no segment of its own above it, so nothing
+    // to put back: the device goes back to the last position both agree on
+    // (see the P2-2 tests).
     await b.db.batch([
       {
         sql: "UPDATE log_state SET position = 9 WHERE connection_id = ?",
         params: [CONNECTION_ID],
       },
     ]);
-    const before = b.gets.length;
-    await expect(b.cycle()).rejects.toThrow(/behind this device/);
-    expect(await b.position()).toBe(9);
-    expect(b.gets.slice(before).some((k) => k.startsWith(`${LOG}/s-`))).toBe(
-      false,
-    );
-    await b.db.batch([
-      {
-        sql: "UPDATE log_state SET position = 1 WHERE connection_id = ?",
-        params: [CONNECTION_ID],
-      },
-    ]);
+    await b.cycle();
+    expect(await b.position()).toBe(1);
 
     // Segment 2 is missing: segment 3 must not apply.
     await a.run("run-2", [{ stream: sName(0), id: "two" }], {
@@ -1081,7 +1072,7 @@ describe("log protocol: boundary kinds at equal stamps (P2-1)", () => {
   });
 });
 
-describe("log protocol: a registry behind this device gets its lost segments back; one on another history fails closed (P2-2)", () => {
+describe("log protocol: a registry behind this device gets its lost segments back; one on another history gets what only the device's history held (P2-2)", () => {
   /** a writes an insert (position 1) and a delete (position 2); b applies both. */
   const history = async () => {
     const w = await world({ streams: 1 });
@@ -1121,9 +1112,8 @@ describe("log protocol: a registry behind this device gets its lost segments bac
     expect(await c.rows()).toEqual(before.rows);
   });
 
-  it("the same position under a different segment is not read as caught up", async () => {
+  it("the same position under a different segment is not read as caught up: the device reads it and puts back the delete only its history held", async () => {
     const { w, b } = await history();
-    const before = { rows: await b.rows(), position: await b.position() };
     w.gateway.versions.get(LOG)!.pop();
     // Another device continues the rolled-back log with its own segment 2.
     const c = await w.device("c");
@@ -1135,9 +1125,15 @@ describe("log protocol: a registry behind this device gets its lost segments bac
     });
     await c.cycle();
     expect(await c.position()).toBe(2);
-    await expect(b.cycle()).rejects.toThrow(/different segment/);
-    expect(await b.position()).toBe(before.position);
-    expect(await b.rows()).toEqual(before.rows);
+    await b.cycle();
+    expect(await b.position()).toBe(3);
+    const ids = (await b.records()).map((r) => r.split("=")[0]);
+    expect(ids).toEqual([`${sName(0)}/from-c`, `${sName(0)}/x`]);
+    await c.cycle();
+    const d = await w.device("d");
+    await d.cycle();
+    expect(await c.rows()).toEqual(await b.rows());
+    expect(await d.rows()).toEqual(await b.rows());
   });
 });
 

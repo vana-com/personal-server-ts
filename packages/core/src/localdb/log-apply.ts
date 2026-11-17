@@ -17,9 +17,10 @@
 // this device commits the segments it applied above it again, in order
 // (`log-recommit.ts`). A registry that names another segment at a position
 // this device applied is not a continuation: the rows, tombstones and
-// checkpoints this device holds came from segments the log no longer has, and
-// replaying into them is not the log's fold. That fails closed
-// (`LogDivergedError`, nothing applied, the position unchanged).
+// checkpoints this device holds came from segments the log no longer has.
+// This device queues what only those segments held as changes of its own and
+// reads the registry's log from the last position both agree on
+// (`log-rebase.ts`).
 
 import {
   classifyStreamRow,
@@ -41,6 +42,7 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { keccakOf } from "../stream-sync/crypto-port.js";
 import { resolveBodies } from "./log-bodies.js";
+import { rebaseOnLog } from "./log-rebase.js";
 import { seedFromRecords } from "./log-seed.js";
 import { announceApplied } from "./apply-progress.js";
 import type { LocalSyncDeps } from "./deps.js";
@@ -156,9 +158,18 @@ export async function applyLog(
   deps: LocalSyncDeps,
   connectionId: string,
   context: LogApplyContext,
+  rebased = false,
 ): Promise<{ readonly applied: number }> {
   const scope = logScope(context.connector, context.ns);
   const local = await readLogState(deps, connectionId);
+  // A log that does not continue this device's history: put back what only
+  // that history held, then read the log from where both agree. Once per
+  // pass: a log that diverges again under the second read is refused.
+  const rebase = async (registry: readonly SegmentRef[], why: string) => {
+    if (rebased) throw new LogDivergedError(why);
+    await rebaseOnLog(deps, connectionId, context, local, registry);
+    return applyLog(deps, connectionId, context, true);
+  };
   // A listed row is a hint taken before this apply. One behind this device can
   // be a listing taken before this device's own later commit, so it is read
   // again before it is believed.
@@ -200,10 +211,32 @@ export async function applyLog(
   // above its position are still in storage, and this device applied them: it
   // commits them again, in order (`recommitApplied`), so the log is the one
   // this device's rows are the fold of. A registry row this device did not
-  // apply is another history, and that fails closed.
+  // apply is another history, which this device rebases onto.
   if (local.position > read.version) {
-    await recommitApplied(deps, connectionId, context, local, read);
-    return { applied: 0 };
+    try {
+      await recommitApplied(deps, connectionId, context, local, read);
+      return { applied: 0 };
+    } catch (error) {
+      if (!(error instanceof LogDivergedError)) throw error;
+      const named = await fetchSegment(
+        deps,
+        scope,
+        context,
+        read.dataHash,
+        read.version,
+      );
+      return rebase(
+        [
+          ...named.segment.refs,
+          {
+            position: read.version,
+            dataHash: read.dataHash.toLowerCase() as `0x${string}`,
+            bytes: named.bytes,
+          },
+        ],
+        error.message,
+      );
+    }
   }
 
   const lastRef = local.refs.at(-1);
@@ -257,7 +290,8 @@ export async function applyLog(
       named &&
       named.dataHash.toLowerCase() !== lastRef.dataHash.toLowerCase()
     )
-      throw new LogDivergedError(
+      return rebase(
+        allRefs,
         `apply: the log names a different segment at position ${lastRef.position} than this device applied`,
       );
   }
@@ -267,7 +301,8 @@ export async function applyLog(
   let gap = false;
   if (plan.kind === "gap") {
     if (plan.reason === "ahead_of_head")
-      throw new LogDivergedError(
+      return rebase(
+        allRefs,
         `apply: the log's newest position ${head.position} is behind this device at ${since}`,
       );
     // A full check. Behind `base` the log no longer holds the prefix: a

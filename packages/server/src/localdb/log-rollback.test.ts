@@ -2,8 +2,9 @@
 // the newest positions are gone, while the segments they named are still in
 // storage and their effects are in the rows of every device that applied them.
 // A device that applied them puts them back, in order, each against the
-// registry's current position; a registry that names another history at a
-// position the device applied stays refused (`LogDivergedError`).
+// registry's current position. A registry that names another history at a
+// position the device applied gets what only the device's history held as the
+// device's own changes, on top of its own (`log-rebase.ts`).
 import { afterEach, describe, expect, it } from "vitest";
 import {
   closeWorldDrivers,
@@ -61,29 +62,62 @@ describe("log apply: a registry behind this device", () => {
     expect(await c.rows()).toEqual(await a.rows());
   });
 
-  it("stays refused when the registry names another segment at a position this device applied", async () => {
+  it("a registry that names another segment at a position this device applied gets that device's records, deletes and omissions back", async () => {
     const w = await world({ streams: 1 });
     const a = await w.device("a");
-    await a.run("r1", [{ stream: s, id: "x" }]);
+    await a.run(
+      "r1",
+      [
+        { stream: s, id: "x" },
+        { stream: s, id: "v" },
+        { stream: s, id: "w" },
+      ],
+      { observedAt: 1100 },
+    );
     await a.cycle();
     const b = await w.device("b");
     await b.cycle();
-    await a.run("r2", [{ stream: s, id: "y" }], { full: false });
+    // Position 2 deletes x; position 3 is a full pass that no longer lists v.
+    await a.run("r2", [{ stream: s, id: "x", remove: true }], {
+      full: false,
+      observedAt: 1300,
+    });
     await a.cycle();
-    await a.run("r3", [{ stream: s, id: "z" }], { full: false });
+    await a.run(
+      "r3",
+      [
+        { stream: s, id: "w" },
+        { stream: s, id: "z" },
+      ],
+      { observedAt: 1400 },
+    );
     await a.cycle();
+    expect(await a.position()).toBe(3);
 
-    // Rolled back to position 1, then b writes another position 2.
+    // Rolled back to position 1, then b writes another position 2: q, and x
+    // and v as seen before a deleted and dropped them.
     w.gateway.versions.get(LOG)!.splice(-2);
-    await b.run("rb", [{ stream: s, id: "q" }], { full: false });
+    await b.run(
+      "rb",
+      [
+        { stream: s, id: "q" },
+        { stream: s, id: "x", v: 2 },
+        { stream: s, id: "v", v: 2 },
+      ],
+      { full: false, observedAt: 1200 },
+    );
     await b.cycle();
     expect(await b.position()).toBe(2);
 
     const report = await a.sync.cycle();
-    expect(report.connections.map((c) => c.error)).toEqual([
-      expect.stringContaining("position 2"),
-    ]);
-    expect(await a.position()).toBe(3);
-    expect(w.gateway.rowsOf(LOG)).toBe(2);
+    expect(report.connections.map((c) => c.error)).toEqual([null]);
+    const ids = (await a.records()).map((r) => r.split("=")[0]);
+    expect(ids).toEqual([`${s}/q`, `${s}/w`, `${s}/z`]);
+
+    await b.cycle();
+    const c = await w.device("c");
+    await c.cycle();
+    expect(await b.rows()).toEqual(await a.rows());
+    expect(await c.rows()).toEqual(await a.rows());
   });
 });
