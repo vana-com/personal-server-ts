@@ -3094,8 +3094,8 @@
       }
     },
     {
-      "id": "failed-done-failed-stream-delete-publishes",
-      "why": "A stream named failed in DONE is never covered, so its upserts are dropped, but its explicit delete still publishes.",
+      "id": "failed-done-failed-stream-with-delete-is-not-covered",
+      "why": "A stream named failed in DONE is never covered, even when it also sent an explicit delete. Run end still keeps that delete; packages/server/src/localdb/run-end.test.ts asserts it.",
       "declared": {
         "a": {
           "mode": "incremental"

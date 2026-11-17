@@ -6,7 +6,7 @@
  */
 import type { ControlState } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { PublicationReceipt } from "../localdb/publish.js";
-import type { RunPublicationStatus } from "./intake.js";
+import type { RunPublicationStatus, RunStreamPublication } from "./intake.js";
 
 /**
  * `receipt_or_status`: a publication receipt that lists the run, or, when
@@ -73,6 +73,35 @@ function soundReceipt(receipt: PublicationReceipt): boolean {
   );
 }
 
+type StreamPublication = NonNullable<RunStreamPublication["publication"]>;
+
+/**
+ * The publication of every required stream in the run's durable status, or
+ * null when the status does not cover them all.
+ */
+function publishedStatus(
+  input: RunSavedInput,
+  required: readonly string[],
+): StreamPublication[] | null {
+  const status = input.status;
+  if (
+    input.mode !== "receipt_or_status" ||
+    status === null ||
+    status.runId !== input.runId ||
+    status.state !== "published"
+  )
+    return null;
+  const publications: StreamPublication[] = [];
+  for (const stream of required) {
+    const publication = status.streams.find(
+      (entry) => entry.name === stream && entry.state === "published",
+    )?.publication;
+    if (publication === undefined) return null;
+    publications.push(publication);
+  }
+  return publications;
+}
+
 export function decideRunSaved(input: RunSavedInput): RunSavedVerdict {
   const refuse = (reason: RunSavedRefusal): RunSavedVerdict => ({
     saved: false,
@@ -89,24 +118,10 @@ export function decideRunSaved(input: RunSavedInput): RunSavedVerdict {
   const receiptCovers = required.every((stream) =>
     receipts.some((receipt) => receipt.stream === stream),
   );
-  const status = input.status;
   // A published stream proves the run only with the publication it names,
   // so its generation can be checked like a receipt's head.
-  const statusPublications =
-    input.mode === "receipt_or_status" &&
-    status !== null &&
-    status.runId === input.runId &&
-    status.state === "published"
-      ? required.map(
-          (stream) =>
-            status.streams.find(
-              (entry) => entry.name === stream && entry.state === "published",
-            )?.publication,
-        )
-      : [];
-  const statusCovers =
-    statusPublications.length > 0 &&
-    statusPublications.every((publication) => publication !== undefined);
+  const statusPublications = publishedStatus(input, required);
+  const statusCovers = statusPublications !== null;
   if (!receiptCovers && !statusCovers)
     return refuse(receipts.length > 0 ? "streams_uncovered" : "no_receipt");
   let connectionId: string | null = null;
@@ -118,9 +133,10 @@ export function decideRunSaved(input: RunSavedInput): RunSavedVerdict {
   // A connection deleted and connected again purges every head of an
   // earlier generation, so a proof from one names data that is gone.
   const control = input.control;
-  const generations = receiptCovers
-    ? receipts.map((receipt) => receipt.head.generation)
-    : statusPublications.map((publication) => publication!.generation);
+  const generations =
+    receiptCovers || statusPublications === null
+      ? receipts.map((receipt) => receipt.head.generation)
+      : statusPublications.map((publication) => publication.generation);
   if (
     control?.kind === "active" &&
     generations.some((generation) => generation !== control.generation)
