@@ -387,7 +387,20 @@ async function applyLogPass(
       pending = null;
     }
   }
-  if (gap && deps.progressiveFirstLoad === true && pending === null) {
+  // A first load of a log too big for one commit loads key by key (see
+  // `log-keyed.ts`), on a host that shows streams while they load too; the
+  // segments are the same, and so is their order.
+  const buckets = await planKeyedLoad(
+    deps,
+    connectionId,
+    local,
+    snapshot !== null,
+    tail,
+    pending,
+  );
+  const progressive =
+    deps.progressiveFirstLoad === true && pending === null && buckets === null;
+  if (gap && progressive) {
     const after = planOpsSince(head, headRef, head.base);
     return {
       applied: await loadProgressively(
@@ -404,7 +417,7 @@ async function applyLogPass(
   }
   if (tail.length === 0 && snapshot === null && pending === null)
     return { applied: 0 };
-  if (deps.progressiveFirstLoad === true && pending === null)
+  if (progressive)
     return {
       applied: await loadProgressively(
         deps,
@@ -418,16 +431,6 @@ async function applyLogPass(
       ),
     };
 
-  // A first load of a log too big for one commit loads key by key (see
-  // `log-keyed.ts`); the segments are the same, and so is their order.
-  const buckets = await planKeyedLoad(
-    deps,
-    connectionId,
-    local,
-    snapshot !== null,
-    tail,
-    pending,
-  );
   if (buckets !== null) {
     await loadKeyed(
       deps,

@@ -22,6 +22,7 @@ import { IDBFactory } from "fake-indexeddb";
 import { createMockPsLiteGateway } from "./test-support/gateway.js";
 import { createSwitchedIndexedDbPsLiteRuntime } from "./test-support/unswitched-runtime.js";
 import { createBearerTokenPsLiteAuth } from "./runtime.js";
+import { wasmStreamCrypto } from "./wasm-stream-crypto.js";
 
 const engineDeps = vi.hoisted(() => [] as Array<Record<string, unknown>>);
 vi.mock(
@@ -102,6 +103,13 @@ const FLAGS = [
   ["logProtocol", "streamSyncLogProtocol"],
   ["progressiveFirstLoad", "streamSyncProgressiveFirstLoad"],
 ] as const;
+
+describe("PS-Lite stream-sync engine", () => {
+  it("hashes log segments with the WebAssembly Keccak port", async () => {
+    const deps = await depsFor({});
+    expect(deps.streamCrypto).toBe(await wasmStreamCrypto());
+  });
+});
 
 describe("PS-Lite stream-sync design flags", () => {
   it.each(FLAGS)(
