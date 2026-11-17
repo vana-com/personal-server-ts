@@ -139,6 +139,20 @@ describe("a change delta", () => {
     await t.manager.stop();
   });
 
+  it("does not request deltas until stream sync is switched on", async () => {
+    let mode = "switched";
+    const t = setup({ mode: () => mode });
+    await settled(t);
+    expect(t.handlers().since?.()).toBe("7");
+    mode = "unswitched";
+    expect(t.handlers().since?.()).toBeUndefined();
+    mode = "unknown";
+    expect(t.handlers().since?.()).toBeUndefined();
+    mode = "switched";
+    expect(t.handlers().since?.()).toBe("7");
+    await t.manager.stop();
+  });
+
   it("from the held position is the whole pass: no cycle, no server read, settled at its seq (mutation: delta ignored)", async () => {
     const t = setup();
     await settled(t);

@@ -1364,11 +1364,13 @@ export function createSyncManager(
       // end clean leaves no position (`syncedPosition` is cleared when a pass
       // starts), so after it the request asks from none.
       since: () =>
-        cycleInFlight === null
-          ? syncedPosition
-          : rerunRequested
-            ? knownPosition
-            : inFlightTarget,
+        options?.accountStorageMode?.read() !== "switched"
+          ? undefined
+          : cycleInFlight === null
+            ? syncedPosition
+            : rerunRequested
+              ? knownPosition
+              : inFlightTarget,
       onHealth(healthy) {
         if (run !== lifecycle) return;
         const wasHealthy = pushHealthy;
