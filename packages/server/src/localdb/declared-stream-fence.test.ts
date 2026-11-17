@@ -61,43 +61,78 @@ describe("a stream declared and never published", () => {
     expect(w.gateway.versions.get(LOG)).toHaveLength(1);
   });
 
-  it("is refused to a run that began before the delete and ends after it", async () => {
-    const w = await world({ streams: 2 });
-    const a = await w.device("a");
-    const b = await w.device("b");
-    await a.run("run-a", [{ stream: sName(0), id: "1" }], {
-      covered: [sName(0)],
+  describe("a run that began before the delete and ends after it", () => {
+    const setup = async () => {
+      const w = await world({ streams: 2 });
+      const a = await w.device("a");
+      const b = await w.device("b");
+      await a.run("run-a", [{ stream: sName(0), id: "1" }], {
+        covered: [sName(0)],
+      });
+      await a.cycle();
+      await b.cycle();
+      // B is collecting `s1` and has staged a record for it.
+      await b.sync.intake.begin("run-b", request(5000));
+      await b.sync.intake.batch("run-b", {
+        batch: 0,
+        records: [{ stream: NEVER_PUBLISHED, data: { id: "late" } }],
+      });
+      const end = () =>
+        b.sync.intake.end(
+          "run-b",
+          endRequest({
+            lastBatch: 0,
+            streams: [NEVER_PUBLISHED],
+            live: [NEVER_PUBLISHED],
+            provenFullStreams: [NEVER_PUBLISHED],
+          }),
+        );
+      const logPublishes = (from: number) =>
+        w.gateway.calls
+          .slice(from)
+          .filter((call) => call.kind === "batch")
+          .filter((call) =>
+            call.body.rows.some((row) => String(row.scope).includes("~log")),
+          );
+      return { w, a, b, end, logPublishes };
+    };
+
+    it("publishes when nothing was deleted (positive control)", async () => {
+      const { w, a, b, end, logPublishes } = await setup();
+      const before = w.gateway.calls.length;
+      await end();
+      await b.cycle();
+      await a.cycle();
+
+      expect(logPublishes(before)).toHaveLength(1);
+      expect(w.gateway.versions.get(LOG)).toHaveLength(2);
+      expect(await a.records()).toContain(
+        `${NEVER_PUBLISHED}/late={"id":"late"}`,
+      );
     });
-    await a.cycle();
-    await b.cycle();
 
-    // B's run is collecting `s1` when A deletes.
-    await b.sync.intake.begin("run-b", request(5000));
-    await b.sync.intake.batch("run-b", {
-      batch: 0,
-      records: [{ stream: NEVER_PUBLISHED, data: { id: "late" } }],
+    it("is refused by the gateway's control condition after the delete", async () => {
+      const { w, a, b, end, logPublishes } = await setup();
+      await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+      expect(await a.sync.deleter.resumeDeletes()).toEqual([]);
+      const before = w.gateway.calls.length;
+
+      await end();
+      await b.cycle();
+
+      // B did attempt the publish, and named the control row as a condition.
+      const attempts = logPublishes(before);
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]?.body.requires).toEqual([
+        expect.objectContaining({ scope: CONTROL, notDeleted: true }),
+      ]);
+      // The gateway refused it: no new log version, nothing written for `s1`.
+      expect(w.gateway.versions.get(LOG)).toHaveLength(1);
+      expect([...w.gateway.versions.keys()].sort()).toEqual([CONTROL, LOG]);
+      expect(await b.records()).toEqual([]);
+      await a.cycle();
+      expect(await a.records()).toEqual([]);
     });
-    await a.sync.deleter.requestConnectionDelete(CONNECTOR);
-    expect(await a.sync.deleter.resumeDeletes()).toEqual([]);
-
-    await b.sync.intake
-      .end(
-        "run-b",
-        endRequest({
-          lastBatch: 0,
-          streams: [NEVER_PUBLISHED],
-          live: [NEVER_PUBLISHED],
-          provenFullStreams: [NEVER_PUBLISHED],
-        }),
-      )
-      .catch(() => undefined);
-    await b.cycle();
-
-    expect(await b.records()).toEqual([]);
-    await a.cycle();
-    expect(await a.records()).toEqual([]);
-    expect(w.gateway.versions.get(LOG)).toHaveLength(1);
-    expect([...w.gateway.versions.keys()].sort()).toEqual([CONTROL, LOG]);
   });
 
   it("is refused after a connection that never published anything is deleted", async () => {
@@ -122,14 +157,15 @@ describe("a stream declared and never published", () => {
 });
 
 /**
- * The one thing a second device lacks. The writing device keeps a `stream_state`
- * row for every stream its manifest declares; a replica gets one only from a
- * segment that touched the stream, and a segment is written for a stream a run
- * covers. A stream no run covered is named on the writer and not on the
- * replica. `it.fails` keeps this visible: it fails, and so must be removed,
- * the day a replica learns a declared stream without a covering run.
+ * What a second device lacks. The writing device keeps a `stream_state` row for
+ * every stream its manifest declares; a replica gets one only from a segment
+ * that touched the stream, and a segment is written for a stream a run covers.
+ * So a stream no run covered is named on the writer and not on the replica.
+ * This pins today's behavior as a characterisation, not a wish: if a replica
+ * ever learns such a stream, this test fails and its expectation changes with
+ * the decision. Each precondition below can fail on its own.
  */
-it.fails("a second device names a declared stream no run covered", async () => {
+it("a second device names only the streams a run covered", async () => {
   const w = await world({ streams: 2 });
   const a = await w.device("a");
   const b = await w.device("b");
@@ -138,11 +174,16 @@ it.fails("a second device names a declared stream no run covered", async () => {
   });
   await a.cycle();
   await b.cycle();
+
+  // Setup: the run published, and B applied it.
+  expect(w.gateway.versions.get(LOG)).toHaveLength(1);
+  expect(await b.records()).toEqual(await a.records());
+  expect(await b.records()).toHaveLength(1);
+  // Writer: A names both manifest streams, one of them never covered.
   expect(await a.sync.declarations.streamsOf(CONNECTOR)).toEqual([
     sName(0),
     NEVER_PUBLISHED,
   ]);
-  expect(await b.sync.declarations.streamsOf(CONNECTOR)).toEqual(
-    await a.sync.declarations.streamsOf(CONNECTOR),
-  );
+  // Replica: B names the covered stream only.
+  expect(await b.sync.declarations.streamsOf(CONNECTOR)).toEqual([sName(0)]);
 });
