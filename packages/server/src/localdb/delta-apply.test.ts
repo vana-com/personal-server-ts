@@ -8,6 +8,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { RegistryChangeDelta } from "../../../core/src/stream-sync/ports.js";
+import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { applyRegistryDelta } from "../../../core/src/localdb/delta-apply.js";
 import {
   CONNECTION_ID,
@@ -115,6 +116,29 @@ async function changedBy(w: World, step: () => Promise<unknown>) {
     .filter(([scope, v]) => before.get(scope) !== v)
     .map(([scope]) => scope);
 }
+
+it("an explicit control observation wins over a listed control", async () => {
+  const { here } = await peerCommitted();
+  const listed = await here.deps.registry.listOwnerRows();
+  const live = await here.deps.registry.read(CONTROL);
+  if (!live.found) throw new Error("no control row");
+  const observedControl = { ...live, version: live.version + 1, deleted: true };
+  const reads: string[] = [];
+  const read = here.deps.registry.read.bind(here.deps.registry);
+  here.deps.registry.read = async (scope) => {
+    reads.push(scope);
+    return read(scope);
+  };
+  await applyConnection(here.deps, CONNECTION_ID, listed, observedControl);
+  expect(reads).toEqual([]);
+  expect(
+    await here.db.query(
+      "SELECT control_state FROM connections WHERE connection_id=?",
+      [CONNECTION_ID],
+    ),
+  ).toEqual([{ control_state: "deleted" }]);
+  expect(await here.rows()).toEqual([]);
+});
 
 describe("applying a change delta", () => {
   it("a peer's log commit: no registry read, one segment GET, the rows a cycle gives (mutation: applyLog without the delta's read)", async () => {
