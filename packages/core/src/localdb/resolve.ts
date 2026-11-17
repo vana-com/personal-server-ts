@@ -20,6 +20,7 @@ import {
   readability,
   selectForTarget,
   servedStreamOf,
+  servedStreams,
   targetsForScope,
   tombstoned,
   tombstonedForRead,
@@ -42,11 +43,22 @@ export interface LocalResolver {
 export interface LocalAliasTarget {
   readonly connector: string;
   readonly streams: readonly string[];
+  /**
+   * The streams a read must find installed and complete. The rest of
+   * `streams` are read when present and left out when absent. Absent: every
+   * stream of `streams` is required.
+   */
+  readonly requiredStreams?: readonly string[];
   readonly servedStream?: string;
   readonly windowed?: boolean;
+  /**
+   * `fetched` names the streams the read served, whether or not they had
+   * rows: a stream left out of it was never read.
+   */
   readonly project: (
     records: readonly LocalAliasRecord[],
     now: string,
+    fetched: readonly string[],
   ) =>
     | { readonly ok: true; readonly payload: unknown }
     | { readonly ok: false; readonly error: { readonly kind: string } };
@@ -255,18 +267,21 @@ export function createLocalResolver(
       return deleted();
     if (connection.control_state === "foreign") return { kind: "key_mismatch" };
     const all = await streams(connection.connection_id);
-    const selected = candidate.target.streams.map((name) =>
-      all.find((s) => s.stream === name),
+    const { streams: served } = servedStreams(
+      candidate.target,
+      candidate.target.streams.flatMap((name) => {
+        const s = all.find((s) => s.stream === name);
+        return s ? [s] : [];
+      }),
+      connection,
     );
-    if (selected.some((s) => s && tombstonedForRead(s, connection, true)))
+    if (served.some((s) => tombstonedForRead(s, connection, true)))
       return deleted();
-    const states = selected.map((s) =>
-      s ? readability(s, connection, true) : "none",
-    );
+    const states = served.map((s) => readability(s, connection, true));
     if (states.includes("none")) return noData();
     if (!states.includes("partial")) return undefined;
     // A logical stream is one stream: an alias is never served partial.
-    const stream = selected[0]!;
+    const stream = served[0]!;
     const load = stream.partial!;
     const current = { ...candidate, connection, streams: [stream] };
     const cursor = cursorFor({ ...current, partialStreams: [stream.stream] });
@@ -335,12 +350,17 @@ export function createLocalResolver(
     }
     if (connection.control_state === "foreign") return { kind: "key_mismatch" };
     const all = await streams(connection.connection_id);
-    const selected = candidate.target.streams.map((name) =>
-      all.find((s) => s.stream === name),
+    const { streams: installed, missingRequired } = servedStreams(
+      candidate.target,
+      candidate.target.streams.flatMap((name) => {
+        const s = all.find((s) => s.stream === name);
+        return s ? [s] : [];
+      }),
+      connection,
     );
-    if (selected.some((s) => s && tombstoned(s))) return deleted();
-    if (selected.some((s) => !s || !complete(s, connection))) return noData();
-    const installed = selected as Stream[];
+    if (installed.some(tombstoned)) return deleted();
+    if (missingRequired || installed.some((s) => !complete(s, connection)))
+      return noData();
     const current = { ...candidate, connection, streams: installed };
     const cursor = cursorFor(current);
     if (input.cursor !== null && input.cursor !== cursor)

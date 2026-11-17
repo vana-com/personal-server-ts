@@ -22,6 +22,18 @@ import type {
   ProjectionResult,
 } from "./types.js";
 
+/**
+ * The bound streams a host must have completed before it serves a binding:
+ * every stream except the ones the projection serves without. Every host
+ * reads this one rule; none compares against `pdppStreams` itself.
+ */
+export function requiredLegacyStreams(
+  binding: Pick<LegacyScopeBinding, "pdppStreams" | "optionalStreams">,
+): string[] {
+  const optional = new Set(binding.optionalStreams ?? []);
+  return binding.pdppStreams.filter((stream) => !optional.has(stream));
+}
+
 export { ANTHROPIC_LIVE_BINDINGS } from "./bindings.js";
 export { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
 export { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
@@ -88,19 +100,27 @@ export function legacyAliasScopes(scope: string) {
     );
     if (!targets.has(connector)) targets.set(connector, original);
   }
-  return [...targets].map(([connector, binding]) => ({
-    connector,
-    streams: binding.pdppStreams,
-    servedStream: binding.window?.parentStream,
-    windowed: Boolean(binding.window),
-    project: (records: readonly PdppRecord[], now: string) =>
-      projectPdppRecordsToLegacyPayload(scope, [...records], {
-        fetchedStreams: [...binding.pdppStreams],
-        profileKey: connector,
-        orderByPrimaryKey: true,
-        now,
-      }),
-  }));
+  return [...targets].map(([connector, binding]) => {
+    const required = requiredLegacyStreams(binding);
+    return {
+      connector,
+      streams: binding.pdppStreams,
+      requiredStreams: required,
+      servedStream: binding.window?.parentStream,
+      windowed: Boolean(binding.window),
+      project: (
+        records: readonly PdppRecord[],
+        now: string,
+        fetched: readonly string[],
+      ) =>
+        projectPdppRecordsToLegacyPayload(scope, [...records], {
+          fetchedStreams: [...fetched],
+          profileKey: connector,
+          orderByPrimaryKey: true,
+          now,
+        }),
+    };
+  });
 }
 
 /** Only declaration-reviewed profile keys may project into retained scopes. */

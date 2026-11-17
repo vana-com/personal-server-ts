@@ -6,8 +6,10 @@ import instagramProfileSmall from "./__fixtures__/instagram.profile.small.json";
 import amazonPdppInput from "./__fixtures__/amazon.orders.pdpp-input.json";
 import {
   LEGACY_SCOPE_BINDINGS,
+  legacyAliasScopes,
   legacyScopeToPdppSelection,
   projectPdppRecordsToLegacyPayload,
+  requiredLegacyStreams,
 } from "./index.js";
 import amazonOrdersSchema from "./legacy-schemas/amazon.orders.json";
 import chatgptConversationsSchema from "./legacy-schemas/chatgpt.conversations.json";
@@ -1693,6 +1695,123 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       ).toBeNull();
     });
 
+    it("hands the database the required streams of an alias and projects the streams it served", () => {
+      const [target] = legacyAliasScopes("icloud_notes.notes");
+      expect(target?.streams).toEqual(["notes", "folders", "profile"]);
+      expect(target?.requiredStreams).toEqual(["notes", "folders"]);
+      const note = {
+        id: "n1",
+        title: "t",
+        snippet: "s",
+        folder_id: "f1",
+        is_pinned: false,
+        created_at: "2026-09-01T00:00:00Z",
+        modified_at: "2026-09-02T00:00:00Z",
+        has_attachments: false,
+        text_content: "s",
+      };
+      const base = [
+        { stream: "notes", data: note },
+        { stream: "folders", data: { id: "f1", name: "Notes" } },
+      ];
+      const now = "2026-10-01T00:00:00.000Z";
+      // Served without a profile stream.
+      expect(target?.project(base, now, ["notes", "folders"])).toMatchObject({
+        ok: true,
+        payload: { userName: null },
+      });
+      // Served and empty: a fetched stream with zero rows stays named.
+      expect(
+        target?.project(base, now, ["notes", "folders", "profile"]),
+      ).toMatchObject({ ok: true, payload: { userName: null } });
+      expect(
+        target?.project(
+          [...base, { stream: "profile", data: { id: "p", user_name: "Ada" } }],
+          now,
+          ["notes", "folders", "profile"],
+        ),
+      ).toMatchObject({ ok: true, payload: { userName: "Ada" } });
+      // A required stream the database did not serve is reported missing.
+      expect(target?.project(base, now, ["notes", "profile"])).toEqual({
+        ok: false,
+        error: expect.objectContaining({ kind: "missing_stream" }),
+      });
+    });
+
+    it("hands the database at least one required stream for every legacy scope", () => {
+      // A read gates only on required streams, so an alias with none would
+      // serve whatever a connection happens to hold. The self-check asserts
+      // the same of every binding; this asserts it of the alias port itself.
+      for (const scope of LEGACY_SCOPE_BINDINGS.keys()) {
+        for (const target of legacyAliasScopes(scope)) {
+          expect(
+            target.requiredStreams?.length,
+            `${scope}: no required stream`,
+          ).toBeGreaterThan(0);
+          for (const stream of target.requiredStreams ?? []) {
+            expect(target.streams, `${scope}: ${stream}`).toContain(stream);
+          }
+        }
+      }
+    });
+
+    it("names profile as the one stream a host need not wait for", () => {
+      const notes = LEGACY_SCOPE_BINDINGS.get("icloud_notes.notes")!;
+      expect(requiredLegacyStreams(notes)).toEqual(["notes", "folders"]);
+      // A binding that declares no optional stream requires every stream.
+      const folders = LEGACY_SCOPE_BINDINGS.get("icloud_notes.folders")!;
+      expect(requiredLegacyStreams(folders)).toEqual(folders.pdppStreams);
+    });
+
+    // Connectors that predate the profile stream (the signed 0.1.0 declaration)
+    // never had one. Legacy's fullName was always null for them, so the scope
+    // keeps serving notes with that same null rather than disappearing.
+    it("serves notes and folders without a profile stream, with the pre-profile userName of null", () => {
+      const result = projectPdppRecordsToLegacyPayload(
+        "icloud_notes.notes",
+        [
+          {
+            stream: "notes",
+            data: {
+              id: "note-1",
+              title: "A note",
+              snippet: null,
+              folder_id: "folder-1",
+              is_pinned: false,
+              created_at: null,
+              modified_at: null,
+              has_attachments: false,
+              text_content: "Body",
+            },
+          },
+          { stream: "folders", data: { id: "folder-1", name: "Ideas" } },
+        ],
+        { fetchedStreams: ["notes", "folders"] },
+      );
+
+      expect(result).toEqual({
+        ok: true,
+        payload: {
+          notes: [
+            {
+              recordName: "note-1",
+              title: "A note",
+              snippet: null,
+              folder: "Ideas",
+              isPinned: false,
+              createdDate: null,
+              modifiedDate: null,
+              hasAttachments: false,
+              textContent: "Body",
+            },
+          ],
+          total: 1,
+          userName: null,
+        },
+      });
+      validateAgainst(icloudNotesSchema, result.ok ? result.payload : result);
+    });
+
     it("rejects records that violate required manifest fields and distinguishes an unfetched stream", () => {
       expect(
         projectPdppRecordsToLegacyPayload(
@@ -1718,14 +1837,14 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       });
       expect(
         projectPdppRecordsToLegacyPayload("icloud_notes.notes", [], {
-          fetchedStreams: ["notes", "folders"],
+          fetchedStreams: ["folders"],
         }),
       ).toEqual({
         ok: false,
         error: {
           kind: "missing_stream",
           scope: "icloud_notes.notes",
-          expectedStream: "profile",
+          expectedStream: "notes",
         },
       });
     });
