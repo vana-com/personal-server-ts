@@ -19,7 +19,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { pino } from "pino";
 import { Hono } from "hono";
 import {
@@ -2283,11 +2283,11 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
 
     const approved = (await store.getById(created.connectionId))!;
     const dataApiDeps = buildDataApiDeps(gateway, accessLogWriter);
+    // A path under this machine's home directory: the error must not leak it.
+    const HOME_DATA = join(homedir(), "personal-server", "data");
     dataApiDeps.storage.readScopeBlocks = vi
       .fn()
-      .mockRejectedValue(
-        new Error("ENOENT: /srv/personal-server/data/github.profile.json"),
-      );
+      .mockRejectedValue(new Error(`ENOENT: ${HOME_DATA}/github.profile.json`));
     const readClient = createMcpDataReadClient({
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: loadMcpGranteeAccount({
@@ -2316,7 +2316,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         bodyPreview: expect.stringContaining("BOUNDED_DATA_UNAVAILABLE"),
       }),
     ]);
-    expect(result.content[0].text).not.toContain("/srv/personal-server");
+    expect(result.content[0].text).not.toContain(homedir());
   });
 
   it("read_scope returns scope_not_granted for scopes outside the grant", async () => {

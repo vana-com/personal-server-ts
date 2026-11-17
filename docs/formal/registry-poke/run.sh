@@ -10,7 +10,9 @@ META=$(mktemp -d)
 nice -n 19 java -XX:+UseParallelGC -Xmx2g -cp "$JAR" tlc2.TLC \
   -workers 4 -metadir "$META/$1" -config "$1.cfg" RegistryPoke.tla > "out/$1.out" 2>&1
 echo "exit $?" >> "out/$1.out"
-# Keep local paths out of the committed output.
-sed -i -e "s#$D/##" -e "s#Parsing file /tmp/#Parsing file #" "out/$1.out"
+# Keep local paths out of the committed output. (A temp file, not `sed -i`,
+# whose argument differs between GNU and BSD sed.)
+sed -e "s#$D/##" -e "s#Parsing file /tmp/#Parsing file #" "out/$1.out" > "out/$1.out.tmp"
+mv "out/$1.out.tmp" "out/$1.out"
 rm -rf "$META"
 grep -E "Error:|Invariant|Model checking completed|states generated|distinct states|^exit" "out/$1.out" | head -8
