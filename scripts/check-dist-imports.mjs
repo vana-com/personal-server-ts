@@ -11,41 +11,31 @@ const builtins = new Set(
   builtinModules.flatMap((name) => [name, `node:${name}`]),
 );
 const violations = [];
-// Loader uses that cannot be proven, by repository-relative file and the name of
-// the enclosing property/method/function (prefix match), with the reason.
-// Each entry covers only code inside that owner.
+// Published browser assets that Node never loads: the server only reads them
+// from disk and serves the bytes (packages/server/src/routes/ui.ts, route
+// `/:file`, readFileSync + Response), and no Node module imports or requires
+// them. Node loader calls inside them cannot break an install, so the loader
+// check skips them; their static import/export declarations are still checked.
+const servedOnlyBrowserAssets = new Map([
+  [
+    "packages/server/dist/ui/ps-lite-debug.js",
+    "esbuild browser bundle served by the UI route; its inlined unpdf and pdfjs-dist Node branches are never run by Node",
+  ],
+]);
+// Loader uses in Node-loaded files that cannot be proven by shape. Each entry is
+// the exact text of the enclosing property, method or function (whitespace
+// collapsed). Any change to that text, or any other loader use in the file,
+// fails the check.
 const unanalysableLoaderAllowlist = [
   {
     file: "packages/lite/dist/browser-tls-rustls/browser_tls_rustls.js",
-    ownerPrefix: "__wbg_require_",
+    ownerText:
+      "__wbg_require_b4edbdcf3e2a1ef0: function() { return handleError(function () { const ret = module.require; return ret; }, arguments); }",
     reason:
-      "wasm-bindgen glue hands the host `module.require` to the wasm module; browsers have no `module`, and the call is wrapped by handleError",
-  },
-  {
-    file: "packages/server/dist/ui/ps-lite-debug.js",
-    ownerPrefix: "__wbg_require_",
-    reason: "the same wasm-bindgen glue, inlined by esbuild into the UI bundle",
-  },
-  {
-    file: "packages/server/dist/ui/ps-lite-debug.js",
-    ownerPrefix: "_createCanvas",
-    reason:
-      "pdfjs-dist's Node canvas factory, inlined by unpdf: it builds a loader but discards it and returns a stub that throws, so nothing loads",
+      'wasm-bindgen glue hands `module.require` to the wasm module. getrandom 0.2.17 (src/js.rs:83-84) calls it only with the literal "crypto" (a builtin), and only when Web Crypto is missing. In an ES module `module` is undefined, so handleError catches the ReferenceError',
   },
 ];
 const computedImports = [];
-// Exact "<repository-relative file>|<specifier>" pairs that stay undeclared on
-// purpose, with the reason. Everything else in the same file is still checked.
-const undeclaredImportAllowlist = new Map([
-  [
-    "packages/server/dist/ui/ps-lite-debug.js|node-readable-to-web-readable-stream",
-    "pdfjs-dist's Node-only fallback when a stream has no toWeb(); the bundle targets browsers, which never take that branch",
-  ],
-  [
-    "packages/server/dist/ui/ps-lite-debug.js|pdfjs-dist/package.json",
-    "unpdf, inlined by esbuild, calls import.meta.resolve only when process.release.name is node (never in the browser) and inside try/catch, so a failed resolve falls back to defaults",
-  ],
-]);
 
 // Fail-closed loader analysis. A "loader" is anything that can load a module at
 // run time: `require`, `module.require`, `process.mainModule.require`, the
@@ -92,18 +82,38 @@ const bindingNames = (name) =>
 // catch variable, import, or declaration among a block's statements. Returns
 // undefined for a free (global) name.
 const declaredNamesCache = new WeakMap();
+// `var` declarations are function-scoped: collect them from anywhere inside a
+// function (or source file) body, except nested functions.
+const collectVarNames = (node, names) => {
+  ts.forEachChild(node, (child) => {
+    if (ts.isFunctionLike(child)) return;
+    if (
+      ts.isVariableDeclarationList(child) &&
+      !(child.flags & ts.NodeFlags.BlockScoped)
+    )
+      for (const d of child.declarations)
+        for (const n of bindingNames(d.name)) names.add(n);
+    collectVarNames(child, names);
+  });
+};
 const declaredNames = (scope) => {
   let names = declaredNamesCache.get(scope);
   if (names) return names;
   names = new Set();
-  if (ts.isFunctionLike(scope))
+  if (ts.isFunctionLike(scope)) {
     for (const p of scope.parameters)
       for (const n of bindingNames(p.name)) names.add(n);
+    if (scope.body) collectVarNames(scope.body, names);
+  }
+  if (ts.isSourceFile(scope)) collectVarNames(scope, names);
   if (ts.isCatchClause(scope) && scope.variableDeclaration)
     for (const n of bindingNames(scope.variableDeclaration.name)) names.add(n);
   if (ts.isBlock(scope) || ts.isSourceFile(scope))
     for (const st of scope.statements) {
-      if (ts.isVariableStatement(st))
+      if (
+        ts.isVariableStatement(st) &&
+        st.declarationList.flags & ts.NodeFlags.BlockScoped
+      )
         for (const d of st.declarationList.declarations)
           for (const n of bindingNames(d.name)) names.add(n);
       if (
@@ -127,16 +137,17 @@ const declScope = (node, name = node.text) => {
     if (declaredNames(scope).has(name)) return scope;
   return undefined;
 };
-const ownerName = (node) => {
+// Source text of the nearest enclosing named property, method or function,
+// whitespace collapsed.
+const ownerText = (node) => {
   for (let n = node; n; n = n.parent)
     if (
       (ts.isPropertyAssignment(n) ||
         ts.isMethodDeclaration(n) ||
         ts.isFunctionDeclaration(n)) &&
-      n.name &&
-      (ts.isIdentifier(n.name) || ts.isStringLiteral(n.name))
+      n.name
     )
-      return n.name.text;
+      return n.getText().replace(/\s+/g, " ");
   return undefined;
 };
 
@@ -251,7 +262,7 @@ function createLoaderAnalysis(source) {
     );
   };
   return {
-    ownerName,
+    ownerText,
     // `<loader>(x)`, `<loader>.resolve(x)`, `import.meta.resolve(x)`.
     isLoaderCall(expression) {
       const callee = unwrapDown(expression);
@@ -350,10 +361,9 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
     const relFile = path.relative(root, file).split(path.sep).join("/");
     const reportUnanalysable = (node) => {
       const location = `${relFile}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}`;
-      const owner = loaders.ownerName(node);
+      const ownerText = loaders.ownerText(node);
       const reason = unanalysableLoaderAllowlist.find(
-        (entry) =>
-          entry.file === relFile && owner?.startsWith(entry.ownerPrefix),
+        (entry) => entry.file === relFile && entry.ownerText === ownerText,
       )?.reason;
       computedImports.push(
         `${location}${reason ? ` (allowed: ${reason})` : " (unanalysable)"}`,
@@ -363,6 +373,7 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
           `${location} has an unanalysable dynamic import or loader use`,
         );
     };
+    const loaderChecked = !servedOnlyBrowserAssets.has(relFile);
     const pending = [source];
     while (pending.length) {
       const node = pending.pop();
@@ -373,7 +384,7 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
         ts.isStringLiteral(node.moduleSpecifier)
       ) {
         specifier = node.moduleSpecifier.text;
-      } else if (ts.isCallExpression(node)) {
+      } else if (loaderChecked && ts.isCallExpression(node)) {
         const isDynamicImport =
           node.expression.kind === ts.SyntaxKind.ImportKeyword;
         const isRuntimeLoader = loaders.isLoaderCall(node.expression);
@@ -388,7 +399,8 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
           reportUnanalysable(node);
         }
       }
-      if (loaders.isUnanalysableUse(node)) reportUnanalysable(node);
+      if (loaderChecked && loaders.isUnanalysableUse(node))
+        reportUnanalysable(node);
       if (specifier?.startsWith(".")) {
         const target = path.posix.normalize(
           path.posix.join(path.posix.dirname(packedPath), specifier),
@@ -402,10 +414,7 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
         const name = specifier.startsWith("@")
           ? specifier.split("/").slice(0, 2).join("/")
           : specifier.split("/")[0];
-        if (
-          !allowed.has(name) &&
-          !undeclaredImportAllowlist.has(`${relFile}|${specifier}`)
-        )
+        if (!allowed.has(name))
           violations.push(`${path.relative(root, file)} imports ${specifier}`);
       }
       ts.forEachChild(node, (child) => {

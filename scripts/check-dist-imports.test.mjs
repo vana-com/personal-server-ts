@@ -120,6 +120,26 @@ test("checks the files npm actually packs", async (t) => {
         `import { createRequire } from "node:module"; const make = createRequire; make(import.meta.url)(${arg});`,
     ],
     [
+      "var hoisted alias",
+      (arg) =>
+        `function f() { if (true) { var load = require; } load(${arg}); } f();`,
+    ],
+    [
+      "var hoisted alias chain",
+      (arg) =>
+        `function f() { if (true) { var a = require; } for (;;) { var b = a; } b(${arg}); } f();`,
+    ],
+    [
+      "var hoisted require.resolve",
+      (arg) =>
+        `function f() { try { var load = require; } finally {} load.resolve(${arg}); } f();`,
+    ],
+    [
+      "var hoisted createRequire",
+      (arg) =>
+        `import { createRequire } from "node:module"; function f() { if (true) { var make = createRequire; } make(import.meta.url)(${arg}); } f();`,
+    ],
+    [
       "module.require through an alias",
       (arg) => `const m = module; m.require(${arg});`,
     ],
@@ -177,43 +197,88 @@ test("checks the files npm actually packs", async (t) => {
     ])
       assert.equal(check(code).status, 0, code);
   });
-  await t.test("allows only the listed bundle call site", () => {
-    const uiDir = path.join(fixture, "packages", "server", "dist", "ui");
-    fs.mkdirSync(uiDir, { recursive: true });
+  await t.test(
+    "skips loader checks only for served-only browser assets",
+    () => {
+      fs.rmSync(file);
+      fs.rmSync(path.join(pkg, "dist-test"), { recursive: true });
+      const runAt = (pkgName, relFile, code) => {
+        const dir = path.join(fixture, "packages", pkgName);
+        fs.mkdirSync(path.dirname(path.join(dir, relFile)), {
+          recursive: true,
+        });
+        fs.writeFileSync(
+          path.join(dir, "package.json"),
+          JSON.stringify({ name: pkgName, version: "1.0.0", files: ["dist"] }),
+        );
+        fs.writeFileSync(path.join(dir, relFile), code);
+        const result = spawnSync(
+          process.execPath,
+          [path.join(fixture, "scripts/check-dist-imports.mjs")],
+          { encoding: "utf8" },
+        );
+        fs.rmSync(path.join(dir, relFile));
+        return result;
+      };
+      const bundle = "dist/ui/ps-lite-debug.js";
+      for (const code of [
+        'import.meta.resolve("pdfjs-dist/package.json");',
+        'process.getBuiltinModule("module").createRequire(import.meta.url)("missing-package");',
+        "import(runtimePackage);",
+        "const load = require; use(load);",
+      ]) {
+        assert.equal(runAt("server", bundle, code).status, 0, code);
+        // The same code in any other file, or in a differently named file of the
+        // same package, is still checked.
+        assert.equal(runAt("server", "dist/ui/other.js", code).status, 1, code);
+        assert.equal(runAt("other", bundle, code).status, 1, code);
+      }
+      // Static imports in a served-only asset still need a declared dependency.
+      const staticImport = runAt("server", bundle, 'import "missing-package";');
+      assert.equal(staticImport.status, 1);
+      assert.match(staticImport.stderr, /imports missing-package/);
+    },
+  );
+  await t.test("owner names do not exempt a Node-loaded file", () => {
+    const glue = "dist/browser-tls-rustls/browser_tls_rustls.js";
+    const dir = path.join(fixture, "packages", "lite");
+    fs.mkdirSync(path.join(dir, "dist/browser-tls-rustls"), {
+      recursive: true,
+    });
     fs.writeFileSync(
-      path.join(fixture, "packages", "server", "package.json"),
-      JSON.stringify({ name: "server", version: "1.0.0", files: ["dist"] }),
+      path.join(dir, "package.json"),
+      JSON.stringify({ name: "lite", version: "1.0.0", files: ["dist"] }),
     );
-    fs.rmSync(file);
-    fs.rmSync(path.join(pkg, "dist-test"), { recursive: true });
-    const bundle = path.join(uiDir, "ps-lite-debug.js");
     const run = (code) => {
-      fs.writeFileSync(bundle, code);
+      fs.writeFileSync(path.join(dir, glue), code);
       return spawnSync(
         process.execPath,
         [path.join(fixture, "scripts/check-dist-imports.mjs")],
         { encoding: "utf8" },
       );
     };
+    const owner =
+      "__wbg_require_b4edbdcf3e2a1ef0: function() { return handleError(function () {\n" +
+      "  const ret = module.require;\n  return ret;\n}, arguments); }";
+    assert.equal(run(`const imports = {\n${owner},\n};`).status, 0);
+    // A new loader use next to the exact owner still fails.
     assert.equal(
-      run('import.meta.resolve("pdfjs-dist/package.json");').status,
-      0,
+      run(`const imports = {\n${owner},\n};\nuse(module.require);`).status,
+      1,
     );
-    const other = run('import.meta.resolve("other-package/package.json");');
-    assert.equal(other.status, 1);
-    assert.match(other.stderr, /imports other-package/);
-    const unlisted = path.join(uiDir, "other.js");
-    fs.writeFileSync(
-      unlisted,
-      'import.meta.resolve("pdfjs-dist/package.json");',
+    // Same owner name, different body: fails.
+    const changed = run(
+      "const imports = { __wbg_require_b4edbdcf3e2a1ef0: function() { return import(runtimePackage); } };",
     );
-    fs.writeFileSync(bundle, "export {};");
-    const elsewhere = spawnSync(
-      process.execPath,
-      [path.join(fixture, "scripts/check-dist-imports.mjs")],
-      { encoding: "utf8" },
-    );
-    assert.equal(elsewhere.status, 1);
-    assert.match(elsewhere.stderr, /other\.js imports pdfjs-dist/);
+    assert.equal(changed.status, 1);
+    assert.match(changed.stderr, /unanalysable/i);
+    // Old owner-prefix names do not exempt anything.
+    for (const name of ["__wbg_require_other", "_createCanvas"])
+      assert.equal(
+        run(`const o = { ${name}() { return import(runtimePackage); } };`)
+          .status,
+        1,
+        name,
+      );
   });
 });
