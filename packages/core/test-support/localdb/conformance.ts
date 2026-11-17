@@ -180,11 +180,15 @@ export function runDriverConformance(
 
     it("rebuilds records as a rowid table and keeps its rows, indexes and triggers", async () => {
       const driver = await opts.fresh();
+      const rebuild = MIGRATIONS.findIndex((statements) =>
+        statements.some((sql) => sql.startsWith("CREATE TABLE records_rowid")),
+      );
+      expect(rebuild).toBeGreaterThan(0);
       await driver.batch([
-        ...MIGRATIONS.slice(0, -1)
+        ...MIGRATIONS.slice(0, rebuild)
           .flat()
           .map((sql) => ({ sql })),
-        { sql: `PRAGMA user_version = ${MIGRATIONS.length - 1}` },
+        { sql: `PRAGMA user_version = ${rebuild}` },
         ...TEMP_TABLES.map((sql) => ({ sql })),
       ]);
       await seedConnection(driver);
