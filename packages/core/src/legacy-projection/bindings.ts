@@ -4755,6 +4755,7 @@ const icloudNotes: LegacyScopeBinding = {
   scope: "icloud_notes.notes",
   pdppSource: "https://registry.pdpp.dev/connectors/icloud-notes",
   pdppStreams: ["notes", "folders", "profile"],
+  optionalStreams: ["profile"],
   legacySchemaPath: "icloud_notes.notes.json",
   fieldsRead: {
     notes: [
@@ -4775,21 +4776,26 @@ const icloudNotes: LegacyScopeBinding = {
   memoryBound:
     "One flat list of notes; folders is a name lookup, so there are no per-parent children to split.",
   lossy: [
-    "userName is null when the profile stream has no readable user_name (legacy's fullName default); it is never inferred from an Apple ID or the account id.",
+    "userName is null when the connector has no profile stream or the stream has no readable user_name (legacy's fullName default); it is never inferred from an Apple ID or the account id.",
     "folder uses the legacy display-name shape; unresolved folder references fall back to folder_id.",
   ],
   provenance: [ICLOUD_NOTES_PROFILE_PROVENANCE],
   project(records, options): ProjectionResult {
+    // `profile` is optional: connectors that predate it (the signed 0.1.0
+    // declaration) have none, and legacy's fullName was always null for them.
+    // Requiring it would drop the whole scope for those users.
     const guard = requireStreams("icloud_notes.notes", options, [
       "notes",
       "folders",
-      "profile",
     ]);
     if (guard) return guard;
 
     // The profile stream is a singleton: legacy's fullName maps to exactly one
-    // account. No row, several rows, or an unreadable name leave userName null.
-    const profiles = byStream(records, "profile");
+    // account. No stream, no row, several rows, or an unreadable name leave
+    // userName null.
+    const profiles = options.fetchedStreams.includes("profile")
+      ? byStream(records, "profile")
+      : [];
     const profileName =
       profiles.length === 1 ? profiles[0]?.user_name : undefined;
     const userName =

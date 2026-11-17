@@ -1693,6 +1693,55 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       ).toBeNull();
     });
 
+    // Connectors that predate the profile stream (the signed 0.1.0 declaration)
+    // never had one. Legacy's fullName was always null for them, so the scope
+    // keeps serving notes with that same null rather than disappearing.
+    it("serves notes and folders without a profile stream, with the pre-profile userName of null", () => {
+      const result = projectPdppRecordsToLegacyPayload(
+        "icloud_notes.notes",
+        [
+          {
+            stream: "notes",
+            data: {
+              id: "note-1",
+              title: "A note",
+              snippet: null,
+              folder_id: "folder-1",
+              is_pinned: false,
+              created_at: null,
+              modified_at: null,
+              has_attachments: false,
+              text_content: "Body",
+            },
+          },
+          { stream: "folders", data: { id: "folder-1", name: "Ideas" } },
+        ],
+        { fetchedStreams: ["notes", "folders"] },
+      );
+
+      expect(result).toEqual({
+        ok: true,
+        payload: {
+          notes: [
+            {
+              recordName: "note-1",
+              title: "A note",
+              snippet: null,
+              folder: "Ideas",
+              isPinned: false,
+              createdDate: null,
+              modifiedDate: null,
+              hasAttachments: false,
+              textContent: "Body",
+            },
+          ],
+          total: 1,
+          userName: null,
+        },
+      });
+      validateAgainst(icloudNotesSchema, result.ok ? result.payload : result);
+    });
+
     it("rejects records that violate required manifest fields and distinguishes an unfetched stream", () => {
       expect(
         projectPdppRecordsToLegacyPayload(
@@ -1718,14 +1767,14 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       });
       expect(
         projectPdppRecordsToLegacyPayload("icloud_notes.notes", [], {
-          fetchedStreams: ["notes", "folders"],
+          fetchedStreams: ["folders"],
         }),
       ).toEqual({
         ok: false,
         error: {
           kind: "missing_stream",
           scope: "icloud_notes.notes",
-          expectedStream: "profile",
+          expectedStream: "notes",
         },
       });
     });
