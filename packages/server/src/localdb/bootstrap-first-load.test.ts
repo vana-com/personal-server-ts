@@ -130,6 +130,66 @@ async function history(w: World) {
   return p;
 }
 describe("disk-backed bootstrap swap", () => {
+  it("starts tail reads after preview commits and overlaps them with a heap commit", async () => {
+    const w = await world({ streams: 1 });
+    const p = await history(w);
+    const keys = await w.segmentKeys();
+    const reached = deferred(),
+      release = deferred(),
+      ahead = deferred();
+    let previewAtTail = false;
+    const d = await connect(w, "overlap", async (key) => {
+      if (key === keys.get(4)) {
+        previewAtTail =
+          (
+            await d.db.query<{ preview_done: number }>(
+              "SELECT preview_done FROM bootstrap_load",
+            )
+          )[0]?.preview_done === 1;
+        ahead.resolve();
+      }
+    });
+    const governor = d.deps.blobs.governor;
+    const reserve = governor.reserve.bind(governor);
+    let held = 0;
+    vi.spyOn(governor, "reserve").mockImplementation(async (...args) => {
+      const reservation = await reserve(...args);
+      held++;
+      return Object.assign(
+        () => {
+          held--;
+          reservation();
+        },
+        { shrink: reservation.shrink },
+      );
+    });
+    const batch = d.db.batch.bind(d.db);
+    d.db.batch = async (statements) => {
+      if (
+        statements.some(
+          (s) =>
+            s.sql.includes("INSERT INTO bootstrap_segments") &&
+            s.params?.[0] === 2,
+        )
+      ) {
+        reached.resolve();
+        await release.promise;
+      }
+      return batch(statements);
+    };
+    const applying = applyConnection(d.deps, CONNECTION_ID);
+    try {
+      await reached.promise;
+      await expect.poll(() => previewAtTail, { timeout: 2000 }).toBe(true);
+      await ahead.promise;
+      expect(held).toBeGreaterThan(0);
+    } finally {
+      release.resolve();
+      await applying;
+    }
+    await expect.poll(() => held).toBe(0);
+    expect(await d.rows()).toEqual(await p.rows());
+  });
   it("returns an owner row before a held tail; listing counts only returned keys; final rows match the publication", async () => {
     const w = await world({ streams: 1 });
     const p = await history(w);
@@ -229,6 +289,113 @@ describe("disk-backed bootstrap swap", () => {
       { failed: 1 },
     ]);
     expect(await d.db.query("SELECT 1 FROM records")).toEqual([]);
+  });
+
+  it("retries a failed tail GET from durable receipts without advancing the cursor", async () => {
+    const w = await world({ streams: 1 });
+    const p = await history(w);
+    const keys = await w.segmentKeys();
+    let fail = true;
+    const d = await connect(w, "retry-get", async (key) => {
+      if (fail && key === keys.get(4)) throw new Error("tail unavailable");
+    });
+    const governor = d.deps.blobs.governor;
+    const reserve = governor.reserve.bind(governor);
+    let held = 0;
+    vi.spyOn(governor, "reserve").mockImplementation(async (...args) => {
+      const reservation = await reserve(...args);
+      held++;
+      return Object.assign(
+        () => {
+          held--;
+          reservation();
+        },
+        { shrink: reservation.shrink },
+      );
+    });
+    await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toThrow(
+      "tail unavailable",
+    );
+    await expect.poll(() => held).toBe(0);
+    expect(await d.position()).toBe(0);
+    expect(await d.db.query("SELECT failed FROM stream_partial")).toEqual([
+      { failed: 1 },
+    ]);
+    expect(await d.db.query("SELECT preview_done FROM bootstrap_load")).toEqual(
+      [{ preview_done: 1 }],
+    );
+    expect(
+      await d.db.query(
+        "SELECT position FROM bootstrap_segments ORDER BY position",
+      ),
+    ).toEqual([{ position: 1 }, { position: 2 }, { position: 3 }]);
+    fail = false;
+    await applyConnection(d.deps, CONNECTION_ID);
+    expect(await d.rows()).toEqual(await p.rows());
+    expect(await d.position()).toBe(5);
+  });
+
+  it("resumes receipted prerequisites when preview publication fails", async () => {
+    const w = await world({ streams: 1 });
+    const p = await history(w);
+    const d = await connect(w, "retry-preview");
+    const batch = d.db.batch.bind(d.db);
+    let fail = true;
+    d.db.batch = async (statements) => {
+      if (
+        fail &&
+        statements.some((s) =>
+          s.sql.includes("UPDATE bootstrap_load SET preview_done=1"),
+        )
+      ) {
+        fail = false;
+        throw new Error("preview failure");
+      }
+      return batch(statements);
+    };
+    await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toThrow(
+      "preview failure",
+    );
+    expect(await d.db.query("SELECT preview_done FROM bootstrap_load")).toEqual(
+      [{ preview_done: 0 }],
+    );
+    expect(
+      await d.db.query(
+        "SELECT position FROM bootstrap_segments ORDER BY position",
+      ),
+    ).toEqual([{ position: 1 }, { position: 3 }]);
+    expect(await d.position()).toBe(0);
+    await applyConnection(d.deps, CONNECTION_ID);
+    expect(await d.rows()).toEqual(await p.rows());
+  });
+
+  it("does not publish a bootstrap after its connection is deleted during a tail GET", async () => {
+    const w = await world({ streams: 1 });
+    await history(w);
+    const keys = await w.segmentKeys();
+    const reached = deferred(),
+      release = deferred();
+    const d = await connect(w, "deleted", async (key) => {
+      if (key === keys.get(4)) {
+        reached.resolve();
+        await release.promise;
+      }
+    });
+    const applying = applyConnection(d.deps, CONNECTION_ID);
+    const rejected = expect(applying).rejects.toThrow();
+    try {
+      await reached.promise;
+      await d.db.batch([
+        {
+          sql: "UPDATE connections SET control_state='deleted',deleted_at=1 WHERE connection_id=?",
+          params: [CONNECTION_ID],
+        },
+      ]);
+    } finally {
+      release.resolve();
+      await rejected;
+    }
+    expect(await d.position()).toBe(0);
   });
 
   it("rolls back a SQL failure after DROP records and resumes from durable segment receipts", async () => {
@@ -605,6 +772,14 @@ describe("disk-backed bootstrap swap", () => {
 
   it.each([
     { first: "delete", a: 10, second: "upsert", b: 5, live: false },
+    {
+      first: "delete",
+      a: 10,
+      second: "upsert",
+      b: 5,
+      live: false,
+      unknown: true,
+    },
     { first: "upsert", a: 10, second: "delete", b: 5, live: true },
     { first: "delete", a: 10, second: "upsert", b: 10, live: false },
     { first: "delete", a: 10, second: "upsert", b: 11, live: true },
@@ -661,7 +836,9 @@ describe("disk-backed bootstrap swap", () => {
           position: i + 1,
           dataHash,
           bytes: bytes.length,
-          removes: operation.kind === "delete",
+          ...(test.unknown && i === 0
+            ? {}
+            : { removes: operation.kind === "delete" }),
         });
       }
       await applyConnection(d.deps, CONNECTION_ID);
