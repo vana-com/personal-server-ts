@@ -106,4 +106,47 @@ describe("the first publish of a connection", () => {
     expect(await fresh.records()).toEqual(want);
     expect(await a.records()).toEqual(want);
   });
+
+  it("a device with records from before the log that applies the log before it publishes still puts its own records in it", async () => {
+    const w = await world({ streams: 2 });
+    const old = await w.device("old");
+    await old.run("r1", rows("o"));
+    await old.cycle();
+    w.gateway.versions.delete(LOG);
+    await old.db.batch([
+      {
+        sql: "DELETE FROM log_state WHERE connection_id = ?",
+        params: [CONNECTION_ID],
+      },
+      { sql: "DELETE FROM record_changes", params: [] },
+    ]);
+    const a = await w.device("a");
+    await a.run("r2", rows("a"));
+    await a.cycle();
+
+    // A read or a join applies the log first (`sync.apply`, as `resolve` and
+    // `bootstrap` do): this device's position leaves 0 before it publishes.
+    await old.sync.apply();
+    expect(await old.position()).toBeGreaterThan(0);
+    // Only what this device held is queued, not the log's rows it installed.
+    expect(
+      await old.db.query<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM record_changes WHERE connection_id = ? AND origin <> 'remote'",
+        [CONNECTION_ID],
+      ),
+    ).toEqual([{ n: 4 }]);
+    await old.cycle();
+
+    const fresh = await w.device("fresh");
+    await fresh.cycle();
+    const want = await old.records();
+    expect(want.length).toBe(8);
+    expect(await fresh.records()).toEqual(want);
+    expect(
+      await fresh.db.query<{ complete: number }>(
+        "SELECT complete FROM stream_state WHERE connection_id=? ORDER BY stream",
+        [CONNECTION_ID],
+      ),
+    ).toEqual([{ complete: 1 }, { complete: 1 }]);
+  });
 });

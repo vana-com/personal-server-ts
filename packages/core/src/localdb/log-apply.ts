@@ -41,6 +41,7 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { keccakOf } from "../stream-sync/crypto-port.js";
 import { resolveBodies } from "./log-bodies.js";
+import { seedFromRecords } from "./log-seed.js";
 import { announceApplied } from "./apply-progress.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
@@ -235,6 +236,11 @@ export async function applyLog(
     return { applied: 0 };
   }
   if (head.generation > context.generation) return { applied: 0 };
+  // This device's first install of the connection's log. What it holds from
+  // before goes into the log with its next publish (`log-seed.ts`). An
+  // unfinished key-ordered load already passed here at its start.
+  if (local.position === 0 && pending === null)
+    await seedFromRecords(deps, connectionId);
 
   const headRef: SegmentRef = {
     position: head.position,
