@@ -1088,3 +1088,103 @@ it("close drains pending admission before closing services or returning state ow
     await rm(path, { recursive: true, force: true });
   }
 });
+
+it("joins pending admission and its durable demotion before closing listeners", async () => {
+  const path = await mkdtemp(join(tmpdir(), "central-close-admission-"));
+  const dstack = createFakeDstackClient({ appId: CONTROLLER_APP_ID });
+  const info = await dstack.info();
+  const keys = generateKeyPairSync("ed25519");
+  const env = await controllerEnv(path, [workerEntry(2)]);
+  let rejectAdmission!: (reason: Error) => void;
+  let admissionStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    admissionStarted = resolve;
+  });
+  const admission = new Promise<Response>((_resolve, reject) => {
+    rejectAdmission = reject;
+  });
+  const request = vi.fn<typeof fetch>(() => {
+    admissionStarted();
+    return admission;
+  });
+  const closeMcp = vi.fn();
+  const startMcp = mcpService.startMcpRouter;
+  const startSpy = vi
+    .spyOn(mcpService, "startMcpRouter")
+    .mockImplementation(async (...args) => {
+      const router = await startMcp(...args);
+      if (router) {
+        const close = router.close.bind(router);
+        vi.spyOn(router, "close").mockImplementation(async () => {
+          closeMcp();
+          await close();
+        });
+      }
+      return router;
+    });
+  let runtime: Awaited<ReturnType<typeof startFleetCentral>> | undefined;
+  let closing: Promise<void> | undefined;
+  let closed = false;
+  const writesAfterClose: boolean[] = [];
+  try {
+    runtime = await startFleetCentral(
+      signedConfig(env, info, keys),
+      dstack,
+      request,
+    );
+    await started;
+    // Declare starts unavailable. Make it available so the pending rejection
+    // necessarily persists a demotion rather than taking the no-op branch.
+    await runtime.controller.admit({
+      nodeId: "worker-2",
+      nodeIncarnation: "i1",
+      capacity: 1,
+      worker: {
+        activity: vi.fn(),
+        prepare: vi.fn(async () => []),
+        readiness: vi.fn(async () => []),
+        renew: vi.fn(),
+        execute: vi.fn(),
+        release: vi.fn(),
+      },
+    });
+    const markUnavailable = runtime.controller.markUnavailable.bind(
+      runtime.controller,
+    );
+    vi.spyOn(runtime.controller, "markUnavailable").mockImplementation(
+      async (nodeId) => {
+        await markUnavailable(nodeId); // includes the atomic snapshot write
+        writesAfterClose.push(closed);
+      },
+    );
+    closing = runtime.close().then(() => {
+      closed = true;
+    });
+    expect(closed).toBe(false);
+    // This boundary is synchronous without the in-flight await. Unlike a
+    // timed wait for sockets, it reliably kills removal of that await.
+    expect(closeMcp).not.toHaveBeenCalled();
+    rejectAdmission(new Error("controlled admission refusal"));
+    await closing;
+    expect(closed).toBe(true);
+    expect(closeMcp).toHaveBeenCalledTimes(1);
+    expect(writesAfterClose).toEqual([false]);
+    expect(runtime.controller.nodeStatus()[0]).toMatchObject({
+      unavailable: true,
+    });
+    const { readFile, readdir } = await import("node:fs/promises");
+    const persisted = JSON.parse(await readFile(env.FLEET_STATE_PATH!, "utf8"));
+    expect(persisted.nodes["worker-2"].unavailable).toBe(true);
+    expect(
+      (await readdir(path)).filter((name) => name.endsWith(".tmp")),
+    ).toEqual([]);
+    await rm(path, { recursive: true, force: true });
+    await expect(readdir(path)).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    rejectAdmission(new Error("test cleanup"));
+    if (closing) await closing;
+    else await runtime?.close();
+    startSpy.mockRestore();
+    await rm(path, { recursive: true, force: true });
+  }
+});
