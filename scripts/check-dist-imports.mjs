@@ -11,17 +11,305 @@ const builtins = new Set(
   builtinModules.flatMap((name) => [name, `node:${name}`]),
 );
 const violations = [];
-// Repository-relative paths and reasons for computed imports/loaders that cannot be made static.
-const computedImportAllowlist = new Map();
+// Loader uses that cannot be proven, by repository-relative file and the name of
+// the enclosing property/method/function (prefix match), with the reason.
+// Each entry covers only code inside that owner.
+const unanalysableLoaderAllowlist = [
+  {
+    file: "packages/lite/dist/browser-tls-rustls/browser_tls_rustls.js",
+    ownerPrefix: "__wbg_require_",
+    reason:
+      "wasm-bindgen glue hands the host `module.require` to the wasm module; browsers have no `module`, and the call is wrapped by handleError",
+  },
+  {
+    file: "packages/server/dist/ui/ps-lite-debug.js",
+    ownerPrefix: "__wbg_require_",
+    reason: "the same wasm-bindgen glue, inlined by esbuild into the UI bundle",
+  },
+  {
+    file: "packages/server/dist/ui/ps-lite-debug.js",
+    ownerPrefix: "_createCanvas",
+    reason:
+      "pdfjs-dist's Node canvas factory, inlined by unpdf: it builds a loader but discards it and returns a stub that throws, so nothing loads",
+  },
+];
 const computedImports = [];
 // Exact "<repository-relative file>|<specifier>" pairs that stay undeclared on
 // purpose, with the reason. Everything else in the same file is still checked.
 const undeclaredImportAllowlist = new Map([
   [
+    "packages/server/dist/ui/ps-lite-debug.js|node-readable-to-web-readable-stream",
+    "pdfjs-dist's Node-only fallback when a stream has no toWeb(); the bundle targets browsers, which never take that branch",
+  ],
+  [
     "packages/server/dist/ui/ps-lite-debug.js|pdfjs-dist/package.json",
     "unpdf, inlined by esbuild, calls import.meta.resolve only when process.release.name is node (never in the browser) and inside try/catch, so a failed resolve falls back to defaults",
   ],
 ]);
+
+// Fail-closed loader analysis. A "loader" is anything that can load a module at
+// run time: `require`, `module.require`, `process.mainModule.require`, the
+// result of `createRequire(...)` (the factory under any local name), or any
+// identifier bound from those. Every reference to a loader identity must be a
+// recognised direct call (or `.resolve(...)` call) or a plain binding; anything
+// else (alias passed, assigned, destructured, returned, ...) is unanalysable.
+const MODULE_PROPS_SAFE = new Set([
+  "exports",
+  "id",
+  "filename",
+  "path",
+  "loaded",
+  "paths",
+]);
+const LOADER_PROPS_SAFE = new Set(["cache", "extensions", "main"]);
+const isWrapper = (node) =>
+  ts.isParenthesizedExpression(node) ||
+  ts.isAsExpression(node) ||
+  ts.isNonNullExpression(node) ||
+  ts.isTypeAssertionExpression(node) ||
+  ts.isSatisfiesExpression(node);
+const unwrapDown = (node) => {
+  while (isWrapper(node)) node = node.expression;
+  return node;
+};
+const outerOf = (node) => {
+  while (node.parent && isWrapper(node.parent)) node = node.parent;
+  return node;
+};
+const isId = (node, text) => ts.isIdentifier(node) && node.text === text;
+const isImportMeta = (node) =>
+  ts.isMetaProperty(node) &&
+  node.keywordToken === ts.SyntaxKind.ImportKeyword &&
+  node.name.text === "meta";
+
+const bindingNames = (name) =>
+  ts.isIdentifier(name)
+    ? [name.text]
+    : name.elements.flatMap((element) =>
+        ts.isOmittedExpression(element) ? [] : bindingNames(element.name),
+      );
+// Nearest enclosing scope that declares `name` (no type checker): a parameter,
+// catch variable, import, or declaration among a block's statements. Returns
+// undefined for a free (global) name.
+const declaredNamesCache = new WeakMap();
+const declaredNames = (scope) => {
+  let names = declaredNamesCache.get(scope);
+  if (names) return names;
+  names = new Set();
+  if (ts.isFunctionLike(scope))
+    for (const p of scope.parameters)
+      for (const n of bindingNames(p.name)) names.add(n);
+  if (ts.isCatchClause(scope) && scope.variableDeclaration)
+    for (const n of bindingNames(scope.variableDeclaration.name)) names.add(n);
+  if (ts.isBlock(scope) || ts.isSourceFile(scope))
+    for (const st of scope.statements) {
+      if (ts.isVariableStatement(st))
+        for (const d of st.declarationList.declarations)
+          for (const n of bindingNames(d.name)) names.add(n);
+      if (
+        (ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st)) &&
+        st.name
+      )
+        names.add(st.name.text);
+      const clause = ts.isImportDeclaration(st) && st.importClause;
+      if (clause) {
+        if (clause.name) names.add(clause.name.text);
+        const nb = clause.namedBindings;
+        if (nb && ts.isNamespaceImport(nb)) names.add(nb.name.text);
+        else if (nb) for (const e of nb.elements) names.add(e.name.text);
+      }
+    }
+  declaredNamesCache.set(scope, names);
+  return names;
+};
+const declScope = (node, name = node.text) => {
+  for (let scope = node.parent; scope; scope = scope.parent)
+    if (declaredNames(scope).has(name)) return scope;
+  return undefined;
+};
+const ownerName = (node) => {
+  for (let n = node; n; n = n.parent)
+    if (
+      (ts.isPropertyAssignment(n) ||
+        ts.isMethodDeclaration(n) ||
+        ts.isFunctionDeclaration(n)) &&
+      n.name &&
+      (ts.isIdentifier(n.name) || ts.isStringLiteral(n.name))
+    )
+      return n.name.text;
+  return undefined;
+};
+
+function createLoaderAnalysis(source) {
+  // Derived bindings: name -> scopes where that name is bound to the kind.
+  const bound = { loader: new Map(), factory: new Map(), moduleObj: new Map() };
+  const literalName = (node) =>
+    ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)
+      ? node.text
+      : undefined;
+  const memberName = (node) =>
+    ts.isPropertyAccessExpression(node)
+      ? node.name.text
+      : ts.isElementAccessExpression(node)
+        ? literalName(node.argumentExpression)
+        : undefined;
+  const anyBound = (name) =>
+    bound.loader.has(name) ||
+    bound.factory.has(name) ||
+    bound.moduleObj.has(name);
+  const kindOf = (raw) => {
+    const node = unwrapDown(raw);
+    if (ts.isIdentifier(node)) {
+      // `require` and `createRequire` are loader identities under any scope
+      // (a parameter named `require` may be a real loader); `module` is the
+      // module object only when it is a free name.
+      if (node.text === "require") return "loader";
+      if (node.text === "createRequire") return "factory";
+      const known = node.text === "module" || anyBound(node.text);
+      if (!known) return undefined;
+      const scope = declScope(node);
+      if (node.text === "module" && scope === undefined) return "moduleObj";
+      for (const [kind, names] of Object.entries(bound))
+        if (names.get(node.text)?.has(scope)) return kind;
+      return undefined;
+    }
+    if (
+      ts.isPropertyAccessExpression(node) ||
+      ts.isElementAccessExpression(node)
+    ) {
+      const name = memberName(node);
+      const base = kindOf(node.expression);
+      if (base === "moduleObj" && name === "require") return "loader";
+      if (name === "createRequire") return "factory";
+      if (name === "mainModule" && isId(unwrapDown(node.expression), "process"))
+        return "moduleObj";
+      if (name === "main" && base === "loader") return "moduleObj";
+      return undefined;
+    }
+    if (ts.isCallExpression(node) && kindOf(node.expression) === "factory")
+      return "loader";
+    return undefined;
+  };
+  // Bindings first, to a fixed point: traversal order must not change results.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const visit = (node) => {
+      let kind;
+      let name;
+      if (
+        ts.isVariableDeclaration(node) &&
+        ts.isIdentifier(node.name) &&
+        node.initializer
+      ) {
+        kind = kindOf(node.initializer);
+        name = node.name;
+      } else if (
+        (ts.isImportSpecifier(node) || ts.isBindingElement(node)) &&
+        ts.isIdentifier(node.name) &&
+        (node.propertyName ?? node.name).text === "createRequire"
+      ) {
+        kind = "factory";
+        name = node.name;
+      }
+      if (kind) {
+        const scopes = bound[kind].get(name.text) ?? new Set();
+        const scope = declScope(name);
+        if (!scopes.has(scope)) {
+          scopes.add(scope);
+          bound[kind].set(name.text, scopes);
+          changed = true;
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+  }
+  const isDeclarationName = (node) => {
+    const parent = node.parent;
+    if (
+      !parent ||
+      ts.isShorthandPropertyAssignment(parent) ||
+      ts.isExportSpecifier(parent)
+    )
+      return false;
+    return parent.name === node || parent.propertyName === node;
+  };
+  const isCallee = (node) => {
+    const outer = outerOf(node);
+    return (
+      ts.isCallExpression(outer.parent) && outer.parent.expression === outer
+    );
+  };
+  const isResolveCallee = (node) => {
+    const outer = outerOf(node);
+    return (
+      ts.isPropertyAccessExpression(outer.parent) &&
+      outer.parent.expression === outer &&
+      outer.parent.name.text === "resolve" &&
+      isCallee(outer.parent)
+    );
+  };
+  return {
+    ownerName,
+    // `<loader>(x)`, `<loader>.resolve(x)`, `import.meta.resolve(x)`.
+    isLoaderCall(expression) {
+      const callee = unwrapDown(expression);
+      if (kindOf(callee) === "loader") return true;
+      if (
+        ts.isPropertyAccessExpression(callee) &&
+        callee.name.text === "resolve"
+      )
+        return (
+          kindOf(callee.expression) === "loader" ||
+          isImportMeta(unwrapDown(callee.expression))
+        );
+      return false;
+    },
+    // A loader-identity reference that is not a proven form.
+    isUnanalysableUse(node) {
+      if (isWrapper(node)) return false;
+      if (
+        ts.isPropertyAccessExpression(node) &&
+        isImportMeta(unwrapDown(node.expression)) &&
+        node.name.text === "resolve"
+      )
+        return !isCallee(node);
+      const kind = kindOf(node);
+      if (!kind) return false;
+      if (ts.isIdentifier(node)) {
+        if (isDeclarationName(node)) return false;
+        if (ts.isTypeOfExpression(outerOf(node).parent)) return false;
+      }
+      const outer = outerOf(node);
+      const parent = outer.parent;
+      if (
+        ts.isVariableDeclaration(parent) &&
+        parent.initializer === outer &&
+        ts.isIdentifier(parent.name)
+      )
+        // A plain local binding; exporting it would hand the loader away.
+        return !!parent.parent.parent?.modifiers?.some(
+          (m) => m.kind === ts.SyntaxKind.ExportKeyword,
+        );
+      const member =
+        ts.isPropertyAccessExpression(parent) && parent.expression === outer
+          ? parent.name.text
+          : undefined;
+      if (kind === "loader")
+        return !(
+          isCallee(node) ||
+          LOADER_PROPS_SAFE.has(member) ||
+          (member === "resolve" && isResolveCallee(node))
+        );
+      if (kind === "factory") return !isCallee(node);
+      return !(
+        member !== undefined &&
+        (member === "require" || MODULE_PROPS_SAFE.has(member))
+      );
+    },
+  };
+}
 
 for (const dir of fs.readdirSync(path.join(root, "packages"))) {
   const pkgDir = path.join(root, "packages", dir);
@@ -58,37 +346,23 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
       true,
       ts.ScriptKind.JS,
     );
-    const isCreateRequireCall = (node) =>
-      ts.isCallExpression(node) &&
-      ts.isIdentifier(node.expression) &&
-      node.expression.text === "createRequire";
-    // Collect before visiting calls: traversal order must not affect which
-    // local names are recognized as loaders.
-    const requireBindings = new Set(["require"]);
-    const collectBindings = (node) => {
-      if (
-        ts.isVariableDeclaration(node) &&
-        ts.isIdentifier(node.name) &&
-        node.initializer &&
-        isCreateRequireCall(node.initializer)
-      ) {
-        requireBindings.add(node.name.text);
-      }
-      ts.forEachChild(node, collectBindings);
+    const loaders = createLoaderAnalysis(source);
+    const relFile = path.relative(root, file).split(path.sep).join("/");
+    const reportUnanalysable = (node) => {
+      const location = `${relFile}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}`;
+      const owner = loaders.ownerName(node);
+      const reason = unanalysableLoaderAllowlist.find(
+        (entry) =>
+          entry.file === relFile && owner?.startsWith(entry.ownerPrefix),
+      )?.reason;
+      computedImports.push(
+        `${location}${reason ? ` (allowed: ${reason})` : " (unanalysable)"}`,
+      );
+      if (!reason)
+        violations.push(
+          `${location} has an unanalysable dynamic import or loader use`,
+        );
     };
-    collectBindings(source);
-    const isRequireIdentifier = (node) =>
-      ts.isIdentifier(node) && requireBindings.has(node.text);
-    const isLoaderCall = (expression) =>
-      isRequireIdentifier(expression) ||
-      isCreateRequireCall(expression) ||
-      (ts.isPropertyAccessExpression(expression) &&
-        expression.name.text === "resolve" &&
-        (isRequireIdentifier(expression.expression) ||
-          (ts.isMetaProperty(expression.expression) &&
-            expression.expression.keywordToken ===
-              ts.SyntaxKind.ImportKeyword &&
-            expression.expression.name.text === "meta")));
     const pending = [source];
     while (pending.length) {
       const node = pending.pop();
@@ -102,7 +376,7 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
       } else if (ts.isCallExpression(node)) {
         const isDynamicImport =
           node.expression.kind === ts.SyntaxKind.ImportKeyword;
-        const isRuntimeLoader = isLoaderCall(node.expression);
+        const isRuntimeLoader = loaders.isLoaderCall(node.expression);
         const arg = node.arguments[0];
         if (
           (isDynamicImport || isRuntimeLoader) &&
@@ -111,17 +385,10 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
         ) {
           specifier = arg.text;
         } else if (isDynamicImport || isRuntimeLoader) {
-          const location = `${path.relative(root, file)}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}`;
-          const reason = computedImportAllowlist.get(path.relative(root, file));
-          computedImports.push(
-            `${location}${reason ? ` (allowed: ${reason})` : " (unanalysable)"}`,
-          );
-          if (!reason)
-            violations.push(
-              `${location} has an unanalysable dynamic import or runtime loader`,
-            );
+          reportUnanalysable(node);
         }
       }
+      if (loaders.isUnanalysableUse(node)) reportUnanalysable(node);
       if (specifier?.startsWith(".")) {
         const target = path.posix.normalize(
           path.posix.join(path.posix.dirname(packedPath), specifier),
@@ -135,7 +402,6 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
         const name = specifier.startsWith("@")
           ? specifier.split("/").slice(0, 2).join("/")
           : specifier.split("/")[0];
-        const relFile = path.relative(root, file).split(path.sep).join("/");
         if (
           !allowed.has(name) &&
           !undeclaredImportAllowlist.has(`${relFile}|${specifier}`)
