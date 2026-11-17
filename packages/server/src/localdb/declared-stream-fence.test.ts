@@ -1,0 +1,148 @@
+/**
+ * A connection delete fences every stream of the lifetime it ends, including a
+ * stream the manifest declares and no run ever published.
+ *
+ * The fence is the control tombstone (docs/261114-connection-delete-fence.md):
+ * admission re-reads the control row and the gateway conditions each publish
+ * on it. Neither reads a list of streams, so a second device needs no record
+ * that a stream exists in order to be refused a write to it. These tests pin
+ * that with real intake, publish and apply drivers and the fake gateway.
+ */
+import { afterEach, describe, expect, it } from "vitest";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
+import {
+  CONNECTOR,
+  CONTROL,
+  LOG,
+  OWNER,
+  closeWorldDrivers,
+  sName,
+  world,
+} from "./log-world.test-utils.js";
+
+afterEach(closeWorldDrivers);
+
+const NEVER_PUBLISHED = sName(1);
+const request = (observedAt: number) => ({
+  connector: CONNECTOR,
+  artifactDigest: CONNECTOR,
+  wantFull: true,
+  observedAt,
+  owner: { address: OWNER, leaseId: null },
+});
+
+describe("a stream declared and never published", () => {
+  it("is refused to a second device that has not yet applied the delete", async () => {
+    const w = await world({ streams: 2 });
+    const a = await w.device("a");
+    const b = await w.device("b");
+    // A publishes `s0` only. `s1` is declared by the manifest and no run covers it.
+    await a.run("run-a", [{ stream: sName(0), id: "1" }], {
+      covered: [sName(0)],
+    });
+    await a.cycle();
+    await b.cycle();
+    expect(await b.sync.declarations.streamsOf(CONNECTOR)).toEqual([sName(0)]);
+
+    await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+    expect(await a.sync.deleter.resumeDeletes()).toEqual([]);
+
+    // B holds no record of `s1` and has not applied the delete.
+    await expect(
+      b.run("run-b", [{ stream: NEVER_PUBLISHED, id: "late" }]),
+    ).rejects.toMatchObject({ message: "connection_stopped" });
+    // The refused begin read the registry and applied the delete.
+    await b.cycle();
+    expect(await b.records()).toEqual([]);
+    expect(await a.records()).toEqual([]);
+    // Nothing was written for the stream: the log row and the control row are
+    // the only registry rows, and the log row has its one pre-delete version.
+    expect([...w.gateway.versions.keys()].sort()).toEqual([CONTROL, LOG]);
+    expect(w.gateway.versions.get(LOG)).toHaveLength(1);
+  });
+
+  it("is refused to a run that began before the delete and ends after it", async () => {
+    const w = await world({ streams: 2 });
+    const a = await w.device("a");
+    const b = await w.device("b");
+    await a.run("run-a", [{ stream: sName(0), id: "1" }], {
+      covered: [sName(0)],
+    });
+    await a.cycle();
+    await b.cycle();
+
+    // B's run is collecting `s1` when A deletes.
+    await b.sync.intake.begin("run-b", request(5000));
+    await b.sync.intake.batch("run-b", {
+      batch: 0,
+      records: [{ stream: NEVER_PUBLISHED, data: { id: "late" } }],
+    });
+    await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+    expect(await a.sync.deleter.resumeDeletes()).toEqual([]);
+
+    await b.sync.intake
+      .end(
+        "run-b",
+        endRequest({
+          lastBatch: 0,
+          streams: [NEVER_PUBLISHED],
+          live: [NEVER_PUBLISHED],
+          provenFullStreams: [NEVER_PUBLISHED],
+        }),
+      )
+      .catch(() => undefined);
+    await b.cycle();
+
+    expect(await b.records()).toEqual([]);
+    await a.cycle();
+    expect(await a.records()).toEqual([]);
+    expect(w.gateway.versions.get(LOG)).toHaveLength(1);
+    expect([...w.gateway.versions.keys()].sort()).toEqual([CONTROL, LOG]);
+  });
+
+  it("is refused after a connection that never published anything is deleted", async () => {
+    const w = await world({ streams: 2 });
+    const a = await w.device("a");
+    const b = await w.device("b");
+    await a.run("run-a", [], { covered: [] });
+    await a.cycle();
+    await b.cycle();
+    // No run published: the registry holds the control row only.
+    expect([...w.gateway.versions.keys()]).toEqual([CONTROL]);
+
+    await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+    expect(await a.sync.deleter.resumeDeletes()).toEqual([]);
+
+    await expect(
+      b.run("run-b", [{ stream: NEVER_PUBLISHED, id: "late" }]),
+    ).rejects.toMatchObject({ message: "connection_stopped" });
+    await b.cycle();
+    expect(await b.records()).toEqual([]);
+  });
+});
+
+/**
+ * The one thing a second device lacks. The writing device keeps a `stream_state`
+ * row for every stream its manifest declares; a replica gets one only from a
+ * segment that touched the stream, and a segment is written for a stream a run
+ * covers. A stream no run covered is named on the writer and not on the
+ * replica. `it.fails` keeps this visible: it fails, and so must be removed,
+ * the day a replica learns a declared stream without a covering run.
+ */
+it.fails("a second device names a declared stream no run covered", async () => {
+  const w = await world({ streams: 2 });
+  const a = await w.device("a");
+  const b = await w.device("b");
+  await a.run("run-a", [{ stream: sName(0), id: "1" }], {
+    covered: [sName(0)],
+  });
+  await a.cycle();
+  await b.cycle();
+  expect(await a.sync.declarations.streamsOf(CONNECTOR)).toEqual([
+    sName(0),
+    NEVER_PUBLISHED,
+  ]);
+  expect(await b.sync.declarations.streamsOf(CONNECTOR)).toEqual(
+    await a.sync.declarations.streamsOf(CONNECTOR),
+  );
+});
