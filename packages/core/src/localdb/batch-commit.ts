@@ -38,12 +38,35 @@ export const GATEWAY_MAX_BATCH_REQUIRES = 16;
 export function batchBounds(registry: LocalSyncDeps["registry"]): {
   readonly rows: number;
   readonly requires: number;
+  /** See `RegistryBatchPolicy.lockedScopes`; absent when the gateway sends none. */
+  readonly lockedScopes?: number;
 } {
   const policy = registry.batchPolicy?.();
   return {
     rows: policy?.rows ?? GATEWAY_MAX_BATCH_ROWS,
     requires: policy?.requires ?? GATEWAY_MAX_BATCH_REQUIRES,
+    ...(policy?.lockedScopes !== undefined && {
+      lockedScopes: policy.lockedScopes,
+    }),
   };
+}
+
+/**
+ * Whether a batch of `rows` written rows that fence `fences` distinct log rows
+ * (the log rows of their connections, none of them written in the batch) is
+ * within the gateway's bounds. With a fence the lock budget applies, else rows.
+ */
+export function fitsRowBounds(
+  bounds: ReturnType<typeof batchBounds>,
+  rows: number,
+  fences: number,
+): boolean {
+  if (rows > bounds.rows) return false;
+  return (
+    fences === 0 ||
+    bounds.lockedScopes === undefined ||
+    rows + fences <= bounds.lockedScopes
+  );
 }
 
 export interface CommitGroup<E, R> {
