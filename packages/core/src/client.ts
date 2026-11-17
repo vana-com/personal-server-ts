@@ -344,13 +344,40 @@ export class PersonalServerClientError extends Error {
     errorCode?: string;
     details?: unknown;
     body?: unknown;
+    cause?: unknown;
   }) {
-    super(params.message);
+    super(
+      params.message,
+      params.cause === undefined ? undefined : { cause: params.cause },
+    );
     this.name = "PersonalServerClientError";
     this.status = params.status;
     this.errorCode = params.errorCode;
     this.details = params.details;
     this.body = params.body;
+  }
+}
+
+/**
+ * A response's body stopped before its end. In process the body errors with
+ * what produced it (a view whose head moved while the body was read, which
+ * the database layer calls `PartialViewMoved`); over HTTP the connection drops
+ * after the headers and the reader sees only a network error. Both reach the
+ * caller as this one error, so a caller does not need to know which transport
+ * it has. The body is not a complete read of anything: a read that follows
+ * starts from the data as it then stands. `cause` holds the original error.
+ */
+export class PersonalServerReadInterrupted extends PersonalServerClientError {
+  readonly retryable = true;
+
+  constructor(params: { status: number; cause: unknown }) {
+    super({
+      message: "Personal Server response body stopped before its end",
+      status: params.status,
+      errorCode: "READ_INTERRUPTED",
+      cause: params.cause,
+    });
+    this.name = "PersonalServerReadInterrupted";
   }
 }
 
@@ -601,7 +628,10 @@ async function readJsonBody(response: Response): Promise<unknown> {
   } catch (error) {
     // A body it stopped reading still holds what produced it.
     await response.body?.cancel(error).catch(() => undefined);
-    throw error;
+    throw new PersonalServerReadInterrupted({
+      status: response.status,
+      cause: error,
+    });
   }
   if (!text) return null;
   try {

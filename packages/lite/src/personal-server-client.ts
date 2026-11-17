@@ -4,6 +4,7 @@ import {
   dataReadPath,
   dataVersionsPath,
   parsePersonalServerJsonResponse,
+  PersonalServerReadInterrupted,
   type PersonalServerAuthRequestOptions,
   type PersonalServerListAccessLogsOptions,
   type PersonalServerListAccessLogsResult,
@@ -60,6 +61,25 @@ export interface PersonalServerClient {
   ): Promise<PersonalServerSyncTriggerResult>;
 }
 
+/**
+ * How many times a data read is made when its body keeps stopping before the
+ * end (a read of a whole stream while an apply replaces the stream's head).
+ *
+ * A stopped read means another head was committed while the body was read.
+ * The next read queues behind the apply still running, so it starts from that
+ * apply's result and stops again only if one more apply of the same stream
+ * lands during the new read. Nothing bounds how often a stream's head moves,
+ * so no number can be derived from the data. The bound is a fixed three (two
+ * retries) for this reason: one retry covers the usual case of one apply
+ * overlapping the read, the second covers a second apply in quick succession,
+ * and a read stopped three times in a row is a stream that changes faster than
+ * a body of it can be read. A fourth try would again spend a whole body for
+ * the same odds, so the caller gets the typed error and decides when to ask
+ * again. The bound also holds for any other interruption, such as a dropped
+ * connection.
+ */
+const READ_ATTEMPTS = 3;
+
 export function createPersonalServerClient(
   options: PersonalServerClientOptions,
 ): PersonalServerClient {
@@ -105,8 +125,25 @@ export function createPersonalServerClient(
         "GET",
         versionOptions,
       ),
-    readData: (scope, readOptions = {}) =>
-      call("data read", dataReadPath(scope, readOptions), "GET", readOptions),
+    readData: async (scope, readOptions = {}) => {
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          return await call<DataFileEnvelope>(
+            "data read",
+            dataReadPath(scope, readOptions),
+            "GET",
+            readOptions,
+          );
+        } catch (error) {
+          if (
+            !(error instanceof PersonalServerReadInterrupted) ||
+            attempt >= READ_ATTEMPTS
+          ) {
+            throw error;
+          }
+        }
+      }
+    },
     syncStatus: (syncOptions = {}) =>
       call("sync status", "/v1/sync/status", "GET", syncOptions),
     syncNow: (syncOptions = {}) =>
