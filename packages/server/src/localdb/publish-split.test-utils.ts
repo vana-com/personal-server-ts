@@ -224,7 +224,6 @@ export async function makeDevice(
         },
       ],
     }),
-    declaredStreams: () => ["items"],
     olderVersionReads: () => true,
   });
   /** One connection's run helpers and local reads. */

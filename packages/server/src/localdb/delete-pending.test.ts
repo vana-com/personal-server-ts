@@ -76,7 +76,6 @@ async function stuckDelete(
         { name: "items", semantics: "mutable_state", primaryKey: ["id"] },
       ],
     }),
-    declaredStreams: () => ["items"],
     olderVersionReads: () => true,
     deleteRetryMs: { first: 5, max: 20 },
   });

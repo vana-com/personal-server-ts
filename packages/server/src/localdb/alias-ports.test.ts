@@ -24,7 +24,6 @@ describe("server alias ports", () => {
   it("supplies fresh catalogue iterators and keeps projection knowledge on the host side", () => {
     createServerLocalSync({} as never, {
       resolveArtifact: () => null,
-      declaredStreams: () => [],
       olderVersionReads: () => false,
     });
     const { aliasScopes, aliasTargets } = build.mock.calls[0][1];

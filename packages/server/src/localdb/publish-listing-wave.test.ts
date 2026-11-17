@@ -147,7 +147,6 @@ async function world(options: Options) {
         primaryKey: ["id"],
       })),
     }),
-    declaredStreams: () => names,
     olderVersionReads: () => true,
   });
   let runs = 0;

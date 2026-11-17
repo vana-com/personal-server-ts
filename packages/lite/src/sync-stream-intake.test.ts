@@ -73,7 +73,6 @@ async function fixture(
     streamSyncRegistry: registry,
     streamSyncBlobs: blobs,
     streamSyncDeclarations: () => declaration,
-    streamSyncDeclaredStreams: () => ["items"],
     stateStore,
     storage: createMemoryPsLiteStorage(),
     ownerSignature: signature,
@@ -112,7 +111,6 @@ async function fixture(
     },
     {
       resolveArtifact: () => declaration,
-      declaredStreams: () => ["items"],
       olderVersionReads: () => true,
     },
   );

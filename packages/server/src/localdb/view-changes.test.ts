@@ -115,7 +115,6 @@ async function device(
         primaryKey: ["id"],
       })),
     }),
-    declaredStreams: () => streams,
     olderVersionReads: () => true,
   });
   return Object.assign(sync, {

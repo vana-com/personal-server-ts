@@ -88,7 +88,6 @@ async function world() {
           },
         ],
       }),
-      declaredStreams: () => ["A"],
       olderVersionReads: () => true,
     });
     /** One run that observes `rows` in full, then one sync cycle. */
