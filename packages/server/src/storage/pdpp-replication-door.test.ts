@@ -20,7 +20,10 @@ import {
   resolveReplication,
 } from "../pdpp/records-bootstrap.js";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
-import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
+import {
+  createReplicaRecordStore,
+  ensureReplicaSchema,
+} from "./pdpp-replica-canonical-port.js";
 import {
   admitReplication,
   REPLICATION_DOOR_PROBE,
@@ -474,6 +477,116 @@ describe("the fence's cost on a flag-off database", () => {
     return best;
   }
 
+  /** Compare full trigger definitions, including dormant journal protections. */
+  function triggerSet(path: string): { name: string; sql: string }[] {
+    const db = open(path);
+    try {
+      return db
+        .prepare(
+          "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+        )
+        .all() as { name: string; sql: string }[];
+    } finally {
+      db.close();
+    }
+  }
+
+  function assertPointLookupPlans(db: Database.Database): void {
+    const triggers = db
+      .prepare(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'pdpp_replica_door_*' ORDER BY name",
+      )
+      .all() as { name: string; sql: string }[];
+    expect(triggers).toHaveLength(17);
+    for (const { name, sql } of triggers) {
+      // Deliberately scoped to the generated fence grammar, not a SQL parser.
+      // Unknown shapes fail closed: do not silently skip new per-row work.
+      const match =
+        /\bWHEN\s+([\s\S]+?)\s+BEGIN\s+([\s\S]+?)\s+END\s*;?\s*$/i.exec(sql);
+      if (!match) throw new Error(name + ": unrecognized fence trigger SQL");
+      const body = match[2]
+        .split(";")
+        .map((part) => part.trim())
+        .filter(Boolean);
+      expect(body, name + ": expected the single fence update").toHaveLength(1);
+      expect(body[0], name).toMatch(/^UPDATE\b/i);
+      // Today's SQL uses the literal singleton id = 1, with no OLD/NEW
+      // references or parameters. Require adaptation if that ever changes.
+      expect(sql, name).not.toMatch(/\b(?:OLD|NEW)\s*\./i);
+      for (const statement of ["SELECT " + match[1], ...body]) {
+        const plan = db.prepare("EXPLAIN QUERY PLAN " + statement).all() as {
+          detail: string;
+        }[];
+        expect(plan.length, name + ": empty query plan").toBeGreaterThan(0);
+        for (const { detail } of plan) {
+          // SELECT (WHEN-subquery) also has a harmless constant-row node.
+          if (/\bSCAN\b/i.test(detail) && !/^SCAN CONSTANT ROW$/i.test(detail))
+            throw new Error(name + ": full SCAN: " + detail);
+        }
+        expect(
+          plan.some(({ detail }) => /\bSEARCH\b/i.test(detail)),
+          name + ": expected an indexed/primary-key lookup for " + statement,
+        ).toBe(true);
+      }
+    }
+  }
+
+  function warmChanges(path: string): number[] {
+    const db = open(path);
+    try {
+      const store = createSqliteRecordStore(db);
+      // Trip the fence before measuring. Also bring plain-store metadata to
+      // the same generation on both paths; initialization is not per-row cost.
+      ingest(store, "cost-warm-up");
+      const changes = () =>
+        (db.prepare("SELECT total_changes() AS n").get() as { n: number }).n;
+      return [0, 1].map((pass) => {
+        const before = changes();
+        store.ingestBatch(
+          Array.from({ length: 100 }, (_, i) => ({
+            instance: "conn_a",
+            stream: "messages",
+            key: "cost-" + i,
+            data: { id: "cost-" + i, text: "pass " + pass },
+            emitted_at: at,
+          })),
+          () => "mutable_state",
+          () => ["id"],
+          { method: "collector", generation: 1 },
+        );
+        // First pass inserts, second updates; total_changes includes triggers.
+        return changes() - before;
+      });
+    } finally {
+      db.close();
+    }
+  }
+
+  it("detects a scan introduced only in a fence WHEN condition", () => {
+    const db = open(enabledDatabase());
+    const trigger = db
+      .prepare(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'pdpp_replica_door_*' ORDER BY name LIMIT 1",
+      )
+      .get() as { name: string; sql: string };
+    assertPointLookupPlans(db);
+    const mutated = trigger.sql.replace(
+      /WHERE id = 1(?=\s*\)\s*BEGIN)/i,
+      "WHERE capturing IN (0, 1)",
+    );
+    expect(mutated).not.toBe(trigger.sql);
+    const drop = 'DROP TRIGGER "' + trigger.name.replace(/"/g, '""') + '"';
+    try {
+      db.exec(drop);
+      db.exec(mutated);
+      expect(() => assertPointLookupPlans(db)).toThrow(/full SCAN/);
+    } finally {
+      db.exec(drop);
+      db.exec(trigger.sql);
+    }
+    assertPointLookupPlans(db);
+  });
+
   it("costs a flag-off database nothing, and an older build's writes little", () => {
     const never = file();
     boot(never, false, (store) => register(store));
@@ -481,9 +594,34 @@ describe("the fence's cost on a flag-off database", () => {
     const closed = enabledDatabase();
     expect(boot(closed, false)).toEqual({ state: "off" });
     expect(fenceTriggers(closed)).toBe(0);
+    // Journal protections survive closing but only target replica tables.
+    // Match the whole set against an equally migrated, never-enabled control;
+    // keep the pristine never database for the write-count and timing controls.
+    const schemaOnly = file();
+    boot(schemaOnly, false, () => undefined);
+    const schemaDb = open(schemaOnly);
+    try {
+      ensureReplicaSchema(schemaDb);
+      expect(schemaDb.prepare(REPLICATION_DOOR_PROBE).get()).toBeUndefined();
+    } finally {
+      schemaDb.close();
+    }
+    expect(triggerSet(closed)).toEqual(triggerSet(schemaOnly));
+    expect(triggerSet(never)).toEqual([]);
     // A build without the door writing to an enabled database: the fence
     // stays, trips on the first row, then costs one point read per row.
     const fenced = enabledDatabase();
+    const db = open(fenced);
+    try {
+      assertPointLookupPlans(db);
+    } finally {
+      db.close();
+    }
+    const plainChanges = warmChanges(never);
+    const fencedChanges = warmChanges(fenced);
+    expect(door(fenced)).toEqual({ capturing: 0, uncaptured: 1, off: 0 });
+    expect(plainChanges.every((n) => n >= 100)).toBe(true);
+    expect(fencedChanges).toEqual(plainChanges);
     const times = {
       never: writeTime(never, 3000),
       closed: writeTime(closed, 3000),
@@ -492,9 +630,5 @@ describe("the fence's cost on a flag-off database", () => {
     process.stderr.write(
       `3000 flag-off writes (ms, best of 3): ${JSON.stringify(times, (_, v: unknown) => (typeof v === "number" ? Math.round(v) : v))}\n`,
     );
-    // Loose bounds: a shared CI runner is noisy. These catch a per-row write
-    // or scan, not a few percent.
-    expect(times.closed).toBeLessThan(times.never * 1.5);
-    expect(times.fenced).toBeLessThan(times.never * 2);
   }, 30_000);
 });
