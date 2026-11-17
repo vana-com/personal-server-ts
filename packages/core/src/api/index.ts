@@ -2687,6 +2687,7 @@ export async function listOwnerVisibleScopes(
     }
     const listed = await listScopes({
       canRead: (scope) => !isSystemScope(scope),
+      includeLoading: true,
     });
     return {
       // The stream listing applies the resolver's own selection rule, so a
@@ -2698,7 +2699,8 @@ export async function listOwnerVisibleScopes(
           ...(row.latestCollectedAt && {
             latestCollectedAt: row.latestCollectedAt,
           }),
-          dataStatus: "ready" as const,
+          // A scope whose first load is running serves the rows applied so far.
+          dataStatus: row.dataStatus ?? ("ready" as const),
         })),
       total: listed.length,
     };
@@ -2767,6 +2769,8 @@ export async function handlePersonalServerDataRequest(
           canRead: (scope) =>
             !isSystemScope(scope) &&
             (!listAuth || listAuthCovers(listAuth, scope)),
+          // No grant on the request: the owner's view, which serves loads in progress.
+          includeLoading: !listAuth,
         });
         const prefix = url.searchParams.get("scopePrefix") ?? "";
         const filtered = scopes.filter((row) => row.scope.startsWith(prefix));

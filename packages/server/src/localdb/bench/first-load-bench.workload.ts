@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { Session } from "node:inspector/promises";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import {
   controlHashes,
   deriveKeyCheck,
@@ -28,6 +28,7 @@ import {
   createGatewayStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
 } from "../../../../core/src/stream-sync/index.js";
+import { createLocalListing } from "../../../../core/src/localdb/listing.js";
 import { endRequest } from "../../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "../better-sqlite3-driver.js";
 import { createFakeGateway } from "../fake-gateway.js";
@@ -41,6 +42,8 @@ const arg = (name: string, d: string) => {
 };
 const ROWS = Number(arg("rows", "20000"));
 const PROGRESSIVE = arg("progressive", "on") === "on";
+// `--keyed off` loads segment by segment even when the key-ordered load would apply.
+const KEYED = arg("keyed", "on") === "on";
 const READERS = Number(arg("readers", "1"));
 const ROW_BYTES = Number(arg("rowbytes", "2200"));
 const BATCH_ROWS = Number(arg("batchrows", "2000"));
@@ -54,6 +57,16 @@ const nodeStreamCrypto =
     : hostCrypto;
 const REAL_CRYPTO = NODE_CRYPTO || arg("realcrypto", "off") === "on";
 const CAPTURE = arg("capture", "");
+// "on" opens the reader as the Web host does: 64 KiB pages and TRUNCATE journaling
+// (`openLocalDb` picks the journal from `driver.info.host`). The page-write oracle
+// below counts bytes written to the file and its journal over the reader's cycle.
+const WEB = arg("web", "off") === "on";
+const PAGE_SIZE = 65536;
+const ioBytes = () => {
+  const text = readFileSync("/proc/self/io", "utf8");
+  const pick = (k: string) => Number(new RegExp(`${k}: (\\d+)`).exec(text)![1]);
+  return { read: pick("rchar"), written: pick("wchar") };
+};
 // A directory: write a main-thread CPU profile of each reader cycle there.
 const PROF = arg("prof", "");
 // A reader's GET takes this long (a store's latency), so GET and apply can overlap.
@@ -130,6 +143,11 @@ function makeDeps(
         const t = performance.now();
         const v = store.get(key) ?? null;
         timing?.add("blob_get", performance.now() - t);
+        if (timing) {
+          if (timing.marks["first_blob_get_done"] === undefined)
+            timing.mark("first_blob_get_done");
+          timing.mark("last_blob_get_done");
+        }
         return v;
       },
       exists: async (key) => store.has(key),
@@ -156,6 +174,7 @@ function makeDeps(
     newOp: () => `${deviceId}-${++op}`,
     ...(NODE_CRYPTO ? { streamCrypto: nodeStreamCrypto } : {}),
     ...(PROGRESSIVE && timing ? { progressiveFirstLoad: true } : {}),
+    ...(KEYED ? {} : { keyedFirstLoad: false }),
   } as LocalSyncDeps;
 }
 
@@ -163,7 +182,7 @@ class Timing {
   t0 = performance.now();
   marks: Record<string, string> = {};
   mark(k: string) {
-    this.marks[k] = `${((performance.now() - this.t0) / 1000).toFixed(1)}s`;
+    this.marks[k] = `${((performance.now() - this.t0) / 1000).toFixed(2)}s`;
   }
   gets = 0;
   maxGets = 0;
@@ -177,11 +196,16 @@ class Timing {
     this.total.set(k, (this.total.get(k) ?? 0) + ms);
     this.count.set(k, (this.count.get(k) ?? 0) + 1);
   }
+  maxima = new Map<string, number>();
+  max(k: string, v: number) {
+    this.maxima.set(k, Math.max(this.maxima.get(k) ?? 0, v));
+  }
   report() {
     const out: Record<string, string> = {
       max_gets_in_flight: String(this.maxGets),
       ...this.marks,
     };
+    for (const [k, v] of this.maxima) out[k] = v.toFixed(0);
     for (const [k, v] of this.total)
       out[k] = `${(v / 1000).toFixed(2)}s over ${this.count.get(k)} calls`;
     return out;
@@ -209,9 +233,19 @@ function instrument(
     }
     if (capture) capture.write(JSON.stringify({ statements }) + "\n");
     const t = performance.now();
+    const w0 = ioBytes().written;
     const r = await batch(statements);
     const ms = performance.now() - t;
+    const kind = statements.some((st) =>
+      st.sql.includes("INSERT INTO log_stage_"),
+    )
+      ? "stage"
+      : statements.some((st) => st.sql.includes("INSERT INTO temp.incoming"))
+        ? "apply"
+        : "other";
+    timing.add(`pages(${kind})`, ((ioBytes().written - w0) / PAGE_SIZE) * 1000);
     timing.add("db.batch", ms);
+    timing.max("db.batch.max_ms", ms);
     const big = statements.length > 50 ? "db.batch(big)" : "db.batch(small)";
     timing.add(big, ms);
     timing.add("statements", statements.length);
@@ -312,6 +346,13 @@ for (let r = 0; r < READERS; r++) {
   for (const s of ["", "-wal", "-shm", ".lock"])
     rmSync(path + s, { force: true });
   const raw = openBetterSqlite3(path);
+  if (WEB) {
+    await raw.query(`PRAGMA page_size = ${PAGE_SIZE}`);
+    await raw.query("PRAGMA temp_store = MEMORY");
+    Object.defineProperty(raw, "info", {
+      value: { ...raw.info, host: "web" },
+    });
+  }
   const timing = new Timing();
   const cap = CAPTURE && r === 0 ? createWriteStream(CAPTURE) : undefined;
   instrument(raw, timing, cap);
@@ -358,9 +399,47 @@ for (let r = 0; r < READERS; r++) {
     await session.post("Profiler.start");
   }
   timing.t0 = performance.now();
+  const io0 = ioBytes();
   const t0 = performance.now();
+  // What a user sees first: the source in the owner's listing, and the first
+  // stored row. Polled on the same thread as the load, as a page would be.
+  const listing = createLocalListing(deps as never);
+  let polling = true;
+  const poll = (async () => {
+    let listed = false;
+    let row = false;
+    while (polling && !(listed && row)) {
+      if (!listed) {
+        const scopes = await listing.listScopes({
+          canRead: () => true,
+          includeLoading: true,
+        });
+        if (scopes.length > 0) {
+          listed = true;
+          timing.mark("listed_at");
+        }
+      }
+      if (!row) {
+        const [{ n }] = await db.query<{ n: number }>(
+          "SELECT EXISTS(SELECT 1 FROM records) AS n",
+        );
+        if (n === 1) {
+          row = true;
+          timing.mark("first_row_at");
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  })();
   const report = await sync.cycle();
   const wall = (performance.now() - t0) / 1000;
+  timing.mark("cycle_done_at");
+  polling = false;
+  await poll;
+  const io1 = ioBytes();
+  console.log(
+    `[reader ${r}] io: page_writes=${Math.round((io1.written - io0.written) / PAGE_SIZE)} page_reads=${Math.round((io1.read - io0.read) / PAGE_SIZE)} (bytes written ${((io1.written - io0.written) / 1e6).toFixed(0)} MB, read ${((io1.read - io0.read) / 1e6).toFixed(0)} MB; page size ${PAGE_SIZE})`,
+  );
   if (session) {
     const { profile } = await session.post("Profiler.stop");
     mkdirSync(PROF, { recursive: true });
@@ -386,8 +465,9 @@ for (let r = 0; r < READERS; r++) {
     timing.report(),
   );
   await db.close();
-  for (const s of ["", "-wal", "-shm", ".lock"])
-    rmSync(path + s, { force: true });
+  if (arg("keep", "off") !== "on")
+    for (const s of ["", "-wal", "-shm", ".lock"])
+      rmSync(path + s, { force: true });
 }
 results.sort((a, b) => a - b);
 console.log(

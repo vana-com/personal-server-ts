@@ -8,13 +8,13 @@
 // state.
 //
 // The rule these tests hold to: a row is shown only if the finished log keeps
-// it. A segment is applied only after every later segment is fetched, so a key
-// that a later segment deletes or omits is never shown, at any point.
+// it. The segments that delete or omit a key are read before the first apply
+// (the head's refs say which), so a key that a later segment deletes or omits is
+// never shown, at any point. `streaming-first-load.test.ts` holds the timing:
+// listed before a segment is fetched, first rows before the last one is.
 //
-// The devices turn the key-ordered first load off (`keyedFirstLoad: false`):
-// with a budget of one segment, a first load would otherwise load key by key
-// (`planKeyedLoad`) and show nothing until it ends. These tests hold the
-// segment-by-segment pass that a load the key-ordered plan declines takes.
+// The devices set `keyedFirstLoad: false`, which a progressive host no longer
+// needs: it loads segment by segment whatever its budget.
 import { afterEach, describe, expect, it } from "vitest";
 import {
   logScope,
@@ -849,7 +849,7 @@ describe("progressive first load, batches committed together", () => {
     return { w, x, y, z };
   }
 
-  it("a stream is complete when its own last batch commits, not when the group that holds it would", async () => {
+  it("every stream of the connection finishes in the pass's last commit, and is listed as partial from the first", async () => {
     const { w, x, y, z } = await threeStreams();
     const b = await w.device("b", {
       progressiveFirstLoad: true,
@@ -863,7 +863,7 @@ describe("progressive first load, batches committed together", () => {
         last: positions.at(-1)!,
         partial: (
           await b.db.query<{ stream: string }>(
-            "SELECT stream FROM stream_partial",
+            "SELECT stream FROM stream_partial ORDER BY stream",
           )
         ).map((r) => r.stream),
         complete: (
@@ -875,25 +875,26 @@ describe("progressive first load, batches committed together", () => {
     });
     await applyConnection(b.deps, CONNECTION_ID);
     expect(commits.flat()).toEqual([1, 2, 3, 4, 5]);
-    // x's last batch is position 3: a commit ends there, and x is complete in
-    // it while y is still partial. z, one batch, is never partial.
-    const atThree = states.find((s) => s.last === 3);
-    expect(atThree, `commits ${JSON.stringify(commits)}`).toBeDefined();
-    expect(atThree!.complete).toContain(x);
-    expect(atThree!.partial).toEqual([y]);
-    for (const s of states) expect(s.partial).not.toContain(z);
+    // Which segment holds a stream's last batch is not known before the
+    // segments are read, so no stream is complete before the pass's last commit
+    // and every stream the head names is partial until then.
+    const before = states.slice(0, -1);
+    expect(before.length).toBeGreaterThan(0);
+    // The head names y and the first batch names x: both are listed from the
+    // first commit. z is listed with the batch that first names it.
+    expect(before[0]!.partial).toEqual([x, y].sort());
+    for (const s of before) expect(s.complete).toEqual([]);
     expect(states.at(-1)!.partial).toEqual([]);
+    expect(states.at(-1)!.complete.sort()).toEqual([x, y, z].sort());
   });
 
-  it("a batch that is missing anywhere in the tail stops the load before any batch is applied, as a one-batch-at-a-time load does", async () => {
-    const { w } = await threeStreams();
+  it("a batch that is missing in the tail stops the load at the batch before it, marks the streams unfinished, and a retry ends right", async () => {
+    const { w, x, y, z } = await threeStreams();
     const keys = await w.segmentKeys();
     const missing = keys.get(4)!;
     const bytes = (await w.innerBlobs.get(missing))!;
     await w.innerBlobs.delete(missing);
 
-    const one = await reference(w);
-    await expect(applyConnection(one.deps, CONNECTION_ID)).rejects.toThrow();
     const grouped = await w.device("grouped", {
       progressiveFirstLoad: true,
       keyedFirstLoad: false,
@@ -902,57 +903,55 @@ describe("progressive first load, batches committed together", () => {
     await expect(
       applyConnection(grouped.deps, CONNECTION_ID),
     ).rejects.toThrow();
-    // Every tail segment is fetched before the first apply: no new prefix.
-    expect(await grouped.position()).toBe(0);
-    expect(await count(grouped, "records")).toBe(0);
-    expect(await dump(grouped)).toEqual(await dump(one));
+    // Segments are read as the apply reaches them: the prefix before the
+    // missing one is kept, the missing one and the ones after it are not.
+    expect(await grouped.position()).toBeLessThan(4);
+    const complete = await grouped.db.query<{ stream: string }>(
+      "SELECT stream FROM stream_state WHERE complete = 1",
+    );
+    expect(complete).toEqual([]);
+    const marked = await grouped.db.query<{ stream: string; failed: number }>(
+      "SELECT stream, failed FROM stream_partial ORDER BY stream",
+    );
+    expect(marked).toEqual(
+      [x, y, z].sort().map((stream) => ({ stream, failed: 1 })),
+    );
 
     await w.innerBlobs.put(missing, bytes);
     await applyConnection(grouped.deps, CONNECTION_ID);
     expect(await grouped.position()).toBe(5);
     expect(await count(grouped, "stream_partial")).toBe(0);
+    const whole = await reference(w);
+    await applyConnection(whole.deps, CONNECTION_ID);
+    expect(await dump(grouped)).toEqual(await dump(whole));
   });
 
-  it("a commit that fails after a stream finished leaves that stream finished and unmarked, and marks the one that stopped, as a one-batch-at-a-time load does", async () => {
+  it("a commit that fails keeps the commits before it, marks every stream unfinished, and a retry ends where an uninterrupted load ends", async () => {
     const { w, x, y } = await threeStreams();
-    // One at a time, the fourth commit is position 4. Together, the third is
-    // positions 4 and 5: the second ended at position 3, where x finishes.
-    const one = await reference(w);
-    afterCommits(one, async () => undefined, { failCommit: 4 });
-    await expect(applyConnection(one.deps, CONNECTION_ID)).rejects.toThrow(
-      "injected",
-    );
     const grouped = await w.device("grouped", {
       progressiveFirstLoad: true,
       keyedFirstLoad: false,
     });
     await connect(grouped);
     const commits = afterCommits(grouped, async () => undefined, {
-      failCommit: 3,
+      failCommit: 2,
     });
     await expect(applyConnection(grouped.deps, CONNECTION_ID)).rejects.toThrow(
       "injected",
     );
-
-    expect(commits.at(-1)!.at(-1)).toBe(3);
-    expect(await grouped.position()).toBe(3);
-    expect(await dump(grouped)).toEqual(await dump(one));
-    // x finished and is not marked; y stopped short and is.
-    const rows = await grouped.db.query<{
-      stream: string;
-      failed: number;
-      parts_applied: number;
-      parts_total: number;
-    }>("SELECT stream, failed, parts_applied, parts_total FROM stream_partial");
-    expect(rows).toEqual([
-      { stream: y, failed: 1, parts_applied: 1, parts_total: 3 },
-    ]);
+    expect(commits).toEqual([[1]]);
+    expect(await grouped.position()).toBe(1);
     const complete = await grouped.db.query<{ stream: string }>(
       "SELECT stream FROM stream_state WHERE complete = 1",
     );
-    expect(complete.map((r) => r.stream)).toContain(x);
+    expect(complete).toEqual([]);
+    const rows = await grouped.db.query<{ stream: string; failed: number }>(
+      "SELECT stream, failed FROM stream_partial ORDER BY stream",
+    );
+    expect(rows).toEqual(
+      [x, y].sort().map((stream) => ({ stream, failed: 1 })),
+    );
 
-    // Resumed, the load ends where an uninterrupted one ends.
     await applyConnection(grouped.deps, CONNECTION_ID);
     const whole = await reference(w);
     await applyConnection(whole.deps, CONNECTION_ID);

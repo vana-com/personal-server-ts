@@ -691,3 +691,39 @@ Run on 2026-11-16, TLC 2.19 (`tla2tools.jar` 1.7.4, Java 17), `-workers 4`.
 Traces: `traces/head-cursor-*.txt`. The two mutants show that both halves of the
 fix are needed: the cursor (skip by consumption) and the replay (a head applied
 over log rows can drop them).
+
+## Progressive first load shows only rows the finished log keeps (`PartialView.tla`, host run, 2026-11-17)
+
+A progressive first load applies the segments of a log tail in position order
+and shows the rows of the applied prefix. Row 3b of the stream-sync plan starts
+that load from the first downloaded segment, so the reader cannot know, at that
+point, what the later segments hold. The head's refs carry one fact per segment,
+`removes`: whether the segment holds a delete or an omission. The reader reads
+the segments that say they remove first, before it applies a batch, and hides
+the keys they remove until its last batch commits. The segments that remove
+nothing arrive in any order while the batches apply.
+
+The model chooses a corpus of `N = 3` segments, each any set of
+`{k1, k2} x {up, del}` operations, and which segments the head says remove.
+`Exact`: every row the view shows is in the finished fold, at every step.
+`Complete`: after the last segment the view is the fold. The stamp is the
+position, later wins, and a delete outranks an upsert inside one segment (the
+log's rank).
+
+| Config                  | Constants                     | Expected                                                         | TLC result                                         |
+| ----------------------- | ----------------------------- | ---------------------------------------------------------------- | -------------------------------------------------- |
+| `PartialView.cfg`       | `Lie = FALSE`, `Hold = TRUE`  | no error                                                         | no error; 20,480 states generated, 16,384 distinct |
+| `PartialViewLie.cfg`    | `Lie = TRUE`, `Hold = TRUE`   | `Exact` violated: a segment removes but its ref says it does not | `Exact` violated                                   |
+| `PartialViewNoHold.cfg` | `Lie = FALSE`, `Hold = FALSE` | `Exact` violated: the view ignores later removals                | `Exact` violated                                   |
+
+Outcome: as expected. The model holds the head's facts true. The code meets a
+false fact (`removes: false` on a segment that removes) at the moment it stages
+that segment, and then refuses the segment: the load stops and marks its streams
+unfinished instead of finishing. Rows a load showed before it reached that
+segment stay shown until a retry ends (the writer is the owner's own device, so
+a false fact is a writer bug, not an attack). A ref with no `removes` field
+(a log written before the fact existed) counts as removing, so such a log is
+read in full before its first apply, as before.
+
+Run: `java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers 2 -config
+PartialView.cfg PartialView` (and the other two configs), with `nice -n 19`.

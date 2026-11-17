@@ -291,6 +291,18 @@ export interface LogCompletion {
 
 export type LogOperation = LogUpsert | LogDelete | LogCompletion;
 
+/**
+ * Whether a segment's operations remove a key: an explicit delete, or a
+ * completion that omits at least one. This is the fact a ref carries as
+ * `removes`.
+ */
+export function segmentRemoves(operations: readonly WireOperation[]): boolean {
+  return operations.some(
+    (op) =>
+      op.kind === "delete" || (op.kind === "complete" && op.omitted.length > 0),
+  );
+}
+
 /** What the stream's head said, carried with the batch that touched the stream. */
 export interface LogStreamMeta {
   readonly stream: string;
@@ -306,6 +318,15 @@ export interface SegmentRef {
   readonly dataHash: `0x${string}`;
   /** Encrypted length is not known to a reader; this is the CLEAR length. */
   readonly bytes: number;
+  /**
+   * Whether the segment deletes or omits any key (`segmentRemoves`). A reader
+   * that applies a log while it still downloads reads the segments that say
+   * `true` first: the keys they remove are the rows it keeps out of its view
+   * until the log's end. A ref without the fact (a log an older writer made)
+   * counts as removing, so that reader falls back to reading every segment
+   * first. A segment that says `false` and removes a key is invalid.
+   */
+  readonly removes?: boolean;
 }
 
 /** One snapshot part, as the head names it. */
@@ -818,6 +839,7 @@ const SEGMENT_FIELDS = [
   "streams",
 ];
 const REF_FIELDS = ["bytes", "dataHash", "position"];
+const REF_FIELDS_WITH_REMOVES = ["bytes", "dataHash", "position", "removes"];
 const META_FIELDS = ["complete", "primaryKey", "profile", "stream"];
 const UPSERT_FIELDS = ["f", "k", "o", "p", "r", "s", "v"];
 /** An upsert of a run's later intake batch also carries its ordinal `n` (>= 1). */
@@ -860,8 +882,13 @@ const isStamp = (o: unknown, r: unknown): boolean =>
   isCount(o, 0) && typeof r === "string" && r !== "";
 
 function refProblem(ref: unknown, at: string): string | null {
-  if (!isPlainObject(ref) || !exactKeys(ref, REF_FIELDS))
-    return `${at} must have exactly ${REF_FIELDS.join(", ")}`;
+  if (
+    !isPlainObject(ref) ||
+    !(exactKeys(ref, REF_FIELDS) || exactKeys(ref, REF_FIELDS_WITH_REMOVES))
+  )
+    return `${at} must have exactly ${REF_FIELDS.join(", ")}, and may have removes`;
+  if ("removes" in ref && typeof ref["removes"] !== "boolean")
+    return `${at} removes must be a boolean`;
   if (!isCount(ref["position"], 1)) return `${at} position must be >= 1`;
   if (
     typeof ref["dataHash"] !== "string" ||
@@ -1139,6 +1166,7 @@ function toWire(segment: WireSegment): Record<string, unknown> {
       bytes: r.bytes,
       dataHash: r.dataHash,
       position: r.position,
+      ...(r.removes === undefined ? {} : { removes: r.removes }),
     })),
     snapshot: segment.snapshot
       ? {
