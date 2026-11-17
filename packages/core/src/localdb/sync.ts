@@ -1,3 +1,8 @@
+import type {
+  DeltaApplyResult,
+  RegistryChangeDelta,
+} from "../stream-sync/ports.js";
+import { applyRegistryDelta } from "./delta-apply.js";
 import {
   readBeginReceipt,
   readEndReceipt,
@@ -60,8 +65,14 @@ export interface LocalSync {
   readonly blobs: BlobStore;
   /** `/sync/trigger` and the timer: C.4 order, apply then publish. */
   cycle(): Promise<CycleReport>;
-  /** Apply remote heads without publishing (download hook). */
+  /** Apply remote logs without publishing (download hook). */
   apply(): Promise<void>;
+  /**
+   * Apply a change delta without the cycle's registry reads, or say that a
+   * cycle must run (`applyRegistryDelta`). The host serializes answers and
+   * advances its cursor only after this promise or that cycle completes.
+   */
+  applyDelta(delta: RegistryChangeDelta): Promise<DeltaApplyResult>;
   /** `/sync/file/:id`: apply and publish that connection, then read. */
   syncConnection(
     connectionId: string,
@@ -312,6 +323,11 @@ export function createLocalSync(
     async cycle() {
       await resume();
       return runCycle(deps);
+    },
+    async applyDelta(delta) {
+      if ((await resume()).length > 0)
+        return { outcome: "cycle", reason: "a delete is pending" };
+      return applyRegistryDelta(deps, delta);
     },
     async apply() {
       await resume();

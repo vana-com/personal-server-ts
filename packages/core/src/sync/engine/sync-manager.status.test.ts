@@ -9,6 +9,7 @@ import type { StreamSyncRegistry } from "../../stream-sync/ports.js";
 import type { SyncStatus } from "../types.js";
 import { createRegistryChangeProbe } from "./change-probe.js";
 import { createSyncManager, type SyncManagerOptions } from "./sync-manager.js";
+import { deltaToCycle } from "./local-sync.test-helper.js";
 
 const logger = {
   info: vi.fn(),
@@ -75,7 +76,9 @@ const shape = (events: readonly SyncStatus[]) =>
 
 describe("subscribeStatus", () => {
   it("(a) the first cycle with no data ends with exactly one event that has lastSync set and syncing false", async () => {
-    const manager = build({ localSync: { cycle: async () => {} } });
+    const manager = build({
+      localSync: { cycle: async () => {}, applyDelta: deltaToCycle },
+    });
     manager.start();
     const { events } = heard(manager); // the cycle is already running
     await settle();
@@ -88,7 +91,9 @@ describe("subscribeStatus", () => {
 
   it("(b) a syncing to idle transition emits, and a pull that finds nothing new emits nothing", async () => {
     const held = heldCycle();
-    const manager = build({ localSync: { cycle: held.cycle } });
+    const manager = build({
+      localSync: { cycle: held.cycle, applyDelta: deltaToCycle },
+    });
     manager.start();
     await settle();
     held.end();
@@ -122,7 +127,7 @@ describe("subscribeStatus", () => {
     } as unknown as StreamSyncRegistry;
     const cycle = vi.fn(async () => {});
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: createRegistryChangeProbe(registry, { intervalMs: 5_000 })!,
     });
     manager.start();
@@ -139,7 +144,9 @@ describe("subscribeStatus", () => {
   });
 
   it("(c) a subscriber taken before start hears the first cycle, from start to idle", async () => {
-    const manager = build({ localSync: { cycle: async () => {} } });
+    const manager = build({
+      localSync: { cycle: async () => {}, applyDelta: deltaToCycle },
+    });
     const { events } = heard(manager);
     expect(events).toEqual([]);
     manager.start();
@@ -179,7 +186,7 @@ describe("subscribeStatus", () => {
     };
     const manager = build({
       accountStorageMode,
-      localSync: { cycle: async () => {} },
+      localSync: { cycle: async () => {}, applyDelta: deltaToCycle },
     });
     await manager.trigger();
     const bare = reads;
@@ -198,7 +205,9 @@ describe("subscribeStatus", () => {
   });
 
   it("(d) stop leaves the subscription registered, delivers the stop once, and leaves no timer", async () => {
-    const manager = build({ localSync: { cycle: async () => {} } });
+    const manager = build({
+      localSync: { cycle: async () => {}, applyDelta: deltaToCycle },
+    });
     const { events } = heard(manager);
     manager.start();
     await settle();
@@ -218,7 +227,9 @@ describe("subscribeStatus", () => {
   });
 
   it("(d) pause leaves no timer of its own, and the status reads the same", async () => {
-    const manager = build({ localSync: { cycle: async () => {} } });
+    const manager = build({
+      localSync: { cycle: async () => {}, applyDelta: deltaToCycle },
+    });
     manager.start();
     await settle();
     const timers = vi.getTimerCount();
@@ -232,7 +243,7 @@ describe("subscribeStatus", () => {
 
   it("(d) a listener that calls getStatus on every event and trigger on the first does not loop", async () => {
     const cycle = vi.fn(async () => {});
-    const manager = build({ localSync: { cycle } });
+    const manager = build({ localSync: { cycle, applyDelta: deltaToCycle } });
     let calls = 0;
     let reads = 0;
     manager.subscribeStatus(() => {
@@ -254,7 +265,9 @@ describe("subscribeStatus", () => {
   });
 
   it("a listener that triggers inside the delivery is not nested: its change is delivered after it returns", async () => {
-    const manager = build({ localSync: { cycle: async () => {} } });
+    const manager = build({
+      localSync: { cycle: async () => {}, applyDelta: deltaToCycle },
+    });
     let depth = 0;
     let deepest = 0;
     let calls = 0;
@@ -275,7 +288,9 @@ describe("subscribeStatus", () => {
   });
 
   it("a listener that throws does not stop the others or the manager", async () => {
-    const manager = build({ localSync: { cycle: async () => {} } });
+    const manager = build({
+      localSync: { cycle: async () => {}, applyDelta: deltaToCycle },
+    });
     manager.subscribeStatus(() => {
       throw new Error("listener bug");
     });

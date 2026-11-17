@@ -212,7 +212,70 @@ export interface RegistryChangeAnswer {
   readonly seq: string;
   /** `seq` differs from the cursor the request carried (or it carried none). */
   readonly changed: boolean;
+  /**
+   * What changed after the request's `since`, read in one snapshot at `seq`.
+   * Present on, and only on, a changed answer to a request that sent `since`
+   * (a gateway that cannot read the delta answers `reset`). A changed answer
+   * to such a request without a readable delta fails the request.
+   */
+  readonly delta?: RegistryChangeDelta;
 }
+
+/**
+ * The registry rows that changed in `(since, seq]`, as of one snapshot at
+ * `seq`. The gateway numbers changes in commit order, per owner, with no gap,
+ * so a reader that has applied everything up to `since` and applies these
+ * rows holds the registry as of `seq`.
+ *
+ * `reset`: the gateway cannot say (the cursor is below the records it keeps,
+ * above its counter, or more than one listing page behind): list everything.
+ * `gone`: ids of rows the gateway removed (only a failed registration's
+ * rollback does), which no scope names. `serversChanged`: the owner's server
+ * registrations changed.
+ */
+export type RegistryChangeDelta =
+  | {
+      readonly since: string;
+      readonly seq: string;
+      readonly reset: true;
+    }
+  | {
+      readonly since: string;
+      readonly seq: string;
+      readonly reset: false;
+      readonly rows: readonly {
+        readonly scope: string;
+        readonly read: ControlRead;
+      }[];
+      readonly gone: readonly string[];
+      readonly serversChanged: boolean;
+    };
+
+/**
+ * What applying a change delta did. `cycle`: the delta holds something only a
+ * full cycle handles (a new or reconnected lifetime, an unsupported row or a
+ * deleted log row of a live connection, a row of a connection this device
+ * does not hold, a removed row, a server change, a reset, a partial apply
+ * standing on any connection), or the apply did not reach the delta's
+ * position, or the publisher still has eligible work; nothing is settled and
+ * the caller runs a cycle. `applied`: the device has applied through the
+ * delta's `seq`, run the publisher, and checked its local eligibility queries
+ * for remaining work. A reached version or aggregate receipt is insufficient.
+ */
+export type DeltaApplyResult =
+  | {
+      readonly outcome: "applied";
+      /** Connections whose log moved (a row of this device's own commit does not). */
+      readonly connections: number;
+      /** Connections the delta's control tombstones deleted here. */
+      readonly deleted: number;
+      /** Segment and snapshot GETs, and the time spent in them. */
+      readonly blobGets: number;
+      readonly blobMs: number;
+      /** The whole apply, blob GETs included. */
+      readonly applyMs: number;
+    }
+  | { readonly outcome: "cycle"; readonly reason: string };
 
 export class RegistryRefusedError extends Error {
   constructor(
@@ -296,19 +359,23 @@ export interface StreamSyncRegistry {
   /**
    * One held request: answers when the owner's registry sequence differs from
    * `after` (a cursor from an earlier answer; none asks for the current one),
-   * or after about `waitMs` with `changed: false`. It carries no registry
-   * data, only the owner's sequence, which is a position: it changes whenever
-   * anything a client can see changed. A caller that gets `changed` pulls with
-   * its ordinary reads, and one that gets nothing (a lost answer, a dropped
+   * or after about `waitMs` with `changed: false`. It carries the owner's
+   * sequence, which is a position: it changes whenever anything a client can
+   * see changed. A caller that gets `changed` pulls with its ordinary reads,
+   * or applies the answer's delta when it holds everything up to its `since`,
+   * and one that gets nothing (a lost answer, a dropped
    * connection) is repaired by the next pull. A caller may skip pulls while
    * the same position stands (see `ChangePush`). Throws `ChangeFeedAbsentError`
    * when the gateway has no such route, and any other error on a failed read.
-   * `signal` ends the request.
+   * `signal` ends the request. `since`: the position up to which the caller
+   * holds the registry; a changed answer may then carry the rows changed after
+   * it (`RegistryChangeAnswer.delta`).
    */
   waitForChange?(
     after: string | undefined,
     waitMs: number,
     signal: AbortSignal,
+    since: string | undefined,
   ): Promise<RegistryChangeAnswer>;
 }
 
