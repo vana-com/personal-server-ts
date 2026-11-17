@@ -8,17 +8,20 @@ import { createLocalListing } from "../../../core/src/localdb/listing.js";
 import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
 import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
-import { loadBootstrap } from "../../../core/src/localdb/log-bootstrap.js";
 import {
   pkHash,
-  type Segment,
+  encodeSegment,
+  digestSegment,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { sha256 } from "@noble/hashes/sha2";
+import { keccak_256 } from "@noble/hashes/sha3";
 import { bootstrapSchema } from "../../../core/src/localdb/bootstrap-swap.js";
+import { copyBootstrapRecords } from "../../../core/src/localdb/bootstrap-copy.js";
 import { firstOwnerRow } from "./bench/owner-row.js";
 import {
   CONNECTION_ID,
   CONNECTOR,
+  LOG,
   closeWorldDrivers,
   world,
   sName,
@@ -286,7 +289,21 @@ describe("disk-backed bootstrap swap", () => {
           name,
           await d.db.query(`SELECT * FROM "${name.replaceAll('"', '""')}"`),
         ]);
+      const tempTables = [];
+      for (const { name } of await d.db.query<{ name: string }>(
+        "SELECT name FROM sqlite_temp_master WHERE type='table' ORDER BY name",
+      ))
+        tempTables.push([
+          name,
+          await d.db.query(
+            `SELECT * FROM temp."${name.replaceAll('"', '""')}"`,
+          ),
+        ]);
       return {
+        tempMaster: await d.db.query(
+          "SELECT type,name,tbl_name,sql FROM sqlite_temp_master ORDER BY type,name",
+        ),
+        tempTables,
         master: await d.db.query(
           "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
         ),
@@ -483,9 +500,44 @@ describe("disk-backed bootstrap swap", () => {
       const triggers = await d.db.query(
         "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE type IN ('trigger','index') AND tbl_name='records' ORDER BY type,name",
       );
+      expect(
+        triggers.filter((row) => row.type === "index").map((row) => row.name),
+      ).toEqual([
+        "records_by_first",
+        "records_by_key",
+        "records_by_observation",
+        "records_key",
+        "records_size",
+      ]);
+      expect(
+        triggers
+          .filter(
+            (row) =>
+              row.type === "trigger" &&
+              !String(row.name).startsWith("records_bootstrap_"),
+          )
+          .map((row) => row.name),
+      ).toEqual([
+        "records_ad",
+        "records_ai",
+        "records_au",
+        "records_key_type_conflict",
+        "view_records_ad",
+        "view_records_ai",
+        "view_records_au",
+      ]);
       const realBatch = d.db.batch.bind(d.db);
       let stagingCommits = 0;
       d.db.batch = (statements) => {
+        if (
+          !swap &&
+          statements.some((st) => st.sql === "DROP TABLE bootstrap_records")
+        )
+          expect(
+            statements.filter((st) =>
+              st.sql.startsWith("INSERT INTO records("),
+            ),
+          ).toHaveLength(1);
         if (
           statements.some((st) =>
             st.sql.includes("INSERT INTO bootstrap_segments"),
@@ -554,12 +606,6 @@ describe("disk-backed bootstrap swap", () => {
       const hash = await pkHash(async (bytes) => sha256(bytes), { id: "k" }, [
         "id",
       ]);
-      const meta = {
-        stream: sName(0),
-        primaryKey: ["id"],
-        profile: { key: null, version: null },
-        complete: true,
-      };
       const op = (kind: string, o: number) =>
         kind === "upsert"
           ? {
@@ -577,39 +623,38 @@ describe("disk-backed bootstrap swap", () => {
               stamp: { o, r: "same-writer" },
               key: ["k"],
             };
-      const refs = [1, 2].map((position) => ({
-        position,
-        dataHash: `0x${String(position).repeat(64)}`,
-        bytes: 100,
-        removes: (position === 1 ? test.first : test.second) === "delete",
-      }));
-      const segments = [op(test.first, test.a), op(test.second, test.b)].map(
-        (operation, i) =>
-          ({
-            format: 2,
-            connector: CONNECTOR,
-            ns: "",
-            keyCheck: "",
-            position: i + 1,
-            base: 0,
-            generation: 1,
-            observedAt: 1,
-            streams: [meta],
-            operations: [operation],
-            refs: refs.slice(0, i),
-            snapshot: null,
-          }) as unknown as Segment,
-      );
-      await loadBootstrap({
-        deps: d.deps,
-        connectionId: CONNECTION_ID,
-        generation: 1,
-        base: 0,
-        head: segments[1]!,
-        refs,
-        fetch: async (ref) => segments[ref.position - 1]!,
-        state: { position: 2, base: 0, refs, snapshot: null },
-      });
+      const publisher = await w.device("stamp-publisher");
+      await publisher.run("seed-control", [{ stream: sName(0), id: "seed" }]);
+      await publisher.cycle();
+      const template = (await w.segments()).get(1)!;
+      const metadataHash = w.gateway.versions.get(LOG)!.at(-1)!.metadataHash;
+      const refs: StreamSync.SegmentRef[] = [];
+      for (const [i, operation] of [
+        op(test.first, test.a),
+        op(test.second, test.b),
+      ].entries()) {
+        const segment = {
+          ...template,
+          position: i + 1,
+          operations: [operation],
+          refs: [...refs],
+        } as StreamSync.Segment;
+        const bytes = encodeSegment(segment);
+        const { dataHash, blobName } = await digestSegment(
+          async (b) => keccak_256(b),
+          bytes,
+        );
+        await w.innerBlobs.put(`${LOG}/${blobName}`, bytes);
+        if (i === 0) w.gateway.replaceHead(LOG, { dataHash, metadataHash });
+        else w.gateway.write(LOG, { dataHash, metadataHash });
+        refs.push({
+          position: i + 1,
+          dataHash,
+          bytes: bytes.length,
+          removes: operation.kind === "delete",
+        });
+      }
+      await applyConnection(d.deps, CONNECTION_ID);
       const rows = await d.db.query<{ body: string; stamp_o: number }>(
         "SELECT body,stamp_o FROM records",
       );
@@ -620,6 +665,47 @@ describe("disk-backed bootstrap swap", () => {
       expect(await d.position()).toBe(2);
     },
   );
+
+  it("copies through sorted key pointers and rowid lookups without a body sorter", async () => {
+    const w = await world({ streams: 1 });
+    const d = await connect(w, "copy-plan");
+    const schema = await bootstrapSchema(d.db);
+    await d.db.batch([
+      { sql: schema.table },
+      ...["b", "a"].map((key) => ({
+        sql: "INSERT INTO bootstrap_records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES(?,'s0',?,?,1,'writer',?,'hash')",
+        params: [CONNECTION_ID, key, key, JSON.stringify({ id: key })],
+      })),
+    ]);
+    const statements = await copyBootstrapRecords(d.db, schema, [
+      {
+        connectionId: CONNECTION_ID,
+        stream: "s0",
+        keys: [
+          ["a", 2, 0],
+          ["b", 1, 0],
+        ],
+      },
+    ]);
+    const at = statements.findIndex((st) =>
+      st.sql.startsWith("INSERT INTO records("),
+    );
+    expect(at).toBeGreaterThan(0);
+    await d.db.batch(statements.slice(0, at));
+    const plan = await d.db.query<{ detail: string }>(
+      "EXPLAIN QUERY PLAN " + statements[at]!.sql,
+    );
+    expect(plan.some((row) => row.detail.includes("USE TEMP B-TREE"))).toBe(
+      false,
+    );
+    expect(
+      plan.some((row) => /SEARCH b USING INTEGER PRIMARY KEY/.test(row.detail)),
+    ).toBe(true);
+    await d.db.batch(statements.slice(at));
+    expect(
+      await d.db.query("SELECT pk_hash FROM records ORDER BY rowid"),
+    ).toEqual([{ pk_hash: "a" }, { pk_hash: "b" }]);
+  });
 
   it.each(["view", "trigger", "foreign key"])(
     "refuses a swap with an external %s reference",

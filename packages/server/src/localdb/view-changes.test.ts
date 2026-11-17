@@ -40,6 +40,15 @@ const OWNER = `0x${"11".repeat(20)}` as const;
 const STREAMS = ["s0", "s1"];
 /** A second namespace of one connector: 16 lowercase hex characters. */
 const OTHER_NS = "ffffffffffffffff";
+// These fixtures restore an older on-disk schema before testing migrations.
+const dropBootstrapSchema = [
+  ...["insert", "update", "delete"].map((event) => ({
+    sql: `DROP TRIGGER records_bootstrap_${event}`,
+  })),
+  ...["load", "segments", "deletions", "preview"].map((table) => ({
+    sql: `DROP TABLE bootstrap_${table}`,
+  })),
+];
 const drivers: SqlDriver[] = [];
 afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
@@ -990,6 +999,7 @@ describe("view changes", () => {
     // the per-stream head path and the consumed-head columns, and its version
     // rows had no stream meta.
     await raw.batch([
+      ...dropBootstrapSchema,
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_version" },
@@ -1106,6 +1116,7 @@ describe("view changes", () => {
     );
     expect(MIGRATIONS[metaMigration]).toHaveLength(3);
     await raw.batch([
+      ...dropBootstrapSchema,
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
       // A later migration made the mark of a stream's changes.

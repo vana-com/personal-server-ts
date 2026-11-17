@@ -222,6 +222,16 @@ export function runDriverConformance(
       expect(await objects()).toEqual(
         [
           ...before.objects,
+          ...MIGRATIONS.slice(rebuild + 1)
+            .flat()
+            .filter((sql) =>
+              sql.startsWith("CREATE TRIGGER records_bootstrap_"),
+            )
+            .map((sql) => ({
+              type: "trigger",
+              name: /^CREATE TRIGGER (\w+)/.exec(sql)![1]!,
+              sql: sql.replaceAll("\n", " "),
+            })),
           {
             type: "index",
             name: "records_key",

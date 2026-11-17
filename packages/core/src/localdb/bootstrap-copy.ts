@@ -1,6 +1,7 @@
 import type { SqlReader, SqlStatement } from "./driver.js";
 import type { WinnerGroup } from "./bootstrap-keys.js";
 import type { BootstrapSchema } from "./bootstrap-swap.js";
+import { rowsPerStatement } from "./log-batch.js";
 
 const columns = [
   "connection_id",
@@ -42,6 +43,24 @@ export async function copyBootstrapRecords(
   const statements: SqlStatement[] = secondary.map((index) => ({
     sql: `DROP INDEX "${index.name.replaceAll('"', '""')}"`,
   }));
+  statements.push({
+    sql: `CREATE TEMP TABLE bootstrap_winners(connection_id TEXT NOT NULL,stream TEXT NOT NULL,pk_hash TEXT NOT NULL,row_id INTEGER NOT NULL,
+      PRIMARY KEY(connection_id,stream,pk_hash)) WITHOUT ROWID`,
+  });
+  const size = rowsPerStatement(4);
+  let rows: (string | number)[][] = [];
+  const flush = () => {
+    if (!rows.length) return;
+    statements.push({
+      sql: `INSERT INTO temp.bootstrap_winners VALUES ${rows.map(() => "(?,?,?,?)").join(",")}`,
+      params: rows.flat(),
+    });
+    rows = [];
+  };
+  const fields = columns.slice(3);
+  const update = `UPDATE records SET ${fields.map((field) => `${field}=(SELECT ${field} FROM bootstrap_records WHERE rowid=?)`).join(",")}
+    WHERE connection_id=? AND stream=? AND pk_hash=?
+      AND EXISTS(SELECT 1 FROM bootstrap_records s WHERE s.rowid=? AND (${changed.map((field) => `records.${field} IS NOT s.${field}`).join(" OR ")}))`;
   for (const group of groups)
     for (const [hash, upsert] of group.keys) {
       const identity = [group.connectionId, group.stream, hash];
@@ -52,22 +71,26 @@ export async function copyBootstrapRecords(
             params: identity,
           });
       } else if (preview.has(JSON.stringify(identity))) {
-        const fields = columns.slice(3);
         statements.push({
-          sql: `UPDATE records SET ${fields.map((field) => `${field}=(SELECT ${field} FROM bootstrap_records WHERE rowid=?)`).join(",")}
-        WHERE connection_id=? AND stream=? AND pk_hash=?
-          AND EXISTS(SELECT 1 FROM bootstrap_records s WHERE s.rowid=? AND (${changed.map((field) => `records.${field} IS NOT s.${field}`).join(" OR ")}))`,
+          sql: update,
           params: [...fields.map(() => upsert), ...identity, upsert],
         });
       } else {
-        // Each statement performs one rowid lookup. There is no body sorter and
-        // no body/structured clone in this statement's sole parameter.
-        statements.push({
-          sql: `INSERT INTO records(${columns.join(",")}) SELECT ${columns.join(",")} FROM bootstrap_records WHERE rowid=?`,
-          params: [upsert],
-        });
+        rows.push([...identity, upsert]);
+        if (rows.length === size) flush();
       }
     }
+  flush();
+  // CROSS JOIN fixes the key table as the outer loop. Its PRIMARY KEY supplies
+  // ORDER BY; each inner lookup reads one body by rowid. No body enters a sorter.
+  statements.push(
+    {
+      sql: `INSERT INTO records(${columns.join(",")}) SELECT ${columns.map((column) => `b.${column}`).join(",")}
+      FROM temp.bootstrap_winners w CROSS JOIN bootstrap_records b ON b.rowid=w.row_id
+      ORDER BY w.connection_id,w.stream,w.pk_hash`,
+    },
+    { sql: "DROP TABLE temp.bootstrap_winners" },
+  );
   statements.push(...secondary.map((index) => ({ sql: index.sql })), {
     sql: "DROP TABLE bootstrap_records",
   });
