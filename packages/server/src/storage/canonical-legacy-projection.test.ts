@@ -9,6 +9,7 @@ import {
   type CanonicalLegacyReadStore,
 } from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
 import type { PdppRecordEnvelopeInput } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import { LEGACY_SCOPE_BINDINGS } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 
 const SRC = (name: string) => `https://registry.pdpp.dev/sources/${name}`;
@@ -1401,6 +1402,108 @@ describe("canonical legacy projection over the real SQLite record store", () => 
         ok: false,
         reason: "stream_completion_unknown",
         streams: ["messages"],
+      });
+    });
+
+    it.each([
+      { label: "by default", receipts: false },
+      { label: "when receipts are required", receipts: true },
+    ])(
+      "serves iCloud Notes without a profile stream, with receipts for notes and folders only ($label)",
+      async ({ receipts }) => {
+        const a = connect("conn_a", "icloud-notes");
+        replace("conn_a", "folders", [{ id: "f1", name: "Notes" }], COLLECTED);
+        replace(
+          "conn_a",
+          "notes",
+          [
+            {
+              id: "n1",
+              title: "Grocery list",
+              snippet: "milk",
+              folder_id: "f1",
+              is_pinned: false,
+              created_at: "2026-09-01T00:00:00Z",
+              modified_at: "2026-09-02T00:00:00Z",
+              has_attachments: false,
+              text_content: "milk",
+            },
+          ],
+          COLLECTED,
+        );
+        const read = await readCanonicalLegacyScope({
+          store,
+          scope: "icloud_notes.notes",
+          selection: a,
+          requireCompletionReceipts: receipts,
+        });
+        expect(read).toMatchObject({ ok: true, complete: true });
+        if (!read.ok) return;
+        expect(read.envelope.data).toMatchObject({
+          userName: null,
+          notes: [{ recordName: "n1" }],
+        });
+      },
+    );
+
+    it("moves the iCloud Notes revision when the binding's optional streams change", async () => {
+      const a = connect("conn_a", "icloud-notes");
+      replace("conn_a", "folders", [{ id: "f1", name: "Notes" }], COLLECTED);
+      replace("conn_a", "profile", [{ id: "p1", user_name: "Ada" }], COLLECTED);
+      replace(
+        "conn_a",
+        "notes",
+        [
+          {
+            id: "n1",
+            title: "Grocery list",
+            snippet: "milk",
+            folder_id: "f1",
+            is_pinned: false,
+            created_at: "2026-09-01T00:00:00Z",
+            modified_at: "2026-09-02T00:00:00Z",
+            has_attachments: false,
+            text_content: "milk",
+          },
+        ],
+        COLLECTED,
+      );
+      const binding = LEGACY_SCOPE_BINDINGS.get("icloud_notes.notes")!;
+      const declared = binding.optionalStreams;
+      const read = () =>
+        readCanonicalLegacyScope({
+          store,
+          scope: "icloud_notes.notes",
+          selection: a,
+          requireCompletionReceipts: true,
+        });
+      try {
+        const before = await read();
+        binding.optionalStreams = [];
+        const after = await read();
+        expect(before).toMatchObject({ ok: true });
+        expect(after).toMatchObject({ ok: true });
+        if (!before.ok || !after.ok) return;
+        expect(after.revision).not.toBe(before.revision);
+      } finally {
+        binding.optionalStreams = declared;
+      }
+    });
+
+    it("still requires a receipt for the streams iCloud Notes cannot do without", async () => {
+      const a = connect("conn_a", "icloud-notes");
+      replace("conn_a", "notes", [{ id: "n1", title: "t" }], COLLECTED);
+      expect(
+        await readCanonicalLegacyScope({
+          store,
+          scope: "icloud_notes.notes",
+          selection: a,
+          requireCompletionReceipts: true,
+        }),
+      ).toMatchObject({
+        ok: false,
+        reason: "stream_completion_unknown",
+        streams: ["folders"],
       });
     });
 

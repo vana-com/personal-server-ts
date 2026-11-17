@@ -375,6 +375,7 @@ export async function readCanonicalLegacyScope(
             : MAX_BLOB_READ_BYTES,
           input.requireCompletionReceipts === true,
           input.allowUnprovenEmptyStreams === true,
+          new Set(binding.optionalStreams),
           new Set(binding.ancillaryBlobStreams),
           input.declarations,
         ),
@@ -420,6 +421,7 @@ function collectSnapshot(
   blobByteBudget: number,
   requireCompletionReceipts: boolean,
   allowUnprovenEmptyStreams: boolean,
+  optionalStreams: ReadonlySet<string>,
   ancillaryBlobStreams: ReadonlySet<string>,
   declarations?: Pick<StreamDeclarationRegistry, "forInstance">,
 ): Snapshot | { ok: false; result: CanonicalLegacyReadResult } {
@@ -484,8 +486,11 @@ function collectSnapshot(
   ) {
     return { ok: false, result: unavailable({ reason: "no_synced_data" }) };
   }
+  // A stream the binding serves without needs no receipt: a connection that
+  // never collected it still projects.
   const unprovenStreams = streams.filter(
     (stream) =>
+      !optionalStreams.has(stream) &&
       !completions.has(stream) &&
       (requireCompletionReceipts ||
         (!allowUnprovenEmptyStreams &&
@@ -831,8 +836,16 @@ async function projectSnapshot(
       });
     }
   }
+  // An optional stream the connection never collected is not "fetched".
+  const optional = new Set(binding.optionalStreams);
+  const fetchedStreams = streams.filter(
+    (stream) =>
+      !optional.has(stream) ||
+      completions.has(stream) ||
+      (rowsByStream.get(stream)?.length ?? 0) > 0,
+  );
   const projected = projectPdppRecordsToLegacyPayload(scope, records, {
-    fetchedStreams: streams,
+    fetchedStreams,
     ...(profileKey ? { profileKey } : {}),
     now: collectedAt,
     // Rows of an arrival-ordered scope go in as read. Without proof of that
@@ -1147,6 +1160,7 @@ async function viewRevision(input: {
       declaration: {
         pdppSource: input.binding.pdppSource,
         streams: input.binding.pdppStreams,
+        optionalStreams: input.binding.optionalStreams ?? [],
         primaryKey: input.binding.primaryKey,
         fieldsRead: input.binding.fieldsRead,
         provenance: input.binding.provenance,

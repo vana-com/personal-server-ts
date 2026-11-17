@@ -108,13 +108,15 @@ async function retainClaudeProfile(
   }
 }
 
-function scopeDeclarationCursor(scope: string): string {
+/** The binding facts a cached view or cursor is only good for. */
+export function scopeDeclarationCursor(scope: string): string {
   return JSON.stringify(
     BINDING_PROFILES.flatMap((profile) => [...profile.values()])
       .filter((binding) => binding.scope === scope)
       .map((binding) => ({
         pdppSource: binding.pdppSource,
         pdppStreams: binding.pdppStreams,
+        optionalStreams: binding.optionalStreams ?? [],
         primaryKey: binding.primaryKey,
         fieldsRead: binding.fieldsRead,
         provenance: binding.provenance,
