@@ -21,6 +21,7 @@ import {
   world,
 } from "./log-world.test-utils.js";
 import { requestTrace } from "./request-trace.test-utils.js";
+import { createGatewayStreamSyncRegistry } from "../../../core/src/stream-sync/registry.js";
 
 afterEach(closeWorldDrivers);
 
@@ -146,4 +147,94 @@ describe("log apply: the cycle's listing is a hint", () => {
     ).resolves.toBeUndefined();
     expect(await a.position()).toBe(position);
   });
+});
+
+describe("registry listings: explicit arrival cohorts", () => {
+  function deferred<T>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    const promise = new Promise<T>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  }
+
+  for (const lateCaller of [false, true])
+    it(`held L1 queues one L2 for its cohort${lateCaller ? " and a fresh L3 for a late caller" : ""}`, async () => {
+      const started = Array.from({ length: 3 }, () => deferred<void>());
+      const replies = Array.from({ length: 3 }, () => deferred<Response>());
+      const urls: string[] = [];
+      const registry = createGatewayStreamSyncRegistry({
+        gatewayUrl: "https://gateway.test",
+        ownerAddress: `0x${"11".repeat(20)}`,
+        fetch: ((input: string) => {
+          const index = urls.push(input) - 1;
+          if (!replies[index])
+            return Promise.reject(new Error("unexpected extra listing"));
+          started[index]!.resolve();
+          return replies[index]!.promise;
+        }) as typeof fetch,
+      });
+      const response = (version: number) =>
+        new Response(
+          JSON.stringify({
+            data: {
+              dataPoints: [
+                {
+                  scope: CONNECTION_ID,
+                  expectedVersion: String(version),
+                  dataHash: `0x${"ab".repeat(32)}`,
+                  metadataHash: `0x${"cd".repeat(32)}`,
+                },
+              ],
+            },
+            pagination: { hasMore: false },
+          }),
+          { status: 200 },
+        );
+      const pending: ReturnType<typeof registry.listOwnerRows>[] = [];
+      const list = () => {
+        const promise = registry.listOwnerRows();
+        // Observe rejection immediately, including when an assertion aborts.
+        void promise.catch(() => {});
+        pending.push(promise);
+        return promise;
+      };
+      const versions = async (promise: ReturnType<typeof list>) =>
+        (await promise).map(({ read }) => (read.found ? read.version : null));
+      try {
+        const first = list();
+        await started[0]!.promise;
+        const second = list();
+        const third = list();
+        expect(urls).toHaveLength(1); // L1 remains held; its later callers wait.
+        replies[0]!.resolve(response(1));
+        await started[1]!.promise;
+        expect(await versions(first)).toEqual([1]);
+        expect(urls).toHaveLength(2);
+
+        // L2 has definitely begun. This caller must not receive its snapshot.
+        const late = lateCaller ? list() : undefined;
+        expect(urls).toHaveLength(2); // L3 cannot start until L2 completes.
+        replies[1]!.resolve(response(2));
+        expect(await versions(second)).toEqual([2]);
+        expect(await versions(third)).toEqual([2]);
+        if (late) {
+          await started[2]!.promise;
+          expect(urls).toHaveLength(3);
+          replies[2]!.resolve(response(3));
+          expect(await versions(late)).toEqual([3]);
+        }
+        expect(urls).toHaveLength(lateCaller ? 3 : 2);
+        for (const input of urls) {
+          const url = new URL(input);
+          expect(url.pathname).toBe("/v1/data");
+          expect(url.searchParams.get("includeDeleted")).toBe("true");
+          expect(url.searchParams.has("cursor")).toBe(false);
+        }
+      } finally {
+        // No held fetch or detached rejection survives a failed assertion.
+        replies.forEach((reply, index) => reply.resolve(response(index + 1)));
+        await Promise.allSettled(pending);
+      }
+    });
 });

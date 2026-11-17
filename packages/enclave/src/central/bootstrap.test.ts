@@ -987,7 +987,26 @@ it("close drains pending admission before closing services or returning state ow
     });
   const open = vi.spyOn(fs, "open");
   const mkdir = vi.spyOn(fs, "mkdir");
-  const rename = vi.spyOn(fs, "rename");
+  // Hold the real markUnavailable persistence at its atomic-rename boundary.
+  // Earlier declaration/admission writes must finish normally.
+  let holdPersistence = false;
+  let persistenceEntered!: () => void;
+  let releasePersistence!: () => void;
+  const persistenceStarted = new Promise<void>((resolve) => {
+    persistenceEntered = resolve;
+  });
+  const persistence = new Promise<void>((resolve) => {
+    releasePersistence = resolve;
+  });
+  const { rename: originalRename } =
+    await vi.importActual<typeof fs>("node:fs/promises");
+  const rename = vi.spyOn(fs, "rename").mockImplementation(async (...args) => {
+    if (holdPersistence && args[1] === env.FLEET_STATE_PATH) {
+      persistenceEntered();
+      await persistence;
+    }
+    return originalRename(...args);
+  });
   const logs = vi.spyOn(console, "error").mockImplementation(() => undefined);
   let runtime: Awaited<ReturnType<typeof startFleetCentral>> | undefined;
   let closing: Promise<void> | undefined;
@@ -1022,7 +1041,19 @@ it("close drains pending admission before closing services or returning state ow
     // Decisive mutation oracle: without the in-flight await, close invokes
     // mcp.close synchronously even though admission is still held.
     expect(serviceClose).not.toHaveBeenCalled();
+    holdPersistence = true;
     release(new Response("admission refused", { status: 503 }));
+    await persistenceStarted;
+    // Admission has now failed and markUnavailable has written its temporary
+    // file, but the new directory snapshot has not been renamed into place.
+    expect(resolved).toBe(false);
+    expect(serviceClose).not.toHaveBeenCalled();
+    expect(
+      JSON.parse(await readFile(env.FLEET_STATE_PATH!, "utf8")).nodes[
+        "worker-2"
+      ].unavailable,
+    ).toBe(false);
+    releasePersistence();
     await closing;
     expect(resolved).toBe(true);
     expect(serviceClose).toHaveBeenCalledTimes(1);
@@ -1046,6 +1077,7 @@ it("close drains pending admission before closing services or returning state ow
     expect(await readFile(env.FLEET_STATE_PATH!, "utf8")).toBe(persisted);
   } finally {
     release(new Response("admission refused", { status: 503 }));
+    releasePersistence();
     if (closing) await closing;
     else await runtime?.close();
     start.mockRestore();
