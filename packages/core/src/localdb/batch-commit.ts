@@ -38,6 +38,44 @@ export function batchBounds(
 }
 
 /**
+ * The gateway's `Batch-Policy` has no room for a request the caller cannot
+ * split (a first save's control row and log row commit together). Not a race:
+ * nothing goes until the gateway advertises a larger policy.
+ */
+export class RegistryBatchPolicyTooSmallError extends Error {
+  constructor(
+    readonly policy: RegistryBatchPolicy,
+    readonly rows: number,
+    readonly requires: number,
+  ) {
+    super(
+      `Batch-Policy rows=${policy.rows};requires=${policy.requires} has no room for one request of ${rows} rows and ${requires} conditions`,
+    );
+    this.name = "RegistryBatchPolicyTooSmallError";
+  }
+}
+
+/** Throws when a known policy has no room for a request of this shape. */
+export function checkBatchRoom(
+  policy: RegistryBatchPolicy | undefined,
+  request: {
+    readonly rows: readonly unknown[];
+    readonly requires: readonly unknown[];
+  },
+): void {
+  if (
+    policy !== undefined &&
+    (request.rows.length > policy.rows ||
+      request.requires.length > policy.requires)
+  )
+    throw new RegistryBatchPolicyTooSmallError(
+      policy,
+      request.rows.length,
+      request.requires.length,
+    );
+}
+
+/**
  * The gateway's batch bounds, for a caller that commits only in batches (a
  * connection delete, a log publish). Read once per process. Throws
  * `RegistryBatchRouteMissingError` when the gateway serves no batch contract,

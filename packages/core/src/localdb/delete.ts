@@ -3,9 +3,9 @@
 // the log's lifetimes end with the control row (`log-apply.ts`): a segment of
 // an earlier generation holds nothing of a later one, and every log commit
 // requires the control row active at its generation. So the fence is the
-// whole of a delete on the registry. Per-stream rows that older builds wrote
-// are read by nobody, and the gateway refuses a write to them once the log
-// row exists; the delete leaves them as they are.
+// whole of a delete on the registry. Nothing reads a per-stream row, and the
+// gateway refuses a write to one once the log row exists; the delete writes
+// none.
 //
 // The fences go in one batch request (delete-batch.ts), within the gateway's
 // bounds. A fence the request did not store (it lost a race, or got no
@@ -40,11 +40,7 @@ export class ConnectionDeleteSuperseded extends Error {
   }
 }
 
-/**
- * Persisted byte-for-byte in delete_intents before any registry write. An
- * intent saved by an older build may also hold `streams` and `streamsLanded`;
- * they are ignored.
- */
+/** Persisted byte-for-byte in delete_intents before any registry write. */
 export interface DeleteIntent {
   readonly id?: string;
   /** The version each namespace's control row held when the delete was planned. */

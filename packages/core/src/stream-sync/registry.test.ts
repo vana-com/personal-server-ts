@@ -1191,3 +1191,89 @@ describe("Batch-Policy", () => {
     }
   });
 });
+
+describe("the batch policy read (OPTIONS /v1/data/batch)", () => {
+  const POLICY = "rows=36;requires=2152;bytes=3979801";
+  function gatewayAnsweringPolicy(answers: (() => Response)[]) {
+    let reads = 0;
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test/",
+      ownerAddress: OWNER,
+      fetch: (async (_url: string, init?: RequestInit) => {
+        expect(init?.method).toBe("OPTIONS");
+        const answer = answers[Math.min(reads, answers.length - 1)]!;
+        reads += 1;
+        return answer();
+      }) as typeof fetch,
+    });
+    return { registry, reads: () => reads };
+  }
+  const withPolicy = () =>
+    new Response(null, { status: 204, headers: { "batch-policy": POLICY } });
+
+  it("asks again after an error status, and keeps the policy it then gets", async () => {
+    const { registry, reads } = gatewayAnsweringPolicy([
+      () => new Response("busy", { status: 503 }),
+      withPolicy,
+    ]);
+    await expect(registry.readBatchPolicy!()).rejects.toBeInstanceOf(
+      AmbiguousRegistryReplyError,
+    );
+    const policy = { rows: 36, requires: 2152, bytes: 3_979_801 };
+    await expect(registry.readBatchPolicy!()).resolves.toEqual(policy);
+    await expect(registry.readBatchPolicy!()).resolves.toEqual(policy);
+    expect(reads()).toBe(2);
+  });
+
+  it("asks again after a success without the header", async () => {
+    const { registry, reads } = gatewayAnsweringPolicy([
+      () => new Response(null, { status: 204 }),
+      withPolicy,
+    ]);
+    await expect(registry.readBatchPolicy!()).resolves.toBeUndefined();
+    await expect(registry.readBatchPolicy!()).resolves.toMatchObject({
+      rows: 36,
+    });
+    expect(reads()).toBe(2);
+  });
+
+  it("asks again after no reply", async () => {
+    let reads = 0;
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test/",
+      ownerAddress: OWNER,
+      fetch: (async () => {
+        if (reads++ === 0) throw new TypeError("connection reset");
+        return withPolicy();
+      }) as typeof fetch,
+    });
+    await expect(registry.readBatchPolicy!()).rejects.toBeInstanceOf(
+      AmbiguousRegistryReplyError,
+    );
+    await expect(registry.readBatchPolicy!()).resolves.toMatchObject({
+      rows: 36,
+    });
+  });
+
+  it.each([404, 405])(
+    "keeps a %i (no batch route) for the process's lifetime",
+    async (status) => {
+      const { registry, reads } = gatewayAnsweringPolicy([
+        () => new Response(null, { status }),
+        withPolicy,
+      ]);
+      await expect(registry.readBatchPolicy!()).resolves.toBeUndefined();
+      await expect(registry.readBatchPolicy!()).resolves.toBeUndefined();
+      expect(reads()).toBe(1);
+    },
+  );
+
+  it("shares one request between concurrent callers", async () => {
+    const { registry, reads } = gatewayAnsweringPolicy([withPolicy]);
+    await Promise.all([
+      registry.readBatchPolicy!(),
+      registry.readBatchPolicy!(),
+    ]);
+    expect(reads()).toBe(1);
+  });
+});

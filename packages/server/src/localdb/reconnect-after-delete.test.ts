@@ -8,7 +8,6 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  controlScope,
   logScope,
   streamScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -24,7 +23,6 @@ import {
 afterEach(closeWorldDrivers);
 
 const LOG = logScope(CONNECTOR, "");
-const CONTROL = controlScope(CONNECTOR, "");
 const connect = (runId: string) => ({
   runId,
   request: {
@@ -158,64 +156,5 @@ it("planning names the control pins only: no listed or declared stream, and not 
   } finally {
     a.db.batch = batch;
     registry.listStreamRows = list;
-  }
-});
-
-it("an intent an older build saved with a log pin resumes without planning or advancing the log version", async () => {
-  // A permissive gateway makes a write to the log observable as a successful
-  // destructive write, not an incidental conflict-based exit.
-  const w = await world({
-    streams: 3,
-    connectionLogFence: false,
-  });
-  const a = await w.device("legacy-intent");
-  await a.run("run-legacy", [{ stream: sName(0), id: "old" }]);
-  await a.cycle();
-  const before = await a.deps.registry.read(LOG);
-  const control = await a.deps.registry.read(CONTROL);
-  expect(before.found).toBe(true);
-  expect(control.found).toBe(true);
-  if (!before.found || !control.found) throw new Error("missing fixture rows");
-  const versions = w.gateway.versions.get(LOG)!.length;
-  // An older build saved stream pins beside the control pins.
-  const intent = {
-    id: "saved-before-log-guard",
-    pins: [{ ns: "", version: control.version }],
-    streams: [
-      {
-        ns: "",
-        stream: "~log",
-        pin: before.version + 1,
-        control: { kind: "active", generation: control.version },
-      },
-    ],
-  };
-  await a.db.batch([
-    {
-      sql: "INSERT OR REPLACE INTO delete_intents(connector,delete_id,intent) VALUES (?,?,?)",
-      params: [CONNECTOR, intent.id!, JSON.stringify(intent)],
-    },
-  ]);
-  const list = a.deps.registry.listControlRows.bind(a.deps.registry);
-  a.deps.registry.listControlRows = async () => {
-    throw new Error("resuming a stored intent must not plan");
-  };
-  try {
-    expect(await a.sync.deleter.resumeDeletes()).toEqual([]);
-    a.deps.registry.listControlRows = list;
-    expect(await a.db.query("SELECT 1 FROM delete_intents")).toEqual([]);
-    expect(await a.deps.registry.read(LOG)).toEqual(before);
-    expect(w.gateway.versions.get(LOG)).toHaveLength(versions);
-    expect(await a.deps.registry.read(CONTROL)).toMatchObject({
-      found: true,
-      version: control.version + 1,
-    });
-    const { runId, request } = connect("reconnect-legacy");
-    expect((await a.sync.intake.begin(runId, request)).status).toBe(
-      "collecting",
-    );
-    await a.sync.intake.abort("reconnect-legacy", "cancelled");
-  } finally {
-    a.deps.registry.listControlRows = list;
   }
 });

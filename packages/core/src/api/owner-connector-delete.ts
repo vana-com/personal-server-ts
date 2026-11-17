@@ -33,7 +33,7 @@
  *   409 NOT_SWITCHED            the account has not moved to stream sync
  *   503 ACCOUNT_MODE_UNKNOWN    the storage mode cannot be read yet; retry
  *   503 STREAM_SYNC_UNAVAILABLE no stream-sync writer is wired on this host
- * *
+ *
  * Every refusal has the one error shape of the API, the `ProtocolError`
  * envelope: `{ error: { code, errorCode, message } }`.
  */
