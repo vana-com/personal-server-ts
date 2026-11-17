@@ -1,5 +1,8 @@
 import {
   classifyControl,
+  classifyStreamRow,
+  logScope,
+  segmentBlobName,
   controlHashes,
   controlScope,
   deriveKeyCheck,
@@ -11,6 +14,8 @@ import {
 import { keccakOf } from "../stream-sync/crypto-port.js";
 import type { OwnerRows } from "./bootstrap.js";
 import type { ConnectionQueue, LocalSyncDeps } from "./deps.js";
+import { createApplyMeter } from "./apply-meter.js";
+import { readLogState } from "./log-state.js";
 import { applyLog } from "./log-apply.js";
 import { purgeConnection } from "./purge.js";
 import {
@@ -137,12 +142,45 @@ function launch(
   });
 }
 function runFlight(deps: LocalSyncDeps, id: string, flight: Flight) {
+  const meter = createApplyMeter();
+  const began = performance.now();
+  const measured: LocalSyncDeps = {
+    ...deps,
+    registry: {
+      ...deps.registry,
+      read: (scope) => meter.time("registry", () => deps.registry.read(scope)),
+    },
+    blobs: {
+      ...deps.blobs,
+      get: (key) => meter.time("fetch", () => deps.blobs.get(key)),
+    },
+    keys: {
+      ...deps.keys,
+      decrypt: (scope, cipher) =>
+        meter.time("decrypt", () => deps.keys.decrypt(scope, cipher)),
+    },
+    db: new Proxy(deps.db, {
+      get(target, prop) {
+        if (prop === "batch")
+          return (statements: Parameters<typeof target.batch>[0]) =>
+            meter.time("write", () => target.batch(statements));
+        const member = Reflect.get(target, prop) as unknown;
+        return typeof member === "function" ? member.bind(target) : member;
+      },
+    }),
+  };
   const reuse: Reuse = { partial: false };
-  return runJob(deps, id, flight, reuse).catch((error: unknown) => {
-    throw error instanceof RegistryUnavailableError && !reuse.partial
-      ? new RegistryUnavailableBeforeWriteError(error)
-      : error;
-  });
+  return runJob(measured, id, flight, reuse)
+    .catch((error: unknown) => {
+      throw error instanceof RegistryUnavailableError && !reuse.partial
+        ? new RegistryUnavailableBeforeWriteError(error)
+        : error;
+    })
+    .finally(() => {
+      const timing = meter.report(performance.now() - began);
+      if (timing)
+        deps.logger.info({ connectionId: id, ...timing }, "apply timing");
+    });
 }
 function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
   return deps.queue.run(id, "apply", async () => {
@@ -181,7 +219,11 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
     }
     const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
     const hashes = await controlHashes(keccakOf(deps.streamCrypto), keyCheck);
-    const initial = await control(
+    // The control read admits writes; the log row and encrypted segment can
+    // be fetched beside it. Nothing from that speculative fetch is applied
+    // until control admits this lifetime. Every request settles with the job.
+    const prefetched = new Map<string, Uint8Array | null>();
+    const initialRead = control(
       locked,
       id,
       connection,
@@ -189,22 +231,75 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
       reuse,
       flight.observedControl,
     );
+    const logRead = (async () => {
+      // A listing or delta may already show deletion. In that case wait for
+      // fresh admission rather than fetching bytes that will be discarded.
+      const hint =
+        flight.observedControl ??
+        flight.listed?.find(
+          (row) =>
+            row.scope === controlScope(connection.connector, connection.ns),
+        )?.read;
+      if (
+        hint &&
+        classifyControl(hint, hashes).kind !== "active" &&
+        (await initialRead).kind !== "active"
+      )
+        return { found: false as const };
+      const scope = logScope(connection.connector, connection.ns);
+      const read =
+        (flight.listed && logRowOf(flight.listed, connection)) ??
+        (await deps.registry.read(scope));
+      const local = await readLogState(deps, id);
+      if (
+        read.found &&
+        classifyStreamRow(read, hashes) === "present" &&
+        read.version >= local.position &&
+        !(
+          read.version === local.position &&
+          local.refs.at(-1)?.dataHash.toLowerCase() ===
+            read.dataHash.toLowerCase()
+        )
+      ) {
+        const key = `${scope}/${segmentBlobName(read.dataHash)}`;
+        prefetched.set(key, await deps.blobs.get(key));
+      }
+      return read;
+    })();
+    const [initialResult, logResult] = await Promise.allSettled([
+      initialRead,
+      logRead,
+    ]);
+    if (initialResult.status === "rejected") throw initialResult.reason;
+    const initial = initialResult.value;
     if (initial.kind !== "active") {
-      // A purged connection has nothing left to repair.
       if (initial.kind === "deleted") await clearPartial(deps, id, reuse);
       return;
     }
-    // The connection's data is its log. The cycle's one listing of the owner
-    // says where the log stands when every caller of this flight came with
-    // it; without it `applyLog` reads the log row.
-    await applyLog(locked, id, {
-      connector: connection.connector,
-      ns: connection.ns,
-      generation: initial.generation,
-      keyCheck,
-      hashes,
-      read: flight.listed && logRowOf(flight.listed, connection),
-    });
+    if (logResult.status === "rejected") throw logResult.reason;
+    await applyLog(
+      {
+        ...locked,
+        blobs: {
+          ...locked.blobs,
+          get: (key) => {
+            if (!prefetched.has(key)) return locked.blobs.get(key);
+            const bytes = prefetched.get(key)!;
+            prefetched.delete(key);
+            return Promise.resolve(bytes);
+          },
+        },
+      },
+      id,
+      {
+        connector: connection.connector,
+        ns: connection.ns,
+        generation: initial.generation,
+        keyCheck,
+        hashes,
+        read: logResult.value,
+      },
+    );
     // A pass that ran to its end has applied the log through the position it
     // read, which is what the mark waits for.
     await clearPartial(deps, id, reuse);
