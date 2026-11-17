@@ -278,10 +278,14 @@
     "@opendatalabs/personal-server-ts-stream-sync": "*"
   },
   "peerDependencies": {
-    "vitest": ">=4"
+    "vitest": ">=4",
+    "better-sqlite3": "^12.11.1"
   },
   "peerDependenciesMeta": {
     "vitest": {
+      "optional": true
+    },
+    "better-sqlite3": {
       "optional": true
     }
   }

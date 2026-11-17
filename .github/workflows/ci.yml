@@ -46,5 +46,7 @@ jobs:
           echo "LOCALDB_SQLITE3_CLI=$RUNNER_TEMP/sqlite3-3.22.0" >> "$GITHUB_ENV"
       - run: npm ci
       - run: npm run build
+      - run: node --test scripts/check-dist-imports.test.mjs
+      - run: npm run check:dist
       - run: npm test
       - run: npm run test:e2e

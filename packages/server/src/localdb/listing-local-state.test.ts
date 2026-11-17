@@ -9,7 +9,7 @@ import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { addConnection, addStream } from "./local-state-fixture.js";
-import { referenceListScopes } from "./listing-reference.js";
+import { referenceListScopes } from "./listing-reference.test-utils.js";
 
 const mocked = vi.hoisted(() => ({ apply: vi.fn(async () => []) }));
 // The reference listing applies before it reads; with this no-op it sees the
