@@ -25,6 +25,7 @@ import {
 } from "../../../core/src/stream-sync/ports.js";
 import { remoteFixture } from "./apply-fixture.js";
 import { postStreamDeleteOnly } from "./legacy-delete-fixture.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}`;
@@ -386,11 +387,10 @@ it("L11 publishes an incremental run over a stream tombstone as incomplete and n
     batch: 0,
     records: [{ stream: "items", data: { id: "fresh" } }],
   });
-  await createRunEndStore(f.b.deps).end("incremental", {
-    outcome: "succeeded",
-    coveredStreams: ["items"],
-    lastBatch: 0,
-  });
+  await createRunEndStore(f.b.deps).end(
+    "incremental",
+    endRequest({ lastBatch: 0, live: ["items"] }),
+  );
   expect((await publishConnection(f.b.deps, f.control))[0]?.outcome).toBe(
     "published",
   );

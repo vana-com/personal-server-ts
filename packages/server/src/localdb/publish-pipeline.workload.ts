@@ -4,7 +4,7 @@
 // `rows` records of about `rowBytes` bytes of filler.
 //
 //   npx tsx packages/server/src/localdb/publish-pipeline.workload.ts \
-//     --db ~/.tmp/<dir>/stream.sqlite --rows 198001 --row-bytes 2200 \
+//     --db <work-dir>/stream.sqlite --rows 198001 --row-bytes 2200 \
 //     --put-ms 1200 (--production | --width 16) [--profile]
 //
 // `--production` runs under the store's default policy, whatever commit this is
@@ -30,6 +30,7 @@ import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { publishConnection } from "../../../core/src/localdb/publish.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import { createLocalSync } from "../../../core/src/localdb/sync.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const identity = {
@@ -97,11 +98,10 @@ export async function buildStreamDb(
       }
       await sync.intake.batch("seed", { batch, records });
     }
-    await sync.intake.end("seed", {
-      outcome: "succeeded",
-      coveredStreams: ["items"],
-      lastBatch: batch - 1,
-    });
+    await sync.intake.end(
+      "seed",
+      endRequest({ lastBatch: batch - 1, live: ["items"] }),
+    );
   } finally {
     await db.close();
   }

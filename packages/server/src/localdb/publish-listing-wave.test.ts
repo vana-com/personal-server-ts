@@ -33,6 +33,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { openRegistryView } from "../../../core/src/localdb/registry-view.js";
 import { newUploadWave } from "../../../core/src/localdb/upload-wave.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const OWNER = `0x${"11".repeat(20)}` as const;
@@ -168,15 +169,21 @@ async function world(options: Options) {
         })),
       ),
     });
-    await sync.intake.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: names,
-      lastBatch: 0,
-    });
+    await sync.intake.end(runId, endRequest({ lastBatch: 0, live: names }));
   };
   /** A later partial run that found nothing new in any stream. */
+  /** An incremental run that found nothing new in any stream. */
   const idle = async () => {
     const runId = `run-${++runs}`;
+    // A cursor from an earlier run makes this run incremental: its silent
+    // streams answer "nothing new". This world has no control generation, so
+    // no run end saves one.
+    await db.batch([
+      {
+        sql: "UPDATE connections SET checkpoint = '{}' WHERE connector = ?",
+        params: [CONNECTOR],
+      },
+    ]);
     await sync.intake.begin(runId, {
       connector: CONNECTOR,
       artifactDigest: CONNECTOR,
@@ -184,11 +191,7 @@ async function world(options: Options) {
       owner: { address: OWNER, leaseId: null },
     });
     await sync.intake.batch(runId, { batch: 0, records: [] });
-    await sync.intake.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: names,
-      lastBatch: 0,
-    });
+    await sync.intake.end(runId, endRequest({ lastBatch: 0, streams: names }));
     return runId;
   };
   await collect(1);

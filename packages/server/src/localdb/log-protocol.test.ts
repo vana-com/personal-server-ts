@@ -31,6 +31,7 @@ import {
   recordKeyOfKey,
 } from "../../../core/src/localdb/log-apply.js";
 import { PAGE_BYTES } from "../../../core/src/localdb/encode.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { computeRecordKeyFromData } from "../../../core/src/storage/pdpp-records/record-key.js";
 import {
   applyConnection,
@@ -2276,12 +2277,14 @@ describe("log protocol: a run emits a key again after an interim publish", () =>
       records: records.map((data) => ({ stream, data })),
     });
   const end = (d: Device, lastBatch: number, runId = RUN) =>
-    d.sync.intake.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: [stream],
-      provenFullStreams: [stream],
-      lastBatch,
-    });
+    d.sync.intake.end(
+      runId,
+      endRequest({
+        lastBatch,
+        live: [stream],
+        provenFullStreams: [stream],
+      }),
+    );
   const body = (v: number) => `s0/K={"id":"K","v":${v}}`;
 
   it("converges to the later batch on the writer, a fresh reader and a reader that applied the first body", async () => {
@@ -2571,12 +2574,14 @@ describe("log protocol: first loads of a per-stream head and a log that name one
       records: [{ stream, data: { id: "K", v } }],
     });
   const end = (d: Device, lastBatch: number, run: RunAt = WRITER_RUN) =>
-    d.sync.intake.end(run.runId, {
-      outcome: "succeeded",
-      coveredStreams: [stream],
-      provenFullStreams: [stream],
-      lastBatch,
-    });
+    d.sync.intake.end(
+      run.runId,
+      endRequest({
+        lastBatch,
+        live: [stream],
+        provenFullStreams: [stream],
+      }),
+    );
   const keyOf = async (d: Device) =>
     (await d.rows())
       .map(
@@ -2736,12 +2741,14 @@ describe("log protocol: the ordinal with the log off", () => {
       records: [{ stream, data: { id: "K", v } }],
     });
   const end = (d: Device, lastBatch: number) =>
-    d.sync.intake.end(RUN, {
-      outcome: "succeeded",
-      coveredStreams: [stream],
-      provenFullStreams: [stream],
-      lastBatch,
-    });
+    d.sync.intake.end(
+      RUN,
+      endRequest({
+        lastBatch,
+        live: [stream],
+        provenFullStreams: [stream],
+      }),
+    );
   const keyOf = async (d: Device) =>
     (await d.rows())
       .map(

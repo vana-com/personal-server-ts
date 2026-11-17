@@ -12,6 +12,7 @@ import { listStreamBlobs } from "../../../core/src/localdb/blobs.js";
 import { encodePrefixes } from "../../../core/src/localdb/encode.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import { createMemoryStreamSyncRegistry } from "../../../core/src/stream-sync/memory-registry.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const identity = {
@@ -109,11 +110,10 @@ export async function buildPublishMemoryDb(
       }
       await sync.intake.batch("seed", { batch, records });
     }
-    await sync.intake.end("seed", {
-      outcome: "succeeded",
-      coveredStreams: ["items"],
-      lastBatch: batch - 1,
-    });
+    await sync.intake.end(
+      "seed",
+      endRequest({ lastBatch: batch - 1, live: ["items"] }),
+    );
   } finally {
     await deps.db.close();
   }

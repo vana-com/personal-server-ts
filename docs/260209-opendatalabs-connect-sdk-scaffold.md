@@ -11,7 +11,7 @@ E2e reference: `session-relay/scripts/e2e/test-session-flow.ts` + `utils.ts`
 
 ## Stage 1: Scaffold vana-connect Repository
 
-**Goal**: New repo at `/Users/kahtaf/Documents/workspace_vana/vana-connect` with CI/CD, OSS hygiene, and NPM publishing mirrored from `personal-server-ts`.
+**Goal**: New repo at `<workspace>/vana-connect` with CI/CD, OSS hygiene, and NPM publishing mirrored from `personal-server-ts`.
 
 **Files to create**:
 
@@ -393,7 +393,7 @@ Check `packages/core/src/signing/eip712.ts` — it may already use a configurabl
 ### Unit Tests (vana-connect)
 
 ```bash
-cd /Users/kahtaf/Documents/workspace_vana/vana-connect
+cd <workspace>/vana-connect
 npm test
 ```
 
@@ -412,7 +412,7 @@ SESSION_RELAY_URL=https://session-relay-git-dev-opendatalabs.vercel.app npm run 
 ### Personal Server Tests
 
 ```bash
-cd /Users/kahtaf/Documents/workspace_vana/personal-server-ts
+cd <workspace>/personal-server-ts
 npm test
 ```
 
@@ -422,6 +422,6 @@ npm test
 ### Lint/Format
 
 ```bash
-cd /Users/kahtaf/Documents/workspace_vana/vana-connect
+cd <workspace>/vana-connect
 npm run validate  # lint + format:check + test
 ```

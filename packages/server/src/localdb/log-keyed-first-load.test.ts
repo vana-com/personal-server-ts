@@ -25,6 +25,7 @@ import {
   pendingAdmits,
 } from "../../../core/src/localdb/log-keyed.js";
 import { withOrigin } from "../../../core/src/localdb/merge.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import {
   CONNECTION_ID,
   LOG,
@@ -458,12 +459,10 @@ describe("log first load, key by key: a run that emits a key again at its stamp"
       { id: "twice", v: 2 },
       { id: "later", v: 1, pad: 4_000 },
     ]);
-    await a.sync.intake.end(run, {
-      outcome: "succeeded",
-      coveredStreams: [S0],
-      provenFullStreams: [],
-      lastBatch: 1,
-    });
+    await a.sync.intake.end(
+      run,
+      endRequest({ lastBatch: 1, live: [S0], provenFullStreams: [] }),
+    );
     await a.cycle();
 
     const plain = await connected(w, "plain", { keyedFirstLoad: false });

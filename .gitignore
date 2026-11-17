@@ -29,6 +29,6 @@ packages/server/bin/
 # Rust build output for packages/lite/rust/*
 packages/lite/rust/*/target/
 
-# Python bytecode (it embeds the source path of the machine that built it)
+# Python bytecode
 __pycache__/
 *.pyc

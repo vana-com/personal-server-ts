@@ -24,6 +24,7 @@ import {
   parseBatchPolicy,
   type StreamSyncBlobs,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { createFakeGateway, type FakeGatewayOptions } from "./fake-gateway.js";
 
@@ -142,11 +143,15 @@ async function world(options: Options) {
       batch: 0,
       records: records.map(({ stream, id }) => ({ stream, data: { id } })),
     });
-    await sync.intake.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: covered,
-      lastBatch: 0,
-    });
+    await sync.intake.end(
+      runId,
+      endRequest({
+        lastBatch: 0,
+        streams: names,
+        live: records.map((record) => record.stream),
+        skipped: names.filter((name) => !covered.includes(name)),
+      }),
+    );
   };
   await run(
     "run-1",
@@ -168,8 +173,17 @@ async function world(options: Options) {
     });
   const outcomes = (results: readonly { stream: string; outcome: string }[]) =>
     results.map((r) => [r.stream, r.outcome]);
-  /** A later partial run that found nothing new in any stream. */
+  /** A later incremental run that found nothing new in any stream. */
   const idleRun = async (runId: string) => {
+    // A cursor from an earlier run makes this run incremental: its silent
+    // streams answer "nothing new". This world has no control generation, so
+    // no run end saves one.
+    await db.batch([
+      {
+        sql: "UPDATE connections SET checkpoint = '{}' WHERE connector = ?",
+        params: [CONNECTOR],
+      },
+    ]);
     await sync.intake.begin(runId, {
       connector: CONNECTOR,
       artifactDigest: CONNECTOR,
@@ -177,11 +191,7 @@ async function world(options: Options) {
       owner: { address: OWNER, leaseId: null },
     });
     await sync.intake.batch(runId, { batch: 0, records: [] });
-    await sync.intake.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: names,
-      lastBatch: 0,
-    });
+    await sync.intake.end(runId, endRequest({ lastBatch: 0, streams: names }));
   };
   return {
     idleRun,

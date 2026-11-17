@@ -354,7 +354,7 @@ Not represented: hintApplied (job 1 item c, not done), the transport and
 generation fences of the real gateway, and firstSeen as a wall-clock value.
 
 Expected results were written down before any run, in
-`~/.tmp/job3-scratch/EXPECTED.md` (not committed), and are restated here.
+a local `EXPECTED.md` (not committed), and are restated here.
 
 | Configuration           | Invariant                                  | Expected                                                                     | Actual                                                                                                                    | Distinct states                                      | Depth | Wall time                       |
 | ----------------------- | ------------------------------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- | ----- | ------------------------------- |

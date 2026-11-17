@@ -44,6 +44,7 @@ import { createMockPsLiteGateway } from "./test-support/gateway.js";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
+  endRequest,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
 import {
@@ -596,12 +597,14 @@ describe("createIndexedDbPsLiteRuntime own-write reads", () => {
       batch: 0,
       records: [{ stream: "items", data: { id: "a", v: 1 } }],
     });
-    await context.streamSyncIntake!.end("run-1", {
-      outcome: "succeeded",
-      coveredStreams: ["items"],
-      provenFullStreams: ["items"],
-      lastBatch: 0,
-    });
+    await context.streamSyncIntake!.end(
+      "run-1",
+      endRequest({
+        lastBatch: 0,
+        live: ["items"],
+        provenFullStreams: ["items"],
+      }),
+    );
     await context.localSync!.cycle();
 
     const read = await context.runtime.fetch(
@@ -1031,12 +1034,14 @@ describe("startPersonalServer publication receipts", () => {
       batch: 0,
       records: [{ stream: "items", data: { id: "a" } }],
     });
-    await server.streamSyncIntake!.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: ["items"],
-      provenFullStreams: ["items"],
-      lastBatch: 0,
-    });
+    await server.streamSyncIntake!.end(
+      runId,
+      endRequest({
+        lastBatch: 0,
+        live: ["items"],
+        provenFullStreams: ["items"],
+      }),
+    );
   }
   it("returns both connections' confirmed heads and run coverage, then nothing new", async () => {
     const { options } = await setup();
