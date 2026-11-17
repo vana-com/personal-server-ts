@@ -93,7 +93,6 @@ async function world(
           ],
         };
       },
-      declaredStreams: () => ["items"],
     });
     const begin = (
       id: string,

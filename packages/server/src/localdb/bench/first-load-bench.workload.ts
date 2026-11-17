@@ -242,7 +242,6 @@ mkdirSync(DIR, { recursive: true });
         },
       ],
     }),
-    declaredStreams: () => [STREAM],
   });
   const t0 = performance.now();
   const RUNS = Number(arg("runs", "1"));
@@ -335,7 +334,6 @@ for (let r = 0; r < READERS; r++) {
         },
       ],
     }),
-    declaredStreams: () => [STREAM],
   });
   await db.batch([
     {

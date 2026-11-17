@@ -81,7 +81,6 @@ async function device(
           },
         ],
       }),
-      declaredStreams: () => ["s0"],
     },
   );
   return Object.assign(sync, { db });

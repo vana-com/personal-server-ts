@@ -83,7 +83,6 @@ async function world() {
           },
         ],
       }),
-      declaredStreams: () => ["A"],
     });
     /** One run that observes `rows` in full, then one sync cycle. */
     const refresh = async (

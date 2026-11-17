@@ -8,41 +8,24 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
-import {
-  createModeAuthority,
-  createMemoryModeRecordStore,
-} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
-import {
-  connectionQueue,
-  openLocalDb,
-  type LocalSync,
-  type SqlDriver,
-} from "@opendatalabs/personal-server-ts-core/localdb";
-import {
-  createTestWallet,
-  buildWeb3SignedHeader,
-} from "@opendatalabs/personal-server-ts-core/test-utils";
+import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
+import { buildWeb3SignedHeader } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createStreamDeclarationRegistry } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createMemoryRecordStore } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createFixtureAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
-import { createPsLiteRuntime, createWeb3SignedPsLiteAuth } from "./runtime.js";
 import {
-  createMemoryPsLiteStorage,
-  createMemoryPsLiteTokenStore,
-} from "./test-support/memory.js";
-import { openBetterSqlite3 } from "../../server/src/localdb/better-sqlite3-driver.js";
-import { remoteFixture } from "../../server/src/localdb/apply-fixture.js";
-import { createServerLocalSync } from "../../server/src/localdb/sync.js";
+  closeStores,
+  CONNECTOR,
+  liteGet,
+  liteRuntime,
+  ORIGIN,
+  owner,
+  syncedStore,
+} from "./test-support/records-route.js";
 import { pdppRecordsRoutes } from "../../server/src/routes/pdpp-records.js";
 
-const ORIGIN = "https://ps-lite.local";
-const owner = createTestWallet(7);
-const CONNECTOR = "meta";
 const SOURCE_ID = "https://registry.test/connectors/meta";
-const drivers: SqlDriver[] = [];
-afterEach(async () => {
-  for (const db of drivers.splice(0)) await db.close();
-});
+afterEach(closeStores);
 
 const POSTS = ["p1", "p2", "p3", "p4", "p5"].map((id, index) => ({
   id,
@@ -51,91 +34,12 @@ const POSTS = ["p1", "p2", "p3", "p4", "p5"].map((id, index) => ({
 }));
 
 async function switchedStore(): Promise<LocalSync> {
-  const keys = {
-    namespaceHmac: async () => new Uint8Array(32),
-    encrypt: async (_s: string, b: Uint8Array) => b,
-    encryptPart: async (_s: string, b: Uint8Array) => b,
-    decrypt: async (_s: string, b: Uint8Array) => b,
-  };
-  const remote = await remoteFixture(keys, CONNECTOR);
-  await remote.head("posts", POSTS, {
-    profile: { key: CONNECTOR, version: "1" },
+  const { local } = await syncedStore(async (remote) => {
+    await remote.head("posts", POSTS, {
+      profile: { key: CONNECTOR, version: "1" },
+    });
   });
-  const db = await openLocalDb(openBetterSqlite3(":memory:"), {
-    owner: owner.address,
-    network: "test",
-    deviceId: "lite-records",
-  });
-  drivers.push(db);
-  let op = 0;
-  const local = createServerLocalSync(
-    {
-      db,
-      queue: connectionQueue(),
-      ownerAddress: owner.address,
-      registry: remote.registry,
-      blobs: remote.storage,
-      keys,
-      signer: { signAddData: async () => "0x00" },
-      logger: { info() {}, warn() {} },
-      now: () => 100,
-      newOp: () => String(++op),
-    },
-    {
-      resolveArtifact: () => undefined,
-      declaredStreams: (connector) =>
-        connector === CONNECTOR ? ["posts"] : [],
-    },
-  );
-  await local.apply();
   return local;
-}
-
-async function liteRuntime(local: LocalSync) {
-  const authority = createModeAuthority({
-    store: createMemoryModeRecordStore(),
-  });
-  await authority.ready;
-  await authority.submitEvidence({ owner: owner.address, state: "on" });
-  const accessLogSink = {
-    async write() {},
-    async read() {
-      return { logs: [], total: 0, limit: 50, offset: 0 };
-    },
-  };
-  return createPsLiteRuntime({
-    accountModeAuthority: authority,
-    active: true,
-    storage: createMemoryPsLiteStorage(),
-    accessLogReader: accessLogSink,
-    accessLogWriter: accessLogSink,
-    tokenStore: createMemoryPsLiteTokenStore(),
-    saveConfig: async () => {},
-    stateCapabilities: { config: "memory" },
-    serverOwner: owner.address,
-    localSync: async () => local,
-    auth: createWeb3SignedPsLiteAuth({
-      origin: ORIGIN,
-      ownerAddress: owner.address,
-    }),
-  });
-}
-
-async function liteGet(
-  runtime: Awaited<ReturnType<typeof liteRuntime>>,
-  pathAndQuery: string,
-): Promise<Response> {
-  const auth = await buildWeb3SignedHeader({
-    wallet: owner,
-    aud: ORIGIN,
-    method: "GET",
-    uri: pathAndQuery.split("?")[0]!,
-  });
-  return runtime.fetch(
-    new Request(`${ORIGIN}${pathAndQuery}`, {
-      headers: { Authorization: auth },
-    }),
-  );
 }
 
 /** The Node route over the same store, with an unscoped owner token. */

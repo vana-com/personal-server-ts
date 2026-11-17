@@ -107,7 +107,6 @@ async function world(connectors: number, streamsPer: number) {
         primaryKey: ["id"],
       })),
     }),
-    declaredStreams: () => names,
   });
   let runs = 0;
   for (let c = 0; c < connectors; c++) {

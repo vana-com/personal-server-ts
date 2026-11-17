@@ -43,7 +43,6 @@ export async function databaseReadFixture(connector: string) {
     },
     {
       resolveArtifact: () => undefined,
-      declaredStreams: () => [],
     },
   );
   return { remote, local };

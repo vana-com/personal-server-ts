@@ -800,7 +800,6 @@ describe("run publication state", () => {
       await endRun(world, "r1");
       const sync = createLocalSync(world.deps, {
         resolveArtifact: () => null,
-        declaredStreams: () => [],
       });
       const code = (work: Promise<unknown>) =>
         work.then(

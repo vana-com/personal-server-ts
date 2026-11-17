@@ -98,7 +98,6 @@ async function world(options: {
           },
         ],
       }),
-      declaredStreams: () => ["items"],
     });
     const begin = (id: string, observedAt?: number) => {
       clock++;

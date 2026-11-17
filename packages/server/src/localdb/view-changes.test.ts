@@ -116,7 +116,6 @@ async function device(
         primaryKey: ["id"],
       })),
     }),
-    declaredStreams: () => streams,
   });
   return Object.assign(sync, {
     db,

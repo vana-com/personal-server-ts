@@ -65,7 +65,6 @@ async function world(
             },
           ],
         }),
-        declaredStreams: () => ["items"],
       },
     );
     return {

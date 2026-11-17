@@ -113,7 +113,6 @@ async function world() {
       streamSyncRegistry: registry,
       streamSyncBlobs: blobs,
       streamSyncDeclarations: () => declaration,
-      streamSyncDeclaredStreams: () => ["items"],
       stateStore,
       storage: storage as never,
       ownerSignature: signature,
@@ -152,7 +151,6 @@ async function world() {
     },
     {
       resolveArtifact: () => declaration,
-      declaredStreams: () => ["items"],
     },
   );
   const readerKeys = async () => {

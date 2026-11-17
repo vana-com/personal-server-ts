@@ -89,7 +89,6 @@ async function openDevice(
         coverageStrategy: "full_inventory" as const,
       })),
     }),
-    declaredStreams: () => streams,
   });
   const keys = async (stream = "items") =>
     (await sync.query.listRecords({ connectionId, stream, limit: 100 })).records

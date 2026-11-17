@@ -1,6 +1,7 @@
 // A shared world for log-protocol tests: one fake gateway and one blob store,
 // and any number of devices of one owner, each with its own real SQLite and the
 // real publish and apply drivers (see log-protocol.test.ts).
+import { AsyncLocalStorage } from "node:async_hooks";
 import { keccak_256 } from "@noble/hashes/sha3";
 import type { StreamCryptoPort } from "../../../core/src/stream-sync/crypto-port.js";
 import {
@@ -31,6 +32,7 @@ import {
   DEFAULT_STORAGE_ACCESS_POLICY,
 } from "../../../core/src/stream-sync/storage-retry.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
+import { retainedManifest } from "./apply-fixture.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { createFakeGateway } from "./fake-gateway.js";
 import type { RequestTrace } from "./request-trace.test-utils.js";
@@ -91,6 +93,8 @@ export async function world(options: {
       beforePut?: (key: string) => Promise<void>;
       /** Awaited before a blob is returned: stops an apply where it fetches. */
       beforeGet?: (key: string) => Promise<void>;
+      /** Test-only arrival barrier, before entering the real listing coalescer. */
+      beforeListStreamRows?: (connector: string) => Promise<void>;
       /** A host that serves a first load's applied parts while it fills. */
       progressiveFirstLoad?: boolean;
       /**
@@ -116,28 +120,51 @@ export async function world(options: {
     const puts: string[] = [];
     const gets: string[] = [];
     let op = 0;
+    const logicalCall = new AsyncLocalStorage<string>();
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test",
+      ownerAddress: OWNER,
+      fetch: trace
+        ? (((input: string, init?: RequestInit) => {
+            const url = new URL(input);
+            const method = init?.method ?? "GET";
+            const kind =
+              url.pathname === "/v1/data/batch"
+                ? "batch"
+                : url.pathname === "/v1/data"
+                  ? method === "GET"
+                    ? "list"
+                    : "post"
+                  : "read";
+            const label =
+              kind === "list"
+                ? `${logicalCall.getStore() ?? "unlabelled"} limit=${url.searchParams.get("limit") ?? ""} cursor=${url.searchParams.get("cursor") ?? "<first>"}`
+                : "";
+            return trace.track(kind, label, () => gateway.fetch(input, init));
+          }) as unknown as typeof fetch)
+        : gateway.fetch,
+    });
     const deps: LocalSyncDeps = {
       db,
       queue: connectionQueue(),
-      registry: createGatewayStreamSyncRegistry({
-        gatewayUrl: "https://gateway.test",
-        ownerAddress: OWNER,
-        fetch: trace
-          ? (((input: string, init?: RequestInit) => {
-              const url = new URL(input);
-              const method = init?.method ?? "GET";
-              const kind =
-                url.pathname === "/v1/data/batch"
-                  ? "batch"
-                  : url.pathname === "/v1/data"
-                    ? method === "GET"
-                      ? "list"
-                      : "post"
-                    : "read";
-              return trace.track(kind, "", () => gateway.fetch(input, init));
-            }) as unknown as typeof fetch)
-          : gateway.fetch,
-      }),
+      registry: {
+        ...registry,
+        listControlRows: () =>
+          logicalCall.run("listControlRows", () => registry.listControlRows()),
+        listOwnerRows: () =>
+          logicalCall.run("listOwnerRows", () => registry.listOwnerRows()),
+        listStreamRows: async (connector) => {
+          if (hooks.beforeListStreamRows)
+            await hooks.beforeListStreamRows(connector);
+          return logicalCall.run(`listStreamRows(${connector})`, () =>
+            registry.listStreamRows(connector),
+          );
+        },
+        ...(registry.probeChange && {
+          probeChange: (signal?: AbortSignal) =>
+            logicalCall.run("probeChange", () => registry.probeChange!(signal)),
+        }),
+      },
       blobs: {
         governor:
           hooks.maxBytesInFlight === undefined
@@ -200,7 +227,8 @@ export async function world(options: {
           ...(options.keyTypes ? { keyTypes: options.keyTypes } : {}),
         })),
       }),
-      declaredStreams: () => names,
+      // The host's retained manifest names the streams a delete fences.
+      retainedManifests: () => [retainedManifest(CONNECTOR, names)],
     });
     /** One run that writes `records` and ends covering `covered`. */
     const run = async (

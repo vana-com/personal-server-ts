@@ -70,7 +70,6 @@ async function world() {
             },
           ],
         }),
-        declaredStreams: () => ["items"],
       });
     return { db, sync: reopen(), reopen };
   };

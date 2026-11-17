@@ -114,7 +114,6 @@ describe("local sync intake adapter", () => {
     };
     const sync = createLocalSync(deps, {
       resolveArtifact: () => declaration,
-      declaredStreams: () => ["items"],
       ...aliases,
     });
     return { db, deps, sync };

@@ -165,7 +165,6 @@ async function streamView(): Promise<StreamSyncReadPort> {
     },
     {
       resolveArtifact: () => undefined,
-      declaredStreams: () => ["posts", "post_likes"],
     },
   );
   await local.apply();

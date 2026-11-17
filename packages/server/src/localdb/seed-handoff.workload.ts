@@ -183,7 +183,6 @@ export async function benchHandoff(options: {
           },
         ],
       }),
-      declaredStreams: () => [STREAM],
     });
     const staging = createSeedStaging(
       createFsStreamSyncFiles(join(options.dir, "staging")),

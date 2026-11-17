@@ -48,7 +48,12 @@ export interface LocalSync {
   readonly history: LocalHistory;
   /** What connections here declare: the one source both hosts read it from. */
   readonly declarations: {
-    streamsOf(connector: string): readonly string[];
+    /**
+     * The streams a connector has here: those of its active connections that
+     * are not deleted, read from the synced stream state, so a device that
+     * only synced answers as one that wrote.
+     */
+    streamsOf(connector: string): Promise<readonly string[]>;
     /** Connectors with an active connection in this database. */
     connectors(): Promise<readonly string[]>;
   };
@@ -74,7 +79,6 @@ export function createLocalSync(
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
     readonly resolveArtifact: ResolveArtifact;
-    readonly declaredStreams: (connector: string) => readonly string[];
     readonly retainedManifests?: () => readonly string[];
     readonly eraseLegacy?: (connector: string) => Promise<void>;
     readonly deleting?: (connector: string) => boolean | Promise<boolean>;
@@ -208,7 +212,6 @@ export function createLocalSync(
   const query = createRecordQuery(deps.db);
   const makeDeleter = () =>
     createConnectionDeleter(deps, {
-      declaredStreams: options.declaredStreams,
       ...(options.retainedManifests && {
         retainedManifests: options.retainedManifests,
       }),
@@ -276,7 +279,28 @@ export function createLocalSync(
       aliasTargets: options.aliasTargets,
     }),
     declarations: {
-      streamsOf: options.declaredStreams,
+      streamsOf: async (connector) =>
+        // A stream whose delete floor reaches its head is `tombstoned` for
+        // reads (read-selection.ts), unless a load of a newer head of this
+        // generation has applied parts (`partialReadable`). One with no head
+        // yet and no floor is mid first load.
+        (
+          await readerOf(deps.db).query<{ stream: string }>(
+            `SELECT DISTINCT s.stream FROM stream_state s
+               JOIN connections c ON c.connection_id = s.connection_id
+              WHERE c.connector = ? AND c.control_state = 'active'
+                AND c.deleted_at IS NULL
+                AND (s.last_delete_version = 0
+                     OR s.head_version > s.last_delete_version
+                     OR EXISTS (SELECT 1 FROM stream_partial p
+                                 WHERE p.connection_id = s.connection_id
+                                   AND p.stream = s.stream
+                                   AND p.generation = c.generation
+                                   AND p.version > s.last_delete_version))
+              ORDER BY s.stream`,
+            [connector],
+          )
+        ).map((row) => row.stream),
       connectors: async () =>
         (
           await readerOf(deps.db).query<{ connector: string }>(

@@ -89,7 +89,6 @@ async function fixture() {
       streamSyncRegistry: registry,
       streamSyncBlobs: blobs,
       streamSyncDeclarations: () => declaration,
-      streamSyncDeclaredStreams: () => ["items"],
       streamSyncRetainedManifests: () => [manifest],
       configDefaults: {
         sync: { enabled: false },

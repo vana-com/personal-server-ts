@@ -64,7 +64,6 @@ async function world(seed = true) {
           semantics: "mutable_state",
         })),
       }),
-      declaredStreams: () => ["A", "B"],
     });
     const collect = async (
       id: string,

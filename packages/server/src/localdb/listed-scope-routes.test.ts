@@ -113,7 +113,6 @@ async function switchedFixture() {
       aliasScopes: () => Object.keys(ALIASES),
       aliasTargets: (scope) => ALIASES[scope] ?? [],
       resolveArtifact: () => null,
-      declaredStreams: () => [],
     },
   );
   const deps = {
