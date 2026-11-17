@@ -14,6 +14,7 @@ import {
   type SignedRegistryBatch,
   type StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { deriveKeyCheck } from "@opendatalabs/personal-server-ts-stream-sync";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import { createConnectionDeleter } from "../../../core/src/localdb/delete.js";
@@ -23,8 +24,8 @@ import {
   RegistryRefusedError,
   RegistryUnavailableError,
 } from "../../../core/src/stream-sync/ports.js";
-import { remoteFixture } from "./apply-fixture.js";
-import { postStreamDeleteOnly } from "./legacy-delete-fixture.js";
+import { remoteFixture, retainedManifest } from "./apply-fixture.js";
+import { legacyHeadRow } from "./legacy-head-fixture.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}`;
@@ -45,10 +46,22 @@ async function world(
   };
   const fixture = await remoteFixture(keys);
   const registry = createMemoryStreamSyncRegistry() as MemoryStreamSyncRegistry;
+  // The delete tests start from a gateway without the batch route; the ones
+  // that test the route give it back (`withBatchRoute`).
+  (registry as StreamSyncRegistry).postBatch = undefined;
   const blobs = createMemoryStreamSyncBlobs();
   const heads = [];
   for (const name of names)
-    heads.push(await fixture.head(name, [{ id: "base" }]));
+    heads.push(
+      await legacyHeadRow({
+        ...fixture,
+        keys,
+        keyCheck: await deriveKeyCheck((m) => keys.namespaceHmac(m)),
+        connector: "fixture-source",
+        ns: "",
+        stream: name,
+      }),
+    );
   const h = heads[0]!;
   for (const [key, value] of fixture.blobs) await blobs.put(key, value);
   for (const [scope, row] of fixture.reads)
@@ -87,9 +100,7 @@ async function world(
     };
     await bootstrapConnections(deps);
     await applyConnection(deps, fixture.control);
-    const deleter = createConnectionDeleter(deps, {
-      declaredStreams: () => names,
-    });
+    const deleter = createConnectionDeleter(deps, {});
     devices.push({ db, deps, deleter });
   }
   return {
@@ -184,9 +195,7 @@ it("resumes a saved stream pin after a failed post without losing the intent", a
   expect(JSON.parse(saved!.intent).streams[0].pin).toBe(2);
   expect(await f.a.db.query("SELECT * FROM records")).toEqual([]);
   f.registry.beforePost = undefined;
-  const resumed = createConnectionDeleter(f.a.deps, {
-    declaredStreams: () => [],
-  });
+  const resumed = createConnectionDeleter(f.a.deps, {});
   expect(await resumed.resumeDeletes()).toEqual([]);
   expect(await f.registry.read(f.head.scope)).toMatchObject({ version: 2 });
   expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
@@ -213,7 +222,7 @@ it("resumes a pinned delete even when the old head cannot be read", async () => 
         },
       },
     },
-    { declaredStreams: () => [] },
+    {},
   );
   expect(await resumed.resumeDeletes()).toEqual([]);
   expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
@@ -244,9 +253,16 @@ it("an intent blocks local apply and publish until its landing can finish", asyn
   expect(await f.a.db.query("SELECT control_state FROM connections")).toEqual([
     { control_state: "deleted" },
   ]);
-  const { publishConnection } =
-    await import("../../../core/src/localdb/publish.js");
-  expect((await publishConnection(f.a.deps, f.control))[0]?.outcome).toBe(
+  withBatchRoute(f);
+  await f.a.db.batch([
+    {
+      sql: "INSERT INTO stream_state(connection_id,stream,primary_key,semantics,incremental) VALUES (?,'items','[\"id\"]','mutable_state',0)",
+      params: [f.control],
+    },
+  ]);
+  const { publishLog } =
+    await import("../../../core/src/localdb/log-publish.js");
+  expect((await publishLog(f.a.deps, f.control))?.[0]?.outcome).toBe(
     "deferred",
   );
   f.registry.beforePost = undefined;
@@ -287,10 +303,15 @@ it("a reconnect that wins the fence race is never tombstoned, and the ended life
 
 it("ConnectorNotVerifiedError refuses a pin-only connection before persisting or purging", async () => {
   const f = await world();
+  await f.a.db.batch([
+    { sql: "UPDATE write_ctx SET origin='import'" },
+    {
+      sql: "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,'items',?,'kept',2000,'remote','{}','fixture')",
+      params: [f.control, "e".repeat(64)],
+    },
+  ]);
   f.registry.listStreamRows = async () => [];
-  const store = createConnectionDeleter(f.a.deps, {
-    declaredStreams: () => [],
-  });
+  const store = createConnectionDeleter(f.a.deps, {});
   await expect(
     store.requestConnectionDelete("fixture-source"),
   ).rejects.toMatchObject({ name: "ConnectorNotVerifiedError" });
@@ -318,7 +339,9 @@ it("the second device's unpublished rows are purged along with its imported rows
 it("deletion fences declared rowless streams after the control tombstone", async () => {
   const f = await world();
   const store = createConnectionDeleter(f.a.deps, {
-    declaredStreams: () => ["items", "rowless"],
+    retainedManifests: () => [
+      retainedManifest("fixture-source", ["items", "rowless"]),
+    ],
   });
   await store.requestConnectionDelete("fixture-source");
   expect(await store.resumeDeletes()).toEqual([]);
@@ -332,75 +355,6 @@ it("deletion fences declared rowless streams after the control tombstone", async
     f.head.scope,
     f.control + ".rowless",
   ]);
-});
-
-it("L11 publishes an incremental run over a stream tombstone as incomplete and needs_full", async () => {
-  const f = await world();
-  // A stream delete of the active lifetime with the control row still active.
-  await postStreamDeleteOnly({
-    registry: f.registry,
-    blobs: f.blobs,
-    keys: f.a.deps.keys,
-    owner,
-    connector: "fixture-source",
-    ns: "",
-    stream: "items",
-    scope: f.head.scope,
-    endedGeneration: 1,
-  });
-  await applyConnection(f.b.deps, f.control);
-  await f.b.db.batch([
-    {
-      sql: "UPDATE connections SET checkpoint=?",
-      params: [JSON.stringify({ items: "old-cursor" })],
-    },
-  ]);
-  const { createRunIntakeStore } =
-    await import("../../../core/src/localdb/run-intake.js");
-  const { createRunEndStore } =
-    await import("../../../core/src/localdb/run-end.js");
-  const { publishConnection } =
-    await import("../../../core/src/localdb/publish.js");
-  const intake = createRunIntakeStore(f.b.deps);
-  const req = {
-    connector: "fixture-source",
-    artifactDigest: "fixture",
-    owner: { address: owner, leaseId: null },
-    observedAt: 1000,
-  };
-  const decl = {
-    connector: "fixture-source",
-    version: "1",
-    streams: [
-      {
-        name: "items",
-        semantics: "mutable_state" as const,
-        primaryKey: ["id"],
-      },
-    ],
-  };
-  expect(
-    (await intake.begin("incremental", req, decl)).start.collection_mode,
-  ).toBe("incremental");
-  await intake.batch("incremental", {
-    batch: 0,
-    records: [{ stream: "items", data: { id: "fresh" } }],
-  });
-  await createRunEndStore(f.b.deps).end("incremental", {
-    outcome: "succeeded",
-    coveredStreams: ["items"],
-    lastBatch: 0,
-  });
-  expect((await publishConnection(f.b.deps, f.control))[0]?.outcome).toBe(
-    "published",
-  );
-  expect(
-    await f.b.db.query("SELECT complete,needs_full FROM stream_state"),
-  ).toEqual([{ complete: 0, needs_full: 1 }]);
-  expect(
-    (await intake.begin("full-next", { ...req, observedAt: 1100 }, decl)).start
-      .collection_mode,
-  ).toBe("full_refresh");
 });
 
 it("resumes an intent from a reopened SQLite database after a crash", async () => {
@@ -427,7 +381,7 @@ it("resumes an intent from a reopened SQLite database after a crash", async () =
     f.registry.beforePost = undefined;
     const resumed = createConnectionDeleter(
       { ...f.a.deps, db, queue: connectionQueue() },
-      { declaredStreams: () => [] },
+      {},
     );
     expect(await resumed.resumeDeletes()).toEqual([]);
     expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
@@ -521,9 +475,9 @@ it("an absent registry answer never clears a local-only delete, but explicit con
     await db.query("SELECT generation FROM runs WHERE run_id='offline-run'"),
   ).toEqual([{ generation: null }]);
   registry.beforeRead = undefined;
-  await createConnectionDeleter(deps, {
-    declaredStreams: () => ["items"],
-  }).requestConnectionDelete("fixture-source");
+  await createConnectionDeleter(deps, {}).requestConnectionDelete(
+    "fixture-source",
+  );
   for (const run of ["scheduled-1", "scheduled-2"]) {
     await applyConnection(deps, f.control);
     await bootstrapConnections(deps);
@@ -925,9 +879,7 @@ it("the fence phase is saved with the version it expects, and a restart resumes 
   expect(JSON.parse(saved!.intent).fences).toEqual([{ ns: "", version: 2 }]);
   f.registry.beforePost = undefined;
   const posts = vi.spyOn(f.registry, "post");
-  const restarted = createConnectionDeleter(f.a.deps, {
-    declaredStreams: () => [],
-  });
+  const restarted = createConnectionDeleter(f.a.deps, {});
   expect(await restarted.resumeDeletes()).toEqual([]);
   expect(posts.mock.calls.map(([post]) => post.scope)).toEqual([f.head.scope]);
 });
@@ -950,9 +902,7 @@ it("an intent saved before the fence existed, with its streams landed, finishes 
     },
   ]);
   f.registry.beforePost = undefined;
-  const resumed = createConnectionDeleter(f.a.deps, {
-    declaredStreams: () => [],
-  });
+  const resumed = createConnectionDeleter(f.a.deps, {});
   expect(await resumed.resumeDeletes()).toEqual([]);
   expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
   expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);

@@ -1,10 +1,4 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { keccak_256 } from "@noble/hashes/sha3";
-import {
-  decodeHead,
-  digestHead,
-  encodeHead,
-} from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   connectionQueue,
   openLocalDb,
@@ -35,22 +29,7 @@ async function fixture() {
     decrypt: async (_s: string, b: Uint8Array) => b,
   };
   const remote = await remoteFixture(keys);
-  const h = await remote.head("items", [{ id: "a" }]);
-  const decoded = decodeHead(remote.blobs.get(`${h.scope}/${h.blobName}`)!);
-  if (decoded.kind !== "ok") throw new Error("invalid fixture");
-  const bytes = encodeHead({
-    ...decoded.head,
-    profile: { key: "fixture-source", version: "1" },
-  });
-  const digest = await digestHead(async (b) => keccak_256(b), bytes);
-  remote.blobs.set(`${h.scope}/${digest.blobName}`, bytes);
-  remote.reads.set(h.scope, {
-    found: true,
-    version: 1,
-    dataHash: digest.dataHash,
-    metadataHash: remote.hashes.activeMetadata,
-    deleted: false,
-  });
+  await remote.head("items", [{ id: "a" }]);
   let op = 0;
   const deps: LocalSyncDeps = {
     db,
@@ -66,6 +45,12 @@ async function fixture() {
   };
   await bootstrapConnections(deps);
   await applyConnection(deps, remote.control);
+  // The stream is read as the source's own: its profile names the connector.
+  await db.batch([
+    {
+      sql: "UPDATE stream_state SET profile_key = 'fixture-source', profile_version = '1'",
+    },
+  ]);
   const project = vi.fn(() => ({ ok: true as const, payload: { ok: true } }));
   const aliases = {
     aliasScopes: () => ["fixture.summary"],

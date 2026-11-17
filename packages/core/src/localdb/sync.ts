@@ -27,7 +27,6 @@ import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
 import { createLocalHistory, type LocalHistory } from "./history.js";
 import { createLocalListing, type LocalListing } from "./listing.js";
-import { createOlderVersions, type OlderVersions } from "./older-versions.js";
 import { createRecordQuery, type RecordQuery } from "./query.js";
 import {
   createLocalResolver,
@@ -54,11 +53,15 @@ export interface LocalSync {
   readonly history: LocalHistory;
   /** What connections here declare: the one source both hosts read it from. */
   readonly declarations: {
-    streamsOf(connector: string): readonly string[];
+    /**
+     * The streams a connector has here: those of its active connections that
+     * are not deleted, read from the synced stream state, so a device that
+     * only synced answers as one that wrote.
+     */
+    streamsOf(connector: string): Promise<readonly string[]>;
     /** Connectors with an active connection in this database. */
     connectors(): Promise<readonly string[]>;
   };
-  readonly olderVersions: OlderVersions;
   readonly blobs: BlobStore;
   /** `/sync/trigger` and the timer: C.4 order, apply then publish. */
   cycle(): Promise<CycleReport>;
@@ -87,10 +90,8 @@ export function createLocalSync(
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
     readonly resolveArtifact: ResolveArtifact;
-    readonly declaredStreams: (connector: string) => readonly string[];
     readonly retainedManifests?: () => readonly string[];
     readonly eraseLegacy?: (connector: string) => Promise<void>;
-    readonly olderVersionReads: () => boolean;
     readonly deleting?: (connector: string) => boolean | Promise<boolean>;
     readonly currentLease?: () => string | null;
     /** Waits between resumes of a delete that keeps failing (tests shorten). */
@@ -220,12 +221,8 @@ export function createLocalSync(
     },
   };
   const query = createRecordQuery(deps.db);
-  const olderVersions = createOlderVersions(deps, {
-    enabled: options.olderVersionReads,
-  });
   const makeDeleter = () =>
     createConnectionDeleter(deps, {
-      declaredStreams: options.declaredStreams,
       ...(options.retainedManifests && {
         retainedManifests: options.retainedManifests,
       }),
@@ -281,21 +278,40 @@ export function createLocalSync(
     deleter,
     resolver: createLocalResolver(deps, {
       query,
-      olderVersions,
       aliasScopes: options.aliasScopes,
       aliasTargets: options.aliasTargets,
     }),
-    listing: createLocalListing(listingDeps, () => olderVersions.counts()),
+    listing: createLocalListing(listingDeps),
     query,
     recordsFor: (link) => createLinkedRecordQuery(readerOf(deps.db), link),
     changesFor: (link) => createGrantHistory(readerOf(deps.db), link),
     history: createLocalHistory(deps, {
-      olderVersionReads: options.olderVersionReads,
       aliasScopes: options.aliasScopes,
       aliasTargets: options.aliasTargets,
     }),
     declarations: {
-      streamsOf: options.declaredStreams,
+      streamsOf: async (connector) =>
+        // A stream whose delete floor reaches its head is `tombstoned` for
+        // reads (read-selection.ts), unless a load of a newer head of this
+        // generation has applied parts (`partialReadable`). One with no head
+        // yet and no floor is mid first load.
+        (
+          await readerOf(deps.db).query<{ stream: string }>(
+            `SELECT DISTINCT s.stream FROM stream_state s
+               JOIN connections c ON c.connection_id = s.connection_id
+              WHERE c.connector = ? AND c.control_state = 'active'
+                AND c.deleted_at IS NULL
+                AND (s.last_delete_version = 0
+                     OR s.head_version > s.last_delete_version
+                     OR EXISTS (SELECT 1 FROM stream_partial p
+                                 WHERE p.connection_id = s.connection_id
+                                   AND p.stream = s.stream
+                                   AND p.generation = c.generation
+                                   AND p.version > s.last_delete_version))
+              ORDER BY s.stream`,
+            [connector],
+          )
+        ).map((row) => row.stream),
       connectors: async () =>
         (
           await readerOf(deps.db).query<{ connector: string }>(
@@ -303,7 +319,6 @@ export function createLocalSync(
           )
         ).map((row) => row.connector),
     },
-    olderVersions,
     blobs: createBlobStore(deps),
     async cycle() {
       await resume();

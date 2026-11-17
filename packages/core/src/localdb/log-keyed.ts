@@ -58,13 +58,6 @@
 // one this load made, so each of them raises with the marker kept. The model:
 // `KeyedBucket`, `KeyedPage`, `PendingAdmits`, `NoPending`.
 //
-// A per-stream head admitted while the marker stands may drop rows the load
-// wrote (a full head omits the keys of its stream it did not carry). The marker
-// stays: rows beyond the cursor can remain, and a retry that holds a shorter
-// prefix must still not publish over them. The retry stages the whole log again
-// and the merge is order-insensitive per key, so it ends in the rows of a device
-// that read the head and then the log.
-//
 // The way out. A log that compacted, or was rewritten, after a stopped load has
 // nothing a key-ordered load can finish, and the rows the stopped load left are
 // not told apart from rows of the live log (no per-key record says which
@@ -174,15 +167,19 @@ export function keyedBuckets(
  * Whether this pass loads key by key, and into how many ranges. It does when
  * the device holds nothing of the log's streams (no stream version, so no
  * reader serves a row, and no position) and the log is more than the memory
- * budget can apply in one commit. Not for a progressive load, which shows a
- * stream while it loads (`progressiveFirstLoad`), nor with a snapshot: its
- * parts are key-ordered already and load as they are.
+ * budget can apply in one commit. Not with a snapshot: its parts are
+ * key-ordered already and load as they are.
+ *
+ * A host that shows a stream while it loads (`progressiveFirstLoad`) loads
+ * key by key too. Segment by segment, each commit rewrites most of the table
+ * (see the top of this file): on the Web's OPFS a 198,001-row log took 378 s
+ * that way and 26 s key by key, and the rows the progressive load would show
+ * meanwhile reach no listing, which serves a stream only once its head is
+ * complete. The key-ordered load shows the streams when its last range
+ * commits.
  */
 export async function planKeyedLoad(
-  deps: Pick<
-    LocalSyncDeps,
-    "db" | "blobs" | "progressiveFirstLoad" | "keyedFirstLoad"
-  >,
+  deps: Pick<LocalSyncDeps, "db" | "blobs" | "keyedFirstLoad">,
   connectionId: string,
   local: LogState,
   snapshotPresent: boolean,
@@ -213,7 +210,6 @@ export async function planKeyedLoad(
   }
   if (
     deps.keyedFirstLoad === false ||
-    deps.progressiveFirstLoad === true ||
     snapshotPresent ||
     local.position !== 0 ||
     tail.length < 2

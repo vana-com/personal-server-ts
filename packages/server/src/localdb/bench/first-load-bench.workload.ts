@@ -2,11 +2,14 @@
 // readers (own file DB each) over the same published blobs. Generic synthetic
 // stream, no connector knowledge. Usage:
 //   npx tsx packages/server/src/localdb/bench/first-load-bench.workload.ts \
-//     --rows 198001 --log on --progressive off --readers 3 --get-ms 250 --node-crypto on
-// Run it under `nice -n 19 ionice -c3`. `--dir` holds the databases and is
-// removed afterwards; the default is on disk, since /tmp may be memory.
+//     --rows 198001 --progressive off --readers 3 --get-ms 250 --node-crypto on
+// Run it under `nice -n 19 ionice -c3`. `--dir` holds the databases, which
+// are removed afterwards. The default is a fresh directory under the OS temp
+// directory; pass a disk-backed `--dir` when that is in memory.
 import { keccak_256 } from "@noble/hashes/sha3";
-import { mkdirSync, rmSync, createWriteStream } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, createWriteStream } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { Session } from "node:inspector/promises";
 import { writeFileSync } from "node:fs";
@@ -25,6 +28,7 @@ import {
   createGatewayStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
 } from "../../../../core/src/stream-sync/index.js";
+import { endRequest } from "../../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "../better-sqlite3-driver.js";
 import { createFakeGateway } from "../fake-gateway.js";
 import { createStreamSyncKeyPorts } from "../../../../core/src/stream-sync/crypto.js";
@@ -36,7 +40,6 @@ const arg = (name: string, d: string) => {
   return i < 0 ? d : process.argv[i + 1]!;
 };
 const ROWS = Number(arg("rows", "20000"));
-const LOG = arg("log", "off") === "on";
 const PROGRESSIVE = arg("progressive", "on") === "on";
 const READERS = Number(arg("readers", "1"));
 const ROW_BYTES = Number(arg("rowbytes", "2200"));
@@ -55,7 +58,10 @@ const CAPTURE = arg("capture", "");
 const PROF = arg("prof", "");
 // A reader's GET takes this long (a store's latency), so GET and apply can overlap.
 const GET_MS = Number(arg("get-ms", "0"));
-const DIR = arg("dir", `${process.env.HOME}/.tmp/first-load-bench`);
+// The work directory: the bench writes large SQLite files there. By default a
+// fresh one under the OS temp directory; pass --dir (or set TMPDIR) for a
+// disk-backed one when the temp directory is in memory.
+const DIR = arg("dir", "") || mkdtempSync(join(tmpdir(), "first-load-bench-"));
 const realKeys = REAL_CRYPTO
   ? createStreamSyncKeyPorts(
       `0x${"ab".repeat(64)}1b`,
@@ -149,7 +155,6 @@ function makeDeps(
     now: () => Date.now(),
     newOp: () => `${deviceId}-${++op}`,
     ...(NODE_CRYPTO ? { streamCrypto: nodeStreamCrypto } : {}),
-    ...(LOG ? { logProtocol: true } : {}),
     ...(PROGRESSIVE && timing ? { progressiveFirstLoad: true } : {}),
   } as LocalSyncDeps;
 }
@@ -237,8 +242,6 @@ mkdirSync(DIR, { recursive: true });
         },
       ],
     }),
-    declaredStreams: () => [STREAM],
-    olderVersionReads: () => true,
   });
   const t0 = performance.now();
   const RUNS = Number(arg("runs", "1"));
@@ -277,12 +280,14 @@ mkdirSync(DIR, { recursive: true });
         });
       await sync.intake.batch(runId, { batch: b++, records });
     }
-    await sync.intake.end(runId, {
-      outcome: "succeeded",
-      coveredStreams: [STREAM],
-      lastBatch: b - 1,
-      ...(RUNS === 1 ? { provenFullStreams: [STREAM] } : {}),
-    });
+    await sync.intake.end(
+      runId,
+      endRequest({
+        lastBatch: b - 1,
+        live: [STREAM],
+        ...(RUNS === 1 ? { provenFullStreams: [STREAM] } : {}),
+      }),
+    );
     const tb = performance.now();
     const report = await sync.cycle();
     const err = report.connections.find((c) => c.error !== null);
@@ -295,7 +300,7 @@ mkdirSync(DIR, { recursive: true });
   let bytes = 0;
   for (const v of store.values()) bytes += v.byteLength;
   console.log(
-    `[publisher] rows=${ROWS} intake=${((t1 - t0) / 1000).toFixed(1)}s publish-cycle=${((t2 - t1) / 1000).toFixed(1)}s blobs=${store.size} bytes=${(bytes / 1e6).toFixed(1)}MB log=${LOG}`,
+    `[publisher] rows=${ROWS} intake=${((t1 - t0) / 1000).toFixed(1)}s publish-cycle=${((t2 - t1) / 1000).toFixed(1)}s blobs=${store.size} bytes=${(bytes / 1e6).toFixed(1)}MB`,
   );
   await db.close();
 }
@@ -329,8 +334,6 @@ for (let r = 0; r < READERS; r++) {
         },
       ],
     }),
-    declaredStreams: () => [STREAM],
-    olderVersionReads: () => true,
   });
   await db.batch([
     {
@@ -379,7 +382,7 @@ for (let r = 0; r < READERS; r++) {
   );
   results.push(wall);
   console.log(
-    `[reader ${r}] wall=${wall.toFixed(1)}s records=${n} log=${LOG} progressive=${PROGRESSIVE}`,
+    `[reader ${r}] wall=${wall.toFixed(1)}s records=${n} progressive=${PROGRESSIVE}`,
     timing.report(),
   );
   await db.close();

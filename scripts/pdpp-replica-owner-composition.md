@@ -1,17 +1,17 @@
 # External-owner replica composition
 
-Real connector mode reuses `~/.tmp/replica-owner-composition-B8aUYY/auth.sqlite` and the exact issuer/Personal Server origin `http://127.0.0.1:3286`. An explicit `--root` requires an existing readable authority DB. Real mode also checks that its recorded owner matches the configured owner. No token, grant, retained declaration, or old fixture data is deleted.
+Real connector mode reuses `$WORK_DIR/replica-owner-composition/auth.sqlite` (`WORK_DIR` is a disk-backed work directory of your choice) and the exact issuer/Personal Server origin `http://127.0.0.1:3286`. An explicit `--root` requires an existing readable authority DB. Real mode also checks that its recorded owner matches the configured owner. No token, grant, retained declaration, or old fixture data is deleted.
 
 ```sh
-PATH=/home/tnunamak/.local/lib/qwen-code/node/bin:$PATH TMPDIR=$HOME/.tmp \
+TMPDIR="$WORK_DIR" \
 node --import tsx scripts/pdpp-replica-owner-composition.ts \
-  --root "$HOME/.tmp/replica-owner-composition-B8aUYY" \
+  --root "$WORK_DIR/replica-owner-composition" \
   --owner 0x21674d255a8a6806ba332b4d0b795822ae85a67f \
   --port 3286 \
   --account-origin http://localhost:3084 \
   --client-id odl_app_4e15deb70fdd449b8d09f733 \
   --redirect-uri http://localhost:3284/api/demo/pdpp/callback \
-  --declaration-path "$HOME/.tmp/cutover-handoff/strava-browser-public-0.1.35-1021/collection-profiles/strava-browser/source-declaration.json" \
+  --declaration-path "$WORK_DIR/strava-browser-public-0.1.35/collection-profiles/strava-browser/source-declaration.json" \
   --declaration-sha256 659b0e99f4a4284514c72989881dee56c0d72347f0cc77ddb5cf7fd9aa9851bb \
   --method-id strava-browser \
   --connection-id strava:0x21674d255a8a6806ba332b4d0b795822ae85a67f \
@@ -62,9 +62,9 @@ Owner-signed `POST /v1/grants` uses ordinary Web3Signed proof over the exact bod
 ## Verification and lifecycle
 
 ```sh
-PATH=/home/tnunamak/.local/lib/qwen-code/node/bin:$PATH TMPDIR=$HOME/.tmp \
+TMPDIR="$WORK_DIR" \
 node_modules/.bin/vitest run scripts/pdpp-replica-owner-composition.test.ts
-PATH=/home/tnunamak/.local/lib/qwen-code/node/bin:$PATH TMPDIR=$HOME/.tmp \
+TMPDIR="$WORK_DIR" \
 node_modules/.bin/tsc -p scripts/tsconfig.json --pretty false
 ```
 

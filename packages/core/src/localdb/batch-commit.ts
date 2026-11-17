@@ -38,108 +38,16 @@ export const GATEWAY_MAX_BATCH_REQUIRES = 16;
 export function batchBounds(registry: LocalSyncDeps["registry"]): {
   readonly rows: number;
   readonly requires: number;
+  /** See `RegistryBatchPolicy.lockedScopes`; absent when the gateway sends none. */
+  readonly lockedScopes?: number;
 } {
   const policy = registry.batchPolicy?.();
   return {
     rows: policy?.rows ?? GATEWAY_MAX_BATCH_ROWS,
     requires: policy?.requires ?? GATEWAY_MAX_BATCH_REQUIRES,
-  };
-}
-
-export interface CommitGroup<E, R> {
-  /** Resolves when the entry's commit turn ends; rejects if the turn failed. */
-  submit(entry: E): Promise<R>;
-}
-
-/**
- * `runInSlot` runs `work` in one slot turn of the connection and may throw
- * before it starts (a purge stopped the run). `flush` receives the entries that
- * waited and returns one settled result per entry, in the same order; a throw
- * from `flush` fails every entry of that turn.
- */
-export function createCommitGroup<E, R>(options: {
-  readonly runInSlot: <T>(
-    work: (held: LocalSyncDeps) => Promise<T>,
-  ) => Promise<T>;
-  readonly flush: (
-    held: LocalSyncDeps,
-    entries: readonly E[],
-  ) => Promise<readonly PromiseSettledResult<R>[]>;
-  /**
-   * Whether `next` fits in the turn that already holds `taken`. The first
-   * entry always fits. By default a turn holds `GATEWAY_MAX_BATCH_ROWS`.
-   */
-  readonly canJoin?: (taken: readonly E[], next: E) => boolean;
-}): CommitGroup<E, R> {
-  const canJoin =
-    options.canJoin ??
-    ((taken: readonly E[]) => taken.length < GATEWAY_MAX_BATCH_ROWS);
-  type Waiting = {
-    readonly entry: E;
-    readonly resolve: (result: R) => void;
-    readonly reject: (error: unknown) => void;
-  };
-  const waiting: Waiting[] = [];
-  let turnQueued = false;
-
-  const runTurn = (): void => {
-    options
-      .runInSlot(async (held) => {
-        // From here an arriving entry waits for the next turn.
-        turnQueued = false;
-        let count = 0;
-        while (count < waiting.length) {
-          const fits =
-            count === 0 ||
-            canJoin(
-              waiting.slice(0, count).map(({ entry }) => entry),
-              waiting[count]!.entry,
-            );
-          if (!fits) break;
-          count++;
-        }
-        const taken = waiting.splice(0, count);
-        if (waiting.length > 0) queueTurn();
-        let settled: readonly PromiseSettledResult<R>[];
-        try {
-          settled = await options.flush(
-            held,
-            taken.map(({ entry }) => entry),
-          );
-          if (settled.length !== taken.length) {
-            throw new Error(
-              `commit group: ${taken.length} entries, ${settled.length} results`,
-            );
-          }
-        } catch (error) {
-          for (const { reject } of taken) reject(error);
-          return;
-        }
-        taken.forEach(({ resolve, reject }, at) => {
-          const result = settled[at]!;
-          if (result.status === "fulfilled") resolve(result.value);
-          else reject(result.reason);
-        });
-      })
-      .catch((error: unknown) => {
-        // The slot refused the turn before `flush` ran: nobody was taken.
-        turnQueued = false;
-        for (const { reject } of waiting.splice(0)) reject(error);
-      });
-  };
-
-  const queueTurn = (): void => {
-    if (turnQueued) return;
-    turnQueued = true;
-    runTurn();
-  };
-
-  return {
-    submit: (entry) =>
-      new Promise<R>((resolve, reject) => {
-        waiting.push({ entry, resolve, reject });
-        queueTurn();
-      }),
+    ...(policy?.lockedScopes !== undefined && {
+      lockedScopes: policy.lockedScopes,
+    }),
   };
 }
 

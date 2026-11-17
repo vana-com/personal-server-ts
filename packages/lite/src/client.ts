@@ -3,13 +3,8 @@ import type {
   SeedIntake,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
-  accessLogsListPath,
-  createOwnerSignedPersonalServerRequest,
   createPersonalServerInfoFromHealth,
   createPersonalServerRegistrationRequest,
-  dataListPath,
-  dataReadPath,
-  dataVersionsPath,
   grantRevokePath,
   parsePersonalServerJsonResponse,
   PersonalServerClientError,
@@ -20,18 +15,10 @@ import {
   type PersonalServerCreateGrantResult,
   type PersonalServerHandle,
   type PersonalServerInfo,
-  type PersonalServerListAccessLogsOptions,
-  type PersonalServerListAccessLogsResult,
-  type PersonalServerListDataOptions,
-  type PersonalServerListDataResult,
   type PersonalServerListGrantsResult,
-  type PersonalServerListVersionsOptions,
-  type PersonalServerListVersionsResult,
   type PersonalServerOpenScopeUploadOptions,
-  type PersonalServerOwnerAuth,
   type PersonalServerPostDataOptions,
   type PersonalServerPrepareRegistrationOptions,
-  type PersonalServerReadDataOptions,
   type PersonalServerReadyOptions,
   type PersonalServerRevokeGrantResult,
   type PersonalServerRegistrationRequest,
@@ -39,9 +26,7 @@ import {
   type PersonalServerScopeUploadResult,
   type PersonalServerStatus,
   type PersonalServerSubmitRegistrationOptions,
-  type PersonalServerSyncTriggerResult,
 } from "@opendatalabs/personal-server-ts-core/client";
-import type { SyncStatus } from "@opendatalabs/personal-server-ts-core/sync";
 import type {
   RunIntake,
   RunPublicationStatus,
@@ -52,10 +37,11 @@ import {
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
   createGatewayClient,
-  type DataFileEnvelope,
   type GatewayClient,
   type RegisterServerResult,
 } from "@opendatalabs/vana-sdk/browser";
+import { createOwnerRequest } from "./owner-request.js";
+import { createPersonalServerClient } from "./personal-server-client.js";
 import {
   createIndexedDbPsLiteRuntime,
   type IndexedDbPsLiteRuntime,
@@ -514,87 +500,20 @@ export async function startPersonalServer(
     };
   }
 
-  async function listData(
-    listOptions: PersonalServerListDataOptions = {},
-  ): Promise<PersonalServerListDataResult> {
-    const request = await createOwnerRequest({
-      origin: apiOrigin(),
-      path: dataListPath(listOptions),
-      method: "GET",
-      authOptions: listOptions,
-      headers: listOptions.headers,
-    });
-    return parsePersonalServerJsonResponse(
-      await callFetch(request),
-      "data list",
-    );
-  }
+  // The read calls are the factory's, over this handle's `fetch` and origin.
+  const client = createPersonalServerClient({
+    fetch: (request) => callFetch(request),
+    origin: apiOrigin,
+  });
+  const listData = client.listData;
 
-  async function listAccessLogs(
-    accessLogOptions: PersonalServerListAccessLogsOptions = {},
-  ): Promise<PersonalServerListAccessLogsResult> {
-    const request = await createOwnerRequest({
-      origin: apiOrigin(),
-      path: accessLogsListPath(accessLogOptions),
-      method: "GET",
-      authOptions: accessLogOptions,
-      headers: accessLogOptions.headers,
-    });
-    return parsePersonalServerJsonResponse(
-      await callFetch(request),
-      "access logs list",
-    );
-  }
+  const listAccessLogs = client.listAccessLogs;
 
-  async function listVersions(
-    scope: string,
-    versionOptions: PersonalServerListVersionsOptions = {},
-  ): Promise<PersonalServerListVersionsResult> {
-    const request = await createOwnerRequest({
-      origin: apiOrigin(),
-      path: dataVersionsPath(scope, versionOptions),
-      method: "GET",
-      authOptions: versionOptions,
-      headers: versionOptions.headers,
-    });
-    return parsePersonalServerJsonResponse(
-      await callFetch(request),
-      "data versions list",
-    );
-  }
+  const listVersions = client.listVersions;
 
-  async function readData(
-    scope: string,
-    readOptions: PersonalServerReadDataOptions = {},
-  ): Promise<DataFileEnvelope> {
-    const request = await createOwnerRequest({
-      origin: apiOrigin(),
-      path: dataReadPath(scope, readOptions),
-      method: "GET",
-      authOptions: readOptions,
-      headers: readOptions.headers,
-    });
-    return parsePersonalServerJsonResponse(
-      await callFetch(request),
-      "data read",
-    );
-  }
+  const readData = client.readData;
 
-  async function syncStatus(
-    syncOptions: PersonalServerAuthRequestOptions = {},
-  ): Promise<SyncStatus> {
-    const request = await createOwnerRequest({
-      origin: apiOrigin(),
-      path: "/v1/sync/status",
-      method: "GET",
-      authOptions: syncOptions,
-      headers: syncOptions.headers,
-    });
-    return parsePersonalServerJsonResponse(
-      await callFetch(request),
-      "sync status",
-    );
-  }
+  const syncStatus = client.syncStatus;
 
   async function createGrant(
     grantOptions: PersonalServerCreateGrantOptions,
@@ -658,21 +577,7 @@ export async function startPersonalServer(
     );
   }
 
-  async function syncNow(
-    syncOptions: PersonalServerAuthRequestOptions = {},
-  ): Promise<PersonalServerSyncTriggerResult> {
-    const request = await createOwnerRequest({
-      origin: apiOrigin(),
-      path: "/v1/sync/trigger",
-      method: "POST",
-      authOptions: syncOptions,
-      headers: syncOptions.headers,
-    });
-    return parsePersonalServerJsonResponse(
-      await callFetch(request),
-      "sync trigger",
-    );
-  }
+  const syncNow = client.syncNow;
 
   async function rememberRegisteredRelay(serverUrl: string): Promise<void> {
     if (!resolvedRelayOptions || !relayStateStore) return;
@@ -681,37 +586,6 @@ export async function startPersonalServer(
       controlUrl: resolvedRelayOptions.controlUrl,
       publicSuffix: resolvedRelayOptions.publicSuffix,
       publicUrl: serverUrl,
-    });
-  }
-
-  async function createOwnerRequest(params: {
-    origin: string;
-    path: string;
-    method: string;
-    body?: unknown;
-    authOptions:
-      PersonalServerAuthRequestOptions | PersonalServerPostDataOptions;
-    headers?: Record<string, string>;
-  }): Promise<Request> {
-    const encoded =
-      params.body === undefined
-        ? undefined
-        : new TextEncoder().encode(JSON.stringify(params.body));
-    const auth = authFromOptions(params.authOptions);
-    if (auth) {
-      return createOwnerSignedPersonalServerRequest({
-        origin: params.origin,
-        path: params.path,
-        method: params.method,
-        body: encoded,
-        auth,
-        headers: params.headers,
-      });
-    }
-    return new Request(`${params.origin}${params.path}`, {
-      method: params.method,
-      body: encoded,
-      headers: params.headers,
     });
   }
 
@@ -839,15 +713,6 @@ function randomSessionId(): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
   );
-}
-
-function authFromOptions(
-  options: PersonalServerAuthRequestOptions | PersonalServerPostDataOptions,
-): PersonalServerOwnerAuth | undefined {
-  if ("auth" in options && options.auth) return options.auth;
-  if ("signMessage" in options) return { signMessage: options.signMessage };
-  if ("bearerToken" in options) return { bearerToken: options.bearerToken };
-  return undefined;
 }
 
 function requiredOwnerSignature(

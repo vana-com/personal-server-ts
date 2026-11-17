@@ -10,6 +10,7 @@ import { createLocalSync } from "../../../core/src/localdb/sync.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import { remoteFixture } from "./apply-fixture.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const ports = vi.hoisted(() => ({
@@ -33,13 +34,6 @@ vi.mock("../../../core/src/localdb/delete.js", () => ({
   createConnectionDeleter: () => ({
     requestConnectionDelete: vi.fn(),
     resumeDeletes: vi.fn(async () => []),
-  }),
-}));
-vi.mock("../../../core/src/localdb/older-versions.js", () => ({
-  createOlderVersions: () => ({
-    list: vi.fn(),
-    read: vi.fn(),
-    counts: () => ({ served: 0, gone: 0, off: 0 }),
   }),
 }));
 vi.mock("../../../core/src/localdb/listing.js", () => ({
@@ -120,8 +114,6 @@ describe("local sync intake adapter", () => {
     };
     const sync = createLocalSync(deps, {
       resolveArtifact: () => declaration,
-      declaredStreams: () => ["items"],
-      olderVersionReads: () => true,
       ...aliases,
     });
     return { db, deps, sync };
@@ -151,29 +143,38 @@ describe("local sync intake adapter", () => {
     expect(createStreamSyncIntake({ intake: sync.intake })).toBe(sync.intake);
   });
 
+  /** The full end answer of a run, with its result and outcome. */
+  const answer = (
+    result: string,
+    outcome: string,
+    coveredStreams: string[],
+    provenFullStreams: string[] = [],
+  ) => ({
+    result,
+    stuck: false,
+    updateRequired: false,
+    outcome,
+    coveredStreams,
+    provenFullStreams,
+    unconfirmed: false,
+  });
+
   it("retry-pending-keeps-progress", async () => {
     const { db, sync } = await setup();
     await sync.intake.begin("A", beginRequest);
-    await sync.intake.batch("A", { batch: 0, records: records(1, 50) });
+    // A connector that asks to be retried before it sends records keeps its
+    // job token.
     expect(
-      await sync.intake.end("A", {
-        outcome: "retry_pending",
-        coveredStreams: ["items"],
-        lastBatch: 0,
-        checkpointCandidate: { items: "C50" },
-        provenFullStreams: ["items"],
-      }),
-    ).toEqual({ result: "queued", stuck: false, updateRequired: false });
-    const afterA = await sync.query.listRecords({
-      connectionId: "pdpp.fixture~",
-      stream: "items",
-      limit: 100,
-    });
-    expect(afterA.records.map((r) => r.recordKey).sort()).toEqual(
-      records(1, 50)
-        .map((r) => r.data.id)
-        .sort(),
-    );
+      await sync.intake.end(
+        "A",
+        endRequest({
+          lastBatch: -1,
+          streams: ["items"],
+          retry: true,
+          checkpoints: { items: "C50" },
+        }),
+      ),
+    ).toEqual(answer("checkpoint_only", "retry_pending", []));
     expect(
       await db.query("SELECT replace FROM run_streams WHERE run_id = 'A'"),
     ).toEqual([{ replace: 0 }]);
@@ -186,24 +187,18 @@ describe("local sync intake adapter", () => {
     const b = await sync.intake.begin("B", beginRequest);
     expect(b.start.state).toEqual({ items: "C50" });
     const receivedByB = records(51, 60);
-    expect(receivedByB.every((r) => Number(r.data.id.slice(1)) > 50)).toBe(
-      true,
-    );
     await sync.intake.batch("B", { batch: 0, records: receivedByB });
     expect(
-      await db.query<{ record_key: string }>(
-        "SELECT record_key FROM run_rows WHERE run_id = 'B' ORDER BY record_key",
+      await sync.intake.end(
+        "B",
+        endRequest({
+          lastBatch: 0,
+          live: ["items"],
+          checkpoints: { items: "C60" },
+          provenFullStreams: ["items"],
+        }),
       ),
-    ).toEqual(receivedByB.map((r) => ({ record_key: r.data.id })));
-    expect(
-      await sync.intake.end("B", {
-        outcome: "succeeded",
-        coveredStreams: ["items"],
-        lastBatch: 0,
-        checkpointCandidate: { items: "C60" },
-        provenFullStreams: ["items"],
-      }),
-    ).toEqual({ result: "queued", stuck: false, updateRequired: false });
+    ).toEqual(answer("queued", "succeeded", ["items"], ["items"]));
 
     const head = await sync.query.listRecords({
       connectionId: "pdpp.fixture~",
@@ -211,17 +206,7 @@ describe("local sync intake adapter", () => {
       limit: 100,
     });
     expect(head.records.map((r) => r.recordKey).sort()).toEqual(
-      records(1, 60)
-        .map((r) => r.data.id)
-        .sort(),
-    );
-    const changes = await db.query<{ record_key: string; count: number }>(
-      "SELECT record_key, COUNT(*) AS count FROM record_changes WHERE origin = 'local' AND stamp_r = 'A' GROUP BY record_key ORDER BY record_key",
-    );
-    expect(changes).toEqual(
-      records(1, 50)
-        .map((r) => ({ record_key: r.data.id, count: 1 }))
-        .sort((a, b) => a.record_key.localeCompare(b.record_key)),
+      receivedByB.map((r) => r.data.id).sort(),
     );
     // B resumed incrementally: producer proof cannot bypass the server's
     // full-read fact, so neither run reaches the replacement predicate.
@@ -233,21 +218,63 @@ describe("local sync intake adapter", () => {
     ).toEqual([{ full_read: 0, replace: 0 }]);
   });
 
+  it("a retry run keeps its deletes, not its upserts, and holds the cursor of a stream that sent records", async () => {
+    const { db, sync } = await setup();
+    await sync.intake.begin("seed", beginRequest);
+    await sync.intake.batch("seed", { batch: 0, records: records(1, 2) });
+    await sync.intake.end(
+      "seed",
+      endRequest({
+        lastBatch: 0,
+        live: ["items"],
+        checkpoints: { items: "C2" },
+      }),
+    );
+    await sync.intake.begin("retry", beginRequest);
+    await sync.intake.batch("retry", {
+      batch: 0,
+      records: [
+        ...records(3, 4),
+        { stream: "items", op: "delete", data: { id: "r1" } },
+      ],
+    });
+    expect(
+      await sync.intake.end(
+        "retry",
+        endRequest({
+          lastBatch: 0,
+          live: ["items"],
+          deleted: ["items"],
+          retry: true,
+          checkpoints: { items: "C4" },
+        }),
+      ),
+    ).toEqual(answer("queued", "retry_pending", []));
+    const head = await sync.query.listRecords({
+      connectionId: "pdpp.fixture~",
+      stream: "items",
+      limit: 100,
+    });
+    expect(head.records.map((r) => r.recordKey)).toEqual(["r2"]);
+    expect(await db.query("SELECT checkpoint FROM connections")).toEqual([
+      { checkpoint: JSON.stringify({ items: "C2" }) },
+    ]);
+  });
+
   it("returns checkpoint_only for an all-empty retry", async () => {
     const { db, sync } = await setup();
     await sync.intake.begin("empty", beginRequest);
     expect(
-      await sync.intake.end("empty", {
-        outcome: "retry_pending",
-        coveredStreams: [],
-        lastBatch: -1,
-        checkpointCandidate: { items: "C0" },
-      }),
-    ).toEqual({
-      result: "checkpoint_only",
-      stuck: false,
-      updateRequired: false,
-    });
+      await sync.intake.end(
+        "empty",
+        endRequest({
+          lastBatch: -1,
+          streams: ["items"],
+          retry: true,
+          checkpoints: { items: "C0" },
+        }),
+      ),
+    ).toEqual(answer("checkpoint_only", "retry_pending", []));
     expect(
       await db.query(
         "SELECT checkpoint FROM connections WHERE connection_id = 'pdpp.fixture~'",
@@ -259,15 +286,24 @@ describe("local sync intake adapter", () => {
   });
 
   it("returns no_checkpoint when neither rows nor a checkpoint are merged", async () => {
-    const { sync } = await setup();
+    const { db, sync } = await setup();
     await sync.intake.begin("empty", beginRequest);
+    // The stream answered with a gap: the run covers nothing and keeps nothing.
     expect(
-      await sync.intake.end("empty", {
-        outcome: "partial",
-        coveredStreams: [],
-        lastBatch: -1,
-      }),
-    ).toEqual({ result: "no_checkpoint", stuck: false, updateRequired: false });
+      await sync.intake.end(
+        "empty",
+        endRequest({
+          lastBatch: -1,
+          streams: ["items"],
+          provenFullStreams: ["items"],
+          checkpoints: { items: "C1" },
+          observe: { items: { detailGap: "fatal" } },
+        }),
+      ),
+    ).toEqual(answer("no_checkpoint", "partial", []));
+    expect(await db.query("SELECT checkpoint FROM connections")).toEqual([
+      { checkpoint: null },
+    ]);
   });
 
   it("discards a tombstoned run and clears its checkpoint before a full recollect", async () => {
@@ -284,13 +320,15 @@ describe("local sync intake adapter", () => {
       },
     ]);
     expect(
-      await sync.intake.end("deleted", {
-        outcome: "succeeded",
-        coveredStreams: ["items"],
-        lastBatch: 0,
-        checkpointCandidate: { items: "new" },
-      }),
-    ).toEqual({ result: "discarded", stuck: false, updateRequired: false });
+      await sync.intake.end(
+        "deleted",
+        endRequest({
+          lastBatch: 0,
+          live: ["items"],
+          checkpoints: { items: "new" },
+        }),
+      ),
+    ).toEqual(answer("discarded", "succeeded", ["items"]));
     expect(await db.query("SELECT COUNT(*) AS count FROM run_rows")).toEqual([
       { count: 0 },
     ]);
@@ -305,27 +343,23 @@ describe("local sync intake adapter", () => {
     ]);
   });
 
-  it.each(["failed", "cancelled"] as const)(
-    "returns aborted and drops staged rows after %s",
-    async (outcome) => {
-      const { db, sync } = await setup();
-      await sync.intake.begin("aborted", beginRequest);
-      await sync.intake.batch("aborted", { batch: 0, records: records(1, 1) });
-      expect(
-        await sync.intake.end("aborted", {
-          outcome,
-          coveredStreams: [],
-          lastBatch: 0,
-        }),
-      ).toEqual({ result: "aborted", stuck: false, updateRequired: false });
-      expect(await db.query("SELECT COUNT(*) AS count FROM run_rows")).toEqual([
-        { count: 0 },
-      ]);
-      expect(await db.query("SELECT COUNT(*) AS count FROM records")).toEqual([
-        { count: 0 },
-      ]);
-    },
-  );
+  it("returns aborted and drops staged rows when no stream answered", async () => {
+    const { db, sync } = await setup();
+    await sync.intake.begin("aborted", beginRequest);
+    await sync.intake.batch("aborted", { batch: 0, records: records(1, 1) });
+    expect(
+      await sync.intake.end(
+        "aborted",
+        endRequest({ lastBatch: 0, live: ["items"], skipped: ["items"] }),
+      ),
+    ).toEqual({ ...answer("aborted", "failed", []), unconfirmed: true });
+    expect(await db.query("SELECT COUNT(*) AS count FROM run_rows")).toEqual([
+      { count: 0 },
+    ]);
+    expect(await db.query("SELECT COUNT(*) AS count FROM records")).toEqual([
+      { count: 0 },
+    ]);
+  });
 
   it("routes explicit abort to the same durable cleanup", async () => {
     const { db, sync } = await setup();

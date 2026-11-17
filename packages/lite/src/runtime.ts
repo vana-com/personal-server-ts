@@ -1757,7 +1757,6 @@ export function createPsLiteRuntime(
             listed: status.listed,
             streams: liveStreamCounts(status),
             issues: status.issues.length,
-            olderVersionReads: local.olderVersions.counts(),
           });
         }
         // Whether a run is saved: `GET /v1/stream-sync/runs/:runId/publication`.

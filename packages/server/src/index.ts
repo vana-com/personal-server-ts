@@ -5,11 +5,14 @@ import { verifyTunnelUrl } from "./tunnel/index.js";
 import { runEnclaveMain } from "./enclave-main.js";
 import { mcpOptionsFromEnv } from "./mcp/env-options.js";
 import { listenHttpServer, type NodeServer } from "./listen.js";
+import { runShutdown } from "./shutdown.js";
 
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json") as { version: string };
 
 const DRAIN_TIMEOUT_MS = 5_000;
+/** The stores and background work stop, then the outbound pool drains. */
+const CLEANUP_TIMEOUT_MS = 20_000;
 async function main(): Promise<void> {
   if (process.env.ENCLAVE_MODE === "true") {
     await runEnclaveMain();
@@ -97,28 +100,19 @@ async function main(): Promise<void> {
     }
   });
 
+  let shuttingDown = false;
   function shutdown(signal: string): void {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info({ signal }, "Shutdown signal received, draining connections");
-
-    let pending = localAuthServer ? 2 : 1;
-    const finish = () => {
-      pending -= 1;
-      if (pending === 0) {
-        logger.info("Server stopped");
-        process.exit(0);
-      }
-    };
-
-    server.close(finish);
-    if (localAuthServer) {
-      localAuthServer.close(finish);
-    }
-
-    // Force exit after drain timeout
-    setTimeout(() => {
-      logger.warn("Drain timeout exceeded, forcing exit");
-      process.exit(1);
-    }, DRAIN_TIMEOUT_MS).unref();
+    void runShutdown({
+      servers: localAuthServer ? [server, localAuthServer] : [server],
+      cleanup: context.cleanup,
+      logger,
+      exit: (code) => process.exit(code),
+      drainTimeoutMs: DRAIN_TIMEOUT_MS,
+      cleanupTimeoutMs: CLEANUP_TIMEOUT_MS,
+    });
   }
 
   process.on("SIGTERM", () => shutdown("SIGTERM"));

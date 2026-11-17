@@ -394,10 +394,7 @@ export function createApp(deps: AppDeps): Hono {
       : { read: () => "unknown" },
     deps.serverOwner,
   );
-  let loadedLocalSync: LocalSync | undefined;
-  const localSync = deps.localSync
-    ? async () => (loadedLocalSync = await deps.localSync!())
-    : undefined;
+  const localSync = deps.localSync;
   const history: LocalHistory | undefined =
     deps.history ??
     (localSync
@@ -434,18 +431,6 @@ export function createApp(deps: AppDeps): Hono {
         resolve: async (input) => (await localSync()).resolver.resolve(input),
         listScopes: async (input) =>
           (await localSync()).listing.listScopes(input),
-        olderVersions: {
-          read: async (...args) =>
-            (await localSync()).olderVersions.read(...args),
-          list: async (...args) =>
-            (await localSync()).olderVersions.list(...args),
-          counts: () =>
-            loadedLocalSync?.olderVersions.counts() ?? {
-              served: 0,
-              gone: 0,
-              off: 0,
-            },
-        },
       }
     : deps.streamSyncRead;
   // The one seal for the legacy writes these routes make durable: the host's

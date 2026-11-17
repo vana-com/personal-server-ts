@@ -7,6 +7,7 @@ import {
   mergeIncoming,
   openLocalDb,
   replaceDelete,
+  TEMP_TABLES,
   withOrigin,
   type SqlDriver,
   type SqlStatement,
@@ -175,6 +176,77 @@ export function runDriverConformance(
           highest_seq: null,
         },
       ]);
+    });
+
+    it("rebuilds records as a rowid table and keeps its rows, indexes and triggers", async () => {
+      const driver = await opts.fresh();
+      const rebuild = MIGRATIONS.findIndex((statements) =>
+        statements.some((sql) => sql.startsWith("CREATE TABLE records_rowid")),
+      );
+      expect(rebuild).toBeGreaterThan(0);
+      await driver.batch([
+        ...MIGRATIONS.slice(0, rebuild)
+          .flat()
+          .map((sql) => ({ sql })),
+        { sql: `PRAGMA user_version = ${rebuild}` },
+        ...TEMP_TABLES.map((sql) => ({ sql })),
+      ]);
+      await seedConnection(driver);
+      await merge(
+        driver,
+        "local",
+        "m",
+        stage("m", "bb02", "2", 1, "r", '{"v":"b"}'),
+        stage("m", "aa01", "1", 2, "r", '{"v":"a"}'),
+      );
+      const rows = () => driver.query("SELECT * FROM records ORDER BY pk_hash");
+      const logged = () => log(driver);
+      const objects = () =>
+        driver.query<{ type: string; name: string; sql: string }>(
+          // One line per object: the 3.22.0 shell returns rows as lines.
+          "SELECT type, name, replace(sql, char(10), ' ') AS sql FROM sqlite_master WHERE tbl_name = 'records' AND type <> 'table' AND sql IS NOT NULL ORDER BY name",
+        );
+      const before = {
+        rows: await rows(),
+        log: await logged(),
+        objects: await objects(),
+      };
+      expect(before.rows).toHaveLength(2);
+
+      await openLocalDb(driver, ID);
+
+      expect(await rows()).toEqual(before.rows);
+      expect(await logged()).toEqual(before.log);
+      // The same indexes and triggers, and the unique index that replaces
+      // the WITHOUT ROWID key.
+      expect(await objects()).toEqual(
+        [
+          ...before.objects,
+          {
+            type: "index",
+            name: "records_key",
+            sql: "CREATE UNIQUE INDEX records_key ON records(connection_id, stream, pk_hash)",
+          },
+        ].sort((a, b) => (a.name < b.name ? -1 : 1)),
+      );
+      const [table] = await driver.query<{ sql: string }>(
+        "SELECT replace(sql, char(10), ' ') AS sql FROM sqlite_master WHERE type = 'table' AND name = 'records'",
+      );
+      expect(table?.sql).toMatch(/^CREATE TABLE/);
+      expect(table?.sql).not.toMatch(/WITHOUT ROWID/i);
+      // The triggers still act: a change is logged, a reused key refused.
+      await merge(driver, "local", "m", stage("m", "cc03", "3", 3, "r"));
+      expect(await logged()).toHaveLength(before.log.length + 1);
+      await expect(
+        merge(driver, "local", "m", stage("m", "dd04", "1", 4, "r")),
+      ).rejects.toThrow(/key_type_conflict/);
+      await expect(
+        driver.batch([
+          {
+            sql: "INSERT INTO records (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256) VALUES ('c1', 's', 'aa01', '9', 9, 'r', '{}', 'x')",
+          },
+        ]),
+      ).rejects.toThrow(/UNIQUE/);
     });
 
     it("refuses a file written by a newer build", async () => {

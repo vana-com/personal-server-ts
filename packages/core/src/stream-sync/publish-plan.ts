@@ -83,11 +83,6 @@ export interface StreamFloor {
   readonly committed: CommitStamp | null;
 }
 
-export const NO_FLOOR: StreamFloor = Object.freeze({
-  version: null,
-  committed: null,
-});
-
 /**
  * The seed of one run's stream (§2.9): none, merged into this publish, or not
  * decided yet (the run is not admitted, so its target generation is unknown).
@@ -119,16 +114,6 @@ export interface PlanRun extends CommitStamp {
   readonly executed?: ExecutedStep;
   /** The writer persisted a signed request and has not recorded the registry's answer. */
   readonly inFlight?: boolean;
-}
-
-/** Which rows a head holds, relative to the head the plan started from. */
-export interface PlanRows {
-  /** The starting head's rows are kept (merged under the runs). */
-  readonly fromHead: boolean;
-  /** Run line sets merged over them, in commit order. */
-  readonly runs: readonly string[];
-  /** Seed rows (§2.9) are merged in; the overlay does not expose them. */
-  readonly seed: boolean;
 }
 
 export type RefusedReason = "connector_update_required" | "out_of_order";
@@ -254,96 +239,4 @@ export function sameHead(a: PlanHead, b: PlanHead): boolean {
     a.primaryKey.length === b.primaryKey.length &&
     a.primaryKey.every((field, i) => field === b.primaryKey[i])
   );
-}
-
-/** One run's step in a stream's plan. */
-export interface PlanStep {
-  readonly runId: string;
-  readonly decision: StepDecision;
-  /** The writer already executed this step; it waits for the reader to import it. */
-  readonly executed: boolean;
-  /** The head after this step, and the rows it holds; null when the stream has no head yet. */
-  readonly head: PlanHead | null;
-  readonly rows: PlanRows;
-}
-
-export function commitOrder(a: CommitStamp, b: CommitStamp): number {
-  if (a.observedAt !== b.observedAt) return a.observedAt - b.observedAt;
-  return a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0;
-}
-
-/**
- * The whole plan of one stream from `head`: every retained run, in commit
- * order, with its decision and the head and rows it leaves. A run the writer
- * already executed keeps the decision it executed. Once a run is deferred,
- * every later run of the stream waits for it.
- */
-export function planStream(
-  head: PlanHead | null,
-  floor: StreamFloor,
-  runs: readonly PlanRun[],
-): PlanStep[] {
-  let state: PlanState = { head, floor };
-  let rows: PlanRows = { fromHead: head !== null, runs: [], seed: false };
-  let waiting = false;
-  const steps: PlanStep[] = [];
-  const ordered = [...runs].sort(commitOrder);
-  // A signed request is never proof of success. The newest run in flight may
-  // commit, which refuses every older run, or fail, which does not: neither
-  // that run nor an older one has a known fate yet, and a later run waits.
-  const barrier = ordered.filter((r) => r.inFlight && !r.executed).at(-1);
-  for (const run of ordered) {
-    let decision: StepDecision;
-    if (!run.executed && barrier && commitOrder(run, barrier) <= 0) {
-      decision = { kind: "deferred", reason: "publication_in_flight" };
-    } else if (run.executed) {
-      const { executed } = run;
-      decision =
-        executed.kind === "noop"
-          ? {
-              kind: "noop",
-              head: executed.head,
-              floor: higherVersion(state.floor.version, run.profile.version)!,
-            }
-          : {
-              kind: "publish",
-              head: executed.head,
-              replacesBase: executed.replacesBase,
-              seed: run.seed === "merged",
-              floor: higherVersion(state.floor.version, run.profile.version)!,
-            };
-    } else if (waiting) {
-      decision = { kind: "deferred", reason: "earlier_run_pending" };
-    } else {
-      decision = planStreamStep(state, run);
-    }
-    if (decision.kind === "deferred") waiting = true;
-    if (decision.kind === "publish" || decision.kind === "noop") {
-      if (decision.kind === "publish") {
-        rows = decision.replacesBase
-          ? { fromHead: false, runs: [run.runId], seed: decision.seed }
-          : {
-              fromHead: rows.fromHead,
-              runs: [...rows.runs, run.runId],
-              seed: rows.seed || decision.seed,
-            };
-      }
-      const committed =
-        state.floor.committed && stampBefore(run, state.floor.committed)
-          ? state.floor.committed
-          : { observedAt: run.observedAt, runId: run.runId };
-      state = {
-        head: decision.head,
-        floor: { version: decision.floor, committed },
-      };
-    }
-    steps.push({
-      runId: run.runId,
-      decision,
-      executed: run.executed !== undefined,
-      head: state.head,
-      rows,
-    });
-  }
-  return steps;
 }

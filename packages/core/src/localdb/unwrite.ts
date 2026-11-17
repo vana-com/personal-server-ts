@@ -5,10 +5,9 @@ import { dropRunRows, withOrigin } from "./merge.js";
 /**
  * C.2 step 3: a run accepted at `end` but now refused is un-written in ONE
  * batch with origin `purge`: delete the stream's rows whose stamp is the
- * run's stamp AND delete the stream's `head_parts`, and record the run's
- * stream decision as `refused`. The caller then applies at once (even at
- * the same version), so rows the refused run overwrote come back from the
- * head and rows that existed only in the refused run are lost.
+ * run's stamp, and record the run's stream decision as `refused`. The caller
+ * then applies the log at once, so rows that existed only in the refused run
+ * are lost.
  * DELETES USER DATA. Spec: C.2 step 3 (must-fix 2).
  *
  * A run that was admitting (`runs.admitting`, fixed at begin) admitted its rows
@@ -69,10 +68,6 @@ export async function unwriteRefusedRun(
   const { changes } = await deps.db.batch(
     withOrigin("purge", [
       ...dropRunRows(input.connectionId, input.stream, run.o, input.runId),
-      {
-        sql: `DELETE FROM head_parts WHERE connection_id = ? AND stream = ?`,
-        params: [input.connectionId, input.stream],
-      },
       refuse,
     ]),
   );
@@ -83,7 +78,6 @@ export async function unwriteRefusedRun(
       runId: input.runId,
       reason: input.reason,
       rowsRemoved: changes[1],
-      headPartsRemoved: changes[3],
     },
     "unwrite refused run",
   );

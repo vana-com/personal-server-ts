@@ -9,6 +9,7 @@ import {
   createMemoryStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
 } from "../../../core/src/stream-sync/index.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 // Publish while collecting (default-off flag `publishWhileCollecting`): a batch
@@ -92,8 +93,6 @@ async function world(
           ],
         };
       },
-      declaredStreams: () => ["items"],
-      olderVersionReads: () => true,
     });
     const begin = (
       id: string,
@@ -112,6 +111,8 @@ async function world(
         owner: { address: owner, leaseId: null },
       });
     };
+    /** What each run sent, for its end. */
+    const sent = new Map<string, { live: boolean; deleted: boolean }>();
     const batch = (
       id: string,
       n: number,
@@ -122,6 +123,10 @@ async function world(
         batch: n,
         records: rows.map((r) => {
           const row = typeof r === "string" ? { id: r } : r;
+          const seen = sent.get(id) ?? { live: false, deleted: false };
+          if (row.remove) seen.deleted = true;
+          else seen.live = true;
+          sent.set(id, seen);
           return {
             stream: "items",
             ...(row.remove ? { op: "delete" as const } : {}),
@@ -142,15 +147,21 @@ async function world(
         checkpoint?: string;
       } = {},
     ) =>
-      sync.intake.end(id, {
-        outcome: extra.outcome ?? "succeeded",
-        coveredStreams: ["items"],
-        lastBatch,
-        ...(extra.proven ? { provenFullStreams: ["items"] } : {}),
-        ...(extra.checkpoint
-          ? { checkpointCandidate: { items: extra.checkpoint } }
-          : {}),
-      });
+      sync.intake.end(
+        id,
+        endRequest({
+          lastBatch,
+          streams: ["items"],
+          ...(sent.get(id)?.live ? { live: ["items"] } : {}),
+          ...(sent.get(id)?.deleted ? { deleted: ["items"] } : {}),
+          // A failed run: the connector skipped its one stream.
+          ...(extra.outcome === "failed" ? { skipped: ["items"] } : {}),
+          ...(extra.proven ? { provenFullStreams: ["items"] } : {}),
+          ...(extra.checkpoint
+            ? { checkpoints: { items: extra.checkpoint } }
+            : {}),
+        }),
+      );
     return {
       db,
       sync,

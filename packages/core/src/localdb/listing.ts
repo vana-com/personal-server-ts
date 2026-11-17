@@ -4,7 +4,6 @@ import { logicalStreamScopeParts } from "../stream-sync-read/routing.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
 import { SEEN_O } from "./merge.js";
-import type { OlderVersionCounts } from "./older-versions.js";
 import { createRecordQuery } from "./query.js";
 import {
   chooseCandidate,
@@ -66,9 +65,7 @@ export interface LocalListing {
   listScopes(input: {
     readonly canRead: (scope: string) => boolean | Promise<boolean>;
   }): Promise<readonly ListedScope[]>;
-  status(): Promise<
-    StreamSyncReadStatus & { readonly olderVersionReads: OlderVersionCounts }
-  >;
+  status(): Promise<StreamSyncReadStatus>;
   /** Changes whenever any control row or stream head changes. */
   cacheKey(): Promise<string>;
 }
@@ -108,7 +105,6 @@ export function createLocalListing(
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
   },
-  counts: () => OlderVersionCounts,
 ): LocalListing {
   // Listing and status only read: they take the read connection, so they do
   // not wait for a long import or publish batch on the writer.
@@ -266,20 +262,12 @@ export function createLocalListing(
     return entries;
   }
 
-  /**
-   * Can a read build this alias body from the records installed now? A read
-   * whose installed head lags the newest complete head would fetch the
-   * retained head over the network; the listing does not, so it lists the
-   * scope without projecting.
-   */
+  /** Can a read build this alias body from the records installed now? */
   async function aliasBodyBuilds(
     target: Target,
     chosen: Candidate,
   ): Promise<boolean> {
     if (!target.alias) return true;
-    if (chosen.streams.some((s) => s.head_version !== s.installed_version)) {
-      return true;
-    }
     const projected = await projectAlias(
       target.alias,
       chosen,
@@ -408,7 +396,6 @@ export function createLocalListing(
         listed: true,
         connections: result,
         issues: [],
-        olderVersionReads: counts(),
       };
     },
 

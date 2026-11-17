@@ -91,8 +91,9 @@ describe("local history versions", () => {
     ]);
   }
 
+  // No version has a body to read by selector: the log keeps none per stream.
   const item = (version: number, observed: number) => ({
-    fileId: "blob-" + version,
+    fileId: null,
     schemaId: null,
     collectedAt: new Date(observed).toISOString(),
     version,
@@ -100,65 +101,10 @@ describe("local history versions", () => {
     producer_provenance: null,
   });
 
-  it("versions-six-fields-from-stream-versions", async () => {
+  it("versions lists only the version a read serves, without a selector to read it by", async () => {
     const { db, deps } = await fresh();
     await seed(db);
-    const history = createLocalHistory(deps, { olderVersionReads: () => true });
-    await expect(
-      history.versions({ scope: SCOPE, limit: 20, offset: 0 }),
-    ).resolves.toEqual({
-      ok: true,
-      value: {
-        scope: SCOPE,
-        versions: [item(6, OBSERVED_6), item(5, OBSERVED_5)],
-        total: 2,
-        limit: 20,
-        offset: 0,
-        nextCursor: null,
-      },
-    });
-    await expect(
-      history.versions({ scope: SCOPE, limit: 1, offset: 0, cursor: 6 }),
-    ).resolves.toEqual({
-      ok: true,
-      value: {
-        scope: SCOPE,
-        versions: [item(5, OBSERVED_5)],
-        total: 2,
-        limit: 1,
-        offset: 0,
-        nextCursor: null,
-      },
-    });
-    await expect(
-      history.versions({ scope: SCOPE, limit: 1, offset: 0, cursor: 5 }),
-    ).resolves.toEqual({
-      ok: true,
-      value: {
-        scope: SCOPE,
-        versions: [],
-        total: 2,
-        limit: 1,
-        offset: 0,
-        nextCursor: null,
-      },
-    });
-  });
-
-  it("versions-flag-off-lists-current-only", async () => {
-    const { db, deps } = await fresh();
-    await seed(db);
-    let enabled = true;
-    const history = createLocalHistory(deps, {
-      olderVersionReads: () => enabled,
-    });
-    const before = await history.versions({
-      scope: SCOPE,
-      limit: 20,
-      offset: 0,
-    });
-    expect(before.ok && before.value.total).toBe(2);
-    enabled = false;
+    const history = createLocalHistory(deps, {});
     await expect(
       history.versions({ scope: SCOPE, limit: 20, offset: 0 }),
     ).resolves.toEqual({
@@ -185,12 +131,29 @@ describe("local history versions", () => {
         nextCursor: null,
       },
     });
+    // A newer log position replaces the listed version.
+    await db.batch([
+      {
+        sql: "INSERT INTO stream_versions(connection_id, stream, version, generation, head_blob, head_format, record_count, observed_at, complete, kind) VALUES ('c1', 'events', 8, 2, 'blob-8', 1, 0, ?, 1, 'published')",
+        params: [OBSERVED_5],
+      },
+      { sql: "UPDATE stream_state SET head_version = 8" },
+    ]);
+    await expect(
+      history.versions({ scope: SCOPE, limit: 20, offset: 0 }),
+    ).resolves.toMatchObject({
+      ok: true,
+      value: { total: 1, versions: [item(8, OBSERVED_5)] },
+    });
+    await expect(
+      history.versions({ scope: SCOPE, limit: 1, offset: 1 }),
+    ).rejects.toMatchObject({ code: 400 });
   });
 
   it("lineage-root-answer-and-404-410", async () => {
     const { db, deps } = await fresh();
     await seed(db);
-    const history = createLocalHistory(deps, { olderVersionReads: () => true });
+    const history = createLocalHistory(deps, {});
     // GatewayProof requires userSignature and gatewaySignature. The local
     // database cannot attest them, so root proof is explicitly null.
     await expect(history.lineage({ scope: SCOPE })).resolves.toEqual({
@@ -251,7 +214,7 @@ describe("local history versions", () => {
   it("versions-and-lineage-respect-delete-frontier-and-reject-delete-head", async () => {
     const { db, deps } = await fresh();
     await seed(db);
-    const history = createLocalHistory(deps, { olderVersionReads: () => true });
+    const history = createLocalHistory(deps, {});
     await db.batch([
       { sql: "UPDATE stream_state SET last_delete_version = 5" },
     ]);
@@ -294,7 +257,7 @@ describe("local history versions", () => {
   it("versions-and-lineage-only-serve-active-connections", async () => {
     const { db, deps } = await fresh();
     await seed(db);
-    const history = createLocalHistory(deps, { olderVersionReads: () => true });
+    const history = createLocalHistory(deps, {});
     for (const state of ["absent", "foreign"]) {
       await db.batch([
         { sql: "UPDATE connections SET control_state = ?", params: [state] },
@@ -336,19 +299,13 @@ describe("local history versions", () => {
           return Reflect.get(target, key);
         },
       });
-      const history = createLocalHistory(
-        { ...deps, db: racingDb },
-        { olderVersionReads: () => true },
-      );
+      const history = createLocalHistory({ ...deps, db: racingDb }, {});
       if (method === "versions") {
         await expect(
           history.versions({ scope: SCOPE, limit: 20, offset: 0 }),
         ).resolves.toMatchObject({
           ok: true,
-          value: {
-            total: 2,
-            versions: [item(6, OBSERVED_6), item(5, OBSERVED_5)],
-          },
+          value: { total: 1, versions: [item(6, OBSERVED_6)] },
         });
       } else {
         await expect(history.lineage({ scope: SCOPE })).resolves.toMatchObject({
@@ -360,62 +317,12 @@ describe("local history versions", () => {
     }
   });
 
-  it("version-cursor-pages-do-not-repeat-or-skip-after-concurrent-changes", async () => {
-    const { db, deps } = await fresh();
-    await seed(db);
-    const insert = (version: number) =>
-      db.batch([
-        {
-          sql: "INSERT INTO stream_versions(connection_id, stream, version, generation, head_blob, head_format, record_count, observed_at, complete, kind) VALUES ('c1', 'events', ?, 2, ?, 1, 0, ?, 1, 'published')",
-          params: [version, "blob-" + version, OBSERVED_5],
-        },
-      ]);
-    await insert(4);
-    const history = createLocalHistory(deps, { olderVersionReads: () => true });
-    const first = await history.versions({ scope: SCOPE, limit: 1, offset: 0 });
-    expect(first).toMatchObject({
-      ok: true,
-      value: { versions: [item(6, OBSERVED_6)], nextCursor: 6 },
-    });
-    if (!first.ok) throw new Error("Expected first page");
-    await insert(8);
-    const second = await history.versions({
-      scope: SCOPE,
-      limit: 1,
-      offset: 0,
-      cursor: first.value.nextCursor!,
-    });
-    expect(second).toMatchObject({
-      ok: true,
-      value: { versions: [item(5, OBSERVED_5)], nextCursor: 5 },
-    });
-    if (!second.ok) throw new Error("Expected second page");
-    await db.batch([
-      { sql: "DELETE FROM stream_versions WHERE version IN (6, 8)" },
-    ]);
-    await expect(
-      history.versions({
-        scope: SCOPE,
-        limit: 1,
-        offset: 0,
-        cursor: second.value.nextCursor!,
-      }),
-    ).resolves.toMatchObject({
-      ok: true,
-      value: { versions: [item(4, OBSERVED_5)], nextCursor: null },
-    });
-    await expect(
-      history.versions({ scope: SCOPE, limit: 1, offset: 1 }),
-    ).rejects.toMatchObject({ code: 400 });
-  });
-
   it("history-never-reads-legacy", async () => {
     const { db, deps, poison } = await fresh();
     await seed(db);
     // No legacy port is in LocalSyncDeps. Adjacent, structurally extra
     // options are poisoned to detect an accidental fallback.
     const options = {
-      olderVersionReads: () => true,
       storage: poison,
       legacyStore: poison,
       projection: poison,
@@ -431,7 +338,7 @@ describe("local history versions", () => {
       history.versions({ scope: SCOPE, limit: 20, offset: 0 }),
     ).resolves.toMatchObject({
       ok: true,
-      value: { total: 2 },
+      value: { total: 1 },
     });
     await expect(history.lineage({ scope: SCOPE })).resolves.toMatchObject({
       ok: true,

@@ -102,11 +102,10 @@ async function purgeDeleted(deps: LocalSyncDeps, row: ConnectionRow) {
       WHERE EXISTS (SELECT 1 FROM records WHERE connection_id = ?)
       OR EXISTS (SELECT 1 FROM run_rows rr JOIN runs r ON r.run_id = rr.run_id
                  WHERE r.connection_id = ?)
-      OR EXISTS (SELECT 1 FROM head_parts WHERE connection_id = ?)
       OR EXISTS (SELECT 1 FROM blob_refs WHERE connection_id = ?)
       OR EXISTS (SELECT 1 FROM connections
                  WHERE connection_id = ? AND checkpoint IS NOT NULL)`,
-    Array(5).fill(row.connectionId),
+    Array(4).fill(row.connectionId),
   );
   if (present.length > 0) {
     await purgeConnection(deps, row.connectionId, {
@@ -114,6 +113,12 @@ async function purgeDeleted(deps: LocalSyncDeps, row: ConnectionRow) {
     });
   }
 }
+
+/** Rows of one owner listing (`StreamSyncRegistry.listOwnerRows`). */
+export type OwnerRows = readonly {
+  readonly scope: string;
+  readonly read: ControlRead;
+}[];
 
 /**
  * C.0 step 1: list the registry's control rows and upsert one `connections`
@@ -123,9 +128,11 @@ async function purgeDeleted(deps: LocalSyncDeps, row: ConnectionRow) {
  */
 export async function bootstrapConnections(
   deps: LocalSyncDeps,
+  /** The owner's rows, when the caller already listed them (`listOwnerRows`). */
+  listed?: OwnerRows,
 ): Promise<readonly ConnectionRow[]> {
   const control = await hashes(deps);
-  const rows = await deps.registry.listControlRows();
+  const rows = listed ?? (await deps.registry.listControlRows());
   for (const row of rows) {
     const parsed = parseScope(row.scope);
     if (parsed?.kind !== "control") continue;
@@ -187,9 +194,8 @@ export async function connectionsWithStreams(
 
 /**
  * C.0 step 2, inside the connection queue and before any row is staged:
- * read the control row and the stream rows, then apply every stream whose
- * registry version differs from `head_version` or whose `head_parts` is empty
- * while `head_version > 0`. `unreachable` = the registry did not answer (C.0
+ * read the control row, then apply the connection's log up to the position
+ * the registry holds. `unreachable` = the registry did not answer (C.0
  * step 3); a caller with no connection stages `generation_unbound`.
  *
  * `control` is the control row as the registry answered, classified for this
@@ -240,7 +246,7 @@ export async function syncBeforeBegin(
     await purgeDeleted(locked, connection);
     if (connection.controlState === "active") {
       try {
-        // Apply reads the control row and lists the streams itself, after this
+        // Apply reads the control row and the log row itself, after this
         // call began. Only an unreachable registry that apply met before its
         // first local write, with no earlier apply left half done, goes on
         // offline: nothing new was learned and nothing changed. Apply has no

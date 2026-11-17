@@ -11,6 +11,7 @@ import {
   createMemoryStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
 } from "../../../core/src/stream-sync/index.js";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 const drivers: SqlDriver[] = [];
 afterEach(async () => {
@@ -56,8 +57,6 @@ async function fixture(late = false) {
             { name: "media", semantics: "mutable_state", primaryKey: ["id"] },
           ],
         }),
-        declaredStreams: () => ["media"],
-        olderVersionReads: () => true,
       }),
     };
   };
@@ -89,11 +88,7 @@ async function fixture(late = false) {
       bytes,
     });
   }
-  await a.sync.intake.end("run", {
-    outcome: "succeeded",
-    coveredStreams: ["media"],
-    lastBatch: 0,
-  });
+  await a.sync.intake.end("run", endRequest({ lastBatch: 0, live: ["media"] }));
   expect((await a.sync.cycle()).connections.map((c) => c.error)).toEqual([
     null,
   ]);
@@ -104,11 +99,11 @@ async function fixture(late = false) {
       mimeType: "application/octet-stream",
       bytes,
     });
-    expect(
-      (await a.sync.cycle()).connections
-        .flatMap((c) => c.published)
-        .map((r) => r.outcome),
-    ).toEqual(["noop"]);
+    const outcomes = (await a.sync.cycle()).connections
+      .flatMap((c) => c.published)
+      .map((r) => r.outcome);
+    expect(outcomes.length).toBeGreaterThan(0);
+    expect(outcomes.every((o) => o === "noop")).toBe(true);
   }
   await b.sync.apply();
   return { a, b, blobs, bytes, hash, blobId };

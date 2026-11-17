@@ -1,5 +1,12 @@
 # Mixed fleet: one connection, devices that differ in build and log flag
 
+> **Status: historical.** The `logProtocol` flag and the per-stream head writer
+> are removed: the connection log is the only publish and read protocol, so no
+> device writes a head beside the log and a mixed fleet of flag settings no
+> longer exists. The model and its traces stay as the record of why the gate
+> was needed while both protocols ran. A device that holds only old heads
+> reads nothing from them; its first log publish carries every record it holds.
+
 `MixedFleet.tla` asks one question: when devices of one owner differ in their
 build and in the local `logProtocol` flag, does a device ever show stale data as
 current, or write beside the log, or lose a write?

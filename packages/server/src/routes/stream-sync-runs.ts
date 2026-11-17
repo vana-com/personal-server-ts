@@ -3,7 +3,7 @@
  *
  *   PUT  /v1/stream-sync/runs/:runId            begin
  *   POST /v1/stream-sync/runs/:runId/batches    one ordered batch of records
- *   POST /v1/stream-sync/runs/:runId/end        outcome, covered streams
+ *   POST /v1/stream-sync/runs/:runId/end        what the host saw of each stream
  *   POST /v1/stream-sync/runs/:runId/abort      {"reason": "failed"|"cancelled"}
  *
  * A thin map from the JSON body to `StreamSyncIntake`; the same adapter

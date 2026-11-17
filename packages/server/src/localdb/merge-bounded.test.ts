@@ -22,8 +22,8 @@ it("looks up incoming merge updates by the complete record key", async () => {
       // SQLite plan must seek the incoming key, independent of total input size.
       expect(
         plan.some((row) =>
-          row.detail.includes(
-            "records USING PRIMARY KEY (connection_id=? AND stream=? AND pk_hash=?)",
+          /records USING (COVERING )?INDEX \w+ \(connection_id=\? AND stream=\? AND pk_hash=\?\)/.test(
+            row.detail,
           ),
         ),
       ).toBe(true);
