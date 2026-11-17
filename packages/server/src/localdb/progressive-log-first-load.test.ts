@@ -38,6 +38,7 @@ import {
   sName,
   world,
 } from "./log-world.test-utils.js";
+import { retainedManifest } from "./apply-fixture.js";
 
 afterEach(closeWorldDrivers);
 
@@ -481,7 +482,9 @@ describe("progressive first load, log protocol on", () => {
     });
     expect((await body.next()).value).toBe('{"records":[');
     for (let i = 0; i < 100; i++) expect((await body.next()).done).toBe(false);
-    const deleter = createConnectionDeleter(b.deps, {});
+    const deleter = createConnectionDeleter(b.deps, {
+      retainedManifests: () => [retainedManifest(CONNECTOR, [STREAM])],
+    });
     const requested = deleter
       .requestConnectionDelete(CONNECTOR)
       .catch(() => undefined);

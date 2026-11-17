@@ -31,6 +31,7 @@ import {
   DEFAULT_STORAGE_ACCESS_POLICY,
 } from "../../../core/src/stream-sync/storage-retry.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
+import { retainedManifest } from "./apply-fixture.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { createFakeGateway } from "./fake-gateway.js";
 import type { RequestTrace } from "./request-trace.test-utils.js";
@@ -202,13 +203,7 @@ export async function world(options: {
         })),
       }),
       // The host's retained manifest names the streams a delete fences.
-      retainedManifests: () => [
-        JSON.stringify({
-          connector_key: CONNECTOR,
-          version: "1",
-          streams: names.map((name) => ({ name, primary_key: ["id"] })),
-        }),
-      ],
+      retainedManifests: () => [retainedManifest(CONNECTOR, names)],
       olderVersionReads: () => true,
     });
     /** One run that writes `records` and ends covering `covered`. */

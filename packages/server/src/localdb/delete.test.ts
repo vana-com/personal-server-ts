@@ -23,7 +23,7 @@ import {
   RegistryRefusedError,
   RegistryUnavailableError,
 } from "../../../core/src/stream-sync/ports.js";
-import { remoteFixture } from "./apply-fixture.js";
+import { remoteFixture, retainedManifest } from "./apply-fixture.js";
 import { postStreamDeleteOnly } from "./legacy-delete-fixture.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
@@ -33,13 +33,6 @@ const drivers: SqlDriver[] = [];
 afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
 });
-/** A retained connector manifest: it names a stream the registry holds no row for. */
-const manifestOf = (streams: readonly string[]) =>
-  JSON.stringify({
-    connector_key: "fixture-source",
-    version: "1",
-    streams: streams.map((name) => ({ name, primary_key: ["id"] })),
-  });
 async function world(
   file?: string,
   names: readonly string[] = ["items"],
@@ -320,7 +313,9 @@ it("the second device's unpublished rows are purged along with its imported rows
 it("deletion fences declared rowless streams after the control tombstone", async () => {
   const f = await world();
   const store = createConnectionDeleter(f.a.deps, {
-    retainedManifests: () => [manifestOf(["items", "rowless"])],
+    retainedManifests: () => [
+      retainedManifest("fixture-source", ["items", "rowless"]),
+    ],
   });
   await store.requestConnectionDelete("fixture-source");
   expect(await store.resumeDeletes()).toEqual([]);

@@ -55,7 +55,7 @@ import {
   deleteMetadataHash,
   endedGenerationDeleteMetadataHash,
 } from "../../../core/src/stream-sync/delete-metadata.js";
-import { remoteFixture } from "./apply-fixture.js";
+import { remoteFixture, retainedManifest } from "./apply-fixture.js";
 import { postStreamDeleteOnly } from "./legacy-delete-fixture.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
@@ -1177,7 +1177,11 @@ const twoStreams = {
 
 /** A deleter of `device` that knows both streams, so "events" is a declared stream with no row yet. */
 const twoStreamDeleter = (device: Device) =>
-  createConnectionDeleter(device.deps, {});
+  createConnectionDeleter(device.deps, {
+    retainedManifests: () => [
+      retainedManifest(declaration.connector, ["items", "events"]),
+    ],
+  });
 
 /** `deleter` lands the fence, then stops before any stream is cleaned. */
 async function fencedThenStopped(
