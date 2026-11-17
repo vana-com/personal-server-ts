@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-test("checks the files npm actually packs", (t) => {
+test("checks the files npm actually packs", async (t) => {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "dist-imports-"));
   t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
   fs.mkdirSync(path.join(fixture, "scripts"));
@@ -66,4 +66,37 @@ test("checks the files npm actually packs", (t) => {
     0,
     "packed relative targets and excluded files are accepted",
   );
+
+  const loaderForms = [
+    ["require.resolve", (arg) => `require.resolve(${arg});`],
+    ["import.meta.resolve", (arg) => `import.meta.resolve(${arg});`],
+    [
+      "direct createRequire",
+      (arg) =>
+        `import { createRequire } from "node:module"; createRequire(import.meta.url)(${arg});`,
+    ],
+    [
+      "renamed createRequire binding",
+      (arg) =>
+        `import { createRequire } from "node:module"; const load = createRequire(import.meta.url); load(${arg});`,
+    ],
+  ];
+  for (const [name, code] of loaderForms) {
+    await t.test(`${name} rejects an undeclared runtime package`, () => {
+      assertViolation(
+        code('"missing-loader-package"'),
+        /imports missing-loader-package/,
+      );
+    });
+    await t.test(`${name} rejects a computed runtime specifier`, () => {
+      assertViolation(code("runtimePackage"), /unanalysable/i);
+    });
+    await t.test(`${name} uses the existing packed-relative and builtin rules`, () => {
+      assertViolation(code('"./excluded.js"'), /unpacked relative target/);
+      assert.equal(check(code('"./present.js"')).status, 0);
+      assert.equal(check(code('"node:fs"')).status, 0);
+      // Extensionless/directory CJS resolution remains deliberately deferred.
+      assertViolation(code('"./present"'), /unpacked relative target/);
+    });
+  }
 });

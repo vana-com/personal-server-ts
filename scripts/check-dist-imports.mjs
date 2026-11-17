@@ -11,7 +11,7 @@ const builtins = new Set(
   builtinModules.flatMap((name) => [name, `node:${name}`]),
 );
 const violations = [];
-// Repository-relative paths and reasons for computed imports that cannot be made static.
+// Repository-relative paths and reasons for computed imports/loaders that cannot be made static.
 const computedImportAllowlist = new Map();
 const computedImports = [];
 
@@ -50,6 +50,36 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
       true,
       ts.ScriptKind.JS,
     );
+    const isCreateRequireCall = (node) =>
+      ts.isCallExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === "createRequire";
+    // Collect before visiting calls: traversal order must not affect which
+    // local names are recognized as loaders.
+    const requireBindings = new Set(["require"]);
+    const collectBindings = (node) => {
+      if (
+        ts.isVariableDeclaration(node) &&
+        ts.isIdentifier(node.name) &&
+        node.initializer &&
+        isCreateRequireCall(node.initializer)
+      ) {
+        requireBindings.add(node.name.text);
+      }
+      ts.forEachChild(node, collectBindings);
+    };
+    collectBindings(source);
+    const isRequireIdentifier = (node) =>
+      ts.isIdentifier(node) && requireBindings.has(node.text);
+    const isLoaderCall = (expression) =>
+      isRequireIdentifier(expression) ||
+      isCreateRequireCall(expression) ||
+      (ts.isPropertyAccessExpression(expression) &&
+        expression.name.text === "resolve" &&
+        (isRequireIdentifier(expression.expression) ||
+          (ts.isMetaProperty(expression.expression) &&
+            expression.expression.keywordToken === ts.SyntaxKind.ImportKeyword &&
+            expression.expression.name.text === "meta")));
     const pending = [source];
     while (pending.length) {
       const node = pending.pop();
@@ -63,24 +93,24 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
       } else if (ts.isCallExpression(node)) {
         const isDynamicImport =
           node.expression.kind === ts.SyntaxKind.ImportKeyword;
-        const isRequire =
-          ts.isIdentifier(node.expression) &&
-          node.expression.text === "require";
+        const isRuntimeLoader = isLoaderCall(node.expression);
         const arg = node.arguments[0];
         if (
-          (isDynamicImport || (isRequire && node.arguments.length === 1)) &&
+          (isDynamicImport || isRuntimeLoader) &&
           arg &&
           (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg))
         ) {
           specifier = arg.text;
-        } else if (isDynamicImport) {
+        } else if (isDynamicImport || isRuntimeLoader) {
           const location = `${path.relative(root, file)}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}`;
           const reason = computedImportAllowlist.get(path.relative(root, file));
           computedImports.push(
             `${location}${reason ? ` (allowed: ${reason})` : " (unanalysable)"}`,
           );
           if (!reason)
-            violations.push(`${location} has an unanalysable dynamic import`);
+            violations.push(
+              `${location} has an unanalysable dynamic import or runtime loader`,
+            );
         }
       }
       if (specifier?.startsWith(".")) {
@@ -106,7 +136,7 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
   }
 }
 console.log(
-  `Computed dynamic imports: ${computedImports.length ? `\n${computedImports.join("\n")}` : "none"}`,
+  `Computed imports and runtime loaders: ${computedImports.length ? `\n${computedImports.join("\n")}` : "none"}`,
 );
 if (violations.length) {
   console.error(violations.join("\n"));
