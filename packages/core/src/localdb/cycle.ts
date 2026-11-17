@@ -20,9 +20,10 @@ export interface CycleReport {
     readonly error: string | null;
     /**
      * Set when the connection's log is in a format this build cannot read:
-     * nothing was published for it and its pending changes stay pending. Rows
-     * applied before the unreadable segment was reached (a snapshot, earlier
-     * segments) stay applied (see `UpdateRequiredError`).
+     * this pass stopped at that refusal. Any acknowledged early publication
+     * remains in `published`; this status does not undo it. Rows applied
+     * before the unreadable segment was reached (a snapshot, earlier segments)
+     * stay applied (see `UpdateRequiredError`).
      */
     readonly status?: "update_required";
   }[];
@@ -67,7 +68,7 @@ export async function runCycle(
   };
 }
 
-/** Retry only the named connections; a purged connection needs no pass. */
+/** Retry only the named connections using one shared owner listing. */
 async function runScoped(
   deps: LocalSyncDeps,
   scope: CycleScope,
@@ -80,15 +81,17 @@ async function runScoped(
     ).map((row) => row.id),
   );
   const ids = [...new Set(scope.connections)].filter((id) => held.has(id));
+  if (ids.length === 0) return { connections: [] };
   const only = new Set(ids);
   const candidates = await earlyCandidates(deps);
   const early = await publishEarly(deps, {
     active: candidates.active.filter((row) => only.has(row.connectionId)),
     fresh: candidates.fresh.filter((row) => only.has(row.connectionId)),
   });
+  const listed = await deps.registry.listOwnerRows();
   return {
     connections: await Promise.all(
-      ids.map((id) => syncConnection(deps, id, early.get(id))),
+      ids.map((id) => syncConnection(deps, id, early.get(id), listed)),
     ),
   };
 }
@@ -236,7 +239,7 @@ export async function syncConnection(
   /** The cycle's listing of the owner's rows, taken before this call. */
   listed?: OwnerRows,
 ): Promise<CycleReport["connections"][number]> {
-  let published: readonly PublishResult[] = [];
+  let published: readonly PublishResult[] = early?.published ?? [];
   let error: string | null = null;
   let status: "update_required" | undefined;
   try {
@@ -255,7 +258,7 @@ export async function syncConnection(
     // until it has one. What apply left to publish goes after what the early
     // publish already sent.
     const through = await publishLog(deps, connectionId);
-    published = [...(early?.published ?? []), ...through];
+    published = [...published, ...through];
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause);
     if (cause instanceof UpdateRequiredError) status = "update_required";

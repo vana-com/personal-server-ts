@@ -344,14 +344,22 @@ export function createLocalSync(
     async apply() {
       await resume();
       const listed = await deps.registry.listOwnerRows();
+      let failed = false;
+      let firstError: unknown;
       for (const connection of await bootstrapConnections(deps, listed)) {
-        await applyConnection(
-          deps,
-          connection.connectionId,
-          listed,
-          listed.find((row) => row.scope === connection.connectionId)?.read,
-        );
+        try {
+          await applyConnection(
+            deps,
+            connection.connectionId,
+            listed,
+            listed.find((row) => row.scope === connection.connectionId)?.read,
+          );
+        } catch (error) {
+          if (!failed) firstError = error;
+          failed = true;
+        }
       }
+      if (failed) throw firstError;
     },
     async syncConnection(connectionId) {
       await resume();

@@ -54,7 +54,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/10";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/11";
 
 const DEFAULT_PAGE_SIZE = 500;
 const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
@@ -180,6 +180,7 @@ export interface CanonicalLegacyReadOk {
 }
 
 export type CanonicalLegacyReadFailure =
+  | { status: "unavailable"; reason: "invalid_binding"; scope: string }
   | {
       status: "unavailable";
       reason: "unbound_scope";
@@ -340,6 +341,8 @@ export async function readCanonicalLegacyScope(
     : profileKeyForSource(selection.sourceId);
   const lookup = legacyScopeToPdppSelection(scope, { profileKey });
   const binding = bindingFor(scope, profileKey);
+  if (!lookup.ok && lookup.error.kind === "invalid_binding")
+    return unavailable({ reason: "invalid_binding", scope });
   if (!lookup.ok || !binding) {
     return unavailable({
       reason: "unbound_scope",
@@ -430,6 +433,7 @@ function collectSnapshot(
   optionalStreams: ReadonlySet<string>,
   ancillaryBlobStreams: ReadonlySet<string>,
   declarations?: Pick<StreamDeclarationRegistry, "forInstance">,
+  horizonOnly = false,
 ): Snapshot | { ok: false; result: CanonicalLegacyReadResult } {
   const { instance } = selection;
   const binding = store.getInstanceBinding(instance);
@@ -446,7 +450,7 @@ function collectSnapshot(
   // A stream the binding serves without counts only while a current receipt
   // proves its live set. Otherwise it is left out before any read of it: no
   // schema, rows, blobs or projection input, and never "fetched".
-  const served = streams.filter(
+  let served = streams.filter(
     (stream) =>
       !optionalStreams.has(stream) ||
       receipts.some(
@@ -492,6 +496,20 @@ function collectSnapshot(
     }
     throw error;
   }
+  // Optional unsupported blobs are absent, irrespective of receipt presence.
+  // Decide this before completions, preflight, or any blob-body access.
+  served = served.filter((stream) => {
+    const unsupported =
+      !ancillaryBlobStreams.has(stream) &&
+      !supportedBlobStream(selection, stream, streamSchemas[stream]) &&
+      (rowsByStream.get(stream) ?? []).some(hasBlobRef);
+    if (!optionalStreams.has(stream) || !unsupported) return true;
+    rowsByStream.delete(stream);
+    delete streamSchemas[stream];
+    const gap = orderGaps.indexOf(stream);
+    if (gap !== -1) orderGaps.splice(gap, 1);
+    return false;
+  });
   const completions = new Map<string, CanonicalStreamCompletion>();
   for (const receipt of receipts) {
     if (
@@ -530,6 +548,19 @@ function collectSnapshot(
     };
   }
 
+  if (horizonOnly)
+    return {
+      ok: true,
+      generation: binding.generation,
+      served,
+      listing: listing.filter((entry) => served.includes(entry.stream)),
+      rowsByStream,
+      orderGaps,
+      completions,
+      blobContents: new Map(),
+      streamSchemas,
+    };
+
   // Preflight all unique references/metadata before copying ANY body. A legal
   // per-blob size does not bound fan-in; excluded raw fields still cost bytes.
   const blobContents = new Map<string, ClaudeBlobContents>();
@@ -541,11 +572,7 @@ function collectSnapshot(
     const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
     if (blobBacked.length === 0) continue;
     const projectedField = declaredBlobField(streamSchemas[stream]);
-    if (
-      !projectedField &&
-      (selection.sourceId !== CLAUDE_SOURCE_ID ||
-        (stream !== "conversations" && stream !== "projects"))
-    ) {
+    if (!supportedBlobStream(selection, stream, streamSchemas[stream])) {
       return {
         ok: false,
         result: unavailable({
@@ -682,7 +709,7 @@ function collectSnapshot(
     ok: true,
     generation: binding.generation,
     served,
-    listing,
+    listing: listing.filter((entry) => served.includes(entry.stream)),
     rowsByStream,
     orderGaps,
     completions,
@@ -1093,6 +1120,19 @@ function unavailable(
   } as CanonicalLegacyReadResult;
 }
 
+/** Preserve the existing verified raw-blob mapping alongside declared fields. */
+function supportedBlobStream(
+  selection: CanonicalConnectionSelection,
+  stream: string,
+  schema: Record<string, unknown> | undefined,
+): boolean {
+  return (
+    Boolean(declaredBlobField(schema)) ||
+    (selection.sourceId === CLAUDE_SOURCE_ID &&
+      (stream === "conversations" || stream === "projects"))
+  );
+}
+
 function hasBlobRef(row: PdppStoredRecord): boolean {
   return Object.hasOwn(row.data, "blob_ref");
 }
@@ -1257,4 +1297,43 @@ function canonicalSourceId(pdppSource: string): string {
   return pdppSource.startsWith(CONNECTOR_ID_PREFIX)
     ? SOURCE_ID_PREFIX + pdppSource.slice(CONNECTOR_ID_PREFIX.length)
     : pdppSource;
+}
+
+/** Same served-set and receipt horizon as a body, without projection or blob-body reads. */
+export function canonicalLegacyCollectionHorizon(
+  input: ReadCanonicalLegacyScopeInput,
+):
+  | { ok: true; collectedAt: string }
+  | { ok: false; reason: "invalid_binding" | "unavailable" } {
+  const { scope, selection, store } = input;
+  const binding = bindingFor(scope, selection.method);
+  if (!binding) return { ok: false, reason: "unavailable" };
+  const optional = new Set(binding.optionalStreams);
+  if (binding.pdppStreams.every((stream) => optional.has(stream)))
+    return { ok: false, reason: "invalid_binding" };
+  return store.readSnapshot(() => {
+    const snapshot = collectSnapshot(
+      store,
+      selection,
+      binding.pdppStreams,
+      false,
+      DEFAULT_PAGE_SIZE,
+      0,
+      input.requireCompletionReceipts === true,
+      input.allowUnprovenEmptyStreams === true,
+      optional,
+      new Set(binding.ancillaryBlobStreams),
+      input.declarations,
+      true,
+    );
+    if (!snapshot.ok) return { ok: false, reason: "unavailable" };
+    const collectedAt = latestCollectedAt(
+      snapshot.rowsByStream,
+      snapshot.completions,
+      snapshot.listing,
+    );
+    return collectedAt === null
+      ? { ok: false, reason: "unavailable" }
+      : { ok: true, collectedAt };
+  });
 }

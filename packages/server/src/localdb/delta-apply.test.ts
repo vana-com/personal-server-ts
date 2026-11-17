@@ -8,6 +8,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { RegistryChangeDelta } from "../../../core/src/stream-sync/ports.js";
+import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { applyRegistryDelta } from "../../../core/src/localdb/delta-apply.js";
 import {
   CONNECTION_ID,
@@ -88,6 +89,11 @@ async function applied(w: World, device: Device, delta: RegistryChangeDelta) {
 }
 
 /** What a device holds for its connections, apart from per-device ids. */
+// Publish watermarks are local change-sequence cursors; a full cycle advances
+// them, while a download-only startup apply does not.
+const remoteStreamState = (rows: Record<string, unknown>[]) =>
+  rows.map(({ publish_watermark: _watermark, ...state }) => state);
+
 async function localState(device: Device) {
   const q = (sql: string) => device.db.query(sql);
   return {
@@ -116,7 +122,96 @@ async function changedBy(w: World, step: () => Promise<unknown>) {
     .map(([scope]) => scope);
 }
 
+it("an explicit control observation wins over a listed control", async () => {
+  const { here } = await peerCommitted();
+  const listed = await here.deps.registry.listOwnerRows();
+  const live = await here.deps.registry.read(CONTROL);
+  if (!live.found) throw new Error("no control row");
+  const observedControl = { ...live, version: live.version + 1, deleted: true };
+  const listedControl = listed.find((row) => row.scope === CONTROL)?.read;
+  expect(listedControl).toEqual(live);
+  expect(observedControl).not.toEqual(listedControl);
+  const reads: string[] = [];
+  const read = here.deps.registry.read.bind(here.deps.registry);
+  here.deps.registry.read = async (scope) => {
+    reads.push(scope);
+    return read(scope);
+  };
+  await applyConnection(here.deps, CONNECTION_ID, listed, observedControl);
+  expect(reads).toEqual([]);
+  expect(
+    await here.db.query(
+      "SELECT control_state FROM connections WHERE connection_id=?",
+      [CONNECTION_ID],
+    ),
+  ).toEqual([{ control_state: "deleted" }]);
+  expect(await here.rows()).toEqual([]);
+});
+
+it("an old listing cannot roll back a reconnected generation", async () => {
+  const w = await world({ streams: 1 });
+  const peer = await w.device("peer");
+  const here = await w.device("here");
+  await peer.run("old", [{ stream: sName(0), id: "old" }]);
+  await peer.cycle();
+  await here.cycle();
+  const listed = await here.deps.registry.listOwnerRows();
+  const oldControl = listed.find((row) => row.scope === CONTROL)!.read;
+  const oldState = await localState(here);
+  await peer.sync.deleter.requestConnectionDelete(CONNECTOR);
+  expect(await peer.sync.deleter.resumeDeletes()).toEqual([]);
+  await here.cycle();
+  expect(await here.rows()).toEqual([]);
+  await peer.run("new", [{ stream: sName(0), id: "new" }], { connect: true });
+  await peer.cycle();
+  await here.cycle();
+  const current = await localState(here);
+  expect(current.connections[0]!.generation).toBeGreaterThan(
+    oldState.connections[0]!.generation,
+  );
+  expect(current.records.join(" ")).toContain('"new"');
+  const reads: string[] = [];
+  const read = here.deps.registry.read.bind(here.deps.registry);
+  here.deps.registry.read = async (scope) => {
+    reads.push(scope);
+    return read(scope);
+  };
+  await applyConnection(here.deps, CONNECTION_ID, listed, oldControl);
+  expect(await localState(here)).toEqual(current);
+  expect(reads).toContain(CONTROL);
+  expect((await here.rows()).join(" ")).not.toContain('"old"');
+});
+
 describe("applying a change delta", () => {
+  it("startup apply and cycle converge after a peer update", async () => {
+    const w = await world({ streams: 2 });
+    const peer = await w.device("peer");
+    const here = await w.device("startup");
+    const twin = await w.device("cycle");
+    await peer.run("seed", records("a"));
+    await peer.cycle();
+    await here.cycle();
+    await twin.cycle();
+    const before = await localState(here);
+    expect(await localState(twin)).toEqual(before);
+    await peer.run("update", [{ stream: sName(0), id: "a-0-1", pad: 64 }], {
+      full: false,
+      covered: [sName(0)],
+    });
+    await peer.cycle();
+    const peerRows = await peer.rows();
+    expect(peerRows).not.toEqual(before.records);
+    await here.sync.apply();
+    await twin.cycle();
+    const startup = await localState(here);
+    const cycled = await localState(twin);
+    expect(cycled.records).toEqual(peerRows);
+    expect(startup.records).toEqual(cycled.records);
+    expect(remoteStreamState(startup.streams)).toEqual(
+      remoteStreamState(cycled.streams),
+    );
+    expect(await here.position()).toBe(await twin.position());
+  });
   it("a peer's log commit: no registry read, one segment GET, the rows a cycle gives (mutation: applyLog without the delta's read)", async () => {
     const { w, peer, here } = await peerCommitted();
     const delta = await deltaOf(here, [LOG]);
@@ -715,6 +810,42 @@ describe("a peer's connection delete", () => {
     return { w, peer, here, twin, scopes };
   }
 
+  it.each(["delete", "re-create"] as const)(
+    "startup apply and cycle converge after a peer %s",
+    async (change) => {
+      const { peer, here, twin } = await peerDeleted();
+      const before = await localState(here);
+      expect(before.records.length).toBeGreaterThan(0);
+      expect(await localState(twin)).toEqual(before);
+      if (change === "re-create") {
+        await peer.sync.intake.begin("startup-reconnect", {
+          connector: CONNECTOR,
+          artifactDigest: CONNECTOR,
+          connect: true,
+          observedAt: 3000,
+          owner: { address: OWNER, leaseId: null },
+        });
+        await peer.sync.intake.abort("startup-reconnect", "cancelled");
+        await peer.run("new-lifetime", [{ stream: sName(1), id: "new" }]);
+        await peer.cycle();
+      }
+      const peerRows = await peer.rows();
+      expect(peerRows).not.toEqual(before.records);
+      if (change === "delete") expect(peerRows).toEqual([]);
+      else expect(await peer.records()).toHaveLength(1);
+      // No local writes: both receivers observe the same settled peer state.
+      await here.sync.apply();
+      await twin.cycle();
+      const startup = await localState(here);
+      const cycled = await localState(twin);
+      expect(cycled.records).toEqual(peerRows);
+      expect(startup.records).toEqual(cycled.records);
+      expect(remoteStreamState(startup.streams)).toEqual(
+        remoteStreamState(cycled.streams),
+      );
+      expect(startup.connections).toEqual(cycled.connections);
+    },
+  );
   it("applies with no registry read and no GET, leaving what a cycle leaves (mutation: control tombstones handed to the cycle)", async () => {
     const { w, here, twin, scopes } = await peerDeleted();
     expect(scopes).toContain(CONTROL);

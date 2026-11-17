@@ -135,6 +135,7 @@ export interface OwnerNotes {
 }
 
 export type ReadDecision =
+  | { readonly kind: "invalid_binding" }
   /** Not a stream-sync read: the existing path answers, unchanged. */
   | ({ readonly kind: "pass" } & OwnerNotes)
   /** §2.10 step 3: serve the legacy or raw file through the existing path. */

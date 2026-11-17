@@ -137,7 +137,7 @@ async function world(connectors: number, streamsPer: number) {
     Array(connectors).fill(null),
   );
   await sync.cycle(); // settles: a second pass finds nothing to do
-  return { sync, calls };
+  return { sync, calls, deps };
 }
 
 const tally = (calls: readonly string[]) =>
@@ -166,7 +166,7 @@ describe("an idle sync cycle", () => {
 describe("a retry scoped to the connections that are owed", () => {
   // The manager retries owed work on its timer. When the change push shows the
   // registry has not moved, the retry names the connections that are owed, and
-  // the cycle skips the listing and reads for those alone.
+  // the cycle applies those connections using one shared listing.
   it("reads only the owed connection; a full idle cycle shares one listing", async () => {
     const w = await world(6, 4);
     w.calls.length = 0;
@@ -179,11 +179,30 @@ describe("a retry scoped to the connections that are owed", () => {
     const one = tally(w.calls);
     console.log("SCOPED-CYCLE of 1/6", JSON.stringify({ full, one }));
     expect(scoped.connections.map((c) => c.connectionId)).toEqual([owed]);
-    expect(w.calls).not.toContain("registry.list");
+    expect(w.calls.filter((x) => x === "registry.list")).toHaveLength(1);
     expect(w.calls).not.toContain("registry.post");
     expect(full).toEqual({ "registry.list": 1 });
-    expect(one).toEqual({ "registry.read": 2 });
+    expect(one).toEqual({ "registry.list": 1 });
   });
+
+  it.each([1, 6, 50])(
+    "uses one listing for any nonempty subset of %i connections",
+    async (n) => {
+      const w = await world(n, 1);
+      const ids = (await w.sync.cycle()).connections.map(
+        (connection) => connection.connectionId,
+      );
+      for (const k of [0, 1, n]) {
+        w.calls.length = 0;
+        const owed = ids.slice(0, k);
+        const report = await w.sync.cycle({ connections: [...owed, ...owed] });
+        expect(
+          report.connections.map((connection) => connection.connectionId),
+        ).toEqual(owed);
+        expect(tally(w.calls)).toEqual(k === 0 ? {} : { "registry.list": 1 });
+      }
+    },
+  );
 
   it("an empty scope reads nothing", async () => {
     const w = await world(3, 2);
@@ -200,4 +219,51 @@ describe("a retry scoped to the connections that are owed", () => {
     expect(report.connections).toEqual([]);
     expect(w.calls).toEqual([]);
   });
+});
+it("keeps an acknowledged early publication when apply fails, and completes B", async () => {
+  const w = await world(2, 1);
+  const initial = await w.sync.cycle();
+  const [a, b] = initial.connections.map((c) => c.connectionId);
+  expect(a).toBeDefined();
+  expect(b).toBeDefined();
+  await w.sync.intake.begin("late-a", {
+    connector: "c0",
+    artifactDigest: "c0",
+    wantFull: false,
+    observedAt: 2000,
+    owner: { address: OWNER, leaseId: null },
+  });
+  await w.sync.intake.batch("late-a", {
+    batch: 0,
+    records: [{ stream: "s0", data: { id: "later", version: 2 } }],
+  });
+  await w.sync.intake.end("late-a", endRequest({ lastBatch: 0, live: ["s0"] }));
+  const postBatch = w.deps.registry.postBatch!.bind(w.deps.registry);
+  const read = w.deps.registry.read.bind(w.deps.registry);
+  let acknowledged = 0;
+  w.deps.registry.postBatch = async (request) => {
+    const result = await postBatch(request);
+    acknowledged++;
+    return result;
+  };
+  const list = w.deps.registry.listOwnerRows.bind(w.deps.registry);
+  w.deps.registry.listOwnerRows = async () =>
+    (await list()).filter((row) => row.scope !== a);
+  w.deps.registry.read = async (scope) => {
+    if (scope === a && acknowledged > 0)
+      throw new Error("apply read failed after commit");
+    return read(scope);
+  };
+  w.calls.length = 0;
+  const report = await w.sync.cycle({ connections: [a!, b!] });
+  expect(acknowledged).toBe(1);
+  expect(w.calls.filter((call) => call === "registry.batch")).toHaveLength(1);
+  const failed = report.connections.find((c) => c.connectionId === a)!;
+  expect(failed.error).toContain("apply read failed after commit");
+  expect(
+    failed.published.filter((result) => result.outcome === "published"),
+  ).toHaveLength(1);
+  expect(
+    report.connections.find((c) => c.connectionId === b)?.error,
+  ).toBeNull();
 });

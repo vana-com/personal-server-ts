@@ -397,6 +397,97 @@ describe("disk-backed bootstrap swap", () => {
     }
     expect(await d.position()).toBe(0);
   });
+  it.each(["swap", "copy"] as const)(
+    "advances the visible view token when the %s finish publishes",
+    async (mode) => {
+      const w = await world({ streams: 1 });
+      const peer = await history(w);
+      const d = await connect(w, `view-${mode}`);
+      if (mode === "copy")
+        Object.assign(d.deps, { bootstrapFirstLoadFinish: "copy" });
+      const token = async () =>
+        (
+          await d.db.query<{ version: number }>(
+            "SELECT version FROM view_versions WHERE connection_id=?",
+            [CONNECTION_ID],
+          )
+        )[0]?.version ?? 0;
+      const initial = await token();
+      expect((await ownerSnapshot(d)).ids).toEqual([]);
+      const batch = d.db.batch.bind(d.db);
+      let beforeFinish = -1;
+      let afterFinish = -1;
+      let sawSwap = false;
+      d.db.batch = async (statements) => {
+        const finish = statements.some(
+          (statement) => statement.sql === "DELETE FROM bootstrap_load",
+        );
+        if (!finish) return batch(statements);
+        sawSwap = statements.some(
+          (statement) => statement.sql === "DROP TABLE records",
+        );
+        beforeFinish = await token();
+        const result = await batch(statements);
+        afterFinish = await token();
+        return result;
+      };
+      await applyConnection(d.deps, CONNECTION_ID);
+      expect(sawSwap).toBe(mode === "swap");
+      expect(beforeFinish).toBeGreaterThanOrEqual(initial);
+      expect(afterFinish).toBeGreaterThan(beforeFinish);
+      expect((await ownerSnapshot(d)).ids).toEqual(["b", "c", "d", "safe"]);
+      expect(await d.rows()).toEqual(await peer.rows());
+    },
+  );
+
+  it("blocks a foreign insert after the swap decision while bootstrap owns records", async () => {
+    const w = await world({ streams: 1 });
+    const peer = await history(w);
+    const d = await connect(w, "swap-race");
+    const other = "pdpp.fixture~1111111111111111";
+    await d.db.batch([
+      {
+        sql: "INSERT INTO connections(connection_id,connector,ns,generation,control_state,control_version) VALUES(?,'fixture','1111111111111111',1,'active',1)",
+        params: [other],
+      },
+    ]);
+    const batch = d.db.batch.bind(d.db);
+    let attempted = false;
+    d.db.batch = async (statements) => {
+      if (
+        !attempted &&
+        statements.some((statement) => statement.sql === "DROP TABLE records")
+      ) {
+        attempted = true;
+        await expect(
+          batch([
+            { sql: "UPDATE write_ctx SET origin='remote' WHERE id=1" },
+            {
+              sql: `INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256,first_o)
+            SELECT ?,stream,pk_hash,record_key,stamp_o,stamp_r,?,'foreign-hash',first_o FROM records
+            WHERE connection_id=? AND stream='s0' AND record_key='safe'`,
+              params: [
+                other,
+                JSON.stringify({ id: "safe", source: "B" }),
+                CONNECTION_ID,
+              ],
+            },
+            { sql: "UPDATE write_ctx SET origin='local' WHERE id=1" },
+          ]),
+        ).rejects.toThrow("bootstrap_busy");
+        expect(
+          await d.db.query("SELECT body FROM records WHERE connection_id=?", [
+            other,
+          ]),
+        ).toEqual([]);
+      }
+      return batch(statements);
+    };
+    await applyConnection(d.deps, CONNECTION_ID);
+    expect(attempted).toBe(true);
+    expect(await d.rows()).toEqual(await peer.rows());
+    expect(await d.position()).toBe(5);
+  });
 
   it("rolls back a SQL failure after DROP records and resumes from durable segment receipts", async () => {
     const w = await world({ streams: 1 });
@@ -531,6 +622,78 @@ describe("disk-backed bootstrap swap", () => {
     await p.cycle();
     await applyConnection(d.deps, CONNECTION_ID);
     expect(await d.rows()).toEqual(await p.rows());
+  });
+
+  it("discards a staged prefix when the head is rewritten and converges on retry", async () => {
+    const w = await world({ streams: 1 });
+    await history(w);
+    const d = await connect(w, "rewritten");
+    const batch = d.db.batch.bind(d.db);
+    let fail = true;
+    d.db.batch = async (statements) => {
+      if (
+        fail &&
+        statements.some(
+          (statement) =>
+            statement.sql.includes("INSERT INTO bootstrap_segments") &&
+            statement.params?.[0] === 2,
+        )
+      ) {
+        fail = false;
+        throw new Error("stop after prefix");
+      }
+      return batch(statements);
+    };
+    await expect(d.cycle()).rejects.toThrow("stop after prefix");
+    expect(
+      await d.db.query(
+        "SELECT position FROM bootstrap_segments WHERE position=1",
+      ),
+    ).toEqual([{ position: 1 }]);
+    expect(await d.position()).toBe(0);
+    const segments = await w.segments();
+    const first = segments.get(1)!;
+    const replacement = {
+      ...first,
+      operations: first.operations.map((op) =>
+        op.kind === "upsert"
+          ? { ...op, value: { ...(op.value as object), revised: true } }
+          : op,
+      ),
+    };
+    const firstBytes = encodeSegment(replacement);
+    const firstHash = await digestSegment(
+      async (bytes) => keccak_256(bytes),
+      firstBytes,
+    );
+    await w.innerBlobs.put(`${LOG}/${firstHash.blobName}`, firstBytes);
+    const head = segments.get(5)!;
+    const rewritten = {
+      ...head,
+      refs: head.refs.map((ref) =>
+        ref.position === 1
+          ? { ...ref, dataHash: firstHash.dataHash, bytes: firstBytes.length }
+          : ref,
+      ),
+    };
+    const headBytes = encodeSegment(rewritten);
+    const headHash = await digestSegment(
+      async (bytes) => keccak_256(bytes),
+      headBytes,
+    );
+    await w.innerBlobs.put(`${LOG}/${headHash.blobName}`, headBytes);
+    const metadataHash = w.gateway.versions.get(LOG)!.at(-1)!.metadataHash;
+    w.gateway.replaceHead(LOG, { dataHash: headHash.dataHash, metadataHash });
+    await d.cycle();
+    const fresh = await connect(w, "fresh-rewritten");
+    await fresh.cycle();
+    expect(await d.rows()).toEqual(await fresh.rows());
+    expect((await d.rows()).join(" ")).toContain("revised");
+    expect(await d.position()).toBe(await fresh.position());
+    expect(await d.position()).toBeGreaterThanOrEqual(5);
+    expect(await d.db.query("SELECT * FROM bootstrap_load")).toEqual([]);
+    await d.cycle();
+    expect(await d.rows()).toEqual(await fresh.rows());
   });
 
   it("finishes a prefix-only stream after an advanced-head retry, with SQL-layer append rollback", async () => {

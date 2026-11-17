@@ -4,7 +4,17 @@ import {
   type CanonicalLegacyReadStore,
   type CanonicalStreamCompletion,
 } from "./canonical-legacy-projection.js";
-import { projectPdppRecordsToLegacyPayload } from "../legacy-projection/index.js";
+import {
+  LEGACY_SCOPE_BINDINGS,
+  legacyScopeToPdppSelection,
+  type LegacyScopeBinding,
+  projectPdppRecordsToLegacyPayload,
+} from "../legacy-projection/index.js";
+import {
+  createLegacyScopeView,
+  type LegacyScopeAuthority,
+} from "./legacy-scope-view.js";
+import { selectForTarget } from "../localdb/read-selection.js";
 import type { PdppStoredRecord } from "./pdpp-records/types.js";
 
 vi.mock("../legacy-projection/index.js", async (importOriginal) => {
@@ -156,4 +166,219 @@ describe("the stored legacy read hands the projector the streams it serves", () 
       fetchedStreams: ["notes", "folders", "profile"],
     });
   });
+});
+
+describe("synthetic optional-stream contract", () => {
+  const scope = "synthetic.items";
+  const selected = {
+    instance: "test",
+    sourceId: "https://registry.pdpp.dev/sources/synthetic",
+    method: "synthetic",
+  };
+  const project = vi.fn<LegacyScopeBinding["project"]>(() => ({
+    ok: true,
+    payload: { items: [] },
+  }));
+  const binding: LegacyScopeBinding = {
+    scope,
+    pdppSource: "https://registry.pdpp.dev/connectors/synthetic",
+    pdppStreams: ["R", "O"],
+    optionalStreams: ["O"],
+    project,
+    fieldsRead: {},
+    primaryKey: {},
+    legacySchemaPath: "",
+    lossy: [],
+    provenance: [],
+  };
+  function fixture(
+    withOptionalReceipt: boolean,
+    optionalBlob = true,
+  ): CanonicalLegacyReadStore {
+    const owner = {
+      ...selected,
+      deletedAt: null,
+      generation: 1,
+      resetClock: 0,
+    };
+    return {
+      getInstanceBinding: () => owner,
+      listConnections: () => [owner],
+      readSnapshot: (read) => read(),
+      listArrivalOrder: () => [],
+      listStreams: () =>
+        ["R", "O"].map((stream) => ({
+          stream,
+          recordCount: 1,
+          lastUpdated: NOW,
+        })),
+      listStreamCompletions: () =>
+        (withOptionalReceipt ? ["R", "O"] : ["R"]).map((stream) => ({
+          stream,
+          method: "synthetic",
+          generation: 1,
+          sourceCollectedAt: NOW,
+          writeSeq: 1,
+          liveCount: 1,
+        })),
+      listRecords: (stream) => ({
+        data: [
+          {
+            stream,
+            instance: "test",
+            recordKey: "1",
+            version: 1,
+            emittedAt: NOW,
+            deleted: false,
+            data:
+              stream === "O" && optionalBlob
+                ? { id: "1", blob_ref: "sha256:unsupported" }
+                : { id: "1" },
+          },
+        ],
+        hasMore: false,
+        nextCursor: null,
+        horizon: "1",
+      }),
+      getBlobBytes: vi.fn(() => {
+        throw new Error("optional blob body must not be read");
+      }),
+    };
+  }
+  async function withBinding(run: () => Promise<void>) {
+    if (!(LEGACY_SCOPE_BINDINGS instanceof Map))
+      throw new Error("expected test catalogue Map");
+    LEGACY_SCOPE_BINDINGS.set(scope, binding);
+    project.mockClear();
+    projector.mockClear();
+    try {
+      await run();
+    } finally {
+      LEGACY_SCOPE_BINDINGS.delete(scope);
+      binding.optionalStreams = ["O"];
+    }
+  }
+  for (const receipt of [false, true]) {
+    it(`omits unsupported optional blobs with optional receipt=${receipt}`, () =>
+      withBinding(async () => {
+        const store = fixture(receipt);
+        const result = await readCanonicalLegacyScope({
+          store,
+          scope,
+          selection: selected,
+          requireCompletionReceipts: true,
+        });
+        expect(result).toMatchObject({ ok: true });
+        if (result.ok)
+          expect(result.diagnostics.sourceRowCounts).toEqual({ R: 1 });
+        expect(handedToProjector()).toEqual({
+          streams: ["R"],
+          fetchedStreams: ["R"],
+        });
+        expect(store.getBlobBytes).not.toHaveBeenCalled();
+      }));
+  }
+  it("refuses an all-optional binding before lookup or projection", () =>
+    withBinding(async () => {
+      binding.optionalStreams = ["R", "O"];
+      expect(legacyScopeToPdppSelection(scope)).toMatchObject({
+        ok: false,
+        error: { kind: "invalid_binding" },
+      });
+      expect(
+        projectPdppRecordsToLegacyPayload(scope, [], {
+          fetchedStreams: ["R", "O"],
+        }),
+      ).toMatchObject({ ok: false, error: { kind: "invalid_binding" } });
+      const result = await readCanonicalLegacyScope({
+        store: fixture(true, false),
+        scope,
+        selection: selected,
+        requireCompletionReceipts: true,
+      });
+      expect(result).toMatchObject({ ok: false, reason: "invalid_binding" });
+      expect(project).not.toHaveBeenCalled();
+    }));
+
+  function viewFor(store: CanonicalLegacyReadStore) {
+    const authority: LegacyScopeAuthority = {
+      listMethodConnections: () => [store.getInstanceBinding("test")],
+      hasHeldData: () => true,
+      hasRetainedTombstones: () => false,
+      readSnapshot: (read) => read(),
+      writeClock: () => 1,
+      arrivalRevision: () => 1,
+      hasTakeover: () => false,
+      hasMethodTakeover: () => false,
+      hasCoveredHead: () => false,
+      isReset: () => false,
+      cachedVerdict: () => null,
+      verdictFor: () => [],
+      resetTakeover: () => {},
+      eligibleLegacyHead: () => null,
+      confirmRead: () => true,
+    };
+    return createLegacyScopeView({
+      authority,
+      records: store,
+      configuredMethods: () => ["synthetic"],
+    });
+  }
+  it("rejects all-optional listing and alias selection without a projector call", () =>
+    withBinding(async () => {
+      binding.optionalStreams = ["R", "O"];
+      expect(viewFor(fixture(true, false)).listingFor(scope)).toMatchObject({
+        kind: "refused",
+        refusal: { reason: "invalid_binding" },
+      });
+      expect(
+        selectForTarget(
+          {
+            connector: "synthetic",
+            streams: ["R", "O"],
+            alias: {
+              connector: "synthetic",
+              streams: ["R", "O"],
+              requiredStreams: [],
+              project: () => project([], { fetchedStreams: [] }),
+            },
+          },
+          [],
+        ),
+      ).toMatchObject({ kind: "invalid_binding" });
+      expect(project).not.toHaveBeenCalled();
+    }));
+  it("keeps listing and body horizons equal through an optional-only refresh", () =>
+    withBinding(async () => {
+      const store = fixture(true, false);
+      let optionalTime = "2026-11-02T00:00:00.000Z";
+      const receipts = store.listStreamCompletions;
+      store.listStreamCompletions = (instance) =>
+        receipts(instance).map((receipt) => ({
+          ...receipt,
+          sourceCollectedAt:
+            receipt.stream === "O" ? optionalTime : "2026-11-01T00:00:00.000Z",
+        }));
+      const view = viewFor(store);
+      for (const time of [
+        "2026-11-02T00:00:00.000Z",
+        "2026-11-03T00:00:00.000Z",
+      ]) {
+        optionalTime = time;
+        const result = await readCanonicalLegacyScope({
+          store,
+          scope,
+          selection: selected,
+          requireCompletionReceipts: true,
+        });
+        expect(result).toMatchObject({
+          ok: true,
+          envelope: { collectedAt: time },
+        });
+        expect(view.listCanonicalScopes(undefined)).toContainEqual({
+          scope,
+          collectedAt: time,
+        });
+      }
+    }));
 });

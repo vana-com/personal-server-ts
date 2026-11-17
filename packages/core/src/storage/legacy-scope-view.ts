@@ -19,6 +19,7 @@ import {
 import {
   legacyConnectorKey,
   readCanonicalLegacyScope,
+  canonicalLegacyCollectionHorizon,
   type CanonicalConnectionBinding,
   type CanonicalConnectionSelection,
   type CanonicalLegacyReadFailure,
@@ -280,7 +281,7 @@ export type LegacyScopeLatest =
 export type LegacyScopeListing =
   | { kind: "file"; deletion: LegacyScopeDeletion }
   | { kind: "canonical"; collectedAt: string }
-  | { kind: "refused" };
+  | { kind: "refused"; refusal?: LegacyScopeRefusal };
 
 /**
  * The deletion history of a body, decided with the body. Callers never
@@ -300,7 +301,7 @@ export interface LegacyScopeViewPort {
   /** The latest body of a scope. Never used for an explicit version. */
   readLatest(scope: string): Promise<LegacyScopeLatest>;
   /**
-   * Listing metadata from counts and receipts only, without reading rows.
+   * Listing metadata from the same served rows and receipts as the body, without blob-body reads.
    * A refusal here is also a refusal on read; a read can still refuse what
    * this lists (for example a projection rejection).
    */
@@ -540,6 +541,12 @@ export function createLegacyScopeView(
         detail: "method_not_configured",
       });
     }
+    if (requiredStreamsOf(scope, method).length === 0)
+      return refused({
+        status: "unavailable",
+        reason: "invalid_binding",
+        scope,
+      });
     return {
       kind: "canonical",
       records,
@@ -593,6 +600,11 @@ export function createLegacyScopeView(
     scope: string,
     decision: Decision,
   ): { kind: "file" } | Exclude<LegacyScopeListing, { kind: "file" }> {
+    if (
+      decision.kind === "refused" &&
+      decision.refusal.reason === "invalid_binding"
+    )
+      return { kind: "refused", refusal: decision.refusal };
     if (authority.isReset(scope)) return { kind: "file" };
     const legacyHead = authority.eligibleLegacyHead(scope);
     const hasTakeover = authority.hasTakeover(
@@ -668,14 +680,17 @@ export function createLegacyScopeView(
     ) {
       return { kind: "refused" };
     }
-    const collectedAt = listedCollectedAt(
-      decision.records,
-      decision.selection.instance,
-      decision.requiredStreams,
-    );
-    return collectedAt === null
-      ? { kind: "refused" }
-      : { kind: "canonical", collectedAt };
+    const horizon = canonicalLegacyCollectionHorizon({
+      store: decision.records,
+      scope,
+      selection: decision.selection,
+      declarations: input.declarations,
+      profileBy: "method",
+      allowUnprovenEmptyStreams: legacyHead !== null && !!input.readLegacyHead,
+    });
+    return horizon.ok
+      ? { kind: "canonical", collectedAt: horizon.collectedAt }
+      : { kind: "refused" };
   }
 
   function ouraHasRetainedEntityLoss(
@@ -959,6 +974,28 @@ export function createLegacyScopeView(
       confirmSelection: () => sameSelection(decide(scope), decision),
     });
     if (!read.ok) {
+      // A taken-over stream that lost its last row without a completion receipt
+      // has no collection horizon, but its loss is still an incomplete view.
+      if (
+        read.reason === "invalid_collected_at" &&
+        hasTakeover &&
+        missingCompletionReceipts(decision).some(
+          (stream) =>
+            !decision.records
+              .listStreams([decision.selection.instance])
+              .some(
+                (entry) => entry.stream === stream && entry.recordCount > 0,
+              ),
+        )
+      )
+        return {
+          kind: "refused",
+          refusal: {
+            status: "incomplete",
+            reason: "canonical_view_incomplete",
+            diagnostics: [],
+          },
+        };
       if (
         legacyHead !== null &&
         input.readLegacyHead &&
@@ -1550,40 +1587,6 @@ function boundScopes(): string[] {
     for (const scope of profile.keys()) scopes.add(scope);
   }
   return [...scopes].sort();
-}
-
-/**
- * The `collectedAt` a read would return, from listing counts and receipts:
- * a stream's valid receipt time, else its newest row time. Null when a bound
- * stream is empty without a valid receipt, which a read refuses.
- */
-function listedCollectedAt(
-  store: CanonicalLegacyReadStore,
-  instance: string,
-  streams: readonly string[],
-): string | null {
-  const binding = store.getInstanceBinding(instance);
-  const listing = store.listStreams([instance]);
-  const receipts = store.listStreamCompletions(instance);
-  let newest = Number.NEGATIVE_INFINITY;
-  for (const stream of streams) {
-    const entry = listing.find((candidate) => candidate.stream === stream);
-    const count = entry?.recordCount ?? 0;
-    const receipt = receipts.find(
-      (candidate) =>
-        candidate.stream === stream &&
-        candidate.method === binding.method &&
-        candidate.generation === binding.generation &&
-        candidate.liveCount === count,
-    );
-    const stamp = receipt?.sourceCollectedAt ?? entry?.lastUpdated ?? null;
-    if (count === 0 && !receipt) return null;
-    if (stamp === null) return null;
-    const ms = Date.parse(stamp);
-    if (Number.isNaN(ms)) return null;
-    newest = Math.max(newest, ms);
-  }
-  return Number.isFinite(newest) ? new Date(newest).toISOString() : null;
 }
 
 function incompleteness(

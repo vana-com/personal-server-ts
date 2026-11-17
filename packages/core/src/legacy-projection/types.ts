@@ -12,7 +12,10 @@ export interface PdppRecord {
   stream: string;
 }
 
+export type InvalidLegacyBinding = { kind: "invalid_binding"; scope: string };
+
 export type LegacyScopeLookupError =
+  | InvalidLegacyBinding
   | { kind: "unknown_scope"; scope: string }
   | { kind: "unsupported_profile"; scope: string; profileKey: string }
   | { kind: "test_debris_scope"; scope: string; reason: string };
@@ -29,6 +32,7 @@ export type LegacyScopeLookupResult =
   LegacyScopeLookupOk | LegacyScopeLookupErr;
 
 export type ProjectionError =
+  | InvalidLegacyBinding
   | { kind: "unknown_scope"; scope: string }
   | { kind: "unsupported_profile"; scope: string; profileKey: string }
   | { kind: "missing_stream"; scope: string; expectedStream: string }

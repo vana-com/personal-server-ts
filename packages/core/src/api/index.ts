@@ -785,6 +785,12 @@ function legacyMutationRefusal(mode: AccountMode): Response | undefined {
 /** The response for a stream-sync decision that serves nothing; `null` otherwise. */
 function streamSyncRefusal(decision: ReadDecision): Response | null {
   switch (decision.kind) {
+    case "invalid_binding":
+      return errorResponse(
+        503,
+        "INVALID_BINDING",
+        "This legacy scope has no required stream",
+      );
     case "unavailable":
       return decision.reason === "connection_not_found"
         ? errorResponse(

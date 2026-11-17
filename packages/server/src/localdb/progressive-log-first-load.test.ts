@@ -24,6 +24,7 @@ import {
   applyConnection,
   createConnectionDeleter,
 } from "../../../core/src/localdb/index.js";
+import { nextApplied } from "../../../core/src/localdb/apply-progress.js";
 import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
 import {
@@ -712,6 +713,80 @@ describe(
     });
   },
 );
+
+it("marks a failed removal prerequisite and wakes a waiting reader before retry", async () => {
+  const w = await world({ streams: 1 });
+  const a = await w.device("a");
+  await publish(a, "first", ["safe", "victim"], {
+    full: true,
+    observedAt: 1100,
+  });
+  await publish(a, "remove", ["victim"], { remove: true, observedAt: 1200 });
+  await publish(a, "last", ["tail"], { observedAt: 1300 });
+  const key = (await w.segmentKeys()).get(2)!;
+  let arrived!: () => void;
+  const reached = new Promise<void>((resolve) => {
+    arrived = resolve;
+  });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const failure = new Error("removal prerequisite failed");
+  let fail = true;
+  const b = await w.device("b", {
+    progressiveFirstLoad: true,
+    keyedFirstLoad: false,
+    beforeGet: async (requested) => {
+      if (requested !== key || !fail) return;
+      arrived();
+      await held;
+      fail = false;
+      throw failure;
+    },
+  });
+  await connect(b);
+  const listed = nextApplied(b.deps, CONNECTION_ID);
+  const applying = applyConnection(b.deps, CONNECTION_ID);
+  const outcome = applying.then(
+    () => null,
+    (error: unknown) => error,
+  );
+  await Promise.race([
+    reached,
+    outcome.then((error) => {
+      throw error;
+    }),
+  ]);
+  await Promise.race([
+    listed,
+    outcome.then((error) => {
+      throw error;
+    }),
+  ]);
+  expect(await b.db.query("SELECT failed FROM stream_partial")).toEqual([
+    { failed: 0 },
+  ]);
+  let woke = false;
+  const waiter = nextApplied(b.deps, CONNECTION_ID).then(() => {
+    woke = true;
+  });
+  release();
+  expect(await outcome).toBe(failure);
+  expect(await b.position()).toBe(0);
+  expect(await b.rows()).toEqual([]);
+  expect(await b.db.query("SELECT failed FROM stream_partial")).toEqual([
+    { failed: 1 },
+  ]);
+  expect(woke).toBe(true);
+  await waiter;
+  await applyConnection(b.deps, CONNECTION_ID);
+  expect(await idsOf(b)).toEqual(["safe", "tail"]);
+  expect(await b.position()).toBe(3);
+  expect(await count(b, "stream_partial")).toBe(0);
+  await applyConnection(b.deps, CONNECTION_ID);
+  expect(await idsOf(b)).toEqual(["safe", "tail"]);
+});
 
 describe("progressive first load, log protocol on, flag off", () => {
   it("is as before: nothing is readable until the whole log is applied, and no load row is written", async () => {
