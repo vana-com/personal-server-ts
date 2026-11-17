@@ -1081,7 +1081,7 @@ describe("log protocol: boundary kinds at equal stamps (P2-1)", () => {
   });
 });
 
-describe("log protocol: a registry that is behind or on another history fails closed (P2-2)", () => {
+describe("log protocol: a registry behind this device gets its lost segments back; one on another history fails closed (P2-2)", () => {
   /** a writes an insert (position 1) and a delete (position 2); b applies both. */
   const history = async () => {
     const w = await world({ streams: 1 });
@@ -1107,13 +1107,18 @@ describe("log protocol: a registry that is behind or on another history fails cl
     return { w, a, b };
   };
 
-  it("a registry rolled back below the applied position is not read as caught up", async () => {
+  it("a registry rolled back below the applied position is not read as caught up: the device commits the lost segment again", async () => {
     const { w, b } = await history();
     const before = { rows: await b.rows(), position: await b.position() };
     w.gateway.versions.get(LOG)!.pop(); // the registry is at position 1 again
-    await expect(b.cycle()).rejects.toThrow(/behind this device/);
+    await b.cycle();
     expect(await b.position()).toBe(before.position);
     expect(await b.rows()).toEqual(before.rows);
+    expect(w.gateway.rowsOf(LOG)).toBe(before.position);
+    // A device that never read the log gets the delete at position 2.
+    const c = await w.device("c");
+    await c.cycle();
+    expect(await c.rows()).toEqual(before.rows);
   });
 
   it("the same position under a different segment is not read as caught up", async () => {

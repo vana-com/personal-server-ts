@@ -13,13 +13,13 @@
 //
 // A device that is behind the log's `base` installs the snapshot the head
 // names, then applies the tail. A registry that is BEHIND this device (a
-// rollback or restore), or that names another segment at a position this
-// device already applied, is not a continuation: the rows, tombstones and
+// rollback or restore) whose row is one this device applied lost only rows:
+// this device commits the segments it applied above it again, in order
+// (`log-recommit.ts`). A registry that names another segment at a position
+// this device applied is not a continuation: the rows, tombstones and
 // checkpoints this device holds came from segments the log no longer has, and
 // replaying into them is not the log's fold. That fails closed
-// (`LogDivergedError`, nothing applied, the position unchanged). A rebaseline
-// that rebuilds them from the log, with the local overlay kept apart, is later
-// work.
+// (`LogDivergedError`, nothing applied, the position unchanged).
 
 import {
   classifyStreamRow,
@@ -67,6 +67,7 @@ import {
   writeLogState,
   type LogState,
 } from "./log-state.js";
+import { recommitApplied } from "./log-recommit.js";
 import { UpdateRequiredError } from "./update-required.js";
 import {
   failedRowStatement,
@@ -193,15 +194,15 @@ export async function applyLog(
     return { applied: 0 };
   }
 
-  // A registry behind this device is a rollback or a restore. What this device
-  // applied from the segments above the registry's position is still in its
-  // rows, tombstones and checkpoints, and replaying the log into them does not
-  // give the log's fold. Failing closed keeps the position true: it is not
-  // moved back, and nothing is applied.
-  if (local.position > read.version)
-    throw new LogDivergedError(
-      `apply: the log registry is at position ${read.version}, behind this device at ${local.position}`,
-    );
+  // A registry behind this device is a rollback or a restore. The segments
+  // above its position are still in storage, and this device applied them: it
+  // commits them again, in order (`recommitApplied`), so the log is the one
+  // this device's rows are the fold of. A registry row this device did not
+  // apply is another history, and that fails closed.
+  if (local.position > read.version) {
+    await recommitApplied(deps, connectionId, context, local, read);
+    return { applied: 0 };
+  }
 
   const lastRef = local.refs.at(-1);
   if (
@@ -507,7 +508,7 @@ export async function fetchSegment(
   context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
   dataHash: string,
   position: number,
-): Promise<{ segment: Segment; bytes: number }> {
+): Promise<{ segment: Segment; bytes: number; cipherBytes: number }> {
   const cipher = await deps.blobs.get(`${scope}/${segmentBlobName(dataHash)}`);
   if (cipher === null)
     throw new Error(`apply: missing log segment ${position}`);
@@ -531,7 +532,7 @@ export async function fetchSegment(
     throw new Error(
       `apply: invalid log segment ${position} (${verified.kind})`,
     );
-  return verified;
+  return { ...verified, cipherBytes: cipher.length };
 }
 
 /** One snapshot part, fetched, decrypted and verified. */
