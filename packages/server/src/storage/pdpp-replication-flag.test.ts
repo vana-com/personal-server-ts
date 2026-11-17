@@ -595,7 +595,7 @@ describe("replication flag on", () => {
         off.close();
         const on = createReplicaRecordStore(open(path));
         expect(() => on.replication.beginBaseline(baseline)).toThrow(
-          /connection conn_a has a Strava or Claude method transition/,
+          /^replication cannot be enabled: connection conn_a has a method transition$/,
         );
       }
     });
