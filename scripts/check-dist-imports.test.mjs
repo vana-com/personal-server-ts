@@ -140,6 +140,18 @@ test("checks the files npm actually packs", async (t) => {
         `import { createRequire } from "node:module"; function f() { if (true) { var make = createRequire; } make(import.meta.url)(${arg}); } f();`,
     ],
     [
+      "import.meta element-access resolve",
+      (arg) => `import.meta["resolve"](${arg});`,
+    ],
+    [
+      "import.meta template-literal element-access resolve",
+      (arg) => `import.meta[\`resolve\`](${arg});`,
+    ],
+    [
+      "parenthesized import.meta resolve",
+      (arg) => `(import.meta).resolve(${arg});`,
+    ],
+    [
       "module.require through an alias",
       (arg) => `const m = module; m.require(${arg});`,
     ],
@@ -184,6 +196,63 @@ test("checks the files npm actually packs", async (t) => {
     ])
       assertViolation(code, /unanalysable/i);
   });
+  await t.test(
+    "rejects every import.meta use except .url and .resolve(...)",
+    () => {
+      for (const code of [
+        // alias of the meta object, then the resolver through the alias
+        'const m = import.meta; m.resolve("missing-package");',
+        "const m = import.meta; m.resolve(runtimePackage);",
+        // destructured resolver, literal and computed argument
+        'const { resolve } = import.meta; resolve("missing-package");',
+        "const { resolve } = import.meta; resolve(runtimePackage);",
+        'const { resolve: r } = import.meta; r("missing-package");',
+        // other ways of handing the meta object to code the checker cannot follow
+        "use(import.meta);",
+        "export default import.meta;",
+        "const meta = { import: import.meta }; use(meta);",
+        "function f(m = import.meta) { return m; } f();",
+        // computed member, including a computed name that could be "resolve"
+        "import.meta[key](name);",
+        "import.meta[`res${suffix}`](name);",
+        // unknown properties
+        "use(import.meta.dirname);",
+        "use(import.meta.filename);",
+        "use(import.meta.env);",
+        "use(import.meta.hot.accept);",
+        // resolver detached from its call
+        'import.meta.resolve.call(null, "missing-package");',
+        'import.meta["resolve"].apply(null, ["missing-package"]);',
+        // mutation of the one allowed property
+        'import.meta.url = "file:///elsewhere";',
+        "import.meta.url++;",
+        "delete import.meta.url;",
+        "[import.meta.url] = [other];",
+        "({ a: import.meta.url } = other);",
+        "for (import.meta.url of list);",
+      ])
+        assertViolation(code, /unanalysable/i);
+    },
+  );
+  await t.test(
+    "accepts import.meta.url reads and builtin resolver uses",
+    () => {
+      for (const code of [
+        "use(import.meta.url);",
+        'use(import.meta["url"]);',
+        "const here = import.meta.url; use(here);",
+        "use([import.meta.url]);",
+        'use(new URL("./present.js", import.meta.url));',
+        'import { fileURLToPath } from "node:url"; use(fileURLToPath(import.meta.url));',
+        'import { createRequire } from "node:module"; createRequire(import.meta.url)("node:fs");',
+        'import { createRequire } from "node:module"; const require = createRequire(import.meta.url); require("./present.js");',
+        'import.meta.resolve("node:fs");',
+        'import.meta["resolve"]("./present.js");',
+        'import.meta?.resolve("node:fs");',
+      ])
+        assert.equal(check(code).status, 0, code);
+    },
+  );
   await t.test("accepts proven loader uses", () => {
     for (const code of [
       'import { createRequire } from "node:module"; const require = createRequire(import.meta.url); require("./present.js");',
@@ -237,6 +306,76 @@ test("checks the files npm actually packs", async (t) => {
       const staticImport = runAt("server", bundle, 'import "missing-package";');
       assert.equal(staticImport.status, 1);
       assert.match(staticImport.stderr, /imports missing-package/);
+    },
+  );
+  await t.test(
+    "rejects any checked file that loads a served-only asset",
+    () => {
+      const server = path.join(fixture, "packages", "server");
+      fs.mkdirSync(path.join(server, "dist/ui"), { recursive: true });
+      fs.mkdirSync(path.join(server, "dist/other"), { recursive: true });
+      fs.writeFileSync(
+        path.join(server, "package.json"),
+        JSON.stringify({ name: "server", version: "1.0.0", files: ["dist"] }),
+      );
+      fs.writeFileSync(
+        path.join(server, "dist/ui/ps-lite-debug.js"),
+        "export {};",
+      );
+      const asset = "ps-lite-debug.js";
+      const run = (relFile, code) => {
+        fs.writeFileSync(path.join(server, relFile), code);
+        const result = spawnSync(
+          process.execPath,
+          [path.join(fixture, "scripts/check-dist-imports.mjs")],
+          { encoding: "utf8" },
+        );
+        fs.rmSync(path.join(server, relFile));
+        return result;
+      };
+      const importer = "dist/ui/importer.js";
+      // No importer: the asset alone passes.
+      assert.equal(run(importer, "export {};").status, 0);
+      for (const code of [
+        `import "./${asset}";`,
+        `import { x } from "./${asset}";`,
+        `export * from "./${asset}";`,
+        `import("./${asset}");`,
+        `import.meta.resolve("./${asset}");`,
+        `import.meta["resolve"]("./${asset}");`,
+        `import { createRequire } from "node:module"; createRequire(import.meta.url)("./${asset}");`,
+        `require.resolve("./${asset}");`,
+      ]) {
+        const result = run(importer, code);
+        assert.equal(result.status, 1, code);
+        assert.match(
+          result.stderr,
+          /packages\/server\/dist\/ui\/importer\.js loads served-only browser asset dist\/ui\/ps-lite-debug\.js/,
+          code,
+        );
+      }
+      // A different directory reaching the same file is still caught.
+      const viaParent = run(
+        "dist/other/importer.js",
+        `import "../ui/${asset}";`,
+      );
+      assert.equal(viaParent.status, 1);
+      assert.match(
+        viaParent.stderr,
+        /dist\/other\/importer\.js loads served-only/,
+      );
+      // A same-named file elsewhere is not the asset.
+      fs.writeFileSync(path.join(server, "dist/other", asset), "export {};");
+      assert.equal(
+        run("dist/other/importer.js", `import "./${asset}";`).status,
+        0,
+      );
+      // Controls: other relative imports still pass.
+      fs.writeFileSync(path.join(server, "dist/ui/other.js"), "export {};");
+      assert.equal(run(importer, 'import "./other.js";').status, 0);
+      // Leave an empty dist/ so later tests see the same fixture as before.
+      for (const sub of ["ui", "other"])
+        fs.rmSync(path.join(server, "dist", sub), { recursive: true });
     },
   );
   await t.test("owner names do not exempt a Node-loaded file", () => {

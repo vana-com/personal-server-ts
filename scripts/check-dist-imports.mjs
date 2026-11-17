@@ -151,6 +151,47 @@ const ownerText = (node) => {
   return undefined;
 };
 
+// True when `node` is assigned to, updated, deleted, or is a destructuring
+// target, so `import.meta.url` cannot be treated as a plain read.
+const isWriteTarget = (node) => {
+  let current = outerOf(node);
+  for (;;) {
+    const parent = current.parent;
+    if (!parent) return false;
+    if (
+      ts.isArrayLiteralExpression(parent) ||
+      ts.isSpreadElement(parent) ||
+      ts.isObjectLiteralExpression(parent) ||
+      (ts.isPropertyAssignment(parent) && parent.initializer === current) ||
+      ts.isParenthesizedExpression(parent)
+    ) {
+      // Keep climbing: a write only if the enclosing literal is an assignment
+      // pattern, which the binary-expression or for-in/of checks below decide.
+      current = parent;
+      continue;
+    }
+    if (ts.isBinaryExpression(parent))
+      return (
+        parent.left === current &&
+        parent.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+        parent.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+      );
+    if (
+      ts.isPrefixUnaryExpression(parent) ||
+      ts.isPostfixUnaryExpression(parent)
+    )
+      return (
+        parent.operator === ts.SyntaxKind.PlusPlusToken ||
+        parent.operator === ts.SyntaxKind.MinusMinusToken
+      );
+    if (ts.isDeleteExpression(parent)) return true;
+    return (
+      (ts.isForInStatement(parent) || ts.isForOfStatement(parent)) &&
+      parent.initializer === current
+    );
+  }
+};
+
 function createLoaderAnalysis(source) {
   // Derived bindings: name -> scopes where that name is bound to the kind.
   const bound = { loader: new Map(), factory: new Map(), moduleObj: new Map() };
@@ -263,29 +304,43 @@ function createLoaderAnalysis(source) {
   };
   return {
     ownerText,
-    // `<loader>(x)`, `<loader>.resolve(x)`, `import.meta.resolve(x)`.
+    // `<loader>(x)`, `<loader>.resolve(x)`, `import.meta.resolve(x)` and
+    // `import.meta["resolve"](x)`.
     isLoaderCall(expression) {
       const callee = unwrapDown(expression);
       if (kindOf(callee) === "loader") return true;
       if (
-        ts.isPropertyAccessExpression(callee) &&
-        callee.name.text === "resolve"
-      )
-        return (
-          kindOf(callee.expression) === "loader" ||
-          isImportMeta(unwrapDown(callee.expression))
-        );
+        (ts.isPropertyAccessExpression(callee) ||
+          ts.isElementAccessExpression(callee)) &&
+        memberName(callee) === "resolve"
+      ) {
+        const base = unwrapDown(callee.expression);
+        return kindOf(base) === "loader" || isImportMeta(base);
+      }
       return false;
+    },
+    // Deny by default: `import.meta` may only be read through `.url` or called
+    // through `.resolve(...)`. Any other use (alias, destructuring, computed or
+    // unknown member, mutation, passing it on) hands the meta object to code
+    // this checker does not follow, so it is unanalysable. No alias tracking.
+    isUnanalysableImportMeta(node) {
+      if (!isImportMeta(node)) return false;
+      const outer = outerOf(node);
+      const parent = outer.parent;
+      if (!(
+        (ts.isPropertyAccessExpression(parent) ||
+          ts.isElementAccessExpression(parent)) &&
+        parent.expression === outer
+      ))
+        return true;
+      const name = memberName(parent);
+      if (name === "url") return isWriteTarget(parent);
+      if (name === "resolve") return !isCallee(parent);
+      return true;
     },
     // A loader-identity reference that is not a proven form.
     isUnanalysableUse(node) {
       if (isWrapper(node)) return false;
-      if (
-        ts.isPropertyAccessExpression(node) &&
-        isImportMeta(unwrapDown(node.expression)) &&
-        node.name.text === "resolve"
-      )
-        return !isCallee(node);
       const kind = kindOf(node);
       if (!kind) return false;
       if (ts.isIdentifier(node)) {
@@ -399,7 +454,11 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
           reportUnanalysable(node);
         }
       }
-      if (loaderChecked && loaders.isUnanalysableUse(node))
+      if (
+        loaderChecked &&
+        (loaders.isUnanalysableUse(node) ||
+          loaders.isUnanalysableImportMeta(node))
+      )
         reportUnanalysable(node);
       if (specifier?.startsWith(".")) {
         const target = path.posix.normalize(
@@ -408,6 +467,13 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
         if (!packedFiles.has(target))
           violations.push(
             `${path.relative(root, file)} imports unpacked relative target ${specifier}`,
+          );
+        // A served-only asset is exempt from loader checks only because no
+        // checked file loads it. Any static, dynamic or resolver reference to it
+        // voids that premise.
+        if (servedOnlyBrowserAssets.has(`packages/${dir}/${target}`))
+          violations.push(
+            `${relFile} loads served-only browser asset ${target} (${specifier}); the loader checks are skipped for it only because nothing loads it`,
           );
       }
       if (specifier && !specifier.startsWith(".") && !builtins.has(specifier)) {
