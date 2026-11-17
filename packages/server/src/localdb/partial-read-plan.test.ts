@@ -101,16 +101,14 @@ async function seed(
     await db.batch(statements.slice(at, at + 500));
 }
 
+type PlanStep = { id: number; parent: number; detail: string };
+
 async function plan(
   db: SqlDriver,
   sql: string,
   params: readonly (string | number)[],
 ) {
-  const rows = await db.query<{ detail: string }>(
-    `EXPLAIN QUERY PLAN ${sql}`,
-    params,
-  );
-  return rows.map((row) => row.detail);
+  return db.query<PlanStep>(`EXPLAIN QUERY PLAN ${sql}`, params);
 }
 
 type Page = { ok: number; pk_hash: string | null; body: string | null };
@@ -140,21 +138,49 @@ describe("the page query of a partial body", () => {
     ["the first page", undefined],
     ["a later page", hex(41)],
   ])(
-    "%s has no sort and no walk of the observation index",
+    "%s reads the key index in order, and sorts no more than the page",
     async (_name, after) => {
       const db = await open();
       await seed(db, "c1", "items", 250);
       const { sql, params } = partialPage(HEAD, after);
       const steps = await plan(db, sql, params);
-      expect(steps.filter((s) => /TEMP B-TREE/.test(s))).toEqual([]);
-      expect(steps.filter((s) => /records_by_observation/.test(s))).toEqual([]);
-      expect(steps.filter((s) => /records_by_key/.test(s))).toEqual([]);
-      // The records are read through an index that ends in the key hash.
+      const rows = steps.filter((s) => /\b(SEARCH|SCAN) r\b/.test(s.detail));
+      // The rows of the stream are read in one place: the subquery that takes
+      // the page, which the plan names as the materialization of `r`.
+      const page = steps.find((s) => s.detail === "MATERIALIZE r");
+      expect(page).toBeDefined();
+      const inPage = (step: PlanStep) => step.parent === page!.id;
+      const reads = rows.filter(inPage);
+      expect(reads).toHaveLength(1);
+      expect(reads[0]!.detail).toMatch(/^SEARCH r USING /);
+      // That read is not sorted: the sort the plan shows is a step of the
+      // statement itself, which orders what the subquery produced (the page).
       expect(
-        steps.some((s) =>
-          /SEARCH r USING (COVERING )?INDEX records_(key|size)\b/.test(s),
-        ),
-      ).toBe(true);
+        steps.filter((s) => inPage(s) && /TEMP B-TREE/.test(s.detail)),
+      ).toEqual([]);
+      expect(
+        steps.filter((s) => /records_by_observation/.test(s.detail)),
+      ).toEqual([]);
+      expect(steps.filter((s) => /records_by_key/.test(s.detail))).toEqual([]);
+      // The index it reads leads with the connection, the stream and the key
+      // hash, so its entries come in the order the page is asked for.
+      const index = /USING (?:COVERING )?INDEX (\w+)/.exec(
+        reads[0]!.detail,
+      )?.[1];
+      expect(index).toBeDefined();
+      const columns = (
+        await db.query<{ seqno: number; name: string | null; key: number }>(
+          `PRAGMA index_xinfo(${index})`,
+        )
+      )
+        .filter((column) => column.key === 1)
+        .sort((x, y) => x.seqno - y.seqno)
+        .map((column) => column.name);
+      expect(columns.slice(0, 3)).toEqual([
+        "connection_id",
+        "stream",
+        "pk_hash",
+      ]);
     },
   );
 });
@@ -252,6 +278,24 @@ describe("the page query against the one it replaces", () => {
       await seed(db, "c2", "items", 130);
       await change(db);
       const before = await chain(db, HEAD, legacyPage);
+      const now = await chain(db, HEAD, partialPage);
+      expect(now.cursors).toEqual(before.cursors);
+      expect(now.pages).toEqual(before.pages);
+    },
+  );
+
+  it.each(states)(
+    "%s: with the engine free to reverse an unordered scan, the same rows in the same order",
+    async (_name, count, change) => {
+      const db = await open();
+      await seed(db, "c1", "items", count);
+      await seed(db, "c1", "other", 120);
+      await seed(db, "c2", "items", 130);
+      await change(db);
+      const before = await chain(db, HEAD, legacyPage);
+      // A scan with no ORDER BY runs backwards: an order a statement leaves to
+      // the engine is the order this makes wrong.
+      await db.query("PRAGMA reverse_unordered_selects = ON");
       const now = await chain(db, HEAD, partialPage);
       expect(now.cursors).toEqual(before.cursors);
       expect(now.pages).toEqual(before.pages);

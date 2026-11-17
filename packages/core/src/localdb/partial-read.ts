@@ -41,12 +41,14 @@ const PAGE_SIZE = 100;
  * page read per row. A browser's 64 KiB pages and small cache turned that into
  * tens of seconds for a 200,000-row stream.
  *
- * A subquery with a `LIMIT` is never merged into the join around it, so its
- * rows stay in the order it produced them and the outer query needs no sort
- * (a test pins the plan). `g.ok` is still the one statement that reads the
- * rows and checks the head, and the subquery reads nothing when it is 0: the
- * outer join then gives its one row with a null key, as it does for an empty
- * stream.
+ * A subquery with a `LIMIT` is never merged into the join around it, so the
+ * rows it reads come in key order and stop after the page (a test pins the
+ * plan). SQL does not promise that the join keeps that order, and the reader
+ * takes the last row of a page as the next cursor, so the outer query sorts
+ * again. It sorts the page, at most `PAGE_SIZE` rows, never the stream.
+ * `g.ok` is still the one statement that reads the rows and checks the head,
+ * and the subquery reads nothing when it is 0: the outer join then gives its
+ * one row with a null key, as it does for an empty stream.
  */
 export function partialPage(
   head: PartialHead,
@@ -68,7 +70,8 @@ export function partialPage(
            ${after === undefined ? "" : "AND r.pk_hash > ?"}
            AND NOT EXISTS (SELECT 1 FROM partial_hidden h WHERE h.connection_id = r.connection_id
                              AND h.stream = r.stream AND h.pk_hash = r.pk_hash)
-         ORDER BY r.pk_hash LIMIT ?) r`,
+         ORDER BY r.pk_hash LIMIT ?) r
+       ORDER BY r.pk_hash`,
     params: [
       head.connectionId,
       head.stream,
