@@ -136,3 +136,53 @@ it("reconciles R1's lost commit before replacing the basis changed by R2's end",
   expect((await d.sync.intake.publicationStatus("r1")).state).toBe("published");
   expect((await d.sync.intake.publicationStatus("r2")).state).toBe("published");
 });
+
+it("reports R1 published when a waiting publish succeeds after the first fence refusal", async () => {
+  const w = await world({ streams: 1 });
+  const d = await w.device("d1");
+  await d.run("seed", [{ stream: "s0", id: "seed" }]);
+  await publishLog(d.deps, CONNECTION_ID);
+  await d.run("r1", [{ stream: "s0", id: "one" }]);
+  let entered!: () => void;
+  const committing = new Promise<void>((r) => (entered = r));
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let batches = 0;
+  w.gateway.beforeBatch = async () => {
+    if (++batches === 1) {
+      entered();
+      await gate;
+      w.gateway.failFenceOnce(CONTROL);
+    }
+  };
+  const first = publishLog(d.deps, CONNECTION_ID);
+  await committing;
+  const second = publishLog(d.deps, CONNECTION_ID);
+  release();
+  await first;
+  const result = await second;
+  expect(await d.sync.intake.publicationStatus("r1")).toMatchObject({
+    state: "published",
+    streams: [{ publication: { version: 2 } }],
+  });
+  expect(result?.map((r) => r.outcome)).toEqual(["published"]);
+});
+
+it("reports R1 published when reconciliation confirms a lost commit before a refused resend", async () => {
+  const w = await world({ streams: 1 });
+  const d = await w.device("d1");
+  await d.run("seed", [{ stream: "s0", id: "seed" }]);
+  await publishLog(d.deps, CONNECTION_ID);
+  await d.run("r1", [{ stream: "s0", id: "one" }]);
+  let batches = 0;
+  w.gateway.beforeBatch = () => {
+    if (++batches === 1) w.gateway.dropNextBatchReply = true;
+    else w.gateway.failFenceOnce(CONTROL);
+  };
+  const result = await publishLog(d.deps, CONNECTION_ID);
+  expect(await d.sync.intake.publicationStatus("r1")).toMatchObject({
+    state: "published",
+    streams: [{ publication: { version: 2 } }],
+  });
+  expect(result?.map((r) => r.outcome)).toEqual(["published"]);
+});

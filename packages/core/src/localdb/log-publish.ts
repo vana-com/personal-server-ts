@@ -111,6 +111,14 @@ import {
 } from "./publish.js";
 import { BODY_BYTES } from "./part-layout.js";
 import { connectionLifetime, purgeConnection } from "./purge.js";
+import {
+  ELIGIBLE_CHANGE,
+  PENDING_RUN,
+  readPublicationWork,
+  pendingChangeReasons,
+  type PublicationWork,
+} from "./publication-work.js";
+import { readPublicationStatus } from "./run-receipts.js";
 import { insideQueue } from "./slot.js";
 import { unwriteRefusedRun } from "./unwrite.js";
 
@@ -261,18 +269,23 @@ export async function publishLog(
   // snapshot in between would choose the same changes: it would encode and
   // upload the same segment again and commit nothing. It waits for the first
   // instead, then publishes what is left, which is usually nothing; the
-  // results of both come back, so a caller that asked while a wake's publish
-  // was running still receives the receipt for the rows that publish sent.
+  // completion read covers the work pending when each caller arrived, even
+  // if the preceding publish was the one that acknowledged it.
   const earlier = inFlight.get(deps.db)?.get(connectionId);
   const own = (async () => {
     // The earlier publish's own failure is its caller's; this one starts over.
-    const before = earlier ? await earlier.catch(() => null) : null;
+    // Order the call's initial read after intake already queued by its caller.
+    const work = await deps.queue.run(connectionId, "publish", () =>
+      readPublicationWork(deps.db, connectionId),
+    );
+    if (earlier) await earlier.catch(() => null);
     const clock = openPhases(deps);
     try {
-      const results = await publishRounds(deps, connectionId, clock);
-      return results === null || before === null
-        ? results
-        : mergeResults(before, results);
+      const supported = await publishRounds(deps, connectionId, clock);
+      if (!supported) return null;
+      return deps.queue.run(connectionId, "publish", () =>
+        completedResults(insideQueue(deps, connectionId), connectionId, work),
+      );
     } finally {
       logPublishPhases(deps, connectionId, clock);
     }
@@ -299,42 +312,146 @@ function inFlightOf(
   return chain;
 }
 
-/** Only a noop can yield to an earlier receipt; refusals survive both merges. */
-function mergeResult(
-  held: PublishResult | undefined,
-  next: PublishResult,
-): PublishResult {
-  if (!held || held.outcome === "noop") return next;
-  if (next.outcome === "noop") return held;
-  if (held.outcome !== "published") return held;
-  return next.outcome === "published" ? unionRuns(held, next) : next;
-}
-
-function mergeResults(
-  earlier: readonly PublishResult[],
-  later: readonly PublishResult[],
-): readonly PublishResult[] {
-  const byStream = new Map<string, PublishResult>();
-  for (const result of [...earlier, ...later]) {
-    const held = byStream.get(result.stream);
-    byStream.set(result.stream, mergeResult(held, result));
+/** Attempt outcomes describe blocked work, never the caller's completion. */
+const blockedOrder = [
+  "deferred",
+  "backoff",
+  "discarded",
+  "purged",
+  "refused",
+] as const;
+async function recordBlocked(
+  deps: LocalSyncDeps,
+  id: string,
+  results: readonly PublishResult[],
+) {
+  for (const result of results) {
+    const rank = blockedOrder.indexOf(
+      result.outcome as (typeof blockedOrder)[number],
+    );
+    if (rank < 0) continue;
+    // Attach the reason to the pending rows themselves. Once those rows are
+    // acknowledged, their reason cannot leak into a later collector's work.
+    const retainsRank = `COALESCE(CASE publish_blocked_reason
+      WHEN 'deferred' THEN 0 WHEN 'backoff' THEN 1 WHEN 'discarded' THEN 2
+      WHEN 'purged' THEN 3 WHEN 'refused' THEN 4 END, -1) <= ?`;
+    await deps.db.batch([
+      {
+        sql: `UPDATE record_changes SET publish_blocked_reason=?
+          WHERE connection_id=? AND stream=?
+            AND seq > (SELECT publish_watermark FROM stream_state WHERE connection_id=? AND stream=?)
+            AND ${ELIGIBLE_CHANGE} AND ${retainsRank}`,
+        params: [result.outcome, id, result.stream, id, result.stream, rank],
+      },
+      {
+        sql: `UPDATE run_streams SET publish_blocked_reason=? WHERE stream=?
+          AND run_id IN (SELECT r.run_id FROM runs r JOIN run_streams rs ON rs.run_id=r.run_id
+            WHERE r.connection_id=? AND rs.stream=? AND ${PENDING_RUN})
+          AND ${retainsRank}`,
+        params: [result.outcome, result.stream, id, result.stream, rank],
+      },
+    ]);
   }
-  return [...byStream.values()].sort((a, b) =>
-    a.stream.localeCompare(b.stream),
-  );
 }
 
-function unionRuns(held: PublishResult, result: PublishResult): PublishResult {
-  if (
-    !held.publication ||
-    !result.publication ||
-    held.publication.head.generation !== result.publication.head.generation
-  )
-    return result;
-  const runIds = [
-    ...new Set([...held.publication.runIds, ...result.publication.runIds]),
-  ];
-  return { ...result, publication: { ...result.publication, runIds } };
+/** Completion is read after all work, independently of the order of attempts. */
+async function completedResults(
+  deps: LocalSyncDeps,
+  id: string,
+  work: readonly PublicationWork[],
+): Promise<PublishResult[]> {
+  const [connection] = await deps.db.query<
+    ConnectionRow & { control_state: string }
+  >(
+    "SELECT connector, ns, generation, control_state FROM connections WHERE connection_id=?",
+    [id],
+  );
+  const deleting = connection
+    ? await hasDeleteIntent(deps, connection.connector)
+    : false;
+  const log = await readLogState(deps, id);
+  const remaining = await readPublicationWork(deps.db, id);
+  const results: PublishResult[] = [];
+  for (const item of work) {
+    const [state] = await deps.db.query<{
+      publish_watermark: number;
+      head_generation: number | null;
+      head_data_hash: string | null;
+    }>(
+      "SELECT publish_watermark, head_generation, head_data_hash FROM stream_state WHERE connection_id=? AND stream=?",
+      [id, item.stream],
+    );
+    const statuses = await Promise.all(
+      item.runIds.map((runId) => readPublicationStatus(deps.db, runId)),
+    );
+    const streams = statuses.map((status) =>
+      status.streams.find((s) => s.name === item.stream)!,
+    );
+    const changeReasons = await pendingChangeReasons(deps.db, id, item);
+    const rest = remaining.find((w) => w.stream === item.stream);
+    const pending =
+      changeReasons.length > 0 || streams.some((s) => s.state === "pending");
+    const reasons = new Set([
+      ...changeReasons,
+      ...item.runIds
+        .filter((_, i) => streams[i]!.state === "pending")
+        .map((runId) => rest?.runReasons.get(runId)),
+    ]);
+    const blocked =
+      [...blockedOrder].reverse().find((reason) => reasons.has(reason)) ??
+      "deferred";
+    const superseded = streams.some(
+      (s) => s.state === "superseded" && !s.reason?.startsWith("replaced_by:"),
+    );
+    const runIds = item.runIds.filter(
+      (_, i) => streams[i]!.publication !== undefined,
+    );
+    const evidence = streams
+      .flatMap((s) => (s.publication ? [s.publication] : []))
+      .sort((a, b) => b.version - a.version)[0];
+    const hadWork = item.hadChanges || item.runIds.length > 0;
+    const outcome = deleting
+      ? "deferred"
+      : connection?.control_state === "deleted"
+        ? "purged"
+        : pending
+          ? blocked
+          : superseded
+            ? "discarded"
+            : hadWork
+              ? "published"
+              : "noop";
+    results.push({
+      stream: item.stream,
+      outcome,
+      watermark: state?.publish_watermark ?? null,
+      ...(outcome === "published" &&
+        connection &&
+        state?.head_data_hash && {
+          publication: {
+            connectionId: id,
+            connector: connection.connector,
+            ns: connection.ns,
+            stream: item.stream,
+            head: {
+              version:
+                evidence?.version ??
+                log.refs.find((r) => r.dataHash === state.head_data_hash)
+                  ?.position ??
+                log.position,
+              generation:
+                evidence?.generation ??
+                state.head_generation ??
+                connection.generation,
+              dataHash: evidence?.dataHash ?? state.head_data_hash,
+            },
+            watermark: evidence?.watermark ?? state.publish_watermark,
+            runIds,
+          },
+        }),
+    });
+  }
+  return results;
 }
 
 // Process-local lifecycle: uploading -> uploaded (commit unresolved) ->
@@ -442,16 +559,9 @@ async function publishRounds(
   deps: LocalSyncDeps,
   connectionId: string,
   clock: PhaseClock,
-): Promise<readonly PublishResult[] | null> {
-  const results = new Map<string, PublishResult>();
-  const keep = (list: readonly PublishResult[]) => {
-    for (const result of list) {
-      results.set(
-        result.stream,
-        mergeResult(results.get(result.stream), result),
-      );
-    }
-  };
+): Promise<boolean> {
+  const record = (list: readonly PublishResult[]) =>
+    recordBlocked(deps, connectionId, list);
   let attempts = 0;
   const pending = pendingOf(deps.db);
   for (;;) {
@@ -479,7 +589,7 @@ async function publishRounds(
           return null;
         },
       );
-      if (recovered) keep(recovered);
+      if (recovered) await record(recovered);
       if (
         entry.state.kind === "invalidated" ||
         entry.state.kind === "committed" ||
@@ -503,12 +613,12 @@ async function publishRounds(
         const attachments = turn.attachments;
         await clock.time("attachments", () => uploadBlobs(deps, attachments));
       }
-      keep(turn.results);
+      await record(turn.results);
       break;
     }
     if (turn.kind === "retry") {
       if (++attempts >= MAX_ATTEMPTS) {
-        keep(await backoff(deps, connectionId));
+        await record(await backoff(deps, connectionId));
         break;
       }
       continue;
@@ -563,7 +673,7 @@ async function publishRounds(
         { connectionId, error: error.message },
         "stream sync: storage unavailable, publish left in the queue",
       );
-      keep(await backoff(deps, connectionId));
+      await record(await backoff(deps, connectionId));
       break;
     }
 
@@ -593,20 +703,20 @@ async function publishRounds(
     releaseCandidate(pending, connectionId, transfer);
     if (committed.kind === "unsupported") {
       withoutBatchRoute.add(deps.registry);
-      return null;
+      return false;
     }
     if (committed.kind === "retry") {
       if (++attempts >= MAX_ATTEMPTS) {
-        keep(await backoff(deps, connectionId));
+        await record(await backoff(deps, connectionId));
         break;
       }
       continue;
     }
-    keep(committed.results);
+    await record(committed.results);
     attempts = 0;
     if (!committed.more) break;
   }
-  return [...results.values()].sort((a, b) => a.stream.localeCompare(b.stream));
+  return true;
 }
 
 /**
@@ -1380,12 +1490,7 @@ async function changedKeys(
   const rows = await deps.db.query<{ pk_hash: string; seq: number }>(
     `SELECT pk_hash, MAX(seq) AS seq FROM record_changes
       WHERE connection_id = ? AND stream = ? AND seq > ? AND seq <= ?
-        AND origin IN ('local', 'import', 'refresh')
-        AND NOT EXISTS (SELECT 1 FROM runs r JOIN run_streams rs ON rs.run_id=r.run_id
-          WHERE r.connection_id=record_changes.connection_id AND rs.stream=record_changes.stream
-            AND r.run_id=record_changes.stamp_r AND r.o=record_changes.stamp_o
-            AND r.admitting = 0
-            AND rs.decision IN ('refused','discarded'))
+        AND ${ELIGIBLE_CHANGE}
       GROUP BY pk_hash ORDER BY MAX(seq)`,
     [connectionId, stream, from, to],
   );

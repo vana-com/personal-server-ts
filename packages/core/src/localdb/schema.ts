@@ -547,4 +547,9 @@ END`,
                              AND s.stream = stream_versions.stream)
      WHERE primary_key IS NULL`,
   ],
+  [
+    // Why eligible work is still waiting. Completion reads this only while work remains.
+    `ALTER TABLE record_changes ADD COLUMN publish_blocked_reason TEXT CHECK (publish_blocked_reason IN ('deferred','backoff','discarded','purged','refused'))`,
+    `ALTER TABLE run_streams ADD COLUMN publish_blocked_reason TEXT CHECK (publish_blocked_reason IN ('deferred','backoff','discarded','purged','refused'))`,
+  ],
 ];

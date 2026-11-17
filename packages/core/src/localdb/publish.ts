@@ -25,6 +25,7 @@ import {
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { dropRunRows, withOrigin } from "./merge.js";
+import { PENDING_RUN } from "./publication-work.js";
 import { checkRunFence } from "./fence.js";
 import { replaceMayApply } from "./replace.js";
 
@@ -174,9 +175,7 @@ async function retainedRuns(
             (SELECT COUNT(*) FROM run_rows rr
               WHERE rr.run_id = r.run_id AND rr.stream = rs.stream) AS row_count
        FROM runs r JOIN run_streams rs ON rs.run_id = r.run_id
-      WHERE r.connection_id = ? AND rs.stream = ? AND r.state = 'ended'
-        AND rs.decision IN ('publish', 'noop', 'deferred')
-        AND rs.publication_state = 'pending'
+      WHERE r.connection_id = ? AND rs.stream = ? AND ${PENDING_RUN}
       ORDER BY r.o, r.run_id`,
     [connectionId, stream],
   );

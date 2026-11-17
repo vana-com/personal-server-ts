@@ -115,10 +115,8 @@ describe("publish", () => {
     const first = d.sync.publish();
     // The first publish holds its upload; a run that ends meanwhile joins its
     // next round, and the second publish, which waits for the first, must
-    // still return the receipt that names both runs. (`mergeResults` keeps
-    // the runs of both receipts when each publish sent one; no run order in
-    // the fake world makes the second publish send a run of its own, so that
-    // union is not pinned by a test.)
+    // still return durable evidence for both runs from its starting work,
+    // even when the first publish acknowledged them.
     while (!held) await new Promise((r) => setImmediate(r));
     await d.run("r2", [{ stream: "s0", id: "b" }]);
     const second = d.sync.publish();
