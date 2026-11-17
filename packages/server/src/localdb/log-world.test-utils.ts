@@ -248,6 +248,8 @@ export async function world(options: {
         covered?: readonly string[];
         full?: boolean;
         observedAt?: number;
+        /** An explicit connect by the owner: the only start of a deleted connection. */
+        connect?: boolean;
         /** Bytes the record named by `blobId` carries, sent before the run ends. */
         blob?: { hash: string; bytes: Uint8Array };
         /** The connector the run collects for (default: the world's one connector). */
@@ -265,6 +267,7 @@ export async function world(options: {
             ? connector
             : `${connector}@${opts.version}`,
         wantFull: opts.full ?? true,
+        ...(opts.connect ? { connect: true } : {}),
         observedAt: opts.observedAt,
         owner: { address: OWNER, leaseId: null },
       });

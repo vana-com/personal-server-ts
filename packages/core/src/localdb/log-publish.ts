@@ -1380,13 +1380,19 @@ async function establishControl(
 async function readControl(
   held: LocalSyncDeps,
   connectionId: string,
-  connection: ConnectionRow,
+  connection: ConnectionRow & { control_state: string },
   hashes: ControlHashes,
 ): Promise<"active" | "create" | PublishResult["outcome"]> {
   const control = controlScope(connection.connector, connection.ns);
   const state = classifyControl(await held.registry.read(control), hashes);
+  // Absence creates the row only for a connection this device never saved. A
+  // connection this device deleted is absent from the registry too (a delete
+  // of a never-saved connection fences nothing), and only an explicit connect
+  // starts it again: creating its row here would undo the delete.
   if (state.kind === "absent")
-    return connection.generation === 1 ? "create" : "deferred";
+    return connection.control_state === "absent" && connection.generation === 1
+      ? "create"
+      : "deferred";
   if (state.kind === "deleted") {
     await purgeConnection(held, connectionId, {
       controlVersion: state.version,
@@ -1473,7 +1479,7 @@ async function controlFailed(
 async function commitControl(
   held: LocalSyncDeps,
   connectionId: string,
-  connection: ConnectionRow,
+  connection: ConnectionRow & { control_state: string },
   hashes: ControlHashes,
 ): Promise<"active" | "retry" | PublishResult["outcome"]> {
   const control = controlScope(connection.connector, connection.ns);
@@ -1919,8 +1925,10 @@ async function commitRound(
   await invalidateExpiredCandidate(held, connectionId, entry);
   if (entry.state.kind === "invalidated")
     return { kind: "retry", conflict: false };
-  const [connection] = await held.db.query<ConnectionRow>(
-    "SELECT connector, ns, generation FROM connections WHERE connection_id = ?",
+  const [connection] = await held.db.query<
+    ConnectionRow & { control_state: string }
+  >(
+    "SELECT connector, ns, generation, control_state FROM connections WHERE connection_id = ?",
     [connectionId],
   );
   if (!connection || connection.generation !== candidate.generation) {
