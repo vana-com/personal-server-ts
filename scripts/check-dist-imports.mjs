@@ -11,6 +11,9 @@ const builtins = new Set(
   builtinModules.flatMap((name) => [name, `node:${name}`]),
 );
 const violations = [];
+// Repository-relative paths and reasons for computed imports that cannot be made static.
+const computedImportAllowlist = new Map();
+const computedImports = [];
 
 for (const dir of fs.readdirSync(path.join(root, "packages"))) {
   const pkgDir = path.join(root, "packages", dir);
@@ -29,15 +32,16 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
     ...Object.keys(pkg.optionalDependencies ?? {}),
     ...Object.keys(pkg.peerDependencies ?? {}),
   ]);
-  const [{ files }] = JSON.parse(
+  const packed = JSON.parse(
     execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
       cwd: pkgDir,
       encoding: "utf8",
     }),
   );
+  const [{ files }] = Array.isArray(packed) ? packed : Object.values(packed);
+  const packedFiles = new Set(files.map(({ path: packedPath }) => packedPath));
   for (const { path: packedPath } of files) {
-    if (!packedPath.startsWith("dist/") || !/\.(?:c?js|mjs)$/.test(packedPath))
-      continue;
+    if (!/\.(?:c?js|mjs)$/.test(packedPath)) continue;
     const file = path.join(pkgDir, packedPath);
     const source = ts.createSourceFile(
       file,
@@ -56,15 +60,37 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
         ts.isStringLiteral(node.moduleSpecifier)
       ) {
         specifier = node.moduleSpecifier.text;
-      } else if (
-        ts.isCallExpression(node) &&
-        node.arguments.length === 1 &&
-        ts.isStringLiteral(node.arguments[0]) &&
-        (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
-          (ts.isIdentifier(node.expression) &&
-            node.expression.text === "require"))
-      ) {
-        specifier = node.arguments[0].text;
+      } else if (ts.isCallExpression(node)) {
+        const isDynamicImport =
+          node.expression.kind === ts.SyntaxKind.ImportKeyword;
+        const isRequire =
+          ts.isIdentifier(node.expression) &&
+          node.expression.text === "require";
+        const arg = node.arguments[0];
+        if (
+          (isDynamicImport || (isRequire && node.arguments.length === 1)) &&
+          arg &&
+          (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg))
+        ) {
+          specifier = arg.text;
+        } else if (isDynamicImport) {
+          const location = `${path.relative(root, file)}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}`;
+          const reason = computedImportAllowlist.get(path.relative(root, file));
+          computedImports.push(
+            `${location}${reason ? ` (allowed: ${reason})` : " (unanalysable)"}`,
+          );
+          if (!reason)
+            violations.push(`${location} has an unanalysable dynamic import`);
+        }
+      }
+      if (specifier?.startsWith(".")) {
+        const target = path.posix.normalize(
+          path.posix.join(path.posix.dirname(packedPath), specifier),
+        );
+        if (!packedFiles.has(target))
+          violations.push(
+            `${path.relative(root, file)} imports unpacked relative target ${specifier}`,
+          );
       }
       if (specifier && !specifier.startsWith(".") && !builtins.has(specifier)) {
         const name = specifier.startsWith("@")
@@ -79,6 +105,9 @@ for (const dir of fs.readdirSync(path.join(root, "packages"))) {
     }
   }
 }
+console.log(
+  `Computed dynamic imports: ${computedImports.length ? `\n${computedImports.join("\n")}` : "none"}`,
+);
 if (violations.length) {
   console.error(violations.join("\n"));
   process.exit(1);
