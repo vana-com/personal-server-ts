@@ -135,6 +135,8 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   inferenceProvider?: InferenceProvider;
   ownerSignature: `0x${string}`;
   ownerSyncSigner?: PsLiteOwnerSyncSigner;
+  /** Closed until incoming-server registration commits; initial sync only pulls. */
+  registrationReady?: () => boolean;
   additionsWorkerFactory?: PsLiteSyncOptions["additionsWorkerFactory"];
   dbName?: string;
   stateStoreName?: string;
@@ -452,6 +454,7 @@ export async function createIndexedDbPsLiteRuntime(
       ),
       ownerAddress: options.ownerAddress,
       ownerSyncSigner: options.ownerSyncSigner,
+      registrationReady: options.registrationReady,
       additionsWorkerFactory: options.additionsWorkerFactory,
       serverAccount: identity.account,
       gateway,

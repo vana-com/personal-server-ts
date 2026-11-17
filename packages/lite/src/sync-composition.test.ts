@@ -158,6 +158,7 @@ async function openLite(opts: {
     cursor: string | null;
   };
   localDb?: LiteLocalDbOptions;
+  registrationReady?: () => boolean;
   accountStorageMode?: OwnedAccountStorageMode;
 }) {
   return createPsLiteSyncManager({
@@ -165,6 +166,7 @@ async function openLite(opts: {
       sync: { enabled: true },
     }),
     localDb: opts.localDb,
+    registrationReady: opts.registrationReady,
     accountStorageMode: opts.accountStorageMode ?? {
       owner: opts.identity.account.address,
       read: () => "unswitched",
@@ -391,6 +393,59 @@ describe("PS Lite local database composition", () => {
     });
     return { lite, owner };
   }
+
+  it("pulls a proven owner's data while registration is held, then publishes only after admission", async () => {
+    const db = driver();
+    const { localSync } = facade(db);
+    const events: string[] = [];
+    let started!: () => void;
+    const pulling = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.mocked(localSync.apply).mockImplementation(async () => {
+      events.push("pull");
+      started();
+      await held;
+    });
+    vi.mocked(localSync.cycle).mockImplementation(async () => {
+      events.push("publish-cycle");
+      return { connections: [] };
+    });
+    const owner = await recoverServerOwner(OWNER_SIGNATURE);
+    const stateStore = namedState("owner-boot-test");
+    const { identity, gateway } = await fixture(stateStore, owner);
+    let registered = false;
+    const lite = await openLite({
+      stateStore,
+      identity,
+      gateway,
+      storage: createMemoryPsLiteStorage(),
+      localDb: { openDriver: async () => db },
+      accountStorageMode: { owner, read: () => "switched" },
+      registrationReady: () => registered,
+    });
+    const first = lite.syncManager.trigger();
+    try {
+      await Promise.race([pulling, first]);
+      expect(events).toEqual(["pull"]);
+      expect(gateway.getServer).not.toHaveBeenCalled();
+      expect(localSync.cycle).not.toHaveBeenCalled();
+      registered = true;
+      release();
+      await first;
+      await lite.syncManager.trigger();
+      expect(events).toEqual(["pull", "publish-cycle"]);
+    } finally {
+      release();
+      await first;
+      await lite.syncManager.stop();
+      await lite.closeStreamSync();
+    }
+  });
 
   it("opens Lite's database through the host factory and shared initializer", async () => {
     const db = driver();

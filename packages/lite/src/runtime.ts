@@ -1297,7 +1297,11 @@ export function createPsLiteRuntime(
           const apiOrigin = url.origin;
           const identity = options.identity ?? null;
           let serverId: string | null = null;
-          if (identity && options.gateway) {
+          if (
+            identity &&
+            options.gateway &&
+            url.searchParams.get("registration") !== "skip"
+          ) {
             try {
               const server = await options.gateway.getServer(identity.address);
               serverId = server?.id ?? null;

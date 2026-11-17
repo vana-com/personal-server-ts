@@ -167,7 +167,7 @@ describe("a retry scoped to the connections that are owed", () => {
   // The manager retries owed work on its timer. When the change push shows the
   // registry has not moved, the retry names the connections that are owed, and
   // the cycle skips the listing and reads for those alone.
-  it("reads the registry for the owed connection only: no listing, and a share of the full cycle's reads", async () => {
+  it("reads only the owed connection; a full idle cycle shares one listing", async () => {
     const w = await world(6, 4);
     w.calls.length = 0;
     const report = await w.sync.cycle();
@@ -181,7 +181,7 @@ describe("a retry scoped to the connections that are owed", () => {
     expect(scoped.connections.map((c) => c.connectionId)).toEqual([owed]);
     expect(w.calls).not.toContain("registry.list");
     expect(w.calls).not.toContain("registry.post");
-    expect(full).toEqual({ "registry.list": 1, "registry.read": 6 });
+    expect(full).toEqual({ "registry.list": 1 });
     expect(one).toEqual({ "registry.read": 2 });
   });
 

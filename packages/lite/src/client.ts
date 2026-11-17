@@ -80,6 +80,9 @@ export interface StartPersonalServerLiteOptions extends Omit<
   IndexedDbPsLiteRuntimeOptions,
   "ownerSignature" | "active"
 > {
+  /** Pull switched owner data before advertising. Incoming relay and cycle
+   * publication stay closed until registration is confirmed. Built runtimes only. */
+  ownerReadBeforeRegistration?: boolean;
   ownerSignature?: `0x${string}`;
   active?: boolean;
   runtime?: PsLiteRuntime;
@@ -97,6 +100,10 @@ export type PersonalServerLitePublicationResult = {
 
 /** The Lite handle: the shared handle plus the host's run-intake door. */
 export type PersonalServerLiteHandle = PersonalServerHandle & {
+  /** True only when this handle admits verified owner pulls before registration. */
+  readonly ownerReadBeforeRegistration: boolean;
+  /** Local identity/status only: never looks up server registration. */
+  localInfo(): Promise<PersonalServerInfo>;
   /** In-process run intake; `null` unless the host built a run intake. */
   readonly streamSyncIntake: RunIntake | null;
   /** One-time retained-snapshot intake, with the runtime's Account admission. */
@@ -123,6 +130,9 @@ export type PersonalServerLiteHandle = PersonalServerHandle & {
 export async function startPersonalServer(
   options: StartPersonalServerLiteOptions,
 ): Promise<PersonalServerLiteHandle> {
+  if (options.ownerReadBeforeRegistration && options.runtime) {
+    throw new Error("Early owner reads require a verified built runtime");
+  }
   if (options.persistence && options.runtime) {
     throw new Error(
       "runtime cannot be supplied with a complete persistence bundle",
@@ -175,10 +185,15 @@ export async function startPersonalServer(
           () => relayClientForDrain,
         )
       : options.readFulfillmentReporter;
+  let registrationConfirmed = false;
+  const earlyOwnerReads = options.ownerReadBeforeRegistration === true;
   const runtimeBundle: IndexedDbPsLiteRuntime | null = options.runtime
     ? null
     : await createIndexedDbPsLiteRuntime({
         ...options,
+        ...(earlyOwnerReads && {
+          registrationReady: () => registrationConfirmed,
+        }),
         readFulfillmentReporter,
         ownerSignature: requiredOwnerSignature(options.ownerSignature),
         active: options.active ?? true,
@@ -194,6 +209,7 @@ export async function startPersonalServer(
     runtime.activate();
   }
 
+  let stopping = false;
   let status: PersonalServerStatus = "ready";
   let relayStatus: PsLiteRelayStatus = "closed";
   let relayClient: PsLiteRelayClient | undefined;
@@ -207,7 +223,15 @@ export async function startPersonalServer(
     options.onStatus?.(nextStatus);
   };
 
-  if (resolvedRelayOptions) {
+  publicUrl = initialPublicUrl;
+  function startRelay(): void {
+    if (
+      !resolvedRelayOptions ||
+      relayClient ||
+      status === "stopped" ||
+      stopping
+    )
+      return;
     relayStatus = "connecting";
     publicUrl = initialPublicUrl;
     relayClient = startPsLiteRelayClient({
@@ -225,12 +249,24 @@ export async function startPersonalServer(
     });
     relayClientForDrain = relayClient;
   }
+  function confirmRegistration(): void {
+    if (registrationConfirmed || stopping || status === "stopped") return;
+    registrationConfirmed = true;
+    startRelay();
+    // A pull may already be running. Trigger coalesces the publication pass
+    // behind it, without delaying the registration receipt on historical data.
+    if (earlyOwnerReads)
+      void runtimeBundle?.syncManager?.trigger().catch(() => {});
+  }
+  if (!earlyOwnerReads) startRelay();
 
-  async function info(): Promise<PersonalServerInfo> {
+  async function readInfo(lookup: boolean): Promise<PersonalServerInfo> {
     if (status === "stopped" && lastInfo) {
       return { ...lastInfo, status: "stopped" };
     }
-    const response = await runtime.fetch(new Request(`${localOrigin}/health`));
+    const response = await runtime.fetch(
+      new Request(`${localOrigin}/health${lookup ? "" : "?registration=skip"}`),
+    );
     const body = await response.json();
     lastInfo = createPersonalServerInfoFromHealth({
       kind: "lite",
@@ -242,8 +278,10 @@ export async function startPersonalServer(
       localUrl: localOrigin,
       publicUrl,
     });
+    if (lastInfo.registration.registered) confirmRegistration();
     return lastInfo;
   }
+  const info = () => readInfo(true);
 
   /**
    * Where API calls go: the relay URL once there is one, else the local
@@ -294,6 +332,7 @@ export async function startPersonalServer(
       signature: submitOptions.signature,
     }).then(async (result) => {
       await rememberRegisteredRelay(request.candidate.serverUrl);
+      confirmRegistration();
       return result;
     });
   }
@@ -590,7 +629,6 @@ export async function startPersonalServer(
   }
 
   const publishing = new Set<Promise<PersonalServerLitePublicationResult>>();
-  let stopping = false;
   const seedPort = runtime.streamSyncSeed;
   const streamSyncSeed: SeedIntake | null = seedPort
     ? {
@@ -616,7 +654,11 @@ export async function startPersonalServer(
   }
 
   async function publishCycle(): Promise<PersonalServerLitePublicationResult> {
-    if (status === "stopped" || !runtimeBundle?.getLocalSync)
+    if (
+      (earlyOwnerReads && !registrationConfirmed) ||
+      status === "stopped" ||
+      !runtimeBundle?.getLocalSync
+    )
       throw new Error("Stream publication is unavailable");
     const report = await (await runtimeBundle.getLocalSync()).publish();
     const publications: PublicationReceipt[] = [];
@@ -664,6 +706,8 @@ export async function startPersonalServer(
   const replicationStatus = runtimeBundle?.replication;
   return {
     kind: "lite",
+    ownerReadBeforeRegistration: earlyOwnerReads,
+    localInfo: () => readInfo(false),
     ...(replicationStatus && {
       replication: { status: () => replicationStatus },
     }),
