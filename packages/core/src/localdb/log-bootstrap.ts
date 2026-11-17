@@ -27,6 +27,7 @@ import {
 } from "./partial-load.js";
 import { withOrigin } from "./merge.js";
 import { announceApplied } from "./apply-progress.js";
+import { readPartsAhead, type PartReader } from "./part-readahead.js";
 
 export class FalseRemovalFact extends Error {
   constructor() {
@@ -156,6 +157,8 @@ async function runBootstrap(input: {
         0,
       ),
     ]);
+  let ahead: PartReader<SegmentRef, Segment> | undefined;
+  let indexes = new Map<number, number>();
   try {
     await deps.db.batch(seed());
     announceApplied(deps, connectionId);
@@ -166,8 +169,13 @@ async function runBootstrap(input: {
         if (ref.removes === false && old.removes) throw new FalseRemovalFact();
         return;
       }
+      const index = indexes.get(ref.position);
       const segment =
-        ref.position === head.position ? head : await input.fetch(ref);
+        ahead && index !== undefined
+          ? await ahead.load(ref, index)
+          : ref.position === head.position
+            ? head
+            : await input.fetch(ref);
       if (ref.position === refs[0]!.position && !load!.preview_done)
         previewSegment = segment;
       const removes = segmentRemoves(segment.operations);
@@ -246,6 +254,7 @@ async function runBootstrap(input: {
         ],
       });
       await deps.db.batch(statements);
+      if (ahead && index !== undefined) ahead.committed(index);
       receipts.push(receipt);
       for (const meta of segment.streams) known.set(meta.stream, meta);
     };
@@ -306,6 +315,12 @@ async function runBootstrap(input: {
       previewSegment = undefined;
       announceApplied(deps, connectionId);
     }
+    const receipted = new Set(receipts.map((receipt) => receipt.position));
+    const remaining = refs.filter((ref) => !receipted.has(ref.position));
+    indexes = new Map(remaining.map((ref, index) => [ref.position, index]));
+    ahead = readPartsAhead(deps.blobs, remaining, async (ref) =>
+      ref.position === head.position ? head : input.fetch(ref),
+    );
     for (const ref of refs) await stage(ref);
     // Rebuildable narrow index: no downloaded segment promise/body is retained.
     receipts = receipts.sort((a, b) => a.position - b.position);
@@ -458,6 +473,8 @@ async function runBootstrap(input: {
         () => undefined,
       );
     throw error;
+  } finally {
+    ahead?.close();
   }
 }
 
