@@ -48,7 +48,7 @@ export async function runCycle(deps: LocalSyncDeps): Promise<CycleReport> {
   // bootstrap reads the control rows from it and every apply its log row. Each
   // apply's own listing would be shared only by the applies that reach it while
   // it is out, so the count would follow how their control reads line up.
-  const listed = await deps.registry.listOwnerRows?.();
+  const listed = await deps.registry.listOwnerRows();
   const connections = await bootstrapConnections(deps, listed);
   return {
     connections: await Promise.all(

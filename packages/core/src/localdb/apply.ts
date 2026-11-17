@@ -68,7 +68,7 @@ type Flight = {
   /**
    * The listing the flight reads its log row from, when every caller of the
    * flight brought this same one (`applyConnection`). A caller with another
-   * listing, or none, joins and clears it: the flight then lists for itself.
+   * listing, or none, joins and clears it: the flight then reads the row.
    */
   listed?: OwnerRows;
 };
@@ -178,21 +178,16 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
       if (initial.kind === "deleted") await clearPartial(deps, id, reuse);
       return;
     }
-    // The connection's data is its log. The owner's listing says where the log
-    // stands: the cycle's one listing when every caller of this flight came
-    // with it, else one this flight takes (concurrent applies share it). A
-    // read of each log row would be one request per connection.
+    // The connection's data is its log. The cycle's one listing of the owner
+    // says where the log stands when every caller of this flight came with
+    // it; without it `applyLog` reads the log row.
     await applyLog(locked, id, {
       connector: connection.connector,
       ns: connection.ns,
       generation: initial.generation,
       keyCheck,
       hashes,
-      read: logRowOf(
-        flight.listed ??
-          (await deps.registry.listStreamRows(connection.connector)),
-        connection,
-      ),
+      read: flight.listed && logRowOf(flight.listed, connection),
     });
     // A pass that ran to its end has applied the log through the position it
     // read, which is what the mark waits for.
@@ -224,7 +219,7 @@ function logRowOf(
 /**
  * Apply the connection's log; concurrent requests share one flight. `listed`
  * is a listing of the owner's rows the caller took for this apply (a sync
- * cycle's); without it the apply lists for itself.
+ * cycle's); without it the apply reads the connection's log row.
  */
 export function applyConnection(
   deps: LocalSyncDeps,

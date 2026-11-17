@@ -70,6 +70,8 @@ export async function remoteFixture(
       [...reads]
         .filter(([scope]) => key === connector && scope !== control)
         .map(([scope, read]) => ({ scope, read })),
+    listOwnerRows: async () =>
+      [...reads].map(([scope, read]) => ({ scope, read })),
     post: async (post) => {
       if (String(versionOf(post.scope) + 1) !== post.expectedVersion)
         return {

@@ -133,7 +133,7 @@ describe("log apply: the cycle's listing is a hint", () => {
     await a.cycle();
     // A listing a cycle took, then a commit of this device after it (a run's
     // end publishes while the cycle is still bootstrapping).
-    const listed = await a.deps.registry.listOwnerRows!();
+    const listed = await a.deps.registry.listOwnerRows();
     await a.run("second", [{ stream: sName(0), id: "y" }], {
       full: false,
       covered: [sName(0)],

@@ -265,11 +265,9 @@ export interface StreamSyncRegistry {
    * listing. A sync cycle takes it once and reads each connection's control
    * and log rows from it, so the cycle's listings do not depend on when its
    * applies run. The rows are a hint taken before the applies: an apply that
-   * holds a newer log position than the listing reads the row again. A
-   * registry that cannot list in one pass leaves this out, and each apply
-   * lists for itself.
+   * holds a newer log position than the listing reads the row again.
    */
-  listOwnerRows?(): Promise<
+  listOwnerRows(): Promise<
     readonly { readonly scope: string; readonly read: ControlRead }[]
   >;
   /**
