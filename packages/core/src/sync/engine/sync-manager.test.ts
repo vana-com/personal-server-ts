@@ -38,6 +38,7 @@ import { downloadAll, downloadScopes } from "../workers/download.js";
 import { requeueLostDataPoints } from "../workers/lost-data-points.js";
 import { createSyncManager } from "./sync-manager.js";
 import { createUploadStateTracker } from "../upload-state.js";
+import { deltaToCycle } from "./local-sync.test-helper.js";
 
 function makeMockLogger(): Logger {
   return {
@@ -104,7 +105,7 @@ describe("SyncManager", () => {
     const cycle = vi.fn(async () => {});
     const manager = createSyncManager(makeMockUploadDeps(), download, {
       accountStorageMode: { read: () => "unswitched" },
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       transferMode: "download-only",
     });
     try {

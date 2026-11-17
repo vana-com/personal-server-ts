@@ -33,6 +33,7 @@ type Handlers = Parameters<ChangePush["subscribe"]>[0];
 const APPLIED: DeltaApplyResult = {
   outcome: "applied",
   connections: 1,
+  deleted: 0,
   blobGets: 1,
   blobMs: 0,
   applyMs: 0,

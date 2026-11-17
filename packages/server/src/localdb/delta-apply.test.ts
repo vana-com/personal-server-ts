@@ -47,6 +47,14 @@ async function peerCommitted() {
   return { w, peer, here };
 }
 
+const markPartial = (device: Device) =>
+  device.db.batch([
+    {
+      sql: "UPDATE connections SET apply_partial=1 WHERE connection_id=?",
+      params: [CONNECTION_ID],
+    },
+  ]);
+
 /** The delta the gateway would send for these scopes, read from the registry. */
 async function deltaOf(
   device: Device,
@@ -392,6 +400,67 @@ describe("applying a change delta", () => {
     expect(here.gets.slice(before)).toEqual([]);
   });
 
+  it.each([
+    ["no rows", []],
+    [
+      "only a row that is not a stream-sync scope",
+      [
+        {
+          scope: "legacy.conversations",
+          read: {
+            found: true,
+            version: 1,
+            dataHash: `0x${"aa".repeat(32)}`,
+            metadataHash: `0x${"bb".repeat(32)}`,
+            deleted: false,
+          },
+        },
+      ],
+    ],
+  ])(
+    "a stale partial mark on a connection the delta does not name hands to the cycle, which repairs it (mutation: partial checked only for the delta's connections), %s",
+    async (_n, rows) => {
+      const { w, here } = await peerCommitted();
+      await markPartial(here);
+      const before = await localState(here);
+      const delta = await deltaOf(here, []);
+      const out = await applied(w, here, {
+        ...delta,
+        rows,
+      } as RegistryChangeDelta);
+      expect(out.result.outcome).toBe("cycle");
+      expect(await localState(here)).toEqual(before);
+      // The cycle it hands to clears the mark.
+      await here.cycle();
+      expect(
+        await here.db.query(
+          "SELECT apply_partial FROM connections WHERE connection_id=?",
+          [CONNECTION_ID],
+        ),
+      ).toEqual([{ apply_partial: 0 }]);
+    },
+  );
+
+  it("a row this device's own commit has passed hands to the cycle without an apply (mutation: no position check before applyLog)", async () => {
+    const { w, here } = await peerCommitted();
+    // The delta was read at the peer's commit; before it is applied, this
+    // device catches up and commits on top.
+    const stale = await deltaOf(here, [LOG]);
+    await here.cycle();
+    await here.run("run-3", [{ stream: sName(1), id: "mine" }], {
+      full: false,
+      covered: [sName(1)],
+    });
+    await here.cycle();
+    const row = (stale as { rows: { read: { version: number } }[] }).rows[0]!;
+    expect(await here.position()).toBeGreaterThan(row.read.version);
+    const before = await localState(here);
+    const out = await applied(w, here, stale);
+    expect(out.result.outcome).toBe("cycle");
+    expect(out.gets).toEqual([]);
+    expect(await localState(here)).toEqual(before);
+  });
+
   it("a reset hands to the cycle", async () => {
     const { w, here } = await peerCommitted();
     const out = await applied(w, here, { since: "0", seq: "2", reset: true });
@@ -442,19 +511,41 @@ describe.each([
     expect(await localState(here)).toEqual(await localState(twin));
   });
 
-  it("a connection left partly applied is finished by the delete, as the cycle finishes it (mutation: the partial mark kept)", async () => {
+  it("a connection left partly applied hands to the cycle, which finishes it (mutation: no partial check)", async () => {
     const { w, here, twin, scopes } = await peerDeleted();
-    for (const device of [here, twin])
-      await device.db.batch([
-        {
-          sql: "UPDATE connections SET apply_partial=1 WHERE connection_id=?",
-          params: [CONNECTION_ID],
-        },
-      ]);
+    for (const device of [here, twin]) await markPartial(device);
+    const before = await localState(here);
     const out = await applied(w, here, await deltaOf(here, scopes));
-    expect(out.result).toMatchObject({ outcome: "applied", deleted: 1 });
+    expect(out.result.outcome).toBe("cycle");
+    expect(await localState(here)).toEqual(before);
+    await here.cycle();
     await twin.cycle();
     expect(await localState(here)).toEqual(await localState(twin));
+  });
+
+  it("a partial mark an apply leaves after the delta is decided hands to the cycle (mutation: no partial check in the queue)", async () => {
+    const { here, scopes } = await peerDeleted();
+    const before = await localState(here);
+    const delta = await deltaOf(here, scopes);
+    // Another apply holds the queue when the delete reaches it, and leaves a
+    // partial mark.
+    const result = await applyRegistryDelta(
+      {
+        ...here.deps,
+        queue: {
+          run: async (id, kind, work) => {
+            await markPartial(here);
+            return here.deps.queue.run(id, kind, work);
+          },
+        },
+      },
+      delta,
+    );
+    expect(result.outcome).toBe("cycle");
+    expect(await localState(here)).toEqual({
+      ...before,
+      connections: before.connections.map((c) => ({ ...c, apply_partial: 1 })),
+    });
   });
 
   it("a commit the peer made before the delete, in the same delta, is not fetched (mutation: a deleted connection's rows applied)", async () => {

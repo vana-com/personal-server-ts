@@ -20,6 +20,7 @@ import {
   type ChangePush,
   type SyncManagerOptions,
 } from "./sync-manager.js";
+import { deltaToCycle } from "./local-sync.test-helper.js";
 
 const logger = {
   info: vi.fn(),
@@ -120,7 +121,7 @@ function setup(
     {
       accountStorageMode: { read: () => options.mode?.current ?? "switched" },
       pollInterval: 60_000,
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: { read, intervalMs: 5_000, push },
       ...(options.withDeleteData === false
         ? {}

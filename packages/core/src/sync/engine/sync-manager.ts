@@ -110,10 +110,10 @@ export interface ChangePush {
    * sent: the position the manager holds the registry up to, if any.
    */
   subscribe(handlers: {
-    onChange(delta?: RegistryChangeDelta): void;
+    onChange(delta: RegistryChangeDelta | undefined): void;
     onHealth(healthy: boolean): void;
     onPosition(position: string): void;
-    since?(): string | undefined;
+    since(): string | undefined;
   }): () => void;
 }
 
@@ -124,9 +124,9 @@ export interface SyncManagerOptions {
     cycle(): Promise<unknown>;
     /**
      * Apply a change delta without the cycle's registry reads, when it can
-     * (`applyRegistryDelta`). Optional: without it every wake runs a cycle.
+     * (`applyRegistryDelta`).
      */
-    applyDelta?(delta: RegistryChangeDelta): Promise<DeltaApplyResult>;
+    applyDelta(delta: RegistryChangeDelta): Promise<DeltaApplyResult>;
   };
 
   /** Polling interval in milliseconds (default: 60_000 = 1 minute) */
@@ -585,9 +585,9 @@ export function createSyncManager(
     heldUpTo: string | undefined,
     startedUnder: string | undefined,
   ): Promise<"settle" | "owed" | "full"> {
-    const applyDelta = options?.localSync?.applyDelta;
+    const localSync = options?.localSync;
     if (
-      !applyDelta ||
+      !localSync ||
       delta.reset ||
       delta.since !== heldUpTo ||
       delta.seq !== startedUnder ||
@@ -598,7 +598,7 @@ export function createSyncManager(
     const started = Date.now();
     let result: DeltaApplyResult;
     try {
-      result = await applyDelta(delta);
+      result = await localSync.applyDelta(delta);
     } catch (error) {
       // Whatever failed is the full pass's to meet and report.
       downloadDeps.logger.warn(

@@ -536,6 +536,7 @@ describe("waitForChange", () => {
       "9",
       25_000,
       controller.signal,
+      undefined,
     );
     expect(answer).toEqual({ seq: "12", changed: true });
     const url = new URL(urls[0]!);
@@ -556,6 +557,7 @@ describe("waitForChange", () => {
       undefined,
       25_000,
       new AbortController().signal,
+      undefined,
     );
     expect(new URL(urls[0]!).searchParams.has("after")).toBe(false);
   });
@@ -564,7 +566,12 @@ describe("waitForChange", () => {
     for (const status of [404, 405]) {
       const { registry } = waiting(() => new Response("no", { status }));
       await expect(
-        registry.waitForChange!("1", 25_000, new AbortController().signal),
+        registry.waitForChange!(
+          "1",
+          25_000,
+          new AbortController().signal,
+          undefined,
+        ),
       ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
     }
   });
@@ -584,7 +591,12 @@ describe("waitForChange", () => {
           ),
       );
       await expect(
-        registry.waitForChange!(after, 25_000, new AbortController().signal),
+        registry.waitForChange!(
+          after,
+          25_000,
+          new AbortController().signal,
+          undefined,
+        ),
       ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
     }
   });
@@ -606,6 +618,7 @@ describe("waitForChange", () => {
       undefined,
       25_000,
       new AbortController().signal,
+      undefined,
     ).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(Error);
     expect((failure as Error).name).not.toBe("ChangeFeedAbsentError");
@@ -625,10 +638,20 @@ describe("waitForChange", () => {
         : new Response(JSON.stringify({ seq: "4", changed: true }));
     });
     await expect(
-      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+      registry.waitForChange!(
+        undefined,
+        25_000,
+        new AbortController().signal,
+        undefined,
+      ),
     ).rejects.toThrow(/400/);
     await expect(
-      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+      registry.waitForChange!(
+        undefined,
+        25_000,
+        new AbortController().signal,
+        undefined,
+      ),
     ).resolves.toEqual({ seq: "4", changed: true });
     expect(urls).toHaveLength(2);
   });
@@ -641,11 +664,21 @@ describe("waitForChange", () => {
         : new Response("no", { status: 404 }),
     );
     await expect(
-      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+      registry.waitForChange!(
+        undefined,
+        25_000,
+        new AbortController().signal,
+        undefined,
+      ),
     ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
     upgraded = true;
     await expect(
-      registry.waitForChange!(undefined, 25_000, new AbortController().signal),
+      registry.waitForChange!(
+        undefined,
+        25_000,
+        new AbortController().signal,
+        undefined,
+      ),
     ).resolves.toEqual({ seq: "1", changed: true });
     expect(urls).toHaveLength(2);
   });
@@ -656,7 +689,12 @@ describe("waitForChange", () => {
     );
     for (let attempt = 0; attempt < 3; attempt += 1) {
       await expect(
-        registry.waitForChange!("1", 25_000, new AbortController().signal),
+        registry.waitForChange!(
+          "1",
+          25_000,
+          new AbortController().signal,
+          undefined,
+        ),
       ).rejects.toThrow(/503/);
     }
     expect(urls).toHaveLength(3);
@@ -665,7 +703,12 @@ describe("waitForChange", () => {
   it("throws on any other failure, and on an answer that is not a sequence", async () => {
     const down = waiting(() => new Response("no", { status: 503 }));
     await expect(
-      down.registry.waitForChange!("1", 25_000, new AbortController().signal),
+      down.registry.waitForChange!(
+        "1",
+        25_000,
+        new AbortController().signal,
+        undefined,
+      ),
     ).rejects.toThrow(/503/);
     for (const body of [
       {},
@@ -675,7 +718,12 @@ describe("waitForChange", () => {
     ]) {
       const bad = waiting(() => new Response(JSON.stringify(body)));
       await expect(
-        bad.registry.waitForChange!("1", 25_000, new AbortController().signal),
+        bad.registry.waitForChange!(
+          "1",
+          25_000,
+          new AbortController().signal,
+          undefined,
+        ),
       ).rejects.toThrow(/change answer/);
     }
   });

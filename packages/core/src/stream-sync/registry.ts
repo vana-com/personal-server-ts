@@ -516,9 +516,7 @@ export function createGatewayStreamSyncRegistry(
         params.set("after", after);
         params.set("wait", String(Math.max(0, Math.round(waitMs / 1000))));
       }
-      const sent =
-        since !== undefined && DECIMAL.test(since) ? since : undefined;
-      if (sent !== undefined) params.set("since", sent);
+      if (since !== undefined) params.set("since", since);
       const res = await fetchImpl(
         `${base}/v1/data/changes?${params.toString()}`,
         { signal },
@@ -557,12 +555,12 @@ export function createGatewayStreamSyncRegistry(
       // (rows or reset). One that does not, or carries another request's, or
       // one this client cannot read, fails the request: the push then pokes a
       // full pull on its next answer.
-      if (!body.changed || sent === undefined)
+      if (!body.changed || since === undefined)
         return { seq: body.seq, changed: body.changed };
-      const delta = parseDelta(body.delta, sent, body.seq);
+      const delta = parseDelta(body.delta, since, body.seq);
       if (delta === undefined)
         throw new Error(
-          `registry change answer has no readable delta for since=${sent}`,
+          `registry change answer has no readable delta for since=${since}`,
         );
       return { seq: body.seq, changed: true, delta };
     },

@@ -139,7 +139,7 @@ export function createRegistryChangePush(
             cursor,
             waitMs,
             request.signal,
-            cursor === undefined ? undefined : handlers.since?.(),
+            cursor === undefined ? undefined : handlers.since(),
           );
           wait.catch(() => {}); // a late failure after the race is not ours
           const answer = await Promise.race([wait, ended]);

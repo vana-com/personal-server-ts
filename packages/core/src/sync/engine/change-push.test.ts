@@ -65,6 +65,7 @@ function subscribed(
       order.push(`position:${p}`);
       positions.push(p);
     },
+    since: () => undefined,
   });
   return { ...s, push, pokes, health, positions, order, stop };
 }
@@ -335,6 +336,8 @@ describe("a request the registry never cancels", () => {
     const stop = push.subscribe({
       onChange: pokes,
       onHealth: (h) => health.push(h),
+      onPosition: () => {},
+      since: () => undefined,
     });
     await flush();
     expect(vi.getTimerCount()).toBe(1); // the request's deadline
@@ -395,7 +398,7 @@ describe("the delta", () => {
       since,
     ) => {
       sent.push(since);
-      return wait(after, waitMs, signal);
+      return wait(after, waitMs, signal, undefined);
     };
     let held: string | undefined = "4";
     const push = createRegistryChangePush(s.registry)!;

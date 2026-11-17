@@ -247,8 +247,9 @@ export type RegistryChangeDelta =
  * What applying a change delta did. `cycle`: the delta holds something only a
  * full cycle handles (a new or reconnected lifetime, a stream head or a
  * deleted log row of a live connection, a row of a connection this device
- * does not hold, a removed row, a server change, a reset), or the apply did
- * not reach the delta's position; nothing is settled and the caller runs a
+ * does not hold, a removed row, a server change, a reset, a partial apply
+ * standing on any connection), or the apply did not reach the delta's
+ * position; nothing is settled and the caller runs a
  * cycle. `applied`: the device holds what the registry held at the delta's
  * `seq`, for everything a switched cycle reads.
  */
@@ -367,7 +368,7 @@ export interface StreamSyncRegistry {
     after: string | undefined,
     waitMs: number,
     signal: AbortSignal,
-    since?: string,
+    since: string | undefined,
   ): Promise<RegistryChangeAnswer>;
 }
 

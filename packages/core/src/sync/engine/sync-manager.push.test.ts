@@ -9,13 +9,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Logger } from "../../logger/index.js";
 import type { DownloadWorkerDeps } from "../workers/download.js";
 import type { UploadWorkerDeps } from "../workers/upload.js";
-import type { StreamSyncRegistry } from "../../stream-sync/ports.js";
+import type {
+  RegistryChangeDelta,
+  StreamSyncRegistry,
+} from "../../stream-sync/ports.js";
 import { createRegistryChangePush } from "./change-push.js";
 import {
   createSyncManager,
   type ChangePush,
   type SyncManagerOptions,
 } from "./sync-manager.js";
+import { deltaToCycle } from "./local-sync.test-helper.js";
 
 const logger = {
   info: vi.fn(),
@@ -51,7 +55,7 @@ function fakePush() {
     subscribed: 0,
     stopped: 0,
     handlers: null as null | {
-      onChange(): void;
+      onChange(delta?: RegistryChangeDelta): void;
       onHealth(healthy: boolean): void;
       onPosition(position: string): void;
     },
@@ -82,7 +86,7 @@ describe("a poke", () => {
     const cycle = vi.fn(async () => {});
     const read = vi.fn(async () => marker);
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: { read, intervalMs: 5_000, push },
     });
     manager.start();
@@ -102,7 +106,7 @@ describe("a poke", () => {
     const { push } = fakePush();
     const cycle = vi.fn(async () => {});
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
     });
     manager.start();
@@ -122,7 +126,7 @@ describe("a poke", () => {
     const { push, state } = fakePush();
     const cycle = vi.fn(async () => {});
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
     });
     manager.start();
@@ -140,7 +144,7 @@ describe("a poke", () => {
     const { push, state } = fakePush();
     const cycle = vi.fn(async () => {});
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: {
         read: async () => {
           throw new Error("probe down");
@@ -166,6 +170,7 @@ describe("a poke", () => {
         cycle: async () => {
           throw new Error("cycle failed");
         },
+        applyDelta: deltaToCycle,
       },
       changeProbe: { read: async () => marker, intervalMs: 5_000, push },
     });
@@ -193,7 +198,7 @@ describe("a pushed change does not wait for the optional probe", () => {
     const cycle = vi.fn(async () => {});
     const probe = hangingProbe();
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: { read: probe.read, intervalMs: 5_000, push },
     });
     manager.start();
@@ -213,7 +218,7 @@ describe("a pushed change does not wait for the optional probe", () => {
     const cycle = vi.fn(async () => {});
     const probe = hangingProbe();
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: { read: probe.read, intervalMs: 5_000, push },
     });
     manager.start();
@@ -245,7 +250,7 @@ describe("a pushed change does not wait for the optional probe", () => {
     });
     const probe = hangingProbe();
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: { read: probe.read, intervalMs: 5_000, push },
     });
     manager.start();
@@ -297,7 +302,7 @@ describe("a pushed change does not wait for the optional probe", () => {
       const { push, state } = fakePush();
       const { cycle, rejects, overlap } = failingCycles();
       const manager = build({
-        localSync: { cycle },
+        localSync: { cycle, applyDelta: deltaToCycle },
         changeProbe: quietProbe(push),
       });
       manager.start();
@@ -320,7 +325,7 @@ describe("a pushed change does not wait for the optional probe", () => {
       const { push } = fakePush();
       const { cycle, rejects } = failingCycles();
       const manager = build({
-        localSync: { cycle },
+        localSync: { cycle, applyDelta: deltaToCycle },
         changeProbe: quietProbe(push),
       });
       manager.start();
@@ -336,7 +341,10 @@ describe("a pushed change does not wait for the optional probe", () => {
       const { cycle, rejects, overlap } = failingCycles();
       const deleted = vi.fn(async () => 1);
       const manager = build(
-        { localSync: { cycle }, changeProbe: quietProbe(push) },
+        {
+          localSync: { cycle, applyDelta: deltaToCycle },
+          changeProbe: quietProbe(push),
+        },
         {
           findUnsynced: () => [],
           deleteScope: deleted,
@@ -395,7 +403,7 @@ describe("a pushed change does not wait for the optional probe", () => {
       const { push, state } = fakePush();
       const { cycle, rejects } = failingCycles();
       const manager = build({
-        localSync: { cycle },
+        localSync: { cycle, applyDelta: deltaToCycle },
         changeProbe: quietProbe(push),
       });
       manager.start();
@@ -423,7 +431,7 @@ describe("a pushed change does not wait for the optional probe", () => {
           ),
       );
       const manager = build({
-        localSync: { cycle },
+        localSync: { cycle, applyDelta: deltaToCycle },
         changeProbe: quietProbe(push),
       });
       manager.start();
@@ -450,7 +458,7 @@ describe("a pushed change does not wait for the optional probe", () => {
       const { push, state } = fakePush();
       const { cycle, rejects } = failingCycles();
       const manager = build({
-        localSync: { cycle },
+        localSync: { cycle, applyDelta: deltaToCycle },
         changeProbe: quietProbe(push),
       });
       manager.start();
@@ -475,7 +483,7 @@ describe("a pushed change does not wait for the optional probe", () => {
     let marker = "m1";
     const cycle = vi.fn(async () => {});
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: { read: async () => marker, intervalMs: 5_000, push },
     });
     manager.start();
@@ -515,7 +523,7 @@ describe("a pushed change does not wait for the optional probe", () => {
       if (hold) await new Promise<void>((resolve) => (release = resolve)); // applying it
     });
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: { read, intervalMs: 5_000, push },
     });
     manager.start();
@@ -564,7 +572,7 @@ describe("the push position", () => {
     });
     const read = vi.fn(async () => "m1");
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: { read, intervalMs: 5_000, push },
     });
     return { manager, state, cycle, read };
@@ -604,7 +612,7 @@ describe("the push position", () => {
     }));
     const read = vi.fn(async () => "m1");
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: { read, intervalMs: 5_000, push },
     });
     manager.start();
@@ -707,7 +715,7 @@ describe("the push position", () => {
     const cycle = vi.fn(async () => {});
     const read = vi.fn(async () => "m1");
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: { read, intervalMs: 5_000, push },
     });
     manager.start();
@@ -744,7 +752,7 @@ describe("the push position", () => {
     let ok = true;
     const cycle = vi.fn(async () => {});
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       canSync: () =>
         ok ? { ok: true } : { ok: false, reason: "paused", message: "m" },
       changeProbe: {
@@ -809,7 +817,7 @@ describe("the push position", () => {
         return next;
       });
       const manager = build({
-        localSync: { cycle },
+        localSync: { cycle, applyDelta: deltaToCycle },
         changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
       });
       manager.start();
@@ -924,7 +932,7 @@ describe("the push position", () => {
         const { push, state } = fakePush();
         const cycle = vi.fn(async () => ({ connections: [refused("c")] }));
         const manager = build({
-          localSync: { cycle },
+          localSync: { cycle, applyDelta: deltaToCycle },
           changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
         });
         manager.start();
@@ -988,7 +996,7 @@ describe("the push position", () => {
     );
     const cycle = vi.fn(async () => ({ connections: [] }));
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       canSync,
       changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
     });
@@ -1037,7 +1045,7 @@ describe("the subscription's lifecycle", () => {
   it("subscribes on start, ends on stop, and resubscribes on a restart", async () => {
     const { push, state } = fakePush();
     const manager = build({
-      localSync: { cycle: async () => {} },
+      localSync: { cycle: async () => {}, applyDelta: deltaToCycle },
       changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
     });
     expect(state.subscribed).toBe(0);
@@ -1056,7 +1064,7 @@ describe("the subscription's lifecycle", () => {
     const cycle = vi.fn(async () => {});
     const read = vi.fn(async () => "m1");
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: { read, intervalMs: 5_000, push },
     });
     manager.start();
@@ -1073,7 +1081,7 @@ describe("the subscription's lifecycle", () => {
   it("changes nothing for a probe without a push", async () => {
     const read = vi.fn(async () => "m1");
     const manager = build({
-      localSync: { cycle: async () => {} },
+      localSync: { cycle: async () => {}, applyDelta: deltaToCycle },
       changeProbe: { read, intervalMs: 5_000 },
     });
     manager.start();
@@ -1115,7 +1123,7 @@ describe("the real subscription driving the manager", () => {
     const cycle = vi.fn(async () => {});
     // The probe marker never moves: every cycle that follows is the push's doing.
     const manager = build({
-      localSync: { cycle },
+      localSync: { cycle, applyDelta: deltaToCycle },
       changeProbe: { read: async () => "m1", intervalMs: 5_000, push },
     });
     manager.start();

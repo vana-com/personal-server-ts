@@ -15,9 +15,8 @@
 //
 //  - a control row that is a tombstone: the cycle's own steps for it, with
 //    the delta's read in place of the listing's and the control read's. The
-//    row is saved as the listing saves it, the connection is purged as a
-//    deleted control purges it, and its partial mark goes, as a purge
-//    finishes the connection. Its stream and log rows are not read: the
+//    row is saved as the listing saves it, and the connection is purged as a
+//    deleted control purges it. Its stream and log rows are not read: the
 //    cycle's apply returns at a deleted control before it lists them;
 //  - no control row, and this device holds the connection deleted: the same
 //    (its later stream tombstones change nothing a cycle reads);
@@ -29,8 +28,11 @@
 //    row's version with no partial mark standing, or the cycle runs;
 //  - anything else (another lifetime's control row, which needs a first load;
 //    a foreign one; a stream head or a deleted log row of a live connection; a
-//    log of a connection not held here; a removed row; a server change; a
-//    reset): `cycle`.
+//    log of a connection not held here; a log this device's own commit holds
+//    it past; a removed row; a server change; a reset): `cycle`.
+//
+// A partial mark on any connection, named in the delta or not, is a repair
+// the cycle owes: the whole delta is the cycle's.
 //
 // Each connection's work runs in its queue as an operation of its own: it
 // never joins another apply, whose answer would not be this delta's.
@@ -80,6 +82,7 @@ interface Held {
   connection_id: string;
   generation: number;
   control_state: string;
+  apply_partial: number;
 }
 
 export async function applyRegistryDelta(
@@ -105,17 +108,20 @@ export async function applyRegistryDelta(
     else if (isLogStream(scope.stream)) rows.log = row.read;
     else rows.heads = true;
   }
+  const connections = await deps.db.query<
+    Held & Record<string, string | number>
+  >(
+    "SELECT connection_id, generation, control_state, apply_partial FROM connections",
+  );
+  // A partial mark is an apply the cycle owes, whether or not the delta names
+  // its connection: the cycle re-applies every partial connection it meets.
+  if (connections.some((row) => row.apply_partial !== 0))
+    return cycle("a connection has a partial apply");
   if (byConnection.size === 0) return applied(started, 0, 0);
 
   const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
   const hashes = await controlHashes(keccakOf(deps.streamCrypto), keyCheck);
-  const held = new Map(
-    (
-      await deps.db.query<Held & Record<string, string | number>>(
-        "SELECT connection_id, generation, control_state FROM connections",
-      )
-    ).map((row) => [row.connection_id, row]),
-  );
+  const held = new Map(connections.map((row) => [row.connection_id, row]));
 
   // Decide every connection before any is applied: one that only the cycle
   // can take hands the whole delta back with nothing written.
@@ -174,6 +180,10 @@ export async function applyRegistryDelta(
         )
           return false;
         const before = (await readLogState(deps, id)).position;
+        // This device's own commit can already hold it past the row: the
+        // registry has moved past this delta, and the cycle reads where it
+        // stands now. (`applyLog` would take the row as a rollback and fail.)
+        if (!read.found || before > read.version) return false;
         await applyLog(insideQueue(counted, id), id, {
           connector: rows.connector,
           ns: rows.ns,
@@ -201,9 +211,9 @@ export async function applyRegistryDelta(
 
 /**
  * A control tombstone, as the cycle meets it: the listing's save of the row,
- * then the purge a deleted control read runs, which finishes the connection
- * (its partial mark goes). A delete this device has pending, or a row this
- * device holds a newer control than, is the cycle's.
+ * then the purge a deleted control read runs. A delete this device has
+ * pending, a partial mark (an apply that ran since the delta was decided can
+ * leave one), or a row this device holds a newer control than, is the cycle's.
  */
 async function applyDelete(
   locked: LocalSyncDeps,
@@ -214,6 +224,7 @@ async function applyDelete(
 ): Promise<boolean> {
   if (!read.found) return false;
   if (await deleteIntent(locked, rows.connector)) return false;
+  if (await partial(locked, id)) return false;
   const saved = await saveControl(
     locked,
     rows.connector,
@@ -224,13 +235,15 @@ async function applyDelete(
   if (saved.controlState !== "deleted" || saved.controlVersion !== read.version)
     return false;
   await purgeConnection(locked, id, { controlVersion: read.version });
-  await locked.db.batch([
-    {
-      sql: "UPDATE connections SET apply_partial=0 WHERE connection_id=?",
-      params: [id],
-    },
-  ]);
   return true;
+}
+
+async function partial(deps: LocalSyncDeps, id: string) {
+  const rows = await deps.db.query(
+    "SELECT 1 FROM connections WHERE connection_id = ? AND apply_partial = 1",
+    [id],
+  );
+  return rows.length > 0;
 }
 
 /** The connection is active at `generation`, with no partial apply standing. */
