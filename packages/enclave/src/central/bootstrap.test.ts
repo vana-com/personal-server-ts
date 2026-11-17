@@ -4,7 +4,9 @@ import {
   canonicalFleetConfigPayload,
   type FleetSecurityConfigPayload,
 } from "../fleet/security-config.js";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readFile } from "node:fs/promises";
+import * as fs from "node:fs/promises";
+import * as mcpService from "../mcp/service.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it, vi } from "vitest";
@@ -15,6 +17,9 @@ import { createMcpConnection } from "@opendatalabs/personal-server-ts-core/mcp";
 import { openMcpDurableState } from "@opendatalabs/personal-server-ts-server/mcp/tee";
 import { userPsId } from "@opendatalabs/vana-sdk/protocol/identity";
 import type { FleetOwner, FleetWorkerPort } from "../fleet/contracts.js";
+
+vi.mock("node:fs/promises", { spy: true });
+
 async function freePort() {
   const server = createServer();
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -914,6 +919,112 @@ it("boots a controller whose signed config names mainnet", async () => {
     expect(runtime.controller.paused()).toBe(true);
   } finally {
     await runtime?.close();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
+it("close drains pending admission before closing services or returning state ownership", async () => {
+  const path = await mkdtemp(join(tmpdir(), "central-close-admission-"));
+  const dstack = createFakeDstackClient({ appId: CONTROLLER_APP_ID });
+  const info = await dstack.info();
+  const keys = generateKeyPairSync("ed25519");
+  const env = await controllerEnv(path, [workerEntry(2)]);
+  let release!: (value: Response) => void;
+  let entered!: () => void;
+  const admission = new Promise<Response>((resolve) => {
+    release = resolve;
+  });
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const requestFetch = vi.fn<typeof fetch>(() => {
+    entered();
+    return admission;
+  });
+  const serviceClose = vi.fn();
+  const originalStart = mcpService.startMcpRouter;
+  const start = vi
+    .spyOn(mcpService, "startMcpRouter")
+    .mockImplementation(async (...args) => {
+      const service = await originalStart(...args);
+      if (!service) return service;
+      const close = service.close.bind(service);
+      return {
+        ...service,
+        close: async () => {
+          serviceClose();
+          await close();
+        },
+      };
+    });
+  const open = vi.spyOn(fs, "open");
+  const mkdir = vi.spyOn(fs, "mkdir");
+  const rename = vi.spyOn(fs, "rename");
+  const logs = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  let runtime: Awaited<ReturnType<typeof startFleetCentral>> | undefined;
+  let closing: Promise<void> | undefined;
+  try {
+    runtime = await startFleetCentral(
+      signedConfig(env, info, keys),
+      dstack,
+      requestFetch,
+    );
+    await started;
+    // Initial declaration is already unavailable. Make the pending failure
+    // perform a real persisted transition, not an idempotent no-op.
+    await runtime.controller.admit({
+      nodeId: "worker-2",
+      nodeIncarnation: "i1",
+      capacity: 1,
+      worker: {
+        activity: vi.fn(),
+        prepare: vi.fn(async () => []),
+        readiness: vi.fn(async () => []),
+        renew: vi.fn(),
+        execute: vi.fn(),
+        release: vi.fn(),
+      },
+    });
+    let resolved = false;
+    closing = runtime.close().then(() => {
+      resolved = true;
+    });
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    // Decisive mutation oracle: without the in-flight await, close invokes
+    // mcp.close synchronously even though admission is still held.
+    expect(serviceClose).not.toHaveBeenCalled();
+    release(new Response("admission refused", { status: 503 }));
+    await closing;
+    expect(resolved).toBe(true);
+    expect(serviceClose).toHaveBeenCalledTimes(1);
+    expect(runtime.controller.nodeStatus()[0]).toMatchObject({
+      unavailable: true,
+    });
+    const persisted = await readFile(env.FLEET_STATE_PATH!, "utf8");
+    expect(JSON.parse(persisted).nodes["worker-2"].unavailable).toBe(true);
+    const writes = [
+      open.mock.calls.length,
+      mkdir.mock.calls.length,
+      rename.mock.calls.length,
+    ];
+    // Cross an event-loop turn, not a delay, after all controlled work settled.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect([
+      open.mock.calls.length,
+      mkdir.mock.calls.length,
+      rename.mock.calls.length,
+    ]).toEqual(writes);
+    expect(await readFile(env.FLEET_STATE_PATH!, "utf8")).toBe(persisted);
+  } finally {
+    release(new Response("admission refused", { status: 503 }));
+    if (closing) await closing;
+    else await runtime?.close();
+    start.mockRestore();
+    open.mockRestore();
+    mkdir.mockRestore();
+    rename.mockRestore();
+    logs.mockRestore();
     await rm(path, { recursive: true, force: true });
   }
 });

@@ -482,14 +482,23 @@ export async function startFleetCentral(
   );
   let stopped = false;
   const timers = new Set<ReturnType<typeof setTimeout>>();
+  const inFlight = new Set<Promise<unknown>>();
+  const track = (operation: () => Promise<unknown>): Promise<void> => {
+    const pending = Promise.resolve()
+      .then(operation)
+      .then(() => undefined)
+      .catch(() => logger.warn({}, "Fleet reconcile unavailable"));
+    inFlight.add(pending);
+    void pending.then(() => inFlight.delete(pending));
+    return pending;
+  };
   const schedule = (interval: number, operation: () => Promise<void>): void => {
     const timer = setTimeout(() => {
       timers.delete(timer);
-      void operation()
-        .catch(() => logger.warn({}, "Fleet reconcile unavailable"))
-        .finally(() => {
-          if (!stopped) schedule(interval, operation);
-        });
+      if (stopped) return;
+      void track(operation).finally(() => {
+        if (!stopped) schedule(interval, operation);
+      });
     }, interval);
     timer.unref();
     timers.add(timer);
@@ -517,7 +526,7 @@ export async function startFleetCentral(
     );
   });
   const attestAll = () =>
-    Promise.all(
+    Promise.allSettled(
       workers.map(async (worker) => {
         const nodeId = worker.policy.identity.nodeId;
         try {
@@ -530,12 +539,15 @@ export async function startFleetCentral(
           recordAdmitFailure(nodeId, error);
         }
       }),
-    );
+    ).then((outcomes) => {
+      const failure = outcomes.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+    });
   schedule(30_000, async () => {
     await attestAll();
   });
   // Staging may precede worker activation. No admission failure silently relaxes policy.
-  void attestAll();
+  void track(attestAll);
   logger.info(
     {
       nodeId: identity.nodeId,
@@ -550,6 +562,8 @@ export async function startFleetCentral(
     async close() {
       stopped = true;
       for (const timer of timers) clearTimeout(timer);
+      timers.clear();
+      await Promise.allSettled(inFlight);
       await mcp.close();
       await Promise.all(
         servers.map(
