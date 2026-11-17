@@ -38,6 +38,13 @@ export interface ListedScope {
    * that carry it; the alias stays listed because grants and reads use it.
    */
   readonly aliasOf?: string;
+  /**
+   * `"indexing"` only on an owner listing that includes loads in progress: the
+   * scope is served from a first load that has not finished, so a read of it
+   * returns the rows applied so far (`X-Stream-Sync-Partial` says how many).
+   * Absent means ready, as on every other listing that carries the field.
+   */
+  readonly dataStatus?: "indexing";
 }
 
 function collectedAt(updatedAt: number | null): { latestCollectedAt?: string } {
@@ -64,6 +71,13 @@ function collectedAt(updatedAt: number | null): { latestCollectedAt?: string } {
 export interface LocalListing {
   listScopes(input: {
     readonly canRead: (scope: string) => boolean | Promise<boolean>;
+    /**
+     * The owner's listing: a scope whose first load is still running is
+     * listed, marked `dataStatus: "indexing"`, from the moment the load names its stream,
+     * as a read of it by the owner serves the rows applied so far. Only a host
+     * that serves progressive loads lists them; a grantee's listing never does.
+     */
+    readonly includeLoading?: boolean;
   }): Promise<readonly ListedScope[]>;
   status(): Promise<StreamSyncReadStatus>;
   /** Changes whenever any control row or stream head changes. */
@@ -119,7 +133,7 @@ export function createLocalListing(
    * five queries however many scopes there are. Nothing here depends on the
    * caller's authority, so overlapping callers share one.
    */
-  async function readSnapshot(): Promise<readonly Entry[]> {
+  async function readSnapshot(progressive: boolean): Promise<readonly Entry[]> {
     const rows = await reads.db.query<SelectionConnection>(
       "SELECT connection_id, connector, ns, generation, control_state, deleted_at FROM connections ORDER BY connector, ns, connection_id",
     );
@@ -216,6 +230,7 @@ export function createLocalListing(
             connection,
             streams: streamsOf.get(connection.connection_id) ?? [],
           })),
+          { progressive },
         );
         if (picked.candidate) picks.push(picked.candidate);
       }
@@ -250,6 +265,9 @@ export function createLocalListing(
           records: logicalStreamScopeParts(scope) ? records : null,
           updatedAt,
           ...collectedAt(updatedAt),
+          ...(chosen.partialStreams?.length
+            ? { dataStatus: "indexing" as const }
+            : {}),
           ...(target.alias
             ? {
                 aliasOf: `pdpp.${owner.connector}.${servedStreamOf(target)}`,
@@ -279,18 +297,23 @@ export function createLocalListing(
 
   // Overlapping calls share one read of local state; the next call after it
   // settles starts a new one, so nothing is served from a cache.
-  let inflight: Promise<readonly Entry[]> | undefined;
-  const snapshot = () => {
-    const running = (inflight ??= readSnapshot().finally(() => {
-      if (inflight === running) inflight = undefined;
-    }));
+  const inflight = new Map<boolean, Promise<readonly Entry[]>>();
+  const snapshot = (progressive: boolean) => {
+    const running =
+      inflight.get(progressive) ??
+      readSnapshot(progressive).finally(() => {
+        if (inflight.get(progressive) === running) inflight.delete(progressive);
+      });
+    inflight.set(progressive, running);
     return running;
   };
 
   return {
-    async listScopes({ canRead }) {
+    async listScopes({ canRead, includeLoading }) {
       const out: ListedScope[] = [];
-      for (const entry of await snapshot()) {
+      const progressive =
+        includeLoading === true && deps.progressiveFirstLoad === true;
+      for (const entry of await snapshot(progressive)) {
         try {
           if (!(await canRead(entry.scope))) continue;
           if (!entry.listed || !(await entry.bodyBuilds())) continue;

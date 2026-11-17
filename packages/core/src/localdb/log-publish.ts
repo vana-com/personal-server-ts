@@ -52,6 +52,7 @@ import {
   deriveKeyCheck,
   digestSegment,
   encodeSegment,
+  segmentRemoves,
   deletionKeyMatchesHash,
   firstDeletionKeyMismatch,
   keyFromRecordKey,
@@ -237,6 +238,8 @@ type Candidate = {
   readonly blobName: string;
   readonly cipher: Uint8Array;
   readonly clearBytes: number;
+  /** Whether the segment removes a key (`segmentRemoves`): the fact its ref carries. */
+  readonly removes: boolean;
   readonly observedAt: number;
   readonly planned: readonly Planned[];
   readonly attachments: readonly BlobDescriptor[];
@@ -1306,6 +1309,7 @@ async function snapshotRound(
       blobName,
       cipher,
       clearBytes: clear.length,
+      removes: segmentRemoves(segment.operations),
       observedAt: segment.observedAt,
       planned,
       attachments,
@@ -2074,6 +2078,7 @@ async function commitRound(
     position: candidate.position,
     dataHash: candidate.dataHash,
     bytes: candidate.clearBytes,
+    removes: candidate.removes,
   };
   const statements: SqlStatement[] = candidate.createControl
     ? [markControlActive(connectionId, connection)]

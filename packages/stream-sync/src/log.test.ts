@@ -33,6 +33,7 @@ import {
   type WireSegment,
   bodyPieceBlobName,
   isBodyPieceBlobName,
+  segmentRemoves,
 } from "./log.js";
 import { pkHash } from "./records.js";
 import { keccak256, nodePorts } from "./test-support/ports.js";
@@ -169,6 +170,77 @@ describe("segment codec", () => {
       encodeSegment(segment({ refs: [...refs(1, 1), ...refs(3, 3)] })),
     ).toThrow(/dense/);
     expect(() => encodeSegment(segment({ base: 1 }))).toThrow(/dense/);
+  });
+
+  it("carries the removal fact of a ref when it has one, and reads a ref without it", () => {
+    const withFact = refs(1, 3).map((ref, i) => ({ ...ref, removes: i === 1 }));
+    const decoded = decodeSegment(encodeSegment(segment({ refs: withFact })));
+    if (decoded.kind !== "ok") throw new Error("did not decode");
+    expect(decoded.segment.refs.map((r) => r.removes)).toEqual([
+      false,
+      true,
+      false,
+    ]);
+    // A ref written before the fact existed has no field: it is not read as false.
+    const without = decodeSegment(encodeSegment(segment()));
+    if (without.kind !== "ok") throw new Error("did not decode");
+    expect(without.segment.refs.map((r) => "removes" in r)).toEqual([
+      false,
+      false,
+      false,
+    ]);
+    // Neither form is a malformed ref, and the two encode differently.
+    expect(encodeSegment(segment({ refs: withFact }))).not.toEqual(
+      encodeSegment(segment()),
+    );
+  });
+
+  it("refuses a removal fact that is not a boolean", () => {
+    const text = new TextDecoder().decode(
+      encodeSegment(
+        segment({ refs: refs(1, 3).map((ref) => ({ ...ref, removes: true })) }),
+      ),
+    );
+    const bad = text.replace('"removes":true', '"removes":"yes"');
+    expect(bad).not.toBe(text);
+    expect(decodeSegment(utf8(bad)).kind).toBe("malformed");
+  });
+
+  it("says a segment removes when it holds a delete or an omission, and not otherwise", () => {
+    const upsert = segment().operations.filter((op) => op.kind === "upsert");
+    expect(upsert.length).toBeGreaterThan(0);
+    expect(segmentRemoves(upsert)).toBe(false);
+    expect(
+      segmentRemoves([
+        {
+          kind: "complete",
+          stream: "a",
+          cutoff: { o: 1, r: "r" },
+          omitted: [],
+        },
+      ]),
+    ).toBe(false);
+    expect(
+      segmentRemoves([
+        {
+          kind: "complete",
+          stream: "a",
+          cutoff: { o: 1, r: "r" },
+          omitted: [om(3)],
+        },
+      ]),
+    ).toBe(true);
+    expect(
+      segmentRemoves([
+        {
+          kind: "delete",
+          stream: "a",
+          pkHash: pk(5),
+          key: rk(5),
+          stamp: { o: 1, r: "r" },
+        },
+      ]),
+    ).toBe(true);
   });
 
   it("rejects an operation on a stream with no meta and the reserved log stream", () => {

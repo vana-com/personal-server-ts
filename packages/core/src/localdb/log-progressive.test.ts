@@ -2,16 +2,9 @@ import { describe, expect, it } from "vitest";
 import type {
   LogOmitted,
   LogOperation,
-  LogStreamMeta,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { heldKeys, planLogLoad, type PlannedBatch } from "./log-progressive.js";
+import { heldKeys, removalsOf } from "./log-progressive.js";
 
-const meta = (stream: string, complete = true): LogStreamMeta => ({
-  stream,
-  primaryKey: ["id"],
-  profile: { key: null, version: "1" },
-  complete,
-});
 const stamp = { o: 1, r: "a" };
 const upsert = (stream: string, pkHash: string): LogOperation => ({
   kind: "upsert",
@@ -35,80 +28,57 @@ const omit = (stream: string, pkHash: string): LogOmitted => ({
   key: [pkHash],
   stamp,
 });
-const batch = (
-  streams: LogStreamMeta[],
-  operations: (LogOperation | LogOmitted)[] = [],
-): PlannedBatch => ({ streams, operations });
+const complete = (stream: string, pkHashes: string[]): LogOperation => ({
+  kind: "complete",
+  stream,
+  cutoff: stamp,
+  omitted: pkHashes.map((pkHash) => ({ pkHash, key: [pkHash] })),
+});
 
-describe("planLogLoad", () => {
-  it("loads a stream progressively when two batches name it and its last meta is complete", () => {
-    const plans = planLogLoad(
-      [batch([meta("a", false)]), batch([meta("b")]), batch([meta("a")])],
-      new Set(),
-    );
-    expect([...plans.keys()]).toEqual(["a"]);
-    expect(plans.get("a")).toMatchObject({ total: 2, first: 0, last: 2 });
-  });
-
-  it("does not load progressively a stream whose last meta says it is incomplete: it never ends", () => {
-    const plans = planLogLoad(
-      [batch([meta("a")]), batch([meta("a", false)])],
-      new Set(),
-    );
-    expect(plans.size).toBe(0);
-  });
-
-  it("does not load progressively a stream one batch names, or one that already reads as complete", () => {
-    const plans = planLogLoad(
-      [batch([meta("a"), meta("b")]), batch([meta("b")])],
-      new Set(["b"]),
-    );
-    expect(plans.size).toBe(0);
-  });
-
-  it("records the last batch that deletes or omits a key, and holds a key only until it is written after that", () => {
-    const plans = planLogLoad(
-      [
-        batch([meta("a")], [upsert("a", "k1"), upsert("a", "k2")]),
-        batch([meta("a")], [remove("a", "k1"), omit("a", "k2")]),
-        batch([meta("a")], [upsert("a", "k1")]),
-        batch([meta("a")], [remove("a", "k1")]),
-      ],
-      new Set(),
-    );
-    const plan = plans.get("a")!;
-    expect(plan.removedAt.get("k1")).toBe(3);
-    expect(plan.removedAt.get("k2")).toBe(1);
-    expect(heldKeys(plan, 0, [upsert("a", "k1"), upsert("a", "k2")])).toEqual([
-      "k1",
-      "k2",
+describe("removalsOf", () => {
+  it("records the last batch that deletes or omits a key, per stream", () => {
+    const removed = removalsOf([
+      { index: 1, operations: [remove("a", "k1"), omit("a", "k2")] },
+      { index: 3, operations: [remove("a", "k1"), remove("b", "k1")] },
     ]);
-    // k1 is written again at 2 and removed again at 3: held there too. k2 is
-    // not written again.
-    expect(heldKeys(plan, 2, [upsert("a", "k1")])).toEqual(["k1"]);
-    expect(heldKeys(plan, 3, [upsert("a", "k1")])).toEqual([]);
+    expect(removed.get("a")!.get("k1")).toBe(3);
+    expect(removed.get("a")!.get("k2")).toBe(1);
+    expect(removed.get("b")!.get("k1")).toBe(3);
   });
 
-  it("holds the keys a later completion omits", () => {
-    const plans = planLogLoad(
-      [
-        batch([meta("a")], [upsert("a", "k1"), upsert("a", "k2")]),
-        batch(
-          [meta("a")],
-          [
-            {
-              kind: "complete",
-              stream: "a",
-              cutoff: stamp,
-              omitted: [{ pkHash: "k2", key: ["k2"] }],
-            },
-          ],
-        ),
-      ],
-      new Set(),
-    );
+  it("takes the keys a completion omits, and nothing from one that omits none", () => {
+    const removed = removalsOf([
+      { index: 2, operations: [complete("a", ["k1", "k2"])] },
+      { index: 4, operations: [complete("b", [])] },
+    ]);
+    expect([...removed.get("a")!.keys()].sort()).toEqual(["k1", "k2"]);
+    expect(removed.has("b")).toBe(false);
+  });
+
+  it("does not look at upserts", () => {
     expect(
-      heldKeys(plans.get("a")!, 0, [upsert("a", "k1"), upsert("a", "k2")]),
-    ).toEqual(["k2"]);
+      removalsOf([{ index: 0, operations: [upsert("a", "k1")] }]).size,
+    ).toBe(0);
+  });
+});
+
+describe("heldKeys", () => {
+  const removed = removalsOf([
+    { index: 3, operations: [remove("a", "k1"), omit("a", "k2")] },
+  ]);
+
+  it("holds a key of the batch that a later batch removes", () => {
+    expect(
+      heldKeys(removed, "a", 1, [upsert("a", "k1"), upsert("a", "k3")]),
+    ).toEqual(["k1"]);
+  });
+
+  it("holds nothing once the batch is the one that removes, or after it", () => {
+    expect(heldKeys(removed, "a", 3, [upsert("a", "k1")])).toEqual([]);
+    expect(heldKeys(removed, "a", 5, [upsert("a", "k1")])).toEqual([]);
+  });
+
+  it("holds a key of its own stream only", () => {
+    expect(heldKeys(removed, "b", 1, [upsert("b", "k1")])).toEqual([]);
   });
 });

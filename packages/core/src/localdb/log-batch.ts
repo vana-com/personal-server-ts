@@ -88,7 +88,11 @@ export interface BatchIdentity {
  * only by the batch that `final` names.
  */
 export interface BatchStep {
-  /** The first batch of a load that is not a resumed one hides the stored rows. */
+  /**
+   * The load of a stream that is not a resumed one hides the stored rows with
+   * the first batch of it that commits (`StagedBatch.begins`). Batches are
+   * staged in any order, so which one is first is known only at the commit.
+   */
   readonly begin: boolean;
   readonly final: boolean;
   /** Keys of this batch a later, fetched batch deletes or omits. */
@@ -517,6 +521,17 @@ export interface StagedBatch {
   /** The id of its rows in `temp.incoming`. */
   readonly op: string;
   readonly statements: readonly SqlStatement[];
+  /**
+   * Per stream whose load begins here: the statements that hide what it
+   * held. The commit writes them once per stream, ahead of the first batch
+   * that carries them, in the same transaction as that batch's rows.
+   */
+  readonly begins?: ReadonlyMap<string, readonly SqlStatement[]>;
+  /**
+   * Statements that read what the pass knows when this batch commits: the
+   * batch is the last of the pass, and the batches before it are all staged.
+   */
+  readonly after?: () => Promise<readonly SqlStatement[]>;
 }
 
 /**
@@ -542,8 +557,9 @@ export async function stageBatch(
     statements.push(streamStateStatement(connectionId, meta));
   // A progressive load's first batch hides what the stream held, in the same
   // transaction as its first rows (see `hideStoredRows`).
+  const begins = new Map<string, readonly SqlStatement[]>();
   for (const [stream, step] of steps)
-    if (step.begin) statements.push(...hideStoredRows(connectionId, stream));
+    if (step.begin) begins.set(stream, hideStoredRows(connectionId, stream));
   statements.push(...operationStatements(connectionId, op, operations, steps));
   // A stream still loading progressively has no head yet; its last batch
   // writes it, with `complete`.
@@ -561,7 +577,7 @@ export async function stageBatch(
         partialRowStatement(step.row.head, step.row.applied, step.row.total, 0),
       );
   if (state) statements.push(writeLogState(connectionId, state));
-  return { op, statements };
+  return { op, statements, ...(begins.size > 0 ? { begins } : {}) };
 }
 
 /**
@@ -573,11 +589,21 @@ export async function stageBatch(
 export async function commitStaged(
   deps: Pick<LocalSyncDeps, "db">,
   batches: readonly StagedBatch[],
+  /** The streams whose load has begun: this commit adds the ones it begins. */
+  begun: Set<string> = new Set(),
 ): Promise<void> {
   const statements: SqlStatement[] = [];
   // One by one: a group's statements can outnumber what a call takes as arguments.
-  for (const batch of batches)
+  for (const batch of batches) {
+    for (const [stream, hide] of batch.begins ?? [])
+      if (!begun.has(stream)) {
+        begun.add(stream);
+        for (const statement of hide) statements.push(statement);
+      }
     for (const statement of batch.statements) statements.push(statement);
+    for (const statement of (await batch.after?.()) ?? [])
+      statements.push(statement);
+  }
   try {
     await deps.db.batch(withOrigin("remote", statements));
   } finally {
@@ -645,11 +671,14 @@ export async function applyInGroups(
   items: readonly PassItem[],
   options: {
     readonly firstAlone: boolean;
+    /** Streams whose load a commit before the pass began (hidden rows included). */
+    readonly begun?: Set<string>;
     /** The batches `first..last` are committed. */
     readonly onCommit?: (first: number, last: number) => void;
   },
 ): Promise<void> {
   const ahead = readPartsAhead(deps.blobs, items, (item) => item.stage());
+  const begun = options.begun ?? new Set<string>();
   let pending: StagedBatch[] = [];
   let first = 0;
   let began = !options.firstAlone;
@@ -657,7 +686,7 @@ export async function applyInGroups(
     for (const [index, item] of items.entries()) {
       pending.push(await ahead.load(item, index));
       if (began && !item.closesGroup && ahead.ready(index + 1)) continue;
-      await commitStaged(deps, pending);
+      await commitStaged(deps, pending, begun);
       pending = [];
       began = true;
       ahead.committed(index);

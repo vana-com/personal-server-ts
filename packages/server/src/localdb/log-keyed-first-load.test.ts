@@ -22,6 +22,7 @@ import {
   keyedLoadBlocked,
   pendingAdmits,
 } from "../../../core/src/localdb/log-keyed.js";
+import { createLocalListing } from "../../../core/src/localdb/listing.js";
 import { withOrigin } from "../../../core/src/localdb/merge.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import {
@@ -207,7 +208,7 @@ describe("log first load, key by key", () => {
     expect(expected.tombstones.length).toBeGreaterThan(0);
   });
 
-  it("loads key by key on a host that shows streams while they load, and ends in the same tables", async () => {
+  it("loads key by key on a host that shows streams while they load, lists them before the first segment, and ends in the same tables", async () => {
     const w = await world({ streams: 2, logProtocol: true });
     await history(w);
     const reference = await connected(w, "reference", {
@@ -229,9 +230,10 @@ describe("log first load, key by key", () => {
     });
     await applyConnection(progressive.deps, CONNECTION_ID);
 
-    // Key by key: several ranges, and no segment-by-segment partial view.
-    expect(stages.length).toBeGreaterThan(1);
-    expect(partialMarks).toBe(0);
+    // Key by key, as a host without the flag loads, and the streams are listed
+    // from the head (one partial mark each, before a segment is fetched).
+    expect(stages.length).toBeGreaterThan(0);
+    expect(partialMarks).toBeGreaterThan(0);
     const expected = await tables(reference);
     const got = await tables(progressive);
     expect(got.records).toEqual(expected.records);
@@ -240,6 +242,64 @@ describe("log first load, key by key", () => {
     expect(got.heads).toEqual(expected.heads);
     expect(got.state).toEqual(expected.state);
     expect(got.changes).toEqual(expected.changes);
+  });
+
+  it("lists a key-ordered first load from the head, before a segment is fetched, and ends the listing with the load", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    await history(w);
+    const keys = await w.segmentKeys();
+    const first = keys.get(1)!;
+    let reached!: () => void;
+    const arrived = new Promise<void>((resolve) => (reached = resolve));
+    let release!: () => void;
+    const open = new Promise<void>((resolve) => (release = resolve));
+    const d = await connected(w, "listed", {
+      maxBytesInFlight: await splitting(w),
+      progressiveFirstLoad: true,
+      beforeGet: async (key: string) => {
+        if (key !== first) return;
+        reached();
+        await open;
+      },
+    });
+    const listOwner = () =>
+      createLocalListing(d.deps).listScopes({
+        canRead: () => true,
+        includeLoading: true,
+      });
+    const applying = applyConnection(d.deps, CONNECTION_ID);
+    await Promise.race([arrived, applying]);
+    // Nothing is staged or merged yet, and the stream the head names is listed
+    // as loading (the other is listed when its last range commits).
+    expect(await d.db.query("SELECT 1 FROM records")).toEqual([]);
+    expect((await listOwner()).map((s) => s.dataStatus)).toEqual(["indexing"]);
+    // A grantee's listing does not name them.
+    expect(
+      await createLocalListing(d.deps).listScopes({ canRead: () => true }),
+    ).toEqual([]);
+    release();
+    await applying;
+    const done = await listOwner();
+    expect(done.length).toBe(2);
+    expect(done.map((s) => s.dataStatus)).toEqual([undefined, undefined]);
+    expect(await d.db.query("SELECT 1 FROM stream_partial")).toEqual([]);
+  });
+
+  it("marks a key-ordered first load that stops before its first segment as failed, on the listing's rows", async () => {
+    const w = await world({ streams: 2, logProtocol: true });
+    await history(w);
+    const first = (await w.segmentKeys()).get(1)!;
+    const d = await connected(w, "stopped", {
+      maxBytesInFlight: await splitting(w),
+      progressiveFirstLoad: true,
+      beforeGet: async (key: string) => {
+        if (key === first) throw new Error("storage is unreachable");
+      },
+    });
+    await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toThrow();
+    expect(await d.db.query("SELECT failed FROM stream_partial")).toEqual([
+      { failed: 1 },
+    ]);
   });
 
   it("keeps a first load's streams unreadable and its position at 0 until its last commit", async () => {
