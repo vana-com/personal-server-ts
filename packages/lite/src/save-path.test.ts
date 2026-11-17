@@ -67,7 +67,7 @@ afterEach(async () => {
 });
 
 /** One Personal Server over a timed wire, and what the wire saw. */
-async function savePathWorld() {
+async function savePathWorld(autoStartSync = true) {
   const gateway = createFakeGateway({
     owner: ownerAddress,
     isTombstone: () => false,
@@ -78,7 +78,9 @@ async function savePathWorld() {
   let releaseListings!: () => void;
   const listingsHeld = new Promise<void>((r) => (releaseListings = r));
   let holdListings = false;
+  const reads: string[] = [];
   const timedFetch = (async (input: string, init?: RequestInit) => {
+    if ((init?.method ?? "GET") === "GET") reads.push(new URL(input).pathname);
     await sleep(WIRE_MS);
     if (
       holdListings &&
@@ -124,6 +126,7 @@ async function savePathWorld() {
   const server = await startPersonalServer({
     ownerAddress,
     ownerSignature,
+    active: autoStartSync,
     persistence: memoryBundle(),
     accountModeStore: modes,
     gateway: {
@@ -155,7 +158,7 @@ async function savePathWorld() {
     }),
     configDefaults: {
       gateway: { url: "https://gateway.local" },
-      sync: { enabled: true },
+      sync: { enabled: autoStartSync },
     },
   } as never);
   servers.push(server);
@@ -171,7 +174,7 @@ async function savePathWorld() {
     await server.streamSyncIntake!.batch(runId, {
       batch: 0,
       records: [
-        { stream: "items", data: { id: "1" } },
+        { stream: "items", data: { id: "1", value: runId } },
         { stream: "items", data: { id: "2" } },
       ],
     });
@@ -190,6 +193,7 @@ async function savePathWorld() {
     commits,
     segmentPuts,
     gateway,
+    reads,
     /** From now on a registry listing answers only after the returned release. */
     holdListings: () => {
       holdListings = true;
@@ -199,6 +203,19 @@ async function savePathWorld() {
 }
 
 describe("the save path of a Web write", () => {
+  it("admits and publishes first and warm full collections without registry GETs", async () => {
+    const { server, collect, reads, segmentPuts, commits } =
+      await savePathWorld(false);
+    for (const id of ["first", "warm"]) {
+      reads.length = 0;
+      await collect(id);
+      await server.publish();
+      expect(reads).toEqual([]);
+    }
+    expect(segmentPuts).toHaveLength(2);
+    expect(commits).toEqual([{ landed: true }, { landed: true }]);
+  });
+
   it("publishes a save's records once: one segment PUT and one registry commit", async () => {
     const { server, collect, commits, segmentPuts } = await savePathWorld();
     await collect("run-1");

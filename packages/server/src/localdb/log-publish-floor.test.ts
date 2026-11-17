@@ -11,7 +11,10 @@
 import { sha256 } from "@noble/hashes/sha2";
 import { afterEach, describe, expect, it } from "vitest";
 import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
-import { applyConnection } from "@opendatalabs/personal-server-ts-core/localdb";
+import {
+  applyConnection,
+  syncConnection,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   CONNECTION_ID,
   CONNECTOR,
@@ -88,10 +91,8 @@ describe("log publish: the requests of one save", () => {
     expect(trace.depthToLast("batch"), trace.describe()).toBe(2);
   });
 
-  // The applies of a cycle reach their listing when their own control read
-  // answers. On a loaded host those answers spread over more than one
-  // request's time; here each read is held 6 ms longer than the one before,
-  // so the spread is set, not left to the host's scheduler.
+  // A regression that reintroduces point reads must fail whether their
+  // replies arrive together or are staggered by the fake wire.
   for (const [name, latency] of [
     ["at one latency", 2],
     [
@@ -111,10 +112,9 @@ describe("log publish: the requests of one save", () => {
         await a.cycle();
         // The publish itself is a PUT and a commit, ahead of everything else.
         expect(trace.depthToLast("batch"), trace.describe()).toBe(2);
-        // Each connection's apply still reads its own control row (the
-        // freshness contract of apply); nothing else is read one request at a
-        // time.
-        expect(trace.count("read"), trace.describe()).toBe(others);
+        // The listing already carries every control and log row at one
+        // registry snapshot. Apply needs no duplicate point reads.
+        expect(trace.count("read"), trace.describe()).toBe(0);
         // The cycle's one listing, which every apply of the cycle reads its
         // log row from.
         expect(trace.count("list"), trace.describe()).toBe(1);
@@ -164,4 +164,22 @@ describe("log apply: the cycle's listing is a hint", () => {
     ).resolves.toBeUndefined();
     expect(await a.position()).toBe(position);
   });
+});
+
+it("a cycle listing older than a local reconnect cannot roll its control lifetime back", async () => {
+  const w = await world({ streams: 1 });
+  const a = await w.device("a");
+  await a.run("first", [{ stream: sName(0), id: "old" }]);
+  await a.cycle();
+  const listed = await a.deps.registry.listOwnerRows();
+  await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+  expect(await a.sync.deleter.resumeDeletes()).toEqual([]);
+  await a.run("new", [{ stream: sName(0), id: "new" }], { connect: true });
+  await a.sync.publish();
+  const report = await syncConnection(a.deps, CONNECTION_ID, undefined, listed);
+  expect(report.error).toBeNull();
+  expect((await a.sync.intake.publicationStatus("new")).state).toBe(
+    "published",
+  );
+  expect(await a.records()).toEqual(['s0/new={"id":"new"}']);
 });

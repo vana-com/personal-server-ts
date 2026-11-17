@@ -209,7 +209,12 @@ export async function syncConnection(
   try {
     // A pass includes publish, so it must not join an apply-only operation.
     await deps.queue.run(connectionId, "publish", () =>
-      applyConnection(insideQueue(deps, connectionId), connectionId, listed),
+      applyConnection(
+        insideQueue(deps, connectionId),
+        connectionId,
+        listed,
+        listed?.find((row) => row.scope === connectionId)?.read,
+      ),
     );
     if (early && early.error !== null) throw early.error;
     // One segment and one commit per batch. A registry without the batch
