@@ -26,6 +26,9 @@ packages/server/bin/
 /REVIEW-*.md
 /PREWARM-*.md
 
+# Rust build output for packages/lite/rust/*
+packages/lite/rust/*/target/
+
 # Python bytecode
 __pycache__/
 *.pyc

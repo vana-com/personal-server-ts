@@ -37,6 +37,7 @@
     "dist"
   ],
   "scripts": {
+    "build:tls-wasm": "bash scripts/build-tls-wasm.sh",
     "copy-tls": "mkdir -p dist/browser-tls-rustls && cp src/browser-tls-rustls/* dist/browser-tls-rustls/",
     "build": "tsc --build && npm run copy-tls && npm run build-worker",
     "build-worker": "esbuild src/additions-worker.ts --bundle --platform=browser --format=esm --target=es2022 --outfile=dist/additions-worker.bundle.js && esbuild src/history-probe.worker.ts --bundle --platform=browser --format=esm --target=es2022 --outfile=dist/history-probe-worker.bundle.js"
