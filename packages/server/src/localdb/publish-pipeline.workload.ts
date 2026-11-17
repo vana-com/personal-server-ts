@@ -4,7 +4,7 @@
 // `rows` records of about `rowBytes` bytes of filler.
 //
 //   npx tsx packages/server/src/localdb/publish-pipeline.workload.ts \
-//     --db ~/.tmp/<dir>/stream.sqlite --rows 198001 --row-bytes 2200 \
+//     --db <work-dir>/stream.sqlite --rows 198001 --row-bytes 2200 \
 //     --put-ms 1200 (--production | --width 16) [--profile]
 //
 // `--production` runs under the store's default policy, whatever commit this is

@@ -25,3 +25,7 @@ packages/server/bin/
 /RESULT-*.md
 /REVIEW-*.md
 /PREWARM-*.md
+
+# Python bytecode
+__pycache__/
+*.pyc

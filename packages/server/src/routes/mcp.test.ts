@@ -2286,7 +2286,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     dataApiDeps.storage.readScopeBlocks = vi
       .fn()
       .mockRejectedValue(
-        new Error("ENOENT: /home/tim/personal-server/data/github.profile.json"),
+        new Error("ENOENT: /srv/personal-server/data/github.profile.json"),
       );
     const readClient = createMcpDataReadClient({
       serverOrigin: SERVER_ORIGIN,
@@ -2316,7 +2316,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
         bodyPreview: expect.stringContaining("BOUNDED_DATA_UNAVAILABLE"),
       }),
     ]);
-    expect(result.content[0].text).not.toContain("/home/tim");
+    expect(result.content[0].text).not.toContain("/srv/personal-server");
   });
 
   it("read_scope returns scope_not_granted for scopes outside the grant", async () => {

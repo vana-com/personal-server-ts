@@ -64,7 +64,7 @@ describe("tunnel/binary", () => {
 
   describe("getBinaryPath", () => {
     it("returns path under storageRoot/bin", () => {
-      const path = getBinaryPath("/home/user/personal-server");
+      const path = getBinaryPath("/srv/personal-server");
       expect(path).toContain(
         join("bin", process.platform === "win32" ? "frpc.exe" : "frpc"),
       );

@@ -55,7 +55,9 @@ const CAPTURE = arg("capture", "");
 const PROF = arg("prof", "");
 // A reader's GET takes this long (a store's latency), so GET and apply can overlap.
 const GET_MS = Number(arg("get-ms", "0"));
-const DIR = arg("dir", `${process.env.HOME}/.tmp/first-load-bench`);
+// A disk-backed work directory: the bench writes large SQLite files there.
+const DIR = arg("dir", "");
+if (DIR === "") throw new Error("first-load-bench: pass --dir <work-dir>");
 const realKeys = REAL_CRYPTO
   ? createStreamSyncKeyPorts(
       `0x${"ab".repeat(64)}1b`,
