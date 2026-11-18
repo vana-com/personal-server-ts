@@ -2783,6 +2783,7 @@ export async function handlePersonalServerDataRequest(
         const offset = normalizeLimit(url.searchParams.get("offset"), 0);
         const limit = normalizeLimit(url.searchParams.get("limit"), 20);
         return jsonResponse({
+          listingStore: "stream-sync",
           scopes: filtered.slice(offset, offset + limit),
           total: filtered.length,
           limit,
@@ -2804,6 +2805,7 @@ export async function handlePersonalServerDataRequest(
       });
       return jsonResponse({
         ...result.response,
+        listingStore: "legacy",
         scopes: result.response.scopes.map((summary) =>
           withCanonicalListing(deps, summary),
         ),

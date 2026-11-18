@@ -8,7 +8,7 @@ exports[`a read of an unswitched account > answers write, list, read and version
     "status": 201,
   },
   {
-    "body": "{"scopes":[{"scope":"notes.entries","latestCollectedAt":"2026-11-01T00:00:00.000Z","versionCount":1,"dataStatus":"indexing","sizeBytes":112}],"total":1,"limit":20,"offset":0}",
+    "body": "{"scopes":[{"scope":"notes.entries","latestCollectedAt":"2026-11-01T00:00:00.000Z","versionCount":1,"dataStatus":"indexing","sizeBytes":112}],"total":1,"limit":20,"offset":0,"listingStore":"legacy"}",
     "path": "/",
     "status": 200,
   },

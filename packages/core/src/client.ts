@@ -151,6 +151,8 @@ export interface PersonalServerListDataOptions {
 }
 
 export interface PersonalServerListDataResult {
+  /** The store that served this page, fixed before any listing read. */
+  listingStore?: "stream-sync" | "legacy";
   scopes: ScopeSummary[];
   total: number;
   limit: number;
