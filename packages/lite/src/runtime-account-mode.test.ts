@@ -64,37 +64,38 @@ async function signed(
   path: string,
   body: unknown,
   wallet = owner,
-  options: { chunked?: boolean } = {},
+  options: { chunked?: boolean; noBodyStream?: boolean } = {},
 ) {
   const text = typeof body === "string" ? body : JSON.stringify(body);
   const bytes = new TextEncoder().encode(text);
-  return runtime.fetch(
-    new Request(`${ORIGIN}${path}`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: await buildWeb3SignedHeader({
-          wallet,
-          aud: ORIGIN,
-          method: "POST",
-          uri: path,
-          body: bytes,
-        }),
-      },
-      // A stream has no declared length: the cap has to count what arrives.
-      ...(options.chunked
-        ? {
-            body: new ReadableStream({
-              start(controller) {
-                controller.enqueue(bytes);
-                controller.close();
-              },
-            }),
-            duplex: "half",
-          }
-        : { body: text }),
-    } as RequestInit),
-  );
+  const request = new Request(`${ORIGIN}${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: await buildWeb3SignedHeader({
+        wallet,
+        aud: ORIGIN,
+        method: "POST",
+        uri: path,
+        body: bytes,
+      }),
+    },
+    // A stream has no declared length: the cap has to count what arrives.
+    ...(options.chunked
+      ? {
+          body: new ReadableStream({
+            start(controller) {
+              controller.enqueue(bytes);
+              controller.close();
+            },
+          }),
+          duplex: "half",
+        }
+      : { body: text }),
+  } as RequestInit);
+  if (options.noBodyStream)
+    Object.defineProperty(request, "body", { value: undefined });
+  return runtime.fetch(request);
 }
 
 const evidence = (state: string, extra: Record<string, unknown> = {}) => ({
@@ -104,6 +105,42 @@ const evidence = (state: string, extra: Record<string, unknown> = {}) => ({
 });
 
 describe("the Lite runtime's account-mode evidence route", () => {
+  it("accepts account evidence when the request body stream is unavailable", async () => {
+    const { runtime } = await build(
+      {},
+      { auth: { authorizeOwner: async () => {} } },
+    );
+    const res = await signed(
+      runtime,
+      "/v1/account-mode/evidence",
+      evidence("off"),
+      owner,
+      {
+        noBodyStream: true,
+      },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ decision: "legacy" });
+  });
+
+  it("rejects an oversized body when the request body stream is unavailable", async () => {
+    const { runtime } = await build(
+      {},
+      { auth: { authorizeOwner: async () => {} } },
+    );
+    const res = await signed(
+      runtime,
+      "/v1/account-mode/evidence",
+      evidence("off", { padding: "x".repeat(16 * 1024) }),
+      owner,
+      {
+        noBodyStream: true,
+      },
+    );
+    expect(res.status).toBe(413);
+    expect((await res.json()).error).toBe("CONTENT_TOO_LARGE");
+  });
+
   // UNKNOWN_AS_OFF
   it("refuses a legacy write with a retryable 503 before the Account has answered", async () => {
     const { runtime } = await build();
