@@ -48,8 +48,8 @@ export const EXPLICIT_DELETE_RANK = 2;
 /**
  * The most variables any one statement of the log code binds. SQLite before
  * 3.32 (the 3.22 this code supports) refuses a statement over 999, and the
- * limit is a build option of the host, so a statement keeps well under it
- * rather than at it. A statement that binds a set of keys or rows takes what
+ * limit is a build option of the host, so this code caps statements at 400
+ * binds. A statement that binds a set of keys or rows takes what
  * is left after its fixed binds: `rowsPerStatement`.
  */
 export const BIND_CEILING = 400;
