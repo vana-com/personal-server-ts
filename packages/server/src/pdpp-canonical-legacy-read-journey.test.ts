@@ -1389,7 +1389,10 @@ describe("GET /v1/data listing", () => {
 
     const listing = await ownerGet("/v1/data");
     expect(listing.status).toBe(200);
-    expect(JSON.parse(listing.text)).toEqual({
+    const body = JSON.parse(listing.text);
+    expect(body.listingStore).toBe("legacy");
+    expect(body).toEqual({
+      listingStore: "legacy",
       scopes: [
         {
           scope: "oura.activity",
