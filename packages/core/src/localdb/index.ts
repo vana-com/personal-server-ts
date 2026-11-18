@@ -116,3 +116,10 @@ export * from "./legacy-retire.js";
 export * from "./import-fingerprint.js";
 
 export * from "./seed.js";
+
+// Trusted composition ports; no connector/request flag grants producer access.
+export { createSystemStreamStore } from "./system-streams.js";
+export {
+  systemStreamIdentity,
+  type SystemStreamDescriptor,
+} from "./system-stream-descriptor.js";

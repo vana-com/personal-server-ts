@@ -609,4 +609,31 @@ END`,
       END`,
   ],
   [`ALTER TABLE runs ADD COLUMN raw_end TEXT`],
+  [
+    `CREATE TABLE system_stream_instance(id INTEGER PRIMARY KEY CHECK(id=1), instance_id TEXT NOT NULL)`,
+    `CREATE TABLE system_stream_outbox(connection_id TEXT NOT NULL,stream TEXT NOT NULL,record_id TEXT NOT NULL,body TEXT NOT NULL,sort_at TEXT NOT NULL,run_id TEXT NOT NULL,observed_at INTEGER NOT NULL,PRIMARY KEY(connection_id,stream,record_id)) WITHOUT ROWID`,
+    `CREATE TABLE system_stream_projection(connection_id TEXT NOT NULL,stream TEXT NOT NULL,record_id TEXT NOT NULL,sort_at TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(connection_id,stream,record_id)) WITHOUT ROWID`,
+    `CREATE INDEX system_stream_page ON system_stream_projection(connection_id,stream,sort_at DESC,record_id DESC)`,
+    `CREATE TABLE system_stream_checkpoint(connection_id TEXT NOT NULL,stream TEXT NOT NULL,seq INTEGER NOT NULL,PRIMARY KEY(connection_id,stream)) WITHOUT ROWID`,
+    `CREATE TABLE system_stream_quarantine(connection_id TEXT NOT NULL,stream TEXT NOT NULL,record_id TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(connection_id,stream,record_id,body)) WITHOUT ROWID`,
+    `CREATE TRIGGER system_stream_outbox_capacity BEFORE INSERT ON system_stream_outbox
+      WHEN NOT EXISTS(SELECT 1 FROM system_stream_outbox WHERE connection_id=NEW.connection_id AND stream=NEW.stream AND record_id=NEW.record_id)
+      AND ((SELECT count(*) FROM system_stream_outbox)>=100000 OR (SELECT COALESCE(sum(length(CAST(body AS BLOB))),0) FROM system_stream_outbox)+length(CAST(NEW.body AS BLOB))>104857600)
+      BEGIN SELECT RAISE(ABORT,'system_stream_outbox_full'); END`,
+  ],
+  [
+    // A projection must survive publisher compaction of record_changes. This
+    // inbox is committed with each canonical change and consumed atomically.
+    `CREATE TABLE system_stream_changes(seq INTEGER PRIMARY KEY AUTOINCREMENT,connection_id TEXT NOT NULL,stream TEXT NOT NULL,record_id TEXT NOT NULL,body TEXT)`,
+    `CREATE INDEX system_stream_changes_by_stream ON system_stream_changes(connection_id,stream,seq)`,
+    // Table-local triggers survive the bootstrap table swap through its schema
+    // capture. An external trigger referencing records would refuse that swap.
+    ...["INSERT", "UPDATE", "DELETE"].map((event) => {
+      const row = event === "DELETE" ? "OLD" : "NEW";
+      return `CREATE TRIGGER system_stream_records_${event.toLowerCase()} AFTER ${event === "UPDATE" ? "UPDATE OF stamp_o,stamp_r,body_sha256" : event} ON records
+        WHEN ${row}.connection_id GLOB 'pdpp.vana-system-*~*'
+        BEGIN INSERT INTO system_stream_changes(connection_id,stream,record_id,body)
+        VALUES (${row}.connection_id,${row}.stream,${row}.record_key,${event === "DELETE" ? "NULL" : "NEW.body"}); END`;
+    }),
+  ],
 ];

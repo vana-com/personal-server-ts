@@ -217,15 +217,16 @@ export function runDriverConformance(
 
       expect(await rows()).toEqual(before.rows);
       expect(await logged()).toEqual(before.log);
-      // The same indexes and triggers, and the unique index that replaces
-      // the WITHOUT ROWID key.
+      // The same indexes and triggers, every later migration's records
+      // trigger, and the unique index that replaces the WITHOUT ROWID key.
       expect(await objects()).toEqual(
         [
           ...before.objects,
           ...MIGRATIONS.slice(rebuild + 1)
             .flat()
-            .filter((sql) =>
-              sql.startsWith("CREATE TRIGGER records_bootstrap_"),
+            .filter(
+              (sql) =>
+                sql.startsWith("CREATE TRIGGER ") && /\bON records\b/.test(sql),
             )
             .map((sql) => ({
               type: "trigger",
