@@ -4,15 +4,15 @@ import type { RawEndV1 } from "./raw-end.js";
 import type { DurableRecordEvidence } from "./normalize-raw-end.js";
 
 const empty: DurableRecordEvidence = {
-  liveKeys: [],
-  deletedKeys: [],
-  everDeletedKeys: [],
+  liveCount: 0,
+  deletedCount: 0,
+  everDeleted: false,
   upsertEvents: 0,
   deleteEvents: 0,
 };
 const live: DurableRecordEvidence = {
   ...empty,
-  liveKeys: [["one"]],
+  liveCount: 1,
   upsertEvents: 1,
 };
 const raw = (patch: Partial<RawEndV1> = {}): RawEndV1 => ({
@@ -41,7 +41,7 @@ const begin = {
 };
 describe("normalizeRawEnd", () => {
   it("keeps completion separate from whole proof and folds delete history", () => {
-    const evidence = { ...live, everDeletedKeys: [["one"]], deleteEvents: 1 };
+    const evidence = { ...live, everDeleted: true, deleteEvents: 1 };
     const end = normalizeRawEnd(raw({ covered: ["A"] }), begin, {
       A: evidence,
     });
@@ -324,3 +324,45 @@ it("classifies stream-scoped structured retry hints independently on succeeded D
   });
   expect(end.finish).toBe("completed");
 });
+
+it.each([
+  {
+    required_keys: [["one"], ["one"]],
+    hydrated_keys: [["one"]],
+    gap: "none",
+    invalid: false,
+  },
+  {
+    required_keys: [{ b: 2, a: 1 }],
+    hydrated_keys: [{ a: 1, b: 2 }],
+    gap: "none",
+    invalid: false,
+  },
+  {
+    required_keys: [null, 1, "key"],
+    hydrated_keys: [1, null, "key", "key"],
+    gap: "none",
+    invalid: false,
+  },
+  {
+    required_keys: [["missing"]],
+    hydrated_keys: [["one"], ["one"]],
+    gap: "retryable",
+    invalid: false,
+  },
+  { required_keys: "malformed", hydrated_keys: [], gap: "none", invalid: true },
+  { required_keys: [], hydrated_keys: null, gap: "none", invalid: true },
+])(
+  "preserves gap membership and malformed report handling: %j",
+  ({ gap, invalid, ...keys }) => {
+    const result = normalizeRawEnd(
+      raw({ detailCoverage: { A: { considered: 1, covered: 1, ...keys } } }),
+      begin,
+      {},
+    );
+    expect(result.streams.A).toMatchObject({
+      detailGap: gap,
+      invalidDetailCoverage: invalid,
+    });
+  },
+);

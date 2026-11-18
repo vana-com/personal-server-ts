@@ -1,50 +1,41 @@
-import type { JsonValue } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { DurableRecordEvidence } from "../stream-sync/normalize-raw-end.js";
 import type { SqlReader } from "./driver.js";
 
-/** Intake's atomic event ledger plus its ordered, final key fold. */
+/**
+ * Raw intake writes typed run_rows and its event ledger in the same transaction.
+ * Reuse run end's final fold counts; orphan ledger entries still contribute event
+ * totals and history, but never final rows. Group presence is kept for selection
+ * validation. Unlike the old materialization this does not parse stored keys:
+ * those keys are written by our own trigger after intake's key validation, and
+ * normalization needs no key values to authorize its count-based proof.
+ */
 export async function readRawRecordEvidence(
   db: SqlReader,
   runId: string,
+  finalCounts: readonly { stream: string; upserts: number; deletes: number }[],
 ): Promise<Record<string, DurableRecordEvidence>> {
   const rows = await db.query<{
     stream: string;
-    pk_values: string;
     ever_deleted: number;
     upsert_events: number;
     delete_events: number;
-    op: string | null;
   }>(
-    `SELECT e.stream,e.pk_values,e.ever_deleted,e.upsert_events,e.delete_events,r.op
-     FROM run_record_evidence e LEFT JOIN run_rows r
-       ON r.run_id=e.run_id AND r.stream=e.stream AND r.pk_hash=e.pk_hash
-     WHERE e.run_id=?`,
+    `SELECT stream,MAX(CASE WHEN ever_deleted=1 THEN 1 ELSE 0 END) AS ever_deleted,
+       SUM(upsert_events) AS upsert_events,SUM(delete_events) AS delete_events
+     FROM run_record_evidence WHERE run_id=? GROUP BY stream`,
     [runId],
   );
-  const evidence: Record<
-    string,
-    {
-      liveKeys: JsonValue[];
-      deletedKeys: JsonValue[];
-      everDeletedKeys: JsonValue[];
-      upsertEvents: number;
-      deleteEvents: number;
-    }
-  > = Object.create(null);
+  const counts = new Map(finalCounts.map((row) => [row.stream, row]));
+  const evidence: Record<string, DurableRecordEvidence> = Object.create(null);
   for (const row of rows) {
-    const stream = (evidence[row.stream] ??= {
-      liveKeys: [],
-      deletedKeys: [],
-      everDeletedKeys: [],
-      upsertEvents: 0,
-      deleteEvents: 0,
-    });
-    const key = JSON.parse(row.pk_values) as JsonValue;
-    if (row.op === "upsert") stream.liveKeys.push(key);
-    if (row.op === "delete") stream.deletedKeys.push(key);
-    if (row.ever_deleted === 1) stream.everDeletedKeys.push(key);
-    stream.upsertEvents += row.upsert_events;
-    stream.deleteEvents += row.delete_events;
+    const final = counts.get(row.stream);
+    evidence[row.stream] = {
+      liveCount: final?.upserts ?? 0,
+      deletedCount: final?.deletes ?? 0,
+      everDeleted: row.ever_deleted === 1,
+      upsertEvents: row.upsert_events,
+      deleteEvents: row.delete_events,
+    };
   }
   return evidence;
 }

@@ -931,3 +931,38 @@ it.fails(
     ).toEqual([]);
   },
 );
+
+it("run end honors a delete admitted after its zero-delete read and retains history across runs", async () => {
+  const { a } = await world(true, "checkpoint_window");
+  await a.run("seed-skip-check", ["keep", "remove"]);
+  await a.begin("older-skip-check", { observedAt: 1100 });
+  await a.batch("older-skip-check", 0, ["remove"]);
+  await a.begin("end-skip-check", { observedAt: 1200 });
+  await a.batch("end-skip-check", 0, ["keep"]);
+  const original = a.db.batch.bind(a.db);
+  let raced = false;
+  a.db.batch = async (statements) => {
+    if (!raced && statements.some((s) => s.sql.includes("decision = ?"))) {
+      raced = true;
+      // Another admitted batch commits after the end planner read its counts.
+      // Keep the same batch boundary: the race changes only the durable fold.
+      await original([
+        {
+          sql: `INSERT OR REPLACE INTO run_rows(run_id,stream,pk_hash,record_key,body,body_sha256,op,pk_values)
+          SELECT 'end-skip-check',stream,pk_hash,record_key,'{}','digest','delete',pk_values
+          FROM run_rows WHERE run_id='older-skip-check'`,
+        },
+      ]);
+    }
+    return original(statements);
+  };
+  await a.end("end-skip-check", 0);
+  expect(raced).toBe(true);
+  expect(await a.keys()).toEqual(["keep"]);
+  expect(await a.tombstones()).toBe(1);
+  await a.end("older-skip-check", 0);
+  expect(await a.keys()).toEqual(["keep"]);
+  expect(await a.tombstones()).toBe(0);
+  await a.run("later-zero-delete", ["keep"]);
+  expect(await a.keys()).toEqual(["keep"]);
+});
