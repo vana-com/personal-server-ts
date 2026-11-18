@@ -30,16 +30,19 @@ export interface RawEndV1 {
   readonly lastBatch: number;
   readonly selectedStreams: readonly string[];
   readonly covered?: readonly string[];
-  readonly finish:
-    | { readonly kind: "completed" }
-    | {
-        readonly kind: "certified_failed_done";
-        readonly failedStreams: readonly string[];
-      }
-    | {
-        readonly kind: "failed_done_upsert_only";
-        readonly failedStreams?: readonly string[];
-      };
+  /** The connector's actual DONE, never a host-certified finish verdict.
+   * Missing, cancelled and protocol-invalid DONE use the abort path.
+   */
+  readonly done: {
+    readonly status: "succeeded" | "failed";
+    readonly recordsEmitted?: number;
+    readonly error?: {
+      readonly code?: string;
+      readonly retryable?: boolean;
+      readonly message?: string;
+      readonly diagnostics?: JsonValue;
+    };
+  };
   readonly errors: readonly RawEndError[];
   readonly records: Readonly<Record<string, RawRecordEvidence>>;
   readonly checkpoints: Readonly<Record<string, JsonValue>>;
@@ -118,19 +121,28 @@ export function validateRawEnd(body: unknown): RawEndV1 {
     if (!Object.values(map(value)).every(json))
       rawEndInvalid("JSON value required");
   }
-  const finish = body.finish;
+  if ("finish" in body || "failedStreams" in body)
+    rawEndInvalid("host finish verdicts are not raw DONE evidence");
+  const done = body.done;
   if (
-    !object(finish) ||
-    !["completed", "certified_failed_done", "failed_done_upsert_only"].some(
-      (kind) => kind === finish.kind,
+    !object(done) ||
+    (done.status !== "succeeded" && done.status !== "failed")
+  )
+    rawEndInvalid("valid DONE required; otherwise abort");
+  if (done.recordsEmitted !== undefined && !count(done.recordsEmitted))
+    rawEndInvalid("unsafe DONE record count");
+  if (done.error !== undefined) {
+    const e = done.error;
+    if (
+      done.status === "succeeded" ||
+      !object(e) ||
+      (e.code !== undefined && (typeof e.code !== "string" || !e.code)) ||
+      (e.retryable !== undefined && typeof e.retryable !== "boolean") ||
+      (e.message !== undefined && typeof e.message !== "string") ||
+      (e.diagnostics !== undefined && !json(e.diagnostics))
     )
-  )
-    rawEndInvalid("unknown finish");
-  if (
-    finish.kind === "certified_failed_done" ||
-    finish.failedStreams !== undefined
-  )
-    names(finish.failedStreams, selected);
+      rawEndInvalid("invalid DONE error");
+  }
   for (const evidence of Object.values(map(body.records))) {
     if (
       !object(evidence) ||

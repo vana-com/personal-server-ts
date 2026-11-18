@@ -18,7 +18,7 @@ const raw = (patch: Partial<RawEndV1> = {}): RawEndV1 => ({
   wireDialect: "connector-end-evidence/1",
   lastBatch: -1,
   selectedStreams: ["A", "B"],
-  finish: { kind: "completed" },
+  done: { status: "succeeded" },
   errors: [],
   records: {},
   checkpoints: {},
@@ -162,10 +162,72 @@ describe("normalizeRawEnd", () => {
   it("downgrades failed-DONE without selected failure certification", () => {
     expect(
       normalizeRawEnd(
-        raw({ finish: { kind: "certified_failed_done", failedStreams: [] } }),
+        raw({
+          done: {
+            status: "failed",
+            error: { code: "stream_collection_failed" },
+          },
+        }),
         begin,
         {},
       ).finish,
     ).toBe("failed_done_upsert_only");
   });
+});
+
+it("refuses a host-certified finish claim instead of trusting failedStreams", () => {
+  expect(() =>
+    normalizeRawEnd(
+      {
+        ...raw({ records: { A: live } }),
+        finish: { kind: "certified_failed_done", failedStreams: ["B"] },
+      },
+      begin,
+      { A: live },
+    ),
+  ).toThrow();
+});
+it("certifies raw failed DONE only from attributable collection-failure skips", () => {
+  const base = raw();
+  const body = {
+    ...base,
+    done: { status: "failed", error: { code: "stream_collection_failed" } },
+    errors: [
+      {
+        kind: "skip_result",
+        code: "stream_collection_failed",
+        scope: { kind: "stream", stream: "B" },
+      },
+    ],
+  };
+  expect(normalizeRawEnd(body, begin, {}).finish).toBe("certified_failed_done");
+  expect(normalizeRawEnd({ ...body, errors: [] }, begin, {}).finish).toBe(
+    "failed_done_upsert_only",
+  );
+  expect(
+    normalizeRawEnd(
+      { ...body, errors: [{ ...body.errors[0], scope: { kind: "run" } }] },
+      begin,
+      {},
+    ).finish,
+  ).toBe("failed_done_upsert_only");
+  expect(() =>
+    normalizeRawEnd({ ...body, done: undefined }, begin, {}),
+  ).toThrow();
+  expect(() =>
+    normalizeRawEnd({ ...body, done: { status: "cancelled" } }, begin, {}),
+  ).toThrow();
+  expect(() =>
+    normalizeRawEnd(
+      {
+        ...body,
+        done: {
+          status: "succeeded",
+          error: { code: "stream_collection_failed" },
+        },
+      },
+      begin,
+      {},
+    ),
+  ).toThrow();
 });

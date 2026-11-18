@@ -617,7 +617,7 @@ it("normalizes raw evidence before run-end fences and rejects invented history",
     wireDialect: "connector-end-evidence/1",
     lastBatch: 0,
     selectedStreams: ["items"],
-    finish: { kind: "completed" },
+    done: { status: "succeeded" },
     errors: [],
     records: {
       items: {
@@ -727,7 +727,7 @@ it.each([
       wireDialect: "connector-end-evidence/1",
       lastBatch: 0,
       selectedStreams: ["b", "a"],
-      finish: { kind: "completed" },
+      done: { status: "succeeded" },
       errors:
         safety === "refused-child"
           ? []
@@ -807,7 +807,7 @@ it("an empty explicit selection is a no-op for declared stream state", async () 
     wireDialect: "connector-end-evidence/1",
     lastBatch: -1,
     selectedStreams: [],
-    finish: { kind: "completed" },
+    done: { status: "succeeded" },
     errors: [],
     records: {},
     checkpoints: {},

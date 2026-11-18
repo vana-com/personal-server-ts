@@ -8,16 +8,16 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -27,16 +27,16 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": [],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -46,16 +46,16 @@
         "wireDialect": "connector-end-evidence/2",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -65,16 +65,16 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -2,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -84,16 +84,16 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": 1.2,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -103,16 +103,16 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": 9007199254740992,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -122,16 +122,16 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "A"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -141,16 +141,16 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": [""],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -160,9 +160,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
@@ -170,7 +167,10 @@
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
         "wholeStreamEvidence": [],
-        "covered": ["C"]
+        "covered": ["C"],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -180,9 +180,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
@@ -190,7 +187,10 @@
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
         "wholeStreamEvidence": [],
-        "covered": ["A", "A"]
+        "covered": ["A", "A"],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -200,9 +200,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {
@@ -211,7 +208,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -221,9 +221,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "C": {}
@@ -232,7 +229,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -242,16 +242,16 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": ["C"],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -261,16 +261,16 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": ["C"],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -280,9 +280,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
@@ -291,7 +288,10 @@
           "C": {}
         },
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -301,9 +301,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
@@ -315,7 +312,10 @@
             "stream": "C",
             "report": {}
           }
-        ]
+        ],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -335,7 +335,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -345,9 +348,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [
           {
             "kind": "error",
@@ -363,7 +363,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -373,9 +376,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -390,7 +390,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -400,9 +403,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -417,7 +417,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -427,9 +430,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -444,7 +444,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -454,9 +457,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -471,7 +471,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -481,9 +484,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -498,7 +498,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -508,9 +511,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -525,7 +525,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -535,9 +538,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -552,7 +552,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -562,9 +565,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -579,7 +579,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -589,9 +592,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -619,7 +619,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -629,9 +632,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [
           {
             "kind": "error",
@@ -649,7 +649,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -659,16 +662,16 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": null,
         "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -687,7 +690,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -697,9 +703,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [
           {
             "kind": ["error"],
@@ -714,7 +717,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       }
     },
     {
@@ -724,9 +730,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -741,7 +744,106 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
+      }
+    },
+    {
+      "name": "missing DONE",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
         "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "unknown DONE status",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "completed"
+        }
+      }
+    },
+    {
+      "name": "cancelled DONE uses abort",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "cancelled"
+        }
+      }
+    },
+    {
+      "name": "succeeded DONE with error",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded",
+          "error": {
+            "code": "stream_collection_failed"
+          }
+        }
+      }
+    },
+    {
+      "name": "unsafe DONE count",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded",
+          "recordsEmitted": -1
+        }
       }
     }
   ],
@@ -752,9 +854,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {
@@ -764,7 +863,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -799,9 +901,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -820,7 +919,10 @@
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
         "wholeStreamEvidence": [],
-        "covered": []
+        "covered": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -860,9 +962,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -881,7 +980,10 @@
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
         "wholeStreamEvidence": [],
-        "covered": ["A"]
+        "covered": ["A"],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -923,9 +1025,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [
           {
             "kind": "skip_result",
@@ -955,7 +1054,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -997,9 +1099,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [
           {
             "kind": "skip_result",
@@ -1029,7 +1128,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -1071,9 +1173,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [
           {
             "kind": "skip_result",
@@ -1099,7 +1198,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -1139,9 +1241,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [
           {
             "kind": "skip_result",
@@ -1162,7 +1261,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -1194,9 +1296,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {
@@ -1205,7 +1304,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A"],
@@ -1235,9 +1337,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {
@@ -1255,7 +1354,10 @@
               "covered": 0
             }
           }
-        ]
+        ],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A"],
@@ -1287,9 +1389,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [
           {
             "kind": "detail_gap",
@@ -1326,7 +1425,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -1375,9 +1477,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [
           {
             "kind": "detail_gap",
@@ -1414,7 +1513,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -1463,9 +1565,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -1490,7 +1589,10 @@
         "preflightExcludedStreams": ["A"],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -1539,9 +1641,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -1559,7 +1658,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -1602,9 +1704,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -1622,7 +1721,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -1665,11 +1767,16 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "certified_failed_done",
-          "failedStreams": ["B"]
-        },
-        "errors": [],
+        "errors": [
+          {
+            "kind": "skip_result",
+            "code": "stream_collection_failed",
+            "scope": {
+              "kind": "stream",
+              "stream": "B"
+            }
+          }
+        ],
         "records": {
           "A": {
             "liveKeys": [["one"]],
@@ -1693,7 +1800,13 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "failed",
+          "error": {
+            "code": "stream_collection_failed"
+          }
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -1740,11 +1853,16 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "failed_done_upsert_only",
-          "failedStreams": ["B"]
-        },
-        "errors": [],
+        "errors": [
+          {
+            "kind": "skip_result",
+            "code": "fixture_skip",
+            "scope": {
+              "kind": "stream",
+              "stream": "B"
+            }
+          }
+        ],
         "records": {
           "A": {
             "liveKeys": [["one"]],
@@ -1768,7 +1886,13 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "failed",
+          "error": {
+            "code": "uncertified_failure"
+          }
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -1815,9 +1939,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [
           {
             "kind": "detail_gap",
@@ -1854,7 +1975,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -1902,9 +2026,6 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {
           "A": {
@@ -1928,7 +2049,10 @@
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": ["A", "B"],
@@ -1976,16 +2100,16 @@
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": [],
-        "finish": {
-          "kind": "completed"
-        },
         "errors": [],
         "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": []
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
       },
       "begin": {
         "selectedStreams": [],

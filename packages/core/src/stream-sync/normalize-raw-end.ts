@@ -119,12 +119,32 @@ export function normalizeRawEnd(
     StreamObservation & { sourceAnswered?: boolean }
   > = Object.create(null);
   const proven: string[] = [];
-  const failed =
-    raw.finish.kind === "completed" ? [] : (raw.finish.failedStreams ?? []);
+  // Collection-failure SKIPs are complete evidence, not a capped diagnostic
+  // sample. Every one must be attributable to the selected set. A run-scoped
+  // failure withdraws certification; unknown streams were already rejected.
+  const failureSkips = raw.errors.filter(
+    (e) => e.kind === "skip_result" && e.code === "stream_collection_failed",
+  );
+  const certified =
+    raw.done.status === "failed" &&
+    raw.done.error?.code === "stream_collection_failed" &&
+    failureSkips.length > 0 &&
+    failureSkips.every((e) => e.scope.kind === "stream");
+  const failed = certified
+    ? [
+        ...new Set(
+          failureSkips.flatMap((e) =>
+            e.scope.kind === "stream" ? [e.scope.stream] : [],
+          ),
+        ),
+      ]
+    : [];
   const finish =
-    raw.finish.kind === "certified_failed_done" && failed.length === 0
-      ? "failed_done_upsert_only"
-      : raw.finish.kind;
+    raw.done.status === "succeeded"
+      ? "completed"
+      : certified
+        ? "certified_failed_done"
+        : "failed_done_upsert_only";
   for (const stream of raw.selectedStreams) {
     const supplied = raw.records[stream] ?? EMPTY_RAW_RECORDS;
     const captured = durable[stream] ?? EMPTY_RAW_RECORDS;
