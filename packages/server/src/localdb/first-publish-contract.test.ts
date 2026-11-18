@@ -26,7 +26,7 @@ for (const adapter of ["memory", "http"] as const) {
       adapter === "memory"
         ? new MemoryStreamSyncRegistry()
         : createGatewayStreamSyncRegistry({
-            gatewayUrl: "https://gateway.test",
+            gatewayUrl: "http://127.0.0.1",
             ownerAddress: owner,
             fetch: createFakeGateway({
               owner,
@@ -77,3 +77,17 @@ for (const adapter of ["memory", "http"] as const) {
     });
   });
 }
+
+it("a settled head permits replay but rejects a different same-version write", async () => {
+  const registry = new MemoryStreamSyncRegistry();
+  const post = (entry: SignedBatchRow) =>
+    registry.postBatch({ ownerAddress: owner, rows: [entry], requires: [] });
+  const first = row("aa");
+  expect((await post(first)).kind).toBe("committed");
+  registry.settleHead(first.scope);
+  expect((await post(first)).kind).toBe("committed");
+  expect((await post(row("bb"))).kind).toBe("refused");
+  expect(await registry.read(first.scope)).toMatchObject({
+    dataHash: first.dataHash,
+  });
+});

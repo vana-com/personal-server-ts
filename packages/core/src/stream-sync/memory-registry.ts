@@ -52,6 +52,14 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
   /** Every committed registry post, in order. */
   readonly log: { scope: string; version: number; dataHash: string }[] = [];
   protected readonly versions = new Map<string, Version[]>();
+  private readonly settled = new Map<string, number>();
+
+  /** Model settlement of the current gateway head in a test. */
+  settleHead(scope: string): void {
+    const version = this.versions.get(scope)?.length;
+    if (!version) throw new Error(`No head to settle: ${scope}`);
+    this.settled.set(scope, version);
+  }
 
   /** `at` of the n-th version of a scope is `baseMs + n` seconds. */
   constructor(private readonly baseMs = 0) {}
@@ -199,8 +207,7 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
       ) {
         // A replay, as the gateway judges one (`replaysStoredRow`, without
         // `exclusive`, which a batch never sets): the same data hash and the
-        // same signature, so the same signer sent it again. Another signer's
-        // row at that version is a conflict, whatever it holds.
+        // same signature. A different signature follows the refresh rules.
         rows.push({ kind: "committed" });
         continue;
       }
@@ -208,6 +215,7 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
       if (
         (Number(row.expectedVersion) !== stored.length + 1 &&
           (Number(row.expectedVersion) !== stored.length ||
+            this.settled.get(row.scope) === Number(row.expectedVersion) ||
             (head !== undefined && isTombstone(head.dataHash)))) ||
         (row.expectedHeadAbsent === true && head !== undefined) ||
         (row.expectedHeadDataHash !== undefined &&
