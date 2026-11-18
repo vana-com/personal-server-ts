@@ -165,6 +165,22 @@ export const tombstonedForRead = (
   c: Connection,
   progressive: boolean,
 ) => tombstoned(s) && !(progressive && partialReadable(s, c));
+/** Deletion evidence for one connection and target, independent of its rank. */
+export function tombstonedForTarget(
+  target: Target,
+  connection: Connection,
+  streams: readonly Stream[],
+  progressive: boolean,
+): boolean {
+  const served = servedStreams(
+    target,
+    streams.filter((s) => target.streams.includes(s.stream)),
+    connection,
+  );
+  return served.streams.some((s) =>
+    tombstonedForRead(s, connection, progressive && !target.alias),
+  );
+}
 export const live = (s: Stream, c: Connection) =>
   c.control_state === "active" &&
   c.deleted_at === null &&
@@ -348,8 +364,11 @@ export function selectForTarget(
   const selected = active[0];
   if (!selected) return { candidate: undefined, tombstoned: false };
   if (
-    selected.streams.some((s) =>
-      tombstonedForRead(s, selected.connection, progressive),
+    tombstonedForTarget(
+      target,
+      selected.connection,
+      selected.streams,
+      progressive,
     )
   ) {
     return { candidate: undefined, tombstoned: true };

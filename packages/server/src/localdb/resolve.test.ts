@@ -330,6 +330,54 @@ describe("local resolve", () => {
     });
   });
 
+  it("reports busy when a tombstoned winner outranks a refused live connection", async () => {
+    const f = await fixture();
+    await f.connection("active", "c1");
+    await f.connection("active", "c2", "1111111111111111");
+    await f.head("x", { version: 5, floor: 5 });
+    await f.head("y");
+    await f.head("x", { id: "c2" });
+    await f.db.batch([
+      {
+        sql: "UPDATE stream_versions SET observed_at = ? WHERE connection_id = ? AND stream = ?",
+        params: [200, "c1", "y"],
+      },
+      {
+        sql: "UPDATE stream_versions SET observed_at = ? WHERE connection_id = ? AND stream = ?",
+        params: [100, "c2", "x"],
+      },
+    ]);
+    mocked.apply.mockImplementation(async (_deps, id) => {
+      if (id === "c2")
+        throw new RegistryUnavailableBeforeWriteError(
+          new RegistryUnavailableError("offline"),
+        );
+      return [];
+    });
+    expect(await f.resolver.resolve(input("pdpp.fixture-source.x"))).toEqual({
+      kind: "busy",
+      retryAfterSeconds: 5,
+    });
+  });
+
+  it("keeps deleted precedence when every refused connection is tombstoned", async () => {
+    const f = await fixture();
+    await f.connection("active", "c1");
+    await f.connection("active", "c2", "1111111111111111");
+    await f.head("x", { version: 5, floor: 5 });
+    await f.head("y");
+    await f.head("x", { id: "c2", version: 5, floor: 5 });
+    mocked.apply.mockRejectedValue(
+      new RegistryUnavailableBeforeWriteError(
+        new RegistryUnavailableError("offline"),
+      ),
+    );
+    expect(await f.resolver.resolve(input("pdpp.fixture-source.x"))).toEqual({
+      kind: "unavailable",
+      reason: "deleted",
+    });
+  });
+
   it("does not serve local rows after an unclassified apply failure", async () => {
     const f = await fixture();
     await f.connection();
