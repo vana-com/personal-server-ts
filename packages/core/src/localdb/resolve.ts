@@ -452,18 +452,29 @@ export function createLocalResolver(
       let sawActive = false;
       let applyUnavailable = false;
       for (const target of targets) {
-        let rows = await connections(target.connector);
+        // Apply sees the persisted state so it can mark pending deletes before
+        // selection hides them. Selection below still uses effective control.
+        const beforeApply = await deps.db.query<
+          Connection & { pending_delete: number }
+        >(
+          `SELECT c.connection_id, c.connector, c.ns, c.generation, c.control_state, c.deleted_at,
+                  EXISTS (SELECT 1 FROM delete_intents d WHERE d.connector = c.connector) AS pending_delete
+           FROM connections c WHERE c.connector = ? ORDER BY c.ns`,
+          [target.connector],
+        );
         const refused = new Set<string>();
         // applyConnection is the single-flight boundary and verifies keys before
         // installing rows. No rejected/foreign head is eligible for a DB read.
-        for (const c of rows) {
+        for (const c of beforeApply) {
           if (
             c.control_state === "active" &&
             c.deleted_at === null &&
             (input.connection === null || input.connection === c.ns)
           ) {
             try {
-              await applyFor(c, target, progressive);
+              if (c.pending_delete)
+                await applyConnection(deps, c.connection_id);
+              else await applyFor(c, target, progressive);
             } catch (error) {
               if (!(error instanceof RegistryUnavailableBeforeWriteError))
                 throw error;
@@ -471,7 +482,7 @@ export function createLocalResolver(
             }
           }
         }
-        rows = await connections(target.connector);
+        let rows = await connections(target.connector);
         if (input.connection !== null)
           rows = rows.filter((c) => c.ns === input.connection);
         sawConnection ||= rows.length > 0;

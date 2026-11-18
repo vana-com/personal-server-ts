@@ -10,6 +10,7 @@ import { readerOf } from "./driver.js";
 import {
   chooseCandidate,
   connectionsOf,
+  effectiveControl,
   loadStreams,
   selectForTarget,
   servedStreamOf,
@@ -216,13 +217,13 @@ SELECT c.connection_id, c.connector, s.stream, NULL AS first_o,
        0 AS row_count, s.head_version
 FROM connections c
 LEFT JOIN stream_state s ON s.connection_id = c.connection_id
-WHERE c.control_state = 'active'
+WHERE ${effectiveControl("c")} = 'active'
 UNION ALL
 SELECT c.connection_id, c.connector, r.stream, r.first_o,
        COUNT(*) AS row_count, NULL AS head_version
 FROM records r NOT INDEXED
 JOIN connections c ON c.connection_id = r.connection_id
-WHERE c.control_state = 'active'
+WHERE ${effectiveControl("c")} = 'active'
 GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
 
       const all = newCounts();
@@ -326,7 +327,7 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
         version: number | null;
       }>(
         `WITH context AS (
-           SELECT c.connection_id, c.generation, c.control_state,
+           SELECT c.connection_id, c.generation, ${effectiveControl("c")} AS control_state,
                   s.head_version, s.last_delete_version
            FROM (SELECT * FROM connections WHERE connector = ? AND ns = ?
                  ORDER BY connection_id LIMIT 1) c
@@ -383,14 +384,14 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
         control_state: string;
         version: number | null;
       }>(
-        `SELECT c.control_state, v.version
+        `SELECT ${effectiveControl("c")} AS control_state, v.version
          FROM (SELECT * FROM connections WHERE connector = ? AND ns = ?
                ORDER BY connection_id LIMIT 1) c
          LEFT JOIN stream_state s ON s.connection_id = c.connection_id
            AND s.stream = ?
          LEFT JOIN stream_versions v ON v.connection_id = c.connection_id
            AND v.stream = s.stream AND v.generation = c.generation
-           AND c.control_state = 'active'
+           AND ${effectiveControl("c")} = 'active'
            AND v.version = COALESCE(?, s.head_version)
            AND v.version > s.last_delete_version
            AND v.kind IN ('published', 'applied')

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createLocalHistory } from "../../../core/src/localdb/history.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import {
@@ -383,5 +384,68 @@ describe("bounded local scope list", () => {
       updatedAt: null,
     });
     expect(bare).not.toHaveProperty("latestCollectedAt");
+  });
+});
+
+it("a durable pending delete is hidden in diagnostics as it is in the owner listing", async () => {
+  const f = await fixture();
+  await addConnection(f.db, "pending1", "alpha");
+  await addStream(f.db, "pending1", "items", { records: 2 });
+  await f.db.batch([
+    {
+      sql: "INSERT INTO delete_intents(connector, delete_id, intent) VALUES (?, ?, ?)",
+      params: ["alpha", "delete1", "{}"],
+    },
+  ]);
+  expect(await f.listing.listScopes({ canRead: async () => true })).toEqual([]);
+  const connection = (await f.listing.status()).connections.find(
+    (row) => row.connector === "alpha",
+  )!;
+  expect(connection.control).toBe("deleted");
+  expect(connection.streams.items).toMatchObject({
+    live: false,
+    complete: false,
+    records: null,
+    version: null,
+  });
+});
+
+describe("pending delete visibility", () => {
+  it.each([
+    "additions",
+    "versions",
+    "lineage",
+    "alias versions",
+    "alias lineage",
+    "cache key",
+  ])("hides a pending delete from %s", async (reader) => {
+    const f = await fixture();
+    await addConnection(f.db, "pending1", "alpha");
+    await addStream(f.db, "pending1", "a1", { records: 2, profile: "alpha" });
+    await addStream(f.db, "pending1", "a2", { records: 1, profile: "alpha" });
+    const history = createLocalHistory(f.deps, f.deps);
+    const before = await f.listing.cacheKey();
+    expect((await history.additions({ timezone: "UTC", days: 1 })).total).toBe(
+      3,
+    );
+    await f.db.batch([
+      {
+        sql: "INSERT INTO delete_intents(connector, delete_id, intent) VALUES (?, ?, ?)",
+        params: ["alpha", "delete1", "{}"],
+      },
+    ]);
+    if (reader === "additions") {
+      expect(
+        await history.additions({ timezone: "UTC", days: 1 }),
+      ).toMatchObject({ total: 0, scopes: [], through: {} });
+    } else if (reader === "cache key") {
+      expect(await f.listing.cacheKey()).not.toBe(before);
+    } else {
+      const scope = reader.startsWith("alias") ? "fixture.summary" : "alpha.a1";
+      const result = reader.endsWith("versions")
+        ? await history.versions({ scope, limit: 10, offset: 0 })
+        : await history.lineage({ scope });
+      expect(result).toEqual({ ok: false, reason: "deleted" });
+    }
   });
 });

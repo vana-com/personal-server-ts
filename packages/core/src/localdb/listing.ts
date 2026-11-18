@@ -7,6 +7,7 @@ import { SEEN_O } from "./merge.js";
 import { createRecordQuery } from "./query.js";
 import {
   chooseCandidate,
+  effectiveControl,
   loadStreams,
   projectAlias,
   selectForTarget,
@@ -125,7 +126,9 @@ export function createLocalListing(
   const reads = { db: readerOf(deps.db) };
   const connections = () =>
     reads.db.query<Connection>(
-      "SELECT connection_id, connector, ns, generation, control_state FROM connections ORDER BY connector, ns, connection_id",
+      `SELECT connection_id, connector, ns, generation,
+       ${effectiveControl("connections")} AS control_state
+       FROM connections ORDER BY connector, ns, connection_id`,
     );
 
   /**
@@ -135,7 +138,9 @@ export function createLocalListing(
    */
   async function readSnapshot(progressive: boolean): Promise<readonly Entry[]> {
     const rows = await reads.db.query<SelectionConnection>(
-      "SELECT connection_id, connector, ns, generation, control_state, deleted_at FROM connections ORDER BY connector, ns, connection_id",
+      `SELECT connection_id, connector, ns, generation,
+       ${effectiveControl("connections")} AS control_state, deleted_at
+       FROM connections ORDER BY connector, ns, connection_id`,
     );
     const streams = await loadStreams(reads);
     const stamps = await reads.db.query<{
@@ -438,8 +443,11 @@ export function createLocalListing(
       const heads = await reads.db.query(
         "SELECT * FROM stream_state ORDER BY connection_id, stream",
       );
+      const intents = await reads.db.query(
+        "SELECT connector FROM delete_intents ORDER BY connector",
+      );
       const digest = sha256(
-        new TextEncoder().encode(JSON.stringify([controls, heads])),
+        new TextEncoder().encode(JSON.stringify([controls, heads, intents])),
       );
       return Array.from(digest, (byte) =>
         byte.toString(16).padStart(2, "0"),
