@@ -154,3 +154,23 @@ describe("parseEndRequest", () => {
     );
   });
 });
+
+describe("partial retry", () => {
+  it("covers a finished stream while another remains retryable", () => {
+    const finished = observe({ records: { a: [{ key: "one" }] } }, "a");
+    const retrying = observe(
+      { skips: [{ stream: "b", retryable: true }] },
+      "b",
+    );
+    const plan = planRunFinish(
+      {
+        finish: "completed",
+        streams: { a: finished, b: retrying },
+        checkpoints: {},
+      },
+      { a: { mode: "incremental" }, b: { mode: "incremental" } },
+    );
+    expect(plan.outcome).toBe("partial");
+    expect(plan.covered).toEqual(["a"]);
+  });
+});

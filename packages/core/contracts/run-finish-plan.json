@@ -529,7 +529,7 @@
     },
     {
       "id": "retry-real-plan-withholds-streams-with-records",
-      "why": "A retry run covers nothing; streams with captured records keep their cursor, record-free tokens move.",
+      "why": "A run-wide retry covers nothing; streams with captured records keep their cursor, record-free tokens move.",
       "declared": {
         "a": {
           "mode": "incremental"
@@ -1111,7 +1111,7 @@
     },
     {
       "id": "retryable-and-other-skips",
-      "why": "A retryable skip makes the run retry; an other skip blocks that stream's cursor.",
+      "why": "The silent incremental stream c finishes; skipped streams keep their existing retry and cursor restrictions.",
       "declared": {
         "a": {
           "mode": "incremental"
@@ -1188,8 +1188,8 @@
         }
       },
       "expect": {
-        "outcome": "retry_pending",
-        "covered": [],
+        "outcome": "partial",
+        "covered": ["c"],
         "provenFull": [],
         "candidate": {
           "c": "cc"
@@ -1199,7 +1199,7 @@
     },
     {
       "id": "retryable-skip-keeps-own-token",
-      "why": "A retryable skip of a record-free stream keeps that stream's job token.",
+      "why": "Finished stream b commits and advances its cursor; record-free retryable stream a keeps its job token.",
       "declared": {
         "a": {
           "mode": "incremental"
@@ -1253,11 +1253,12 @@
         }
       },
       "expect": {
-        "outcome": "retry_pending",
-        "covered": [],
+        "outcome": "partial",
+        "covered": ["b"],
         "provenFull": [],
         "candidate": {
-          "a": "ca"
+          "a": "ca",
+          "b": "cb"
         },
         "unconfirmed": false
       }
