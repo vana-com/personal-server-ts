@@ -29,6 +29,13 @@
  */
 
 import { ProtocolError } from "../errors/catalog.js";
+import { verifiedApplicationAuthority } from "./application.js";
+import type {
+  ApplicationIntake,
+  ApplicationEnvelope,
+  ApplicationReceipt,
+  AuthorizedApplicationMutation,
+} from "../localdb/application-intake.js";
 import {
   verifyDataWritePolicy,
   type DataWritePolicyPorts,
@@ -70,6 +77,18 @@ export interface WriteSessionAuthorizationDeps {
 }
 
 export interface WriteSessionAuthorization {
+  authorizeApplicationWrite(
+    input: PersonalServerWriteAuthInput,
+    applications: ApplicationIntake,
+    envelope: ApplicationEnvelope,
+  ): Promise<
+    | {
+        mutation: AuthorizedApplicationMutation;
+        releaseProof?: () => Promise<void>;
+      }
+    | { receipt: ApplicationReceipt }
+    | undefined
+  >;
   /**
    * Authorize a delegated write to `input.scope`, or `undefined` when the
    * request carries no live write-session credential (the caller then applies
@@ -115,6 +134,63 @@ export function createWriteSessionAuthorization(
   }
 
   return {
+    async authorizeApplicationWrite(input, applications, envelope) {
+      const session = await liveSession(input.request);
+      if (!session) return undefined;
+      if (!deps.serverOwner) throw writeServerNotConfigured();
+      if ((await input.request.clone().text()) !== JSON.stringify(envelope))
+        throw new ProtocolError(
+          400,
+          "APPLICATION_BODY_MISMATCH",
+          "Application envelope differs from signed request",
+        );
+      let grant;
+      let refusal: unknown;
+      try {
+        grant = await verifyDataWritePolicy(
+          {
+            signer: session.builderAddress,
+            grantId: session.grantId,
+            requestedScope: input.scope,
+            serverOwner: deps.serverOwner,
+          },
+          { ...deps.policyPorts, grantObservations: applications.grants },
+        );
+      } catch (error) {
+        if (
+          !(error instanceof ProtocolError) ||
+          !["GRANT_REVOKED", "GRANT_EXPIRED"].includes(error.errorCode)
+        )
+          throw error;
+        refusal = error;
+      }
+      const { releaseProof, ...attribution } = await verifyWriterAttribution({
+        request: input.request,
+        builderAddress: session.builderAddress,
+        grantId: session.grantId,
+        serverOrigin: deps.serverOrigin,
+        replayStore: deps.replayStore,
+        now: deps.now,
+      });
+      try {
+        const authority = verifiedApplicationAuthority({
+          owner: deps.serverOwner,
+          builder: session.builderAddress,
+          grant: grant ?? ({ id: session.grantId } as never),
+          attribution,
+        });
+        const receipt = await applications.replay(authority, envelope);
+        if (receipt) return { receipt };
+        if (refusal) throw refusal;
+        return {
+          mutation: await applications.prepare(authority, envelope),
+          releaseProof,
+        };
+      } catch (error) {
+        await releaseProof?.();
+        throw error;
+      }
+    },
     async authorizeSessionWrite(input) {
       const session = await liveSession(input.request);
       if (!session) return undefined;

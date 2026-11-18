@@ -595,4 +595,9 @@ END`,
       status TEXT NOT NULL CHECK(status IN ('active','revoked','expired')),
       expires_at INTEGER, observed_at INTEGER NOT NULL)`,
   ],
+  [
+    `CREATE TABLE application_sources(source_id TEXT PRIMARY KEY, writer TEXT NOT NULL, revision TEXT NOT NULL, connection_id TEXT NOT NULL UNIQUE)`,
+    `CREATE TABLE application_declarations(source_id TEXT NOT NULL, version TEXT NOT NULL, digest TEXT NOT NULL, document TEXT NOT NULL, PRIMARY KEY(source_id,version))`,
+    `CREATE TABLE application_receipts(source_id TEXT NOT NULL, mutation_id TEXT NOT NULL, request_hash TEXT NOT NULL, receipt TEXT NOT NULL, provenance TEXT NOT NULL, declaration_digest TEXT NOT NULL, PRIMARY KEY(source_id,mutation_id))`,
+  ],
 ];
