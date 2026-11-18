@@ -10,6 +10,8 @@ import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import {
   pkHash,
+  canonicalJson,
+  toHex,
   encodeSegment,
   digestSegment,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -1050,6 +1052,7 @@ describe("disk-backed bootstrap swap", () => {
         return realBatch(statements);
       };
       await applyConnection(d.deps, CONNECTION_ID);
+      expect(await d.position()).toBe(9);
       expect(stagingCommits).toBeGreaterThan(0);
       const afterRoot = await d.db.query(
         "SELECT rootpage FROM sqlite_master WHERE type='table' AND name='records'",
@@ -1096,9 +1099,13 @@ describe("disk-backed bootstrap swap", () => {
     },
   );
 
-  it.each(["swap", "copy"] as const)(
-    "preserves equal-stamp winners when tail fetches finish out of order in %s mode",
-    async (mode) => {
+  it.each(
+    (["swap", "copy"] as const).flatMap((mode) =>
+      ([0, 2, 3] as const).map((winnerPosition) => ({ mode, winnerPosition })),
+    ),
+  )(
+    "preserves equal-stamp winners in $mode with ordinal winner at $winnerPosition",
+    async ({ mode, winnerPosition }) => {
       const w = await world({ streams: 1 });
       const publisher = await w.device("tie-publisher");
       await publisher.run("seed", [{ stream: sName(0), id: "seed" }]);
@@ -1108,6 +1115,14 @@ describe("disk-backed bootstrap swap", () => {
       const hash = await pkHash(async (bytes) => sha256(bytes), { id: "tie" }, [
         "id",
       ]);
+      const values = [
+        { id: "tie", v: 2 },
+        { id: "tie", v: 3 },
+      ];
+      const digestBody = (value: (typeof values)[number]) =>
+        toHex(sha256(new TextEncoder().encode(canonicalJson(value))));
+      values.sort((a, b) => digestBody(a).localeCompare(digestBody(b)));
+      expect(digestBody(values[0]!)).not.toBe(digestBody(values[1]!));
       const refs: StreamSync.SegmentRef[] = [];
       const keys = new Map<number, string>();
       for (let position = 1; position <= 4; position++) {
@@ -1122,7 +1137,12 @@ describe("disk-backed bootstrap swap", () => {
                     stream: sName(0),
                     pkHash: hash,
                     stamp: { o: 10, r: "same" },
-                    value: { id: "tie", v: position },
+                    value: winnerPosition
+                      ? values[position === winnerPosition ? 0 : 1]!
+                      : { id: "tie", v: position },
+                    ...(winnerPosition && {
+                      ordinal: position === winnerPosition ? 9 : 1,
+                    }),
                     firstSeen: 10,
                   },
                 ];
@@ -1167,6 +1187,7 @@ describe("disk-backed bootstrap swap", () => {
       });
       const get = d.deps.blobs.get.bind(d.deps.blobs);
       d.deps.blobs.get = async (key) => {
+        if (key === keys.get(3)) await secondStarted.promise;
         const value = await get(key);
         if (key === keys.get(3) && secondHeld) thirdCompleted.resolve();
         return value;
@@ -1184,13 +1205,40 @@ describe("disk-backed bootstrap swap", () => {
         return result;
       };
       const applying = applyConnection(d.deps, CONNECTION_ID);
+      const settled = applying.then(
+        () => ({ error: null }),
+        (error: unknown) => ({ error }),
+      );
+      let watchdog: ReturnType<typeof setTimeout>;
+      const timeout = new Promise<never>((_, reject) => {
+        watchdog = setTimeout(
+          () =>
+            reject(
+              new Error(
+                "Timed out waiting for held tail reads or apply settlement",
+              ),
+            ),
+          2000,
+        );
+      });
+      const premature = settled.then(({ error }) => {
+        throw (
+          error ??
+          new Error("Apply settled before the tail read ordering was observed")
+        );
+      });
       try {
-        await secondStarted.promise;
-        await thirdCompleted.promise;
+        await Promise.race([secondStarted.promise, premature, timeout]);
+        await Promise.race([thirdCompleted.promise, premature, timeout]);
         expect(secondHeld).toBe(true);
       } finally {
         releaseSecond.resolve();
-        await applying;
+        try {
+          const result = await Promise.race([settled, timeout]);
+          if (result.error) throw result.error;
+        } finally {
+          clearTimeout(watchdog!);
+        }
       }
       expect(committed).toEqual([1, 2, 3, 4]);
       const ordinary = await w.device("tie-ordinary", {
@@ -1203,6 +1251,16 @@ describe("disk-backed bootstrap swap", () => {
         },
       ]);
       await applyConnection(ordinary.deps, CONNECTION_ID);
+      if (winnerPosition) {
+        const expected = [{ body: canonicalJson(values[0]!), stamp_n: 9 }];
+        for (const reader of [d, ordinary])
+          expect(
+            await reader.db.query(
+              "SELECT body,stamp_n FROM records WHERE connection_id=? AND stream=? AND pk_hash=?",
+              [CONNECTION_ID, sName(0), hash],
+            ),
+          ).toEqual(expected);
+      }
       expect(await d.rows()).toEqual(await ordinary.rows());
       expect(
         await d.db.query(
