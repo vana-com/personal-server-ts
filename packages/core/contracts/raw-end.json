@@ -798,9 +798,9 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -850,9 +850,9 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -915,9 +915,9 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -980,9 +980,9 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -1041,9 +1041,9 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -1248,16 +1248,16 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         },
         "B": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -1320,16 +1320,16 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         },
         "B": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -1380,16 +1380,16 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [],
-          "deletedKeys": [["one"]],
-          "everDeletedKeys": [["one"]],
+          "liveCount": 0,
+          "deletedCount": 1,
+          "everDeleted": true,
           "upsertEvents": 0,
           "deleteEvents": 1
         },
         "B": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -1440,9 +1440,9 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [],
-          "deletedKeys": [["one"]],
-          "everDeletedKeys": [["one"]],
+          "liveCount": 0,
+          "deletedCount": 1,
+          "everDeleted": true,
           "upsertEvents": 1,
           "deleteEvents": 1
         }
@@ -1494,9 +1494,9 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [["one"]],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": true,
           "upsertEvents": 1,
           "deleteEvents": 1
         }
@@ -1560,16 +1560,16 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         },
         "B": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -1630,16 +1630,16 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         },
         "B": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -1701,16 +1701,16 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         },
         "B": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -1759,16 +1759,16 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         },
         "B": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -1862,16 +1862,16 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         },
         "B": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -1934,16 +1934,16 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         },
         "B": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -1992,9 +1992,9 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["live"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": false,
           "upsertEvents": 1,
           "deleteEvents": 0
         }
@@ -2052,9 +2052,9 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [],
-          "deletedKeys": [["gone"]],
-          "everDeletedKeys": [["gone"]],
+          "liveCount": 0,
+          "deletedCount": 1,
+          "everDeleted": true,
           "upsertEvents": 0,
           "deleteEvents": 1
         }
@@ -2112,9 +2112,9 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["restored"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [["restored"]],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": true,
           "upsertEvents": 1,
           "deleteEvents": 1
         }
@@ -2231,9 +2231,9 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["live"]],
-          "deletedKeys": [["gone"]],
-          "everDeletedKeys": [["gone"]],
+          "liveCount": 1,
+          "deletedCount": 1,
+          "everDeleted": true,
           "upsertEvents": 1,
           "deleteEvents": 1
         }
@@ -2336,9 +2336,9 @@
       },
       "durable": {
         "A": {
-          "liveKeys": [["one"]],
-          "deletedKeys": [],
-          "everDeletedKeys": [["one"]],
+          "liveCount": 1,
+          "deletedCount": 0,
+          "everDeleted": true,
           "upsertEvents": 3,
           "deleteEvents": 1
         }

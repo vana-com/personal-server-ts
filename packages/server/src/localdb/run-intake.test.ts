@@ -904,3 +904,92 @@ it("reconciles DONE against durable event counts before repeated keys fold", asy
     { checkpoint: '{"items":"new"}' },
   ]);
 });
+
+it("reconciles run-wide DONE events across distinct selected streams without replay or skipped batches", async () => {
+  const f = await fixture();
+  const streams = ["a", "b"].map((name) => ({
+    name,
+    semantics: "mutable_state" as const,
+    primaryKey: ["id"],
+    coverageStrategy: "full_inventory" as const,
+  }));
+  await f.store.begin(
+    "multi-count",
+    { ...request, wantFull: true, selectedStreams: ["a", "b"] },
+    { ...declaration, streams },
+  );
+  const first = {
+    batch: 0,
+    records: [
+      { stream: "a", data: { id: "one", n: 1 } },
+      { stream: "a", data: { id: "one", n: 2 } },
+      { stream: "b", data: { id: "two" } },
+      { stream: "b", data: { id: "three" } },
+      { stream: "b", data: { id: "four" } },
+    ],
+  };
+  expect(await f.store.batch("multi-count", first)).toMatchObject({
+    applied: true,
+    accepted: 5,
+  });
+  expect(await f.store.batch("multi-count", first)).toMatchObject({
+    applied: false,
+    accepted: 0,
+  });
+  // Batch 2 skips the required batch 1: its RECORD never enters the ledger.
+  await expect(
+    f.store.batch("multi-count", {
+      batch: 2,
+      records: [{ stream: "b", data: { id: "skipped" } }],
+    }),
+  ).rejects.toMatchObject({ code: "batch_gap", nextBatch: 1 });
+  expect(
+    await f.store.batch("multi-count", {
+      batch: 1,
+      records: [
+        { stream: "a", op: "delete", data: { id: "one" } },
+        { stream: "a", data: { id: "five" } },
+      ],
+    }),
+  ).toMatchObject({ applied: true, accepted: 2 });
+  const end = {
+    wireDialect: "connector-end-evidence/1",
+    lastBatch: 1,
+    selectedStreams: ["a", "b"],
+    done: { status: "succeeded", recordsEmitted: 7 },
+    errors: [],
+    checkpoints: {},
+    preflightExcludedStreams: [],
+    detailCoverage: {},
+    invalidDetailCoverageStreams: [],
+    wholeStreamEvidence: [
+      { stream: "a", report: { considered: 2, covered: 2 } },
+      { stream: "b", report: { considered: 3, covered: 3 } },
+    ],
+  };
+  // Per-stream event totals are 4 and 3; final key totals are 2 and 3.
+  // Neither those subtotals, the five final keys, the skipped RECORD, nor
+  // recounting batch 0's five replayed RECORDs can match the run-wide seven.
+  for (const recordsEmitted of [4, 3, 5, 8, 12])
+    await expect(
+      f.end.end("multi-count", {
+        ...end,
+        done: { ...end.done, recordsEmitted },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+  expect(await f.end.end("multi-count", end)).toMatchObject({
+    outcome: "succeeded",
+    coveredStreams: ["a", "b"],
+    provenFullStreams: ["a", "b"],
+  });
+  expect(
+    await f.db.query(
+      "SELECT stream,record_key FROM records ORDER BY stream,record_key",
+    ),
+  ).toEqual([
+    { stream: "a", record_key: "five" },
+    { stream: "b", record_key: "four" },
+    { stream: "b", record_key: "three" },
+    { stream: "b", record_key: "two" },
+  ]);
+});

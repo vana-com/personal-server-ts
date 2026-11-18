@@ -169,7 +169,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
     return queue.run(
       binding.connection_id,
       "end",
-      async (): Promise<RunEndResponse> => {
+      async function complete(skipZeroDeletes = true): Promise<RunEndResponse> {
         // Re-read after acquiring the queue: an earlier end or delete may have won.
         const [run] = await db.query<Run>(
           "SELECT * FROM runs WHERE run_id = ?",
@@ -270,7 +270,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
                   ]),
                 ),
               },
-              await readRawRecordEvidence(db, runId),
+              await readRawRecordEvidence(db, runId, streams),
             )
           : parseEndRequest(
               body,
@@ -349,6 +349,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         );
         const op = deps.newOp();
         const statements: SqlStatement[] = [];
+        const zeroDeleteStreams: string[] = [];
         const results: Record<string, StreamRunResult> = Object.create(null);
         let merged = false;
         let lateAdmission = false;
@@ -447,22 +448,25 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
                 FROM run_rows WHERE run_id = ? AND stream = ? AND op = 'upsert'`,
               params: [op, run.o, runId, run.o, runId, stream.stream],
             });
-          statements.push(
-            ...deleteRunRecords(
-              run.connection_id,
-              stream.stream,
-              runId,
-              run.o,
-              before!.seq,
-            ),
-            ...tombstoneRunDeletes(
-              run.connection_id,
-              stream.stream,
-              runId,
-              run.o,
-              deps.publishWhileCollecting === true,
-            ),
-          );
+          if (skipZeroDeletes && stream.deletes === 0)
+            zeroDeleteStreams.push(stream.stream);
+          else
+            statements.push(
+              ...deleteRunRecords(
+                run.connection_id,
+                stream.stream,
+                runId,
+                run.o,
+                before!.seq,
+              ),
+              ...tombstoneRunDeletes(
+                run.connection_id,
+                stream.stream,
+                runId,
+                run.o,
+                deps.publishWhileCollecting === true,
+              ),
+            );
           merged ||= kept > 0;
           const nextVersion =
             stream.floor_version === null ||
@@ -646,7 +650,36 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           updateRequired,
         );
         statements.push(...cleanup(response));
-        await db.batch(withOrigin("local", statements));
+        // Counts above are a planning hint. Intake does not use the connection
+        // queue, so prove zero again INSIDE the merge transaction before omitting
+        // delete work. A raced delete rolls back everything and replans once,
+        // with the skip disabled. No driver-specific transaction API is needed.
+        const deleteCheck: SqlStatement[] =
+          zeroDeleteStreams.length === 0
+            ? []
+            : [
+                {
+                  sql: "CREATE TEMP TABLE run_end_delete_check(ok INTEGER CONSTRAINT run_end_delete_count_changed CHECK(ok=1))",
+                },
+                ...zeroDeleteStreams.map((stream) => ({
+                  sql: "INSERT INTO run_end_delete_check SELECT NOT EXISTS(SELECT 1 FROM run_rows WHERE run_id=? AND stream=? AND op='delete')",
+                  params: [runId, stream],
+                })),
+                { sql: "DROP TABLE run_end_delete_check" },
+              ];
+        try {
+          await db.batch(withOrigin("local", [...deleteCheck, ...statements]));
+        } catch (error) {
+          if (
+            skipZeroDeletes &&
+            error instanceof Error &&
+            error.message.includes(
+              "CHECK constraint failed: run_end_delete_count_changed",
+            )
+          )
+            return complete(false);
+          throw error;
+        }
         announceRecordsCommitted(deps);
         return response;
       },

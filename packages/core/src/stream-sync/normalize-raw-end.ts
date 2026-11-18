@@ -6,11 +6,11 @@ import type { EndRequest, StreamObservation } from "./intake.js";
 import type { RunFinishStream } from "./run-finish-plan.js";
 import { rawEndInvalid, validateRawEnd, type RawEndError } from "./raw-end.js";
 
-/** Core-owned final keys and delete history captured by durable intake. */
+/** Core-owned final counts and delete history captured by durable intake. */
 export interface DurableRecordEvidence {
-  readonly liveKeys: readonly JsonValue[];
-  readonly deletedKeys: readonly JsonValue[];
-  readonly everDeletedKeys: readonly JsonValue[];
+  readonly liveCount: number;
+  readonly deletedCount: number;
+  readonly everDeleted: boolean;
   readonly upsertEvents: number;
   readonly deleteEvents: number;
 }
@@ -26,9 +26,9 @@ export interface NormalizedRawEnd extends EndRequest {
   >;
 }
 export const EMPTY_RAW_RECORDS: DurableRecordEvidence = {
-  liveKeys: [],
-  deletedKeys: [],
-  everDeletedKeys: [],
+  liveCount: 0,
+  deletedCount: 0,
+  everDeleted: false,
   upsertEvents: 0,
   deleteEvents: 0,
 };
@@ -80,7 +80,7 @@ function wholeProof(
     !("keys" in report) &&
     Number.isSafeInteger(considered) &&
     considered === covered &&
-    considered === evidence.liveKeys.length + evidence.deletedKeys.length &&
+    considered === evidence.liveCount + evidence.deletedCount &&
     (gaps === undefined || (Array.isArray(gaps) && gaps.length === 0)) &&
     validDetailReport(report) &&
     !reportHasGap(report)
@@ -110,15 +110,20 @@ function validDetailReport(report: JsonValue | undefined): boolean {
 function reportHasGap(report: JsonValue | undefined): boolean {
   if (report === undefined || !validDetailReport(report)) return false;
   const r = report as { readonly [key: string]: JsonValue };
-  const hydrated = Array.isArray(r.hydrated_keys) ? r.hydrated_keys : [];
-  return (
+  // Preserve the short circuit for count gaps and absent required keys.
+  if (
     r.considered !== r.covered ||
-    (Array.isArray(r.gap_keys) && r.gap_keys.length > 0) ||
-    (Array.isArray(r.required_keys) &&
-      r.required_keys.some(
-        (key) => !hydrated.some((h) => canonicalJson(key) === canonicalJson(h)),
-      ))
+    (Array.isArray(r.gap_keys) && r.gap_keys.length > 0)
+  )
+    return true;
+  if (!Array.isArray(r.required_keys) || r.required_keys.length === 0)
+    return false;
+  const hydrated = new Set(
+    (Array.isArray(r.hydrated_keys) ? r.hydrated_keys : []).map((key) =>
+      canonicalJson(key),
+    ),
   );
+  return r.required_keys.some((key) => !hydrated.has(canonicalJson(key)));
 }
 
 /** Validate, bind to START selection, and derive record facts from durably captured batches. */
@@ -204,8 +209,8 @@ export function normalizeRawEnd(
       declaration.coverageStrategy === "full_inventory" &&
       wholeProof(proof.report, captured);
     const observation: StreamObservation & { sourceAnswered?: boolean } = {
-      liveRecord: captured.liveKeys.length > 0,
-      explicitDelete: captured.everDeletedKeys.length > 0,
+      liveRecord: captured.liveCount > 0,
+      explicitDelete: captured.everDeleted,
       retryableSkip: skips.some(retryable),
       otherSkip: skips.some((e) => !retryable(e)),
       preflightExclusion: raw.preflightExcludedStreams.includes(stream),
