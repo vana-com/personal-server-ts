@@ -1,15 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { normalizeRawEnd } from "./normalize-raw-end.js";
-import type { RawEndV1, RawRecordEvidence } from "./raw-end.js";
+import type { RawEndV1 } from "./raw-end.js";
+import type { DurableRecordEvidence } from "./normalize-raw-end.js";
 
-const empty: RawRecordEvidence = {
+const empty: DurableRecordEvidence = {
   liveKeys: [],
   deletedKeys: [],
   everDeletedKeys: [],
   upsertEvents: 0,
   deleteEvents: 0,
 };
-const live: RawRecordEvidence = {
+const live: DurableRecordEvidence = {
   ...empty,
   liveKeys: [["one"]],
   upsertEvents: 1,
@@ -20,7 +21,6 @@ const raw = (patch: Partial<RawEndV1> = {}): RawEndV1 => ({
   selectedStreams: ["A", "B"],
   done: { status: "succeeded" },
   errors: [],
-  records: {},
   checkpoints: {},
   preflightExcludedStreams: [],
   detailCoverage: {},
@@ -42,11 +42,9 @@ const begin = {
 describe("normalizeRawEnd", () => {
   it("keeps completion separate from whole proof and folds delete history", () => {
     const evidence = { ...live, everDeletedKeys: [["one"]], deleteEvents: 1 };
-    const end = normalizeRawEnd(
-      raw({ covered: ["A"], records: { A: evidence } }),
-      begin,
-      { A: evidence },
-    );
+    const end = normalizeRawEnd(raw({ covered: ["A"] }), begin, {
+      A: evidence,
+    });
     expect(end.streams.A).toMatchObject({
       liveRecord: true,
       explicitDelete: true,
@@ -103,42 +101,37 @@ describe("normalizeRawEnd", () => {
     expect(end.streams.A?.otherSkip).toBe(true);
     expect(end.streams.B?.detailGap).toBe("retryable");
   });
-  it("rejects selection mismatch and any disagreement with durable events", () => {
+  it("rejects selection mismatch and unselected durable records", () => {
     expect(() =>
       normalizeRawEnd(raw({ selectedStreams: ["A"] }), begin, {}),
     ).toThrow(/selection/);
+    expect(() => normalizeRawEnd(raw(), begin, { C: live })).toThrow(
+      /unselected/,
+    );
+    expect(
+      normalizeRawEnd(raw(), begin, { A: live }).streams.A?.liveRecord,
+    ).toBe(true);
     expect(() =>
-      normalizeRawEnd(raw({ records: { A: live } }), begin, {}),
-    ).toThrow(/durable/);
-    expect(() => normalizeRawEnd(raw(), begin, { A: live })).toThrow(/durable/);
-    expect(() =>
-      normalizeRawEnd(
-        raw({ records: { A: { ...live, upsertEvents: 2 } } }),
-        begin,
-        { A: live },
-      ),
-    ).toThrow(/durable/);
+      normalizeRawEnd({ ...raw(), records: { A: live } }, begin, {}),
+    ).toThrow(/derived/);
   });
-  it("validates whole-inventory tuples against captured keys, never counts alone", () => {
+  it("validates explicit whole-inventory enumeration against durable final key count", () => {
     const proof = {
       stream: "A",
-      report: { keys: [["one"]], considered: 1, covered: 1, gap_keys: [] },
+      report: { considered: 1, covered: 1, gap_keys: [] },
     };
     expect(
-      normalizeRawEnd(
-        raw({ records: { A: live }, wholeStreamEvidence: [proof] }),
-        begin,
-        { A: live },
-      ).provenFullStreams,
+      normalizeRawEnd(raw({ wholeStreamEvidence: [proof] }), begin, { A: live })
+        .provenFullStreams,
     ).toEqual(["A"]);
     for (const report of [
-      { considered: 1, covered: 1 },
-      { keys: [["other"]], considered: 1, covered: 1 },
-      { keys: [["one"]], considered: 2, covered: 2 },
+      { considered: 1, covered: 0 },
+      { considered: 1, covered: 1, gap_keys: [["one"]] },
+      { considered: 2, covered: 2 },
+      { keys: [["one"]], considered: 1, covered: 1 },
     ]) {
       const end = normalizeRawEnd(
         raw({
-          records: { A: live },
           wholeStreamEvidence: [{ stream: "A", report }],
         }),
         begin,
@@ -151,7 +144,7 @@ describe("normalizeRawEnd", () => {
       normalizeRawEnd(
         raw({
           wholeStreamEvidence: [
-            { stream: "A", report: { keys: [], considered: 0, covered: 0 } },
+            { stream: "A", report: { considered: 0, covered: 0 } },
           ],
         }),
         begin,
@@ -179,7 +172,7 @@ it("refuses a host-certified finish claim instead of trusting failedStreams", ()
   expect(() =>
     normalizeRawEnd(
       {
-        ...raw({ records: { A: live } }),
+        ...raw(),
         finish: { kind: "certified_failed_done", failedStreams: ["B"] },
       },
       begin,
@@ -235,11 +228,10 @@ it("certifies raw failed DONE only from attributable collection-failure skips", 
 it("holds incomplete detail reports even when no separate gap event arrived", () => {
   const end = normalizeRawEnd(
     raw({
-      records: { A: live },
       covered: ["A"],
       detailCoverage: { A: { considered: 1, covered: 0, gap_keys: [["one"]] } },
       wholeStreamEvidence: [
-        { stream: "A", report: { keys: [["one"]], considered: 1, covered: 1 } },
+        { stream: "A", report: { considered: 1, covered: 1 } },
       ],
     }),
     begin,
@@ -301,4 +293,34 @@ it("preserves native gap retryability, recovered frames and string recovery hint
   );
   expect(end.streams.A?.detailGap).toBe("fatal");
   expect(end.streams.B?.retryableSkip).toBe(true);
+});
+
+it("classifies stream-scoped structured retry hints independently on succeeded DONE", () => {
+  const end = normalizeRawEnd(
+    raw({
+      errors: [
+        {
+          kind: "skip_result",
+          scope: { kind: "stream", stream: "A" },
+          recoveryHint: { retryable: true },
+        },
+        {
+          kind: "skip_result",
+          scope: { kind: "stream", stream: "B" },
+          recoveryHint: { retryable: false },
+        },
+      ],
+    }),
+    begin,
+    {},
+  );
+  expect(end.streams.A).toMatchObject({
+    retryableSkip: true,
+    otherSkip: false,
+  });
+  expect(end.streams.B).toMatchObject({
+    retryableSkip: false,
+    otherSkip: true,
+  });
+  expect(end.finish).toBe("completed");
 });

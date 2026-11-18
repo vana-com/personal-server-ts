@@ -61,7 +61,7 @@ async function build(device: string) {
       deviceId: name,
     });
     drivers.push(db);
-    return createLocalSync(
+    const sync = createLocalSync(
       {
         db,
         queue: connectionQueue(),
@@ -83,11 +83,12 @@ async function build(device: string) {
         resolveArtifact: (d) => declarations.get(d) ?? null,
       },
     );
+    return { sync, db };
   };
-  const sync = await open(device);
+  const { sync, db } = await open(device);
   const intake = sync.intake;
   const read = async (connector: string) => {
-    const peer = await open(device + "-peer");
+    const { sync: peer } = await open(device + "-peer");
     await peer.apply();
     const rows = new Map<string, unknown>();
     for await (const record of peer.query.streamRecords(
@@ -131,7 +132,7 @@ async function build(device: string) {
       },
       body: typeof json === "string" ? json : JSON.stringify(json),
     });
-  return { sync, call, read };
+  return { sync, call, read, db };
 }
 
 const beginBody = (extra: Record<string, unknown> = {}) => {
@@ -422,15 +423,6 @@ it.each(["http", "in-process"] as const)(
       selectedStreams: ["items"],
       done: { status: "succeeded" },
       errors: [],
-      records: {
-        items: {
-          liveKeys: [["a"]],
-          deletedKeys: [],
-          everDeletedKeys: [["a"]],
-          upsertEvents: 2,
-          deleteEvents: 1,
-        },
-      },
       checkpoints: { items: "c1" },
       preflightExcludedStreams: [],
       detailCoverage: {},
@@ -467,38 +459,138 @@ it.each(["http", "in-process"] as const)(
   },
 );
 
-it("reads raw key inventories beyond the legacy observation body limit", async () => {
+it("rejects obsolete host key inventories", async () => {
   const { call } = await build("raw-inventory");
   expect(
     (await call("PUT", "raw", beginBody({ selectedStreams: ["items"] })))
       .status,
   ).toBe(200);
-  const keys = Array.from({ length: 9000 }, (_, i) => [
-    `${i}-${"k".repeat(128)}`,
-  ]);
   const response = await call("POST", "raw/end", {
     wireDialect: "connector-end-evidence/1",
     lastBatch: -1,
     selectedStreams: ["items"],
     done: { status: "succeeded" },
     errors: [],
-    records: {
-      items: {
-        liveKeys: keys,
-        deletedKeys: [],
-        everDeletedKeys: [],
-        upsertEvents: keys.length,
-        deleteEvents: 0,
-      },
-    },
+    records: { items: { liveKeys: [["invented"]] } },
     checkpoints: {},
     preflightExcludedStreams: [],
     detailCoverage: {},
     invalidDetailCoverageStreams: [],
     wholeStreamEvidence: [],
   });
-  // This inventory was not uploaded: it must reach core's durable-evidence
-  // refusal, rather than the old small observation-only transport ceiling.
   expect(response.status).toBe(400);
-  expect((await response.json()).message).toMatch(/durable batches/);
+  expect((await response.json()).message).toMatch(
+    /derived from durable batches/,
+  );
 });
+
+it.each(["http", "in-process"] as const)(
+  "binds end dialect to explicit begin selection over %s",
+  async (transport) => {
+    const { sync, call, db } = await build(`dialect-${transport}`);
+    const body = beginBody({ connect: true });
+    body.artifactDigest = artifactFor(body.connector, {
+      ...DECLARATIONS,
+      streams: [
+        { ...DECLARATIONS.streams[0]!, coverageStrategy: "full_inventory" },
+      ],
+    });
+    expect((await call("PUT", "old", body)).status).toBe(200);
+    expect(
+      (
+        await call("POST", "old/batches", {
+          batch: 0,
+          records: [{ stream: "items", data: { id: "old" } }],
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await call(
+          "POST",
+          "old/end",
+          endRequest({
+            lastBatch: 0,
+            live: ["items"],
+            checkpoints: { items: "old" },
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await call("PUT", "selected", {
+          ...body,
+          connect: false,
+          observedAt: T0 + 1,
+          wantFull: true,
+          selectedStreams: ["items"],
+        })
+      ).status,
+    ).toBe(200);
+    // Isolate end admission from the fixture's publication/checkpoint policy.
+    await db.batch([
+      {
+        sql: "UPDATE connections SET checkpoint = ?",
+        params: ['{"items":"old"}'],
+      },
+    ]);
+    const records = await db.query("SELECT * FROM records");
+    expect(records).toHaveLength(1);
+    const checkpoints = await db.query("SELECT checkpoint FROM connections");
+    expect(checkpoints).toEqual([{ checkpoint: '{"items":"old"}' }]);
+    const forged = endRequest({
+      lastBatch: -1,
+      streams: ["items"],
+      provenFullStreams: ["items"],
+      checkpoints: { items: "forged" },
+    });
+    if (transport === "http") {
+      const result = await call("POST", "selected/end", forged);
+      expect(result.status).toBe(400);
+      expect(await result.json()).toMatchObject({ error: "invalid_request" });
+    } else {
+      await expect(sync.intake.end("selected", forged)).rejects.toMatchObject({
+        code: "invalid_request",
+      });
+    }
+    expect(await db.query("SELECT * FROM records")).toEqual(records);
+    expect(await db.query("SELECT checkpoint FROM connections")).toEqual(
+      checkpoints,
+    );
+    expect(
+      await db.query(
+        "SELECT state,raw_end,end_response FROM runs WHERE run_id='selected'",
+      ),
+    ).toEqual([{ state: "collecting", raw_end: null, end_response: null }]);
+    const raw = validateRawEnd({
+      wireDialect: "connector-end-evidence/1",
+      lastBatch: -1,
+      selectedStreams: ["items"],
+      covered: ["items"],
+      done: { status: "succeeded", recordsEmitted: 0 },
+      errors: [],
+      checkpoints: { items: "new" },
+      preflightExcludedStreams: [],
+      detailCoverage: {},
+      invalidDetailCoverageStreams: [],
+      wholeStreamEvidence: [
+        { stream: "items", report: { considered: 0, covered: 0 } },
+      ],
+    });
+    let receipt;
+    if (transport === "http") {
+      const result = await call("POST", "selected/end", raw);
+      expect(result.status).toBe(200);
+      receipt = await result.json();
+    } else receipt = await sync.intake.end("selected", raw);
+    expect(receipt).toMatchObject({
+      outcome: "succeeded",
+      coveredStreams: ["items"],
+      provenFullStreams: ["items"],
+    });
+    expect(
+      await db.query("SELECT state FROM runs WHERE run_id='selected'"),
+    ).toEqual([{ state: "ended" }]);
+  },
+);

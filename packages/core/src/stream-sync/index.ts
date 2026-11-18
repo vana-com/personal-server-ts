@@ -21,6 +21,9 @@ export {
   type RawEndV1,
   type RawEndError,
   type RawEndScope,
-  type RawRecordEvidence,
 } from "./raw-end.js";
-export { normalizeRawEnd, type RawEndBegin } from "./normalize-raw-end.js";
+export {
+  normalizeRawEnd,
+  type RawEndBegin,
+  type DurableRecordEvidence,
+} from "./normalize-raw-end.js";

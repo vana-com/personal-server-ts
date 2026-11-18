@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   connectionQueue,
   createRecordQuery,
-  openLocalDb,
   type LocalSyncDeps,
   type SqlDriver,
 } from "@opendatalabs/personal-server-ts-core/localdb";
@@ -14,6 +13,7 @@ import {
   createRunIntakeStore,
   STAGED_KEY_CONFLICTS,
 } from "../../../core/src/localdb/run-intake.js";
+import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
 import { RegistryUnavailableError } from "../../../core/src/stream-sync/ports.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
@@ -599,7 +599,7 @@ describe("raw evidence capture", () => {
   );
 });
 
-it("normalizes raw evidence before run-end fences and rejects invented history", async () => {
+it("derives raw end facts from durable mixed batches without host record evidence", async () => {
   const f = await fixture();
   await f.store.begin(
     "raw",
@@ -609,6 +609,8 @@ it("normalizes raw evidence before run-end fences and rejects invented history",
   await f.store.batch("raw", {
     batch: 0,
     records: [
+      { stream: "items", data: { id: "live" } },
+      { stream: "items", op: "delete", data: { id: "gone" } },
       { stream: "items", op: "delete", data: { id: "a" } },
       { stream: "items", data: { id: "a" } },
     ],
@@ -619,27 +621,12 @@ it("normalizes raw evidence before run-end fences and rejects invented history",
     selectedStreams: ["items"],
     done: { status: "succeeded" },
     errors: [],
-    records: {
-      items: {
-        liveKeys: [["a"]],
-        deletedKeys: [],
-        everDeletedKeys: [["a"]],
-        upsertEvents: 1,
-        deleteEvents: 1,
-      },
-    },
     checkpoints: {},
     preflightExcludedStreams: [],
     detailCoverage: {},
     invalidDetailCoverageStreams: [],
     wholeStreamEvidence: [],
   };
-  await expect(
-    f.end.end("raw", {
-      ...raw,
-      records: { items: { ...raw.records.items, deleteEvents: 2 } },
-    }),
-  ).rejects.toMatchObject({ code: "invalid_request" });
   await expect(
     f.end.end("raw", { ...raw, lastBatch: -1 }),
   ).rejects.toMatchObject({ code: "batch_gap", nextBatch: 1 });
@@ -650,8 +637,9 @@ it("normalizes raw evidence before run-end fences and rejects invented history",
   expect(
     await f.db.query("SELECT raw_end FROM runs WHERE run_id='raw'"),
   ).toEqual([{ raw_end: JSON.stringify(raw) }]);
-  expect(await f.db.query("SELECT body FROM records")).toEqual([
+  expect(await f.db.query("SELECT body FROM records ORDER BY body")).toEqual([
     { body: '{"id":"a"}' },
+    { body: '{"id":"live"}' },
   ]);
 });
 
@@ -739,15 +727,6 @@ it.each([
                 recoveryHint: { retryable: true },
               },
             ],
-      records: {
-        a: {
-          liveKeys: [["one"]],
-          deletedKeys: [],
-          everDeletedKeys: [],
-          upsertEvents: 1,
-          deleteEvents: 0,
-        },
-      },
       checkpoints: { a: "a1", b: "must-not-advance" },
       preflightExcludedStreams: [],
       detailCoverage: {},
@@ -809,7 +788,6 @@ it("an empty explicit selection is a no-op for declared stream state", async () 
     selectedStreams: [],
     done: { status: "succeeded" },
     errors: [],
-    records: {},
     checkpoints: {},
     preflightExcludedStreams: [],
     detailCoverage: {},
@@ -822,4 +800,107 @@ it("an empty explicit selection is a no-op for declared stream state", async () 
     streamStatus: {},
   });
   expect(await f.db.query("SELECT * FROM stream_state")).toEqual(before);
+});
+
+it("rejects a contradictory DONE count without changing records or checkpoints", async () => {
+  const f = await fixture();
+  const declarations: IntakeDeclarations = {
+    ...declaration,
+    streams: [
+      { ...declaration.streams[0]!, coverageStrategy: "full_inventory" },
+    ],
+  };
+  await f.store.begin("old", request, declarations);
+  await f.store.batch("old", {
+    batch: 0,
+    records: [{ stream: "items", data: { id: "old" } }],
+  });
+  await f.end.end(
+    "old",
+    endRequest({
+      lastBatch: 0,
+      live: ["items"],
+      provenFullStreams: ["items"],
+      checkpoints: { items: "old" },
+    }),
+  );
+  await f.store.begin(
+    "count",
+    { ...request, observedAt: 50, wantFull: true, selectedStreams: ["items"] },
+    declarations,
+  );
+  const records = await f.db.query("SELECT * FROM records");
+  const checkpoints = await f.db.query("SELECT checkpoint FROM connections");
+  expect(checkpoints).toEqual([{ checkpoint: '{"items":"old"}' }]);
+  await expect(
+    f.end.end("count", {
+      wireDialect: "connector-end-evidence/1",
+      lastBatch: -1,
+      selectedStreams: ["items"],
+      covered: ["items"],
+      done: { status: "succeeded", recordsEmitted: 1 },
+      errors: [],
+      checkpoints: { items: "new" },
+      preflightExcludedStreams: [],
+      detailCoverage: {},
+      invalidDetailCoverageStreams: [],
+      wholeStreamEvidence: [
+        { stream: "items", report: { considered: 0, covered: 0 } },
+      ],
+    }),
+  ).rejects.toMatchObject({ code: "invalid_request" });
+  expect(await f.db.query("SELECT * FROM records")).toEqual(records);
+  expect(await f.db.query("SELECT checkpoint FROM connections")).toEqual(
+    checkpoints,
+  );
+  expect(
+    await f.db.query(
+      "SELECT state,raw_end,end_response FROM runs WHERE run_id='count'",
+    ),
+  ).toEqual([{ state: "collecting", raw_end: null, end_response: null }]);
+});
+
+it("reconciles DONE against durable event counts before repeated keys fold", async () => {
+  const f = await fixture();
+  await f.store.begin(
+    "count",
+    { ...request, selectedStreams: ["items"] },
+    declaration,
+  );
+  const batch = {
+    batch: 0,
+    records: [
+      { stream: "items", data: { id: "one", n: 1 } },
+      { stream: "items", data: { id: "one", n: 2 } },
+      { stream: "items", op: "delete", data: { id: "one" } },
+      { stream: "items", data: { id: "one", n: 3 } },
+    ],
+  };
+  await f.store.batch("count", batch);
+  await f.store.batch("count", batch);
+  const end = {
+    wireDialect: "connector-end-evidence/1",
+    lastBatch: 0,
+    selectedStreams: ["items"],
+    done: { status: "succeeded", recordsEmitted: 4 },
+    errors: [],
+    checkpoints: { items: "new" },
+    preflightExcludedStreams: [],
+    detailCoverage: {},
+    invalidDetailCoverageStreams: [],
+    wholeStreamEvidence: [],
+  };
+  await expect(
+    f.end.end("count", { ...end, done: { ...end.done, recordsEmitted: 1 } }),
+  ).rejects.toMatchObject({ code: "invalid_request" });
+  expect(await f.end.end("count", end)).toMatchObject({
+    outcome: "succeeded",
+    coveredStreams: ["items"],
+  });
+  expect(await f.db.query("SELECT body FROM records")).toEqual([
+    { body: '{"id":"one","n":3}' },
+  ]);
+  expect(await f.db.query("SELECT checkpoint FROM connections")).toEqual([
+    { checkpoint: '{"items":"new"}' },
+  ]);
 });

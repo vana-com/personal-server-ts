@@ -1,12 +1,12 @@
 import type { JsonValue } from "@opendatalabs/personal-server-ts-stream-sync";
-import type { RawRecordEvidence } from "../stream-sync/raw-end.js";
+import type { DurableRecordEvidence } from "../stream-sync/normalize-raw-end.js";
 import type { SqlReader } from "./driver.js";
 
 /** Intake's atomic event ledger plus its ordered, final key fold. */
 export async function readRawRecordEvidence(
   db: SqlReader,
   runId: string,
-): Promise<Record<string, RawRecordEvidence>> {
+): Promise<Record<string, DurableRecordEvidence>> {
   const rows = await db.query<{
     stream: string;
     pk_values: string;

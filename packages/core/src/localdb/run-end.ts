@@ -250,6 +250,11 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             "invalid_request",
             "raw end requires explicit selection at begin",
           );
+        if (!raw && run.selected_streams !== null)
+          throw new RunIntakeError(
+            "invalid_request",
+            "explicit selection requires raw end",
+          );
         const req = raw
           ? normalizeRawEnd(
               body,

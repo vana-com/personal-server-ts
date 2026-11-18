@@ -4,14 +4,16 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { EndRequest, StreamObservation } from "./intake.js";
 import type { RunFinishStream } from "./run-finish-plan.js";
-import {
-  rawEndInvalid,
-  rawKeySet,
-  validateRawEnd,
-  type RawEndError,
-  type RawRecordEvidence,
-} from "./raw-end.js";
+import { rawEndInvalid, validateRawEnd, type RawEndError } from "./raw-end.js";
 
+/** Core-owned final keys and delete history captured by durable intake. */
+export interface DurableRecordEvidence {
+  readonly liveKeys: readonly JsonValue[];
+  readonly deletedKeys: readonly JsonValue[];
+  readonly everDeletedKeys: readonly JsonValue[];
+  readonly upsertEvents: number;
+  readonly deleteEvents: number;
+}
 export interface RawEndBegin {
   readonly selectedStreams: readonly string[];
   readonly streams: Readonly<
@@ -23,18 +25,13 @@ export interface NormalizedRawEnd extends EndRequest {
     Record<string, StreamObservation & { readonly sourceAnswered?: boolean }>
   >;
 }
-export const EMPTY_RAW_RECORDS: RawRecordEvidence = {
+export const EMPTY_RAW_RECORDS: DurableRecordEvidence = {
   liveKeys: [],
   deletedKeys: [],
   everDeletedKeys: [],
   upsertEvents: 0,
   deleteEvents: 0,
 };
-function sameKeys(a: readonly JsonValue[], b: readonly JsonValue[]): boolean {
-  const left = rawKeySet(a),
-    right = rawKeySet(b);
-  return left.size === right.size && [...left].every((key) => right.has(key));
-}
 /** V1 machine-code fallback. Human messages are never policy inputs. */
 const RETRYABLE_CODES_V1 = new Set([
   "timeout",
@@ -62,34 +59,32 @@ function retryable(error: RawEndError): boolean {
   );
 }
 
-/** Whole-inventory proof: an explicit tuple inventory matching durable final keys.
- * Counts corroborate that inventory; count-only reports never prove replacement.
- * Other declaration strategies cannot authorize whole-inventory replacement.
+/** The connector claims complete enumeration; core counts its durable final keys.
+ * Only an explicit report under a full-read/full-inventory declaration can prove
+ * replacement. Equal counts alone outside that claim never authorize it.
  */
-function wholeProof(report: JsonValue, evidence: RawRecordEvidence): boolean {
+function wholeProof(
+  report: JsonValue,
+  evidence: DurableRecordEvidence,
+): boolean {
   if (report === null || typeof report !== "object" || Array.isArray(report))
     return false;
   const {
-    keys,
     considered,
     covered,
     gap_keys: gaps,
-  } = report as { readonly [key: string]: JsonValue };
-  if (
-    !Array.isArray(keys) ||
-    !Number.isSafeInteger(considered) ||
-    considered !== covered ||
-    considered !== keys.length ||
-    (gaps !== undefined && (!Array.isArray(gaps) || gaps.length !== 0)) ||
-    !validDetailReport(report) ||
-    reportHasGap(report)
-  )
-    return false;
-  try {
-    return sameKeys(keys, [...evidence.liveKeys, ...evidence.deletedKeys]);
-  } catch {
-    return false;
-  }
+  } = report as {
+    readonly [key: string]: JsonValue;
+  };
+  return (
+    !("keys" in report) &&
+    Number.isSafeInteger(considered) &&
+    considered === covered &&
+    considered === evidence.liveKeys.length + evidence.deletedKeys.length &&
+    (gaps === undefined || (Array.isArray(gaps) && gaps.length === 0)) &&
+    validDetailReport(report) &&
+    !reportHasGap(report)
+  );
 }
 
 function validDetailReport(report: JsonValue | undefined): boolean {
@@ -126,11 +121,11 @@ function reportHasGap(report: JsonValue | undefined): boolean {
   );
 }
 
-/** Validate, bind to START selection, and reconcile against durably captured batches. */
+/** Validate, bind to START selection, and derive record facts from durably captured batches. */
 export function normalizeRawEnd(
   body: unknown,
   begin: RawEndBegin,
-  durable: Readonly<Record<string, RawRecordEvidence>>,
+  durable: Readonly<Record<string, DurableRecordEvidence>>,
 ): NormalizedRawEnd {
   const raw = validateRawEnd(body);
   if (
@@ -146,6 +141,16 @@ export function normalizeRawEnd(
   for (const stream of Object.keys(durable))
     if (!raw.selectedStreams.includes(stream))
       rawEndInvalid("unselected durable records");
+  // Protocol RECORD totals include deletes and repeated upserts before folding.
+  if (raw.done.recordsEmitted !== undefined) {
+    const emitted = Object.values(durable).reduce(
+      (total, evidence) =>
+        total + evidence.upsertEvents + evidence.deleteEvents,
+      0,
+    );
+    if (!Number.isSafeInteger(emitted) || raw.done.recordsEmitted !== emitted)
+      rawEndInvalid("DONE record count contradicts durable batches");
+  }
   const streams: Record<
     string,
     StreamObservation & { sourceAnswered?: boolean }
@@ -179,23 +184,12 @@ export function normalizeRawEnd(
         ? "certified_failed_done"
         : "failed_done_upsert_only";
   for (const stream of raw.selectedStreams) {
-    const supplied = Object.hasOwn(raw.records, stream)
-      ? raw.records[stream]!
-      : EMPTY_RAW_RECORDS;
     const captured = Object.hasOwn(durable, stream)
       ? durable[stream]!
       : EMPTY_RAW_RECORDS;
     const detailCoverage = Object.hasOwn(raw.detailCoverage, stream)
       ? raw.detailCoverage[stream]
       : undefined;
-    if (
-      supplied.upsertEvents !== captured.upsertEvents ||
-      supplied.deleteEvents !== captured.deleteEvents ||
-      !sameKeys(supplied.liveKeys, captured.liveKeys) ||
-      !sameKeys(supplied.deletedKeys, captured.deletedKeys) ||
-      !sameKeys(supplied.everDeletedKeys, captured.everDeletedKeys)
-    )
-      rawEndInvalid(`records contradict durable batches for ${stream}`);
     const errors = raw.errors.filter(
       (e) => e.scope.kind === "run" || e.scope.stream === stream,
     );
