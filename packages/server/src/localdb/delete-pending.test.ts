@@ -35,6 +35,7 @@ async function stuckDelete(
     | "hang"
     | "committed-hang"
     | "uncommitted-hang",
+  options: { holdConfirmation?: boolean; successfulReplies?: boolean } = {},
 ) {
   const keys = {
     namespaceHmac: async () => new Uint8Array(32),
@@ -114,6 +115,16 @@ async function stuckDelete(
     );
   }
   const postSignals: AbortSignal[] = [];
+  const successfulReplies: (() => void)[] = [];
+  let confirmationStarted!: () => void;
+  const confirming = new Promise<void>(
+    (resolve) => (confirmationStarted = resolve),
+  );
+  let failConfirmation!: () => void;
+  const confirmationGate = new Promise<void>(
+    (resolve) => (failConfirmation = resolve),
+  );
+  let confirmNormally = false;
   let postStarted!: () => void;
   const postStartedPromise = new Promise<void>(
     (resolve) => (postStarted = resolve),
@@ -147,6 +158,11 @@ async function stuckDelete(
         if (signal) postSignals.push(signal);
         if (controlReply === "committed-hang") await real(req);
         postStarted();
+        if (options.successfulReplies) {
+          await new Promise<void>((resolve) => successfulReplies.push(resolve));
+          // A successful remote response, even if its AbortSignal was ignored.
+          return real(req);
+        }
         await gate;
         throw new Error("held response released");
       }
@@ -160,7 +176,21 @@ async function stuckDelete(
     registry.beforePost = async () => {
       throw new Error("gateway refused");
     };
+  const realRead = registry.read.bind(registry);
   const reads = vi.spyOn(registry, "read");
+  if (options.holdConfirmation) {
+    reads.mockImplementation(async (scope, signal) => {
+      if (scope === fixture.control && signal && !confirmNormally) {
+        confirmationStarted();
+        await confirmationGate;
+        throw new Error("confirming read failed");
+      }
+      return realRead(scope, signal);
+    });
+  }
+  // Start before the request: an early purge must not evade the assertion.
+  const writes = vi.spyOn(db, "batch");
+  const queries = vi.spyOn(db, "query");
   const startedAt = Date.now();
   const request = sync.deleter.requestConnectionDelete("fixture-source");
   if (controlReply?.endsWith("-hang")) await postStartedPromise;
@@ -189,6 +219,15 @@ async function stuckDelete(
     control: fixture.control,
     postSignals,
     reads,
+    writes,
+    queries,
+    request,
+    confirming,
+    failConfirmation,
+    successfulReplies,
+    confirmNormally: () => {
+      confirmNormally = true;
+    },
   };
 }
 
@@ -259,7 +298,7 @@ it("explicit resume clears the armed retry after finishing the delete", async ()
   expect(vi.getTimerCount()).toBe(1);
   f.registry.beforePost = undefined;
   expect(await f.sync.deleter.resumeDeletes()).toEqual([]);
-  const queries = vi.spyOn(f.db, "query");
+  const queries = f.queries.mockClear();
   expect(vi.getTimerCount()).toBe(0);
   await vi.advanceTimersByTimeAsync(100);
   expect(queries).not.toHaveBeenCalled();
@@ -326,6 +365,129 @@ it("does not hold a sync cycle on a stalled delete landing", async () => {
     ]);
     expect(outcome).toBe("completed");
   } finally {
+    f.release();
+  }
+});
+
+/** No completed fence may erase the durable intent before confirmation. */
+function expectIntentNotErased(f: Awaited<ReturnType<typeof stuckDelete>>) {
+  expect(
+    f.writes.mock.calls
+      .flatMap(([statements]) => statements)
+      .some((statement) =>
+        /DELETE\s+FROM\s+delete_intents/i.test(statement.sql),
+      ),
+  ).toBe(false);
+}
+
+it("keeps the intent through a stalled then failed confirming read until the tombstone is confirmed", async () => {
+  // Protects the delete landing continuation that confirms the tombstone fence
+  // before removing delete_intents; the batch spy predates requestConnectionDelete.
+  const f = await stuckDelete("committed-hang", { holdConfirmation: true });
+  try {
+    await vi.waitFor(() => expect(f.postSignals[0]?.aborted).toBe(true), {
+      timeout: 2000,
+    });
+    await f.confirming;
+    expect((await f.request).fenced).toBe(false);
+    expect(await f.intents()).toHaveLength(1);
+    expectIntentNotErased(f);
+    f.failConfirmation();
+    await vi.waitFor(() => expect(f.postSignals.length).toBeGreaterThan(1), {
+      timeout: 2000,
+    });
+    expect(await f.intents()).toHaveLength(1);
+    expectIntentNotErased(f);
+    f.confirmNormally();
+    await vi.waitFor(async () => expect(await f.intents()).toEqual([]), {
+      timeout: 5000,
+    });
+    expect(await f.registry.read(f.control)).toMatchObject({
+      found: true,
+      version: 2,
+    });
+  } finally {
+    f.failConfirmation();
+    f.release();
+  }
+});
+
+it("ignores a successful POST response arriving after close", async () => {
+  // Protects the post-await closed/attempt guard before any local landing write.
+  const f = await stuckDelete("uncommitted-hang", { successfulReplies: true });
+  try {
+    expect(f.successfulReplies).toHaveLength(1);
+    await f.sync.close();
+    const writes = f.writes.mock.calls.length;
+    const queries = f.queries.mock.calls.length;
+    f.successfulReplies[0]!();
+    // Drain the late asynchronous continuation, without starting a new attempt.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(f.writes.mock.calls.length).toBe(writes);
+    expect(f.queries.mock.calls.length).toBe(queries);
+    expect(f.postSignals[0]?.aborted).toBe(true);
+  } finally {
+    f.successfulReplies.forEach((release) => release());
+    f.release();
+  }
+});
+
+it("ignores an old successful POST after a newer attempt has started", async () => {
+  // Protects the landing continuation's attempt identity check: old success
+  // cannot purge or finish the intent now owned by the newer retry.
+  const f = await stuckDelete("uncommitted-hang", {
+    successfulReplies: true,
+    holdConfirmation: true,
+  });
+  try {
+    await f.confirming;
+    f.failConfirmation();
+    await vi.waitFor(
+      () => expect(f.successfulReplies.length).toBeGreaterThan(1),
+      { timeout: 2000 },
+    );
+    const intent = await f.db.query("SELECT * FROM delete_intents");
+    const connection = await f.db.query("SELECT * FROM connections");
+    const records = await f.db.query("SELECT * FROM records");
+    expect(intent).toHaveLength(1);
+    const writes = f.writes.mock.calls.length;
+    f.successfulReplies[0]!();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(f.writes.mock.calls.length).toBe(writes);
+    expect(await f.db.query("SELECT * FROM delete_intents")).toEqual(intent);
+    expect(await f.db.query("SELECT * FROM connections")).toEqual(connection);
+    expect(await f.db.query("SELECT * FROM records")).toEqual(records);
+    expect(f.postSignals[0]?.aborted).toBe(true);
+  } finally {
+    await f.sync.close();
+    f.failConfirmation();
+    f.successfulReplies.forEach((release) => release());
+    f.release();
+  }
+});
+
+it("publishes connector B while connector A's confirming READ is stalled", async () => {
+  // Protects the confirming-read deadline/released landing slot, not just the
+  // POST deadline: A has already timed out its POST before B starts publishing.
+  const f = await stuckDelete("committed-hang", { holdConfirmation: true });
+  try {
+    await f.confirming;
+    expect(f.postSignals[0]?.aborted).toBe(true);
+    const outcome = await Promise.race([
+      f.sync.publish().then(() => "completed"),
+      new Promise<string>((resolve) =>
+        setTimeout(() => resolve("blocked"), 100),
+      ),
+    ]);
+    expect(outcome).toBe("completed");
+    expect((await f.sync.intake.publicationStatus("other")).state).toBe(
+      "published",
+    );
+    expect(await f.intents()).toHaveLength(1);
+    expectIntentNotErased(f);
+  } finally {
+    await f.sync.close();
+    f.failConfirmation();
     f.release();
   }
 });
