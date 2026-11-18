@@ -609,4 +609,16 @@ END`,
       END`,
   ],
   [`ALTER TABLE runs ADD COLUMN raw_end TEXT`],
+  [
+    `CREATE TABLE system_stream_instance(id INTEGER PRIMARY KEY CHECK(id=1), instance_id TEXT NOT NULL)`,
+    `CREATE TABLE system_stream_outbox(connection_id TEXT NOT NULL,stream TEXT NOT NULL,record_id TEXT NOT NULL,body TEXT NOT NULL,sort_at TEXT NOT NULL,run_id TEXT NOT NULL,observed_at INTEGER NOT NULL,PRIMARY KEY(connection_id,stream,record_id)) WITHOUT ROWID`,
+    `CREATE TABLE system_stream_projection(connection_id TEXT NOT NULL,stream TEXT NOT NULL,record_id TEXT NOT NULL,sort_at TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(connection_id,stream,record_id)) WITHOUT ROWID`,
+    `CREATE INDEX system_stream_page ON system_stream_projection(connection_id,stream,sort_at DESC,record_id DESC)`,
+    `CREATE TABLE system_stream_checkpoint(connection_id TEXT NOT NULL,stream TEXT NOT NULL,seq INTEGER NOT NULL,PRIMARY KEY(connection_id,stream)) WITHOUT ROWID`,
+    `CREATE TABLE system_stream_quarantine(connection_id TEXT NOT NULL,stream TEXT NOT NULL,record_id TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(connection_id,stream,record_id,body)) WITHOUT ROWID`,
+    `CREATE TRIGGER system_stream_outbox_capacity BEFORE INSERT ON system_stream_outbox
+      WHEN NOT EXISTS(SELECT 1 FROM system_stream_outbox WHERE connection_id=NEW.connection_id AND stream=NEW.stream AND record_id=NEW.record_id)
+      AND ((SELECT count(*) FROM system_stream_outbox)>=100000 OR (SELECT COALESCE(sum(length(CAST(body AS BLOB))),0) FROM system_stream_outbox)+length(CAST(NEW.body AS BLOB))>104857600)
+      BEGIN SELECT RAISE(ABORT,'system_stream_outbox_full'); END`,
+  ],
 ];
