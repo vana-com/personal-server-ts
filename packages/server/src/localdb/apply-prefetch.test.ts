@@ -1,5 +1,6 @@
 import { afterEach, expect, it } from "vitest";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
+import { RegistryUnavailableBeforeWriteError } from "../../../core/src/stream-sync/ports.js";
 import {
   CONNECTION_ID,
   CONTROL,
@@ -65,7 +66,7 @@ for (const listed of [false, true]) {
   });
 }
 
-it("an absent control discards a failed speculative fetch without applying it", async () => {
+it("a stale absent control discards a failed speculative fetch without applying it", async () => {
   const w = await world({ streams: 1 });
   const a = await w.device("a");
   await a.run("first", [{ stream: sName(0), id: "x" }]);
@@ -76,26 +77,28 @@ it("an absent control discards a failed speculative fetch without applying it", 
   await a.cycle();
   const before = await b.rows();
   let gets = 0;
-  await applyConnection(
-    {
-      ...b.deps,
-      registry: {
-        ...b.deps.registry,
-        read: (scope) =>
-          scope === CONTROL
-            ? Promise.resolve({ found: false as const })
-            : b.deps.registry.read(scope),
-      },
-      blobs: {
-        ...b.deps.blobs,
-        async get() {
-          gets++;
-          throw new Error("storage unavailable");
+  await expect(
+    applyConnection(
+      {
+        ...b.deps,
+        registry: {
+          ...b.deps.registry,
+          read: (scope) =>
+            scope === CONTROL
+              ? Promise.resolve({ found: false as const })
+              : b.deps.registry.read(scope),
+        },
+        blobs: {
+          ...b.deps.blobs,
+          async get() {
+            gets++;
+            throw new Error("storage unavailable");
+          },
         },
       },
-    },
-    CONNECTION_ID,
-  );
+      CONNECTION_ID,
+    ),
+  ).rejects.toBeInstanceOf(RegistryUnavailableBeforeWriteError);
   expect(gets).toBe(1);
   expect(await b.rows()).toEqual(before);
 });

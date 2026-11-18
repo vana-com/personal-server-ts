@@ -283,6 +283,16 @@ async function fixture() {
 }
 
 describe("local resolve", () => {
+  it("does not serve local rows after an unclassified apply failure", async () => {
+    const f = await fixture();
+    await f.connection();
+    await f.head();
+    await f.record();
+    const failure = new Error("apply failed after writing");
+    mocked.apply.mockRejectedValueOnce(failure);
+    await expect(f.resolver.resolve(input())).rejects.toBe(failure);
+  });
+
   it("serves no legacy alias without a host port, while logical streams remain readable", async () => {
     const f = await fixture();
     await f.connection();
