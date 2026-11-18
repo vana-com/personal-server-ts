@@ -162,7 +162,7 @@ describe("log apply: the cycle's listing is a hint", () => {
     expect(position).toBe(2);
     await expect(
       applyConnection(a.deps, CONNECTION_ID, listed),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ kind: "applied" });
     expect(await a.position()).toBe(position);
   });
 });

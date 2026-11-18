@@ -388,7 +388,12 @@ describe("local sync intake adapter", () => {
     ports.connection.mockResolvedValue(connection);
     expect(await sync.cycle()).toBe(report);
     expect(ports.cycle).toHaveBeenCalledTimes(1);
-    expect(ports.cycle).toHaveBeenCalledWith(deps, undefined);
+    expect(ports.cycle).toHaveBeenCalledWith(
+      deps,
+      undefined,
+      undefined,
+      expect.any(Function),
+    );
     expect(await sync.syncConnection("c")).toBe(connection);
     expect(ports.connection).toHaveBeenCalledTimes(1);
     expect(ports.connection).toHaveBeenCalledWith(deps, "c");

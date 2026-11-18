@@ -66,10 +66,18 @@ async function clearPartial(deps: LocalSyncDeps, id: string, job: Reuse) {
 // takes its own reads. A caller settles when its own flight ends, so a late
 // caller's work or failure never reaches an earlier one, and no stream of
 // arrivals can keep a flight open.
+export type ApplyOutcome =
+  | { readonly kind: "applied" }
+  | {
+      readonly kind: "deferred";
+      readonly reason:
+        "missing-connection" | "pending-delete" | "inactive-control";
+    };
+
 type Flight = {
   /** Closed at the start of the job; later callers join the next flight. */
   closed: boolean;
-  promise: Promise<void>;
+  promise: Promise<ApplyOutcome>;
   /**
    * The listing the flight reads its log row from, when every caller of the
    * flight brought this same one (`applyConnection`). A caller with another
@@ -86,7 +94,7 @@ function request(
   id: string,
   listed: OwnerRows | undefined,
   observedControl: ControlRead | undefined,
-): Promise<void> {
+): Promise<ApplyOutcome> {
   let byId = slots.get(deps.queue);
   if (!byId) {
     byId = new Map();
@@ -123,7 +131,7 @@ const newFlight = (
   observedControl: ControlRead | undefined,
 ): Flight => ({
   closed: false,
-  promise: Promise.resolve(),
+  promise: Promise.resolve({ kind: "applied" }),
   ...(listed ? { listed } : {}),
   ...(observedControl ? { observedControl } : {}),
 });
@@ -133,7 +141,7 @@ function launch(
   flight: Flight,
   byId: Map<string, Slot>,
   slot: Slot,
-): Promise<void> {
+): Promise<ApplyOutcome> {
   return runFlight(deps, id, flight).finally(() => {
     if (slot.next) {
       slot.running = slot.next;
@@ -198,7 +206,8 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
       "SELECT connector, ns, generation, apply_partial FROM connections WHERE connection_id = ?",
       [id],
     );
-    if (!connection) return;
+    if (!connection)
+      return { kind: "deferred", reason: "missing-connection" } as const;
     reuse.partial = connection.apply_partial === 1;
     if (
       (
@@ -215,7 +224,7 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
           params: [id],
         },
       ]);
-      return;
+      return { kind: "deferred", reason: "pending-delete" } as const;
     }
     const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
     const hashes = await controlHashes(keccakOf(deps.streamCrypto), keyCheck);
@@ -274,7 +283,7 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
     const initial = initialResult.value;
     if (initial.kind !== "active") {
       if (initial.kind === "deleted") await clearPartial(deps, id, reuse);
-      return;
+      return { kind: "deferred", reason: "inactive-control" } as const;
     }
     if (logResult.status === "rejected") throw logResult.reason;
     await applyLog(
@@ -303,6 +312,7 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
     // A pass that ran to its end has applied the log through the position it
     // read, which is what the mark waits for.
     await clearPartial(deps, id, reuse);
+    return { kind: "applied" } as const;
   });
 }
 
@@ -338,7 +348,7 @@ export function applyConnection(
   connectionId: string,
   listed?: OwnerRows,
   observedControl?: ControlRead,
-): Promise<void> {
+): Promise<ApplyOutcome> {
   return request(deps, connectionId, listed, observedControl);
 }
 

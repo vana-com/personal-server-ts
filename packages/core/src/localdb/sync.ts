@@ -339,9 +339,13 @@ export function createLocalSync(
     blobs: createBlobStore(deps),
     async cycle(scope) {
       await resume();
-      const report = await runCycle(deps, scope);
+      let allApplied = true;
+      const report = await runCycle(deps, scope, undefined, (outcome) => {
+        if (outcome.kind !== "applied") allApplied = false;
+      });
       if (
         !scope &&
+        allApplied &&
         report.connections.every((connection) => connection.error === null)
       )
         accountHydrated = true;
@@ -360,15 +364,17 @@ export function createLocalSync(
       await resume();
       const listed = await deps.registry.listOwnerRows();
       let failed = false;
+      let allApplied = true;
       let firstError: unknown;
       for (const connection of await bootstrapConnections(deps, listed)) {
         try {
-          await applyConnection(
+          const outcome = await applyConnection(
             deps,
             connection.connectionId,
             listed,
             listed.find((row) => row.scope === connection.connectionId)?.read,
           );
+          if (outcome.kind !== "applied") allApplied = false;
         } catch (error) {
           if (!failed) firstError = error;
           failed = true;
@@ -378,7 +384,7 @@ export function createLocalSync(
         throw firstError instanceof Error
           ? firstError
           : new Error(String(firstError));
-      accountHydrated = true;
+      if (allApplied) accountHydrated = true;
     },
     async syncConnection(connectionId) {
       await resume();
