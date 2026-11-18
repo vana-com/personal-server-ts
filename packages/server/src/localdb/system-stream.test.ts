@@ -1,3 +1,4 @@
+import { runCycle, runPublish } from "../../../core/src/localdb/cycle.js";
 import { createSystemStreamStore } from "../../../core/src/localdb/system-streams.js";
 import { afterEach, expect, it, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -221,4 +222,40 @@ it("a full durable outbox refuses new appends without a visible partial insert",
   expect(await f.db.query("SELECT * FROM system_stream_projection")).toEqual(
     [],
   );
+});
+
+it("A to B to A replication and repeated projection reads emit no new events", async () => {
+  const a = await fixture();
+  const b = await fixture();
+  const shared = { ...b.deps, registry: a.deps.registry, blobs: a.deps.blobs };
+  const desc = { ...descriptor, timestampField: "occurredAt" };
+  const first = createSystemStreamStore(a.deps, desc);
+  const second = createSystemStreamStore(shared, desc);
+  const event = { eventId: "one", occurredAt: "2026-06-01T00:00:00.000Z" };
+  await first.append(event);
+  await first.drain();
+  expect(
+    (await runPublish(a.deps)).connections.every((c) => c.error === null),
+  ).toBe(true);
+  expect(
+    (await runCycle(shared)).connections.every((c) => c.error === null),
+  ).toBe(true);
+  expect(await second.project()).toBe(1);
+  expect(await second.project()).toBe(0);
+  await runCycle(a.deps);
+  await first.project();
+  expect(await b.db.query("SELECT body FROM system_stream_projection")).toEqual(
+    [{ body: JSON.stringify(event) }],
+  );
+  for (const f of [a, b]) {
+    expect(await f.db.query("SELECT count(*) AS n FROM records")).toEqual([
+      { n: 1 },
+    ]);
+    expect(await f.db.query("SELECT * FROM system_stream_outbox")).toEqual([]);
+  }
+  expect(
+    await b.db.query(
+      "SELECT count(*) AS n FROM record_changes WHERE origin='local'",
+    ),
+  ).toEqual([{ n: 0 }]);
 });

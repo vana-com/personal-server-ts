@@ -3,6 +3,7 @@ import {
   type JsonObject,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
+import type { SqlStatement } from "./driver.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { createRunIntakeStore } from "./run-intake.js";
 import { createRunEndStore } from "./run-end.js";
@@ -53,7 +54,87 @@ export function createSystemStreamStore(
     );
     return rows.length === 1 && rows[0]!.body === body;
   }
+  async function project(): Promise<number> {
+    let applied = 0;
+    for (;;) {
+      const [checkpoint] = await db.query<{ seq: number }>(
+        "SELECT seq FROM system_stream_checkpoint WHERE connection_id=? AND stream=?",
+        [identity.connectionId, descriptor.stream],
+      );
+      const changes = await db.query<{
+        seq: number;
+        record_id: string;
+        body: string | null;
+      }>(
+        `SELECT seq,record_id,body FROM system_stream_changes
+         WHERE connection_id=? AND stream=? AND seq>? ORDER BY seq LIMIT 200`,
+        [identity.connectionId, descriptor.stream, checkpoint?.seq ?? 0],
+      );
+      if (!changes.length) return applied;
+      const statements: SqlStatement[] = [];
+      for (const row of changes) {
+        const params = [
+          identity.connectionId,
+          descriptor.stream,
+          row.record_id,
+        ];
+        if (row.body === null) {
+          statements.push({
+            sql: "DELETE FROM system_stream_projection WHERE connection_id=? AND stream=? AND record_id=?",
+            params,
+          });
+          continue;
+        }
+        let encoded: ReturnType<typeof encode>;
+        try {
+          encoded = encode(JSON.parse(row.body));
+          if (encoded.id !== row.record_id)
+            throw new Error("Invalid system stream key");
+        } catch {
+          statements.push({
+            sql: "INSERT OR IGNORE INTO system_stream_quarantine VALUES (?,?,?,?)",
+            params: [...params, row.body],
+          });
+          continue;
+        }
+        const { body, sortAt } = encoded;
+        // A conflicting duplicate is retained for inspection; it cannot replace
+        // the first visible body. Import never calls append or creates outbox work.
+        statements.push(
+          {
+            sql: "INSERT OR IGNORE INTO system_stream_quarantine SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM system_stream_projection WHERE connection_id=? AND stream=? AND record_id=? AND body<>?)",
+            params: [...params, body, ...params, body],
+          },
+          {
+            sql: "INSERT OR IGNORE INTO system_stream_projection VALUES (?,?,?,?,?)",
+            params: [...params, sortAt, body],
+          },
+        );
+      }
+      statements.push({
+        sql: "INSERT OR REPLACE INTO system_stream_checkpoint VALUES (?,?,?)",
+        params: [
+          identity.connectionId,
+          descriptor.stream,
+          changes[changes.length - 1]!.seq,
+        ],
+      });
+      statements.push({
+        sql: "DELETE FROM system_stream_changes WHERE connection_id=? AND stream=? AND seq<=?",
+        params: [
+          identity.connectionId,
+          descriptor.stream,
+          changes[changes.length - 1]!.seq,
+        ],
+      });
+      // Projection and imported position advance in the same local transaction.
+      await db.batch(statements);
+      applied += changes.length;
+      if (changes.length < 200) return applied;
+    }
+  }
   return {
+    project: () => serial(project),
     descriptor,
     identity,
     async instanceId(): Promise<string> {
