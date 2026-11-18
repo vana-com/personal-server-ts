@@ -42,6 +42,20 @@ const port = (status: ReturnType<NonNullable<StreamSyncReadPort["status"]>>) =>
   ({ resolve: vi.fn(), status: () => status }) as unknown as StreamSyncReadPort;
 
 describe("stream-sync read status route", () => {
+  it.each([false, true])(
+    "exposes the runtime's Account hydration fact (%s)",
+    async (accountHydrated) => {
+      const response = await app(
+        port({ listed: true, connections: [], issues: [], accountHydrated }),
+      )();
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        accountHydrated,
+        streams: [],
+      });
+    },
+  );
+
   it("lists exact per-stream counts and nothing else", async () => {
     const call = app(
       port({
@@ -80,6 +94,7 @@ describe("stream-sync read status route", () => {
     const text = await response.text();
     expect(JSON.parse(text)).toEqual({
       listed: true,
+      accountHydrated: false,
       streams: [
         {
           connector: "conn-a",

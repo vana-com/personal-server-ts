@@ -280,6 +280,10 @@ export function createLocalSync(
     aliasScopes: options.aliasScopes,
     aliasTargets: options.aliasTargets,
   };
+  // Completion belongs to this owner/network database runtime, not a UI read.
+  // A local listing (including an empty one) says nothing about remote data.
+  let accountHydrated = false;
+  const listing = createLocalListing(listingDeps);
   let closing: Promise<void> | undefined;
   return {
     intake: runIntake,
@@ -289,7 +293,12 @@ export function createLocalSync(
       aliasScopes: options.aliasScopes,
       aliasTargets: options.aliasTargets,
     }),
-    listing: createLocalListing(listingDeps),
+    listing: {
+      ...listing,
+      async status() {
+        return { ...(await listing.status()), accountHydrated };
+      },
+    },
     query,
     recordsFor: (link) => createLinkedRecordQuery(readerOf(deps.db), link),
     changesFor: (link) => createGrantHistory(readerOf(deps.db), link),
@@ -330,7 +339,13 @@ export function createLocalSync(
     blobs: createBlobStore(deps),
     async cycle(scope) {
       await resume();
-      return runCycle(deps, scope);
+      const report = await runCycle(deps, scope);
+      if (
+        !scope &&
+        report.connections.every((connection) => connection.error === null)
+      )
+        accountHydrated = true;
+      return report;
     },
     async publish() {
       await resume();
@@ -363,6 +378,7 @@ export function createLocalSync(
         throw firstError instanceof Error
           ? firstError
           : new Error(String(firstError));
+      accountHydrated = true;
     },
     async syncConnection(connectionId) {
       await resume();

@@ -220,6 +220,8 @@ export interface StreamSyncConnectionStatus {
 }
 
 export interface StreamSyncReadStatus {
+  /** A full Account listing and apply completed in this database runtime. */
+  readonly accountHydrated?: boolean;
   readonly listed: boolean;
   readonly connections: readonly StreamSyncConnectionStatus[];
   readonly issues: readonly ImportIssue[];
