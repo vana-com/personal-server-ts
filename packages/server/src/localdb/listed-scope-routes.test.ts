@@ -211,6 +211,37 @@ describe("every scope GET /v1/data lists answers on every scope route", () => {
     expect(refused).toEqual([]);
   });
 
+  it("reports stream-sync on every non-empty page of a switched GET /v1/data listing", async () => {
+    const { deps, seed } = await switchedFixture();
+    await seed("plain", "c1", { items: [1] });
+    await seed("acme-browser", "c2", { events: [3], details: [7] });
+
+    const scopes: string[] = [];
+    const limit = 2;
+    for (let offset = 0; offset < ALL_NAMES.length; offset += limit) {
+      const response = await get(deps, `?limit=${limit}&offset=${offset}`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as {
+        listingStore: string;
+        scopes: { scope: string }[];
+        total: number;
+        limit: number;
+        offset: number;
+      };
+      expect(body).toMatchObject({
+        listingStore: "stream-sync",
+        total: ALL_NAMES.length,
+        limit,
+        offset,
+      });
+      expect(body.scopes.map((row) => row.scope)).toEqual(
+        ALL_NAMES.slice(offset, offset + limit),
+      );
+      scopes.push(...body.scopes.map((row) => row.scope));
+    }
+    expect(scopes).toEqual(ALL_NAMES);
+  });
+
   it("lists the version of the stream the alias serves", async () => {
     const { deps, seed } = await switchedFixture();
     await seed("plain", "c1", { items: [1, 2] });
