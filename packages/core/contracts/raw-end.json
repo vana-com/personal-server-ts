@@ -1,0 +1,675 @@
+{
+  "wireDialect": "connector-end-evidence/1",
+  "validation": [
+    {
+      "name": "silent selected streams",
+      "valid": true,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "empty selection is a no-op",
+      "valid": true,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": [],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "unknown dialect",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/2",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "invalid last batch -2",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -2,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "invalid last batch 1.2",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": 1.2,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "invalid last batch 9007199254740992",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": 9007199254740992,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "duplicate selection",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "A"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "empty stream name",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": [""],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "reject covered [\"C\"]",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [],
+        "covered": ["C"]
+      }
+    },
+    {
+      "name": "reject covered [\"A\", \"A\"]",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [],
+        "covered": ["A", "A"]
+      }
+    },
+    {
+      "name": "reject checkpoints {\"C\": null}",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {
+          "C": null
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "reject records {\"C\": {}}",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "C": {}
+        },
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "reject preflightExcludedStreams [\"C\"]",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": ["C"],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "reject invalidDetailCoverageStreams [\"C\"]",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": ["C"],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "reject detailCoverage {\"C\": {}}",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {
+          "C": {}
+        },
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "reject wholeStreamEvidence [{\"stream\": \"C\", \"report\": {}}]",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [
+          {
+            "stream": "C",
+            "report": {}
+          }
+        ]
+      }
+    },
+    {
+      "name": "reject finish {\"kind\": \"certified_failed_done\", \"failedStreams\": [\"C\"]}",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "certified_failed_done",
+          "failedStreams": ["C"]
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "reject errors [{\"kind\": \"error\", \"scope\": {\"kind\": \"stream\", \"stream\": \"C\"}, \"code\": \"unknown\"}]",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [
+          {
+            "kind": "error",
+            "scope": {
+              "kind": "stream",
+              "stream": "C"
+            },
+            "code": "unknown"
+          }
+        ],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "record tuple",
+      "valid": true,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [["x"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "overlap",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [["x"]],
+            "deletedKeys": [["x"]],
+            "everDeletedKeys": [["x"]],
+            "upsertEvents": 1,
+            "deleteEvents": 1
+          }
+        },
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "duplicate keys",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [["x"], ["x"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "unsafe count",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [["x"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 9007199254740992,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "negative count",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [["x"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": -1
+          }
+        },
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "insufficient events",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [["x"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 0,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "delete without history",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [],
+            "deletedKeys": [["x"]],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 1
+          }
+        },
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "non tuple key",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": ["x"],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "canonical object key duplicates",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [
+              [
+                {
+                  "a": 1,
+                  "b": 2
+                }
+              ],
+              [
+                {
+                  "b": 2,
+                  "a": 1
+                }
+              ]
+            ],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 2,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "bad hint",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [
+          {
+            "kind": "error",
+            "code": "unknown",
+            "scope": {
+              "kind": "run"
+            },
+            "recoveryHint": {
+              "retryable": "yes"
+            }
+          }
+        ],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "missing required fields",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": null,
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    }
+  ]
+}
