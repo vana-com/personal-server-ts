@@ -35,6 +35,14 @@ import {
   type WriteSessionStore,
 } from "@opendatalabs/personal-server-ts-core/write";
 import { dataRoutes } from "./data.js";
+import {
+  boot,
+  scratch,
+  switchOn,
+  writeDeclared,
+} from "../localdb/legacy-migration-fixture.test-utils.js";
+import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
+import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const builderWallet = createTestWallet(0);
@@ -756,5 +764,83 @@ describe("POST /v1/data/:scope with a write session after the stream-sync switch
     );
     expect(res.status).not.toBe(201);
     expect(index.countByScope(SCOPE)).toBe(0);
+  });
+});
+
+describe("builder write contract across the stream-sync switch", () => {
+  let root: string;
+  let host: Awaited<ReturnType<typeof boot>>;
+  let app: ReturnType<typeof dataRoutes>;
+
+  beforeEach(async () => {
+    root = await scratch("builder-write-contract-");
+    const declared = await writeDeclared(join(root, "declarations"));
+    host = await boot(join(root, "server"), declared, { retireLegacy: true });
+    const context = host.context;
+    await context.accountModeAuthority.submitEvidence({
+      owner: context.serverOwner!,
+      state: "off",
+    });
+    const sessions = createInMemoryWriteSessionStore();
+    await seedSession(sessions);
+    app = dataRoutes({
+      indexManager: context.indexManager,
+      hierarchyOptions: { dataDir: join(root, "server", "data") },
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: context.serverOwner as `0x${string}`,
+      devToken: "builder-contract-owner",
+      gateway: createMockGateway({
+        getGrant: vi.fn().mockImplementation(async (id: string) =>
+          makeGrant({
+            id,
+            grantorAddress: context.serverOwner,
+            scopes: id === "read-grant" ? [SCOPE] : [`write:${SCOPE}`],
+          }),
+        ),
+      }),
+      accessLogWriter: { write: async () => undefined },
+      writeSessionStore: sessions,
+      legacyWriteSeal: context.legacyWriteSeal,
+      accountStorageMode: accountStorageModeFor(
+        accountStorageModeOf(context.accountModeAuthority),
+        context.serverOwner,
+      ),
+      streamSyncRead: {
+        resolve: async (input) =>
+          (await context.getLocalSync!()).resolver.resolve(input),
+        listScopes: async (input) =>
+          (await context.getLocalSync!()).listing.listScopes(input),
+      },
+    });
+  });
+
+  afterEach(async () => {
+    await host?.context.cleanup();
+    await rm(root, { recursive: true, force: true });
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
+  async function switchAccount() {
+    const run = await switchOn(host.context);
+    expect((await run.finished).message).toBe("legacy retirement finished");
+  }
+
+  it("refuses old-format builder JSON after switching", async () => {
+    await switchAccount();
+    const response = await sessionWrite(app, SCOPE, { note: "new" });
+    expect(response.status).toBe(426);
+  });
+
+  it("refuses old-format builder binary after switching", async () => {
+    await switchAccount();
+    const response = await sessionBinaryWrite(
+      app,
+      SCOPE,
+      new TextEncoder().encode("document"),
+      { contentType: "application/pdf", filename: "document.pdf" },
+    );
+    expect(response.status).toBe(426);
   });
 });

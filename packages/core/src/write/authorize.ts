@@ -1,3 +1,5 @@
+import { readApplicationBody } from "./application-body.js";
+import { canonicalizeJson } from "../derivatives/e2ee/jcs.js";
 /**
  * Delegated-write authorization, shared by every build.
  *
@@ -10,8 +12,12 @@
  * adapters call the same code. There is exactly one implementation of the
  * write policy; a browser build cannot drift into a weaker one.
  *
- * The two entry points differ in what they are allowed to decide:
+ * The entry points differ in what they are allowed to decide:
  *
+ *   - `authorizeApplicationWrite` records the live gateway observation through
+ *     localdb, verifies the signed envelope, and prepares a runtime-bound
+ *     capability. A revoked or expired grant may recover only its builder's
+ *     existing receipt; it cannot prepare another mutation.
  *   - `authorizeSessionWrite` authorizes a write to a NAMED scope. It
  *     re-runs `verifyDataWritePolicy` against the LIVE grant on every call,
  *     so revocation, expiry, grantee binding, owner binding and scope
@@ -22,13 +28,20 @@
  *     NO grant policy runs (there is no scope to run one against). Callers use
  *     it only to choose between error shapes, never to release data.
  *
- * Both fail closed: an unknown bearer, an unknown session, a missing server
+ * All fail closed: an unknown bearer, an unknown session, a missing server
  * owner, or any failing proof check returns/raises rather than falling back to
  * a weaker credential. A request that is not a write-session request at all
  * returns `undefined`, and the caller applies its own owner gate.
  */
 
 import { ProtocolError } from "../errors/catalog.js";
+import { verifiedApplicationAuthority } from "./application.js";
+import type {
+  ApplicationIntake,
+  ApplicationEnvelope,
+  ApplicationReceipt,
+  AuthorizedApplicationMutation,
+} from "../localdb/application-intake.js";
 import {
   verifyDataWritePolicy,
   type DataWritePolicyPorts,
@@ -70,6 +83,18 @@ export interface WriteSessionAuthorizationDeps {
 }
 
 export interface WriteSessionAuthorization {
+  authorizeApplicationWrite(
+    input: PersonalServerWriteAuthInput,
+    applications: ApplicationIntake,
+    envelope: ApplicationEnvelope,
+  ): Promise<
+    | {
+        mutation: AuthorizedApplicationMutation;
+        releaseProof?: () => Promise<void>;
+      }
+    | { receipt: ApplicationReceipt }
+    | undefined
+  >;
   /**
    * Authorize a delegated write to `input.scope`, or `undefined` when the
    * request carries no live write-session credential (the caller then applies
@@ -115,6 +140,73 @@ export function createWriteSessionAuthorization(
   }
 
   return {
+    async authorizeApplicationWrite(input, applications, envelope) {
+      const session = await liveSession(input.request);
+      if (!session) return undefined;
+      if (!deps.serverOwner) throw writeServerNotConfigured();
+      const received = readApplicationBody(
+        new Uint8Array(await input.request.clone().arrayBuffer()),
+      );
+      if (received.text !== canonicalizeJson(envelope))
+        throw new ProtocolError(
+          400,
+          "APPLICATION_BODY_MISMATCH",
+          "Application envelope differs from signed request",
+        );
+      // Admission uses the owned parse of the received bytes, so a caller's
+      // object cannot change while gateway verification yields.
+      const receivedEnvelope = received.value as ApplicationEnvelope;
+      let grant;
+      let refusal: unknown;
+      try {
+        grant = await verifyDataWritePolicy(
+          {
+            signer: session.builderAddress,
+            grantId: session.grantId,
+            requestedScope: input.scope,
+            serverOwner: deps.serverOwner,
+          },
+          { ...deps.policyPorts, grantObservations: applications.grants },
+        );
+      } catch (error) {
+        if (
+          !(error instanceof ProtocolError) ||
+          !["GRANT_REVOKED", "GRANT_EXPIRED"].includes(error.errorCode)
+        )
+          throw error;
+        refusal = error;
+      }
+      const { releaseProof, ...attribution } = await verifyWriterAttribution({
+        request: input.request,
+        bodyProfile: "application-jcs",
+        builderAddress: session.builderAddress,
+        grantId: session.grantId,
+        serverOrigin: deps.serverOrigin,
+        replayStore: deps.replayStore,
+        now: deps.now,
+      });
+      try {
+        const authority = verifiedApplicationAuthority({
+          requestHash: received.requestHash,
+          signedRequest: received.text,
+          scope: input.scope,
+          owner: deps.serverOwner,
+          builder: session.builderAddress,
+          grant,
+          attribution,
+        });
+        const receipt = await applications.replay(authority, receivedEnvelope);
+        if (receipt) return { receipt };
+        if (refusal) throw refusal;
+        return {
+          mutation: await applications.prepare(authority, receivedEnvelope),
+          releaseProof,
+        };
+      } catch (error) {
+        await releaseProof?.();
+        throw error;
+      }
+    },
     async authorizeSessionWrite(input) {
       const session = await liveSession(input.request);
       if (!session) return undefined;

@@ -48,13 +48,44 @@ function checkBytes(blobId: string, bytes: Uint8Array): void {
     throw new Error("blob sha256 does not match bytes");
 }
 
+/** Copy and validate caller-owned bytes before any asynchronous work. */
+export function prepareBlob(input: {
+  readonly sha256: string;
+  readonly mimeType: string;
+  readonly bytes: Uint8Array;
+}): (generation: number | null) => SqlStatement[] {
+  if (input.bytes.byteLength > MAX_BLOB_BYTES)
+    throw new RangeError("blob exceeds 32 MiB");
+  const bytes = new Uint8Array(input.bytes);
+  checkBytes(input.sha256, bytes);
+  return (generation) => [
+    {
+      sql: "INSERT OR IGNORE INTO blobs(blob_id, mime_type, size_bytes, generation, bytes) VALUES (?, ?, ?, ?, ?)",
+      params: [
+        input.sha256,
+        input.mimeType,
+        bytes.byteLength,
+        generation,
+        bytes,
+      ],
+    },
+    {
+      sql: "UPDATE blobs SET mime_type = ?, size_bytes = ?, generation = COALESCE(generation, ?), bytes = ? WHERE blob_id = ? AND bytes IS NULL",
+      params: [
+        input.mimeType,
+        bytes.byteLength,
+        generation,
+        bytes,
+        input.sha256,
+      ],
+    },
+  ];
+}
+
 export function createBlobStore(deps: LocalSyncDeps): BlobStore {
   return {
     async put(input) {
-      if (input.bytes.byteLength > MAX_BLOB_BYTES)
-        throw new RangeError("blob exceeds 32 MiB");
-      const bytes = new Uint8Array(input.bytes);
-      checkBytes(input.sha256, bytes);
+      const blobStatements = prepareBlob(input);
       const [run] = await deps.db.query<{
         connection_id: string;
         generation: number | null;
@@ -74,28 +105,7 @@ export function createBlobStore(deps: LocalSyncDeps): BlobStore {
          WHERE connection_id = ? AND ${seenStamp().r} = ?`,
         [input.runId, run.connection_id, input.runId],
       );
-      const statements: SqlStatement[] = [
-        {
-          sql: "INSERT OR IGNORE INTO blobs(blob_id, mime_type, size_bytes, generation, bytes) VALUES (?, ?, ?, ?, ?)",
-          params: [
-            input.sha256,
-            input.mimeType,
-            bytes.byteLength,
-            run.generation,
-            bytes,
-          ],
-        },
-        {
-          sql: "UPDATE blobs SET mime_type = ?, size_bytes = ?, generation = COALESCE(generation, ?), bytes = ? WHERE blob_id = ? AND bytes IS NULL",
-          params: [
-            input.mimeType,
-            bytes.byteLength,
-            run.generation,
-            bytes,
-            input.sha256,
-          ],
-        },
-      ];
+      const statements = blobStatements(run.generation);
       for (const row of rows) {
         if (!namesBlob(row.body, input.sha256)) continue;
         // Recheck the row in the same transaction as the ref insertion, so

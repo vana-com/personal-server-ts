@@ -1,3 +1,4 @@
+import { readApplicationBody } from "./application-body.js";
 import { decodeBase64UrlUtf8 } from "../encoding/base64url.js";
 /**
  * Builder attribution for delegated writes.
@@ -193,6 +194,8 @@ export interface WriterAttribution {
 }
 
 export interface VerifyWriterAttributionInput {
+  /** Canonical application envelopes use JCS; legacy ingest keeps its profile. */
+  bodyProfile?: "application-jcs";
   request: Request;
   /** The builder address bound to the write session at handshake. */
   builderAddress: `0x${string}`;
@@ -371,7 +374,8 @@ export async function verifyWriterAttribution(
     bodyBytes.byteLength > 0 &&
     isJsonContentType(input.request)
   ) {
-    assertCanonicalJsonBody(bodyBytes);
+    if (input.bodyProfile === "application-jcs") readApplicationBody(bodyBytes);
+    else assertCanonicalJsonBody(bodyBytes);
   }
 
   // Replay guard, last: only a proof that passed every check is consumed,

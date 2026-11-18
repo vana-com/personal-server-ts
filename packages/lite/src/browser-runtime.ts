@@ -158,6 +158,7 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    * given, every digest answers `unknown_artifact`. Admission follows Account mode.
    */
   streamSyncDeclarations?: PsLiteSyncOptions["streamSyncDeclarations"];
+  resolveApplicationDeclaration?: PsLiteSyncOptions["resolveApplicationDeclaration"];
   streamSyncRegistry?: PsLiteSyncOptions["streamSyncRegistry"];
   streamSyncBlobs?: PsLiteSyncOptions["streamSyncBlobs"];
   /** Retained manifest documents for the delete fence; see `PsLiteSyncOptions`. */
@@ -461,6 +462,7 @@ export async function createIndexedDbPsLiteRuntime(
       dataPointFeed: options.dataPointFeed,
       scopeDeletions,
       streamSyncDeclarations: options.streamSyncDeclarations,
+      resolveApplicationDeclaration: options.resolveApplicationDeclaration,
       streamSyncRegistry: options.streamSyncRegistry,
       streamSyncBlobs: options.streamSyncBlobs,
       streamSyncRetainedManifests: options.streamSyncRetainedManifests,

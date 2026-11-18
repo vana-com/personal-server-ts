@@ -1,24 +1,17 @@
 import { keccakOf } from "../stream-sync/crypto-port.js";
 import { readBeginReceipt } from "./run-receipts.js";
 import { RegistryRefusedError } from "../stream-sync/ports.js";
-import { sha256 } from "@noble/hashes/sha2";
 import {
   canonicalJson,
   controlHashes,
   controlScope,
   deriveKeyCheck,
   isPlainObject,
-  pkHash,
-  primaryKeyValues,
   streamScope,
-  toHex,
   type JsonValue,
   type ControlState,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import {
-  computeRecordKeyFromData,
-  keyMatchesData,
-} from "../storage/pdpp-records/record-key.js";
+import { mutationIdentity } from "./mutation-identity.js";
 import {
   RunIntakeError,
   type BatchRequest,
@@ -561,22 +554,8 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           let hash: string;
           let keyValues: string;
           try {
-            keyValues = canonicalJson(
-              primaryKeyValues(record.data, primaryKey) as JsonValue,
-            );
-            recordKey = computeRecordKeyFromData(record.data, primaryKey);
-            if (
-              record.key !== undefined &&
-              !keyMatchesData(record.key, record.data, primaryKey)
-            )
-              throw invalid("record key does not match data");
-            body = canonicalJson(record.data);
-            bodySha256 = toHex(sha256(new TextEncoder().encode(body)));
-            hash = await pkHash(
-              async (b) => sha256(b),
-              record.data,
-              primaryKey,
-            );
+            ({ keyValues, recordKey, body, bodySha256, hash } =
+              await mutationIdentity(record.data, primaryKey, record.key));
           } catch {
             throw invalid("invalid record or primary key");
           }

@@ -1,3 +1,5 @@
+import { handleApplicationWriteRequest } from "@opendatalabs/personal-server-ts-core/write";
+import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
 import type { LocalHistory } from "@opendatalabs/personal-server-ts-core/localdb";
 import { parseScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
@@ -64,6 +66,7 @@ import {
 } from "./chunked-scope-import.js";
 
 export interface DataRouteDeps {
+  localSync?: () => Promise<LocalSync>;
   additions?: DurableAdditionsService;
   indexManager: IndexManager;
   hierarchyOptions: HierarchyManagerOptions;
@@ -218,7 +221,21 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     if (refusal) return refusal;
     await next();
   };
-  app.post("/:scope", refuseLegacy);
+  app.post("/:scope", async (c, next) => {
+    const response = await handleApplicationWriteRequest(
+      c.req.raw,
+      c.req.param("scope"),
+      {
+        auth,
+        accountStorageMode: deps.accountStorageMode,
+        applications: deps.localSync
+          ? async () => (await deps.localSync!()).applications
+          : undefined,
+      },
+    );
+    if (response) return response;
+    return refuseLegacy(c, next);
+  });
   app.post("/:scope/imports", refuseLegacy);
   // The two chunked-import session routes refuse inside the import module
   // (`refuseIfLegacy`), which knows the session and removes its chunks and

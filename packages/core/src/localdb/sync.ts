@@ -1,3 +1,8 @@
+import {
+  createApplicationIntake,
+  type ApplicationIntake,
+  type ResolveApplicationDeclaration,
+} from "./application-intake.js";
 import type {
   DeltaApplyResult,
   RegistryChangeDelta,
@@ -50,6 +55,7 @@ import { createRunIntakeStore } from "./run-intake.js";
  */
 export interface LocalSync {
   readonly intake: RunIntake;
+  readonly applications: ApplicationIntake;
   readonly deleter: ConnectionDeleter;
   readonly resolver: LocalResolver;
   readonly listing: LocalListing;
@@ -99,6 +105,7 @@ const RESUME_RETRY_MAX_MS = 5 * 60_000;
 export function createLocalSync(
   deps: LocalSyncDeps,
   options: {
+    readonly resolveApplicationDeclaration?: ResolveApplicationDeclaration;
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
     readonly resolveArtifact: ResolveArtifact;
@@ -287,6 +294,10 @@ export function createLocalSync(
   let closing: Promise<void> | undefined;
   return {
     intake: runIntake,
+    applications: createApplicationIntake(
+      deps,
+      options.resolveApplicationDeclaration,
+    ),
     deleter,
     resolver: createLocalResolver(deps, {
       query,

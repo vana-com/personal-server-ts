@@ -69,6 +69,8 @@ import { createIndexManager } from "../storage/index-manager.js";
 import { dataRoutes } from "../routes/data.js";
 import { buildDeclarationRegistry } from "./deployment.js";
 import { legacyTestConnectionId } from "./test-connections.js";
+import Database from "better-sqlite3";
+import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const SCOPE = "github.profile";
@@ -224,7 +226,10 @@ describe("local POST /v1/data/:scope -> PDPP import -> scoped read", () => {
       serverOwner: ownerWallet.address,
       gateway: {} as unknown as GatewayClient,
       accessLogWriter,
-      pdppImporter: importer,
+      pdppImporter: {
+        importEnvelope: (envelope) => importer.importEnvelope(envelope),
+        needsRetry: (scope, at) => importer.needsRetry(scope, at),
+      },
     });
     cleanup = () => indexManager.close();
   });
@@ -334,6 +339,46 @@ describe("local POST /v1/data/:scope -> PDPP import -> scoped read", () => {
     const res = await ownerWrite(githubUser());
     expect(res.status).toBe(201);
     expect(readRecords().data).toHaveLength(0);
+  });
+
+  it("keeps a committed JSON write successful when the importer throws", async () => {
+    const importEnvelope = vi.fn(async () => {
+      throw new Error("import unavailable");
+    });
+    importer = { importEnvelope, needsRetry: () => true };
+    const response = await ownerWrite({ note: "saved" });
+    expect(response.status).toBe(201);
+    expect(importEnvelope).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { note: "saved" } }),
+    );
+  });
+
+  it("imports matching metadata through the local route into the production record store", async () => {
+    store.close();
+    store = createSqliteRecordStore(new Database(":memory:"));
+    const realImporter = buildImporter(store);
+    const outcomes: unknown[] = [];
+    importer = {
+      importEnvelope: async (envelope) => {
+        const outcome = await realImporter.importEnvelope(envelope);
+        outcomes.push(outcome);
+        return outcome;
+      },
+      needsRetry: (scope, at) => realImporter.needsRetry(scope, at),
+    };
+    const response = await ownerWrite({
+      ...githubUser(),
+      $pdpp: pdppMetadata("583231"),
+    });
+    expect(response.status).toBe(201);
+    expect(outcomes).toEqual([
+      {
+        status: "rejected",
+        rejection: { code: "method_authority", message: "method_required" },
+      },
+    ]);
+    // A matching declaration alone does not make a canonical write durable.
+    expect(readRecords().data).toHaveLength(1);
   });
 
   it("commits the legacy write even when the declaration digest is wrong", async () => {

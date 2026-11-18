@@ -1,3 +1,8 @@
+import { sha256 } from "@noble/hashes/sha2";
+import {
+  canonicalJson,
+  toHex,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import { isSystemScope } from "./reserved-scopes.js";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
 import { scopeMatchesPattern } from "@opendatalabs/vana-sdk/browser";
@@ -97,6 +102,58 @@ export interface DataWritePolicyPorts {
   runtimeAvailability?: RuntimeAvailabilityPort;
   /** Absent = writes are free (see WriteFeeVerifierPort). */
   writeFeeVerifier?: WriteFeeVerifierPort;
+  /** Persist every gateway observation before policy can refuse it. */
+  grantObservations?: GrantObservationPort;
+}
+
+export interface GrantObservation {
+  readonly grantId: string;
+  readonly revision: string;
+  readonly authorityHash?: string;
+  readonly status: "active" | "revoked" | "expired";
+  readonly expiresAt: number | null;
+  readonly observedAt: number;
+}
+
+export interface GrantObservationPort {
+  record(observation: GrantObservation): Promise<void>;
+}
+
+/** Adapter for the gateway's current flat scope grant; no synthetic grant IDs. */
+export function observeWriteGrant(
+  grant: GatewayGrantResponse,
+): GrantObservation {
+  const expiry =
+    grant.expiresAt == null
+      ? null
+      : parseGrantExpiresAtSeconds(grant.expiresAt);
+  const observedAt = Date.now();
+  return {
+    grantId: grant.id,
+    revision: grant.grantVersion,
+    authorityHash: toHex(
+      sha256(
+        new TextEncoder().encode(
+          canonicalJson({
+            owner: grant.grantorAddress?.toLowerCase() ?? "",
+            grantee: grant.granteeId.toLowerCase(),
+            scopes: grant.scopes ?? [],
+            expiresAt: grant.expiresAt ?? null,
+            version: grant.grantVersion,
+          }),
+        ),
+      ),
+    ),
+    status:
+      grant.revokedAt !== null
+        ? "revoked"
+        : grant.expired ||
+            (expiry !== null && expiry > 0 && expiry * 1000 < observedAt)
+          ? "expired"
+          : "active",
+    expiresAt: expiry !== null && expiry > 0 ? expiry * 1000 : null,
+    observedAt,
+  };
 }
 
 /**
@@ -150,6 +207,8 @@ export async function verifyDataWritePolicy(
     });
   }
 
+  await ports.grantObservations?.record(observeWriteGrant(grant));
+
   if (grant.revokedAt !== null) {
     throw new GrantRevokedError({ grantId: grant.id });
   }
@@ -160,6 +219,8 @@ export async function verifyDataWritePolicy(
       reason: "Grant has no write scopes",
     });
   }
+
+  if (grant.expired) throw new GrantExpiredError();
 
   if (grant.expiresAt !== null && grant.expiresAt !== undefined) {
     const expiresAtSec = parseGrantExpiresAtSeconds(grant.expiresAt);

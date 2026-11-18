@@ -1,3 +1,4 @@
+import { handleApplicationWriteRequest } from "@opendatalabs/personal-server-ts-core/write";
 import type { SeedIntake } from "@opendatalabs/personal-server-ts-core/localdb";
 import type {
   LocalSync,
@@ -682,7 +683,10 @@ function writeSessionAuthMethods(
     serverOwner: `0x${string}`;
   },
   authorizeOwner: (request: Request) => Promise<void>,
-): Pick<PsLiteAuthAdapter, "authorizeWrite" | "authorizeWriteSession"> {
+): Pick<
+  PsLiteAuthAdapter,
+  "authorizeWrite" | "authorizeWriteSession" | "authorizeApplicationWrite"
+> {
   const authorization: WriteSessionAuthorization =
     createWriteSessionAuthorization({
       serverOrigin: writeSessions.serverOrigin,
@@ -693,6 +697,7 @@ function writeSessionAuthMethods(
       policyPorts: writeSessions.policyPorts,
     });
   return {
+    authorizeApplicationWrite: authorization.authorizeApplicationWrite,
     async authorizeWrite(input) {
       const delegated = await authorization.authorizeSessionWrite(input);
       if (delegated) return delegated;
@@ -1580,6 +1585,21 @@ export function createPsLiteRuntime(
           url.pathname === dataPrefix ||
           url.pathname.startsWith(`${dataPrefix}/`)
         ) {
+          const dataScope = /^\/v1\/data\/([^/]+)$/.exec(url.pathname);
+          if (dataScope) {
+            const response = await handleApplicationWriteRequest(
+              request,
+              decodeURIComponent(dataScope[1]!),
+              {
+                auth,
+                accountStorageMode,
+                applications: options.localSync
+                  ? async () => (await options.localSync!()).applications
+                  : undefined,
+              },
+            );
+            if (response) return response;
+          }
           const x402 = resolveX402Settings(options.config, boundGatewayConfig);
           return handlePersonalServerDataRequest(
             request,

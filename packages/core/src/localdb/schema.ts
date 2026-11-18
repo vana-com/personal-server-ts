@@ -589,4 +589,20 @@ END`,
       BEGIN SELECT RAISE(ABORT,'bootstrap_busy'); END`,
     ),
   ],
+  [
+    `CREATE TABLE application_grants (
+      grant_id TEXT PRIMARY KEY, revision TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('active','revoked','expired')),
+      expires_at INTEGER, observed_at INTEGER NOT NULL)`,
+  ],
+  [
+    `CREATE TABLE application_sources(source_id TEXT PRIMARY KEY, writer TEXT NOT NULL, revision TEXT NOT NULL, connection_id TEXT NOT NULL UNIQUE)`,
+    `CREATE TABLE application_declarations(source_id TEXT NOT NULL, version TEXT NOT NULL, digest TEXT NOT NULL, document TEXT NOT NULL, PRIMARY KEY(source_id,version))`,
+    `CREATE TABLE application_receipts(source_id TEXT NOT NULL, mutation_id TEXT NOT NULL, request_hash TEXT NOT NULL, receipt TEXT NOT NULL, provenance TEXT NOT NULL, declaration_digest TEXT NOT NULL, PRIMARY KEY(source_id,mutation_id))`,
+  ],
+  [
+    `ALTER TABLE application_grants ADD COLUMN authority_hash TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE application_receipts ADD COLUMN emitted_at TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE application_receipts ADD COLUMN signed_request TEXT NOT NULL DEFAULT ''`,
+  ],
 ];

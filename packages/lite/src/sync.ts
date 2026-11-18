@@ -1,3 +1,4 @@
+import type { ResolveApplicationDeclaration } from "@opendatalabs/personal-server-ts-core/localdb";
 import { createPsLiteSeedStaging } from "./seed-staging.js";
 import {
   LEGACY_SCOPE_BINDINGS,
@@ -142,6 +143,7 @@ export interface PsLiteSyncOptions {
    * `unknown_artifact`.
    */
   streamSyncDeclarations?: ResolveArtifact;
+  resolveApplicationDeclaration?: ResolveApplicationDeclaration;
   /**
    * Verified manifests retained for seed-descriptor admission. Seed profiles
    * and primary keys must match one of these documents. Default: none.
@@ -644,6 +646,7 @@ export async function createPsLiteSyncManager(
         localSync = createLocalSync(localSyncDeps, {
           aliasScopes: () => LEGACY_SCOPE_BINDINGS.keys(),
           aliasTargets: legacyAliasScopes,
+          resolveApplicationDeclaration: options.resolveApplicationDeclaration,
           resolveArtifact: options.streamSyncDeclarations ?? (() => null),
           eraseLegacy: (connector) =>
             eraseLegacyScopesOf(connector, options.storage),
