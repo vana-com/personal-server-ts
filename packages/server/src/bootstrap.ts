@@ -83,7 +83,10 @@ import {
   NodeECIESProvider,
 } from "@opendatalabs/vana-sdk/node";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
-import { createAccessLogWriter } from "./logging/access-log.js";
+import {
+  createAccessLogWriter,
+  type AccessLogWriter,
+} from "./logging/access-log.js";
 import { createAccessLogReader } from "./logging/access-reader.js";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import { buildWeb3SignedHeader } from "@opendatalabs/vana-sdk/node";
@@ -1354,8 +1357,22 @@ async function bootstrapServer(
 
   const logsDir = join(storageRoot, "logs");
   await mkdir(logsDir, { recursive: true });
-  const accessLogWriter = createAccessLogWriter(logsDir);
-  const accessLogReader = createAccessLogReader(logsDir);
+  const legacyAccessLogWriter = createAccessLogWriter(logsDir);
+  const accessLogWriter: AccessLogWriter = {
+    async write(entry) {
+      if (localSyncSource && accountStorageMode.read() === "switched")
+        await (await localSyncSource()).accessActivity.write(entry);
+      else await legacyAccessLogWriter.write(entry);
+    },
+  };
+  const legacyAccessLogReader = createAccessLogReader(logsDir);
+  const accessLogReader: AccessLogReader = {
+    async read(page) {
+      if (localSyncSource && accountStorageMode.read() === "switched")
+        return (await localSyncSource()).accessActivity.read(page);
+      return legacyAccessLogReader.read(page);
+    },
+  };
 
   // Generate ephemeral dev token when devUi is enabled
   const devToken =

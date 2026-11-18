@@ -965,6 +965,24 @@ export function createPsLiteRuntime(
     accessLogReader ??= accessLogStore;
     accessLogWriter ??= accessLogStore;
   }
+  if (options.localSync) {
+    const legacyReader = accessLogReader;
+    accessLogReader = {
+      read: async (page) => {
+        if (accountStorageMode.read() === "switched")
+          return (await options.localSync!()).accessActivity.read(page);
+        return legacyReader!.read(page);
+      },
+    };
+    const fallback = accessLogWriter;
+    accessLogWriter = {
+      write: async (entry) => {
+        if (accountStorageMode.read() === "switched")
+          await (await options.localSync!()).accessActivity.write(entry);
+        else await fallback!.write(entry);
+      },
+    };
+  }
   const tokenStore = options.tokenStore ?? createDefaultPsLiteTokenStore();
   const saveConfig = options.saveConfig ?? createDefaultPsLiteSaveConfig();
 

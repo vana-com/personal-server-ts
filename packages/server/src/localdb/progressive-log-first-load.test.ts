@@ -616,6 +616,7 @@ describe(
       const blocked = new Promise<void>((resolve) => {
         arrived = resolve;
       });
+      let fail = true;
       const b = await w.device("hydration", {
         progressiveFirstLoad: true,
         keyedFirstLoad: false,
@@ -624,6 +625,7 @@ describe(
           if (key === partKey(head, 2)) {
             arrived();
             await held;
+            if (fail) throw new Error("later part failed");
           }
         },
       });
@@ -633,8 +635,11 @@ describe(
         expect((await b.sync.listing.status()).accountHydrated).toBe(false);
       } finally {
         release();
-        await applying;
+        await expect(applying).rejects.toThrow("later part failed");
       }
+      expect((await b.sync.listing.status()).accountHydrated).toBe(false);
+      fail = false;
+      await b.sync.apply();
       expect((await b.sync.listing.status()).accountHydrated).toBe(true);
       expect(await idsOf(b)).toEqual(ids.filter((id) => id !== victim).sort());
     });

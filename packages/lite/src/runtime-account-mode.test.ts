@@ -276,6 +276,71 @@ describe("the Lite runtime's account-mode evidence route", () => {
 describe("the Lite runtime's mode routes bound what they read", () => {
   const paths = ["/v1/account-mode/evidence"];
 
+  // Pin byte counts, not string length or a generously oversized fixture.
+  for (const [reader, options] of [
+    ["stream", { chunked: true }],
+    ["no body stream", { noBodyStream: true }],
+  ] as const) {
+    for (const byteLength of [16383, 16384, 16385]) {
+      it(`counts exactly ${byteLength} ASCII bytes through ${reader}`, async () => {
+        const encoder = new TextEncoder();
+        const body = { ...evidence("off"), padding: "" };
+        const overhead = encoder.encode(JSON.stringify(body)).byteLength;
+        body.padding = "x".repeat(byteLength - overhead);
+        expect(encoder.encode(JSON.stringify(body)).byteLength).toBe(
+          byteLength,
+        );
+        for (const path of paths) {
+          // Each boundary starts with unresolved authority: an earlier accepted
+          // Off must not conceal a rejected request mutating the authority.
+          const { runtime, authority } = await build(
+            {},
+            { auth: { authorizeOwner: async () => {} } },
+          );
+          expect(authority.read(owner.address).kind).toBe("refuse");
+          const res = await signed(runtime, path, body, owner, options);
+          if (byteLength <= 16384) {
+            expect(res.status, `${path} ${reader} ${byteLength} bytes`).toBe(
+              200,
+            );
+            expect(await res.json()).toEqual({ decision: "legacy" });
+          } else {
+            expect(res.status, `${path} ${reader} ${byteLength} bytes`).toBe(
+              413,
+            );
+            expect((await res.json()).error).toBe("CONTENT_TOO_LARGE");
+            expect(authority.read(owner.address).kind).toBe("refuse");
+          }
+        }
+      });
+    }
+
+    it(`rejects multibyte padding below the character cap through ${reader}`, async () => {
+      const encoder = new TextEncoder();
+      const body = { ...evidence("off"), padding: "" };
+      const overhead = encoder.encode(JSON.stringify(body)).byteLength;
+      // U+00E9 uses two UTF-8 bytes but one UTF-16 code unit.
+      body.padding = "é".repeat(Math.ceil((16385 - overhead) / 2));
+      const text = JSON.stringify(body);
+      expect(text.length).toBeLessThan(16384);
+      expect(encoder.encode(text).byteLength).toBeGreaterThan(16384);
+      expect(encoder.encode(text).byteLength).toBe(
+        overhead + 2 * String(body.padding).length,
+      );
+      for (const path of paths) {
+        const { runtime, authority } = await build(
+          {},
+          { auth: { authorizeOwner: async () => {} } },
+        );
+        expect(authority.read(owner.address).kind).toBe("refuse");
+        const res = await signed(runtime, path, body, owner, options);
+        expect(res.status, `${path} ${reader} UTF-8 overflow`).toBe(413);
+        expect((await res.json()).error).toBe("CONTENT_TOO_LARGE");
+        expect(authority.read(owner.address).kind).toBe("refuse");
+      }
+    });
+  }
+
   // LITE_BODY_CAP_COUNTS_ONLY_DECLARED_SIZE
   it("answers 413 above 16 KiB, whether the length is declared or the body is chunked", async () => {
     const { runtime } = await build();

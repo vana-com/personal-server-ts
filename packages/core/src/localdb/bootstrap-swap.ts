@@ -80,6 +80,23 @@ export function swapBootstrapRecords(
           AND r.body_sha256=b.body_sha256 AND r.stamp_o=b.stamp_o AND r.stamp_r=b.stamp_r AND r.stamp_n=b.stamp_n)
       ORDER BY b.connection_id,b.stream,b.pk_hash`,
     },
+    // The replacement table was filled without records' triggers. Preserve
+    // reserved-stream projection work in the same transaction as its swap;
+    // record_changes may be compacted before a consumer projects the bodies.
+    {
+      sql: `INSERT INTO system_stream_changes(connection_id,stream,record_id,body)
+      SELECT r.connection_id,r.stream,r.record_key,NULL FROM records r
+      WHERE r.connection_id=? AND r.connection_id GLOB 'pdpp.vana-system-*~*'
+        AND NOT EXISTS(SELECT 1 FROM bootstrap_records b WHERE b.connection_id=r.connection_id AND b.stream=r.stream AND b.pk_hash=r.pk_hash)`,
+      params: [connectionId],
+    },
+    {
+      sql: `INSERT INTO system_stream_changes(connection_id,stream,record_id,body)
+      SELECT b.connection_id,b.stream,b.record_key,b.body FROM bootstrap_records b
+      WHERE b.connection_id GLOB 'pdpp.vana-system-*~*' AND NOT EXISTS(SELECT 1 FROM records r
+        WHERE r.connection_id=b.connection_id AND r.stream=b.stream AND r.pk_hash=b.pk_hash
+          AND r.body_sha256=b.body_sha256 AND r.stamp_o=b.stamp_o AND r.stamp_r=b.stamp_r AND r.stamp_n=b.stamp_n)`,
+    },
     // DROP removes only the preview table's own triggers. Never rename it:
     // modern SQLite would rewrite external references to the retired name.
     { sql: "DROP TABLE records" },

@@ -14,8 +14,8 @@ export interface AccessLogEntry {
   action: "read" | "write" | "delete" | "lineage";
   scope: string;
   timestamp: string;
-  ipAddress: string;
-  userAgent: string;
+  ipAddress?: string;
+  userAgent?: string;
 }
 
 export interface AccessLogWriter {

@@ -3,7 +3,10 @@ import type { LocalListing } from "../localdb/listing.js";
 import { isOwnAppRead } from "../payment/own-app.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
 import { HISTORY_PAGE_LIMIT, type LocalHistory } from "../localdb/history.js";
-import { isSystemScope } from "../policy/reserved-scopes.js";
+import {
+  isReservedSystemScope,
+  isSystemScope,
+} from "../policy/reserved-scopes.js";
 import {
   DataDeletedError,
   DeleteTombstoneFailedError,
@@ -2812,6 +2815,14 @@ export async function handlePersonalServerDataRequest(
       });
     }
 
+    // Reserved streams have one dedicated owner API, never ordinary body,
+    // version, lineage or write routes (including raw/stored views).
+    const targetScope = decodePathPart(
+      pathname.split("/").filter(Boolean)[0] ?? "",
+    );
+    if (isReservedSystemScope(targetScope))
+      return errorResponse(403, "RESERVED_SCOPE", "System streams are private");
+
     // "additions" has no dot, so it can never be a real scope name (scopes are
     // "source.dataset"); handle it before the single-segment scope path.
     if (pathname === "/additions") {
@@ -4108,6 +4119,7 @@ export async function handlePersonalServerAccessLogsRequest(
     return contractResponse(
       await listAccessLogsContract({
         accessLogReader: deps.accessLogReader,
+        cursor: url.searchParams.get("cursor"),
         limit: url.searchParams.get("limit"),
         offset: url.searchParams.get("offset"),
       }),
