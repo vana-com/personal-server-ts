@@ -92,22 +92,75 @@ function withinBudget(work: Promise<boolean>, ms?: number): Promise<boolean> {
 }
 
 export function createConnectionDeleter(
-  deps: LocalSyncDeps,
+  originalDeps: LocalSyncDeps,
   options: {
     readonly eraseLegacy?: (connector: string) => Promise<void>;
     /**
      * How long a request waits for the fence before it answers
      * `fenced: false`. The landing keeps going in the background and the
-     * resume loop re-checks it. Production passes the loop's first resume
+     * resume loop re-checks it. Each registry request uses the same deadline.
+     * Production passes the loop's first resume
      * wait, so a delete that has not fenced by then is the one the loop would
      * pick up next. Absent: the request waits for the fence however long it
      * takes (tests only).
      */
     readonly fenceWaitMs?: number;
   } = {},
-): ConnectionDeleter {
+) {
+  // Each registry request gets the same budget as the first resume wait.
+  // A lost POST reply remains ambiguous; landFence confirms it with a fresh read.
+  // Race the signal too, so a non-cooperating adapter cannot hold a flight.
+  const stop = new AbortController();
+  const bounded = async <T>(
+    work: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> => {
+    const timeout = new AbortController();
+    const timer =
+      options.fenceWaitMs === undefined
+        ? undefined
+        : setTimeout(
+            () => timeout.abort(new Error("registry deadline exceeded")),
+            options.fenceWaitMs,
+          );
+    const signal = AbortSignal.any([stop.signal, timeout.signal]);
+    try {
+      signal.throwIfAborted();
+      return await new Promise<T>((resolve, reject) => {
+        const abort = () => reject(signal.reason);
+        signal.addEventListener("abort", abort, { once: true });
+        work(signal)
+          .then(resolve, reject)
+          .finally(() => signal.removeEventListener("abort", abort));
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const registry = originalDeps.registry;
+  const deps: LocalSyncDeps = {
+    ...originalDeps,
+    registry: {
+      ...registry,
+      ...(registry.batchPolicy && {
+        batchPolicy: () => registry.batchPolicy!(),
+      }),
+      read: (scope) => bounded((signal) => registry.read(scope, signal)),
+      post: (request) => bounded((signal) => registry.post(request, signal)),
+      listControlRows: () =>
+        bounded((signal) => registry.listControlRows(signal)),
+      ...(registry.postBatch && {
+        postBatch: (request) =>
+          bounded((signal) => registry.postBatch!(request, signal)),
+      }),
+      ...(registry.readBatchPolicy && {
+        readBatchPolicy: () =>
+          bounded((signal) => registry.readBatchPolicy!(signal)),
+      }),
+    },
+  };
   const keccak = keccakOf(deps.streamCrypto);
   const flights = new Map<string, Landing>();
+  const requests = new Set<Promise<ConnectionDeleteRequest>>();
   /**
    * The control rows the plan listed, by delete id, then by scope. Only a
    * delete this process just planned has one; the landing takes it. Each
@@ -494,86 +547,107 @@ export function createConnectionDeleter(
     flights.set(connector, landing);
     return landing;
   }
-  return {
-    async requestConnectionDelete(connector) {
-      controlScope(connector, "");
-      const intent = await deps.queue.run(
-        `delete:${connector}`,
-        "purge",
-        async () => {
-          const decide = async (
-            planned: Awaited<ReturnType<typeof plan>>,
-            held: ReadonlySet<string>,
-          ) => {
-            const open = await readIntent(connector);
-            const empty = planned.intent.pins.length === 0;
-            if (open && (empty || samePlan(open, planned.intent))) return open;
-            if (empty) {
-              await purgeLocal(connector, planned.intent, held);
-              await options.eraseLegacy?.(connector);
-              return null;
-            }
-            await save(connector, planned.intent);
-            listings.set(planned.intent.id!, planned.listing);
+  async function resumeDelete(
+    connector: string,
+  ): Promise<PendingDelete | null> {
+    if (stop.signal.aborted || !(await readIntent(connector))) return null;
+    if (stop.signal.aborted) return null;
+    try {
+      await schedule(connector).done;
+      return null;
+    } catch (error) {
+      return { connector, why: error instanceof Error ? error.name : "Error" };
+    }
+  }
+  async function requestConnectionDelete(connector: string) {
+    stop.signal.throwIfAborted();
+    controlScope(connector, "");
+    const intent = await deps.queue.run(
+      `delete:${connector}`,
+      "purge",
+      async () => {
+        const decide = async (
+          planned: Awaited<ReturnType<typeof plan>>,
+          held: ReadonlySet<string>,
+        ) => {
+          const open = await readIntent(connector);
+          const empty = planned.intent.pins.length === 0;
+          if (open && (empty || samePlan(open, planned.intent))) return open;
+          if (empty) {
             await purgeLocal(connector, planned.intent, held);
-            return planned.intent;
-          };
-          const planned = await plan(connector);
-          // A local connection with no control row in the listing may be
-          // creating it: its first save commits control row and first segment
-          // in one request, under the connection's queue. That listing cannot
-          // tell whether the commit is in flight. Wait for the queue, then
-          // list again: the commit has landed (the listing pins its control
-          // row) or none is in flight and none starts before the intent is
-          // saved or the connection purged. A connection every pin covers
-          // needs no wait: its fence is a compare-and-set on the row the
-          // listing showed.
-          if (await hasUnpinnedConnection(connector, planned.intent))
-            return holdingConnections(connector, async (held) =>
-              decide(await plan(connector), held),
-            );
-          return decide(planned, new Set());
+            await options.eraseLegacy?.(connector);
+            return null;
+          }
+          await save(connector, planned.intent);
+          listings.set(planned.intent.id!, planned.listing);
+          await purgeLocal(connector, planned.intent, held);
+          return planned.intent;
+        };
+        const planned = await plan(connector);
+        // A local connection with no control row in the listing may be
+        // creating it: its first save commits control row and first segment
+        // in one request, under the connection's queue. That listing cannot
+        // tell whether the commit is in flight. Wait for the queue, then
+        // list again: the commit has landed (the listing pins its control
+        // row) or none is in flight and none starts before the intent is
+        // saved or the connection purged. A connection every pin covers
+        // needs no wait: its fence is a compare-and-set on the row the
+        // listing showed.
+        if (await hasUnpinnedConnection(connector, planned.intent))
+          return holdingConnections(connector, async (held) =>
+            decide(await plan(connector), held),
+          );
+        return decide(planned, new Set());
+      },
+    );
+    if (!intent) return { deleteId: deps.newOp(), fenced: true };
+    const landing = schedule(connector);
+    landing.done.catch((error) =>
+      deps.logger.warn(
+        {
+          connector,
+          reason: error instanceof Error ? error.name : "Error",
+          // The cause an operator needs: a delete that stays pending blocks
+          // every reconnect, and the name alone ("Error") does not say why.
+          message: error instanceof Error ? error.message : String(error),
+          ...(error instanceof Error && { stack: error.stack }),
         },
+        "connection delete pending",
+      ),
+    );
+    // The request waits for the fences only; the local purge runs after the
+    // answer. A registry that is slower than the budget answers "not fenced
+    // yet"; the landing is not cancelled and the resume loop re-checks it.
+    return {
+      deleteId: intent.id!,
+      fenced: await withinBudget(landing.fenced, options.fenceWaitMs),
+    };
+  }
+  return {
+    requestConnectionDelete(connector: string) {
+      const request = requestConnectionDelete(connector);
+      requests.add(request);
+      void request.then(
+        () => requests.delete(request),
+        () => requests.delete(request),
       );
-      if (!intent) return { deleteId: deps.newOp(), fenced: true };
-      const landing = schedule(connector);
-      landing.done.catch((error) =>
-        deps.logger.warn(
-          {
-            connector,
-            reason: error instanceof Error ? error.name : "Error",
-            // The cause an operator needs: a delete that stays pending blocks
-            // every reconnect, and the name alone ("Error") does not say why.
-            message: error instanceof Error ? error.message : String(error),
-            ...(error instanceof Error && { stack: error.stack }),
-          },
-          "connection delete pending",
-        ),
-      );
-      // The request waits for the fences only; the local purge runs after the
-      // answer. A registry that is slower than the budget answers "not fenced
-      // yet"; the landing is not cancelled and the resume loop re-checks it.
-      return {
-        deleteId: intent.id!,
-        fenced: await withinBudget(landing.fenced, options.fenceWaitMs),
-      };
+      return request;
     },
     async resumeDeletes() {
       const rows = await deps.db.query<{ connector: string }>(
         "SELECT connector FROM delete_intents ORDER BY connector",
       );
-      const pending: PendingDelete[] = [];
-      for (const { connector } of rows) {
-        try {
-          await schedule(connector).done;
-        } catch (error) {
-          pending.push({
-            connector,
-            why: error instanceof Error ? error.name : "Error",
-          });
-        }
-      }
-      return pending;
+      return (
+        await Promise.all(rows.map(({ connector }) => resumeDelete(connector)))
+      ).filter((p): p is PendingDelete => p !== null);
+    },
+    resumeDelete,
+    async close() {
+      stop.abort(new Error("sync closed"));
+      await Promise.allSettled([...requests]);
+      await Promise.allSettled(
+        [...flights.values()].map((flight) => flight.done),
+      );
     },
   };
 }

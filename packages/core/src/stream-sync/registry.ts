@@ -189,10 +189,13 @@ export function createGatewayStreamSyncRegistry(
    * unavailability, which a caller may go on offline from. Writes keep their
    * own ambiguity handling.
    */
-  async function fetchForRead(url: string): Promise<Response> {
+  async function fetchForRead(
+    url: string,
+    signal?: AbortSignal,
+  ): Promise<Response> {
     let res: Response;
     try {
-      res = await fetchImpl(url);
+      res = await fetchImpl(url, { signal });
     } catch (cause) {
       throw new RegistryUnavailableError(
         `registry unreachable: ${cause instanceof Error ? cause.message : String(cause)}`,
@@ -226,7 +229,7 @@ export function createGatewayStreamSyncRegistry(
   type OwnerRow = { scope: string; read: ControlRead };
 
   /** Page through every owner row. */
-  async function fetchOwnerRows(): Promise<OwnerRow[]> {
+  async function fetchOwnerRows(signal?: AbortSignal): Promise<OwnerRow[]> {
     const out: OwnerRow[] = [];
     let cursor: string | null = null;
     do {
@@ -236,7 +239,10 @@ export function createGatewayStreamSyncRegistry(
         limit: String(pageSize),
       });
       if (cursor !== null) params.set("cursor", cursor);
-      const res = await fetchForRead(`${base}/v1/data?${params.toString()}`);
+      const res = await fetchForRead(
+        `${base}/v1/data?${params.toString()}`,
+        signal,
+      );
       if (!res.ok) {
         throw new Error(`registry listing failed: ${res.status}`);
       }
@@ -303,8 +309,13 @@ export function createGatewayStreamSyncRegistry(
   }
 
   /** Every owner row whose scope `keep` accepts. */
-  async function listRows(keep: (scope: string) => boolean) {
-    return (await ownerRows()).filter((row) => keep(row.scope));
+  async function listRows(
+    keep: (scope: string) => boolean,
+    signal?: AbortSignal,
+  ) {
+    return (await (signal ? fetchOwnerRows(signal) : ownerRows())).filter(
+      (row) => keep(row.scope),
+    );
   }
 
   let batchPolicy: RegistryBatchPolicy | undefined;
@@ -322,11 +333,13 @@ export function createGatewayStreamSyncRegistry(
   async function sendPost(
     request: SignedRegistryPost,
     requires: readonly RegistryRequirement[] | undefined,
+    signal?: AbortSignal,
   ): Promise<ConditionalPostResult> {
     let res: Response;
     try {
       res = await fetchImpl(`${base}/v1/data`, {
         method: "POST",
+        signal,
         headers: {
           "content-type": "application/json",
           authorization: `Web3Signed ${request.signature}`,
@@ -394,10 +407,11 @@ export function createGatewayStreamSyncRegistry(
   }
 
   return {
-    async read(scope) {
+    async read(scope, signal) {
       const id = computeDataPointId(options.ownerAddress, scope);
       const res = await fetchForRead(
         `${base}/v1/data/${id}?includeDeleted=true`,
+        signal,
       );
       if (res.status === 404) return { found: false };
       if (res.status !== 200) {
@@ -406,8 +420,11 @@ export function createGatewayStreamSyncRegistry(
       return toControlRead(unwrap(await bodyForRead(res)));
     },
 
-    async post(request: SignedRegistryPost): Promise<RegistryPostResult> {
-      const result = await sendPost(request, undefined);
+    async post(
+      request: SignedRegistryPost,
+      signal?: AbortSignal,
+    ): Promise<RegistryPostResult> {
+      const result = await sendPost(request, undefined, signal);
       // Without `requires` the gateway has no condition to fail.
       if (result.kind === "precondition_failed") {
         throw new RegistryRefusedError(
@@ -426,11 +443,13 @@ export function createGatewayStreamSyncRegistry(
 
     async postBatch(
       request: SignedRegistryBatch,
+      signal?: AbortSignal,
     ): Promise<RegistryBatchResult> {
       let res: Response;
       try {
         res = await fetchImpl(`${base}/v1/data/batch`, {
           method: "POST",
+          signal,
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             ownerAddress: request.ownerAddress,
@@ -502,7 +521,7 @@ export function createGatewayStreamSyncRegistry(
 
     batchPolicy: () => batchPolicy,
 
-    readBatchPolicy() {
+    readBatchPolicy(signal) {
       if (batchPolicy !== undefined) return Promise.resolve(batchPolicy);
       // The route sets `Batch-Policy` before it answers a preflight, so an
       // OPTIONS request reads it without writing. Only two answers are kept
@@ -510,35 +529,38 @@ export function createGatewayStreamSyncRegistry(
       // route). Any other answer says nothing lasting, so the next call asks
       // again: an error status is no answer, and a success without the header
       // is no policy for now.
-      policyRead ??= fetchImpl(`${base}/v1/data/batch`, { method: "OPTIONS" })
-        .catch((cause: unknown) => {
-          throw new AmbiguousRegistryReplyError(
-            `registry batch policy read got no reply: ${(cause as Error).message}`,
-          );
-        })
-        .then((res) => {
-          const policy = parseBatchPolicy(res.headers.get("batch-policy"));
-          if (policy !== undefined) {
-            batchPolicy = policy;
-            return policy;
-          }
-          if (res.status === 404 || res.status === 405) return undefined;
-          policyRead = undefined;
-          if (res.status < 200 || res.status >= 300)
+      const read = () =>
+        fetchImpl(`${base}/v1/data/batch`, { method: "OPTIONS", signal })
+          .catch((cause: unknown) => {
             throw new AmbiguousRegistryReplyError(
-              `registry batch policy read answered ${res.status}`,
+              `registry batch policy read got no reply: ${(cause as Error).message}`,
             );
-          return undefined;
-        })
-        .catch((error: unknown) => {
-          policyRead = undefined;
-          throw error;
-        });
+          })
+          .then((res) => {
+            const policy = parseBatchPolicy(res.headers.get("batch-policy"));
+            if (policy !== undefined) {
+              batchPolicy = policy;
+              return policy;
+            }
+            if (res.status === 404 || res.status === 405) return undefined;
+            if (!signal) policyRead = undefined;
+            if (res.status < 200 || res.status >= 300)
+              throw new AmbiguousRegistryReplyError(
+                `registry batch policy read answered ${res.status}`,
+              );
+            return undefined;
+          })
+          .catch((error: unknown) => {
+            if (!signal) policyRead = undefined;
+            throw error;
+          });
+      if (signal) return read();
+      policyRead ??= read();
       return policyRead;
     },
 
-    listControlRows: () =>
-      listRows((scope) => parseScope(scope)?.kind === "control"),
+    listControlRows: (signal) =>
+      listRows((scope) => parseScope(scope)?.kind === "control", signal),
 
     listStreamRows: (connector) =>
       listRows((scope) => {

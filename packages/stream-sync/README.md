@@ -1,17 +1,49 @@
 # @opendatalabs/personal-server-ts-stream-sync
 
-The pure core of whole-file stream sync (design revision 4.1, section 2). Every
-host (full server, Lite, and client libraries) builds against this one tested
-package.
+## Current protocol and ownership
 
-The package does no I/O. It imports no SDK, no Node built-ins, no browser APIs,
-no clock and no randomness. Hosts inject SHA-256, Keccak-256 and the namespace
-HMAC, and do every registry, storage and spool call themselves.
+Documentation snapshot: Personal Server source tree
+`2f3228e6f461d5a1c2e1672d1570c1980bafdd2e`.
 
-This is version 0.0.1 and marked `private`. It is not wired into the release
-workflows.
+This package supplies pure protocol building blocks for connection-log stream
+sync. It is not itself the database, transport or publication loop. The host
+core stores canonical local records, publishes encrypted operation segments,
+and advances the connection's registry log head. Readers follow that head and
+apply its segments; it is not a new whole-file head for each stream on every
+save. The source entry points are
+[`log-publish.ts`](../core/src/localdb/log-publish.ts) and
+[`log-apply.ts`](../core/src/localdb/log-apply.ts); the model's
+[progressive first-load section](../../docs/formal/log-protocol/README.md#progressive-first-load-shows-only-rows-the-finished-log-keeps-partialviewtla-host-run-2026-11-17)
+describes segment references and ordered application.
 
-## Contract
+Publication commits registry rows as a batch, with the connection's active
+control generation required for the commit. A connection delete publishes the
+control tombstone as its fence; an earlier generation cannot continue to
+publish through that fence. See
+[`log-publish.ts`](../core/src/localdb/log-publish.ts),
+[`delete.ts`](../core/src/localdb/delete.ts), and
+[`delete-batch.ts`](../core/src/localdb/delete-batch.ts).
+These are runtime contracts, not claims that the formal models prove the
+actual gateway's concurrency or authorization behavior. See the
+[formal evidence summary](../../docs/formal/log-protocol/README.md#current-evidence-summary-and-open-obligations)
+for those boundaries.
+
+The pure package does no I/O: hosts supply cryptographic ports and perform
+registry/storage operations. Keep package codecs and reducers separate from
+those host orchestration responsibilities. The tables below are retained
+historical revision-4.1 documentation, **not a current export inventory or the
+connection-log wire specification**. In particular, their per-stream head,
+merge, checkpoint and fallback descriptions must not be used as today's
+publication contract.
+
+## History: whole-file design revision 4.1
+
+The original README described a private version 0.0.1 whole-file package not
+wired into release workflows. That packaging/release statement is historical;
+this document does not assert current release wiring. The following contract,
+API and vector descriptions record that design and are retained for context.
+
+### Historical contract
 
 | Area          | Rule                                                                                                                                                                                                                                                                                     |
 | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -31,7 +63,7 @@ workflows.
 Open questions and the readings the package takes until they are answered are
 in [DESIGN-QUESTIONS.md](DESIGN-QUESTIONS.md).
 
-## API
+### Historical API
 
 | Export                                                                      | Purpose                                           |
 | --------------------------------------------------------------------------- | ------------------------------------------------- |
@@ -53,7 +85,7 @@ in [DESIGN-QUESTIONS.md](DESIGN-QUESTIONS.md).
 | `createOutboxEntry`, `streamRunResult`, `OutboxEntry`                       | Outbox entry type.                                |
 | `runVectors`                                                                | Run `vectors/v1.json` against a host's ports.     |
 
-## Vectors
+### Historical vectors
 
 `vectors/v1.json` holds byte-exact expected outputs (namespace, scopes, key
 hashes, lines, merge, parts, planner, heads) and the expected result of every
@@ -67,7 +99,7 @@ its own runner.
 holds the rule expectations as hand-written tables. A test fails if the
 checked-in file differs from the generator output.
 
-## Tests
+## Package tests
 
 ```sh
 nice -n 10 npx vitest run --maxWorkers=4 packages/stream-sync

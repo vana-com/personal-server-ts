@@ -742,6 +742,8 @@ export async function createPsLiteSyncManager(
       {
         accountStorageMode: mode,
         localSync: {
+          hasPendingPublication: async () =>
+            (await getLocalSync()).hasPendingPublication(),
           cycle: async (scope) => {
             const sync = await getLocalSync();
             if (options.registrationReady && !options.registrationReady()) {
