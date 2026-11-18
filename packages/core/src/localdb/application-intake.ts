@@ -1,6 +1,5 @@
 import { factsGuard, type StreamFacts } from "./admit.js";
 import {
-  canonicalJson,
   controlScope,
   streamScope,
   deriveNs,
@@ -98,8 +97,6 @@ export const applicationSource = (builder: string): string =>
   `urn:vana:builder:${builder.toLowerCase()}`;
 const digestOf = (text: string) =>
   toHex(sha256(new TextEncoder().encode(text)));
-const semanticHash = (input: ApplicationEnvelope, scope: string): string =>
-  digestOf(canonicalJson({ scope, envelope: input } as unknown as JsonValue));
 
 export function createApplicationIntake(
   deps: LocalSyncDeps,
@@ -152,7 +149,7 @@ export function createApplicationIntake(
       [applicationSource(authority.builder), input.mutationId],
     );
     if (!row) return null;
-    if (row.request_hash !== semanticHash(input, authority.scope))
+    if (row.request_hash !== authority.requestHash)
       fail("APPLICATION_MUTATION_CONFLICT");
     return JSON.parse(row.receipt) as ApplicationReceipt;
   }
@@ -323,7 +320,7 @@ export function createApplicationIntake(
         authority,
         grant: authority.grant,
         input,
-        hash: semanticHash(input, authority.scope),
+        hash: authority.requestHash,
         source,
         connector,
         ns,
@@ -541,7 +538,7 @@ export function createApplicationIntake(
               JSON.stringify(p.authority.attribution),
               input.declaration.digest,
               input.record.emitted_at,
-              JSON.stringify(input),
+              p.authority.signedRequest,
             ],
           },
         ];

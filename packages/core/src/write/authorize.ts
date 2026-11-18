@@ -1,3 +1,5 @@
+import { readApplicationBody } from "./application-body.js";
+import { canonicalizeJson } from "../derivatives/e2ee/jcs.js";
 /**
  * Delegated-write authorization, shared by every build.
  *
@@ -142,12 +144,18 @@ export function createWriteSessionAuthorization(
       const session = await liveSession(input.request);
       if (!session) return undefined;
       if (!deps.serverOwner) throw writeServerNotConfigured();
-      if ((await input.request.clone().text()) !== JSON.stringify(envelope))
+      const received = readApplicationBody(
+        new Uint8Array(await input.request.clone().arrayBuffer()),
+      );
+      if (received.text !== canonicalizeJson(envelope))
         throw new ProtocolError(
           400,
           "APPLICATION_BODY_MISMATCH",
           "Application envelope differs from signed request",
         );
+      // Admission uses the owned parse of the received bytes, so a caller's
+      // object cannot change while gateway verification yields.
+      const receivedEnvelope = received.value as ApplicationEnvelope;
       let grant;
       let refusal: unknown;
       try {
@@ -170,6 +178,7 @@ export function createWriteSessionAuthorization(
       }
       const { releaseProof, ...attribution } = await verifyWriterAttribution({
         request: input.request,
+        bodyProfile: "application-jcs",
         builderAddress: session.builderAddress,
         grantId: session.grantId,
         serverOrigin: deps.serverOrigin,
@@ -178,17 +187,19 @@ export function createWriteSessionAuthorization(
       });
       try {
         const authority = verifiedApplicationAuthority({
+          requestHash: received.requestHash,
+          signedRequest: received.text,
           scope: input.scope,
           owner: deps.serverOwner,
           builder: session.builderAddress,
           grant,
           attribution,
         });
-        const receipt = await applications.replay(authority, envelope);
+        const receipt = await applications.replay(authority, receivedEnvelope);
         if (receipt) return { receipt };
         if (refusal) throw refusal;
         return {
-          mutation: await applications.prepare(authority, envelope),
+          mutation: await applications.prepare(authority, receivedEnvelope),
           releaseProof,
         };
       } catch (error) {

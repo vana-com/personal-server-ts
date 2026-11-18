@@ -1,3 +1,4 @@
+import { canonicalizeJson } from "../../../core/src/derivatives/e2ee/jcs.js";
 import type { ApplicationEnvelope } from "@opendatalabs/personal-server-ts-core/localdb";
 import { pino } from "pino";
 import { dataRoutes } from "../routes/data.js";
@@ -241,8 +242,11 @@ async function applicationFixture(
     },
   };
   let nonce = 0;
-  async function authorize(input: ApplicationEnvelope = envelope) {
-    const body = JSON.stringify(input);
+  async function authorize(
+    input: ApplicationEnvelope = envelope,
+    rawBody?: string,
+  ) {
+    const body = rawBody ?? canonicalizeJson(input);
     const signature = await buildWeb3SignedHeader({
       wallet: signingWallet,
       aud: "https://server.example",
@@ -266,7 +270,7 @@ async function applicationFixture(
         scope: "notes.items",
       },
       sync.applications,
-      input,
+      JSON.parse(body) as ApplicationEnvelope,
     );
   }
   return {
@@ -334,7 +338,7 @@ async function commit(
     : f.sync.applications.commit(authorized.mutation);
 }
 
-it("replays the same semantic request and conflicts on changed content", async () => {
+it("replays the same envelope bytes and conflicts on changed content", async () => {
   const f = await applicationFixture();
   const first = await commit(f);
   expect(await commit(f)).toEqual(first);
@@ -613,7 +617,7 @@ it.each(["node", "lite"] as const)(
           : undefined;
       let nonce = 0;
       async function send(body: unknown) {
-        const text = JSON.stringify(body);
+        const text = canonicalizeJson(body);
         const proof = await buildWeb3SignedHeader({
           wallet,
           aud: "https://server.example",
@@ -680,7 +684,7 @@ it.each(["node", "lite"] as const)(
 );
 
 it.each(["stream", "key", "operation", "declaration", "blob"])(
-  "binds the receipt to the semantic %s",
+  "binds the receipt to the envelope %s",
   async (field) => {
     const f = await applicationFixture();
     await commit(f);
@@ -804,4 +808,73 @@ it("journals a mutable-record tombstone with the deletion's stamp", async () => 
   expect(await f.db.query("SELECT * FROM records")).toEqual([]);
   const tombstones = await f.db.query("SELECT stamp_r FROM record_tombstones");
   expect(rows[0]!.stamp_r).toBe(tombstones[0]!.stamp_r);
+});
+
+it("stores SHA-256 of the exact received envelope bytes, independent of refreshed proofs", async () => {
+  const f = await applicationFixture();
+  await commit(f);
+  const exact = canonicalizeJson(f.envelope);
+  const expected = toHex(sha256(new TextEncoder().encode(exact)));
+  const row = (
+    await f.db.query(
+      "SELECT request_hash,signed_request FROM application_receipts",
+    )
+  )[0]!;
+  expect(row.request_hash).toBe(expected);
+  expect(row.signed_request).toBe(exact);
+  expect(await commit(f)).toEqual(await commit(f));
+  expect(await f.db.query("SELECT count(*) AS n FROM record_changes")).toEqual([
+    { n: 1 },
+  ]);
+});
+
+it.each(["unsorted", "duplicate", "overflow", "rounded", "surrogate"])(
+  "rejects the %s byte profile before receipt lookup",
+  async (variant) => {
+    const f = await applicationFixture();
+    await commit(f);
+    const canonical = canonicalizeJson(f.envelope);
+    const raw =
+      variant === "unsorted"
+        ? JSON.stringify(f.envelope)
+        : variant === "duplicate"
+          ? canonical.replace(
+              '"mutationId":"mutation-one"',
+              '"mutationId":"mutation-one","mutationId":"mutation-one"',
+            )
+          : variant === "overflow"
+            ? canonical.replace('"value":"first"', '"value":1e400')
+            : variant === "rounded"
+              ? canonical.replace('"value":"first"', '"value":9007199254740993')
+              : canonical.replace('"value":"first"', '"value":"\\ud800"');
+    await expect(f.authorize(f.envelope, raw)).rejects.toMatchObject({
+      errorCode: "APPLICATION_BODY_NOT_JCS",
+    });
+    expect(
+      await f.db.query("SELECT count(*) AS n FROM application_receipts"),
+    ).toEqual([{ n: 1 }]);
+  },
+);
+
+it("accepts JCS numeric member ordering while retaining the received byte spelling", async () => {
+  const f = await applicationFixture();
+  const input = {
+    ...f.envelope,
+    record: {
+      ...f.envelope.record,
+      data: { ...f.envelope.record.data, "2": 0.1, "10": 1e30 },
+    },
+  };
+  await commit(f, input);
+  const exact = canonicalizeJson(input);
+  expect(
+    (
+      await f.db.query(
+        "SELECT signed_request,request_hash FROM application_receipts",
+      )
+    )[0],
+  ).toEqual({
+    signed_request: exact,
+    request_hash: toHex(sha256(new TextEncoder().encode(exact))),
+  });
 });

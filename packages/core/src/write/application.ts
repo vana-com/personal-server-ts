@@ -6,6 +6,8 @@ export interface VerifiedApplicationAuthority {
   readonly kind: "verified-application-authority";
 }
 export interface ApplicationAuthority {
+  readonly requestHash: string;
+  readonly signedRequest: string;
   readonly scope: string;
   readonly owner: string;
   readonly builder: `0x${string}`;
