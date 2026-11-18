@@ -141,14 +141,19 @@ export function servedStreams(
 export const servedStreamOf = (target: Target): string =>
   target.alias?.servedStream ?? target.streams[0]!;
 
+/** Effective control state while a connector deletion is pending. */
+export const effectiveControl = (connection: string): string =>
+  `CASE WHEN EXISTS (SELECT 1 FROM delete_intents d WHERE d.connector = ${connection}.connector)
+    THEN 'deleted' ELSE ${connection}.control_state END`;
+
 /** Every connection of one connector, by namespace. */
 export function connectionsOf(
   deps: { readonly db: SqlReader },
   connector: string,
 ): Promise<Connection[]> {
   return deps.db.query<Connection>(
-    `SELECT connection_id, connector, ns, generation, control_state, deleted_at
-     FROM connections WHERE connector = ? ORDER BY ns`,
+    `SELECT connection_id, connector, ns, generation, ${effectiveControl("c")} AS control_state, deleted_at
+     FROM connections c WHERE connector = ? ORDER BY ns`,
     [connector],
   );
 }
