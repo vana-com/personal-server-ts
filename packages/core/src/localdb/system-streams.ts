@@ -320,11 +320,12 @@ export function createSystemStreamStore(
           [identity.connectionId, descriptor.stream],
         );
         for (const row of rows) {
-          if (!(await canonical(row.record_id, row.body))) {
-            const [run] = await db.query<{ state: string }>(
-              "SELECT state FROM runs WHERE run_id=?",
-              [row.run_id],
-            );
+          const [run] = await db.query<{ state: string }>(
+            "SELECT state FROM runs WHERE run_id=?",
+            [row.run_id],
+          );
+          const bodyCanonical = await canonical(row.record_id, row.body);
+          if (!bodyCanonical) {
             if (run?.state === "ended") {
               row.run_id = deps.newOp();
               row.observed_at = Math.max(deps.now(), row.observed_at + 1);
@@ -376,6 +377,10 @@ export function createSystemStreamStore(
                 },
               ],
             });
+          }
+          // Batch admission can precede a crash at end. Settle the outbox's
+          // original run even when its exact body is already canonical.
+          if (!bodyCanonical || run?.state === "collecting") {
             await end.end(row.run_id, {
               finish: "completed",
               lastBatch: 0,
