@@ -354,6 +354,11 @@ describe("PS-Lite POST /v1/write/session", () => {
     expect((await handshake(runtime)).status).toBe(404);
   });
 
+  it("offers the builder handshake on a custom-auth host without explicit write-session wiring", async () => {
+    const { runtime } = setup({ writeSessions: false });
+    expect((await handshake(runtime)).status).toBe(200);
+  });
+
   it("answers 405 for a non-POST handshake", async () => {
     const { runtime } = setup();
     const res = await runtime.fetch(
@@ -814,6 +819,13 @@ describe("the stream-sync switch refuses every legacy write on the browser runti
     const response = await sessionWrite(h.runtime, { v: 1 }, { token });
     expect(response.status).toBe(426);
     expect(h.storage.findEntry({ scope: SCOPE })).toBeFalsy();
+  });
+
+  it("preserves the builder write API on a switched browser host", async () => {
+    const h = setup({ mode: "switched" });
+    const token = await openSession(h.runtime);
+    const response = await sessionWrite(h.runtime, { v: 1 }, { token });
+    expect(response.status).toBe(201);
   });
 
   it("refuses an Oura browser import and stores nothing", async () => {
