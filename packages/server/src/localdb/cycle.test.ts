@@ -62,6 +62,23 @@ beforeEach(() => {
 });
 
 describe("local database cycle", () => {
+  it.each([[], ["missing"]])(
+    "avoids registry calls when no scoped connection is held: %j",
+    async (connections) => {
+      const deps = dependencies();
+      deps.db = {
+        query: vi.fn().mockResolvedValue([]),
+      } as unknown as LocalSyncDeps["db"];
+      const list = vi.spyOn(deps.registry, "listOwnerRows");
+      expect(await runCycle(deps, { connections })).toEqual({
+        connections: [],
+      });
+      expect(list).not.toHaveBeenCalled();
+      expect(publishLog).not.toHaveBeenCalled();
+      expect(applyConnection).not.toHaveBeenCalled();
+    },
+  );
+
   it("lists first and applies before publishing each queued connection", async () => {
     const deps = dependencies();
     const events: string[] = [];
