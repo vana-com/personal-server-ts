@@ -1,3 +1,4 @@
+import { isReservedSystemConnector } from "../policy/reserved-scopes.js";
 import {
   ADDITIONS_BUCKET_MS,
   ADDITIONS_FINE_DAYS,
@@ -249,6 +250,7 @@ GROUP BY c.connection_id, c.connector, r.stream, r.first_o`);
       };
 
       for (const row of rows) {
+        if (isReservedSystemConnector(row.connector)) continue;
         connections.add(row.connection_id);
         if (row.stream === null) continue;
         const scope = `${row.connector}.${row.stream}`;

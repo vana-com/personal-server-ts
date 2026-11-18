@@ -48,6 +48,8 @@ describe("stream-sync read status route", () => {
   it("reads hydration from the local runtime through the route", async () => {
     const localSync = createLocalSync(
       {
+        ownerAddress: OWNER,
+        now: Date.now,
         db: {
           query: async () => [],
           batch: async () => {},

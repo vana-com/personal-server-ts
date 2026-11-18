@@ -1,3 +1,5 @@
+import { createAccessActivity } from "../logging/activity-stream.js";
+import { isReservedSystemConnector } from "../policy/reserved-scopes.js";
 import type {
   DeltaApplyResult,
   RegistryChangeDelta,
@@ -50,6 +52,7 @@ import { createRunIntakeStore } from "./run-intake.js";
  */
 export interface LocalSync {
   readonly intake: RunIntake;
+  readonly accessActivity: ReturnType<typeof createAccessActivity>;
   readonly deleter: ConnectionDeleter;
   readonly resolver: LocalResolver;
   readonly listing: LocalListing;
@@ -114,6 +117,7 @@ export function createLocalSync(
   let intakeStore: ReturnType<typeof createRunIntakeStore> | undefined;
   const intake = () => (intakeStore ??= createRunIntakeStore(deps));
   const endStore = createRunEndStore(deps);
+  const accessActivity = createAccessActivity(deps);
   const bindings = new Map<
     string,
     { readonly connector: string; readonly leaseId: string | null }
@@ -167,6 +171,11 @@ export function createLocalSync(
       if (req.owner.address.toLowerCase() !== deps.ownerAddress.toLowerCase()) {
         throw new RunIntakeError("owner_mismatch");
       }
+      if (isReservedSystemConnector(req.connector))
+        throw new RunIntakeError(
+          "invalid_request",
+          "reserved system connector",
+        );
       await sweepOnce();
       const receipt = await readBeginReceipt(deps.db, runId, req);
       if (receipt) return receipt;
@@ -287,6 +296,7 @@ export function createLocalSync(
   let closing: Promise<void> | undefined;
   return {
     intake: runIntake,
+    accessActivity,
     deleter,
     resolver: createLocalResolver(deps, {
       query,
@@ -308,13 +318,15 @@ export function createLocalSync(
     }),
     declarations: {
       streamsOf: async (connector) =>
-        // A stream whose delete floor reaches its head is `tombstoned` for
-        // reads (read-selection.ts), unless a load of a newer head of this
-        // generation has applied parts (`partialReadable`). One with no head
-        // yet and no floor is mid first load.
-        (
-          await readerOf(deps.db).query<{ stream: string }>(
-            `SELECT DISTINCT s.stream FROM stream_state s
+        isReservedSystemConnector(connector)
+          ? []
+          : // A stream whose delete floor reaches its head is `tombstoned` for
+            // reads (read-selection.ts), unless a load of a newer head of this
+            // generation has applied parts (`partialReadable`). One with no head
+            // yet and no floor is mid first load.
+            (
+              await readerOf(deps.db).query<{ stream: string }>(
+                `SELECT DISTINCT s.stream FROM stream_state s
                JOIN connections c ON c.connection_id = s.connection_id
               WHERE c.connector = ? AND c.control_state = 'active'
                 AND c.deleted_at IS NULL
@@ -326,15 +338,17 @@ export function createLocalSync(
                                    AND p.generation = c.generation
                                    AND p.version > s.last_delete_version))
               ORDER BY s.stream`,
-            [connector],
-          )
-        ).map((row) => row.stream),
+                [connector],
+              )
+            ).map((row) => row.stream),
       connectors: async () =>
         (
           await readerOf(deps.db).query<{ connector: string }>(
             "SELECT DISTINCT connector FROM connections WHERE control_state='active' ORDER BY connector",
           )
-        ).map((row) => row.connector),
+        )
+          .map((row) => row.connector)
+          .filter((connector) => !isReservedSystemConnector(connector)),
     },
     blobs: createBlobStore(deps),
     async cycle(scope) {
@@ -349,16 +363,25 @@ export function createLocalSync(
         report.connections.every((connection) => connection.error === null)
       )
         accountHydrated = true;
+      // Maintenance stages activity for a later publish. It must not delay
+      // the early publish between a collection's admitted batch and its end.
+      await accessActivity.drain();
+      await accessActivity.prune();
+      await accessActivity.project();
       return report;
     },
     async publish() {
       await resume();
-      return runPublish(deps);
+      const report = await runPublish(deps);
+      await accessActivity.project();
+      return report;
     },
     async applyDelta(delta) {
       if ((await resume()).length > 0)
         return { outcome: "cycle", reason: "a delete is pending" };
-      return applyRegistryDelta(deps, delta);
+      const result = await applyRegistryDelta(deps, delta);
+      await accessActivity.project();
+      return result;
     },
     async apply() {
       await resume();
@@ -384,11 +407,14 @@ export function createLocalSync(
         throw firstError instanceof Error
           ? firstError
           : new Error(String(firstError));
+      await accessActivity.project();
       if (allApplied) accountHydrated = true;
     },
     async syncConnection(connectionId) {
       await resume();
-      return syncConnection(deps, connectionId);
+      const report = await syncConnection(deps, connectionId);
+      await accessActivity.project();
+      return report;
     },
     close: () => {
       closed = true;
