@@ -314,12 +314,13 @@ export function invalidAliasBinding(binding: LocalAliasTarget): boolean {
 
 /**
  * Pick the connection a read of `target` serves, from its active connections.
- * Rank by the newest readable head among the binding's target streams, then the
- * lowest namespace. Required streams participate; optional streams participate
- * only when complete, as they do in the served body. Unrelated streams never
- * affect rank. Keep one connection for the whole target: a winner with a deleted
- * required stream is `tombstoned`; missing or incomplete required streams serve
- * nothing. Progressive logical reads retain their first-load readability gates.
+ * Prefer complete candidates, then the newest readable head among the binding's
+ * target streams, then the lowest namespace. Required streams participate;
+ * optional streams participate only when complete, as they do in the served
+ * body. Unrelated streams never affect rank. Keep one connection for the whole
+ * target: a winner with a deleted required stream is `tombstoned`; missing or
+ * incomplete required streams serve nothing. Progressive logical reads retain
+ * their first-load readability gates.
  */
 export function selectForTarget(
   target: Target,
@@ -366,6 +367,7 @@ export function selectForTarget(
   }
   active.sort(
     (a, b) =>
+      compareCompleteness(a, b) ||
       b.registered - a.registered ||
       a.connection.ns.localeCompare(b.connection.ns),
   );
@@ -401,12 +403,28 @@ export function selectForTarget(
   };
 }
 
-/** Across the targets of one scope, the newest head wins, then the connector. */
+/** Missing or unreadable required streams do not count as a complete copy. */
+const completeCandidate = (candidate: Candidate): boolean =>
+  candidate.target.streams.length > 0 &&
+  candidate.target.streams.every(
+    (name) =>
+      isOptionalStream(candidate.target, name) ||
+      candidate.streams.some(
+        (s) => s.stream === name && complete(s, candidate.connection),
+      ),
+  );
+
+/** Complete copies precede first loads at every candidate selection level. */
+const compareCompleteness = (a: Candidate, b: Candidate): number =>
+  Number(completeCandidate(b)) - Number(completeCandidate(a));
+
+/** Across one scope's targets: completeness, newest head, then connector. */
 export function chooseCandidate(
   candidates: readonly Candidate[],
 ): Candidate | undefined {
   return [...candidates].sort(
     (a, b) =>
+      compareCompleteness(a, b) ||
       b.registered - a.registered ||
       a.target.connector.localeCompare(b.target.connector),
   )[0];
