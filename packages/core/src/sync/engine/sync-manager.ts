@@ -387,6 +387,10 @@ function connectionsOwingWork(report: unknown): OwedConnection[] {
   return owed;
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export function createSyncManager(
   uploadDeps: UploadWorkerDeps,
   downloadDeps: DownloadWorkerDeps,
@@ -857,7 +861,7 @@ export function createSyncManager(
             needsStartupHydration = false;
           } catch (err) {
             downloadDeps.logger.warn(
-              { error: (err as Error).message },
+              { error: errorMessage(err) },
               "Scope hydration failed; continuing with full sync",
             );
           }
@@ -909,12 +913,12 @@ export function createSyncManager(
           const syncError: SyncError = {
             fileId: null,
             scope: null,
-            message: `Download cycle failed: ${(err as Error).message}`,
+            message: `Download cycle failed: ${errorMessage(err)}`,
             timestamp: new Date().toISOString(),
           };
           pushError(syncError);
           downloadDeps.logger.error(
-            { error: (err as Error).message },
+            { error: errorMessage(err) },
             "Download cycle failed",
           );
         }

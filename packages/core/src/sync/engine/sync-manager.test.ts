@@ -119,6 +119,56 @@ describe("SyncManager", () => {
     }
   });
 
+  it("records an undefined download rejection and permits a later cycle", async () => {
+    const download = makeMockDownloadDeps();
+    const apply = vi.fn().mockRejectedValue(undefined);
+    download.localSync = { apply };
+    vi.mocked(downloadAll).mockImplementation(async (deps) => {
+      await deps.localSync!.apply();
+      return [];
+    });
+    const manager = createSyncManager(makeMockUploadDeps(), download, {
+      transferMode: "download-only",
+    });
+    try {
+      await expect(manager.trigger()).resolves.toBeUndefined();
+      expect(manager.getStatus().errors).toEqual([
+        expect.objectContaining({
+          message: "Download cycle failed: undefined",
+        }),
+      ]);
+      apply.mockResolvedValue(undefined);
+      await expect(manager.trigger()).resolves.toBeUndefined();
+      expect(apply).toHaveBeenCalledTimes(2);
+    } finally {
+      await manager.stop();
+    }
+  });
+
+  it("falls back after an undefined startup hydration rejection", async () => {
+    const download = makeMockDownloadDeps();
+    download.localSync = { apply: vi.fn().mockRejectedValue(undefined) };
+    vi.mocked(downloadScopes).mockImplementation(async (deps) => {
+      await deps.localSync!.apply();
+      return [];
+    });
+    const manager = createSyncManager(makeMockUploadDeps(), download, {
+      transferMode: "download-only",
+      hydrateScopes: ["example.records"],
+    });
+    try {
+      await expect(manager.trigger()).resolves.toBeUndefined();
+      expect(downloadAll).toHaveBeenCalledOnce();
+      expect(manager.getStatus().hydratedScopes).toEqual([]);
+      expect(download.logger.warn).toHaveBeenCalledWith(
+        { error: "undefined" },
+        "Scope hydration failed; continuing with full sync",
+      );
+    } finally {
+      await manager.stop();
+    }
+  });
+
   it("start() triggers an immediate sync cycle", async () => {
     const uploadDeps = makeMockUploadDeps();
     const downloadDeps = makeMockDownloadDeps();

@@ -359,7 +359,10 @@ export function createLocalSync(
           failed = true;
         }
       }
-      if (failed) throw firstError;
+      if (failed)
+        throw firstError instanceof Error
+          ? firstError
+          : new Error(String(firstError));
     },
     async syncConnection(connectionId) {
       await resume();
