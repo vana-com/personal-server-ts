@@ -38,10 +38,10 @@ vi.mock("@opendatalabs/personal-server-ts-stream-sync", async (original) => {
       writer.lie ? false : real.segmentRemoves(ops),
   };
 });
-let beforeClose: (() => void) | undefined;
+let beforeClose: (() => Promise<void>) | undefined;
 afterEach(async () => {
   try {
-    beforeClose?.();
+    await beforeClose?.();
   } finally {
     beforeClose = undefined;
     writer.lie = false;
@@ -1243,8 +1243,10 @@ describe("disk-backed bootstrap swap", () => {
           return { error };
         },
       );
-      beforeClose = () =>
+      beforeClose = async () => {
+        await settled;
         expect(applySettled, "apply settled before closing drivers").toBe(true);
+      };
       const observationTimeout = new Error(
         "Timed out waiting for held tail reads or apply settlement",
       );
@@ -1289,18 +1291,16 @@ describe("disk-backed bootstrap swap", () => {
         secondStarted.resolve();
         if (!secondHeld) secondFinished.resolve();
         let drainError: unknown;
+        const drainTimeout = new Error("Timed out draining apply");
         try {
-          const result = await wait(
-            settled,
-            2000,
-            new Error("Timed out draining apply"),
-          );
+          const result = await wait(settled, serial ? 5 : 2000, drainTimeout);
           if (result.error) throw result.error;
           expect(applySettled, "apply must settle before cleanup returns").toBe(
             true,
           );
         } catch (error) {
           drainError = error;
+          await settled;
         }
         if (observationError) {
           if (drainError && observationError instanceof Error)
@@ -1310,6 +1310,9 @@ describe("disk-backed bootstrap swap", () => {
       };
       if (serial) {
         await expect(observeAndDrain()).rejects.toBe(observationTimeout);
+        expect(observationTimeout.cause).toEqual(
+          new Error("Timed out draining apply"),
+        );
         expect(applySettled, "expired observation must still drain apply").toBe(
           true,
         );

@@ -473,7 +473,7 @@ export function createLocalResolver(
         rows = await connections(target.connector);
         if (input.connection !== null)
           rows = rows.filter((c) => c.ns === input.connection);
-        applyUnavailable ||= rows.some(
+        const targetUnavailable = rows.some(
           (c) =>
             refused.has(c.connection_id) &&
             c.control_state === "active" &&
@@ -502,12 +502,13 @@ export function createLocalResolver(
         const picked = selectForTarget(target, loaded, { progressive });
         if (picked.kind === "invalid_binding") return picked;
         if (picked.tombstoned) sawTombstoned = true;
+        else if (targetUnavailable) applyUnavailable = true;
         if (picked.candidate) candidates.push(picked.candidate);
       }
       const chosen = chooseCandidate(candidates);
       if (!chosen) {
-        if (sawTombstoned) return deleted();
         if (applyUnavailable) return { kind: "busy", retryAfterSeconds: 5 };
+        if (sawTombstoned) return deleted();
         if (sawDeleted) return deleted();
         if (sawForeign && !sawActive) return { kind: "key_mismatch" };
         if (input.cursor !== null) return { kind: "cursor_stale" };
