@@ -606,6 +606,39 @@ describe(
       expect(await idsOf(b)).toEqual(await idsOf(plain));
     });
 
+    it("does not mark the account hydrated while a later snapshot part is held", async () => {
+      const { w, head, ids, victim } = await compacted();
+      let release!: () => void;
+      let arrived!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const blocked = new Promise<void>((resolve) => {
+        arrived = resolve;
+      });
+      const b = await w.device("hydration", {
+        progressiveFirstLoad: true,
+        keyedFirstLoad: false,
+        maxBytesInFlight: ONE_AT_A_TIME,
+        beforeGet: async (key) => {
+          if (key === partKey(head, 2)) {
+            arrived();
+            await held;
+          }
+        },
+      });
+      const applying = b.sync.apply();
+      try {
+        await Promise.race([blocked, applying]);
+        expect((await b.sync.listing.status()).accountHydrated).toBe(false);
+      } finally {
+        release();
+        await applying;
+      }
+      expect((await b.sync.listing.status()).accountHydrated).toBe(true);
+      expect(await idsOf(b)).toEqual(ids.filter((id) => id !== victim).sort());
+    });
+
     it("a snapshot part that is missing stops the load on its row; the next apply carries it on to the end", async () => {
       const { w, head, victim } = await compacted();
       const key = partKey(head, 2);

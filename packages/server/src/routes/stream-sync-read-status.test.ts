@@ -7,6 +7,9 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
+import { createLocalSync } from "../../../core/src/localdb/sync.js";
+import { connectionQueue } from "../../../core/src/localdb/queue.js";
+import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import { streamSyncReadStatusRoutes } from "./stream-sync-read-status.js";
 
 const OWNER = "0x1111111111111111111111111111111111111111" as const;
@@ -42,6 +45,44 @@ const port = (status: ReturnType<NonNullable<StreamSyncReadPort["status"]>>) =>
   ({ resolve: vi.fn(), status: () => status }) as unknown as StreamSyncReadPort;
 
 describe("stream-sync read status route", () => {
+  it("reads hydration from the local runtime through the route", async () => {
+    const localSync = createLocalSync(
+      {
+        db: {
+          query: async () => [],
+          batch: async () => {},
+          close: async () => {},
+        },
+        queue: connectionQueue(),
+        registry: { listOwnerRows: async () => [] },
+        keys: { namespaceHmac: async () => new Uint8Array(32) },
+        logger: { info: vi.fn(), warn: vi.fn() },
+      } as unknown as LocalSyncDeps,
+      { resolveArtifact: () => null },
+    );
+    const route = streamSyncReadStatusRoutes({
+      serverOrigin: "http://127.0.0.1",
+      serverOwner: OWNER,
+      gateway: {} as GatewayClient,
+      accessToken: TOKEN,
+      localSync,
+      streamSyncRead: undefined,
+    });
+    const read = async () =>
+      (
+        await route.request("/", {
+          headers: { authorization: `Bearer ${TOKEN}` },
+        })
+      ).json();
+    try {
+      expect(await read()).toMatchObject({ accountHydrated: false });
+      await localSync.cycle();
+      expect(await read()).toMatchObject({ accountHydrated: true });
+    } finally {
+      await localSync.close();
+    }
+  });
+
   it.each([false, true])(
     "exposes the runtime's Account hydration fact (%s)",
     async (accountHydrated) => {
