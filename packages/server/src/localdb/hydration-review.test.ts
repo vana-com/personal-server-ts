@@ -66,6 +66,7 @@ it("keeps hydration false while a full download is held and a scoped retry runs"
     },
   });
   const full = here.sync.cycle();
+  let publishing: Promise<unknown> | undefined;
   try {
     await arrived;
     expect((await here.sync.listing.status()).accountHydrated).toBe(false);
@@ -74,9 +75,12 @@ it("keeps hydration false while a full download is held and a scoped retry runs"
         .connections,
     ).toHaveLength(1);
     expect((await here.sync.listing.status()).accountHydrated).toBe(false);
+    publishing = here.sync.publish();
+    expect((await here.sync.listing.status()).accountHydrated).toBe(false);
   } finally {
     release();
     await full;
+    await publishing;
   }
   expect((await here.sync.listing.status()).accountHydrated).toBe(true);
   expect(
