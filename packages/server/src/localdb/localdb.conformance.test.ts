@@ -95,20 +95,44 @@ describe("connection queue", () => {
     await Promise.all([a, b]);
   });
 
-  it("joins an apply that is queued or running instead of starting a second", async () => {
-    const q = connectionQueue();
-    const g = gate();
-    let runs = 0;
-    const apply = () =>
-      q.run("c1", "apply", async () => ((runs += 1), g.open, runs));
-    const first = apply();
-    const joined = apply();
-    expect(joined).toBe(first);
-    g.release();
-    expect(await joined).toBe(1);
-    expect(await apply()).toBe(2);
-    expect(runs).toBe(2);
-  });
+  it.each(["queued", "running"])(
+    "joins an apply that is %s instead of starting a second",
+    async (phase) => {
+      const q = connectionQueue();
+      const held = gate();
+      const entered = gate();
+      let runs = 0;
+      const apply = () =>
+        q.run("c1", "apply", async () => {
+          runs += 1;
+          entered.release();
+          await held.open;
+          return runs;
+        });
+      const first = apply();
+      let joined = first;
+      try {
+        if (phase === "running") {
+          // Observe callback entry, not just a microtask or elapsed time.
+          // It remains suspended on held.open when the second request arrives.
+          await entered.open;
+          expect(runs).toBe(1);
+        } else {
+          expect(runs).toBe(0);
+        }
+        joined = apply();
+        expect(joined).toBe(first);
+        await entered.open;
+        expect(runs).toBe(1);
+      } finally {
+        held.release();
+        await Promise.all([first, joined]);
+      }
+      expect(await joined).toBe(1);
+      expect(await apply()).toBe(2);
+      expect(runs).toBe(2);
+    },
+  );
 
   it("queues an apply behind a running end, and a joiner still shares its promise", async () => {
     const q = connectionQueue();
