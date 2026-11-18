@@ -771,6 +771,7 @@ export function createApp(deps: AppDeps): Hono {
   app.route(
     "/v1/data",
     dataRoutes({
+      localSync,
       additions: deps.additions,
       indexManager: deps.indexManager,
       hierarchyOptions: deps.hierarchyOptions,

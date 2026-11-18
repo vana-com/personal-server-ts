@@ -1,3 +1,4 @@
+import { stageMutation } from "./mutation-identity.js";
 import { planStreamStep } from "../stream-sync/publish-plan.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
@@ -132,33 +133,29 @@ export function admitUpserts(input: {
     const stream = known
       ? factsGuard(connectionId, row.stream, known)
       : { sql: "0", params: [] };
-    statements.push({
-      // A later row for the same key in this batch replaces the earlier one.
-      sql: `INSERT OR REPLACE INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, stamp_n)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${guard.sql} AND ${stream.sql}
+    statements.push(
+      stageMutation({
+        operation: op,
+        stream: row.stream,
+        row,
+        stamp: { observedAt: o, id: runId, ordinal: batch },
+        guard: {
+          sql: `${guard.sql} AND ${stream.sql}
           AND NOT EXISTS (SELECT 1 FROM record_tombstones t
             WHERE t.connection_id = ? AND t.stream = ? AND t.pk_hash = ?
               AND (t.stamp_o, t.stamp_r) > (?, ?))`,
-      params: [
-        op,
-        row.stream,
-        row.pkHash,
-        row.recordKey,
-        o,
-        runId,
-        row.body,
-        row.bodySha256,
-        o,
-        batch,
-        ...guardParams,
-        ...(stream.params ?? []),
-        connectionId,
-        row.stream,
-        row.pkHash,
-        o,
-        runId,
-      ],
-    });
+          params: [
+            ...guardParams,
+            ...(stream.params ?? []),
+            connectionId,
+            row.stream,
+            row.pkHash,
+            o,
+            runId,
+          ],
+        },
+      }),
+    );
   }
   statements.push(
     replaceOwnRunRows(op, connectionId, runId, o),

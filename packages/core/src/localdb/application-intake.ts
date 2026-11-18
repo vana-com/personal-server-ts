@@ -1,6 +1,8 @@
+import { factsGuard, type StreamFacts } from "./admit.js";
 import {
   canonicalJson,
   controlScope,
+  streamScope,
   deriveNs,
   isPlainObject,
   toHex,
@@ -20,9 +22,9 @@ import { ProtocolError } from "../errors/catalog.js";
 import { compileRecordSchema } from "../storage/pdpp-records/schema.js";
 import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
 import { createApplicationGrantStore } from "./application-grants.js";
-import { mutationIdentity } from "./mutation-identity.js";
+import { mutationIdentity, stageMutation } from "./mutation-identity.js";
 import { mergeIncoming, withOrigin } from "./merge.js";
-import { prepareBlob } from "./blobs.js";
+import { prepareApplicationBlobs } from "./application-blobs.js";
 import type { SqlStatement } from "./driver.js";
 
 /** Full snapshot supplied by the host's declaration/onboarding authority.
@@ -30,6 +32,7 @@ import type { SqlStatement } from "./driver.js";
  * Publishing/trust policy stays outside localdb; a request's document is not authority.
  */
 export interface AcceptedApplicationDeclaration {
+  readonly scopeBindings: Readonly<Record<string, readonly string[]>>;
   readonly document: string;
   readonly writer: string;
   readonly bindingRevision: string;
@@ -70,6 +73,14 @@ export interface AuthorizedApplicationMutation {
 }
 export interface ApplicationIntake {
   readonly grants: GrantObservationPort;
+  /** Trusted host observation of a new binding revision, through the same writer. */
+  readonly bindings: {
+    record(input: {
+      readonly sourceId: string;
+      readonly writer: string;
+      readonly revision: string;
+    }): Promise<void>;
+  };
   prepare(
     authority: VerifiedApplicationAuthority,
     input: ApplicationEnvelope,
@@ -87,8 +98,8 @@ export const applicationSource = (builder: string): string =>
   `urn:vana:builder:${builder.toLowerCase()}`;
 const digestOf = (text: string) =>
   toHex(sha256(new TextEncoder().encode(text)));
-const semanticHash = (input: ApplicationEnvelope): string =>
-  digestOf(canonicalJson(input as unknown as JsonValue));
+const semanticHash = (input: ApplicationEnvelope, scope: string): string =>
+  digestOf(canonicalJson({ scope, envelope: input } as unknown as JsonValue));
 
 export function createApplicationIntake(
   deps: LocalSyncDeps,
@@ -96,6 +107,7 @@ export function createApplicationIntake(
 ): ApplicationIntake {
   type Prepared = {
     authority: ApplicationAuthority;
+    grant: NonNullable<ApplicationAuthority["grant"]>;
     input: ApplicationEnvelope;
     hash: string;
     source: string;
@@ -105,15 +117,13 @@ export function createApplicationIntake(
     generation: number;
     revision: string;
     deleteSnapshot: number;
+    facts: StreamFacts;
     document: string;
     version: string;
     primaryKey: string[];
     semantics: string;
     row: Awaited<ReturnType<typeof mutationIdentity>>;
-    blobs: readonly {
-      hash: string;
-      statements: ReturnType<typeof prepareBlob>;
-    }[];
+    blobs: ReturnType<typeof prepareApplicationBlobs>;
   };
   const capabilities = new WeakMap<AuthorizedApplicationMutation, Prepared>();
   const grants = createApplicationGrantStore(deps.db);
@@ -121,6 +131,17 @@ export function createApplicationIntake(
     authority: ApplicationAuthority,
     input: ApplicationEnvelope,
   ): Promise<ApplicationReceipt | null> {
+    if (
+      !input ||
+      typeof input.mutationId !== "string" ||
+      !input.mutationId ||
+      input.mutationId.length > 128 ||
+      !input.record ||
+      !isPlainObject(input.record.data) ||
+      !input.declaration ||
+      typeof input.declaration.digest !== "string"
+    )
+      fail("INVALID_APPLICATION_MUTATION", 400);
     if (authority.owner.toLowerCase() !== deps.ownerAddress.toLowerCase())
       fail("APPLICATION_OWNER_MISMATCH", 403);
     const [row] = await deps.db.query<{
@@ -131,12 +152,46 @@ export function createApplicationIntake(
       [applicationSource(authority.builder), input.mutationId],
     );
     if (!row) return null;
-    if (row.request_hash !== semanticHash(input))
+    if (row.request_hash !== semanticHash(input, authority.scope))
       fail("APPLICATION_MUTATION_CONFLICT");
     return JSON.parse(row.receipt) as ApplicationReceipt;
   }
   return {
     grants,
+    bindings: {
+      async record(input) {
+        if (
+          input.sourceId !== applicationSource(input.writer) ||
+          !input.revision
+        )
+          fail("INVALID_APPLICATION_BINDING", 400);
+        const connector = `app-${digestOf(input.sourceId)}`;
+        const ns = await deriveNs(
+          (bytes) => deps.keys.namespaceHmac(bytes),
+          connector,
+          input.sourceId,
+        );
+        await deps.db.batch([
+          {
+            sql: "INSERT OR IGNORE INTO application_sources(source_id,writer,revision,connection_id) VALUES (?,?,?,?)",
+            params: [
+              input.sourceId,
+              input.writer.toLowerCase(),
+              input.revision,
+              controlScope(connector, ns),
+            ],
+          },
+          {
+            sql: "UPDATE application_sources SET revision=? WHERE source_id=? AND writer=?",
+            params: [
+              input.revision,
+              input.sourceId,
+              input.writer.toLowerCase(),
+            ],
+          },
+        ]);
+      },
+    },
     async replay(token, input) {
       return receipt(applicationAuthority(token), input);
     },
@@ -157,6 +212,7 @@ export function createApplicationIntake(
         !/^[a-f0-9]{64}$/.test(input.declaration.digest)
       )
         fail("INVALID_APPLICATION_MUTATION", 400);
+      if (!authority.grant) fail("APPLICATION_GRANT_REQUIRED", 403);
       const source = applicationSource(authority.builder);
       const accepted = await resolve?.({
         digest: input.declaration.digest,
@@ -185,7 +241,8 @@ export function createApplicationIntake(
       );
       if (
         !stream ||
-        !/^[a-zA-Z0-9_-]+$/.test(stream.name) ||
+        typeof stream.name !== "string" ||
+        stream.name === "" ||
         !["mutable_state", "append_only"].includes(stream.semantics) ||
         !Array.isArray(stream.primary_key) ||
         !stream.primary_key.length ||
@@ -204,11 +261,22 @@ export function createApplicationIntake(
         fail("INVALID_APPLICATION_RECORD", 400);
       if (input.record.op === "delete" && stream.semantics === "append_only")
         fail("APPLICATION_APPEND_ONLY");
+      try {
+        if (
+          !stream.schema ||
+          !compileRecordSchema(stream.schema)(input.record.data)
+        )
+          fail("APPLICATION_SCHEMA_VIOLATION", 400);
+      } catch (error) {
+        if (error instanceof ProtocolError) throw error;
+        fail("INVALID_APPLICATION_DECLARATION", 400);
+      }
       if (
-        !stream.schema ||
-        !compileRecordSchema(stream.schema)(input.record.data)
+        !accepted.scopeBindings?.[authority.scope]?.includes(
+          input.record.stream,
+        )
       )
-        fail("APPLICATION_SCHEMA_VIOLATION", 400);
+        fail("APPLICATION_SCOPE_BINDING_MISMATCH", 403);
       const row = await mutationIdentity(
         input.record.data,
         stream.primary_key,
@@ -220,6 +288,7 @@ export function createApplicationIntake(
         connector,
         source,
       );
+      streamScope(connector, ns, input.record.stream);
       const connection = controlScope(connector, ns);
       const [binding] = await deps.db.query<{
         revision: string;
@@ -238,39 +307,36 @@ export function createApplicationIntake(
         "SELECT generation FROM connections WHERE connection_id=?",
         [connection],
       );
-      const [state] = await deps.db.query<{ last_delete_version: number }>(
-        "SELECT last_delete_version FROM stream_state WHERE connection_id=? AND stream=?",
+      const [state] = await deps.db.query<
+        { [K in keyof StreamFacts]: StreamFacts[K] } & {
+          last_delete_version: number;
+        }
+      >(
+        "SELECT last_delete_version, head_version, head_generation, floor_version, floor_o, primary_key AS local_primary_key FROM stream_state WHERE connection_id=? AND stream=?",
         [connection, input.record.stream],
       );
-      const blobs = (input.blobs ?? []).map((blob) => {
-        if (
-          !Array.isArray(blob.bytes) ||
-          blob.bytes.some((b) => !Number.isInteger(b) || b < 0 || b > 255)
-        )
-          fail("INVALID_APPLICATION_BLOB", 400);
-        if (!row.body.includes(JSON.stringify(blob.sha256)))
-          fail("UNREFERENCED_APPLICATION_BLOB", 400);
-        return {
-          hash: blob.sha256,
-          statements: prepareBlob({
-            ...blob,
-            bytes: new Uint8Array(blob.bytes),
-          }),
-        };
-      });
+      const blobs = prepareApplicationBlobs(input);
       const cap = Object.freeze({
         kind: "authorized-application-mutation" as const,
       });
       capabilities.set(cap, {
         authority,
+        grant: authority.grant,
         input,
-        hash: semanticHash(input),
+        hash: semanticHash(input, authority.scope),
         source,
         connector,
         ns,
         connection,
         generation: known?.generation ?? 1,
         deleteSnapshot: state?.last_delete_version ?? 0,
+        facts: state ?? {
+          head_version: 0,
+          head_generation: null,
+          floor_version: null,
+          floor_o: null,
+          local_primary_key: JSON.stringify(stream.primary_key),
+        },
         revision: accepted.bindingRevision,
         document: accepted.document,
         version: doc.declaration_version,
@@ -299,6 +365,11 @@ export function createApplicationIntake(
           },
           publication: "pending",
         };
+        const streamFacts = factsGuard(
+          p.connection,
+          input.record.stream,
+          p.facts,
+        );
         const statements: SqlStatement[] = [
           {
             sql: "INSERT OR IGNORE INTO application_sources(source_id,writer,revision,connection_id) VALUES (?,?,?,?)",
@@ -314,7 +385,7 @@ export function createApplicationIntake(
             params: [p.source, p.version, input.declaration.digest, p.document],
           },
           {
-            sql: "INSERT OR IGNORE INTO connections(connection_id,connector,ns,control_state) VALUES (?,?,?,'active')",
+            sql: "INSERT OR IGNORE INTO connections(connection_id,connector,ns,control_state) VALUES (?,?,?,'absent')",
             params: [p.connection, p.connector, p.ns],
           },
           {
@@ -333,16 +404,18 @@ export function createApplicationIntake(
           },
           {
             sql: `INSERT INTO application_guard SELECT ?, CASE WHEN
-              EXISTS(SELECT 1 FROM application_grants WHERE grant_id=? AND revision=? AND status='active' AND (expires_at IS NULL OR expires_at>=?))
+              EXISTS(SELECT 1 FROM application_grants WHERE grant_id=? AND revision=? AND authority_hash=? AND status='active' AND (expires_at IS NULL OR expires_at>=?))
               AND EXISTS(SELECT 1 FROM application_sources WHERE source_id=? AND writer=? AND revision=? AND connection_id=?)
               AND EXISTS(SELECT 1 FROM connections c WHERE c.connection_id=? AND c.generation=? AND c.control_state IN ('active','absent') AND c.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector=c.connector))
               AND EXISTS(SELECT 1 FROM stream_state WHERE connection_id=? AND stream=? AND last_delete_version=? AND primary_key=? AND semantics=?)
               AND EXISTS(SELECT 1 FROM application_declarations WHERE source_id=? AND version=? AND digest=? AND document=?)
+              AND ${streamFacts.sql}
               THEN 1 ELSE 0 END`,
             params: [
               op,
-              p.authority.grant.id,
-              observeWriteGrant(p.authority.grant).revision,
+              p.grant.id,
+              observeWriteGrant(p.grant).revision,
+              observeWriteGrant(p.grant).authorityHash!,
               deps.now(),
               p.source,
               p.authority.builder.toLowerCase(),
@@ -359,33 +432,107 @@ export function createApplicationIntake(
               p.version,
               input.declaration.digest,
               p.document,
+              ...(streamFacts.params ?? []),
             ],
           },
           { sql: "DELETE FROM application_guard WHERE op=?", params: [op] },
           {
-            sql: `INSERT INTO incoming(op,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256,first_o,stamp_n) VALUES (?,?,?,?,?,?,?,?,?,0)`,
+            sql: "CREATE TEMP TABLE IF NOT EXISTS application_append_guard(op TEXT PRIMARY KEY, ok INTEGER NOT NULL CONSTRAINT application_append_only CHECK(ok=1))",
+          },
+          {
+            sql: `INSERT INTO application_append_guard SELECT ?, CASE WHEN ? <> 'append_only' OR NOT EXISTS(SELECT 1 FROM records WHERE connection_id=? AND stream=? AND pk_hash=? AND (body<>? OR body_sha256<>?)) THEN 1 ELSE 0 END`,
             params: [
               op,
+              p.semantics,
+              p.connection,
               input.record.stream,
               row.hash,
-              row.recordKey,
-              deps.now(),
-              `application:${op}`,
               row.body,
               row.bodySha256,
-              deps.now(),
             ],
           },
-          ...mergeIncoming(op, p.connection),
-          ...p.blobs.flatMap((blob) => [
-            ...blob.statements(p.generation),
-            {
-              sql: "INSERT OR IGNORE INTO blob_refs(blob_id,connection_id,stream,pk_hash) VALUES (?,?,?,?)",
-              params: [blob.hash, p.connection, input.record.stream, row.hash],
-            },
-          ]),
           {
-            sql: "INSERT INTO application_receipts(source_id,mutation_id,request_hash,receipt,provenance,declaration_digest) VALUES (?,?,?,?,?,?)",
+            sql: "DELETE FROM application_append_guard WHERE op=?",
+            params: [op],
+          },
+          {
+            sql: "CREATE TEMP TABLE IF NOT EXISTS mutation_stamps(op TEXT PRIMARY KEY, o INTEGER NOT NULL)",
+          },
+          {
+            sql: `INSERT INTO mutation_stamps SELECT ?, MAX(?,COALESCE((SELECT MAX(COALESCE(seen_o,stamp_o))+1 FROM records WHERE connection_id=?),0),COALESCE((SELECT MAX(stamp_o)+1 FROM record_tombstones WHERE connection_id=?),0))`,
+            params: [op, deps.now(), p.connection, p.connection],
+          },
+          ...(input.record.op === "delete"
+            ? [
+                {
+                  sql: `INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin,explicit_delete,pk_values) SELECT ?,?,?,?,'remove',o,?,'local',1,? FROM mutation_stamps WHERE op=? AND NOT EXISTS(SELECT 1 FROM records WHERE connection_id=? AND stream=? AND pk_hash=?)`,
+                  params: [
+                    p.connection,
+                    input.record.stream,
+                    row.hash,
+                    row.recordKey,
+                    `application:${op}`,
+                    row.keyValues,
+                    op,
+                    p.connection,
+                    input.record.stream,
+                    row.hash,
+                  ],
+                },
+                {
+                  sql: `INSERT OR REPLACE INTO record_tombstones(connection_id,stream,pk_hash,stamp_o,stamp_r) SELECT ?,?,?,o,? FROM mutation_stamps WHERE op=?`,
+                  params: [
+                    p.connection,
+                    input.record.stream,
+                    row.hash,
+                    `application:${op}`,
+                    op,
+                  ],
+                },
+                {
+                  sql: "DELETE FROM records WHERE connection_id=? AND stream=? AND pk_hash=?",
+                  params: [p.connection, input.record.stream, row.hash],
+                },
+                {
+                  sql: `UPDATE record_changes SET stamp_o=(SELECT o FROM mutation_stamps WHERE op=?),stamp_r=?,explicit_delete=1,pk_values=? WHERE seq=(SELECT MAX(seq) FROM record_changes WHERE connection_id=? AND stream=? AND pk_hash=?)`,
+                  params: [
+                    op,
+                    `application:${op}`,
+                    row.keyValues,
+                    p.connection,
+                    input.record.stream,
+                    row.hash,
+                  ],
+                },
+              ]
+            : [
+                stageMutation({
+                  operation: op,
+                  stream: input.record.stream,
+                  row: {
+                    pkHash: row.hash,
+                    recordKey: row.recordKey,
+                    body: row.body,
+                    bodySha256: row.bodySha256,
+                  },
+                  stamp: { operation: op, id: `application:${op}` },
+                }),
+                ...mergeIncoming(op, p.connection),
+              ]),
+          { sql: "DELETE FROM mutation_stamps WHERE op=?", params: [op] },
+          {
+            sql: "DELETE FROM blob_refs WHERE connection_id=? AND stream=? AND pk_hash=?",
+            params: [p.connection, input.record.stream, row.hash],
+          },
+          ...p.blobs({
+            op,
+            connection: p.connection,
+            generation: p.generation,
+            stream: input.record.stream,
+            pkHash: row.hash,
+          }),
+          {
+            sql: "INSERT INTO application_receipts(source_id,mutation_id,request_hash,receipt,provenance,declaration_digest,emitted_at,signed_request) VALUES (?,?,?,?,?,?,?,?)",
             params: [
               p.source,
               input.mutationId,
@@ -393,12 +540,18 @@ export function createApplicationIntake(
               JSON.stringify(result),
               JSON.stringify(p.authority.attribution),
               input.declaration.digest,
+              input.record.emitted_at,
+              JSON.stringify(input),
             ],
           },
         ];
         try {
           await deps.db.batch(withOrigin("local", statements));
         } catch (error) {
+          if (String(error).includes("application_blob_ready"))
+            fail("APPLICATION_BLOB_UNAVAILABLE", 400);
+          if (String(error).includes("application_append_only"))
+            fail("APPLICATION_APPEND_ONLY");
           if (String(error).includes("CHECK constraint failed"))
             fail("APPLICATION_AUTHORITY_CHANGED", 403);
           throw error;

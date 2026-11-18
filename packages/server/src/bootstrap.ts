@@ -1,3 +1,4 @@
+import type { ResolveApplicationDeclaration } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   createViewChanges,
   localDatabaseName,
@@ -332,6 +333,7 @@ export interface CreateServerOptions {
    * test with no gateway passes its own (for example
    * `createMemoryStreamSyncRegistry()`).
    */
+  resolveApplicationDeclaration?: ResolveApplicationDeclaration;
   streamSyncRegistry?: StreamSyncRegistry;
   /**
    * The `fetch` for every request to the data gateway and to storage. Default:
@@ -978,6 +980,7 @@ async function bootstrapServer(
             : {}),
         };
         const facade = createServerLocalSync(deps, {
+          resolveApplicationDeclaration: options?.resolveApplicationDeclaration,
           resolveArtifact: (digest) =>
             manifestArtifactResolver(pdppAuth?.retainedManifests ?? [])(digest),
           eraseLegacy: (connector) =>

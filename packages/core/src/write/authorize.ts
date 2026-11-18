@@ -10,8 +10,12 @@
  * adapters call the same code. There is exactly one implementation of the
  * write policy; a browser build cannot drift into a weaker one.
  *
- * The two entry points differ in what they are allowed to decide:
+ * The entry points differ in what they are allowed to decide:
  *
+ *   - `authorizeApplicationWrite` records the live gateway observation through
+ *     localdb, verifies the signed envelope, and prepares a runtime-bound
+ *     capability. A revoked or expired grant may recover only its builder's
+ *     existing receipt; it cannot prepare another mutation.
  *   - `authorizeSessionWrite` authorizes a write to a NAMED scope. It
  *     re-runs `verifyDataWritePolicy` against the LIVE grant on every call,
  *     so revocation, expiry, grantee binding, owner binding and scope
@@ -22,7 +26,7 @@
  *     NO grant policy runs (there is no scope to run one against). Callers use
  *     it only to choose between error shapes, never to release data.
  *
- * Both fail closed: an unknown bearer, an unknown session, a missing server
+ * All fail closed: an unknown bearer, an unknown session, a missing server
  * owner, or any failing proof check returns/raises rather than falling back to
  * a weaker credential. A request that is not a write-session request at all
  * returns `undefined`, and the caller applies its own owner gate.
@@ -174,9 +178,10 @@ export function createWriteSessionAuthorization(
       });
       try {
         const authority = verifiedApplicationAuthority({
+          scope: input.scope,
           owner: deps.serverOwner,
           builder: session.builderAddress,
-          grant: grant ?? ({ id: session.grantId } as never),
+          grant,
           attribution,
         });
         const receipt = await applications.replay(authority, envelope);

@@ -20,14 +20,15 @@ export function createApplicationGrantStore(
         },
         {
           sql: `INSERT OR IGNORE INTO application_grants
-            (grant_id, revision, status, expires_at, observed_at)
-            VALUES (?, ?, ?, ?, ?)`,
+            (grant_id, revision, status, expires_at, observed_at, authority_hash)
+            VALUES (?, ?, ?, ?, ?, ?)`,
           params: [
             observation.grantId,
             observation.revision,
             observation.status,
             observation.expiresAt,
             observation.observedAt,
+            observation.authorityHash ?? "",
           ],
         },
       ]);

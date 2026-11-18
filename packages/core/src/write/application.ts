@@ -6,9 +6,10 @@ export interface VerifiedApplicationAuthority {
   readonly kind: "verified-application-authority";
 }
 export interface ApplicationAuthority {
+  readonly scope: string;
   readonly owner: string;
   readonly builder: `0x${string}`;
-  readonly grant: GatewayGrantResponse;
+  readonly grant?: GatewayGrantResponse;
   readonly attribution: WriterAttribution;
 }
 const authorities = new WeakMap<
@@ -21,7 +22,10 @@ export function verifiedApplicationAuthority(
   const token = Object.freeze({
     kind: "verified-application-authority" as const,
   });
-  authorities.set(token, value);
+  authorities.set(
+    token,
+    JSON.parse(JSON.stringify(value)) as ApplicationAuthority,
+  );
   return token;
 }
 export function applicationAuthority(

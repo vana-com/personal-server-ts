@@ -600,4 +600,9 @@ END`,
     `CREATE TABLE application_declarations(source_id TEXT NOT NULL, version TEXT NOT NULL, digest TEXT NOT NULL, document TEXT NOT NULL, PRIMARY KEY(source_id,version))`,
     `CREATE TABLE application_receipts(source_id TEXT NOT NULL, mutation_id TEXT NOT NULL, request_hash TEXT NOT NULL, receipt TEXT NOT NULL, provenance TEXT NOT NULL, declaration_digest TEXT NOT NULL, PRIMARY KEY(source_id,mutation_id))`,
   ],
+  [
+    `ALTER TABLE application_grants ADD COLUMN authority_hash TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE application_receipts ADD COLUMN emitted_at TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE application_receipts ADD COLUMN signed_request TEXT NOT NULL DEFAULT ''`,
+  ],
 ];

@@ -821,11 +821,25 @@ describe("the stream-sync switch refuses every legacy write on the browser runti
     expect(h.storage.findEntry({ scope: SCOPE })).toBeFalsy();
   });
 
-  it("preserves the builder write API on a switched browser host", async () => {
+  it("fails closed when a canonical write has no application capability", async () => {
     const h = setup({ mode: "switched" });
     const token = await openSession(h.runtime);
-    const response = await sessionWrite(h.runtime, { v: 1 }, { token });
-    expect(response.status).toBe(201);
+    const response = await sessionWrite(
+      h.runtime,
+      {
+        mutationId: "one",
+        declaration: { digest: "0".repeat(64) },
+        record: {
+          stream: "items",
+          key: "one",
+          data: { id: "one" },
+          emitted_at: "2026-01-01T00:00:00Z",
+        },
+      },
+      { token },
+    );
+    expect(response.status).toBe(503);
+    expect(h.storage.findEntry({ scope: SCOPE })).toBeFalsy();
   });
 
   it("refuses an Oura browser import and stores nothing", async () => {

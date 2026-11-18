@@ -1,3 +1,4 @@
+import type { WriteSessionAuthorization } from "../write/authorize.js";
 import { decodeBase64UrlUtf8 } from "../encoding/base64url.js";
 import type { LocalListing } from "../localdb/listing.js";
 import { isOwnAppRead } from "../payment/own-app.js";
@@ -275,6 +276,7 @@ export interface PersonalServerListAuthResult {
 }
 
 export interface PersonalServerApiAuthPort {
+  authorizeApplicationWrite?: WriteSessionAuthorization["authorizeApplicationWrite"];
   authorizeOwner(request: Request): Promise<void>;
   /**
    * Authorize `GET /v1/data` and `GET /v1/data/:scope/versions`.

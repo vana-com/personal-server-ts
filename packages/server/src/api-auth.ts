@@ -339,6 +339,7 @@ export function createServerApiAuth(
     authorizeOwner,
     authorizeWrite,
     authorizeWriteSession,
+    authorizeApplicationWrite: writeSessions.authorizeApplicationWrite,
     async authorizeOwnerScope(input: PersonalServerScopeAuthInput) {
       if (await authorizePdppOwnerBearerForScope(input)) return;
       await authorizeOwner(input.request);

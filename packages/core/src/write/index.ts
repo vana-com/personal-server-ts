@@ -39,3 +39,5 @@ export {
   type VerifyWriterAttributionInput,
   type WriterAttribution,
 } from "./attribution.js";
+
+export { handleApplicationWriteRequest } from "./application-request.js";

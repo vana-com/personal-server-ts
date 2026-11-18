@@ -43,7 +43,6 @@ import {
 } from "../localdb/legacy-migration-fixture.test-utils.js";
 import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
 import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
-import { existsSync } from "node:fs";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const builderWallet = createTestWallet(0);
@@ -828,13 +827,13 @@ describe("builder write contract across the stream-sync switch", () => {
     expect((await run.finished).message).toBe("legacy retirement finished");
   }
 
-  it("preserves the builder JSON write API after switching", async () => {
+  it("refuses old-format builder JSON after switching", async () => {
     await switchAccount();
     const response = await sessionWrite(app, SCOPE, { note: "new" });
-    expect(response.status).toBe(201);
+    expect(response.status).toBe(426);
   });
 
-  it("preserves the builder binary write API after switching", async () => {
+  it("refuses old-format builder binary after switching", async () => {
     await switchAccount();
     const response = await sessionBinaryWrite(
       app,
@@ -842,59 +841,6 @@ describe("builder write contract across the stream-sync switch", () => {
       new TextEncoder().encode("document"),
       { contentType: "application/pdf", filename: "document.pdf" },
     );
-    expect(response.status).toBe(201);
-  });
-
-  it.each(["owner", "read-grantee"])(
-    "keeps an earlier builder write readable to the %s after switching",
-    async (reader) => {
-      expect((await sessionWrite(app, SCOPE, { note: "saved" })).status).toBe(
-        201,
-      );
-      const authorization =
-        reader === "owner"
-          ? "Bearer builder-contract-owner"
-          : await buildWeb3SignedHeader({
-              wallet: builderWallet,
-              aud: SERVER_ORIGIN,
-              method: "GET",
-              uri: `/${SCOPE}`,
-              grantId: "read-grant",
-            });
-      const read = () =>
-        app.request(`/${SCOPE}`, {
-          headers: { Authorization: authorization },
-        });
-      expect((await read()).status).toBe(200);
-      // Keep retirement disabled here to isolate read selection from unlink.
-      host.context.config.streamSync.retireLegacy = false;
-      await switchAccount();
-      expect(host.context.indexManager.findLatestByScope(SCOPE)).toBeTruthy();
-      const response = await read();
-      expect(response.status).toBe(200);
-      expect((await response.json()).data.note).toBe("saved");
-    },
-  );
-
-  it("retains an earlier builder file until its data has a canonical home", async () => {
-    expect((await sessionWrite(app, SCOPE, { note: "saved" })).status).toBe(
-      201,
-    );
-    const entry = host.context.indexManager.findLatestByScope(SCOPE)!;
-    const path = join(root, "server", "data", entry.path);
-    expect(existsSync(path)).toBe(true);
-    await switchAccount();
-    expect(existsSync(path)).toBe(true);
-  });
-
-  it("publishes an earlier builder write into the stream-sync store", async () => {
-    expect((await sessionWrite(app, SCOPE, { note: "saved" })).status).toBe(
-      201,
-    );
-    await switchAccount();
-    const local = await host.context.getLocalSync!();
-    await local.cycle();
-    const listing = await local.listing.listScopes({ canRead: () => true });
-    expect(listing.some((row) => row.scope === SCOPE)).toBe(true);
+    expect(response.status).toBe(426);
   });
 });

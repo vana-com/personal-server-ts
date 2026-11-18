@@ -1,3 +1,8 @@
+import { sha256 } from "@noble/hashes/sha2";
+import {
+  canonicalJson,
+  toHex,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import { isSystemScope } from "./reserved-scopes.js";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
 import { scopeMatchesPattern } from "@opendatalabs/vana-sdk/browser";
@@ -104,6 +109,7 @@ export interface DataWritePolicyPorts {
 export interface GrantObservation {
   readonly grantId: string;
   readonly revision: string;
+  readonly authorityHash?: string;
   readonly status: "active" | "revoked" | "expired";
   readonly expiresAt: number | null;
   readonly observedAt: number;
@@ -125,6 +131,19 @@ export function observeWriteGrant(
   return {
     grantId: grant.id,
     revision: grant.grantVersion,
+    authorityHash: toHex(
+      sha256(
+        new TextEncoder().encode(
+          canonicalJson({
+            owner: grant.grantorAddress?.toLowerCase() ?? "",
+            grantee: grant.granteeId.toLowerCase(),
+            scopes: grant.scopes ?? [],
+            expiresAt: grant.expiresAt ?? null,
+            version: grant.grantVersion,
+          }),
+        ),
+      ),
+    ),
     status:
       grant.revokedAt !== null
         ? "revoked"
@@ -200,6 +219,8 @@ export async function verifyDataWritePolicy(
       reason: "Grant has no write scopes",
     });
   }
+
+  if (grant.expired) throw new GrantExpiredError();
 
   if (grant.expiresAt !== null && grant.expiresAt !== undefined) {
     const expiresAtSec = parseGrantExpiresAtSeconds(grant.expiresAt);

@@ -116,3 +116,12 @@ export * from "./legacy-retire.js";
 export * from "./import-fingerprint.js";
 
 export * from "./seed.js";
+
+export type {
+  ApplicationIntake,
+  ApplicationEnvelope,
+  ApplicationReceipt,
+  AuthorizedApplicationMutation,
+  ResolveApplicationDeclaration,
+  AcceptedApplicationDeclaration,
+} from "./application-intake.js";
