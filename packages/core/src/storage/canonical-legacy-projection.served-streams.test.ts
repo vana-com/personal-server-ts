@@ -299,6 +299,7 @@ describe("synthetic optional-stream contract", () => {
           expect(result).toMatchObject({
             ok: false,
             reason: "blob_backed_records_unsupported",
+            stream: "O",
           });
           expect(store.getBlobBytes).not.toHaveBeenCalled();
           expect(projector).not.toHaveBeenCalled();
