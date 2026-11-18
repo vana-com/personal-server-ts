@@ -1314,6 +1314,8 @@ async function bootstrapServer(
       ...(changeProbe && { changeProbe }),
       ...(localSyncSource && {
         localSync: {
+          hasPendingPublication: async () =>
+            (await localSyncSource()).hasPendingPublication(),
           cycle: async (scope) => (await localSyncSource()).cycle(scope),
           applyDelta: async (delta) =>
             (await localSyncSource()).applyDelta(delta),

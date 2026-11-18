@@ -1,4 +1,59 @@
-# Bounded ordered-log design model
+# Connection-log models and recorded evidence
+
+## Current evidence summary and open obligations
+
+**Documentation/source snapshot:**
+`2f3228e6f461d5a1c2e1672d1570c1980bafdd2e` is the tree reviewed for this
+summary. It is **not** a claimed source SHA for every TLC run below. The only
+explicit original source pin, `1ca1a110d9304adc4dab709c78cf770584a895fa`,
+belongs to the initial design exploration in [History](#history-initial-design-exploration).
+Later sections record model revisions and run dates, but do not provide one
+verified implementation/model pin covering the whole set.
+
+**Status:** TLC has been run. Results are model-specific: completed checks,
+intentional failing mutants and interrupted runs are distinguished below.
+This is bounded model evidence, not a proof of the integrated product or a
+refinement proof from the models to its implementation.
+
+| Evidence                                        | Bounds and last recorded result                                                                                                                                                                            | Source in this document                                                                                                                                      |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Latest dated run: `PartialView.tla`, 2026-11-17 | Three segments; operations over two keys; position stamps. `PartialView.cfg` records no error, 20,480 generated / 16,384 distinct states. Both lying-removal and no-hold mutants violate `Exact`.          | [Progressive first load](#progressive-first-load-shows-only-rows-the-finished-log-keeps-partialviewtla-host-run-2026-11-17)                                  |
+| Incremental SQL rank, 2026-11-16                | One key at one stamp; ordinal/body ordering. `SqlRank.cfg` completes: 1,029,883 distinct states, depth 6. Two mutants fail `RowIsFold`.                                                                    | [Incremental apply](#incremental-apply-sqlranktla-host-run-2026-11-16)                                                                                       |
+| Equal-stamp abstract order, rerun 2026-11-16    | Five-batch corpus; `EqualStamp.cfg` completes at 3,447,086 distinct states. Lifetime variant stopped at 40 minutes; liveness not checked.                                                                  | [Equal-stamp order](#equal-stamp-order-host-run-2026-11-15)                                                                                                  |
+| Head cursor/replay, 2026-11-16                  | One stream, three devices, two heads/two rounds. Durable-obligation checks and rollback variant pass their listed properties; memory-only variants fail. Pending local writes and compaction are excluded. | [HeadCursor](#headcursor-a-per-stream-head-that-predates-the-log), [stored replay obligation](#the-stored-replay-obligation)                                 |
+| General and keyed log models, 2026-11-15/16     | Corpus/config-specific bounds; `MaxSteps=6` bounds commits/reset, not network steps. Good, LostPush temporal checking and keyed runs include unfinished checks, not established PASS results.              | [State and abstraction](#state-and-abstraction), [TLC results](#tlc-results-host-run), [key-ordered first load](#key-ordered-first-load-host-run-2026-11-16) |
+
+**Open obligations before relying on this evidence:**
+
+- Record matching implementation/model/config pins and rerun relevant checks
+  for a release. The dated receipts below are not fresh runs on this snapshot.
+- Complete or explicitly bound the unfinished safety/liveness obligations;
+  no invariant error before a timeout is not a completed PASS. See the Good,
+  LostPush, keyed and EqualStampLifetime rows.
+- Preserve each model's assumptions. General convergence assumes eventual
+  successful reads and writer quiescence; keyed recovery explicitly conditions
+  liveness on crashes ending. See [properties](#properties-and-expected-host-results)
+  and [rebaseline](#rebaseline-of-an-unfinishable-key-ordered-load-host-run-2026-11-16).
+- Establish implementation-level evidence for omitted concerns, including real
+  gateway CAS/authentication, crypto, crash/storage behavior and local pending
+  writes where excluded. [Host invocation and exclusions](#host-invocation-and-exclusions)
+  and the individual model sections state what is not proved.
+- `PartialView` assumes truthful removal facts. Its section explicitly describes
+  the runtime limitation when a writer supplies a false fact; do not interpret
+  the model's `Exact` result as unconditional runtime safety.
+
+The runtime uses a connection log, segment application, batch publication and
+control-row deletion fences; see the [package overview](../../../packages/stream-sync/README.md#current-protocol-and-ownership).
+Descriptions below are retained at the revision they discuss. In particular,
+[per-stream heads beside the log](#per-stream-heads-beside-the-log-applyts)
+records an older fallback/flag design, not the current publication contract.
+No new TLC or product test was executed for this documentation update.
+
+## History: initial design exploration
+
+The following opening and source mapping describe the initial authored model,
+before the recorded host runs and later protocol changes. “Not run” and
+“future protocol” here are historical status, not the current evidence summary.
 
 Source pin: `1ca1a110d9304adc4dab709c78cf770584a895fa`.
 Status: authored and statically reviewed; **TLC has not been run**. Expected
@@ -6,7 +61,7 @@ outcomes below are predictions, not verification evidence. No production code
 changes. This models the requested future protocol, not a claim that this pin
 already implements immutable operation segments.
 
-## Source mapping and explicit boundaries
+### Source mapping and explicit boundaries
 
 - `packages/core/src/localdb/merge.ts`: `mergeIncoming` compares effective
   SEEN observation pairs, preserves later local sightings, and can promote a
@@ -50,7 +105,7 @@ already implements immutable operation segments.
   (which is absorbing rather than reset). Local purge implementation and
   lifetime-boundary internals are outside this source selection.
 
-## State and abstraction
+### State and abstraction
 
 Devices 1 and 2 are writers and replicas; device 3 only reads. Two keys stand
 for two distinct streams. A batch is an ordered sequence applied atomically;
@@ -79,7 +134,7 @@ claims about delivery after writers stop. The graph is finite without bounding
 duplicate hints. One reset is possible; position resets to zero only when
 adopting a newer epoch, so monotonicity means the pair (epoch, position).
 
-## Actions
+### Actions
 
 - Commit: writer of the next catalog batch appends one immutable segment and
   atomically advances the connection position; emits a hint.
@@ -145,7 +200,7 @@ adopting a newer epoch, so monotonicity means the pair (epoch, position).
   model: the code keeps it, and its tests state that (`log-keyed-first-load.test.ts`,
   "keeps the writes the device has not published").
 
-## Properties and expected host results
+### Properties and expected host results
 
 | Configuration             | Expected result                     | Target                                                                                                        |
 | ------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------- |
@@ -193,7 +248,7 @@ this is stronger than merely checking an epoch tag on stale content.
 and Recover. Storage reads succeed eventually; Byzantine storage, perpetual
 outage and infinitely continuing writers are not silently proved live.
 
-## Predicted counterexample recipes (not TLC output)
+### Predicted counterexample recipes (not TLC output)
 
 - Gap: Commit twice; FullCheck(3); SkipGap(3) advances 0 to 2 without records.
 - Out-of-order: Commit twice; FullCheck(3); Apply(3,2) violates prefixOK.
@@ -211,7 +266,7 @@ mutant folds the compacted prefix with explicit delete operations removed,
 retaining earlier live values; its config tests a reader-visible error rather
 than failing immediately on the snapshot oracle.
 
-## Host invocation and exclusions
+### Host invocation and exclusions
 
 From this directory, use the host's installed TLC, for example:
 `java -cp /path/to/tla2tools.jar tlc2.TLC -workers 1 -config Good.cfg LogProtocol`.

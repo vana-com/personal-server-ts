@@ -46,6 +46,7 @@ import {
   type AliasScopes,
   type AliasTargets,
 } from "./resolve.js";
+import { ELIGIBLE_CHANGE, PENDING_RUN } from "./publication-work.js";
 import { createRunEndStore } from "./run-end.js";
 import { createRunIntakeStore } from "./run-intake.js";
 
@@ -76,6 +77,7 @@ export interface LocalSync {
     connectors(): Promise<readonly string[]>;
   };
   readonly blobs: BlobStore;
+  hasPendingPublication(): Promise<boolean>;
   /** `/sync/trigger` and the timer: C.4 order, apply then publish. */
   cycle(scope?: CycleScope): Promise<CycleReport>;
   /**
@@ -319,6 +321,15 @@ export function createLocalSync(
   let closing: Promise<void> | undefined;
   return {
     intake: runIntake,
+    async hasPendingPublication() {
+      const rows = await deps.db.query(`SELECT 1 FROM system_stream_outbox
+        UNION ALL SELECT 1 FROM record_changes JOIN stream_state s
+          ON s.connection_id=record_changes.connection_id AND s.stream=record_changes.stream
+          WHERE record_changes.seq>s.publish_watermark AND ${ELIGIBLE_CHANGE}
+        UNION ALL SELECT 1 FROM runs r JOIN run_streams rs ON rs.run_id=r.run_id
+          WHERE ${PENDING_RUN} LIMIT 1`);
+      return rows.length > 0;
+    },
     accessActivity,
     deleter,
     resolver: createLocalResolver(deps, {
