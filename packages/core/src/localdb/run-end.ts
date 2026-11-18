@@ -1,3 +1,5 @@
+import { normalizeRawEnd } from "../stream-sync/normalize-raw-end.js";
+import { readRawRecordEvidence } from "./raw-end-evidence.js";
 import { readEndReceipt } from "./run-receipts.js";
 import {
   checkpointDecision,
@@ -10,6 +12,8 @@ import {
 } from "../stream-sync/intake.js";
 import {
   parseEndRequest,
+  pruneDownward,
+  blockUpward,
   planRunFinish,
   type RunFinishPlan,
   type RunFinishStream,
@@ -74,6 +78,7 @@ type Run = {
   last_batch: number;
   admitting: number;
   begin_response: string | null;
+  selected_streams: string | null;
 };
 
 /** The run's START per declared stream. Runs stored no response before it existed. */
@@ -102,7 +107,10 @@ function declaredStreams(
 }
 
 function answer(
-  plan: Pick<RunFinishPlan, "covered" | "provenFull" | "unconfirmed"> & {
+  plan: Pick<
+    RunFinishPlan,
+    "covered" | "provenFull" | "unconfirmed" | "streamStatus"
+  > & {
     readonly outcome: EndResponse["outcome"];
   },
   result: EndResponse["result"],
@@ -114,6 +122,7 @@ function answer(
     outcome: plan.outcome,
     coveredStreams: plan.covered,
     provenFullStreams: plan.provenFull,
+    ...(plan.streamStatus ? { streamStatus: plan.streamStatus } : {}),
     unconfirmed: plan.unconfirmed,
   };
 }
@@ -175,8 +184,18 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         const cleanup = (receipt: RunEndResponse): SqlStatement[] => [
           { sql: "DELETE FROM run_rows WHERE run_id = ?", params: [runId] },
           {
-            sql: "UPDATE runs SET state = 'ended',end_response=? WHERE run_id = ?",
-            params: [JSON.stringify(receipt), runId],
+            sql: "DELETE FROM run_record_evidence WHERE run_id = ?",
+            params: [runId],
+          },
+          {
+            sql: "UPDATE runs SET state = 'ended',end_response=?,raw_end=? WHERE run_id = ?",
+            params: [
+              JSON.stringify(receipt),
+              body !== null && typeof body === "object" && "wireDialect" in body
+                ? JSON.stringify(body)
+                : null,
+              runId,
+            ],
           },
           // This run no longer holds back older tombstones. Last, so the
           // compaction sees the run as ended.
@@ -186,9 +205,16 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         const discard = async (
           reason: "failed" | "cancelled",
           unconfirmed: boolean,
+          streamStatus?: EndResponse["streamStatus"],
         ): Promise<RunEndResponse> => {
           const response = answer(
-            { outcome: reason, covered: [], provenFull: [], unconfirmed },
+            {
+              outcome: reason,
+              covered: [],
+              provenFull: [],
+              unconfirmed,
+              ...(streamStatus ? { streamStatus } : {}),
+            },
             "aborted",
             false,
           );
@@ -216,10 +242,35 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           WHERE rs.run_id = ? ORDER BY rs.stream`,
           [run.connection_id, runId],
         );
-        const req = parseEndRequest(
-          body,
-          streams.map((stream) => stream.stream),
-        );
+        const raw =
+          body !== null && typeof body === "object" && "wireDialect" in body;
+        const declarations = declaredStreams(run, streams);
+        if (raw && run.selected_streams === null)
+          throw new RunIntakeError(
+            "invalid_request",
+            "raw end requires explicit selection at begin",
+          );
+        const req = raw
+          ? normalizeRawEnd(
+              body,
+              {
+                selectedStreams: JSON.parse(run.selected_streams ?? "[]"),
+                streams: Object.fromEntries(
+                  streams.map((stream) => [
+                    stream.stream,
+                    {
+                      ...declarations[stream.stream]!,
+                      fullRead: stream.full_read === 1,
+                    },
+                  ]),
+                ),
+              },
+              await readRawRecordEvidence(db, runId),
+            )
+          : parseEndRequest(
+              body,
+              streams.map((stream) => stream.stream),
+            );
         if (req.lastBatch !== run.last_batch) {
           throw new RunIntakeError(
             "batch_gap",
@@ -227,13 +278,35 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             run.last_batch + 1,
           );
         }
-        const plan = planRunFinish(req, declaredStreams(run, streams));
+        const plan = planRunFinish(
+          req,
+          declarations,
+          raw ? "raw-v1" : "legacy",
+        );
         if (plan.outcome === "failed")
-          return discard("failed", plan.unconfirmed);
+          return discard("failed", plan.unconfirmed, plan.streamStatus);
         const covered = new Set(plan.covered);
         const trips = await checkRunFence(deps, runId, "end");
         if (trips.length > 0) {
-          const fenced = answer(plan, "discarded", false);
+          const fenced = answer(
+            raw
+              ? {
+                  ...plan,
+                  outcome: "failed",
+                  unconfirmed: true,
+                  covered: [],
+                  provenFull: [],
+                  streamStatus: Object.fromEntries(
+                    Object.keys(req.streams).map((name) => [
+                      name,
+                      "held" as const,
+                    ]),
+                  ),
+                }
+              : plan,
+            "discarded",
+            false,
+          );
           await db.batch([
             {
               sql: "UPDATE connections SET checkpoint = NULL WHERE connection_id = ?",
@@ -441,7 +514,43 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             replaceOwnRunRows(op, run.connection_id, runId, run.o),
           );
         statements.push(...mergeIncoming(op, run.connection_id));
-        const candidate = plan.candidate;
+        let candidate = plan.candidate;
+        if (raw) {
+          const dependencies = Object.entries(declarations).map(
+            ([name, d]) => [name, d.stateParents ?? []] as const,
+          );
+          const blocked = new Set(
+            streams
+              .filter(
+                (stream) =>
+                  run.generation === null ||
+                  checkpointDecision({
+                    target: run.generation,
+                    streams: Object.fromEntries([
+                      [stream.stream, results[stream.stream]!],
+                    ]),
+                    control:
+                      connection.control_state === "active"
+                        ? { kind: "active", generation: connection.generation }
+                        : { kind: "absent" },
+                    seedReceiptsPending: stream.seed === "unresolved",
+                  }).kind !== "save",
+              )
+              .map((stream) => stream.stream),
+          );
+          // A refused/deferred child is just as unsafe for its parent's cursor
+          // as a child held by the source. Reapply both dependency directions.
+          blockUpward(blocked, dependencies);
+          const eligible = new Set(
+            Object.keys(candidate).filter(
+              (name) => plan.covered.includes(name) && !blocked.has(name),
+            ),
+          );
+          pruneDownward(eligible, dependencies);
+          candidate = Object.fromEntries(
+            Object.entries(candidate).filter(([name]) => eligible.has(name)),
+          );
+        }
         const refused = Object.keys(results).filter(
           (stream) => results[stream]!.state === "discarded",
         );
@@ -484,7 +593,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
                 (stream) => stream.seed === "unresolved",
               ),
             }).kind === "save");
-        const saved = canSave;
+        const saved = raw
+          ? req.finish === "completed" && Object.keys(candidate).length > 0
+          : canSave;
         if (saved) {
           // A stream the plan held back keeps the cursor it had.
           statements.push({
@@ -495,8 +606,37 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             ],
           });
         }
+        const acceptedCovered = raw
+          ? plan.covered.filter((name) => results[name]?.state !== "discarded")
+          : plan.covered;
+        const receiptPlan = raw
+          ? {
+              ...plan,
+              covered: acceptedCovered,
+              unconfirmed:
+                plan.unconfirmed ||
+                (plan.covered.length > 0 && acceptedCovered.length === 0),
+              provenFull: plan.provenFull.filter((name) =>
+                acceptedCovered.includes(name),
+              ),
+              outcome:
+                acceptedCovered.length < plan.covered.length
+                  ? acceptedCovered.length > 0
+                    ? ("partial" as const)
+                    : ("failed" as const)
+                  : plan.outcome,
+              streamStatus: Object.fromEntries(
+                Object.keys(req.streams).map((name) => [
+                  name,
+                  acceptedCovered.includes(name)
+                    ? ("succeeded" as const)
+                    : ("held" as const),
+                ]),
+              ),
+            }
+          : plan;
         const response = answer(
-          plan,
+          receiptPlan,
           merged ? "queued" : saved ? "checkpoint_only" : "no_checkpoint",
           updateRequired,
         );

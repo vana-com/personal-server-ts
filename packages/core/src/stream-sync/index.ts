@@ -15,3 +15,12 @@ export * from "./storage-retry.js";
 export * from "./send-gate.js";
 
 export * from "./design-flags.js";
+
+export {
+  validateRawEnd,
+  type RawEndV1,
+  type RawEndError,
+  type RawEndScope,
+  type RawRecordEvidence,
+} from "./raw-end.js";
+export { normalizeRawEnd, type RawEndBegin } from "./normalize-raw-end.js";

@@ -1,3 +1,4 @@
+import type { RawEndV1 } from "./raw-end.js";
 /** Shared run-intake contract for Node, Lite and native hosts.
  * P03/P04 own persistence and lifecycle; hosts compose the database facade.
  */
@@ -108,6 +109,8 @@ export type ResolveArtifact = (
 ) => IntakeDeclarations | null | Promise<IntakeDeclarations | null>;
 
 export interface BeginRequest {
+  /** Explicit selection for raw-end V1; absence preserves legacy admission. */
+  readonly selectedStreams?: readonly string[];
   readonly connector: string;
   readonly artifactDigest: string;
   readonly owner: { readonly address: string; readonly leaseId: string | null };
@@ -215,6 +218,8 @@ export type RunFinish =
  * run-wide skip (one that names no stream) is reported on every stream.
  */
 export interface StreamObservation {
+  /** Explicit completion ceiling; absent preserves legacy evidence rules. */
+  readonly sourceAnswered?: boolean;
   /** The stream's records, folded by key in order, leave a live record. */
   readonly liveRecord: boolean;
   /** The stream emitted at least one explicit delete. */
@@ -250,6 +255,8 @@ export interface EndRequest {
 }
 
 export interface EndResponse {
+  /** V1 only: core-confirmed per-stream completion, independent of whole proof. */
+  readonly streamStatus?: Readonly<Record<string, "succeeded" | "held">>;
   readonly result: EndResult;
   readonly stuck: boolean;
   /** At least one stream was refused because this app needs an update. */
@@ -303,10 +310,13 @@ export interface RunPublicationStatus {
   readonly streams: readonly RunStreamPublication[];
 }
 
+/** The observation request is retained until every host has migrated to V1. */
+export type RunEndRequest = EndRequest | RawEndV1;
+
 export interface RunIntake {
   begin(runId: string, req: BeginRequest): Promise<BeginResponse>;
   batch(runId: string, req: BatchRequest): Promise<BatchResponse>;
-  end(runId: string, req: EndRequest): Promise<EndResponse>;
+  end(runId: string, req: RunEndRequest): Promise<EndResponse>;
   abort(runId: string, reason: "failed" | "cancelled"): Promise<void>;
   /**
    * Whether an ended run is saved, from durable local state. An unknown run

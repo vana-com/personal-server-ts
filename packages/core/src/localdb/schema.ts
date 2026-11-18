@@ -589,4 +589,24 @@ END`,
       BEGIN SELECT RAISE(ABORT,'bootstrap_busy'); END`,
     ),
   ],
+  [
+    // Selection is independent of declaration/scope data. Old runs stay legacy.
+    `ALTER TABLE runs ADD COLUMN selected_streams TEXT`,
+    `CREATE TABLE run_record_evidence (
+      run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+      stream TEXT NOT NULL, pk_hash TEXT NOT NULL, pk_values TEXT NOT NULL,
+      ever_deleted INTEGER NOT NULL, upsert_events INTEGER NOT NULL, delete_events INTEGER NOT NULL,
+      PRIMARY KEY(run_id,stream,pk_hash)) WITHOUT ROWID`,
+    // AFTER INSERT sees each accepted event, including REPLACE of a final row.
+    // It shares the intake transaction, key checks and last-batch replay guard.
+    `CREATE TRIGGER run_rows_evidence AFTER INSERT ON run_rows WHEN NEW.pk_values IS NOT NULL
+      BEGIN
+        INSERT OR REPLACE INTO run_record_evidence(run_id,stream,pk_hash,pk_values,ever_deleted,upsert_events,delete_events)
+        VALUES(NEW.run_id,NEW.stream,NEW.pk_hash,NEW.pk_values,
+          MAX(NEW.op='delete',COALESCE((SELECT ever_deleted FROM run_record_evidence WHERE run_id=NEW.run_id AND stream=NEW.stream AND pk_hash=NEW.pk_hash),0)),
+          (NEW.op='upsert')+COALESCE((SELECT upsert_events FROM run_record_evidence WHERE run_id=NEW.run_id AND stream=NEW.stream AND pk_hash=NEW.pk_hash),0),
+          (NEW.op='delete')+COALESCE((SELECT delete_events FROM run_record_evidence WHERE run_id=NEW.run_id AND stream=NEW.stream AND pk_hash=NEW.pk_hash),0));
+      END`,
+  ],
+  [`ALTER TABLE runs ADD COLUMN raw_end TEXT`],
 ];

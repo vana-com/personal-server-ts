@@ -35,6 +35,7 @@ export interface RunFinishInput {
 }
 
 export interface RunFinishPlan {
+  readonly streamStatus?: Readonly<Record<string, "succeeded" | "held">>;
   /** `failed`: nothing of the run counts; run end discards it. */
   readonly outcome: Exclude<EndOutcome, "cancelled">;
   /** Sorted. Upserts of other streams are dropped; deletes always count. */
@@ -170,8 +171,9 @@ function safeCheckpoints(
   published: readonly string[],
   retry: boolean,
   heldInDone = false,
+  held: readonly string[] = [],
 ): Record<string, JsonValue> {
-  const blocked = new Set<string>();
+  const blocked = new Set<string>(held);
   for (const stream of run.selected) {
     const o = run.obs(stream);
     const retryableSkip = retry && o.retryableSkip;
@@ -242,6 +244,7 @@ const FAILED: RunFinishPlan = {
 export function planRunFinish(
   input: RunFinishInput,
   declared: Readonly<Record<string, RunFinishStream>>,
+  policy: "legacy" | "raw-v1" = "legacy",
 ): RunFinishPlan {
   const selected = Object.keys(input.streams).sort();
   const obs = (stream: string) => input.streams[stream]!;
@@ -263,6 +266,7 @@ export function planRunFinish(
   };
   const proven = new Set(input.provenFullStreams ?? []);
   const anyDelete = selected.some((stream) => obs(stream).explicitDelete);
+  if (policy === "raw-v1") return planRawV1(input, run, proven, anyDelete);
   if (input.finish !== "completed")
     return planFailedDone(input, run, proven, anyDelete);
 
@@ -271,6 +275,7 @@ export function planRunFinish(
   const answered = selected.filter((stream) => {
     const o = obs(stream);
     return (
+      o.sourceAnswered !== false &&
       !skipped(o) &&
       (declaredOf(stream)?.mode !== "full_refresh" ||
         o.liveRecord ||
@@ -324,6 +329,67 @@ export function planRunFinish(
   };
 }
 
+/** V1 has no retry cursor-only exception: every held stream keeps its cursor. */
+function planRawV1(
+  input: RunFinishInput,
+  run: Run,
+  proven: ReadonlySet<string>,
+  anyDelete: boolean,
+): RunFinishPlan {
+  const completed = input.finish === "completed";
+  const covered = run.selected.filter((stream) => {
+    const o = run.obs(stream);
+    if (
+      o.sourceAnswered === false ||
+      skipped(o) ||
+      o.detailGap !== "none" ||
+      o.invalidDetailCoverage ||
+      o.failedInDone
+    )
+      return false;
+    if (!completed) return anyRecord(o);
+    return (
+      run.declared(stream)?.mode !== "full_refresh" ||
+      anyRecord(o) ||
+      proven.has(stream)
+    );
+  });
+  const held = run.selected.filter((stream) => !covered.includes(stream));
+  const retry = run.selected.some(
+    (stream) =>
+      run.obs(stream).retryableSkip ||
+      run.obs(stream).detailGap === "retryable",
+  );
+  const noAnswer = covered.length === 0 && run.selected.length > 0;
+  const certified =
+    input.finish === "certified_failed_done" &&
+    run.selected.some((stream) => run.obs(stream).failedInDone);
+  return {
+    outcome: noAnswer
+      ? retry || anyDelete
+        ? "retry_pending"
+        : "failed"
+      : !completed || held.length > 0
+        ? "partial"
+        : "succeeded",
+    covered,
+    provenFull:
+      completed || certified
+        ? covered.filter((stream) => proven.has(stream))
+        : [],
+    candidate: completed
+      ? safeCheckpoints(run, input.checkpoints, covered, false, true, held)
+      : {},
+    unconfirmed: noAnswer && !retry,
+    streamStatus: Object.fromEntries(
+      run.selected.map((stream) => [
+        stream,
+        covered.includes(stream) ? "succeeded" : "held",
+      ]),
+    ),
+  };
+}
+
 /** The retry rule: streams with unsent records, and their parents, keep their cursor. */
 function withheld(
   run: Run,
@@ -359,6 +425,7 @@ function planFailedDone(
   // kept, while its explicit deletes still publish (end keeps every delete).
   const published = run.selected.filter(
     (stream) =>
+      run.obs(stream).sourceAnswered !== false &&
       !skipped(run.obs(stream)) &&
       !run.obs(stream).failedInDone &&
       anyRecord(run.obs(stream)),
@@ -442,6 +509,8 @@ export function parseEndRequest(
       throw invalid(`unknown stream ${name}`);
     if (
       !isPlainObject(o) ||
+      (o.sourceAnswered !== undefined &&
+        typeof o.sourceAnswered !== "boolean") ||
       OBSERVATION_FLAGS.some((flag) => typeof o[flag] !== "boolean") ||
       (o.detailGap !== "none" &&
         o.detailGap !== "retryable" &&

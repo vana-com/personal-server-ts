@@ -59,6 +59,7 @@ type Run = {
   generation: number | null;
   artifact_version: string;
   admitting: number;
+  selected_streams: string | null;
 };
 const invalid = (message: string) =>
   new RunIntakeError("invalid_request", message);
@@ -155,7 +156,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
   }
   async function live(id: string): Promise<Run> {
     const [run] = await db.query<Run>(
-      "SELECT connection_id,state,last_batch,o,generation,artifact_version,admitting FROM runs WHERE run_id=?",
+      "SELECT connection_id,state,last_batch,o,generation,artifact_version,admitting,selected_streams FROM runs WHERE run_id=?",
       [id],
     );
     if (!run || run.state !== "collecting") {
@@ -238,6 +239,13 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           if (entry.fields != null || entry.resources != null)
             throw new RunIntakeError("restricted_scope_unsupported");
         }
+        if (
+          req.selectedStreams !== undefined &&
+          (!Array.isArray(req.selectedStreams) ||
+            new Set(req.selectedStreams).size !== req.selectedStreams.length ||
+            req.selectedStreams.some((name) => !seen.has(name)))
+        )
+          throw invalid("invalid selected streams");
         const id = controlScope(req.connector, "");
         const text = canonicalJson(JSON.parse(JSON.stringify(req)));
         // End is a separate owner. Reap its completed begin responses without
@@ -409,7 +417,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
               SELECT RAISE(ABORT,'connection_stopped') WHERE ${STOPPED}; END`,
           },
           {
-            sql: "INSERT INTO runs(run_id,connection_id,o,generation,artifact_version,collection_mode,state,begin_control_version,begin_request,begin_response) VALUES (?,?,?,?,?,?,'collecting',?,?,?)",
+            sql: "INSERT INTO runs(run_id,connection_id,o,generation,artifact_version,collection_mode,state,begin_control_version,begin_request,begin_response,selected_streams) VALUES (?,?,?,?,?,?,'collecting',?,?,?,?)",
             params: [
               runId,
               id,
@@ -420,10 +428,18 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
               admittedControlVersion,
               text,
               JSON.stringify(response),
+              req.selectedStreams === undefined
+                ? null
+                : JSON.stringify(req.selectedStreams),
             ],
           },
         ];
         for (const d of declarations.streams) {
+          if (
+            req.selectedStreams !== undefined &&
+            !req.selectedStreams.includes(d.name)
+          )
+            continue;
           statements.push(
             {
               sql: "INSERT OR IGNORE INTO stream_state(connection_id,stream,primary_key,semantics,incremental) VALUES (?,?,?,?,?)",
@@ -532,6 +548,10 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
             },
           ]),
         );
+        const selected: string[] | null =
+          run.selected_streams === null
+            ? null
+            : JSON.parse(run.selected_streams);
         const rows: SqlStatement[] = [];
         const upserts: AdmitRow[] = [];
         let accepted = 0;
@@ -539,6 +559,7 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           if (
             !isPlainObject(record as unknown) ||
             !streams.has(record.stream) ||
+            (selected !== null && !selected.includes(record.stream)) ||
             !isPlainObject(record.data)
           )
             throw invalid("invalid record or stream");
