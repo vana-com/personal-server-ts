@@ -51,7 +51,7 @@ export interface StreamFacts {
   readonly local_primary_key: string;
 }
 
-function factsGuard(
+export function factsGuard(
   connectionId: string,
   stream: string,
   facts: StreamFacts,
