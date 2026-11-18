@@ -21,6 +21,8 @@ import {
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import { createConnectionDeleter } from "../../../core/src/localdb/delete.js";
+import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
+import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import {
   AmbiguousRegistryReplyError,
   RegistryRefusedError,
@@ -981,10 +983,29 @@ it("purges an interrupted delete before clearing a superseded intent", async () 
   await f.a.db.batch([
     { sql: "UPDATE write_ctx SET origin='local'" },
     {
+      sql: `INSERT OR REPLACE INTO stream_state(connection_id,stream,primary_key,semantics,incremental,complete,head_version,head_generation,head_data_hash,head_blob) VALUES (?,'items','["id"]','mutable_state',0,1,1,1,'hash','head')`,
+      params: [f.control],
+    },
+    {
+      sql: "INSERT OR REPLACE INTO stream_versions(connection_id,stream,version,generation,head_blob,head_format,record_count,observed_at,complete,kind) VALUES (?,'items',1,1,'head',3,1,1000,1,'applied')",
+      params: [f.control],
+    },
+    {
       sql: "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,'items',?,'old',2000,'pending','{}','fixture')",
       params: [f.control, "f".repeat(64)],
     },
   ]);
+  const resolver = createLocalResolver(f.a.deps, {
+    query: createRecordQuery(f.a.db),
+  });
+  const input = {
+    scope: "pdpp.fixture-source.items",
+    connection: "",
+    cursor: null,
+    legacyFile: false,
+    isOwnerView: true,
+  };
+  expect((await resolver.resolve(input)).kind).toBe("view");
   const queue = f.a.deps.queue;
   const interrupted = createConnectionDeleter({
     ...f.a.deps,
@@ -1070,6 +1091,7 @@ it("purges an interrupted delete before clearing a superseded intent", async () 
   f.registry.read = async (scope) =>
     scope === f.control ? stale : read(scope);
   await applyConnection(f.a.deps, f.control);
+  expect((await resolver.resolve(input)).kind).not.toBe("view");
   expect(
     await f.a.db.query("SELECT record_key FROM records WHERE connection_id=?", [
       f.control,
