@@ -36,6 +36,7 @@ export interface RawEndV1 {
    */
   readonly done: {
     readonly status: "succeeded" | "failed";
+    /** Emitted RECORD frames, including deletes and repeated keys. */
     readonly recordsEmitted?: number;
     readonly error?: {
       readonly code?: string;

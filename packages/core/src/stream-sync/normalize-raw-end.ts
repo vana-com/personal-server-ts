@@ -141,6 +141,16 @@ export function normalizeRawEnd(
   for (const stream of Object.keys(durable))
     if (!raw.selectedStreams.includes(stream))
       rawEndInvalid("unselected durable records");
+  // Protocol RECORD totals include deletes and repeated upserts before folding.
+  if (raw.done.recordsEmitted !== undefined) {
+    const emitted = Object.values(durable).reduce(
+      (total, evidence) =>
+        total + evidence.upsertEvents + evidence.deleteEvents,
+      0,
+    );
+    if (!Number.isSafeInteger(emitted) || raw.done.recordsEmitted !== emitted)
+      rawEndInvalid("DONE record count contradicts durable batches");
+  }
   const streams: Record<
     string,
     StreamObservation & { sourceAnswered?: boolean }

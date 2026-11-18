@@ -11,6 +11,12 @@ const vectors = JSON.parse(
 describe("V1 raw end acceptance", () => {
   for (const c of vectors.finish)
     it(c.id, () => {
+      if (c.reject) {
+        expect(() => normalizeRawEnd(c.raw, c.begin, c.durable)).toThrowError(
+          expect.objectContaining({ code: c.reject }),
+        );
+        return;
+      }
       const end = normalizeRawEnd(c.raw, c.begin, c.durable);
       expect(planRunFinish(end, c.begin.streams, "raw-v1")).toEqual(c.expect);
       if (c.expectObservation)

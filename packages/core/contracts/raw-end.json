@@ -2256,6 +2256,105 @@
           "explicitDelete": true
         }
       }
+    },
+    {
+      "id": "reject-DONE-count-with-no-durable-events",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A"],
+        "errors": [],
+        "checkpoints": {
+          "A": "a1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [
+          {
+            "stream": "A",
+            "report": {
+              "considered": 0,
+              "covered": 0
+            }
+          }
+        ],
+        "done": {
+          "status": "succeeded",
+          "recordsEmitted": 1
+        }
+      },
+      "begin": {
+        "selectedStreams": ["A"],
+        "streams": {
+          "A": {
+            "mode": "full_refresh",
+            "coverageStrategy": "full_inventory",
+            "fullRead": true
+          }
+        }
+      },
+      "durable": {},
+      "reject": "invalid_request"
+    },
+    {
+      "id": "matching-DONE-count-after-repeated-upserts-and-delete-upsert",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": 0,
+        "selectedStreams": ["A"],
+        "errors": [],
+        "checkpoints": {
+          "A": "a1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [
+          {
+            "stream": "A",
+            "report": {
+              "considered": 1,
+              "covered": 1
+            }
+          }
+        ],
+        "done": {
+          "status": "succeeded",
+          "recordsEmitted": 4
+        }
+      },
+      "begin": {
+        "selectedStreams": ["A"],
+        "streams": {
+          "A": {
+            "mode": "full_refresh",
+            "coverageStrategy": "full_inventory",
+            "fullRead": true
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [["one"]],
+          "upsertEvents": 3,
+          "deleteEvents": 1
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["A"],
+        "provenFull": ["A"],
+        "candidate": {
+          "A": "a1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded"
+        }
+      }
     }
   ]
 }
