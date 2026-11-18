@@ -1,8 +1,5 @@
 /** Versioned, neutral connector evidence. Hosts collect facts; core owns policy. */
-import {
-  canonicalJson,
-  type JsonValue,
-} from "@opendatalabs/personal-server-ts-stream-sync";
+import type { JsonValue } from "@opendatalabs/personal-server-ts-stream-sync";
 import { RunIntakeError } from "./intake.js";
 
 export type RawEndScope =
@@ -29,13 +26,6 @@ export interface RawEndError {
         readonly retryAfterMs?: number;
       };
 }
-export interface RawRecordEvidence {
-  readonly liveKeys: readonly JsonValue[];
-  readonly deletedKeys: readonly JsonValue[];
-  readonly everDeletedKeys: readonly JsonValue[];
-  readonly upsertEvents: number;
-  readonly deleteEvents: number;
-}
 export interface RawEndV1 {
   readonly wireDialect: "connector-end-evidence/1";
   readonly lastBatch: number;
@@ -55,7 +45,6 @@ export interface RawEndV1 {
     };
   };
   readonly errors: readonly RawEndError[];
-  readonly records: Readonly<Record<string, RawRecordEvidence>>;
   readonly checkpoints: Readonly<Record<string, JsonValue>>;
   readonly preflightExcludedStreams: readonly string[];
   readonly detailCoverage: Readonly<Record<string, JsonValue>>;
@@ -85,20 +74,6 @@ function json(value: unknown): value is JsonValue {
     (object(value) && Object.values(value).every(json))
   );
 }
-/** Canonical tuple equality, shared with durable intake (never host stringify). */
-export function rawKeySet(value: unknown): Set<string> {
-  if (!Array.isArray(value)) return rawEndInvalid("key list required");
-  const keys = new Set<string>();
-  for (const key of value) {
-    if (!Array.isArray(key) || key.length === 0 || !json(key))
-      rawEndInvalid("primary-key tuple required");
-    const canonical = canonicalJson(key as JsonValue);
-    if (keys.has(canonical)) rawEndInvalid("duplicate key");
-    keys.add(canonical);
-  }
-  return keys;
-}
-
 /** Parse untrusted wire input. Scope-less legacy errors become run-scoped once. */
 export function validateRawEnd(body: unknown): RawEndV1 {
   if (!object(body) || body.wireDialect !== "connector-end-evidence/1")
@@ -155,28 +130,8 @@ export function validateRawEnd(body: unknown): RawEndV1 {
     )
       rawEndInvalid("invalid DONE error");
   }
-  for (const evidence of Object.values(map(body.records))) {
-    if (
-      !object(evidence) ||
-      !count(evidence.upsertEvents) ||
-      !count(evidence.deleteEvents)
-    )
-      rawEndInvalid("unsafe event counts");
-    const live = rawKeySet(evidence.liveKeys);
-    const deleted = rawKeySet(evidence.deletedKeys);
-    const ever = rawKeySet(evidence.everDeletedKeys);
-    if (
-      [...live].some((k) => deleted.has(k)) ||
-      [...deleted].some((k) => !ever.has(k)) ||
-      [...ever].some((k) => !live.has(k) && !deleted.has(k)) ||
-      live.size > evidence.upsertEvents ||
-      ever.size > evidence.deleteEvents ||
-      (ever.size === 0 && evidence.deleteEvents !== 0) ||
-      (live.size + deleted.size === 0 &&
-        (evidence.upsertEvents !== 0 || evidence.deleteEvents !== 0))
-    )
-      rawEndInvalid("inconsistent record evidence");
-  }
+  if ("records" in body)
+    rawEndInvalid("record evidence is derived from durable batches");
   if (!Array.isArray(body.wholeStreamEvidence))
     rawEndInvalid("whole stream evidence list required");
   const proofs: string[] = [];

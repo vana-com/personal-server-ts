@@ -9,7 +9,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -28,7 +27,6 @@
         "lastBatch": -1,
         "selectedStreams": [],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -47,7 +45,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -66,7 +63,6 @@
         "lastBatch": -2,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -85,7 +81,6 @@
         "lastBatch": 1.2,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -104,7 +99,6 @@
         "lastBatch": 9007199254740992,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -123,7 +117,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "A"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -142,7 +135,6 @@
         "lastBatch": -1,
         "selectedStreams": [""],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -161,7 +153,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -181,7 +172,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -201,31 +191,9 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {
           "C": null
         },
-        "preflightExcludedStreams": [],
-        "detailCoverage": {},
-        "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": [],
-        "done": {
-          "status": "succeeded"
-        }
-      }
-    },
-    {
-      "name": "reject records {\"C\": {}}",
-      "valid": false,
-      "raw": {
-        "wireDialect": "connector-end-evidence/1",
-        "lastBatch": -1,
-        "selectedStreams": ["A", "B"],
-        "errors": [],
-        "records": {
-          "C": {}
-        },
-        "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
         "invalidDetailCoverageStreams": [],
@@ -243,7 +211,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": ["C"],
         "detailCoverage": {},
@@ -262,7 +229,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -281,7 +247,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {
@@ -302,7 +267,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -330,7 +294,6 @@
           "failedStreams": ["C"]
         },
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -358,7 +321,6 @@
             "code": "unknown"
           }
         ],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -370,251 +332,13 @@
       }
     },
     {
-      "name": "record tuple",
+      "name": "accepts end without host record evidence",
       "valid": true,
       "raw": {
         "wireDialect": "connector-end-evidence/1",
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [["x"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
-        "checkpoints": {},
-        "preflightExcludedStreams": [],
-        "detailCoverage": {},
-        "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": [],
-        "done": {
-          "status": "succeeded"
-        }
-      }
-    },
-    {
-      "name": "overlap",
-      "valid": false,
-      "raw": {
-        "wireDialect": "connector-end-evidence/1",
-        "lastBatch": -1,
-        "selectedStreams": ["A", "B"],
-        "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [["x"]],
-            "deletedKeys": [["x"]],
-            "everDeletedKeys": [["x"]],
-            "upsertEvents": 1,
-            "deleteEvents": 1
-          }
-        },
-        "checkpoints": {},
-        "preflightExcludedStreams": [],
-        "detailCoverage": {},
-        "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": [],
-        "done": {
-          "status": "succeeded"
-        }
-      }
-    },
-    {
-      "name": "duplicate keys",
-      "valid": false,
-      "raw": {
-        "wireDialect": "connector-end-evidence/1",
-        "lastBatch": -1,
-        "selectedStreams": ["A", "B"],
-        "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [["x"], ["x"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
-        "checkpoints": {},
-        "preflightExcludedStreams": [],
-        "detailCoverage": {},
-        "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": [],
-        "done": {
-          "status": "succeeded"
-        }
-      }
-    },
-    {
-      "name": "unsafe count",
-      "valid": false,
-      "raw": {
-        "wireDialect": "connector-end-evidence/1",
-        "lastBatch": -1,
-        "selectedStreams": ["A", "B"],
-        "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [["x"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 9007199254740992,
-            "deleteEvents": 0
-          }
-        },
-        "checkpoints": {},
-        "preflightExcludedStreams": [],
-        "detailCoverage": {},
-        "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": [],
-        "done": {
-          "status": "succeeded"
-        }
-      }
-    },
-    {
-      "name": "negative count",
-      "valid": false,
-      "raw": {
-        "wireDialect": "connector-end-evidence/1",
-        "lastBatch": -1,
-        "selectedStreams": ["A", "B"],
-        "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [["x"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": -1
-          }
-        },
-        "checkpoints": {},
-        "preflightExcludedStreams": [],
-        "detailCoverage": {},
-        "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": [],
-        "done": {
-          "status": "succeeded"
-        }
-      }
-    },
-    {
-      "name": "insufficient events",
-      "valid": false,
-      "raw": {
-        "wireDialect": "connector-end-evidence/1",
-        "lastBatch": -1,
-        "selectedStreams": ["A", "B"],
-        "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [["x"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 0,
-            "deleteEvents": 0
-          }
-        },
-        "checkpoints": {},
-        "preflightExcludedStreams": [],
-        "detailCoverage": {},
-        "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": [],
-        "done": {
-          "status": "succeeded"
-        }
-      }
-    },
-    {
-      "name": "delete without history",
-      "valid": false,
-      "raw": {
-        "wireDialect": "connector-end-evidence/1",
-        "lastBatch": -1,
-        "selectedStreams": ["A", "B"],
-        "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [],
-            "deletedKeys": [["x"]],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 1
-          }
-        },
-        "checkpoints": {},
-        "preflightExcludedStreams": [],
-        "detailCoverage": {},
-        "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": [],
-        "done": {
-          "status": "succeeded"
-        }
-      }
-    },
-    {
-      "name": "non tuple key",
-      "valid": false,
-      "raw": {
-        "wireDialect": "connector-end-evidence/1",
-        "lastBatch": -1,
-        "selectedStreams": ["A", "B"],
-        "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": ["x"],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
-        "checkpoints": {},
-        "preflightExcludedStreams": [],
-        "detailCoverage": {},
-        "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": [],
-        "done": {
-          "status": "succeeded"
-        }
-      }
-    },
-    {
-      "name": "canonical object key duplicates",
-      "valid": false,
-      "raw": {
-        "wireDialect": "connector-end-evidence/1",
-        "lastBatch": -1,
-        "selectedStreams": ["A", "B"],
-        "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [
-              [
-                {
-                  "a": 1,
-                  "b": 2
-                }
-              ],
-              [
-                {
-                  "b": 2,
-                  "a": 1
-                }
-              ]
-            ],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 2,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -644,7 +368,6 @@
             }
           }
         ],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -663,7 +386,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": null,
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -685,7 +407,6 @@
           "kind": ["completed"]
         },
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -712,34 +433,6 @@
             "code": "unknown"
           }
         ],
-        "records": {},
-        "checkpoints": {},
-        "preflightExcludedStreams": [],
-        "detailCoverage": {},
-        "invalidDetailCoverageStreams": [],
-        "wholeStreamEvidence": [],
-        "done": {
-          "status": "succeeded"
-        }
-      }
-    },
-    {
-      "name": "reject orphan delete history",
-      "valid": false,
-      "raw": {
-        "wireDialect": "connector-end-evidence/1",
-        "lastBatch": -1,
-        "selectedStreams": ["A", "B"],
-        "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [["a"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [["b"]],
-            "upsertEvents": 1,
-            "deleteEvents": 1
-          }
-        },
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -758,7 +451,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -774,7 +466,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -793,7 +484,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -812,7 +502,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -834,7 +523,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -870,7 +558,6 @@
             }
           }
         ],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -901,7 +588,6 @@
             }
           }
         ],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -929,7 +615,6 @@
             "recoveryHint": "retry_by_runtime"
           }
         ],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -955,7 +640,6 @@
             }
           }
         ],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -982,7 +666,6 @@
             "retryable": "false"
           }
         ],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -1001,7 +684,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -1014,6 +696,25 @@
           }
         }
       }
+    },
+    {
+      "name": "reject obsolete host record map",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "errors": [],
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        },
+        "records": {}
+      }
     }
   ],
   "finish": [
@@ -1024,7 +725,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {},
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -1062,7 +762,8 @@
           "A": "succeeded",
           "B": "succeeded"
         }
-      }
+      },
+      "description": "A silent succeeded incremental stream may save the connector's STATE cursor; that cursor grants neither full-inventory proof nor replacement authority."
     },
     {
       "id": "02-empty-covered-live",
@@ -1071,15 +772,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -1132,15 +824,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -1207,15 +890,6 @@
             }
           }
         ],
-        "records": {
-          "A": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -1281,15 +955,6 @@
             }
           }
         ],
-        "records": {
-          "A": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -1351,15 +1016,6 @@
             }
           }
         ],
-        "records": {
-          "A": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -1422,7 +1078,6 @@
             }
           }
         ],
-        "records": {},
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -1466,7 +1121,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A"],
         "errors": [],
-        "records": {},
         "checkpoints": {
           "A": "a1"
         },
@@ -1507,7 +1161,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A"],
         "errors": [],
-        "records": {},
         "checkpoints": {
           "A": "a1"
         },
@@ -1518,7 +1171,6 @@
           {
             "stream": "A",
             "report": {
-              "keys": [],
               "considered": 0,
               "covered": 0
             }
@@ -1571,22 +1223,6 @@
             }
           }
         ],
-        "records": {
-          "A": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          },
-          "B": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -1659,22 +1295,6 @@
             }
           }
         ],
-        "records": {
-          "A": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          },
-          "B": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -1735,22 +1355,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [],
-            "deletedKeys": [["one"]],
-            "everDeletedKeys": [["one"]],
-            "upsertEvents": 0,
-            "deleteEvents": 1
-          },
-          "B": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -1811,15 +1415,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [],
-            "deletedKeys": [["one"]],
-            "everDeletedKeys": [["one"]],
-            "upsertEvents": 1,
-            "deleteEvents": 1
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -1874,15 +1469,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [["one"]],
-            "upsertEvents": 1,
-            "deleteEvents": 1
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -1946,22 +1532,6 @@
             }
           }
         ],
-        "records": {
-          "A": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          },
-          "B": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -2032,22 +1602,6 @@
             }
           }
         ],
-        "records": {
-          "A": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          },
-          "B": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -2121,22 +1675,6 @@
             }
           }
         ],
-        "records": {
-          "A": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          },
-          "B": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -2196,22 +1734,6 @@
         "lastBatch": -1,
         "selectedStreams": ["A", "B"],
         "errors": [],
-        "records": {
-          "A": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          },
-          "B": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {
           "B": "b1"
         },
@@ -2270,7 +1792,6 @@
         "lastBatch": -1,
         "selectedStreams": [],
         "errors": [],
-        "records": {},
         "checkpoints": {},
         "preflightExcludedStreams": [],
         "detailCoverage": {},
@@ -2316,22 +1837,6 @@
             }
           }
         ],
-        "records": {
-          "A": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          },
-          "B": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -2401,22 +1906,6 @@
             "reason": "stream_collection_failed"
           }
         ],
-        "records": {
-          "A": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          },
-          "B": {
-            "liveKeys": [["one"]],
-            "deletedKeys": [],
-            "everDeletedKeys": [],
-            "upsertEvents": 1,
-            "deleteEvents": 0
-          }
-        },
         "checkpoints": {
           "A": "a1",
           "B": "b1"
@@ -2468,6 +1957,303 @@
         "streamStatus": {
           "A": "succeeded",
           "B": "held"
+        }
+      }
+    },
+    {
+      "id": "durable-only-live",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": 0,
+        "selectedStreams": ["A", "B"],
+        "errors": [],
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["live"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["A", "B"],
+        "provenFull": [],
+        "candidate": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded",
+          "B": "succeeded"
+        }
+      },
+      "expectObservation": {
+        "A": {
+          "liveRecord": true,
+          "explicitDelete": false
+        }
+      }
+    },
+    {
+      "id": "durable-only-delete",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": 0,
+        "selectedStreams": ["A", "B"],
+        "errors": [],
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [],
+          "deletedKeys": [["gone"]],
+          "everDeletedKeys": [["gone"]],
+          "upsertEvents": 0,
+          "deleteEvents": 1
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["A", "B"],
+        "provenFull": [],
+        "candidate": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded",
+          "B": "succeeded"
+        }
+      },
+      "expectObservation": {
+        "A": {
+          "liveRecord": false,
+          "explicitDelete": true
+        }
+      }
+    },
+    {
+      "id": "durable-only-delete-then-upsert",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": 0,
+        "selectedStreams": ["A", "B"],
+        "errors": [],
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["restored"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [["restored"]],
+          "upsertEvents": 1,
+          "deleteEvents": 1
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["A", "B"],
+        "provenFull": [],
+        "candidate": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded",
+          "B": "succeeded"
+        }
+      },
+      "expectObservation": {
+        "A": {
+          "liveRecord": true,
+          "explicitDelete": true
+        }
+      }
+    },
+    {
+      "id": "durable-only-empty",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "errors": [],
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [],
+        "done": {
+          "status": "succeeded"
+        }
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {},
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["A", "B"],
+        "provenFull": [],
+        "candidate": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded",
+          "B": "succeeded"
+        }
+      },
+      "expectObservation": {
+        "A": {
+          "liveRecord": false,
+          "explicitDelete": false
+        }
+      }
+    },
+    {
+      "id": "durable-only-full-inventory",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": 0,
+        "selectedStreams": ["A"],
+        "errors": [],
+        "checkpoints": {
+          "A": "a1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [
+          {
+            "stream": "A",
+            "report": {
+              "considered": 2,
+              "covered": 2,
+              "gap_keys": []
+            }
+          }
+        ],
+        "done": {
+          "status": "succeeded"
+        }
+      },
+      "begin": {
+        "selectedStreams": ["A"],
+        "streams": {
+          "A": {
+            "mode": "full_refresh",
+            "coverageStrategy": "full_inventory",
+            "fullRead": true
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["live"]],
+          "deletedKeys": [["gone"]],
+          "everDeletedKeys": [["gone"]],
+          "upsertEvents": 1,
+          "deleteEvents": 1
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["A"],
+        "provenFull": ["A"],
+        "candidate": {
+          "A": "a1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded"
+        }
+      },
+      "expectObservation": {
+        "A": {
+          "liveRecord": true,
+          "explicitDelete": true
         }
       }
     }

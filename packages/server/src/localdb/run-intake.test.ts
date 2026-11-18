@@ -599,7 +599,7 @@ describe("raw evidence capture", () => {
   );
 });
 
-it("normalizes raw evidence before run-end fences and rejects invented history", async () => {
+it("derives raw end facts from durable mixed batches without host record evidence", async () => {
   const f = await fixture();
   await f.store.begin(
     "raw",
@@ -609,6 +609,8 @@ it("normalizes raw evidence before run-end fences and rejects invented history",
   await f.store.batch("raw", {
     batch: 0,
     records: [
+      { stream: "items", data: { id: "live" } },
+      { stream: "items", op: "delete", data: { id: "gone" } },
       { stream: "items", op: "delete", data: { id: "a" } },
       { stream: "items", data: { id: "a" } },
     ],
@@ -619,27 +621,12 @@ it("normalizes raw evidence before run-end fences and rejects invented history",
     selectedStreams: ["items"],
     done: { status: "succeeded" },
     errors: [],
-    records: {
-      items: {
-        liveKeys: [["a"]],
-        deletedKeys: [],
-        everDeletedKeys: [["a"]],
-        upsertEvents: 1,
-        deleteEvents: 1,
-      },
-    },
     checkpoints: {},
     preflightExcludedStreams: [],
     detailCoverage: {},
     invalidDetailCoverageStreams: [],
     wholeStreamEvidence: [],
   };
-  await expect(
-    f.end.end("raw", {
-      ...raw,
-      records: { items: { ...raw.records.items, deleteEvents: 2 } },
-    }),
-  ).rejects.toMatchObject({ code: "invalid_request" });
   await expect(
     f.end.end("raw", { ...raw, lastBatch: -1 }),
   ).rejects.toMatchObject({ code: "batch_gap", nextBatch: 1 });
@@ -650,8 +637,9 @@ it("normalizes raw evidence before run-end fences and rejects invented history",
   expect(
     await f.db.query("SELECT raw_end FROM runs WHERE run_id='raw'"),
   ).toEqual([{ raw_end: JSON.stringify(raw) }]);
-  expect(await f.db.query("SELECT body FROM records")).toEqual([
+  expect(await f.db.query("SELECT body FROM records ORDER BY body")).toEqual([
     { body: '{"id":"a"}' },
+    { body: '{"id":"live"}' },
   ]);
 });
 
@@ -739,15 +727,6 @@ it.each([
                 recoveryHint: { retryable: true },
               },
             ],
-      records: {
-        a: {
-          liveKeys: [["one"]],
-          deletedKeys: [],
-          everDeletedKeys: [],
-          upsertEvents: 1,
-          deleteEvents: 0,
-        },
-      },
       checkpoints: { a: "a1", b: "must-not-advance" },
       preflightExcludedStreams: [],
       detailCoverage: {},
@@ -809,7 +788,6 @@ it("an empty explicit selection is a no-op for declared stream state", async () 
     selectedStreams: [],
     done: { status: "succeeded" },
     errors: [],
-    records: {},
     checkpoints: {},
     preflightExcludedStreams: [],
     detailCoverage: {},

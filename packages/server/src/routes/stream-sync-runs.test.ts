@@ -422,15 +422,6 @@ it.each(["http", "in-process"] as const)(
       selectedStreams: ["items"],
       done: { status: "succeeded" },
       errors: [],
-      records: {
-        items: {
-          liveKeys: [["a"]],
-          deletedKeys: [],
-          everDeletedKeys: [["a"]],
-          upsertEvents: 2,
-          deleteEvents: 1,
-        },
-      },
       checkpoints: { items: "c1" },
       preflightExcludedStreams: [],
       detailCoverage: {},
@@ -467,38 +458,27 @@ it.each(["http", "in-process"] as const)(
   },
 );
 
-it("reads raw key inventories beyond the legacy observation body limit", async () => {
+it("rejects obsolete host key inventories", async () => {
   const { call } = await build("raw-inventory");
   expect(
     (await call("PUT", "raw", beginBody({ selectedStreams: ["items"] })))
       .status,
   ).toBe(200);
-  const keys = Array.from({ length: 9000 }, (_, i) => [
-    `${i}-${"k".repeat(128)}`,
-  ]);
   const response = await call("POST", "raw/end", {
     wireDialect: "connector-end-evidence/1",
     lastBatch: -1,
     selectedStreams: ["items"],
     done: { status: "succeeded" },
     errors: [],
-    records: {
-      items: {
-        liveKeys: keys,
-        deletedKeys: [],
-        everDeletedKeys: [],
-        upsertEvents: keys.length,
-        deleteEvents: 0,
-      },
-    },
+    records: { items: { liveKeys: [["invented"]] } },
     checkpoints: {},
     preflightExcludedStreams: [],
     detailCoverage: {},
     invalidDetailCoverageStreams: [],
     wholeStreamEvidence: [],
   });
-  // This inventory was not uploaded: it must reach core's durable-evidence
-  // refusal, rather than the old small observation-only transport ceiling.
   expect(response.status).toBe(400);
-  expect((await response.json()).message).toMatch(/durable batches/);
+  expect((await response.json()).message).toMatch(
+    /derived from durable batches/,
+  );
 });
