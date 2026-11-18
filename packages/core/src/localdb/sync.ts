@@ -168,6 +168,11 @@ export function createLocalSync(
       if (req.owner.address.toLowerCase() !== deps.ownerAddress.toLowerCase()) {
         throw new RunIntakeError("owner_mismatch");
       }
+      if (isReservedSystemConnector(req.connector))
+        throw new RunIntakeError(
+          "invalid_request",
+          "reserved system connector",
+        );
       await sweepOnce();
       const receipt = await readBeginReceipt(deps.db, runId, req);
       if (receipt) return receipt;

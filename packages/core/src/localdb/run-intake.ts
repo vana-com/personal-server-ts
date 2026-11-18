@@ -1,3 +1,7 @@
+import {
+  systemStreamIdentity,
+  type SystemStreamDescriptor,
+} from "./system-stream-descriptor.js";
 import { isReservedSystemConnector } from "../policy/reserved-scopes.js";
 import { keccakOf } from "../stream-sync/crypto-port.js";
 import { readBeginReceipt } from "./run-receipts.js";
@@ -104,7 +108,11 @@ const BATCH_CHECK = `CREATE TEMP TRIGGER intake_batch_check BEFORE UPDATE OF las
 END`;
 
 /** Begin and batch stage durable rows; end owns their merge into records. */
-export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
+export function createRunIntakeStore(
+  deps: LocalSyncDeps,
+  systemStream?: SystemStreamDescriptor,
+): RunIntakeStore {
+  const trusted = systemStream ? systemStreamIdentity(systemStream) : null;
   const { db } = deps;
   const active = new Map<
     string,
@@ -165,6 +173,11 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
       throw new RunIntakeError("gone");
     }
     if (
+      run.connection_id.startsWith("pdpp.vana-system-") &&
+      run.connection_id !== trusted?.connectionId
+    )
+      throw invalid("reserved system run");
+    if (
       (await stopped(run.connection_id)) ||
       (await checkRunFence(deps, id, "batch")).length > 0
     ) {
@@ -187,7 +200,13 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           req.connector.includes(".")
         )
           throw invalid("invalid connector key");
-        if (isReservedSystemConnector(req.connector))
+        if (
+          isReservedSystemConnector(req.connector) &&
+          (!systemStream ||
+            req.connector !== systemStream.connector ||
+            JSON.stringify(declarations) !==
+              JSON.stringify(trusted!.declarations))
+        )
           throw invalid("reserved system connector");
         if (typeof req.artifactDigest !== "string" || !req.artifactDigest)
           throw invalid("artifactDigest is required");
@@ -284,7 +303,10 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           ).length
         )
           throw new RunIntakeError("connection_stopped");
-        let synced = await collectionBasis(deps, req);
+        let synced = await collectionBasis(
+          deps,
+          systemStream ? { ...req, connect: true } : req,
+        );
         // Another key's control row: this owner cannot publish what a run
         // would collect. Nothing is written for it (`syncBeforeBegin`).
         if (synced.control?.kind === "foreign")
@@ -361,10 +383,11 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           [id],
         );
         const full =
-          req.connect === true ||
-          req.wantFull === true ||
-          cached?.checkpoint == null ||
-          cached.needs_full === 1;
+          !systemStream &&
+          (req.connect === true ||
+            req.wantFull === true ||
+            cached?.checkpoint == null ||
+            cached.needs_full === 1);
         const collection = full ? "full_refresh" : "incremental";
         const modes = new Map(
           declarations.streams.map((d) => [
