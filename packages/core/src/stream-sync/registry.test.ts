@@ -1317,3 +1317,46 @@ describe("the batch policy read (OPTIONS /v1/data/batch)", () => {
     expect(reads()).toBe(1);
   });
 });
+
+it("passes delete-operation abort signals to gateway fetches", async () => {
+  const seen: AbortSignal[] = [];
+  const registry = createGatewayStreamSyncRegistry({
+    gatewayUrl: "https://gateway.test",
+    ownerAddress: "0x" + "11".repeat(20),
+    fetch: (async (_url: string, init?: RequestInit) => {
+      const signal = init?.signal;
+      if (!signal) throw new Error("missing signal");
+      seen.push(signal);
+      return new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), {
+          once: true,
+        });
+      });
+    }) as typeof fetch,
+  });
+  const controller = new AbortController();
+  const post = {
+    ownerAddress: `0x${"11".repeat(20)}` as const,
+    scope: "pdpp.fixture~",
+    dataHash: `0x${"aa".repeat(32)}` as const,
+    metadataHash: `0x${"bb".repeat(32)}` as const,
+    expectedVersion: "1",
+    signature: "0x00" as const,
+  };
+  const calls = [
+    registry.read(post.scope, controller.signal),
+    registry.post(post, controller.signal),
+    registry.postBatch!(
+      { ownerAddress: post.ownerAddress, rows: [post], requires: [] },
+      controller.signal,
+    ),
+    registry.listControlRows(controller.signal),
+    registry.readBatchPolicy!(controller.signal),
+  ];
+  controller.abort();
+  expect(
+    (await Promise.allSettled(calls)).every((r) => r.status === "rejected"),
+  ).toBe(true);
+  expect(seen).toHaveLength(5);
+  expect(seen.every((signal) => signal.aborted)).toBe(true);
+});
