@@ -710,3 +710,77 @@ it("keeps system activity pending for the next publish without waking one", asyn
   ]);
   expect((await runPublish(f.deps)).connections).toHaveLength(1);
 });
+
+it("publishes idle activity on the timer without waking for each record", async () => {
+  const { createLocalSync } = await import("../../../core/src/localdb/sync.js");
+  const { createSyncManager } =
+    await import("../../../core/src/sync/engine/sync-manager.js");
+  const f = await fixture();
+  const sync = createLocalSync(f.deps, { resolveArtifact: () => null });
+  const cycle = vi.fn((scope?: { readonly connections: readonly string[] }) =>
+    sync.cycle(scope),
+  );
+  const pending = vi.spyOn(sync, "hasPendingPublication");
+  let handlers!: {
+    onHealth(healthy: boolean): void;
+    onPosition(position: string): void;
+  };
+  const posts = vi.spyOn(f.deps.registry, "postBatch");
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+  const manager = createSyncManager(
+    {
+      logger: f.deps.logger,
+      storage: { findUnsynced: () => [] },
+      serverOwner: owner,
+    } as never,
+    { logger: f.deps.logger } as never,
+    {
+      accountStorageMode: { read: () => "switched" },
+      localSync: {
+        cycle,
+        applyDelta: sync.applyDelta,
+        hasPendingPublication: sync.hasPendingPublication,
+      },
+      pollInterval: 60_000,
+      changeProbe: {
+        read: async () => "1",
+        push: {
+          subscribe(h) {
+            handlers = h;
+            return () => {};
+          },
+        },
+      },
+    },
+  );
+  try {
+    manager.start();
+    handlers.onPosition("1");
+    handlers.onHealth(true);
+    await manager.trigger();
+    cycle.mockClear();
+    posts.mockClear();
+    vi.advanceTimersByTime(60_000);
+    await vi.waitFor(() => expect(pending).toHaveBeenCalledTimes(1));
+    await pending.mock.results[0]!.value;
+    expect(cycle).not.toHaveBeenCalled();
+    await sync.accessActivity.write({
+      logId: crypto.randomUUID(),
+      grantId: "owner",
+      builder: owner,
+      action: "read",
+      scope: "fixture.items",
+      timestamp: "2026-06-01T00:00:00.000Z",
+      ipAddress: "",
+      userAgent: "",
+    });
+    await sync.accessActivity.drain();
+    expect(cycle).not.toHaveBeenCalled();
+    expect(posts).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(60_000);
+    await vi.waitFor(() => expect(posts).toHaveBeenCalled());
+  } finally {
+    await manager.stop();
+    vi.useRealTimers();
+  }
+});

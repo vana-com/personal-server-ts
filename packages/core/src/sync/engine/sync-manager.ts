@@ -124,6 +124,7 @@ export interface SyncManagerOptions {
   /** Personal Server hosts always supply their owner-bound Account mode. */
   accountStorageMode?: Pick<OwnedAccountStorageMode, "read">;
   localSync?: {
+    hasPendingPublication?(): Promise<boolean>;
     cycle(scope?: {
       readonly connections: readonly string[];
     }): Promise<unknown>;
@@ -1410,8 +1411,20 @@ export function createSyncManager(
   function startInterval(): void {
     if (intervalId !== null) return;
     intervalId = setInterval(() => {
-      if (pushCovers()) return;
-      runCycle(undefined, owedScope()).catch(() => {
+      const run = lifecycle;
+      void (async () => {
+        let pending = false;
+        try {
+          pending = await (options?.localSync?.hasPendingPublication?.() ??
+            false);
+        } catch {
+          // A failed local read cannot prove the cycle is safe to skip.
+          pending = true;
+        }
+        if (run !== lifecycle || !isRunning || paused) return;
+        if (!pending && pushCovers()) return;
+        await runCycle(undefined, pending ? undefined : owedScope());
+      })().catch(() => {
         // Errors already captured in ring buffer
       });
     }, pollInterval);
