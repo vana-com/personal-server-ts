@@ -121,8 +121,8 @@ export function validateRawEnd(body: unknown): RawEndV1 {
   const finish = body.finish;
   if (
     !object(finish) ||
-    !["completed", "certified_failed_done", "failed_done_upsert_only"].includes(
-      String(finish.kind),
+    !["completed", "certified_failed_done", "failed_done_upsert_only"].some(
+      (kind) => kind === finish.kind,
     )
   )
     rawEndInvalid("unknown finish");
@@ -144,6 +144,7 @@ export function validateRawEnd(body: unknown): RawEndV1 {
     if (
       [...live].some((k) => deleted.has(k)) ||
       [...deleted].some((k) => !ever.has(k)) ||
+      [...ever].some((k) => !live.has(k) && !deleted.has(k)) ||
       live.size > evidence.upsertEvents ||
       ever.size > evidence.deleteEvents ||
       (ever.size === 0 && evidence.deleteEvents !== 0) ||
@@ -169,7 +170,9 @@ export function validateRawEnd(body: unknown): RawEndV1 {
   const errors = body.errors.map((error: unknown) => {
     if (
       !object(error) ||
-      !["error", "skip_result", "detail_gap"].includes(String(error.kind)) ||
+      !["error", "skip_result", "detail_gap"].some(
+        (kind) => kind === error.kind,
+      ) ||
       typeof error.code !== "string" ||
       !error.code
     )

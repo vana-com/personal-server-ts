@@ -12,6 +12,8 @@ import {
 } from "../stream-sync/intake.js";
 import {
   parseEndRequest,
+  pruneDownward,
+  blockUpward,
   planRunFinish,
   type RunFinishPlan,
   type RunFinishStream,
@@ -105,7 +107,10 @@ function declaredStreams(
 }
 
 function answer(
-  plan: Pick<RunFinishPlan, "covered" | "provenFull" | "unconfirmed"> & {
+  plan: Pick<
+    RunFinishPlan,
+    "covered" | "provenFull" | "unconfirmed" | "streamStatus"
+  > & {
     readonly outcome: EndResponse["outcome"];
   },
   result: EndResponse["result"],
@@ -117,6 +122,7 @@ function answer(
     outcome: plan.outcome,
     coveredStreams: plan.covered,
     provenFullStreams: plan.provenFull,
+    ...(plan.streamStatus ? { streamStatus: plan.streamStatus } : {}),
     unconfirmed: plan.unconfirmed,
   };
 }
@@ -199,9 +205,16 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         const discard = async (
           reason: "failed" | "cancelled",
           unconfirmed: boolean,
+          streamStatus?: EndResponse["streamStatus"],
         ): Promise<RunEndResponse> => {
           const response = answer(
-            { outcome: reason, covered: [], provenFull: [], unconfirmed },
+            {
+              outcome: reason,
+              covered: [],
+              provenFull: [],
+              unconfirmed,
+              ...(streamStatus ? { streamStatus } : {}),
+            },
             "aborted",
             false,
           );
@@ -268,13 +281,33 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             run.last_batch + 1,
           );
         }
-        const plan = planRunFinish(req, declarations);
+        const plan = planRunFinish(
+          req,
+          declarations,
+          raw ? "raw-v1" : "legacy",
+        );
         if (plan.outcome === "failed")
-          return discard("failed", plan.unconfirmed);
+          return discard("failed", plan.unconfirmed, plan.streamStatus);
         const covered = new Set(plan.covered);
         const trips = await checkRunFence(deps, runId, "end");
         if (trips.length > 0) {
-          const fenced = answer(plan, "discarded", false);
+          const fenced = answer(
+            raw
+              ? {
+                  ...plan,
+                  covered: [],
+                  provenFull: [],
+                  streamStatus: Object.fromEntries(
+                    Object.keys(req.streams).map((name) => [
+                      name,
+                      "held" as const,
+                    ]),
+                  ),
+                }
+              : plan,
+            "discarded",
+            false,
+          );
           await db.batch([
             {
               sql: "UPDATE connections SET checkpoint = NULL WHERE connection_id = ?",
@@ -482,7 +515,41 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             replaceOwnRunRows(op, run.connection_id, runId, run.o),
           );
         statements.push(...mergeIncoming(op, run.connection_id));
-        const candidate = plan.candidate;
+        let candidate = plan.candidate;
+        if (raw) {
+          const dependencies = Object.entries(declarations).map(
+            ([name, d]) => [name, d.stateParents ?? []] as const,
+          );
+          const blocked = new Set(
+            streams
+              .filter(
+                (stream) =>
+                  run.generation === null ||
+                  checkpointDecision({
+                    target: run.generation,
+                    streams: { [stream.stream]: results[stream.stream]! },
+                    control:
+                      connection.control_state === "active"
+                        ? { kind: "active", generation: connection.generation }
+                        : { kind: "absent" },
+                    seedReceiptsPending: stream.seed === "unresolved",
+                  }).kind !== "save",
+              )
+              .map((stream) => stream.stream),
+          );
+          // A refused/deferred child is just as unsafe for its parent's cursor
+          // as a child held by the source. Reapply both dependency directions.
+          blockUpward(blocked, dependencies);
+          const eligible = new Set(
+            Object.keys(candidate).filter(
+              (name) => plan.covered.includes(name) && !blocked.has(name),
+            ),
+          );
+          pruneDownward(eligible, dependencies);
+          candidate = Object.fromEntries(
+            Object.entries(candidate).filter(([name]) => eligible.has(name)),
+          );
+        }
         const refused = Object.keys(results).filter(
           (stream) => results[stream]!.state === "discarded",
         );
@@ -525,7 +592,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
                 (stream) => stream.seed === "unresolved",
               ),
             }).kind === "save");
-        const saved = canSave;
+        const saved = raw
+          ? req.finish === "completed" && Object.keys(candidate).length > 0
+          : canSave;
         if (saved) {
           // A stream the plan held back keeps the cursor it had.
           statements.push({
@@ -536,8 +605,34 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             ],
           });
         }
+        const acceptedCovered = raw
+          ? plan.covered.filter((name) => results[name]?.state !== "discarded")
+          : plan.covered;
+        const receiptPlan = raw
+          ? {
+              ...plan,
+              covered: acceptedCovered,
+              provenFull: plan.provenFull.filter((name) =>
+                acceptedCovered.includes(name),
+              ),
+              outcome:
+                acceptedCovered.length < plan.covered.length
+                  ? acceptedCovered.length > 0
+                    ? ("partial" as const)
+                    : ("failed" as const)
+                  : plan.outcome,
+              streamStatus: Object.fromEntries(
+                Object.keys(req.streams).map((name) => [
+                  name,
+                  acceptedCovered.includes(name)
+                    ? ("succeeded" as const)
+                    : ("held" as const),
+                ]),
+              ),
+            }
+          : plan;
         const response = answer(
-          plan,
+          receiptPlan,
           merged ? "queued" : saved ? "checkpoint_only" : "no_checkpoint",
           updateRequired,
         );

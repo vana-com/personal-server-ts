@@ -435,6 +435,11 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           },
         ];
         for (const d of declarations.streams) {
+          if (
+            req.selectedStreams !== undefined &&
+            !req.selectedStreams.includes(d.name)
+          )
+            continue;
           statements.push(
             {
               sql: "INSERT OR IGNORE INTO stream_state(connection_id,stream,primary_key,semantics,incremental) VALUES (?,?,?,?,?)",

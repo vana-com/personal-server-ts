@@ -654,3 +654,172 @@ it("normalizes raw evidence before run-end fences and rejects invented history",
     { body: '{"id":"a"}' },
   ]);
 });
+
+it.each([
+  "independent",
+  "parent",
+  "refused",
+  "seed",
+  "generation",
+  "refused-child",
+] as const)(
+  "raw partial finish preserves held cursors with %s safety",
+  async (safety) => {
+    const f = await fixture();
+    const decl: IntakeDeclarations = {
+      ...declaration,
+      streams: [
+        { name: "a", semantics: "mutable_state", primaryKey: ["id"] },
+        {
+          name: "b",
+          semantics: "mutable_state",
+          primaryKey: ["id"],
+          ...(safety === "parent" || safety === "refused-child"
+            ? { stateParents: ["a"] }
+            : {}),
+        },
+      ],
+    };
+    await f.store.begin("initial", request, decl);
+    await f.store.batch("initial", {
+      batch: 0,
+      records: [
+        { stream: "a", data: { id: "one" } },
+        { stream: "b", data: { id: "two" } },
+      ],
+    });
+    await f.end.end(
+      "initial",
+      endRequest({
+        lastBatch: 0,
+        live: ["a", "b"],
+        checkpoints: { a: "a0", b: "b0" },
+      }),
+    );
+    await f.store.begin(
+      "raw",
+      { ...request, selectedStreams: ["a", "b"], observedAt: 50 },
+      decl,
+    );
+    await f.store.batch("raw", {
+      batch: 0,
+      records: [{ stream: "a", data: { id: "one" } }],
+    });
+    if (safety === "refused")
+      await f.db.batch([
+        { sql: "UPDATE stream_state SET floor_version='99' WHERE stream='a'" },
+      ]);
+    if (safety === "refused-child")
+      await f.db.batch([
+        { sql: "UPDATE stream_state SET floor_version='99' WHERE stream='b'" },
+      ]);
+    if (safety === "seed")
+      await f.db.batch([
+        {
+          sql: "UPDATE run_streams SET seed='unresolved' WHERE run_id='raw' AND stream='a'",
+        },
+      ]);
+    if (safety === "generation")
+      await f.db.batch([
+        { sql: "UPDATE connections SET generation=generation+1" },
+      ]);
+    const result = await f.end.end("raw", {
+      wireDialect: "connector-end-evidence/1",
+      lastBatch: 0,
+      selectedStreams: ["b", "a"],
+      finish: { kind: "completed" },
+      errors:
+        safety === "refused-child"
+          ? []
+          : [
+              {
+                kind: "skip_result",
+                scope: { kind: "stream", stream: "b" },
+                code: "fixture_skip",
+                recoveryHint: { retryable: true },
+              },
+            ],
+      records: {
+        a: {
+          liveKeys: [["one"]],
+          deletedKeys: [],
+          everDeletedKeys: [],
+          upsertEvents: 1,
+          deleteEvents: 0,
+        },
+      },
+      checkpoints: { a: "a1", b: "must-not-advance" },
+      preflightExcludedStreams: [],
+      detailCoverage: {},
+      invalidDetailCoverageStreams: [],
+      wholeStreamEvidence: [],
+    });
+    const stored = (
+      await f.db.query<{ checkpoint: string | null }>(
+        "SELECT checkpoint FROM connections",
+      )
+    )[0]!.checkpoint;
+    if (safety === "generation") expect(stored).toBeNull();
+    else
+      expect(JSON.parse(stored!)).toEqual({
+        a: safety === "independent" ? "a1" : "a0",
+        b: "b0",
+      });
+    expect(result.streamStatus?.b).toBe("held");
+    if (safety === "independent")
+      expect(result).toMatchObject({
+        outcome: "partial",
+        coveredStreams: ["a"],
+        streamStatus: { a: "succeeded", b: "held" },
+      });
+    if (safety === "refused") expect(result.coveredStreams).toEqual([]);
+  },
+);
+
+it("an empty explicit selection is a no-op for declared stream state", async () => {
+  const f = await fixture();
+  await f.store.begin("initial", request, declaration);
+  await f.store.batch("initial", {
+    batch: 0,
+    records: [{ stream: "items", data: { id: "one" } }],
+  });
+  await f.end.end(
+    "initial",
+    endRequest({
+      lastBatch: 0,
+      live: ["items"],
+      checkpoints: { items: "old" },
+    }),
+  );
+  const before = await f.db.query("SELECT * FROM stream_state");
+  await f.store.begin(
+    "noop",
+    { ...request, observedAt: 60, selectedStreams: [] },
+    declaration,
+  );
+  await expect(
+    f.store.batch("noop", {
+      batch: 0,
+      records: [{ stream: "items", data: { id: "two" } }],
+    }),
+  ).rejects.toMatchObject({ code: "invalid_request" });
+  const result = await f.end.end("noop", {
+    wireDialect: "connector-end-evidence/1",
+    lastBatch: -1,
+    selectedStreams: [],
+    finish: { kind: "completed" },
+    errors: [],
+    records: {},
+    checkpoints: {},
+    preflightExcludedStreams: [],
+    detailCoverage: {},
+    invalidDetailCoverageStreams: [],
+    wholeStreamEvidence: [],
+  });
+  expect(result).toMatchObject({
+    outcome: "succeeded",
+    coveredStreams: [],
+    streamStatus: {},
+  });
+  expect(await f.db.query("SELECT * FROM stream_state")).toEqual(before);
+});

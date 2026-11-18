@@ -670,6 +670,1336 @@
         "invalidDetailCoverageStreams": [],
         "wholeStreamEvidence": []
       }
+    },
+    {
+      "name": "reject coerced finish",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": ["completed"]
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "reject coerced error",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [
+          {
+            "kind": ["error"],
+            "scope": {
+              "kind": "run"
+            },
+            "code": "unknown"
+          }
+        ],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    },
+    {
+      "name": "reject orphan delete history",
+      "valid": false,
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [["a"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [["b"]],
+            "upsertEvents": 1,
+            "deleteEvents": 1
+          }
+        },
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      }
+    }
+  ],
+  "finish": [
+    {
+      "id": "01-absent-covered-silent",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {},
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["A", "B"],
+        "provenFull": [],
+        "candidate": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded",
+          "B": "succeeded"
+        }
+      }
+    },
+    {
+      "id": "02-empty-covered-live",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [],
+        "covered": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        }
+      },
+      "expect": {
+        "outcome": "failed",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": true,
+        "streamStatus": {
+          "A": "held",
+          "B": "held"
+        }
+      }
+    },
+    {
+      "id": "03-subset-covered",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [],
+        "covered": ["A"]
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["A"],
+        "provenFull": [],
+        "candidate": {
+          "A": "a1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded",
+          "B": "held"
+        }
+      }
+    },
+    {
+      "id": "04-terminal-sibling",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [
+          {
+            "kind": "skip_result",
+            "scope": {
+              "kind": "stream",
+              "stream": "B"
+            },
+            "code": "fixture_error",
+            "recoveryHint": {
+              "retryable": false
+            }
+          }
+        ],
+        "records": {
+          "A": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["A"],
+        "provenFull": [],
+        "candidate": {
+          "A": "a1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded",
+          "B": "held"
+        }
+      }
+    },
+    {
+      "id": "05-retry-sibling",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [
+          {
+            "kind": "skip_result",
+            "scope": {
+              "kind": "stream",
+              "stream": "B"
+            },
+            "code": "fixture_error",
+            "recoveryHint": {
+              "retryable": true
+            }
+          }
+        ],
+        "records": {
+          "A": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["A"],
+        "provenFull": [],
+        "candidate": {
+          "A": "a1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded",
+          "B": "held"
+        }
+      }
+    },
+    {
+      "id": "06-run-retry",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [
+          {
+            "kind": "skip_result",
+            "code": "fixture_error",
+            "recoveryHint": {
+              "retryable": true
+            }
+          }
+        ],
+        "records": {
+          "A": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        }
+      },
+      "expect": {
+        "outcome": "retry_pending",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "held",
+          "B": "held"
+        }
+      }
+    },
+    {
+      "id": "07-run-terminal",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [
+          {
+            "kind": "skip_result",
+            "scope": {
+              "kind": "run"
+            },
+            "code": "fixture_error",
+            "recoveryHint": {
+              "retryable": false
+            }
+          }
+        ],
+        "records": {},
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {},
+      "expect": {
+        "outcome": "failed",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": true,
+        "streamStatus": {
+          "A": "held",
+          "B": "held"
+        }
+      }
+    },
+    {
+      "id": "08-full-silent",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {
+          "A": "a1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A"],
+        "streams": {
+          "A": {
+            "mode": "full_refresh",
+            "coverageStrategy": "full_inventory",
+            "fullRead": true
+          }
+        }
+      },
+      "durable": {},
+      "expect": {
+        "outcome": "failed",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": true,
+        "streamStatus": {
+          "A": "held"
+        }
+      }
+    },
+    {
+      "id": "09-full-empty-inventory",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {
+          "A": "a1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": [
+          {
+            "stream": "A",
+            "report": {
+              "keys": [],
+              "considered": 0,
+              "covered": 0
+            }
+          }
+        ]
+      },
+      "begin": {
+        "selectedStreams": ["A"],
+        "streams": {
+          "A": {
+            "mode": "full_refresh",
+            "coverageStrategy": "full_inventory",
+            "fullRead": true
+          }
+        }
+      },
+      "durable": {},
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["A"],
+        "provenFull": ["A"],
+        "candidate": {
+          "A": "a1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded"
+        }
+      }
+    },
+    {
+      "id": "10-detail-gap",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [
+          {
+            "kind": "detail_gap",
+            "scope": {
+              "kind": "stream",
+              "stream": "A"
+            },
+            "code": "fixture_error",
+            "recoveryHint": {
+              "retryable": true
+            }
+          }
+        ],
+        "records": {
+          "A": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          },
+          "B": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        },
+        "B": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["B"],
+        "provenFull": [],
+        "candidate": {
+          "B": "b1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "held",
+          "B": "succeeded"
+        }
+      }
+    },
+    {
+      "id": "11-detail-gap",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [
+          {
+            "kind": "detail_gap",
+            "scope": {
+              "kind": "stream",
+              "stream": "A"
+            },
+            "code": "fixture_error",
+            "recoveryHint": {
+              "retryable": false
+            }
+          }
+        ],
+        "records": {
+          "A": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          },
+          "B": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        },
+        "B": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["B"],
+        "provenFull": [],
+        "candidate": {
+          "B": "b1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "held",
+          "B": "succeeded"
+        }
+      }
+    },
+    {
+      "id": "12-excluded-delete",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [],
+            "deletedKeys": [["one"]],
+            "everDeletedKeys": [["one"]],
+            "upsertEvents": 0,
+            "deleteEvents": 1
+          },
+          "B": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": ["A"],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [],
+          "deletedKeys": [["one"]],
+          "everDeletedKeys": [["one"]],
+          "upsertEvents": 0,
+          "deleteEvents": 1
+        },
+        "B": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["B"],
+        "provenFull": [],
+        "candidate": {
+          "B": "b1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "held",
+          "B": "succeeded"
+        }
+      }
+    },
+    {
+      "id": "13-upsert-delete",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [],
+            "deletedKeys": [["one"]],
+            "everDeletedKeys": [["one"]],
+            "upsertEvents": 1,
+            "deleteEvents": 1
+          }
+        },
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [],
+          "deletedKeys": [["one"]],
+          "everDeletedKeys": [["one"]],
+          "upsertEvents": 1,
+          "deleteEvents": 1
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["A", "B"],
+        "provenFull": [],
+        "candidate": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded",
+          "B": "succeeded"
+        }
+      }
+    },
+    {
+      "id": "13b-delete-upsert",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [["one"]],
+            "upsertEvents": 1,
+            "deleteEvents": 1
+          }
+        },
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [["one"]],
+          "upsertEvents": 1,
+          "deleteEvents": 1
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["A", "B"],
+        "provenFull": [],
+        "candidate": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded",
+          "B": "succeeded"
+        }
+      }
+    },
+    {
+      "id": "14-certified-failed",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "certified_failed_done",
+          "failedStreams": ["B"]
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          },
+          "B": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        },
+        "B": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["A"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded",
+          "B": "held"
+        }
+      }
+    },
+    {
+      "id": "15-uncertified-failed",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "failed_done_upsert_only",
+          "failedStreams": ["B"]
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          },
+          "B": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental"
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        },
+        "B": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["A"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded",
+          "B": "held"
+        }
+      }
+    },
+    {
+      "id": "16-child-blocks-parent",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [
+          {
+            "kind": "detail_gap",
+            "scope": {
+              "kind": "stream",
+              "stream": "B"
+            },
+            "code": "fixture_error",
+            "recoveryHint": {
+              "retryable": true
+            }
+          }
+        ],
+        "records": {
+          "A": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          },
+          "B": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {
+          "A": "a1",
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental",
+            "stateParents": ["A"]
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        },
+        "B": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        }
+      },
+      "expect": {
+        "outcome": "partial",
+        "covered": ["A"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded",
+          "B": "held"
+        }
+      }
+    },
+    {
+      "id": "16b-absent-parent-prunes-child",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": ["A", "B"],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {
+          "A": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          },
+          "B": {
+            "liveKeys": [["one"]],
+            "deletedKeys": [],
+            "everDeletedKeys": [],
+            "upsertEvents": 1,
+            "deleteEvents": 0
+          }
+        },
+        "checkpoints": {
+          "B": "b1"
+        },
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": ["A", "B"],
+        "streams": {
+          "A": {
+            "mode": "incremental"
+          },
+          "B": {
+            "mode": "incremental",
+            "stateParents": ["A"]
+          }
+        }
+      },
+      "durable": {
+        "A": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        },
+        "B": {
+          "liveKeys": [["one"]],
+          "deletedKeys": [],
+          "everDeletedKeys": [],
+          "upsertEvents": 1,
+          "deleteEvents": 0
+        }
+      },
+      "expect": {
+        "outcome": "succeeded",
+        "covered": ["A", "B"],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false,
+        "streamStatus": {
+          "A": "succeeded",
+          "B": "succeeded"
+        }
+      }
+    },
+    {
+      "id": "empty-selected-noop",
+      "raw": {
+        "wireDialect": "connector-end-evidence/1",
+        "lastBatch": -1,
+        "selectedStreams": [],
+        "finish": {
+          "kind": "completed"
+        },
+        "errors": [],
+        "records": {},
+        "checkpoints": {},
+        "preflightExcludedStreams": [],
+        "detailCoverage": {},
+        "invalidDetailCoverageStreams": [],
+        "wholeStreamEvidence": []
+      },
+      "begin": {
+        "selectedStreams": [],
+        "streams": {}
+      },
+      "durable": {},
+      "expect": {
+        "outcome": "succeeded",
+        "covered": [],
+        "provenFull": [],
+        "candidate": {},
+        "unconfirmed": false,
+        "streamStatus": {}
+      }
     }
   ]
 }

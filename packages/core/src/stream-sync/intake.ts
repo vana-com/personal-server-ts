@@ -217,6 +217,8 @@ export type RunFinish =
  * run-wide skip (one that names no stream) is reported on every stream.
  */
 export interface StreamObservation {
+  /** Explicit completion ceiling; absent preserves legacy evidence rules. */
+  readonly sourceAnswered?: boolean;
   /** The stream's records, folded by key in order, leave a live record. */
   readonly liveRecord: boolean;
   /** The stream emitted at least one explicit delete. */
@@ -252,6 +254,8 @@ export interface EndRequest {
 }
 
 export interface EndResponse {
+  /** V1 only: core-confirmed per-stream completion, independent of whole proof. */
+  readonly streamStatus?: Readonly<Record<string, "succeeded" | "held">>;
   readonly result: EndResult;
   readonly stuck: boolean;
   /** At least one stream was refused because this app needs an update. */
