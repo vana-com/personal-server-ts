@@ -259,3 +259,114 @@ it("A to B to A replication and repeated projection reads emit no new events", a
     ),
   ).toEqual([{ n: 0 }]);
 });
+
+it("each served owner or delegated read durably appends one minimized served-start event", async () => {
+  const { createLocalSync } = await import("../../../core/src/localdb/sync.js");
+  const { handlePersonalServerDataRequest } =
+    await import("../../../core/src/api/index.js");
+  const { createMemoryDataStorage } =
+    await import("../../../core/src/test-utils/memory-storage.js");
+  const f = await fixture();
+  const local = createLocalSync(f.deps, { resolveArtifact: () => null });
+  const scope = "pdpp.fixture-source.items";
+  for (const grantId of ["owner", "grant-1"]) {
+    const eventId = crypto.randomUUID();
+    const response = await handlePersonalServerDataRequest(
+      new Request(`https://server.example/${scope}`, {
+        headers: {
+          "x-forwarded-for": "192.0.2.1",
+          "user-agent": "private-agent",
+        },
+      }),
+      {
+        storage: createMemoryDataStorage(),
+        accountStorageMode: { owner, read: () => "switched" },
+        streamSyncRead: {
+          resolve: async () => ({
+            kind: "view",
+            connector: "fixture-source",
+            ns: "",
+            cursor: "head",
+            served: { scope: "pdpp.fixture-source~.items", version: 1 },
+            body: new Response('{"data":{"records":[]}}').body!,
+          }),
+        },
+        auth: {
+          authorizeBuilderRead: async () => ({ grantId, builder: owner }),
+        },
+        accessLogWriter: {
+          write: (entry) => local.accessActivity.write(entry),
+        },
+        createLogId: () => eventId,
+        now: () => new Date(f.deps.now()),
+      } as never,
+    );
+    expect(response.status).toBe(200);
+    const rows = await f.db.query<{ body: string }>(
+      "SELECT body FROM system_stream_projection WHERE record_id=?",
+      [eventId],
+    );
+    expect(rows).toHaveLength(1);
+    const event = JSON.parse(rows[0]!.body);
+    expect(event).toEqual({
+      schemaVersion: 1,
+      eventId,
+      instanceId: expect.any(String),
+      occurredAt: "2026-06-01T00:00:00.000Z",
+      action: "read",
+      scope,
+      grantId,
+      builder: owner,
+      phase: "served-start",
+    });
+    expect(rows[0]!.body).not.toMatch(
+      /192\.0\.2\.1|private-agent|ipAddress|userAgent/,
+    );
+    await response.body?.cancel();
+  }
+  await local.accessActivity.drain();
+  expect(await f.db.query("SELECT count(*) AS n FROM records")).toEqual([
+    { n: 2 },
+  ]);
+  await local.accessActivity.write({
+    logId: crypto.randomUUID(),
+    grantId: "owner",
+    builder: owner,
+    action: "read",
+    scope: "pdpp.vana-system-access-v1.events",
+    timestamp: "2026-06-01T00:00:00.000Z",
+    ipAddress: "",
+    userAgent: "",
+  });
+  expect(await f.db.query("SELECT * FROM system_stream_outbox")).toEqual([]);
+});
+
+it("retention deletes old activity canonically and persists its deletion watermark", async () => {
+  const { createAccessActivity } =
+    await import("../../../core/src/logging/activity-stream.js");
+  const f = await fixture();
+  const activity = createAccessActivity(f.deps);
+  await activity.write({
+    logId: crypto.randomUUID(),
+    grantId: "owner",
+    builder: owner,
+    action: "read",
+    scope: "fixture.items",
+    timestamp: "2026-04-01T00:00:00.000Z",
+    ipAddress: "",
+    userAgent: "",
+  });
+  await activity.drain();
+  expect(await f.db.query("SELECT count(*) AS n FROM records")).toEqual([
+    { n: 1 },
+  ]);
+  await activity.prune();
+  expect(await f.db.query("SELECT * FROM records")).toEqual([]);
+  expect(
+    await f.db.query("SELECT op FROM record_changes ORDER BY seq"),
+  ).toEqual([{ op: "upsert" }, { op: "remove" }]);
+  const [deleted] = await f.db.query<{ tombstone_wm_o: number }>(
+    "SELECT tombstone_wm_o FROM connections WHERE connector='vana-system-access-v1'",
+  );
+  expect(deleted!.tombstone_wm_o).toBeGreaterThan(f.deps.now());
+});

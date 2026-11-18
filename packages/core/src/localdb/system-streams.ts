@@ -4,7 +4,7 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { SqlStatement } from "./driver.js";
-import type { LocalSyncDeps } from "./deps.js";
+import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
 import { createRunIntakeStore } from "./run-intake.js";
 import { createRunEndStore } from "./run-end.js";
 import {
@@ -22,8 +22,13 @@ export function createSystemStreamStore(
 ) {
   const { db } = deps;
   const identity = systemStreamIdentity(descriptor);
-  const intake = createRunIntakeStore(deps, descriptor);
-  const end = createRunEndStore(deps);
+  // System producers always admit fenced batches and retain explicit-delete
+  // tombstones, independently of connector collection feature flags.
+  const intake = createRunIntakeStore(
+    { ...deps, publishWhileCollecting: true },
+    descriptor,
+  );
+  const end = createRunEndStore({ ...deps, publishWhileCollecting: true });
   let tail: Promise<unknown> = Promise.resolve();
   function serial<T>(work: () => Promise<T>): Promise<T> {
     const result = tail.catch(() => {}).then(work);
@@ -180,6 +185,70 @@ export function createSystemStreamStore(
             params: [...params, sortAt, body],
           },
         ]);
+        announceRecordsCommitted(deps);
+      });
+    },
+    /** Bounded canonical retention, shared by all server-owned consumers. */
+    removeBefore(cutoff: string): Promise<number> {
+      return serial(async () => {
+        await project();
+        const rows = await db.query<{ record_id: string; body: string }>(
+          `SELECT p.record_id,p.body FROM system_stream_projection p
+           JOIN records r ON r.connection_id=p.connection_id AND r.stream=p.stream AND r.record_key=p.record_id
+           WHERE p.connection_id=? AND p.stream=? AND p.sort_at<? ORDER BY p.sort_at,p.record_id LIMIT 200`,
+          [identity.connectionId, descriptor.stream, cutoff],
+        );
+        if (!rows.length) return 0;
+        const [floor] = await db.query<{ o: number }>(
+          "SELECT COALESCE(MAX(floor_o),0) AS o FROM stream_state WHERE connection_id=?",
+          [identity.connectionId],
+        );
+        const runId = deps.newOp();
+        await intake.begin(
+          runId,
+          {
+            connector: descriptor.connector,
+            artifactDigest: `system:${descriptor.version}`,
+            owner: { address: deps.ownerAddress, leaseId: null },
+            observedAt: Math.max(deps.now(), (floor?.o ?? 0) + 1),
+          },
+          identity.declarations,
+        );
+        await intake.batch(runId, {
+          batch: 0,
+          records: rows.map((row) => ({
+            stream: descriptor.stream,
+            op: "delete",
+            data: JSON.parse(row.body),
+          })),
+        });
+        await end.end(runId, {
+          finish: "completed",
+          lastBatch: 0,
+          checkpoints: {},
+          streams: {
+            [descriptor.stream]: {
+              liveRecord: false,
+              explicitDelete: true,
+              retryableSkip: false,
+              otherSkip: false,
+              preflightExclusion: false,
+              detailGap: "none",
+              invalidDetailCoverage: false,
+              failedInDone: false,
+            },
+          },
+        });
+        for (const row of rows) {
+          const remains = await db.query(
+            "SELECT 1 FROM records WHERE connection_id=? AND stream=? AND record_key=?",
+            [identity.connectionId, descriptor.stream, row.record_id],
+          );
+          if (remains.length)
+            throw new Error("System stream canonical deletion refused");
+        }
+        await project();
+        return rows.length;
       });
     },
     /** Bounded recovery sweep; no network work runs in append. */
@@ -208,6 +277,24 @@ export function createSystemStreamStore(
                   sql: "UPDATE system_stream_outbox SET run_id=?,observed_at=? WHERE connection_id=? AND stream=? AND record_id=?",
                   params: [
                     row.run_id,
+                    row.observed_at,
+                    identity.connectionId,
+                    descriptor.stream,
+                    row.record_id,
+                  ],
+                },
+              ]);
+            }
+            if (!run || run.state === "ended") {
+              const [floor] = await db.query<{ o: number }>(
+                "SELECT COALESCE(MAX(floor_o),0) AS o FROM stream_state WHERE connection_id=?",
+                [identity.connectionId],
+              );
+              row.observed_at = Math.max(row.observed_at, (floor?.o ?? 0) + 1);
+              await db.batch([
+                {
+                  sql: "UPDATE system_stream_outbox SET observed_at=? WHERE connection_id=? AND stream=? AND record_id=?",
+                  params: [
                     row.observed_at,
                     identity.connectionId,
                     descriptor.stream,

@@ -1,3 +1,4 @@
+import { createAccessActivity } from "../logging/activity-stream.js";
 import { isReservedSystemConnector } from "../policy/reserved-scopes.js";
 import type {
   DeltaApplyResult,
@@ -51,6 +52,7 @@ import { createRunIntakeStore } from "./run-intake.js";
  */
 export interface LocalSync {
   readonly intake: RunIntake;
+  readonly accessActivity: ReturnType<typeof createAccessActivity>;
   readonly deleter: ConnectionDeleter;
   readonly resolver: LocalResolver;
   readonly listing: LocalListing;
@@ -115,6 +117,7 @@ export function createLocalSync(
   let intakeStore: ReturnType<typeof createRunIntakeStore> | undefined;
   const intake = () => (intakeStore ??= createRunIntakeStore(deps));
   const endStore = createRunEndStore(deps);
+  const accessActivity = createAccessActivity(deps);
   const bindings = new Map<
     string,
     { readonly connector: string; readonly leaseId: string | null }
@@ -293,6 +296,7 @@ export function createLocalSync(
   let closing: Promise<void> | undefined;
   return {
     intake: runIntake,
+    accessActivity,
     deleter,
     resolver: createLocalResolver(deps, {
       query,
@@ -349,6 +353,8 @@ export function createLocalSync(
     blobs: createBlobStore(deps),
     async cycle(scope) {
       await resume();
+      await accessActivity.drain();
+      await accessActivity.prune();
       let allApplied = true;
       const report = await runCycle(deps, scope, undefined, (outcome) => {
         if (outcome.kind !== "applied") allApplied = false;
@@ -359,16 +365,23 @@ export function createLocalSync(
         report.connections.every((connection) => connection.error === null)
       )
         accountHydrated = true;
+      await accessActivity.project();
       return report;
     },
     async publish() {
       await resume();
-      return runPublish(deps);
+      await accessActivity.drain();
+      await accessActivity.prune();
+      const report = await runPublish(deps);
+      await accessActivity.project();
+      return report;
     },
     async applyDelta(delta) {
       if ((await resume()).length > 0)
         return { outcome: "cycle", reason: "a delete is pending" };
-      return applyRegistryDelta(deps, delta);
+      const result = await applyRegistryDelta(deps, delta);
+      await accessActivity.project();
+      return result;
     },
     async apply() {
       await resume();
@@ -394,11 +407,14 @@ export function createLocalSync(
         throw firstError instanceof Error
           ? firstError
           : new Error(String(firstError));
+      await accessActivity.project();
       if (allApplied) accountHydrated = true;
     },
     async syncConnection(connectionId) {
       await resume();
-      return syncConnection(deps, connectionId);
+      const report = await syncConnection(deps, connectionId);
+      await accessActivity.project();
+      return report;
     },
     close: () => {
       closed = true;
