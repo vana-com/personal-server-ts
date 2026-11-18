@@ -5,6 +5,7 @@ import { legacyAliasScopes } from "@opendatalabs/personal-server-ts-core/legacy-
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
+import { createLocalListing } from "../../../core/src/localdb/listing.js";
 import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import { readerOf, type SqlDriver } from "../../../core/src/localdb/driver.js";
@@ -288,6 +289,236 @@ async function fixture() {
 }
 
 describe("local resolve", () => {
+  it("ranks x independently of unrelated y and keeps listing and reads together", async () => {
+    const f = await fixture();
+    const a = "aaaaaaaaaaaaaaaa";
+    const b = "bbbbbbbbbbbbbbbb";
+    const scope = "pdpp.fixture-source.x";
+    await f.connection("active", "c1", a);
+    await f.connection("active", "c2", b);
+    await f.head("x", { version: 5, floor: 5 });
+    await f.head("y");
+    await f.head("x", { id: "c2", version: 1 });
+    await f.record("x", "from B", "c2");
+    await f.db.batch([
+      {
+        sql: "UPDATE stream_versions SET observed_at = 100 WHERE connection_id = 'c2' AND stream = 'x'",
+      },
+    ]);
+    const listing = createLocalListing(f.deps);
+    for (const time of [200, 50, 300]) {
+      await f.db.batch([
+        {
+          sql: "UPDATE stream_versions SET observed_at = ? WHERE connection_id = 'c1' AND stream = 'y'",
+          params: [time],
+        },
+      ]);
+      expect(
+        (await listing.listScopes({ canRead: () => true })).find(
+          (s) => s.scope === scope,
+        ),
+      ).toMatchObject({ ns: b, records: 1 });
+      const read = await f.resolver.resolve(input(scope));
+      expect(read).toMatchObject({
+        kind: "view",
+        ns: b,
+        served: { version: 1 },
+      });
+      expect((await drain(read)).data.records).toEqual([
+        { id: "key", value: "from B" },
+      ]);
+    }
+    expect(await f.resolver.resolve(input(scope, { connection: a }))).toEqual({
+      kind: "unavailable",
+      reason: "deleted",
+    });
+    const explicit = await f.resolver.resolve(input(scope, { connection: b }));
+    expect(explicit).toMatchObject({ kind: "view", ns: b });
+    expect((await drain(explicit)).data.records[0]?.value).toBe("from B");
+    await f.head("x", { id: "c2", version: 2, floor: 2 });
+    expect(
+      (await listing.listScopes({ canRead: () => true })).some(
+        (s) => s.scope === scope,
+      ),
+    ).toBe(false);
+    expect(await f.resolver.resolve(input(scope))).toEqual({
+      kind: "unavailable",
+      reason: "deleted",
+    });
+  });
+
+  it("breaks equal target timestamps by namespace despite newer unrelated activity", async () => {
+    const f = await fixture();
+    await f.connection("active", "c1", "aaaaaaaaaaaaaaaa");
+    await f.connection("active", "c2", "bbbbbbbbbbbbbbbb");
+    await f.head("x");
+    await f.head("x", { id: "c2" });
+    await f.head("y", { id: "c2", version: 99 });
+    await f.record("x", "namespace A");
+    await f.record("x", "namespace B", "c2");
+    const read = await f.resolver.resolve(input("pdpp.fixture-source.x"));
+    expect(read).toMatchObject({ kind: "view", ns: "aaaaaaaaaaaaaaaa" });
+    expect((await drain(read)).data.records[0]?.value).toBe("namespace A");
+    const listing = createLocalListing(f.deps);
+    expect(
+      (await listing.listScopes({ canRead: () => true })).find(
+        (s) => s.scope === "pdpp.fixture-source.x",
+      ),
+    ).toMatchObject({ ns: "aaaaaaaaaaaaaaaa", records: 1 });
+  });
+
+  it("gates missing and incomplete targets without stitching a multi-stream alias", async () => {
+    const f = await fixture();
+    await f.connection("active", "c1", "aaaaaaaaaaaaaaaa");
+    await f.connection("active", "c2", "bbbbbbbbbbbbbbbb");
+    await f.head("parents", { version: 3 });
+    await f.head("children", { id: "c2", version: 2 });
+    expect(verdict(await f.resolver.resolve(input("fixture.alias")))).toBe(
+      "no_data",
+    );
+    await f.head("children", { complete: false, version: 4 });
+    expect(verdict(await f.resolver.resolve(input("fixture.alias")))).toBe(
+      "no_data",
+    );
+    expect(
+      verdict(await f.resolver.resolve(input("pdpp.fixture-source.missing"))),
+    ).toBe("no_data");
+    const listing = createLocalListing({
+      ...f.deps,
+      aliasScopes: () => ["fixture.alias"],
+      aliasTargets: () => [
+        {
+          connector: CONNECTOR,
+          streams: ["parents", "children"],
+          project: () => ({ ok: true as const, payload: {} }),
+        },
+      ],
+    });
+    expect(
+      (await listing.listScopes({ canRead: () => true })).some(
+        (s) => s.scope === "fixture.alias",
+      ),
+    ).toBe(false);
+    expect(f.visited).not.toHaveBeenCalled();
+  });
+
+  it("ranks a multi-stream binding by required and complete optional streams only", async () => {
+    const f = await fixture();
+    await f.connection("active", "c1", "aaaaaaaaaaaaaaaa");
+    await f.connection("active", "c2", "bbbbbbbbbbbbbbbb");
+    await f.head("parents", { version: 1 });
+    await f.head("children", { version: 1 });
+    await f.head("optional", { version: 99, complete: false });
+    await f.head("unrelated", { version: 100 });
+    await f.head("parents", { id: "c2", version: 2 });
+    await f.head("children", { id: "c2", version: 2 });
+    await f.record("parents", "A parent");
+    await f.record("children", "A child");
+    await f.record("optional", "A optional");
+    await f.record("parents", "B parent", "c2");
+    await f.record("children", "B child", "c2");
+    const aliases = {
+      aliasScopes: () => ["fixture.optional"],
+      aliasTargets: () => [
+        {
+          connector: CONNECTOR,
+          streams: ["parents", "children", "optional"],
+          requiredStreams: ["parents", "children"],
+          servedStream: "parents",
+          project: (
+            records: readonly unknown[],
+            _now: string,
+            fetched: readonly string[],
+          ) => ({ ok: true as const, payload: { records, fetched } }),
+        },
+      ],
+    };
+    const resolver = createLocalResolver(f.deps, {
+      query: f.query,
+      ...aliases,
+    });
+    const listing = createLocalListing({ ...f.deps, ...aliases });
+    for (const optionalState of [
+      "incomplete",
+      "complete",
+      "deleted",
+    ] as const) {
+      if (optionalState === "complete")
+        await f.head("optional", { version: 99 });
+      if (optionalState === "deleted")
+        await f.head("optional", { version: 99, floor: 99 });
+      const ns =
+        optionalState === "complete" ? "aaaaaaaaaaaaaaaa" : "bbbbbbbbbbbbbbbb";
+      const read = await resolver.resolve(input("fixture.optional"));
+      expect(read).toMatchObject({ kind: "view", ns });
+      expect((await drain(read)).data).toEqual({
+        records:
+          optionalState === "complete"
+            ? [
+                { stream: "parents", data: { id: "key", value: "A parent" } },
+                { stream: "children", data: { id: "key", value: "A child" } },
+                {
+                  stream: "optional",
+                  data: { id: "key", value: "A optional" },
+                },
+              ]
+            : [
+                { stream: "parents", data: { id: "key", value: "B parent" } },
+                { stream: "children", data: { id: "key", value: "B child" } },
+              ],
+        fetched:
+          optionalState === "complete"
+            ? ["parents", "children", "optional"]
+            : ["parents", "children"],
+      });
+      expect(
+        (await listing.listScopes({ canRead: () => true })).find(
+          (s) => s.scope === "fixture.optional",
+        ),
+      ).toMatchObject({ ns });
+    }
+  });
+
+  it("keeps progressive first loads readable beside another connection's unrelated activity", async () => {
+    const f = await fixture();
+    await f.connection("active", "c1", "aaaaaaaaaaaaaaaa");
+    await f.connection("active", "c2", "bbbbbbbbbbbbbbbb");
+    await f.head("x", { version: 1, complete: false });
+    await f.record("x", "first part");
+    await f.head("y", { id: "c2", version: 99 });
+    await f.db.batch([
+      {
+        sql: "INSERT INTO stream_partial(connection_id,stream,version,generation,data_hash,head_blob,observed_at,parts_applied,parts_total,records_total) VALUES ('c1','x',1,2,'hash-x-1','head-x-1',100,1,2,2)",
+      },
+    ]);
+    const deps = { ...f.deps, progressiveFirstLoad: true };
+    const resolver = createLocalResolver(deps, { query: f.query });
+    expect(
+      verdict(await resolver.resolve(input("pdpp.fixture-source.x"))),
+    ).toBe("no_data");
+    const read = await resolver.resolve(
+      input("pdpp.fixture-source.x", { isOwnerView: true }),
+    );
+    expect(read).toMatchObject({
+      kind: "view",
+      ns: "aaaaaaaaaaaaaaaa",
+      partial: { partsApplied: 1, partsTotal: 2 },
+    });
+    expect((await drain(read)).data.records).toEqual([
+      { id: "key", value: "first part" },
+    ]);
+    const listing = createLocalListing(deps);
+    expect(
+      (
+        await listing.listScopes({ canRead: () => true, includeLoading: true })
+      ).find((s) => s.scope === "pdpp.fixture-source.x"),
+    ).toMatchObject({
+      ns: "aaaaaaaaaaaaaaaa",
+      records: 1,
+      dataStatus: "indexing",
+    });
+  });
+
   it("reports busy when another alias target is refused beside a tombstone", async () => {
     const f = await fixture();
     await f.connection();
@@ -312,13 +543,35 @@ describe("local resolve", () => {
         [CONNECTOR, "other-source"].map((connector) => ({
           connector,
           streams: ["items"],
-          project: () => ({ ok: true as const, payload: {} }),
+          project: (records) => ({ ok: true as const, payload: { records } }),
         })),
     });
     expect(await resolver.resolve(input("fixture.multi"))).toEqual({
       kind: "busy",
       retryAfterSeconds: 5,
     });
+    await f.head("items", { version: 7 });
+    await f.record("items", "complete target");
+    mocked.apply.mockClear();
+    f.visited.mockClear();
+    const fallback = await resolver.resolve(input("fixture.multi"));
+    expect(fallback).toMatchObject({
+      kind: "view",
+      connector: CONNECTOR,
+      ns: "",
+      served: { scope: "pdpp.fixture-source~.items", version: 7 },
+    });
+    expect((await drain(fallback)).data).toEqual({
+      records: [
+        { stream: "items", data: { id: "key", value: "complete target" } },
+      ],
+    });
+    expect(mocked.apply.mock.calls.map((call) => call[1])).toEqual([
+      "c1",
+      "c2",
+    ]);
+    expect(f.visited.mock.calls).toEqual([["c1", "items"]]);
+    await f.head("items", { version: 8, floor: 8 });
     mocked.apply.mockRejectedValue(
       new RegistryUnavailableBeforeWriteError(
         new RegistryUnavailableError("offline"),
@@ -330,13 +583,13 @@ describe("local resolve", () => {
     });
   });
 
-  it("reports busy when a tombstoned winner outranks a refused live connection", async () => {
+  it("isolates explicit namespaces and serves complete local data during classified refusal", async () => {
     const f = await fixture();
     await f.connection("active", "c1");
     await f.connection("active", "c2", "1111111111111111");
     await f.head("x", { version: 5, floor: 5 });
     await f.head("y");
-    await f.head("x", { id: "c2" });
+    await f.head("x", { id: "c2", complete: false });
     await f.db.batch([
       {
         sql: "UPDATE stream_versions SET observed_at = ? WHERE connection_id = ? AND stream = ?",
@@ -358,6 +611,42 @@ describe("local resolve", () => {
       kind: "busy",
       retryAfterSeconds: 5,
     });
+    await f.head("x", { id: "c2", version: 7 });
+    await f.record("x", "local fallback", "c2");
+    mocked.apply.mockClear();
+    expect(
+      await f.resolver.resolve(
+        input("pdpp.fixture-source.x", { connection: "" }),
+      ),
+    ).toEqual({ kind: "unavailable", reason: "deleted" });
+    expect(mocked.apply.mock.calls.map((call) => call[1])).toEqual(["c1"]);
+
+    // c1 now wins an unqualified x read on x itself, not on unrelated y.
+    await f.head("x", { version: 9 });
+    await f.record("x", "newer c1");
+    mocked.apply.mockClear();
+    const selected = await f.resolver.resolve(
+      input("pdpp.fixture-source.x", { connection: "1111111111111111" }),
+    );
+    expect(selected).toMatchObject({
+      kind: "view",
+      connector: CONNECTOR,
+      ns: "1111111111111111",
+      served: { scope: "pdpp.fixture-source~1111111111111111.x", version: 7 },
+    });
+    expect((await drain(selected)).data.records).toEqual([
+      { id: "key", value: "local fallback" },
+    ]);
+    expect(mocked.apply.mock.calls.map((call) => call[1])).toEqual(["c2"]);
+    const unqualified = await f.resolver.resolve(
+      input("pdpp.fixture-source.x"),
+    );
+    expect(unqualified).toMatchObject({
+      kind: "view",
+      ns: "",
+      served: { version: 9 },
+    });
+    expect((await drain(unqualified)).data.records[0]?.value).toBe("newer c1");
   });
 
   it("keeps deleted precedence when every refused connection is tombstoned", async () => {
