@@ -314,7 +314,7 @@ export function invalidAliasBinding(binding: LocalAliasTarget): boolean {
 
 /**
  * Pick the connection a read of `target` serves, from its active connections.
- * Rank by the newest live head among the binding's target streams, then the
+ * Rank by the newest readable head among the binding's target streams, then the
  * lowest namespace. Required streams participate; optional streams participate
  * only when complete, as they do in the served body. Unrelated streams never
  * affect rank. Keep one connection for the whole target: a winner with a deleted
@@ -348,9 +348,14 @@ export function selectForTarget(
       }),
       connection,
     );
-    const rank = served.streams
-      .filter((s) => live(s, connection))
-      .map((s) => s.observed_at ?? 0);
+    // Deletion is per connection; a tombstone removes only its own connection's copy.
+    const rank = served.streams.flatMap((s) =>
+      live(s, connection)
+        ? [s.observed_at ?? 0]
+        : progressive && partialReadable(s, connection)
+          ? [s.partial!.observedAt]
+          : [],
+    );
     active.push({
       target,
       connection,
