@@ -449,8 +449,15 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           connection.checkpoint === null
             ? null
             : (JSON.parse(connection.checkpoint) as Record<string, unknown>);
-        let retryCanSave = retry;
-        if (retry && refused.length > 0) {
+        // Partial retries save the same dependency-safe candidate as an
+        // all-pending retry, including finished streams' committed progress.
+        const retryCheckpoint =
+          retry ||
+          (outcome === "partial" &&
+            req.finish === "completed" &&
+            Object.values(req.streams).some((stream) => stream.retryableSkip));
+        let retryCanSave = retryCheckpoint;
+        if (retryCheckpoint && refused.length > 0) {
           // Cursors are opaque: only unchanged or absent refused-stream entries
           // prove that this candidate carries no progress for refused rows.
           retryCanSave =

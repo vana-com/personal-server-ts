@@ -266,18 +266,6 @@ export function planRunFinish(
   if (input.finish !== "completed")
     return planFailedDone(input, run, proven, anyDelete);
 
-  if (run.retry) {
-    // A retry run keeps no record and moves only cursors no unsent record,
-    // and no stream depending on one, holds back.
-    const safe = safeCheckpoints(run, input.checkpoints, selected, true);
-    return {
-      outcome: "retry_pending",
-      covered: [],
-      provenFull: [],
-      candidate: withheld(run, safe),
-      unconfirmed: false,
-    };
-  }
   // A silent stream counts unless this run would clear it; then it needs an
   // explicit answer from the source: a delete or a whole-stream proof.
   const answered = selected.filter((stream) => {
@@ -290,6 +278,29 @@ export function planRunFinish(
         proven.has(stream))
     );
   });
+  const covered = answered.filter((stream) => obs(stream).detailGap === "none");
+  if (run.retry) {
+    // Finished streams publish independently. Unfinished streams retain the
+    // retry rule: only record-free tokens with safe dependencies may move.
+    const finished = safeCheckpoints(run, input.checkpoints, covered, false);
+    const retryTokens = withheld(
+      run,
+      safeCheckpoints(run, input.checkpoints, selected, true),
+    );
+    return {
+      outcome: covered.length > 0 ? "partial" : "retry_pending",
+      covered,
+      provenFull: covered.filter((stream) => proven.has(stream)),
+      candidate: {
+        ...pick(
+          retryTokens,
+          selected.filter((stream) => !covered.includes(stream)),
+        ),
+        ...pick(finished, covered),
+      },
+      unconfirmed: false,
+    };
+  }
   if (answered.length === 0 && selected.length > 0) {
     // Nothing confirmed. Explicit deletes still count, key by key; no cursor
     // moves. A run that selected no stream has nothing to confirm.
@@ -303,7 +314,6 @@ export function planRunFinish(
         }
       : { ...FAILED, unconfirmed: true };
   }
-  const covered = answered.filter((stream) => obs(stream).detailGap === "none");
   const safe = safeCheckpoints(run, input.checkpoints, answered, false);
   return {
     outcome: covered.length < selected.length ? "partial" : "succeeded",

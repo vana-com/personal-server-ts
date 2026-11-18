@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   connectionQueue,
+  createRecordQuery,
   openLocalDb,
   type LocalSyncDeps,
   type SqlDriver,
@@ -407,4 +408,127 @@ describe("run intake staging cost", () => {
     // The last two batches must both stay near the first; a scan makes them 4x and 6x it.
     expect(Math.min(timed[2]!, timed[3]!) / timed[0]!).toBeLessThan(2);
   }, 60_000);
+});
+
+describe("partial retry checkpoints", () => {
+  it.each(["independent", "child", "parent"] as const)(
+    "keeps finished records and resumes the pending stream with %s checkpoints",
+    async (dependency) => {
+      const f = await fixture();
+      const declarations: IntakeDeclarations = {
+        ...declaration,
+        streams: [
+          {
+            name: "a",
+            semantics: "mutable_state",
+            primaryKey: ["id"],
+            ...(dependency === "child" ? { stateParents: ["b"] } : {}),
+          },
+          {
+            name: "b",
+            semantics: "mutable_state",
+            primaryKey: ["id"],
+            ...(dependency === "parent" ? { stateParents: ["a"] } : {}),
+          },
+        ],
+      };
+      await f.store.begin("initial", request, declarations);
+      await f.store.batch("initial", {
+        batch: 0,
+        records: [
+          { stream: "a", data: { id: "one", value: "old" } },
+          { stream: "b", data: { id: "two", value: "old" } },
+        ],
+      });
+      await f.end.end(
+        "initial",
+        endRequest({
+          lastBatch: 0,
+          live: ["a", "b"],
+          checkpoints: { a: "a0", b: "b0" },
+        }),
+      );
+      const begin = await f.store.begin(
+        "partial",
+        { ...request, observedAt: 50 },
+        declarations,
+      );
+      expect(begin.start.state).toEqual({ a: "a0", b: "b0" });
+      await f.store.batch("partial", {
+        batch: 0,
+        records: [{ stream: "a", data: { id: "one", value: "finished" } }],
+      });
+      const response = await f.end.end(
+        "partial",
+        endRequest({
+          lastBatch: 0,
+          streams: ["a", "b"],
+          live: ["a"],
+          observe: { b: { retryableSkip: true } },
+          checkpoints: { a: "a1", b: "retry-job" },
+        }),
+      );
+      expect(response).toMatchObject({
+        outcome: "partial",
+        coveredStreams: ["a"],
+      });
+      const query = createRecordQuery(f.db);
+      const connectionId = (
+        await f.db.query<{ connection_id: string }>(
+          "SELECT connection_id FROM connections",
+        )
+      )[0]!.connection_id;
+      const read = async (stream: string) =>
+        (await query.listRecords({ connectionId, stream })).records.map((r) =>
+          JSON.parse(r.body),
+        );
+      expect(await read("a")).toEqual([{ id: "one", value: "finished" }]);
+      expect(await read("b")).toEqual([{ id: "two", value: "old" }]);
+      const checkpoint =
+        dependency === "independent"
+          ? { a: "a1", b: "retry-job" }
+          : { a: "a0", b: "b0" };
+      expect(
+        JSON.parse(
+          (
+            await f.db.query<{ checkpoint: string }>(
+              "SELECT checkpoint FROM connections",
+            )
+          )[0]!.checkpoint,
+        ),
+      ).toEqual(checkpoint);
+      const resumed = await f.store.begin(
+        "retry",
+        { ...request, observedAt: 60 },
+        declarations,
+      );
+      expect(resumed.start.state).toEqual(checkpoint);
+      await f.store.batch("retry", {
+        batch: 0,
+        records: [{ stream: "b", data: { id: "two", value: "finished" } }],
+      });
+      expect(
+        await f.end.end(
+          "retry",
+          endRequest({
+            lastBatch: 0,
+            streams: ["a", "b"],
+            live: ["b"],
+            checkpoints: { a: "a1", b: "b1" },
+          }),
+        ),
+      ).toMatchObject({ outcome: "succeeded" });
+      expect(await read("a")).toEqual([{ id: "one", value: "finished" }]);
+      expect(await read("b")).toEqual([{ id: "two", value: "finished" }]);
+      expect(
+        JSON.parse(
+          (
+            await f.db.query<{ checkpoint: string }>(
+              "SELECT checkpoint FROM connections",
+            )
+          )[0]!.checkpoint,
+        ),
+      ).toEqual({ a: "a1", b: "b1" });
+    },
+  );
 });
