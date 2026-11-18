@@ -445,12 +445,14 @@ export function createLocalResolver(
       const progressive = progressiveFirstLoad && input.isOwnerView;
       const candidates: Candidate[] = [];
       let sawDeleted = false;
+      let sawTombstoned = false;
       let sawForeign = false;
       let sawConnection = false;
       let sawActive = false;
       let applyUnavailable = false;
       for (const target of targets) {
         let rows = await connections(target.connector);
+        const refused = new Set<string>();
         // applyConnection is the single-flight boundary and verifies keys before
         // installing rows. No rejected/foreign head is eligible for a DB read.
         for (const c of rows) {
@@ -464,13 +466,19 @@ export function createLocalResolver(
             } catch (error) {
               if (!(error instanceof RegistryUnavailableBeforeWriteError))
                 throw error;
-              applyUnavailable = true;
+              refused.add(c.connection_id);
             }
           }
         }
         rows = await connections(target.connector);
         if (input.connection !== null)
           rows = rows.filter((c) => c.ns === input.connection);
+        applyUnavailable ||= rows.some(
+          (c) =>
+            refused.has(c.connection_id) &&
+            c.control_state === "active" &&
+            c.deleted_at === null,
+        );
         sawConnection ||= rows.length > 0;
         sawDeleted ||= rows.some(
           (c) => c.control_state === "deleted" || c.deleted_at !== null,
@@ -493,14 +501,15 @@ export function createLocalResolver(
         }
         const picked = selectForTarget(target, loaded, { progressive });
         if (picked.kind === "invalid_binding") return picked;
-        if (picked.tombstoned) sawDeleted = true;
+        if (picked.tombstoned) sawTombstoned = true;
         if (picked.candidate) candidates.push(picked.candidate);
       }
       const chosen = chooseCandidate(candidates);
       if (!chosen) {
+        if (sawTombstoned) return deleted();
+        if (applyUnavailable) return { kind: "busy", retryAfterSeconds: 5 };
         if (sawDeleted) return deleted();
         if (sawForeign && !sawActive) return { kind: "key_mismatch" };
-        if (applyUnavailable) return { kind: "busy", retryAfterSeconds: 5 };
         if (input.cursor !== null) return { kind: "cursor_stale" };
         if (input.connection !== null && !sawConnection) {
           return { kind: "unavailable", reason: "connection_not_found" };

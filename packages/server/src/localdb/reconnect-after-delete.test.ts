@@ -12,6 +12,10 @@ import {
   logScope,
   streamScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  handlePersonalServerDataRequest,
+  type PersonalServerDataApiDeps,
+} from "../../../core/src/api/index.js";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import {
   RegistryUnavailableBeforeWriteError,
@@ -221,6 +225,15 @@ it.each(
     );
     expect(heads.length).toBeGreaterThan(0);
 
+    const registryBefore = structuredClone([...w.gateway.versions]);
+    const batch = a.db.batch.bind(a.db);
+    let partialMarks = 0;
+    a.db.batch = async (statements) => {
+      partialMarks += statements.filter((statement) =>
+        statement.sql.includes("SET apply_partial=1"),
+      ).length;
+      return batch(statements);
+    };
     const read = registry.read.bind(registry);
     let controlReads = 0;
     registry.read = async (scope) => {
@@ -241,6 +254,8 @@ it.each(
         ),
       ).rejects.toBeInstanceOf(RegistryUnavailableBeforeWriteError);
       expect(controlReads).toBe(1);
+      expect(partialMarks).toBe(0);
+      expect([...w.gateway.versions]).toEqual(registryBefore);
       expect(
         await a.db.query("SELECT * FROM records ORDER BY stream, record_key"),
       ).toEqual(records);
@@ -254,15 +269,31 @@ it.each(
       ).toEqual(heads);
     } finally {
       registry.read = read;
+      a.db.batch = batch;
     }
     let retryControlReads = 0;
     registry.read = async (scope) => {
-      if (scope === control) retryControlReads++;
-      return read(scope);
+      const result = await read(scope);
+      if (scope === control) {
+        retryControlReads++;
+        expect(result.found && result.version).toBe(before.control_version);
+      }
+      return result;
     };
     try {
       await applyConnection(a.deps, before.connection_id);
       expect(retryControlReads).toBe(1);
+      const [after] = await a.db.query<{
+        generation: number;
+        control_version: number;
+      }>(
+        "SELECT generation, control_version FROM connections WHERE connector=?",
+        [CONNECTOR],
+      );
+      expect(after).toEqual({
+        generation: before.generation,
+        control_version: before.control_version,
+      });
       expect(await a.records()).toEqual(rows);
       expect(
         await a.db.query("SELECT * FROM stream_state ORDER BY stream"),
@@ -318,27 +349,73 @@ it.each(
   },
 );
 
-it("refuses a first read for retry when the registry is unavailable", async () => {
-  const w = await world({ streams: 1 });
-  const a = await w.device("read-empty");
-  await a.db.batch([
-    {
-      sql: "INSERT INTO connections(connection_id, connector, ns, generation, control_state, control_version) VALUES (?, ?, '', 1, 'active', 1)",
-      params: [CONNECTION_ID, CONNECTOR],
-    },
-  ]);
-  a.deps.registry.read = () =>
-    Promise.reject(new RegistryUnavailableError("offline"));
-  const resolver = createLocalResolver(a.deps, {
-    query: createRecordQuery(a.db),
-  });
-  expect(
-    await resolver.resolve({
-      scope: streamScope(CONNECTOR, "", sName(0)),
-      connection: null,
-      cursor: null,
-      legacyFile: false,
-      isOwnerView: true,
-    }),
-  ).toEqual({ kind: "busy", retryAfterSeconds: 5 });
-});
+it.each([false, true])(
+  "refuses a first read when the registry is unavailable (old deleted connection: %s)",
+  async (withDeleted) => {
+    const w = await world({ streams: 1 });
+    const a = await w.device("read-empty");
+    await a.db.batch([
+      {
+        sql: "INSERT INTO connections(connection_id, connector, ns, generation, control_state, control_version) VALUES (?, ?, '', 1, 'active', 1)",
+        params: [CONNECTION_ID, CONNECTOR],
+      },
+      ...(withDeleted
+        ? [
+            {
+              sql: "INSERT INTO connections(connection_id, connector, ns, generation, control_state, control_version) VALUES (?, ?, ?, 1, 'deleted', 1)",
+              params: ["deleted-connection", CONNECTOR, "0123456789abcdef"],
+            },
+          ]
+        : []),
+    ]);
+    a.deps.registry.read = () =>
+      Promise.reject(new RegistryUnavailableError("offline"));
+    const resolver = createLocalResolver(a.deps, {
+      query: createRecordQuery(a.db),
+    });
+    expect(
+      await resolver.resolve({
+        scope: streamScope(CONNECTOR, "", sName(0)),
+        connection: null,
+        cursor: null,
+        legacyFile: false,
+        isOwnerView: true,
+      }),
+    ).toEqual({ kind: "busy", retryAfterSeconds: 5 });
+    const deps = {
+      accountMode: { read: () => "switched" },
+      streamSyncRead: resolver,
+      auth: {
+        authorizeOwner: async () => undefined,
+        authorizeBuilderList: async () => undefined,
+        authorizeBuilderRead: async () => ({ grantId: "owner" }),
+      },
+      accessLogWriter: { write: async () => undefined },
+      logger: { debug() {}, error() {}, warn() {}, info() {} },
+      serverOwner: OWNER,
+      createLogId: () => "read-1",
+    } as unknown as PersonalServerDataApiDeps;
+    const response = await handlePersonalServerDataRequest(
+      new Request(
+        `https://server.example/v1/data/${streamScope(CONNECTOR, "", sName(0))}`,
+      ),
+      deps,
+      { basePath: "/v1/data" },
+    );
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Retry-After")).toBe("5");
+    expect((await response.json()).error.errorCode).toBe(
+      "STREAM_SYNC_READ_BUSY",
+    );
+    if (withDeleted)
+      expect(
+        await resolver.resolve({
+          scope: streamScope(CONNECTOR, "", sName(0)),
+          connection: "0123456789abcdef",
+          cursor: null,
+          legacyFile: false,
+          isOwnerView: true,
+        }),
+      ).toEqual({ kind: "unavailable", reason: "deleted" });
+  },
+);

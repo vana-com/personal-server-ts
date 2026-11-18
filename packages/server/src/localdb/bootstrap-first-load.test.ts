@@ -38,9 +38,15 @@ vi.mock("@opendatalabs/personal-server-ts-stream-sync", async (original) => {
       writer.lie ? false : real.segmentRemoves(ops),
   };
 });
+let beforeClose: (() => void) | undefined;
 afterEach(async () => {
-  writer.lie = false;
-  await closeWorldDrivers();
+  try {
+    beforeClose?.();
+  } finally {
+    beforeClose = undefined;
+    writer.lie = false;
+    await closeWorldDrivers();
+  }
 });
 type World = Awaited<ReturnType<typeof world>>;
 type Device = Awaited<ReturnType<World["device"]>>;
@@ -1099,13 +1105,18 @@ describe("disk-backed bootstrap swap", () => {
     },
   );
 
-  it.each(
-    (["swap", "copy"] as const).flatMap((mode) =>
-      ([0, 2, 3] as const).map((winnerPosition) => ({ mode, winnerPosition })),
+  it.each([
+    ...(["swap", "copy"] as const).flatMap((mode) =>
+      ([0, 2, 3] as const).map((winnerPosition) => ({
+        mode,
+        winnerPosition,
+        serial: false,
+      })),
     ),
-  )(
+    { mode: "swap" as const, winnerPosition: 2 as const, serial: true },
+  ])(
     "preserves equal-stamp winners in $mode with ordinal winner at $winnerPosition",
-    async ({ mode, winnerPosition }) => {
+    async ({ mode, winnerPosition, serial }) => {
       const w = await world({ streams: 1 });
       const publisher = await w.device("tie-publisher");
       await publisher.run("seed", [{ stream: sName(0), id: "seed" }]);
@@ -1177,6 +1188,9 @@ describe("disk-backed bootstrap swap", () => {
         releaseSecond = deferred(),
         thirdCompleted = deferred();
       let secondHeld = false;
+      const secondFinished = deferred();
+      let released = false;
+      let delayedBatchFinished = false;
       const d = await connect(w, `tie-${mode}`, async (key) => {
         if (key === keys.get(2)) {
           secondHeld = true;
@@ -1187,8 +1201,12 @@ describe("disk-backed bootstrap swap", () => {
       });
       const get = d.deps.blobs.get.bind(d.deps.blobs);
       d.deps.blobs.get = async (key) => {
-        if (key === keys.get(3)) await secondStarted.promise;
+        if (key === keys.get(3)) {
+          await secondStarted.promise;
+          if (serial) await secondFinished.promise;
+        }
         const value = await get(key);
+        if (key === keys.get(2)) secondFinished.resolve();
         if (key === keys.get(3) && secondHeld) thirdCompleted.resolve();
         return value;
       };
@@ -1200,45 +1218,104 @@ describe("disk-backed bootstrap swap", () => {
         const receipt = statements.find((s) =>
           s.sql.includes("INSERT INTO bootstrap_segments"),
         );
+        if (
+          serial &&
+          released &&
+          receipt &&
+          Number(receipt.params?.[0]) === 2
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          delayedBatchFinished = true;
+        }
         const result = await batch(statements);
         if (receipt) committed.push(Number(receipt.params?.[0]));
         return result;
       };
       const applying = applyConnection(d.deps, CONNECTION_ID);
+      let applySettled = false;
       const settled = applying.then(
-        () => ({ error: null }),
-        (error: unknown) => ({ error }),
+        () => {
+          applySettled = true;
+          return { error: null };
+        },
+        (error: unknown) => {
+          applySettled = true;
+          return { error };
+        },
       );
-      let watchdog: ReturnType<typeof setTimeout>;
-      const timeout = new Promise<never>((_, reject) => {
-        watchdog = setTimeout(
-          () =>
-            reject(
-              new Error(
-                "Timed out waiting for held tail reads or apply settlement",
-              ),
-            ),
-          2000,
-        );
-      });
+      beforeClose = () =>
+        expect(applySettled, "apply settled before closing drivers").toBe(true);
+      const observationTimeout = new Error(
+        "Timed out waiting for held tail reads or apply settlement",
+      );
+      const wait = async <T>(promise: Promise<T>, ms: number, error: Error) => {
+        let watchdog: ReturnType<typeof setTimeout> | undefined;
+        try {
+          return await Promise.race([
+            promise,
+            new Promise<never>((_, reject) => {
+              watchdog = setTimeout(() => reject(error), ms);
+            }),
+          ]);
+        } finally {
+          clearTimeout(watchdog);
+        }
+      };
       const premature = settled.then(({ error }) => {
         throw (
           error ??
           new Error("Apply settled before the tail read ordering was observed")
         );
       });
-      try {
-        await Promise.race([secondStarted.promise, premature, timeout]);
-        await Promise.race([thirdCompleted.promise, premature, timeout]);
-        expect(secondHeld).toBe(true);
-      } finally {
-        releaseSecond.resolve();
+      const observeAndDrain = async () => {
+        let observationError: unknown;
         try {
-          const result = await Promise.race([settled, timeout]);
-          if (result.error) throw result.error;
-        } finally {
-          clearTimeout(watchdog!);
+          await wait(
+            Promise.race([secondStarted.promise, premature]),
+            serial ? 100 : 2000,
+            observationTimeout,
+          );
+          await wait(
+            Promise.race([thirdCompleted.promise, premature]),
+            serial ? 100 : 2000,
+            observationTimeout,
+          );
+          expect(secondHeld).toBe(true);
+        } catch (error) {
+          observationError = error;
         }
+        released = true;
+        releaseSecond.resolve();
+        secondStarted.resolve();
+        if (!secondHeld) secondFinished.resolve();
+        let drainError: unknown;
+        try {
+          const result = await wait(
+            settled,
+            2000,
+            new Error("Timed out draining apply"),
+          );
+          if (result.error) throw result.error;
+          expect(applySettled, "apply must settle before cleanup returns").toBe(
+            true,
+          );
+        } catch (error) {
+          drainError = error;
+        }
+        if (observationError) {
+          if (drainError && observationError instanceof Error)
+            observationError.cause = drainError;
+          throw observationError;
+        } else if (drainError) throw drainError;
+      };
+      if (serial) {
+        await expect(observeAndDrain()).rejects.toBe(observationTimeout);
+        expect(applySettled, "expired observation must still drain apply").toBe(
+          true,
+        );
+        expect(delayedBatchFinished).toBe(true);
+      } else {
+        await observeAndDrain();
       }
       expect(committed).toEqual([1, 2, 3, 4]);
       const ordinary = await w.device("tie-ordinary", {
