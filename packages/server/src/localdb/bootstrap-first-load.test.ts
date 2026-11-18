@@ -1050,6 +1050,7 @@ describe("disk-backed bootstrap swap", () => {
         return realBatch(statements);
       };
       await applyConnection(d.deps, CONNECTION_ID);
+      expect(await d.position()).toBe(9);
       expect(stagingCommits).toBeGreaterThan(0);
       const afterRoot = await d.db.query(
         "SELECT rootpage FROM sqlite_master WHERE type='table' AND name='records'",
@@ -1167,6 +1168,7 @@ describe("disk-backed bootstrap swap", () => {
       });
       const get = d.deps.blobs.get.bind(d.deps.blobs);
       d.deps.blobs.get = async (key) => {
+        if (key === keys.get(3)) await secondStarted.promise;
         const value = await get(key);
         if (key === keys.get(3) && secondHeld) thirdCompleted.resolve();
         return value;
@@ -1184,13 +1186,40 @@ describe("disk-backed bootstrap swap", () => {
         return result;
       };
       const applying = applyConnection(d.deps, CONNECTION_ID);
+      const settled = applying.then(
+        () => ({ error: null }),
+        (error: unknown) => ({ error }),
+      );
+      let watchdog: ReturnType<typeof setTimeout>;
+      const timeout = new Promise<never>((_, reject) => {
+        watchdog = setTimeout(
+          () =>
+            reject(
+              new Error(
+                "Timed out waiting for held tail reads or apply settlement",
+              ),
+            ),
+          2000,
+        );
+      });
+      const premature = settled.then(({ error }) => {
+        throw (
+          error ??
+          new Error("Apply settled before the tail read ordering was observed")
+        );
+      });
       try {
-        await secondStarted.promise;
-        await thirdCompleted.promise;
+        await Promise.race([secondStarted.promise, premature, timeout]);
+        await Promise.race([thirdCompleted.promise, premature, timeout]);
         expect(secondHeld).toBe(true);
       } finally {
         releaseSecond.resolve();
-        await applying;
+        try {
+          const result = await Promise.race([settled, timeout]);
+          if (result.error) throw result.error;
+        } finally {
+          clearTimeout(watchdog!);
+        }
       }
       expect(committed).toEqual([1, 2, 3, 4]);
       const ordinary = await w.device("tie-ordinary", {
