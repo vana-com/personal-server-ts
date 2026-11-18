@@ -305,12 +305,6 @@ export async function loadStreams(
   });
 }
 
-/**
- * Pick the connection a read of `target` serves, from the active connections
- * of its connector. The newest live head wins, then the lowest namespace. A
- * winner with a deleted stream is `tombstoned`; a winner that lacks a stream
- * or holds an incomplete one serves nothing.
- */
 /** An alias needs an actual required stream, even if every optional head is present. */
 export function invalidAliasBinding(binding: LocalAliasTarget): boolean {
   return !(binding.requiredStreams ?? binding.streams).some((stream) =>
@@ -318,6 +312,15 @@ export function invalidAliasBinding(binding: LocalAliasTarget): boolean {
   );
 }
 
+/**
+ * Pick the connection a read of `target` serves, from its active connections.
+ * Rank by the newest live head among the binding's target streams, then the
+ * lowest namespace. Required streams participate; optional streams participate
+ * only when complete, as they do in the served body. Unrelated streams never
+ * affect rank. Keep one connection for the whole target: a winner with a deleted
+ * required stream is `tombstoned`; missing or incomplete required streams serve
+ * nothing. Progressive logical reads retain their first-load readability gates.
+ */
 export function selectForTarget(
   target: Target,
   connections: readonly {
@@ -337,9 +340,6 @@ export function selectForTarget(
   for (const { connection, streams: all } of connections) {
     if (connection.control_state !== "active" || connection.deleted_at !== null)
       continue;
-    const rank = all
-      .filter((s) => live(s, connection))
-      .map((s) => s.observed_at ?? 0);
     const served = servedStreams(
       target,
       target.streams.flatMap((name) => {
@@ -348,6 +348,9 @@ export function selectForTarget(
       }),
       connection,
     );
+    const rank = served.streams
+      .filter((s) => live(s, connection))
+      .map((s) => s.observed_at ?? 0);
     active.push({
       target,
       connection,
