@@ -5,6 +5,7 @@ import { createLocalSync } from "./sync.js";
 import type { LocalSyncDeps } from "./deps.js";
 
 it("does not mark hydration complete while a later registry page is held or fails", async () => {
+  const ownerAddress = `0x${"11".repeat(20)}` as const;
   let release!: () => void;
   let arrive!: () => void;
   const held = new Promise<void>((resolve) => {
@@ -16,7 +17,7 @@ it("does not mark hydration complete while a later registry page is held or fail
   let fail = true;
   const registry = createGatewayStreamSyncRegistry({
     gatewayUrl: "https://gateway.test",
-    ownerAddress: `0x${"11".repeat(20)}`,
+    ownerAddress,
     listPageSize: 1,
     fetch: (async (input: string) => {
       const later = new URL(input).searchParams.has("cursor");
@@ -38,6 +39,8 @@ it("does not mark hydration complete while a later registry page is held or fail
   });
   const sync = createLocalSync(
     {
+      ownerAddress,
+      now: Date.now,
       db: {
         query: async () => [],
         batch: async () => {},
