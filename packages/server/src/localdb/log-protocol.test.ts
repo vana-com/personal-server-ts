@@ -59,6 +59,55 @@ const six = (prefix = "a") =>
   ]).flat();
 
 describe("log protocol", () => {
+  it("two devices first publish the same connection: the loser rebases and a fresh reader sees both", async () => {
+    const w = await world({ streams: 2 });
+    const b = await w.device("b");
+    let raced = false;
+    const a = await w.device("a", {
+      beforePut: async (key) => {
+        if (raced || !key.includes(`${LOG}/s-`)) return;
+        raced = true;
+        await b.run("run-b", [{ stream: sName(1), id: "from-b" }], {
+          observedAt: 2000,
+        });
+        await b.cycle();
+      },
+    });
+    await a.run("run-a", [{ stream: sName(0), id: "from-a" }], {
+      observedAt: 1000,
+    });
+    await a.cycle();
+    await b.cycle();
+    const c = await w.device("fresh");
+    await c.cycle();
+    expect(raced).toBe(true);
+    expect(await a.position()).toBe(2);
+    expect(await c.position()).toBe(2);
+    expect(await c.records()).toEqual(await a.records());
+    expect(await c.records()).toEqual(await b.records());
+    expect((await c.records()).length).toBe(2);
+    const publications = w.gateway
+      .batches()
+      .flatMap((batch) => batch.body.rows.filter((r) => r.scope === LOG));
+    // Reconciliation may resend the loser's signed request before rebasing.
+    // There are two distinct first heads, regardless of those retries.
+    expect(
+      new Set(
+        publications
+          .filter((r) => r.expectedVersion === "1")
+          .map((r) => r.dataHash),
+      ).size,
+    ).toBe(2);
+    expect(
+      publications
+        .filter((r) => r.expectedVersion === "1")
+        .every((r) => r.expectedHeadAbsent === true),
+    ).toBe(true);
+    expect(
+      publications.find((r) => r.expectedVersion === "2")?.expectedHeadDataHash,
+    ).toBeDefined();
+  });
+
   it("a 6-stream batch is one segment PUT and one registry commit, which also creates the control row", async () => {
     const w = await world({ streams: 6 });
     const a = await w.device("a");
@@ -71,6 +120,10 @@ describe("log protocol", () => {
     // A first save: the control row and the log row that needs it.
     expect(batch!.body.rows.map((r) => r.scope)).toEqual([CONTROL, LOG]);
     expect(batch!.body.rows.map((r) => r.expectedVersion)).toEqual(["1", "1"]);
+    expect(batch!.body.rows.find((r) => r.scope === LOG)).toHaveProperty(
+      "expectedHeadAbsent",
+      true,
+    );
     // No stream row exists: the log row is the only data row besides control.
     expect([...w.gateway.versions.keys()].filter((s) => s !== CONTROL)).toEqual(
       [LOG],

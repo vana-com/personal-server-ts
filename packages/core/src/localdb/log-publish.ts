@@ -1984,9 +1984,13 @@ async function commitRound(
     metadataHash,
     expectedVersion: String(candidate.position),
     signature,
-    ...(candidate.prevHash !== null && {
-      expectedHeadDataHash: candidate.prevHash,
-    }),
+    // A reset can have no refs while retaining an older registry position.
+    // Only position 1 creates the log row for the first time.
+    ...(candidate.position === 1
+      ? { expectedHeadAbsent: true }
+      : candidate.prevHash !== null
+        ? { expectedHeadDataHash: candidate.prevHash }
+        : {}),
   };
   // A first save creates the control row in the same request: one commit.
   const creation = candidate.createControl

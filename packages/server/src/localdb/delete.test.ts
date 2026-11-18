@@ -1033,6 +1033,8 @@ it("purges an interrupted delete before clearing a superseded intent", async () 
     },
   ]);
   await rivalPost(f, f.control, 2, FOREIGN);
+  // A settled competing head cannot be refreshed at the same version.
+  f.registry.settleHead(f.control);
   const failing = createConnectionDeleter({
     ...f.a.deps,
     queue: {

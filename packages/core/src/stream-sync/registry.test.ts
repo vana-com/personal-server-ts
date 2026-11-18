@@ -297,7 +297,7 @@ it("sends each row's head fence and each condition's data hash as given, and omi
         ...batchRequest.rows[0]!,
         expectedHeadDataHash: hash("dd") as `0x${string}`,
       },
-      batchRequest.rows[1]!,
+      { ...batchRequest.rows[1]!, expectedHeadAbsent: true },
     ],
     requires: [
       {
@@ -314,6 +314,8 @@ it("sends each row's head fence and each condition's data hash as given, and omi
     requires: Record<string, unknown>[];
   };
   expect(body.rows[0]!.expectedHeadDataHash).toBe(hash("dd"));
+  expect(body.rows[1]!.expectedHeadAbsent).toBe(true);
+  expect("expectedHeadAbsent" in body.rows[0]!).toBe(false);
   expect("expectedHeadDataHash" in body.rows[1]!).toBe(false);
   expect(body.requires[0]!.expectedDataHash).toBe(hash("ee"));
   expect("expectedDataHash" in body.requires[1]!).toBe(false);

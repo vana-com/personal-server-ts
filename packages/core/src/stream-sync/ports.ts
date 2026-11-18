@@ -86,6 +86,8 @@ export type SignedBatchRow = Omit<SignedRegistryPost, "ownerAddress"> & {
    * version.
    */
   readonly expectedHeadDataHash?: `0x${string}`;
+  /** First create only. An identical signed replay still succeeds. */
+  readonly expectedHeadAbsent?: boolean;
 };
 
 /**
