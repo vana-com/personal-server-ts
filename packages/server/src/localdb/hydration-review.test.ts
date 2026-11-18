@@ -89,3 +89,66 @@ it("keeps hydration false while a full download is held and a scoped retry runs"
   ).toHaveLength(1);
   expect((await here.sync.listing.status()).accountHydrated).toBe(true);
 });
+
+it("reads a record whose connection appears on a later registry page", async () => {
+  const { createGatewayStreamSyncRegistry } =
+    await import("../../../core/src/stream-sync/registry.js");
+  const w = await world({ streams: 1 });
+  const peer = await w.device("paged-peer");
+  await peer.run("first", [{ stream: sName(0), id: "first" }]);
+  await peer.run("later", [{ stream: sName(0), id: "later" }], {
+    connector: "second-connector",
+  });
+  await peer.cycle();
+  const here = await w.device("paged-here");
+  const laterScopes: string[] = [];
+  const registry = createGatewayStreamSyncRegistry({
+    gatewayUrl: "https://gateway.test",
+    ownerAddress: here.deps.ownerAddress,
+    listPageSize: 1,
+    fetch: (async (input: string, init?: RequestInit) => {
+      const url = new URL(input);
+      const response = await w.gateway.fetch(input, init);
+      if (url.pathname !== "/v1/data" || (init?.method ?? "GET") !== "GET")
+        return response;
+      const body = (await response.json()) as {
+        data: { dataPoints: { scope: string }[] };
+      };
+      const offset = Number(url.searchParams.get("cursor") ?? "0");
+      const rows = body.data.dataPoints.slice(offset, offset + 1);
+      if (offset > 0) laterScopes.push(...rows.map((row) => row.scope));
+      const next = offset + rows.length;
+      return new Response(
+        JSON.stringify({
+          data: { dataPoints: rows },
+          pagination: {
+            hasMore: next < body.data.dataPoints.length,
+            nextCursor: String(next),
+          },
+        }),
+      );
+    }) as typeof fetch,
+  });
+  const sync = createLocalSync(
+    { ...here.deps, registry },
+    { resolveArtifact: () => null },
+  );
+  expect((await sync.listing.status()).accountHydrated).toBe(false);
+  await sync.apply();
+  expect((await sync.listing.status()).accountHydrated).toBe(true);
+  expect(laterScopes.some((scope) => scope.includes("second-connector"))).toBe(
+    true,
+  );
+  const result = await sync.query.listRecords({
+    connectionId: "pdpp.second-connector~",
+    stream: sName(0),
+  });
+  expect(result.records).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        recordKey: "later",
+        body: '{"id":"later"}',
+      }),
+    ]),
+  );
+});

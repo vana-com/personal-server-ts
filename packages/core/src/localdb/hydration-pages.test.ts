@@ -54,6 +54,7 @@ it("does not mark hydration complete while a later registry page is held or fail
     { resolveArtifact: () => null },
   );
   try {
+    expect((await sync.listing.status()).accountHydrated).toBe(false);
     const applying = sync.apply();
     await arrived;
     expect((await sync.listing.status()).accountHydrated).toBe(false);
