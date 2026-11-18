@@ -19,6 +19,7 @@ type BatchRow = {
   metadataHash: string;
   signature?: string;
   expectedHeadDataHash?: string;
+  expectedHeadAbsent?: boolean;
 };
 
 type Requirement = {
@@ -420,6 +421,19 @@ export function createFakeGateway(options: FakeGatewayOptions) {
             reason: "log-exists",
             latestVersion: String(rows.length),
             latestDataHash: null,
+          };
+        }
+        if (
+          !isReplay &&
+          row.expectedHeadAbsent === true &&
+          head !== undefined
+        ) {
+          return {
+            scope: row.scope,
+            status: 409,
+            reason: "stale",
+            latestVersion: String(rows.length),
+            latestDataHash: head.dataHash,
           };
         }
         const fence = row.expectedHeadDataHash;

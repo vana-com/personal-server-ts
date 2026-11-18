@@ -459,6 +459,9 @@ export function createGatewayStreamSyncRegistry(
               metadataHash: row.metadataHash,
               expectedVersion: row.expectedVersion,
               signature: row.signature,
+              ...(row.expectedHeadAbsent !== undefined && {
+                expectedHeadAbsent: row.expectedHeadAbsent,
+              }),
               ...(row.expectedHeadDataHash !== undefined && {
                 expectedHeadDataHash: row.expectedHeadDataHash,
               }),

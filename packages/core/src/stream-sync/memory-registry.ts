@@ -6,6 +6,8 @@
  * `afterPost` let a test hold a post before or after it commits (a batch calls
  * them once per row).
  *
+ * Stored batch versions model pending, unsubmitted gateway slots: the head
+ * can be refreshed at the same version unless a head precondition refuses it.
  * It serves the gateway's batch contract: one all-or-nothing request,
  * conditions judged on the state the request commits. `serveBatch` changes
  * the policy it advertises; `stopServingBatch` makes it a gateway without
@@ -204,7 +206,10 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
       }
       const head = stored.at(-1);
       if (
-        Number(row.expectedVersion) !== stored.length + 1 ||
+        (Number(row.expectedVersion) !== stored.length + 1 &&
+          (Number(row.expectedVersion) !== stored.length ||
+            (head !== undefined && isTombstone(head.dataHash)))) ||
+        (row.expectedHeadAbsent === true && head !== undefined) ||
         (row.expectedHeadDataHash !== undefined &&
           head?.dataHash.toLowerCase() !==
             row.expectedHeadDataHash.toLowerCase())
@@ -216,12 +221,17 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
         });
         continue;
       }
-      stored.push({
+      // Like a pending, unsubmitted gateway slot: a same-version refresh
+      // replaces it unless a head precondition refuses it. Replays above
+      // retain their original acknowledgement.
+      stored[Number(row.expectedVersion) - 1] = {
         dataHash: row.dataHash,
         metadataHash: row.metadataHash,
         signature: row.signature,
-        at: new Date(this.baseMs + stored.length * 1000).toISOString(),
-      });
+        at: new Date(
+          this.baseMs + (Number(row.expectedVersion) - 1) * 1000,
+        ).toISOString(),
+      };
       this.versions.set(row.scope, stored);
       this.log.push({
         scope: row.scope,

@@ -29,6 +29,12 @@ export function gatewayBatchRefusal(
     return `requires: at most ${policy.requires} entries (got ${request.requires.length})`;
   const written = new Set<string>();
   for (const [i, row] of request.rows.entries()) {
+    if (
+      row.expectedHeadAbsent === true &&
+      row.expectedHeadDataHash !== undefined
+    )
+      return `rows[${i}]: expectedHeadAbsent and expectedHeadDataHash are mutually exclusive`;
+
     if (written.has(row.scope)) return `rows[${i}].scope: repeated`;
     written.add(row.scope);
   }
