@@ -637,6 +637,94 @@ describe("local resolve", () => {
     });
   });
 
+  it.each([false, true])(
+    "serves the complete legacy copy until canonical first load completes (canonical complete: %s)",
+    async (canonicalComplete) => {
+      const f = await fixture();
+      await f.connection("active", "c1", "aaaaaaaaaaaaaaaa");
+      await f.connection("active", "c2", "bbbbbbbbbbbbbbbb");
+      await f.head("x", { version: 3, complete: false });
+      await f.record("x", "canonical first part");
+      await f.head("x", { id: "c2", version: 2 });
+      await f.record("x", "legacy first record", "c2");
+      await f.db.batch([
+        {
+          sql: "INSERT INTO stream_partial(connection_id,stream,version,generation,data_hash,head_blob,observed_at,parts_applied,parts_total,records_total) VALUES ('c1','x',3,2,'hash-x-3','head-x-3',3000,1,2,2)",
+        },
+        {
+          sql: `INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256)
+              VALUES ('c2','x','hash-2','key-2',2000,'run','{"id":"key-2","value":"legacy second record"}','body-hash-2')`,
+        },
+      ]);
+      const aliases = {
+        aliasScopes: () => ["fixture.copy"],
+        aliasTargets: () => [
+          {
+            connector: CONNECTOR,
+            streams: ["x"],
+            project: (records: readonly unknown[]) => ({
+              ok: true as const,
+              payload: { records },
+            }),
+          },
+        ],
+      };
+      const deps = { ...f.deps, progressiveFirstLoad: true };
+      const resolver = createLocalResolver(deps, {
+        query: f.query,
+        ...aliases,
+      });
+      const listing = createLocalListing({ ...deps, ...aliases });
+      if (canonicalComplete) {
+        await f.db.batch([
+          {
+            sql: `INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256)
+              VALUES ('c1','x','hash-2','key-2',3000,'run','{"id":"key-2","value":"canonical second part"}','body-hash-2')`,
+          },
+        ]);
+        await f.head("x", { version: 3 });
+      }
+      const ns = canonicalComplete ? "aaaaaaaaaaaaaaaa" : "bbbbbbbbbbbbbbbb";
+      for (const scope of ["pdpp.fixture-source.x", "fixture.copy"]) {
+        const read = await resolver.resolve(
+          input(scope, { isOwnerView: true }),
+        );
+        expect(read).toMatchObject({
+          kind: "view",
+          ns,
+          served: { version: canonicalComplete ? 3 : 2 },
+        });
+        const records = (await drain(read)).data.records;
+        expect(records).toHaveLength(2);
+        expect(JSON.stringify(records)).toContain(
+          canonicalComplete ? "canonical first part" : "legacy first record",
+        );
+        expect(JSON.stringify(records)).toContain(
+          canonicalComplete ? "canonical second part" : "legacy second record",
+        );
+        expect(
+          (
+            await listing.listScopes({
+              canRead: () => true,
+              includeLoading: true,
+            })
+          ).find((s) => s.scope === scope),
+        ).toMatchObject({ ns, records: scope === "fixture.copy" ? null : 2 });
+      }
+      const history = createLocalHistory(deps, aliases);
+      expect(
+        await history.versions({ scope: "fixture.copy", limit: 20, offset: 0 }),
+      ).toMatchObject({
+        ok: true,
+        value: { versions: [{ version: canonicalComplete ? 3 : 2 }] },
+      });
+      expect(await history.lineage({ scope: "fixture.copy" })).toMatchObject({
+        ok: true,
+        value: { version: canonicalComplete ? 3 : 2 },
+      });
+    },
+  );
+
   it("ranks partial heads by observation time and prefers a connection's complete head", async () => {
     const f = await fixture();
     await f.connection("active", "c1", "bbbbbbbbbbbbbbbb");
@@ -659,13 +747,20 @@ describe("local resolve", () => {
     const listing = createLocalListing(deps);
     for (const withComplete of [false, true]) {
       if (withComplete) await f.version("x", 2, true, 2, "c1");
-      const ns = withComplete ? "aaaaaaaaaaaaaaaa" : "bbbbbbbbbbbbbbbb";
+      const ns = "bbbbbbbbbbbbbbbb";
       const read = await resolver.resolve(
         input("pdpp.fixture-source.x", { isOwnerView: true }),
       );
       expect(read).toMatchObject({ kind: "view", ns });
+      if (withComplete) {
+        expect(read).not.toHaveProperty("partial");
+      } else {
+        expect(read).toMatchObject({
+          partial: { partsApplied: 1, partsTotal: 2 },
+        });
+      }
       expect((await drain(read)).data.records).toEqual([
-        { id: "key", value: withComplete ? "c2" : "c1" },
+        { id: "key", value: "c1" },
       ]);
       expect(
         (
