@@ -8,9 +8,12 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  controlScope,
   logScope,
   streamScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { applyConnection } from "../../../core/src/localdb/apply.js";
+import { RegistryUnavailableBeforeWriteError } from "../../../core/src/stream-sync/ports.js";
 import type { DeleteIntent } from "../../../core/src/localdb/delete.js";
 import {
   CONNECTOR,
@@ -158,3 +161,92 @@ it("planning names the control pins only: no listed or declared stream, and not 
     registry.listStreamRows = list;
   }
 });
+
+it.each([false, true])(
+  "retries a stale control read after reconnect (observed hint: %s)",
+  async (withHint) => {
+    const w = await world({ streams: 3 });
+    const a = await w.device("lagging-control");
+    const registry = a.deps.registry;
+    const control = controlScope(CONNECTOR, "");
+    await a.run("before-delete", [{ stream: sName(0), id: "old" }]);
+    await a.cycle();
+    const staleControl = await registry.read(control);
+    const staleLog = await registry.read(LOG);
+    if (!staleControl.found || !staleLog.found)
+      throw new Error("missing old lifetime");
+    expect(staleControl.version).toBe(1);
+
+    await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+    expect(await a.sync.deleter.resumeDeletes()).toEqual([]);
+    expect(await a.records()).toEqual([]);
+    await a.run("after-reconnect", [{ stream: sName(1), id: "new" }], {
+      connect: true,
+    });
+    await a.cycle();
+    const rows = await a.records();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toContain(`${sName(1)}/`);
+    const [before] = await a.db.query<{
+      connection_id: string;
+      generation: number;
+      control_version: number;
+    }>("SELECT * FROM connections WHERE connector=?", [CONNECTOR]);
+    expect(before.generation).toBe(3);
+    expect(before.control_version).toBe(3);
+    const heads = await a.db.query(
+      "SELECT * FROM stream_state ORDER BY stream",
+    );
+    expect(heads.length).toBeGreaterThan(0);
+
+    const read = registry.read.bind(registry);
+    let controlReads = 0;
+    registry.read = async (scope) => {
+      if (scope === control) {
+        controlReads++;
+        return staleControl;
+      }
+      if (scope === LOG) return staleLog;
+      return read(scope);
+    };
+    try {
+      await expect(
+        applyConnection(
+          a.deps,
+          before.connection_id,
+          undefined,
+          withHint ? staleControl : undefined,
+        ),
+      ).rejects.toBeInstanceOf(RegistryUnavailableBeforeWriteError);
+      expect(controlReads).toBe(1);
+      expect(await a.records()).toEqual(rows);
+      expect(
+        await a.db.query("SELECT * FROM connections WHERE connector=?", [
+          CONNECTOR,
+        ]),
+      ).toEqual([before]);
+      expect(
+        await a.db.query("SELECT * FROM stream_state ORDER BY stream"),
+      ).toEqual(heads);
+    } finally {
+      registry.read = read;
+    }
+    let retryControlReads = 0;
+    registry.read = async (scope) => {
+      if (scope === control) retryControlReads++;
+      return read(scope);
+    };
+    try {
+      await applyConnection(a.deps, before.connection_id);
+      expect(retryControlReads).toBe(1);
+      expect(await a.records()).toEqual(rows);
+      expect(
+        await a.db.query("SELECT * FROM stream_state ORDER BY stream"),
+      ).toEqual(heads);
+    } finally {
+      registry.read = read;
+    }
+    await a.cycle();
+    expect(await a.records()).toEqual(rows);
+  },
+);

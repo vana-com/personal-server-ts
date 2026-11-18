@@ -377,6 +377,10 @@ async function control(
     "SELECT control_state,control_version FROM connections WHERE connection_id=?",
     [id],
   );
+  if ((read.found ? read.version : 0) < (local?.control_version ?? 0))
+    throw new RegistryUnavailableError(
+      "Registry control read is older than local control version",
+    );
   if (
     state.kind === "active" &&
     local?.control_state === "deleted" &&
