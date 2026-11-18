@@ -267,3 +267,16 @@ it("does not certify hydration when a pending delete skips a connection download
   await f.sync.apply();
   expect((await f.sync.listing.status()).accountHydrated).toBe(true);
 });
+
+it("does not hold a sync cycle on a stalled delete landing", async () => {
+  const f = await stuckDelete("hang");
+  try {
+    const outcome = await Promise.race([
+      f.sync.cycle().then(() => "completed"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("blocked"), 100)),
+    ]);
+    expect(outcome).toBe("completed");
+  } finally {
+    f.release();
+  }
+});
