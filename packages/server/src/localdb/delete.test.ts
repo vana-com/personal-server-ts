@@ -21,6 +21,8 @@ import {
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import { createConnectionDeleter } from "../../../core/src/localdb/delete.js";
+import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
+import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import {
   AmbiguousRegistryReplyError,
   RegistryRefusedError,
@@ -973,4 +975,132 @@ it("an absent registry answer never clears a local-only delete, but explicit con
       )
     ).status,
   ).toBe("collecting");
+});
+
+it("purges an interrupted delete before clearing a superseded intent", async () => {
+  const f = await world(undefined, ["items"], true, [WORK]);
+  const stale = await f.registry.read(f.control);
+  await f.a.db.batch([
+    { sql: "UPDATE write_ctx SET origin='local'" },
+    {
+      sql: `INSERT OR REPLACE INTO stream_state(connection_id,stream,primary_key,semantics,incremental,complete,head_version,head_generation,head_data_hash,head_blob) VALUES (?,'items','["id"]','mutable_state',0,1,1,1,'hash','head')`,
+      params: [f.control],
+    },
+    {
+      sql: "INSERT OR REPLACE INTO stream_versions(connection_id,stream,version,generation,head_blob,head_format,record_count,observed_at,complete,kind) VALUES (?,'items',1,1,'head',3,1,1000,1,'applied')",
+      params: [f.control],
+    },
+    {
+      sql: "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,'items',?,'old',2000,'pending','{}','fixture')",
+      params: [f.control, "f".repeat(64)],
+    },
+  ]);
+  const resolver = createLocalResolver(f.a.deps, {
+    query: createRecordQuery(f.a.db),
+  });
+  const input = {
+    scope: "pdpp.fixture-source.items",
+    connection: "",
+    cursor: null,
+    legacyFile: false,
+    isOwnerView: true,
+  };
+  expect((await resolver.resolve(input)).kind).toBe("view");
+  const queue = f.a.deps.queue;
+  const interrupted = createConnectionDeleter({
+    ...f.a.deps,
+    queue: {
+      run: (id, kind, work) => {
+        if (id === f.control && kind === "purge")
+          throw new Error("crash before purge");
+        return queue.run(id, kind, work);
+      },
+    },
+  });
+  await expect(
+    interrupted.requestConnectionDelete("fixture-source"),
+  ).rejects.toThrow("crash before purge");
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toHaveLength(1);
+  expect(await f.a.db.query("SELECT * FROM records")).toHaveLength(1);
+  await f.a.db.batch([
+    {
+      sql: "UPDATE connections SET generation=2,control_state='active',control_version=2 WHERE connection_id=?",
+      params: [f.others[0]!],
+    },
+    {
+      sql: "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,'items',?,'new',2000,'pending','{}','fixture')",
+      params: [f.others[0]!, "e".repeat(64)],
+    },
+  ]);
+  await rivalPost(f, f.control, 2, FOREIGN);
+  const failing = createConnectionDeleter({
+    ...f.a.deps,
+    queue: {
+      run: (id, kind, work) => {
+        if (id === f.control && kind === "purge")
+          throw new Error("purge failed");
+        return queue.run(id, kind, work);
+      },
+    },
+  });
+  expect(await failing.resumeDeletes()).toEqual([
+    { connector: "fixture-source", why: "Error" },
+  ]);
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toHaveLength(1);
+  const batch = f.a.db.batch.bind(f.a.db);
+  f.a.db.batch = async (statements) => {
+    if (
+      statements.some((s) => s.sql.startsWith("DELETE FROM delete_intents"))
+    ) {
+      expect(
+        await f.a.db.query(
+          "SELECT record_key FROM records WHERE connection_id=?",
+          [f.control],
+        ),
+      ).toEqual([]);
+      expect(
+        await f.a.db.query(
+          "SELECT control_state FROM connections WHERE connection_id=?",
+          [f.control],
+        ),
+      ).toEqual([{ control_state: "deleted" }]);
+    }
+    return batch(statements);
+  };
+  const resumed = createConnectionDeleter(f.a.deps);
+  expect(await resumed.resumeDeletes()).toEqual([
+    { connector: "fixture-source", why: "ConnectionDeleteSuperseded" },
+  ]);
+  expect(
+    await f.a.db.query("SELECT connection_id,record_key FROM records"),
+  ).toEqual([{ connection_id: f.others[0], record_key: "new" }]);
+  expect(
+    await f.a.db.query(
+      "SELECT connection_id,control_state FROM connections ORDER BY connection_id",
+    ),
+  ).toEqual([
+    { connection_id: f.control, control_state: "deleted" },
+    { connection_id: f.others[0], control_state: "active" },
+  ]);
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+  expect(await f.registry.read(f.control)).toMatchObject({
+    version: 2,
+    ...FOREIGN,
+  });
+  const read = f.registry.read.bind(f.registry);
+  f.registry.read = async (scope) =>
+    scope === f.control ? stale : read(scope);
+  await applyConnection(f.a.deps, f.control);
+  expect((await resolver.resolve(input)).kind).not.toBe("view");
+  expect(
+    await f.a.db.query("SELECT record_key FROM records WHERE connection_id=?", [
+      f.control,
+    ]),
+  ).toEqual([]);
+  expect(
+    await f.a.db.query(
+      "SELECT control_state FROM connections WHERE connection_id=?",
+      [f.control],
+    ),
+  ).toEqual([{ control_state: "deleted" }]);
 });
