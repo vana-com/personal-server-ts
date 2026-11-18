@@ -92,6 +92,7 @@ export function streamSyncReadStatusRoutes(
     const streams = liveStreamCounts(status);
     return c.json({
       listed: status.listed,
+      accountHydrated: status.accountHydrated === true,
       streams,
       issues: status.issues.length,
     });

@@ -67,6 +67,7 @@ describe("database route wiring", () => {
     });
     expect(await (await readStatus.request("/", { headers })).json()).toEqual({
       listed: 1,
+      accountHydrated: false,
       streams: expect.any(Object),
       issues: 0,
     });
