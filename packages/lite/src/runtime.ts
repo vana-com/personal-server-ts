@@ -12,6 +12,7 @@ import {
   type LegacyProjectionIssue,
 } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import {
+  ContentTooLargeError,
   GrantRequiredError,
   InvalidSignatureError,
   MissingAuthError,
@@ -21,6 +22,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/errors";
 import {
   authenticateRequest,
+  cacheRequestBodyBytes,
   type AuthenticatedRequest,
   type SessionTokenVerifierPort,
 } from "@opendatalabs/personal-server-ts-core/auth";
@@ -465,25 +467,19 @@ async function readModeBody(
   if (Number(request.headers.get("content-length")) > MODE_BODY_MAX_BYTES) {
     return BODY_TOO_LARGE;
   }
-  const reader = request.body?.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  let size = 0;
-  while (reader) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    size += value.byteLength;
-    if (size > MODE_BODY_MAX_BYTES) {
-      await reader.cancel().catch(() => undefined);
-      return BODY_TOO_LARGE;
-    }
-    text += decoder.decode(value, { stream: true });
-  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text + decoder.decode());
-  } catch {
-    return null;
+    const bytes = await cacheRequestBodyBytes(
+      request,
+      MODE_BODY_MAX_BYTES,
+      true,
+    );
+    if (bytes && bytes.byteLength > MODE_BODY_MAX_BYTES) return BODY_TOO_LARGE;
+    parsed = JSON.parse(new TextDecoder().decode(bytes));
+  } catch (error) {
+    if (error instanceof ContentTooLargeError) return BODY_TOO_LARGE;
+    if (error instanceof SyntaxError) return null;
+    throw error;
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     return null;
