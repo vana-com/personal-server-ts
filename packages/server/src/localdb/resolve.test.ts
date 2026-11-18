@@ -10,6 +10,10 @@ import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import { readerOf, type SqlDriver } from "../../../core/src/localdb/driver.js";
 import type { RecordQuery } from "../../../core/src/localdb/query.js";
 import { COMPLETE_PAGE_SIZE } from "../../../core/src/localdb/complete-read.js";
+import {
+  RegistryUnavailableBeforeWriteError,
+  RegistryUnavailableError,
+} from "../../../core/src/stream-sync/ports.js";
 import { PartialViewMoved } from "../../../core/src/localdb/partial-read.js";
 import type {
   ReadDecision,
@@ -46,7 +50,8 @@ const rows = JSON.parse(
 const opened: SqlDriver[] = [];
 const dirs: string[] = [];
 beforeEach(() => {
-  mocked.apply.mockClear();
+  mocked.apply.mockReset();
+  mocked.apply.mockResolvedValue([]);
   mocked.targets.mockImplementation((scope: string) => {
     if (scope.startsWith("pdpp.fixture-source.")) {
       return [
@@ -283,6 +288,48 @@ async function fixture() {
 }
 
 describe("local resolve", () => {
+  it("reports busy when another alias target is refused beside a tombstone", async () => {
+    const f = await fixture();
+    await f.connection();
+    await f.head("items", { version: 2, floor: 2 });
+    await f.db.batch([
+      {
+        sql: "INSERT INTO connections(connection_id, connector, ns, generation, control_state) VALUES (?, ?, '', 2, 'active')",
+        params: ["c2", "other-source"],
+      },
+    ]);
+    mocked.apply.mockImplementation(async (_deps, id) => {
+      if (id === "c2")
+        throw new RegistryUnavailableBeforeWriteError(
+          new RegistryUnavailableError("offline"),
+        );
+      return [];
+    });
+    const resolver = createLocalResolver(f.deps, {
+      query: f.query,
+      aliasScopes: () => ["fixture.multi"],
+      aliasTargets: () =>
+        [CONNECTOR, "other-source"].map((connector) => ({
+          connector,
+          streams: ["items"],
+          project: () => ({ ok: true as const, payload: {} }),
+        })),
+    });
+    expect(await resolver.resolve(input("fixture.multi"))).toEqual({
+      kind: "busy",
+      retryAfterSeconds: 5,
+    });
+    mocked.apply.mockRejectedValue(
+      new RegistryUnavailableBeforeWriteError(
+        new RegistryUnavailableError("offline"),
+      ),
+    );
+    expect(await f.resolver.resolve(input())).toEqual({
+      kind: "unavailable",
+      reason: "deleted",
+    });
+  });
+
   it("does not serve local rows after an unclassified apply failure", async () => {
     const f = await fixture();
     await f.connection();
