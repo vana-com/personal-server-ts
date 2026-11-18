@@ -26,6 +26,7 @@ import {
   targetsForScope,
   tombstoned,
   tombstonedForRead,
+  tombstonedForTarget,
   type Candidate,
   type Connection,
   type Stream,
@@ -473,12 +474,6 @@ export function createLocalResolver(
         rows = await connections(target.connector);
         if (input.connection !== null)
           rows = rows.filter((c) => c.ns === input.connection);
-        const targetUnavailable = rows.some(
-          (c) =>
-            refused.has(c.connection_id) &&
-            c.control_state === "active" &&
-            c.deleted_at === null,
-        );
         sawConnection ||= rows.length > 0;
         sawDeleted ||= rows.some(
           (c) => c.control_state === "deleted" || c.deleted_at !== null,
@@ -502,7 +497,16 @@ export function createLocalResolver(
         const picked = selectForTarget(target, loaded, { progressive });
         if (picked.kind === "invalid_binding") return picked;
         if (picked.tombstoned) sawTombstoned = true;
-        else if (targetUnavailable) applyUnavailable = true;
+        // A winner's tombstone says nothing about another connection whose
+        // pending apply could change the selection.
+        if (
+          loaded.some(
+            ({ connection, streams }) =>
+              refused.has(connection.connection_id) &&
+              !tombstonedForTarget(target, connection, streams, progressive),
+          )
+        )
+          applyUnavailable = true;
         if (picked.candidate) candidates.push(picked.candidate);
       }
       const chosen = chooseCandidate(candidates);
