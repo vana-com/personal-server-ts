@@ -5,6 +5,7 @@ import { legacyAliasScopes } from "@opendatalabs/personal-server-ts-core/legacy-
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
+import { createLocalHistory } from "../../../core/src/localdb/history.js";
 import { createLocalListing } from "../../../core/src/localdb/listing.js";
 import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
@@ -347,6 +348,83 @@ describe("local resolve", () => {
     });
   });
 
+  it("deletion is per connection: older live copies remain visible in reads, listing and alias history", async () => {
+    const f = await fixture();
+    const aliases = {
+      aliasScopes: () => ["fixture.copy"],
+      aliasTargets: () => [
+        {
+          connector: CONNECTOR,
+          streams: ["x"],
+          project: (records: readonly unknown[]) => ({
+            ok: true as const,
+            payload: { records },
+          }),
+        },
+      ],
+    };
+    const resolver = createLocalResolver(f.deps, {
+      query: f.query,
+      ...aliases,
+    });
+    const listing = createLocalListing({ ...f.deps, ...aliases });
+    const history = createLocalHistory(f.deps, aliases);
+    await f.connection("active", "c1", "aaaaaaaaaaaaaaaa");
+    await f.connection("active", "c2", "bbbbbbbbbbbbbbbb");
+    await f.connection("active", "c3", "cccccccccccccccc");
+    await f.head("x", { version: 5, floor: 5 });
+    await f.head("x", { id: "c2", version: 2 });
+    await f.head("x", { id: "c3", version: 1 });
+    await f.record("x", "B", "c2");
+    await f.record("x", "C", "c3");
+    await f.db.batch([
+      {
+        sql: "UPDATE stream_versions SET observed_at = 100 WHERE connection_id = 'c2'",
+      },
+      {
+        sql: "UPDATE stream_versions SET observed_at = 50 WHERE connection_id = 'c3'",
+      },
+    ]);
+    for (const deleted of [false, true]) {
+      if (deleted) await f.head("x", { id: "c2", version: 3, floor: 3 });
+      const ns = deleted ? "cccccccccccccccc" : "bbbbbbbbbbbbbbbb";
+      const version = deleted ? 1 : 2;
+      const observedAt = deleted ? 50 : 100;
+      for (const scope of ["pdpp.fixture-source.x", "fixture.copy"]) {
+        const read = await resolver.resolve(input(scope));
+        expect(read).toMatchObject({ kind: "view", ns, served: { version } });
+        const body = (await drain(read)).data.records;
+        expect(body).toEqual(
+          scope === "fixture.copy"
+            ? [{ stream: "x", data: { id: "key", value: deleted ? "C" : "B" } }]
+            : [{ id: "key", value: deleted ? "C" : "B" }],
+        );
+        expect(
+          (await listing.listScopes({ canRead: () => true })).find(
+            (s) => s.scope === scope,
+          ),
+        ).toMatchObject({ ns, records: scope === "fixture.copy" ? null : 1 });
+        if (scope === "fixture.copy") {
+          expect(
+            await history.versions({ scope, limit: 20, offset: 0 }),
+          ).toMatchObject({
+            ok: true,
+            value: {
+              total: 1,
+              versions: [
+                { version, collectedAt: new Date(observedAt).toISOString() },
+              ],
+            },
+          });
+          expect(await history.lineage({ scope })).toMatchObject({
+            ok: true,
+            value: { version },
+          });
+        }
+      }
+    }
+  });
+
   it("breaks equal target timestamps by namespace despite newer unrelated activity", async () => {
     const f = await fixture();
     await f.connection("active", "c1", "aaaaaaaaaaaaaaaa");
@@ -517,6 +595,87 @@ describe("local resolve", () => {
       records: 1,
       dataStatus: "indexing",
     });
+  });
+
+  it("ranks a readable partial head above an empty target despite reversed namespaces", async () => {
+    const f = await fixture();
+    await f.connection("active", "c1", "bbbbbbbbbbbbbbbb");
+    await f.connection("active", "c2", "aaaaaaaaaaaaaaaa");
+    await f.head("x", { version: 1, complete: false });
+    await f.record("x", "first part");
+    await f.head("y", { id: "c2", version: 99 });
+    await f.db.batch([
+      {
+        sql: "INSERT INTO stream_partial(connection_id,stream,version,generation,data_hash,head_blob,observed_at,parts_applied,parts_total,records_total) VALUES ('c1','x',1,2,'hash-x-1','head-x-1',100,1,2,2)",
+      },
+    ]);
+    const deps = { ...f.deps, progressiveFirstLoad: true };
+    const resolver = createLocalResolver(deps, { query: f.query });
+    expect(
+      verdict(await resolver.resolve(input("pdpp.fixture-source.x"))),
+    ).toBe("no_data");
+    const read = await resolver.resolve(
+      input("pdpp.fixture-source.x", { isOwnerView: true }),
+    );
+    expect(read).toMatchObject({
+      kind: "view",
+      ns: "bbbbbbbbbbbbbbbb",
+      partial: { partsApplied: 1, partsTotal: 2 },
+    });
+    expect((await drain(read)).data.records).toEqual([
+      { id: "key", value: "first part" },
+    ]);
+    const listing = createLocalListing(deps);
+    expect(
+      (
+        await listing.listScopes({ canRead: () => true, includeLoading: true })
+      ).find((s) => s.scope === "pdpp.fixture-source.x"),
+    ).toMatchObject({
+      ns: "bbbbbbbbbbbbbbbb",
+      records: 1,
+      dataStatus: "indexing",
+    });
+  });
+
+  it("ranks partial heads by observation time and prefers a connection's complete head", async () => {
+    const f = await fixture();
+    await f.connection("active", "c1", "bbbbbbbbbbbbbbbb");
+    await f.connection("active", "c2", "aaaaaaaaaaaaaaaa");
+    for (const [id, observedAt] of [
+      ["c1", 3000],
+      ["c2", 2500],
+    ] as const) {
+      await f.head("x", { id, version: 3, complete: false });
+      await f.record("x", id, id);
+      await f.db.batch([
+        {
+          sql: "INSERT INTO stream_partial(connection_id,stream,version,generation,data_hash,head_blob,observed_at,parts_applied,parts_total,records_total) VALUES (?,'x',3,2,'hash-x-3','head-x-3',?,1,2,2)",
+          params: [id, observedAt],
+        },
+      ]);
+    }
+    const deps = { ...f.deps, progressiveFirstLoad: true };
+    const resolver = createLocalResolver(deps, { query: f.query });
+    const listing = createLocalListing(deps);
+    for (const withComplete of [false, true]) {
+      if (withComplete) await f.version("x", 2, true, 2, "c1");
+      const ns = withComplete ? "aaaaaaaaaaaaaaaa" : "bbbbbbbbbbbbbbbb";
+      const read = await resolver.resolve(
+        input("pdpp.fixture-source.x", { isOwnerView: true }),
+      );
+      expect(read).toMatchObject({ kind: "view", ns });
+      expect((await drain(read)).data.records).toEqual([
+        { id: "key", value: withComplete ? "c2" : "c1" },
+      ]);
+      expect(
+        (
+          await listing.listScopes({
+            canRead: () => true,
+            includeLoading: true,
+          })
+        ).find((s) => s.scope === "pdpp.fixture-source.x"),
+      ).toMatchObject({ ns });
+    }
   });
 
   it("reports busy when another alias target is refused beside a tombstone", async () => {

@@ -1455,25 +1455,34 @@ describe("GET /v1/data listing", () => {
       const body = JSON.parse((await ownerGet(`/v1/data${query}`)).text) as {
         scopes: { scope: string }[];
         total: number;
+        listingStore: string;
       };
-      return { scopes: body.scopes.map((s) => s.scope), total: body.total };
+      return {
+        scopes: body.scopes.map((s) => s.scope),
+        total: body.total,
+        listingStore: body.listingStore,
+      };
     };
     // oura.readiness has no canonical data: it stays its file's.
     expect(await scopesOf("")).toEqual({
       scopes: ["notes.manual", "oura.activity", "oura.readiness"],
       total: 3,
+      listingStore: "legacy",
     });
     expect(await scopesOf("?limit=1&offset=1")).toEqual({
       scopes: ["oura.activity"],
       total: 3,
+      listingStore: "legacy",
     });
     expect(await scopesOf("?scopePrefix=oura.")).toEqual({
       scopes: ["oura.activity", "oura.readiness"],
       total: 2,
+      listingStore: "legacy",
     });
     expect(await scopesOf("?scopePrefix=notes.")).toEqual({
       scopes: ["notes.manual"],
       total: 1,
+      listingStore: "legacy",
     });
   });
 });
