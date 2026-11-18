@@ -237,6 +237,18 @@ async function visible(d: Device) {
 /** A second namespace of `from` that serves the same data. */
 async function cloneConnection(d: Device, from: string, ns: string) {
   const to = `${from}${ns}`;
+  const control = await d.deps.registry.read(from);
+  if (!control.found || control.version !== 1)
+    throw new Error("Expected an active first-generation fixture control");
+  const posted = await d.deps.registry.post({
+    ownerAddress: OWNER,
+    scope: to,
+    dataHash: control.dataHash,
+    metadataHash: control.metadataHash,
+    expectedVersion: "1",
+    signature: "0x00",
+  });
+  if (posted.kind !== "committed") throw new Error("Fixture control conflict");
   await d.db.batch([
     {
       sql: `INSERT INTO connections (connection_id, connector, ns, generation, control_state, control_version, checkpoint, label, deleted_at)
@@ -486,7 +498,15 @@ describe("view changes", () => {
     });
 
   it("(k) deleting a version row, as an eviction does, emits", async () => {
-    const { a, before, other, seen } = await twoNamespaces();
+    const { a, other, seen } = await twoNamespaces();
+    await a.db.batch([
+      {
+        sql: "UPDATE stream_versions SET observed_at = observed_at + 1 WHERE connection_id LIKE '%ffffffffffffffff'",
+      },
+    ]);
+    const before = await visible(a);
+    await a.views.settled();
+    seen.length = 0;
     await a.db.batch([
       {
         sql: "DELETE FROM stream_versions WHERE connection_id LIKE '%ffffffffffffffff'",
