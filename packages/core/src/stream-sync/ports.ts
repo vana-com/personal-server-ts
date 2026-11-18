@@ -308,9 +308,12 @@ export class RegistryBatchRouteMissingError extends Error {
 
 export interface StreamSyncRegistry {
   /** Authoritative read: `GET /v1/data/:id?includeDeleted=true`. */
-  read(scope: string): Promise<ControlRead>;
+  read(scope: string, signal?: AbortSignal): Promise<ControlRead>;
   /** `POST /v1/data` with `exclusive: true`. Throws `AmbiguousRegistryReplyError`. */
-  post(request: SignedRegistryPost): Promise<RegistryPostResult>;
+  post(
+    request: SignedRegistryPost,
+    signal?: AbortSignal,
+  ): Promise<RegistryPostResult>;
   /**
    * `POST /v1/data` with `requires`. A gateway that does not know `requires`
    * ignores it and writes anyway, and the answer does not say so, so a caller
@@ -325,7 +328,10 @@ export interface StreamSyncRegistry {
    * batch route. Throws `AmbiguousRegistryReplyError`: resend the same
    * request; a row that already landed answers as committed (a replay).
    */
-  postBatch?(request: SignedRegistryBatch): Promise<RegistryBatchResult>;
+  postBatch?(
+    request: SignedRegistryBatch,
+    signal?: AbortSignal,
+  ): Promise<RegistryBatchResult>;
   /**
    * The policy the gateway advertised on its last batch answer or policy
    * read, or `undefined` when it has advertised none yet.
@@ -338,7 +344,9 @@ export interface StreamSyncRegistry {
    * a route without the header). Throws `AmbiguousRegistryReplyError` when
    * the request got no answer; the next call asks again.
    */
-  readBatchPolicy?(): Promise<RegistryBatchPolicy | undefined>;
+  readBatchPolicy?(
+    signal?: AbortSignal,
+  ): Promise<RegistryBatchPolicy | undefined>;
   /**
    * Every control scope row of the owner (`pdpp.<c>~<ns>`), deleted or not.
    * Used for the per-session control listing (§2.4 `controls`).
@@ -347,9 +355,9 @@ export interface StreamSyncRegistry {
    * listing is never a copy taken before it. (A row may move after, as after
    * any read.) A connection delete takes its pins from it.
    */
-  listControlRows(): Promise<
-    readonly { readonly scope: string; readonly read: ControlRead }[]
-  >;
+  listControlRows(
+    signal?: AbortSignal,
+  ): Promise<readonly { readonly scope: string; readonly read: ControlRead }[]>;
   /**
    * Every stream scope row of `connector` in any namespace, deleted or not,
    * whichever device or connector version wrote it. A connection delete

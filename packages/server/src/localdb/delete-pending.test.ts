@@ -16,6 +16,7 @@ import { createLocalSync } from "../../../core/src/localdb/sync.js";
 import { remoteFixture } from "./apply-fixture.test-utils.js";
 import { legacyHeadRow } from "./legacy-head-fixture.test-utils.js";
 import { deriveKeyCheck } from "@opendatalabs/personal-server-ts-stream-sync";
+import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const owner = `0x${"12".repeat(20)}` as const;
@@ -27,7 +28,13 @@ afterEach(async () => {
 
 /** One device with a delete that the gateway refuses to finish. */
 async function stuckDelete(
-  controlReply?: "conflict" | "refused" | "unconfirmed" | "hang",
+  controlReply?:
+    | "conflict"
+    | "refused"
+    | "unconfirmed"
+    | "hang"
+    | "committed-hang"
+    | "uncommitted-hang",
 ) {
   const keys = {
     namespaceHmac: async () => new Uint8Array(32),
@@ -85,9 +92,32 @@ async function stuckDelete(
         { name: "items", semantics: "mutable_state", primaryKey: ["id"] },
       ],
     }),
-    deleteRetryMs: { first: 5, max: 20 },
+    deleteRetryMs: controlReply?.endsWith("-hang")
+      ? { first: 200, max: 400 }
+      : { first: 5, max: 20 },
   });
   syncs.push(sync);
+  if (controlReply?.endsWith("-hang")) {
+    await sync.intake.begin("other", {
+      connector: "other-source",
+      artifactDigest: "other-source",
+      owner: { address: owner, leaseId: null },
+      observedAt: 40,
+    });
+    await sync.intake.batch("other", {
+      batch: 0,
+      records: [{ stream: "items", data: { id: "other" } }],
+    });
+    await sync.intake.end(
+      "other",
+      endRequest({ lastBatch: 0, live: ["items"] }),
+    );
+  }
+  const postSignals: AbortSignal[] = [];
+  let postStarted!: () => void;
+  const postStartedPromise = new Promise<void>(
+    (resolve) => (postStarted = resolve),
+  );
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
   if (controlReply) {
@@ -104,11 +134,21 @@ async function stuckDelete(
       throw new Error("connection reset fixture");
     });
     const real = registry.post.bind(registry);
-    vi.spyOn(registry, "post").mockImplementation(async (req) => {
+    vi.spyOn(registry, "post").mockImplementation(async (req, signal) => {
       if (req.scope !== fixture.control) return real(req);
       if (controlReply === "hang") {
         await gate;
         return real(req);
+      }
+      if (
+        controlReply === "committed-hang" ||
+        controlReply === "uncommitted-hang"
+      ) {
+        if (signal) postSignals.push(signal);
+        if (controlReply === "committed-hang") await real(req);
+        postStarted();
+        await gate;
+        throw new Error("held response released");
       }
       if (controlReply === "refused")
         throw new RegistryRefusedError("refused", 409);
@@ -120,8 +160,13 @@ async function stuckDelete(
     registry.beforePost = async () => {
       throw new Error("gateway refused");
     };
+  const reads = vi.spyOn(registry, "read");
   const startedAt = Date.now();
-  const started = await sync.deleter.requestConnectionDelete("fixture-source");
+  const request = sync.deleter.requestConnectionDelete("fixture-source");
+  if (controlReply?.endsWith("-hang")) await postStartedPromise;
+  const started = controlReply?.endsWith("-hang")
+    ? { deleteId: "", fenced: false }
+    : await request;
   const answeredMs = Date.now() - startedAt;
   const begin = (id: string, connect: boolean) =>
     sync.intake.begin(id, {
@@ -142,6 +187,8 @@ async function stuckDelete(
     answeredMs,
     release,
     control: fixture.control,
+    postSignals,
+    reads,
   };
 }
 
@@ -266,4 +313,64 @@ it("does not certify hydration when a pending delete skips a connection download
   expect((await f.begin("reconnected", true)).status).toBe("collecting");
   await f.sync.apply();
   expect((await f.sync.listing.status()).accountHydrated).toBe(true);
+});
+
+it("does not hold a sync cycle on a stalled delete landing", async () => {
+  const f = await stuckDelete("hang");
+  try {
+    const outcome = await Promise.race([
+      f.sync.cycle().then(() => "completed"),
+      new Promise<string>((resolve) =>
+        setTimeout(() => resolve("blocked"), 100),
+      ),
+    ]);
+    expect(outcome).toBe("completed");
+  } finally {
+    f.release();
+  }
+});
+
+it.each(["committed-hang", "uncommitted-hang"] as const)(
+  "reconciles a %s POST without blocking another connection",
+  async (reply) => {
+    const f = await stuckDelete(reply);
+    try {
+      const outcome = await Promise.race([
+        f.sync.publish().then(() => "completed"),
+        new Promise<string>((resolve) =>
+          setTimeout(() => resolve("blocked"), 100),
+        ),
+      ]);
+      expect(outcome).toBe("completed");
+      expect((await f.sync.intake.publicationStatus("other")).state).toBe(
+        "published",
+      );
+      if (reply === "committed-hang") {
+        await vi.waitFor(async () => expect(await f.intents()).toEqual([]), {
+          timeout: 2000,
+        });
+      } else {
+        await vi.waitFor(
+          () => expect(f.postSignals.length).toBeGreaterThan(1),
+          { timeout: 2000 },
+        );
+        expect(await f.intents()).toHaveLength(1);
+      }
+      expect(f.postSignals[0]?.aborted).toBe(true);
+      expect(f.reads).toHaveBeenCalledWith(f.control, expect.any(AbortSignal));
+    } finally {
+      f.release();
+    }
+  },
+);
+
+it("aborts the held registry request before closing the database", async () => {
+  const f = await stuckDelete("uncommitted-hang");
+  try {
+    expect(f.postSignals[0]?.aborted).toBe(false);
+    await f.sync.close();
+    expect(f.postSignals[0]?.aborted).toBe(true);
+  } finally {
+    f.release();
+  }
 });

@@ -30,7 +30,11 @@ import {
   type CycleReport,
   type CycleScope,
 } from "./cycle.js";
-import { createConnectionDeleter, type ConnectionDeleter } from "./delete.js";
+import {
+  createConnectionDeleter,
+  type ConnectionDeleter,
+  type PendingDelete,
+} from "./delete.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
 import { createLocalHistory, type LocalHistory } from "./history.js";
@@ -195,9 +199,9 @@ export function createLocalSync(
         [req.connector],
       );
       if (req.connect === true || unfinished.length > 0) {
-        const pending = await resume();
+        const stuck = await deletes().resumeDelete(req.connector);
+        if (stuck) armRetry();
         await checkBinding(binding);
-        const stuck = pending.find((p) => p.connector === req.connector);
         if (stuck)
           throw new RunIntakeError(
             "delete_pending",
@@ -248,7 +252,7 @@ export function createLocalSync(
       // at a delete that has not landed.
       fenceWaitMs: retryFirst,
     });
-  let deleteStore: ConnectionDeleter | undefined;
+  let deleteStore: ReturnType<typeof createConnectionDeleter> | undefined;
   const deletes = () => (deleteStore ??= makeDeleter());
   // A delete that cannot land is retried here, with backoff, until it lands:
   // finishing it must not wait for a begin or a sync cycle to ask.
@@ -265,7 +269,17 @@ export function createLocalSync(
     }, delay);
     retryTimer.unref?.();
   };
-  const resume = async () => {
+  const resumes = new Set<Promise<readonly PendingDelete[]>>();
+  const resume = () => {
+    const work = resumeOnce();
+    resumes.add(work);
+    void work.then(
+      () => resumes.delete(work),
+      () => resumes.delete(work),
+    );
+    return work;
+  };
+  const resumeOnce = async () => {
     const pending = await deletes().resumeDeletes();
     if (pending.length > 0) armRetry();
     else {
@@ -274,6 +288,15 @@ export function createLocalSync(
       retryDelay = retryFirst;
     }
     return pending;
+  };
+  // Start recovery without holding unrelated connections. The apply and
+  // publish paths check their own connector's durable intent before work.
+  const kickDeletes = async () => {
+    const rows = await deps.db.query<{ connector: string }>(
+      "SELECT connector FROM delete_intents ORDER BY connector",
+    );
+    if (rows.length) void resume().catch(armRetry);
+    return rows;
   };
   const deleter: ConnectionDeleter = {
     async requestConnectionDelete(connector) {
@@ -352,7 +375,7 @@ export function createLocalSync(
     },
     blobs: createBlobStore(deps),
     async cycle(scope) {
-      await resume();
+      await kickDeletes();
       let allApplied = true;
       const report = await runCycle(deps, scope, undefined, (outcome) => {
         if (outcome.kind !== "applied") allApplied = false;
@@ -371,20 +394,20 @@ export function createLocalSync(
       return report;
     },
     async publish() {
-      await resume();
+      await kickDeletes();
       const report = await runPublish(deps);
       await accessActivity.project();
       return report;
     },
     async applyDelta(delta) {
-      if ((await resume()).length > 0)
+      if ((await kickDeletes()).length > 0)
         return { outcome: "cycle", reason: "a delete is pending" };
       const result = await applyRegistryDelta(deps, delta);
       await accessActivity.project();
       return result;
     },
     async apply() {
-      await resume();
+      await kickDeletes();
       const listed = await deps.registry.listOwnerRows();
       let failed = false;
       let allApplied = true;
@@ -411,7 +434,7 @@ export function createLocalSync(
       if (allApplied) accountHydrated = true;
     },
     async syncConnection(connectionId) {
-      await resume();
+      await kickDeletes();
       const report = await syncConnection(deps, connectionId);
       await accessActivity.project();
       return report;
@@ -420,7 +443,11 @@ export function createLocalSync(
       closed = true;
       clearTimeout(retryTimer);
       retryTimer = undefined;
-      return (closing ??= deps.db.close());
+      return (closing ??= (async () => {
+        await deleteStore?.close();
+        await Promise.allSettled([...resumes]);
+        await deps.db.close();
+      })());
     },
   };
 }
