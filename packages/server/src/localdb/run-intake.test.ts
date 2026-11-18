@@ -532,3 +532,69 @@ describe("partial retry checkpoints", () => {
     },
   );
 });
+
+describe("raw evidence capture", () => {
+  it("persists selection and delete-then-upsert history without counting replay", async () => {
+    const f = await fixture();
+    await f.store.begin(
+      "raw",
+      { ...request, selectedStreams: ["items"] },
+      declaration,
+    );
+    const batch = {
+      batch: 0,
+      records: [
+        { stream: "items", op: "delete", data: { id: "a" } },
+        { stream: "items", data: { id: "a" } },
+      ],
+    };
+    await f.store.batch("raw", batch);
+    await f.store.batch("raw", batch);
+    expect(
+      await f.db.query("SELECT selected_streams FROM runs WHERE run_id='raw'"),
+    ).toEqual([{ selected_streams: '["items"]' }]);
+    expect(
+      await f.db.query(
+        "SELECT pk_values,ever_deleted,upsert_events,delete_events FROM run_record_evidence WHERE run_id='raw'",
+      ),
+    ).toEqual([
+      {
+        pk_values: '["a"]',
+        ever_deleted: 1,
+        upsert_events: 1,
+        delete_events: 1,
+      },
+    ]);
+    expect(
+      await f.db.query("SELECT op FROM run_rows WHERE run_id='raw'"),
+    ).toEqual([{ op: "upsert" }]);
+    await expect(
+      f.store.batch("raw", {
+        batch: 1,
+        records: [
+          { stream: "items", data: { id: "b" } },
+          { stream: "unknown", data: {} },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(
+      await f.db.query(
+        "SELECT count(*) AS n FROM run_record_evidence WHERE run_id='raw'",
+      ),
+    ).toEqual([{ n: 1 }]);
+  });
+  it.each([["items", "items"], ["unknown"]])(
+    "rejects invalid selected set %j",
+    async (...names) => {
+      const f = await fixture();
+      await expect(
+        f.store.begin(
+          "raw",
+          { ...request, selectedStreams: names },
+          declaration,
+        ),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+      expect(await f.db.query("SELECT * FROM runs")).toEqual([]);
+    },
+  );
+});

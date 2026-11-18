@@ -108,6 +108,8 @@ export type ResolveArtifact = (
 ) => IntakeDeclarations | null | Promise<IntakeDeclarations | null>;
 
 export interface BeginRequest {
+  /** Explicit selection for raw-end V1; absence preserves legacy admission. */
+  readonly selectedStreams?: readonly string[];
   readonly connector: string;
   readonly artifactDigest: string;
   readonly owner: { readonly address: string; readonly leaseId: string | null };
