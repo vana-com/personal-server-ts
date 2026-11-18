@@ -353,8 +353,6 @@ export function createLocalSync(
     blobs: createBlobStore(deps),
     async cycle(scope) {
       await resume();
-      await accessActivity.drain();
-      await accessActivity.prune();
       let allApplied = true;
       const report = await runCycle(deps, scope, undefined, (outcome) => {
         if (outcome.kind !== "applied") allApplied = false;
@@ -365,13 +363,15 @@ export function createLocalSync(
         report.connections.every((connection) => connection.error === null)
       )
         accountHydrated = true;
+      // Maintenance stages activity for a later publish. It must not delay
+      // the early publish between a collection's admitted batch and its end.
+      await accessActivity.drain();
+      await accessActivity.prune();
       await accessActivity.project();
       return report;
     },
     async publish() {
       await resume();
-      await accessActivity.drain();
-      await accessActivity.prune();
       const report = await runPublish(deps);
       await accessActivity.project();
       return report;

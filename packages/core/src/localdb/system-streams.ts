@@ -4,7 +4,7 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { SqlDriver, SqlStatement } from "./driver.js";
-import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
+import type { LocalSyncDeps } from "./deps.js";
 import { createRunIntakeStore } from "./run-intake.js";
 import { createRunEndStore } from "./run-end.js";
 import {
@@ -27,11 +27,15 @@ export function createSystemStreamStore(
   const identity = systemStreamIdentity(descriptor);
   // System producers always admit fenced batches and retain explicit-delete
   // tombstones, independently of connector collection feature flags.
-  const intake = createRunIntakeStore(
-    { ...deps, publishWhileCollecting: true },
-    descriptor,
-  );
-  const end = createRunEndStore({ ...deps, publishWhileCollecting: true });
+  // Activity rides a later publish; neither enqueue nor canonical admission
+  // may schedule a publish just for the system stream.
+  const producerDeps = {
+    ...deps,
+    publishWhileCollecting: true,
+    recordsCommitted: undefined,
+  };
+  const intake = createRunIntakeStore(producerDeps, descriptor);
+  const end = createRunEndStore(producerDeps);
   let lanes = producerLanes.get(db);
   if (!lanes) producerLanes.set(db, (lanes = new Map()));
   const laneKey = JSON.stringify([identity.connectionId, descriptor.stream]);
@@ -228,7 +232,6 @@ export function createSystemStreamStore(
           ]);
           throw new Error("Conflicting system stream record");
         }
-        announceRecordsCommitted(deps);
       });
     },
     /** Bounded canonical retention, shared by all server-owned consumers. */

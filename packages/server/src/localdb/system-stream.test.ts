@@ -690,3 +690,23 @@ it("keeps private access activity out of ordinary imported-data additions", asyn
   ).toBe(0);
   expect((await activity.read()).logs).toHaveLength(1);
 });
+
+it("keeps system activity pending for the next publish without waking one", async () => {
+  const f = await fixture();
+  const recordsCommitted = vi.fn();
+  const store = createSystemStreamStore(
+    { ...f.deps, recordsCommitted },
+    { ...descriptor, timestampField: "occurredAt" },
+  );
+  await store.append({
+    eventId: "one",
+    occurredAt: "2026-06-01T00:00:00.000Z",
+  });
+  expect(recordsCommitted).not.toHaveBeenCalled();
+  await store.drain();
+  expect(recordsCommitted).not.toHaveBeenCalled();
+  expect(await f.db.query("SELECT count(*) AS n FROM records")).toEqual([
+    { n: 1 },
+  ]);
+  expect((await runPublish(f.deps)).connections).toHaveLength(1);
+});
