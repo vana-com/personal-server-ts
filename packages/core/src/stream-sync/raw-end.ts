@@ -9,14 +9,25 @@ export type RawEndScope =
   | { readonly kind: "run" }
   | { readonly kind: "stream"; readonly stream: string };
 export interface RawEndError {
-  readonly kind: "error" | "skip_result" | "detail_gap";
+  readonly kind:
+    "error" | "skip_result" | "detail_gap" | "detail_gap_recovered";
   readonly scope: RawEndScope;
-  readonly code: string;
-  readonly recoveryHint?: {
-    readonly retryable?: boolean;
-    readonly action?: string;
-    readonly retryAfterMs?: number;
-  };
+  readonly code?: string;
+  /** Native SKIP/DETAIL_GAP reason, preserved when the event has no code. */
+  readonly reason?: string;
+  readonly retryable?: boolean;
+  readonly status?: string;
+  readonly message?: string;
+  readonly diagnostics?: JsonValue;
+  /** Original detail/reference payload, including gap identity and locator. */
+  readonly raw?: JsonValue;
+  readonly recoveryHint?:
+    | string
+    | {
+        readonly retryable?: boolean;
+        readonly action?: string;
+        readonly retryAfterMs?: number;
+      };
 }
 export interface RawRecordEvidence {
   readonly liveKeys: readonly JsonValue[];
@@ -136,7 +147,8 @@ export function validateRawEnd(body: unknown): RawEndV1 {
     if (
       done.status === "succeeded" ||
       !object(e) ||
-      (e.code !== undefined && (typeof e.code !== "string" || !e.code)) ||
+      (e.code !== undefined &&
+        (typeof e.code !== "string" || !e.code.trim())) ||
       (e.retryable !== undefined && typeof e.retryable !== "boolean") ||
       (e.message !== undefined && typeof e.message !== "string") ||
       (e.diagnostics !== undefined && !json(e.diagnostics))
@@ -182,11 +194,17 @@ export function validateRawEnd(body: unknown): RawEndV1 {
   const errors = body.errors.map((error: unknown) => {
     if (
       !object(error) ||
-      !["error", "skip_result", "detail_gap"].some(
+      !["error", "skip_result", "detail_gap", "detail_gap_recovered"].some(
         (kind) => kind === error.kind,
       ) ||
-      typeof error.code !== "string" ||
-      !error.code
+      (error.code !== undefined &&
+        (typeof error.code !== "string" || !error.code)) ||
+      (error.reason !== undefined && typeof error.reason !== "string") ||
+      (error.retryable !== undefined && typeof error.retryable !== "boolean") ||
+      (error.status !== undefined && typeof error.status !== "string") ||
+      (error.message !== undefined && typeof error.message !== "string") ||
+      (error.diagnostics !== undefined && !json(error.diagnostics)) ||
+      (error.raw !== undefined && !json(error.raw))
     )
       rawEndInvalid("bad error");
     const scope = error.scope ?? { kind: "run" };
@@ -196,10 +214,11 @@ export function validateRawEnd(body: unknown): RawEndV1 {
     if (error.recoveryHint !== undefined) {
       const h = error.recoveryHint;
       if (
-        !object(h) ||
-        (h.retryable !== undefined && typeof h.retryable !== "boolean") ||
-        (h.action !== undefined && typeof h.action !== "string") ||
-        (h.retryAfterMs !== undefined && !count(h.retryAfterMs))
+        typeof h !== "string" &&
+        (!object(h) ||
+          (h.retryable !== undefined && typeof h.retryable !== "boolean") ||
+          (h.action !== undefined && typeof h.action !== "string") ||
+          (h.retryAfterMs !== undefined && !count(h.retryAfterMs)))
       )
         rawEndInvalid("bad recovery hint");
     }

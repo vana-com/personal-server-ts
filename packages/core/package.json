@@ -259,7 +259,8 @@
     "./oura": {
       "types": "./dist/oura/index.d.ts",
       "import": "./dist/oura/index.js"
-    }
+    },
+    "./raw-end.json": "./contracts/raw-end.json"
   },
   "scripts": {
     "build": "tsc --build && tsc --build tsconfig.test-support.json"

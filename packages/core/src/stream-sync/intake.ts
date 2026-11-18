@@ -1,3 +1,4 @@
+import type { RawEndV1 } from "./raw-end.js";
 /** Shared run-intake contract for Node, Lite and native hosts.
  * P03/P04 own persistence and lifecycle; hosts compose the database facade.
  */
@@ -309,10 +310,13 @@ export interface RunPublicationStatus {
   readonly streams: readonly RunStreamPublication[];
 }
 
+/** The observation request is retained until every host has migrated to V1. */
+export type RunEndRequest = EndRequest | RawEndV1;
+
 export interface RunIntake {
   begin(runId: string, req: BeginRequest): Promise<BeginResponse>;
   batch(runId: string, req: BatchRequest): Promise<BatchResponse>;
-  end(runId: string, req: EndRequest): Promise<EndResponse>;
+  end(runId: string, req: RunEndRequest): Promise<EndResponse>;
   abort(runId: string, reason: "failed" | "cancelled"): Promise<void>;
   /**
    * Whether an ended run is saved, from durable local state. An unknown run

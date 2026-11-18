@@ -1,4 +1,7 @@
-import { type JsonValue } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  canonicalJson,
+  type JsonValue,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import type { EndRequest, StreamObservation } from "./intake.js";
 import type { RunFinishStream } from "./run-finish-plan.js";
 import {
@@ -38,12 +41,24 @@ const RETRYABLE_CODES_V1 = new Set([
   "rate_limited",
   "temporarily_unavailable",
 ]);
+function machineCode(error: RawEndError): string | undefined {
+  return error.code ?? error.reason;
+}
+function isGap(error: RawEndError): boolean {
+  return error.kind === "detail_gap" || error.kind === "detail_gap_recovered";
+}
 function retryable(error: RawEndError): boolean {
   const hint = error.recoveryHint;
-  if (hint?.retryable !== undefined) return hint.retryable;
-  if (error.kind === "detail_gap") return true;
+  const structured = typeof hint === "object" ? hint : undefined;
+  // Preserve the native gap field; never fabricate a recoveryHint for it.
+  if (error.retryable === false || structured?.retryable === false)
+    return false;
+  if (error.retryable === true || structured?.retryable === true) return true;
+  if (isGap(error)) return true;
   return (
-    hint?.action === "retry_by_runtime" || RETRYABLE_CODES_V1.has(error.code)
+    hint === "retry_by_runtime" ||
+    structured?.action === "retry_by_runtime" ||
+    RETRYABLE_CODES_V1.has(machineCode(error) ?? "")
   );
 }
 
@@ -65,7 +80,9 @@ function wholeProof(report: JsonValue, evidence: RawRecordEvidence): boolean {
     !Number.isSafeInteger(considered) ||
     considered !== covered ||
     considered !== keys.length ||
-    (gaps !== undefined && (!Array.isArray(gaps) || gaps.length !== 0))
+    (gaps !== undefined && (!Array.isArray(gaps) || gaps.length !== 0)) ||
+    !validDetailReport(report) ||
+    reportHasGap(report)
   )
     return false;
   try {
@@ -91,6 +108,21 @@ function validDetailReport(report: JsonValue | undefined): boolean {
     ["required_keys", "hydrated_keys", "gap_keys"].every(
       (field) => r[field] === undefined || Array.isArray(r[field]),
     )
+  );
+}
+
+/** A report can expose a gap even if the connector omitted its gap event. */
+function reportHasGap(report: JsonValue | undefined): boolean {
+  if (report === undefined || !validDetailReport(report)) return false;
+  const r = report as { readonly [key: string]: JsonValue };
+  const hydrated = Array.isArray(r.hydrated_keys) ? r.hydrated_keys : [];
+  return (
+    r.considered !== r.covered ||
+    (Array.isArray(r.gap_keys) && r.gap_keys.length > 0) ||
+    (Array.isArray(r.required_keys) &&
+      r.required_keys.some(
+        (key) => !hydrated.some((h) => canonicalJson(key) === canonicalJson(h)),
+      ))
   );
 }
 
@@ -123,7 +155,8 @@ export function normalizeRawEnd(
   // sample. Every one must be attributable to the selected set. A run-scoped
   // failure withdraws certification; unknown streams were already rejected.
   const failureSkips = raw.errors.filter(
-    (e) => e.kind === "skip_result" && e.code === "stream_collection_failed",
+    (e) =>
+      e.kind === "skip_result" && machineCode(e) === "stream_collection_failed",
   );
   const certified =
     raw.done.status === "failed" &&
@@ -146,8 +179,15 @@ export function normalizeRawEnd(
         ? "certified_failed_done"
         : "failed_done_upsert_only";
   for (const stream of raw.selectedStreams) {
-    const supplied = raw.records[stream] ?? EMPTY_RAW_RECORDS;
-    const captured = durable[stream] ?? EMPTY_RAW_RECORDS;
+    const supplied = Object.hasOwn(raw.records, stream)
+      ? raw.records[stream]!
+      : EMPTY_RAW_RECORDS;
+    const captured = Object.hasOwn(durable, stream)
+      ? durable[stream]!
+      : EMPTY_RAW_RECORDS;
+    const detailCoverage = Object.hasOwn(raw.detailCoverage, stream)
+      ? raw.detailCoverage[stream]
+      : undefined;
     if (
       supplied.upsertEvents !== captured.upsertEvents ||
       supplied.deleteEvents !== captured.deleteEvents ||
@@ -159,8 +199,8 @@ export function normalizeRawEnd(
     const errors = raw.errors.filter(
       (e) => e.scope.kind === "run" || e.scope.stream === stream,
     );
-    const skips = errors.filter((e) => e.kind !== "detail_gap");
-    const gaps = errors.filter((e) => e.kind === "detail_gap");
+    const skips = errors.filter((e) => !isGap(e));
+    const gaps = errors.filter(isGap);
     const proof = raw.wholeStreamEvidence.find((p) => p.stream === stream);
     const declaration = begin.streams[stream]!;
     const validProof =
@@ -177,18 +217,18 @@ export function normalizeRawEnd(
       preflightExclusion: raw.preflightExcludedStreams.includes(stream),
       detailGap:
         gaps.length === 0
-          ? "none"
+          ? reportHasGap(detailCoverage)
+            ? "retryable"
+            : "none"
           : gaps.some((e) => !retryable(e))
             ? "fatal"
             : "retryable",
       invalidDetailCoverage:
-        !validDetailReport(raw.detailCoverage[stream]) ||
+        !validDetailReport(detailCoverage) ||
         raw.invalidDetailCoverageStreams.includes(stream) ||
         (proof !== undefined && !validProof),
       failedInDone: failed.includes(stream),
-      ...(raw.detailCoverage[stream] === undefined
-        ? {}
-        : { detailCoverage: raw.detailCoverage[stream] }),
+      ...(detailCoverage === undefined ? {} : { detailCoverage }),
       ...(raw.covered === undefined
         ? {}
         : { sourceAnswered: raw.covered.includes(stream) }),

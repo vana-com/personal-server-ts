@@ -15,6 +15,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   createMemoryStreamSyncRegistry,
+  validateRawEnd,
   createMemoryStreamSyncBlobs,
   type IntakeDeclarations,
   RunIntakeError,
@@ -395,4 +396,109 @@ it("delete_pending exposes only fixed error names", async () => {
     error: "delete_pending",
     lastError: "Error",
   });
+});
+
+it.each(["http", "in-process"] as const)(
+  "accepts raw DONE on the existing %s entry point and publishes its ordered result",
+  async (transport) => {
+    const { sync, call, read } = await build(`raw-${transport}`);
+    const body = beginBody({ selectedStreams: ["items"] });
+    expect((await call("PUT", "raw", body)).status).toBe(200);
+    expect(
+      (
+        await call("POST", "raw/batches", {
+          batch: 0,
+          records: [
+            { stream: "items", data: { id: "a", n: 1 } },
+            { stream: "items", op: "delete", data: { id: "a" } },
+            { stream: "items", data: { id: "a", n: 2 } },
+          ],
+        })
+      ).status,
+    ).toBe(200);
+    const raw = validateRawEnd({
+      wireDialect: "connector-end-evidence/1",
+      lastBatch: 0,
+      selectedStreams: ["items"],
+      done: { status: "succeeded" },
+      errors: [],
+      records: {
+        items: {
+          liveKeys: [["a"]],
+          deletedKeys: [],
+          everDeletedKeys: [["a"]],
+          upsertEvents: 2,
+          deleteEvents: 1,
+        },
+      },
+      checkpoints: { items: "c1" },
+      preflightExcludedStreams: [],
+      detailCoverage: {},
+      invalidDetailCoverageStreams: [],
+      wholeStreamEvidence: [],
+    });
+    for (const invalid of [
+      { ...raw, wireDialect: "unknown" },
+      { ...raw, done: null },
+      { ...raw, selectedStreams: [] },
+      { ...raw, finish: { kind: "certified_failed_done", failedStreams: [] } },
+    ])
+      expect((await call("POST", "raw/end", invalid)).status).toBe(400);
+    expect(
+      (await call("POST", "raw/end", { ...raw, lastBatch: -1 })).status,
+    ).toBe(409);
+    let receipt;
+    if (transport === "http") {
+      const result = await call("POST", "raw/end", raw);
+      expect(result.status).toBe(200);
+      receipt = await result.json();
+    } else receipt = await sync.intake.end("raw", raw);
+    expect(receipt).toMatchObject({
+      outcome: "succeeded",
+      coveredStreams: ["items"],
+      provenFullStreams: [],
+      streamStatus: { items: "succeeded" },
+    });
+    expect(await (await call("POST", "raw/end", raw)).json()).toEqual(receipt);
+    await sync.cycle();
+    expect([...(await read(body.connector)).values()]).toEqual([
+      { id: "a", n: 2 },
+    ]);
+  },
+);
+
+it("reads raw key inventories beyond the legacy observation body limit", async () => {
+  const { call } = await build("raw-inventory");
+  expect(
+    (await call("PUT", "raw", beginBody({ selectedStreams: ["items"] })))
+      .status,
+  ).toBe(200);
+  const keys = Array.from({ length: 9000 }, (_, i) => [
+    `${i}-${"k".repeat(128)}`,
+  ]);
+  const response = await call("POST", "raw/end", {
+    wireDialect: "connector-end-evidence/1",
+    lastBatch: -1,
+    selectedStreams: ["items"],
+    done: { status: "succeeded" },
+    errors: [],
+    records: {
+      items: {
+        liveKeys: keys,
+        deletedKeys: [],
+        everDeletedKeys: [],
+        upsertEvents: keys.length,
+        deleteEvents: 0,
+      },
+    },
+    checkpoints: {},
+    preflightExcludedStreams: [],
+    detailCoverage: {},
+    invalidDetailCoverageStreams: [],
+    wholeStreamEvidence: [],
+  });
+  // This inventory was not uploaded: it must reach core's durable-evidence
+  // refusal, rather than the old small observation-only transport ceiling.
+  expect(response.status).toBe(400);
+  expect((await response.json()).message).toMatch(/durable batches/);
 });

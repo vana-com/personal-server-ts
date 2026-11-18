@@ -169,11 +169,16 @@ export function streamSyncRunsRoutes(deps: StreamSyncRunsRouteDeps): Hono {
       ),
     ),
   );
+  // Core distinguishes the versioned raw DONE body from the retained legacy
+  // observation body; both transports use the same validation and finish owner.
+  // Raw key inventories scale with batches, so reuse the existing ingest ceiling.
   app.post("/:runId/end", (c) =>
     answer(c, async () =>
       intake.end(
         c.req.param("runId"),
-        (await body(c, 1024 * 1024)) as Parameters<typeof intake.end>[1],
+        (await body(c, MAX_BATCH_REQUEST_BYTES)) as Parameters<
+          typeof intake.end
+        >[1],
       ),
     ),
   );

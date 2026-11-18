@@ -49,6 +49,12 @@ const dropBootstrapSchema = [
     sql: `DROP TABLE bootstrap_${table}`,
   })),
 ];
+const dropRawEndSchema = [
+  { sql: "DROP TRIGGER IF EXISTS run_rows_evidence" },
+  { sql: "DROP TABLE IF EXISTS run_record_evidence" },
+  { sql: "ALTER TABLE runs DROP COLUMN selected_streams" },
+  { sql: "ALTER TABLE runs DROP COLUMN raw_end" },
+];
 const drivers: SqlDriver[] = [];
 afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
@@ -965,6 +971,7 @@ describe("view changes", () => {
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_version" },
       { sql: "ALTER TABLE record_changes DROP COLUMN publish_blocked_reason" },
       { sql: "ALTER TABLE run_streams DROP COLUMN publish_blocked_reason" },
+      ...dropRawEndSchema,
       { sql: `PRAGMA user_version = ${viewMigration}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");
@@ -1019,6 +1026,7 @@ describe("view changes", () => {
     // the per-stream head path and the consumed-head columns, and its version
     // rows had no stream meta.
     await raw.batch([
+      ...dropRawEndSchema,
       ...dropBootstrapSchema,
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
@@ -1136,6 +1144,7 @@ describe("view changes", () => {
     );
     expect(MIGRATIONS[metaMigration]).toHaveLength(3);
     await raw.batch([
+      ...dropRawEndSchema,
       ...dropBootstrapSchema,
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },

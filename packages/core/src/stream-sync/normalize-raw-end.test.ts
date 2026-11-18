@@ -231,3 +231,74 @@ it("certifies raw failed DONE only from attributable collection-failure skips", 
     ),
   ).toThrow();
 });
+
+it("holds incomplete detail reports even when no separate gap event arrived", () => {
+  const end = normalizeRawEnd(
+    raw({
+      records: { A: live },
+      covered: ["A"],
+      detailCoverage: { A: { considered: 1, covered: 0, gap_keys: [["one"]] } },
+      wholeStreamEvidence: [
+        { stream: "A", report: { keys: [["one"]], considered: 1, covered: 1 } },
+      ],
+    }),
+    begin,
+    { A: live },
+  );
+  expect(end.streams.A?.detailGap).toBe("retryable");
+  expect(end.provenFullStreams).toEqual([]);
+});
+
+it.each(["__proto__", "constructor", "toString"])(
+  "treats prototype-named stream %s as an ordinary selected stream",
+  (name) => {
+    const begin = {
+      selectedStreams: [name],
+      streams: Object.fromEntries([[name, { mode: "incremental" as const }]]),
+    };
+    const end = normalizeRawEnd(raw({ selectedStreams: [name] }), begin, {});
+    expect(end.streams[name]).toMatchObject({
+      liveRecord: false,
+      detailGap: "none",
+      invalidDetailCoverage: false,
+    });
+    expect(end.streams[name]?.sourceAnswered).toBeUndefined();
+  },
+);
+
+it("preserves native gap retryability, recovered frames and string recovery hints", () => {
+  const end = normalizeRawEnd(
+    {
+      ...raw(),
+      errors: [
+        {
+          kind: "detail_gap",
+          scope: { kind: "stream", stream: "A" },
+          reason: "source_unrepresentable",
+          retryable: false,
+          status: "pending",
+          raw: {
+            record_key: "one",
+            detail_locator: { kind: "api" },
+            reference_only: true,
+          },
+        },
+        {
+          kind: "detail_gap_recovered",
+          scope: { kind: "stream", stream: "A" },
+          raw: { gap_id: "gap-1", reference_only: true },
+        },
+        {
+          kind: "skip_result",
+          scope: { kind: "stream", stream: "B" },
+          reason: "temporary_unavailable",
+          recoveryHint: "retry_by_runtime",
+        },
+      ],
+    },
+    begin,
+    {},
+  );
+  expect(end.streams.A?.detailGap).toBe("fatal");
+  expect(end.streams.B?.retryableSkip).toBe(true);
+});

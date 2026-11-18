@@ -245,19 +245,16 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         const raw =
           body !== null && typeof body === "object" && "wireDialect" in body;
         const declarations = declaredStreams(run, streams);
+        if (raw && run.selected_streams === null)
+          throw new RunIntakeError(
+            "invalid_request",
+            "raw end requires explicit selection at begin",
+          );
         const req = raw
           ? normalizeRawEnd(
               body,
               {
-                selectedStreams:
-                  run.selected_streams === null
-                    ? (() => {
-                        throw new RunIntakeError(
-                          "invalid_request",
-                          "raw end requires explicit selection at begin",
-                        );
-                      })()
-                    : JSON.parse(run.selected_streams),
+                selectedStreams: JSON.parse(run.selected_streams ?? "[]"),
                 streams: Object.fromEntries(
                   streams.map((stream) => [
                     stream.stream,
@@ -295,6 +292,8 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             raw
               ? {
                   ...plan,
+                  outcome: "failed",
+                  unconfirmed: true,
                   covered: [],
                   provenFull: [],
                   streamStatus: Object.fromEntries(
@@ -527,7 +526,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
                   run.generation === null ||
                   checkpointDecision({
                     target: run.generation,
-                    streams: { [stream.stream]: results[stream.stream]! },
+                    streams: Object.fromEntries([
+                      [stream.stream, results[stream.stream]!],
+                    ]),
                     control:
                       connection.control_state === "active"
                         ? { kind: "active", generation: connection.generation }
@@ -612,6 +613,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           ? {
               ...plan,
               covered: acceptedCovered,
+              unconfirmed:
+                plan.unconfirmed ||
+                (plan.covered.length > 0 && acceptedCovered.length === 0),
               provenFull: plan.provenFull.filter((name) =>
                 acceptedCovered.includes(name),
               ),
