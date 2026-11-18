@@ -889,7 +889,7 @@ async function projectSnapshot(
     }
   }
   // Every served stream was fetched, empty or not; an optional stream left
-  // out of `served` was never read, and is not named.
+  // out of `served` contributes no projection input and is not named.
   const projected = projectPdppRecordsToLegacyPayload(scope, records, {
     fetchedStreams: served,
     ...(profileKey ? { profileKey } : {}),
