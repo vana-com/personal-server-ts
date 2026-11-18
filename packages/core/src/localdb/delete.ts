@@ -472,8 +472,10 @@ export function createConnectionDeleter(
       await clear(connector, intent.id!);
     } catch (error) {
       await saved.catch(() => undefined);
-      if (error instanceof ConnectionDeleteSuperseded)
+      if (error instanceof ConnectionDeleteSuperseded) {
+        await purgeLocal(connector, intent);
         await clear(connector, intent.id!);
+      }
       throw error;
     }
   }
