@@ -1,4 +1,4 @@
-import { applyConnection } from "./apply.js";
+import { applyConnection, type ApplyOutcome } from "./apply.js";
 import {
   bootstrapConnections,
   connectionsWithStreams,
@@ -53,6 +53,7 @@ export async function runCycle(
   deps: LocalSyncDeps,
   scope?: CycleScope,
   made?: Map<string, EarlyPublish>,
+  onApply?: (outcome: ApplyOutcome) => void,
 ): Promise<CycleReport> {
   if (scope) return runScoped(deps, scope);
   const early = made ?? (await publishEarly(deps, await earlyCandidates(deps)));
@@ -62,7 +63,13 @@ export async function runCycle(
   return {
     connections: await Promise.all(
       connections.map(({ connectionId }) =>
-        syncConnection(deps, connectionId, early.get(connectionId), listed),
+        syncConnection(
+          deps,
+          connectionId,
+          early.get(connectionId),
+          listed,
+          onApply,
+        ),
       ),
     ),
   };
@@ -238,13 +245,14 @@ export async function syncConnection(
   early?: EarlyPublish,
   /** The cycle's listing of the owner's rows, taken before this call. */
   listed?: OwnerRows,
+  onApply?: (outcome: ApplyOutcome) => void,
 ): Promise<CycleReport["connections"][number]> {
   let published: readonly PublishResult[] = early?.published ?? [];
   let error: string | null = null;
   let status: "update_required" | undefined;
   try {
     // A pass includes publish, so it must not join an apply-only operation.
-    await deps.queue.run(connectionId, "publish", () =>
+    const outcome = await deps.queue.run(connectionId, "publish", () =>
       applyConnection(
         insideQueue(deps, connectionId),
         connectionId,
@@ -252,6 +260,7 @@ export async function syncConnection(
         listed?.find((row) => row.scope === connectionId)?.read,
       ),
     );
+    onApply?.(outcome);
     if (early && early.error !== null) throw early.error;
     // One segment and one commit per batch. A registry without the batch
     // route fails it (`RegistryBatchRouteMissingError`): nothing is published

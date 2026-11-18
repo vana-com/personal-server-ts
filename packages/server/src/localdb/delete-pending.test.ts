@@ -248,3 +248,22 @@ it("a registry that never answers the fence gets fenced:false within the resume 
     version: 2,
   });
 });
+
+it("does not certify hydration when a pending delete skips a connection download", async () => {
+  const f = await stuckDelete();
+  expect(await f.intents()).toHaveLength(1);
+  expect(
+    (await f.registry.listOwnerRows()).some((row) => row.scope === f.control),
+  ).toBe(true);
+  expect((await f.sync.listing.status()).accountHydrated).toBe(false);
+  await f.sync.apply();
+  expect(await f.intents()).toHaveLength(1);
+  expect((await f.sync.listing.status()).accountHydrated).toBe(false);
+  await f.sync.cycle();
+  expect((await f.sync.listing.status()).accountHydrated).toBe(false);
+  f.registry.beforePost = undefined;
+  expect(await f.sync.deleter.resumeDeletes()).toEqual([]);
+  expect((await f.begin("reconnected", true)).status).toBe("collecting");
+  await f.sync.apply();
+  expect((await f.sync.listing.status()).accountHydrated).toBe(true);
+});

@@ -678,6 +678,63 @@ describe("local resolve", () => {
     }
   });
 
+  it("chooses a newer complete connection over an older partial for reads, listing and alias history", async () => {
+    const f = await fixture();
+    await f.connection("active", "c1", "aaaaaaaaaaaaaaaa");
+    await f.connection("active", "c2", "bbbbbbbbbbbbbbbb");
+    await f.head("x", { id: "c1", version: 1, complete: false });
+    await f.record("x", "partial", "c1");
+    await f.head("x", { id: "c2", version: 2 });
+    await f.record("x", "complete", "c2");
+    await f.db.batch([
+      {
+        sql: "INSERT INTO stream_partial(connection_id,stream,version,generation,data_hash,head_blob,observed_at,parts_applied,parts_total,records_total) VALUES ('c1','x',1,2,'hash-x-1','head-x-1',100,1,2,2)",
+      },
+    ]);
+    const aliases = {
+      aliasScopes: () => ["fixture.copy"],
+      aliasTargets: () => [
+        {
+          connector: CONNECTOR,
+          streams: ["x"],
+          project: (records: readonly unknown[]) => ({
+            ok: true as const,
+            payload: { records },
+          }),
+        },
+      ],
+    };
+    const deps = { ...f.deps, progressiveFirstLoad: true };
+    const resolver = createLocalResolver(deps, { query: f.query, ...aliases });
+    const listing = createLocalListing({ ...deps, ...aliases });
+    const history = createLocalHistory(deps, aliases);
+    for (const scope of ["pdpp.fixture-source.x", "fixture.copy"]) {
+      const read = await resolver.resolve(input(scope, { isOwnerView: true }));
+      expect(read).toMatchObject({
+        kind: "view",
+        ns: "bbbbbbbbbbbbbbbb",
+        served: { version: 2 },
+      });
+      const body = (await drain(read)).data.records;
+      expect(JSON.stringify(body)).toContain("complete");
+      expect(
+        (
+          await listing.listScopes({
+            canRead: () => true,
+            includeLoading: true,
+          })
+        ).find((s) => s.scope === scope),
+      ).toMatchObject({ ns: "bbbbbbbbbbbbbbbb" });
+    }
+    expect(
+      await history.versions({ scope: "fixture.copy", limit: 20, offset: 0 }),
+    ).toMatchObject({ ok: true, value: { versions: [{ version: 2 }] } });
+    expect(await history.lineage({ scope: "fixture.copy" })).toMatchObject({
+      ok: true,
+      value: { version: 2 },
+    });
+  });
+
   it("reports busy when another alias target is refused beside a tombstone", async () => {
     const f = await fixture();
     await f.connection();
