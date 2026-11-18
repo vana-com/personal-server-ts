@@ -252,27 +252,59 @@ describe("disk-backed bootstrap swap", () => {
     writer.lie = false;
     const keys = await w.segmentKeys(),
       reached = deferred(),
-      release = deferred();
+      release = deferred(),
+      tailStarted = deferred(),
+      releaseTail = deferred();
     const d = await connect(w, "reader", async (key) => {
       if (key === keys.get(3)) {
         reached.resolve();
         await release.promise;
       }
+      if (key === keys.get(4)) {
+        tailStarted.resolve();
+        await releaseTail.promise;
+      }
+    });
+    const governor = d.deps.blobs.governor;
+    const reserve = governor.reserve.bind(governor);
+    let held = 0;
+    vi.spyOn(governor, "reserve").mockImplementation(async (...args) => {
+      const reservation = await reserve(...args);
+      held++;
+      return Object.assign(
+        () => {
+          held--;
+          reservation();
+        },
+        { shrink: reservation.shrink },
+      );
     });
     const applying = applyConnection(d.deps, CONNECTION_ID);
     const rejected = expect(applying).rejects.toThrow(/removes a key/);
     try {
       await reached.promise;
+      await tailStarted.promise;
       expect((await ownerSnapshot(d)).ids).toEqual(["safe", "victim"]);
     } finally {
       release.resolve();
       await rejected;
     }
-    expect((await ownerSnapshot(d)).ids).toEqual([]);
-    expect(await d.db.query("SELECT failed FROM stream_partial")).toEqual([
-      { failed: 1 },
-    ]);
-    expect(await d.position()).toBe(0);
+    try {
+      expect((await ownerSnapshot(d)).ids).toEqual([]);
+      expect(await d.db.query("SELECT failed FROM stream_partial")).toEqual([
+        { failed: 1 },
+      ]);
+      expect(await d.position()).toBe(0);
+      expect(
+        await d.db.query(
+          "SELECT position FROM bootstrap_segments WHERE position=3",
+        ),
+      ).toEqual([]);
+      expect(held).toBeGreaterThan(0);
+    } finally {
+      releaseTail.resolve();
+    }
+    await expect.poll(() => held).toBe(0);
   });
 
   it("marks prerequisite removal-fetch failure before preview as stopped", async () => {
@@ -289,6 +321,130 @@ describe("disk-backed bootstrap swap", () => {
       { failed: 1 },
     ]);
     expect(await d.db.query("SELECT 1 FROM records")).toEqual([]);
+  });
+
+  it("stages an unknown removal before preview and overlaps the tail with staging", async () => {
+    const w = await world({ streams: 1 });
+    const publisher = await history(w);
+    const head = (await w.segments()).get(5)!;
+    const rewritten = {
+      ...head,
+      refs: head.refs.map((ref) => {
+        if (ref.position !== 3) return ref;
+        const { removes: _removes, ...unknown } = ref;
+        return unknown;
+      }),
+    };
+    const bytes = encodeSegment(rewritten);
+    const hash = await digestSegment(async (value) => keccak_256(value), bytes);
+    await w.innerBlobs.put(`${LOG}/${hash.blobName}`, bytes);
+    const metadataHash = w.gateway.versions.get(LOG)!.at(-1)!.metadataHash;
+    w.gateway.replaceHead(LOG, { dataHash: hash.dataHash, metadataHash });
+    const keys = await w.segmentKeys();
+    const removalStarted = deferred(),
+      releaseRemoval = deferred(),
+      stageStarted = deferred(),
+      releaseStage = deferred(),
+      tailStarted = deferred();
+    const d = await connect(w, "unknown-removal", async (key) => {
+      if (key === keys.get(3)) {
+        removalStarted.resolve();
+        await releaseRemoval.promise;
+      }
+      if (key === keys.get(4)) tailStarted.resolve();
+    });
+    const batch = d.db.batch.bind(d.db);
+    d.db.batch = async (statements) => {
+      if (
+        statements.some(
+          (s) =>
+            s.sql.includes("INSERT INTO bootstrap_segments") &&
+            s.params?.[0] === 2,
+        )
+      ) {
+        stageStarted.resolve();
+        await releaseStage.promise;
+      }
+      return batch(statements);
+    };
+    const applying = applyConnection(d.deps, CONNECTION_ID);
+    try {
+      await removalStarted.promise;
+      expect(await d.db.query("SELECT 1 FROM records")).toEqual([]);
+      releaseRemoval.resolve();
+      await stageStarted.promise;
+      await tailStarted.promise;
+      expect((await ownerSnapshot(d)).ids).toEqual(["safe"]);
+    } finally {
+      releaseRemoval.resolve();
+      releaseStage.resolve();
+      await applying;
+    }
+    expect(await d.rows()).toEqual(await publisher.rows());
+    expect(await d.position()).toBe(5);
+  });
+
+  it("retains the reservation for a blocked tail after a stage failure", async () => {
+    const w = await world({ streams: 1 });
+    const publisher = await history(w);
+    const keys = await w.segmentKeys();
+    const started = deferred();
+    const release = deferred();
+    let block = true;
+    const d = await connect(w, "stage-failure", async (key) => {
+      if (block && key === keys.get(4)) {
+        started.resolve();
+        await release.promise;
+      }
+    });
+    const governor = d.deps.blobs.governor;
+    const reserve = governor.reserve.bind(governor);
+    let held = 0;
+    vi.spyOn(governor, "reserve").mockImplementation(async (...args) => {
+      const reservation = await reserve(...args);
+      held++;
+      return Object.assign(
+        () => {
+          held--;
+          reservation();
+        },
+        { shrink: reservation.shrink },
+      );
+    });
+    const batch = d.db.batch.bind(d.db);
+    let fail = true;
+    d.db.batch = async (statements) => {
+      if (
+        fail &&
+        statements.some(
+          (statement) =>
+            statement.sql.includes("INSERT INTO bootstrap_segments") &&
+            statement.params?.[0] === 2,
+        )
+      ) {
+        await started.promise;
+        fail = false;
+        throw new Error("stage failed");
+      }
+      return batch(statements);
+    };
+    try {
+      await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toThrow(
+        "stage failed",
+      );
+      expect(await d.position()).toBe(0);
+      expect(await d.db.query("SELECT failed FROM stream_partial")).toEqual([
+        { failed: 1 },
+      ]);
+      expect(held).toBeGreaterThan(0);
+    } finally {
+      block = false;
+      release.resolve();
+    }
+    await expect.poll(() => held).toBe(0);
+    await applyConnection(d.deps, CONNECTION_ID);
+    expect(await d.rows()).toEqual(await publisher.rows());
+    expect(await d.position()).toBe(5);
   });
 
   it("retries a failed tail GET from durable receipts without advancing the cursor", async () => {
@@ -756,9 +912,10 @@ describe("disk-backed bootstrap swap", () => {
     expect(await d.position()).toBe(4);
   });
 
-  it.each([true, false])(
-    "preserves other-connection evidence under the %s swap fact, including churn",
-    async (swap) => {
+  it.each(["swap", "foreign-default", "foreign-copy"] as const)(
+    "preserves other-connection evidence under %s, including churn",
+    async (mode) => {
+      const swap = mode === "swap";
       const w = await world({ streams: 1 }),
         p = await history(w);
       await p.run("change", [{ stream: sName(0), id: "safe", v: 2 }], {
@@ -796,6 +953,8 @@ describe("disk-backed bootstrap swap", () => {
         hash = await pkHash(async (bytes) => sha256(bytes), { id: "foreign" }, [
           "id",
         ]);
+      if (mode === "foreign-copy")
+        Object.assign(d.deps, { bootstrapFirstLoadFinish: "copy" });
       await d.db.batch([
         {
           sql: "INSERT INTO connections(connection_id,connector,ns,generation,control_state,control_version) VALUES(?,'fixture','1111111111111111',1,'active',1)",
@@ -869,6 +1028,10 @@ describe("disk-backed bootstrap swap", () => {
       const realBatch = d.db.batch.bind(d.db);
       let stagingCommits = 0;
       d.db.batch = (statements) => {
+        if (!swap)
+          expect(statements.some((st) => st.sql === "DROP TABLE records")).toBe(
+            false,
+          );
         if (
           !swap &&
           statements.some((st) => st.sql === "DROP TABLE bootstrap_records")
@@ -930,6 +1093,121 @@ describe("disk-backed bootstrap swap", () => {
           .map((r) => JSON.parse(r.body).id)
           .sort(),
       ).toEqual(["c", "d", "safe", "victim"]);
+    },
+  );
+
+  it.each(["swap", "copy"] as const)(
+    "preserves equal-stamp winners when tail fetches finish out of order in %s mode",
+    async (mode) => {
+      const w = await world({ streams: 1 });
+      const publisher = await w.device("tie-publisher");
+      await publisher.run("seed", [{ stream: sName(0), id: "seed" }]);
+      await publisher.cycle();
+      const template = (await w.segments()).get(1)!;
+      const metadataHash = w.gateway.versions.get(LOG)!.at(-1)!.metadataHash;
+      const hash = await pkHash(async (bytes) => sha256(bytes), { id: "tie" }, [
+        "id",
+      ]);
+      const refs: StreamSync.SegmentRef[] = [];
+      const keys = new Map<number, string>();
+      for (let position = 1; position <= 3; position++) {
+        const operations =
+          position === 1
+            ? template.operations
+            : [
+                {
+                  kind: "upsert",
+                  stream: sName(0),
+                  pkHash: hash,
+                  stamp: { o: 10, r: "same" },
+                  value: { id: "tie", v: position },
+                  firstSeen: 10,
+                },
+              ];
+        const segment = {
+          ...template,
+          position,
+          operations,
+          refs: [...refs],
+        } as StreamSync.Segment;
+        const bytes = encodeSegment(segment);
+        const digest = await digestSegment(
+          async (value) => keccak_256(value),
+          bytes,
+        );
+        const key = `${LOG}/${digest.blobName}`;
+        keys.set(position, key);
+        await w.innerBlobs.put(key, bytes);
+        if (position === 1)
+          w.gateway.replaceHead(LOG, {
+            dataHash: digest.dataHash,
+            metadataHash,
+          });
+        else w.gateway.write(LOG, { dataHash: digest.dataHash, metadataHash });
+        refs.push({
+          position,
+          dataHash: digest.dataHash,
+          bytes: bytes.length,
+          removes: false,
+        });
+      }
+      const secondStarted = deferred(),
+        releaseSecond = deferred(),
+        thirdStarted = deferred();
+      const d = await connect(w, `tie-${mode}`, async (key) => {
+        if (key === keys.get(2)) {
+          secondStarted.resolve();
+          await releaseSecond.promise;
+        }
+      });
+      const get = d.deps.blobs.get.bind(d.deps.blobs);
+      d.deps.blobs.get = async (key) => {
+        const value = await get(key);
+        if (key === keys.get(3)) thirdStarted.resolve();
+        return value;
+      };
+      if (mode === "copy")
+        Object.assign(d.deps, { bootstrapFirstLoadFinish: "copy" });
+      const batch = d.db.batch.bind(d.db);
+      const committed: number[] = [];
+      d.db.batch = async (statements) => {
+        const receipt = statements.find((s) =>
+          s.sql.includes("INSERT INTO bootstrap_segments"),
+        );
+        const result = await batch(statements);
+        if (receipt) committed.push(Number(receipt.params?.[0]));
+        return result;
+      };
+      const applying = applyConnection(d.deps, CONNECTION_ID);
+      try {
+        await secondStarted.promise;
+        await thirdStarted.promise;
+      } finally {
+        releaseSecond.resolve();
+        await applying;
+      }
+      expect(committed).toEqual([1, 2, 3]);
+      const ordinary = await w.device("tie-ordinary", {
+        keyedFirstLoad: false,
+      });
+      await ordinary.db.batch([
+        {
+          sql: "INSERT INTO connections(connection_id,connector,ns,generation,control_state,control_version) VALUES(?,?,'',1,'active',1)",
+          params: [CONNECTION_ID, CONNECTOR],
+        },
+      ]);
+      await applyConnection(ordinary.deps, CONNECTION_ID);
+      expect(await d.rows()).toEqual(await ordinary.rows());
+      expect(
+        await d.db.query(
+          "SELECT * FROM log_tombstones ORDER BY stream,pk_hash",
+        ),
+      ).toEqual(
+        await ordinary.db.query(
+          "SELECT * FROM log_tombstones ORDER BY stream,pk_hash",
+        ),
+      );
+      expect(await d.position()).toBe(3);
     },
   );
 
