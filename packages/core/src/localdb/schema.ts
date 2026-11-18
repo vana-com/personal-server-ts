@@ -589,4 +589,10 @@ END`,
       BEGIN SELECT RAISE(ABORT,'bootstrap_busy'); END`,
     ),
   ],
+  [
+    `CREATE TABLE application_grants (
+      grant_id TEXT PRIMARY KEY, revision TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('active','revoked','expired')),
+      expires_at INTEGER, observed_at INTEGER NOT NULL)`,
+  ],
 ];

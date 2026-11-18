@@ -97,6 +97,44 @@ export interface DataWritePolicyPorts {
   runtimeAvailability?: RuntimeAvailabilityPort;
   /** Absent = writes are free (see WriteFeeVerifierPort). */
   writeFeeVerifier?: WriteFeeVerifierPort;
+  /** Persist every gateway observation before policy can refuse it. */
+  grantObservations?: GrantObservationPort;
+}
+
+export interface GrantObservation {
+  readonly grantId: string;
+  readonly revision: string;
+  readonly status: "active" | "revoked" | "expired";
+  readonly expiresAt: number | null;
+  readonly observedAt: number;
+}
+
+export interface GrantObservationPort {
+  record(observation: GrantObservation): Promise<void>;
+}
+
+/** Adapter for the gateway's current flat scope grant; no synthetic grant IDs. */
+export function observeWriteGrant(
+  grant: GatewayGrantResponse,
+): GrantObservation {
+  const expiry =
+    grant.expiresAt == null
+      ? null
+      : parseGrantExpiresAtSeconds(grant.expiresAt);
+  const observedAt = Date.now();
+  return {
+    grantId: grant.id,
+    revision: grant.grantVersion,
+    status:
+      grant.revokedAt !== null
+        ? "revoked"
+        : grant.expired ||
+            (expiry !== null && expiry > 0 && expiry * 1000 < observedAt)
+          ? "expired"
+          : "active",
+    expiresAt: expiry !== null && expiry > 0 ? expiry * 1000 : null,
+    observedAt,
+  };
 }
 
 /**
@@ -149,6 +187,8 @@ export async function verifyDataWritePolicy(
       grantId: input.grantId,
     });
   }
+
+  await ports.grantObservations?.record(observeWriteGrant(grant));
 
   if (grant.revokedAt !== null) {
     throw new GrantRevokedError({ grantId: grant.id });
