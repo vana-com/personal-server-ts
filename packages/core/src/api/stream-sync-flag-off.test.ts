@@ -117,6 +117,20 @@ describe("#596 account-mode data reads", () => {
     expect(f.storageCalls).not.toHaveBeenCalled();
   });
 
+  it("returns a retryable refusal when the local reader is busy", async () => {
+    const f = fixture("switched");
+    f.resolve.mockResolvedValueOnce({
+      kind: "busy",
+      retryAfterSeconds: 5,
+    } as never);
+    const response = await get(f.deps);
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Retry-After")).toBe("5");
+    expect((await response.json()).error.errorCode).toBe(
+      "STREAM_SYNC_READ_BUSY",
+    );
+  });
+
   it("answers 410 to a version selector: no older version has a body", async () => {
     const f = fixture("switched");
     for (const selector of ["?fileId=retained", "?at=2025-01-01T00:00:00Z"]) {

@@ -13,10 +13,16 @@ import {
   streamScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
-import { RegistryUnavailableBeforeWriteError } from "../../../core/src/stream-sync/ports.js";
+import {
+  RegistryUnavailableBeforeWriteError,
+  RegistryUnavailableError,
+} from "../../../core/src/stream-sync/ports.js";
+import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
+import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import type { DeleteIntent } from "../../../core/src/localdb/delete.js";
 import {
   CONNECTOR,
+  CONNECTION_ID,
   OWNER,
   closeWorldDrivers,
   sName,
@@ -250,3 +256,71 @@ it.each([false, true])(
     expect(await a.records()).toEqual(rows);
   },
 );
+
+it.each(
+  ["older control", "registry unavailable"].flatMap((failure) =>
+    [false, true].map((progressive) => ({ failure, progressive })),
+  ),
+)(
+  "serves local rows when apply fails before writing: $failure (progressive: $progressive)",
+  async ({ failure, progressive }) => {
+    const w = await world({ streams: 1 });
+    const a = await w.device("read-local", {
+      progressiveFirstLoad: progressive,
+    });
+    await a.run("first", [{ stream: sName(0), id: "local" }]);
+    await a.cycle();
+    if (failure === "older control") {
+      await a.db.batch([
+        { sql: "UPDATE connections SET control_version = control_version + 1" },
+      ]);
+    } else {
+      const read = a.deps.registry.read.bind(a.deps.registry);
+      a.deps.registry.read = (scope) =>
+        scope === controlScope(CONNECTOR, "")
+          ? Promise.reject(new RegistryUnavailableError("offline"))
+          : read(scope);
+    }
+    const resolver = createLocalResolver(a.deps, {
+      query: createRecordQuery(a.db),
+    });
+    const result = await resolver.resolve({
+      scope: streamScope(CONNECTOR, "", sName(0)),
+      connection: null,
+      cursor: null,
+      legacyFile: false,
+      isOwnerView: true,
+    });
+    expect(result.kind).toBe("view");
+    if (result.kind !== "view") throw new Error("missing local view");
+    const body = (await new Response(result.body).json()) as {
+      data: { records: { id: string }[] };
+    };
+    expect(body.data.records.map((r) => r.id)).toEqual(["local"]);
+  },
+);
+
+it("refuses a first read for retry when the registry is unavailable", async () => {
+  const w = await world({ streams: 1 });
+  const a = await w.device("read-empty");
+  await a.db.batch([
+    {
+      sql: "INSERT INTO connections(connection_id, connector, ns, generation, control_state, control_version) VALUES (?, ?, '', 1, 'active', 1)",
+      params: [CONNECTION_ID, CONNECTOR],
+    },
+  ]);
+  a.deps.registry.read = () =>
+    Promise.reject(new RegistryUnavailableError("offline"));
+  const resolver = createLocalResolver(a.deps, {
+    query: createRecordQuery(a.db),
+  });
+  expect(
+    await resolver.resolve({
+      scope: streamScope(CONNECTOR, "", sName(0)),
+      connection: null,
+      cursor: null,
+      legacyFile: false,
+      isOwnerView: true,
+    }),
+  ).toEqual({ kind: "busy", retryAfterSeconds: 5 });
+});

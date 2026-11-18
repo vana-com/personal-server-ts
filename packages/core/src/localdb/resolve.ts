@@ -4,6 +4,7 @@ import {
   type ResolveInput,
 } from "../stream-sync-read/service.js";
 import { streamReadScope } from "../stream-sync-read/routing.js";
+import { RegistryUnavailableBeforeWriteError } from "../stream-sync/ports.js";
 import { applyConnection } from "./apply.js";
 import { nextApplied } from "./apply-progress.js";
 import type { LocalSyncDeps } from "./deps.js";
@@ -447,6 +448,7 @@ export function createLocalResolver(
       let sawForeign = false;
       let sawConnection = false;
       let sawActive = false;
+      let applyUnavailable = false;
       for (const target of targets) {
         let rows = await connections(target.connector);
         // applyConnection is the single-flight boundary and verifies keys before
@@ -457,7 +459,13 @@ export function createLocalResolver(
             c.deleted_at === null &&
             (input.connection === null || input.connection === c.ns)
           ) {
-            await applyFor(c, target, progressive);
+            try {
+              await applyFor(c, target, progressive);
+            } catch (error) {
+              if (!(error instanceof RegistryUnavailableBeforeWriteError))
+                throw error;
+              applyUnavailable = true;
+            }
           }
         }
         rows = await connections(target.connector);
@@ -492,6 +500,7 @@ export function createLocalResolver(
       if (!chosen) {
         if (sawDeleted) return deleted();
         if (sawForeign && !sawActive) return { kind: "key_mismatch" };
+        if (applyUnavailable) return { kind: "busy", retryAfterSeconds: 5 };
         if (input.cursor !== null) return { kind: "cursor_stale" };
         if (input.connection !== null && !sawConnection) {
           return { kind: "unavailable", reason: "connection_not_found" };
