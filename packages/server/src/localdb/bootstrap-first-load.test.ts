@@ -1110,20 +1110,22 @@ describe("disk-backed bootstrap swap", () => {
       ]);
       const refs: StreamSync.SegmentRef[] = [];
       const keys = new Map<number, string>();
-      for (let position = 1; position <= 3; position++) {
+      for (let position = 1; position <= 4; position++) {
         const operations =
           position === 1
             ? template.operations
-            : [
-                {
-                  kind: "upsert",
-                  stream: sName(0),
-                  pkHash: hash,
-                  stamp: { o: 10, r: "same" },
-                  value: { id: "tie", v: position },
-                  firstSeen: 10,
-                },
-              ];
+            : position === 4
+              ? []
+              : [
+                  {
+                    kind: "upsert",
+                    stream: sName(0),
+                    pkHash: hash,
+                    stamp: { o: 10, r: "same" },
+                    value: { id: "tie", v: position },
+                    firstSeen: 10,
+                  },
+                ];
         const segment = {
           ...template,
           position,
@@ -1153,17 +1155,20 @@ describe("disk-backed bootstrap swap", () => {
       }
       const secondStarted = deferred(),
         releaseSecond = deferred(),
-        thirdStarted = deferred();
+        thirdCompleted = deferred();
+      let secondHeld = false;
       const d = await connect(w, `tie-${mode}`, async (key) => {
         if (key === keys.get(2)) {
+          secondHeld = true;
           secondStarted.resolve();
           await releaseSecond.promise;
+          secondHeld = false;
         }
       });
       const get = d.deps.blobs.get.bind(d.deps.blobs);
       d.deps.blobs.get = async (key) => {
         const value = await get(key);
-        if (key === keys.get(3)) thirdStarted.resolve();
+        if (key === keys.get(3) && secondHeld) thirdCompleted.resolve();
         return value;
       };
       if (mode === "copy")
@@ -1181,12 +1186,13 @@ describe("disk-backed bootstrap swap", () => {
       const applying = applyConnection(d.deps, CONNECTION_ID);
       try {
         await secondStarted.promise;
-        await thirdStarted.promise;
+        await thirdCompleted.promise;
+        expect(secondHeld).toBe(true);
       } finally {
         releaseSecond.resolve();
         await applying;
       }
-      expect(committed).toEqual([1, 2, 3]);
+      expect(committed).toEqual([1, 2, 3, 4]);
       const ordinary = await w.device("tie-ordinary", {
         keyedFirstLoad: false,
       });
@@ -1207,7 +1213,7 @@ describe("disk-backed bootstrap swap", () => {
           "SELECT * FROM log_tombstones ORDER BY stream,pk_hash",
         ),
       );
-      expect(await d.position()).toBe(3);
+      expect(await d.position()).toBe(4);
     },
   );
 
