@@ -302,3 +302,33 @@ it("preserves native gap retryability, recovered frames and string recovery hint
   expect(end.streams.A?.detailGap).toBe("fatal");
   expect(end.streams.B?.retryableSkip).toBe(true);
 });
+
+it("classifies stream-scoped structured retry hints independently on succeeded DONE", () => {
+  const end = normalizeRawEnd(
+    raw({
+      errors: [
+        {
+          kind: "skip_result",
+          scope: { kind: "stream", stream: "A" },
+          recoveryHint: { retryable: true },
+        },
+        {
+          kind: "skip_result",
+          scope: { kind: "stream", stream: "B" },
+          recoveryHint: { retryable: false },
+        },
+      ],
+    }),
+    begin,
+    {},
+  );
+  expect(end.streams.A).toMatchObject({
+    retryableSkip: true,
+    otherSkip: false,
+  });
+  expect(end.streams.B).toMatchObject({
+    retryableSkip: false,
+    otherSkip: true,
+  });
+  expect(end.finish).toBe("completed");
+});
