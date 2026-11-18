@@ -1,3 +1,4 @@
+import { isReservedSystemConnector } from "../policy/reserved-scopes.js";
 import { keccakOf } from "../stream-sync/crypto-port.js";
 import { readBeginReceipt } from "./run-receipts.js";
 import { RegistryRefusedError } from "../stream-sync/ports.js";
@@ -186,6 +187,8 @@ export function createRunIntakeStore(deps: LocalSyncDeps): RunIntakeStore {
           req.connector.includes(".")
         )
           throw invalid("invalid connector key");
+        if (isReservedSystemConnector(req.connector))
+          throw invalid("reserved system connector");
         if (typeof req.artifactDigest !== "string" || !req.artifactDigest)
           throw invalid("artifactDigest is required");
         if (

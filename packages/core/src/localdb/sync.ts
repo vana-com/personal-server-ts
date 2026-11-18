@@ -1,3 +1,4 @@
+import { isReservedSystemConnector } from "../policy/reserved-scopes.js";
 import type {
   DeltaApplyResult,
   RegistryChangeDelta,
@@ -308,13 +309,15 @@ export function createLocalSync(
     }),
     declarations: {
       streamsOf: async (connector) =>
-        // A stream whose delete floor reaches its head is `tombstoned` for
-        // reads (read-selection.ts), unless a load of a newer head of this
-        // generation has applied parts (`partialReadable`). One with no head
-        // yet and no floor is mid first load.
-        (
-          await readerOf(deps.db).query<{ stream: string }>(
-            `SELECT DISTINCT s.stream FROM stream_state s
+        isReservedSystemConnector(connector)
+          ? []
+          : // A stream whose delete floor reaches its head is `tombstoned` for
+            // reads (read-selection.ts), unless a load of a newer head of this
+            // generation has applied parts (`partialReadable`). One with no head
+            // yet and no floor is mid first load.
+            (
+              await readerOf(deps.db).query<{ stream: string }>(
+                `SELECT DISTINCT s.stream FROM stream_state s
                JOIN connections c ON c.connection_id = s.connection_id
               WHERE c.connector = ? AND c.control_state = 'active'
                 AND c.deleted_at IS NULL
@@ -326,15 +329,17 @@ export function createLocalSync(
                                    AND p.generation = c.generation
                                    AND p.version > s.last_delete_version))
               ORDER BY s.stream`,
-            [connector],
-          )
-        ).map((row) => row.stream),
+                [connector],
+              )
+            ).map((row) => row.stream),
       connectors: async () =>
         (
           await readerOf(deps.db).query<{ connector: string }>(
             "SELECT DISTINCT connector FROM connections WHERE control_state='active' ORDER BY connector",
           )
-        ).map((row) => row.connector),
+        )
+          .map((row) => row.connector)
+          .filter((connector) => !isReservedSystemConnector(connector)),
     },
     blobs: createBlobStore(deps),
     async cycle(scope) {
