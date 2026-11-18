@@ -1,3 +1,5 @@
+import { normalizeRawEnd } from "../stream-sync/normalize-raw-end.js";
+import { readRawRecordEvidence } from "./raw-end-evidence.js";
 import { readEndReceipt } from "./run-receipts.js";
 import {
   checkpointDecision,
@@ -74,6 +76,7 @@ type Run = {
   last_batch: number;
   admitting: number;
   begin_response: string | null;
+  selected_streams: string | null;
 };
 
 /** The run's START per declared stream. Runs stored no response before it existed. */
@@ -175,8 +178,18 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         const cleanup = (receipt: RunEndResponse): SqlStatement[] => [
           { sql: "DELETE FROM run_rows WHERE run_id = ?", params: [runId] },
           {
-            sql: "UPDATE runs SET state = 'ended',end_response=? WHERE run_id = ?",
-            params: [JSON.stringify(receipt), runId],
+            sql: "DELETE FROM run_record_evidence WHERE run_id = ?",
+            params: [runId],
+          },
+          {
+            sql: "UPDATE runs SET state = 'ended',end_response=?,raw_end=? WHERE run_id = ?",
+            params: [
+              JSON.stringify(receipt),
+              body !== null && typeof body === "object" && "wireDialect" in body
+                ? JSON.stringify(body)
+                : null,
+              runId,
+            ],
           },
           // This run no longer holds back older tombstones. Last, so the
           // compaction sees the run as ended.
@@ -216,10 +229,38 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           WHERE rs.run_id = ? ORDER BY rs.stream`,
           [run.connection_id, runId],
         );
-        const req = parseEndRequest(
-          body,
-          streams.map((stream) => stream.stream),
-        );
+        const raw =
+          body !== null && typeof body === "object" && "wireDialect" in body;
+        const declarations = declaredStreams(run, streams);
+        const req = raw
+          ? normalizeRawEnd(
+              body,
+              {
+                selectedStreams:
+                  run.selected_streams === null
+                    ? (() => {
+                        throw new RunIntakeError(
+                          "invalid_request",
+                          "raw end requires explicit selection at begin",
+                        );
+                      })()
+                    : JSON.parse(run.selected_streams),
+                streams: Object.fromEntries(
+                  streams.map((stream) => [
+                    stream.stream,
+                    {
+                      ...declarations[stream.stream]!,
+                      fullRead: stream.full_read === 1,
+                    },
+                  ]),
+                ),
+              },
+              await readRawRecordEvidence(db, runId),
+            )
+          : parseEndRequest(
+              body,
+              streams.map((stream) => stream.stream),
+            );
         if (req.lastBatch !== run.last_batch) {
           throw new RunIntakeError(
             "batch_gap",
@@ -227,7 +268,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             run.last_batch + 1,
           );
         }
-        const plan = planRunFinish(req, declaredStreams(run, streams));
+        const plan = planRunFinish(req, declarations);
         if (plan.outcome === "failed")
           return discard("failed", plan.unconfirmed);
         const covered = new Set(plan.covered);

@@ -608,4 +608,5 @@ END`,
           (NEW.op='delete')+COALESCE((SELECT delete_events FROM run_record_evidence WHERE run_id=NEW.run_id AND stream=NEW.stream AND pk_hash=NEW.pk_hash),0));
       END`,
   ],
+  [`ALTER TABLE runs ADD COLUMN raw_end TEXT`],
 ];

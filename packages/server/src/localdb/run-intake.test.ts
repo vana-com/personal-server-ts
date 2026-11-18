@@ -598,3 +598,59 @@ describe("raw evidence capture", () => {
     },
   );
 });
+
+it("normalizes raw evidence before run-end fences and rejects invented history", async () => {
+  const f = await fixture();
+  await f.store.begin(
+    "raw",
+    { ...request, selectedStreams: ["items"] },
+    declaration,
+  );
+  await f.store.batch("raw", {
+    batch: 0,
+    records: [
+      { stream: "items", op: "delete", data: { id: "a" } },
+      { stream: "items", data: { id: "a" } },
+    ],
+  });
+  const raw = {
+    wireDialect: "connector-end-evidence/1",
+    lastBatch: 0,
+    selectedStreams: ["items"],
+    finish: { kind: "completed" },
+    errors: [],
+    records: {
+      items: {
+        liveKeys: [["a"]],
+        deletedKeys: [],
+        everDeletedKeys: [["a"]],
+        upsertEvents: 1,
+        deleteEvents: 1,
+      },
+    },
+    checkpoints: {},
+    preflightExcludedStreams: [],
+    detailCoverage: {},
+    invalidDetailCoverageStreams: [],
+    wholeStreamEvidence: [],
+  };
+  await expect(
+    f.end.end("raw", {
+      ...raw,
+      records: { items: { ...raw.records.items, deleteEvents: 2 } },
+    }),
+  ).rejects.toMatchObject({ code: "invalid_request" });
+  await expect(
+    f.end.end("raw", { ...raw, lastBatch: -1 }),
+  ).rejects.toMatchObject({ code: "batch_gap", nextBatch: 1 });
+  expect(await f.end.end("raw", raw)).toMatchObject({
+    outcome: "succeeded",
+    coveredStreams: ["items"],
+  });
+  expect(
+    await f.db.query("SELECT raw_end FROM runs WHERE run_id='raw'"),
+  ).toEqual([{ raw_end: JSON.stringify(raw) }]);
+  expect(await f.db.query("SELECT body FROM records")).toEqual([
+    { body: '{"id":"a"}' },
+  ]);
+});
