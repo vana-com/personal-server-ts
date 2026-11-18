@@ -14,7 +14,7 @@ export interface SystemStreamDescriptor {
 
 export function systemStreamIdentity(descriptor: SystemStreamDescriptor) {
   if (
-    !descriptor.connector.startsWith("vana-system-") ||
+    !/^vana-system-[a-z0-9][a-z0-9-]*$/.test(descriptor.connector) ||
     !descriptor.version ||
     descriptor.primaryKey.length === 0
   )

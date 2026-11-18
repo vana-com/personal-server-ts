@@ -19,6 +19,12 @@ it("routes served reads to shared activity even when browser composition injects
   await authority.submitEvidence({ owner, state: "on" });
   const legacy = createMemoryPsLiteAccessLogStore();
   const write = vi.fn(async () => {});
+  const read = vi.fn(async () => ({
+    logs: [],
+    limit: 50,
+    offset: 0,
+    nextCursor: null,
+  }));
   const runtime = createPsLiteRuntime({
     serverOwner: owner,
     active: true,
@@ -29,7 +35,7 @@ it("routes served reads to shared activity even when browser composition injects
     saveConfig: async () => {},
     accessLogReader: legacy,
     accessLogWriter: legacy,
-    localSync: async () => ({ accessActivity: { write } }) as never,
+    localSync: async () => ({ accessActivity: { write, read } }) as never,
     streamSyncRead: {
       resolve: async () => ({
         kind: "view",
@@ -50,5 +56,22 @@ it("routes served reads to shared activity even when browser composition injects
   await response.body?.cancel();
   expect(write).toHaveBeenCalledOnce();
   expect((await legacy.read()).logs).toEqual([]);
+  const history = await runtime.fetch(
+    new Request("https://server.example/v1/access-logs?cursor=fixture-cursor", {
+      headers: { authorization: "Bearer owner-token" },
+    }),
+  );
+  expect(history.status).toBe(200);
+  expect(read).toHaveBeenCalledWith({
+    limit: 50,
+    offset: 0,
+    cursor: "fixture-cursor",
+  });
+  expect(write).toHaveBeenCalledOnce();
+  const denied = await runtime.fetch(
+    new Request("https://server.example/v1/access-logs"),
+  );
+  expect(denied.status).toBeGreaterThanOrEqual(400);
+  expect(read).toHaveBeenCalledOnce();
   await authority.close();
 });

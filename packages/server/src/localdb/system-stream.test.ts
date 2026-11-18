@@ -370,3 +370,323 @@ it("retention deletes old activity canonically and persists its deletion waterma
   );
   expect(deleted!.tombstone_wm_o).toBeGreaterThan(f.deps.now());
 });
+
+it("owner history pages tied timestamps without skips, duplicate rows or recursive audit", async () => {
+  const { createAccessActivity } =
+    await import("../../../core/src/logging/activity-stream.js");
+  const { handlePersonalServerAccessLogsRequest } =
+    await import("../../../core/src/api/index.js");
+  const f = await fixture();
+  const activity = createAccessActivity(f.deps);
+  const ids = [1, 2, 3, 4, 5].map(
+    (n) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`,
+  );
+  for (const id of ids)
+    await activity.write({
+      logId: id,
+      grantId: "owner",
+      builder: owner,
+      action: "read",
+      scope: "fixture.items",
+      timestamp: "2026-06-01T00:00:00.000Z",
+      ipAddress: "",
+      userAgent: "",
+    });
+  await activity.drain();
+  const seen: string[] = [];
+  let cursor: string | null = null;
+  do {
+    const url = new URL("https://server.example/?limit=2");
+    if (cursor) url.searchParams.set("cursor", cursor);
+    const response = await handlePersonalServerAccessLogsRequest(
+      new Request(url),
+      {
+        auth: { authorizeOwner: async () => {} },
+        accessLogReader: activity,
+      } as never,
+    );
+    expect(response.status).toBe(200);
+    const page = await response.json();
+    seen.push(...page.logs.map((row: { eventId: string }) => row.eventId));
+    cursor = page.nextCursor;
+    expect(page).not.toHaveProperty("total");
+  } while (cursor);
+  expect(seen).toEqual([...ids].reverse());
+  expect(await f.db.query("SELECT * FROM system_stream_outbox")).toEqual([]);
+  expect(await f.db.query("SELECT count(*) AS n FROM records")).toEqual([
+    { n: 5 },
+  ]);
+});
+
+it("owner history enforces the page cap and rejects malformed or foreign cursors", async () => {
+  const { createAccessActivity } =
+    await import("../../../core/src/logging/activity-stream.js");
+  const f = await fixture();
+  const activity = createAccessActivity(f.deps);
+  for (let n = 0; n < 205; n++)
+    await activity.write({
+      logId: crypto.randomUUID(),
+      grantId: "owner",
+      builder: owner,
+      action: "read",
+      scope: "fixture.items",
+      timestamp: "2026-06-01T00:00:00.000Z",
+      ipAddress: "",
+      userAgent: "",
+    });
+  const page = await activity.read({ limit: 1000 });
+  expect(page.limit).toBe(200);
+  expect(page.logs).toHaveLength(200);
+  expect((await activity.read({ cursor: page.nextCursor! })).logs).toHaveLength(
+    5,
+  );
+  await expect(activity.read({ cursor: "bad-cursor" })).rejects.toMatchObject({
+    code: 400,
+  });
+  const foreign = createAccessActivity({
+    ...f.deps,
+    ownerAddress: `0x${"34".repeat(20)}`,
+  });
+  await expect(
+    foreign.read({ cursor: page.nextCursor! }),
+  ).rejects.toMatchObject({ code: 400 });
+});
+
+it("imported expired activity stays invisible and duplicate imports produce one history row", async () => {
+  const { createAccessActivity } =
+    await import("../../../core/src/logging/activity-stream.js");
+  const a = await fixture();
+  const b = await fixture();
+  const shared = { ...b.deps, registry: a.deps.registry, blobs: a.deps.blobs };
+  const producer = createAccessActivity(a.deps);
+  const consumer = createAccessActivity(shared);
+  for (const timestamp of [
+    "2026-04-01T00:00:00.000Z",
+    "2026-06-01T00:00:00.000Z",
+  ])
+    await producer.write({
+      logId: crypto.randomUUID(),
+      grantId: "owner",
+      builder: owner,
+      action: "read",
+      scope: "fixture.items",
+      timestamp,
+      ipAddress: "",
+      userAgent: "",
+    });
+  await producer.drain();
+  await runPublish(a.deps);
+  await runCycle(shared);
+  await runCycle(shared);
+  expect((await consumer.read()).logs).toHaveLength(1);
+  expect(await b.db.query("SELECT * FROM system_stream_outbox")).toEqual([]);
+  await producer.prune();
+  await runPublish(a.deps);
+  await runCycle(shared);
+  expect((await consumer.read()).logs).toHaveLength(1);
+  expect(await b.db.query("SELECT count(*) AS n FROM records")).toEqual([
+    { n: 1 },
+  ]);
+});
+
+it("defers durable producer work while another connection owns bootstrap staging", async () => {
+  const f = await fixture();
+  const store = createSystemStreamStore(f.deps, {
+    ...descriptor,
+    timestampField: "occurredAt",
+  });
+  await store.append({
+    eventId: "one",
+    occurredAt: "2026-06-01T00:00:00.000Z",
+  });
+  await f.db.batch([
+    {
+      sql: "INSERT INTO bootstrap_load(id,connection_id,generation,base) VALUES (1,'pdpp.fixture~',1,0)",
+    },
+  ]);
+  expect(await store.drain()).toBe(0);
+  expect(
+    await f.db.query("SELECT count(*) AS n FROM system_stream_outbox"),
+  ).toEqual([{ n: 1 }]);
+  await f.db.batch([{ sql: "DELETE FROM bootstrap_load" }]);
+  await store.drain();
+  expect(await f.db.query("SELECT count(*) AS n FROM records")).toEqual([
+    { n: 1 },
+  ]);
+});
+
+it("quarantines a conflicting event id even when its imported projection is still pending", async () => {
+  const a = await fixture();
+  const b = await fixture();
+  const shared = { ...b.deps, registry: a.deps.registry, blobs: a.deps.blobs };
+  const desc = { ...descriptor, timestampField: "occurredAt" };
+  const first = createSystemStreamStore(a.deps, desc);
+  const second = createSystemStreamStore(shared, desc);
+  const data = { eventId: "one", occurredAt: "2026-06-01T00:00:00.000Z" };
+  await first.append(data);
+  await first.drain();
+  await runPublish(a.deps);
+  await runCycle(shared);
+  await expect(
+    second.append({ ...data, value: "conflicting" }),
+  ).rejects.toThrow("Conflicting system stream record");
+  expect(
+    await b.db.query("SELECT count(*) AS n FROM system_stream_quarantine"),
+  ).toEqual([{ n: 1 }]);
+  expect(await b.db.query("SELECT * FROM system_stream_outbox")).toEqual([]);
+});
+
+it("keeps a first-page upper watermark until the owner refreshes history", async () => {
+  const { createAccessActivity } =
+    await import("../../../core/src/logging/activity-stream.js");
+  const f = await fixture();
+  const activity = createAccessActivity(f.deps);
+  const entry = (logId: string, timestamp: string) => ({
+    logId,
+    timestamp,
+    grantId: "owner",
+    builder: owner,
+    action: "read" as const,
+    scope: "fixture.items",
+  });
+  const earlier = [
+    crypto.randomUUID(),
+    crypto.randomUUID(),
+    crypto.randomUUID(),
+  ];
+  for (const id of earlier)
+    await activity.write(entry(id, "2026-06-01T00:00:00.000Z"));
+  const first = await activity.read({ limit: 2 });
+  const later = crypto.randomUUID();
+  await activity.write(entry(later, "2026-06-01T00:00:01.000Z"));
+  const next = await activity.read({ limit: 2, cursor: first.nextCursor! });
+  expect(next.logs).toHaveLength(1);
+  expect([...first.logs, ...next.logs].map((row) => row.logId).sort()).toEqual(
+    [...earlier].sort(),
+  );
+  expect((await activity.read({ limit: 2 })).logs[0]!.logId).toBe(later);
+});
+
+it("concurrent producer handles dedupe identical retries and quarantine conflicting ids", async () => {
+  const f = await fixture();
+  const desc = { ...descriptor, timestampField: "occurredAt" };
+  const a = createSystemStreamStore(f.deps, desc);
+  const b = createSystemStreamStore(f.deps, desc);
+  const data = { eventId: "one", occurredAt: "2026-06-01T00:00:00.000Z" };
+  await Promise.all([a.append(data), b.append(data)]);
+  const results = await Promise.allSettled([
+    a.append({ ...data, eventId: "two" }),
+    b.append({ ...data, eventId: "two", value: "conflict" }),
+  ]);
+  expect(results.map((r) => r.status).sort()).toEqual([
+    "fulfilled",
+    "rejected",
+  ]);
+  expect(
+    await f.db.query("SELECT count(*) AS n FROM system_stream_outbox"),
+  ).toEqual([{ n: 2 }]);
+  expect(
+    await f.db.query("SELECT count(*) AS n FROM system_stream_quarantine"),
+  ).toEqual([{ n: 1 }]);
+});
+
+it("a served read can commit its outbox event while drain waits for canonical sync admission", async () => {
+  const f = await fixture();
+  const desc = { ...descriptor, timestampField: "occurredAt" };
+  let intercept = true;
+  const queue: LocalSyncDeps["queue"] = {
+    async run(id, kind, work) {
+      if (intercept && kind === "end") {
+        intercept = false;
+        // Another served read arrives while the sync admission slot is unavailable.
+        await store.append({
+          eventId: "two",
+          occurredAt: "2026-06-01T00:00:00.000Z",
+        });
+        throw new Error("sync admission unavailable");
+      }
+      return f.deps.queue.run(id, kind, work);
+    },
+  };
+  const store = createSystemStreamStore({ ...f.deps, queue }, desc);
+  await store.append({
+    eventId: "one",
+    occurredAt: "2026-06-01T00:00:00.000Z",
+  });
+  await expect(store.drain()).rejects.toThrow("sync admission unavailable");
+  expect(
+    await f.db.query("SELECT count(*) AS n FROM system_stream_outbox"),
+  ).toEqual([{ n: 2 }]);
+  await store.drain();
+  expect(await f.db.query("SELECT count(*) AS n FROM records")).toEqual([
+    { n: 2 },
+  ]);
+});
+
+it("projects reserved events installed by the bootstrap table swap without re-emitting them", async () => {
+  const { createAccessActivity } =
+    await import("../../../core/src/logging/activity-stream.js");
+  const a = await fixture();
+  const b = await fixture();
+  const producer = createAccessActivity(a.deps);
+  const eventId = crypto.randomUUID();
+  await producer.write({
+    logId: eventId,
+    grantId: "owner",
+    builder: owner,
+    action: "read",
+    scope: "fixture.items",
+    timestamp: "2026-06-01T00:00:00.000Z",
+  });
+  await producer.drain();
+  await runPublish(a.deps);
+  const shared = {
+    ...b.deps,
+    registry: a.deps.registry,
+    blobs: a.deps.blobs,
+    bootstrapFirstLoad: true,
+    progressiveFirstLoad: true,
+    keyedFirstLoad: false,
+  };
+  const batch = b.db.batch.bind(b.db);
+  let swapped = false;
+  vi.spyOn(b.db, "batch").mockImplementation((statements) => {
+    if (statements.some((s) => s.sql === "DROP TABLE records")) swapped = true;
+    return batch(statements);
+  });
+  const report = await runCycle(shared);
+  expect(report.connections.every((c) => c.error === null)).toBe(true);
+  expect(swapped).toBe(true);
+  expect(
+    (await createAccessActivity(shared).read()).logs.map((row) => row.logId),
+  ).toEqual([eventId]);
+  expect(await b.db.query("SELECT * FROM system_stream_outbox")).toEqual([]);
+});
+
+it("keeps private access activity out of ordinary imported-data additions", async () => {
+  const { createAccessActivity } =
+    await import("../../../core/src/logging/activity-stream.js");
+  const { createLocalHistory } =
+    await import("../../../core/src/localdb/history.js");
+  const f = await fixture();
+  const activity = createAccessActivity(f.deps);
+  await activity.write({
+    logId: crypto.randomUUID(),
+    grantId: "owner",
+    builder: owner,
+    action: "read",
+    scope: "fixture.items",
+    timestamp: "2026-06-01T00:00:00.000Z",
+  });
+  await activity.drain();
+  await runPublish(f.deps);
+  expect(
+    (
+      await createLocalHistory(f.deps, {}).additions({
+        timezone: "UTC",
+        days: 7,
+      })
+    ).total,
+  ).toBe(0);
+  expect((await activity.read()).logs).toHaveLength(1);
+});

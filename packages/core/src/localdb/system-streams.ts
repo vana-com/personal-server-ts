@@ -3,7 +3,7 @@ import {
   type JsonObject,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
-import type { SqlStatement } from "./driver.js";
+import type { SqlDriver, SqlStatement } from "./driver.js";
 import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
 import { createRunIntakeStore } from "./run-intake.js";
 import { createRunEndStore } from "./run-end.js";
@@ -11,6 +11,9 @@ import {
   systemStreamIdentity,
   type SystemStreamDescriptor,
 } from "./system-stream-descriptor.js";
+
+type ProducerLane = { local: Promise<unknown>; maintenance: Promise<unknown> };
+const producerLanes = new WeakMap<SqlDriver, Map<string, ProducerLane>>();
 
 /** A durable local producer. Only canonical intake writes replicated records. */
 export function createSystemStreamStore(
@@ -29,10 +32,23 @@ export function createSystemStreamStore(
     descriptor,
   );
   const end = createRunEndStore({ ...deps, publishWhileCollecting: true });
-  let tail: Promise<unknown> = Promise.resolve();
-  function serial<T>(work: () => Promise<T>): Promise<T> {
-    const result = tail.catch(() => {}).then(work);
-    tail = result;
+  let lanes = producerLanes.get(db);
+  if (!lanes) producerLanes.set(db, (lanes = new Map()));
+  const laneKey = JSON.stringify([identity.connectionId, descriptor.stream]);
+  let lane = lanes.get(laneKey);
+  if (!lane)
+    lanes.set(
+      laneKey,
+      (lane = { local: Promise.resolve(), maintenance: Promise.resolve() }),
+    );
+  // All handles share local mutation order. Canonical drain may wait for the
+  // sync queue or registry; it must never hold up append's durable local commit.
+  function serial<T>(
+    kind: keyof ProducerLane,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    const result = lane![kind].catch(() => {}).then(work);
+    lane![kind] = result;
     return result;
   }
   function encode(data: JsonObject) {
@@ -84,10 +100,16 @@ export function createSystemStreamStore(
           row.record_id,
         ];
         if (row.body === null) {
-          statements.push({
-            sql: "DELETE FROM system_stream_projection WHERE connection_id=? AND stream=? AND record_id=?",
-            params,
-          });
+          statements.push(
+            {
+              sql: "DELETE FROM system_stream_projection WHERE connection_id=? AND stream=? AND record_id=?",
+              params,
+            },
+            {
+              sql: "DELETE FROM system_stream_outbox WHERE connection_id=? AND stream=? AND record_id=?",
+              params,
+            },
+          );
           continue;
         }
         let encoded: ReturnType<typeof encode>;
@@ -139,7 +161,7 @@ export function createSystemStreamStore(
     }
   }
   return {
-    project: () => serial(project),
+    project: () => serial("local", project),
     descriptor,
     identity,
     async instanceId(): Promise<string> {
@@ -156,7 +178,8 @@ export function createSystemStreamStore(
       )[0]!.instance_id;
     },
     append(data: JsonObject): Promise<void> {
-      return serial(async () => {
+      return serial("local", async () => {
+        await project();
         const { body, sortAt, id } = encode(data);
         const params = [identity.connectionId, descriptor.stream, id];
         const old = await db.query<{ body: string }>(
@@ -177,21 +200,43 @@ export function createSystemStreamStore(
         }
         await db.batch([
           {
-            sql: "INSERT INTO system_stream_outbox VALUES (?,?,?,?,?,?,?)",
-            params: [...params, body, sortAt, deps.newOp(), deps.now()],
+            sql: "INSERT OR IGNORE INTO system_stream_outbox SELECT ?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM system_stream_projection WHERE connection_id=? AND stream=? AND record_id=?)",
+            params: [
+              ...params,
+              body,
+              sortAt,
+              deps.newOp(),
+              deps.now(),
+              ...params,
+            ],
           },
           {
-            sql: "INSERT INTO system_stream_projection VALUES (?,?,?,?,?)",
+            sql: "INSERT OR IGNORE INTO system_stream_projection VALUES (?,?,?,?,?)",
             params: [...params, sortAt, body],
           },
         ]);
+        const [stored] = await db.query<{ body: string }>(
+          "SELECT body FROM system_stream_projection WHERE connection_id=? AND stream=? AND record_id=?",
+          params,
+        );
+        if (stored?.body !== body) {
+          await db.batch([
+            {
+              sql: "INSERT OR IGNORE INTO system_stream_quarantine VALUES (?,?,?,?)",
+              params: [...params, body],
+            },
+          ]);
+          throw new Error("Conflicting system stream record");
+        }
         announceRecordsCommitted(deps);
       });
     },
     /** Bounded canonical retention, shared by all server-owned consumers. */
     removeBefore(cutoff: string): Promise<number> {
-      return serial(async () => {
-        await project();
+      return serial("maintenance", async () => {
+        if ((await db.query("SELECT 1 FROM bootstrap_load LIMIT 1")).length)
+          return 0;
+        await serial("local", project);
         const rows = await db.query<{ record_id: string; body: string }>(
           `SELECT p.record_id,p.body FROM system_stream_projection p
            JOIN records r ON r.connection_id=p.connection_id AND r.stream=p.stream AND r.record_key=p.record_id
@@ -226,18 +271,21 @@ export function createSystemStreamStore(
           finish: "completed",
           lastBatch: 0,
           checkpoints: {},
-          streams: {
-            [descriptor.stream]: {
-              liveRecord: false,
-              explicitDelete: true,
-              retryableSkip: false,
-              otherSkip: false,
-              preflightExclusion: false,
-              detailGap: "none",
-              invalidDetailCoverage: false,
-              failedInDone: false,
-            },
-          },
+          streams: Object.fromEntries([
+            [
+              descriptor.stream,
+              {
+                liveRecord: false,
+                explicitDelete: true,
+                retryableSkip: false,
+                otherSkip: false,
+                preflightExclusion: false,
+                detailGap: "none",
+                invalidDetailCoverage: false,
+                failedInDone: false,
+              },
+            ],
+          ]),
         });
         for (const row of rows) {
           const remains = await db.query(
@@ -247,13 +295,18 @@ export function createSystemStreamStore(
           if (remains.length)
             throw new Error("System stream canonical deletion refused");
         }
-        await project();
+        await serial("local", project);
         return rows.length;
       });
     },
     /** Bounded recovery sweep; no network work runs in append. */
     drain(): Promise<number> {
-      return serial(async () => {
+      return serial("maintenance", async () => {
+        // Bootstrap owns canonical writes across network batches. Keep this
+        // outbox durable while the sync cycle finishes that work first.
+        if ((await db.query("SELECT 1 FROM bootstrap_load LIMIT 1")).length)
+          return 0;
+        await serial("local", project);
         const rows = await db.query<{
           record_id: string;
           body: string;
@@ -324,18 +377,21 @@ export function createSystemStreamStore(
               finish: "completed",
               lastBatch: 0,
               checkpoints: {},
-              streams: {
-                [descriptor.stream]: {
-                  liveRecord: true,
-                  explicitDelete: false,
-                  retryableSkip: false,
-                  otherSkip: false,
-                  preflightExclusion: false,
-                  detailGap: "none",
-                  invalidDetailCoverage: false,
-                  failedInDone: false,
-                },
-              },
+              streams: Object.fromEntries([
+                [
+                  descriptor.stream,
+                  {
+                    liveRecord: true,
+                    explicitDelete: false,
+                    retryableSkip: false,
+                    otherSkip: false,
+                    preflightExclusion: false,
+                    detailGap: "none",
+                    invalidDetailCoverage: false,
+                    failedInDone: false,
+                  },
+                ],
+              ]),
             });
           }
           // Accepted/staged is not canonical admission. A fence or profile refusal

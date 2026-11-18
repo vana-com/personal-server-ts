@@ -1,3 +1,5 @@
+import { createSystemStreamPager } from "../localdb/system-stream-page.js";
+import type { AccessLogReader } from "./access-reader.js";
 import type { JsonObject } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { LocalSyncDeps } from "../localdb/deps.js";
 import { createSystemStreamStore } from "../localdb/system-streams.js";
@@ -45,6 +47,14 @@ export const ACCESS_ACTIVITY_DESCRIPTOR = {
       !["read", "write", "delete", "lineage"].includes(String(data.action))
     )
       throw new Error("Invalid access activity event");
+    for (const key of ["eventId", "instanceId"])
+      if (
+        typeof data[key] !== "string" ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+          data[key],
+        )
+      )
+        throw new Error("Invalid access activity identity");
     for (const key of ["eventId", "instanceId", "scope", "grantId", "builder"])
       if (typeof data[key] !== "string" || !data[key] || data[key].length > 512)
         throw new Error("Invalid access activity field");
@@ -54,6 +64,28 @@ export const ACCESS_ACTIVITY_DESCRIPTOR = {
 /** One consumer of the generic reserved-system-stream mechanism. */
 export function createAccessActivity(deps: LocalSyncDeps) {
   const store = createSystemStreamStore(deps, ACCESS_ACTIVITY_DESCRIPTOR);
+  const page = createSystemStreamPager(deps, ACCESS_ACTIVITY_DESCRIPTOR);
+  const reader: AccessLogReader = {
+    async read(options) {
+      await store.project();
+      const result = await page(
+        new Date(deps.now() - ACCESS_ACTIVITY_RETENTION_MS).toISOString(),
+        options,
+      );
+      const { bodies, ...paging } = result;
+      return {
+        ...paging,
+        logs: bodies.map((body) => {
+          const event = JSON.parse(body) as AccessActivityEvent;
+          return {
+            ...event,
+            logId: event.eventId,
+            timestamp: event.occurredAt,
+          };
+        }),
+      };
+    },
+  };
   const writer: AccessLogWriter = {
     async write(entry) {
       if (isReservedSystemScope(entry.scope)) return;
@@ -72,6 +104,7 @@ export function createAccessActivity(deps: LocalSyncDeps) {
   };
   return {
     ...writer,
+    ...reader,
     drain: store.drain,
     project: store.project,
     prune: () =>

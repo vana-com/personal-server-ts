@@ -966,6 +966,14 @@ export function createPsLiteRuntime(
     accessLogWriter ??= accessLogStore;
   }
   if (options.localSync) {
+    const legacyReader = accessLogReader;
+    accessLogReader = {
+      read: async (page) => {
+        if (accountStorageMode.read() === "switched")
+          return (await options.localSync!()).accessActivity.read(page);
+        return legacyReader!.read(page);
+      },
+    };
     const fallback = accessLogWriter;
     accessLogWriter = {
       write: async (entry) => {

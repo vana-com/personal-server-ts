@@ -4119,6 +4119,7 @@ export async function handlePersonalServerAccessLogsRequest(
     return contractResponse(
       await listAccessLogsContract({
         accessLogReader: deps.accessLogReader,
+        cursor: url.searchParams.get("cursor"),
         limit: url.searchParams.get("limit"),
         offset: url.searchParams.get("offset"),
       }),

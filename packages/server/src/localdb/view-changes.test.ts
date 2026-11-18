@@ -42,6 +42,20 @@ const STREAMS = ["s0", "s1"];
 const OTHER_NS = "ffffffffffffffff";
 // These fixtures restore an older on-disk schema before testing migrations.
 const dropBootstrapSchema = [
+  // A fixture restored to an old version must remove later system-stream
+  // schema too; the forward migration still creates each object exactly once.
+  ...["insert", "update", "delete"].map((event) => ({
+    sql: `DROP TRIGGER system_stream_records_${event}`,
+  })),
+  { sql: "DROP TRIGGER system_stream_outbox_capacity" },
+  ...[
+    "instance",
+    "outbox",
+    "projection",
+    "checkpoint",
+    "quarantine",
+    "changes",
+  ].map((table) => ({ sql: `DROP TABLE system_stream_${table}` })),
   ...["insert", "update", "delete"].map((event) => ({
     sql: `DROP TRIGGER records_bootstrap_${event}`,
   })),

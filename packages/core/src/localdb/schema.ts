@@ -626,9 +626,14 @@ END`,
     // inbox is committed with each canonical change and consumed atomically.
     `CREATE TABLE system_stream_changes(seq INTEGER PRIMARY KEY AUTOINCREMENT,connection_id TEXT NOT NULL,stream TEXT NOT NULL,record_id TEXT NOT NULL,body TEXT)`,
     `CREATE INDEX system_stream_changes_by_stream ON system_stream_changes(connection_id,stream,seq)`,
-    `CREATE TRIGGER system_stream_changes_ai AFTER INSERT ON record_changes
-      WHEN NEW.connection_id GLOB 'pdpp.vana-system-*~*'
-      BEGIN INSERT INTO system_stream_changes(connection_id,stream,record_id,body)
-      VALUES (NEW.connection_id,NEW.stream,NEW.record_key,(SELECT body FROM records WHERE connection_id=NEW.connection_id AND stream=NEW.stream AND pk_hash=NEW.pk_hash)); END`,
+    // Table-local triggers survive the bootstrap table swap through its schema
+    // capture. An external trigger referencing records would refuse that swap.
+    ...["INSERT", "UPDATE", "DELETE"].map((event) => {
+      const row = event === "DELETE" ? "OLD" : "NEW";
+      return `CREATE TRIGGER system_stream_records_${event.toLowerCase()} AFTER ${event === "UPDATE" ? "UPDATE OF stamp_o,stamp_r,body_sha256" : event} ON records
+        WHEN ${row}.connection_id GLOB 'pdpp.vana-system-*~*'
+        BEGIN INSERT INTO system_stream_changes(connection_id,stream,record_id,body)
+        VALUES (${row}.connection_id,${row}.stream,${row}.record_key,${event === "DELETE" ? "NULL" : "NEW.body"}); END`;
+    }),
   ],
 ];

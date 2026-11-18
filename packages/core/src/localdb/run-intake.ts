@@ -201,7 +201,8 @@ export function createRunIntakeStore(
         )
           throw invalid("invalid connector key");
         if (
-          isReservedSystemConnector(req.connector) &&
+          (isReservedSystemConnector(req.connector) ||
+            systemStream !== undefined) &&
           (!systemStream ||
             req.connector !== systemStream.connector ||
             JSON.stringify(declarations) !==

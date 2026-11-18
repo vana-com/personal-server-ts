@@ -1365,7 +1365,14 @@ async function bootstrapServer(
       else await legacyAccessLogWriter.write(entry);
     },
   };
-  const accessLogReader = createAccessLogReader(logsDir);
+  const legacyAccessLogReader = createAccessLogReader(logsDir);
+  const accessLogReader: AccessLogReader = {
+    async read(page) {
+      if (localSyncSource && accountStorageMode.read() === "switched")
+        return (await localSyncSource()).accessActivity.read(page);
+      return legacyAccessLogReader.read(page);
+    },
+  };
 
   // Generate ephemeral dev token when devUi is enabled
   const devToken =
