@@ -164,7 +164,15 @@ describe("a switched device owes storage deletes whose tombstone is not final", 
     // Only the version row changes: no position moves, no wake is sent.
     t.setFinality(FINAL);
     t.tombstoneFinality.tombstoneState.mockClear();
-    await vi.advanceTimersByTimeAsync(60_000);
+    t.cycle.mockClear();
+    t.read.mockClear();
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(t.tombstoneFinality.tombstoneState).not.toHaveBeenCalled();
+    expect(t.deleteData.deleteBlobVersions).not.toHaveBeenCalled();
+    expect(await t.store.list()).toEqual([MARKER]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(t.cycle).not.toHaveBeenCalled();
+    expect(t.read).not.toHaveBeenCalled();
     expect(t.tombstoneFinality.tombstoneState).toHaveBeenCalledTimes(1);
     expect(t.deleteData.deleteBlobVersions).toHaveBeenCalledTimes(1);
     expect(t.deleteData.deleteBlobVersions).toHaveBeenCalledWith(
@@ -186,6 +194,8 @@ describe("a switched device owes storage deletes whose tombstone is not final", 
     expect(t.cycle).not.toHaveBeenCalled();
     expect(t.read).not.toHaveBeenCalled();
     expect(t.tombstoneFinality.tombstoneState).not.toHaveBeenCalled();
+    expect(t.deleteData.deleteBlobVersions).toHaveBeenCalledTimes(1);
+    expect(await t.store.list()).toEqual([]);
     await t.manager.stop();
   });
 
@@ -196,9 +206,17 @@ describe("a switched device owes storage deletes whose tombstone is not final", 
     await t.start();
     t.cycle.mockClear();
     t.tombstoneFinality.tombstoneState.mockClear();
-    await vi.advanceTimersByTimeAsync(3 * 60_000);
-    expect(t.cycle).not.toHaveBeenCalled();
-    expect(t.tombstoneFinality.tombstoneState).toHaveBeenCalledTimes(3);
+    t.read.mockClear();
+    for (let i = 1; i <= 3; i++) {
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(t.tombstoneFinality.tombstoneState).toHaveBeenCalledTimes(i - 1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(t.tombstoneFinality.tombstoneState).toHaveBeenCalledTimes(i);
+      expect(t.cycle).not.toHaveBeenCalled();
+      expect(t.read).not.toHaveBeenCalled();
+      expect(t.deleteData.deleteBlobVersions).not.toHaveBeenCalled();
+      expect(await t.store.list()).toEqual([MARKER]);
+    }
     await t.manager.stop();
   });
 
@@ -374,11 +392,16 @@ describe("a switched device owes storage deletes whose tombstone is not final", 
       });
 
       // Parked debt is not runnable work: the device goes quiet.
+      t.read.mockClear();
       t.cycle.mockClear();
       t.tombstoneFinality.tombstoneState.mockClear();
       await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
       expect(t.cycle).not.toHaveBeenCalled();
       expect(t.tombstoneFinality.tombstoneState).not.toHaveBeenCalled();
+      expect(t.read).not.toHaveBeenCalled();
+      expect(t.deleteData.deleteBlobVersions).not.toHaveBeenCalled();
+      expect(t.deleteData.tombstone).not.toHaveBeenCalled();
+      expect(await t.store.list()).toEqual([MARKER]);
       await t.manager.stop();
     });
 
