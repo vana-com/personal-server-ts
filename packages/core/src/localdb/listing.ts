@@ -125,7 +125,10 @@ export function createLocalListing(
   const reads = { db: readerOf(deps.db) };
   const connections = () =>
     reads.db.query<Connection>(
-      "SELECT connection_id, connector, ns, generation, control_state FROM connections ORDER BY connector, ns, connection_id",
+      `SELECT connection_id, connector, ns, generation,
+       CASE WHEN EXISTS (SELECT 1 FROM delete_intents d WHERE d.connector = connections.connector)
+         THEN 'deleted' ELSE control_state END AS control_state
+       FROM connections ORDER BY connector, ns, connection_id`,
     );
 
   /**
@@ -135,7 +138,10 @@ export function createLocalListing(
    */
   async function readSnapshot(progressive: boolean): Promise<readonly Entry[]> {
     const rows = await reads.db.query<SelectionConnection>(
-      "SELECT connection_id, connector, ns, generation, control_state, deleted_at FROM connections ORDER BY connector, ns, connection_id",
+      `SELECT connection_id, connector, ns, generation,
+       CASE WHEN EXISTS (SELECT 1 FROM delete_intents d WHERE d.connector = connections.connector)
+         THEN 'deleted' ELSE control_state END AS control_state, deleted_at
+       FROM connections ORDER BY connector, ns, connection_id`,
     );
     const streams = await loadStreams(reads);
     const stamps = await reads.db.query<{
