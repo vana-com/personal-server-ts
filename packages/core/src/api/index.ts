@@ -1549,12 +1549,28 @@ export async function handleX402Cycle(
   if (verify.payment.payload.accessRecord) {
     body["accessRecord"] = verify.payment.payload.accessRecord;
   }
+  // Own the final cancellation gate here, after every asynchronous read,
+  // projection and signature check and immediately before sending payment.
+  if (input.request.signal.aborted) {
+    return {
+      kind: "gateway-error",
+      status: 503,
+      body: {
+        error: {
+          code: 503,
+          errorCode: "READ_ABORTED",
+          message: "This read ended before payment",
+        },
+      },
+    };
+  }
   let gatewayRes: Response;
   try {
     gatewayRes = await doFetch(
       `${gatewayUrl.replace(/\/+$/, "")}/v1/escrow/pay`,
       {
         method: "POST",
+        signal: input.request.signal,
         headers: {
           "Content-Type": "application/json",
           Authorization: `Web3Signed ${verify.payment.payload.signature}`,

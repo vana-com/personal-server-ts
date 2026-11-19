@@ -383,7 +383,7 @@ export function createLocalResolver(
           installed.map((s) => s.stream),
         )
       : null;
-    if (input.requireRegistered && (position === null || input.signal?.aborted))
+    if (input.requireRegistered && position === null)
       return { kind: "read_not_registered" };
 
     let payload: AsyncIterable<string>;
@@ -471,7 +471,7 @@ export function createLocalResolver(
       let sawConnection = false;
       let sawActive = false;
       let applyUnavailable = false;
-      let sawUnregistered = false;
+      const initial: Candidate[] = [];
       for (const target of targets) {
         // Apply sees the persisted state so it can mark pending deletes before
         // selection hides them. Selection below still uses effective control.
@@ -484,40 +484,18 @@ export function createLocalResolver(
           [target.connector],
         );
         const refused = new Set<string>();
-        const refusedPublication = new Set<string>();
         // applyConnection is the single-flight boundary and verifies keys before
         // installing rows. No rejected/foreign head is eligible for a DB read.
         for (const c of beforeApply) {
           if (
-            (c.control_state === "active" ||
-              (input.requireRegistered && c.control_state === "absent")) &&
+            c.control_state === "active" &&
             c.deleted_at === null &&
             (input.connection === null || input.connection === c.ns)
           ) {
             try {
               if (c.pending_delete)
                 await applyConnection(deps, c.connection_id);
-              else if (c.control_state === "active")
-                await applyFor(c, target, progressive);
-              if (input.requireRegistered) {
-                const installed = await streams(c.connection_id);
-                const contributing = servedStreams(
-                  target,
-                  installed.filter((s) => target.streams.includes(s.stream)),
-                  c,
-                ).streams;
-                if (
-                  contributing.length > 0 &&
-                  !tombstonedForTarget(target, c, installed, false) &&
-                  !(await ensureRegisteredRead(
-                    deps,
-                    c.connection_id,
-                    contributing.map((s) => s.stream),
-                    input.signal,
-                  ))
-                )
-                  refusedPublication.add(c.connection_id);
-              }
+              else await applyFor(c, target, progressive);
             } catch (error) {
               if (!(error instanceof RegistryUnavailableBeforeWriteError))
                 throw error;
@@ -525,7 +503,6 @@ export function createLocalResolver(
             }
           }
         }
-        sawUnregistered ||= refusedPublication.size > 0;
         let rows = await connections(target.connector);
         if (input.connection !== null)
           rows = rows.filter((c) => c.ns === input.connection);
@@ -540,21 +517,31 @@ export function createLocalResolver(
         const loaded: { connection: Connection; streams: Stream[] }[] = [];
         for (const connection of rows) {
           if (
-            connection.control_state !== "active" ||
-            connection.deleted_at !== null
+            connection.deleted_at !== null ||
+            (connection.control_state !== "active" &&
+              !(
+                input.requireRegistered && connection.control_state === "absent"
+              ))
           )
             continue;
-          loaded.push({
-            connection,
-            streams: await streams(connection.connection_id),
-          });
+          const available = await streams(connection.connection_id);
+          if (connection.control_state === "active")
+            loaded.push({ connection, streams: available });
+          if (input.requireRegistered) {
+            const pending = servedStreams(
+              target,
+              available.filter((s) => target.streams.includes(s.stream)),
+              connection,
+            );
+            if (!pending.missingRequired && pending.streams.length > 0)
+              initial.push({
+                target,
+                connection,
+                streams: pending.streams,
+                registered: -Infinity,
+              });
+          }
         }
-        if (
-          loaded.some(({ connection }) =>
-            refusedPublication.has(connection.connection_id),
-          )
-        )
-          return { kind: "read_not_registered" };
         const picked = selectForTarget(target, loaded, { progressive });
         if (picked.kind === "invalid_binding") return picked;
         if (picked.tombstoned) sawTombstoned = true;
@@ -570,7 +557,18 @@ export function createLocalResolver(
           applyUnavailable = true;
         if (picked.candidate) candidates.push(picked.candidate);
       }
-      const chosen = chooseCandidate(candidates);
+      const ranked = chooseCandidate(candidates);
+      // First publication has no readable head to rank yet. Bootstrap only
+      // an unambiguous connection after ordinary selection found no body.
+      // A readable winner always keeps its existing rank and identity.
+      const chosen =
+        ranked ??
+        (!sawTombstoned &&
+        !sawDeleted &&
+        !applyUnavailable &&
+        initial.length === 1
+          ? initial[0]
+          : undefined);
       if (!chosen) {
         if (applyUnavailable)
           return input.requireRegistered
@@ -579,13 +577,22 @@ export function createLocalResolver(
         if (sawTombstoned) return deleted();
         if (sawDeleted) return deleted();
         if (sawForeign && !sawActive) return { kind: "key_mismatch" };
-        if (sawUnregistered) return { kind: "read_not_registered" };
         if (input.cursor !== null) return { kind: "cursor_stale" };
         if (input.connection !== null && !sawConnection) {
           return { kind: "unavailable", reason: "connection_not_found" };
         }
         return noData();
       }
+      if (
+        input.requireRegistered &&
+        !(await ensureRegisteredRead(
+          deps,
+          chosen.connection.connection_id,
+          chosen.streams.map((s) => s.stream),
+          input.signal,
+        ))
+      )
+        return { kind: "read_not_registered" };
       if (chosen.partialStreams?.length) {
         const partial = await buildPartial({ ...input, scope }, chosen);
         if (partial) return partial;
