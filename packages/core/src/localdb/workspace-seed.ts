@@ -1,8 +1,13 @@
+import { workspaceAttempt } from "./workspace-failure.js";
 import type { LogEntry } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { SqlDriver } from "./driver.js";
 import type { WorkspaceBinding } from "./workspace-capability.js";
 import { workspaceAssert, workspaceGuard } from "./workspace.js";
-import { recordKeyOfKey } from "./log-batch.js";
+import {
+  recordKeyOfKey,
+  EXPLICIT_DELETE_RANK,
+  OMISSION_RANK,
+} from "./log-batch.js";
 import { writeLogState, type LogState } from "./log-state.js";
 
 /** Scalar seed relation: final promotion never parses bodies or builds N statements. */
@@ -16,31 +21,37 @@ export async function stageWorkspaceSeed(
 ) {
   const key =
     entry.kind === "upsert" ? null : recordKeyOfKey(primaryKey, entry.key);
-  await db.batch([
-    ...workspaceGuard(b),
-    {
-      sql: "INSERT OR IGNORE INTO workspace_seed(operation,stream,pk_hash,record_key) VALUES(?,?,?,?)",
-      params: [b.operation, entry.stream, entry.pkHash, key ?? ""],
-    },
-    entry.kind === "upsert"
-      ? {
-          sql: "UPDATE workspace_seed SET has_upsert=1 WHERE operation=? AND stream=? AND pk_hash=?",
-          params: [b.operation, entry.stream, entry.pkHash],
-        }
-      : {
-          sql: "UPDATE workspace_seed SET record_key=?,stamp_o=?,stamp_r=?,rank=?,pk_values=? WHERE operation=? AND stream=? AND pk_hash=?",
-          params: [
-            key,
-            entry.stamp.o,
-            entry.stamp.r,
-            entry.kind === "delete" ? 2 : 0,
-            JSON.stringify(entry.key),
-            b.operation,
-            entry.stream,
-            entry.pkHash,
-          ],
-        },
-  ]);
+  await workspaceAttempt(
+    db,
+    b,
+    JSON.stringify([entry.stream, entry.pkHash]),
+    "stage-seed",
+    [
+      ...workspaceGuard(b),
+      {
+        sql: "INSERT OR IGNORE INTO workspace_seed(operation,stream,pk_hash,record_key) VALUES(?,?,?,?)",
+        params: [b.operation, entry.stream, entry.pkHash, key ?? ""],
+      },
+      entry.kind === "upsert"
+        ? {
+            sql: "UPDATE workspace_seed SET has_upsert=1 WHERE operation=? AND stream=? AND pk_hash=?",
+            params: [b.operation, entry.stream, entry.pkHash],
+          }
+        : {
+            sql: "UPDATE workspace_seed SET record_key=?,stamp_o=?,stamp_r=?,rank=?,pk_values=? WHERE operation=? AND stream=? AND pk_hash=?",
+            params: [
+              key,
+              entry.stamp.o,
+              entry.stamp.r,
+              entry.kind === "delete" ? EXPLICIT_DELETE_RANK : OMISSION_RANK,
+              JSON.stringify(entry.key),
+              b.operation,
+              entry.stream,
+              entry.pkHash,
+            ],
+          },
+    ],
+  );
 }
 
 export async function promoteWorkspaceSeed(
@@ -51,7 +62,7 @@ export async function promoteWorkspaceSeed(
   controlVersion: number,
 ) {
   const pending = `NOT EXISTS(SELECT 1 FROM record_changes c WHERE c.connection_id=? AND c.stream=s.stream AND c.pk_hash=s.pk_hash AND c.seq>COALESCE((SELECT publish_watermark FROM stream_state WHERE connection_id=? AND stream=s.stream),0))`;
-  await db.batch([
+  await workspaceAttempt(db, b, "seed", "promote-seed", [
     ...workspaceGuard(b),
     workspaceAssert(
       "EXISTS(SELECT 1 FROM connections WHERE connection_id=? AND control_version=?)",
@@ -89,7 +100,7 @@ export async function promoteWorkspaceSeed(
     },
     {
       sql: `INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin,explicit_delete,pk_values)
-      SELECT ?,s.stream,s.pk_hash,s.record_key,'remove',s.stamp_o,s.stamp_r,'import',CASE WHEN s.rank=2 THEN 1 ELSE 0 END,s.pk_values FROM workspace_seed s
+      SELECT ?,s.stream,s.pk_hash,s.record_key,'remove',s.stamp_o,s.stamp_r,'import',CASE WHEN s.rank=${EXPLICIT_DELETE_RANK} THEN 1 ELSE 0 END,s.pk_values FROM workspace_seed s
       WHERE s.operation=? AND s.rank IS NOT NULL AND NOT EXISTS(SELECT 1 FROM records r WHERE r.connection_id=? AND r.stream=s.stream AND r.pk_hash=s.pk_hash) AND ${pending}`,
       params: [
         b.connection,

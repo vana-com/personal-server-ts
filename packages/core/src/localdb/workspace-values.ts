@@ -13,7 +13,6 @@ import type {
 } from "./workspace-capability.js";
 import {
   bindingIdentity,
-  checkLease,
   ownLease,
   runtimeAdmission,
   workspaceGuard,
@@ -110,6 +109,7 @@ export function createSqlWorkspaceValues(
   });
   const store: BoundedValueStore = {
     version: 1,
+    supportsBorrowedSeal: true,
     frameCapacityBytes,
     admission: runtimeAdmission,
     begin(b, bytes, digest, encoding) {
@@ -217,7 +217,11 @@ export function createSqlWorkspaceValues(
               t.binding.operation,
               chunkCapacity * 6 + 2048,
             ));
-          checkLease(lease, t.binding.operation, chunkCapacity * 6 + 2048);
+          const releaseUnit = ownLease(
+            lease,
+            t.binding.operation,
+            chunkCapacity * 6 + 2048,
+          );
           try {
             const hash = sha256.create(),
               decoder =
@@ -247,6 +251,7 @@ export function createSqlWorkspaceValues(
             ]);
             return sealed(t.binding, v);
           } finally {
+            releaseUnit();
             if (!borrowedLease) await lease.release();
           }
         }),

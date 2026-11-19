@@ -87,6 +87,9 @@ export interface WorkspaceFailure {
 
 export interface BoundedValueStore {
   readonly version: 1;
+  /** Explicit opt-in: seal(token, lease) verifies under the caller's existing
+   * lease and rejects while another unit owns it. Older version-1 stores omit it. */
+  readonly supportsBorrowedSeal?: true;
   /** Includes escaping/base64/envelope; only one frame may be in flight. */
   readonly frameCapacityBytes: number;
   readonly admission: ByteAdmission;

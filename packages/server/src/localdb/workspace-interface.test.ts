@@ -44,6 +44,7 @@ it("typed units validate sealed references and revoke staging aliases after rece
   };
   const ws = await openLogWorkspace(db, b),
     values = db.boundedValues!;
+  expect(values.supportsBorrowedSeal).toBe(true);
   const bytes = Buffer.from("body"),
     writer = await values.begin(
       b,
@@ -85,6 +86,39 @@ it("typed units validate sealed references and revoke staging aliases after rece
     unit.stage("outputs", { objectKey: "o", value: body }),
   ).rejects.toThrow("receipted");
   expect((await ws.unit("u", "digest", 0)).state).toBe("receipted");
+  const streams = ["z", "a\n", "a", 'a"', "a\\", "é", "😀", "a\u0000", "aa"];
+  const order = await ws.unit("order", "order-digest", 1);
+  if (order.state !== "staging") throw new Error("expected staging");
+  for (const stream of streams)
+    await order.stage("streams", { stream, metadata: body });
+  await order.commit();
+  const cursor = ws.cursor("streams"),
+    cursorLease = await runtimeAdmission.acquire("op", 2 * 1024 * 1024),
+    seen = [];
+  const pendingWriter = await values.begin(
+    b,
+    bytes.length,
+    createHash("sha256").update(bytes).digest("hex"),
+    "utf8",
+  );
+  await values.append(pendingWriter, 0, bytes, cursorLease);
+  try {
+    for (;;) {
+      const next = await cursor.next(cursorLease);
+      if (!next) break;
+      if (seen.length === 0)
+        await expect(values.seal(pendingWriter, cursorLease)).rejects.toThrow(
+          "workspace_unit_owned",
+        );
+      seen.push(next.value.row.stream);
+      await next.release();
+      if (seen.length === 1) await values.seal(pendingWriter, cursorLease);
+    }
+  } finally {
+    await cursor.close();
+    await cursorLease.release();
+  }
+  expect(seen).toEqual([...streams].sort());
   await setWorkspaceAuthority(db, { ...b, keyCheck: "other" });
   await expect(ws.unit("u", "digest", 0)).rejects.toThrow();
   await setWorkspaceAuthority(db, b);
@@ -213,4 +247,101 @@ it("seed promotion reads current local rows and atomically validates the origina
       pk_values: null,
     },
   ]);
+});
+
+it("set-based history seed preserves pending changes, delete kinds and current-row selection exactly", async () => {
+  const { seedFromHistory } = await import("./history-seed.test-utils.js");
+  const { writeLogState } =
+    await import("../../../core/src/localdb/log-state.js");
+  const dir = await mkdtemp(join(tmpdir(), "workspace-seed-oracle-"));
+  cleanup.push(() => rm(dir, { recursive: true, force: true }));
+  const db = openBetterSqlite3(join(dir, "db"));
+  cleanup.push(() => db.close());
+  await migrate(db);
+  await db.batch([
+    {
+      sql: "INSERT INTO db_meta(id,owner,network,device_id,created_at) VALUES(1,'o','test','d',0)",
+    },
+  ]);
+  const old = { position: 2, base: 0, refs: [], snapshot: null },
+    target = { ...old, position: 0 };
+  for (const connection of ["c", "reference"]) {
+    await db.batch([
+      {
+        sql: "INSERT INTO connections(connection_id,connector,ns,control_state) VALUES(?,'test','','active')",
+        params: [connection],
+      },
+      writeLogState(connection, old),
+      ...["live", "resurrected", "only-delete", "pending"].map((pk) => ({
+        sql: "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES(?,'s',?,?,9,'local','{}','hash')",
+        params: [connection, pk, pk],
+      })),
+      {
+        sql: "DELETE FROM record_changes WHERE connection_id=?",
+        params: [connection],
+      },
+      {
+        sql: "INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin) VALUES(?,'s','pending','pending','upsert',10,'pending','local')",
+        params: [connection],
+      },
+    ]);
+  }
+  const stamp = { o: 1, r: "history" };
+  const up = (pkHash: string) => ({
+    kind: "upsert" as const,
+    stream: "s",
+    pkHash,
+    stamp,
+    firstSeen: null,
+    value: { id: pkHash },
+  });
+  const del = (pkHash: string, kind: "delete" | "omitted") => ({
+    kind,
+    stream: "s",
+    pkHash,
+    key: [pkHash],
+    stamp,
+  });
+  const entries = [
+    up("live"),
+    up("missing"),
+    del("explicit", "delete"),
+    del("omission", "omitted"),
+    del("resurrected", "delete"),
+    up("resurrected"),
+    del("only-delete", "delete"),
+    up("pending"),
+  ];
+  const ws = await openLogWorkspace(db, {
+    owner: "o",
+    databaseIncarnation: "db",
+    connection: "c",
+    generation: 1,
+    keyCheck: "k",
+    operation: "seed-oracle",
+    expectedHead: "h",
+    codecVersion: 1,
+  });
+  for (const entry of entries) await ws.stageSeed(entry, ["id"]);
+  await ws.transition("collect", "folded");
+  await ws.promoteSeed(old, target, 0);
+  await db.batch([
+    ...seedFromHistory("reference", entries, new Map([["s", ["id"]]])),
+    writeLogState("reference", target),
+  ]);
+  for (const table of ["record_changes", "log_tombstones"]) {
+    const columns =
+      table === "record_changes"
+        ? "stream,pk_hash,record_key,op,stamp_o,stamp_r,origin,explicit_delete,pk_values"
+        : "stream,pk_hash,record_key,stamp_o,stamp_r,rank";
+    expect(
+      await db.query(
+        `SELECT ${columns} FROM ${table} WHERE connection_id='c' ORDER BY pk_hash`,
+      ),
+    ).toEqual(
+      await db.query(
+        `SELECT ${columns} FROM ${table} WHERE connection_id='reference' ORDER BY pk_hash`,
+      ),
+    );
+  }
 });
