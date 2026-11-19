@@ -86,6 +86,7 @@ export function startVisibilityPause(
     const activity = sources.activity;
     let disposed = false;
     let previous: boolean | undefined;
+    let subscribed = false;
     let unsubscribe: (() => void) | undefined;
     const stop = () => {
       disposed = true;
@@ -96,21 +97,21 @@ export function startVisibilityPause(
       }
     };
     const apply = () => {
-      if (disposed) return;
+      if (disposed || !subscribed) return;
       let active = false;
       try {
         active = activity.isActive();
       } catch {
         // An unreadable activity source is inactive until it recovers.
       }
-      if (active === previous) return;
+      if (disposed || active === previous) return;
       const wasActive = previous;
       previous = active;
       try {
         if (!active) manager.pause?.();
         else {
           manager.resume?.();
-          if (wasActive === false) sources.onActive?.();
+          if (!disposed && wasActive === false) sources.onActive?.();
         }
       } catch {
         // A manager that refuses is not the host's problem.
@@ -127,6 +128,7 @@ export function startVisibilityPause(
       }
       return stop;
     }
+    subscribed = true;
     apply();
     return stop;
   }

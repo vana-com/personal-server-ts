@@ -64,6 +64,105 @@ describe("startPullSignals", () => {
 });
 
 describe("startVisibilityPause", () => {
+  it("never resumes when a synchronous active notification precedes a failed subscription", () => {
+    const manager = { pause: vi.fn(), resume: vi.fn() };
+    const onActive = vi.fn();
+    let notify = () => {};
+    const stop = startVisibilityPause(manager, {
+      activity: {
+        isActive: () => true,
+        subscribe: (callback) => {
+          notify = callback;
+          callback();
+          throw new Error("subscription failed");
+        },
+      },
+      onActive,
+    });
+    expect(manager.resume).not.toHaveBeenCalled();
+    expect(manager.pause).toHaveBeenCalledTimes(1);
+    notify();
+    stop();
+    expect(manager.resume).not.toHaveBeenCalled();
+    expect(manager.pause).toHaveBeenCalledTimes(1);
+    expect(onActive).not.toHaveBeenCalled();
+  });
+
+  it("ignores a queued notification delivered after disposal", () => {
+    const manager = { pause: vi.fn(), resume: vi.fn() };
+    let active = false;
+    let notify = () => {};
+    const stop = startVisibilityPause(manager, {
+      activity: {
+        isActive: () => active,
+        subscribe: (callback) => {
+          notify = callback;
+          return () => {};
+        },
+      },
+    });
+    manager.pause.mockClear();
+    const queued = notify;
+    active = true;
+    stop();
+    queued();
+    expect(manager.pause).not.toHaveBeenCalled();
+    expect(manager.resume).not.toHaveBeenCalled();
+  });
+
+  it("does not resume when activity reading disposes the subscription", () => {
+    const manager = { pause: vi.fn(), resume: vi.fn() };
+    const onActive = vi.fn();
+    let stop = () => {};
+    let notify = () => {};
+    let reenter = false;
+    stop = startVisibilityPause(manager, {
+      activity: {
+        isActive: () => {
+          if (reenter) stop();
+          return reenter;
+        },
+        subscribe: (callback) => {
+          notify = callback;
+          return () => {};
+        },
+      },
+      onActive,
+    });
+    manager.pause.mockClear();
+    reenter = true;
+    notify();
+    expect(manager.resume).not.toHaveBeenCalled();
+    expect(manager.pause).not.toHaveBeenCalled();
+    expect(onActive).not.toHaveBeenCalled();
+  });
+
+  it("applies the latest state after synchronous subscription notifications", () => {
+    const manager = { pause: vi.fn(), resume: vi.fn() };
+    let active = false;
+    let inSubscribe = true;
+    const isActive = vi.fn(() => {
+      expect(inSubscribe).toBe(false);
+      return active;
+    });
+    const stop = startVisibilityPause(manager, {
+      activity: {
+        isActive,
+        subscribe: (callback) => {
+          callback();
+          active = true;
+          callback();
+          inSubscribe = false;
+          return () => {};
+        },
+      },
+    });
+    expect(isActive).toHaveBeenCalledTimes(1);
+    expect(manager.resume).toHaveBeenCalledTimes(1);
+    expect(manager.pause).not.toHaveBeenCalled();
+    stop();
+  });
+
   it("pauses on hide, resumes on show, and ignores a repeat of the same state", () => {
     const doc = target("visible");
     const manager = { pause: vi.fn(), resume: vi.fn() };
