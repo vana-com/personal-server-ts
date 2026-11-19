@@ -1,4 +1,5 @@
 import type { TombstoneResubmitSnapshot } from "./tombstone-resubmits.js";
+import type { UploadStateSnapshot } from "./upload-state.js";
 /** Sync engine status for GET /v1/sync/status */
 export interface SyncStatus {
   enabled: boolean;
@@ -21,6 +22,12 @@ export interface SyncStatus {
    * delete the scope again. Both lists are empty when nothing is owed.
    */
   deletions?: TombstoneResubmitSnapshot;
+  /**
+   * Local entries that are too large to upload (kept locally, not synced),
+   * and failing uploads that are backing off or have stopped. Each list is
+   * empty when nothing is owed.
+   */
+  uploads?: UploadStateSnapshot;
 }
 
 export interface SyncBlockedReason {

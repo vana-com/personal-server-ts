@@ -26,6 +26,14 @@ import {
   type ScopeDeletionTracker,
 } from "../scope-deletions.js";
 import type { LineageGatewayPort } from "../../lineage/gateway.js";
+import {
+  MAX_UPLOAD_BODY_BYTES,
+  createUploadStateTracker,
+  exceedsUploadCap,
+  isUsableUploadSize,
+  type RowIdentity,
+  type UploadStateTracker,
+} from "../upload-state.js";
 
 export { computeDataPointId } from "../data-point-id.js";
 export { isEntryCoveredByTombstone } from "../scope-deletions.js";
@@ -66,6 +74,13 @@ export interface UploadWorkerDeps {
    * version key; exact-key cleanup belongs to the durable deletion worker.
    */
   pendingBlobDeletions?: PendingBlobDeletionStore;
+  /**
+   * Owner-visible record of entries that are too large to upload and of
+   * failing uploads that back off. The sync manager owns one and reports it
+   * in its status. Without it, `uploadAll` keeps no memory across calls: the
+   * size cap still applies, but failures are retried on every call.
+   */
+  uploadState?: UploadStateTracker;
 }
 
 export interface UploadResult {
@@ -80,8 +95,17 @@ export interface UploadResult {
   dataPointId: string;
 }
 
+/** Default most unsynced rows read per cycle (index rows only, no bodies). */
+export const UPLOAD_SCAN_BUDGET = 2000;
+
 export interface UploadAllOptions {
   batchSize?: number;
+  /**
+   * Most unsynced rows read in one cycle, on a host with `findUnsyncedPage`.
+   * A larger backlog is swept in windows of this size across cycles.
+   * Default `UPLOAD_SCAN_BUDGET`.
+   */
+  scanBudget?: number;
   onError?: (entry: IndexEntry, error: Error) => void;
   /** Clock for the coalesced-scope quiet window. Defaults to the wall clock. */
   now?: () => Date;
@@ -110,6 +134,38 @@ export class DeletedScopeEntryError extends Error {
   constructor(path: string, deletedAt: string) {
     super(`Dropped local entry for a scope deleted at ${deletedAt}: ${path}`);
     this.name = "DeletedScopeEntryError";
+  }
+}
+
+/**
+ * Thrown before anything is read when an unsynced entry's upload body would
+ * pass `MAX_UPLOAD_BODY_BYTES`. The entry stays local and readable; it can
+ * never sync, so retrying it is wasted work.
+ */
+export class UploadTooLargeError extends Error {
+  constructor(
+    readonly path: string,
+    readonly sizeBytes: number,
+  ) {
+    super(
+      `Too large to sync: ${path} is ${sizeBytes} bytes and an upload body is limited to ${MAX_UPLOAD_BODY_BYTES} bytes`,
+    );
+    this.name = "UploadTooLargeError";
+  }
+}
+
+/**
+ * Thrown before anything is read when an unsynced entry's stored size is
+ * missing or not a positive finite number. The cap cannot be checked, so the
+ * entry is held back (fail closed) and stays local.
+ */
+export class UploadUnsizableError extends Error {
+  constructor(
+    readonly path: string,
+    readonly sizeBytes: unknown,
+  ) {
+    super(`No usable stored size for ${path}: ${String(sizeBytes)}`);
+    this.name = "UploadUnsizableError";
   }
 }
 
@@ -181,6 +237,15 @@ export async function uploadOne(
     serverOwner,
     logger,
   } = deps;
+
+  // Decide from the stored size alone, before anything is read, parsed or
+  // encrypted: a body over the request limit can never be accepted.
+  if (!entry.dataPointId) {
+    if (!isUsableUploadSize(entry.sizeBytes))
+      throw new UploadUnsizableError(entry.path, entry.sizeBytes);
+    if (exceedsUploadCap(entry.sizeBytes))
+      throw new UploadTooLargeError(entry.path, entry.sizeBytes);
+  }
 
   // 1. Read local data file
   let envelope;
@@ -310,6 +375,10 @@ interface CoalescedScope {
 }
 
 const at = (entry: IndexEntry) => Date.parse(entry.collectedAt);
+const identityOf = (entry: IndexEntry): RowIdentity => ({
+  id: entry.id,
+  sizeBytes: entry.sizeBytes,
+});
 const VERSION_PAGE = 200;
 
 /**
@@ -324,17 +393,28 @@ function coalescePlan(
   entries: readonly IndexEntry[],
   nowMs: number,
 ): Map<string, CoalescedScope> {
-  const byScope = new Map<string, IndexEntry[]>();
+  // One pass, one small aggregate per scope: the batch's newest row and the
+  // oldest time. Nothing is copied per row, so the cost is linear in the
+  // entries however many versions one scope holds.
+  const aggregates = new Map<
+    string,
+    { batchHead: IndexEntry; oldestMs: number }
+  >();
   for (const entry of entries) {
     if (!isCoalescedScope(entry.scope)) continue;
-    byScope.set(entry.scope, [...(byScope.get(entry.scope) ?? []), entry]);
+    const known = aggregates.get(entry.scope);
+    if (!known) {
+      aggregates.set(entry.scope, { batchHead: entry, oldestMs: at(entry) });
+      continue;
+    }
+    if (at(entry) > at(known.batchHead)) known.batchHead = entry;
+    if (at(entry) < known.oldestMs) known.oldestMs = at(entry);
   }
   const plans = new Map<string, CoalescedScope>();
-  for (const [scope, inBatch] of byScope) {
-    const batchHead = inBatch.reduce((a, b) => (at(b) > at(a) ? b : a));
+  for (const [scope, { batchHead, oldestMs }] of aggregates) {
     const latest = deps.storage.findEntry?.({ scope });
     const head = latest && at(latest) >= at(batchHead) ? latest : batchHead;
-    const oldest = Math.min(...inBatch.map(at), at(head));
+    const oldest = Math.min(oldestMs, at(head));
     const deferred =
       head.dataPointId === null &&
       nowMs - at(head) < COALESCE_QUIET_MS &&
@@ -395,6 +475,44 @@ async function eraseSuperseded(
 }
 
 /**
+ * Note an entry whose stored size means it can never be uploaded (too large,
+ * or no usable size), log it once, and say so. Reads nothing but the row.
+ */
+function holdBackTerminal(
+  deps: UploadWorkerDeps,
+  state: UploadStateTracker,
+  target: IndexEntry,
+): boolean {
+  if (target.dataPointId !== null) return false;
+  const at = {
+    scope: target.scope,
+    path: target.path,
+    identity: identityOf(target),
+  };
+  if (!isUsableUploadSize(target.sizeBytes)) {
+    if (state.markUnsizable(at)) {
+      deps.logger.warn(
+        { ...at, sizeBytes: String(target.sizeBytes) },
+        "Entry has no usable size; it stays local and is not uploaded",
+      );
+    }
+    return true;
+  }
+  if (!exceedsUploadCap(target.sizeBytes)) return false;
+  if (state.markTooLarge(at, target.sizeBytes)) {
+    deps.logger.warn(
+      {
+        ...at,
+        sizeBytes: target.sizeBytes,
+        maxBodyBytes: MAX_UPLOAD_BODY_BYTES,
+      },
+      "Entry is too large to sync; it stays local and is not uploaded",
+    );
+  }
+  return true;
+}
+
+/**
  * Process all unsynced entries (dataPointId === null).
  * Processes sequentially to avoid overwhelming storage backend.
  * Returns array of results (skips failures, logs errors).
@@ -408,30 +526,137 @@ export async function uploadAll(
   options?: UploadAllOptions,
 ): Promise<UploadResult[]> {
   const batchSize = options?.batchSize ?? 50;
-  const entries = deps.storage.findUnsynced({ limit: batchSize });
-  const nowMs = (options?.now ?? (() => new Date()))().getTime();
-  const plans = coalescePlan(deps, entries, nowMs);
-  const handled = new Set<string>();
+  const clock = () => (options?.now ?? (() => new Date()))().getTime();
+  // Unsynced index rows only, no bodies. Entries that cannot be attempted now
+  // must not occupy the batch, or they hide every entry behind them, so the
+  // batch is chosen below from everything listed, not from a limited page.
+  // A host with keyset paging lists one window of at most `scanBudget` rows
+  // per cycle, resuming where the last cycle stopped, so a huge backlog costs
+  // a bounded amount per cycle and is still swept in full. Any other host is
+  // listed whole.
+  const state = deps.uploadState ?? createUploadStateTracker();
+  // Paging needs both methods: the page method alone has no fence, so a
+  // growing tail could keep the sweep from ever wrapping. Such a host is
+  // listed whole.
+  const paged = deps.storage.maxUnsyncedId
+    ? deps.storage.findUnsyncedPage
+    : undefined;
+  const scanBudget = options?.scanBudget ?? UPLOAD_SCAN_BUDGET;
+  const scanAfter = paged ? state.scanCursor() : 0;
+  // A sweep covers the rows present when it began: its upper id is fixed at
+  // the start. Rows that arrive above it wait for the next sweep, so a tail
+  // that keeps growing cannot stop the sweep from wrapping back to earlier
+  // rows (a failed upload that is due again would never be revisited).
+  if (paged && scanAfter === 0 && state.scanFence() === null) {
+    const max = deps.storage.maxUnsyncedId?.() ?? Number.POSITIVE_INFINITY;
+    state.setScanFence(max);
+    // No unsynced row is above the fresh maximum, so state recorded for ids
+    // beyond it belongs to rows that are gone (a remote deletion removes rows
+    // without the sync manager). Only a new sweep may say this: an older
+    // sweep's fence can sit below live state.
+    if (Number.isFinite(max)) {
+      state.reconcile([], {
+        afterId: max,
+        throughId: Number.POSITIVE_INFINITY,
+      });
+    }
+  }
+  const scanFence = paged ? (state.scanFence() ?? Number.POSITIVE_INFINITY) : 0;
+  const listed = paged
+    ? paged.call(deps.storage, { afterId: scanAfter, limit: scanBudget })
+    : deps.storage.findUnsynced();
+  const entries = paged ? listed.filter((e) => e.id <= scanFence) : listed;
+  // The window is full only if it filled the budget and stayed inside the
+  // fence; otherwise the sweep has listed everything up to its fence.
+  const windowFull =
+    paged !== undefined &&
+    listed.length >= scanBudget &&
+    entries.length === listed.length;
+  // Tracked state is dropped for rows that are gone or were rewritten. After a
+  // partial window only the id range actually listed counts, so backoff of
+  // rows beyond it survives; a window that reached the end covers the rest.
+  state.reconcile(
+    entries,
+    paged
+      ? {
+          afterId: scanAfter,
+          throughId: windowFull
+            ? Number(entries[entries.length - 1]?.id)
+            : scanFence,
+        }
+      : undefined,
+  );
+  const plans = coalescePlan(deps, entries, clock());
   const results: UploadResult[] = [];
 
+  /** Erase superseded snapshots and forget their upload state. */
+  const supersede = async (head: IndexEntry) => {
+    const older = olderUnsynced(deps, head);
+    await eraseSuperseded(deps, older);
+    for (const entry of older) state.clear(entry.path);
+  };
+
+  // Choose the batch: the first `batchSize` entries that can be worked on
+  // now. Too-large, unsizable, stopped and backing-off entries are skipped
+  // here and stay in the index untouched.
+  interface Work {
+    entry: IndexEntry;
+    plan: CoalescedScope | undefined;
+  }
+  const batch: Work[] = [];
+  const planned = new Set<string>();
+  const selectedAt = clock();
+  // Last listed row the selection looked at; the next window resumes after it.
+  let lastLookedAt = scanAfter;
+  let selectionStopped = false;
   for (const entry of entries) {
+    if (batch.length >= batchSize) {
+      selectionStopped = true;
+      break;
+    }
+    lastLookedAt = Number(entry.id);
     const plan = plans.get(entry.scope);
     if (plan) {
-      if (handled.has(entry.scope)) continue;
-      handled.add(entry.scope);
+      if (planned.has(entry.scope)) continue;
+      planned.add(entry.scope);
       if (plan.deferred) continue;
-      if (plan.head.dataPointId !== null) {
-        // The latest version is already published: older unpublished
-        // snapshots are superseded, never published.
-        await eraseSuperseded(deps, olderUnsynced(deps, plan.head));
-        continue;
+      if (plan.head.dataPointId === null) {
+        if (!state.shouldAttempt(plan.head.path, selectedAt)) continue;
       }
+    } else if (!state.shouldAttempt(entry.path, selectedAt)) continue;
+    // Entries that can never upload are classified here, from the index row
+    // alone, so they cost no batch slot even the first time they are seen.
+    if (holdBackTerminal(deps, state, plan ? plan.head : entry)) continue;
+    batch.push({ entry, plan });
+  }
+
+  if (paged) {
+    // Stopped early: resume right after the last row looked at. Looked at all
+    // of a full window: continue past it. Reached the end of the sweep's
+    // fence: start over with a new fence.
+    const resumes = selectionStopped || windowFull;
+    state.setScanCursor(resumes ? lastLookedAt : 0);
+    if (!resumes) state.setScanFence(null);
+  }
+
+  for (const { entry, plan } of batch) {
+    if (plan && plan.head.dataPointId !== null) {
+      // The latest version is already published: older unpublished
+      // snapshots are superseded, never published.
+      await supersede(plan.head);
+      continue;
     }
     const target = plan ? plan.head : entry;
+    // Earlier entries may have taken minutes: judge this one at its own time.
+    if (!state.shouldAttempt(target.path, clock())) continue;
+    // A first attempt at an entry is new data: it releases the scope's
+    // stopped entries to try again.
+    if (!state.has(target.path)) state.releaseStopped(target.scope);
     try {
       const result = await uploadOne(deps, target);
       results.push(result);
-      if (plan) await eraseSuperseded(deps, olderUnsynced(deps, plan.head));
+      state.clear(target.path);
+      if (plan) await supersede(plan.head);
     } catch (err) {
       // A dropped orphan is a self-heal, not a failure: the row is already
       // gone, there is nothing to retry, and surfacing it would keep the
@@ -441,14 +666,30 @@ export async function uploadAll(
         err instanceof OrphanedEntryError ||
         err instanceof DeletedScopeEntryError
       ) {
+        state.clear(target.path);
         continue;
       }
       const error = err as Error;
+      state.recordFailure(
+        {
+          scope: target.scope,
+          path: target.path,
+          identity: identityOf(target),
+        },
+        error.message,
+        clock(),
+      );
       options?.onError?.(entry, error);
       deps.logger.error(
         { path: entry.path, scope: entry.scope, error: error.message },
         "Failed to upload entry",
       );
+      if (!state.shouldAttempt(target.path, Number.MAX_SAFE_INTEGER)) {
+        deps.logger.warn(
+          { path: target.path, scope: target.scope },
+          "Stopped retrying the upload of an entry after repeated failures",
+        );
+      }
     }
   }
 

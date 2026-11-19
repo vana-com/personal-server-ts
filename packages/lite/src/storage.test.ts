@@ -1524,3 +1524,109 @@ describe("deleteVersionIfEnvelopeMissing", () => {
     );
   });
 });
+
+describe("same-path replacement of an unsynced row", () => {
+  const scope = "notes.entries";
+  const collectedAt = "2026-11-07T12:00:00.000Z";
+
+  // The upload worker keys its held and backoff state by path and tells a
+  // replaced row apart by its id and size. This pins what a replacement at an
+  // existing scope and collectedAt looks like to `findUnsynced`.
+  it("lists one unsynced row, with a fresh id and the new size", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteDataFileStore("custom"),
+    );
+    const large = await storage.writeEnvelopeAndIndex!(
+      createDataFileEnvelope(scope, collectedAt, { value: 1 }),
+      {
+        fileId: null,
+        scope,
+        collectedAt,
+        dataPointId: null,
+        sizeBytes: 337 * 1024 * 1024,
+      },
+    );
+
+    const small = await storage.writeEnvelopeAndIndex!(
+      createDataFileEnvelope(scope, collectedAt, { value: 2 }),
+      { fileId: null, scope, collectedAt, dataPointId: null },
+    );
+
+    expect(small.path).toBe(large.path);
+    expect(small.id).not.toBe(large.id);
+    expect(small.sizeBytes).toBeLessThan(1024);
+    const unsynced = storage.findUnsynced();
+    expect(unsynced).toHaveLength(1);
+    expect(unsynced[0]).toMatchObject({
+      id: small.id,
+      path: large.path,
+      sizeBytes: small.sizeBytes,
+    });
+  });
+});
+
+describe("findUnsyncedPage", () => {
+  it("pages unsynced rows by id and skips synced ones", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteDataFileStore("custom"),
+    );
+    const rows = [];
+    for (let i = 0; i < 5; i++) {
+      const collectedAt = `2026-11-07T12:00:0${i}.000Z`;
+      rows.push(
+        await storage.writeEnvelopeAndIndex!(
+          createDataFileEnvelope(`notes.s${i}`, collectedAt, { value: i }),
+          {
+            fileId: null,
+            scope: `notes.s${i}`,
+            collectedAt,
+            dataPointId: i === 2 ? "0xdp" : null,
+          },
+        ),
+      );
+    }
+
+    const first = storage.findUnsyncedPage!({ afterId: 0, limit: 2 });
+    const second = storage.findUnsyncedPage!({
+      afterId: first[first.length - 1].id,
+      limit: 2,
+    });
+    const done = storage.findUnsyncedPage!({
+      afterId: second[second.length - 1].id,
+      limit: 2,
+    });
+
+    expect(first.map((e) => e.id)).toEqual([rows[0].id, rows[1].id]);
+    expect(second.map((e) => e.id)).toEqual([rows[3].id, rows[4].id]);
+    expect(done).toEqual([]);
+  });
+
+  it("maxUnsyncedId is the highest unsynced id, 0 when none", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteDataFileStore("custom"),
+    );
+    expect(storage.maxUnsyncedId!()).toBe(0);
+    const rows = [];
+    for (let i = 0; i < 3; i++) {
+      const collectedAt = `2026-11-07T12:00:0${i}.000Z`;
+      rows.push(
+        await storage.writeEnvelopeAndIndex!(
+          createDataFileEnvelope(`notes.m${i}`, collectedAt, { value: i }),
+          {
+            fileId: null,
+            scope: `notes.m${i}`,
+            collectedAt,
+            dataPointId: i === 2 ? "0xdp" : null,
+          },
+        ),
+      );
+    }
+    expect(storage.maxUnsyncedId!()).toBe(rows[1].id);
+  });
+});

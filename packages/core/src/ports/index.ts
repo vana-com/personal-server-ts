@@ -172,6 +172,22 @@ export interface DataStoragePort extends RuntimeStoragePort {
    */
   findByDataPointId(dataPointId: string): IndexEntry | undefined;
   findUnsynced(options?: { limit?: number }): IndexEntry[];
+  /**
+   * Keyset page of the unsynced rows: those with `id > afterId`, ordered by
+   * `id` ascending, at most `limit`. Index rows only; no envelope is read. Lets
+   * the upload worker scan a large backlog a bounded window per cycle. Used
+   * only together with `maxUnsyncedId`; a host without both is scanned whole
+   * through `findUnsynced`.
+   */
+  findUnsyncedPage?(options: { afterId: number; limit: number }): IndexEntry[];
+  /**
+   * Highest row id among the unsynced rows (0 when there are none). With
+   * `findUnsyncedPage` it fences a scan sweep: rows that arrive above the
+   * fence wait for the next sweep, so a moving tail cannot keep the sweep
+   * from ever wrapping back to earlier rows. Without it the page method is
+   * not used.
+   */
+  maxUnsyncedId?(): number;
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
   /**
    * The envelope exactly as stored, bypassing any read-time view. Only a

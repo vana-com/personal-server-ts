@@ -719,8 +719,21 @@ export async function createPersistentPsLiteStorage(
     return indexed!;
   }
 
+  // Rows grouped by scope, rebuilt once per index state (state is replaced,
+  // never edited in place), so a lookup is O(scope rows) instead of O(all
+  // rows): the upload worker looks up every coalesced scope it plans.
+  let scopeGroups: { source: IndexEntry[]; groups: Map<string, IndexEntry[]> };
   function entriesForScope(scope: string): IndexEntry[] {
-    return sortEntries(state.entries.filter((entry) => entry.scope === scope));
+    if (scopeGroups?.source !== state.entries) {
+      const groups = new Map<string, IndexEntry[]>();
+      for (const entry of state.entries) {
+        const group = groups.get(entry.scope);
+        if (group) group.push(entry);
+        else groups.set(entry.scope, [entry]);
+      }
+      scopeGroups = { source: state.entries, groups };
+    }
+    return sortEntries(scopeGroups.groups.get(scope) ?? []);
   }
 
   const storagePort: PsLiteStoragePort = {
@@ -748,6 +761,22 @@ export async function createPersistentPsLiteStorage(
       return options?.limit === undefined
         ? entries
         : entries.slice(0, options.limit);
+    },
+
+    findUnsyncedPage({ afterId, limit }) {
+      const page: IndexEntry[] = [];
+      for (const entry of state.entries) {
+        if (entry.dataPointId === null && entry.id > afterId) page.push(entry);
+      }
+      return page.sort((a, b) => a.id - b.id).slice(0, limit);
+    },
+
+    maxUnsyncedId() {
+      let max = 0;
+      for (const entry of state.entries) {
+        if (entry.dataPointId === null && entry.id > max) max = entry.id;
+      }
+      return max;
     },
 
     async readEnvelope(scope, collectedAt) {
