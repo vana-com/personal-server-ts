@@ -1,6 +1,10 @@
 import { WORKSPACE_SEED_SCHEMA } from "./workspace-seed.js";
-import { PARTIAL_WORKSPACE_SCHEMA } from "./workspace-partial.js";
-import { WORKSPACE_SCHEMA } from "./workspace-schema.js";
+import {
+  WORKSPACE_SCHEMA,
+  PARTIAL_WORKSPACE_SCHEMA,
+  PARTIAL_STAGE_SCHEMA,
+  PARTIAL_PASS_SCHEMA,
+} from "./workspace-schema.js";
 /** The statement every view trigger runs: add one to the connection's counter. */
 const bumpView = (row: "NEW" | "OLD") =>
   `INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (${row}.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = ${row}.connection_id), 0) + 1);`;
@@ -646,4 +650,6 @@ END`,
   ],
   [WORKSPACE_SEED_SCHEMA],
   PARTIAL_WORKSPACE_SCHEMA,
+  PARTIAL_STAGE_SCHEMA,
+  PARTIAL_PASS_SCHEMA,
 ];

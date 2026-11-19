@@ -1,7 +1,13 @@
+import {
+  stagePartialOperation,
+  promotePartialOperations,
+  partialOp,
+} from "./workspace-partial-stage.js";
 // Indexed, lineage-bound facts for progressive replay. No decoded batch escapes
 // commitPart; scan facts contain only keys, stamps and stream/batch metadata.
 import {
   HEAD_FORMAT,
+  PART_LIMIT_BYTES,
   type LogKey,
   type LogStamp,
   type LogStreamMeta,
@@ -9,13 +15,18 @@ import {
 import type { SqlDriver, SqlStatement } from "./driver.js";
 import type { WorkspaceBinding, ByteLease } from "./workspace-capability.js";
 import { checkLease, workspaceGuard, workspaceAssert } from "./workspace.js";
-import { workspaceAttempt } from "./workspace-failure.js";
+import {
+  workspaceAttempt,
+  recordWorkspaceFailure,
+} from "./workspace-failure.js";
 import {
   stageBatch,
   streamStateStatement,
   type BatchIdentity,
   type OperationBatch,
   type BatchStep,
+  prepareOperations,
+  type PreparedOperation,
 } from "./log-batch.js";
 import {
   hideStoredRows,
@@ -28,7 +39,7 @@ import type { LogState } from "./log-state.js";
 export interface KeyFact {
   stream: string;
   pkHash: string;
-  key: LogKey;
+  key: LogKey | null;
   lastNamingUnit: number;
   lastRemovalUnit: number;
   futureRemoval: LogStamp | null;
@@ -76,6 +87,16 @@ export function workspacePartial(db: SqlDriver, b: WorkspaceBinding) {
       ...workspaceGuard(b),
       ...statements,
     ]);
+  };
+  const admitMetadata = async (value: unknown) => {
+    if (new TextEncoder().encode(JSON.stringify(value)).length > MAX_METADATA)
+      await recordWorkspaceFailure(
+        db,
+        b,
+        "metadata",
+        "admission",
+        new Error("workspace_metadata_admission"),
+      );
   };
   const plan = () => read<PartialPlan>("partial-plan", "plan");
   const naming = async (stream: string) => {
@@ -142,12 +163,55 @@ export function workspacePartial(db: SqlDriver, b: WorkspaceBinding) {
   return {
     plan,
     async initialize(value: PartialPlan) {
+      await admitMetadata(value);
       const old = await plan();
       if (old && JSON.stringify(old) !== JSON.stringify(value))
         throw new Error("workspace_partial_plan_conflict");
       if (!old) await write("plan", [put("partial-plan", "plan", value)]);
     },
     key,
+    async snapshotSchema(digest: string) {
+      const old = await read<string>("partial-schema", "schema");
+      if (old !== null && old !== digest)
+        throw new Error("apply: invalid log snapshot part (inconsistent)");
+      if (old === null)
+        await write("schema", [put("partial-schema", "schema", digest)]);
+    },
+    async clearPart(index: number) {
+      await write("clear", [
+        {
+          sql: "DELETE FROM workspace_partial_incoming WHERE op=?",
+          params: [partialOp(b, index)],
+        },
+        {
+          sql: "DELETE FROM workspace_partial_deletions WHERE op=?",
+          params: [partialOp(b, index)],
+        },
+      ]);
+    },
+    async admitRecord(bytes: number, lease: ByteLease) {
+      checkLease(lease, b.operation, 1);
+      if (
+        !Number.isSafeInteger(bytes) ||
+        bytes < 0 ||
+        bytes * 4 + 2 * PART_LIMIT_BYTES + 2 * 1024 * 1024 > lease.capacityBytes
+      )
+        await recordWorkspaceFailure(
+          db,
+          b,
+          "record",
+          "admission",
+          new Error("workspace_record_admission"),
+        );
+    },
+    async stageOperation(
+      index: number,
+      operation: PreparedOperation,
+      lease: ByteLease,
+    ) {
+      checkLease(lease, b.operation, 1);
+      await stagePartialOperation(db, b, index, operation);
+    },
     async held(stream: string, pk: string, index: number) {
       return ((await key(stream, pk))?.lastRemovalUnit ?? -1) > index;
     },
@@ -155,43 +219,82 @@ export function workspacePartial(db: SqlDriver, b: WorkspaceBinding) {
       index: number,
       stream: string,
       pkHash: string,
-      typedKey: LogKey,
+      typedKey: LogKey | null,
       removal: LogStamp | null,
     ) {
-      const old = await key(stream, pkHash);
-      const laterRemoval =
-        removal !== null && index >= (old?.lastRemovalUnit ?? -1);
-      const encodedKey = JSON.stringify(typedKey);
+      await this.noteKeys(index, [{ stream, pkHash, key: typedKey, removal }]);
+    },
+    async noteKeys(
+      index: number,
+      facts: readonly {
+        stream: string;
+        pkHash: string;
+        key: LogKey | null;
+        removal: LogStamp | null;
+      }[],
+    ) {
       if (
-        new TextEncoder().encode(encodedKey + stream + pkHash).length >
-        MAX_METADATA
+        facts.length > 64 ||
+        new TextEncoder().encode(JSON.stringify(facts)).length > MAX_METADATA
       )
-        throw new Error("workspace_metadata_admission");
-      const lastRemoval = laterRemoval ? removal : (old?.futureRemoval ?? null);
-      await write("key", [
-        {
-          sql: "INSERT OR REPLACE INTO workspace_partial_keys VALUES(?,?,?,?,?,?,?,?)",
-          params: [
-            b.operation,
-            stream,
-            pkHash,
-            encodedKey,
-            Math.max(old?.lastNamingUnit ?? -1, index),
-            laterRemoval ? index : (old?.lastRemovalUnit ?? -1),
-            lastRemoval?.o ?? null,
-            lastRemoval?.r ?? null,
-          ],
-        },
-      ]);
+        return recordWorkspaceFailure(
+          db,
+          b,
+          "keys",
+          "admission",
+          new Error("workspace_metadata_admission"),
+        );
+      const statements: SqlStatement[] = [];
+      for (const fact of facts) {
+        const encodedKey = JSON.stringify(fact.key);
+        const removalIndex = fact.removal === null ? -1 : index;
+        statements.push(
+          {
+            sql: "INSERT OR IGNORE INTO workspace_partial_keys VALUES(?,?,?,?,?,?,?,?)",
+            params: [
+              b.operation,
+              fact.stream,
+              fact.pkHash,
+              encodedKey,
+              index,
+              removalIndex,
+              fact.removal?.o ?? null,
+              fact.removal?.r ?? null,
+            ],
+          },
+          {
+            sql: `UPDATE workspace_partial_keys SET typed_key=CASE WHEN ?='null' THEN typed_key ELSE ? END,last_naming=MAX(last_naming,?),removal_o=CASE WHEN ? >= last_removal AND ?>=0 THEN ? ELSE removal_o END,removal_r=CASE WHEN ?>=last_removal AND ?>=0 THEN ? ELSE removal_r END,last_removal=MAX(last_removal,?) WHERE operation=? AND stream=? AND pk_hash=?`,
+            params: [
+              encodedKey,
+              encodedKey,
+              index,
+              removalIndex,
+              removalIndex,
+              fact.removal?.o ?? null,
+              removalIndex,
+              removalIndex,
+              fact.removal?.r ?? null,
+              removalIndex,
+              b.operation,
+              fact.stream,
+              fact.pkHash,
+            ],
+          },
+        );
+      }
+      await write("keys", statements);
     },
     /** List before fetching; subsequent names replace only the last-name facts. */
     async name(
       index: number,
       meta: LogStreamMeta,
-      batch: Naming["batch"],
+      { generation, observedAt }: Naming["batch"],
       identity: BatchIdentity,
       list = false,
     ) {
+      // Structural typing also accepts an OperationBatch here. Project at the
+      // boundary so its operations can never enter the durable naming facts.
+      const batch = { generation, observedAt };
       const old = await naming(meta.stream);
       let row: Naming;
       if (old)
@@ -249,6 +352,7 @@ export function workspacePartial(db: SqlDriver, b: WorkspaceBinding) {
             marker.version === head.version,
         };
       }
+      await admitMetadata(row);
       const statements: SqlStatement[] = [];
       if (list && !row.skip && !row.begun) {
         statements.push(
@@ -266,7 +370,14 @@ export function workspacePartial(db: SqlDriver, b: WorkspaceBinding) {
       if (old && JSON.stringify(old) !== JSON.stringify(identity))
         throw new Error("workspace_partial_digest_conflict");
       if (!old)
-        await write("scan", [put("partial-parts", String(index), identity)]);
+        await write("scan", [
+          workspaceAssert(
+            "(?=0 AND NOT EXISTS(SELECT 1 FROM workspace_cells WHERE operation=? AND relation='partial-scan' AND key='cursor')) OR EXISTS(SELECT 1 FROM workspace_cells WHERE operation=? AND relation='partial-scan' AND key='cursor' AND payload=?)",
+            [index, b.operation, b.operation, String(index)],
+          ),
+          put("partial-parts", String(index), identity),
+          put("partial-scan", "cursor", index + 1),
+        ]);
     },
     async hasScan(index: number, identity: BatchIdentity) {
       const old = await read<BatchIdentity>("partial-parts", String(index));
@@ -315,7 +426,6 @@ export function workspacePartial(db: SqlDriver, b: WorkspaceBinding) {
           begin: false,
           final: false,
           held: [],
-          holdback: { operation: b.operation, index },
           row: {
             head: row.head,
             applied: Math.min(index + 1, p.total - 1),
@@ -324,10 +434,15 @@ export function workspacePartial(db: SqlDriver, b: WorkspaceBinding) {
         });
         after.push(putNaming({ ...row, begun: true }));
       }
+      for (const operation of batch.operations) {
+        const prepared = await prepareOperations(batch.streams, [operation]);
+        for (const row of prepared)
+          await stagePartialOperation(db, b, index, row);
+      }
       const staged = await stageBatch(
         { newOp },
         b.connection,
-        batch,
+        { ...batch, operations: [] },
         identity,
         state,
         steps,
@@ -335,12 +450,12 @@ export function workspacePartial(db: SqlDriver, b: WorkspaceBinding) {
       // Both the scan receipt and the immediately preceding applied receipt must exist.
       before.push(
         workspaceAssert(
-          "EXISTS(SELECT 1 FROM workspace_cells WHERE operation=? AND relation='partial-parts' AND key=?) AND (SELECT COUNT(*) FROM workspace_cells WHERE operation=? AND relation='partial-parts')=? AND (?=0 OR EXISTS(SELECT 1 FROM workspace_receipts WHERE operation=? AND unit=?))",
+          "EXISTS(SELECT 1 FROM workspace_cells WHERE operation=? AND relation='partial-parts' AND key=?) AND EXISTS(SELECT 1 FROM workspace_cells WHERE operation=? AND relation='partial-scan' AND key='cursor' AND payload=?) AND (?=0 OR EXISTS(SELECT 1 FROM workspace_receipts WHERE operation=? AND unit=?))",
           [
             b.operation,
             String(index),
             b.operation,
-            p.total,
+            String(p.total),
             index,
             b.operation,
             `partial-${index - 1}`,
@@ -355,13 +470,32 @@ export function workspacePartial(db: SqlDriver, b: WorkspaceBinding) {
       try {
         await write(
           `part-${index}`,
-          withOrigin("remote", [...before, ...staged.statements, ...after]),
+          withOrigin("remote", [
+            ...before,
+            ...batch.streams.map((meta) =>
+              streamStateStatement(b.connection, meta),
+            ),
+            ...promotePartialOperations(b, index),
+            ...staged.statements,
+            ...after,
+          ]),
         );
       } finally {
         await db.batch([
           { sql: "DELETE FROM temp.incoming WHERE op=?", params: [staged.op] },
         ]);
       }
+    },
+    async close() {
+      const p = await plan();
+      if (!p || !(await this.applied(p.total - 1, p.finalIdentity)))
+        throw new Error("workspace_partial_unfinished");
+      await write("finish", [
+        {
+          sql: "UPDATE workspaces SET phase='finished' WHERE operation=?",
+          params: [b.operation],
+        },
+      ]);
     },
     async failed(code: string, hide = false) {
       const p = await plan();
@@ -396,7 +530,7 @@ function finishStatements(b: WorkspaceBinding): SqlStatement[] {
     },
     {
       sql: `UPDATE stream_state SET primary_key=${select("primary_key")},profile_key=${select("profile_key")},profile_version=${select("profile_version")},complete=${select("complete")},head_generation=${select("generation")},head_data_hash=${select("data_hash")},head_blob=${select("blob_name")},head_version=MAX(head_version,last_delete_version)+1
-      WHERE connection_id=? AND stream IN (SELECT stream FROM workspace_partial_streams WHERE operation=? AND skip=0)`,
+      WHERE connection_id=? AND EXISTS (SELECT 1 FROM workspace_partial_streams w WHERE w.operation=? AND w.stream=stream_state.stream AND w.skip=0)`,
       params: [
         b.operation,
         b.operation,
@@ -410,12 +544,8 @@ function finishStatements(b: WorkspaceBinding): SqlStatement[] {
       ],
     },
     {
-      sql: "DELETE FROM stream_partial WHERE connection_id=? AND stream IN (SELECT stream FROM workspace_partial_streams WHERE operation=? AND skip=0)",
+      sql: "DELETE FROM stream_partial WHERE connection_id=? AND EXISTS (SELECT 1 FROM workspace_partial_streams w WHERE w.operation=? AND w.stream=stream_partial.stream AND w.skip=0)",
       params: [b.connection, b.operation],
     },
   ];
 }
-export const PARTIAL_WORKSPACE_SCHEMA = [
-  `CREATE TABLE workspace_partial_keys(operation TEXT NOT NULL,stream TEXT NOT NULL,pk_hash TEXT NOT NULL,typed_key TEXT NOT NULL,last_naming INTEGER NOT NULL,last_removal INTEGER NOT NULL,removal_o INTEGER,removal_r TEXT,PRIMARY KEY(operation,stream,pk_hash)) WITHOUT ROWID`,
-  `CREATE TABLE workspace_partial_streams(operation TEXT NOT NULL,stream TEXT NOT NULL,payload TEXT NOT NULL,primary_key TEXT NOT NULL,profile_key TEXT,profile_version TEXT NOT NULL,complete INTEGER NOT NULL,generation INTEGER NOT NULL,observed_at INTEGER NOT NULL,data_hash TEXT NOT NULL,blob_name TEXT NOT NULL,skip INTEGER NOT NULL,partial_version INTEGER NOT NULL,PRIMARY KEY(operation,stream)) WITHOUT ROWID`,
-];

@@ -84,7 +84,7 @@ export interface BatchIdentity {
 
 /**
  * What one batch does for a stream that loads progressively (see
- * `log-progressive.ts`). The stream's head, and with it `complete`, is written
+ * `log-progressive-workspace.ts`). The stream's head, and with it `complete`, is written
  * only by the batch that `final` names.
  */
 export interface BatchStep {
@@ -97,8 +97,6 @@ export interface BatchStep {
   readonly final: boolean;
   /** Keys of this batch a later, fetched batch deletes or omits. */
   readonly held: readonly string[];
-  /** Disk-backed holdback, owned by the same lineage as the applied receipt. */
-  readonly holdback?: { readonly operation: string; readonly index: number };
   /** The stream's row after this batch; absent in the final batch. */
   readonly row?: {
     readonly head: PartialIdentity;
@@ -436,24 +434,6 @@ export function mergeStaged(
       statements.push(
         showIncomingKeys(connectionId, stream, op),
         ...holdKeys(connectionId, stream, step.held),
-        ...(step.holdback
-          ? [
-              {
-                sql: `INSERT OR IGNORE INTO partial_hidden(connection_id,stream,pk_hash)
-            SELECT ?,?,i.pk_hash FROM temp.incoming i WHERE i.op=? AND i.stream=?
-            AND EXISTS(SELECT 1 FROM workspace_partial_keys w WHERE w.operation=?
-              AND w.stream=i.stream AND w.pk_hash=i.pk_hash AND w.last_removal>?)`,
-                params: [
-                  connectionId,
-                  stream,
-                  op,
-                  stream,
-                  step.holdback.operation,
-                  step.holdback.index,
-                ],
-              },
-            ]
-          : []),
       );
   statements.push(
     ...mergeIncoming(op, connectionId, {

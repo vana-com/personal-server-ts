@@ -145,6 +145,7 @@ export {
 export { createSqlWorkspaceValues } from "./workspace-values.js";
 export {
   openLogWorkspace,
+  openProgressiveLogWorkspace,
   workspaceValueReader,
   type WorkspaceCanonicalRecord,
   type WorkspaceCanonicalChange,

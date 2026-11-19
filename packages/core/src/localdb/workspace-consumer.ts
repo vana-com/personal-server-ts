@@ -4,6 +4,8 @@ import type { LogEntry } from "@opendatalabs/personal-server-ts-stream-sync";
 import { SEEN_BEFORE, seenBeforeParams } from "./merge.js";
 import { ELIGIBLE_CHANGE } from "./publication-work.js";
 import { workspaceAttempt } from "./workspace-failure.js";
+import { sha256 } from "@noble/hashes/sha2";
+import { bytesToHex } from "@noble/hashes/utils";
 import { workspacePartial } from "./workspace-partial.js";
 import { recordWorkspaceFailure } from "./workspace-failure.js";
 import { runtimeAdmission } from "./workspace.js";
@@ -28,6 +30,7 @@ import {
   openWorkspace,
   workspaceAssert,
   workspaceGuard,
+  setWorkspaceAuthority,
 } from "./workspace.js";
 
 export interface WorkspaceCanonicalRecord {
@@ -842,4 +845,119 @@ export async function openLogWorkspace(
     cleanupOne: storage.cleanupOne,
   };
   return api;
+}
+
+/** The connection queue serializes callers. The durable owner survives a busy
+ * lease or a crash; a finished/replaced pass can never reopen a revoked id. */
+export async function openProgressiveLogWorkspace(
+  db: SqlDriver,
+  binding: Omit<WorkspaceBinding, "operation">,
+  newOp: () => string,
+) {
+  const active = (
+    await db.query<{
+      operation: string;
+      binding: string;
+      phase: string;
+      incarnation: string;
+      key_check: string;
+      head: string;
+    }>(
+      "SELECT p.operation,w.binding,w.phase,a.incarnation,a.key_check,a.head FROM workspace_partial_passes p JOIN workspaces w ON w.operation=p.operation JOIN workspace_authority a ON a.connection=p.connection WHERE p.connection=?",
+      [binding.connection],
+    )
+  )[0];
+  let resume =
+    active?.phase === "collect" &&
+    active.binding ===
+      bindingIdentity({ ...binding, operation: active.operation }) &&
+    active.incarnation === binding.databaseIncarnation &&
+    active.key_check === binding.keyCheck &&
+    active.head === binding.expectedHead;
+  if (resume) {
+    const receipt = (
+      await db.query<{ position: number }>(
+        "SELECT position FROM workspace_receipts WHERE operation=? ORDER BY position DESC LIMIT 1",
+        [active.operation],
+      )
+    )[0];
+    const naming = (
+      await db.query(
+        "SELECT 1 n FROM workspace_partial_streams WHERE operation=? AND skip=0 LIMIT 1",
+        [active.operation],
+      )
+    )[0];
+    if (receipt || naming) {
+      const marker = (
+        await db.query(
+          "SELECT 1 n FROM workspace_partial_streams w JOIN stream_partial p ON p.connection_id=? AND p.stream=w.stream AND p.version=w.partial_version WHERE w.operation=? AND p.generation=? AND p.data_hash=? LIMIT 1",
+          [
+            binding.connection,
+            active.operation,
+            binding.generation,
+            binding.expectedHead,
+          ],
+        )
+      )[0];
+      resume = marker !== undefined;
+      const plan = (
+        await db.query<{ payload: string }>(
+          "SELECT payload FROM workspace_cells WHERE operation=? AND relation='partial-plan' AND key='plan'",
+          [active.operation],
+        )
+      )[0];
+      if (
+        receipt &&
+        (!plan || receipt.position >= JSON.parse(plan.payload).total)
+      )
+        resume = false;
+    }
+  }
+  const operation = resume
+    ? active!.operation
+    : "partial-" +
+      bytesToHex(
+        sha256(
+          new TextEncoder().encode(
+            JSON.stringify([
+              bindingIdentity({ ...binding, operation: "" }),
+              newOp(),
+            ]),
+          ),
+        ),
+      );
+  if (!resume && active?.operation === operation)
+    throw new Error("workspace_operation_id_reused");
+  const complete = { ...binding, operation };
+  await setWorkspaceAuthority(db, complete);
+  const ws = await openLogWorkspace(db, complete);
+  if (!resume)
+    await db.batch([
+      ...workspaceGuard(complete),
+      {
+        sql: "DELETE FROM stream_partial WHERE connection_id=?",
+        params: [binding.connection],
+      },
+      {
+        sql: "INSERT OR REPLACE INTO workspace_partial_passes(connection,operation) VALUES(?,?)",
+        params: [binding.connection, operation],
+      },
+      ...(active
+        ? [
+            {
+              sql: "DELETE FROM workspace_jobs WHERE job=?",
+              params: [active.operation],
+            },
+          ]
+        : []),
+      ...(active?.phase === "collect"
+        ? [
+            {
+              sql: "UPDATE workspaces SET phase='aborted' WHERE operation=? AND phase='collect'",
+              params: [active.operation],
+            },
+          ]
+        : []),
+    ]);
+  return ws;
 }

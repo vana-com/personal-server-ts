@@ -137,6 +137,8 @@ export function mergeIncoming(
   options: {
     readonly promoteSeen?: boolean;
     readonly firstSeenOfWinner?: boolean;
+    /** Persistent one-record workspace staging with the same indexed columns. */
+    readonly source?: "workspace_partial_incoming";
   } = {},
 ): SqlStatement[] {
   const pick = (f: string) =>
@@ -248,7 +250,12 @@ SELECT ?, i.stream, i.pk_hash, ${FIELDS.map((f) => `i.${f}`).join(", ")}, ${STOR
     },
     { sql: "DELETE FROM incoming WHERE op = ?", params: [op] },
   );
-  return statements;
+  return options.source
+    ? statements.map((s) => ({
+        ...s,
+        sql: s.sql.replace(/\b(?:temp\.)?incoming\b/g, options.source!),
+      }))
+    : statements;
 }
 
 /**
