@@ -1,6 +1,8 @@
 import { stageWorkspaceSeed, promoteWorkspaceSeed } from "./workspace-seed.js";
 import type { LogState } from "./log-state.js";
 import type { LogEntry } from "@opendatalabs/personal-server-ts-stream-sync";
+import { ELIGIBLE_CHANGE } from "./publication-work.js";
+import { workspaceAttempt } from "./workspace-failure.js";
 import { recordWorkspaceFailure } from "./workspace-failure.js";
 import { runtimeAdmission } from "./workspace.js";
 import type {
@@ -146,6 +148,56 @@ export async function openLogWorkspace(
       }
     },
     position: storage.position,
+    /** Freeze the latest eligible change per key. SQLite maintains the sequence
+     * index on disk; neither input history nor the result enters a JS array.
+     * One workspace owns one frozen stream/window. A retry cannot widen it. */
+    async freezeChanges(stream: string, from: number, to: number) {
+      const identity = JSON.stringify([stream, from, to]);
+      await workspaceAttempt(db, binding, "changes", "freeze", [
+        ...workspaceGuard(binding),
+        workspaceAssert(
+          "NOT EXISTS(SELECT 1 FROM workspace_cells WHERE operation=? AND relation='replacement' AND payload<>?)",
+          [binding.operation, identity],
+        ),
+        {
+          sql: `INSERT OR IGNORE INTO workspace_cells(operation,relation,key,payload)
+          SELECT ?, 'changes', printf('%020d',MAX(seq)), pk_hash FROM record_changes
+          WHERE connection_id=? AND stream=? AND seq>? AND seq<=? AND ${ELIGIBLE_CHANGE}
+            AND NOT EXISTS(SELECT 1 FROM workspace_cells WHERE operation=? AND relation='replacement')
+          GROUP BY pk_hash`,
+          params: [
+            binding.operation,
+            binding.connection,
+            stream,
+            from,
+            to,
+            binding.operation,
+          ],
+        },
+        {
+          sql: "INSERT OR IGNORE INTO workspace_cells VALUES(?,'replacement','window',?)",
+          params: [binding.operation, identity],
+        },
+      ]);
+    },
+    changeCursor(): BoundedCursor<{
+      readonly pk: string;
+      readonly seq: number;
+    }> {
+      const cursor = storage.cursor("changes");
+      return {
+        async next(lease) {
+          const unit = await cursor.next(lease);
+          return (
+            unit && {
+              ...unit,
+              value: { pk: unit.value.payload, seq: Number(unit.value.key) },
+            }
+          );
+        },
+        close: cursor.close,
+      };
+    },
     async unit(
       unit: string,
       digest: string,

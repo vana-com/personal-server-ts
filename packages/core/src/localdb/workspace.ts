@@ -148,6 +148,8 @@ export const runtimeAdmission = {
 export type WorkspaceRelation =
   | "fold"
   | "streams"
+  | "changes"
+  | "replacement"
   | "membership"
   | "omissions"
   | "outputs"
