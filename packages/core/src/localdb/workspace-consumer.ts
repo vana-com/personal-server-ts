@@ -4,6 +4,7 @@ import type { LogEntry } from "@opendatalabs/personal-server-ts-stream-sync";
 import { SEEN_BEFORE, seenBeforeParams } from "./merge.js";
 import { ELIGIBLE_CHANGE } from "./publication-work.js";
 import { workspaceAttempt } from "./workspace-failure.js";
+import { workspacePartial } from "./workspace-partial.js";
 import { recordWorkspaceFailure } from "./workspace-failure.js";
 import { runtimeAdmission } from "./workspace.js";
 import type {
@@ -422,6 +423,7 @@ export async function openLogWorkspace(
   let writing = false;
   const api = {
     binding,
+    partial: workspacePartial(db, binding),
     async acquire(bytes: number, signal?: AbortSignal) {
       await runtimeAdmission.enqueue(db, binding.operation);
       try {

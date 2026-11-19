@@ -1,4 +1,5 @@
 import { WORKSPACE_SEED_SCHEMA } from "./workspace-seed.js";
+import { PARTIAL_WORKSPACE_SCHEMA } from "./workspace-partial.js";
 import { WORKSPACE_SCHEMA } from "./workspace-schema.js";
 /** The statement every view trigger runs: add one to the connection's counter. */
 const bumpView = (row: "NEW" | "OLD") =>
@@ -644,4 +645,5 @@ END`,
     `CREATE INDEX workspace_attempts_page ON workspace_attempts(operation,id)`,
   ],
   [WORKSPACE_SEED_SCHEMA],
+  PARTIAL_WORKSPACE_SCHEMA,
 ];

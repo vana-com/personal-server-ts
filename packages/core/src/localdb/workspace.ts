@@ -483,21 +483,25 @@ export async function openWorkspace(db: SqlDriver, b: WorkspaceBinding) {
         throw new Error("workspace_live_cleanup");
       for (const table of [
         "workspace_seed",
+        "workspace_partial_keys",
+        "workspace_partial_streams",
         "workspace_stage",
         "workspace_cells",
         "workspace_receipts",
         "workspace_attempts",
       ]) {
         const keys =
-          table === "workspace_seed"
+          table === "workspace_seed" || table === "workspace_partial_keys"
             ? ["stream", "pk_hash"]
-            : table === "workspace_stage"
-              ? ["unit", "relation", "key"]
-              : table === "workspace_cells"
-                ? ["relation", "key"]
-                : table === "workspace_attempts"
-                  ? ["unit", "action"]
-                  : ["unit"];
+            : table === "workspace_partial_streams"
+              ? ["stream"]
+              : table === "workspace_stage"
+                ? ["unit", "relation", "key"]
+                : table === "workspace_cells"
+                  ? ["relation", "key"]
+                  : table === "workspace_attempts"
+                    ? ["unit", "action"]
+                    : ["unit"];
         const row = (
           await db.query<Record<string, string>>(
             `SELECT ${keys.join(",")} FROM ${table} WHERE operation=? ORDER BY ${keys.join(",")} LIMIT 1`,
