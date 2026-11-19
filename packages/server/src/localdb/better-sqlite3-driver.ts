@@ -1,3 +1,4 @@
+import { createWorkspaceValues } from "./workspace-values.js";
 import { Worker } from "node:worker_threads";
 import Database from "better-sqlite3";
 import type {
@@ -251,7 +252,7 @@ export function openBetterSqlite3(
       }
     : undefined;
 
-  return {
+  const driver: SqlDriver = {
     info: { sqliteVersion: v, host: "node", persistent },
     query: writer.query,
     batch: writer.batch,
@@ -266,4 +267,7 @@ export function openBetterSqlite3(
       }
     },
   };
+  return persistent
+    ? { ...driver, boundedValues: createWorkspaceValues(driver) }
+    : driver;
 }

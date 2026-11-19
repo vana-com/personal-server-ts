@@ -1,3 +1,4 @@
+import { WORKSPACE_SCHEMA } from "./workspace-schema.js";
 /** The statement every view trigger runs: add one to the connection's counter. */
 const bumpView = (row: "NEW" | "OLD") =>
   `INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (${row}.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = ${row}.connection_id), 0) + 1);`;
@@ -636,4 +637,5 @@ END`,
         VALUES (${row}.connection_id,${row}.stream,${row}.record_key,${event === "DELETE" ? "NULL" : "NEW.body"}); END`;
     }),
   ],
+  WORKSPACE_SCHEMA,
 ];
