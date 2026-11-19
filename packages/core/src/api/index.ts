@@ -1,3 +1,4 @@
+import { gatewayPaymentReasonCode } from "../payment/x402.js";
 import { decodeBase64UrlUtf8 } from "../encoding/base64url.js";
 import type { LocalListing } from "../localdb/listing.js";
 import { isOwnAppRead } from "../payment/own-app.js";
@@ -1410,7 +1411,7 @@ export type X402CycleResult =
  *   X-PAYMENT valid, forward to gateway succeeds
  *     → ok: caller proceeds to read the data
  *   X-PAYMENT valid, gateway returns 4xx/5xx
- *     → gateway-error: relay the gateway's body verbatim so the builder
+ *     → gateway-error: preserve the gateway's error fields with safe diagnostics so the builder
  *       can dispatch (insufficient balance vs. replay vs. race etc.)
  *
  * The gateway POST goes through `fetch` directly (not `gateway.payForOperation`)
@@ -1584,20 +1585,37 @@ export async function handleX402Cycle(
     errorBody = { error: gatewayRes.statusText };
   }
 
+  const reasonCode = gatewayPaymentReasonCode(errorBody);
+  deps.logger?.info?.(
+    { scope, grantId: opIdLower, status: gatewayRes.status, reasonCode },
+    "Gateway rejected X-PAYMENT",
+  );
+
   // 409 (replay or race) and 400 (amount mismatch / shape error) are
   // recoverable with a fresh challenge — the builder re-signs with the
-  // new state and retries. 402 (insufficient balance) is relayed verbatim
+  // new state and retries. 402 (insufficient balance) retains its error fields
   // because the builder needs to fix their escrow, not their signature.
   // 5xx is treated like 402-relayed since the personal server can't
   // distinguish "transient" from "permanent" without more info.
   if (gatewayRes.status === 409 || gatewayRes.status === 400) {
-    deps.logger?.info?.(
-      { scope, grantId: opIdLower, status: gatewayRes.status, errorBody },
-      "Gateway rejected X-PAYMENT; reissuing X402 challenge",
-    );
-    return { kind: "challenge", body: await buildFreshChallenge() };
+    return {
+      kind: "challenge",
+      body: {
+        ...(await buildFreshChallenge()),
+        gatewayStatus: gatewayRes.status,
+        gatewayReasonCode: reasonCode,
+      },
+    };
   }
-  return { kind: "gateway-error", status: gatewayRes.status, body: errorBody };
+  return {
+    kind: "gateway-error",
+    status: gatewayRes.status,
+    body: {
+      ...(errorBody && typeof errorBody === "object" ? errorBody : {}),
+      gatewayStatus: gatewayRes.status,
+      gatewayReasonCode: reasonCode,
+    },
+  };
 }
 
 const pendingIngestStamps = new WeakMap<

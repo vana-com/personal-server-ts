@@ -127,10 +127,52 @@ export interface X402Accept {
   expiresAt: number;
 }
 
-/**
- * Body of the 402 Payment Required response.
- */
+// Only these gateway validation diagnostics may cross the payment boundary.
+export const GATEWAY_PAYMENT_REASON_CODES = [
+  "REQUEST_BODY_INVALID",
+  "REQUEST_FIELD_INVALID",
+  "PAYER_INVALID",
+  "OP_TYPE_INVALID",
+  "OP_ID_INVALID",
+  "ASSET_INVALID",
+  "AMOUNT_INVALID",
+  "AMOUNT_OVERFLOW",
+  "NONCE_INVALID",
+  "NONCE_OVERFLOW",
+  "RECEIPT_ID_INVALID",
+  "RECEIPT_VERSION_INVALID",
+  "RECEIPT_ACCESSOR_INVALID",
+  "RECEIPT_RECORD_ID_INVALID",
+  "RECEIPT_SIGNATURE_INVALID",
+  "RECEIPT_REQUIRED",
+  "RECEIPT_OP_ID_MISMATCH",
+  "RECEIPT_PAYER_MISMATCH",
+  "PAYMENT_ASSET_MISMATCH",
+  "RECEIPT_DATA_POINT_UNKNOWN",
+  "PAYMENT_AMOUNT_MISMATCH",
+  "RECEIPT_VERSION_UNAVAILABLE",
+  "GATEWAY_REJECTED",
+] as const;
+export type GatewayPaymentReasonCode =
+  (typeof GATEWAY_PAYMENT_REASON_CODES)[number];
+
+export function gatewayPaymentReasonCode(
+  body: unknown,
+): GatewayPaymentReasonCode {
+  const code =
+    body && typeof body === "object" && "reasonCode" in body
+      ? body.reasonCode
+      : undefined;
+  return typeof code === "string" &&
+    GATEWAY_PAYMENT_REASON_CODES.includes(code as GatewayPaymentReasonCode)
+    ? (code as GatewayPaymentReasonCode)
+    : "GATEWAY_REJECTED";
+}
+
+/** Body of the 402 Payment Required response. */
 export interface X402Challenge {
+  gatewayStatus?: number;
+  gatewayReasonCode?: GatewayPaymentReasonCode;
   x402Version: 1;
   error: "PAYMENT_REQUIRED";
   accepts: [X402Accept];
