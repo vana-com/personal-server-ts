@@ -5,6 +5,7 @@ import {
   type Segment,
   type LogOperation,
   type SnapshotPart,
+  type LogEntry,
 } from "../../../stream-sync/src/index.js";
 import {
   applySegmentOperations,
@@ -129,19 +130,88 @@ it.each([0x12345678, 0xaabbccdd, 0x13579bdf])(
           "SELECT stream,pk_hash,record_key,body,body_sha256,stamp_o,stamp_r,stamp_n,first_o FROM records ORDER BY stream,pk_hash",
         ),
         deletions: await d.db.query(
-          // Compare the full effective deletion frontier. Dominated receipts may differ:
-          // foldLog drops tied omissions; subsequent replay can retain an older receipt.
-          `SELECT t.* FROM log_tombstones t WHERE NOT EXISTS (
-          SELECT 1 FROM records r WHERE r.connection_id=t.connection_id
-          AND r.stream=t.stream AND r.pk_hash=t.pk_hash
-          AND (r.stamp_o>t.stamp_o OR (r.stamp_o=t.stamp_o
-          AND (r.stamp_r>t.stamp_r OR (r.stamp_r=t.stamp_r AND t.rank=0)))))
-          ORDER BY t.stream,t.pk_hash`,
+          "SELECT * FROM log_tombstones ORDER BY stream,pk_hash",
         ),
         completion: await d.db.query(
           "SELECT stream,primary_key,profile_key,profile_version,complete FROM stream_state ORDER BY stream",
         ),
       };
+    }
+    // foldLog omits ONLY a greatest omission tied by the winning upsert.
+    // operationStatements retains the greatest (stamp,rank) receipt regardless of
+    // the live row. Therefore raw tables need not match across compaction.
+    // Assert each raw table exactly against its delivered operations, including
+    // dominated receipts, then compare cross-reader observable state. Never mask
+    // a missing receipt merely because a row currently dominates it.
+    function deletionReceipts(
+      operations: readonly (LogOperation | LogEntry)[],
+    ) {
+      const cells = new Map<
+        string,
+        {
+          connection_id: string;
+          stream: string;
+          pk_hash: string;
+          record_key: string;
+          stamp_o: number;
+          stamp_r: string;
+          rank: number;
+        }
+      >();
+      for (const op of operations) {
+        if (op.kind === "upsert") continue;
+        const removed = op.kind === "complete" ? op.omitted : [op];
+        const stamp = op.kind === "complete" ? op.cutoff : op.stamp;
+        for (const key of removed) {
+          const row = {
+            connection_id: CONNECTION_ID,
+            stream: op.stream,
+            pk_hash: key.pkHash,
+            record_key: String(key.key[0]),
+            stamp_o: stamp.o,
+            stamp_r: stamp.r,
+            rank: op.kind === "delete" ? 2 : 0,
+          };
+          const id = row.stream + "/" + row.pk_hash,
+            old = cells.get(id);
+          if (
+            !old ||
+            row.stamp_o > old.stamp_o ||
+            (row.stamp_o === old.stamp_o &&
+              (row.stamp_r > old.stamp_r ||
+                (row.stamp_r === old.stamp_r && row.rank > old.rank)))
+          )
+            cells.set(id, row);
+        }
+      }
+      return [...cells.values()].sort(
+        (a, b) =>
+          a.stream.localeCompare(b.stream) ||
+          a.pk_hash.localeCompare(b.pk_hash),
+      );
+    }
+    async function assertReaders(
+      compact: Awaited<ReturnType<typeof w.device>>,
+      sequential: Awaited<ReturnType<typeof w.device>>,
+      foldedOps: readonly (LogOperation | LogEntry)[],
+      sequentialOps: readonly LogOperation[],
+    ) {
+      const x = await state(compact),
+        y = await state(sequential);
+      expect(x.deletions).toEqual(deletionReceipts(foldedOps));
+      expect(y.deletions).toEqual(deletionReceipts(sequentialOps));
+      expect(x.rows).toEqual(y.rows);
+      expect(x.completion).toEqual(y.completion);
+      // Deleted keys' complete frontiers are externally effective. Live rows
+      // already reject all older operations by the same stamp/rank order.
+      const effective = (snapshot: typeof x) =>
+        snapshot.deletions.filter(
+          (t) =>
+            !snapshot.rows.some(
+              (r) => r.stream === t.stream && r.pk_hash === t.pk_hash,
+            ),
+        );
+      expect(effective(x)).toEqual(effective(y));
     }
     for (const prefix of [1, 8, 17, 32, 33, 34, 35, 36]) {
       const sequential = await w.device(`seq${prefix}`),
@@ -166,16 +236,35 @@ it.each([0x12345678, 0xaabbccdd, 0x13579bdf])(
         entries: fold.entries,
       };
       await applySnapshotPart(compact.deps, CONNECTION_ID, part);
-      expect(await state(compact)).toEqual(await state(sequential));
+      const prefixOps = history.slice(0, prefix).flatMap((g) => g.operations);
+      await assertReaders(compact, sequential, fold.entries, prefixOps);
+      if (prefix >= 33) {
+        const row = (await state(compact)).rows.find(
+          (r) => r.pk_hash === hash[0],
+        );
+        if (prefix === 35) expect(row).toBeUndefined();
+        else {
+          expect(JSON.parse(String(row!.body))).toEqual({
+            id: 0,
+            v: prefix === 36 ? 2 : 1,
+          });
+          expect(row!.first_o).toBe(prefix === 36 ? 3001 : null);
+          expect(row!.stamp_o).toBe(prefix === 36 ? 3001 : 3000);
+        }
+      }
       // Replay a fork suffix, including older stamps, after installing the prefix.
-      for (const segment of [
-        ...history.slice(prefix),
-        ...history.slice(0, 3),
-      ]) {
+      const suffix = [...history.slice(prefix), ...history.slice(0, 3)];
+      for (const segment of suffix) {
         await applySegmentOperations(sequential.deps, CONNECTION_ID, segment);
         await applySegmentOperations(compact.deps, CONNECTION_ID, segment);
       }
-      expect(await state(compact)).toEqual(await state(sequential));
+      const suffixOps = suffix.flatMap((g) => g.operations);
+      await assertReaders(
+        compact,
+        sequential,
+        [...fold.entries, ...suffixOps],
+        [...prefixOps, ...suffixOps],
+      );
     }
   },
   60000,
