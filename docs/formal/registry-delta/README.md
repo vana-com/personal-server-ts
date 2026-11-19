@@ -13,7 +13,7 @@ The reader side is the Personal Server's `SyncManager` and `applyRegistryDelta` 
 
 - applies a control tombstone (a delete): it saves the row and purges the connection, as the cycle does, and skips the connection's log row, because the cycle's apply returns at a deleted control before it reads the log;
 - applies a log row of a connection it holds active;
-- hands the delta to the cycle for a control row active again (a reconnect, which needs a first load), a gone row, and a log row of a connection it does not hold.
+- hands the delta to the cycle for a control row active again (a reconnect, which needs a first load), a gone row, and a log row of a connection it does not hold without a complete first-create pair (see below).
 
 The code also skips an active control row of the lifetime it holds (only bookkeeping moved) and hands a deleted log row to the cycle. The model has no such writes.
 
@@ -87,3 +87,22 @@ M1–M7 each let the reader skip a committed change. M8 lets it settle without e
 One configuration (one TLC job, 4 workers, `nice 19`):
 
     TLA2TOOLS=/path/to/tla2tools.jar docs/formal/registry-delta/run.sh D1-design
+
+## First creation from a delta
+
+`D2-first-create.cfg` checks a reader initially missing the connection. An atomic
+`FirstCreate` action commits its first control and log together. Ordinary writers
+still change either row separately, including deletes and reconnects. The reader
+may establish the connection from a complete pair only when it has never held a
+control and the active control is version 1. Missing pairs and later lifetimes
+still hand off to a listing. The existing configuration remains unchanged.
+
+The four existing properties pass with two writers and three transactions:
+3,277,860 generated states, 1,189,558 distinct states, depth 23. TLC 2.19 used
+four workers and a 2 GiB heap. The model abstracts segment verification and SQL
+failure. The SQLite delta tests cover namespace/key mismatch, queue admission
+against deletion, and failure after saving control followed by a new sync instance
+replaying the same delta. Host tests cover position gaps and delayed settlement.
+The model does not prove process termination or storage durability.
+
+Run with the same command above, substituting `D2-first-create` for `D1-design`.

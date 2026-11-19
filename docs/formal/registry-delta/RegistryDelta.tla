@@ -86,9 +86,9 @@ Init ==
   /\ counter = 0 /\ nextSeq = 1 /\ lock = NoWriter
   /\ txn = [w \in Writers |-> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0]]
   /\ ver = [s \in Scopes |-> 0] /\ chg = [s \in Scopes |-> 0]
-  /\ kind = [ctl |-> "act", log |-> "app"]
+  /\ kind = [ctl |-> IF ControlRows = "first-create" THEN "gone" ELSE "act", log |-> "app"]
   /\ hist = {} /\ txns = 0 /\ floor = 0 /\ floored = FALSE
-  /\ since = 0 /\ view = [s \in Scopes |-> 0] /\ rkind = "act"
+  /\ since = 0 /\ view = [s \in Scopes |-> 0] /\ rkind = IF ControlRows = "first-create" THEN "gone" ELSE "act"
   /\ rphase = "idle" /\ rcursor = 0 /\ debt = 0
   /\ rbuf = [handoff |-> FALSE, view |-> [s \in Scopes |-> 0], rkind |-> "act"]
 
@@ -155,14 +155,17 @@ Decide ==
   LET rows == {s \in Scopes : chg[s] > since}
       ctlIn == "ctl" \in rows
       ck == kind["ctl"]
+      firstCreate == ControlRows = "first-create" /\ ctlIn
+        /\ "log" \in rows /\ ck = "act" /\ kind["log"] = "app"
+        /\ ver["ctl"] = 1 /\ view["ctl"] = 0 /\ rkind = "gone"
       newKind ==
-        IF ctlIn /\ ck = "tomb" /\ ControlRows \in {"apply", "reconnect"} THEN "tomb"
-        ELSE IF ctlIn /\ ck = "act" /\ ControlRows = "reconnect" THEN "act"
+        IF ctlIn /\ ck = "tomb" /\ ControlRows \in {"apply", "reconnect", "first-create"} THEN "tomb"
+        ELSE IF firstCreate \/ (ctlIn /\ ck = "act" /\ ControlRows = "reconnect") THEN "act"
         ELSE rkind
       handoff ==
         \/ \E s \in rows : kind[s] = "gone"
         \/ ctlIn /\ ControlRows = "handoff"
-        \/ ctlIn /\ ck = "act" /\ ControlRows \in {"apply", "ignore"}
+        \/ ctlIn /\ ck = "act" /\ ControlRows \in {"apply", "ignore", "first-create"} /\ ~firstCreate
         \* a log of a connection this device does not hold
         \/ "log" \in rows /\ newKind = "gone"
       newView == [s \in Scopes |->
@@ -260,7 +263,19 @@ Listing ==
   /\ UNCHANGED <<counter, nextSeq, lock, txn, ver, kind, chg, hist, txns, floor, floored,
                  rbuf, rcursor, debt>>
 
+FirstCreate ==
+  /\ ControlRows = "first-create" /\ txns < MaxTxns
+  /\ lock = NoWriter /\ ver["ctl"] = 0 /\ ver["log"] = 0
+  /\ ver' = [s \in Scopes |-> 1]
+  /\ kind' = [ctl |-> "act", log |-> "app"]
+  /\ chg' = [ctl |-> counter + 1, log |-> counter + 2]
+  /\ hist' = hist \cup {<<counter + 1, "ctl", 1>>, <<counter + 2, "log", 1>>}
+  /\ counter' = counter + 2 /\ txns' = txns + 1
+  /\ UNCHANGED <<nextSeq, lock, txn, floor, floored, since, view, rkind,
+                 rphase, rbuf, rcursor, debt>>
+
 Next ==
+  \/ FirstCreate
   \/ \E w \in Writers : Begin(w) \/ Number(w) \/ Commit(w) \/ Abort(w)
   \/ RaiseFloor
   \/ Delta \/ DeltaRows \/ DeltaCounter \/ ApplyDelta \/ PublishDebt \/ DeferPublication \/ RetryPublication \/ SettleDelta \/ Listing

@@ -5,9 +5,20 @@
 // Applying it must leave the device exactly where a full cycle would, with no
 // registry read and one segment GET; anything it cannot prove so it hands to
 // the cycle and leaves untouched. Each test names the mutation it pins.
-import { afterEach, describe, expect, it } from "vitest";
-import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import { keccak_256 } from "@noble/hashes/sha3";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  digestSegment,
+  encodeSegment,
+  controlScope,
+  logScope,
+  streamScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import type { RegistryChangeDelta } from "../../../core/src/stream-sync/ports.js";
+import {
+  connectionQueue,
+  createLocalSync,
+} from "../../../core/src/localdb/index.js";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { applyRegistryDelta } from "../../../core/src/localdb/delta-apply.js";
 import {
@@ -1058,4 +1069,261 @@ describe("empty delta and idle full cycle request counts", () => {
     expect(trace.count("list")).toBe(1);
     expect(trace.count("read")).toBe(0);
   });
+});
+
+it("a first-create pair avoids the owner listing and downloads only its segment", async () => {
+  const w = await world({ streams: 1 });
+  const peer = await w.device("peer");
+  const here = await w.device("receiver");
+  await here.cycle(); // establish an empty owner baseline
+  await peer.run("first", [{ stream: sName(0), id: "first-record" }]);
+  await peer.cycle();
+  const delta = await deltaOf(here, [CONTROL, LOG], { since: "0", seq: "2" });
+  const list = vi.spyOn(here.deps.registry, "listOwnerRows");
+  const out = await applied(w, here, delta);
+  if (out.result.outcome === "cycle") await here.cycle();
+  expect(await here.rows()).toEqual(await peer.rows());
+  expect(list).not.toHaveBeenCalled();
+  expect(out.result.outcome).toBe("applied");
+  expect(out.gets).toEqual(peer.puts);
+  expect(out.gets).toHaveLength(1);
+  expect(out.registryCalls).toEqual([]);
+});
+
+async function firstCreated() {
+  const w = await world({ streams: 1 });
+  const peer = await w.device("creator");
+  const here = await w.device("receiver");
+  await here.cycle();
+  await peer.run("first", [{ stream: sName(0), id: "first" }]);
+  await peer.cycle();
+  const delta = await deltaOf(here, [CONTROL, LOG], { since: "0", seq: "2" });
+  if (delta.reset) throw new Error("expected rows");
+  return { w, peer, here, delta };
+}
+
+it.each([
+  "control only",
+  "log only",
+  "reset",
+  "foreign control",
+  "later generation",
+  "split namespace",
+])("first-create rejects %s before local writes", async (scenario) => {
+  const { here, delta } = await firstCreated();
+  let candidate: RegistryChangeDelta = delta;
+  if (scenario === "control only")
+    candidate = { ...delta, rows: delta.rows.slice(0, 1) };
+  if (scenario === "log only")
+    candidate = { ...delta, rows: delta.rows.slice(1) };
+  if (scenario === "reset")
+    candidate = { since: delta.since, seq: delta.seq, reset: true };
+  if (scenario === "foreign control" || scenario === "later generation") {
+    candidate = {
+      ...delta,
+      rows: delta.rows.map((row) =>
+        row.scope !== CONTROL || !row.read.found
+          ? row
+          : {
+              ...row,
+              read: {
+                ...row.read,
+                ...(scenario === "foreign control"
+                  ? { dataHash: `0x${"ab".repeat(32)}` }
+                  : { version: 3 }),
+              },
+            },
+      ),
+    };
+  }
+  if (scenario === "split namespace")
+    candidate = {
+      ...delta,
+      rows: delta.rows.map((row) =>
+        row.scope === LOG
+          ? { ...row, scope: logScope(CONNECTOR, "0123456789abcdef") }
+          : row,
+      ),
+    };
+  const before = await localState(here);
+  expect((await here.sync.applyDelta(candidate)).outcome).toBe("cycle");
+  expect(await localState(here)).toEqual(before);
+  expect(here.gets).toEqual([]);
+});
+
+it("a pair split across answers keeps reconciliation until the connection is established", async () => {
+  const { here, peer, delta } = await firstCreated();
+  for (const [index, row] of delta.rows.entries()) {
+    expect(
+      (
+        await here.sync.applyDelta({
+          ...delta,
+          since: String(index),
+          seq: String(index + 1),
+          rows: [row],
+        })
+      ).outcome,
+    ).toBe("cycle");
+    expect(await here.rows()).toEqual([]);
+  }
+  await here.cycle();
+  expect(await here.rows()).toEqual(await peer.rows());
+});
+
+it.each(["delete intent", "local tombstone"])(
+  "first-create rechecks %s after queue admission",
+  async (scenario) => {
+    const { here, delta } = await firstCreated();
+    const deps = {
+      ...here.deps,
+      queue: {
+        run: async <T>(
+          id: string,
+          kind: "end" | "publish" | "apply" | "purge",
+          work: () => Promise<T>,
+        ) => {
+          await here.deps.queue.run(id, "end", () =>
+            here.db
+              .batch([
+                scenario === "delete intent"
+                  ? {
+                      sql: "INSERT INTO delete_intents (connector, delete_id, intent) VALUES (?, 'delete', '{}')",
+                      params: [CONNECTOR],
+                    }
+                  : {
+                      sql: "INSERT INTO connections (connection_id, connector, ns, generation, control_state, control_version) VALUES (?, ?, '', 1, 'deleted', 2)",
+                      params: [CONNECTION_ID, CONNECTOR],
+                    },
+              ])
+              .then(() => {}),
+          );
+          return here.deps.queue.run(id, kind, work);
+        },
+      },
+    };
+    expect((await applyRegistryDelta(deps, delta)).outcome).toBe("cycle");
+    expect(await here.rows()).toEqual([]);
+    expect(here.gets).toEqual([]);
+  },
+);
+
+it("a tombstone followed by recreation requires a full cycle", async () => {
+  const { here, peer } = await firstCreated();
+  await peer.sync.deleter.requestConnectionDelete(CONNECTOR);
+  await peer.sync.deleter.resumeDeletes();
+  await peer.run("recreated", [{ stream: sName(0), id: "recreated" }], {
+    connect: true,
+  });
+  await peer.cycle();
+  expect(
+    (await here.sync.applyDelta(await deltaOf(here, [CONTROL, LOG]))).outcome,
+  ).toBe("cycle");
+  expect(await here.rows()).toEqual([]);
+  await here.cycle();
+  expect(await here.rows()).toEqual(await peer.rows());
+});
+
+it("a first control paired with a later-generation log cannot settle", async () => {
+  const { here, peer, delta } = await firstCreated();
+  await peer.sync.deleter.requestConnectionDelete(CONNECTOR);
+  await peer.sync.deleter.resumeDeletes();
+  await peer.run("recreated", [{ stream: sName(0), id: "recreated" }], {
+    connect: true,
+  });
+  await peer.cycle();
+  const later = await deltaOf(here, [LOG]);
+  if (later.reset) throw new Error("expected rows");
+  expect(
+    (
+      await here.sync.applyDelta({
+        ...delta,
+        rows: [delta.rows[0]!, ...later.rows],
+      })
+    ).outcome,
+  ).toBe("cycle");
+  expect(await here.rows()).toEqual([]);
+});
+
+it("a log from another namespace fails verification even with a matching control", async () => {
+  const { here, delta, w } = await firstCreated();
+  const ns = "0123456789abcdef";
+  const original = (await w.innerBlobs.get((await w.segmentKeys()).get(1)!))!;
+  here.deps.blobs.get = async () => original;
+  const candidate = {
+    ...delta,
+    rows: delta.rows.map((row) => ({
+      ...row,
+      scope:
+        row.scope === CONTROL
+          ? controlScope(CONNECTOR, ns)
+          : logScope(CONNECTOR, ns),
+    })),
+  };
+  await expect(here.sync.applyDelta(candidate)).rejects.toThrow(
+    /invalid log segment/,
+  );
+  expect(await here.rows()).toEqual([]);
+});
+
+it("failure after control insertion is recoverable by a new sync instance and replay", async () => {
+  const { here, peer, delta } = await firstCreated();
+  const get = here.deps.blobs.get;
+  here.deps.blobs.get = async () => {
+    throw new Error("interrupted download");
+  };
+  await expect(here.sync.applyDelta(delta)).rejects.toThrow(
+    "interrupted download",
+  );
+  expect((await localState(here)).connections).toMatchObject([
+    { control_state: "active", generation: 1 },
+  ]);
+  expect(await here.position()).toBe(0);
+  expect(await here.rows()).toEqual([]);
+  here.deps.blobs.get = get;
+  const restarted = createLocalSync(
+    { ...here.deps, queue: connectionQueue() },
+    {
+      resolveArtifact: () => {
+        throw new Error("replay must not resolve an artifact");
+      },
+    },
+  );
+  expect((await restarted.applyDelta(delta)).outcome).toBe("applied");
+  expect(await here.rows()).toEqual(await peer.rows());
+  expect((await restarted.applyDelta(delta)).outcome).toBe("applied");
+  expect(await here.rows()).toEqual(await peer.rows());
+});
+
+it("a first-create log with another key check fails before committing records", async () => {
+  const { here, delta, w } = await firstCreated();
+  const segment = (await w.segments()).get(1)!;
+  const bytes = encodeSegment({ ...segment, keyCheck: "0123456789abcdef" });
+  const { dataHash } = await digestSegment(async (b) => keccak_256(b), bytes);
+  await w.innerBlobs.put(`${LOG}/s-${dataHash.slice(2)}`, bytes);
+  const candidate = {
+    ...delta,
+    rows: delta.rows.map((row) =>
+      row.scope === LOG && row.read.found
+        ? { ...row, read: { ...row.read, dataHash } }
+        : row,
+    ),
+  };
+  await expect(here.sync.applyDelta(candidate)).rejects.toThrow(
+    /invalid log segment/,
+  );
+  expect(await here.rows()).toEqual([]);
+  expect(await here.position()).toBe(0);
+});
+
+it("a first-create pair uses the production first-load bootstrap path", async () => {
+  const { here, peer, delta } = await firstCreated();
+  const list = vi.spyOn(here.deps.registry, "listOwnerRows");
+  const result = await applyRegistryDelta(
+    { ...here.deps, bootstrapFirstLoad: true },
+    delta,
+  );
+  expect(result).toMatchObject({ outcome: "applied", blobGets: 1 });
+  expect(list).not.toHaveBeenCalled();
+  expect(here.gets).toEqual(peer.puts);
+  expect(await here.rows()).toEqual(await peer.rows());
 });
