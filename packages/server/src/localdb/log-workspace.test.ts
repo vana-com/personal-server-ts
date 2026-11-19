@@ -1,3 +1,4 @@
+import { openWorkspace } from "../../../core/dist/localdb/workspace.js";
 import { afterEach, expect, it } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -5,10 +6,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { migrate } from "../../../core/src/localdb/migrate.js";
-import {
-  openWorkspace,
-  runtimeAdmission,
-} from "@opendatalabs/personal-server-ts-core/localdb";
+import { runtimeAdmission } from "@opendatalabs/personal-server-ts-core/localdb";
 import { createWorkspaceValues } from "./workspace-values.js";
 import type { WorkspaceBinding } from "../../../core/src/localdb/index.js";
 

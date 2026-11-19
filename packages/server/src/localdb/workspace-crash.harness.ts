@@ -1,8 +1,8 @@
+import { openWorkspace } from "../../../core/dist/localdb/workspace.js";
 import { createHash } from "node:crypto";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { createWorkspaceValues } from "./workspace-values.js";
 import {
-  openWorkspace,
   runtimeAdmission,
   type SqlDriver,
   type WorkspaceBinding,

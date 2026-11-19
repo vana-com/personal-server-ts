@@ -1,3 +1,4 @@
+import { openWorkspace } from "../../../core/dist/localdb/workspace.js";
 import { afterEach, expect, it } from "vitest";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -7,7 +8,6 @@ import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { migrate } from "../../../core/src/localdb/migrate.js";
 import {
   createSqlWorkspaceValues,
-  openWorkspace,
   runtimeAdmission,
   setWorkspaceAuthority,
   type WorkspaceBinding,

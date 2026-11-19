@@ -137,11 +137,18 @@ export type {
   BoundedValueStore,
   WorkspaceResourceLedger,
 } from "./workspace-capability.js";
-export {
-  openWorkspace,
-  runtimeAdmission,
-  setWorkspaceAuthority,
-  type WorkspaceCell,
-  type WorkspaceRelation,
-} from "./workspace.js";
+export { runtimeAdmission, setWorkspaceAuthority } from "./workspace.js";
 export { createSqlWorkspaceValues } from "./workspace-values.js";
+export {
+  openLogWorkspace,
+  workspaceValueReader,
+  type WorkspaceRecordKey,
+  type WorkspaceDeletion,
+  type WorkspaceUpsert,
+  type WorkspaceFoldCell,
+  type WorkspaceRows,
+  type WorkspaceRowKind,
+  type ReceiptedWorkspaceUnit,
+  type StagingWorkspaceUnit,
+  type WorkspaceValueReader,
+} from "./workspace-consumer.js";
