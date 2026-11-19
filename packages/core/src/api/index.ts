@@ -786,9 +786,19 @@ function legacyMutationRefusal(mode: AccountMode): Response | undefined {
   return undefined;
 }
 
+const readAbortedBody = () => ({
+  error: {
+    code: 503,
+    errorCode: "READ_ABORTED",
+    message: "This read ended before payment",
+  },
+});
+
 /** The response for a stream-sync decision that serves nothing; `null` otherwise. */
 function streamSyncRefusal(decision: ReadDecision): Response | null {
   switch (decision.kind) {
+    case "read_aborted":
+      return jsonResponse(readAbortedBody(), { status: 503 });
     case "read_not_registered":
       return jsonResponse(
         {
@@ -1555,13 +1565,7 @@ export async function handleX402Cycle(
     return {
       kind: "gateway-error",
       status: 503,
-      body: {
-        error: {
-          code: 503,
-          errorCode: "READ_ABORTED",
-          message: "This read ended before payment",
-        },
-      },
+      body: readAbortedBody(),
     };
   }
   let gatewayRes: Response;

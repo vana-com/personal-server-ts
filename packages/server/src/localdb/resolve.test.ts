@@ -1,3 +1,4 @@
+import { world, closeWorldDrivers } from "./log-world.test-utils.js";
 import {
   handlePersonalServerDataRequest,
   type PersonalServerDataApiDeps,
@@ -1566,9 +1567,9 @@ it("never charges keyed first-load rows before their pending publication", async
 });
 
 async function chargedRead(
-  f: Awaited<ReturnType<typeof fixture>>,
+  f: Pick<Awaited<ReturnType<typeof fixture>>, "resolver">,
   scope: string,
-  beforeRetry?: () => void,
+  beforeRetry?: () => void | Promise<void>,
   signal?: AbortSignal,
 ) {
   const builder = privateKeyToAccount(`0x${"11".repeat(32)}`);
@@ -1635,7 +1636,7 @@ async function chargedRead(
       paymentNonce: BigInt(accept.message.paymentNonce),
     },
   });
-  beforeRetry?.();
+  await beforeRetry?.();
   const response = await handlePersonalServerDataRequest(
     new Request(url, {
       signal,
@@ -1724,4 +1725,45 @@ it("sends no payment when an alias projection aborts the request", async () => {
   expect(await paid.response.json()).toMatchObject({
     error: { errorCode: "READ_ABORTED" },
   });
+});
+
+it("returns READ_ABORTED when publication is interrupted before payment", async () => {
+  const controller = new AbortController();
+  let blocked = false;
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const w = await world({ streams: 1 });
+  const a = await w.device("a", {
+    beforePut: async () => {
+      if (blocked) {
+        controller.abort();
+        await gate;
+      }
+    },
+  });
+  try {
+    await a.run("first", [{ stream: "s0", id: 1, v: 1 }]);
+    await a.sync.publish();
+    const paid = await chargedRead(
+      { resolver: a.sync.resolver },
+      "pdpp.fixture.s0",
+      async () => {
+        await a.run("second", [{ stream: "s0", id: 1, v: 2 }]);
+        blocked = true;
+      },
+      controller.signal,
+    );
+    expect(paid.response.status).toBe(503);
+    expect(await paid.response.json()).toMatchObject({
+      error: { errorCode: "READ_ABORTED" },
+    });
+    expect(paid.paymentFetch).not.toHaveBeenCalled();
+  } finally {
+    blocked = false;
+    release();
+    await a.sync.publish();
+    await closeWorldDrivers();
+  }
 });

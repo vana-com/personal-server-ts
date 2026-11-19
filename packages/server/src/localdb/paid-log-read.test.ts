@@ -183,12 +183,33 @@ describe("paid reads of registered log folds", () => {
     try {
       await uploading;
       controller.abort();
-      expect(await pending).toMatchObject({ kind: "read_not_registered" });
+      expect(await pending).toMatchObject({ kind: "read_aborted" });
     } finally {
       release();
       await a.sync.publish();
     }
     expect(await a.position()).toBe(2);
+  });
+  it("publishes a replacement despite a deleted sibling", async () => {
+    const w = await world({ streams: 1 });
+    const a = await w.device("a");
+    await a.run("first", [{ stream: "s0", id: 1, v: 1 }]);
+    await a.deps.db.batch([
+      {
+        sql: "INSERT INTO connections (connection_id, connector, ns, generation, control_state, deleted_at) VALUES ('old', 'fixture', 'aaaaaaaaaaaaaaaa', 1, 'deleted', 1)",
+      },
+    ]);
+    const decision = await a.sync.resolver.resolve(read());
+    expect(decision).toMatchObject({
+      kind: "view",
+      served: { scope: LOG, version: 1 },
+    });
+    if (decision.kind === "view") {
+      expect(await new Response(decision.body).json()).toMatchObject({
+        data: { records: [{ id: 1, v: 1 }] },
+      });
+    }
+    expect(await a.position()).toBe(1);
   });
   it("publishes the first local image before charging a new connection", async () => {
     const w = await world({ streams: 1 });
@@ -212,7 +233,7 @@ describe("paid reads of registered log folds", () => {
       ...read(),
       signal: AbortSignal.abort(),
     });
-    expect(decision).toMatchObject({ kind: "read_not_registered" });
+    expect(decision).toMatchObject({ kind: "read_aborted" });
     expect(post).not.toHaveBeenCalled();
   });
   it("binds a covered stream to the accepted log position, not its local counter", async () => {

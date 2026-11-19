@@ -140,6 +140,7 @@ export interface OwnerNotes {
 
 export type ReadDecision =
   | { readonly kind: "read_not_registered" }
+  | { readonly kind: "read_aborted" }
   | { readonly kind: "invalid_binding" }
   /** Not a stream-sync read: the existing path answers, unchanged. */
   | ({ readonly kind: "pass" } & OwnerNotes)

@@ -563,10 +563,7 @@ export function createLocalResolver(
       // A readable winner always keeps its existing rank and identity.
       const chosen =
         ranked ??
-        (!sawTombstoned &&
-        !sawDeleted &&
-        !applyUnavailable &&
-        initial.length === 1
+        (!sawTombstoned && !applyUnavailable && initial.length === 1
           ? initial[0]
           : undefined);
       if (!chosen) {
@@ -592,7 +589,9 @@ export function createLocalResolver(
           input.signal,
         ))
       )
-        return { kind: "read_not_registered" };
+        return {
+          kind: input.signal?.aborted ? "read_aborted" : "read_not_registered",
+        };
       if (chosen.partialStreams?.length) {
         const partial = await buildPartial({ ...input, scope }, chosen);
         if (partial) return partial;
@@ -608,17 +607,16 @@ export function createLocalResolver(
       const decision = await decide();
       // A collector can commit between the early coverage check and build.
       // Publish outside the queue and reselect the body once in that case.
-      if (
-        decision.kind === "read_not_registered" &&
-        input.requireRegistered &&
-        (await ensureRegisteredRead(
+      if (decision.kind === "read_not_registered" && input.requireRegistered) {
+        const registered = await ensureRegisteredRead(
           deps,
           chosen.connection.connection_id,
           chosen.target.streams,
           input.signal,
-        ))
-      )
-        return decide();
+        );
+        if (input.signal?.aborted) return { kind: "read_aborted" };
+        if (registered) return decide();
+      }
       return decision;
     },
   };
