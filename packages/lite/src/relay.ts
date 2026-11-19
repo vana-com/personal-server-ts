@@ -1,4 +1,5 @@
 import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
+import { parseDataScopeContract } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
   handlePsLiteBridgeRequest,
   type PsLiteBridgeRequest,
@@ -42,7 +43,107 @@ export interface PsLiteRelayClientOptions {
   reconnectInitialDelayMs?: number;
   /** Max reconnect backoff delay (ms). Default 30_000. */
   reconnectMaxDelayMs?: number;
+  /**
+   * Read-reliability telemetry hook: one `ps_read_received` and one
+   * `ps_read_finished` per relayed `/v1/data/<scope>` HTTP request. Hosts
+   * forward the events to their analytics; a throwing hook never affects the
+   * relay.
+   *
+   * These count HTTP requests (attempts), not logical reads. A paid builder
+   * read is at least two requests: the first answers 402 (`payment_required`)
+   * and the paid retry answers 200; a requester's transport retry repeats the
+   * whole exchange. Dashboards must treat `payment_required` as a step, not a
+   * failure, and take the number of logical reads from the requester side.
+   */
+  onReadEvent?: (event: PsLiteReadEvent) => void;
+  /**
+   * Where the app's visibility comes from, for `appVisibility` and
+   * `hiddenDuring`. Default: `document.visibilityState` and its
+   * `visibilitychange` events. A host whose document does not reflect the app
+   * (PS-Lite in a headless WebView on mobile, where the document is never the
+   * screen) must pass its own source, or `() => "unknown"`; the events then
+   * omit `hiddenDuring` and carry `appVisibility: "unknown"` instead of a
+   * value that is constant and wrong.
+   */
+  appVisibility?: () => PsLiteAppVisibility;
 }
+
+/**
+ * How a relayed read ended, as seen by the PS-Lite relay client. `ok` and
+ * `empty` mean the response was handed to the socket, not that the requester
+ * received it: delivery comes from joining the relay's `relay_stream_ended`
+ * on streamRef (`bytes_unflushed` there is what the requester never got).
+ * `payment_required` is the expected first answer of a paid read, a step on
+ * the way to `ok`, not a failed read.
+ */
+export type PsLiteReadOutcome =
+  | "ok"
+  | "empty"
+  | "denied"
+  | "payment_required"
+  | "not_found"
+  | "error"
+  | "handler_error"
+  | "tls_error"
+  | "stream_closed";
+
+export type PsLiteAppVisibility = "visible" | "hidden" | "unknown";
+
+interface PsLiteReadEventIds {
+  /**
+   * Epoch ms when the fact happened on the device: the request was parsed
+   * (`ps_read_received`) or the response was handed to the socket or given up
+   * (`ps_read_finished`). Taken at that moment, not when the hook runs: the
+   * hook is deferred to a later task, which in a suspended WebView may be the
+   * moment the app resumes.
+   */
+  at: number;
+  /** `<streamRef or local uuid>:<seq>`; random, never derived from user data. */
+  readRef: string;
+  /** Relay-generated per-TCP-stream UUID from `stream.open` (old relays: absent). */
+  streamRef?: string;
+  /** Random 16-hex tag of the WebSocket connection that carried the read. */
+  connTag: string;
+  /**
+   * Scope from the request path (`/v1/data/<scope>`), query dropped. Read
+   * before auth, so anything that is not a valid scope (or is longer than 128
+   * chars) is reported as "invalid".
+   */
+  scope: string;
+  method: string;
+}
+
+/**
+ * Read telemetry emitted by the relay client. Carries no data content, no
+ * addresses, grant ids, sessionId, IPs or SNI.
+ */
+export type PsLiteReadEvent =
+  | (PsLiteReadEventIds & {
+      type: "ps_read_received";
+      appVisibility: PsLiteAppVisibility;
+    })
+  | (PsLiteReadEventIds & {
+      type: "ps_read_finished";
+      /**
+       * First 12 hex of sha256(lowercased grantee address), "owner", or
+       * absent. A pseudonym, not an anonymous id: builders are a small public
+       * set, so their addresses map back to it.
+       */
+      granteeRef?: string;
+      /** HTTP status written; absent when no response was produced. */
+      status?: number;
+      outcome: PsLiteReadOutcome;
+      /** Plaintext HTTP response bytes written (head + body, after gzip). */
+      bytesOut: number;
+      gzip: boolean;
+      durationMs: number;
+      /**
+       * The app was hidden at any point between received and finished. Absent
+       * when the visibility source never knew (`appVisibility` "unknown"
+       * throughout), so an unknowing host cannot look like a visible one.
+       */
+      hiddenDuring?: boolean;
+    });
 
 export type PsLiteRelayStatus =
   "connecting" | "connected" | "disconnected" | "closed" | "replaced" | "error";
@@ -57,6 +158,8 @@ export type PsLiteRelayStatus =
 export interface PsLiteRelayStatusDetail {
   code?: number;
   reason?: string;
+  /** Random 16-hex tag of the current WebSocket connection (`?tag=`). */
+  connTag?: string;
 }
 
 /**
@@ -164,11 +267,38 @@ interface StreamState {
   ready: boolean;
   handling: boolean;
   tls?: PsLiteRelayTlsStream;
+  /** Relay-generated stream id from `stream.open`, when the relay sends one. */
+  streamRef?: string;
+  /** connTag of the socket this stream arrived on. */
+  connTag: string;
+  /** HTTP requests seen on this stream (read_ref suffix). */
+  requestSeq: number;
+  activeRead?: ReadTracker;
 }
+
+interface ReadTracker {
+  ids: Omit<PsLiteReadEventIds, "at">;
+  startedAt: number;
+  /** undefined until the visibility source reports visible or hidden. */
+  hiddenDuring: boolean | undefined;
+  done: boolean;
+}
+
+type ReadFinish = {
+  /** "classify" defers the empty-body check to the async dispatch. */
+  outcome: PsLiteReadOutcome | "classify";
+  status?: number;
+  granteeRef?: Promise<string | undefined>;
+  bytesOut?: number;
+  gzip?: boolean;
+  body?: Uint8Array;
+  contentType?: string;
+};
 
 interface ControlMessage {
   type: string;
   streamId?: number;
+  streamRef?: unknown;
   issueToken?: string;
   reason?: string;
 }
@@ -184,8 +314,10 @@ interface ParsedHttpRequest {
 export function psLiteRelayControlUrl(
   sessionId: string,
   controlUrl = DEFAULT_CONTROL_URL,
+  connTag?: string,
 ): string {
-  return `${controlUrl.replace(/\/+$/, "")}/browser/${sessionId}`;
+  const base = `${controlUrl.replace(/\/+$/, "")}/browser/${sessionId}`;
+  return connTag ? `${base}?tag=${encodeURIComponent(connTag)}` : base;
 }
 
 export function psLiteRelayPublicUrl(
@@ -264,8 +396,197 @@ export function startPsLiteRelayClient(
   let unansweredPingSentAt: number | undefined;
   let lastHeartbeatCheckAt = 0;
   let heartbeatGraceUsed = false;
+  // Fresh per WebSocket connection; joins device and relay telemetry.
+  let connTag = randomConnTag();
 
   const log = (line: string) => options.logger?.(line);
+
+  const emitStatus = (
+    status: PsLiteRelayStatus,
+    detail?: PsLiteRelayStatusDetail,
+  ) => options.onStatus?.(status, { ...detail, connTag });
+
+  const logHookError = (error: unknown) =>
+    log(
+      `relay read event hook failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+
+  // Read events never run on the response path. They are queued and one
+  // shared timer drains the whole queue in a later macrotask (after the
+  // response is written and the stream closed). Each event resolves on its
+  // own, so a slow one never holds back the rest, and the hook's result is
+  // never awaited. The queue is capped: throttled timers in a hidden tab must
+  // not let it grow without bound.
+  type ReadEventProducer = () => PsLiteReadEvent | Promise<PsLiteReadEvent>;
+  const readQueue: ReadEventProducer[] = [];
+  let readFlushTimer: ReturnType<typeof setTimeout> | undefined;
+  let droppedReadEvents = 0;
+  const flushReadEvents = () => {
+    readFlushTimer = undefined;
+    const batch = readQueue.splice(0);
+    const hook = options.onReadEvent;
+    if (closed || !hook) return;
+    if (droppedReadEvents > 0) {
+      log(`relay read events dropped (queue full): ${droppedReadEvents}`);
+      droppedReadEvents = 0;
+    }
+    for (const produce of batch) {
+      // A producer may still await the grantee lookup when close() runs;
+      // re-check so nothing reaches the hook after close.
+      void Promise.resolve()
+        .then(produce)
+        .then((event) => (closed ? undefined : hook(event)))
+        .catch(logHookError);
+    }
+  };
+  const dispatchReadEvent = (produce: ReadEventProducer) => {
+    if (closed || !options.onReadEvent) return;
+    if (readQueue.length >= MAX_QUEUED_READ_EVENTS) {
+      readQueue.shift();
+      droppedReadEvents += 1;
+    }
+    readQueue.push(produce);
+    readFlushTimer ??= setTimeout(flushReadEvents, 0);
+  };
+  const stopReadEvents = () => {
+    readQueue.length = 0;
+    if (readFlushTimer !== undefined) {
+      clearTimeout(readFlushTimer);
+      readFlushTimer = undefined;
+    }
+  };
+
+  // The host decides where visibility comes from (see
+  // PsLiteRelayClientOptions.appVisibility); the document is the default.
+  const appVisibility = (): PsLiteAppVisibility => {
+    try {
+      const state = options.appVisibility
+        ? options.appVisibility()
+        : documentVisibility();
+      return state === "visible" || state === "hidden" ? state : "unknown";
+    } catch {
+      return "unknown";
+    }
+  };
+  const sampleHidden = (tracker: ReadTracker) => {
+    const visibility = appVisibility();
+    if (visibility === "hidden") tracker.hiddenDuring = true;
+    else if (visibility === "visible") tracker.hiddenDuring ??= false;
+    return visibility;
+  };
+
+  const beginRead = (
+    stream: StreamState,
+    request: ParsedHttpRequest,
+  ): ReadTracker | undefined => {
+    const seq = stream.requestSeq;
+    stream.requestSeq += 1;
+    const scope = relayReadScope(request);
+    if (scope === undefined) return undefined;
+    const tracker: ReadTracker = {
+      ids: {
+        readRef: `${stream.streamRef ?? crypto.randomUUID()}:${seq}`,
+        ...(stream.streamRef ? { streamRef: stream.streamRef } : {}),
+        connTag: stream.connTag,
+        scope,
+        method: request.method.toUpperCase(),
+      },
+      startedAt: Date.now(),
+      hiddenDuring: undefined,
+      done: false,
+    };
+    const visibility = sampleHidden(tracker);
+    stream.activeRead = tracker;
+    const received: PsLiteReadEvent = {
+      type: "ps_read_received",
+      at: tracker.startedAt,
+      ...tracker.ids,
+      appVisibility: visibility,
+    };
+    dispatchReadEvent(() => received);
+    return tracker;
+  };
+
+  /** Records the end synchronously; builds and dispatches the event later. */
+  const finishRead = (tracker: ReadTracker | undefined, result: ReadFinish) => {
+    if (!tracker || tracker.done) return;
+    tracker.done = true;
+    sampleHidden(tracker);
+    const finishedAt = Date.now();
+    const durationMs = Math.max(0, finishedAt - tracker.startedAt);
+    const hiddenDuring = tracker.hiddenDuring;
+    // Keep only what the empty check can use: a body over the cap is never
+    // empty, so a large body is not held while the event waits.
+    const emptyCheckBody =
+      result.body && result.body.length <= EMPTY_CHECK_MAX_BYTES
+        ? result.body
+        : undefined;
+    const { status, contentType, granteeRef: granteeRefPromise } = result;
+    const outcomeOrClassify = result.outcome;
+    const bytesOut = result.bytesOut ?? 0;
+    const gzip = result.gzip ?? false;
+    dispatchReadEvent(async () => {
+      const outcome =
+        outcomeOrClassify === "classify"
+          ? classifyReadOutcome(status ?? 0, emptyCheckBody, contentType)
+          : outcomeOrClassify;
+      const granteeRef = validGranteeRef(
+        granteeRefPromise
+          ? await withTimeout(granteeRefPromise, GRANTEE_REF_WAIT_MS)
+          : undefined,
+      );
+      return {
+        type: "ps_read_finished",
+        at: finishedAt,
+        ...tracker.ids,
+        ...(granteeRef ? { granteeRef } : {}),
+        ...(status !== undefined ? { status } : {}),
+        outcome,
+        bytesOut,
+        gzip,
+        durationMs,
+        ...(hiddenDuring !== undefined ? { hiddenDuring } : {}),
+      };
+    });
+  };
+
+  // hidden_during: a read in flight while the page/webview goes hidden. Only
+  // the document's own events when the document is the visibility source.
+  const visibilityDocument = options.appVisibility
+    ? undefined
+    : readVisibilityDocument();
+  const onVisibilityChange = () => {
+    if (visibilityDocument?.visibilityState !== "hidden") return;
+    for (const stream of streams.values()) {
+      if (stream.activeRead && !stream.activeRead.done) {
+        stream.activeRead.hiddenDuring = true;
+      }
+    }
+  };
+  let visibilityListening = false;
+  if (visibilityDocument) {
+    try {
+      visibilityDocument.addEventListener(
+        "visibilitychange",
+        onVisibilityChange,
+      );
+      visibilityListening = true;
+    } catch {
+      // No listener: hiddenDuring falls back to the received/finished samples.
+    }
+  }
+  const stopVisibilityListener = () => {
+    if (!visibilityListening || !visibilityDocument) return;
+    visibilityListening = false;
+    try {
+      visibilityDocument.removeEventListener(
+        "visibilitychange",
+        onVisibilityChange,
+      );
+    } catch {
+      // Ignore.
+    }
+  };
 
   const isLive = (stream: StreamState) =>
     !closed &&
@@ -289,6 +610,8 @@ export function startPsLiteRelayClient(
   const disposeStream = (stream: StreamState) => {
     if (stream.closed) return;
     stream.closed = true;
+    // A read still in flight when its stream dies never reaches the wire.
+    finishRead(stream.activeRead, { outcome: "stream_closed" });
     if (streams.get(stream.streamId) === stream) {
       streams.delete(stream.streamId);
       pendingStreamData.delete(stream.streamId);
@@ -313,21 +636,22 @@ export function startPsLiteRelayClient(
     pendingStreamData.clear();
   };
 
+  /** Returns false when the stream died before the last chunk was sent. */
   const writePlaintextResponse = (
     stream: StreamState,
     responseBytes: Uint8Array,
-  ) => {
-    if (!isLive(stream)) return;
+  ): boolean => {
+    if (!isLive(stream)) return false;
     if (!stream.tls) {
       for (const chunk of chunks(responseBytes, RESPONSE_CHUNK_BYTES)) {
         sendData(stream, chunk);
       }
-      return;
+      return isLive(stream);
     }
 
     const responseChunks = chunks(responseBytes, RESPONSE_CHUNK_BYTES);
     for (let index = 0; index < responseChunks.length; index += 1) {
-      if (!isLive(stream)) return;
+      if (!isLive(stream)) return false;
       const step = stream.tls.writePlaintext(
         responseChunks[index],
         index === responseChunks.length - 1,
@@ -338,6 +662,7 @@ export function startPsLiteRelayClient(
         }
       }
     }
+    return isLive(stream);
   };
 
   const drainHttpRequests = async (stream: StreamState) => {
@@ -348,12 +673,31 @@ export function startPsLiteRelayClient(
       }
 
       stream.plaintext = stream.plaintext.slice(parsed.consumedBytes);
-      const response = await handleRelayHttpRequest(
-        options.runtime,
-        parsed.request,
-        origin,
-      );
-      if (!isLive(stream)) return;
+      const read = beginRead(stream, parsed.request);
+      let relayed: RelayHttpResult;
+      try {
+        relayed = await handleRelayHttpRequest(
+          options.runtime,
+          parsed.request,
+          origin,
+          Boolean(read),
+        );
+      } catch (error) {
+        finishRead(read, { outcome: "handler_error" });
+        throw error;
+      }
+      const { response } = relayed;
+      const finish = (outcome: ReadFinish["outcome"]): ReadFinish => ({
+        outcome,
+        status: relayed.status,
+        granteeRef: relayed.granteeRef,
+        bytesOut: response.length,
+        gzip: relayed.gzip,
+      });
+      if (!isLive(stream)) {
+        finishRead(read, { ...finish("stream_closed"), bytesOut: 0 });
+        return;
+      }
       // `response` is a binary (latin1) string: buildHttpResponse appends the
       // body via bytesToBinary, so each char code 0x00–0xFF is one body byte.
       // It must be turned back into bytes the same way (binaryToBytes), NOT
@@ -361,7 +705,24 @@ export function startPsLiteRelayClient(
       // 2-byte sequence, corrupting binary payloads (e.g. OpenPGP-encrypted
       // files fail downstream with "not a valid OpenPGP message"). ASCII/JSON
       // bodies survive UTF-8, which is why only encrypted binary downloads broke.
-      writePlaintextResponse(stream, binaryToBytes(response));
+      let written: boolean;
+      try {
+        written = writePlaintextResponse(stream, binaryToBytes(response));
+      } catch (error) {
+        finishRead(read, { ...finish("tls_error"), bytesOut: 0 });
+        throw error;
+      }
+      // Finish before closeStream: disposal would report stream_closed.
+      finishRead(
+        read,
+        written
+          ? {
+              ...finish("classify"),
+              body: relayed.plainBody,
+              contentType: relayed.contentType,
+            }
+          : finish("stream_closed"),
+      );
       closeStream(stream, "http_response_sent");
       return;
     }
@@ -400,7 +761,7 @@ export function startPsLiteRelayClient(
     }
   };
 
-  const openStream = async (streamId: number) => {
+  const openStream = async (streamId: number, streamRef?: string) => {
     const previous = streams.get(streamId);
     if (previous) disposeStream(previous);
     const stream: StreamState = {
@@ -410,6 +771,9 @@ export function startPsLiteRelayClient(
       closed: false,
       ready: !tls,
       handling: false,
+      ...(streamRef ? { streamRef } : {}),
+      connTag,
+      requestSeq: 0,
     };
     // Register before awaiting creation so cancellation can invalidate it.
     streams.set(streamId, stream);
@@ -441,7 +805,7 @@ export function startPsLiteRelayClient(
   const handleControl = (message: ControlMessage) => {
     if (message.type === "session.ready") {
       issueToken = message.issueToken;
-      options.onStatus?.("connected");
+      emitStatus("connected");
       if (tls && tls.prepare) {
         void tls
           .prepare({
@@ -465,7 +829,7 @@ export function startPsLiteRelayClient(
       message.type === "stream.open" &&
       typeof message.streamId === "number"
     ) {
-      void openStream(message.streamId);
+      void openStream(message.streamId, parseStreamRef(message.streamRef));
       return;
     }
 
@@ -586,19 +950,23 @@ export function startPsLiteRelayClient(
       return;
     }
     issueToken = undefined;
-    socket = createSocket(options.webSocketFactory, controlUrl);
+    connTag = randomConnTag();
+    socket = createSocket(
+      options.webSocketFactory,
+      psLiteRelayControlUrl(options.sessionId, baseControlUrl, connTag),
+    );
     const currentSocket = socket;
     const isCurrent = () => !closed && socket === currentSocket;
     const acceptsFrames = () =>
       isCurrent() && currentSocket.readyState === currentSocket.OPEN;
     socket.binaryType = "arraybuffer";
-    options.onStatus?.("connecting");
+    emitStatus("connecting");
 
     socket.onopen = () => {
       if (!acceptsFrames()) return;
       reconnectAttempts = 0;
       startHeartbeat();
-      options.onStatus?.("connected");
+      emitStatus("connected");
     };
     socket.onmessage = (event) => {
       if (!acceptsFrames()) return;
@@ -616,7 +984,9 @@ export function startPsLiteRelayClient(
       issueToken = undefined;
       const detail = { code: event?.code, reason: event?.reason };
       if (closed) {
-        options.onStatus?.("closed", detail);
+        stopVisibilityListener();
+        stopReadEvents();
+        emitStatus("closed", detail);
         return;
       }
       if (event?.code === RELAY_CLOSE_SESSION_REPLACED) {
@@ -624,6 +994,8 @@ export function startPsLiteRelayClient(
         // Reconnecting would evict it and start a session tug-of-war, so this
         // client steps down for good and lets the host surface the handoff.
         closed = true;
+        stopVisibilityListener();
+        stopReadEvents();
         // Cancel any reconnect already scheduled by an earlier drop so a
         // pending timer can't fire connect() after we've stepped down.
         if (reconnectTimer !== undefined) {
@@ -631,17 +1003,17 @@ export function startPsLiteRelayClient(
           reconnectTimer = undefined;
         }
         log("relay session replaced by another connection — not reconnecting");
-        options.onStatus?.("replaced", detail);
+        emitStatus("replaced", detail);
         return;
       }
-      options.onStatus?.("disconnected", detail);
+      emitStatus("disconnected", detail);
       scheduleReconnect();
     };
     socket.onerror = () => {
       if (!isCurrent() || currentSocket.readyState > currentSocket.OPEN) {
         return;
       }
-      options.onStatus?.("error");
+      emitStatus("error");
     };
   }
 
@@ -673,6 +1045,8 @@ export function startPsLiteRelayClient(
       if (closed) return;
       closed = true;
       stopHeartbeat();
+      stopVisibilityListener();
+      stopReadEvents();
       if (reconnectTimer !== undefined) {
         clearTimeout(reconnectTimer);
         reconnectTimer = undefined;
@@ -683,11 +1057,23 @@ export function startPsLiteRelayClient(
   };
 }
 
+interface RelayHttpResult {
+  /** Full HTTP/1.1 response as a binary (latin1) string. */
+  response: string;
+  status: number;
+  /** Body before gzip, for the empty-result check. */
+  plainBody: Uint8Array;
+  contentType?: string;
+  gzip: boolean;
+  granteeRef?: Promise<string | undefined>;
+}
+
 async function handleRelayHttpRequest(
   runtime: PsLiteRuntime,
   request: ParsedHttpRequest,
   origin: string,
-): Promise<string> {
+  isRead: boolean,
+): Promise<RelayHttpResult> {
   const bridgeRequest: PsLiteBridgeRequest = {
     requestId: crypto.randomUUID(),
     method: request.method,
@@ -696,13 +1082,24 @@ async function handleRelayHttpRequest(
     headers: request.headers,
     body: encodeBase64(request.body),
   };
+  // The grantee label travels in-process (an observer on the Request
+  // object), never as a header a requester could set or read.
+  let granteeRef: Promise<string | undefined> | undefined;
   const bridgeResponse = await handlePsLiteBridgeRequest(
     runtime,
     bridgeRequest,
     {
       origin,
+      ...(isRead
+        ? {
+            onReadGrantee: (ref: Promise<string | undefined>) => {
+              granteeRef = ref;
+            },
+          }
+        : {}),
     },
   );
+  const contentType = headerValue(bridgeResponse.headers, "content-type");
   // Large exports (e.g. chatgpt.conversations) are big JSON streamed over the
   // relay's WebSocket tunnel; an uncompressed body inflates transfer time and the
   // window for a mid-stream drop (truncated read → UND_ERR_RES_CONTENT_LENGTH_MISMATCH).
@@ -713,6 +1110,12 @@ async function handleRelayHttpRequest(
     "gzip",
   );
   const alreadyEncoded = Boolean(bridgeResponse.headers?.["content-encoding"]);
+  const base = {
+    status: bridgeResponse.status,
+    plainBody: bodyBytes,
+    ...(contentType !== undefined ? { contentType } : {}),
+    ...(granteeRef ? { granteeRef } : {}),
+  };
   if (
     acceptsGzip &&
     !alreadyEncoded &&
@@ -720,12 +1123,174 @@ async function handleRelayHttpRequest(
     typeof CompressionStream !== "undefined"
   ) {
     const gzipped = await gzipBytes(bodyBytes);
-    return buildHttpResponse(bridgeResponse, {
-      bodyOverride: gzipped,
-      contentEncoding: "gzip",
-    });
+    return {
+      ...base,
+      gzip: true,
+      response: buildHttpResponse(bridgeResponse, {
+        bodyOverride: gzipped,
+        contentEncoding: "gzip",
+      }),
+    };
   }
-  return buildHttpResponse(bridgeResponse, { bodyOverride: bodyBytes });
+  return {
+    ...base,
+    gzip: false,
+    response: buildHttpResponse(bridgeResponse, { bodyOverride: bodyBytes }),
+  };
+}
+
+function headerValue(
+  headers: Record<string, string>,
+  name: string,
+): string | undefined {
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === name) return value;
+  }
+  return undefined;
+}
+
+const DATA_PATH_PREFIX = "/v1/data/";
+
+/** Scope of a relayed read, or undefined when the request is not a read. */
+function relayReadScope(request: ParsedHttpRequest): string | undefined {
+  const method = request.method.toUpperCase();
+  // Only GET reads data: core answers HEAD on `/v1/data/<scope>` with 405, so
+  // counting HEAD would show every probe as a failed read.
+  if (method !== "GET") return undefined;
+  if (!request.path.startsWith(DATA_PATH_PREFIX)) return undefined;
+  // Only the data read itself (`/v1/data/<scope>`) counts. Sub-routes such as
+  // `/versions` and `/lineage` are metadata reads and would skew read rates.
+  const rest = request.path.slice(DATA_PATH_PREFIX.length).split("?")[0];
+  if (!rest || rest.includes("/")) return undefined;
+  const segment = rest;
+  let scope: string;
+  try {
+    scope = decodeURIComponent(segment);
+  } catch {
+    return INVALID_SCOPE;
+  }
+  if (scope.length > MAX_SCOPE_LENGTH) return INVALID_SCOPE;
+  const parsed = parseDataScopeContract(scope);
+  return parsed.ok ? parsed.scope : INVALID_SCOPE;
+}
+
+const INVALID_SCOPE = "invalid";
+const MAX_SCOPE_LENGTH = 128;
+// Hashing resolves in microseconds; the cap only keeps a stuck promise from
+// holding back later events.
+const GRANTEE_REF_WAIT_MS = 1_000;
+// Read events waiting for the next flush; the oldest are dropped beyond this.
+const MAX_QUEUED_READ_EVENTS = 200;
+
+function validGranteeRef(value: unknown): string | undefined {
+  return typeof value === "string" && /^(owner|[0-9a-f]{12})$/.test(value)
+    ? value
+    : undefined;
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.catch(() => undefined),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+// Bodies larger than this are never "empty"; skip parsing them.
+const EMPTY_CHECK_MAX_BYTES = 64 * 1024;
+
+function classifyReadOutcome(
+  status: number,
+  body: Uint8Array | undefined,
+  contentType?: string,
+): PsLiteReadOutcome {
+  if (status === 401 || status === 403) return "denied";
+  if (status === 402) return "payment_required";
+  if (status === 404) return "not_found";
+  if (status >= 400) return "error";
+  if (status < 200 || status >= 300) return "ok";
+  return body && isEmptyJsonBody(body, contentType) ? "empty" : "ok";
+}
+
+function isEmptyJsonBody(body: Uint8Array, contentType?: string): boolean {
+  if (body.length === 0 || body.length > EMPTY_CHECK_MAX_BYTES) return false;
+  if (contentType !== undefined && !/json/i.test(contentType)) return false;
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    return false;
+  }
+  if (isEmptyValue(value)) return true;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    if (!("data" in record)) return false;
+    const data = record.data;
+    if (isEmptyValue(data)) return true;
+    // `{ data: { sleep: [], readiness: [] } }`: every collection empty.
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      const values = Object.values(data as Record<string, unknown>);
+      return values.length > 0 && values.every(isEmptyValue);
+    }
+  }
+  return false;
+}
+
+function isEmptyValue(value: unknown): boolean {
+  if (value === null || value === undefined || value === "") return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === "object") {
+    return Object.keys(value as Record<string, unknown>).length === 0;
+  }
+  return false;
+}
+
+function parseStreamRef(value: unknown): string | undefined {
+  return typeof value === "string" && /^[A-Za-z0-9-]{1,64}$/.test(value)
+    ? value
+    : undefined;
+}
+
+function randomConnTag(): string {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  let hex = "";
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, "0");
+  return hex;
+}
+
+interface VisibilityDocument {
+  visibilityState?: string;
+  addEventListener(type: string, listener: () => void): void;
+  removeEventListener(type: string, listener: () => void): void;
+}
+
+function readVisibilityDocument(): VisibilityDocument | undefined {
+  const candidate = (globalThis as { document?: unknown }).document as
+    Partial<VisibilityDocument> | undefined;
+  if (
+    !candidate ||
+    typeof candidate.addEventListener !== "function" ||
+    typeof candidate.removeEventListener !== "function"
+  ) {
+    return undefined;
+  }
+  return candidate as VisibilityDocument;
+}
+
+function documentVisibility(): PsLiteAppVisibility {
+  const state = (globalThis as { document?: { visibilityState?: unknown } })
+    .document?.visibilityState;
+  return state === "visible" || state === "hidden" ? state : "unknown";
 }
 
 // Responses below this size aren't worth the gzip overhead, and small reads

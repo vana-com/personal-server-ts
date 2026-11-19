@@ -342,6 +342,8 @@ describe("version inventory head", () => {
     });
     expect(await inventory.head(" scope ")).toEqual({
       expectedVersion: "23",
+      dataHash: hashA,
+      metadataHash: hashB,
       deletedAt: null,
     });
     expect(signRequest).toHaveBeenCalledTimes(1);

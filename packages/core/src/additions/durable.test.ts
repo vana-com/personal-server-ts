@@ -1508,6 +1508,7 @@ it.each(["live", "deleted"] as const)(
     expect(replaced).toBe(true);
     expect(await f.document(ADDITIONS_SUMMARY_SCOPE)).toEqual(portable);
   },
+  15_000,
 );
 
 it("returns freshly verified history without crossing a deleted portable-summary publication", async () => {

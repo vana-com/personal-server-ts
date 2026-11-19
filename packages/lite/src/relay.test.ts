@@ -13,6 +13,7 @@ import {
   encodeDataFrame,
   psLiteRelayControlUrl,
   startPsLiteRelayClient,
+  type PsLiteReadEvent,
   type PsLiteRelayClientOptions,
   type PsLiteRelayWebSocket,
 } from "./relay.js";
@@ -312,7 +313,9 @@ describe("startPsLiteRelayClient", () => {
       controlUrl: "wss://relay.example",
       tls: false,
       webSocketFactory(url) {
-        expect(url).toBe("wss://relay.example/browser/session123");
+        expect(url).toMatch(
+          /^wss:\/\/relay\.example\/browser\/session123\?tag=[0-9a-f]{16}$/,
+        );
         const socket = new FakeRelayWebSocket();
         sockets.push(socket);
         return socket;
@@ -981,5 +984,579 @@ describe("whenDrained + drain-gated read fulfillment", () => {
     await pending;
     expect(events).toHaveLength(2); // delivered -> reported
     client.close();
+  });
+});
+
+describe("read-reliability events", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  type FetchFn = (request: Request) => Promise<Response>;
+
+  function startEventClient(
+    fetch: FetchFn,
+    extra: Partial<PsLiteRelayClientOptions> = {},
+  ) {
+    const sockets: FakeRelayWebSocket[] = [];
+    const urls: string[] = [];
+    const events: PsLiteReadEvent[] = [];
+    const client = startPsLiteRelayClient({
+      sessionId: "evt1",
+      runtime: { fetch } as unknown as ReturnType<typeof createTestRuntime>,
+      controlUrl: "wss://relay.example",
+      tls: false,
+      reconnectInitialDelayMs: 1_000,
+      onReadEvent: (event) => events.push(event),
+      webSocketFactory(url) {
+        urls.push(url);
+        const socket = new FakeRelayWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      ...extra,
+    });
+    sockets[0].receive(JSON.stringify({ type: "session.ready" }));
+    return { client, sockets, urls, events };
+  }
+
+  async function sendRequest(
+    socket: FakeRelayWebSocket,
+    target: string,
+    {
+      method = "GET",
+      headers = {},
+      streamId = 1,
+      streamRef,
+    }: {
+      method?: string;
+      headers?: Record<string, string>;
+      streamId?: number;
+      streamRef?: unknown;
+    } = {},
+  ) {
+    socket.receive(
+      JSON.stringify({
+        type: "stream.open",
+        streamId,
+        ...(streamRef !== undefined ? { streamRef } : {}),
+      }),
+    );
+    socket.receive(
+      encodeDataFrame(streamId, httpRequest(method, target, headers)),
+    );
+    // Wait for the response to finish (gzip takes several macrotasks under
+    // load); requests that stay pending give up after a bounded wait.
+    const closedThisStream = () =>
+      socket.sent.some(
+        (message) =>
+          typeof message === "string" &&
+          JSON.parse(message).type === "stream.close" &&
+          JSON.parse(message).streamId === streamId,
+      );
+    for (let tick = 0; tick < 200 && !closedThisStream(); tick += 1) {
+      await flushRelayTasks();
+    }
+    await flushEvents();
+  }
+
+  // Read events are dispatched in later macrotasks, one per event.
+  async function flushEvents() {
+    for (let tick = 0; tick < 8; tick += 1) await flushRelayTasks();
+  }
+
+  function wireText(socket: FakeRelayWebSocket, streamId = 1): string {
+    return new TextDecoder().decode(
+      concatBytes(
+        sentDataFrames(socket)
+          .filter((frame) => frame.streamId === streamId)
+          .map((frame) => frame.payload),
+      ),
+    );
+  }
+
+  const json = (body: unknown, status = 200, headers = {}) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { "content-type": "application/json", ...headers },
+    });
+
+  it("sends a fresh 16-hex ?tag= per connection and reports it in onStatus", () => {
+    vi.useFakeTimers();
+    try {
+      const statuses: Array<{ status: string; connTag?: string }> = [];
+      const { sockets, urls } = startEventClient(async () => json({}), {
+        onStatus: (status, detail) =>
+          statuses.push({ status, connTag: detail?.connTag }),
+      });
+      sockets[0].onopen?.();
+      sockets[0].close(1006, "abnormal");
+      vi.advanceTimersByTime(1_000);
+      expect(urls).toHaveLength(2);
+      const tags = urls.map((url) =>
+        new URL(url.replace(/^wss:/, "https:")).searchParams.get("tag"),
+      );
+      for (const [index, url] of urls.entries()) {
+        expect(url.startsWith("wss://relay.example/browser/evt1?tag=")).toBe(
+          true,
+        );
+        expect(tags[index]).toMatch(/^[0-9a-f]{16}$/);
+      }
+      expect(tags[0]).not.toBe(tags[1]);
+      expect(statuses[0]).toEqual({ status: "connecting", connTag: tags[0] });
+      expect(statuses).toContainEqual({
+        status: "disconnected",
+        connTag: tags[0],
+      });
+      expect(statuses.at(-1)).toEqual({
+        status: "connecting",
+        connTag: tags[1],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps psLiteRelayControlUrl compatible and appends an optional tag", () => {
+    expect(psLiteRelayControlUrl("abc", "wss://r.example/")).toBe(
+      "wss://r.example/browser/abc",
+    );
+    expect(psLiteRelayControlUrl("abc", "wss://r.example", "00ff")).toBe(
+      "wss://r.example/browser/abc?tag=00ff",
+    );
+  });
+
+  it("emits received + finished once for a data read, keyed on the relay streamRef", async () => {
+    const { sockets, urls, events } = startEventClient(async () =>
+      json({ data: { username: "a" } }),
+    );
+    const streamRef = "3f2b8c1e-0000-4000-8000-000000000001";
+    await sendRequest(sockets[0], "/v1/data/instagram.profile?grantId=g-1", {
+      streamRef,
+    });
+    const connTag = new URL(
+      urls[0].replace(/^wss:/, "https:"),
+    ).searchParams.get("tag");
+    expect(events.map((event) => event.type)).toEqual([
+      "ps_read_received",
+      "ps_read_finished",
+    ]);
+    expect(events[0]).toEqual({
+      type: "ps_read_received",
+      at: expect.any(Number),
+      readRef: `${streamRef}:0`,
+      streamRef,
+      connTag,
+      scope: "instagram.profile",
+      method: "GET",
+      appVisibility: "unknown",
+    });
+    const finished = events[1];
+    expect(finished).toMatchObject({
+      type: "ps_read_finished",
+      readRef: `${streamRef}:0`,
+      streamRef,
+      connTag,
+      scope: "instagram.profile",
+      method: "GET",
+      status: 200,
+      outcome: "ok",
+      gzip: false,
+    });
+    // No document here: the visibility source never knew, so no hiddenDuring
+    // rather than a false "visible throughout".
+    expect("hiddenDuring" in finished).toBe(false);
+    if (finished.type !== "ps_read_finished") throw new Error("unreachable");
+    expect(finished.bytesOut).toBe(
+      new TextEncoder().encode(wireText(sockets[0])).length,
+    );
+    expect(finished.durationMs).toBeGreaterThanOrEqual(0);
+    // `at` is when the fact happened, not when the deferred hook ran.
+    expect(finished.at).toBeGreaterThanOrEqual(events[0].at);
+    expect(finished.at - events[0].at).toBe(finished.durationMs);
+    expect(JSON.stringify(events)).not.toContain("g-1");
+  });
+
+  it("stamps `at` when the fact happens, not when the deferred hook runs", async () => {
+    let now = 1_762_770_000_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      let release!: (response: Response) => void;
+      const { sockets, events } = startEventClient(
+        () =>
+          new Promise<Response>((resolve) => {
+            release = resolve;
+          }),
+      );
+      await sendRequest(sockets[0], "/v1/data/a.b");
+      expect(events[0].at).toBe(1_762_770_000_000);
+      now = 1_762_770_000_750;
+      release(json({ data: 1 }));
+      // Let the response be written (finishRead runs there) ...
+      const closed = () =>
+        sockets[0].sent.some(
+          (message) =>
+            typeof message === "string" &&
+            JSON.parse(message).type === "stream.close",
+        );
+      for (let tick = 0; tick < 200 && !closed(); tick += 1) {
+        await flushRelayTasks();
+      }
+      // ... then move the clock before the deferred hook runs: the event must
+      // keep the finish time, not the dispatch time.
+      now = 1_762_770_009_000;
+      await flushEvents();
+      expect(events[1]).toMatchObject({
+        at: 1_762_770_000_750,
+        durationMs: 750,
+      });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("uses the host's visibility source and omits hiddenDuring while it is unknown", async () => {
+    // A document is present but is not the app (headless WebView): the host
+    // says so and the document is ignored.
+    const listeners = new Set<() => void>();
+    vi.stubGlobal("document", {
+      visibilityState: "visible",
+      addEventListener: (_: string, listener: () => void) =>
+        listeners.add(listener),
+      removeEventListener: (_: string, listener: () => void) =>
+        listeners.delete(listener),
+    });
+    let visibility: "visible" | "hidden" | "unknown" = "unknown";
+    const { sockets, events } = startEventClient(
+      async () => json({ data: 1 }),
+      { appVisibility: () => visibility },
+    );
+    expect(listeners.size).toBe(0);
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    expect(events[0]).toMatchObject({ appVisibility: "unknown" });
+    expect("hiddenDuring" in events[1]).toBe(false);
+
+    visibility = "hidden";
+    await sendRequest(sockets[0], "/v1/data/a.b", { streamId: 2 });
+    expect(events[2]).toMatchObject({ appVisibility: "hidden" });
+    expect(events[3]).toMatchObject({ hiddenDuring: true });
+  });
+
+  it("falls back to a local uuid read ref when the relay sends no (or a bad) streamRef", async () => {
+    const { sockets, events } = startEventClient(async () => json({ data: 1 }));
+    await sendRequest(sockets[0], "/v1/data/a.b", { streamRef: { bad: 1 } });
+    expect(events[0].readRef).toMatch(/^[0-9a-f-]{36}:0$/);
+    expect("streamRef" in events[0]).toBe(false);
+    expect(events[1].readRef).toBe(events[0].readRef);
+  });
+
+  it.each([
+    ["ok", 200, { data: { items: [1] } }],
+    ["empty", 200, { data: [] }],
+    ["empty", 200, { data: { sleep: [], readiness: [] } }],
+    ["empty", 200, []],
+    ["denied", 403, { error: "forbidden" }],
+    ["denied", 401, { error: "unauthorized" }],
+    ["payment_required", 402, { accepts: [] }],
+    ["not_found", 404, { error: "missing" }],
+    ["error", 500, { error: "boom" }],
+  ] as const)("classifies %s for status %i", async (outcome, status, body) => {
+    const { sockets, events } = startEventClient(async () =>
+      json(body, status),
+    );
+    await sendRequest(sockets[0], "/v1/data/oura.sleep");
+    expect(events).toHaveLength(2);
+    expect(events[1]).toMatchObject({ outcome, status });
+  });
+
+  it("treats a non-JSON 2xx body as ok", async () => {
+    const { sockets, events } = startEventClient(
+      async () =>
+        new Response(new Uint8Array([0x7b, 0x7d]), {
+          headers: { "content-type": "application/octet-stream" },
+        }),
+    );
+    await sendRequest(sockets[0], "/v1/data/files.doc?content=raw");
+    expect(events[1]).toMatchObject({ outcome: "ok", scope: "files.doc" });
+  });
+
+  it("reports handler_error once when the runtime throws", async () => {
+    const { sockets, events } = startEventClient(async () => {
+      throw new Error("runtime exploded");
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    expect(events.map((event) => event.type)).toEqual([
+      "ps_read_received",
+      "ps_read_finished",
+    ]);
+    expect(events[1]).toMatchObject({ outcome: "handler_error", bytesOut: 0 });
+    expect("status" in events[1]).toBe(false);
+  });
+
+  it("reports stream_closed when the relay closes the stream mid-read", async () => {
+    let release!: (response: Response) => void;
+    const { sockets, events } = startEventClient(
+      () =>
+        new Promise<Response>((resolve) => {
+          release = resolve;
+        }),
+    );
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    sockets[0].receive(JSON.stringify({ type: "stream.close", streamId: 1 }));
+    await flushEvents();
+    expect(events[1]).toMatchObject({ outcome: "stream_closed", bytesOut: 0 });
+    release(json({ data: 1 }));
+    await flushEvents();
+    expect(events).toHaveLength(2);
+    expect(sentDataFrames(sockets[0])).toHaveLength(0);
+  });
+
+  it("marks hiddenDuring when the page goes hidden mid-read", async () => {
+    const listeners = new Set<() => void>();
+    const fakeDocument = {
+      visibilityState: "visible",
+      addEventListener: (_: string, listener: () => void) =>
+        listeners.add(listener),
+      removeEventListener: (_: string, listener: () => void) =>
+        listeners.delete(listener),
+    };
+    vi.stubGlobal("document", fakeDocument);
+    let release!: (response: Response) => void;
+    const { client, sockets, events } = startEventClient(
+      () =>
+        new Promise<Response>((resolve) => {
+          release = resolve;
+        }),
+    );
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    expect(events[0]).toMatchObject({ appVisibility: "visible" });
+    fakeDocument.visibilityState = "hidden";
+    for (const listener of listeners) listener();
+    fakeDocument.visibilityState = "visible";
+    for (const listener of listeners) listener();
+    release(json({ data: 1 }));
+    await flushEvents();
+    expect(events[1]).toMatchObject({ outcome: "ok", hiddenDuring: true });
+    client.close();
+    expect(listeners.size).toBe(0);
+  });
+
+  it("reports gzip and the compressed wire size for large accepted-gzip reads", async () => {
+    const big = { data: { text: "x".repeat(10_000) } };
+    const { sockets, events } = startEventClient(async () => json(big));
+    await sendRequest(sockets[0], "/v1/data/a.b", {
+      headers: { "accept-encoding": "gzip" },
+    });
+    const wireBytes = concatBytes(
+      sentDataFrames(sockets[0]).map((frame) => frame.payload),
+    );
+    expect(events[1]).toMatchObject({
+      outcome: "ok",
+      gzip: true,
+      bytesOut: wireBytes.length,
+    });
+    expect(wireBytes.length).toBeLessThan(10_000);
+  });
+
+  const GRANTEE_OBSERVER = Symbol.for(
+    "@opendatalabs/personal-server-ts-core/read-grantee-observer",
+  );
+  const granteeObserverOf = (request: Request) =>
+    (request as unknown as Record<symbol, unknown>)[GRANTEE_OBSERVER] as
+      ((ref: Promise<string | undefined>) => void) | undefined;
+
+  it("takes the grantee ref in-process, never from headers", async () => {
+    const { sockets, events } = startEventClient(async (request) => {
+      granteeObserverOf(request)?.(Promise.resolve("0123456789ab"));
+      return json({ data: { a: 1 } }, 200, {
+        "x-ps-grantee-ref": "fedcba987654",
+      });
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b", {
+      headers: { "x-ps-grantee-ref": "fedcba987654" },
+    });
+    expect(events[1]).toMatchObject({ granteeRef: "0123456789ab" });
+  });
+
+  it("drops a grantee ref that is not owner or 12 lowercase hex", async () => {
+    const { sockets, events } = startEventClient(async (request) => {
+      granteeObserverOf(request)?.(Promise.resolve("0xDEADBEEF-leak"));
+      return json({ data: 1 });
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    expect(events[1]).toMatchObject({ outcome: "ok" });
+    expect("granteeRef" in events[1]).toBe(false);
+  });
+
+  it("only attaches the grantee observer to reads", async () => {
+    const observed: boolean[] = [];
+    const { sockets, events } = startEventClient(async (request) => {
+      observed.push(Boolean(granteeObserverOf(request)));
+      return json({ ok: true });
+    });
+    await sendRequest(sockets[0], "/health");
+    await sendRequest(sockets[0], "/v1/data", { streamId: 2 });
+    await sendRequest(sockets[0], "/v1/data/a.b", {
+      method: "POST",
+      streamId: 3,
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b/versions", { streamId: 5 });
+    await sendRequest(sockets[0], "/v1/data/a.b/lineage/3", { streamId: 6 });
+    await sendRequest(sockets[0], "/v1/data/a.b", {
+      method: "HEAD",
+      streamId: 7,
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b?grantId=g1", { streamId: 4 });
+    expect(observed).toEqual([false, false, false, false, false, false, true]);
+    expect(events.map((event) => event.type)).toEqual([
+      "ps_read_received",
+      "ps_read_finished",
+    ]);
+  });
+
+  it.each([
+    ["/v1/data/" + "a".repeat(129)],
+    ["/v1/data/%E0%A4%A"],
+    ["/v1/data/not%20a%20scope"],
+    ["/v1/data/<script>"],
+  ])("reports scope invalid for %s", async (target) => {
+    const { sockets, events } = startEventClient(async () =>
+      json({ error: "bad" }, 400),
+    );
+    await sendRequest(sockets[0], target);
+    expect(events[0]).toMatchObject({ scope: "invalid" });
+    expect(events[1]).toMatchObject({ scope: "invalid", outcome: "error" });
+  });
+
+  it("dispatches events only after the response is written and the stream closed", async () => {
+    const closedWhenHookRan: boolean[] = [];
+    const holder: { socket?: FakeRelayWebSocket } = {};
+    const started = startEventClient(async () => json({ data: 1 }), {
+      onReadEvent: () => {
+        closedWhenHookRan.push(
+          (holder.socket?.sent ?? []).some(
+            (message) =>
+              typeof message === "string" &&
+              JSON.parse(message).type === "stream.close",
+          ),
+        );
+      },
+    });
+    holder.socket = started.sockets[0];
+    await sendRequest(holder.socket, "/v1/data/a.b");
+    expect(closedWhenHookRan).toEqual([true, true]);
+  });
+
+  it("keeps serving and dispatching when the hook never settles or rejects", async () => {
+    const logs: string[] = [];
+    const seen: string[] = [];
+    let calls = 0;
+    const { sockets } = startEventClient(async () => json({ data: 1 }), {
+      onReadEvent: (event) => {
+        seen.push(event.type);
+        calls += 1;
+        return (calls === 1
+          ? new Promise<void>(() => {})
+          : Promise.reject(
+              new Error("async analytics down"),
+            )) as unknown as void;
+      },
+      logger: (line) => logs.push(line),
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    await sendRequest(sockets[0], "/v1/data/a.b", { streamId: 2 });
+    expect(wireText(sockets[0], 1)).toContain("HTTP/1.1 200 OK");
+    expect(wireText(sockets[0], 2)).toContain("HTTP/1.1 200 OK");
+    expect(seen).toHaveLength(4);
+    expect(logs.some((line) => line.includes("async analytics down"))).toBe(
+      true,
+    );
+  });
+
+  it("caps the event queue, dropping the oldest and logging the drop count", async () => {
+    const logs: string[] = [];
+    const { sockets, events } = startEventClient(
+      () => new Promise<Response>(() => {}),
+      { logger: (line) => logs.push(line) },
+    );
+    // All requests arrive before any macrotask, so nothing flushes between.
+    for (let streamId = 1; streamId <= 250; streamId += 1) {
+      sockets[0].receive(JSON.stringify({ type: "stream.open", streamId }));
+      sockets[0].receive(
+        encodeDataFrame(streamId, httpRequest("GET", "/v1/data/a.b", {})),
+      );
+    }
+    await flushEvents();
+    expect(events).toHaveLength(200);
+    expect(events.every((event) => event.type === "ps_read_received")).toBe(
+      true,
+    );
+    expect(logs).toContain("relay read events dropped (queue full): 50");
+  });
+
+  it("does not let one slow grantee lookup hold back later events", async () => {
+    let calls = 0;
+    const { sockets, events } = startEventClient(async (request) => {
+      calls += 1;
+      granteeObserverOf(request)?.(
+        calls === 1
+          ? new Promise<string | undefined>(() => {})
+          : Promise.resolve("0123456789ab"),
+      );
+      return json({ data: 1 });
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b", { streamRef: "first" });
+    await sendRequest(sockets[0], "/v1/data/a.b", {
+      streamId: 2,
+      streamRef: "second",
+    });
+    const finished = events.filter(
+      (event) => event.type === "ps_read_finished",
+    );
+    expect(finished.map((event) => event.readRef)).toEqual(["second:0"]);
+    expect(finished[0]).toMatchObject({ granteeRef: "0123456789ab" });
+  });
+
+  it("dispatches nothing once the client is closed", async () => {
+    const { client, sockets, events } = startEventClient(
+      () => new Promise<Response>(() => {}),
+    );
+    sockets[0].receive(JSON.stringify({ type: "stream.open", streamId: 1 }));
+    sockets[0].receive(
+      encodeDataFrame(1, httpRequest("GET", "/v1/data/a.b", {})),
+    );
+    client.close();
+    await flushEvents();
+    expect(events).toEqual([]);
+  });
+
+  it("drops an in-flight event whose grantee lookup resolves after close", async () => {
+    let resolveGrantee: (value: string | undefined) => void = () => {};
+    const { client, sockets, events } = startEventClient(async (request) => {
+      granteeObserverOf(request)?.(
+        new Promise<string | undefined>((resolve) => {
+          resolveGrantee = resolve;
+        }),
+      );
+      return json({ data: 1 });
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    // The finished event is already flushed and waiting on the lookup.
+    expect(events.map((event) => event.type)).toEqual(["ps_read_received"]);
+    client.close();
+    resolveGrantee("0123456789ab");
+    await flushEvents();
+    expect(events.map((event) => event.type)).toEqual(["ps_read_received"]);
+  });
+
+  it("keeps serving when the read hook throws", async () => {
+    const logs: string[] = [];
+    const { sockets } = startEventClient(async () => json({ data: 1 }), {
+      onReadEvent: () => {
+        throw new Error("analytics down");
+      },
+      logger: (line) => logs.push(line),
+    });
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    expect(wireText(sockets[0])).toContain("HTTP/1.1 200 OK");
+    expect(logs.some((line) => line.includes("analytics down"))).toBe(true);
   });
 });

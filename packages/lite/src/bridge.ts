@@ -1,3 +1,7 @@
+import {
+  attachPersonalServerReadGranteeObserver,
+  type PersonalServerReadGranteeObserver,
+} from "@opendatalabs/personal-server-ts-core/api";
 import type { PsLiteRuntime } from "./runtime.js";
 
 export interface PsLiteBridgeRequest {
@@ -71,12 +75,19 @@ function buildRequest(
 export async function handlePsLiteBridgeRequest(
   runtime: PsLiteRuntime,
   bridgeRequest: PsLiteBridgeRequest,
-  options: { origin?: string } = {},
+  options: {
+    origin?: string;
+    /** In-process only: receives the grantee label of an authorized read. */
+    onReadGrantee?: PersonalServerReadGranteeObserver;
+  } = {},
 ): Promise<PsLiteBridgeResponse> {
   const request = buildRequest(
     options.origin ?? "https://ps-lite.local",
     bridgeRequest,
   );
+  if (options.onReadGrantee) {
+    attachPersonalServerReadGranteeObserver(request, options.onReadGrantee);
+  }
   const response = await runtime.fetch(request);
   const bytes = new Uint8Array(await response.arrayBuffer());
 
