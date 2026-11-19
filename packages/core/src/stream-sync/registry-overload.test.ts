@@ -184,14 +184,12 @@ it("chunks a long feed deadline and stops during the wait", async () => {
   vi.useFakeTimers();
   vi.spyOn(Math, "random").mockReturnValue(0);
   const timer = vi.spyOn(globalThis, "setTimeout");
-  const fetch = vi
-    .fn()
-    .mockResolvedValue(
-      new Response(null, {
-        status: 429,
-        headers: { "Retry-After": "2200000" },
-      }),
-    );
+  const fetch = vi.fn().mockResolvedValue(
+    new Response(null, {
+      status: 429,
+      headers: { "Retry-After": "2200000" },
+    }),
+  );
   const registry = createGatewayStreamSyncRegistry({
     gatewayUrl: "https://gateway.test",
     ownerAddress: "0x" + "11".repeat(20),
