@@ -15,6 +15,8 @@
  * - Shared SQL keeps to SQLite 3.22 (no UPSERT, RETURNING, JSON1 or window
  *   functions).
  */
+import type { BoundedValueStore } from "./workspace-capability.js";
+
 export type SqlValue = string | number | bigint | null | Uint8Array;
 
 export interface SqlStatement {
@@ -29,6 +31,8 @@ export interface SqlStatement {
 export type SqlReader = Pick<SqlDriver, "query">;
 
 export interface SqlDriver {
+  /** Explicit versioned opt-in. Ordinary query/batch do not imply bounded values. */
+  readonly boundedValues?: BoundedValueStore;
   readonly info: {
     readonly sqliteVersion: string;
     readonly host: "node" | "web" | "phone";

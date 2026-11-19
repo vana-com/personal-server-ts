@@ -123,3 +123,17 @@ export {
   systemStreamIdentity,
   type SystemStreamDescriptor,
 } from "./system-stream-descriptor.js";
+
+export type {
+  WorkspaceBinding,
+  ByteLease,
+  ByteAdmission,
+  ValueToken,
+  ValueWriterToken,
+  OwnedUnit,
+  BoundedCursor,
+  UnitReceipt,
+  WorkspaceFailure,
+  BoundedValueStore,
+  WorkspaceResourceLedger,
+} from "./workspace-capability.js";

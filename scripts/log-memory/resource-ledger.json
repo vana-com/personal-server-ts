@@ -1,0 +1,38 @@
+{
+  "phone host": {
+    "Bdb": null,
+    "P": null,
+    "H0": null,
+    "R": null,
+    "C": null,
+    "T": null,
+    "Bcrypto": null,
+    "bR": null,
+    "bC": null,
+    "bT": null
+  },
+  "desktop host": {
+    "Bdb": null,
+    "P": null,
+    "H0": null,
+    "R": null,
+    "C": null,
+    "T": null,
+    "Bcrypto": null,
+    "bR": null,
+    "bC": null,
+    "bT": null
+  },
+  "browser host": {
+    "Bdb": null,
+    "P": null,
+    "H0": null,
+    "R": null,
+    "C": null,
+    "T": null,
+    "Bcrypto": null,
+    "bR": null,
+    "bC": null,
+    "bT": null
+  }
+}
