@@ -17,7 +17,7 @@ import {
   createMemoryStreamSyncBlobs,
 } from "../../../core/src/stream-sync/index.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
-import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import { openLogTestDatabase } from "./log-database.test-utils.js";
 import { createFakeGateway } from "./fake-gateway.js";
 
 // Publish while collecting together with the stream-sync log. Admission is
@@ -57,7 +57,7 @@ async function world(options: {
   let clock = 1000;
 
   const device = async (deviceId: string) => {
-    const db = await openLocalDb(openBetterSqlite3(":memory:"), {
+    const db = await openLocalDb(await openLogTestDatabase(), {
       owner: OWNER,
       network: "test",
       deviceId,

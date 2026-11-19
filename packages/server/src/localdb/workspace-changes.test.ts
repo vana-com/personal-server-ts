@@ -112,7 +112,7 @@ it("freezes one indexed change per key in sequence order with bounded receipts",
     const member = await members.next(lease);
     expect(member!.value).toEqual({
       pkHash: "gone",
-      bodyBytes: Buffer.byteLength(JSON.stringify({ id: "雪" })),
+      recordBytes: Buffer.byteLength(JSON.stringify({ id: "雪" })) + 1,
     });
     await member!.release();
     expect(await members.next(lease)).toBeNull();

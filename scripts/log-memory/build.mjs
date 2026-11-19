@@ -119,17 +119,27 @@ await build({
           },
         );
         b.onLoad({ filter: /log-publish\.ts$/ }, async ({ path: file }) => {
-          let s = await readFile(file, "utf8");
-          if (!s.includes("return { ops, untyped };"))
-            throw Error("operations probe drift");
+          let s = await readFile(
+            process.env.MEMORY_REFERENCE_PUBLISH ?? file,
+            "utf8",
+          );
           s = s.replace(
             "const scope = logScope(candidate.connector, candidate.ns);",
             "await globalThis.memoryCandidate(candidate); const scope = logScope(candidate.connector, candidate.ns);",
           );
-          s = s.replace(
-            "return { ops, untyped };",
-            "globalThis.memoryOperations(ops); return { ops, untyped };",
-          );
+          if (s.includes("return { ops, untyped };"))
+            s = s.replace(
+              "return { ops, untyped };",
+              "globalThis.memoryOperations(ops); return { ops, untyped };",
+            );
+          else if (
+            s.includes("await workspace.prepare(ack, piece, completes);")
+          )
+            s = s.replace(
+              "await workspace.prepare(ack, piece, completes);",
+              'globalThis.memoryOperations([...taken,...(replace&&(completes||piece.length>0)?[{kind:"complete",stream,cutoff:replace,omitted:piece}]:[])]); await workspace.prepare(ack, piece, completes);',
+            );
+          else throw Error("operations probe drift");
           return { contents: s, loader: "ts" };
         });
         b.onLoad({ filter: /log-apply\.ts$/ }, async ({ path: file }) => {

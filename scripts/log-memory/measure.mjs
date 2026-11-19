@@ -108,6 +108,8 @@ globalThis.memoryCandidate = async (candidate) => {
     sample();
   }
 };
+const gcEvery = Number(process.env.MEMORY_GC_EVERY ?? 1);
+let commits = 0;
 globalThis.memoryOperations = (ops) => {
   if (active) {
     let total = 0;
@@ -138,6 +140,8 @@ globalThis.memoryDriver = (id) => {
   const db = new Database(join(dir, id + ".db"));
   nativeDBs.set(id, db);
   db.pragma("journal_mode=WAL");
+  db.pragma("synchronous=NORMAL");
+  db.pragma("mmap_size=0");
   db.pragma("cache_size=-8192");
   db.pragma("temp_store=FILE");
   const statements = createStatementCache(db);
@@ -185,7 +189,10 @@ globalThis.memoryDriver = (id) => {
           ),
         );
         await new Promise((r) => setImmediate(r));
-        if (barrier || mode === "rebase" || mode === "progressive") {
+        if (
+          (barrier || mode === "rebase" || mode === "progressive") &&
+          ++commits % gcEvery === 0
+        ) {
           global.gc?.();
           livePeak = Math.max(
             livePeak,
@@ -232,10 +239,12 @@ const w = await world({
 });
 const a = await w.device("a");
 const streamNames = w.names;
+let observation = 1000;
 async function intake(run, v, count = n) {
   await a.sync.intake.begin(run, {
     connector: "fixture",
     artifactDigest: "fixture",
+    observedAt: ++observation,
     wantFull: true,
     owner: { address: OWNER, leaseId: null },
   });
@@ -278,6 +287,7 @@ async function phase(name, fn) {
   }
   const receipt = {
     phase: name,
+    gcEvery,
     n,
     pad,
     baseline,
@@ -421,8 +431,16 @@ try {
     await intake("changed", 2);
     await phase("covered-replace", () => a.cycle().then(() => ({})));
     if (mode === "metadata") await indexedProbe();
+    const [changed] = await a.db.query(
+      "SELECT COUNT(*) AS n FROM records WHERE stamp_r='changed'",
+    );
+    if (changed.n !== n)
+      throw Error("replacement did not change every source record");
     await intake("omitted", 3, 1);
     await phase("omission", () => a.cycle().then(() => ({})));
+    const [remaining] = await a.db.query("SELECT COUNT(*) AS n FROM records");
+    if (remaining.n !== 1)
+      throw Error("replacement did not publish every omission");
     const b = await w.device("b");
     await b.cycle();
     if (JSON.stringify(await a.rows()) !== JSON.stringify(await b.rows()))

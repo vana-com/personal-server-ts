@@ -5,7 +5,7 @@ import {
   connectionQueue,
   type SqlDriver,
 } from "@opendatalabs/personal-server-ts-core/localdb";
-import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import { openLogTestDatabase } from "./log-database.test-utils.js";
 import { remoteFixture } from "./apply-fixture.test-utils.js";
 import { createServerLocalSync } from "./sync.js";
 const drivers: SqlDriver[] = [];
@@ -21,7 +21,7 @@ export async function databaseReadFixture(connector: string) {
   };
   const remote = await remoteFixture(keys, connector);
   const owner = `0x${"11".repeat(20)}` as const;
-  const db = await openLocalDb(openBetterSqlite3(":memory:"), {
+  const db = await openLocalDb(await openLogTestDatabase(), {
     owner,
     network: "test",
     deviceId: "read-journey",

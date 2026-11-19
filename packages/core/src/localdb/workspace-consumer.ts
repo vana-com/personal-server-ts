@@ -10,7 +10,7 @@ import type {
   LogKey,
   LogStamp,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import type { SqlDriver } from "./driver.js";
+import type { SqlValue, SqlDriver } from "./driver.js";
 import type {
   BoundedCursor,
   BoundedValueStore,
@@ -117,6 +117,7 @@ export interface StagingWorkspaceUnit {
     kind: K,
     row: WorkspaceRows[K],
   ): Promise<void>;
+  stageOmissions(rows: readonly WorkspaceRows["omissions"][]): Promise<void>;
   commit(): Promise<ReceiptedWorkspaceUnit>;
 }
 /** A reader has no append/seal/abort methods. The token remains bound to its operation. */
@@ -238,6 +239,179 @@ function metadataCursor(
   };
 }
 
+/** One encoded input unit; records() is a single-pass decoder. */
+function recordPages(
+  db: SqlDriver,
+  binding: WorkspaceBinding,
+  kind: "changes" | "replacement-membership",
+  stream: string,
+  pageBytes: number,
+): BoundedCursor<WorkspaceChangePage> {
+  const descriptor = kind === "changes" ? "payload" : "key || ':' || payload";
+  const frameDescriptor =
+    kind === "changes" ? "w.payload" : "w.key || ':' || w.payload";
+  let after: string | null = null,
+    owned = false,
+    closed = false;
+  let release: (() => void) | undefined;
+  let dropCurrent: (() => void) | undefined;
+  return {
+    async next(lease) {
+      if (closed || owned) throw new Error("workspace_cursor_owned_or_closed");
+      release = ownLease(lease, binding.operation, 64 * 1024 * 24);
+      try {
+        if (
+          !Number.isSafeInteger(pageBytes) ||
+          pageBytes < 1 ||
+          pageBytes > 65536
+        )
+          throw new Error("workspace_page_admission");
+        await db.batch(workspaceGuard(binding));
+        const [window] = await db.query<{ payload: string }>(
+          "SELECT payload FROM workspace_cells WHERE operation=? AND relation='replacement' AND key=?",
+          [binding.operation, kind === "changes" ? "window" : "members"],
+        );
+        if (!window || JSON.parse(window.payload)[0] !== stream)
+          throw new Error("workspace_window_binding");
+        const meta = await db.query<{
+          key: string;
+          payload: string;
+          n: number;
+        }>(
+          `SELECT key,substr(${descriptor},1,256) AS payload,LENGTH(CAST(${descriptor} AS BLOB)) AS n FROM workspace_cells WHERE operation=? AND relation=? ${after === null ? "" : "AND key>?"} ORDER BY key LIMIT 64`,
+          after === null
+            ? [binding.operation, kind]
+            : [binding.operation, kind, after],
+        );
+        if (meta.length === 0) {
+          release();
+          return null;
+        }
+        let count = 0,
+          bytes = 0;
+        for (const row of meta) {
+          if (row.n > 256) throw new Error("workspace_metadata_admission");
+          const size = Number(
+            row.payload.slice(row.payload.lastIndexOf(":") + 1),
+          );
+          if (!Number.isSafeInteger(size) || size < 0)
+            throw new Error("workspace_record_admission");
+          if (count > 0 && bytes + size > pageBytes) break;
+          bytes += size;
+          count++;
+          if (bytes >= pageBytes) break;
+        }
+        checkLease(lease, binding.operation, 6 * bytes + 64 * 1024 * 24);
+        // The selected range is bounded BEFORE aggregation. ORDER BY is
+        // the workspace primary-key order; GROUP_CONCAT holds one frame.
+        const [frame] = await db.query<{ page: string }>(
+          `SELECT GROUP_CONCAT(encoded,char(10)) AS page FROM (
+                SELECT ${kind === "changes" ? "w.key" : "0"} || '|' || hex(CAST(${frameDescriptor} AS BLOB)) || '|' ||
+                  CASE WHEN r.body IS NULL THEN '-' ELSE
+                    r.stamp_o || '|' || hex(CAST(r.stamp_r AS BLOB)) || '|' || r.stamp_n || '|' ||
+                    COALESCE(CAST(r.first_o AS TEXT),'null') || '|' || hex(CAST(r.body AS BLOB)) END AS encoded
+                FROM workspace_cells w LEFT JOIN records r ON r.connection_id=? AND r.stream=? AND r.pk_hash=${kind === "changes" ? "substr(w.payload,1,instr(w.payload,':')-1)" : "w.key"}
+                WHERE w.operation=? AND w.relation=? AND w.key>=? AND w.key<=? ORDER BY w.key
+              )`,
+          [
+            binding.connection,
+            stream,
+            binding.operation,
+            kind,
+            meta[0]!.key,
+            meta[count - 1]!.key,
+          ],
+        );
+        let text = frame!.page;
+        after = meta[count - 1]!.key;
+        owned = true;
+        const releaseCurrent = release;
+        let released = false,
+          readStarted = false;
+        const dispose = () => {
+          if (!released) {
+            released = true;
+            owned = false;
+            text = "";
+            releaseCurrent();
+          }
+        };
+        dropCurrent = dispose;
+        return {
+          value: {
+            recordCount: count,
+            *records() {
+              if (released || readStarted)
+                throw new Error("workspace_unit_owned_or_released");
+              readStarted = true;
+              let start = 0,
+                decoded = 0;
+              while (start < text.length) {
+                if (released) throw new Error("workspace_unit_released");
+                const newline = text.indexOf("\n", start),
+                  end = newline < 0 ? text.length : newline;
+                let at = start;
+                const field = () => {
+                  const next = text.indexOf("|", at);
+                  const value = text.slice(at, next);
+                  at = next + 1;
+                  return value;
+                };
+                const seq = Number(field()),
+                  identity = decodeHex(field()),
+                  colon = identity.lastIndexOf(":"),
+                  pk = identity.slice(0, colon),
+                  recordBytes = Number(identity.slice(colon + 1));
+                let record: WorkspaceCanonicalRecord | null = null;
+                if (text.slice(at, end) !== "-") {
+                  const stamp_o = Number(field()),
+                    stamp_r = decodeHex(field()),
+                    stamp_n = Number(field()),
+                    first = field();
+                  record = {
+                    pk_hash: pk,
+                    stamp_o,
+                    stamp_r,
+                    stamp_n,
+                    first_o: first === "null" ? null : Number(first),
+                    body: decodeHex(text.slice(at, end)),
+                  };
+                }
+                decoded++;
+                yield { pk, seq, recordBytes, record };
+                start = end + 1;
+              }
+              if (released) throw new Error("workspace_unit_released");
+              if (decoded !== count)
+                throw new Error("workspace_frame_incomplete");
+            },
+          },
+          encodedBytes: text.length,
+          async release() {
+            dispose();
+          },
+        };
+      } catch (error) {
+        release?.();
+        owned = false;
+        return recordWorkspaceFailure(
+          db,
+          binding,
+          "record-page",
+          "read",
+          error,
+        );
+      }
+    },
+    async close() {
+      closed = true;
+      owned = false;
+      dropCurrent?.();
+      release?.();
+    },
+  };
+}
+
 /** Consumer API: typed metadata and sealed references, with runtime revocation
  * for aliases TypeScript cannot consume linearly. No caller-supplied SQL. */
 export async function openLogWorkspace(
@@ -263,6 +437,9 @@ export async function openLogWorkspace(
       }
     },
     position: storage.position,
+    failure(error: unknown): Promise<never> {
+      return recordWorkspaceFailure(db, binding, "consumer", "plan", error);
+    },
     /** These relations contain only replacement metadata. Native set deletion
      * returns a fixed receipt, never a result per historical row. Value-bearing
      * workspaces must use the general guarded cleanup cursor instead. */
@@ -329,12 +506,14 @@ export async function openLogWorkspace(
         ),
         {
           sql: `INSERT OR IGNORE INTO workspace_cells(operation,relation,key,payload)
-          SELECT ?, 'changes', printf('%020d',MAX(seq)), pk_hash || ':' || COALESCE((SELECT LENGTH(CAST(body AS BLOB))+LENGTH(CAST(stamp_r AS BLOB)) FROM records WHERE records.connection_id=record_changes.connection_id AND records.stream=record_changes.stream AND records.pk_hash=record_changes.pk_hash),0) FROM record_changes
+          SELECT ?, 'changes', printf('%020d',MAX(seq)), pk_hash || ':' || COALESCE((SELECT LENGTH(CAST(body AS BLOB))+LENGTH(CAST(stamp_r AS BLOB)) FROM records WHERE records.connection_id=record_changes.connection_id AND records.stream=record_changes.stream AND records.pk_hash=record_changes.pk_hash),(SELECT COALESCE(LENGTH(CAST(d.pk_values AS BLOB)),0)+LENGTH(CAST(d.record_key AS BLOB))+LENGTH(CAST(d.stamp_r AS BLOB)) FROM record_changes d WHERE d.connection_id=record_changes.connection_id AND d.stream=record_changes.stream AND d.pk_hash=record_changes.pk_hash AND d.seq>? AND d.seq<=? AND d.op='remove' AND (d.explicit_delete=1 OR d.pk_values IS NOT NULL) ORDER BY d.seq DESC LIMIT 1),0) FROM record_changes
           WHERE connection_id=? AND stream=? AND seq>? AND seq<=? AND ${ELIGIBLE_CHANGE}
             AND NOT EXISTS(SELECT 1 FROM workspace_cells WHERE operation=? AND relation='replacement' AND key='window')
           GROUP BY pk_hash`,
           params: [
             binding.operation,
+            from,
+            to,
             binding.connection,
             stream,
             from,
@@ -368,7 +547,7 @@ export async function openLogWorkspace(
         ),
         {
           sql: `INSERT OR IGNORE INTO workspace_cells(operation,relation,key,payload)
-          SELECT ?, 'replacement-membership', pk_hash, CAST(LENGTH(CAST(body AS BLOB)) AS TEXT) FROM records
+          SELECT ?, 'replacement-membership', pk_hash, CAST(LENGTH(CAST(body AS BLOB))+LENGTH(CAST(stamp_r AS BLOB)) AS TEXT) FROM records
           WHERE connection_id=? AND stream=? AND ${SEEN_BEFORE}
             AND NOT EXISTS(SELECT 1 FROM workspace_cells WHERE operation=? AND relation='replacement' AND key='members')`,
           params: [
@@ -394,7 +573,7 @@ export async function openLogWorkspace(
         )
       )[0]!.n;
     },
-    membershipCursor(): BoundedCursor<{ pkHash: string; bodyBytes: number }> {
+    membershipCursor(): BoundedCursor<{ pkHash: string; recordBytes: number }> {
       const cursor = metadataCursor(db, binding, "replacement-membership");
       return {
         async next(lease) {
@@ -404,7 +583,7 @@ export async function openLogWorkspace(
               ...unit,
               value: {
                 pkHash: unit.value.key,
-                bodyBytes: Number(unit.value.payload),
+                recordBytes: Number(unit.value.payload),
               },
             }
           );
@@ -442,172 +621,17 @@ export async function openLogWorkspace(
         close: cursor.close,
       };
     },
-    /** One encoded input unit, never a body-valued array. SQLite emits a
-     * length-bounded hexadecimal frame; records() decodes one TEXT body at a
-     * time. At most 64 rows and pageBytes of record text, or one admitted R.
-     * The parent unit owns every yielded record until release. */
-    changeRecordPages(
-      stream: string,
-      pageBytes: number,
-    ): BoundedCursor<WorkspaceChangePage> {
-      let after: string | null = null,
-        owned = false,
-        closed = false;
-      let release: (() => void) | undefined;
-      let dropCurrent: (() => void) | undefined;
-      return {
-        async next(lease) {
-          if (closed || owned)
-            throw new Error("workspace_cursor_owned_or_closed");
-          release = ownLease(lease, binding.operation, 64 * 1024 * 24);
-          try {
-            if (
-              !Number.isSafeInteger(pageBytes) ||
-              pageBytes < 1 ||
-              pageBytes > 65536
-            )
-              throw new Error("workspace_page_admission");
-            await db.batch(workspaceGuard(binding));
-            const [window] = await db.query<{ payload: string }>(
-              "SELECT payload FROM workspace_cells WHERE operation=? AND relation='replacement' AND key='window'",
-              [binding.operation],
-            );
-            if (!window || JSON.parse(window.payload)[0] !== stream)
-              throw new Error("workspace_window_binding");
-            const meta = await db.query<{
-              key: string;
-              payload: string;
-              n: number;
-            }>(
-              `SELECT key,substr(payload,1,256) AS payload,LENGTH(CAST(payload AS BLOB)) AS n FROM workspace_cells WHERE operation=? AND relation='changes' ${after === null ? "" : "AND key>?"} ORDER BY key LIMIT 64`,
-              after === null ? [binding.operation] : [binding.operation, after],
-            );
-            if (meta.length === 0) {
-              release();
-              return null;
-            }
-            let count = 0,
-              bytes = 0;
-            for (const row of meta) {
-              if (row.n > 256) throw new Error("workspace_metadata_admission");
-              const size = Number(
-                row.payload.slice(row.payload.lastIndexOf(":") + 1),
-              );
-              if (!Number.isSafeInteger(size) || size < 0)
-                throw new Error("workspace_record_admission");
-              if (count > 0 && bytes + size > pageBytes) break;
-              bytes += size;
-              count++;
-              if (bytes >= pageBytes) break;
-            }
-            checkLease(lease, binding.operation, 6 * bytes + 64 * 1024 * 24);
-            // The selected range is bounded BEFORE aggregation. ORDER BY is
-            // the workspace primary-key order; GROUP_CONCAT holds one frame.
-            const [frame] = await db.query<{ page: string }>(
-              `SELECT GROUP_CONCAT(encoded,char(10)) AS page FROM (
-                SELECT w.key || '|' || hex(CAST(w.payload AS BLOB)) || '|' ||
-                  CASE WHEN r.body IS NULL THEN '-' ELSE
-                    r.stamp_o || '|' || hex(CAST(r.stamp_r AS BLOB)) || '|' || r.stamp_n || '|' ||
-                    COALESCE(CAST(r.first_o AS TEXT),'null') || '|' || hex(CAST(r.body AS BLOB)) END AS encoded
-                FROM workspace_cells w LEFT JOIN records r ON r.connection_id=? AND r.stream=? AND r.pk_hash=substr(w.payload,1,instr(w.payload,':')-1)
-                WHERE w.operation=? AND w.relation='changes' AND w.key>=? AND w.key<=? ORDER BY w.key
-              )`,
-              [
-                binding.connection,
-                stream,
-                binding.operation,
-                meta[0]!.key,
-                meta[count - 1]!.key,
-              ],
-            );
-            let text = frame!.page;
-            after = meta[count - 1]!.key;
-            owned = true;
-            const releaseCurrent = release;
-            let released = false,
-              readStarted = false;
-            const dispose = () => {
-              if (!released) {
-                released = true;
-                owned = false;
-                text = "";
-                releaseCurrent();
-              }
-            };
-            dropCurrent = dispose;
-            return {
-              value: {
-                recordCount: count,
-                *records() {
-                  if (released || readStarted)
-                    throw new Error("workspace_unit_owned_or_released");
-                  readStarted = true;
-                  let start = 0,
-                    decoded = 0;
-                  while (start < text.length) {
-                    if (released) throw new Error("workspace_unit_released");
-                    const newline = text.indexOf("\n", start),
-                      end = newline < 0 ? text.length : newline;
-                    let at = start;
-                    const field = () => {
-                      const next = text.indexOf("|", at);
-                      const value = text.slice(at, next);
-                      at = next + 1;
-                      return value;
-                    };
-                    const seq = Number(field()),
-                      identity = decodeHex(field()),
-                      colon = identity.lastIndexOf(":"),
-                      pk = identity.slice(0, colon),
-                      recordBytes = Number(identity.slice(colon + 1));
-                    let record: WorkspaceCanonicalRecord | null = null;
-                    if (text.slice(at, end) !== "-") {
-                      const stamp_o = Number(field()),
-                        stamp_r = decodeHex(field()),
-                        stamp_n = Number(field()),
-                        first = field();
-                      record = {
-                        pk_hash: pk,
-                        stamp_o,
-                        stamp_r,
-                        stamp_n,
-                        first_o: first === "null" ? null : Number(first),
-                        body: decodeHex(text.slice(at, end)),
-                      };
-                    }
-                    decoded++;
-                    yield { pk, seq, recordBytes, record };
-                    start = end + 1;
-                  }
-                  if (released) throw new Error("workspace_unit_released");
-                  if (decoded !== count)
-                    throw new Error("workspace_frame_incomplete");
-                },
-              },
-              encodedBytes: text.length,
-              async release() {
-                dispose();
-              },
-            };
-          } catch (error) {
-            release?.();
-            owned = false;
-            return recordWorkspaceFailure(
-              db,
-              binding,
-              "record-page",
-              "read",
-              error,
-            );
-          }
-        },
-        async close() {
-          closed = true;
-          owned = false;
-          dropCurrent?.();
-          release?.();
-        },
-      };
+    changeRecordPages(stream: string, pageBytes: number) {
+      return recordPages(db, binding, "changes", stream, pageBytes);
+    },
+    membershipRecordPages(stream: string, pageBytes: number) {
+      return recordPages(
+        db,
+        binding,
+        "replacement-membership",
+        stream,
+        pageBytes,
+      );
     },
     async replayableUnit(
       unit: string,
@@ -698,6 +722,54 @@ export async function openLogWorkspace(
               ]);
             }
             await storage.stage(unit, kind, key, payload);
+          } finally {
+            writing = false;
+          }
+        },
+        async stageOmissions(rows) {
+          if (committed) throw new Error("workspace_unit_receipted");
+          if (writing) throw new Error("workspace_unit_busy");
+          writing = true;
+          try {
+            if (rows.length > 64)
+              return await recordWorkspaceFailure(
+                db,
+                binding,
+                unit,
+                "stage",
+                new Error("workspace_metadata_admission"),
+              );
+            if (rows.length === 0) return;
+            const values: SqlValue[] = [];
+            let bytes = 0;
+            for (const row of rows) {
+              const payload = JSON.stringify(row),
+                snapshot = JSON.parse(payload) as WorkspaceRows["omissions"],
+                key = JSON.stringify([snapshot.stream, snapshot.pkHash]);
+              bytes +=
+                new TextEncoder().encode(payload).length +
+                new TextEncoder().encode(key).length;
+              if (bytes > 64 * 1024)
+                return await recordWorkspaceFailure(
+                  db,
+                  binding,
+                  unit,
+                  "stage",
+                  new Error("workspace_metadata_admission"),
+                );
+              values.push(binding.operation, unit, "omissions", key, payload);
+            }
+            await workspaceAttempt(db, binding, unit, "stage", [
+              ...workspaceGuard(binding),
+              workspaceAssert(
+                "(SELECT phase FROM workspaces WHERE operation=?)='collect' AND NOT EXISTS(SELECT 1 FROM workspace_receipts WHERE operation=? AND unit=?)",
+                [binding.operation, binding.operation, unit],
+              ),
+              {
+                sql: `INSERT OR REPLACE INTO workspace_stage VALUES ${rows.map(() => "(?,?,?,?,?)").join(",")}`,
+                params: values,
+              },
+            ]);
           } finally {
             writing = false;
           }

@@ -32,7 +32,7 @@ import type {
   StreamSyncKeyPorts,
   StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
-import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import { openLogTestDatabase } from "./log-database.test-utils.js";
 
 const authorDrivers: SqlDriver[] = [];
 afterEach(async () => {
@@ -174,7 +174,7 @@ export async function remoteFixture(
   const declared = new Map<string, readonly string[]>();
   let author: Awaited<ReturnType<typeof createAuthor>> | undefined;
   async function createAuthor() {
-    const db = await openLocalDb(openBetterSqlite3(":memory:"), {
+    const db = await openLocalDb(await openLogTestDatabase(), {
       owner: `0x${"22".repeat(20)}`,
       network: "test",
       deviceId: "remote-author",

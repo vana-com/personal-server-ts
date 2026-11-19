@@ -2121,9 +2121,13 @@ describe("log protocol: an omission reads a bounded page of bodies", () => {
       params?: unknown[],
     ) => {
       const rows = await real(sql, params as never);
-      if (/SELECT pk_hash, body FROM records/.test(sql))
+      // The replacement cursor reads each frozen page of bodies as one hex frame.
+      if (/GROUP_CONCAT\(encoded/.test(sql))
         bodyReads.push(
-          (rows as { body: string }[]).reduce((n, r) => n + r.body.length, 0),
+          (rows as { page: string | null }[]).reduce(
+            (n, r) => n + (r.page?.length ?? 0) / 2,
+            0,
+          ),
         );
       return rows;
     };

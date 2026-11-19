@@ -102,6 +102,7 @@ import {
 import { InvalidArgumentError } from "./errors.js";
 import {
   canonicalJson,
+  canonicalJsonChunks,
   hasOwn,
   isPlainObject,
   type JsonObject,
@@ -1153,6 +1154,11 @@ function opToWire(op: WireOperation | WireEntry): Record<string, unknown> {
         s: op.stream,
       };
   }
+}
+
+/** Exact canonical operation encoding, shared by byte accounting and output. */
+export function* operationWireChunks(op: WireOperation): Generator<string> {
+  yield* canonicalJsonChunks(opToWire(op));
 }
 
 function toWire(segment: WireSegment): Record<string, unknown> {
