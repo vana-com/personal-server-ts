@@ -57,8 +57,8 @@ checks are recorded below.
 Implementation source pin: `584e2be2fdd7ee19ec5bea2784e5d9482b523c14`.
 This is a **proposed local transaction contract**, checked before workspace
 finalize/recovery implementation. It does not claim that this source implements
-these new steps. Model/config pins are the Git commit introducing this section;
-the scratch handoff receipt records their SHA-256 hashes and exact TLC logs.
+these new steps. The model SHA-256 hashes and complete TLC command lines below
+pin the checked models without relying on external handoff files.
 No formal-source-sync registry or checker exists in this source tree.
 
 `Workspace.tla` adds local phases without replacing the remote protocol in
@@ -74,26 +74,37 @@ NULL; positive integers encode first-seen values. This deliberately does not use
 The fold mapping is `packages/stream-sync/src/log.ts:551-650`.
 
 Seven one-operation input units, two keys, one output object, one publication
-candidate and one workspace are modeled. Two chunks stand for a body. Only a
-validated unit commits its receipt, fold data and visible complete bodies.
+candidate, two concurrent CAS request slots and one workspace are modeled. Two
+chunks stand for a body. Only a validated unit commits its receipt, fold data and visible complete bodies.
 The snapshot cursor/completion commits with the last unit. A crash can follow
 **every** transition, including successful commits before reply delivery. Restart
 aborts speculative unreceipted bytes and starts that unit again; durable receipts
 and their fold survive. Replay skips only an exact unit/digest/generation/key-check
 identity. Missing or corrupt input is abstracted as unavailable; no ingest or
-cursor advancement occurs until repair. Digest verification itself is assumed.
+cursor advancement occurs until repair. Digest verification itself is assumed. Retry digest, generation
+and key-check vary independently. The generation/key-check mutants ignore only their named
+field; the oracle always requires all identity fields to match.
 
 Seed preparation precedes a single seed-promotion/cursor-rollback transaction.
+`SeedAtomic` checks both directions: promotion requires reset, reset requires
+promotion, and the old cursor is zero exactly when reset is true. `seedFirst`
+promotes first and delays cursor rollback until after restart; it must fail.
 The seed obligation contains folded entries (including both deletion and later
 resurrection) plus one unpublished local observation. This abstracts a frozen
 connection/revision at finalize, not concurrent mutable local-row handling.
 The remaining phases separate partial output from sealed output, upload success
 from durable upload receipt, CAS send from remote outcome, and authoritative
 outcome read from local watermark finish. An uncertain response can represent
-old authority, the exact candidate, or a competitor. Only the exact accepted
-candidate advances the watermark. Deletion, generation change and key-check
-change each fence subsequent ingest, rebase, CAS and finish; abandonment permits
-cleanup. Cleanup of an active workspace cannot remove its inputs or outputs.
+old authority, the exact candidate, or a competitor. `Send` adds an independent
+pending request; reading old authority, restart and local cleanup cannot erase it.
+`Land` may process either pending request in any local phase. At processing time,
+it checks the expected remote head, deletion state, generation and key-check.
+A lifetime change updates remote authority and the local known fence together in
+this bounded model; it does not cancel the network request. A rejected request
+is removed from the pending set after processing. Two slots also permit a retry before the original
+request lands. Only the exact accepted candidate advances the watermark. Deletion, generation change and key-check
+change each fence subsequent ingest, rebase, CAS admission and finish;
+abandonment permits cleanup. Cleanup of an active workspace cannot remove its inputs or outputs.
 Remote objects are never garbage-collected here.
 
 `PartialWorkspace.tla` extends `PartialView` directly: its exhaustive three-part,
@@ -105,21 +116,26 @@ small product of facts and durability, **not** a composed refinement proof of
 all workspace and progressive actions.
 
 Fresh TLC 2.19 (tools 1.7.4), Java 17, one worker, 1 GiB heap, low CPU/I/O
-priority. All searches completed. The original `SqlRank.cfg` also passes unchanged:
-1,340,914 generated / 1,029,883 distinct states, depth 7. Counts for failures are at the first invariant
-violation, not full graph sizes. No parser/runtime failures count as mutant kills.
+priority. All searches in the table completed. The earlier run of unchanged
+`SqlRank.cfg` passed: 1,340,914 generated / 1,029,883 distinct states, depth 7.
+Counts for failures are at the first invariant violation, not full graph sizes. No parser/runtime failures count as mutant kills.
 
-| Config                                      | Result                              | Generated | Distinct | Depth |
-| ------------------------------------------- | ----------------------------------- | --------: | -------: | ----: |
-| WorkspaceGood                               | PASS safety and temporal properties |   130,049 |    9,140 |    44 |
-| WorkspaceEarlyCursor                        | FAIL `NoGap`                        |         8 |        7 |     2 |
-| WorkspaceOmittedUpload                      | FAIL `UploadBeforeCAS`              |    51,891 |    4,771 |    35 |
-| WorkspaceDroppedTombstone                   | FAIL `ReceiptedFold`                |     4,219 |      845 |    17 |
-| WorkspaceEarlyCleanup                       | FAIL `LiveInputs`                   |       118 |       62 |     6 |
-| WorkspaceSplitSeed                          | FAIL `SeedAtomic`                   |    34,637 |    3,605 |    31 |
-| WorkspaceReceiptWithoutFold                 | FAIL `ReceiptedFold`                |        63 |       35 |     5 |
-| PartialWorkspaceGood                        | PASS safety and temporal properties |    81,920 |   40,960 |    10 |
-| WorkspaceEarlyCompletion (PartialWorkspace) | FAIL `TruthfulMarkers`              |    20,481 |   12,289 |     4 |
+| Config                      | Result                              | Generated | Distinct | Depth |
+| --------------------------- | ----------------------------------- | --------: | -------: | ----: |
+| WorkspaceGood               | PASS safety and temporal properties | 8,320,331 |  143,960 |    49 |
+| WorkspaceLateLandWitness    | REACHED `NoLateReadLand`            |   822,198 |   20,192 |    38 |
+| WorkspaceFencedLandWitness  | REACHED `NoFencedLand`              |   825,851 |   20,481 |    38 |
+| WorkspaceIgnoreGeneration   | FAIL `ReplayGeneration`             |       114 |       58 |     6 |
+| WorkspaceIgnoreKeyCheck     | FAIL `ReplayKeyCheck`               |       116 |       60 |     6 |
+| WorkspaceSeedFirst          | FAIL `SeedAtomic`                   |   404,195 |   12,755 |    31 |
+| WorkspaceEarlyCursor        | FAIL `NoGap`                        |         8 |        7 |     2 |
+| WorkspaceOmittedUpload      | FAIL `UploadBeforeCAS`              |   632,039 |   17,163 |    35 |
+| WorkspaceDroppedTombstone   | FAIL `ReceiptedFold`                |    34,285 |    2,555 |    17 |
+| WorkspaceEarlyCleanup       | FAIL `LiveInputs`                   |       124 |       68 |     6 |
+| WorkspaceSplitSeed          | FAIL `SeedAtomic`                   |   404,195 |   12,755 |    31 |
+| WorkspaceReceiptWithoutFold | FAIL `ReceiptedFold`                |        63 |       35 |     5 |
+| PartialWorkspaceGood        | PASS safety and temporal properties |    81,920 |   40,960 |    10 |
+| WorkspaceEarlyCompletion    | FAIL `TruthfulMarkers`              |    20,481 |   12,289 |     4 |
 
 Liveness is conditional on crashes stopping, input eventually becoming available,
 fair local work and repair, and strong fairness of CAS landing when repeatedly
@@ -128,16 +144,64 @@ than publication. Fairness does not turn permanently corrupt input into success.
 The model does not bound actual RSS, caches, bytes, disk or query complexity.
 `OneLease` checks only the abstract unit ownership shape.
 
-Reproduce from this directory, with a trusted tools jar and a fresh output
-location for each configuration:
+The two witness configurations deliberately check the negation of desired
+reachability: an invariant violation (exit 12) means the requested interleaving
+was reached, not a safety failure. `NoLateReadLand` witnesses successful acceptance
+after an old-authority read returned the local phase to ready. `NoFencedLand`
+witnesses a pending request processed after a lifetime fence (and rejected by its
+remote preconditions). These witnesses are separate from all safety properties.
 
-```sh
-nice -n 19 ionice -c3 java -XX:+UseParallelGC -Xmx1g -cp "$TLA2TOOLS" \
-  tlc2.TLC -workers 1 -metadir "$TLC_OUTPUT" -config WorkspaceGood.cfg Workspace
+Red-first checks against the phase-coupled landing rule could not reach either
+witness: each exhausted 130,049 generated / 9,140 distinct states, depth 44,
+without a violation. Offering independent identities with the old replay check
+violated `ReplayGeneration` (114 / 58, depth 6) and `ReplayKeyCheck` (116 / 60,
+depth 6). The old one-way seed assertion missed the seed-first mutant entirely:
+3,722,825 / 68,264, depth 49, no violation. The strengthened checks discriminate
+all three added mutants. No design contradiction appeared in the good model.
+
+Model SHA-256 hashes (the exact bytes checked for this table):
+
+```text
+ed1bebf8189eefe19e899c6acb0f6ca3f846a68f3e0e78de3f33e74e3fa21e08  Workspace.tla
+234516578a2fcaf52a50bc1e09cfed82d828d3c958c94df014f00f8b491a8bf2  SqlRank.tla
+e0ec444cfb46f2051116212d448a69d11af7b8983a2ec98205e050a7467eda40  PartialWorkspace.tla
+a9a5a2793eb636cbbf19fa864c4db353dbca1df359e1133629665d0181967053  PartialView.tla
 ```
 
-Use `PartialWorkspace` for `PartialWorkspaceGood.cfg` and
-`WorkspaceEarlyCompletion.cfg`. Use `Workspace` for the other workspace configs.
+Reproduce the full table from the repository root. Supply a trusted tools jar
+and a fresh disk-backed output directory. Each job runs serially with one worker;
+expected invariant failures exit 12, while good configurations exit zero.
+
+```sh
+cd docs/formal/log-protocol
+: "${TLA2TOOLS:?set the tools jar path}"
+: "${TLC_OUTPUT:?set a fresh disk-backed output directory}"
+mkdir -p "$TLC_OUTPUT"
+for cfg in \
+  WorkspaceGood WorkspaceLateLandWitness WorkspaceFencedLandWitness \
+  WorkspaceIgnoreGeneration WorkspaceIgnoreKeyCheck WorkspaceSeedFirst \
+  WorkspaceEarlyCursor WorkspaceOmittedUpload WorkspaceDroppedTombstone \
+  WorkspaceEarlyCleanup WorkspaceSplitSeed WorkspaceReceiptWithoutFold \
+  PartialWorkspaceGood WorkspaceEarlyCompletion
+do
+  model=Workspace
+  expected=12
+  case "$cfg" in
+    PartialWorkspaceGood|WorkspaceEarlyCompletion) model=PartialWorkspace ;;
+  esac
+  case "$cfg" in
+    WorkspaceGood|PartialWorkspaceGood) expected=0 ;;
+  esac
+  if nice -n 19 ionice -c3 java -XX:+UseParallelGC -Xmx1g -cp "$TLA2TOOLS" \
+    tlc2.TLC -workers 1 -metadir "$TLC_OUTPUT/$cfg" \
+    -config "$cfg.cfg" "$model" > "$TLC_OUTPUT/$cfg.log" 2>&1
+  then status=0
+  else status=$?
+  fi
+  cat "$TLC_OUTPUT/$cfg.log"
+  if [ "$status" -ne "$expected" ]; then exit 1; fi
+done
+```
 
 Remaining obligations: implementation-to-atomic-step mapping and replay tests on
 real durable SQLite/files; matching source/model/config pins after implementation;

@@ -31,7 +31,9 @@ Init == w = [at |-> 0, chunks |-> 0, inputSeal |-> FALSE,
   output |-> 0, uploaded |-> FALSE, uploadReceipt |-> FALSE,
   remote |-> "old", reply |-> "none", watermark |-> 0,
   seedReady |-> FALSE, seed |-> {}, reset |-> FALSE, oldCursor |-> N,
-  fence |-> "valid", available |-> TRUE, retry |-> 0, retryDigest |-> "digest", skipped |-> FALSE, finishOK |-> TRUE]
+  fence |-> "valid", available |-> TRUE, retry |-> 0, retryDigest |-> "digest", skipped |-> FALSE, finishOK |-> TRUE, lateReadLand |-> FALSE, fencedLand |-> FALSE, pending |-> {}, remoteDeleted |-> FALSE,
+  remoteGeneration |-> 1, remoteKeyCheck |-> "key-check",
+  retryGeneration |-> 1, retryKeyCheck |-> "key-check", seedRestarted |-> FALSE]
 Bound == w.fence="valid"
 Collect ==
  /\ Bound /\ w.phase="collect" /\ w.at<N /\ w.available
@@ -49,9 +51,12 @@ Collect ==
 \* Matching receipts are a no-op. A mismatched retry is refused, never skipped.
 Replay ==
  /\ w.at>0
- /\ \E i \in 1..w.at, digest \in {"digest","corrupt"} :
-     w'=[w EXCEPT !.retry=i, !.retryDigest=digest,
-       !.skipped=(<<i,digest,1,"key-check">> \in w.receipts)]
+ /\ \E i \in 1..w.at, digest \in {"digest","corrupt"},
+       generation \in {1,2}, keyCheck \in {"key-check","other-key"} :
+     w'=[w EXCEPT !.retry=i, !.retryDigest=digest, !.retryGeneration=generation, !.retryKeyCheck=keyCheck,
+       !.skipped=(<<i,digest,
+         IF Mutant="ignoreGeneration" THEN 1 ELSE generation,
+         IF Mutant="ignoreKeyCheck" THEN "key-check" ELSE keyCheck>> \in w.receipts)]
 Unavailable == /\ w.available /\ w.phase="collect"
                /\ w'=[w EXCEPT !.available=FALSE]
 Repair == /\ ~w.available /\ w'=[w EXCEPT !.available=TRUE]
@@ -59,11 +64,17 @@ PrepareSeed == /\ Bound /\ w.at=N /\ w.phase="collect"
                /\ w'=[w EXCEPT !.seedReady=TRUE, !.phase="seed"]
 \* Seed includes all winner/tombstone obligations plus an unpublished local write.
 Obligation == UNION {{Entries(Oracle(N))[k][j] : j \in 1..Len(Entries(Oracle(N))[k])} : k \in Keys} \cup {Op(3,4,0,4,0,"up")}
-Rebase == /\ Bound /\ w.phase="seed" /\ w.seedReady
+Rebase == /\ Mutant#"seedFirst" /\ Bound /\ w.phase="seed" /\ w.seedReady
           /\ w'=[w EXCEPT !.seed=IF Mutant="splitSeed" THEN {} ELSE Obligation,
                  !.oldCursor=0, !.reset=TRUE, !.phase="folded"]
 LateSeed == /\ Mutant="splitSeed" /\ w.reset /\ w.seed={}
             /\ w'=[w EXCEPT !.seed=Obligation]
+\* Mutant promotes the seed before rollback, then resets only after a crash.
+SeedFirst == /\ Mutant="seedFirst" /\ Bound /\ w.phase="seed"
+             /\ w'=[w EXCEPT !.seed=Obligation, !.phase="seedPromoted"]
+ResetAfterSeed == /\ Mutant="seedFirst" /\ Bound /\ w.phase="seedPromoted"
+                  /\ w.seedRestarted
+                  /\ w'=[w EXCEPT !.oldCursor=0, !.reset=TRUE, !.phase="folded"]
 SealOutput == /\ Bound /\ w.phase="folded"
               /\ IF w.output=0 THEN w'=[w EXCEPT !.output=1]
                  ELSE w'=[w EXCEPT !.output=2, !.phase="sealed"]
@@ -73,10 +84,19 @@ Receipt == /\ Bound /\ w.phase="sealed" /\ w.uploaded
            /\ w'=[w EXCEPT !.uploadReceipt=TRUE, !.phase="ready"]
 Send == /\ Bound /\ (w.phase="ready" \/
                      (Mutant="omittedUpload" /\ w.phase="sealed"))
-        /\ w'=[w EXCEPT !.phase="sent", !.reply="unknown"]
-\* CAS may land, lose to a competitor, or not land. Reply may be lost at any point.
-Land == /\ Bound /\ w.phase="sent" /\ w.remote="old"
-        /\ \E result \in {"ours","other"} : w'=[w EXCEPT !.remote=result]
+        /\ \E request \in {1,2} \ w.pending :
+           w'=[w EXCEPT !.phase="sent", !.reply="unknown", !.pending=@ \cup {request}]
+\* Two request slots permit a retry while the original CAS is still in flight.
+\* An old-authority read, restart or local cleanup cannot retract a request.
+\* Evaluate expected head/deletion/generation/key-check at REMOTE processing,
+\* not local admission. A fenced request still processes, but is rejected.
+RemotePreconditions == ~w.remoteDeleted /\ w.remoteGeneration=1
+                       /\ w.remoteKeyCheck="key-check" /\ w.remote="old"
+Land == \E request \in w.pending, result \in {"ours","other"} :
+          w'=[w EXCEPT !.pending=@ \ {request},
+              !.remote=IF RemotePreconditions THEN result ELSE @,
+              !.lateReadLand=(@ \/ (w.phase="ready" /\ RemotePreconditions /\ result="ours")),
+              !.fencedLand=(@ \/ ~Bound)]
 ReadOutcome == /\ Bound /\ w.phase="sent"
                /\ w'=[w EXCEPT !.reply=w.remote,
                  !.phase=IF w.remote="ours" THEN "accepted"
@@ -86,35 +106,44 @@ Finish == /\ Bound /\ w.phase="accepted"
                  !.finishOK=(@ /\ Bound /\ w.remote="ours")]
 Fence == /\ w.fence="valid"
          /\ \E cause \in {"deleted","generation","key-check"} :
-            w'=[w EXCEPT !.fence=cause]
+            w'=[w EXCEPT !.fence=cause,
+              !.remoteDeleted=(cause="deleted"),
+              !.remoteGeneration=IF cause="generation" THEN 2 ELSE @,
+              !.remoteKeyCheck=IF cause="key-check" THEN "other-key" ELSE @]
 Abandon == /\ ~Bound /\ w.phase \notin {"aborted","clean"}
            /\ w'=[w EXCEPT !.phase="aborted"]
 Cleanup == /\ w.phase \in {"finished","aborted"}
            /\ w'=[w EXCEPT !.input={}, !.output=0, !.phase="clean"]
 \* A crash at EVERY action boundary loses only volatile ingest bytes and reply.
 \* Committed input, fold, output seals, receipts, seed and authority survive a lost reply.
-Crash == w'=[w EXCEPT !.chunks=0, !.inputSeal=FALSE, !.reply="none"]
+Crash == w'=[w EXCEPT !.chunks=0, !.inputSeal=FALSE, !.reply="none",
+  !.seedRestarted=(@ \/ w.phase="seedPromoted")]
 EarlyCursor == /\ Mutant="earlyCursor" /\ w.at<N
                /\ w'=[w EXCEPT !.cursor=N]
 EarlyCleanup == /\ Mutant="earlyCleanup" /\ w.at>0 /\ w.phase="collect"
                 /\ w'=[w EXCEPT !.input={}]
-Work == Collect \/ PrepareSeed \/ Rebase \/ LateSeed \/ SealOutput \/ Upload
+Work == SeedFirst \/ ResetAfterSeed \/ Collect \/ PrepareSeed \/ Rebase \/ LateSeed \/ SealOutput \/ Upload
         \/ Receipt \/ Send \/ Land \/ ReadOutcome \/ Finish \/ Abandon \/ Cleanup
 Next == Work \/ Crash \/ Replay \/ Unavailable \/ Repair \/ Fence
         \/ EarlyCursor \/ EarlyCleanup
 Spec == Init /\ [][Next]_vars /\ WF_vars(Work) /\ WF_vars(Repair)
         /\ SF_vars(Land)
-TypeOK == w.at \in 0..N /\ w.cursor \in {0,N} /\ w.output \in 0..2
+NoLateReadLand == ~w.lateReadLand
+NoFencedLand == ~w.fencedLand
+TypeOK == w.at \in 0..N /\ w.cursor \in {0,N} /\ w.output \in 0..2 /\ w.pending \subseteq {1,2}
 ReceiptedFold == w.cells=Oracle(w.at) /\ w.visible=w.cells
 NoGap == w.cursor<=w.at /\ w.receipts={Identity(i) : i \in 1..w.at}
 Visibility == w.complete => w.at=N /\ Entries(w.visible)=Entries(Oracle(N))
 UploadBeforeCAS == w.remote="ours" => w.uploaded /\ w.uploadReceipt
 RemoteAuthority == w.watermark>0 => w.remote="ours" /\ w.finishOK
-SeedAtomic == w.reset => w.oldCursor=0 /\ w.seed=Obligation
+SeedAtomic == /\ (w.reset <=> w.seed=Obligation)
+              /\ (w.oldCursor=0 <=> w.reset)
 LiveInputs == w.phase \notin {"finished","aborted","clean"} => 1..w.at \subseteq w.input
 LiveOutputs == w.phase \in {"sealed","ready","sent","accepted"} => w.output=2
 ReplayIdentity == w.skipped =>
-  <<w.retry,w.retryDigest,1,"key-check">> \in w.receipts /\ w.retryDigest="digest"
+  <<w.retry,w.retryDigest,w.retryGeneration,w.retryKeyCheck>> \in w.receipts /\ w.retryDigest="digest"
+ReplayGeneration == w.skipped => w.retryGeneration=1
+ReplayKeyCheck == w.skipped => w.retryKeyCheck="key-check"
 NoLocalAcceptance == w.phase="accepted" => w.remote="ours"
 FenceStops == [][(~Bound) => UNCHANGED <<w.cells,w.cursor,w.watermark,w.oldCursor>>]_vars
 OnlyAcceptedAdvance == [][w.watermark'>w.watermark =>
