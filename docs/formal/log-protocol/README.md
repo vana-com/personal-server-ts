@@ -23,6 +23,8 @@ refinement proof from the models to its implementation.
 | Head cursor/replay, 2026-11-16                  | One stream, three devices, two heads/two rounds. Durable-obligation checks and rollback variant pass their listed properties; memory-only variants fail. Pending local writes and compaction are excluded. | [HeadCursor](#headcursor-a-per-stream-head-that-predates-the-log), [stored replay obligation](#the-stored-replay-obligation)                                 |
 | General and keyed log models, 2026-11-15/16     | Corpus/config-specific bounds; `MaxSteps=6` bounds commits/reset, not network steps. Good, LostPush temporal checking and keyed runs include unfinished checks, not established PASS results.              | [State and abstraction](#state-and-abstraction), [TLC results](#tlc-results-host-run), [key-ordered first load](#key-ordered-first-load-host-run-2026-11-16) |
 
+Fresh workspace transaction checks are recorded in [Durable bounded workspace](#durable-bounded-workspace-2026-11-19). The historical run summary above remains specific to its original checks.
+
 **Open obligations before relying on this evidence:**
 
 - Record matching implementation/model/config pins and rerun relevant checks
@@ -47,7 +49,103 @@ control-row deletion fences; see the [package overview](../../../packages/stream
 Descriptions below are retained at the revision they discuss. In particular,
 [per-stream heads beside the log](#per-stream-heads-beside-the-log-applyts)
 records an older fallback/flag design, not the current publication contract.
-No new TLC or product test was executed for this documentation update.
+That historical summary did not execute new TLC or product tests. Fresh workspace
+checks are recorded below.
+
+## Durable bounded workspace (2026-11-19)
+
+Implementation source pin: `584e2be2fdd7ee19ec5bea2784e5d9482b523c14`.
+This is a **proposed local transaction contract**, checked before workspace
+finalize/recovery implementation. It does not claim that this source implements
+these new steps. Model/config pins are the Git commit introducing this section;
+the scratch handoff receipt records their SHA-256 hashes and exact TLC logs.
+No formal-source-sync registry or checker exists in this source tree.
+
+`Workspace.tla` adds local phases without replacing the remote protocol in
+`LogProtocol` or the continuity/replay obligations in `HeadCursor`.
+It instantiates `SqlRank`'s comparator and new pure fold-cell operators. The
+existing SQL rank state machine is unchanged. Each cell keeps the greatest
+upsert and greatest deletion independently. An independent set-maximum oracle
+checks every incremental prefix; fixed vectors check same-body ordinal changes,
+body-hash ties, an omission at the upsert stamp, explicit deletion, resurrection,
+the retained preceding tombstone, and the winner's own `first_o`. Zero encodes
+NULL; positive integers encode first-seen values. This deliberately does not use
+`LogProtocol`'s historical minimum-first field as the current `first_o` oracle.
+The fold mapping is `packages/stream-sync/src/log.ts:551-650`.
+
+Seven one-operation input units, two keys, one output object, one publication
+candidate and one workspace are modeled. Two chunks stand for a body. Only a
+validated unit commits its receipt, fold data and visible complete bodies.
+The snapshot cursor/completion commits with the last unit. A crash can follow
+**every** transition, including successful commits before reply delivery. Restart
+aborts speculative unreceipted bytes and starts that unit again; durable receipts
+and their fold survive. Replay skips only an exact unit/digest/generation/key-check
+identity. Missing or corrupt input is abstracted as unavailable; no ingest or
+cursor advancement occurs until repair. Digest verification itself is assumed.
+
+Seed preparation precedes a single seed-promotion/cursor-rollback transaction.
+The seed obligation contains folded entries (including both deletion and later
+resurrection) plus one unpublished local observation. This abstracts a frozen
+connection/revision at finalize, not concurrent mutable local-row handling.
+The remaining phases separate partial output from sealed output, upload success
+from durable upload receipt, CAS send from remote outcome, and authoritative
+outcome read from local watermark finish. An uncertain response can represent
+old authority, the exact candidate, or a competitor. Only the exact accepted
+candidate advances the watermark. Deletion, generation change and key-check
+change each fence subsequent ingest, rebase, CAS and finish; abandonment permits
+cleanup. Cleanup of an active workspace cannot remove its inputs or outputs.
+Remote objects are never garbage-collected here.
+
+`PartialWorkspace.tla` extends `PartialView` directly: its exhaustive three-part,
+two-key corpus and truthful future-removal holdback stay owned there. It adds
+speculative chunk reads, durable body/position/marker commit, restart and final
+snapshot cursor. Partial markers are true exactly for a nonempty unfinished
+prefix; completion and snapshot cursor require the final part. It is a separate
+small product of facts and durability, **not** a composed refinement proof of
+all workspace and progressive actions.
+
+Fresh TLC 2.19 (tools 1.7.4), Java 17, one worker, 1 GiB heap, low CPU/I/O
+priority. All searches completed. The original `SqlRank.cfg` also passes unchanged:
+1,340,914 generated / 1,029,883 distinct states, depth 7. Counts for failures are at the first invariant
+violation, not full graph sizes. No parser/runtime failures count as mutant kills.
+
+| Config                                      | Result                    | Generated | Distinct | Depth |
+| ------------------------------------------- | ------------------------- | --------: | -------: | ----: |
+| WorkspaceGood                               | PASS safety and temporal properties | 130,049 | 9,140 | 44 |
+| WorkspaceEarlyCursor                        | FAIL `NoGap`              | 8 | 7 | 2 |
+| WorkspaceOmittedUpload                      | FAIL `UploadBeforeCAS`    | 51,891 | 4,771 | 35 |
+| WorkspaceDroppedTombstone                   | FAIL `ReceiptedFold`      | 4,219 | 845 | 17 |
+| WorkspaceEarlyCleanup                       | FAIL `LiveInputs`         | 118 | 62 | 6 |
+| WorkspaceSplitSeed                          | FAIL `SeedAtomic`         | 34,637 | 3,605 | 31 |
+| WorkspaceReceiptWithoutFold                 | FAIL `ReceiptedFold`      | 63 | 35 | 5 |
+| PartialWorkspaceGood                        | PASS safety and temporal properties | 81,920 | 40,960 | 10 |
+| WorkspaceEarlyCompletion (PartialWorkspace) | FAIL `TruthfulMarkers`    | 20,481 | 12,289 | 4 |
+
+Liveness is conditional on crashes stopping, input eventually becoming available,
+fair local work and repair, and strong fairness of CAS landing when repeatedly
+attempted. A competing authority or lifetime fence settles by abandonment rather
+than publication. Fairness does not turn permanently corrupt input into success.
+The model does not bound actual RSS, caches, bytes, disk or query complexity.
+`OneLease` checks only the abstract unit ownership shape.
+
+Reproduce from this directory, with a trusted tools jar and a fresh output
+location for each configuration:
+
+```sh
+nice -n 19 ionice -c3 java -XX:+UseParallelGC -Xmx1g -cp "$TLA2TOOLS" \
+  tlc2.TLC -workers 1 -metadir "$TLC_OUTPUT" -config WorkspaceGood.cfg Workspace
+```
+
+Use `PartialWorkspace` for `PartialWorkspaceGood.cfg` and
+`WorkspaceEarlyCompletion.cfg`. Use `Workspace` for the other workspace configs.
+
+Remaining obligations: implementation-to-atomic-step mapping and replay tests on
+real durable SQLite/files; matching source/model/config pins after implementation;
+multiple output objects/publication prefixes; concurrent pending local writes
+and revision validation; schema migrations; stream metadata; host append offset
+and digest checks; cryptographic verification; bounded-memory ownership and
+adapter measurements. Existing uncompleted log-model obligations above remain
+open. No design claim was contradicted by the completed bounded checks.
 
 ## History: initial design exploration
 
