@@ -53,7 +53,11 @@ export function startPullSignals(
 export interface PsLiteActivitySource {
   /** Return the current aggregate activity. */
   isActive(): boolean;
-  /** Notify after the value changes; return a function that unsubscribes. */
+  /**
+   * Notify after the value changes; return a function that unsubscribes.
+   * If this throws, it must leave no listener registered. Notify when a
+   * failed activity read becomes usable again, even if the value did not change.
+   */
   subscribe(onChange: () => void): () => void;
 }
 
@@ -86,34 +90,43 @@ export function startVisibilityPause(
     const activity = sources.activity;
     let disposed = false;
     let previous: boolean | undefined;
+    let subscribed = false;
     let unsubscribe: (() => void) | undefined;
     const stop = () => {
       disposed = true;
+      const cleanup = unsubscribe;
+      unsubscribe = undefined;
       try {
-        unsubscribe?.();
+        cleanup?.();
       } catch {
         // Host cleanup must not interrupt runtime shutdown.
       }
     };
     const apply = () => {
-      if (disposed) return;
+      if (disposed || !subscribed) return;
       let active = false;
       try {
         active = activity.isActive();
       } catch {
         // An unreadable activity source is inactive until it recovers.
       }
-      if (active === previous) return;
+      if (disposed || active === previous) return;
       const wasActive = previous;
-      previous = active;
       try {
         if (!active) manager.pause?.();
-        else {
-          manager.resume?.();
-          if (wasActive === false) sources.onActive?.();
-        }
+        else manager.resume?.();
       } catch {
-        // A manager that refuses is not the host's problem.
+        // Retry on the next activity notification.
+        return;
+      }
+      if (disposed) return;
+      previous = active;
+      if (active && wasActive === false) {
+        try {
+          sources.onActive?.();
+        } catch {
+          // A failed pull request does not undo a successful resume.
+        }
       }
     };
     try {
@@ -127,6 +140,7 @@ export function startVisibilityPause(
       }
       return stop;
     }
+    subscribed = true;
     apply();
     return stop;
   }
