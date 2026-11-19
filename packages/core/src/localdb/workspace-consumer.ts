@@ -26,6 +26,7 @@ import {
 export interface WorkspaceRecordKey {
   readonly stream: string;
   readonly pkHash: string;
+  /** Canonical primary-key tuple in declared field order, including upsert-only cells. */
   readonly key: LogKey;
 }
 export interface WorkspaceDeletion {

@@ -207,6 +207,14 @@ it("disk cells preserve independent maxima, nullable winner checkpoints, metadat
         segment,
         LOG_SCOPE(template),
       );
+      const cellCursor = fold.ws.cursor("fold");
+      const cell = await cellCursor.next(fold.lease);
+      try {
+        expect(cell?.value.row.key).toEqual(['é\\"']);
+      } finally {
+        await cell?.release();
+        await cellCursor.close();
+      }
       const expected = foldLog({ snapshot: [], segments: history });
       const actual = [];
       for await (const entry of fold.entries(false)) actual.push(entry);

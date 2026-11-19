@@ -2,6 +2,7 @@ import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
 import {
   canonicalJson,
+  primaryKeyValues,
   stampAfter,
   PART_LIMIT_BYTES,
   type JsonObject,
@@ -149,6 +150,10 @@ export async function openDiskFold(
     const unit = await ws.unit(unitId, hash, previous);
     if (unit.state === "receipted") return;
     const staged = unit;
+    // This directory belongs only to the current bounded wire unit.
+    const primaryKeys = new Map(
+      input.streams.map((meta) => [meta.stream, meta.primaryKey]),
+    );
     for (const meta of input.streams)
       await staged.stage("streams", {
         stream: meta.stream,
@@ -176,6 +181,7 @@ export async function openDiskFold(
       )
         await staged.stage("fold", {
           ...c,
+          key,
           deletion: { stamp, explicit, key },
         });
     }
@@ -205,19 +211,19 @@ export async function openDiskFold(
       }
       // Resolve exactly one referenced body, even if it later loses the comparison.
       if (op.kind === "upsert-ref") await admitRecord(op.body.bytes);
-      const body = await store(
-        encoder.encode(
-          canonicalJson(
-            op.kind === "upsert"
-              ? op.value
-              : await fetchBody(deps, scope, op.body),
-          ),
-        ),
-      );
+      const value =
+        op.kind === "upsert" ? op.value : await fetchBody(deps, scope, op.body);
+      const primaryKey = primaryKeys.get(op.stream);
+      if (!primaryKey) throw new Error("fold_missing_primary_key");
+      const key = primaryKeyValues(
+        value,
+        primaryKey,
+      ) as WorkspaceFoldCell["key"];
+      const body = await store(encoder.encode(canonicalJson(value)));
       const c = (await lookup(unitId, op.stream, op.pkHash)) ?? {
         stream: op.stream,
         pkHash: op.pkHash,
-        key: [],
+        key,
         upsert: null,
         deletion: null,
       };
@@ -236,6 +242,7 @@ export async function openDiskFold(
             : undefined;
         await staged.stage("fold", {
           ...c,
+          key,
           upsert: {
             stamp: op.stamp,
             ordinal,
