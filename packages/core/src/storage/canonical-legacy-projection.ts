@@ -14,8 +14,11 @@ import {
   type ProjectionError,
 } from "../legacy-projection/index.js";
 import type {
+  ChatgptBranchWalkDiagnostic,
+  ChatgptConversationCoverageGap,
   ProjectionDiagnostic,
   ProjectionOmission,
+  RetainedChatgptMessage,
 } from "../legacy-projection/types.js";
 import {
   declaredBlobField,
@@ -54,7 +57,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/9";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/14";
 
 const DEFAULT_PAGE_SIZE = 500;
 const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
@@ -159,6 +162,12 @@ export interface CanonicalLegacyReadOk {
   ok: true;
   envelope: DataFileEnvelope;
   projectionOmissions?: ProjectionOmission[];
+  /** Stored text omitted from display, from the envelope's same snapshot. */
+  retainedChatgptMessages?: readonly RetainedChatgptMessage[];
+  /** Per-conversation fallback exclusions from this exact projection. */
+  chatgptCoverageGaps?: readonly ChatgptConversationCoverageGap[];
+  /** Hash-only diagnostics for complete walks longer than the declared count. */
+  chatgptBranchDiagnostics?: readonly ChatgptBranchWalkDiagnostic[];
   /** Conservative collection horizon for each input stream in this snapshot. */
   streamCollectionTimes?: Record<string, string | null>;
   /** Current accepted P7 completion time for each input stream, if any. */
@@ -173,7 +182,9 @@ export interface CanonicalLegacyReadOk {
   revision: string;
   /**
    * False when `diagnostics.omissions`, `diagnostics.partialRows` or
-   * `diagnostics.unproven` is not empty.
+   * `diagnostics.unproven` is not empty. Receipted ChatGPT branch exclusions
+   * are exposed separately and do not change this bit; they do not authorize
+   * whole-dataset deletion or replacement.
    */
   complete: boolean;
   diagnostics: CanonicalReadDiagnostics;
@@ -878,15 +889,40 @@ async function projectSnapshot(
     (sum, entry) => sum + entry.count,
     0,
   );
-  if (itemStream && sourceRows > 0 && itemDropped >= sourceRows) {
+  const rejectedMessageRows = decodeDiagnostics.some(
+    (diagnostic) =>
+      diagnostic.kind === "records_dropped" && diagnostic.stream === "messages",
+  );
+  const allConversationsLostToMalformedMessages =
+    scope === "chatgpt.conversations" &&
+    rejectedMessageRows &&
+    Array.isArray(projected.payload.conversations) &&
+    projected.payload.conversations.length === 0
+      ? (projected.chatgptCoverageGaps?.length ?? 0)
+      : 0;
+  if (
+    itemStream &&
+    sourceRows > 0 &&
+    itemDropped + allConversationsLostToMalformedMessages >= sourceRows
+  ) {
     return {
       ok: false,
       status: "incomplete",
       reason: "all_rows_rejected",
       stream: itemStream,
       sourceRows,
-      dropped: itemDropped,
-      reasons: [...new Set(itemOmissions.flatMap((entry) => entry.reasons))],
+      dropped: itemDropped + allConversationsLostToMalformedMessages,
+      reasons: [
+        ...new Set([
+          ...itemOmissions.flatMap((entry) => entry.reasons),
+          ...decodeDiagnostics.flatMap((diagnostic) =>
+            diagnostic.kind === "records_dropped" &&
+            diagnostic.stream === "messages"
+              ? diagnostic.reasons
+              : [],
+          ),
+        ]),
+      ],
       sourceRowCounts,
     };
   }
@@ -909,6 +945,15 @@ async function projectSnapshot(
     ok: true,
     ...(projected.projectionOmissions
       ? { projectionOmissions: projected.projectionOmissions }
+      : {}),
+    ...(projected.retainedChatgptMessages
+      ? { retainedChatgptMessages: projected.retainedChatgptMessages }
+      : {}),
+    ...(projected.chatgptCoverageGaps
+      ? { chatgptCoverageGaps: projected.chatgptCoverageGaps }
+      : {}),
+    ...(projected.chatgptBranchDiagnostics
+      ? { chatgptBranchDiagnostics: projected.chatgptBranchDiagnostics }
       : {}),
     envelope: {
       version: "1.0",

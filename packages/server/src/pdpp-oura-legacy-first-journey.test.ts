@@ -465,9 +465,7 @@ const ACTIVITY_CONTRIB = {
 };
 
 /**
- * oura-playwright 3.1.2 (verified: mapReadiness / mapSleep / mapActivity at
- * /home/tnunamak/.t3/worktrees/data-connectors/t3-0a13df8d/artifacts/oura-playwright/oura-playwright-3.1.2/script.js:2397-2460,
- * identical to 2.0.0 in unity-surfaces) emits `timestamp` on readiness/activity
+ * oura-playwright 3.1.2 emits `timestamp` on readiness/activity
  * days and on sleep dailyScores. `LEGACY_TS = false` models a collector
  * without it, to isolate that field's effect.
  */

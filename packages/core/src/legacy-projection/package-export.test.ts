@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import * as viaExport from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import * as viaSource from "./index.js";
 
-// Consumers (unity-surfaces app-runtime) import the adapter through the
+// Consumers import the adapter through the
 // package export, which resolves to the built dist. This proves the subpath
 // exists and serves the same projection as the source module.
 describe("@opendatalabs/personal-server-ts-core/legacy-projection", () => {

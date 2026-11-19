@@ -28,8 +28,19 @@ function reasonForRow(row: VerdictRow) {
         reason: string;
         missingEntityCount: number;
         mismatchedFieldPaths: string[];
+        excludedConversations?: LegacyCoverageVerdict["excludedConversations"];
+        chatgptBranchDiagnostics?: LegacyCoverageVerdict["chatgptBranchDiagnostics"];
       })
     : null;
+}
+
+function summarizedHashes<T extends { conversationIdHash: string }>(
+  values: readonly T[] | undefined,
+): T[] | undefined {
+  return values?.map((value) => ({
+    ...value,
+    conversationIdHash: value.conversationIdHash.slice(0, 12),
+  }));
 }
 
 function coverageFromRow(row: VerdictRow): LegacyCoverageVerdict {
@@ -43,6 +54,12 @@ function coverageFromRow(row: VerdictRow): LegacyCoverageVerdict {
     appliedExceptions: JSON.parse(
       row.applied_exceptions_json,
     ) as LegacyCoverageVerdict["appliedExceptions"],
+    ...(reason?.excludedConversations
+      ? { excludedConversations: reason.excludedConversations }
+      : {}),
+    ...(reason?.chatgptBranchDiagnostics
+      ? { chatgptBranchDiagnostics: reason.chatgptBranchDiagnostics }
+      : {}),
     reason: (row.verdict === "covered"
       ? null
       : (reason?.reason ?? null)) as LegacyCoverageVerdict["reason"],
@@ -243,27 +260,47 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
           "SELECT * FROM legacy_scope_takeover_verdicts WHERE scope = ? ORDER BY instance",
         )
         .all(scope) as VerdictRow[];
-      return rows.map((row) => ({
-        scope: row.scope,
-        instance: row.instance,
-        generation: row.generation,
-        legacyVersionId: row.legacy_version_id,
-        canonicalCursor: row.canonical_cursor,
-        verdict: row.verdict,
-        comparisonCase: row.comparison_case,
-        reasonCounts: JSON.parse(row.reason_counts_json) as Record<
-          string,
-          number
-        >,
-        appliedExceptions: JSON.parse(
-          row.applied_exceptions_json,
-        ) as LegacyCoverageVerdict["appliedExceptions"],
-        reason: reasonForRow(row),
-        legacyBytes: row.legacy_bytes,
-        canonicalBytes: row.canonical_bytes,
-        byteDelta: row.byte_delta,
-        evaluatedAt: row.evaluated_at,
-      }));
+      return rows.map((row) => {
+        const reason = reasonForRow(row);
+        const excludedConversations = summarizedHashes(
+          reason?.excludedConversations,
+        );
+        const chatgptBranchDiagnostics = summarizedHashes(
+          reason?.chatgptBranchDiagnostics,
+        );
+        const displayReason = reason
+          ? {
+              reason: reason.reason,
+              missingEntityCount: reason.missingEntityCount,
+              mismatchedFieldPaths: reason.mismatchedFieldPaths,
+              ...(excludedConversations ? { excludedConversations } : {}),
+              ...(chatgptBranchDiagnostics ? { chatgptBranchDiagnostics } : {}),
+            }
+          : null;
+        return {
+          scope: row.scope,
+          instance: row.instance,
+          generation: row.generation,
+          legacyVersionId: row.legacy_version_id,
+          canonicalCursor: row.canonical_cursor,
+          verdict: row.verdict,
+          comparisonCase: row.comparison_case,
+          reasonCounts: JSON.parse(row.reason_counts_json) as Record<
+            string,
+            number
+          >,
+          appliedExceptions: JSON.parse(
+            row.applied_exceptions_json,
+          ) as LegacyCoverageVerdict["appliedExceptions"],
+          ...(excludedConversations ? { excludedConversations } : {}),
+          ...(chatgptBranchDiagnostics ? { chatgptBranchDiagnostics } : {}),
+          reason: displayReason,
+          legacyBytes: row.legacy_bytes,
+          canonicalBytes: row.canonical_bytes,
+          byteDelta: row.byte_delta,
+          evaluatedAt: row.evaluated_at,
+        };
+      });
     },
 
     resetTakeover(scope) {
@@ -459,14 +496,30 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
             coverage.comparisonCase,
             JSON.stringify(coverage.reasonCounts),
             JSON.stringify(coverage.appliedExceptions),
-            coverage.covered && coverage.missingEntityCount === 0
+            coverage.covered &&
+              coverage.missingEntityCount === 0 &&
+              !coverage.excludedConversations?.length &&
+              !coverage.chatgptBranchDiagnostics?.length
               ? null
               : JSON.stringify({
                   reason: coverage.covered
-                    ? "proven_deletion"
+                    ? coverage.excludedConversations?.length
+                      ? "receipted_conversation_exclusions"
+                      : coverage.chatgptBranchDiagnostics?.length
+                        ? "branch_count_disagreement"
+                        : "proven_deletion"
                     : coverage.reason,
                   missingEntityCount: coverage.missingEntityCount,
                   mismatchedFieldPaths: coverage.mismatchedFieldPaths,
+                  ...(coverage.excludedConversations
+                    ? { excludedConversations: coverage.excludedConversations }
+                    : {}),
+                  ...(coverage.chatgptBranchDiagnostics
+                    ? {
+                        chatgptBranchDiagnostics:
+                          coverage.chatgptBranchDiagnostics,
+                      }
+                    : {}),
                 }),
             coverage.legacyBytes,
             coverage.canonicalBytes,

@@ -52,7 +52,53 @@ export type ProjectionError =
     }
   | { kind: "empty_singleton"; scope: string };
 
+/** Same-read stored text omitted from the legacy payload, separate from it. */
+export interface RetainedChatgptMessage {
+  scope: "chatgpt.conversations";
+  conversationId: string;
+  message: {
+    id: string;
+    role: "user" | "assistant";
+    content: string;
+    content_type: "text" | "multimodal_text";
+    create_time: string | null;
+    model: string | null;
+  };
+}
+
+/** Receipted exclusion of one conversation whose fallback branch was unusable. */
+export interface ChatgptConversationCoverageGap {
+  /** Full SHA-256 binds the receipt; reports display only the first 12 hex. */
+  conversationIdHash: string;
+  reason: string;
+  declaredCount: number;
+  walkedCount: number;
+}
+
+/** Takeover diagnostics show only the first 12 hex of a full internal receipt hash. */
+export type ChatgptConversationCoverageGapSummary = Omit<
+  ChatgptConversationCoverageGap,
+  "conversationIdHash"
+> & { conversationIdHash: string };
+
+/** Hash-only count disagreement when a complete parent walk is authoritative. */
+export interface ChatgptBranchWalkDiagnostic {
+  conversationIdHash: string;
+  reason: "declared_count_below_walked" | "declared_count_above_walked";
+  declaredCount: number;
+  walkedCount: number;
+}
+
+/** Public branch diagnostics show only the first 12 hex of the full receipt hash. */
+export type ChatgptBranchWalkDiagnosticSummary = Omit<
+  ChatgptBranchWalkDiagnostic,
+  "conversationIdHash"
+> & { conversationIdHash: string };
+
 export interface ProjectionOk {
+  chatgptCoverageGaps?: readonly ChatgptConversationCoverageGap[];
+  chatgptBranchDiagnostics?: readonly ChatgptBranchWalkDiagnostic[];
+  retainedChatgptMessages?: readonly RetainedChatgptMessage[];
   diagnostics?: ProjectionDiagnostic[];
   projectionOmissions?: ProjectionOmission[];
   ok: true;
@@ -71,7 +117,9 @@ export interface ProjectionOmission {
  * `records_dropped`, `records_partial` and `stream_missing` do not: the
  * payload is served without the named rows (`records_dropped`, `count` is
  * distinct source rows of `stream`), or with rows the source says are short
- * of detail (`records_partial`), and the diagnostic says how many.
+ * of detail (`records_partial`). `branch_walk_fallback` reports conversations
+ * whose stored flags were used after an invalid parent walk; it does not mean
+ * that a row was dropped or make the scope incomplete.
  */
 export type ProjectionDiagnostic =
   | {
@@ -93,6 +141,13 @@ export type ProjectionDiagnostic =
       reasons: string[];
       scope: string;
       stream: string;
+    }
+  | {
+      count: number;
+      kind: "branch_walk_fallback";
+      reasons: string[];
+      scope: string;
+      stream: "conversations";
     }
   | { kind: "stream_missing"; scope: string; stream: string };
 export interface ProjectionErr {
