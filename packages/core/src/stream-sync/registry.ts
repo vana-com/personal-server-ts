@@ -17,10 +17,13 @@ import {
   parseScope,
   type ControlRead,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { parseRetryAfterHeader } from "./storage-retry.js";
+import { NODE_MAX_TIMER_DELAY_MS } from "./timer.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 import {
   AmbiguousRegistryReplyError,
   RegistryUnavailableError,
+  RegistryOverloadError,
   ChangeFeedAbsentError,
   RegistryRefusedError,
   RegistryBatchRouteMissingError,
@@ -182,7 +185,55 @@ export function createGatewayStreamSyncRegistry(
   options: GatewayStreamSyncRegistryOptions,
 ): StreamSyncRegistry {
   const base = options.gatewayUrl.replace(/\/+$/, "");
-  const fetchImpl = options.fetch ?? globalThis.fetch;
+  const baseFetch = options.fetch ?? globalThis.fetch;
+  let resumeAt = 0;
+  // One deadline covers every registry route, including concurrent probes and
+  // writes. A later overload can extend it while another caller is waiting.
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const signal = init?.signal;
+    const isFeed = new URL(String(input)).pathname.endsWith("/v1/data/changes");
+    if (isFeed && resumeAt > Date.now()) {
+      throw new RegistryOverloadError(resumeAt - Date.now());
+    }
+    while (resumeAt > Date.now()) {
+      await new Promise<void>((resolve, reject) => {
+        if (signal?.aborted) return reject(signal.reason);
+        const done = () => {
+          signal?.removeEventListener("abort", abort);
+          resolve();
+        };
+        const timer = setTimeout(
+          done,
+          Math.min(resumeAt - Date.now(), NODE_MAX_TIMER_DELAY_MS),
+        );
+        const abort = () => {
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
+          reject(signal?.reason);
+        };
+        signal?.addEventListener("abort", abort, { once: true });
+      });
+    }
+    const response = await baseFetch(input, init);
+    if (response.status === 429 || response.status === 503) {
+      const delay = parseRetryAfterHeader(
+        response.headers.get("retry-after"),
+        Date.now(),
+      );
+      if (delay !== undefined) {
+        // Positive jitter cannot make a request earlier than the server asked.
+        resumeAt = Math.max(
+          resumeAt,
+          Date.now() + delay * (1 + Math.random() * 0.5),
+        );
+        if (isFeed) {
+          await response.body?.cancel().catch(() => undefined);
+          throw new RegistryOverloadError(resumeAt - Date.now());
+        }
+      }
+    }
+    return response;
+  };
   /**
    * A read that cannot reach the registry (a network failure or timeout) or
    * that it answers with a 5xx says nothing about the data: it is
