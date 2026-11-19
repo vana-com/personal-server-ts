@@ -1,3 +1,4 @@
+import { NODE_MAX_TIMER_DELAY_MS } from "../../stream-sync/timer.js";
 import {
   ChangeFeedAbsentError,
   RegistryOverloadError,
@@ -103,16 +104,23 @@ export function createRegistryChangePush(
       // The abort listener goes away on both ways out. An outage sleeps once
       // per attempt; a listener left behind by each sleep is a leak that grows
       // with the subscription's age.
-      const sleep = (ms: number) =>
-        new Promise<void>((resolve) => {
-          const done = () => {
-            clearTimeout(timer);
-            lifetime.signal.removeEventListener("abort", done);
-            resolve();
-          };
-          const timer = setTimeout(done, ms);
-          lifetime.signal.addEventListener("abort", done, { once: true });
-        });
+      const sleep = async (ms: number) => {
+        const deadline = Date.now() + ms;
+        while (!lifetime.signal.aborted && Date.now() < deadline) {
+          await new Promise<void>((resolve) => {
+            const done = () => {
+              clearTimeout(timer);
+              lifetime.signal.removeEventListener("abort", done);
+              resolve();
+            };
+            const timer = setTimeout(
+              done,
+              Math.min(deadline - Date.now(), NODE_MAX_TIMER_DELAY_MS),
+            );
+            lifetime.signal.addEventListener("abort", done, { once: true });
+          });
+        }
+      };
 
       async function once(): Promise<"answer" | "failed" | "absent" | number> {
         const request = new AbortController();

@@ -148,3 +148,100 @@ it("does not replay an overloaded batch and delays the next registry request", a
   expect(fetch.mock.calls[0]![1]?.method).toBe("POST");
   expect(fetch.mock.calls[1]![1]?.method).toBeUndefined();
 });
+
+it("chunks a long registry deadline and aborts while waiting", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const timer = vi.spyOn(globalThis, "setTimeout");
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce(
+      new Response(null, {
+        status: 429,
+        headers: { "Retry-After": "2200000" },
+      }),
+    )
+    .mockResolvedValue(new Response(null, { status: 404 }));
+  const registry = createGatewayStreamSyncRegistry({
+    gatewayUrl: "https://gateway.test",
+    ownerAddress: "0x" + "11".repeat(20),
+    fetch,
+  });
+  await expect(registry.read("first")).rejects.toThrow();
+  const controller = new AbortController();
+  const read = registry.read("second", controller.signal);
+  const rejected = expect(read).rejects.toThrow();
+  expect(timer.mock.calls.at(-1)?.[1]).toBe(2_147_483_647);
+  await vi.advanceTimersByTimeAsync(2_147_483_647);
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(timer.mock.calls.at(-1)?.[1]).toBe(52_516_353);
+  controller.abort(new Error("stop"));
+  await rejected;
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it("chunks a long feed deadline and stops during the wait", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const timer = vi.spyOn(globalThis, "setTimeout");
+  const fetch = vi
+    .fn()
+    .mockResolvedValue(
+      new Response(null, {
+        status: 429,
+        headers: { "Retry-After": "2200000" },
+      }),
+    );
+  const registry = createGatewayStreamSyncRegistry({
+    gatewayUrl: "https://gateway.test",
+    ownerAddress: "0x" + "11".repeat(20),
+    fetch,
+  });
+  const stop = createRegistryChangePush(registry)!.subscribe({
+    onChange: vi.fn(),
+    onHealth: vi.fn(),
+    onPosition: vi.fn(),
+    since: () => undefined,
+  });
+  await vi.advanceTimersByTimeAsync(0);
+  expect(timer.mock.calls.at(-1)?.[1]).toBe(2_147_483_647);
+  await vi.advanceTimersByTimeAsync(2_147_483_647);
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(timer.mock.calls.at(-1)?.[1]).toBe(52_516_353);
+  stop();
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it("uses ordinary failure recovery for a body-only feed delay", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce(Response.json({ seq: "1", changed: false }))
+    .mockResolvedValueOnce(Response.json({ retryAfter: 60 }, { status: 503 }))
+    .mockResolvedValueOnce(Response.json({ seq: "1", changed: false }))
+    .mockImplementation(() => new Promise(() => {}));
+  const registry = createGatewayStreamSyncRegistry({
+    gatewayUrl: "https://gateway.test",
+    ownerAddress: "0x" + "11".repeat(20),
+    fetch,
+  });
+  const onHealth = vi.fn();
+  const onChange = vi.fn();
+  const stop = createRegistryChangePush(registry)!.subscribe({
+    onChange,
+    onHealth,
+    onPosition: vi.fn(),
+    since: () => undefined,
+  });
+  await vi.advanceTimersByTimeAsync(0);
+  expect(onHealth.mock.calls).toEqual([[true], [false]]);
+  expect(fetch).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(999);
+  expect(fetch).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(fetch).toHaveBeenCalledTimes(4);
+  expect(onHealth.mock.calls).toEqual([[true], [false], [true]]);
+  expect(onChange).toHaveBeenCalledTimes(1);
+  stop();
+});

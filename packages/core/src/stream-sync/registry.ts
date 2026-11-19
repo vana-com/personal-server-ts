@@ -17,7 +17,8 @@ import {
   parseScope,
   type ControlRead,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { retryAfterMsOf } from "../storage/adapters/throttle.js";
+import { parseRetryAfterHeader } from "./storage-retry.js";
+import { NODE_MAX_TIMER_DELAY_MS } from "./timer.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 import {
   AmbiguousRegistryReplyError,
@@ -201,7 +202,10 @@ export function createGatewayStreamSyncRegistry(
           signal?.removeEventListener("abort", abort);
           resolve();
         };
-        const timer = setTimeout(done, resumeAt - Date.now());
+        const timer = setTimeout(
+          done,
+          Math.min(resumeAt - Date.now(), NODE_MAX_TIMER_DELAY_MS),
+        );
         const abort = () => {
           clearTimeout(timer);
           signal?.removeEventListener("abort", abort);
@@ -212,7 +216,10 @@ export function createGatewayStreamSyncRegistry(
     }
     const response = await baseFetch(input, init);
     if (response.status === 429 || response.status === 503) {
-      const delay = await retryAfterMsOf(response);
+      const delay = parseRetryAfterHeader(
+        response.headers.get("retry-after"),
+        Date.now(),
+      );
       if (delay !== undefined) {
         // Positive jitter cannot make a request earlier than the server asked.
         resumeAt = Math.max(
@@ -224,11 +231,6 @@ export function createGatewayStreamSyncRegistry(
           throw new RegistryOverloadError(resumeAt - Date.now());
         }
       }
-      return new Response(null, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: response.headers,
-      });
     }
     return response;
   };
