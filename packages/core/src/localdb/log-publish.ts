@@ -1666,7 +1666,7 @@ async function operationsFor(
   readonly untyped: string[];
 }> {
   // A remove change carries its typed key only from an explicit delete
-  // (`explicit_delete`) or from a seeded omission (`seedFromHistory`), which
+  // (`explicit_delete`) or from a seeded history omission, which
   // goes as the completion of that one key at its cutoff.
   const ops = new Map<string, LogOperation>();
   const untyped: string[] = [];

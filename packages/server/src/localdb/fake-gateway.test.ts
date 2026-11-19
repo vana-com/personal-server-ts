@@ -191,3 +191,20 @@ describe("the fake registry's replay rule, in a batch", () => {
     expect(g.rowsOf(STREAM)).toBe(1);
   });
 });
+
+it("an emptied version history reads as absent and is omitted from listings", async () => {
+  const g = gateway();
+  seed(g, row(LOG, 1));
+  g.versions.get(LOG)!.splice(0);
+  const { computeDataPointId } =
+    await import("@opendatalabs/personal-server-ts-core/sync");
+  expect(
+    (
+      await g.fetch(
+        `https://gateway.test/v1/data/${computeDataPointId(OWNER, LOG)}`,
+      )
+    ).status,
+  ).toBe(404);
+  const listed = await g.fetch("https://gateway.test/v1/data");
+  expect((await listed.json()).data.dataPoints).toEqual([]);
+});

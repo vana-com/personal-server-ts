@@ -1,7 +1,21 @@
 import { build } from "esbuild";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 const root = process.cwd();
+// Read only the measured product path from a pinned revision; the harness stays current.
+const source = async (file) =>
+  process.env.MEMORY_SOURCE_REF &&
+  /core\/src\/localdb\/log-(apply|compact|rebase|seed)\.ts$/.test(file)
+    ? execFileSync(
+        "git",
+        [
+          "show",
+          `${process.env.MEMORY_SOURCE_REF}:${path.relative(root, file)}`,
+        ],
+        { encoding: "utf8" },
+      )
+    : readFile(file, "utf8");
 await build({
   entryPoints: ["scripts/log-memory/measure.mjs"],
   outfile: process.argv[2],
@@ -10,6 +24,14 @@ await build({
   format: "esm",
   packages: "external",
   alias: {
+    "@opendatalabs/personal-server-ts-core/stream-sync": path.join(
+      root,
+      "packages/core/src/stream-sync/index.ts",
+    ),
+    "@opendatalabs/personal-server-ts-core/localdb": path.join(
+      root,
+      "packages/core/src/localdb/index.ts",
+    ),
     "@opendatalabs/personal-server-ts-stream-sync": path.join(
       root,
       "packages/stream-sync/src/index.ts",
@@ -24,11 +46,22 @@ await build({
       name: "measurement-boundaries",
       setup(b) {
         b.onLoad(
+          { filter: /log-(compact|rebase|seed)\.ts$/ },
+          async ({ path: file }) => ({
+            contents: await source(file),
+            loader: "ts",
+          }),
+        );
+        b.onLoad(
           { filter: /log-world\.test-utils\.ts$/ },
           async ({ path: file }) => {
             let s = await readFile(file, "utf8");
             s = s.replace(
               'openBetterSqlite3(":memory:")',
+              "globalThis.memoryDriver(deviceId)",
+            );
+            s = s.replace(
+              'openBetterSqlite3(directory ? join(directory, "db") : ":memory:")',
               "globalThis.memoryDriver(deviceId)",
             );
             const start = s.indexOf(
@@ -52,9 +85,8 @@ await build({
           namespace: "measurement",
         }));
         b.onLoad({ filter: /.*/, namespace: "measurement" }, async () => {
-          let s = await readFile(
+          let s = await source(
             path.join(root, "packages/core/src/localdb/log-compact.ts"),
-            "utf8",
           );
           if (!s.includes("!required &&"))
             throw Error("eligibility probe drift");
@@ -101,24 +133,29 @@ await build({
           return { contents: s, loader: "ts" };
         });
         b.onLoad({ filter: /log-apply\.ts$/ }, async ({ path: file }) => {
-          let s = await readFile(file, "utf8");
-          if (
-            !s.includes(
-              "return { segment, bytes: verified.bytes, cipherBytes: cipher.length };",
-            ) ||
-            !s.includes(
+          let s = await source(file);
+          if (s.includes("return verified.part;")) {
+            s = s.replace(
+              "return verified.part;",
+              "globalThis.memoryDecoded(verified.part); return verified.part;",
+            );
+            s = s.replace(
+              /return \{\s*segment: verified.segment,/,
+              "globalThis.memoryDecoded(verified.segment); return {segment: verified.segment,",
+            );
+          } else {
+            const segment =
+              "return { segment, bytes: verified.bytes, cipherBytes: cipher.length };";
+            if (!s.includes(segment)) throw Error("decoded-result probe drift");
+            s = s.replace(
+              segment,
+              "globalThis.memoryDecoded(segment); " + segment,
+            );
+            s = s.replace(
               "return {\n    ...verified.part,\n    entries: await resolveBodies(deps, scope, verified.part.entries),\n  };",
-            )
-          )
-            throw Error("decoded-result probe drift");
-          s = s.replace(
-            "return { segment, bytes: verified.bytes, cipherBytes: cipher.length };",
-            "globalThis.memoryDecoded(segment); return { segment, bytes: verified.bytes, cipherBytes: cipher.length };",
-          );
-          s = s.replace(
-            "return {\n    ...verified.part,\n    entries: await resolveBodies(deps, scope, verified.part.entries),\n  };",
-            "const part = { ...verified.part, entries: await resolveBodies(deps, scope, verified.part.entries) }; globalThis.memoryDecoded(part); return part;",
-          );
+              "const part = { ...verified.part, entries: await resolveBodies(deps, scope, verified.part.entries) }; globalThis.memoryDecoded(part); return part;",
+            );
+          }
           return { contents: s, loader: "ts" };
         });
       },

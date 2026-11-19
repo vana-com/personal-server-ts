@@ -1,5 +1,8 @@
 // Isolated offline reproduction. Crypto calibration is a separate opt-in case.
 import Database from "better-sqlite3";
+import { createStatementCache } from "../../packages/server/src/localdb/statement-cache.cjs";
+import { randomUUID } from "node:crypto";
+import { createSqlWorkspaceValues } from "../../packages/core/src/localdb/workspace-values.js";
 import {
   mkdirSync,
   readFileSync,
@@ -137,14 +140,15 @@ globalThis.memoryDriver = (id) => {
   db.pragma("journal_mode=WAL");
   db.pragma("cache_size=-8192");
   db.pragma("temp_store=FILE");
-  return {
+  const statements = createStatementCache(db);
+  const driver = {
     info: {
       sqliteVersion: db.prepare("select sqlite_version() v").get().v,
       host: "node",
       persistent: true,
     },
     async query(sql, params = []) {
-      const q = db.prepare(sql);
+      const q = statements.prepare(sql);
       const rows = q.reader ? q.all(...params) : (q.run(...params), []);
       if (active) {
         if (/^\s*SELECT/i.test(sql)) {
@@ -168,24 +172,38 @@ globalThis.memoryDriver = (id) => {
     async batch(ss) {
       const result = db.transaction(() => ({
         changes: ss.map(
-          (s) => db.prepare(s.sql).run(...(s.params ?? [])).changes,
+          (s) => statements.prepare(s.sql).run(...(s.params ?? [])).changes,
         ),
       }))();
       if (active) {
         batchBytes = Math.max(batchBytes, bytes(ss));
-        await new Promise((r) => setImmediate(r));
-        if (mode === "rebase" || mode === "progressive") global.gc?.();
-        livePeak = Math.max(
-          livePeak,
-          decoded.reduce((n, x) => n + (x.ref.deref() ? x.bytes : 0), 0),
+        // The decoded graphs are judged at the commit barriers of the load; the
+        // rebase and progressive modes judge them at every write.
+        const barrier = ss.some((s) =>
+          /INSERT OR IGNORE INTO workspace_receipts|INSERT OR REPLACE INTO log_state/.test(
+            s.sql,
+          ),
         );
+        await new Promise((r) => setImmediate(r));
+        if (barrier || mode === "rebase" || mode === "progressive") {
+          global.gc?.();
+          livePeak = Math.max(
+            livePeak,
+            decoded.reduce((n, x) => n + (x.ref.deref() ? x.bytes : 0), 0),
+          );
+        }
         sample();
       }
       return result;
     },
     async close() {
+      statements.clear();
       db.close();
     },
+  };
+  return {
+    ...driver,
+    boundedValues: createSqlWorkspaceValues(driver, randomUUID),
   };
 };
 const blobs = join(dir, "blobs");

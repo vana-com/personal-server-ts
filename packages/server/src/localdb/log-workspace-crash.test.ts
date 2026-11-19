@@ -15,6 +15,7 @@ it.each(
     "seal",
     "stage",
     "receipt",
+    "seed",
     "discard",
     "cleanup",
     "phase-folded",
@@ -49,22 +50,61 @@ it.each(
           stdio: ["ignore", "ignore", "pipe", "ipc"],
         },
       );
-      const timer = setTimeout(() => child.kill("SIGKILL"), 15000);
+      let stderr = "",
+        timedOut = false;
+      child.stderr?.on("data", (chunk) => {
+        stderr = (stderr + String(chunk)).slice(-8000);
+      });
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, 15000);
       try {
         await Promise.race([
           once(child, "message"),
-          once(child, "exit").then(() => {
-            throw new Error("child_exited_before_boundary");
+          once(child, "exit").then(([code, signal]) => {
+            throw new Error(
+              `child_exited_before_boundary code=${code} signal=${signal} timeout=${timedOut}: ${stderr}`,
+            );
           }),
         ]);
+        // The child must stay at the durable boundary until killed, even if delivery is delayed.
         const exit = once(child, "exit");
+        await new Promise((resolve) => setTimeout(resolve, 100));
         child.kill("SIGKILL");
-        expect((await exit)[1]).toBe("SIGKILL");
+        const [code, signal] = await exit;
+        expect({ code, signal }).toEqual({ code: null, signal: "SIGKILL" });
       } finally {
         clearTimeout(timer);
         child.kill("SIGKILL");
       }
       db = openBetterSqlite3(path);
+      if (target === "seed") {
+        const promoted = edge === "after";
+        expect(await db.query("SELECT position FROM log_state")).toEqual([
+          { position: promoted ? 0 : 2 },
+        ]);
+        expect(
+          await db.query(
+            "SELECT pk_hash,op,stamp_o FROM record_changes ORDER BY pk_hash",
+          ),
+        ).toEqual(
+          promoted
+            ? [
+                { pk_hash: "gone", op: "remove", stamp_o: 2 },
+                { pk_hash: "p", op: "upsert", stamp_o: 9 },
+                { pk_hash: "pending", op: "upsert", stamp_o: 10 },
+              ]
+            : [{ pk_hash: "pending", op: "upsert", stamp_o: 10 }],
+        );
+        expect(
+          await db.query("SELECT pk_hash,rank FROM log_tombstones"),
+        ).toEqual(promoted ? [{ pk_hash: "gone", rank: 2 }] : []);
+        expect(await db.query("SELECT phase FROM workspaces")).toEqual([
+          { phase: promoted ? "finished" : "folded" },
+        ]);
+        return;
+      }
       const order = [
         "enqueue",
         "finish",
@@ -135,9 +175,6 @@ it.todo(
 );
 it.todo(
   "D: sent CAS can land after local generation/key/deletion fence; resolve actual remote head/version before resend or discard",
-);
-it.todo(
-  "C1: SIGKILL before/after canonical seed promotion plus cursor reset, including unpublished local writes and revision validation",
 );
 it.todo(
   "C1/D: SIGKILL before/after canonical restore/publication finalization and accepted watermark transaction",

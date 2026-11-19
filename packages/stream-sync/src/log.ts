@@ -652,6 +652,10 @@ export function foldLog(input: {
  * holds at least one entry, and a fold with none still yields one part, which
  * carries the stream metas. The size of an entry is its wire size.
  */
+export function foldEntryBytes(entry: WireEntry): number {
+  return JSON.stringify(opToWire(entry)).length + 1;
+}
+
 export function partitionFold(
   fold: {
     readonly streams: readonly LogStreamMeta[];
@@ -680,7 +684,7 @@ export function partitionFold(
   let current: WireEntry[] = [];
   let size = metaBytes;
   for (const entry of fold.entries) {
-    const bytes = JSON.stringify(opToWire(entry)).length + 1;
+    const bytes = foldEntryBytes(entry);
     if (current.length > 0 && size + bytes > targetBytes) {
       parts.push(base(parts.length, current));
       current = [];

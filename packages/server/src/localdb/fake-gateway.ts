@@ -280,14 +280,18 @@ export function createFakeGateway(options: FakeGatewayOptions) {
       if (method === "GET" && url.pathname === "/v1/data") {
         calls.push({ kind: "list" });
         return json(200, {
-          data: { dataPoints: [...versions.keys()].map(rowJson) },
+          data: {
+            dataPoints: [...versions.keys()]
+              .filter((scope) => versions.get(scope)!.length > 0)
+              .map(rowJson),
+          },
           pagination: { hasMore: false, nextCursor: null },
         });
       }
       if (method === "GET") {
         const scope = scopeOfId.get(url.pathname.split("/").pop()!);
         calls.push({ kind: "read", scope: scope ?? url.pathname });
-        return scope && versions.has(scope)
+        return scope && (versions.get(scope)?.length ?? 0) > 0
           ? json(200, rowJson(scope))
           : json(404, {});
       }

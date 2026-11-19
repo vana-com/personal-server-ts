@@ -27,17 +27,26 @@
 import {
   DEFAULT_PART_TARGET_BYTES,
   compactionRequired,
+  controlScope,
   digestSnapshotPart,
   encodeSnapshotPart,
-  foldLog,
-  partitionFold,
+  foldEntryBytes,
+  LOG_FORMAT,
+  type WireEntry,
+  type LogStreamMeta,
+  type WireSnapshotPart,
   shouldCompact,
   snapshotPartBlobName,
   type SnapshotPointer,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { LocalSyncDeps } from "./deps.js";
 import { keccakOf } from "../stream-sync/crypto-port.js";
-import { fetchSegment, fetchSnapshotPart, type LogState } from "./log-apply.js";
+import {
+  fetchWireSegment,
+  fetchWireSnapshotPart,
+  type LogState,
+} from "./log-apply.js";
+import { openDiskFold } from "./log-disk-fold.js";
 import { putBodiesOutOfLine } from "./log-bodies.js";
 
 export interface CompactionPlan {
@@ -89,67 +98,101 @@ export async function planCompaction(
     ns: input.ns,
     keyCheck: input.keyCheck,
   };
-  const [parts, segments] = await Promise.all([
-    Promise.all(
-      previous.map((part) =>
-        fetchSnapshotPart(
-          deps,
-          input.scope,
-          context,
-          part.dataHash,
-          log.snapshot!.position,
-        ),
-      ),
-    ),
-    Promise.all(
-      log.refs.map(
-        async (ref) =>
-          (
-            await fetchSegment(
-              deps,
-              input.scope,
-              context,
-              ref.dataHash,
-              ref.position,
-            )
-          ).segment,
-      ),
-    ),
-  ]);
-  const fold = foldLog({ snapshot: parts, segments });
-  const outOfLine = await putBodiesOutOfLine(
+  const fold = await openDiskFold(
     deps,
-    input.scope,
-    fold.entries,
-    target,
+    controlScope(input.connector, input.ns),
+    input.keyCheck,
+    JSON.stringify(log),
+    input.generation,
   );
-  const folded = partitionFold(
-    { streams: fold.streams, entries: outOfLine.ops },
-    {
-      connector: input.connector,
-      ns: input.ns,
-      generation: input.generation,
-      keyCheck: input.keyCheck,
-      position: log.position,
-    },
-    target,
-  );
-  const built: { name: string; cipher: Uint8Array }[] = [...outOfLine.pieces];
-  const pointer: { dataHash: `0x${string}`; bytes: number }[] = [];
-  for (const part of folded) {
-    const clear = encodeSnapshotPart(part);
-    const { dataHash } = await digestSnapshotPart(
-      keccakOf(deps.streamCrypto),
-      clear,
-    );
-    pointer.push({ dataHash, bytes: clear.length });
-    built.push({
-      name: snapshotPartBlobName(dataHash),
-      cipher: await deps.keys.encryptPart(input.scope, clear),
-    });
+  let complete = false;
+  try {
+    let position = 0;
+    for (const part of previous) {
+      const unit = await fetchWireSnapshotPart(
+        deps,
+        input.scope,
+        context,
+        part.dataHash,
+        log.snapshot!.position,
+      );
+      await fold.ingest(
+        `snapshot:${position}`,
+        part.dataHash,
+        position++,
+        unit,
+        input.scope,
+      );
+    }
+    for (const ref of [...log.refs].sort((a, b) => a.position - b.position)) {
+      const { segment } = await fetchWireSegment(
+        deps,
+        input.scope,
+        context,
+        ref.dataHash,
+        ref.position,
+      );
+      await fold.ingest(
+        `segment:${ref.position}`,
+        ref.dataHash,
+        position++,
+        segment,
+        input.scope,
+      );
+    }
+    await fold.ws.transition("collect", "folded");
+    const streams: LogStreamMeta[] = [];
+    for await (const meta of fold.metadata()) streams.push(meta);
+    const metaBytes =
+      JSON.stringify(streams.map((m) => m.stream)).length +
+      200 * streams.length;
+    const built: { name: string; cipher: Uint8Array }[] = [];
+    const pieces: { name: string; cipher: Uint8Array }[] = [];
+    const pointer: { dataHash: `0x${string}`; bytes: number }[] = [];
+    let current: WireEntry[] = [],
+      size = metaBytes;
+    async function flush() {
+      const part: WireSnapshotPart = {
+        format: LOG_FORMAT,
+        connector: input.connector,
+        ns: input.ns,
+        generation: input.generation,
+        keyCheck: input.keyCheck,
+        position: log.position,
+        index: pointer.length,
+        streams,
+        entries: current,
+      };
+      const clear = encodeSnapshotPart(part);
+      const { dataHash } = await digestSnapshotPart(
+        keccakOf(deps.streamCrypto),
+        clear,
+      );
+      pointer.push({ dataHash, bytes: clear.length });
+      built.push({
+        name: snapshotPartBlobName(dataHash),
+        cipher: await deps.keys.encryptPart(input.scope, clear),
+      });
+      current = [];
+      size = metaBytes;
+    }
+    for await (const entry of fold.entries(true)) {
+      // Original references survive on disk; inline winners use the existing piece encoder.
+      const out = await putBodiesOutOfLine(deps, input.scope, [entry], target);
+      pieces.push(...out.pieces);
+      const wire = out.ops[0]!;
+      const bytes = foldEntryBytes(wire);
+      if (current.length > 0 && size + bytes > target) await flush();
+      current.push(wire);
+      size += bytes;
+    }
+    await flush();
+    complete = true;
+    return {
+      snapshot: { position: log.position, parts: pointer },
+      objects: [...pieces, ...built],
+    };
+  } finally {
+    await fold.close(complete);
   }
-  return {
-    snapshot: { position: log.position, parts: pointer },
-    objects: built,
-  };
 }

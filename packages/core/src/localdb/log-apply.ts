@@ -46,6 +46,8 @@ import {
   type SegmentRef,
   type SnapshotPart,
   type SnapshotPointer,
+  type WireSegment,
+  type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { keccakOf } from "../stream-sync/crypto-port.js";
 import { resolveBodies } from "./log-bodies.js";
@@ -630,13 +632,13 @@ function snapshotItems(
 }
 
 /** One segment, fetched, decrypted and verified against the hash and position. */
-export async function fetchSegment(
+export async function fetchWireSegment(
   deps: LocalSyncDeps,
   scope: string,
   context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
   dataHash: string,
   position: number,
-): Promise<{ segment: Segment; bytes: number; cipherBytes: number }> {
+): Promise<{ segment: WireSegment; bytes: number; cipherBytes: number }> {
   const cipher = await deps.blobs.get(`${scope}/${segmentBlobName(dataHash)}`);
   if (cipher === null)
     throw new Error(`apply: missing log segment ${position}`);
@@ -660,21 +662,21 @@ export async function fetchSegment(
     throw new Error(
       `apply: invalid log segment ${position} (${verified.kind})`,
     );
-  const segment: Segment = {
-    ...verified.segment,
-    operations: await resolveBodies(deps, scope, verified.segment.operations),
+  return {
+    segment: verified.segment,
+    bytes: verified.bytes,
+    cipherBytes: cipher.length,
   };
-  return { segment, bytes: verified.bytes, cipherBytes: cipher.length };
 }
 
 /** One snapshot part, fetched, decrypted and verified. */
-export async function fetchSnapshotPart(
+export async function fetchWireSnapshotPart(
   deps: LocalSyncDeps,
   scope: string,
   context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
   dataHash: string,
   position: number,
-): Promise<SnapshotPart> {
+): Promise<WireSnapshotPart> {
   const cipher = await deps.blobs.get(
     `${scope}/${snapshotPartBlobName(dataHash)}`,
   );
@@ -697,9 +699,32 @@ export async function fetchSnapshotPart(
     );
   if (verified.kind !== "ok")
     throw new Error(`apply: invalid log snapshot part (${verified.kind})`);
+  return verified.part;
+}
+
+export async function fetchSegment(
+  ...args: Parameters<typeof fetchWireSegment>
+): Promise<{ segment: Segment; bytes: number; cipherBytes: number }> {
+  const result = await fetchWireSegment(...args);
   return {
-    ...verified.part,
-    entries: await resolveBodies(deps, scope, verified.part.entries),
+    ...result,
+    segment: {
+      ...result.segment,
+      operations: await resolveBodies(
+        args[0],
+        args[1],
+        result.segment.operations,
+      ),
+    },
+  };
+}
+export async function fetchSnapshotPart(
+  ...args: Parameters<typeof fetchWireSnapshotPart>
+): Promise<SnapshotPart> {
+  const part = await fetchWireSnapshotPart(...args);
+  return {
+    ...part,
+    entries: await resolveBodies(args[0], args[1], part.entries),
   };
 }
 

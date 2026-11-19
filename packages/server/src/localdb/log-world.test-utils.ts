@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 // A shared world for log-protocol tests: one fake gateway and one blob store,
 // and any number of devices of one owner, each with its own real SQLite and the
 // real publish and apply drivers (see log-protocol.test.ts).
@@ -22,15 +25,15 @@ import {
   openLocalDb,
   type LocalSyncDeps,
   type SqlDriver,
-} from "../../../core/src/localdb/index.js";
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   createGatewayStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
-} from "../../../core/src/stream-sync/index.js";
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
   createStorageAccess,
   DEFAULT_STORAGE_ACCESS_POLICY,
-} from "../../../core/src/stream-sync/storage-retry.js";
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { createFakeGateway, type FakeGatewayOptions } from "./fake-gateway.js";
@@ -46,13 +49,26 @@ export const idHash = (id: string | number) =>
   pkHash(async (b) => sha256(b), { id }, ["id"]);
 
 const drivers: SqlDriver[] = [];
+const directories: string[] = [];
+/** Release a reference reader as soon as its assertions finish. */
+export async function releaseWorldDriver(db: SqlDriver): Promise<void> {
+  const index = drivers.indexOf(db);
+  if (index >= 0) {
+    drivers.splice(index, 1);
+    await db.close();
+  }
+}
 /** Closes the databases of the devices a test opened; call it from `afterEach`. */
 export async function closeWorldDrivers(): Promise<void> {
   for (const db of drivers.splice(0)) await db.close();
+  for (const dir of directories.splice(0))
+    await rm(dir, { recursive: true, force: true });
 }
 
 export async function world(options: {
   streams: number;
+  /** SQL-only reference folds do not need durable workspace storage. */
+  persistent?: boolean;
   publishWhileCollecting?: boolean;
   /** The registry's rule that refuses a stream row write beside a log row (default on). */
   connectionLogFence?: boolean;
@@ -114,11 +130,19 @@ export async function world(options: {
       streamCrypto?: StreamCryptoPort;
     } = {},
   ) {
-    const db = await openLocalDb(openBetterSqlite3(":memory:"), {
-      owner: OWNER,
-      network: "test",
-      deviceId,
-    });
+    const directory =
+      options.persistent === false
+        ? null
+        : await mkdtemp(join(tmpdir(), "log-world-"));
+    if (directory) directories.push(directory);
+    const db = await openLocalDb(
+      openBetterSqlite3(directory ? join(directory, "db") : ":memory:"),
+      {
+        owner: OWNER,
+        network: "test",
+        deviceId,
+      },
+    );
     drivers.push(db);
     const puts: string[] = [];
     const gets: string[] = [];

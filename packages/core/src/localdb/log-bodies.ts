@@ -123,7 +123,7 @@ export async function resolveBodies<T extends { readonly kind: string }>(
   return out;
 }
 
-async function fetchBody(
+export async function fetchBody(
   deps: Pick<LocalSyncDeps, "blobs" | "keys" | "streamCrypto">,
   scope: string,
   body: LogBodyRef,
