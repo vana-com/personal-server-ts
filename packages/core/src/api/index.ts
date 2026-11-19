@@ -786,9 +786,19 @@ function legacyMutationRefusal(mode: AccountMode): Response | undefined {
   return undefined;
 }
 
+const readAbortedBody = () => ({
+  error: {
+    code: 503,
+    errorCode: "READ_ABORTED",
+    message: "This read ended before payment",
+  },
+});
+
 /** The response for a stream-sync decision that serves nothing; `null` otherwise. */
 function streamSyncRefusal(decision: ReadDecision): Response | null {
   switch (decision.kind) {
+    case "read_aborted":
+      return jsonResponse(readAbortedBody(), { status: 503 });
     case "read_not_registered":
       return jsonResponse(
         {
@@ -1549,12 +1559,22 @@ export async function handleX402Cycle(
   if (verify.payment.payload.accessRecord) {
     body["accessRecord"] = verify.payment.payload.accessRecord;
   }
+  // Own the final cancellation gate here, after every asynchronous read,
+  // projection and signature check and immediately before sending payment.
+  if (input.request.signal.aborted) {
+    return {
+      kind: "gateway-error",
+      status: 503,
+      body: readAbortedBody(),
+    };
+  }
   let gatewayRes: Response;
   try {
     gatewayRes = await doFetch(
       `${gatewayUrl.replace(/\/+$/, "")}/v1/escrow/pay`,
       {
         method: "POST",
+        signal: input.request.signal,
         headers: {
           "Content-Type": "application/json",
           Authorization: `Web3Signed ${verify.payment.payload.signature}`,
