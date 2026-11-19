@@ -53,7 +53,10 @@ export function startPullSignals(
 export interface PsLiteActivitySource {
   /** Return the current aggregate activity. */
   isActive(): boolean;
-  /** Notify after the value changes; return a function that unsubscribes. */
+  /**
+   * Notify after the value changes; return a function that unsubscribes.
+   * If this throws, it must leave no listener registered.
+   */
   subscribe(onChange: () => void): () => void;
 }
 
@@ -90,8 +93,10 @@ export function startVisibilityPause(
     let unsubscribe: (() => void) | undefined;
     const stop = () => {
       disposed = true;
+      const cleanup = unsubscribe;
+      unsubscribe = undefined;
       try {
-        unsubscribe?.();
+        cleanup?.();
       } catch {
         // Host cleanup must not interrupt runtime shutdown.
       }

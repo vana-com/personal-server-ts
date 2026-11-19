@@ -116,6 +116,7 @@ describe("startVisibilityPause", () => {
     let stop = () => {};
     let notify = () => {};
     let reenter = false;
+    const unsubscribe = vi.fn();
     stop = startVisibilityPause(manager, {
       activity: {
         isActive: () => {
@@ -124,7 +125,7 @@ describe("startVisibilityPause", () => {
         },
         subscribe: (callback) => {
           notify = callback;
-          return () => {};
+          return unsubscribe;
         },
       },
       onActive,
@@ -132,9 +133,27 @@ describe("startVisibilityPause", () => {
     manager.pause.mockClear();
     reenter = true;
     notify();
+    stop();
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
     expect(manager.resume).not.toHaveBeenCalled();
     expect(manager.pause).not.toHaveBeenCalled();
     expect(onActive).not.toHaveBeenCalled();
+  });
+
+  it("unsubscribes once when unsubscribe re-enters disposal", () => {
+    let stop = () => {};
+    let calls = 0;
+    const unsubscribe = vi.fn(() => {
+      if (++calls === 1) stop();
+    });
+    stop = startVisibilityPause(
+      {},
+      {
+        activity: { isActive: () => true, subscribe: () => unsubscribe },
+      },
+    );
+    stop();
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
   });
 
   it("applies the latest state after synchronous subscription notifications", () => {
