@@ -19,6 +19,7 @@ import type {
   WorkspaceBinding,
 } from "./workspace-capability.js";
 import {
+  checkLease,
   bindingIdentity,
   openWorkspace,
   workspaceAssert,
@@ -55,6 +56,14 @@ export interface WorkspaceRows {
     readonly lastNamingUnit: number;
     readonly futureRemoval: LogStamp | null;
     readonly held: boolean;
+  };
+  publication: {
+    readonly stream: string;
+    readonly watermark: number;
+    readonly complete: boolean;
+    readonly published: boolean;
+    readonly from: string | null;
+    readonly to: string | null;
   };
   membership: WorkspaceRecordKey & { readonly changed: boolean };
   omissions: WorkspaceRecordKey & {
@@ -148,6 +157,13 @@ export async function openLogWorkspace(
       }
     },
     position: storage.position,
+    async admit(lease: ByteLease, bytes: number) {
+      try {
+        checkLease(lease, binding.operation, bytes);
+      } catch (error) {
+        return recordWorkspaceFailure(db, binding, "record", "admit", error);
+      }
+    },
     /** Freeze the latest eligible change per key. SQLite maintains the sequence
      * index on disk; neither input history nor the result enters a JS array.
      * One workspace owns one frozen stream/window. A retry cannot widen it. */

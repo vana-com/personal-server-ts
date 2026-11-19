@@ -21,11 +21,12 @@ const assert = (
 export function workspaceGuard(b: WorkspaceBinding): SqlStatement[] {
   return [
     assert(
-      `EXISTS(SELECT 1 FROM workspaces w JOIN connections c ON c.connection_id=? JOIN db_meta m ON m.id=1 JOIN workspace_authority a ON a.connection=c.connection_id WHERE w.operation=? AND w.binding=? AND w.phase NOT IN ('aborted','clean','finished') AND c.control_state='active' AND c.generation=? AND m.owner=? AND a.incarnation=? AND a.key_check=? AND a.head=?)`,
+      `EXISTS(SELECT 1 FROM workspaces w JOIN connections c ON c.connection_id=? JOIN db_meta m ON m.id=1 JOIN workspace_authority a ON a.connection=c.connection_id WHERE w.operation=? AND w.binding=? AND w.phase NOT IN ('aborted','clean','finished') AND c.control_state IN ('active',?) AND c.generation=? AND m.owner=? AND a.incarnation=? AND a.key_check=? AND a.head=?)`,
       [
         b.connection,
         b.operation,
         bindingIdentity(b),
+        b.controlState ?? "active",
         b.generation,
         b.owner,
         b.databaseIncarnation,
@@ -150,6 +151,7 @@ export type WorkspaceRelation =
   | "streams"
   | "changes"
   | "replacement"
+  | "publication"
   | "membership"
   | "omissions"
   | "outputs"
@@ -165,6 +167,11 @@ const encodedSize = (s: string) => new TextEncoder().encode(s).length;
 export async function openWorkspace(db: SqlDriver, b: WorkspaceBinding) {
   if (!db.info.persistent)
     throw new Error("workspace_requires_persistent_database");
+  if (
+    b.controlState === "absent" &&
+    (b.generation !== 1 || b.expectedHead !== "null")
+  )
+    throw new Error("workspace_control_creation_binding");
   const id = bindingIdentity(b);
   if (id.length > 1024 || encodedSize(id) > 1024)
     throw new Error("workspace_binding_admission");

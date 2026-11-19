@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { migrate } from "../../../core/src/localdb/migrate.js";
+import { setWorkspaceAuthority } from "../../../core/src/localdb/workspace.js";
 import { openLogWorkspace } from "../../../core/src/localdb/workspace-consumer.js";
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -65,6 +66,43 @@ it("freezes one indexed change per key in sequence order with bounded receipts",
     }
     await expect(ws.freezeChanges("s", 0, 31)).rejects.toThrow();
     await ws.freezeChanges("s", 0, 30);
+    await expect(ws.admit(lease, 3 * 1024 * 1024)).rejects.toMatchObject({
+      reason: "admission",
+      retryable: true,
+    });
+    const binding = {
+      ...ws.binding,
+      operation: "first",
+      expectedHead: "null",
+      controlState: "absent" as const,
+    };
+    await db.batch([
+      {
+        sql: "UPDATE connections SET control_state='absent' WHERE connection_id='c'",
+      },
+    ]);
+    await setWorkspaceAuthority(db, binding);
+    const first = await openLogWorkspace(db, binding);
+    await first.freezeChanges("s", 0, 30);
+    await db.batch([
+      {
+        sql: "UPDATE connections SET control_state='active' WHERE connection_id='c'",
+      },
+    ]);
+    const unit = await first.unit("selection", "d", 0);
+    if (unit.state !== "staging") throw new Error("expected staging");
+    await unit.stage("publication", {
+      stream: "s",
+      watermark: 30,
+      complete: false,
+      published: false,
+      from: null,
+      to: null,
+    });
+    await unit.commit();
+    await expect(
+      openLogWorkspace(db, { ...binding, operation: "invalid", generation: 2 }),
+    ).rejects.toThrow("control_creation_binding");
   } finally {
     await lease.release();
   }

@@ -3,6 +3,8 @@
  * Implementations must keep staging in the canonical database's durable store.
  */
 export interface WorkspaceBinding {
+  /** Absent is allowed only while preparing the first control creation. */
+  readonly controlState?: "active" | "absent";
   readonly owner: string;
   readonly databaseIncarnation: string;
   readonly connection: string;
@@ -150,4 +152,5 @@ export const workspaceBindingIdentity = (b: WorkspaceBinding): string =>
     b.operation,
     b.expectedHead,
     b.codecVersion,
+    ...(b.controlState === "absent" ? ["absent"] : []),
   ]);
