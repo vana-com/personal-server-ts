@@ -40,6 +40,10 @@ await build({
               s.slice(0, start) +
               "  const innerBlobs = globalThis.memoryBlobs;\n" +
               s.slice(end);
+            s = s.replace(
+              /keys: \{[\s\S]*?\n      \},\n      signer:/,
+              "keys: globalThis.memoryKeys,\n      signer:",
+            );
             return { contents: s, loader: "ts" };
           },
         );
@@ -56,16 +60,40 @@ await build({
             throw Error("eligibility probe drift");
           // Only the explicitly invoked planner bypasses eligibility. Publication is unchanged.
           s = s.replace("!required &&", "false && !required &&");
+          s = s.replace(
+            "const fold = foldLog({ snapshot: parts, segments });",
+            "await globalThis.memoryFoldInput(parts,segments); const fold = foldLog({ snapshot: parts, segments });",
+          );
           return {
             contents: s,
             loader: "ts",
             resolveDir: path.join(root, "packages/core/src/localdb"),
           };
         });
+        b.onLoad(
+          { filter: /log-(compact|rebase)\.ts$/ },
+          async ({ path: file }) => {
+            let s = await readFile(file, "utf8");
+            if (file.endsWith("log-compact.ts"))
+              s = s.replace(
+                "!required &&",
+                "!globalThis.memoryForcePublicationCompaction && !required &&",
+              );
+            s = s.replace(
+              "const fold = foldLog({ snapshot: parts, segments });",
+              "await globalThis.memoryFoldInput(parts,segments); const fold = foldLog({ snapshot: parts, segments });",
+            );
+            return { contents: s, loader: "ts" };
+          },
+        );
         b.onLoad({ filter: /log-publish\.ts$/ }, async ({ path: file }) => {
           let s = await readFile(file, "utf8");
           if (!s.includes("return { ops, untyped };"))
             throw Error("operations probe drift");
+          s = s.replace(
+            "const scope = logScope(candidate.connector, candidate.ns);",
+            "await globalThis.memoryCandidate(candidate); const scope = logScope(candidate.connector, candidate.ns);",
+          );
           s = s.replace(
             "return { ops, untyped };",
             "globalThis.memoryOperations(ops); return { ops, untyped };",
