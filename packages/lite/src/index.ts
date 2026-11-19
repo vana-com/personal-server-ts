@@ -120,6 +120,7 @@ export {
   type PsLiteReadAuthInput,
   type PsLiteRuntime,
   type PsLiteRuntimeOptions,
+  type PsLiteActivitySource,
   type PsLiteStorageAdapter,
   type PsLiteTokenStore,
   type PsLiteWriteSessionAuthOptions,

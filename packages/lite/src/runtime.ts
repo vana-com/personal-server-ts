@@ -142,6 +142,7 @@ import {
   type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import { startPullSignals, startVisibilityPause } from "./pull-signals.js";
+import type { PsLiteActivitySource } from "./pull-signals.js";
 import type { PsLiteStorageCapabilities } from "./storage.js";
 import type { LiteReplicationRuntime } from "./replication-runtime.js";
 import {
@@ -172,7 +173,11 @@ export interface PsLiteAuthAdapter extends PersonalServerApiAuthPort {
   supportsScopeUploadCommitments?: true;
 }
 
+export type { PsLiteActivitySource } from "./pull-signals.js";
+
 export interface PsLiteRuntimeOptions {
+  /** Aggregate host activity, independent of service availability. */
+  activity?: PsLiteActivitySource;
   localSync?: () => Promise<LocalSync>;
   streamSyncSeed?: SeedIntake | null;
   history?: LocalHistory;
@@ -1252,17 +1257,23 @@ export function createPsLiteRuntime(
     storage: options.storage,
     activate() {
       active = true;
-      options.syncManager?.start?.();
       stopPullSignals?.();
+      options.syncManager?.start?.();
       const manager = options.syncManager;
       // Hides pause the manager; shows resume it, then the pull below probes.
+      const requestPull = () => {
+        manager?.requestPull?.().catch(() => undefined);
+      };
       const stopVisibility = manager
-        ? startVisibilityPause(manager)
+        ? options.activity
+          ? startVisibilityPause(manager, {
+              activity: options.activity,
+              onActive: requestPull,
+            })
+          : startVisibilityPause(manager)
         : undefined;
       const stopPulls = manager?.requestPull
-        ? startPullSignals(() => {
-            manager.requestPull?.().catch(() => undefined);
-          })
+        ? startPullSignals(requestPull)
         : undefined;
       stopPullSignals = () => {
         stopVisibility?.();

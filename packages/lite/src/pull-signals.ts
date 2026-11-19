@@ -49,6 +49,14 @@ export function startPullSignals(
   };
 }
 
+/** Host activity controls sync only; it does not activate the service. */
+export interface PsLiteActivitySource {
+  /** Return the current aggregate activity. */
+  isActive(): boolean;
+  /** Notify after the value changes; return a function that unsubscribes. */
+  subscribe(onChange: () => void): () => void;
+}
+
 export interface VisibilityPausable {
   pause?: () => void;
   resume?: () => void;
@@ -66,11 +74,41 @@ export interface VisibilityPausable {
  */
 export function startVisibilityPause(
   manager: VisibilityPausable,
-  sources: Pick<PullSignalSources, "document"> = {
+  sources: Pick<PullSignalSources, "document"> & {
+    activity?: PsLiteActivitySource;
+    onActive?: () => void;
+  } = {
     document: (globalThis as { document?: PullSignalSources["document"] })
       .document,
   },
 ): () => void {
+  if (sources.activity) {
+    const activity = sources.activity;
+    let disposed = false;
+    let previous: boolean | undefined;
+    const apply = () => {
+      if (disposed) return;
+      const active = activity.isActive();
+      if (active === previous) return;
+      const wasActive = previous;
+      previous = active;
+      try {
+        if (!active) manager.pause?.();
+        else {
+          manager.resume?.();
+          if (wasActive === false) sources.onActive?.();
+        }
+      } catch {
+        // A manager that refuses is not the host's problem.
+      }
+    };
+    const unsubscribe = activity.subscribe(apply);
+    apply();
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }
   const doc = sources.document;
   if (!doc) return () => {};
   const apply = () => {
