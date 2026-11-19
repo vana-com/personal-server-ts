@@ -67,4 +67,23 @@ Spec == Init /\ [][Next]_vars
 TypeOK == row \in [body : 0..3, ord : 0..2] /\ steps \in 0..MaxSteps
 \* The stored row is the fold of the log, whatever order its operations arrived in.
 RowIsFold == row = FoldMax(None, log)
+
+\* Disk-fold vocabulary, shared with Workspace.tla. Unlike the historical
+\* LogProtocol.first field, first_o belongs to the winning upsert, NULL included.
+\* Scalar stamps embed the pair order; Gt above owns equal-stamp ordinal/body ties.
+CellNone == [stamp |-> 0, ord |-> 0, body |-> 0, first_o |-> 0, kind |-> "none"]
+CellEmpty == [up |-> CellNone, del |-> CellNone]
+UpAfter(a,b) == a.stamp > b.stamp \/ (a.stamp = b.stamp /\ Gt(a,b))
+DelAfter(a,b) == a.stamp > b.stamp \/
+                 (a.stamp = b.stamp /\ a.kind = "delete" /\ b.kind # "delete")
+CellStep(c,o) ==
+  IF o.kind = "up" THEN
+    IF UpAfter(o,c.up) THEN [c EXCEPT !.up = o] ELSE c
+  ELSE IF DelAfter(o,c.del) THEN [c EXCEPT !.del = o] ELSE c
+CellEntries(c) ==
+  IF c.up.stamp > c.del.stamp \/
+     (c.up.stamp > 0 /\ c.up.stamp = c.del.stamp /\ c.del.kind = "omit")
+  THEN (IF c.del.stamp > 0 /\ c.up.stamp > c.del.stamp
+        THEN <<c.del,c.up>> ELSE <<c.up>>)
+  ELSE IF c.del.stamp > 0 THEN <<c.del>> ELSE <<>>
 =============================================================================
