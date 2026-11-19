@@ -68,7 +68,7 @@ function makeGrant(
 }
 
 async function cycle(status: number, errorBody: unknown) {
-  const servedEntry = { scope: "pdpp.fixture~.items", version: 7 };
+  const servedEntry = { scope: "pdpp.fixture~.~log", version: 3 };
   const grant = makeGrant();
   const paymentFetch = vi.fn(async () => Response.json(errorBody, { status }));
   const logger = { info: vi.fn() };
@@ -134,13 +134,49 @@ async function cycle(status: number, errorBody: unknown) {
   );
   expect(forwarded.accessRecord).toMatchObject({
     dataPointId: computeDataPointId(OWNER_ADDRESS, servedEntry.scope),
-    version: "7",
+    version: "3",
     accessor: builderAccount.address,
   });
-  return { result, logger };
+  return {
+    result,
+    logger,
+    forwarded,
+    headers: (paymentFetch.mock.calls[0] as unknown as [string, RequestInit])[1]
+      .headers,
+  };
 }
 
-describe("stream-head payment forwarding diagnostics", () => {
+describe("log-bound payment forwarding diagnostics", () => {
+  it("forwards a log-only registered receipt with logical authorization unchanged", async () => {
+    const { result, forwarded, headers } = await cycle(200, { success: true });
+    expect(result).toMatchObject({ kind: "ok" });
+    expect(forwarded).toMatchObject({
+      opType: "grant",
+      accessRecord: {
+        dataPointId: computeDataPointId(OWNER_ADDRESS, "pdpp.fixture~.~log"),
+        version: "3",
+      },
+    });
+    expect(forwarded.accessRecord).not.toHaveProperty("scope");
+    expect(forwarded.accessRecord).not.toHaveProperty("ownerAddress");
+    if (process.env.PAYMENT_FIXTURE_PATH) {
+      const { writeFileSync } = await import("node:fs");
+      writeFileSync(
+        process.env.PAYMENT_FIXTURE_PATH,
+        JSON.stringify(
+          {
+            body: forwarded,
+            headers,
+            owner: OWNER_ADDRESS,
+            server: serverAccount.address,
+            scope: "pdpp.fixture~.~log",
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+    }
+  });
   it("preserves safe diagnostics on a relayed payment error", async () => {
     const { result, logger } = await cycle(402, {
       error: "Insufficient finalized balance",

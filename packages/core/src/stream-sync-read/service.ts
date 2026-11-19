@@ -80,6 +80,10 @@ export interface PartialView {
 }
 
 export interface ResolveInput {
+  /** Paid reads must bind the body to an accepted connection-log fold. */
+  readonly requireRegistered?: boolean;
+  /** The request lifetime, including its existing deadline. */
+  readonly signal?: AbortSignal;
   readonly scope: string;
   /** `connection=<ns>`; `null` when absent. */
   readonly connection: string | null;
@@ -135,6 +139,7 @@ export interface OwnerNotes {
 }
 
 export type ReadDecision =
+  | { readonly kind: "read_not_registered" }
   | { readonly kind: "invalid_binding" }
   /** Not a stream-sync read: the existing path answers, unchanged. */
   | ({ readonly kind: "pass" } & OwnerNotes)
@@ -182,9 +187,9 @@ export type ReadDecision =
       /** Pins `(stream → head version)` of every input head. */
       readonly cursor: string;
       /**
-       * The registered stream head a paid read's access record binds: the
-       * window's parent stream of a windowed legacy name, else the first
-       * stream read. Physical name and registry version. `null` for an
+       * Receipt identity for the selected body. Paid views name the accepted
+       * connection log and the position covering every contributing stream.
+       * Free views may name the local stream head. `null` for an
        * owner-only view with an input stream that has no imported head: there
        * is no registry entry to bind or charge.
        */

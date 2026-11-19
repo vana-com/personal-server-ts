@@ -789,6 +789,17 @@ function legacyMutationRefusal(mode: AccountMode): Response | undefined {
 /** The response for a stream-sync decision that serves nothing; `null` otherwise. */
 function streamSyncRefusal(decision: ReadDecision): Response | null {
   switch (decision.kind) {
+    case "read_not_registered":
+      return jsonResponse(
+        {
+          error: {
+            code: 503,
+            errorCode: "READ_NOT_REGISTERED",
+            message: "This data has not been registered; retry the read",
+          },
+        },
+        { status: 503, headers: { "Retry-After": "5" } },
+      );
     case "invalid_binding":
       return errorResponse(
         503,
@@ -1443,8 +1454,8 @@ export async function handleX402Cycle(
   }
 
   // Bind the accessRecord to the entry being served, if it exists and has
-  // been registered with DPv2 yet. A served stream head is registered: it
-  // was listed from the registry.
+  // been registered with DPv2 yet. Paid database views supply the log
+  // identity whose accepted fold the resolver checked before selecting it.
   const entryRow = input.servedEntry
     ? undefined
     : deps.storage.findEntry({
@@ -3363,12 +3374,19 @@ export async function handlePersonalServerDataRequest(
             "STREAM_HISTORY_UNAVAILABLE",
             "Older versions are not available",
           );
+        const ownApp = await ownAppReadStatus(deps, authResult);
+        const charge =
+          ownApp instanceof Response
+            ? null
+            : readCharge(deps, scopeResult.scope, authResult, ownApp);
         const decision = await deps.streamSyncRead.resolve({
           scope: scopeResult.scope,
           connection: url.searchParams.get("connection"),
           cursor: url.searchParams.get("cursor"),
           legacyFile: false,
           isOwnerView: isOwnerView(authResult),
+          requireRegistered: charge !== null,
+          signal: request.signal,
         });
         if (decision.kind === "local_pending") {
           await decision.body.cancel();
@@ -3405,25 +3423,18 @@ export async function handlePersonalServerDataRequest(
           );
         }
         if (decision.kind === "view") {
+          if (ownApp instanceof Response) {
+            await decision.body.cancel();
+            return ownApp;
+          }
           notifyDataRead(deps, { scope: scopeResult.scope });
           // The same charge as a file read; the access record binds the
-          // stream head the view serves.
+          // accepted log position covering the view.
           let paymentResponseHeader: string | undefined;
           // An owner-only view with no registered head has nothing to
           // charge against: the service serves it to the owner alone.
           if (decision.served !== null) {
             const served = decision.served;
-            const ownApp = await ownAppReadStatus(deps, authResult);
-            if (ownApp instanceof Response) {
-              await decision.body.cancel();
-              return ownApp;
-            }
-            const charge = readCharge(
-              deps,
-              scopeResult.scope,
-              authResult,
-              ownApp,
-            );
             if (charge) {
               let paid: Awaited<ReturnType<typeof payForRead>>;
               try {
