@@ -276,6 +276,134 @@ describe("createMcpSession", () => {
 });
 
 describe("createMcpSessionAuthPort", () => {
+  it.each([
+    { name: "eligible own app", eligibility: "eligible", expected: null },
+    {
+      name: "foreign app",
+      eligibility: "not_eligible",
+      expected: "PAYMENT_REQUIRED",
+    },
+    {
+      name: "unavailable Account",
+      status: 503,
+      expected: "OWN_APP_ELIGIBILITY_UNAVAILABLE",
+    },
+    {
+      name: "malformed evidence",
+      malformed: true,
+      expected: "OWN_APP_ELIGIBILITY_UNAVAILABLE",
+    },
+    {
+      name: "mismatched evidence",
+      mismatched: true,
+      expected: "OWN_APP_ELIGIBILITY_UNAVAILABLE",
+    },
+    {
+      name: "revoked grant",
+      grantOverrides: { revokedAt: "2020-01-01T00:00:00Z" },
+      expected: "GRANT_REVOKED",
+    },
+    {
+      name: "expired grant",
+      grantOverrides: { expiresAt: "2020-01-01T00:00:00Z" },
+      expected: "GRANT_EXPIRED",
+    },
+    {
+      name: "uncovered scope",
+      scope: "instagram.posts",
+      expected: "SCOPE_MISMATCH",
+    },
+  ])(
+    "checks own-app payment eligibility after grant authorization: $name",
+    async (scenario) => {
+      const gw = fakeGateway(
+        grant({
+          paymentStatus: "pending",
+          fee: {
+            totalDue: "100",
+            asset: "0x0000000000000000000000000000000000000fee",
+          },
+          ...scenario.grantOverrides,
+        }),
+      );
+      const settlement = vi.fn();
+      const accountFetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+        Response.json(
+          scenario.malformed
+            ? {}
+            : {
+                object: "own_app_read_eligibility",
+                appAddress: scenario.mismatched ? OTHER : BUILDER,
+                dataOwner: OWNER,
+                network: "moksha",
+                eligibility: scenario.eligibility ?? "eligible",
+              },
+          { status: scenario.status ?? 200 },
+        ),
+      );
+      const port = createMcpSessionAuthPort({
+        builderAddress: BUILDER,
+        grantId: "grant_1",
+        authSessionVerifier: gw,
+        grantVerifier: gw,
+        serverOwner: OWNER,
+        payment: {
+          dataApiDeps: {
+            storage: { findEntry: () => undefined } as never,
+            auth: {} as never,
+            accessLogWriter: { write: vi.fn() },
+            ownAppAccountUrl: "https://account-dev.vana.org",
+            paymentFetch: settlement,
+            serverOwner: OWNER,
+          },
+          gateway: gw as never,
+          gatewayConfig: {
+            chainId: 14800,
+            contracts: {
+              dataPortabilityEscrow:
+                "0x0000000000000000000000000000000000000001",
+              dataRegistry: "0x0000000000000000000000000000000000000002",
+            },
+          } as never,
+          gatewayUrl: "https://gateway.test",
+        },
+      });
+      try {
+        const result = port.authorizeBuilderRead({
+          request: new Request("http://ps.local/"),
+          scope: scenario.scope ?? "instagram.profile",
+        });
+        if (scenario.expected === null) {
+          await expect(result).resolves.toMatchObject({
+            builder: BUILDER,
+            grantId: "grant_1",
+          });
+        } else {
+          await expect(result).rejects.toMatchObject({
+            errorCode: scenario.expected,
+          });
+        }
+        if (scenario.grantOverrides || scenario.scope) {
+          expect(accountFetch).not.toHaveBeenCalled();
+        } else {
+          expect(accountFetch).toHaveBeenCalledOnce();
+          const url = new URL(String(accountFetch.mock.calls[0]?.[0]));
+          expect(url.origin + url.pathname).toBe(
+            "https://account-dev.vana.org/api/v1/apps/own-data-read-eligibility",
+          );
+          expect(Object.fromEntries(url.searchParams)).toEqual({
+            appAddress: BUILDER,
+            dataOwner: OWNER,
+            network: "moksha",
+          });
+        }
+        expect(settlement).not.toHaveBeenCalled();
+      } finally {
+        accountFetch.mockRestore();
+      }
+    },
+  );
+
   it("authorizes a read for a covered scope as the builder", async () => {
     const gw = fakeGateway(grant());
     const port = createMcpSessionAuthPort({
