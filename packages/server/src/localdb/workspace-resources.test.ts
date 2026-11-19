@@ -1,3 +1,4 @@
+import { awaitWorkspaceMemoryAdmission } from "./workspace-memory-admission.test-utils.js";
 import { expect, it } from "vitest";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -109,14 +110,20 @@ it("configures file SQLite caches and bounds every workspace metadata reply by t
 it.skipIf(process.env.STREAM_SYNC_WORKSPACE_MEMORY !== "1")(
   "Node file SQLite RSS stays inside the declared charged budget plus fixed allocator allowance",
   async () => {
-    const mem = await readFile("/proc/meminfo", "utf8"),
-      pressure = await readFile("/proc/pressure/memory", "utf8");
-    expect(
-      Number(/MemAvailable:\s+(\d+)/.exec(mem)![1]) / 1024 / 1024,
-    ).toBeGreaterThanOrEqual(16);
-    expect(Number(/^full .*?avg60=([\d.]+)/m.exec(pressure)![1])).toBeLessThan(
-      1,
+    const admission = await awaitWorkspaceMemoryAdmission(
+      async () => {
+        const mem = await readFile("/proc/meminfo", "utf8"),
+          pressure = await readFile("/proc/pressure/memory", "utf8");
+        return {
+          availableGiB:
+            Number(/MemAvailable:\s+(\d+)/.exec(mem)![1]) / 1024 / 1024,
+          fullAvg60: Number(/^full .*?avg60=([\d.]+)/m.exec(pressure)![1]),
+        };
+      },
+      () => new Promise((resolve) => setTimeout(resolve, 60000)),
     );
+    expect(admission.availableGiB).toBeGreaterThanOrEqual(16);
+    expect(admission.fullAvg60).toBeLessThan(1);
     const dir = await mkdtemp(join(tmpdir(), "workspace-rss-"));
     const baseline = process.memoryUsage().rss,
       budget = workspaceResourceBudget({
@@ -157,6 +164,7 @@ it.skipIf(process.env.STREAM_SYNC_WORKSPACE_MEMORY !== "1")(
       );
       console.info(
         JSON.stringify({
+          admission,
           baseline,
           peak,
           chargedBytes: budget.chargedBytes,
@@ -169,5 +177,36 @@ it.skipIf(process.env.STREAM_SYNC_WORKSPACE_MEMORY !== "1")(
       await rm(dir, { recursive: true, force: true });
     }
   },
-  60000,
+  300000,
 );
+
+it("RSS admission waits through startup pressure and low availability before measuring", async () => {
+  const samples = [
+    { availableGiB: 36, fullAvg60: 1.76 },
+    { availableGiB: 15, fullAvg60: 0.2 },
+    { availableGiB: 36, fullAvg60: 0.2 },
+  ];
+  let waits = 0,
+    reads = 0;
+  const admission = await awaitWorkspaceMemoryAdmission(
+    async () => samples[reads++]!,
+    async () => {
+      waits++;
+    },
+  );
+  expect(admission).toEqual(samples[2]);
+  expect(reads).toBe(3);
+  expect(waits).toBe(2);
+});
+it("RSS admission refuses exhausted gates without starting a measurement", async () => {
+  let waits = 0;
+  await expect(
+    awaitWorkspaceMemoryAdmission(
+      async () => ({ availableGiB: 36, fullAvg60: 1 }),
+      async () => {
+        waits++;
+      },
+    ),
+  ).rejects.toThrow("no measurement started");
+  expect(waits).toBe(3);
+});
