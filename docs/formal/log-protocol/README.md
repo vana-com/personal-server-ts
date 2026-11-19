@@ -109,17 +109,17 @@ priority. All searches completed. The original `SqlRank.cfg` also passes unchang
 1,340,914 generated / 1,029,883 distinct states, depth 7. Counts for failures are at the first invariant
 violation, not full graph sizes. No parser/runtime failures count as mutant kills.
 
-| Config                                      | Result                    | Generated | Distinct | Depth |
-| ------------------------------------------- | ------------------------- | --------: | -------: | ----: |
-| WorkspaceGood                               | PASS safety and temporal properties | 130,049 | 9,140 | 44 |
-| WorkspaceEarlyCursor                        | FAIL `NoGap`              | 8 | 7 | 2 |
-| WorkspaceOmittedUpload                      | FAIL `UploadBeforeCAS`    | 51,891 | 4,771 | 35 |
-| WorkspaceDroppedTombstone                   | FAIL `ReceiptedFold`      | 4,219 | 845 | 17 |
-| WorkspaceEarlyCleanup                       | FAIL `LiveInputs`         | 118 | 62 | 6 |
-| WorkspaceSplitSeed                          | FAIL `SeedAtomic`         | 34,637 | 3,605 | 31 |
-| WorkspaceReceiptWithoutFold                 | FAIL `ReceiptedFold`      | 63 | 35 | 5 |
-| PartialWorkspaceGood                        | PASS safety and temporal properties | 81,920 | 40,960 | 10 |
-| WorkspaceEarlyCompletion (PartialWorkspace) | FAIL `TruthfulMarkers`    | 20,481 | 12,289 | 4 |
+| Config                                      | Result                              | Generated | Distinct | Depth |
+| ------------------------------------------- | ----------------------------------- | --------: | -------: | ----: |
+| WorkspaceGood                               | PASS safety and temporal properties |   130,049 |    9,140 |    44 |
+| WorkspaceEarlyCursor                        | FAIL `NoGap`                        |         8 |        7 |     2 |
+| WorkspaceOmittedUpload                      | FAIL `UploadBeforeCAS`              |    51,891 |    4,771 |    35 |
+| WorkspaceDroppedTombstone                   | FAIL `ReceiptedFold`                |     4,219 |      845 |    17 |
+| WorkspaceEarlyCleanup                       | FAIL `LiveInputs`                   |       118 |       62 |     6 |
+| WorkspaceSplitSeed                          | FAIL `SeedAtomic`                   |    34,637 |    3,605 |    31 |
+| WorkspaceReceiptWithoutFold                 | FAIL `ReceiptedFold`                |        63 |       35 |     5 |
+| PartialWorkspaceGood                        | PASS safety and temporal properties |    81,920 |   40,960 |    10 |
+| WorkspaceEarlyCompletion (PartialWorkspace) | FAIL `TruthfulMarkers`              |    20,481 |   12,289 |     4 |
 
 Liveness is conditional on crashes stopping, input eventually becoming available,
 fair local work and repair, and strong fairness of CAS landing when repeatedly
