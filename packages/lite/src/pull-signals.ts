@@ -55,7 +55,8 @@ export interface PsLiteActivitySource {
   isActive(): boolean;
   /**
    * Notify after the value changes; return a function that unsubscribes.
-   * If this throws, it must leave no listener registered.
+   * If this throws, it must leave no listener registered. Notify when a
+   * failed activity read becomes usable again, even if the value did not change.
    */
   subscribe(onChange: () => void): () => void;
 }
@@ -111,15 +112,21 @@ export function startVisibilityPause(
       }
       if (disposed || active === previous) return;
       const wasActive = previous;
-      previous = active;
       try {
         if (!active) manager.pause?.();
-        else {
-          manager.resume?.();
-          if (!disposed && wasActive === false) sources.onActive?.();
-        }
+        else manager.resume?.();
       } catch {
-        // A manager that refuses is not the host's problem.
+        // Retry on the next activity notification.
+        return;
+      }
+      if (disposed) return;
+      previous = active;
+      if (active && wasActive === false) {
+        try {
+          sources.onActive?.();
+        } catch {
+          // A failed pull request does not undo a successful resume.
+        }
       }
     };
     try {

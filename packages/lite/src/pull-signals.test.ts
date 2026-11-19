@@ -140,6 +140,118 @@ describe("startVisibilityPause", () => {
     expect(onActive).not.toHaveBeenCalled();
   });
 
+  it("retries a failed resume and pulls once after it succeeds", () => {
+    let active = false;
+    let notify = () => {};
+    const manager = {
+      pause: vi.fn(),
+      resume: vi.fn().mockImplementationOnce(() => {
+        throw new Error("resume failed");
+      }),
+    };
+    const onActive = vi.fn();
+    const stop = startVisibilityPause(manager, {
+      activity: {
+        isActive: () => active,
+        subscribe: (callback) => {
+          notify = callback;
+          return () => {};
+        },
+      },
+      onActive,
+    });
+    active = true;
+    notify();
+    expect(onActive).not.toHaveBeenCalled();
+    notify();
+    notify();
+    expect(manager.resume).toHaveBeenCalledTimes(2);
+    expect(onActive).toHaveBeenCalledTimes(1);
+    stop();
+  });
+
+  it("retries a failed pause on the next inactive notification", () => {
+    let active = true;
+    let notify = () => {};
+    const manager = {
+      pause: vi.fn().mockImplementationOnce(() => {
+        throw new Error("pause failed");
+      }),
+      resume: vi.fn(),
+    };
+    const stop = startVisibilityPause(manager, {
+      activity: {
+        isActive: () => active,
+        subscribe: (callback) => {
+          notify = callback;
+          return () => {};
+        },
+      },
+    });
+    active = false;
+    notify();
+    notify();
+    notify();
+    expect(manager.pause).toHaveBeenCalledTimes(2);
+    expect(manager.resume).toHaveBeenCalledTimes(1);
+    stop();
+  });
+
+  it("does not resume again when the pull callback throws", () => {
+    let active = false;
+    let notify = () => {};
+    const manager = { pause: vi.fn(), resume: vi.fn() };
+    const onActive = vi.fn(() => {
+      throw new Error("pull failed");
+    });
+    const stop = startVisibilityPause(manager, {
+      activity: {
+        isActive: () => active,
+        subscribe: (callback) => {
+          notify = callback;
+          return () => {};
+        },
+      },
+      onActive,
+    });
+    active = true;
+    notify();
+    notify();
+    expect(manager.resume).toHaveBeenCalledTimes(1);
+    expect(onActive).toHaveBeenCalledTimes(1);
+    stop();
+  });
+
+  it("recovers an unreadable activity only after a notification", () => {
+    let readable = false;
+    let notify = () => {};
+    const order: string[] = [];
+    const manager = {
+      pause: vi.fn(() => order.push("pause")),
+      resume: vi.fn(() => order.push("resume")),
+    };
+    const onActive = vi.fn(() => order.push("pull"));
+    const stop = startVisibilityPause(manager, {
+      activity: {
+        isActive: () => {
+          if (!readable) throw new Error("read failed");
+          return true;
+        },
+        subscribe: (callback) => {
+          notify = callback;
+          return () => {};
+        },
+      },
+      onActive,
+    });
+    readable = true;
+    expect(order).toEqual(["pause"]);
+    notify();
+    notify();
+    expect(order).toEqual(["pause", "resume", "pull"]);
+    stop();
+  });
+
   it("unsubscribes once when unsubscribe re-enters disposal", () => {
     let stop = () => {};
     let calls = 0;
