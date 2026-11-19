@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { createRegistryChangePush } from "../sync/engine/change-push.js";
 import { createGatewayStreamSyncRegistry } from "./registry.js";
+import { AmbiguousRegistryReplyError } from "./ports.js";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -114,4 +115,36 @@ it("stops promptly during an overload wait", async () => {
   await vi.advanceTimersByTimeAsync(60_000);
   expect(fetch).toHaveBeenCalledTimes(1);
   expect(vi.getTimerCount()).toBe(0);
+});
+
+it("does not replay an overloaded batch and delays the next registry request", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce(
+      new Response(null, { status: 429, headers: { "Retry-After": "4" } }),
+    )
+    .mockResolvedValueOnce(new Response(null, { status: 404 }));
+  const registry = createGatewayStreamSyncRegistry({
+    gatewayUrl: "https://gateway.test",
+    ownerAddress: "0x" + "11".repeat(20),
+    fetch,
+  });
+  await expect(
+    registry.postBatch!({
+      ownerAddress: "0x" + "11".repeat(20),
+      rows: [],
+      requires: [],
+    }),
+  ).rejects.toBeInstanceOf(AmbiguousRegistryReplyError);
+  expect(fetch).toHaveBeenCalledTimes(1);
+  const read = registry.read("next");
+  await vi.advanceTimersByTimeAsync(4999);
+  expect(fetch).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(1);
+  await expect(read).resolves.toEqual({ found: false });
+  expect(fetch).toHaveBeenCalledTimes(2);
+  expect(fetch.mock.calls[0]![1]?.method).toBe("POST");
+  expect(fetch.mock.calls[1]![1]?.method).toBeUndefined();
 });
