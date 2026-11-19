@@ -203,6 +203,7 @@ export const ServerConfigSchema = z.object({
   payment: z
     .object({
       enabled: z.boolean().default(DEFAULTS.payment.enabled),
+      ownAppAccountUrl: z.url().optional(),
     })
     .default(DEFAULTS.payment),
   sync: z
