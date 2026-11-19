@@ -69,6 +69,7 @@ function connect(
   role: "writer" | "reader",
   options: {
     readonly lockTimeoutMs?: number;
+    readonly workspaceCacheKiB?: number;
     /** The file the reader may serve: the writer's `dev:ino`. */
     readonly identity?: string;
     /** The worker died or errored without `close()`, once. */
@@ -82,6 +83,7 @@ function connect(
         path,
         role,
         lockTimeoutMs: options.lockTimeoutMs,
+        workspaceCacheKiB: options.workspaceCacheKiB,
         identity: options.identity,
       },
       // A small young generation makes V8 reclaim received messages early.
@@ -198,8 +200,17 @@ function connect(
  */
 export function openBetterSqlite3(
   path: string,
-  options: { readonly lockTimeoutMs?: number } = {},
+  options: {
+    readonly lockTimeoutMs?: number;
+    readonly workspaceCacheKiB?: number;
+  } = {},
 ): SqlDriver {
+  if (
+    options.workspaceCacheKiB !== undefined &&
+    (!Number.isInteger(options.workspaceCacheKiB) ||
+      options.workspaceCacheKiB < 64)
+  )
+    throw new Error("workspace_cache_config");
   // Read the version here: `info` is synchronous and the worker is not up yet.
   const probe = new Database(":memory:");
   const { v } = probe.prepare("SELECT sqlite_version() AS v").get() as {
@@ -224,6 +235,7 @@ export function openBetterSqlite3(
   };
   const writer = connect(path, "writer", {
     lockTimeoutMs: options.lockTimeoutMs,
+    workspaceCacheKiB: options.workspaceCacheKiB,
     onFailure: onWriterFailure,
   });
   // The reader starts on its first read, bound to the file the writer holds:
@@ -236,7 +248,10 @@ export function openBetterSqlite3(
     identified!.then(({ path: real, identity }) => {
       if (writerFailure) throw writerFailure;
       if (closed) throw new Error("sqlite_driver_closed");
-      return connect(real, "reader", { identity });
+      return connect(real, "reader", {
+        identity,
+        workspaceCacheKiB: options.workspaceCacheKiB,
+      });
     });
   const reads: SqlReader | undefined = persistent
     ? {

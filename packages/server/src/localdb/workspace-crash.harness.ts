@@ -9,7 +9,10 @@ import {
 } from "@opendatalabs/personal-server-ts-core/localdb";
 const [path, edge, target] = process.argv.slice(2);
 const base = openBetterSqlite3(path!);
+await base.query("PRAGMA synchronous=NORMAL");
 const patterns: Record<string, string> = {
+  enqueue: "INSERT OR IGNORE INTO workspace_jobs",
+  finish: "DELETE FROM workspace_jobs",
   begin: "INSERT INTO body_values(",
   append: "UPDATE body_values SET offset",
   seal: "UPDATE body_values SET sealed=1",
@@ -25,7 +28,12 @@ const stop = async () => {
 const db: SqlDriver = {
   ...base,
   async batch(statements) {
-    const match = statements.some((s) => s.sql.includes(patterns[target!]!));
+    const match = statements.some((s) =>
+      target!.startsWith("phase-")
+        ? s.sql === "UPDATE workspaces SET phase=? WHERE operation=?" &&
+          s.params?.[0] === target!.slice(6)
+        : s.sql.includes(patterns[target!]!),
+    );
     if (match && edge === "before") await stop();
     const result = await base.batch(statements);
     if (match && edge === "after") await stop();
@@ -42,6 +50,8 @@ const b: WorkspaceBinding = {
   expectedHead: "h",
   codecVersion: 1,
 };
+await runtimeAdmission.enqueue(db, "job");
+await runtimeAdmission.finish(db, "job");
 const ws = await openWorkspace(db, b),
   values = createWorkspaceValues(db, 4096),
   bytes = Buffer.from("sealed value");
@@ -57,6 +67,11 @@ await lease.release();
 await values.seal(token);
 await ws.stage("unit", "fold", "key", '{"first_o":null,"delete":true}');
 await ws.commitUnit("unit", "digest", 0);
-await ws.discard();
+if (target!.startsWith("phase-")) {
+  await ws.transition("collect", "folded");
+  await ws.transition("folded", "sealed");
+  await ws.transition("sealed", "ready");
+  await ws.transition("ready", "sent");
+} else await ws.discard();
 await ws.cleanupOne();
 throw new Error("boundary_not_reached");

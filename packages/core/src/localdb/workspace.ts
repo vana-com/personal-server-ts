@@ -1,3 +1,7 @@
+import {
+  workspaceAttempt,
+  recordWorkspaceFailure,
+} from "./workspace-failure.js";
 import type { SqlDriver, SqlStatement } from "./driver.js";
 import type {
   BoundedCursor,
@@ -5,18 +9,8 @@ import type {
   WorkspaceBinding,
 } from "./workspace-capability.js";
 
-// JSON tuple order is fixed even when the caller's property insertion order differs.
-export const bindingIdentity = (b: WorkspaceBinding): string =>
-  JSON.stringify([
-    b.owner,
-    b.databaseIncarnation,
-    b.connection,
-    b.generation,
-    b.keyCheck,
-    b.operation,
-    b.expectedHead,
-    b.codecVersion,
-  ]);
+import { workspaceBindingIdentity as bindingIdentity } from "./workspace-capability.js";
+export { bindingIdentity };
 const assert = (
   condition: string,
   params: SqlStatement["params"],
@@ -183,8 +177,14 @@ export async function openWorkspace(db: SqlDriver, b: WorkspaceBinding) {
     },
     ...workspaceGuard(b),
   ]);
-  const write = async (statements: SqlStatement[]) => {
-    await db.batch([...workspaceGuard(b), ...statements]);
+  const write = async (
+    statements: SqlStatement[],
+    unit?: string,
+    action?: string,
+  ) => {
+    const mutation = [...workspaceGuard(b), ...statements];
+    if (unit && action) await workspaceAttempt(db, b, unit, action, mutation);
+    else await db.batch(mutation);
   };
   return {
     binding: b,
@@ -209,17 +209,27 @@ export async function openWorkspace(db: SqlDriver, b: WorkspaceBinding) {
         unit.length > 1024 ||
         encodedSize(key) + encodedSize(payload) > 64 * 1024
       )
-        throw new Error("workspace_metadata_admission");
-      await write([
-        assert(
-          "(SELECT phase FROM workspaces WHERE operation=?)='collect' AND NOT EXISTS(SELECT 1 FROM workspace_receipts WHERE operation=? AND unit=?)",
-          [b.operation, b.operation, unit],
-        ),
-        {
-          sql: "INSERT OR REPLACE INTO workspace_stage VALUES(?,?,?,?,?)",
-          params: [b.operation, unit, relation, key, payload],
-        },
-      ]);
+        return recordWorkspaceFailure(
+          db,
+          b,
+          unit,
+          "stage",
+          new Error("workspace_metadata_admission"),
+        );
+      await write(
+        [
+          assert(
+            "(SELECT phase FROM workspaces WHERE operation=?)='collect' AND NOT EXISTS(SELECT 1 FROM workspace_receipts WHERE operation=? AND unit=?)",
+            [b.operation, b.operation, unit],
+          ),
+          {
+            sql: "INSERT OR REPLACE INTO workspace_stage VALUES(?,?,?,?,?)",
+            params: [b.operation, unit, relation, key, payload],
+          },
+        ],
+        unit,
+        "stage",
+      );
     },
     async commitUnit(unit: string, digest: string, previous: number) {
       if (
@@ -230,37 +240,41 @@ export async function openWorkspace(db: SqlDriver, b: WorkspaceBinding) {
         previous >= Number.MAX_SAFE_INTEGER
       )
         throw new Error("workspace_receipt_admission");
-      await write([
-        assert(
-          "(EXISTS(SELECT 1 FROM workspace_receipts WHERE operation=? AND unit=? AND digest=? AND position=?)) OR ((SELECT phase='collect' AND position=? FROM workspaces WHERE operation=?) AND NOT EXISTS(SELECT 1 FROM workspace_receipts WHERE operation=? AND unit=?))",
-          [
-            b.operation,
-            unit,
-            digest,
-            previous + 1,
-            previous,
-            b.operation,
-            b.operation,
-            unit,
-          ],
-        ),
-        {
-          sql: "INSERT OR REPLACE INTO workspace_cells SELECT operation,relation,key,payload FROM workspace_stage WHERE operation=? AND unit=? AND NOT EXISTS(SELECT 1 FROM workspace_receipts WHERE operation=? AND unit=?)",
-          params: [b.operation, unit, b.operation, unit],
-        },
-        {
-          sql: "INSERT OR IGNORE INTO workspace_receipts VALUES(?,?,?,?)",
-          params: [b.operation, unit, digest, previous + 1],
-        },
-        {
-          sql: "UPDATE workspaces SET position=MAX(position,?) WHERE operation=?",
-          params: [previous + 1, b.operation],
-        },
-        {
-          sql: "DELETE FROM workspace_stage WHERE operation=? AND unit=?",
-          params: [b.operation, unit],
-        },
-      ]);
+      await write(
+        [
+          assert(
+            "(EXISTS(SELECT 1 FROM workspace_receipts WHERE operation=? AND unit=? AND digest=? AND position=?)) OR ((SELECT phase='collect' AND position=? FROM workspaces WHERE operation=?) AND NOT EXISTS(SELECT 1 FROM workspace_receipts WHERE operation=? AND unit=?))",
+            [
+              b.operation,
+              unit,
+              digest,
+              previous + 1,
+              previous,
+              b.operation,
+              b.operation,
+              unit,
+            ],
+          ),
+          {
+            sql: "INSERT OR REPLACE INTO workspace_cells SELECT operation,relation,key,payload FROM workspace_stage WHERE operation=? AND unit=? AND NOT EXISTS(SELECT 1 FROM workspace_receipts WHERE operation=? AND unit=?)",
+            params: [b.operation, unit, b.operation, unit],
+          },
+          {
+            sql: "INSERT OR IGNORE INTO workspace_receipts VALUES(?,?,?,?)",
+            params: [b.operation, unit, digest, previous + 1],
+          },
+          {
+            sql: "UPDATE workspaces SET position=MAX(position,?) WHERE operation=?",
+            params: [previous + 1, b.operation],
+          },
+          {
+            sql: "DELETE FROM workspace_stage WHERE operation=? AND unit=?",
+            params: [b.operation, unit],
+          },
+        ],
+        unit,
+        "promote",
+      );
     },
     cursor(relation: WorkspaceRelation): BoundedCursor<WorkspaceCell> {
       let after: string | null = null,
@@ -320,8 +334,11 @@ export async function openWorkspace(db: SqlDriver, b: WorkspaceBinding) {
       };
     },
     async transition(
-      from: "collect" | "folded" | "sealed" | "ready" | "sent" | "accepted",
-      to: "folded" | "sealed" | "ready" | "sent" | "accepted" | "finished",
+      ...[from, to]:
+        | ["collect", "folded"]
+        | ["folded", "sealed"]
+        | ["sealed", "ready"]
+        | ["ready", "sent"]
     ) {
       // Remote acceptance requires authoritative registry-outcome integration.
       // No local transition can certify a sent candidate as accepted.
@@ -381,13 +398,16 @@ export async function openWorkspace(db: SqlDriver, b: WorkspaceBinding) {
         "workspace_stage",
         "workspace_cells",
         "workspace_receipts",
+        "workspace_attempts",
       ]) {
         const keys =
           table === "workspace_stage"
             ? ["unit", "relation", "key"]
             : table === "workspace_cells"
               ? ["relation", "key"]
-              : ["unit"];
+              : table === "workspace_attempts"
+                ? ["unit", "action"]
+                : ["unit"];
         const row = (
           await db.query<Record<string, string>>(
             `SELECT ${keys.join(",")} FROM ${table} WHERE operation=? ORDER BY ${keys.join(",")} LIMIT 1`,

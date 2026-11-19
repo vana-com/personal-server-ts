@@ -1,3 +1,5 @@
+import { recordWorkspaceFailure } from "./workspace-failure.js";
+import { runtimeAdmission } from "./workspace.js";
 import type {
   LogKey,
   LogStamp,
@@ -105,14 +107,30 @@ export async function openLogWorkspace(
   binding: WorkspaceBinding,
 ) {
   const storage = await openWorkspace(db, binding);
+  let writing = false;
   return {
     binding,
+    async acquire(bytes: number, signal?: AbortSignal) {
+      await runtimeAdmission.enqueue(db, binding.operation);
+      try {
+        return await runtimeAdmission.acquire(binding.operation, bytes, signal);
+      } catch (error) {
+        return recordWorkspaceFailure(
+          db,
+          binding,
+          "admission",
+          "acquire",
+          error,
+        );
+      }
+    },
     position: storage.position,
     async unit(
       unit: string,
       digest: string,
       previous: number,
     ): Promise<StagingWorkspaceUnit | ReceiptedWorkspaceUnit> {
+      await db.batch(workspaceGuard(binding));
       const receipt = (
         await db.query<{ digest: string; position: number }>(
           "SELECT digest,position FROM workspace_receipts WHERE operation=? AND unit=?",
@@ -129,45 +147,63 @@ export async function openLogWorkspace(
         state: "staging",
         async stage(kind, row) {
           if (committed) throw new Error("workspace_unit_receipted");
-          const payload = JSON.stringify(row);
-          if (payload.length > 64 * 1024)
-            throw new Error("workspace_metadata_admission");
-          const snapshot = JSON.parse(payload) as typeof row;
-          const refs = references(kind, snapshot);
-          const key =
-            "objectKey" in snapshot
-              ? JSON.stringify([snapshot.objectKey])
-              : "pkHash" in snapshot
-                ? JSON.stringify([snapshot.stream, snapshot.pkHash])
-                : JSON.stringify([snapshot.stream]);
-          // Validate each sealed reference against durable metadata, including the full
-          // binding. Sealed values cannot be aborted while the workspace is active.
-          for (const token of refs) {
-            if (
-              token.kind !== "sealed-value" ||
-              bindingIdentity(token.binding) !== bindingIdentity(binding)
-            )
-              throw new Error("workspace_value_binding");
-            await db.batch([
-              ...workspaceGuard(binding),
-              workspaceAssert(
-                "EXISTS(SELECT 1 FROM body_values WHERE id=? AND operation=? AND bytes=? AND digest=? AND encoding=? AND sealed=1 AND aborted=0)",
-                [
-                  token.id,
-                  binding.operation,
-                  token.bytes,
-                  token.sha256,
-                  token.encoding,
-                ],
-              ),
-            ]);
+          if (writing) throw new Error("workspace_unit_busy");
+          writing = true;
+          try {
+            const payload = JSON.stringify(row);
+            if (payload.length > 64 * 1024)
+              return await recordWorkspaceFailure(
+                db,
+                binding,
+                unit,
+                "stage",
+                new Error("workspace_metadata_admission"),
+              );
+            const snapshot = JSON.parse(payload) as typeof row;
+            const refs = references(kind, snapshot);
+            const key =
+              "objectKey" in snapshot
+                ? JSON.stringify([snapshot.objectKey])
+                : "pkHash" in snapshot
+                  ? JSON.stringify([snapshot.stream, snapshot.pkHash])
+                  : JSON.stringify([snapshot.stream]);
+            // Validate each sealed reference against durable metadata, including the full
+            // binding. Sealed values cannot be aborted while the workspace is active.
+            for (const token of refs) {
+              if (
+                token.kind !== "sealed-value" ||
+                bindingIdentity(token.binding) !== bindingIdentity(binding)
+              )
+                throw new Error("workspace_value_binding");
+              await db.batch([
+                ...workspaceGuard(binding),
+                workspaceAssert(
+                  "EXISTS(SELECT 1 FROM body_values WHERE id=? AND operation=? AND bytes=? AND digest=? AND encoding=? AND sealed=1 AND aborted=0)",
+                  [
+                    token.id,
+                    binding.operation,
+                    token.bytes,
+                    token.sha256,
+                    token.encoding,
+                  ],
+                ),
+              ]);
+            }
+            await storage.stage(unit, kind, key, payload);
+          } finally {
+            writing = false;
           }
-          await storage.stage(unit, kind, key, payload);
         },
         async commit() {
           if (committed) throw new Error("workspace_unit_receipted");
-          await storage.commitUnit(unit, digest, previous);
-          committed = true;
+          if (writing) throw new Error("workspace_unit_busy");
+          writing = true;
+          try {
+            await storage.commitUnit(unit, digest, previous);
+            committed = true;
+          } finally {
+            writing = false;
+          }
           return { state: "receipted", unit, digest, position: previous + 1 };
         },
       };

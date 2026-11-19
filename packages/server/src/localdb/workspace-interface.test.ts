@@ -9,6 +9,7 @@ import { migrate } from "../../../core/src/localdb/migrate.js";
 import {
   openLogWorkspace,
   runtimeAdmission,
+  setWorkspaceAuthority,
   type WorkspaceBinding,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 const cleanup: (() => Promise<void>)[] = [];
@@ -20,6 +21,8 @@ it("typed units validate sealed references and revoke staging aliases after rece
   cleanup.push(() => rm(dir, { recursive: true, force: true }));
   const db = openBetterSqlite3(join(dir, "db"));
   cleanup.push(() => db.close());
+  await db.query("PRAGMA journal_mode=WAL");
+  await db.query("PRAGMA synchronous=NORMAL");
   await migrate(db);
   await db.batch([
     {
@@ -60,13 +63,26 @@ it("typed units validate sealed references and revoke staging aliases after rece
       value: { ...body, id: "missing" },
     }),
   ).rejects.toThrow();
-  await unit.stage("outputs", { objectKey: "o", value: body });
+  const pendingStage = unit.stage("outputs", { objectKey: "o", value: body });
+  await expect(
+    unit.stage("outputs", { objectKey: "other", value: body }),
+  ).rejects.toThrow("busy");
+  await expect(unit.commit()).rejects.toThrow("busy");
+  await pendingStage;
   const receipt = await unit.commit();
   expect(receipt.state).toBe("receipted");
   await expect(
     unit.stage("outputs", { objectKey: "o", value: body }),
   ).rejects.toThrow("receipted");
   expect((await ws.unit("u", "digest", 0)).state).toBe("receipted");
+  await setWorkspaceAuthority(db, { ...b, keyCheck: "other" });
+  await expect(ws.unit("u", "digest", 0)).rejects.toThrow();
+  await setWorkspaceAuthority(db, b);
+  await db.batch([
+    { sql: "UPDATE connections SET generation=2 WHERE connection_id='c'" },
+  ]);
+  await expect(ws.unit("u", "digest", 0)).rejects.toThrow();
+  await expect(openLogWorkspace(db, { ...b, generation: 2 })).rejects.toThrow();
 });
 it("consumer type contract rejects writer/reader confusion and staging a receipt", async () => {
   const path = join(
@@ -76,10 +92,10 @@ it("consumer type contract rejects writer/reader confusion and staging a receipt
   cleanup.push(() => rm(path, { force: true }));
   await writeFile(
     path,
-    `import type {BoundedValueStore,ValueToken,ReceiptedWorkspaceUnit,StagingWorkspaceUnit,WorkspaceValueReader} from '@opendatalabs/personal-server-ts-core/localdb';
- declare const store:BoundedValueStore, sealed:ValueToken, receipt:ReceiptedWorkspaceUnit, reader:WorkspaceValueReader, staging:StagingWorkspaceUnit;
+    `import type {ByteLease,BoundedValueStore,ValueToken,ReceiptedWorkspaceUnit,StagingWorkspaceUnit,WorkspaceValueReader} from '@opendatalabs/personal-server-ts-core/localdb';
+ declare const lease:ByteLease, store:BoundedValueStore, sealed:ValueToken, receipt:ReceiptedWorkspaceUnit, reader:WorkspaceValueReader, staging:StagingWorkspaceUnit;
  // @ts-expect-error a sealed reader cannot be appended
- store.append(sealed,0,new Uint8Array(),{});
+ store.append(sealed,0,new Uint8Array(),lease);
  // @ts-expect-error a reader has no append
  reader.append(new Uint8Array());
  // @ts-expect-error receipted units have no staging capability

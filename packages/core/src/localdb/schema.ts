@@ -638,4 +638,8 @@ END`,
     }),
   ],
   WORKSPACE_SCHEMA,
+  [
+    `CREATE TABLE workspace_attempts(id INTEGER PRIMARY KEY AUTOINCREMENT,operation TEXT NOT NULL,unit TEXT NOT NULL,action TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','failed','succeeded')),reason TEXT,UNIQUE(operation,unit,action))`,
+    `CREATE INDEX workspace_attempts_page ON workspace_attempts(operation,id)`,
+  ],
 ];

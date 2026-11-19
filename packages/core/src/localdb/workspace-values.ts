@@ -1,3 +1,8 @@
+import {
+  WorkspaceOperationError,
+  workspaceAttempt,
+  recordWorkspaceFailure,
+} from "./workspace-failure.js";
 import { sha256 } from "@noble/hashes/sha2";
 import type { SqlDriver } from "./driver.js";
 import type {
@@ -26,6 +31,23 @@ type ValueRow = {
 };
 const hex = (bytes: Uint8Array) =>
   Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+/** Slice inside SQLite so even a corrupt/older oversized chunk cannot create
+ * an oversized native reply. The primary key finds the enclosing chunk. */
+async function valueChunk(
+  db: SqlDriver,
+  id: string,
+  offset: number,
+  capacity: number,
+): Promise<Uint8Array> {
+  const row = (
+    await db.query<{ body: Uint8Array | null }>(
+      "SELECT CASE WHEN offset+length(body)>? THEN substr(body,?-offset+1,?) ELSE NULL END AS body FROM body_value_chunks WHERE value_id=? AND offset<=? ORDER BY offset DESC LIMIT 1",
+      [offset, offset, capacity, id, offset],
+    )
+  )[0];
+  if (!row?.body?.length) throw new Error("workspace_chunk_missing");
+  return row.body;
+}
 /** Persistent chunk-backed fallback. No whole-value readback at seal. The caller
  * supplies ids so the portable storage implementation imports no host runtime. */
 export function createSqlWorkspaceValues(
@@ -35,7 +57,12 @@ export function createSqlWorkspaceValues(
 ): BoundedValueStore {
   if (!db.info.persistent)
     throw new Error("workspace_requires_persistent_database");
-  if (frameCapacityBytes < 4096) throw new Error("workspace_frame_capacity");
+  if (
+    !Number.isSafeInteger(frameCapacityBytes) ||
+    frameCapacityBytes < 4096 ||
+    frameCapacityBytes > 4 * 1024 * 1024
+  )
+    throw new Error("workspace_frame_capacity");
   const chunkCapacity = Math.min(
     64 * 1024,
     Math.floor((frameCapacityBytes - 2048) / 6),
@@ -51,6 +78,16 @@ export function createSqlWorkspaceValues(
       busy = false;
     }
   };
+  const reported = <T>(
+    binding: WorkspaceBinding,
+    unit: string,
+    action: string,
+    result: Promise<T>,
+  ): Promise<T> =>
+    result.catch((error) => {
+      if (error instanceof WorkspaceOperationError) throw error;
+      return recordWorkspaceFailure(db, binding, unit, action, error);
+    });
   const row = async (t: ValueWriterToken | ValueToken) => {
     await db.batch(workspaceGuard(t.binding));
     const v = (
@@ -75,126 +112,141 @@ export function createSqlWorkspaceValues(
     frameCapacityBytes,
     admission: runtimeAdmission,
     begin(b, bytes, digest, encoding) {
-      return run(async () => {
-        if (
-          !Number.isSafeInteger(bytes) ||
-          bytes < 0 ||
-          !/^[a-f0-9]{64}$/.test(digest)
-        )
-          throw new Error("workspace_value_metadata");
-        if (new TextEncoder().encode(bindingIdentity(b)).length > 1024)
-          throw new Error("workspace_binding_admission");
-        const id = newId();
-        if (id.length > 128) throw new Error("workspace_value_id_admission");
-        await db.batch([
-          ...workspaceGuard(b),
-          {
-            sql: "INSERT INTO body_values(id,operation,bytes,digest,encoding) VALUES(?,?,?,?,?)",
-            params: [id, b.operation, bytes, digest, encoding],
-          },
-        ]);
-        return { kind: "value-writer", binding: b, id };
-      });
+      return reported(
+        b,
+        "value-begin",
+        "begin",
+        run(async () => {
+          if (
+            !Number.isSafeInteger(bytes) ||
+            bytes < 0 ||
+            !/^[a-f0-9]{64}$/.test(digest)
+          )
+            throw new Error("workspace_value_metadata");
+          if (new TextEncoder().encode(bindingIdentity(b)).length > 1024)
+            throw new Error("workspace_binding_admission");
+          const id = newId();
+          if (id.length > 128) throw new Error("workspace_value_id_admission");
+          await workspaceAttempt(db, b, "value-begin", "begin", [
+            ...workspaceGuard(b),
+            {
+              sql: "INSERT INTO body_values(id,operation,bytes,digest,encoding) VALUES(?,?,?,?,?)",
+              params: [id, b.operation, bytes, digest, encoding],
+            },
+          ]);
+          return { kind: "value-writer", binding: b, id };
+        }),
+      );
     },
     append(t, offset, chunk, lease) {
-      return run(async () => {
-        const releaseUnit = ownLease(
-          lease,
-          t.binding.operation,
-          chunk.length * 6 + 2048,
-        );
-        try {
-          if (
-            chunk.length === 0 ||
-            chunk.length > chunkCapacity ||
-            !Number.isSafeInteger(offset) ||
-            offset < 0
-          )
-            throw new Error("workspace_chunk_admission");
-          const v = await row(t);
-          if (v.sealed) throw new Error("workspace_value_sealed");
-          if (offset < v.offset) {
-            const match = (
-              await db.query<{ ok: number }>(
-                "SELECT 1 AS ok FROM body_value_chunks WHERE value_id=? AND offset=? AND body=?",
-                [t.id, offset, chunk],
-              )
-            )[0];
-            if (!match) throw new Error("workspace_chunk_conflict");
-            return { nextOffset: v.offset };
+      return reported(
+        t.binding,
+        t.id,
+        "append",
+        run(async () => {
+          const releaseUnit = ownLease(
+            lease,
+            t.binding.operation,
+            chunk.length * 6 + 2048,
+          );
+          try {
+            if (
+              chunk.length === 0 ||
+              chunk.length > chunkCapacity ||
+              !Number.isSafeInteger(offset) ||
+              offset < 0
+            )
+              return await recordWorkspaceFailure(
+                db,
+                t.binding,
+                t.id,
+                "append",
+                new Error("workspace_chunk_admission"),
+              );
+            const v = await row(t);
+            if (v.sealed) throw new Error("workspace_value_sealed");
+            if (offset < v.offset) {
+              const match = (
+                await db.query<{ ok: number }>(
+                  "SELECT 1 AS ok FROM body_value_chunks WHERE value_id=? AND offset=? AND body=?",
+                  [t.id, offset, chunk],
+                )
+              )[0];
+              if (!match) throw new Error("workspace_chunk_conflict");
+              return { nextOffset: v.offset };
+            }
+            if (offset !== v.offset || offset + chunk.length > v.bytes)
+              throw new Error("workspace_chunk_offset");
+            await workspaceAttempt(db, t.binding, t.id, "append", [
+              ...workspaceGuard(t.binding),
+              workspaceAssert(
+                "EXISTS(SELECT 1 FROM body_values WHERE id=? AND offset=? AND sealed=0 AND aborted=0)",
+                [t.id, offset],
+              ),
+              {
+                sql: "INSERT INTO body_value_chunks VALUES(?,?,?)",
+                params: [t.id, offset, chunk],
+              },
+              {
+                sql: "UPDATE body_values SET offset=? WHERE id=?",
+                params: [offset + chunk.length, t.id],
+              },
+            ]);
+            return { nextOffset: offset + chunk.length };
+          } finally {
+            releaseUnit();
           }
-          if (offset !== v.offset || offset + chunk.length > v.bytes)
-            throw new Error("workspace_chunk_offset");
-          await db.batch([
-            ...workspaceGuard(t.binding),
-            workspaceAssert(
-              "EXISTS(SELECT 1 FROM body_values WHERE id=? AND offset=? AND sealed=0 AND aborted=0)",
-              [t.id, offset],
-            ),
-            {
-              sql: "INSERT INTO body_value_chunks VALUES(?,?,?)",
-              params: [t.id, offset, chunk],
-            },
-            {
-              sql: "UPDATE body_values SET offset=? WHERE id=?",
-              params: [offset + chunk.length, t.id],
-            },
-          ]);
-          return { nextOffset: offset + chunk.length };
-        } finally {
-          releaseUnit();
-        }
-      });
+        }),
+      );
     },
     seal(t) {
-      return run(async () => {
-        const v = await row(t);
-        if (v.sealed) return sealed(t.binding, v);
-        if (v.offset !== v.bytes) throw new Error("workspace_value_incomplete");
-        // Own a bounded verification window before reading a single chunk.
-        const lease = await runtimeAdmission.acquire(
-          t.binding.operation,
-          chunkCapacity * 6 + 2048,
-        );
-        try {
-          const hash = sha256.create(),
-            decoder =
-              v.encoding === "utf8"
-                ? new TextDecoder("utf-8", { fatal: true })
-                : null;
-          let at = 0;
-          while (at < v.bytes) {
-            const c = (
-              await db.query<{ body: Uint8Array }>(
-                "SELECT body FROM body_value_chunks WHERE value_id=? AND offset=?",
-                [t.id, at],
-              )
-            )[0];
-            if (!c || c.body.length === 0)
-              throw new Error("workspace_chunk_missing");
-            hash.update(c.body);
-            decoder?.decode(c.body, { stream: true });
-            at += c.body.length;
+      return reported(
+        t.binding,
+        t.id,
+        "seal",
+        run(async () => {
+          const v = await row(t);
+          if (v.sealed) return sealed(t.binding, v);
+          if (v.offset !== v.bytes)
+            throw new Error("workspace_value_incomplete");
+          // Own a bounded verification window before reading a single chunk.
+          const lease = await runtimeAdmission.acquire(
+            t.binding.operation,
+            chunkCapacity * 6 + 2048,
+          );
+          try {
+            const hash = sha256.create(),
+              decoder =
+                v.encoding === "utf8"
+                  ? new TextDecoder("utf-8", { fatal: true })
+                  : null;
+            let at = 0;
+            while (at < v.bytes) {
+              const chunk = await valueChunk(db, t.id, at, chunkCapacity);
+              hash.update(chunk);
+              decoder?.decode(chunk, { stream: true });
+              at += chunk.length;
+            }
+            decoder?.decode();
+            if (at !== v.bytes || hex(hash.digest()) !== v.digest)
+              throw new Error("workspace_value_digest");
+            await workspaceAttempt(db, t.binding, t.id, "seal", [
+              ...workspaceGuard(t.binding),
+              workspaceAssert(
+                "EXISTS(SELECT 1 FROM body_values WHERE id=? AND offset=bytes AND aborted=0)",
+                [t.id],
+              ),
+              {
+                sql: "UPDATE body_values SET sealed=1 WHERE id=?",
+                params: [t.id],
+              },
+            ]);
+            return sealed(t.binding, v);
+          } finally {
+            await lease.release();
           }
-          decoder?.decode();
-          if (at !== v.bytes || hex(hash.digest()) !== v.digest)
-            throw new Error("workspace_value_digest");
-          await db.batch([
-            ...workspaceGuard(t.binding),
-            workspaceAssert(
-              "EXISTS(SELECT 1 FROM body_values WHERE id=? AND offset=bytes AND aborted=0)",
-              [t.id],
-            ),
-            {
-              sql: "UPDATE body_values SET sealed=1 WHERE id=?",
-              params: [t.id],
-            },
-          ]);
-          return sealed(t.binding, v);
-        } finally {
-          await lease.release();
-        }
-      });
+        }),
+      );
     },
     status(t) {
       return run(async () => {
@@ -221,16 +273,13 @@ export function createSqlWorkspaceValues(
             v.encoding !== t.encoding
           )
             throw new Error("workspace_value_token");
-          const c = (
-            await db.query<{ body: Uint8Array }>(
-              "SELECT body FROM body_value_chunks WHERE value_id=? AND offset=?",
-              [t.id, offset],
-            )
-          )[0];
-          if (!c && offset !== v.bytes)
+          if (!Number.isSafeInteger(offset) || offset < 0 || offset > v.bytes)
             throw new Error("workspace_chunk_offset");
+          const value =
+            offset === v.bytes
+              ? new Uint8Array()
+              : await valueChunk(db, t.id, offset, chunkCapacity);
           owned = true;
-          const value = c?.body ?? new Uint8Array();
           let released = false;
           return {
             value,

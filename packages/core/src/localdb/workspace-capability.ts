@@ -135,3 +135,16 @@ export interface WorkspaceResourceLedger {
   readonly bC: number | null;
   readonly bT: number | null;
 }
+
+/** Stable persisted identity, independent of caller property insertion order. */
+export const workspaceBindingIdentity = (b: WorkspaceBinding): string =>
+  JSON.stringify([
+    b.owner,
+    b.databaseIncarnation,
+    b.connection,
+    b.generation,
+    b.keyCheck,
+    b.operation,
+    b.expectedHead,
+    b.codecVersion,
+  ]);

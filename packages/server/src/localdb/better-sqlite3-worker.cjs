@@ -152,6 +152,13 @@ const openChecked = (open, expected) => {
     throw error;
   }
 };
+function configureWorkspaceCache(connection) {
+  const cacheKiB = workerData.workspaceCacheKiB ?? 2048;
+  connection.pragma(`cache_size = -${cacheKiB}`);
+  connection.pragma("mmap_size = 0");
+  connection.pragma("temp_store = FILE");
+  connection.pragma("cache_spill = ON");
+}
 if (role === "writer") {
   try {
     if (isFile) {
@@ -177,6 +184,7 @@ if (role === "writer") {
     } else {
       db = new Database(path);
     }
+    configureWorkspaceCache(db);
     cache = createStatementCache(db);
     if (!isFile) db.pragma("locking_mode = EXCLUSIVE");
     // A file database checkpoints its WAL after a write has replied (see
@@ -200,6 +208,7 @@ const openReader = () => {
     () => new Database(path, { readonly: true, fileMustExist: true }),
     identity,
   );
+  configureWorkspaceCache(opened);
   opened.pragma("query_only = ON");
   db = opened;
   cache = createStatementCache(db);

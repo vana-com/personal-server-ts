@@ -152,3 +152,14 @@ export {
   type StagingWorkspaceUnit,
   type WorkspaceValueReader,
 } from "./workspace-consumer.js";
+
+export {
+  WorkspaceOperationError,
+  workspaceAttempts,
+  type WorkspaceAttempt,
+  type WorkspaceFailureReason,
+} from "./workspace-failure.js";
+export {
+  workspaceResourceBudget,
+  type WorkspaceResourceConfig,
+} from "./workspace-resources.js";
