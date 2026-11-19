@@ -1,3 +1,6 @@
+import { stageWorkspaceSeed, promoteWorkspaceSeed } from "./workspace-seed.js";
+import type { LogState } from "./log-state.js";
+import type { LogEntry } from "@opendatalabs/personal-server-ts-stream-sync";
 import { recordWorkspaceFailure } from "./workspace-failure.js";
 import { runtimeAdmission } from "./workspace.js";
 import type {
@@ -35,6 +38,7 @@ export interface WorkspaceUpsert {
   readonly ordinal: number;
   readonly firstSeen: number | null;
   readonly body: ValueToken;
+  readonly source?: ValueToken;
 }
 /** Keep both maxima. The fold consumer owns their comparator and resurrection emission. */
 export interface WorkspaceFoldCell extends WorkspaceRecordKey {
@@ -87,13 +91,29 @@ export const workspaceValueReader = (
   read: (offset, lease) => store.read(token, offset, lease),
 });
 
+/** Order strings by JavaScript UTF-16 code units, including escapes and prefixes. */
+export function foldCellKey(stream: string, pkHash?: string): string {
+  const ordered = (s: string) => {
+    let out = "";
+    for (let i = 0; i < s.length; i++)
+      out += s.charCodeAt(i).toString(16).padStart(4, "0");
+    return out;
+  };
+  return ordered(stream) + "/" + (pkHash === undefined ? "" : ordered(pkHash));
+}
+
 function references<K extends WorkspaceRowKind>(
   kind: K,
   row: WorkspaceRows[K],
 ): readonly ValueToken[] {
   if (kind === "fold" || kind === "seed")
     return (row as WorkspaceFoldCell).upsert
-      ? [(row as WorkspaceFoldCell).upsert!.body]
+      ? [
+          (row as WorkspaceFoldCell).upsert!.body,
+          ...((row as WorkspaceFoldCell).upsert!.source
+            ? [(row as WorkspaceFoldCell).upsert!.source!]
+            : []),
+        ]
       : [];
   if (kind === "streams") return [(row as WorkspaceRows["streams"]).metadata];
   if (kind === "outputs" || kind === "uploads")
@@ -162,11 +182,16 @@ export async function openLogWorkspace(
             const snapshot = JSON.parse(payload) as typeof row;
             const refs = references(kind, snapshot);
             const key =
-              "objectKey" in snapshot
-                ? JSON.stringify([snapshot.objectKey])
-                : "pkHash" in snapshot
-                  ? JSON.stringify([snapshot.stream, snapshot.pkHash])
-                  : JSON.stringify([snapshot.stream]);
+              kind === "fold" || kind === "seed" || kind === "streams"
+                ? foldCellKey(
+                    (snapshot as WorkspaceRecordKey).stream,
+                    (snapshot as WorkspaceRecordKey).pkHash,
+                  )
+                : "objectKey" in snapshot
+                  ? JSON.stringify([snapshot.objectKey])
+                  : "pkHash" in snapshot
+                    ? JSON.stringify([snapshot.stream, snapshot.pkHash])
+                    : JSON.stringify([snapshot.stream]);
             // Validate each sealed reference against durable metadata, including the full
             // binding. Sealed values cannot be aborted while the workspace is active.
             for (const token of refs) {
@@ -208,6 +233,17 @@ export async function openLogWorkspace(
         },
       };
     },
+    async lookup<K extends WorkspaceRowKind>(
+      unit: string,
+      kind: K,
+      key: string,
+      lease: ByteLease,
+    ): Promise<WorkspaceRows[K] | null> {
+      const payload = await storage.lookup(unit, kind, key, lease);
+      return payload === null
+        ? null
+        : (JSON.parse(payload) as WorkspaceRows[K]);
+    },
     cursor<K extends WorkspaceRowKind>(
       kind: K,
     ): BoundedCursor<{ readonly key: string; readonly row: WorkspaceRows[K] }> {
@@ -233,6 +269,13 @@ export async function openLogWorkspace(
         close: cursor.close,
       };
     },
+    stageSeed: (entry: LogEntry, primaryKey: readonly string[]) =>
+      stageWorkspaceSeed(db, binding, entry, primaryKey),
+    promoteSeed: (
+      expected: LogState,
+      target: LogState,
+      controlVersion: number,
+    ) => promoteWorkspaceSeed(db, binding, expected, target, controlVersion),
     transition: storage.transition,
     discard: storage.discard,
     cleanupOne: storage.cleanupOne,

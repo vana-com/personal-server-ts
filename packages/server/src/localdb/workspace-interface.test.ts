@@ -53,8 +53,8 @@ it("typed units validate sealed references and revoke staging aliases after rece
     ),
     lease = await runtimeAdmission.acquire("op", 65536);
   await values.append(writer, 0, bytes, lease);
+  const body = await values.seal(writer, lease);
   await lease.release();
-  const body = await values.seal(writer);
   const unit = await ws.unit("u", "digest", 0);
   if (unit.state !== "staging") throw new Error("expected staging");
   await expect(
@@ -63,12 +63,22 @@ it("typed units validate sealed references and revoke staging aliases after rece
       value: { ...body, id: "missing" },
     }),
   ).rejects.toThrow();
+  const lookupLease = await runtimeAdmission.acquire("op", 2 * 1024 * 1024);
+  expect(
+    await ws.lookup("u", "outputs", JSON.stringify(["o"]), lookupLease),
+  ).toBeNull();
+  await lookupLease.release();
   const pendingStage = unit.stage("outputs", { objectKey: "o", value: body });
   await expect(
     unit.stage("outputs", { objectKey: "other", value: body }),
   ).rejects.toThrow("busy");
   await expect(unit.commit()).rejects.toThrow("busy");
   await pendingStage;
+  const stagedLease = await runtimeAdmission.acquire("op", 2 * 1024 * 1024);
+  expect(
+    await ws.lookup("u", "outputs", JSON.stringify(["o"]), stagedLease),
+  ).toEqual({ objectKey: "o", value: body });
+  await stagedLease.release();
   const receipt = await unit.commit();
   expect(receipt.state).toBe("receipted");
   await expect(
@@ -117,4 +127,90 @@ it("consumer type contract rejects writer/reader confusion and staging a receipt
       .getPreEmitDiagnostics(program)
       .map((d) => ts.flattenDiagnosticMessageText(d.messageText, "\n")),
   ).toEqual([]);
+});
+
+it("seed promotion reads current local rows and atomically validates the original cursor and control revision", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "workspace-seed-"));
+  cleanup.push(() => rm(dir, { recursive: true, force: true }));
+  const db = openBetterSqlite3(join(dir, "db"));
+  cleanup.push(() => db.close());
+  await migrate(db);
+  await db.batch([
+    { sql: "INSERT INTO db_meta VALUES(1,'o','test','d',0,0)" },
+    {
+      sql: "INSERT INTO connections(connection_id,connector,ns,control_state) VALUES('c','test','','active')",
+    },
+    { sql: "INSERT INTO log_state VALUES('c',2,0,'[]',NULL)" },
+  ]);
+  const b: WorkspaceBinding = {
+    owner: "o",
+    databaseIncarnation: "db",
+    connection: "c",
+    generation: 1,
+    keyCheck: "k",
+    operation: "seed",
+    expectedHead: "h",
+    codecVersion: 1,
+  };
+  const ws = await openLogWorkspace(db, b);
+  const expected = { position: 2, base: 0, refs: [], snapshot: null },
+    target = { ...expected, position: 0 };
+  await ws.stageSeed(
+    {
+      kind: "upsert",
+      stream: "s",
+      pkHash: "p",
+      stamp: { o: 1, r: "old" },
+      firstSeen: null,
+      value: { id: 1 },
+    },
+    ["id"],
+  );
+  await ws.stageSeed(
+    {
+      kind: "omitted",
+      stream: "s",
+      pkHash: "gone",
+      stamp: { o: 1, r: "old" },
+      key: [2],
+    },
+    ["id"],
+  );
+  await ws.transition("collect", "folded");
+  // Arrives after seed preparation. Promotion must read this newer observation.
+  await db.batch([
+    {
+      sql: "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES('c','s','p','1',9,'new','{}','hash')",
+    },
+    { sql: "DELETE FROM record_changes" },
+  ]);
+  await expect(ws.promoteSeed(expected, target, 1)).rejects.toThrow();
+  expect(await db.query("SELECT position FROM log_state")).toEqual([
+    { position: 2 },
+  ]);
+  expect(await db.query("SELECT * FROM record_changes")).toEqual([]);
+  await ws.promoteSeed(expected, target, 0);
+  expect(await db.query("SELECT position FROM log_state")).toEqual([
+    { position: 0 },
+  ]);
+  expect(
+    await db.query(
+      "SELECT pk_hash,op,stamp_o,explicit_delete,pk_values FROM record_changes ORDER BY pk_hash",
+    ),
+  ).toEqual([
+    {
+      pk_hash: "gone",
+      op: "remove",
+      stamp_o: 1,
+      explicit_delete: 0,
+      pk_values: "[2]",
+    },
+    {
+      pk_hash: "p",
+      op: "upsert",
+      stamp_o: 9,
+      explicit_delete: 0,
+      pk_values: null,
+    },
+  ]);
 });

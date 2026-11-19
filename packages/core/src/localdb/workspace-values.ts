@@ -13,6 +13,7 @@ import type {
 } from "./workspace-capability.js";
 import {
   bindingIdentity,
+  checkLease,
   ownLease,
   runtimeAdmission,
   workspaceGuard,
@@ -199,7 +200,7 @@ export function createSqlWorkspaceValues(
         }),
       );
     },
-    seal(t) {
+    seal(t, borrowedLease) {
       return reported(
         t.binding,
         t.id,
@@ -210,10 +211,13 @@ export function createSqlWorkspaceValues(
           if (v.offset !== v.bytes)
             throw new Error("workspace_value_incomplete");
           // Own a bounded verification window before reading a single chunk.
-          const lease = await runtimeAdmission.acquire(
-            t.binding.operation,
-            chunkCapacity * 6 + 2048,
-          );
+          const lease =
+            borrowedLease ??
+            (await runtimeAdmission.acquire(
+              t.binding.operation,
+              chunkCapacity * 6 + 2048,
+            ));
+          checkLease(lease, t.binding.operation, chunkCapacity * 6 + 2048);
           try {
             const hash = sha256.create(),
               decoder =
@@ -243,7 +247,7 @@ export function createSqlWorkspaceValues(
             ]);
             return sealed(t.binding, v);
           } finally {
-            await lease.release();
+            if (!borrowedLease) await lease.release();
           }
         }),
       );

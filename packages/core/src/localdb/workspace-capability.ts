@@ -110,7 +110,7 @@ export interface BoundedValueStore {
     lease: ByteLease,
   ): Promise<{ readonly nextOffset: number }>;
   /** Atomic immutable seal only after length, digest and declared encoding validation; no visible rows yet. */
-  seal(token: ValueWriterToken): Promise<ValueToken>;
+  seal(token: ValueWriterToken, lease?: ByteLease): Promise<ValueToken>;
   /** Lost append/seal replies query durable status using a fixed-size response. */
   status(
     token: ValueWriterToken,

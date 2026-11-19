@@ -276,6 +276,27 @@ export async function openWorkspace(db: SqlDriver, b: WorkspaceBinding) {
         "promote",
       );
     },
+    async lookup(
+      unit: string,
+      relation: WorkspaceRelation,
+      key: string,
+      lease: ByteLease,
+    ) {
+      const release = ownLease(lease, b.operation, 64 * 1024 * 24);
+      try {
+        await db.batch(workspaceGuard(b));
+        const row = (
+          await db.query<{ payload: string }>(
+            `SELECT payload FROM workspace_stage WHERE operation=? AND unit=? AND relation=? AND key=?
+           UNION ALL SELECT payload FROM workspace_cells WHERE operation=? AND relation=? AND key=? LIMIT 1`,
+            [b.operation, unit, relation, key, b.operation, relation, key],
+          )
+        )[0];
+        return row?.payload ?? null;
+      } finally {
+        release();
+      }
+    },
     cursor(relation: WorkspaceRelation): BoundedCursor<WorkspaceCell> {
       let after: string | null = null,
         owned = false,
@@ -395,19 +416,22 @@ export async function openWorkspace(db: SqlDriver, b: WorkspaceBinding) {
       if (!["aborted", "finished", "clean"].includes(phase ?? ""))
         throw new Error("workspace_live_cleanup");
       for (const table of [
+        "workspace_seed",
         "workspace_stage",
         "workspace_cells",
         "workspace_receipts",
         "workspace_attempts",
       ]) {
         const keys =
-          table === "workspace_stage"
-            ? ["unit", "relation", "key"]
-            : table === "workspace_cells"
-              ? ["relation", "key"]
-              : table === "workspace_attempts"
-                ? ["unit", "action"]
-                : ["unit"];
+          table === "workspace_seed"
+            ? ["stream", "pk_hash"]
+            : table === "workspace_stage"
+              ? ["unit", "relation", "key"]
+              : table === "workspace_cells"
+                ? ["relation", "key"]
+                : table === "workspace_attempts"
+                  ? ["unit", "action"]
+                  : ["unit"];
         const row = (
           await db.query<Record<string, string>>(
             `SELECT ${keys.join(",")} FROM ${table} WHERE operation=? ORDER BY ${keys.join(",")} LIMIT 1`,
