@@ -329,6 +329,265 @@ describe("createPsLiteRuntime", () => {
       vi.unstubAllGlobals();
     });
 
+    it("uses host activity instead of a hidden document", () => {
+      pageStub("hidden");
+      const syncManager = managerStub();
+      const activity = { isActive: () => true, subscribe: () => () => {} };
+      const runtime = createTestRuntime({
+        active: false,
+        syncManager,
+        activity,
+      });
+      runtime.activate();
+      expect(syncManager.pause).not.toHaveBeenCalled();
+      runtime.deactivate();
+    });
+
+    it("pauses for inactive host activity even when the document is visible", () => {
+      pageStub();
+      const syncManager = managerStub();
+      const activity = { isActive: () => false, subscribe: () => () => {} };
+      const runtime = createTestRuntime({
+        active: false,
+        syncManager,
+        activity,
+      });
+      runtime.activate();
+      expect(syncManager.pause).toHaveBeenCalledTimes(1);
+      runtime.deactivate();
+    });
+
+    it("subscribes before reading and resumes before pulling on activity transitions", () => {
+      pageStub();
+      const syncManager = managerStub();
+      let active = true;
+      let notify = () => {};
+      const activity = {
+        isActive: () => active,
+        subscribe: (callback: () => void) => {
+          notify = callback;
+          active = false;
+          return () => {};
+        },
+      };
+      const runtime = createTestRuntime({
+        active: false,
+        syncManager,
+        activity,
+      });
+      runtime.activate();
+      expect(syncManager.pause).toHaveBeenCalledTimes(1);
+      active = true;
+      notify();
+      notify();
+      expect(syncManager.resume).toHaveBeenCalledTimes(1);
+      expect(syncManager.requestPull).toHaveBeenCalledTimes(1);
+      expect(syncManager.resume.mock.invocationCallOrder[0]).toBeLessThan(
+        syncManager.requestPull.mock.invocationCallOrder[0]!,
+      );
+      runtime.deactivate();
+    });
+
+    it("replaces subscriptions on reactivation and ignores late callbacks after deactivation", () => {
+      pageStub();
+      const syncManager = managerStub();
+      let active = false;
+      const callbacks: Array<() => void> = [];
+      const unsubscribe = vi.fn();
+      const activity = {
+        isActive: () => active,
+        subscribe: (callback: () => void) => {
+          callbacks.push(callback);
+          return unsubscribe;
+        },
+      };
+      const runtime = createTestRuntime({
+        active: false,
+        syncManager,
+        activity,
+      });
+      runtime.activate();
+      runtime.activate();
+      expect(unsubscribe).toHaveBeenCalledTimes(1);
+      active = true;
+      callbacks[0]!();
+      expect(syncManager.resume).not.toHaveBeenCalled();
+      callbacks[1]!();
+      expect(syncManager.resume).toHaveBeenCalledTimes(1);
+      runtime.deactivate();
+      expect(unsubscribe).toHaveBeenCalledTimes(2);
+      active = false;
+      callbacks[1]!();
+      active = true;
+      callbacks[1]!();
+      expect(syncManager.resume).toHaveBeenCalledTimes(1);
+      expect(runtime.isAvailable()).toBe(false);
+    });
+
+    it("resumes a previously paused manager when reactivated with active host", () => {
+      pageStub();
+      const syncManager = managerStub();
+      let active = false;
+      const activity = { isActive: () => active, subscribe: () => () => {} };
+      const runtime = createTestRuntime({
+        active: false,
+        syncManager,
+        activity,
+      });
+      runtime.activate();
+      active = true;
+      runtime.activate();
+      expect(syncManager.resume).toHaveBeenCalledTimes(1);
+      runtime.deactivate();
+    });
+
+    it("pauses and retains cleanup when the initial activity read throws", () => {
+      const { win } = pageStub();
+      const syncManager = managerStub();
+      const unsubscribe = vi.fn();
+      let notify = () => {};
+      const activity = {
+        isActive: () => {
+          throw new Error("read failed");
+        },
+        subscribe: (callback: () => void) => {
+          notify = callback;
+          return unsubscribe;
+        },
+      };
+      const runtime = createTestRuntime({
+        active: false,
+        syncManager,
+        activity,
+      });
+      expect(() => runtime.activate()).not.toThrow();
+      expect(syncManager.pause).toHaveBeenCalledTimes(1);
+      runtime.deactivate();
+      expect(unsubscribe).toHaveBeenCalledTimes(1);
+      expect(syncManager.stop).toHaveBeenCalledTimes(1);
+      expect(() => notify()).not.toThrow();
+      win.dispatchEvent(new Event("focus"));
+      expect(syncManager.requestPull).not.toHaveBeenCalled();
+    });
+
+    it("treats a failed activity callback read as inactive and recovers", () => {
+      pageStub();
+      const syncManager = managerStub();
+      let fail = false;
+      let notify = () => {};
+      const activity = {
+        isActive: () => {
+          if (fail) throw new Error("read failed");
+          return true;
+        },
+        subscribe: (callback: () => void) => {
+          notify = callback;
+          return () => {};
+        },
+      };
+      const runtime = createTestRuntime({
+        active: false,
+        syncManager,
+        activity,
+      });
+      runtime.activate();
+      syncManager.resume.mockClear();
+      fail = true;
+      expect(() => notify()).not.toThrow();
+      expect(syncManager.pause).toHaveBeenCalledTimes(1);
+      fail = false;
+      notify();
+      expect(syncManager.resume).toHaveBeenCalledTimes(1);
+      expect(syncManager.requestPull).toHaveBeenCalledTimes(1);
+      runtime.deactivate();
+    });
+
+    it("pauses and ignores callbacks when activity subscription throws", () => {
+      pageStub();
+      const syncManager = managerStub();
+      let notify = () => {};
+      const activity = {
+        isActive: () => true,
+        subscribe: (callback: () => void): (() => void) => {
+          notify = callback;
+          throw new Error("subscription failed");
+        },
+      };
+      const runtime = createTestRuntime({
+        active: false,
+        syncManager,
+        activity,
+      });
+      expect(() => runtime.activate()).not.toThrow();
+      expect(syncManager.pause).toHaveBeenCalledTimes(1);
+      notify();
+      expect(syncManager.resume).not.toHaveBeenCalled();
+      runtime.deactivate();
+      expect(syncManager.stop).toHaveBeenCalledTimes(1);
+    });
+
+    it("cleans up on deactivate when activity unsubscribe throws", () => {
+      const { win } = pageStub();
+      const syncManager = managerStub();
+      let notify = () => {};
+      let active = false;
+      const activity = {
+        isActive: () => active,
+        subscribe: (callback: () => void) => {
+          notify = callback;
+          return () => {
+            throw new Error("unsubscribe failed");
+          };
+        },
+      };
+      const runtime = createTestRuntime({
+        active: false,
+        syncManager,
+        activity,
+      });
+      runtime.activate();
+      expect(() => runtime.deactivate()).not.toThrow();
+      expect(runtime.isAvailable()).toBe(false);
+      expect(syncManager.stop).toHaveBeenCalledTimes(1);
+      active = true;
+      notify();
+      win.dispatchEvent(new Event("focus"));
+      expect(syncManager.resume).not.toHaveBeenCalled();
+      expect(syncManager.requestPull).not.toHaveBeenCalled();
+    });
+
+    it("replaces listeners on reactivate when activity unsubscribe throws", () => {
+      const { win } = pageStub();
+      const syncManager = managerStub();
+      const callbacks: Array<() => void> = [];
+      let active = false;
+      const activity = {
+        isActive: () => active,
+        subscribe: (callback: () => void) => {
+          callbacks.push(callback);
+          return () => {
+            throw new Error("unsubscribe failed");
+          };
+        },
+      };
+      const runtime = createTestRuntime({
+        active: false,
+        syncManager,
+        activity,
+      });
+      runtime.activate();
+      expect(() => runtime.activate()).not.toThrow();
+      expect(callbacks).toHaveLength(2);
+      active = true;
+      callbacks[0]!();
+      expect(syncManager.resume).not.toHaveBeenCalled();
+      callbacks[1]!();
+      expect(syncManager.resume).toHaveBeenCalledTimes(1);
+      win.dispatchEvent(new Event("focus"));
+      expect(syncManager.requestPull).toHaveBeenCalledTimes(2);
+      expect(() => runtime.deactivate()).not.toThrow();
+    });
+
     it("a visibility change to visible and a focus each ask the manager for one pull", () => {
       const { doc, win } = pageStub();
       const syncManager = managerStub();

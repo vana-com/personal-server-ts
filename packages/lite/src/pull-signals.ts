@@ -49,6 +49,14 @@ export function startPullSignals(
   };
 }
 
+/** Host activity controls sync only; it does not activate the service. */
+export interface PsLiteActivitySource {
+  /** Return the current aggregate activity. */
+  isActive(): boolean;
+  /** Notify after the value changes; return a function that unsubscribes. */
+  subscribe(onChange: () => void): () => void;
+}
+
 export interface VisibilityPausable {
   pause?: () => void;
   resume?: () => void;
@@ -66,11 +74,62 @@ export interface VisibilityPausable {
  */
 export function startVisibilityPause(
   manager: VisibilityPausable,
-  sources: Pick<PullSignalSources, "document"> = {
+  sources: Pick<PullSignalSources, "document"> & {
+    activity?: PsLiteActivitySource;
+    onActive?: () => void;
+  } = {
     document: (globalThis as { document?: PullSignalSources["document"] })
       .document,
   },
 ): () => void {
+  if (sources.activity) {
+    const activity = sources.activity;
+    let disposed = false;
+    let previous: boolean | undefined;
+    let unsubscribe: (() => void) | undefined;
+    const stop = () => {
+      disposed = true;
+      try {
+        unsubscribe?.();
+      } catch {
+        // Host cleanup must not interrupt runtime shutdown.
+      }
+    };
+    const apply = () => {
+      if (disposed) return;
+      let active = false;
+      try {
+        active = activity.isActive();
+      } catch {
+        // An unreadable activity source is inactive until it recovers.
+      }
+      if (active === previous) return;
+      const wasActive = previous;
+      previous = active;
+      try {
+        if (!active) manager.pause?.();
+        else {
+          manager.resume?.();
+          if (wasActive === false) sources.onActive?.();
+        }
+      } catch {
+        // A manager that refuses is not the host's problem.
+      }
+    };
+    try {
+      unsubscribe = activity.subscribe(apply);
+    } catch {
+      stop();
+      try {
+        manager.pause?.();
+      } catch {
+        // A manager that refuses is not the host's problem.
+      }
+      return stop;
+    }
+    apply();
+    return stop;
+  }
   const doc = sources.document;
   if (!doc) return () => {};
   const apply = () => {
