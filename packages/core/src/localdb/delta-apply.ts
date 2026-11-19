@@ -3,7 +3,8 @@
 // its log row comes from the listing. A delta already carries changed rows.
 //
 // Decide every connection before applying any. Tombstones save the control
-// row and purge; logs of active connections apply through the supplied row.
+// row and purge; logs apply through the supplied row. A complete first-create
+// pair can establish a connection this device has never held.
 // A reconnect, unsupported row, partial apply, delete intent, or incomplete
 // apply hands back to the cycle. Every successful apply then runs the cycle's
 // publisher before settling.
@@ -103,12 +104,39 @@ export async function applyRegistryDelta(
   // Decide every connection before any is applied: one that only the cycle
   // can take hands the whole delta back with nothing written.
   const deletes: { id: string; rows: ConnectionRows; read: ControlRead }[] = [];
-  const logs: { id: string; rows: ConnectionRows; read: ControlRead }[] = [];
+  const logs: {
+    id: string;
+    rows: ConnectionRows;
+    read: ControlRead;
+    generation: number;
+    create?: ControlRead;
+  }[] = [];
   for (const [id, rows] of byConnection) {
     const local = held.get(id);
     let deleted: boolean;
     if (rows.control) {
       const state = classifyControl(rows.control, hashes);
+      // Only a complete first lifetime can establish an unknown connection.
+      // The host proves continuity from its clean baseline; a delta is not an
+      // owner inventory. Coalesced reconnects and locally held tombstones still
+      // need the cycle, even when both rows appear in this answer.
+      if (
+        state.kind === "active" &&
+        state.generation === 1 &&
+        local === undefined &&
+        rows.log &&
+        classifyStreamRow(rows.log, hashes) === "present" &&
+        BigInt(delta.seq) > BigInt(delta.since)
+      ) {
+        logs.push({
+          id,
+          rows,
+          read: rows.log,
+          generation: state.generation,
+          create: rows.control,
+        });
+        continue;
+      }
       if (state.kind === "deleted") deleted = true;
       else if (
         state.kind === "active" &&
@@ -128,7 +156,7 @@ export async function applyRegistryDelta(
       return cycle("a log of a connection not held here");
     if (classifyStreamRow(rows.log, hashes) !== "present")
       return cycle("a log row was deleted");
-    logs.push({ id, rows, read: rows.log });
+    logs.push({ id, rows, read: rows.log, generation: local.generation });
   }
 
   const timed = timedBlobs(deps.blobs);
@@ -144,9 +172,25 @@ export async function applyRegistryDelta(
         applyDelete(insideQueue(deps, id), id, rows, read, hashes),
       ),
     ),
-    ...logs.map(({ id, rows, read }) =>
+    ...logs.map(({ id, rows, read, generation, create }) =>
       deps.queue.run(id, "end", async () => {
-        const generation = held.get(id)!.generation;
+        if (create) {
+          if (await deleteIntent(deps, rows.connector)) return false;
+          // Intake or deletion may have acquired this queue after the decision.
+          // Any local lifetime now present belongs to reconciliation.
+          const present = await deps.db.query(
+            "SELECT 1 FROM connections WHERE connection_id = ?",
+            [id],
+          );
+          if (present.length > 0) return false;
+          await saveControl(
+            insideQueue(deps, id),
+            rows.connector,
+            rows.ns,
+            create,
+            hashes,
+          );
+        }
         if (
           !(await liveAt(deps, id, generation)) ||
           (await deleteIntent(deps, rows.connector))
