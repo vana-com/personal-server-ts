@@ -1276,8 +1276,11 @@ export function createPsLiteRuntime(
         ? startPullSignals(requestPull)
         : undefined;
       stopPullSignals = () => {
-        stopVisibility?.();
-        stopPulls?.();
+        try {
+          stopVisibility?.();
+        } finally {
+          stopPulls?.();
+        }
       };
       options.derivatives?.scheduler.start();
       options.replication?.resume();

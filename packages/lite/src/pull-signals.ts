@@ -86,9 +86,23 @@ export function startVisibilityPause(
     const activity = sources.activity;
     let disposed = false;
     let previous: boolean | undefined;
+    let unsubscribe: (() => void) | undefined;
+    const stop = () => {
+      disposed = true;
+      try {
+        unsubscribe?.();
+      } catch {
+        // Host cleanup must not interrupt runtime shutdown.
+      }
+    };
     const apply = () => {
       if (disposed) return;
-      const active = activity.isActive();
+      let active = false;
+      try {
+        active = activity.isActive();
+      } catch {
+        // An unreadable activity source is inactive until it recovers.
+      }
       if (active === previous) return;
       const wasActive = previous;
       previous = active;
@@ -102,12 +116,19 @@ export function startVisibilityPause(
         // A manager that refuses is not the host's problem.
       }
     };
-    const unsubscribe = activity.subscribe(apply);
+    try {
+      unsubscribe = activity.subscribe(apply);
+    } catch {
+      stop();
+      try {
+        manager.pause?.();
+      } catch {
+        // A manager that refuses is not the host's problem.
+      }
+      return stop;
+    }
     apply();
-    return () => {
-      disposed = true;
-      unsubscribe();
-    };
+    return stop;
   }
   const doc = sources.document;
   if (!doc) return () => {};
