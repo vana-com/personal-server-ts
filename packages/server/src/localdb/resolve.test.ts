@@ -1530,3 +1530,23 @@ describe("local resolve through the host's real legacy alias port", () => {
     expect(verdict(await readOf(resolver))).toBe("deleted");
   });
 });
+
+it("never charges keyed first-load rows before their pending publication", async () => {
+  const f = await fixture();
+  await f.connection();
+  await f.head();
+  await f.record("items", "keyed-row");
+  await f.db.batch([
+    {
+      sql: "INSERT INTO log_state(connection_id,position,base,refs,snapshot) VALUES ('c1',0,0,'[]',NULL)",
+    },
+    {
+      sql: "INSERT INTO log_keyed_pending(connection_id,position,base,refs) VALUES ('c1',1,0,'[]')",
+    },
+  ]);
+  // The registry fixture cannot publish, and apply is held at this partial
+  // local image. The resolver must not sign the stream's installed counter.
+  expect(
+    await f.resolver.resolve(input(undefined, { requireRegistered: true })),
+  ).toMatchObject({ kind: "read_not_registered" });
+});

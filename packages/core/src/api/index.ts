@@ -1,3 +1,4 @@
+import { gatewayPaymentReasonCode } from "../payment/x402.js";
 import { decodeBase64UrlUtf8 } from "../encoding/base64url.js";
 import type { LocalListing } from "../localdb/listing.js";
 import { isOwnAppRead } from "../payment/own-app.js";
@@ -788,6 +789,17 @@ function legacyMutationRefusal(mode: AccountMode): Response | undefined {
 /** The response for a stream-sync decision that serves nothing; `null` otherwise. */
 function streamSyncRefusal(decision: ReadDecision): Response | null {
   switch (decision.kind) {
+    case "read_not_registered":
+      return jsonResponse(
+        {
+          error: {
+            code: 503,
+            errorCode: "READ_NOT_REGISTERED",
+            message: "This data has not been registered; retry the read",
+          },
+        },
+        { status: 503, headers: { "Retry-After": "5" } },
+      );
     case "invalid_binding":
       return errorResponse(
         503,
@@ -1410,7 +1422,7 @@ export type X402CycleResult =
  *   X-PAYMENT valid, forward to gateway succeeds
  *     → ok: caller proceeds to read the data
  *   X-PAYMENT valid, gateway returns 4xx/5xx
- *     → gateway-error: relay the gateway's body verbatim so the builder
+ *     → gateway-error: preserve the gateway's error fields with safe diagnostics so the builder
  *       can dispatch (insufficient balance vs. replay vs. race etc.)
  *
  * The gateway POST goes through `fetch` directly (not `gateway.payForOperation`)
@@ -1442,8 +1454,8 @@ export async function handleX402Cycle(
   }
 
   // Bind the accessRecord to the entry being served, if it exists and has
-  // been registered with DPv2 yet. A served stream head is registered: it
-  // was listed from the registry.
+  // been registered with DPv2 yet. Paid database views supply the log
+  // identity whose accepted fold the resolver checked before selecting it.
   const entryRow = input.servedEntry
     ? undefined
     : deps.storage.findEntry({
@@ -1584,20 +1596,37 @@ export async function handleX402Cycle(
     errorBody = { error: gatewayRes.statusText };
   }
 
+  const reasonCode = gatewayPaymentReasonCode(errorBody);
+  deps.logger?.info?.(
+    { scope, grantId: opIdLower, status: gatewayRes.status, reasonCode },
+    "Gateway rejected X-PAYMENT",
+  );
+
   // 409 (replay or race) and 400 (amount mismatch / shape error) are
   // recoverable with a fresh challenge — the builder re-signs with the
-  // new state and retries. 402 (insufficient balance) is relayed verbatim
+  // new state and retries. 402 (insufficient balance) retains its error fields
   // because the builder needs to fix their escrow, not their signature.
   // 5xx is treated like 402-relayed since the personal server can't
   // distinguish "transient" from "permanent" without more info.
   if (gatewayRes.status === 409 || gatewayRes.status === 400) {
-    deps.logger?.info?.(
-      { scope, grantId: opIdLower, status: gatewayRes.status, errorBody },
-      "Gateway rejected X-PAYMENT; reissuing X402 challenge",
-    );
-    return { kind: "challenge", body: await buildFreshChallenge() };
+    return {
+      kind: "challenge",
+      body: {
+        ...(await buildFreshChallenge()),
+        gatewayStatus: gatewayRes.status,
+        gatewayReasonCode: reasonCode,
+      },
+    };
   }
-  return { kind: "gateway-error", status: gatewayRes.status, body: errorBody };
+  return {
+    kind: "gateway-error",
+    status: gatewayRes.status,
+    body: {
+      ...(errorBody && typeof errorBody === "object" ? errorBody : {}),
+      gatewayStatus: gatewayRes.status,
+      gatewayReasonCode: reasonCode,
+    },
+  };
 }
 
 const pendingIngestStamps = new WeakMap<
@@ -3345,12 +3374,19 @@ export async function handlePersonalServerDataRequest(
             "STREAM_HISTORY_UNAVAILABLE",
             "Older versions are not available",
           );
+        const ownApp = await ownAppReadStatus(deps, authResult);
+        const charge =
+          ownApp instanceof Response
+            ? null
+            : readCharge(deps, scopeResult.scope, authResult, ownApp);
         const decision = await deps.streamSyncRead.resolve({
           scope: scopeResult.scope,
           connection: url.searchParams.get("connection"),
           cursor: url.searchParams.get("cursor"),
           legacyFile: false,
           isOwnerView: isOwnerView(authResult),
+          requireRegistered: charge !== null,
+          signal: request.signal,
         });
         if (decision.kind === "local_pending") {
           await decision.body.cancel();
@@ -3387,25 +3423,18 @@ export async function handlePersonalServerDataRequest(
           );
         }
         if (decision.kind === "view") {
+          if (ownApp instanceof Response) {
+            await decision.body.cancel();
+            return ownApp;
+          }
           notifyDataRead(deps, { scope: scopeResult.scope });
           // The same charge as a file read; the access record binds the
-          // stream head the view serves.
+          // accepted log position covering the view.
           let paymentResponseHeader: string | undefined;
           // An owner-only view with no registered head has nothing to
           // charge against: the service serves it to the owner alone.
           if (decision.served !== null) {
             const served = decision.served;
-            const ownApp = await ownAppReadStatus(deps, authResult);
-            if (ownApp instanceof Response) {
-              await decision.body.cancel();
-              return ownApp;
-            }
-            const charge = readCharge(
-              deps,
-              scopeResult.scope,
-              authResult,
-              ownApp,
-            );
             if (charge) {
               let paid: Awaited<ReturnType<typeof payForRead>>;
               try {
