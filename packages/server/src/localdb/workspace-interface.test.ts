@@ -146,6 +146,8 @@ it("consumer type contract rejects writer/reader confusion and staging a receipt
  receipt.stage('fold',{});
  // @ts-expect-error fold rows require both independent maxima and a key
  staging.stage('fold',{value:sealed});
+ // @ts-expect-error an unpublished completion must remain false
+ staging.stage('publication',{stream:'s',watermark:1,complete:true,published:false,completesAfterPublish:true,from:null,to:null});
  `,
   );
   const program = ts.createProgram([path], {

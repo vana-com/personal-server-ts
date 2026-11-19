@@ -39,6 +39,28 @@ export function workspaceGuard(b: WorkspaceBinding): SqlStatement[] {
 }
 export const workspaceAssert = assert;
 
+/** Local observed binding, not evidence that a remote publication landed. */
+export async function readWorkspaceAuthority(
+  db: SqlDriver,
+  connection: string,
+) {
+  const [row] = await db.query<{
+    incarnation: string;
+    key_check: string;
+    head: string;
+  }>(
+    "SELECT incarnation,key_check,head FROM workspace_authority WHERE connection=?",
+    [connection],
+  );
+  return row
+    ? {
+        databaseIncarnation: row.incarnation,
+        keyCheck: row.key_check,
+        expectedHead: row.head,
+      }
+    : null;
+}
+
 /** Trusted host must update this alongside a newly observed key/incarnation/head.
  * This does not contact or authorize a remote registry. Connection deletion and
  * generation are additionally checked against canonical state in every write.
@@ -75,6 +97,10 @@ export function checkLease(
     bytes > lease.capacityBytes
   )
     throw new Error("workspace_admission");
+}
+export function assertNoOwnedUnit(operation: string): void {
+  if (current?.operation === operation && activeLeases.get(current)?.owned)
+    throw new Error("workspace_unit_owned");
 }
 /** Reserve the sole unit before reading/allocating; release the unit before its lease. */
 export function ownLease(
@@ -150,6 +176,7 @@ export type WorkspaceRelation =
   | "fold"
   | "streams"
   | "changes"
+  | "replacement-membership"
   | "replacement"
   | "publication"
   | "membership"
