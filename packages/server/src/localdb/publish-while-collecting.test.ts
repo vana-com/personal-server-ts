@@ -758,19 +758,19 @@ it("after a restart a newer run's delete still beats the orphan's late rows", as
   expect(await again.keys()).toEqual([]);
 });
 
-it("a restart with the flag off leaves a run that never admitted exactly as it was", async () => {
+it("a restart with the flag off ends a run that never admitted", async () => {
   const { a, restart } = await world(false, "checkpoint_window");
   await a.begin("orphan", { observedAt: 1200 });
   await a.batch("orphan", 0, ["staged"]);
-  const read = () =>
-    a.query(
-      "SELECT r.state, (SELECT COUNT(*) FROM run_rows w WHERE w.run_id = r.run_id) AS staged FROM runs r WHERE r.run_id = 'orphan'",
-    );
-  const before = await read();
   const again = await restart(a, false);
   await again.begin("fresh", { observedAt: 4000 });
-  expect(await read()).toEqual(before);
-  expect(before).toEqual([{ state: "collecting", staged: 1 }]);
+  expect(
+    await again.query(
+      "SELECT r.state, (SELECT COUNT(*) FROM run_rows w WHERE w.run_id = r.run_id) AS staged FROM runs r WHERE r.run_id = 'orphan'",
+    ),
+  ).toEqual([{ state: "ended", staged: 0 }]);
+  expect(await again.keys()).toEqual([]);
+  expect(await again.end("orphan", 0)).toMatchObject({ result: "aborted" });
 });
 
 it("a restart with the flag off still ends a run that admitted while the flag was on", async () => {

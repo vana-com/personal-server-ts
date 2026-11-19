@@ -56,9 +56,7 @@ export interface RunEndStore {
    * live in memory, so when a sync starts nothing can end them. Read once, at
    * start, before any run of this sync begins: a later read would also return
    * live runs. The host holds the database exclusively (`LiteDatabasePort`),
-   * so no live run of another sync shares it. With the flag off only runs that
-   * admitted their batches count (`runs.admitting`, set while it was on): they
-   * hold tombstones back. A flag-off run stays exactly as it was.
+   * so no live run of another sync shares it.
    */
   orphans(): Promise<string[]>;
   /**
@@ -692,8 +690,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
     },
     async orphans() {
       const rows = await db.query<{ run_id: string }>(
-        "SELECT run_id FROM runs WHERE state = 'collecting' AND (admitting = 1 OR ? = 1) ORDER BY o, run_id",
-        [deps.publishWhileCollecting === true ? 1 : 0],
+        "SELECT run_id FROM runs WHERE state = 'collecting' ORDER BY o, run_id",
       );
       return rows.map((row) => row.run_id);
     },
