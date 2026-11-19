@@ -165,6 +165,13 @@ export class AmbiguousRegistryReplyError extends Error {
   }
 }
 
+/** The gateway asked the client to pause; this is not a feed reset. */
+export class RegistryOverloadError extends Error {
+  constructor(readonly retryAfterMs: number) {
+    super("registry overloaded");
+  }
+}
+
 /**
  * The registry could not be reached or did not answer: a network failure, a
  * timeout or a 5xx. Nothing says the request was refused or that the data is
