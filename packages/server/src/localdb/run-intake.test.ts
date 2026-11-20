@@ -314,8 +314,9 @@ it("filters full-stream cursors and pins basis/deletion snapshots at begin", asy
       "SELECT basis_version,delete_snapshot FROM run_streams WHERE run_id='next' AND stream='items'",
     ),
   ).toEqual([{ basis_version: 1, delete_snapshot: 0 }]);
+  // The head's rows hold stamp 100, so a run with an older `observedAt` starts at it.
   expect(await f.db.query("SELECT o FROM runs WHERE run_id='next'")).toEqual([
-    { o: 40 },
+    { o: 100 },
   ]);
 });
 

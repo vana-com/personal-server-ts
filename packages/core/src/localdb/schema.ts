@@ -684,4 +684,11 @@ END`,
     // be acknowledged; the acknowledgement clears only the write it carried.
     `ALTER TABLE stream_state ADD COLUMN cursor_write INTEGER NOT NULL DEFAULT 0`,
   ],
+  [
+    // The newest stamp (`o`, then `r`) a connection's log tombstones hold, which a run's start
+    // stamp is raised above (`clampRunStart` in admit.ts). The tombstones of a
+    // connection are kept until it is purged, so without this the read is a
+    // scan of all of them at every begin.
+    `CREATE INDEX log_tombstones_by_stamp ON log_tombstones(connection_id, stamp_o, stamp_r)`,
+  ],
 ];

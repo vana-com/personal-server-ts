@@ -328,20 +328,69 @@ export function compactTombstones(connectionId: string): SqlStatement[] {
 }
 
 /**
- * Raise a new run's `o` until its stamp `(o, run_id)` is above the connection's
- * watermark. A tombstone below the watermark is gone, so a run that stamped
- * below it (a caller-supplied old `observedAt`) could admit a row back that a
- * newer run deleted. Runs in the begin batch, after the run row is inserted
- * and before compaction counts it.
+ * The newest stamp `(o, r)` this device holds for the run's connection, as at
+ * most one row, none when it holds none. It is every stamp the device can lose
+ * to, each from an indexed read that touches no row body:
+ *   - a row's effective stamp `COALESCE(seen_o, stamp_o)`, from any device's
+ *     segment or this device's runs, newest per stream in `records_by_observation`
+ *     (the streams are found by a skip scan of the key index, so a stream that
+ *     has rows and no `stream_state` row is still read);
+ *   - a delete or omission the log carried (`log_tombstones_by_stamp`);
+ *   - a tombstone an open run needs, and the watermark of those compaction
+ *     dropped;
+ *   - a stream's floor, which refuses a run that starts below it.
+ * An earlier run of this device leaves its stamp in one of these (a row, a
+ * tombstone or a floor) when it changed anything, so it needs no scan of `runs`.
+ */
+const HELD_STAMP = `SELECT o, r FROM (
+        WITH RECURSIVE s(stream) AS (
+          SELECT MIN(stream) FROM records WHERE connection_id = runs.connection_id
+          UNION ALL
+          SELECT (SELECT MIN(stream) FROM records
+                   WHERE connection_id = runs.connection_id AND stream > s.stream)
+            FROM s WHERE s.stream IS NOT NULL)
+        SELECT (SELECT COALESCE(x.seen_o, x.stamp_o) FROM records x
+                 WHERE x.connection_id = runs.connection_id AND x.stream = s.stream
+                 ORDER BY COALESCE(x.seen_o, x.stamp_o) DESC, COALESCE(x.seen_r, x.stamp_r) DESC LIMIT 1) AS o,
+               (SELECT COALESCE(x.seen_r, x.stamp_r) FROM records x
+                 WHERE x.connection_id = runs.connection_id AND x.stream = s.stream
+                 ORDER BY COALESCE(x.seen_o, x.stamp_o) DESC, COALESCE(x.seen_r, x.stamp_r) DESC LIMIT 1) AS r
+          FROM s WHERE s.stream IS NOT NULL
+        UNION ALL SELECT * FROM (SELECT stamp_o, stamp_r FROM log_tombstones
+          WHERE connection_id = runs.connection_id ORDER BY stamp_o DESC, stamp_r DESC LIMIT 1)
+        UNION ALL SELECT * FROM (SELECT stamp_o, stamp_r FROM record_tombstones
+          WHERE connection_id = runs.connection_id ORDER BY stamp_o DESC, stamp_r DESC LIMIT 1)
+        UNION ALL SELECT * FROM (SELECT floor_o, floor_r FROM stream_state
+          WHERE connection_id = runs.connection_id AND floor_o IS NOT NULL
+          ORDER BY floor_o DESC, floor_r DESC LIMIT 1)
+        UNION ALL SELECT tombstone_wm_o, tombstone_wm_r FROM connections
+          WHERE connection_id = runs.connection_id AND tombstone_wm_o IS NOT NULL)
+      WHERE o IS NOT NULL ORDER BY o DESC, r DESC LIMIT 1`;
+
+/**
+ * Raise a new run's `o` until its stamp `(o, run_id)` is above every stamp this
+ * device holds for the connection (`HELD_STAMP`, which includes the tombstone
+ * watermark). This is the one place a run's start stamp is set from local
+ * state; the device clock only proposes it.
+ *
+ * The bound is a hybrid logical clock, `max(clock, held)` with the run id as
+ * the tie-break: a run that begins after this device applied a version never
+ * loses to it because the clock that wrote it ran fast. A tombstone below the
+ * watermark is gone, so a run that stamped below it (a caller-supplied old
+ * `observedAt`) could also admit back a row a newer run deleted. A run that
+ * ties the held stamp keeps `o` when its id sorts after the stamp's, and
+ * starts one above otherwise. A device that holds no newer stamp keeps `o`.
+ *
+ * Runs in the begin batch, after the run row is inserted and before compaction
+ * counts it.
  */
 export function clampRunStart(runId: string): SqlStatement {
   return {
-    sql: `UPDATE runs SET o = (SELECT CASE
-          WHEN c.tombstone_wm_o IS NULL THEN runs.o
-          WHEN (runs.o, runs.run_id) > (c.tombstone_wm_o, c.tombstone_wm_r) THEN runs.o
-          WHEN runs.run_id > c.tombstone_wm_r THEN c.tombstone_wm_o
-          ELSE c.tombstone_wm_o + 1 END
-        FROM connections c WHERE c.connection_id = runs.connection_id)
+    sql: `UPDATE runs SET o = COALESCE((SELECT CASE
+          WHEN (runs.o, runs.run_id) > (h.o, h.r) THEN runs.o
+          WHEN runs.run_id > h.r THEN h.o
+          ELSE h.o + 1 END
+        FROM (${HELD_STAMP}) h), runs.o)
       WHERE run_id = ?`,
     params: [runId],
   };
