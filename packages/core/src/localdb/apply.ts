@@ -17,6 +17,7 @@ import type { ConnectionQueue, LocalSyncDeps } from "./deps.js";
 import { createApplyMeter } from "./apply-meter.js";
 import { readLogState } from "./log-state.js";
 import { applyLog } from "./log-apply.js";
+import { installControl } from "./lifetime.js";
 import { purgeConnection } from "./purge.js";
 import {
   RegistryUnavailableBeforeWriteError,
@@ -418,20 +419,9 @@ async function control(
       connection.generation = state.generation;
     }
   }
-  // Absence cannot clear a local-only delete; only an observed active row can.
-  await deps.db.batch([
-    {
-      sql: `UPDATE connections SET control_state=?, control_version=?, generation=? WHERE connection_id=?
-        AND NOT (control_state='deleted' AND ?='absent')`,
-      params: [
-        state.kind,
-        read.found ? read.version : 0,
-        state.kind === "active" ? state.generation : connection.generation,
-        id,
-        state.kind,
-      ],
-    },
-  ]);
+  // The same install as `saveControl`: it ends the participation of a lifetime
+  // whose generation this replaces.
+  await deps.db.batch(installControl(id, state, read.found ? read.version : 0));
   return state;
 }
 

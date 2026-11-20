@@ -223,6 +223,50 @@ describe("local database bootstrap", () => {
     );
   });
 
+  it("ends participation only when an accepted control installs a new generation", async () => {
+    const control = await controlHashes(
+      streamSyncHashes.keccak256,
+      "0707070707070707",
+    );
+    const active = (version: number): ControlRead => ({
+      found: true,
+      version,
+      deleted: false,
+      dataHash: control.activeData,
+      metadataHash: control.activeMetadata,
+    });
+    const db = await fresh();
+    // This device joined lifetime 7 and holds nothing else of it.
+    await db.batch([
+      {
+        sql: "INSERT INTO connections (connection_id, connector, ns, generation, control_state, control_version) VALUES (?, ?, '', 7, 'active', 7)",
+        params: [scope, connector],
+      },
+      {
+        sql: "INSERT INTO connection_participation(connection_id, joined_at) VALUES (?, 1)",
+        params: [scope],
+      },
+    ]);
+    const joined = async () =>
+      (await db.query("SELECT 1 FROM connection_participation")).length;
+    // Unchanged and stale controls keep it, whichever path installs them.
+    for (const version of [7, 5]) {
+      await bootstrapConnections(deps(db, registryWith(active(version))));
+      expect(await joined()).toBe(1);
+      await syncBeforeBegin(deps(db, registryWith(active(version))), connector);
+      expect(await joined()).toBe(1);
+    }
+    expect(
+      await db.query("SELECT generation, control_version FROM connections"),
+    ).toEqual([{ generation: 7, control_version: 7 }]);
+    // A newer generation ends it with the install.
+    await syncBeforeBegin(deps(db, registryWith(active(8))), connector);
+    expect(await joined()).toBe(0);
+    expect(
+      await db.query("SELECT generation, control_version FROM connections"),
+    ).toEqual([{ generation: 8, control_version: 8 }]);
+  });
+
   it("uses the cached control when begin is offline and leaves a fresh run generation-unbound", async () => {
     const control = await controlHashes(
       streamSyncHashes.keccak256,

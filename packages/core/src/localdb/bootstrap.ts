@@ -16,6 +16,7 @@ import {
 } from "../stream-sync/ports.js";
 import { applyConnection } from "./apply.js";
 import type { ConnectionRow, LocalSyncDeps } from "./deps.js";
+import { installControl } from "./lifetime.js";
 import { purgeConnection } from "./purge.js";
 import { insideQueue } from "./slot.js";
 import { UpdateRequiredError } from "./update-required.js";
@@ -65,24 +66,7 @@ export async function saveControl(
         VALUES (?, ?, ?, ?, ?, ?)`,
       params: [id, connector, ns, generation, state.kind, version],
     },
-    {
-      // Preserve the last active generation and newer controls. Absence is
-      // not authority to clear a local-only delete; a fresh active row is.
-      sql: `UPDATE connections SET
-        generation = CASE WHEN ? = 'active' THEN ? ELSE generation END,
-        control_state = ?, control_version = ?
-        WHERE connection_id = ? AND control_version <= ?
-          AND NOT (control_state = 'deleted' AND ? = 'absent')`,
-      params: [
-        state.kind,
-        generation,
-        state.kind,
-        version,
-        id,
-        version,
-        state.kind,
-      ],
-    },
+    ...installControl(id, state, version),
   ]);
   return (await cachedConnection(deps, id))!;
 }
