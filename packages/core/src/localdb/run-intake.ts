@@ -34,6 +34,7 @@ import {
 } from "../stream-sync/intake.js";
 import { syncBeforeBegin } from "./bootstrap.js";
 import { foldAppliedCursors } from "./cursor.js";
+import { compareSemver } from "../stream-sync/semver.js";
 import type { ConnectionRow } from "./deps.js";
 import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
@@ -430,6 +431,33 @@ export function createRunIntakeStore(
               : ("incremental" as const),
           ]),
         );
+        // Each stream's cursor carries the version of the connector that
+        // wrote it, here or on another device. An older connector than that
+        // may misread it: refused, before anything is written. A version
+        // order that is unknown (either is not semver) reads the stream in full.
+        if (!full) {
+          const written = await db.query<{
+            stream: string;
+            cursor_version: string;
+          }>(
+            "SELECT stream, cursor_version FROM stream_state WHERE connection_id=? AND cursor_version IS NOT NULL",
+            [id],
+          );
+          for (const { stream, cursor_version } of written) {
+            if (
+              modes.get(stream) !== "incremental" ||
+              cursor_version === declarations.version
+            )
+              continue;
+            const order = compareSemver(cursor_version, declarations.version);
+            if (order === 1)
+              throw new RunIntakeError(
+                "connector_update_required",
+                `stream ${stream}: its cursor was written by connector ${cursor_version}, newer than ${declarations.version}`,
+              );
+            if (order === null) modes.set(stream, "full_refresh");
+          }
+        }
         let state: JsonValue | null = cached?.checkpoint
           ? JSON.parse(cached.checkpoint)
           : null;

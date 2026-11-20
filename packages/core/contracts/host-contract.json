@@ -61,6 +61,10 @@
       {
         "name": "join_required",
         "status": 409
+      },
+      {
+        "name": "connector_update_required",
+        "status": 409
       }
     ],
     "endResults": [

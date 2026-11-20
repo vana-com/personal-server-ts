@@ -45,6 +45,11 @@ export const RUN_INTAKE_ERROR_STATUS = {
    * again with `join: true`; a background run does not ask.
    */
   join_required: 409,
+  /**
+   * A stream's cursor was written by a newer version of the connector than
+   * the run's. The run may start once this device's connector is updated.
+   */
+  connector_update_required: 409,
 } as const;
 
 export type RunIntakeErrorName = keyof typeof RUN_INTAKE_ERROR_STATUS;
