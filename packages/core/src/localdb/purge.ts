@@ -1,5 +1,6 @@
 import { forgetUploadedBlobs } from "./blobs.js";
 import type { LocalSyncDeps } from "./deps.js";
+import type { SqlStatement } from "./driver.js";
 import { endParticipation } from "./lifetime.js";
 import { withOrigin } from "./merge.js";
 
@@ -12,6 +13,25 @@ export function connectionLifetime(db: object, connectionId: string): object {
   let token = entries.get(connectionId);
   if (!token) entries.set(connectionId, (token = {}));
   return token;
+}
+
+/**
+ * Pass each stream's publish watermark over every change logged so far. A
+ * deleted connection's changes are moot: their rows are gone, so none is left
+ * to publish. Changes nothing once the watermark is there.
+ */
+function passWatermark(connectionId: string): SqlStatement {
+  return {
+    sql: `UPDATE stream_state SET publish_watermark = (
+   SELECT MAX(seq) FROM record_changes
+    WHERE record_changes.connection_id = stream_state.connection_id
+      AND record_changes.stream = stream_state.stream)
+   WHERE connection_id = ? AND publish_watermark < COALESCE((
+   SELECT MAX(seq) FROM record_changes
+    WHERE record_changes.connection_id = stream_state.connection_id
+      AND record_changes.stream = stream_state.stream), 0)`,
+    params: [connectionId],
+  };
 }
 
 /**
@@ -37,9 +57,12 @@ export async function adoptDelete(
   );
   if (row?.control_state !== "deleted")
     await purgeConnection(deps, connectionId, deleted);
-  // Changes nothing once the work is settled.
+  // Changes nothing once the work is settled. The watermark passes the moot
+  // changes here too: a delete recorded before the pass was part of the purge
+  // is adopted without a purge, and would owe them on every publish.
   await deps.queue.run(connectionId, "purge", () =>
     deps.db.batch([
+      passWatermark(connectionId),
       {
         sql: `UPDATE run_streams
    SET publication_state = 'superseded', publication_reason = 'connection_deleted',
@@ -110,17 +133,7 @@ export async function purgeConnection(
         // Changes logged before the purge are moot: its lifetime's rows are
         // gone, so none of them is left to publish. The watermark passes them
         // (the purge's own changes included, which are not publishable).
-        {
-          sql: `UPDATE stream_state SET publish_watermark = (
-   SELECT MAX(seq) FROM record_changes
-    WHERE record_changes.connection_id = stream_state.connection_id
-      AND record_changes.stream = stream_state.stream)
-   WHERE connection_id = ? AND publish_watermark < COALESCE((
-   SELECT MAX(seq) FROM record_changes
-    WHERE record_changes.connection_id = stream_state.connection_id
-      AND record_changes.stream = stream_state.stream), 0)`,
-          params: [connectionId],
-        },
+        passWatermark(connectionId),
         // The log position and tombstones belong to the lifetime that ended.
         {
           sql: "DELETE FROM log_state WHERE connection_id = ?",
