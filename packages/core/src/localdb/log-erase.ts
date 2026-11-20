@@ -57,17 +57,19 @@ import {
   classifyControl,
   controlHashes,
   controlScope,
-  decodeSegment,
-  decodeSnapshotPart,
   deriveKeyCheck,
   logScope,
   parseScope,
   segmentBlobName,
   snapshotPartBlobName,
+  verifySegment,
+  verifySnapshotPart,
   type ControlHashes,
   type ControlRead,
   type WireEntry,
   type WireOperation,
+  type WireSegment,
+  type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { keccakOf, type StreamCryptoPort } from "../stream-sync/crypto-port.js";
 import type {
@@ -268,11 +270,18 @@ async function eraseOne(
       String(tombstone),
     );
     if (finality.rolledBack) return { kind: "stopped", why: "rolled-back" };
-    if (finality.finalized === null)
+    // The port answers the highest finalized tombstone at or above the asked
+    // version, but an adapter can answer a lower one while a newer tombstone
+    // is still settling and could yet roll back. Only a finalized version at
+    // or above the one this pass erases for proves it final.
+    if (!finalizedAtOrAbove(finality.finalized, tombstone))
       return { kind: "pending", why: "finality" };
 
     const head = await deps.registry.read(scope, signal);
-    const headName = head.found ? segmentBlobName(head.dataHash) : null;
+    const headRef = head.found
+      ? { dataHash: head.dataHash, position: head.version }
+      : null;
+    const headName = headRef ? segmentBlobName(headRef.dataHash) : null;
     const inventory = await deps.versions.list(scope, { signal });
     if (inventory.complete !== true)
       return {
@@ -281,15 +290,23 @@ async function eraseOne(
         detail: "log version inventory is incomplete",
       };
 
-    const segments = new Set<string>();
+    // Every object is found by the name its bytes hash to: the registry's
+    // data hashes name the segments, and a verified segment names its parts.
+    // `position` is set where the registry or a ref promised one.
+    const segments = new Map<
+      string,
+      { readonly dataHash: string; position?: number }
+    >();
     for (const v of inventory.versions)
-      if (!v.isTombstone) segments.add(segmentBlobName(v.dataHash));
-    const opened =
-      headName === null ? "absent" : await open(deps, scope, headName);
+      if (!v.isTombstone)
+        segments.set(segmentBlobName(v.dataHash), { dataHash: v.dataHash });
+    const opened = headRef
+      ? await openSegment(deps, scope, target, headRef)
+      : "absent";
     if (headName === null || opened === "absent") {
       // A finished pass leaves no listed segment in storage (the head went
       // last). Do not treat a missing head with surviving segments as proof.
-      for (const name of segments) {
+      for (const name of segments.keys()) {
         if (
           name !== headName &&
           (await deps.blobs.get(`${scope}/${name}`)) !== null
@@ -302,15 +319,20 @@ async function eraseOne(
       }
       return { kind: "erased", deleted: 0, unenumerated: 0 };
     }
-    const decoded = opened === "unreadable" ? null : decodeSegment(opened);
-    if (decoded?.kind !== "ok" || decoded.segment.keyCheck !== target.keyCheck)
+    if (opened === "unreadable")
       return { kind: "stopped", why: "head-unreadable" };
 
-    segments.add(headName);
-    for (const ref of decoded.segment.refs)
-      segments.add(segmentBlobName(ref.dataHash));
+    segments.set(headName, headRef!);
+    for (const ref of opened.refs)
+      segments.set(segmentBlobName(ref.dataHash), {
+        dataHash: ref.dataHash,
+        position: ref.position,
+      });
 
-    const parts = new Set<string>();
+    const parts = new Map<
+      string,
+      { readonly dataHash: string; readonly position: number }
+    >();
     const pieces = new Set<string>();
     let unenumerated = 0;
     const note = (references: Iterable<WireOperation | WireEntry>) => {
@@ -319,27 +341,28 @@ async function eraseOne(
           for (const piece of op.body.pieces)
             pieces.add(bodyPieceBlobName(piece));
     };
-    await each([...segments], async (name) => {
-      const bytes = await open(deps, scope, name);
-      if (bytes === "absent") return;
-      const segment = bytes === "unreadable" ? null : decodeSegment(bytes);
-      if (segment?.kind !== "ok") {
+    await each([...segments.values()], async (expected) => {
+      const segment = await openSegment(deps, scope, target, expected);
+      if (segment === "absent") return;
+      if (segment === "unreadable") {
         unenumerated += 1;
         return;
       }
-      for (const part of segment.segment.snapshot?.parts ?? [])
-        parts.add(snapshotPartBlobName(part.dataHash));
-      note(segment.segment.operations);
+      for (const part of segment.snapshot?.parts ?? [])
+        parts.set(snapshotPartBlobName(part.dataHash), {
+          dataHash: part.dataHash,
+          position: segment.snapshot!.position,
+        });
+      note(segment.operations);
     });
-    await each([...parts], async (name) => {
-      const bytes = await open(deps, scope, name);
-      if (bytes === "absent") return;
-      const part = bytes === "unreadable" ? null : decodeSnapshotPart(bytes);
-      if (part?.kind !== "ok") {
+    await each([...parts.values()], async (expected) => {
+      const part = await openPart(deps, scope, target, expected);
+      if (part === "absent") return;
+      if (part === "unreadable") {
         unenumerated += 1;
         return;
       }
-      note(part.part.entries);
+      note(part.entries);
     });
 
     if (unenumerated > 0)
@@ -349,9 +372,9 @@ async function eraseOne(
         detail: `${unenumerated} log objects could not be enumerated`,
       };
 
-    const rest = [...segments].filter((name) => name !== headName);
+    const rest = [...segments.keys()].filter((name) => name !== headName);
     let deleted = 0;
-    for (const phase of [[...pieces], [...parts], rest, [headName]]) {
+    for (const phase of [[...pieces], [...parts.keys()], rest, [headName]]) {
       for (let at = 0; at < phase.length; at += DELETE_BATCH) {
         signal?.throwIfAborted();
         await stillTombstoned(deps, target, signal);
@@ -427,6 +450,72 @@ async function open(
     return await deps.keys.decrypt(scope, cipher);
   } catch {
     return "unreadable";
+  }
+}
+
+/**
+ * The reader's own checks (`verifySegment`, as `fetchSegment` in `log-apply.ts`
+ * runs them) on the segment a name holds: its bytes hash to the name, it is
+ * this connection's log, under this key, at the promised position. An object
+ * that fails any of them, however well it decodes, is another object served
+ * under this name, and is not read for what it names. `"absent"` when storage
+ * has none.
+ */
+async function openSegment(
+  deps: LogErasureDeps,
+  scope: string,
+  target: Target,
+  expected: { readonly dataHash: string; readonly position?: number },
+): Promise<WireSegment | "absent" | "unreadable"> {
+  const bytes = await open(deps, scope, segmentBlobName(expected.dataHash));
+  if (bytes === "absent" || bytes === "unreadable") return bytes;
+  const verified = await verifySegment(keccakOf(deps.streamCrypto), bytes, {
+    dataHash: expected.dataHash,
+    connector: target.connector,
+    ns: target.ns,
+    keyCheck: target.keyCheck,
+    ...(expected.position !== undefined && { position: expected.position }),
+  });
+  return verified.kind === "ok" ? verified.segment : "unreadable";
+}
+
+/** `openSegment` for a snapshot part. */
+async function openPart(
+  deps: LogErasureDeps,
+  scope: string,
+  target: Target,
+  expected: { readonly dataHash: string; readonly position: number },
+): Promise<WireSnapshotPart | "absent" | "unreadable"> {
+  const bytes = await open(
+    deps,
+    scope,
+    snapshotPartBlobName(expected.dataHash),
+  );
+  if (bytes === "absent" || bytes === "unreadable") return bytes;
+  const verified = await verifySnapshotPart(
+    keccakOf(deps.streamCrypto),
+    bytes,
+    {
+      dataHash: expected.dataHash,
+      connector: target.connector,
+      ns: target.ns,
+      keyCheck: target.keyCheck,
+      position: expected.position,
+    },
+  );
+  return verified.kind === "ok" ? verified.part : "unreadable";
+}
+
+/** Whether `finalized` is a version at or above `tombstone`. */
+function finalizedAtOrAbove(
+  finalized: string | null,
+  tombstone: number,
+): boolean {
+  if (finalized === null) return false;
+  try {
+    return BigInt(finalized) >= BigInt(tombstone);
+  } catch {
+    return false;
   }
 }
 

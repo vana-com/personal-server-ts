@@ -10,6 +10,7 @@ import {
   encodeSnapshotPart,
   logScope,
   parseScope,
+  segmentBlobName,
   type ControlRead,
   type LogStreamMeta,
   type SegmentRef,
@@ -664,5 +665,276 @@ describe("eraseDeletedConnectionLogs", () => {
       why: "head-unreadable",
     });
     expect(w.calls).toEqual([]);
+  });
+});
+
+/** A well-formed segment of this key and log, built to be served under another name. */
+const forgedSegment = (connector: string, ns: string, pieces: number[]) =>
+  encodeSegment({
+    format: LOG_FORMAT,
+    connector,
+    ns,
+    generation: 1,
+    keyCheck,
+    position: 1,
+    observedAt: 1,
+    base: 0,
+    snapshot: null,
+    refs: [],
+    streams: [meta],
+    operations: upsertWithPieces(...pieces),
+  });
+
+const forgedPart = (connector: string, ns: string, pieces: number[]) =>
+  encodeSnapshotPart({
+    format: LOG_FORMAT,
+    connector,
+    ns,
+    generation: 1,
+    keyCheck,
+    position: 2,
+    index: 0,
+    streams: [meta],
+    entries: upsertWithPieces(...pieces) as never,
+  });
+
+describe("what the erasure refuses to act on", () => {
+  describe("a tombstone that is not final at the version being erased", () => {
+    it("deletes nothing when the finalized version is below the tombstone", async () => {
+      const w = world();
+      await w.compactedLog("alpha", NS);
+      w.setControl("alpha", NS, 5, true);
+      const before = w.objects("alpha", NS);
+      // A newer tombstone (5) is still settling; the adapter reports 4.
+      w.setFinality("4");
+      const report = await eraseDeletedConnectionLogs(w.deps);
+      expect(report.connections[0]!.outcome).toEqual({
+        kind: "pending",
+        why: "finality",
+      });
+      expect(w.calls).toEqual([]);
+      expect(w.objects("alpha", NS)).toEqual(before);
+    });
+
+    it("deletes nothing when the finalized version is not a version", async () => {
+      const w = world();
+      await w.compactedLog("alpha", NS);
+      w.setControl("alpha", NS, 5, true);
+      w.setFinality("final");
+      const report = await eraseDeletedConnectionLogs(w.deps);
+      expect(report.connections[0]!.outcome).toMatchObject({
+        kind: "pending",
+        why: "finality",
+      });
+      expect(w.calls).toEqual([]);
+    });
+
+    it.each(["5", "6"])(
+      "erases once the finalized version is %s, at or above the tombstone",
+      async (finalized) => {
+        const w = world();
+        await w.compactedLog("alpha", NS);
+        w.setControl("alpha", NS, 5, true);
+        w.setFinality(finalized);
+        const report = await eraseDeletedConnectionLogs(w.deps);
+        expect(report.connections[0]!.outcome).toMatchObject({
+          kind: "erased",
+        });
+        expect(w.objects("alpha", NS)).toEqual([]);
+      },
+    );
+  });
+
+  describe("a log whose newest segment cannot be found", () => {
+    /** Two ways the head is absent: gone from storage, or no log row at all. */
+    const absent = {
+      "the head object is gone from storage": (
+        w: ReturnType<typeof world>,
+        scope: string,
+      ) => {
+        const row = w.reads.get(scope);
+        if (!row?.found) throw new Error("fixture expected a log head");
+        w.store.delete(`${scope}/s-${row.dataHash.replace(/^0x/, "")}`);
+      },
+      "the registry has no log row": (
+        w: ReturnType<typeof world>,
+        scope: string,
+      ) => {
+        w.reads.delete(scope);
+      },
+    };
+    it.each(Object.entries(absent))(
+      "is not erased while an older segment that names a body piece survives (%s)",
+      async (_name, lose) => {
+        const w = world();
+        await w.compactedLog("alpha", NS);
+        w.setControl("alpha", NS, 2, true);
+        const scope = logScope("alpha", NS);
+        lose(w, scope);
+        const surviving = w.objects("alpha", NS);
+        // Segment 1 names piece 1; it is still in storage.
+        expect(surviving).toContain(`v-${hex64(1)}`);
+        expect(
+          surviving.filter((n) => n.startsWith("s-")).length,
+        ).toBeGreaterThan(0);
+
+        const report = await eraseDeletedConnectionLogs(w.deps);
+
+        expect(report.connections[0]!.outcome).toMatchObject({
+          kind: "pending",
+          why: "inventory",
+        });
+        expect(report.pending).toBe(true);
+        expect(w.calls).toEqual([]);
+        expect(w.objects("alpha", NS)).toEqual(surviving);
+      },
+    );
+  });
+
+  describe("an object served under a name its bytes do not hash to", () => {
+    const FOREIGN_PIECE = 99;
+    const hashOfPosition = async (
+      w: ReturnType<typeof world>,
+      scope: string,
+      position: number,
+    ) => {
+      const listed = await w.deps.versions.list(scope);
+      return listed.versions.find(
+        (v) => Number(v.expectedVersion) === position,
+      )!.dataHash;
+    };
+
+    it("does not report a log erased when an older segment is another's bytes, and deletes nothing it names", async () => {
+      const w = world();
+      await w.compactedLog("alpha", NS);
+      w.setControl("alpha", NS, 2, true);
+      const scope = logScope("alpha", NS);
+      // A valid segment of this key and log, under the name of segment 1.
+      const name = segmentBlobName(await hashOfPosition(w, scope, 1));
+      w.store.set(
+        `${scope}/${name}`,
+        forgedSegment("alpha", NS, [FOREIGN_PIECE]),
+      );
+      w.put(scope, `v-${hex64(FOREIGN_PIECE)}`);
+      const before = w.objects("alpha", NS);
+
+      const report = await eraseDeletedConnectionLogs(w.deps);
+
+      expect(report.connections[0]!.outcome).toMatchObject({
+        kind: "pending",
+        why: "inventory",
+      });
+      expect(w.calls).toEqual([]);
+      expect(w.objects("alpha", NS)).toEqual(before);
+    });
+
+    it("does not report a log erased when the newest segment is another's bytes", async () => {
+      const w = world();
+      await w.compactedLog("alpha", NS);
+      w.setControl("alpha", NS, 2, true);
+      const scope = logScope("alpha", NS);
+      const name = segmentBlobName(await hashOfPosition(w, scope, 4));
+      w.store.set(
+        `${scope}/${name}`,
+        forgedSegment("alpha", NS, [FOREIGN_PIECE]),
+      );
+      w.put(scope, `v-${hex64(FOREIGN_PIECE)}`);
+      const before = w.objects("alpha", NS);
+
+      const report = await eraseDeletedConnectionLogs(w.deps);
+
+      expect(report.connections[0]!.outcome).toEqual({
+        kind: "stopped",
+        why: "head-unreadable",
+      });
+      expect(w.calls).toEqual([]);
+      expect(w.objects("alpha", NS)).toEqual(before);
+    });
+
+    it("does not report a log erased when a snapshot part is another's bytes, and deletes nothing it names", async () => {
+      const w = world();
+      await w.compactedLog("alpha", NS);
+      w.setControl("alpha", NS, 2, true);
+      const scope = logScope("alpha", NS);
+      const partName = w.objects("alpha", NS).find((n) => n.startsWith("q-"))!;
+      w.store.set(
+        `${scope}/${partName}`,
+        forgedPart("alpha", NS, [FOREIGN_PIECE]),
+      );
+      w.put(scope, `v-${hex64(FOREIGN_PIECE)}`);
+      const before = w.objects("alpha", NS);
+
+      const report = await eraseDeletedConnectionLogs(w.deps);
+
+      expect(report.connections[0]!.outcome).toMatchObject({
+        kind: "pending",
+        why: "inventory",
+      });
+      expect(w.calls).toEqual([]);
+      expect(w.objects("alpha", NS)).toEqual(before);
+    });
+
+    it("does not hide a descendant: a segment served under the head's name cannot make the real refs unreachable", async () => {
+      const w = world();
+      await w.compactedLog("alpha", NS);
+      w.setControl("alpha", NS, 2, true);
+      const scope = logScope("alpha", NS);
+      // The head's name serves a valid segment with no refs and no pieces.
+      const name = segmentBlobName(await hashOfPosition(w, scope, 4));
+      w.store.set(`${scope}/${name}`, forgedSegment("alpha", NS, []));
+      const report = await eraseDeletedConnectionLogs(w.deps);
+      expect(report.connections[0]!.outcome.kind).not.toBe("erased");
+      expect(w.calls).toEqual([]);
+    });
+  });
+
+  describe("a delete answer that does not account for every name once", () => {
+    const answers: Record<
+      string,
+      (names: string[]) => {
+        deleted: string[];
+        missing: string[];
+        failed: never[];
+      }
+    > = {
+      "a name acknowledged twice, another not at all": (names) => ({
+        deleted: [names[0]!, names[0]!, ...names.slice(2)],
+        missing: [],
+        failed: [],
+      }),
+      "a name acknowledged as both deleted and missing": (names) => ({
+        deleted: names,
+        missing: [names[0]!],
+        failed: [],
+      }),
+      "a name that was not asked for": (names) => ({
+        deleted: [...names.slice(0, -1), `v-${hex64(777)}`],
+        missing: [],
+        failed: [],
+      }),
+    };
+    it.each(Object.entries(answers))(
+      "does not advance past %s",
+      async (_name, answer) => {
+        const w = world();
+        await w.compactedLog("alpha", NS);
+        w.setControl("alpha", NS, 2, true);
+        const batches: string[][] = [];
+        const report = await eraseDeletedConnectionLogs({
+          ...w.deps,
+          objects: {
+            deleteBlobVersions: async (_scope, names) => {
+              batches.push([...names]);
+              return answer(names);
+            },
+          },
+        });
+        expect(report.connections[0]!.outcome).toMatchObject({
+          kind: "pending",
+          why: "storage",
+        });
+        expect(batches).toHaveLength(1);
+      },
+    );
   });
 });
