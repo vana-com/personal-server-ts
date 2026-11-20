@@ -79,7 +79,10 @@ export async function openDiskFold(
   };
   // No decoded input exists before runtime-wide admission.
   await runtimeAdmission.enqueue(deps.db, binding.operation);
-  const lease = await runtimeAdmission.acquire(
+  // Wait for the one lease. No caller holds a lease here (compaction and
+  // rebase open the fold first; the upload loop's lease ends before any other
+  // fold starts), so the wait cannot be on itself.
+  const lease = await runtimeAdmission.acquireWaiting(
     binding.operation,
     FOLD_LEASE_BYTES,
   );

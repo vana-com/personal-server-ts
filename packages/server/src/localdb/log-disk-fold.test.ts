@@ -333,9 +333,11 @@ it("oversized referenced records leave a durable retryable failure without a pie
   expect(pieceGets).toBe(0);
   expect(await d.position()).toBe(1);
   expect(await d.db.query("SELECT unit FROM workspace_receipts")).toEqual([]);
-  expect(await d.db.query("SELECT phase,position FROM workspaces")).toEqual([
-    { phase: "aborted", position: 0 },
-  ]);
+  expect(
+    await d.db.query(
+      "SELECT phase,position FROM workspaces WHERE phase<>'clean'",
+    ),
+  ).toEqual([{ phase: "aborted", position: 0 }]);
   expect(
     await d.db.query(
       "SELECT reason,state FROM workspace_attempts WHERE unit='fold' AND action='admission'",
@@ -366,6 +368,39 @@ it("a stale caller generation cannot acquire a fold for the current connection",
     await expect(attempt).rejects.toThrow("workspace_stale_generation");
   } finally {
     await unexpected?.close();
+  }
+});
+
+it("a second fold waits for the first instead of failing busy", async () => {
+  const w = await world({ streams: 1 }),
+    d = await w.device("waiting");
+  await d.run("seed", [{ stream: "s0", id: 99 }]);
+  await d.cycle();
+  const template = [...(await w.segments()).values()][0]!;
+  const { openDiskFold } =
+    await import("../../../core/dist/localdb/log-disk-fold.js");
+  const open = (head: string) =>
+    openDiskFold(
+      d.deps,
+      CONNECTION_ID,
+      template.keyCheck,
+      head,
+      template.generation,
+    );
+  const first = await open("first");
+  let second: Awaited<ReturnType<typeof openDiskFold>> | undefined;
+  try {
+    const waiting = open("second").then((fold) => (second = fold));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(
+      second,
+      "the second fold waits while the first holds the lease",
+    ).toBe(undefined);
+    await first.close();
+    await waiting;
+    expect(second, "it proceeds once the first lets go").toBeDefined();
+  } finally {
+    await second?.close();
   }
 });
 
