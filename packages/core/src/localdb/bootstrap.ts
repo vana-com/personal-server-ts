@@ -16,6 +16,7 @@ import {
 } from "../stream-sync/ports.js";
 import { applyConnection } from "./apply.js";
 import type { ConnectionRow, LocalSyncDeps } from "./deps.js";
+import { installControl } from "./lifetime.js";
 import { purgeConnection } from "./purge.js";
 import { insideQueue } from "./slot.js";
 import { UpdateRequiredError } from "./update-required.js";
@@ -65,24 +66,7 @@ export async function saveControl(
         VALUES (?, ?, ?, ?, ?, ?)`,
       params: [id, connector, ns, generation, state.kind, version],
     },
-    {
-      // Preserve the last active generation and newer controls. Absence is
-      // not authority to clear a local-only delete; a fresh active row is.
-      sql: `UPDATE connections SET
-        generation = CASE WHEN ? = 'active' THEN ? ELSE generation END,
-        control_state = ?, control_version = ?
-        WHERE connection_id = ? AND control_version <= ?
-          AND NOT (control_state = 'deleted' AND ? = 'absent')`,
-      params: [
-        state.kind,
-        generation,
-        state.kind,
-        version,
-        id,
-        version,
-        state.kind,
-      ],
-    },
+    ...installControl(id, state, version),
   ]);
   return (await cachedConnection(deps, id))!;
 }
@@ -104,8 +88,9 @@ async function purgeDeleted(deps: LocalSyncDeps, row: ConnectionRow) {
                  WHERE r.connection_id = ?)
       OR EXISTS (SELECT 1 FROM blob_refs WHERE connection_id = ?)
       OR EXISTS (SELECT 1 FROM connections
-                 WHERE connection_id = ? AND checkpoint IS NOT NULL)`,
-    Array(4).fill(row.connectionId),
+                 WHERE connection_id = ? AND checkpoint IS NOT NULL)
+      OR EXISTS (SELECT 1 FROM connection_participation WHERE connection_id = ?)`,
+    Array(5).fill(row.connectionId),
   );
   if (present.length > 0) {
     await purgeConnection(deps, row.connectionId, {
@@ -123,7 +108,8 @@ export type OwnerRows = readonly {
 /**
  * C.0 step 1: list the registry's control rows and upsert one `connections`
  * row per control scope (classification is `classifyControl`). A deleted
- * control row whose connection still has rows runs the local purge (F.5).
+ * control row whose connection still has rows, a checkpoint or this device's
+ * participation row runs the local purge (F.5).
  * Returns the connections now known. Spec: C.0.
  */
 export async function bootstrapConnections(

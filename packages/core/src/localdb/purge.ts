@@ -1,5 +1,6 @@
 import { forgetUploadedBlobs } from "./blobs.js";
 import type { LocalSyncDeps } from "./deps.js";
+import { endParticipation } from "./lifetime.js";
 import { withOrigin } from "./merge.js";
 
 // A purge ends the local lifetime even if a later observation restores the
@@ -90,10 +91,7 @@ export async function purgeConnection(
           params: [connectionId],
         },
         // A later lifetime is a connection this device has not joined.
-        {
-          sql: "DELETE FROM connection_participation WHERE connection_id = ?",
-          params: [connectionId],
-        },
+        endParticipation(connectionId),
       ]),
     );
     // Rotate only after the purge batch commits, before releasing its slot.
