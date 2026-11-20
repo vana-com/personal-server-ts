@@ -27,6 +27,7 @@ export function cursorSaved(
   return {
     sql: `UPDATE stream_state SET
       cursor_unpublished = ?,
+      cursor_write = cursor_write + 1,
       cursor_seq = (SELECT COALESCE(MAX(seq), 0) FROM record_changes WHERE connection_id = ? AND stream = ?),
       cursor_children = ?,
       cursor_version = ?
@@ -195,7 +196,8 @@ export async function cursorsRequeued(
       const version = rows.find((r) => r.stream === stream)?.cursor_version;
       if (state === undefined || version == null) continue;
       statements.push({
-        sql: `UPDATE stream_state SET cursor_unpublished = ?, cursor_children = ?
+        sql: `UPDATE stream_state SET cursor_unpublished = ?, cursor_children = ?,
+                 cursor_write = cursor_write + 1
                WHERE connection_id = ? AND stream = ? AND cursor_unpublished IS NULL`,
         params: [
           JSON.stringify({ state, connectorVersion: version }),

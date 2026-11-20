@@ -677,4 +677,11 @@ WHEN NEW.checkpoint IS NULL BEGIN
   WHERE connection_id = NEW.connection_id;
 END`,
   ],
+  [
+    // Counts the writes of `cursor_unpublished`, never reset. A run end can
+    // write the same cursor again (its entry moved away and back), with more
+    // rows under it, while a segment that carried the earlier write waits to
+    // be acknowledged; the acknowledgement clears only the write it carried.
+    `ALTER TABLE stream_state ADD COLUMN cursor_write INTEGER NOT NULL DEFAULT 0`,
+  ],
 ];

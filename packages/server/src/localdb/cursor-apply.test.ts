@@ -311,7 +311,10 @@ describe("a device that reads the log takes the stream's cursor", () => {
   // (503): a learns it committed only when it next reads the registry, after
   // applying the registry's history.
   describe("a commit whose reply was lost", () => {
-    async function lostReply(whileLost: (b: Device) => Promise<void>) {
+    async function lostReply(
+      whileLost: (b: Device) => Promise<void>,
+      beforeReconcile: (a: Device) => Promise<void> = async () => {},
+    ) {
       let lose = 0;
       let other = false;
       const trace = requestTrace(0);
@@ -340,6 +343,7 @@ describe("a device that reads the log takes the stream's cursor", () => {
       lose = 2;
       await expect(a.cycle()).rejects.toThrow(/503/);
       expect(lose).toBe(0);
+      await beforeReconcile(a);
       // a's next cycle applies the registry's history, then acknowledges.
       await a.cycle();
       await b.cycle();
@@ -379,6 +383,32 @@ describe("a device that reads the log takes the stream's cursor", () => {
         state: "ca",
         connectorVersion: "1",
       });
+      await resumesFrom([a, b], "ca");
+    });
+
+    it("publishes a newer pending cursor equal to the lost one after its rows", async () => {
+      // a's own runs move its cursor away and back before it hears: its
+      // pending cursor is the lost commit's again, with rows the log lacks.
+      const { w, a, b } = await lostReply(
+        async () => {},
+        async (a) => {
+          await a.run("run-a2", [{ stream: S0, id: "y" }], {
+            full: false,
+            checkpoints: { [S0]: "cx" },
+          });
+          await a.run("run-a3", [{ stream: S0, id: "z" }], {
+            full: false,
+            checkpoints: { [S0]: "ca" },
+          });
+        },
+      );
+      const head = await headOf(w);
+      const carryingCa = [...(await w.segments())]
+        .filter(([, s]) => cursorOf(s)?.state === "ca")
+        .map(([position]) => position);
+      // The lost commit's segment and the one with y and z both carry it.
+      expect(carryingCa).toEqual([2, head.position]);
+      expect(head.operations.length).toBe(2);
       await resumesFrom([a, b], "ca");
     });
   });
