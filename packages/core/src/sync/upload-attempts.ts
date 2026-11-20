@@ -18,6 +18,14 @@
  * reaches the cap; the count resets only on a successful upload, a new entry
  * version (a different key) or an owner retry.
  *
+ * A quarantine does not last for ever. `probe` releases a quarantined entry
+ * once its backoff has passed (`QUARANTINE_RETRY_BASE_MS`, doubling with each
+ * quarantine of the same entry version up to `QUARANTINE_RETRY_MAX_MS`) and
+ * gives it one attempt, not a fresh budget: if that attempt kills the process
+ * again, the next start quarantines the entry at once for twice as long. The
+ * upload worker calls `probe` every cycle. Hosts show a quarantined entry as
+ * a stopped upload in `SyncStatus.uploads` (`CRASHED_UPLOAD_REASON`).
+ *
  * What this does not bound: the first attempts (up to the cap) still run, and
  * it does not make an upload use less memory. Caught-failure backoff stays in
  * memory (`upload-state.ts`).
@@ -48,6 +56,19 @@ import type { IndexEntry } from "../storage/index/types.js";
 /** Interrupted attempts an entry version gets before it is quarantined. */
 export const MAX_INTERRUPTED_UPLOAD_ATTEMPTS = 2;
 
+/** Wait before the first retry of a quarantined entry. */
+export const QUARANTINE_RETRY_BASE_MS = 60 * 60_000;
+/** The longest wait between retries of one entry version. */
+export const QUARANTINE_RETRY_MAX_MS = 24 * 60 * 60_000;
+
+/** How long after a quarantine, the `count`th of an entry version, a retry is due. */
+export function quarantineBackoffMs(count: number): number {
+  return Math.min(
+    QUARANTINE_RETRY_BASE_MS * 2 ** Math.max(0, count - 1),
+    QUARANTINE_RETRY_MAX_MS,
+  );
+}
+
 /** Status text for a quarantined entry. */
 export const CRASHED_UPLOAD_REASON = "stopped: crashed during upload";
 
@@ -65,6 +86,10 @@ export interface UploadAttemptRecord {
   /** An attempt started and has not settled. Only meaningful at startup. */
   inFlight: boolean;
   quarantined: boolean;
+  /** When the entry was last quarantined (ms); absent in older ledgers: due. */
+  quarantinedAt?: number;
+  /** Times this entry version was quarantined; sets the retry backoff. */
+  quarantines?: number;
 }
 
 export const UPLOAD_ATTEMPTS_ENVELOPE_VERSION = 1;
@@ -255,7 +280,17 @@ export function parseUploadAttemptsEnvelope(
       typeof r.quarantined !== "boolean"
     )
       throw new UploadAttemptStoreInvalidError(`record ${index} is malformed`);
+    const optional = (name: "quarantinedAt" | "quarantines") => {
+      if (r[name] === undefined) return {};
+      if (!isCount(r[name]))
+        throw new UploadAttemptStoreInvalidError(
+          `record ${index} is malformed`,
+        );
+      return { [name]: r[name] as number };
+    };
     return {
+      ...optional("quarantinedAt"),
+      ...optional("quarantines"),
       key: r.key,
       owner: r.owner,
       scope: r.scope,
@@ -342,6 +377,12 @@ export interface UploadAttemptLedger {
    * owner's `scope`, or every scope. Returns the quarantined paths released.
    */
   release(scope?: string): Promise<string[]>;
+  /**
+   * Release this owner's quarantined entries whose backoff has passed at
+   * `nowMs`, each with one attempt left. Returns the released paths, which
+   * the caller must forget in its own upload state.
+   */
+  probe(nowMs: number): Promise<string[]>;
   /** This owner's quarantined records, for status. */
   quarantined(): UploadAttemptRecord[];
   /**
@@ -365,6 +406,8 @@ export function createUploadAttemptLedger(
   ownerAddress: string,
   options: {
     maxInterrupted?: number;
+    /** Clock for quarantine times (ms); tests set it. */
+    now?: () => number;
     /** Crash protection lost something; the owner should be told. */
     onDegraded?: (message: string) => void;
     /** First wait before a stop that could not repair storage is retried. */
@@ -376,6 +419,7 @@ export function createUploadAttemptLedger(
   const maxInterrupted =
     options.maxInterrupted ?? MAX_INTERRUPTED_UPLOAD_ATTEMPTS;
   const owner = ownerAddress.toLowerCase();
+  const clock = options.now ?? Date.now;
   /**
    * The committed state: what storage is known to hold (see `dirty`). Every
    * owner's records, because the whole value is replaced on each write. It is
@@ -547,6 +591,8 @@ export function createUploadAttemptLedger(
           }
           if (!entry.quarantined && entry.interrupted >= maxInterrupted) {
             entry.quarantined = true;
+            entry.quarantinedAt = clock();
+            entry.quarantines = (entry.quarantines ?? 0) + 1;
             changed = true;
           }
         }
@@ -677,6 +723,9 @@ export function createUploadAttemptLedger(
           interrupted: records.get(key)?.interrupted ?? 0,
           inFlight: true,
           quarantined: false,
+          ...(records.get(key)?.quarantines
+            ? { quarantines: records.get(key)!.quarantines }
+            : {}),
         });
         // The body starts only after this resolves. If the write fails the
         // marker is never adopted (and an uncertain one is written away).
@@ -704,6 +753,27 @@ export function createUploadAttemptLedger(
         dropRecords((record) => scope === undefined || record.scope === scope),
       );
       return dropped.filter((r) => r.quarantined).map((r) => r.path);
+    },
+    async probe(nowMs) {
+      return enqueue(async () => {
+        assertOwned();
+        await repair();
+        const next = draft();
+        const released: string[] = [];
+        for (const [key, record] of next) {
+          if (!mine(record) || !record.quarantined || live.has(key)) continue;
+          const due =
+            (record.quarantinedAt ?? 0) +
+            quarantineBackoffMs(record.quarantines ?? 1);
+          if (nowMs < due) continue;
+          // One attempt: a crash during it quarantines the entry again.
+          record.quarantined = false;
+          record.interrupted = Math.max(0, maxInterrupted - 1);
+          released.push(record.path);
+        }
+        if (released.length) await persist(next);
+        return released;
+      });
     },
     quarantined() {
       return [...records.values()]

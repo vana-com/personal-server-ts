@@ -267,6 +267,69 @@ describe("uploadAll — durable attempt markers", () => {
     expect(results.map((r) => r.path)).toEqual([a.path]);
   });
 
+  describe("automatic retry of a quarantined entry", () => {
+    const HOUR = 3_600_000;
+    const at = (base: number, ms: number) => ({
+      now: () => new Date(base + ms),
+    });
+
+    async function quarantine(
+      index: ReturnType<typeof makeIndex>,
+      store: UploadAttemptStore,
+    ) {
+      for (let boots = 0; boots < 2; boots++) {
+        void uploadAll(boot(index, store).deps);
+        await flush();
+      }
+    }
+
+    it("retries once after the backoff, and uploads when the cause is gone", async () => {
+      const a = makeEntry(1);
+      const index = makeIndex([a]);
+      index.dies.add(a.path);
+      const store = createMemoryUploadAttemptStore();
+      await quarantine(index, store);
+
+      const base = Date.now();
+      const host = boot(index, store);
+      expect(await uploadAll(host.deps, at(base, 30 * 60_000))).toEqual([]);
+      expect(host.uploadState.snapshot().stopped).toHaveLength(1);
+      expect(index.reads).toHaveLength(2);
+
+      index.dies.clear();
+      const results = await uploadAll(host.deps, at(base, HOUR + 60_000));
+      expect(results.map((r) => r.path)).toEqual([a.path]);
+      expect(host.uploadState.snapshot().stopped).toEqual([]);
+    });
+
+    it("gives a retry one attempt, and waits twice as long after it kills the process again", async () => {
+      const a = makeEntry(1);
+      const index = makeIndex([a]);
+      index.dies.add(a.path);
+      const store = createMemoryUploadAttemptStore();
+      await quarantine(index, store);
+
+      const base = Date.now();
+      const retry = boot(index, store);
+      void uploadAll(retry.deps, at(base, HOUR + 60_000));
+      await flush();
+      expect(index.reads).toHaveLength(3);
+
+      // The retry died: the next boot quarantines the entry again at once.
+      const after = boot(index, store);
+      await uploadAll(after.deps, at(base, HOUR + 120_000));
+      expect(index.reads).toHaveLength(3);
+      expect(after.uploadState.snapshot().stopped).toHaveLength(1);
+
+      // Not due after one more hour, due after two.
+      await uploadAll(after.deps, at(base, 2 * HOUR));
+      expect(index.reads).toHaveLength(3);
+      void uploadAll(after.deps, at(base, 3 * HOUR + 180_000));
+      await flush();
+      expect(index.reads).toHaveLength(4);
+    });
+  });
+
   it("keeps the interrupted count across a caught failure: crash, caught failure, crash quarantines", async () => {
     const a = makeEntry(1);
     const b = makeEntry(2);

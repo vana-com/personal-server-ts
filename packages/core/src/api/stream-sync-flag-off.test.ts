@@ -1,9 +1,14 @@
+import { createHash } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   handlePersonalServerDataRequest,
   type PersonalServerDataApiDeps,
   type StreamSyncReadPort,
 } from "./index.js";
+import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 
 const payment = vi.hoisted(() => ({
   challenge: vi.fn(async () => ({ x402Version: 1, accepts: [] })),
@@ -192,5 +197,134 @@ describe("#596 account-mode data reads", () => {
       expect(f.modeRead).toHaveBeenCalledTimes(1);
       expect(releaseProof).toHaveBeenCalledTimes(delegated ? 1 : 0);
     }
+  });
+});
+
+/**
+ * With stream sync off (account mode `unswitched`) every read answers as it
+ * did before stream sync existed. `__snapshots__/stream-sync-flag-off.json`
+ * records 88 such reads, taken on the commit before the read side was added.
+ * This test replays them and compares with that file; it must never rewrite it.
+ */
+const PARITY = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "../legacy-projection/__fixtures__/parity",
+);
+const SNAPSHOT = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "__snapshots__/stream-sync-flag-off.json",
+);
+const COLLECTED_AT = "2026-10-01T00:00:00.000Z";
+const BUILDER = "0x000000000000000000000000000000000000bEEF";
+
+/** Parity fixtures that carry a legacy body; the first file per scope. */
+function parityBodies(): { scope: string; data: unknown }[] {
+  const byScope = new Map<string, unknown>();
+  for (const name of readdirSync(PARITY).sort()) {
+    if (!name.endsWith(".json")) continue;
+    const fixture = JSON.parse(readFileSync(join(PARITY, name), "utf8"));
+    if (fixture.legacyBody === undefined || byScope.has(fixture.scope))
+      continue;
+    byScope.set(fixture.scope, fixture.legacyBody);
+  }
+  return [...byScope].map(([scope, data]) => ({ scope, data }));
+}
+
+async function unswitchedDeps(): Promise<PersonalServerDataApiDeps> {
+  const storage = createMemoryDataStorage();
+  const envelopes = parityBodies();
+  envelopes.push({
+    scope: "pdpp.acme.items",
+    data: {
+      records: [
+        { id: "a", n: 1 },
+        { id: "b", n: 2 },
+      ],
+    },
+  });
+  for (const { scope, data } of envelopes) {
+    const written = await storage.writeEnvelope({
+      version: "1.0" as const,
+      scope,
+      collectedAt: COLLECTED_AT,
+      data,
+    });
+    storage.insertEntry({
+      fileId: null,
+      path: written.relativePath,
+      scope,
+      collectedAt: COLLECTED_AT,
+      sizeBytes: written.sizeBytes,
+    } as never);
+  }
+  return {
+    storage,
+    accountMode: { read: () => "unswitched" },
+    auth: {
+      authorizeOwner: vi.fn(async () => undefined),
+      authorizeBuilderList: vi.fn(async () => undefined),
+      authorizeBuilderRead: vi.fn(async ({ request }: { request: Request }) =>
+        request.headers.get("x-test-builder")
+          ? { builder: BUILDER, grantId: "grant-1" }
+          : { builder: BUILDER, grantId: "owner" },
+      ),
+    } as never,
+    accessLogWriter: { write: vi.fn(async () => undefined) },
+    serverOwner: "0x0000000000000000000000000000000000000001",
+    now: () => new Date("2026-11-01T00:00:00.000Z"),
+    createLogId: () => "log-1",
+  } as unknown as PersonalServerDataApiDeps;
+}
+
+function snapshotRequests() {
+  const requests: { name: string; path: string; builder?: boolean }[] = [];
+  for (const { scope } of parityBodies()) {
+    requests.push({ name: `owner ${scope}`, path: `/${scope}` });
+    requests.push({
+      name: `builder ${scope}`,
+      path: `/${scope}`,
+      builder: true,
+    });
+  }
+  requests.push(
+    { name: "raw pdpp stream", path: "/pdpp.acme.items" },
+    {
+      name: "connection and cursor ignored",
+      path: "/pdpp.acme.items?connection=0123456789abcdef&cursor=abc",
+    },
+    {
+      name: "bad connection ignored",
+      path: "/chatgpt.conversations?connection=zz",
+    },
+    { name: "stored view", path: "/pdpp.acme.items?view=stored" },
+    { name: "unknown scope", path: "/acme.nothing" },
+    { name: "physical stream name", path: "/pdpp.acme~0123456789abcdef.items" },
+    { name: "physical control name", path: "/pdpp.acme~0123456789abcdef" },
+    { name: "identity-less physical name", path: "/pdpp.acme~.items" },
+  );
+  return requests;
+}
+
+describe("data reads with stream sync off", () => {
+  it("answer every recorded read as the snapshot says", async () => {
+    const deps = await unswitchedDeps();
+    const observed: Record<string, unknown> = {};
+    for (const request of snapshotRequests()) {
+      const response = await handlePersonalServerDataRequest(
+        new Request(`https://ps.example.com${request.path}`, {
+          headers: request.builder ? { "x-test-builder": "1" } : {},
+        }),
+        deps,
+      );
+      const body = await response.text();
+      observed[request.name] = {
+        status: response.status,
+        contentType: response.headers.get("content-type"),
+        source: response.headers.get("x-vana-data-source"),
+        bytes: body.length,
+        sha256: createHash("sha256").update(body).digest("hex"),
+      };
+    }
+    expect(observed).toEqual(JSON.parse(readFileSync(SNAPSHOT, "utf8")));
   });
 });

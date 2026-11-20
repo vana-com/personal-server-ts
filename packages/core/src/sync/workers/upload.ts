@@ -640,6 +640,10 @@ export async function uploadAll(
     );
     return [];
   }
+  // A quarantine ends by itself: an entry whose backoff has passed gets one
+  // more attempt, so a stopped upload is never stopped for ever unseen.
+  if (attempts)
+    for (const path of await attempts.probe(clock())) state.clear(path);
   // Paging needs both methods: the page method alone has no fence, so a
   // growing tail could keep the sweep from ever wrapping. Such a host is
   // listed whole.
