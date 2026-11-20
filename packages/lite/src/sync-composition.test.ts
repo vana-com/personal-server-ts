@@ -206,7 +206,9 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
     const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
     const stateStore = namedState("indexeddb:composition-a/state");
     const { storage, entry } = await legacyStorage();
-    // A prior boot left this row interrupted twice: it is quarantined.
+    // A prior boot left this row interrupted twice: it is quarantined, and its
+    // retry backoff (an hour) has not passed. A record with no time, from an
+    // older ledger, would be due at once and attempted; that is covered in core.
     await stateStore.set(UPLOAD_ATTEMPTS_KEY, {
       version: 1,
       records: [
@@ -219,6 +221,8 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
           interrupted: 2,
           inFlight: false,
           quarantined: true,
+          quarantinedAt: Date.now(),
+          quarantines: 1,
         },
       ],
     });

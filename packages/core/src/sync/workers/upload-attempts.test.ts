@@ -267,6 +267,129 @@ describe("uploadAll — durable attempt markers", () => {
     expect(results.map((r) => r.path)).toEqual([a.path]);
   });
 
+  describe("automatic retry of a quarantined entry", () => {
+    const HOUR = 3_600_000;
+
+    /** One clock for the ledger (quarantine times) and the worker (probe time). */
+    function clockAt(start: number) {
+      let ms = start;
+      return {
+        set: (to: number) => void (ms = to),
+        ms: () => ms,
+        date: () => new Date(ms),
+      };
+    }
+    type Clock = ReturnType<typeof clockAt>;
+
+    const bootOn = (
+      index: ReturnType<typeof makeIndex>,
+      store: UploadAttemptStore,
+      clock: Clock,
+    ) =>
+      boot(index, store, {
+        uploadAttempts: createUploadAttemptLedger(restartable(store), OWNER, {
+          now: clock.ms,
+        }),
+      });
+    const run = (host: ReturnType<typeof boot>, clock: Clock) =>
+      uploadAll(host.deps, { now: clock.date });
+
+    async function quarantine(
+      index: ReturnType<typeof makeIndex>,
+      store: UploadAttemptStore,
+      clock: Clock,
+    ) {
+      for (let boots = 0; boots < 2; boots++) {
+        void run(bootOn(index, store, clock), clock);
+        await flush();
+      }
+      // The next boot's recovery is what quarantines the entry, at `clock`.
+      await run(bootOn(index, store, clock), clock);
+    }
+
+    it("retries once after the backoff, and uploads when the cause is gone", async () => {
+      const a = makeEntry(1);
+      const index = makeIndex([a]);
+      index.dies.add(a.path);
+      const store = createMemoryUploadAttemptStore();
+      const base = 1_000_000_000_000;
+      const clock = clockAt(base);
+      await quarantine(index, store, clock);
+
+      const host = bootOn(index, store, clock);
+      clock.set(base + HOUR - 1);
+      expect(await run(host, clock)).toEqual([]);
+      expect(host.uploadState.snapshot().stopped).toHaveLength(1);
+      expect(index.reads).toHaveLength(2);
+
+      index.dies.clear();
+      clock.set(base + HOUR);
+      const results = await run(host, clock);
+      expect(results.map((r) => r.path)).toEqual([a.path]);
+      expect(host.uploadState.snapshot().stopped).toEqual([]);
+    });
+
+    it("gives a retry one attempt, and waits twice as long after it kills the process again", async () => {
+      const a = makeEntry(1);
+      const index = makeIndex([a]);
+      index.dies.add(a.path);
+      const store = createMemoryUploadAttemptStore();
+      const base = 1_000_000_000_000;
+      const clock = clockAt(base);
+      await quarantine(index, store, clock);
+
+      clock.set(base + HOUR);
+      void run(bootOn(index, store, clock), clock);
+      await flush();
+      expect(index.reads).toHaveLength(3);
+
+      // The retry died: the next boot quarantines the entry again at once, at
+      // `second`, so it is due 2 h after that, not 1 h.
+      const second = base + HOUR + 60_000;
+      clock.set(second);
+      const after = bootOn(index, store, clock);
+      await run(after, clock);
+      expect(index.reads).toHaveLength(3);
+      expect(after.uploadState.snapshot().stopped).toHaveLength(1);
+
+      clock.set(second + 2 * HOUR - 1);
+      await run(after, clock);
+      expect(index.reads).toHaveLength(3);
+      clock.set(second + 2 * HOUR);
+      void run(after, clock);
+      await flush();
+      expect(index.reads).toHaveLength(4);
+    });
+
+    it("treats a quarantine from an older ledger, with no time, as due at once", async () => {
+      const a = makeEntry(1);
+      const index = makeIndex([a]);
+      const store = createMemoryUploadAttemptStore();
+      // The shape an older ledger wrote: quarantined, no time, no count.
+      await store.write({
+        version: 1,
+        records: [
+          {
+            key: uploadAttemptKey(OWNER, a),
+            owner: OWNER.toLowerCase(),
+            scope: a.scope,
+            path: a.path,
+            rowId: a.id,
+            interrupted: 2,
+            inFlight: false,
+            quarantined: true,
+          },
+        ],
+      });
+
+      // The clock sits at the Unix epoch: no backoff can have passed.
+      const clock = clockAt(0);
+      const host = bootOn(index, store, clock);
+      const results = await run(host, clock);
+      expect(results.map((r) => r.path)).toEqual([a.path]);
+    });
+  });
+
   it("keeps the interrupted count across a caught failure: crash, caught failure, crash quarantines", async () => {
     const a = makeEntry(1);
     const b = makeEntry(2);

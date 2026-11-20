@@ -3,6 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createMemoryUploadAttemptStore,
   createUploadAttemptLedger,
+  QUARANTINE_RETRY_BASE_MS,
+  QUARANTINE_RETRY_MAX_MS,
+  parseUploadAttemptsEnvelope,
+  quarantineBackoffMs,
   UPLOAD_ATTEMPTS_RESET_NOTICE,
   UploadAttemptStorageFailedError,
   UploadAttemptStoreInvalidError,
@@ -614,5 +618,22 @@ describe("a begin whose write was rejected", () => {
     });
     await next.recover();
     expect(next.quarantined()).toEqual([]);
+  });
+});
+
+describe("quarantine retry backoff", () => {
+  it("doubles with each quarantine and stops at the cap", () => {
+    expect(quarantineBackoffMs(1)).toBe(QUARANTINE_RETRY_BASE_MS);
+    expect(quarantineBackoffMs(2)).toBe(2 * QUARANTINE_RETRY_BASE_MS);
+    expect(quarantineBackoffMs(40)).toBe(QUARANTINE_RETRY_MAX_MS);
+  });
+
+  it("rejects a quarantine time that is not a count", () => {
+    expect(() =>
+      parseUploadAttemptsEnvelope({
+        version: 1,
+        records: [record({ quarantined: true, quarantinedAt: -1 })],
+      }),
+    ).toThrow(UploadAttemptStoreInvalidError);
   });
 });
